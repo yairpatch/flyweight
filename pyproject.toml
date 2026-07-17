@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colibri-next"
+version = "0.2.0"
+description = "Hardware-adaptive hierarchical expert residency for sparse MoE inference"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+[project.optional-dependencies]
+fast = ["numpy>=2.0"]
+generation = ["tokenizers>=0.22"]
+client = ["openai>=2.0"]
+cuda13 = ["cupy-cuda13x>=14.1"]
+
+[project.scripts]
+colibri-next = "colibri_next.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+colibri_next = [
+  "ui/*.html",
+  "ui/*.css",
+  "ui/*.js",
+  "ui/*.svg",
+  "_native/*.dll",
+  "_native/*.so",
+  "_native/*.dylib",
+]
+
