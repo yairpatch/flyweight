@@ -214,6 +214,13 @@ dispatch at or above 128 tokens. Set `COLIBRI_EXPERT_MAJOR_PREFILL` to `0` or
 `1` to force either path, or tune the crossover with
 `COLIBRI_EXPERT_MAJOR_MIN_TOKENS`.
 
+DeltaNet prompt processing uses a fused causal-convolution sequence kernel and
+one persistent recurrent-scan block per value head, replacing the per-token
+CuPy launch loop. A focused 256-token layer-0 benchmark on the same GPU and
+BF16-static validation model improved from 2,357 to 7,952 tokens per second
+(about 3.37x). Set `COLIBRI_FUSED_DELTA_PREFILL=0` to use the fallback path for
+parity checks or A/B benchmarks.
+
 Pinned-memory expert upload and a request-local cross-layer transition predictor
 are available experimentally. Enable them with
 `$env:COLIBRI_EXPERT_PREFETCH = "1"` in PowerShell or
@@ -409,14 +416,15 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 - CUDA is the only implemented accelerator backend
 - Image, audio, embeddings, fine-tuning, and hosted OpenAI tools are not implemented
 - Tool calls are buffered before streaming because the native XML call must be parsed as a complete unit
-- DeltaNet recurrence and routed expert execution remain token-sequential during prefill
+- DeltaNet recurrence is fused but inherently sequential within each value head;
+  routed expert execution remains token-sequential below the expert-major threshold
 - Response history and decoder prefix states are process-local; response records
   are limited to 128 and prefix states default to four entries
 
 ## Next milestones
 
 1. Run and publish full-checkpoint Transformers parity results.
-2. Add fused DeltaNet prompt scans and benchmark expert-major prefill dispatch.
+2. Move MoE routing and expert dispatch fully onto the GPU.
 3. Improve expert prediction and reuse pinned staging buffers.
 4. Add CUDA graph replay and persistent fused layer kernels.
 5. Optimize Q8 activation and DP4A expert kernels after graph capture.

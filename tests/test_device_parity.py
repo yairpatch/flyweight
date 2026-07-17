@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,6 +75,33 @@ class DeviceDecodeParityTests(unittest.TestCase):
             self.assertEqual(host_tokens, device_tokens)
         finally:
             disable_cuda()
+
+    def test_fused_delta_prefill_matches_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            create_decoder_checkpoint(source)
+            convert_model(source, output, "bf16")
+            model = QwenForCausalLM.from_model_directory(output)
+            accelerator = configure_cuda(cache_mib=64)
+            try:
+                os.environ["COLIBRI_FUSED_DELTA_PREFILL"] = "0"
+                fallback_state = model.new_state()
+                fallback = model.prefill_device(PROMPT_IDS, fallback_state)
+                fallback_logits = accelerator.device_to_host(fallback.logits)
+
+                os.environ["COLIBRI_FUSED_DELTA_PREFILL"] = "1"
+                fused_state = model.new_state()
+                fused = model.prefill_device(PROMPT_IDS, fused_state)
+                fused_logits = accelerator.device_to_host(fused.logits)
+                for expected, actual in zip(fallback_logits, fused_logits):
+                    self.assertAlmostEqual(actual, expected, delta=TOLERANCE)
+                self.assertEqual(fused_state.tokens, fallback_state.tokens)
+            finally:
+                os.environ.pop("COLIBRI_FUSED_DELTA_PREFILL", None)
+                disable_cuda()
 
     def _assert_device_parity(self, quantization: str) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -150,6 +150,12 @@ class CudaAccelerator:
             self._q4_q8_weighted_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "q4_q8_batched_weighted_matvec"
             )
+            self._delta_conv_sequence_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "delta_conv_sequence"
+            )
+            self._delta_recurrent_sequence_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "delta_recurrent_sequence"
+            )
 
     @property
     def device_name(self) -> str:
@@ -647,6 +653,16 @@ class CudaAccelerator:
             state.cuda_recurrent_state = cp.asarray(
                 state.recurrent_state, dtype=cp.float32
             )
+        if os.environ.get("COLIBRI_FUSED_DELTA_PREFILL", "1") != "0":
+            return self._gated_delta_sequence_fused(
+                layer,
+                hidden,
+                state,
+                mixed_qkv,
+                z,
+                beta_logits,
+                decay_logits,
+            )
         conv_state = state.cuda_conv_state
         recurrent_state = state.cuda_recurrent_state
         conv_weights = self._float32_array(layer._conv_weights).reshape(
@@ -704,6 +720,62 @@ class CudaAccelerator:
             cores[token] = (
                 core * inverse_rms * norm_weights[None, :] * silu_gates
             ).reshape(-1)
+        state.tokens += tokens
+        output = self.matrix_matmul_device(layer.out_proj, cores)
+        return output + hidden
+
+    def _gated_delta_sequence_fused(
+        self,
+        layer: Any,
+        hidden: Any,
+        state: Any,
+        mixed_qkv: Any,
+        z: Any,
+        beta_logits: Any,
+        decay_logits: Any,
+    ) -> Any:
+        """Run the token-sequential DeltaNet recurrence in two CUDA launches."""
+        cp = self.cp
+        tokens = int(hidden.shape[0])
+        conv_weights = self._float32_array(layer._conv_weights).reshape(
+            layer.conv_dim, layer.conv_kernel_size
+        )
+        convolved = cp.empty((tokens, layer.conv_dim), dtype=cp.float32)
+        self._delta_conv_sequence_kernel(
+            (layer.conv_dim,),
+            (1,),
+            (
+                mixed_qkv,
+                conv_weights,
+                state.cuda_conv_state,
+                convolved,
+                tokens,
+                layer.conv_dim,
+                layer.conv_kernel_size,
+            ),
+        )
+        cores = cp.empty((tokens, layer.value_dim), dtype=cp.float32)
+        self._delta_recurrent_sequence_kernel(
+            (layer.num_value_heads,),
+            (THREADS_PER_BLOCK,),
+            (
+                convolved,
+                z,
+                beta_logits,
+                decay_logits,
+                self._float32_array(layer._a_log),
+                self._float32_array(layer._dt_bias),
+                self._float32_array(layer._norm_weights),
+                state.cuda_recurrent_state,
+                cores,
+                tokens,
+                layer.num_key_heads,
+                layer.num_value_heads,
+                layer.key_head_dim,
+                layer.value_head_dim,
+                cp.float32(layer.rms_norm_eps),
+            ),
+        )
         state.tokens += tokens
         output = self.matrix_matmul_device(layer.out_proj, cores)
         return output + hidden
@@ -1481,6 +1553,139 @@ __device__ __forceinline__ float block_reduce_sum(float value) {
         }
     }
     return value;
+}
+
+extern "C" __global__
+void delta_conv_sequence(
+    const float* mixed_qkv,
+    const float* weights,
+    float* state,
+    float* output,
+    const int tokens,
+    const int channels,
+    const int kernel_size
+) {
+    const int channel = blockIdx.x;
+    if (channel >= channels || threadIdx.x != 0) return;
+    float* channel_state = state + channel * kernel_size;
+    const float* channel_weights = weights + channel * kernel_size;
+    for (int token = 0; token < tokens; ++token) {
+        for (int index = 0; index + 1 < kernel_size; ++index) {
+            channel_state[index] = channel_state[index + 1];
+        }
+        channel_state[kernel_size - 1] = mixed_qkv[token * channels + channel];
+        float value = 0.0f;
+        for (int index = 0; index < kernel_size; ++index) {
+            value += channel_state[index] * channel_weights[index];
+        }
+        output[token * channels + channel] = value / (1.0f + expf(-value));
+    }
+}
+
+extern "C" __global__
+void delta_recurrent_sequence(
+    const float* convolved,
+    const float* gates,
+    const float* beta_logits,
+    const float* decay_logits,
+    const float* a_log,
+    const float* dt_bias,
+    const float* norm_weights,
+    float* state,
+    float* output,
+    const int tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float epsilon
+) {
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (head >= value_heads) return;
+    const int key_head = head / (value_heads / key_heads);
+    const int total_key_dim = key_heads * key_dim;
+    const int conv_width = total_key_dim * 2 + value_heads * value_dim;
+    __shared__ float query_inverse_norm;
+    __shared__ float key_inverse_norm;
+    __shared__ float decay_scale;
+    __shared__ float beta;
+    __shared__ float core_values[256];
+    for (int token = 0; token < tokens; ++token) {
+        const float* row = convolved + token * conv_width;
+        const int key_offset = key_head * key_dim;
+        if (lane == 0) {
+            float query_square = 0.0f;
+            float key_square = 0.0f;
+            for (int index = 0; index < key_dim; ++index) {
+                const float query = row[key_offset + index];
+                const float key = row[total_key_dim + key_offset + index];
+                query_square += query * query;
+                key_square += key * key;
+            }
+            query_inverse_norm = rsqrtf(query_square + 1.0e-6f)
+                * rsqrtf((float)key_dim);
+            key_inverse_norm = rsqrtf(key_square + 1.0e-6f);
+            beta = 1.0f / (1.0f + expf(-beta_logits[token * value_heads + head]));
+            const float softplus_input =
+                decay_logits[token * value_heads + head] + dt_bias[head];
+            const float softplus = softplus_input > 20.0f
+                ? softplus_input : log1pf(expf(softplus_input));
+            decay_scale = expf(-expf(a_log[head]) * softplus);
+        }
+        __syncthreads();
+        float core = 0.0f;
+        if (lane < value_dim) {
+            float memory = 0.0f;
+            for (int index = 0; index < key_dim; ++index) {
+                const float key = row[total_key_dim + key_offset + index]
+                    * key_inverse_norm;
+                const int state_index =
+                    (head * key_dim + index) * value_dim + lane;
+                state[state_index] *= decay_scale;
+                memory += state[state_index] * key;
+            }
+            const float value = row[
+                total_key_dim * 2 + head * value_dim + lane
+            ];
+            const float delta = (value - memory) * beta;
+            for (int index = 0; index < key_dim; ++index) {
+                const float key = row[total_key_dim + key_offset + index]
+                    * key_inverse_norm;
+                const int state_index =
+                    (head * key_dim + index) * value_dim + lane;
+                state[state_index] += key * delta;
+            }
+        }
+        __syncthreads();
+        if (lane < value_dim) {
+            for (int index = 0; index < key_dim; ++index) {
+                const float query = row[key_offset + index] * query_inverse_norm;
+                core += state[(head * key_dim + index) * value_dim + lane]
+                    * query;
+            }
+        }
+        core_values[lane] = lane < value_dim ? core : 0.0f;
+        __syncthreads();
+        __shared__ float core_inverse_rms;
+        if (lane == 0) {
+            float core_square = 0.0f;
+            for (int index = 0; index < value_dim; ++index) {
+                core_square += core_values[index] * core_values[index];
+            }
+            core_inverse_rms = rsqrtf(core_square / (float)value_dim + epsilon);
+        }
+        __syncthreads();
+        if (lane < value_dim) {
+            const int gate_index =
+                token * value_heads * value_dim + head * value_dim + lane;
+            const float gate = gates[gate_index];
+            const float silu_gate = gate / (1.0f + expf(-gate));
+            output[gate_index] = core * core_inverse_rms
+                * norm_weights[lane] * silu_gate;
+        }
+        __syncthreads();
+    }
 }
 
 __device__ __forceinline__ int pack_signed_chars(
