@@ -105,6 +105,7 @@ class NativeBackend:
         vector: object,
         *,
         as_array: bool = False,
+        out: object = None,
     ) -> object:
         if len(experts) != len(routing_weights):
             raise ValueError("expert and routing-weight counts must match")
@@ -115,18 +116,25 @@ class NativeBackend:
             [*routing_weights, shared_weight], dtype=np.float32
         )
         if self._fused_moe:
-            output = self._fused_q4_moe(all_experts, weights, input_vector)
+            output = self._fused_q4_moe(
+                all_experts, weights, input_vector, out=out
+            )
         else:
             futures = [
                 self._executor.submit(self.q4_swiglu, expert, input_vector)
                 for expert in all_experts
             ]
             outputs = np.stack([future.result() for future in futures])
-            output = np.einsum("e,eh->h", weights, outputs)
+            output = np.einsum("e,eh->h", weights, outputs, out=out)
         return output if as_array else output.tolist()
 
     def _fused_q4_moe(
-        self, all_experts: list[Q4SwiGLUExpert], weights: object, input_vector: object
+        self,
+        all_experts: list[Q4SwiGLUExpert],
+        weights: object,
+        input_vector: object,
+        *,
+        out: object = None,
     ) -> object:
         np = _numpy()
         count = len(all_experts)
@@ -160,7 +168,11 @@ class NativeBackend:
             down_packed[index] = pointers[2]
             down_scales[index] = pointers[3]
         weight_array = np.ascontiguousarray(weights, dtype=np.float32)
-        output = np.empty(hidden_size, dtype=np.float32)
+        output = (
+            out
+            if out is not None
+            else np.empty(hidden_size, dtype=np.float32)
+        )
         status = self.library.colibri_q4_moe(
             gate_up_packed,
             gate_up_scales,

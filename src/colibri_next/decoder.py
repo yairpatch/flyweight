@@ -327,25 +327,43 @@ class QwenDecoderStack:
         state.tokens
         output = hidden
         previous_route: list[ExpertKey] | None = None
-        for layer, layer_state in zip(self.layers, state.layer_states):
-            predicted = layer_state.last_selected_experts
-            if previous_route is not None:
-                prediction = state.route_predictor.predict(
-                    previous_route,
-                    layer.layer,
-                    min(layer.moe.top_k, accelerator.expert_prefetch_budget),
-                )
-                if prediction:
-                    predicted = tuple(key.expert for key in prediction)
-            accelerator.prefetch_moe(layer.moe, predicted)
+        last_index = len(self.layers) - 1
+        for index, (layer, layer_state) in enumerate(
+            zip(self.layers, state.layer_states)
+        ):
+            on_cuda = layer.moe.expert_device == "cuda"
+            if on_cuda:
+                predicted = layer_state.last_selected_experts
+                if previous_route is not None:
+                    prediction = state.route_predictor.predict(
+                        previous_route,
+                        layer.layer,
+                        min(
+                            layer.moe.top_k,
+                            accelerator.expert_prefetch_budget,
+                        ),
+                    )
+                    if prediction:
+                        predicted = tuple(key.expert for key in prediction)
+                accelerator.prefetch_moe(layer.moe, predicted)
             output = layer.forward_device(output, layer_state, accelerator)
-            current_route = [
-                ExpertKey(layer.layer, expert_id)
-                for expert_id in layer_state.last_selected_experts
-            ]
-            if previous_route is not None:
-                state.route_predictor.observe(previous_route, current_route)
-            previous_route = current_route
+            # Route bookkeeping only feeds GPU expert prefetch, so skip it
+            # unless this layer or the next one keeps its experts on CUDA.
+            if on_cuda or (
+                index < last_index
+                and self.layers[index + 1].moe.expert_device == "cuda"
+            ):
+                current_route = [
+                    ExpertKey(layer.layer, expert_id)
+                    for expert_id in layer_state.last_selected_experts
+                ]
+                if previous_route is not None:
+                    state.route_predictor.observe(
+                        previous_route, current_route
+                    )
+                previous_route = current_route
+            else:
+                previous_route = None
         state.tokens
         return output
 

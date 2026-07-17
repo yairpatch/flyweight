@@ -112,6 +112,7 @@ class CudaAccelerator:
             tuple[str, int], _PendingPrefetch
         ] = OrderedDict()
         self._rope_cache: dict[tuple[int, float, int], tuple[Any, Any]] = {}
+        self._moe_transfer_cache: dict[int, tuple[Any, Any, Any]] = {}
         with cp.cuda.Device(device_id):
             self._prefetch_stream = cp.cuda.Stream(non_blocking=True)
             self._bf16_kernel = cp.RawKernel(_KERNEL_SOURCE, "bf16_matvec")
@@ -1345,7 +1346,10 @@ class CudaAccelerator:
         import numpy as np
 
         router_np, gate_np, norm_np = self._host_moe_weights(layer)
-        host = hidden.get()
+        host, output_host, output_device = self._moe_transfer_buffers(
+            int(hidden.size)
+        )
+        hidden.get(out=host)
         inverse_rms = 1.0 / np.sqrt(
             float(np.mean(host * host)) + layer.rms_norm_eps
         )
@@ -1362,16 +1366,45 @@ class CudaAccelerator:
             route_state.last_selected_experts = tuple(selected_ids)
         shared_logit = float(gate_np @ normalized)
         shared_weight = 1.0 / (1.0 + np.exp(-shared_logit))
-        output = backend.q4_moe(
+        backend.q4_moe(
             [layer._expert(expert_id) for expert_id in selected_ids],
             weights.tolist(),
             layer.shared_expert,
             shared_weight,
             normalized,
             as_array=True,
+            out=output_host,
         )
-        output += host
-        return self.device_vector(output)
+        output_host += host
+        output_device.set(output_host)
+        return output_device
+
+    def _moe_transfer_buffers(self, hidden_size: int) -> tuple[Any, Any, Any]:
+        """Pinned host staging plus a reused device output buffer.
+
+        Reusing one device buffer across offloaded layers is safe because the
+        blocking ``hidden.get`` at the top of the next offloaded layer
+        synchronizes the stream after every consumer of the previous output
+        has been enqueued.
+        """
+        buffers = self._moe_transfer_cache.get(hidden_size)
+        if buffers is None:
+            import numpy as np
+
+            cp = self.cp
+            input_memory = cp.cuda.alloc_pinned_memory(hidden_size * 4)
+            output_memory = cp.cuda.alloc_pinned_memory(hidden_size * 4)
+            buffers = (
+                np.frombuffer(
+                    input_memory, dtype=np.float32, count=hidden_size
+                ),
+                np.frombuffer(
+                    output_memory, dtype=np.float32, count=hidden_size
+                ),
+                cp.empty(hidden_size, dtype=cp.float32),
+            )
+            self._moe_transfer_cache[hidden_size] = buffers
+        return buffers
 
     def _moe_sequence_cpu(
         self, layer: Any, hidden: Any, route_state: Any | None
@@ -1877,6 +1910,7 @@ class CudaAccelerator:
         self._unused_prefetches.clear()
         self._cache.clear()
         self._rope_cache.clear()
+        self._moe_transfer_cache.clear()
         self.cache_bytes = 0
         with self.cp.cuda.Device(self.device_id):
             self.cp.get_default_memory_pool().free_all_blocks()
