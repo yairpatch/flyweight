@@ -346,46 +346,42 @@ class CudaAccelerator:
         cp = self.cp
         with cp.cuda.Device(self.device_id):
             hidden_device = cp.asarray(hidden, dtype=cp.float32)
-            input_norm_weights = self._float32_array(
-                layer._input_norm_weights
+            normalized = self.rms_norm_device(
+                hidden_device, layer._input_norm_weights, layer.rms_norm_eps
             )
-            inverse_rms = cp.float32(1.0) / cp.sqrt(
-                cp.mean(hidden_device * hidden_device) + layer.rms_norm_eps
-            )
-            normalized = hidden_device * inverse_rms * (
-                cp.float32(1.0) + input_norm_weights
-            )
-            projected_queries = self._matrix_matvec_device(
-                layer.q_projection, normalized
-            )
-            projected_keys = self._matrix_matvec_device(
-                layer.k_projection, normalized
-            )
-            projected_values = self._matrix_matvec_device(
-                layer.v_projection, normalized
-            )
+            combined = self._combined_qkv(layer)
+            if combined is not None:
+                projected = self._matrix_matvec_device(combined, normalized)
+                offsets = layer._combined_qkv_offsets
+                projected_queries = projected[: offsets[0]]
+                projected_keys = projected[offsets[0] : offsets[1]]
+                projected_values = projected[offsets[1] :]
+            else:
+                projected_queries = self._matrix_matvec_device(
+                    layer.q_projection, normalized
+                )
+                projected_keys = self._matrix_matvec_device(
+                    layer.k_projection, normalized
+                )
+                projected_values = self._matrix_matvec_device(
+                    layer.v_projection, normalized
+                )
 
             query_gate = projected_queries.reshape(
                 layer.num_attention_heads, 2, layer.head_dim
             )
-            queries = query_gate[:, 0, :]
+            queries = cp.ascontiguousarray(query_gate[:, 0, :])
             gates = query_gate[:, 1, :]
-            query_norm_weights = self._float32_array(layer._q_norm_weights)
-            queries *= cp.float32(1.0) / cp.sqrt(
-                cp.mean(queries * queries, axis=1, keepdims=True)
-                + layer.rms_norm_eps
+            queries = self.rms_norm_rows_device(
+                queries, layer._q_norm_weights, layer.rms_norm_eps
             )
-            queries *= cp.float32(1.0) + query_norm_weights[None, :]
 
             keys = projected_keys.reshape(
                 layer.num_key_value_heads, layer.head_dim
             )
-            key_norm_weights = self._float32_array(layer._k_norm_weights)
-            keys *= cp.float32(1.0) / cp.sqrt(
-                cp.mean(keys * keys, axis=1, keepdims=True)
-                + layer.rms_norm_eps
+            keys = self.rms_norm_rows_device(
+                keys, layer._k_norm_weights, layer.rms_norm_eps
             )
-            keys *= cp.float32(1.0) + key_norm_weights[None, :]
             cosines, sines = self._rope_factors(
                 layer.rotary_dim, layer.rope_theta, position
             )
@@ -698,6 +694,10 @@ class CudaAccelerator:
     ) -> Any:
         cp = self.cp
         with cp.cuda.Device(self.device_id):
+            if os.environ.get("COLIBRI_FUSED_DELTA_DECODE", "1") != "0":
+                return self._gated_delta_decode_fused(
+                    layer, hidden, state, return_device=return_device
+                )
             hidden_device = cp.asarray(hidden, dtype=cp.float32)
             input_norm_weights = self._float32_array(
                 layer._input_norm_weights
@@ -795,6 +795,170 @@ class CudaAccelerator:
             if return_device:
                 return output
             return output.get().tolist()
+
+    def _gated_delta_decode_fused(
+        self, layer: Any, hidden: Any, state: Any, *, return_device: bool
+    ) -> Any:
+        """Single-token DeltaNet step in ~6 launches.
+
+        Reuses the fused prefill conv/recurrence kernels with tokens=1 and a
+        row-concatenated input projection, replacing the ~25 small elementwise
+        launches of the portable path whose Python dispatch dominates decode
+        once the MoE experts run off-GPU.
+        """
+        cp = self.cp
+        hidden_device = cp.asarray(hidden, dtype=cp.float32)
+        normalized = self.rms_norm_device(
+            hidden_device, layer._input_norm_weights, layer.rms_norm_eps
+        )
+        combined = self._combined_in_proj(layer)
+        if combined is not None:
+            projected = self._matrix_matvec_device(combined, normalized)
+            offsets = layer._combined_in_proj_offsets
+            mixed_qkv = projected[: offsets[0]]
+            z = projected[offsets[0] : offsets[1]]
+            beta_logits = projected[offsets[1] : offsets[2]]
+            decay_logits = projected[offsets[2] :]
+        else:
+            mixed_qkv, z, beta_logits, decay_logits = [
+                self._matrix_matvec_device(tensor, normalized)
+                for tensor in (
+                    layer.in_proj_qkv,
+                    layer.in_proj_z,
+                    layer.in_proj_b,
+                    layer.in_proj_a,
+                )
+            ]
+        if state.cuda_conv_state is None:
+            state.cuda_conv_state = cp.asarray(
+                state.conv_state, dtype=cp.float32
+            )
+            state.cuda_recurrent_state = cp.asarray(
+                state.recurrent_state, dtype=cp.float32
+            )
+        conv_weights = self._float32_array(layer._conv_weights).reshape(
+            layer.conv_dim, layer.conv_kernel_size
+        )
+        convolved = cp.empty((1, layer.conv_dim), dtype=cp.float32)
+        self._delta_conv_sequence_kernel(
+            (layer.conv_dim,),
+            (1,),
+            (
+                mixed_qkv.reshape(1, -1),
+                conv_weights,
+                state.cuda_conv_state,
+                convolved,
+                1,
+                layer.conv_dim,
+                layer.conv_kernel_size,
+            ),
+        )
+        cores = cp.empty((1, layer.value_dim), dtype=cp.float32)
+        self._delta_recurrent_sequence_kernel(
+            (layer.num_value_heads,),
+            (THREADS_PER_BLOCK,),
+            (
+                convolved,
+                z.reshape(1, -1),
+                beta_logits.reshape(1, -1),
+                decay_logits.reshape(1, -1),
+                self._float32_array(layer._a_log),
+                self._float32_array(layer._dt_bias),
+                self._float32_array(layer._norm_weights),
+                state.cuda_recurrent_state,
+                cores,
+                1,
+                layer.num_key_heads,
+                layer.num_value_heads,
+                layer.key_head_dim,
+                layer.value_head_dim,
+                cp.float32(layer.rms_norm_eps),
+            ),
+        )
+        output = self._matrix_matvec_device(
+            layer.out_proj, cores.reshape(-1)
+        )
+        if return_device:
+            return output
+        return output.get().tolist()
+
+    def _combined_in_proj(self, layer: Any) -> Any:
+        """Row-concatenate the four DeltaNet input projections once per layer."""
+        combined = getattr(layer, "_combined_in_proj_cache", "unset")
+        if combined != "unset":
+            return combined
+        from .bf16 import BF16Tensor
+        from .q4 import Q4BlockTensor
+
+        tensors = (
+            layer.in_proj_qkv,
+            layer.in_proj_z,
+            layer.in_proj_b,
+            layer.in_proj_a,
+        )
+        columns = tensors[0].shape[1]
+        rows = sum(tensor.shape[0] for tensor in tensors)
+        aligned = columns % 32 == 0 and all(
+            tensor.shape[1] == columns for tensor in tensors
+        )
+        if all(isinstance(tensor, BF16Tensor) for tensor in tensors):
+            combined = BF16Tensor(
+                shape=(rows, columns),
+                data=b"".join(tensor.data for tensor in tensors),
+            )
+        elif aligned and all(
+            isinstance(tensor, Q4BlockTensor) for tensor in tensors
+        ):
+            combined = Q4BlockTensor(
+                shape=(rows, columns),
+                packed=b"".join(tensor.packed for tensor in tensors),
+                scales=b"".join(tensor.scales for tensor in tensors),
+            )
+        else:
+            combined = None
+        boundaries = []
+        offset = 0
+        for tensor in tensors[:-1]:
+            offset += tensor.shape[0]
+            boundaries.append(offset)
+        layer._combined_in_proj_offsets = tuple(boundaries)
+        layer._combined_in_proj_cache = combined
+        return combined
+
+    def _combined_qkv(self, layer: Any) -> Any:
+        """Row-concatenate the attention Q/K/V projections once per layer."""
+        if hasattr(layer, "_combined_qkv_cache"):
+            return layer._combined_qkv_cache
+        from .bf16 import BF16Tensor
+        from .q4 import Q4BlockTensor
+
+        tensors = (layer.q_projection, layer.k_projection, layer.v_projection)
+        columns = tensors[0].shape[1]
+        rows = sum(tensor.shape[0] for tensor in tensors)
+        aligned = columns % 32 == 0 and all(
+            tensor.shape[1] == columns for tensor in tensors
+        )
+        if all(isinstance(tensor, BF16Tensor) for tensor in tensors):
+            combined = BF16Tensor(
+                shape=(rows, columns),
+                data=b"".join(tensor.data for tensor in tensors),
+            )
+        elif aligned and all(
+            isinstance(tensor, Q4BlockTensor) for tensor in tensors
+        ):
+            combined = Q4BlockTensor(
+                shape=(rows, columns),
+                packed=b"".join(tensor.packed for tensor in tensors),
+                scales=b"".join(tensor.scales for tensor in tensors),
+            )
+        else:
+            combined = None
+        layer._combined_qkv_offsets = (
+            tensors[0].shape[0],
+            tensors[0].shape[0] + tensors[1].shape[0],
+        )
+        layer._combined_qkv_cache = combined
+        return combined
 
     def gated_delta_sequence(
         self, layer: Any, hidden: Any, state: Any
