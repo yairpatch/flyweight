@@ -84,6 +84,13 @@ class HuggingFaceTokenizer:
                 raise ValueError(f"unsupported chat role: {role}")
             if not content:
                 raise ValueError("chat message content must not be empty")
+            if role == "assistant" and not content.startswith("<think>"):
+                thinking_prefix = (
+                    "<think>\n"
+                    if enable_thinking
+                    else "<think>\n\n</think>\n\n"
+                )
+                content = thinking_prefix + content
             sections.append(
                 f"<|im_start|>{role}\n{content}<|im_end|>\n"
             )

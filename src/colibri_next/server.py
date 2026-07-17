@@ -167,6 +167,11 @@ class InferenceService:
             "preloaded_experts": self.preloaded_experts,
             "expert_storage_bytes": self.expert_storage_bytes,
             "cpu_moe_layers": self.cpu_moe_layers,
+            "prefix_cache": (
+                self.generator.prefix_cache_stats()
+                if hasattr(self.generator, "prefix_cache_stats")
+                else {"entries": 0, "capacity": 0}
+            ),
             "execution": execution,
         }
 

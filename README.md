@@ -36,6 +36,7 @@ The runtime can inspect and convert real Qwen checkpoints and generate decoded t
 - Hugging Face tokenizer JSON integration and ChatML formatting
 - Greedy, top-k, and nucleus sampling
 - Stateful prompt-to-text generation
+- Bounded cross-request conversation prefix-state caching
 - Persistent OpenAI-compatible local HTTP server
 - Incremental Chat Completions SSE streaming
 - Streaming and stateful Responses API text generation
@@ -315,6 +316,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 The server supports streaming and non-streaming `POST /v1/chat/completions`, `POST /v1/responses`, and legacy `POST /v1/completions`; stateful Responses continuation, retrieval, and deletion; Chat Completions and Responses function tools using Qwen's native tool format; `GET /v1/models`; and llama.cpp-style `/tokenize`, `/detokenize`, `/props`, and `/slots` endpoints. It keeps the CUDA cache warm and serializes generation on one GPU. The first request compiles CUDA kernels and fills VRAM, so later requests are faster.
 
+Completed generations retain a bounded decoder prefix state. When a later chat
+request begins with the same tokenized history, the server reuses its attention
+KV and DeltaNet recurrent state and prefills only newly appended tokens. The
+default cache holds four conversation branches; set
+`COLIBRI_PREFIX_CACHE_ENTRIES=0` to disable it or another non-negative value to
+change the capacity. `/health` reports entries, hits, misses, evictions, and
+reused tokens. A local two-turn Qwen3.5-35B-A3B smoke test reduced follow-up
+latency from 1.474 to 0.648 seconds by reusing 19 of 40 prompt tokens. Results
+depend on answer length, suffix size, expert residency, and cache pressure.
+
 Optional bearer authentication can be enabled without putting the key in shell history:
 
 Windows PowerShell:
@@ -392,7 +403,8 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 - Image, audio, embeddings, fine-tuning, and hosted OpenAI tools are not implemented
 - Tool calls are buffered before streaming because the native XML call must be parsed as a complete unit
 - DeltaNet recurrence and routed expert execution remain token-sequential during prefill
-- Response history is process-local and limited to the latest 128 stored responses
+- Response history and decoder prefix states are process-local; response records
+  are limited to 128 and prefix states default to four entries
 
 ## Next milestones
 

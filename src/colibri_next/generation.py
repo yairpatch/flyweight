@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from .causal_lm import QwenForCausalLM
 from .cuda import active_cuda
@@ -30,12 +32,50 @@ class GenerationStep:
     state_tokens: int
 
 
+@dataclass(slots=True)
+class _PrefixCacheEntry:
+    state: Any
+    logits: Any
+
+
 class TextGenerator:
     def __init__(
-        self, model: QwenForCausalLM, tokenizer: HuggingFaceTokenizer
+        self,
+        model: QwenForCausalLM,
+        tokenizer: HuggingFaceTokenizer,
+        *,
+        prefix_cache_entries: int | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
+        capacity = (
+            int(os.environ.get("COLIBRI_PREFIX_CACHE_ENTRIES", "4"))
+            if prefix_cache_entries is None
+            else prefix_cache_entries
+        )
+        if capacity < 0:
+            raise ValueError("prefix_cache_entries must be non-negative")
+        self.prefix_cache_entries = capacity
+        self._prefix_cache: OrderedDict[
+            tuple[int, ...], _PrefixCacheEntry
+        ] = OrderedDict()
+        self.prefix_cache_hits = 0
+        self.prefix_cache_misses = 0
+        self.prefix_cache_evictions = 0
+        self.prefix_cache_reused_tokens = 0
+
+    def prefix_cache_stats(self) -> dict[str, int]:
+        return {
+            "entries": len(self._prefix_cache),
+            "capacity": self.prefix_cache_entries,
+            "hits": self.prefix_cache_hits,
+            "misses": self.prefix_cache_misses,
+            "evictions": self.prefix_cache_evictions,
+            "reused_tokens": self.prefix_cache_reused_tokens,
+        }
+
+    def clear_prefix_cache(self) -> None:
+        self._prefix_cache.clear()
 
     def generate(
         self,
@@ -153,16 +193,28 @@ class TextGenerator:
         if not prompt_ids:
             raise ValueError("formatted prompt produced no token IDs")
         prompt_tuple = tuple(prompt_ids)
-        state = self.model.new_state()
+        cached = self._take_prefix_state(prompt_tuple)
+        if cached is None:
+            state = self.model.new_state()
+            cached_tokens = 0
+        else:
+            cached_tokens, entry = cached
+            state = entry.state
         sampler = LogitsSampler(sampling or SamplingConfig())
         accelerator = (
             active_cuda() if self.model.device_decode_available else None
         )
-        if accelerator is not None:
-            prompt_result = self.model.prefill_device(prompt_ids, state)
+        remaining_ids = prompt_ids[cached_tokens:]
+        if remaining_ids:
+            if accelerator is not None:
+                prompt_result = self.model.prefill_device(remaining_ids, state)
+            else:
+                prompt_result = self.model.prefill(remaining_ids, state)
+            logits = prompt_result.logits
         else:
-            prompt_result = self.model.prefill(prompt_ids, state)
-        logits = prompt_result.logits
+            assert cached is not None
+            logits = entry.logits
+        processed_ids = list(prompt_ids)
         generated: list[int] = []
         stopped = False
         previous_text = ""
@@ -200,6 +252,8 @@ class TextGenerator:
                     ).logits
                 else:
                     logits = self.model.forward_token(token_id, state).logits
+                processed_ids.append(token_id)
+        self._store_prefix_state(tuple(processed_ids), state, logits)
         yield GenerationStep(
             token_id=None,
             text_delta="",
@@ -210,3 +264,37 @@ class TextGenerator:
             finished=True,
             state_tokens=state.tokens,
         )
+
+    def _take_prefix_state(
+        self, prompt_ids: tuple[int, ...]
+    ) -> tuple[int, _PrefixCacheEntry] | None:
+        best_key = max(
+            (
+                key
+                for key in self._prefix_cache
+                if len(key) <= len(prompt_ids)
+                and prompt_ids[: len(key)] == key
+            ),
+            key=len,
+            default=None,
+        )
+        if best_key is None:
+            self.prefix_cache_misses += 1
+            return None
+        entry = self._prefix_cache.pop(best_key)
+        if entry.state.tokens != len(best_key):
+            raise RuntimeError("cached decoder state token count is inconsistent")
+        self.prefix_cache_hits += 1
+        self.prefix_cache_reused_tokens += len(best_key)
+        return len(best_key), entry
+
+    def _store_prefix_state(
+        self, token_ids: tuple[int, ...], state: Any, logits: Any
+    ) -> None:
+        if self.prefix_cache_entries == 0 or not token_ids:
+            return
+        self._prefix_cache[token_ids] = _PrefixCacheEntry(state, logits)
+        self._prefix_cache.move_to_end(token_ids)
+        while len(self._prefix_cache) > self.prefix_cache_entries:
+            self._prefix_cache.popitem(last=False)
+            self.prefix_cache_evictions += 1

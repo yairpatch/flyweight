@@ -34,10 +34,51 @@ class FakeBackend:
     def decode(
         self, token_ids: list[int], skip_special_tokens: bool = True
     ) -> str:
-        return "".join("ABCD"[token_id] for token_id in token_ids)
+        return "".join("DABC"[token_id] for token_id in token_ids)
 
     def token_to_id(self, token: str) -> int | None:
         return 3 if token == "<eos>" else None
+
+
+class CacheTestState:
+    def __init__(self) -> None:
+        self.tokens = 0
+
+
+class CacheTestResult:
+    logits = [0.0, 2.0, 1.0, -1.0]
+
+
+class CacheTestModel:
+    device_decode_available = False
+
+    def __init__(self) -> None:
+        self.prefill_batches: list[tuple[int, ...]] = []
+
+    def new_state(self) -> CacheTestState:
+        return CacheTestState()
+
+    def prefill(
+        self, token_ids: list[int], state: CacheTestState
+    ) -> CacheTestResult:
+        self.prefill_batches.append(tuple(token_ids))
+        state.tokens += len(token_ids)
+        return CacheTestResult()
+
+    def forward_token(
+        self, token_id: int, state: CacheTestState
+    ) -> CacheTestResult:
+        state.tokens += 1
+        return CacheTestResult()
+
+
+class CacheTestTokenizer:
+    eos_token_ids: tuple[int, ...] = ()
+
+    def decode(
+        self, token_ids: list[int], skip_special_tokens: bool = True
+    ) -> str:
+        return "".join(str(token) for token in token_ids)
 
 
 def create_tokenizer_assets(source: Path) -> None:
@@ -90,6 +131,41 @@ class SamplingTests(unittest.TestCase):
 
 
 class TextGenerationTests(unittest.TestCase):
+    def test_followup_prefills_only_uncached_suffix(self) -> None:
+        model = CacheTestModel()
+        generator = TextGenerator(
+            model, CacheTestTokenizer(), prefix_cache_entries=2
+        )
+        first = generator._generate_ids(
+            [3, 0], max_new_tokens=3, sampling=None
+        )
+        cached_prefix = [*first.prompt_ids, *first.generated_ids[:-1]]
+        second_prompt = [*cached_prefix, 2, 3]
+
+        second = generator._generate_ids(
+            second_prompt, max_new_tokens=1, sampling=None
+        )
+
+        self.assertEqual(model.prefill_batches, [(3, 0), (2, 3)])
+        self.assertEqual(second.state_tokens, len(second_prompt))
+        self.assertEqual(generator.prefix_cache_hits, 1)
+        self.assertEqual(
+            generator.prefix_cache_reused_tokens, len(cached_prefix)
+        )
+
+    def test_prefix_cache_miss_and_capacity(self) -> None:
+        model = CacheTestModel()
+        generator = TextGenerator(
+            model, CacheTestTokenizer(), prefix_cache_entries=1
+        )
+        generator._generate_ids([0], max_new_tokens=1, sampling=None)
+        generator._generate_ids([2], max_new_tokens=1, sampling=None)
+
+        stats = generator.prefix_cache_stats()
+        self.assertEqual(stats["entries"], 1)
+        self.assertEqual(stats["misses"], 2)
+        self.assertEqual(stats["evictions"], 1)
+
     def test_assets_copy_and_chat_formatting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -138,6 +214,39 @@ class TextGenerationTests(unittest.TestCase):
                 result.state_tokens,
                 len(result.prompt_ids) + len(result.generated_ids) - 1,
             )
+
+    def test_chat_followup_reuses_formatted_message_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            create_decoder_checkpoint(source)
+            create_tokenizer_assets(source)
+            convert_generation_model(source, output)
+            tokenizer = HuggingFaceTokenizer.from_model_directory(
+                output, backend=FakeBackend()
+            )
+            model = QwenForCausalLM.from_model_directory(output, rows_per_chunk=2)
+            generator = TextGenerator(model, tokenizer)
+            first = generator.generate_messages(
+                [{"role": "user", "content": "Hi"}],
+                max_new_tokens=3,
+                sampling=SamplingConfig(temperature=0.0),
+            )
+
+            generator.generate_messages(
+                [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": first.text},
+                    {"role": "user", "content": "Again"},
+                ],
+                max_new_tokens=1,
+                sampling=SamplingConfig(temperature=0.0),
+            )
+
+            self.assertEqual(generator.prefix_cache_hits, 1)
+            self.assertGreater(generator.prefix_cache_reused_tokens, 0)
 
     def test_cli_copies_tokenizer_and_generates_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
