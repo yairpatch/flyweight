@@ -440,6 +440,10 @@ class CudaAccelerator:
     def full_attention_sequence(
         self, layer: Any, hidden: Any, position: int, cache: Any
     ) -> Any:
+        if os.environ.get("COLIBRI_BATCHED_ATTENTION_PREFILL", "1") != "0":
+            return self._full_attention_sequence_batched(
+                layer, hidden, position, cache
+            )
         outputs = []
         for offset in range(int(hidden.shape[0])):
             output, _ = self.full_attention(
@@ -453,6 +457,169 @@ class CudaAccelerator:
             )
             outputs.append(output)
         return self.cp.stack(outputs)
+
+    def _full_attention_sequence_batched(
+        self, layer: Any, hidden: Any, position: int, cache: Any
+    ) -> Any:
+        """Prefill every prompt token's attention in a handful of launches.
+
+        Numerically matches the per-token :meth:`full_attention` path (same
+        RMSNorm, q/k norm, RoPE, GQA and causal masking) but computes all
+        tokens at once instead of looping in Python.
+        """
+        cp = self.cp
+        eps = layer.rms_norm_eps
+        heads = layer.num_attention_heads
+        kv_heads = layer.num_key_value_heads
+        head_dim = layer.head_dim
+        with cp.cuda.Device(self.device_id):
+            tokens = int(hidden.shape[0])
+            normalized = self.rms_norm_rows_device(
+                hidden, layer._input_norm_weights, eps
+            )
+            projected_queries = self.matrix_matmul_device(
+                layer.q_projection, normalized
+            )
+            projected_keys = self.matrix_matmul_device(
+                layer.k_projection, normalized
+            )
+            projected_values = self.matrix_matmul_device(
+                layer.v_projection, normalized
+            )
+
+            query_gate = projected_queries.reshape(
+                tokens, heads, 2, head_dim
+            )
+            queries = query_gate[:, :, 0, :]
+            gates = query_gate[:, :, 1, :]
+            query_norm_weights = self._float32_array(layer._q_norm_weights)
+            queries = (
+                queries
+                * (
+                    cp.float32(1.0)
+                    / cp.sqrt(
+                        cp.mean(queries * queries, axis=2, keepdims=True) + eps
+                    )
+                )
+                * (cp.float32(1.0) + query_norm_weights)
+            )
+
+            keys = projected_keys.reshape(tokens, kv_heads, head_dim)
+            key_norm_weights = self._float32_array(layer._k_norm_weights)
+            keys = (
+                keys
+                * (
+                    cp.float32(1.0)
+                    / cp.sqrt(
+                        cp.mean(keys * keys, axis=2, keepdims=True) + eps
+                    )
+                )
+                * (cp.float32(1.0) + key_norm_weights)
+            )
+            values = projected_values.reshape(tokens, kv_heads, head_dim)
+
+            queries = self._apply_rope_sequence(
+                queries, layer.rotary_dim, layer.rope_theta, position
+            )
+            keys = self._apply_rope_sequence(
+                keys, layer.rotary_dim, layer.rope_theta, position
+            )
+            self._append_attention_cache_sequence(cache, keys, values)
+
+            groups = heads // kv_heads
+            grouped_queries = queries.reshape(
+                tokens, kv_heads, groups, head_dim
+            )
+            cached_keys = cache.cuda_keys[:, : cache.tokens, :]
+            cached_values = cache.cuda_values[:, : cache.tokens, :]
+            scores = cp.einsum(
+                "tkgd,ksd->tkgs", grouped_queries, cached_keys
+            ) * cp.float32(head_dim**-0.5)
+            span = int(cache.tokens)
+            query_positions = cp.arange(position, position + tokens)[:, None]
+            key_positions = cp.arange(span)[None, :]
+            allowed = key_positions <= query_positions
+            scores = cp.where(
+                allowed[:, None, None, :], scores, cp.float32(-cp.inf)
+            )
+            scores -= cp.max(scores, axis=3, keepdims=True)
+            attention_weights = cp.exp(scores)
+            attention_weights /= cp.sum(
+                attention_weights, axis=3, keepdims=True
+            )
+            context = cp.einsum(
+                "tkgs,ksd->tkgd", attention_weights, cached_values
+            ).reshape(tokens, heads, head_dim)
+            gated = context * (
+                cp.float32(1.0) / (cp.float32(1.0) + cp.exp(-gates))
+            )
+            output = self.matrix_matmul_device(
+                layer.o_projection, gated.reshape(tokens, heads * head_dim)
+            )
+            return output + hidden
+
+    def _apply_rope_sequence(
+        self, vectors: Any, rotary_dim: int, rope_theta: float, position: int
+    ) -> Any:
+        cp = self.cp
+        tokens = int(vectors.shape[0])
+        half = rotary_dim // 2
+        positions = cp.arange(position, position + tokens, dtype=cp.float32)
+        indices = cp.arange(half, dtype=cp.float32)
+        frequencies = positions[:, None] / cp.power(
+            cp.float32(rope_theta),
+            cp.float32(2.0) * indices / cp.float32(rotary_dim),
+        )
+        cosines = cp.cos(frequencies)[:, None, :]
+        sines = cp.sin(frequencies)[:, None, :]
+        output = cp.empty_like(vectors)
+        first = vectors[:, :, :half]
+        second = vectors[:, :, half:rotary_dim]
+        output[:, :, :half] = first * cosines - second * sines
+        output[:, :, half:rotary_dim] = second * cosines + first * sines
+        if rotary_dim < vectors.shape[2]:
+            output[:, :, rotary_dim:] = vectors[:, :, rotary_dim:]
+        return output
+
+    def _append_attention_cache_sequence(
+        self, cache: Any, keys: Any, values: Any
+    ) -> None:
+        cp = self.cp
+        tokens = int(keys.shape[0])
+        required = cache.tokens + tokens
+        if cache.cuda_keys is None:
+            cache.cuda_capacity = max(256, required)
+            cache.cuda_keys = cp.empty(
+                (cache.num_key_value_heads, cache.cuda_capacity, cache.head_dim),
+                dtype=cp.float32,
+            )
+            cache.cuda_values = cp.empty_like(cache.cuda_keys)
+        elif required > cache.cuda_capacity:
+            capacity = cache.cuda_capacity
+            while capacity < required:
+                capacity *= 2
+            grown_keys = cp.empty(
+                (cache.num_key_value_heads, capacity, cache.head_dim),
+                dtype=cp.float32,
+            )
+            grown_values = cp.empty_like(grown_keys)
+            grown_keys[:, : cache.tokens, :] = cache.cuda_keys[
+                :, : cache.tokens, :
+            ]
+            grown_values[:, : cache.tokens, :] = cache.cuda_values[
+                :, : cache.tokens, :
+            ]
+            cache.cuda_keys = grown_keys
+            cache.cuda_values = grown_values
+            cache.cuda_capacity = capacity
+        base = cache.tokens
+        cache.cuda_keys[:, base : base + tokens, :] = cp.transpose(
+            keys, (1, 0, 2)
+        )
+        cache.cuda_values[:, base : base + tokens, :] = cp.transpose(
+            values, (1, 0, 2)
+        )
+        cache.tokens += tokens
 
     def _rope_factors(
         self, rotary_dim: int, rope_theta: float, position: int

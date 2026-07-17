@@ -106,6 +106,33 @@ class DeviceDecodeParityTests(unittest.TestCase):
                 os.environ.pop("COLIBRI_FUSED_DELTA_PREFILL", None)
                 disable_cuda()
 
+    def test_batched_attention_prefill_matches_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            create_decoder_checkpoint(source)
+            convert_model(source, output, "bf16")
+            model = QwenForCausalLM.from_model_directory(output)
+            accelerator = configure_cuda(cache_mib=64)
+            try:
+                os.environ["COLIBRI_BATCHED_ATTENTION_PREFILL"] = "0"
+                loop_state = model.new_state()
+                loop = model.prefill_device(PROMPT_IDS, loop_state)
+                loop_logits = accelerator.device_to_host(loop.logits)
+
+                os.environ["COLIBRI_BATCHED_ATTENTION_PREFILL"] = "1"
+                batched_state = model.new_state()
+                batched = model.prefill_device(PROMPT_IDS, batched_state)
+                batched_logits = accelerator.device_to_host(batched.logits)
+                for expected, actual in zip(loop_logits, batched_logits):
+                    self.assertAlmostEqual(actual, expected, delta=TOLERANCE)
+                self.assertEqual(batched_state.tokens, loop_state.tokens)
+            finally:
+                os.environ.pop("COLIBRI_BATCHED_ATTENTION_PREFILL", None)
+                disable_cuda()
+
     def _assert_device_parity(
         self, quantization: str, *, cpu_moe_layers: int = 0
     ) -> None:
