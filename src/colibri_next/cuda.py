@@ -947,6 +947,8 @@ class CudaAccelerator:
     def moe_residual_device(
         self, layer: Any, hidden: Any, route_state: Any | None = None
     ) -> Any:
+        if layer.expert_device == "cpu":
+            return self._moe_residual_cpu(layer, hidden, route_state)
         cp = self.cp
         normalized = self.rms_norm_device(
             hidden,
@@ -989,9 +991,41 @@ class CudaAccelerator:
         )
         return hidden + output
 
+    def _moe_residual_cpu(
+        self, layer: Any, hidden: Any, route_state: Any | None
+    ) -> Any:
+        """Offload one token's routed experts to the host CPU backend.
+
+        The token mixer, router, and residual all stay on the GPU; only the
+        Q4 expert MLPs (whose weights are deliberately kept off the device)
+        run on the CPU, so just the hidden vector crosses the PCIe boundary.
+        """
+        result = layer.forward_residual(hidden.get().tolist())
+        if route_state is not None:
+            route_state.last_selected_experts = result.selected_experts
+        return self.device_vector(result.output)
+
+    def _moe_sequence_cpu(
+        self, layer: Any, hidden: Any, route_state: Any | None
+    ) -> Any:
+        """Host-CPU offload of a prefill sequence's routed experts."""
+        rows = hidden.get().tolist()
+        outputs: list[list[float]] = []
+        routes: list[tuple[int, ...]] = []
+        for row in rows:
+            result = layer.forward_residual(row)
+            outputs.append(result.output)
+            routes.append(result.selected_experts)
+        if route_state is not None and routes:
+            route_state.sequence_selected_experts = tuple(routes)
+            route_state.last_selected_experts = routes[-1]
+        return self.device_vector(outputs)
+
     def moe_sequence_device(
         self, layer: Any, hidden: Any, route_state: Any | None = None
     ) -> Any:
+        if layer.expert_device == "cpu":
+            return self._moe_sequence_cpu(layer, hidden, route_state)
         cp = self.cp
         tokens = int(hidden.shape[0])
         normalized = self.rms_norm_rows_device(

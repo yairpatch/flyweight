@@ -128,7 +128,11 @@ class QwenMoELayer:
                     hidden,
                 )
             else:
-                prefer_numpy = accelerator is None
+                # This branch runs only when the native CPU backend is
+                # unavailable; NumPy is strictly faster than the pure-Python
+                # list path (and degrades to it if NumPy is missing), so the
+                # CPU-offloaded experts should always prefer it.
+                prefer_numpy = True
                 routed = [0.0] * self.hidden_size
                 for expert, weight in zip(experts, weights):
                     expert_output = expert.forward(

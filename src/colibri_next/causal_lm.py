@@ -70,7 +70,7 @@ class QwenForCausalLM:
     def device_decode_available(self) -> bool:
         from .cuda import active_cuda
 
-        return active_cuda() is not None and self.cpu_moe_layers == 0
+        return active_cuda() is not None
 
     @property
     def estimated_expert_storage_bytes(self) -> int:
@@ -165,10 +165,6 @@ class QwenForCausalLM:
         accelerator = active_cuda()
         if accelerator is None:
             raise RuntimeError("device decode requires CUDA")
-        if self.cpu_moe_layers:
-            raise RuntimeError(
-                "device decode requires every MoE layer on CUDA"
-            )
         return accelerator
 
     def prefill(

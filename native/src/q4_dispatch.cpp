@@ -13,6 +13,20 @@ namespace {
 constexpr std::uint32_t kFeatureAvx2 = 1u << 0;
 constexpr std::uint32_t kFeatureAvx512 = 1u << 1;
 
+// Read XCR0 without the _xgetbv intrinsic, which GCC/Clang refuse to inline
+// unless the translation unit enables the "xsave" target feature. Raw XGETBV
+// has no such requirement and is only reached after the OSXSAVE bit is set.
+std::uint64_t read_xcr0() {
+#if defined(_MSC_VER)
+    return _xgetbv(0);
+#else
+    std::uint32_t eax = 0;
+    std::uint32_t edx = 0;
+    __asm__ __volatile__("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
+    return (static_cast<std::uint64_t>(edx) << 32) | eax;
+#endif
+}
+
 std::uint32_t detect_features() {
 #if defined(__x86_64__) || defined(_M_X64)
     int registers[4] = {};
@@ -27,7 +41,7 @@ std::uint32_t detect_features() {
     if (!osxsave || !avx || !f16c) {
         return 0;
     }
-    const std::uint64_t xcr0 = _xgetbv(0);
+    const std::uint64_t xcr0 = read_xcr0();
     if ((xcr0 & 0x6) != 0x6) {
         return 0;
     }

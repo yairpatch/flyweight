@@ -52,6 +52,9 @@ class DeviceDecodeParityTests(unittest.TestCase):
     def test_q4_static_decode_matches_portable_path(self) -> None:
         self._assert_device_parity("q4")
 
+    def test_hybrid_cpu_moe_offload_matches_portable_path(self) -> None:
+        self._assert_device_parity("q4", cpu_moe_layers=1)
+
     def test_seeded_device_sampler_matches_host_sampler(self) -> None:
         accelerator = configure_cuda(cache_mib=64)
         try:
@@ -103,7 +106,9 @@ class DeviceDecodeParityTests(unittest.TestCase):
                 os.environ.pop("COLIBRI_FUSED_DELTA_PREFILL", None)
                 disable_cuda()
 
-    def _assert_device_parity(self, quantization: str) -> None:
+    def _assert_device_parity(
+        self, quantization: str, *, cpu_moe_layers: int = 0
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source"
@@ -118,6 +123,9 @@ class DeviceDecodeParityTests(unittest.TestCase):
 
             accelerator = configure_cuda(cache_mib=64)
             try:
+                model.configure_moe_placement(cpu_moe_layers)
+                self.assertEqual(model.cpu_moe_layers, cpu_moe_layers)
+                # Offloading MoE experts to CPU must not disable the GPU path.
                 self.assertTrue(model.device_decode_available)
                 state = model.new_state()
                 result = model.prefill_device(PROMPT_IDS, state)
