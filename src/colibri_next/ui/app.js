@@ -102,7 +102,12 @@ function loadSettings() {
 function normalizeSettings(value) {
   return {
     systemPrompt: typeof value.systemPrompt === "string" ? value.systemPrompt : "",
-    maxTokens: clampInteger(value.maxTokens, 1, 4096, DEFAULT_SETTINGS.maxTokens),
+    maxTokens: clampInteger(
+      value.maxTokens,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      DEFAULT_SETTINGS.maxTokens,
+    ),
     temperature: clampNumber(value.temperature, 0, 2, DEFAULT_SETTINGS.temperature),
     topP: clampNumber(value.topP, 0.01, 1, DEFAULT_SETTINGS.topP),
     topK: clampInteger(value.topK, 1, 200, DEFAULT_SETTINGS.topK),
@@ -778,9 +783,12 @@ async function pollRuntime() {
     if (propertiesResponse.ok) {
       const properties = await propertiesResponse.json();
       state.maxOutputTokens = clampInteger(
-        properties.max_output_tokens,
+        Math.min(
+          properties.context_window || Number.MAX_SAFE_INTEGER,
+          properties.max_output_tokens || Number.MAX_SAFE_INTEGER,
+        ),
         1,
-        4096,
+        Number.MAX_SAFE_INTEGER,
         64,
       );
       if (state.settings.maxTokens > state.maxOutputTokens) {

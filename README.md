@@ -277,8 +277,15 @@ reference fidelity is more important.
 Start one persistent model process with an 8 GiB CUDA weight cache:
 
 ~~~console
-python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0 --host 127.0.0.1 --port 8000
+python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0 --context-window 32768 --host 127.0.0.1 --port 8000
 ~~~
+
+`--context-window` limits formatted input plus generated output. The browser
+reads this value from `/props` and no longer imposes a separate 4096-token cap.
+For example, a 32,768-token window with a 10,000-token conversation leaves at
+most 22,768 tokens for generation. Use `--max-new-tokens` only when you want an
+additional output ceiling below the total context window. Larger contexts grow
+full-attention KV storage and keep more recurrent/conversation state resident.
 
 The server defaults to `--expert-preload auto`. It preloads routed Q4 experts when available RAM can hold them while preserving an 8 GiB reserve, and otherwise continues with on-demand SSD loading. The tested Qwen3.5-35B-A3B conversion uses about 16.9 GiB for routed experts and took about 48.5 seconds to preload from SSD. Use `--expert-preload none` for faster startup or `--expert-preload all` to force preloading. The one-off `generate-text` command defaults to `none` because preload startup is usually not worthwhile for a single short response.
 

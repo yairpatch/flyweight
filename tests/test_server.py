@@ -149,6 +149,39 @@ class InferenceServiceTests(unittest.TestCase):
         )
         self.assertEqual(service.health()["cpu_moe_layers"], 12)
 
+    def test_context_window_limits_combined_prompt_and_output(self) -> None:
+        service = InferenceService(
+            "qwen-local",
+            self.generator,
+            max_new_tokens=10,
+            context_window=10,
+        )
+        accepted = service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "123456"}],
+                "max_tokens": 4,
+            }
+        )
+        self.assertEqual(accepted["object"], "chat.completion")
+        with self.assertRaisesRegex(APIError, "at most 4 output tokens"):
+            service.chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "123456"}],
+                    "max_tokens": 5,
+                }
+            )
+        self.assertEqual(service.properties()["context_window"], 10)
+
+    def test_context_window_limits_legacy_text_completion(self) -> None:
+        service = InferenceService(
+            "qwen-local",
+            self.generator,
+            max_new_tokens=8,
+            context_window=8,
+        )
+        with self.assertRaisesRegex(APIError, "at most 3 output tokens"):
+            service.completion({"prompt": "12345", "max_tokens": 4})
+
     def test_chat_stream_emits_deltas_usage_and_done(self) -> None:
         events = list(
             self.service.stream_chat_completion(

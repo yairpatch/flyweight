@@ -88,17 +88,23 @@ class InferenceService:
         generator: TextGenerator,
         *,
         max_new_tokens: int = 64,
+        context_window: int = 4096,
         api_key: str | None = None,
         cors_origin: str = "*",
         cpu_moe_layers: int = 0,
     ):
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
+        if context_window <= 0:
+            raise ValueError("context_window must be positive")
+        if max_new_tokens > context_window:
+            raise ValueError("max_new_tokens must not exceed context_window")
         if cpu_moe_layers < 0:
             raise ValueError("cpu_moe_layers must be non-negative")
         self.model_name = model_name
         self.generator = generator
         self.max_new_tokens = max_new_tokens
+        self.context_window = context_window
         self.api_key = api_key
         self.cors_origin = cors_origin
         self.cpu_moe_layers = cpu_moe_layers
@@ -119,6 +125,7 @@ class InferenceService:
         model_name: str | None = None,
         rows_per_chunk: int = 4096,
         max_new_tokens: int = 64,
+        context_window: int = 4096,
         api_key: str | None = None,
         cors_origin: str = "*",
         expert_preload: str = "none",
@@ -143,6 +150,7 @@ class InferenceService:
             model_name or root_path.name,
             TextGenerator(model, tokenizer),
             max_new_tokens=max_new_tokens,
+            context_window=context_window,
             api_key=api_key,
             cors_origin=cors_origin,
             cpu_moe_layers=model.cpu_moe_layers,
@@ -167,6 +175,7 @@ class InferenceService:
             "preloaded_experts": self.preloaded_experts,
             "expert_storage_bytes": self.expert_storage_bytes,
             "cpu_moe_layers": self.cpu_moe_layers,
+            "context_window": self.context_window,
             "prefix_cache": (
                 self.generator.prefix_cache_stats()
                 if hasattr(self.generator, "prefix_cache_stats")
@@ -372,6 +381,7 @@ class InferenceService:
             "model_alias": self.model_name,
             "total_slots": 1,
             "max_output_tokens": self.max_new_tokens,
+            "context_window": self.context_window,
             "chat_template": "qwen-chatml",
             "capabilities": [
                 "completion",
@@ -646,6 +656,11 @@ class InferenceService:
                 f"max_tokens must be between 1 and {self.max_new_tokens}",
                 parameter="max_tokens",
             )
+        self._validate_context(
+            len(self.generator.tokenizer.encode(prompt)),
+            max_new_tokens,
+            parameter="max_tokens",
+        )
         try:
             sampling = SamplingConfig(
                 temperature=_float_option(payload, "temperature", 0.0),
@@ -699,9 +714,30 @@ class InferenceService:
         except ValueError as error:
             raise APIError(400, str(error)) from error
         enable_thinking = _boolean_option(payload, "enable_thinking", False)
+        prompt_tokens = len(
+            self.generator.tokenizer.encode_messages(
+                messages, enable_thinking=enable_thinking
+            )
+        )
+        self._validate_context(
+            prompt_tokens, max_new_tokens, parameter=max_key
+        )
         return _GenerationRequest(
             messages, max_new_tokens, sampling, enable_thinking, tools_enabled
         )
+
+    def _validate_context(
+        self, prompt_tokens: int, max_new_tokens: int, *, parameter: str
+    ) -> None:
+        requested = prompt_tokens + max_new_tokens
+        if requested > self.context_window:
+            available = max(0, self.context_window - prompt_tokens)
+            raise APIError(
+                400,
+                f"prompt has {prompt_tokens} tokens; at most {available} output "
+                f"tokens fit in the {self.context_window}-token context window",
+                parameter=parameter,
+            )
 
     def _validate_model(self, requested_model: Any) -> None:
         if requested_model is not None and requested_model != self.model_name:

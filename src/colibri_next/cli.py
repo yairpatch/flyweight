@@ -216,7 +216,17 @@ def _parser() -> argparse.ArgumentParser:
         "--api-key", default=os.environ.get("COLIBRI_API_KEY")
     )
     serve_command.add_argument("--cors-origin", default="*")
-    serve_command.add_argument("--max-new-tokens", type=int, default=64)
+    serve_command.add_argument(
+        "--context-window",
+        type=int,
+        default=4096,
+        help="maximum combined prompt and generated tokens",
+    )
+    serve_command.add_argument(
+        "--max-new-tokens",
+        type=int,
+        help="optional output ceiling below the context window",
+    )
     serve_command.add_argument("--rows-per-chunk", type=int, default=4096)
     _add_device_arguments(serve_command)
     _add_expert_preload_argument(serve_command, default="auto")
@@ -365,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
             args.root,
             model_name=args.model_name,
             rows_per_chunk=args.rows_per_chunk,
-            max_new_tokens=args.max_new_tokens,
+            max_new_tokens=args.max_new_tokens or args.context_window,
+            context_window=args.context_window,
             api_key=args.api_key,
             cors_origin=args.cors_origin,
             expert_preload=args.expert_preload,
