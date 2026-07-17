@@ -188,6 +188,13 @@ def _parser() -> argparse.ArgumentParser:
     convert_tokenizer.add_argument("output", type=Path)
     convert_tokenizer.add_argument("--overwrite", action="store_true")
 
+    convert_mtp = subcommands.add_parser(
+        "convert-mtp", help="extract the multi-token-prediction head (BF16)"
+    )
+    convert_mtp.add_argument("source", type=Path)
+    convert_mtp.add_argument("output", type=Path)
+    convert_mtp.add_argument("--overwrite", action="store_true")
+
     generate_text = subcommands.add_parser(
         "generate-text", help="generate decoded text from a prompt"
     )
@@ -363,6 +370,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "convert-tokenizer":
         storage = TokenizerAssetsConverter(args.source).convert(
+            args.output, overwrite=args.overwrite
+        )
+        print(json.dumps(storage, indent=2))
+        return 0
+
+    if args.command == "convert-mtp":
+        from .mtp_converter import QwenMtpConverter
+
+        storage = QwenMtpConverter(args.source).convert(
             args.output, overwrite=args.overwrite
         )
         print(json.dumps(storage, indent=2))
