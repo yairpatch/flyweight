@@ -102,8 +102,10 @@ class NativeBackend:
         routing_weights: list[float],
         shared_expert: Q4SwiGLUExpert,
         shared_weight: float,
-        vector: list[float],
-    ) -> list[float]:
+        vector: object,
+        *,
+        as_array: bool = False,
+    ) -> object:
         if len(experts) != len(routing_weights):
             raise ValueError("expert and routing-weight counts must match")
         np = _numpy()
@@ -113,17 +115,19 @@ class NativeBackend:
             [*routing_weights, shared_weight], dtype=np.float32
         )
         if self._fused_moe:
-            return self._fused_q4_moe(all_experts, weights, input_vector)
-        futures = [
-            self._executor.submit(self.q4_swiglu, expert, input_vector)
-            for expert in all_experts
-        ]
-        outputs = np.stack([future.result() for future in futures])
-        return np.einsum("e,eh->h", weights, outputs).tolist()
+            output = self._fused_q4_moe(all_experts, weights, input_vector)
+        else:
+            futures = [
+                self._executor.submit(self.q4_swiglu, expert, input_vector)
+                for expert in all_experts
+            ]
+            outputs = np.stack([future.result() for future in futures])
+            output = np.einsum("e,eh->h", weights, outputs)
+        return output if as_array else output.tolist()
 
     def _fused_q4_moe(
         self, all_experts: list[Q4SwiGLUExpert], weights: object, input_vector: object
-    ) -> list[float]:
+    ) -> object:
         np = _numpy()
         count = len(all_experts)
         hidden_size = all_experts[0].hidden_size
@@ -134,19 +138,27 @@ class NativeBackend:
         gate_up_scales = (u16 * count)()
         down_packed = (u8 * count)()
         down_scales = (u16 * count)()
-        keep_alive: list[object] = []
         for index, expert in enumerate(all_experts):
-            gate_up = expert.gate_up
-            down = expert.down
-            gp = np.frombuffer(gate_up.packed, dtype=np.uint8)
-            gs = np.frombuffer(gate_up.scales, dtype="<u2")
-            dp = np.frombuffer(down.packed, dtype=np.uint8)
-            ds = np.frombuffer(down.scales, dtype="<u2")
-            keep_alive += (gp, gs, dp, ds)
-            gate_up_packed[index] = gp.ctypes.data_as(u8)
-            gate_up_scales[index] = gs.ctypes.data_as(u16)
-            down_packed[index] = dp.ctypes.data_as(u8)
-            down_scales[index] = ds.ctypes.data_as(u16)
+            pointers = getattr(expert, "_native_pointers", None)
+            if pointers is None:
+                gate_up = expert.gate_up
+                down = expert.down
+                gp = np.frombuffer(gate_up.packed, dtype=np.uint8)
+                gs = np.frombuffer(gate_up.scales, dtype="<u2")
+                dp = np.frombuffer(down.packed, dtype=np.uint8)
+                ds = np.frombuffer(down.scales, dtype="<u2")
+                pointers = (
+                    gp.ctypes.data_as(u8),
+                    gs.ctypes.data_as(u16),
+                    dp.ctypes.data_as(u8),
+                    ds.ctypes.data_as(u16),
+                    (gp, gs, dp, ds),
+                )
+                expert._native_pointers = pointers
+            gate_up_packed[index] = pointers[0]
+            gate_up_scales[index] = pointers[1]
+            down_packed[index] = pointers[2]
+            down_scales[index] = pointers[3]
         weight_array = np.ascontiguousarray(weights, dtype=np.float32)
         output = np.empty(hidden_size, dtype=np.float32)
         status = self.library.colibri_q4_moe(
@@ -163,7 +175,7 @@ class NativeBackend:
         )
         if status != 0:
             raise RuntimeError(f"native Q4 MoE failed with status {status}")
-        return output.tolist()
+        return output
 
     def _q4_matvec_array(self, tensor: Q4BlockTensor, vector: object) -> object:
         np = _numpy()

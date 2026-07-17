@@ -2,6 +2,7 @@
 #include "q4_kernel.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 
 #if defined(_OPENMP)
@@ -131,10 +132,121 @@ extern "C" int colibri_q4_moe(
     }
     const std::int32_t gate_rows = 2 * intermediate_size;
 
+    // Streaming the expert weights is the bottleneck, and a single core cannot
+    // saturate RAM bandwidth. Parallelize over (expert, row-chunk) work items
+    // so the whole team streams concurrently; the row-offset arithmetic
+    // requires whole Q4 blocks per row.
+    if (hidden_size % 32 == 0 && intermediate_size % 32 == 0) {
 #if defined(_OPENMP)
-    // Cap threads at the expert count: work is parallelized across experts, so
-    // extra threads only oversubscribe the machine (which collapses throughput
-    // when the default team is far larger than the handful of routed experts).
+        // SMT siblings fight over the shared load ports and the spin barriers
+        // between phases, which collapses throughput (measured ~50x slower at
+        // 32 threads than 16 on a 16C/32T part). Default the team to the
+        // physical core count unless the user pinned OMP_NUM_THREADS.
+        int team = omp_get_max_threads();
+        if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+            const int physical = omp_get_num_procs() / 2;
+            if (physical >= 1 && team > physical) {
+                team = physical;
+            }
+        }
+#endif
+        constexpr std::int32_t kChunkRows = 64;
+        const std::int32_t gate_blocks_per_row = hidden_size / 32;
+        const std::int32_t down_blocks_per_row = intermediate_size / 32;
+        const std::int32_t gate_chunks =
+            (gate_rows + kChunkRows - 1) / kChunkRows;
+        const std::int32_t down_chunks =
+            (hidden_size + kChunkRows - 1) / kChunkRows;
+        const std::int32_t gate_tasks = num_experts * gate_chunks;
+        const std::int32_t down_tasks = num_experts * down_chunks;
+        std::vector<float> gate(
+            static_cast<std::size_t>(num_experts) * gate_rows
+        );
+        std::vector<float> activated(
+            static_cast<std::size_t>(num_experts) * intermediate_size
+        );
+        std::vector<float> expert_output(
+            static_cast<std::size_t>(num_experts) * hidden_size
+        );
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(team)
+#endif
+        {
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic)
+#endif
+            for (std::int32_t task = 0; task < gate_tasks; ++task) {
+                const std::int32_t expert = task / gate_chunks;
+                const std::int32_t row0 = (task % gate_chunks) * kChunkRows;
+                const std::int32_t rows =
+                    row0 + kChunkRows > gate_rows ? gate_rows - row0 : kChunkRows;
+                const std::int64_t block0 =
+                    static_cast<std::int64_t>(row0) * gate_blocks_per_row;
+                kQ4Kernel(
+                    gate_up_packed[expert] + block0 * 16,
+                    gate_up_scales[expert] + block0,
+                    input,
+                    gate.data()
+                        + static_cast<std::size_t>(expert) * gate_rows + row0,
+                    rows,
+                    hidden_size
+                );
+            }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+            for (std::int32_t index = 0;
+                 index < num_experts * intermediate_size; ++index) {
+                const std::int32_t expert = index / intermediate_size;
+                const std::int32_t column = index % intermediate_size;
+                const float* expert_gate = gate.data()
+                    + static_cast<std::size_t>(expert) * gate_rows;
+                const float value = expert_gate[column];
+                const float silu = value / (1.0f + std::exp(-value));
+                activated[index] = silu * expert_gate[intermediate_size + column];
+            }
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic)
+#endif
+            for (std::int32_t task = 0; task < down_tasks; ++task) {
+                const std::int32_t expert = task / down_chunks;
+                const std::int32_t row0 = (task % down_chunks) * kChunkRows;
+                const std::int32_t rows =
+                    row0 + kChunkRows > hidden_size
+                        ? hidden_size - row0
+                        : kChunkRows;
+                const std::int64_t block0 =
+                    static_cast<std::int64_t>(row0) * down_blocks_per_row;
+                kQ4Kernel(
+                    down_packed[expert] + block0 * 16,
+                    down_scales[expert] + block0,
+                    activated.data()
+                        + static_cast<std::size_t>(expert) * intermediate_size,
+                    expert_output.data()
+                        + static_cast<std::size_t>(expert) * hidden_size + row0,
+                    rows,
+                    intermediate_size
+                );
+            }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+            for (std::int32_t index = 0; index < hidden_size; ++index) {
+                float total = 0.0f;
+                for (std::int32_t expert = 0; expert < num_experts; ++expert) {
+                    total += weights[expert] * expert_output[
+                        static_cast<std::size_t>(expert) * hidden_size + index
+                    ];
+                }
+                output[index] = total;
+            }
+        }
+        return 0;
+    }
+
+#if defined(_OPENMP)
+    // Fallback: parallelize across experts only, capped at the expert count so
+    // idle threads do not spin at the barrier.
     int thread_count = omp_get_max_threads();
     if (thread_count > num_experts) {
         thread_count = num_experts;
@@ -145,9 +257,6 @@ extern "C" int colibri_q4_moe(
 #else
     const int thread_count = 1;
 #endif
-    // Each thread accumulates the weighted expert outputs into a private row
-    // and the rows are reduced once at the end, so no expert contends on the
-    // shared output buffer.
     std::vector<float> partials(
         static_cast<std::size_t>(thread_count) * hidden_size, 0.0f
     );

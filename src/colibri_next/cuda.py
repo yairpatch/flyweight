@@ -1163,30 +1163,136 @@ class CudaAccelerator:
     ) -> Any:
         """Offload one token's routed experts to the host CPU backend.
 
-        Only the Q4 expert MLPs (whose weights are deliberately kept off the
-        device) run on the CPU, through the fused native MoE kernel; the hidden
-        vector crosses the PCIe boundary once per layer.
+        The whole MoE block runs on the host in NumPy plus the fused native
+        expert kernel, so the hidden vector crosses the PCIe boundary exactly
+        once in each direction and no per-layer GPU round trips are issued for
+        the router. The router matvec deliberately uses ``einsum`` (not ``@``)
+        because BLAS thread fan-out on a tiny per-token matvec costs far more
+        than the arithmetic.
         """
-        result = layer.forward_residual(hidden.get().tolist())
+        from .native import active_native
+
+        backend = active_native()
+        if backend is None:
+            result = layer.forward_residual(hidden.get().tolist())
+            if route_state is not None:
+                route_state.last_selected_experts = result.selected_experts
+            return self.device_vector(result.output)
+        import numpy as np
+
+        router_np, gate_np, norm_np = self._host_moe_weights(layer)
+        host = hidden.get()
+        inverse_rms = 1.0 / np.sqrt(
+            float(np.mean(host * host)) + layer.rms_norm_eps
+        )
+        normalized = (host * (inverse_rms * norm_np)).astype(np.float32)
+        logits = np.einsum("eh,h->e", router_np, normalized)
+        probabilities = np.exp(logits - logits.max())
+        probabilities /= probabilities.sum()
+        selected = np.argpartition(probabilities, -layer.top_k)[-layer.top_k :]
+        selected = selected[np.argsort(probabilities[selected])[::-1]]
+        weights = probabilities[selected]
+        weights /= weights.sum()
+        selected_ids = [int(expert_id) for expert_id in selected]
         if route_state is not None:
-            route_state.last_selected_experts = result.selected_experts
-        return self.device_vector(result.output)
+            route_state.last_selected_experts = tuple(selected_ids)
+        shared_logit = float(gate_np @ normalized)
+        shared_weight = 1.0 / (1.0 + np.exp(-shared_logit))
+        output = backend.q4_moe(
+            [layer._expert(expert_id) for expert_id in selected_ids],
+            weights.tolist(),
+            layer.shared_expert,
+            shared_weight,
+            normalized,
+            as_array=True,
+        )
+        output += host
+        return self.device_vector(output)
 
     def _moe_sequence_cpu(
         self, layer: Any, hidden: Any, route_state: Any | None
     ) -> Any:
         """Host-CPU offload of a prefill sequence's routed experts."""
-        rows = hidden.get().tolist()
-        outputs: list[list[float]] = []
-        routes: list[tuple[int, ...]] = []
-        for row in rows:
-            result = layer.forward_residual(row)
-            outputs.append(result.output)
-            routes.append(result.selected_experts)
+        from .native import active_native
+
+        backend = active_native()
+        if backend is None:
+            rows = hidden.get().tolist()
+            outputs: list[list[float]] = []
+            routes: list[tuple[int, ...]] = []
+            for row in rows:
+                result = layer.forward_residual(row)
+                outputs.append(result.output)
+                routes.append(result.selected_experts)
+            if route_state is not None and routes:
+                route_state.sequence_selected_experts = tuple(routes)
+                route_state.last_selected_experts = routes[-1]
+            return self.device_vector(outputs)
+        import numpy as np
+
+        router_np, gate_np, norm_np = self._host_moe_weights(layer)
+        host = hidden.get()
+        inverse_rms = 1.0 / np.sqrt(
+            np.mean(host * host, axis=1, keepdims=True) + layer.rms_norm_eps
+        )
+        normalized = (host * inverse_rms * norm_np).astype(np.float32)
+        logits = normalized @ router_np.T
+        probabilities = np.exp(logits - logits.max(axis=1, keepdims=True))
+        probabilities /= probabilities.sum(axis=1, keepdims=True)
+        shared_weights = 1.0 / (1.0 + np.exp(-(normalized @ gate_np)))
+        outputs = np.empty_like(host)
+        routes = []
+        for token in range(host.shape[0]):
+            token_probabilities = probabilities[token]
+            selected = np.argpartition(token_probabilities, -layer.top_k)[
+                -layer.top_k :
+            ]
+            selected = selected[
+                np.argsort(token_probabilities[selected])[::-1]
+            ]
+            weights = token_probabilities[selected]
+            weights /= weights.sum()
+            selected_ids = [int(expert_id) for expert_id in selected]
+            routes.append(tuple(selected_ids))
+            output = backend.q4_moe(
+                [layer._expert(expert_id) for expert_id in selected_ids],
+                weights.tolist(),
+                layer.shared_expert,
+                float(shared_weights[token]),
+                normalized[token],
+                as_array=True,
+            )
+            outputs[token] = output + host[token]
         if route_state is not None and routes:
             route_state.sequence_selected_experts = tuple(routes)
             route_state.last_selected_experts = routes[-1]
         return self.device_vector(outputs)
+
+    def _host_moe_weights(self, layer: Any) -> tuple[Any, Any, Any]:
+        """Cache the layer's router/gate/norm weights as float32 host arrays."""
+        cached = getattr(layer, "_host_moe_weights_cache", None)
+        if cached is not None:
+            return cached
+        import numpy as np
+
+        def _bf16_matrix(tensor: Any) -> Any:
+            raw = np.frombuffer(tensor.data, dtype="<u2")
+            return (
+                (raw.astype(np.uint32) << 16)
+                .view(np.float32)
+                .reshape(tensor.shape)
+            )
+
+        cached = (
+            np.ascontiguousarray(_bf16_matrix(layer.router)),
+            np.ascontiguousarray(_bf16_matrix(layer.shared_gate).reshape(-1)),
+            1.0
+            + np.asarray(
+                layer._post_attention_norm_weights, dtype=np.float32
+            ),
+        )
+        layer._host_moe_weights_cache = cached
+        return cached
 
     def moe_sequence_device(
         self, layer: Any, hidden: Any, route_state: Any | None = None

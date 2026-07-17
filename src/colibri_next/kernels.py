@@ -12,6 +12,9 @@ from .tensor_container import ColiTensorFile
 class Q4SwiGLUExpert:
     gate_up: Q4BlockTensor
     down: Q4BlockTensor
+    # ctypes views of the packed tensors, built lazily by the native backend
+    # so repeated fused-MoE calls skip per-call buffer marshalling.
+    _native_pointers: object = None
 
     @classmethod
     def from_file(cls, path: Path | str) -> "Q4SwiGLUExpert":
