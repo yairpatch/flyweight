@@ -15,6 +15,7 @@ fast = ["numpy>=2.0"]
 generation = ["tokenizers>=0.22"]
 client = ["openai>=2.0"]
 cuda13 = ["cupy-cuda13x>=14.1"]
+validation = ["torch>=2.6", "transformers>=4.51", "accelerate>=1.5"]
 
 [project.scripts]
 colibri-next = "colibri_next.cli:main"
@@ -32,4 +33,3 @@ colibri_next = [
   "_native/*.so",
   "_native/*.dylib",
 ]
-

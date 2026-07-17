@@ -34,6 +34,7 @@ from .runtime import ToyMoERuntime
 from .storage import ExpertStore
 from .tokenizer import HuggingFaceTokenizer
 from .tokenizer_converter import TokenizerAssetsConverter
+from .validation import TransformersReference, validate_against_reference
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -145,6 +146,21 @@ def _parser() -> argparse.ArgumentParser:
     benchmark_logits.add_argument("--token-ids", default="0")
     benchmark_logits.add_argument("--rows-per-chunk", type=int, default=4096)
     _add_device_arguments(benchmark_logits)
+
+    validate = subcommands.add_parser(
+        "validate-transformers",
+        help="compare converted-model logits with a Transformers checkpoint",
+    )
+    validate.add_argument("root", type=Path, help="converted Colibri model")
+    validate.add_argument("source", type=Path, help="Hugging Face checkpoint")
+    validate.add_argument("--token-ids", required=True)
+    validate.add_argument("--generate-tokens", type=int, default=4)
+    validate.add_argument("--top-k", type=int, default=10)
+    validate.add_argument("--reference-device", default="cpu")
+    validate.add_argument("--reference-dtype", default="auto")
+    validate.add_argument("--trust-remote-code", action="store_true")
+    validate.add_argument("--rows-per-chunk", type=int, default=4096)
+    _add_device_arguments(validate)
 
     convert_tokenizer = subcommands.add_parser(
         "convert-tokenizer", help="copy tokenizer and generation assets"
@@ -458,6 +474,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "validate-transformers":
+        _configure_execution(args)
+        token_ids = [
+            int(value.strip())
+            for value in args.token_ids.split(",")
+            if value.strip()
+        ]
+        model = QwenForCausalLM.from_model_directory(
+            args.root, rows_per_chunk=args.rows_per_chunk
+        )
+        reference = TransformersReference(
+            args.source,
+            device=args.reference_device,
+            dtype=args.reference_dtype,
+            trust_remote_code=args.trust_remote_code,
+        )
+        report = validate_against_reference(
+            model,
+            reference,
+            token_ids,
+            generate_tokens=args.generate_tokens,
+            top_k=args.top_k,
+        )
+        print(json.dumps(report.to_dict(), indent=2))
+        return 0
+
     if args.command == "benchmark-decoder":
         if args.tokens <= 0:
             raise ValueError("tokens must be positive")
@@ -727,8 +769,6 @@ def _execution_stats() -> dict[str, int | str]:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
 
 
 

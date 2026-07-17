@@ -49,18 +49,68 @@ The runtime can inspect and convert real Qwen checkpoints and generate decoded t
 
 ## Installation
 
+Colibrì Next supports Windows 10/11 and x86-64 Linux with Python 3.11 or
+newer. The native CPU backend needs CMake 3.24+ and a C++20 compiler. CUDA is
+optional and requires an NVIDIA driver plus the CuPy package matching the
+installed CUDA major version.
+
+### Windows PowerShell
+
 ~~~powershell
+$env_dir = ".venv"
+python -m venv $env_dir
+& "$env_dir\Scripts\Activate.ps1"
+python -m pip install --upgrade pip
 $env:PYTHONPATH = "src"
-pip install -e ".[fast,generation,cuda13]"
+pip install -e ".[fast,generation]"
 python -m colibri_next.native_build
 python -m unittest discover -s tests -v
 ~~~
 
-NumPy is optional but strongly recommended for conversion and CPU execution. `native_build` compiles the runtime-dispatched scalar, AVX2, and AVX-512 Q4 CPU kernels with CMake and the platform C++ toolchain. The `cuda13` extra installs CuPy for CUDA 13; use the official `cupy-cuda12x` wheel instead on CUDA 12 systems. Portable Python execution remains available when the native library or CuPy is unavailable.
+Install Visual Studio 2022 Build Tools with the **Desktop development with
+C++** workload if `native_build` cannot find a compiler.
+
+### Linux Bash
+
+On Ubuntu or Debian, install the system build prerequisites first:
+
+~~~bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-dev build-essential cmake
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+export PYTHONPATH=src
+pip install -e ".[fast,generation]"
+python -m colibri_next.native_build
+python -m unittest discover -s tests -v
+~~~
+
+The commands below use forward-slash paths under a local `models` directory;
+Python accepts this form on both Windows and Linux. Replace the paths with the
+locations of your checkpoints if needed.
+
+For CUDA acceleration, add the CuPy package matching the installed CUDA
+toolkit. This command is the same in PowerShell and Bash:
+
+~~~console
+# CUDA 13
+pip install -e ".[cuda13]"
+
+# CUDA 12 (use instead of the cuda13 extra)
+pip install cupy-cuda12x
+~~~
+
+NumPy is optional but strongly recommended for conversion and CPU execution.
+`native_build` produces `colibri_native.dll` on Windows and
+`colibri_native.so` on Linux, compiling runtime-dispatched scalar, AVX2, and
+AVX-512 Q4 CPU kernels. Portable Python execution remains available when the
+native library or CuPy is unavailable.
 
 ## Hardware planning
 
-~~~powershell
+~~~console
 python -m colibri_next.cli inspect-hardware --save hardware-profile.json
 python -m colibri_next.cli plan --hardware hardware-profile.json --model qwen3.6-35b-a3b --context 32768 --expert-bits 4 --save qwen36-placement.json
 ~~~
@@ -69,20 +119,20 @@ The detected 64 GB RAM and 12 GB VRAM profile places static tensors in VRAM, Q4 
 
 ## Qwen conversion
 
-~~~powershell
-python -m colibri_next.cli inspect-model D:\models\Qwen3.6-35B-A3B
+~~~console
+python -m colibri_next.cli inspect-model models/Qwen3.6-35B-A3B
 
-python -m colibri_next.cli convert-qwen D:\models\Qwen3.6-35B-A3B D:\models\colibri-qwen36 --extract-experts --quantization q4
+python -m colibri_next.cli convert-qwen models/Qwen3.6-35B-A3B models/colibri-qwen36 --extract-experts --quantization q4
 
-python -m colibri_next.cli convert-moe-layers D:\models\Qwen3.6-35B-A3B D:\models\colibri-qwen36
+python -m colibri_next.cli convert-moe-layers models/Qwen3.6-35B-A3B models/colibri-qwen36
 
-python -m colibri_next.cli convert-attention-layers D:\models\Qwen3.6-35B-A3B D:\models\colibri-qwen36 --quantization q4
+python -m colibri_next.cli convert-attention-layers models/Qwen3.6-35B-A3B models/colibri-qwen36 --quantization q4
 
-python -m colibri_next.cli convert-linear-layers D:\models\Qwen3.6-35B-A3B D:\models\colibri-qwen36 --quantization q4
+python -m colibri_next.cli convert-linear-layers models/Qwen3.6-35B-A3B models/colibri-qwen36 --quantization q4
 
-python -m colibri_next.cli convert-model-io D:\models\Qwen3.6-35B-A3B D:\models\colibri-qwen36 --quantization q4
+python -m colibri_next.cli convert-model-io models/Qwen3.6-35B-A3B models/colibri-qwen36 --quantization q4
 
-python -m colibri_next.cli convert-tokenizer D:\models\Qwen3.6-35B-A3B D:\models\colibri-qwen36
+python -m colibri_next.cli convert-tokenizer models/Qwen3.6-35B-A3B models/colibri-qwen36
 ~~~
 
 The first conversion creates independently loadable routed experts. The second converts every layer's router, shared expert, shared-expert gate, and post-attention RMSNorm. The remaining commands convert both token-mixer types, model input/output tensors, and tokenizer assets. Static converters accept `--quantization bf16` for compatibility or `--quantization q4` to reduce projection, embedding, and LM-head storage and VRAM-cache pressure. Existing converted models can be upgraded in place by rerunning the three static conversion commands with `--quantization q4 --overwrite`.
@@ -93,17 +143,17 @@ Q4 uses one FP16 scale and 16 packed bytes for every 32 values. Routed experts r
 
 Execute one routed expert:
 
-~~~powershell
-python -m colibri_next.cli benchmark-expert D:\models\colibri-qwen36\experts\layer-000\expert-0000.coli --iterations 10
+~~~console
+python -m colibri_next.cli benchmark-expert models/colibri-qwen36/experts/layer-000/expert-0000.coli --iterations 10
 ~~~
 
 Execute one complete Qwen MoE feed-forward block:
 
-~~~powershell
-python -m colibri_next.cli benchmark-moe-layer D:\models\colibri-qwen36 --layer 0 --iterations 3
+~~~console
+python -m colibri_next.cli benchmark-moe-layer models/colibri-qwen36 --layer 0 --iterations 3
 
 # Also apply post-attention RMSNorm and the residual connection.
-python -m colibri_next.cli benchmark-moe-layer D:\models\colibri-qwen36 --layer 0 --iterations 3 --residual
+python -m colibri_next.cli benchmark-moe-layer models/colibri-qwen36 --layer 0 --iterations 3 --residual
 ~~~
 
 The complete block performs the reference sequence:
@@ -121,54 +171,79 @@ The residual mode first applies Qwen's one-centered RMSNorm and then adds the or
 
 Execute incremental full attention with a growing grouped-query KV cache:
 
-~~~powershell
-python -m colibri_next.cli benchmark-attention-layer D:\models\colibri-qwen36 --layer 3 --tokens 8
+~~~console
+python -m colibri_next.cli benchmark-attention-layer models/colibri-qwen36 --layer 3 --tokens 8
 ~~~
 
 The attention path applies input RMSNorm, Q/K/V projection, per-head Q/K RMSNorm, partial RoPE, grouped-query causal attention, sigmoid query gating, output projection, and the residual connection.
 
 Execute incremental Gated DeltaNet with persistent convolution and recurrent state:
 
-~~~powershell
-python -m colibri_next.cli benchmark-linear-layer D:\models\colibri-qwen36 --layer 0 --tokens 8
+~~~console
+python -m colibri_next.cli benchmark-linear-layer models/colibri-qwen36 --layer 0 --tokens 8
 ~~~
 
 The linear path applies input RMSNorm, projected depthwise causal convolution, Q/K L2 normalization, learned decay and delta-rule state updates, SiLU-gated RMSNorm, output projection, and the residual connection.
 
 Execute every converted decoder layer with persistent per-layer state:
 
-~~~powershell
-python -m colibri_next.cli benchmark-decoder D:\models\colibri-qwen36 --tokens 1
+~~~console
+python -m colibri_next.cli benchmark-decoder models/colibri-qwen36 --tokens 1
 ~~~
 
 The decoder stack selects each layer's configured token mixer, applies both residual paths, executes its sparse MoE block, and advances full-attention or recurrent state for the next token.
 
 Execute real token IDs through embeddings, every decoder layer, final RMSNorm, and the LM head:
 
-~~~powershell
-python -m colibri_next.cli benchmark-logits D:\models\colibri-qwen36 --token-ids 1,2,3 --device cuda --gpu-cache-mib 8192
+~~~console
+python -m colibri_next.cli benchmark-logits models/colibri-qwen36 --token-ids 1,2,3 --device cuda --gpu-cache-mib 8192
 ~~~
 
 CUDA keeps packed BF16 and Q4 weights in a bounded priority-aware VRAM cache and executes them without full dequantization. Routed and shared experts use grouped gate, activation, and weighted-down kernels, attention projections are batched, and Gated DeltaNet recurrent updates remain on the GPU. During generation, decoder hidden states, RMSNorm, residuals, routing probabilities, LM-head logits, and sampling stay device-resident; only selected expert IDs and the sampled token cross to the host. Evicted expert allocations are reused through CuPy's memory pool instead of forcing allocator-wide synchronization. Omit `--device cuda` for the portable CPU path; lower `--gpu-cache-mib` on smaller GPUs.
 
 The generator skips unnecessary vocabulary projections during prompt prefill and only evaluates the LM head for the final prompt token. CUDA full attention keeps RoPE, KV-cache updates, grouped-query attention, gating, and residual execution on the GPU. Fused RMSNorm and routing kernels reduce launch count. Layer-major CUDA prefill batches static projections and routing across prompt tokens and synchronizes selected expert IDs once per layer instead of once per token and layer. In local RTX 5070 Ti Laptop GPU benchmarks using Qwen3.5-35B-A3B with experts preloaded into RAM, the original runtime produced 1.10 output tokens per second, grouped CUDA reached 4.27, device-resident decode reached 4.80, Q4 static weights reached 6.56, and fused normalization/routing reached 6.92 output tokens per second when total response time includes prompt processing. The corrected warmed decode harness measures about 16-18 generated tokens per second with GPU sampling included. A warmed 256-token prefill improved from 13.75 to 18.05 tokens per second after batched routing. Q4 static attention, DeltaNet, embeddings, and LM-head files occupy about 1.24 GiB, protected CUDA weights use about 1.08 GiB, and short measured runs had no weight-cache evictions. Treat these single-run numbers as directional; prompt length, early EOS, storage speed, power limits, and available VRAM materially affect throughput.
 
-Pinned-memory expert upload and a request-local cross-layer transition predictor are available experimentally with `$env:COLIBRI_EXPERT_PREFETCH = "1"`; `COLIBRI_EXPERT_PREFETCH_BUDGET` controls the number of predicted experts and defaults to `2`. The CUDA health statistics report requests, cache hits, waits, useful prefetched tensors, and transferred MiB. This remains opt-in because a forced 2 GiB cache benchmark showed no cold-decode improvement and a small warm-decode regression from cache pollution, while the normal 8 GiB short-prompt run already had all decode-used experts resident.
+Pinned-memory expert upload and a request-local cross-layer transition predictor
+are available experimentally. Enable them with
+`$env:COLIBRI_EXPERT_PREFETCH = "1"` in PowerShell or
+`export COLIBRI_EXPERT_PREFETCH=1` in Bash.
+`COLIBRI_EXPERT_PREFETCH_BUDGET` controls the number of predicted experts and
+defaults to `2`. The CUDA health statistics report requests, cache hits, waits,
+useful prefetched tensors, and transferred MiB. This remains opt-in because a
+forced 2 GiB cache benchmark showed no cold-decode improvement and a small
+warm-decode regression from cache pollution, while the normal 8 GiB
+short-prompt run already had all decode-used experts resident.
 
 Generate decoded text from a chat prompt:
 
-~~~powershell
-python -m colibri_next.cli generate-text D:\models\colibri-qwen36 --prompt "Say hi." --max-new-tokens 8 --temperature 0 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0
+~~~console
+python -m colibri_next.cli generate-text models/colibri-qwen36 --prompt "Say hi." --max-new-tokens 8 --temperature 0 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0
 ~~~
 
 Temperature zero performs greedy decoding. Positive temperatures support top-k and nucleus sampling through `--top-k`, `--top-p`, and `--seed`.
+
+## Transformers validation
+
+Install the optional reference dependencies and compare a converted model with its
+original Hugging Face checkpoint using identical token IDs:
+
+~~~console
+pip install -e ".[validation]"
+python -m colibri_next.cli validate-transformers models/colibri-qwen36 models/Qwen3.6-35B-A3B --token-ids 1,2,3 --generate-tokens 4 --device cuda --gpu-cache-mib 8192 --reference-device cuda --reference-dtype bfloat16
+~~~
+
+The validator compares the complete next-token logit vectors, top-k membership,
+cosine similarity, and greedy token at every step. Generated steps are
+teacher-forced with the Transformers greedy token, so a mismatch does not put the
+two runtimes on different contexts. Use `--trust-remote-code` only for checkpoints
+whose repository code you have reviewed.
 
 ## Local server
 
 Start one persistent model process with an 8 GiB CUDA weight cache:
 
-~~~powershell
-python -m colibri_next.cli serve C:\models\colibri-qwen35 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0 --host 127.0.0.1 --port 8000
+~~~console
+python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0 --host 127.0.0.1 --port 8000
 ~~~
 
 The server defaults to `--expert-preload auto`. It preloads routed Q4 experts when available RAM can hold them while preserving an 8 GiB reserve, and otherwise continues with on-demand SSD loading. The tested Qwen3.5-35B-A3B conversion uses about 16.9 GiB for routed experts and took about 48.5 seconds to preload from SSD. Use `--expert-preload none` for faster startup or `--expert-preload all` to force preloading. The one-off `generate-text` command defaults to `none` because preload startup is usually not worthwhile for a single short response.
@@ -178,6 +253,8 @@ The server defaults to `--expert-preload auto`. It preloads routed Q4 experts wh
 Open `http://127.0.0.1:8000/` for the bundled browser chat UI. Conversations and generation settings are stored locally in the browser. If bearer authentication is enabled, enter the API key in the UI Settings panel.
 
 Send an OpenAI-compatible chat completion request from another terminal:
+
+Windows PowerShell:
 
 ~~~powershell
 $body = @{
@@ -190,17 +267,40 @@ $body = @{
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/v1/chat/completions -ContentType application/json -Body $body
 ~~~
 
+Linux Bash:
+
+~~~bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "model": "colibri-qwen35",
+    "messages": [{"role": "user", "content": "Say hi."}],
+    "max_tokens": 8,
+    "temperature": 0
+  }'
+~~~
+
 The server supports streaming and non-streaming `POST /v1/chat/completions`, `POST /v1/responses`, and legacy `POST /v1/completions`; stateful Responses continuation, retrieval, and deletion; Chat Completions and Responses function tools using Qwen's native tool format; `GET /v1/models`; and llama.cpp-style `/tokenize`, `/detokenize`, `/props`, and `/slots` endpoints. It keeps the CUDA cache warm and serializes generation on one GPU. The first request compiles CUDA kernels and fills VRAM, so later requests are faster.
 
 Optional bearer authentication can be enabled without putting the key in shell history:
 
-~~~powershell
-$env:COLIBRI_API_KEY = "replace-with-a-local-secret"
-python -m colibri_next.cli serve C:\models\colibri-qwen35 --device cuda --api-key $env:COLIBRI_API_KEY --cors-origin http://127.0.0.1:8000
-~~~
-The official OpenAI Python SDK can use the local server directly:
+Windows PowerShell:
 
 ~~~powershell
+$env:COLIBRI_API_KEY = "replace-with-a-local-secret"
+python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --api-key $env:COLIBRI_API_KEY --cors-origin http://127.0.0.1:8000
+~~~
+
+Linux Bash:
+
+~~~bash
+export COLIBRI_API_KEY="replace-with-a-local-secret"
+python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --api-key "$COLIBRI_API_KEY" --cors-origin http://127.0.0.1:8000
+~~~
+
+The official OpenAI Python SDK can use the local server directly:
+
+~~~console
 pip install openai
 ~~~
 
@@ -263,7 +363,7 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 
 ## Next milestones
 
-1. Validate logits and generated tokens against Transformers.
+1. Run and publish full-checkpoint Transformers parity results.
 2. Batch prompt tokens by selected expert and add fused DeltaNet scans.
 3. Improve expert prediction and reuse pinned staging buffers.
 4. Add CUDA graph replay and persistent fused layer kernels.
@@ -273,12 +373,6 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 ## Scope
 
 The project now executes complete mixed Qwen models from text prompts through decoded output. The current implementation supports portable CPU execution and optional bounded-memory NVIDIA CUDA acceleration.
-
-
-
-
-
-
 
 
 
