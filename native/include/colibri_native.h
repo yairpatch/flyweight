@@ -26,4 +26,22 @@ COLIBRI_API int colibri_q4_matvec(
     std::int32_t columns
 );
 
+// Fused Q4 SwiGLU mixture-of-experts for a single token. Every routed expert
+// (the caller appends the shared expert as the final entry with its own
+// weight) is computed and weight-accumulated inside one call, threaded across
+// experts, so the Python side ships pointers once instead of orchestrating a
+// matvec per expert.
+COLIBRI_API int colibri_q4_moe(
+    const std::uint8_t* const* gate_up_packed,
+    const std::uint16_t* const* gate_up_scales,
+    const std::uint8_t* const* down_packed,
+    const std::uint16_t* const* down_scales,
+    const float* weights,
+    const float* input,
+    float* output,
+    std::int32_t num_experts,
+    std::int32_t hidden_size,
+    std::int32_t intermediate_size
+);
+
 }

@@ -14,6 +14,11 @@ target_compile_features(colibri_native PRIVATE cxx_std_20)
 target_include_directories(colibri_native PRIVATE include)
 target_compile_definitions(colibri_native PRIVATE COLIBRI_NATIVE_BUILD)
 
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(colibri_native PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 if(MSVC)
     target_compile_options(colibri_native PRIVATE /O2 /EHsc /permissive-)
     set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")

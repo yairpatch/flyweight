@@ -1163,9 +1163,9 @@ class CudaAccelerator:
     ) -> Any:
         """Offload one token's routed experts to the host CPU backend.
 
-        The token mixer, router, and residual all stay on the GPU; only the
-        Q4 expert MLPs (whose weights are deliberately kept off the device)
-        run on the CPU, so just the hidden vector crosses the PCIe boundary.
+        Only the Q4 expert MLPs (whose weights are deliberately kept off the
+        device) run on the CPU, through the fused native MoE kernel; the hidden
+        vector crosses the PCIe boundary once per layer.
         """
         result = layer.forward_residual(hidden.get().tolist())
         if route_state is not None:

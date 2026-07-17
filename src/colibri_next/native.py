@@ -49,6 +49,21 @@ class NativeBackend:
         self.path = library_path
         self.library = library
         self.version = int(library.colibri_native_version())
+        self._fused_moe = self.version >= 2
+        if self._fused_moe:
+            library.colibri_q4_moe.argtypes = [
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint16)),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint16)),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+            ]
+            library.colibri_q4_moe.restype = ctypes.c_int
         self.feature_mask = int(library.colibri_cpu_features())
         self._executor = ThreadPoolExecutor(
             max_workers=min(16, os.cpu_count() or 1),
@@ -94,15 +109,61 @@ class NativeBackend:
         np = _numpy()
         input_vector = np.ascontiguousarray(vector, dtype=np.float32)
         all_experts = [*experts, shared_expert]
+        weights = np.asarray(
+            [*routing_weights, shared_weight], dtype=np.float32
+        )
+        if self._fused_moe:
+            return self._fused_q4_moe(all_experts, weights, input_vector)
         futures = [
             self._executor.submit(self.q4_swiglu, expert, input_vector)
             for expert in all_experts
         ]
         outputs = np.stack([future.result() for future in futures])
-        weights = np.asarray(
-            [*routing_weights, shared_weight], dtype=np.float32
-        )
         return np.einsum("e,eh->h", weights, outputs).tolist()
+
+    def _fused_q4_moe(
+        self, all_experts: list[Q4SwiGLUExpert], weights: object, input_vector: object
+    ) -> list[float]:
+        np = _numpy()
+        count = len(all_experts)
+        hidden_size = all_experts[0].hidden_size
+        intermediate_size = all_experts[0].intermediate_size
+        u8 = ctypes.POINTER(ctypes.c_uint8)
+        u16 = ctypes.POINTER(ctypes.c_uint16)
+        gate_up_packed = (u8 * count)()
+        gate_up_scales = (u16 * count)()
+        down_packed = (u8 * count)()
+        down_scales = (u16 * count)()
+        keep_alive: list[object] = []
+        for index, expert in enumerate(all_experts):
+            gate_up = expert.gate_up
+            down = expert.down
+            gp = np.frombuffer(gate_up.packed, dtype=np.uint8)
+            gs = np.frombuffer(gate_up.scales, dtype="<u2")
+            dp = np.frombuffer(down.packed, dtype=np.uint8)
+            ds = np.frombuffer(down.scales, dtype="<u2")
+            keep_alive += (gp, gs, dp, ds)
+            gate_up_packed[index] = gp.ctypes.data_as(u8)
+            gate_up_scales[index] = gs.ctypes.data_as(u16)
+            down_packed[index] = dp.ctypes.data_as(u8)
+            down_scales[index] = ds.ctypes.data_as(u16)
+        weight_array = np.ascontiguousarray(weights, dtype=np.float32)
+        output = np.empty(hidden_size, dtype=np.float32)
+        status = self.library.colibri_q4_moe(
+            gate_up_packed,
+            gate_up_scales,
+            down_packed,
+            down_scales,
+            weight_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            input_vector.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            count,
+            hidden_size,
+            intermediate_size,
+        )
+        if status != 0:
+            raise RuntimeError(f"native Q4 MoE failed with status {status}")
+        return output.tolist()
 
     def _q4_matvec_array(self, tensor: Q4BlockTensor, vector: object) -> object:
         np = _numpy()

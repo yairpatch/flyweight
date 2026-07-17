@@ -1,6 +1,13 @@
 #include "colibri_native.h"
 #include "q4_kernel.h"
 
+#include <cmath>
+#include <vector>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
@@ -82,7 +89,7 @@ const Q4MatvecKernel kQ4Kernel = select_kernel(kCpuFeatures);
 }
 
 extern "C" std::uint32_t colibri_native_version() {
-    return 1;
+    return 2;
 }
 
 extern "C" std::uint32_t colibri_cpu_features() {
@@ -102,4 +109,103 @@ extern "C" int colibri_q4_matvec(
         return -1;
     }
     return kQ4Kernel(packed, scales, vector, output, rows, columns);
+}
+
+extern "C" int colibri_q4_moe(
+    const std::uint8_t* const* gate_up_packed,
+    const std::uint16_t* const* gate_up_scales,
+    const std::uint8_t* const* down_packed,
+    const std::uint16_t* const* down_scales,
+    const float* weights,
+    const float* input,
+    float* output,
+    std::int32_t num_experts,
+    std::int32_t hidden_size,
+    std::int32_t intermediate_size
+) {
+    if (gate_up_packed == nullptr || gate_up_scales == nullptr
+        || down_packed == nullptr || down_scales == nullptr
+        || weights == nullptr || input == nullptr || output == nullptr
+        || num_experts <= 0 || hidden_size <= 0 || intermediate_size <= 0) {
+        return -1;
+    }
+    const std::int32_t gate_rows = 2 * intermediate_size;
+
+#if defined(_OPENMP)
+    // Cap threads at the expert count: work is parallelized across experts, so
+    // extra threads only oversubscribe the machine (which collapses throughput
+    // when the default team is far larger than the handful of routed experts).
+    int thread_count = omp_get_max_threads();
+    if (thread_count > num_experts) {
+        thread_count = num_experts;
+    }
+    if (thread_count < 1) {
+        thread_count = 1;
+    }
+#else
+    const int thread_count = 1;
+#endif
+    // Each thread accumulates the weighted expert outputs into a private row
+    // and the rows are reduced once at the end, so no expert contends on the
+    // shared output buffer.
+    std::vector<float> partials(
+        static_cast<std::size_t>(thread_count) * hidden_size, 0.0f
+    );
+
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(thread_count)
+#endif
+    {
+#if defined(_OPENMP)
+        const int thread_id = omp_get_thread_num();
+#else
+        const int thread_id = 0;
+#endif
+        float* accumulator = partials.data()
+            + static_cast<std::size_t>(thread_id) * hidden_size;
+        std::vector<float> gate_up(gate_rows);
+        std::vector<float> activated(intermediate_size);
+        std::vector<float> down_output(hidden_size);
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic)
+#endif
+        for (std::int32_t expert = 0; expert < num_experts; ++expert) {
+            kQ4Kernel(
+                gate_up_packed[expert],
+                gate_up_scales[expert],
+                input,
+                gate_up.data(),
+                gate_rows,
+                hidden_size
+            );
+            for (std::int32_t index = 0; index < intermediate_size; ++index) {
+                const float gate = gate_up[index];
+                const float silu = gate / (1.0f + std::exp(-gate));
+                activated[index] = silu * gate_up[intermediate_size + index];
+            }
+            kQ4Kernel(
+                down_packed[expert],
+                down_scales[expert],
+                activated.data(),
+                down_output.data(),
+                hidden_size,
+                intermediate_size
+            );
+            const float weight = weights[expert];
+            for (std::int32_t index = 0; index < hidden_size; ++index) {
+                accumulator[index] += weight * down_output[index];
+            }
+        }
+    }
+
+    for (std::int32_t index = 0; index < hidden_size; ++index) {
+        float total = 0.0f;
+        for (int thread = 0; thread < thread_count; ++thread) {
+            total += partials[
+                static_cast<std::size_t>(thread) * hidden_size + index
+            ];
+        }
+        output[index] = total;
+    }
+    return 0;
 }
