@@ -16,6 +16,28 @@ if TYPE_CHECKING:
 THREADS_PER_BLOCK = 256
 
 
+def _group_selected_experts(
+    selected_ids: list[list[int]],
+) -> dict[int, list[tuple[int, int]]]:
+    groups: dict[int, list[tuple[int, int]]] = {}
+    for token, route in enumerate(selected_ids):
+        for rank, expert_id in enumerate(route):
+            groups.setdefault(int(expert_id), []).append((token, rank))
+    return groups
+
+
+def _use_expert_major_prefill(tokens: int) -> bool:
+    mode = os.environ.get("COLIBRI_EXPERT_MAJOR_PREFILL", "auto")
+    if mode not in {"0", "1", "auto"}:
+        raise ValueError(
+            "COLIBRI_EXPERT_MAJOR_PREFILL must be 'auto', '0', or '1'"
+        )
+    minimum = int(os.environ.get("COLIBRI_EXPERT_MAJOR_MIN_TOKENS", "128"))
+    if minimum <= 0:
+        raise ValueError("COLIBRI_EXPERT_MAJOR_MIN_TOKENS must be positive")
+    return mode == "1" or (mode == "auto" and tokens >= minimum)
+
+
 class CudaUnavailableError(RuntimeError):
     pass
 
@@ -69,6 +91,7 @@ class CudaAccelerator:
         self.device_resident_decode_tokens = 0
         self.batched_prefill_tokens = 0
         self.batched_moe_tokens = 0
+        self.batched_expert_groups = 0
         self.q8_grouped_moe_calls = 0
         self.q8_moe_enabled = os.environ.get("COLIBRI_Q8_MOE") == "1"
         self.expert_prefetch_enabled = (
@@ -170,7 +193,9 @@ class CudaAccelerator:
         with self.cp.cuda.Device(self.device_id):
             return self._matrix_matvec_device(tensor, vector)
 
-    def matrix_matmul_device(self, tensor: Any, vectors: Any) -> Any:
+    def matrix_matmul_device(
+        self, tensor: Any, vectors: Any, *, protected: bool = True
+    ) -> Any:
         from .q4 import Q4BlockTensor
 
         if vectors.ndim != 2 or vectors.shape[1] != tensor.shape[1]:
@@ -180,7 +205,7 @@ class CudaAccelerator:
         cp = self.cp
         output = cp.empty((tokens, rows), dtype=cp.float32)
         if isinstance(tensor, Q4BlockTensor):
-            packed, scales = self._q4_arrays(tensor, protected=True)
+            packed, scales = self._q4_arrays(tensor, protected=protected)
             self._q4_matmul_kernel(
                 (rows, tokens),
                 (THREADS_PER_BLOCK,),
@@ -935,22 +960,67 @@ class CudaAccelerator:
         shared_weights = cp.float32(1.0) / (
             cp.float32(1.0) + cp.exp(-shared_logits)
         )
-        outputs = []
-        for token in range(tokens):
-            experts = [
-                layer._expert(int(expert_id))
-                for expert_id in selected_ids[token]
-            ]
-            output = self.q4_moe_device(
-                experts,
-                routing_weights[token],
-                layer.shared_expert,
-                shared_weights[token],
-                normalized[token],
+        if not _use_expert_major_prefill(tokens):
+            outputs = []
+            for token in range(tokens):
+                experts = [
+                    layer._expert(int(expert_id))
+                    for expert_id in selected_ids[token]
+                ]
+                output = self.q4_moe_device(
+                    experts,
+                    routing_weights[token],
+                    layer.shared_expert,
+                    shared_weights[token],
+                    normalized[token],
+                )
+                outputs.append(hidden[token] + output)
+            self.batched_moe_tokens += tokens
+            return cp.stack(outputs)
+        outputs = cp.zeros_like(hidden)
+        expert_groups = _group_selected_experts(selected_ids)
+        for expert_id, assignments in expert_groups.items():
+            token_indices = cp.asarray(
+                [token for token, _ in assignments], dtype=cp.int32
             )
-            outputs.append(hidden[token] + output)
+            route_indices = cp.asarray(
+                [route for _, route in assignments], dtype=cp.int32
+            )
+            expert = layer._expert(expert_id)
+            expert_output = self._q4_swiglu_sequence_device(
+                expert, normalized[token_indices], protect_weights=False
+            )
+            weights = routing_weights[token_indices, route_indices]
+            outputs[token_indices] += expert_output * weights[:, None]
+        shared_output = self._q4_swiglu_sequence_device(
+            layer.shared_expert, normalized, protect_weights=True
+        )
+        outputs += shared_output * shared_weights[:, None]
         self.batched_moe_tokens += tokens
-        return cp.stack(outputs)
+        self.batched_expert_groups += len(expert_groups)
+        return hidden + outputs
+
+    def _q4_swiglu_sequence_device(
+        self,
+        expert: Q4SwiGLUExpert,
+        vectors: Any,
+        *,
+        protect_weights: bool,
+    ) -> Any:
+        cp = self.cp
+        gate_up = self.matrix_matmul_device(
+            expert.gate_up, vectors, protected=protect_weights
+        )
+        intermediate_size = expert.intermediate_size
+        gates = gate_up[:, :intermediate_size]
+        activated = (
+            gates
+            / (cp.float32(1.0) + cp.exp(-gates))
+            * gate_up[:, intermediate_size:]
+        )
+        return self.matrix_matmul_device(
+            expert.down, activated, protected=protect_weights
+        )
 
     def _q4_grouped_moe(
         self,
@@ -1288,6 +1358,13 @@ class CudaAccelerator:
             "device_resident_decode_tokens": self.device_resident_decode_tokens,
             "batched_prefill_tokens": self.batched_prefill_tokens,
             "batched_moe_tokens": self.batched_moe_tokens,
+            "batched_expert_groups": self.batched_expert_groups,
+            "expert_major_prefill": os.environ.get(
+                "COLIBRI_EXPERT_MAJOR_PREFILL", "auto"
+            ),
+            "expert_major_min_tokens": int(
+                os.environ.get("COLIBRI_EXPERT_MAJOR_MIN_TOKENS", "128")
+            ),
             "q8_grouped_moe_calls": self.q8_grouped_moe_calls,
             "q8_moe_enabled": str(self.q8_moe_enabled).lower(),
             "expert_prefetch_enabled": str(

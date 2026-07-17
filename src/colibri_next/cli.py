@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from .attention import QwenFullAttentionLayer
@@ -34,7 +35,12 @@ from .runtime import ToyMoERuntime
 from .storage import ExpertStore
 from .tokenizer import HuggingFaceTokenizer
 from .tokenizer_converter import TokenizerAssetsConverter
-from .validation import TransformersReference, validate_against_reference
+from .validation import (
+    TransformersReference,
+    diagnose_hidden_states,
+    diagnose_layer_components,
+    validate_against_reference,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -158,6 +164,19 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--top-k", type=int, default=10)
     validate.add_argument("--reference-device", default="cpu")
     validate.add_argument("--reference-dtype", default="auto")
+    validate.add_argument("--reference-offload-dir", type=Path)
+    validate.add_argument("--reference-gpu-memory-mib", type=int)
+    validate.add_argument("--reference-cpu-memory-mib", type=int)
+    validate.add_argument(
+        "--layerwise",
+        action="store_true",
+        help="compare one-token hidden states instead of generation logits",
+    )
+    validate.add_argument(
+        "--component-layer",
+        type=int,
+        help="compare internal stages of one full-attention layer",
+    )
     validate.add_argument("--trust-remote-code", action="store_true")
     validate.add_argument("--rows-per-chunk", type=int, default=4096)
     _add_device_arguments(validate)
@@ -489,15 +508,48 @@ def main(argv: list[str] | None = None) -> int:
             device=args.reference_device,
             dtype=args.reference_dtype,
             trust_remote_code=args.trust_remote_code,
+            offload_dir=args.reference_offload_dir,
+            max_gpu_memory_mib=args.reference_gpu_memory_mib,
+            max_cpu_memory_mib=args.reference_cpu_memory_mib,
         )
-        report = validate_against_reference(
-            model,
-            reference,
-            token_ids,
-            generate_tokens=args.generate_tokens,
-            top_k=args.top_k,
-        )
-        print(json.dumps(report.to_dict(), indent=2))
+        if args.component_layer is not None:
+            if len(token_ids) != 1:
+                raise ValueError("component validation requires one token ID")
+            comparisons = diagnose_layer_components(
+                model, reference, token_ids[0], args.component_layer
+            )
+            print(
+                json.dumps(
+                    {
+                        "input_token": token_ids[0],
+                        "layer": args.component_layer,
+                        "comparisons": [asdict(item) for item in comparisons],
+                    },
+                    indent=2,
+                )
+            )
+        elif args.layerwise:
+            if len(token_ids) != 1:
+                raise ValueError("layerwise validation requires one token ID")
+            comparisons = diagnose_hidden_states(model, reference, token_ids[0])
+            print(
+                json.dumps(
+                    {
+                        "input_token": token_ids[0],
+                        "comparisons": [asdict(item) for item in comparisons],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            report = validate_against_reference(
+                model,
+                reference,
+                token_ids,
+                generate_tokens=args.generate_tokens,
+                top_k=args.top_k,
+            )
+            print(json.dumps(report.to_dict(), indent=2))
         return 0
 
     if args.command == "benchmark-decoder":
@@ -769,6 +821,3 @@ def _execution_stats() -> dict[str, int | str]:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-

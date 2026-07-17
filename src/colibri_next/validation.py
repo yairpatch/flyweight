@@ -48,6 +48,42 @@ class ValidationReport:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ActivationComparison:
+    stage: str
+    max_absolute_error: float
+    mean_absolute_error: float
+    cosine_similarity: float
+
+
+def compare_activation_vectors(
+    colibri_values: Sequence[float],
+    reference_values: Sequence[float],
+    *,
+    stage: str,
+) -> ActivationComparison:
+    if len(colibri_values) != len(reference_values):
+        raise ValueError(
+            f"activation widths differ at {stage}: "
+            f"{len(colibri_values)} != {len(reference_values)}"
+        )
+    colibri = [float(value) for value in colibri_values]
+    reference = [float(value) for value in reference_values]
+    if not colibri:
+        raise ValueError(f"activation vectors must not be empty at {stage}")
+    errors = [abs(left - right) for left, right in zip(colibri, reference)]
+    dot = sum(left * right for left, right in zip(colibri, reference))
+    left_norm = math.sqrt(sum(value * value for value in colibri))
+    right_norm = math.sqrt(sum(value * value for value in reference))
+    cosine = dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
+    return ActivationComparison(
+        stage=stage,
+        max_absolute_error=max(errors),
+        mean_absolute_error=sum(errors) / len(errors),
+        cosine_similarity=cosine,
+    )
+
+
 def compare_logit_vectors(
     colibri_logits: Sequence[float],
     reference_logits: Sequence[float],
@@ -61,7 +97,7 @@ def compare_logit_vectors(
             "logit vocabulary sizes differ: "
             f"{len(colibri_logits)} != {len(reference_logits)}"
         )
-    if not colibri_logits:
+    if len(colibri_logits) == 0:
         raise ValueError("logit vectors must not be empty")
     if top_k <= 0:
         raise ValueError("top_k must be positive")
@@ -103,6 +139,9 @@ class TransformersReference:
         device: str = "cpu",
         dtype: str = "auto",
         trust_remote_code: bool = False,
+        offload_dir: Path | str | None = None,
+        max_gpu_memory_mib: int | None = None,
+        max_cpu_memory_mib: int | None = None,
     ):
         try:
             import torch
@@ -120,20 +159,219 @@ class TransformersReference:
             except AttributeError as error:
                 raise ValueError(f"unsupported torch dtype: {dtype}") from error
         self._torch = torch
-        self.model = AutoModelForCausalLM.from_pretrained(
-            str(source),
-            torch_dtype=torch_dtype,
-            trust_remote_code=trust_remote_code,
-            low_cpu_mem_usage=True,
-        ).to(device)
+        load_options: dict[str, Any] = {
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": trust_remote_code,
+            "low_cpu_mem_usage": True,
+        }
+        if device == "auto":
+            load_options["device_map"] = "auto"
+            max_memory: dict[Any, str] = {}
+            if max_gpu_memory_mib is not None:
+                max_memory[0] = f"{max_gpu_memory_mib}MiB"
+            if max_cpu_memory_mib is not None:
+                max_memory["cpu"] = f"{max_cpu_memory_mib}MiB"
+            if max_memory:
+                load_options["max_memory"] = max_memory
+            if offload_dir is not None:
+                directory = Path(offload_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                load_options["offload_folder"] = str(directory)
+                load_options["offload_state_dict"] = True
+            self.model = AutoModelForCausalLM.from_pretrained(
+                str(source), **load_options
+            )
+            self.device = self.model.get_input_embeddings().weight.device
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                str(source), **load_options
+            ).to(device)
+            self.device = device
         self.model.eval()
-        self.device = device
 
     def logits(self, token_ids: Sequence[int]) -> list[float]:
         with self._torch.inference_mode():
             inputs = self._torch.tensor([list(token_ids)], device=self.device)
             logits = self.model(input_ids=inputs).logits[0, -1]
         return logits.float().cpu().tolist()
+
+    def hidden_states(self, token_ids: Sequence[int]) -> list[list[float]]:
+        with self._torch.inference_mode():
+            inputs = self._torch.tensor([list(token_ids)], device=self.device)
+            outputs = self.model(
+                input_ids=inputs,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        if outputs.hidden_states is None:
+            raise RuntimeError("Transformers did not return hidden states")
+        return [
+            hidden[0, -1].float().cpu().tolist()
+            for hidden in outputs.hidden_states
+        ]
+
+    def layer_components(
+        self, token_ids: Sequence[int], layer_index: int
+    ) -> dict[str, list[float]]:
+        base_model = self.model.model
+        language_model = getattr(base_model, "language_model", base_model)
+        layer = language_model.layers[layer_index]
+        captured: dict[str, list[float]] = {}
+
+        def save(name: str, *, use_input: bool = False):
+            def hook(module: Any, inputs: Any, output: Any) -> None:
+                value = inputs[0] if use_input else output
+                if isinstance(value, tuple):
+                    value = value[0]
+                captured[name] = value[0, -1].float().cpu().tolist()
+
+            return hook
+
+        mixer = layer.self_attn if layer.block_type == "full_attention" else layer.linear_attn
+        handles = [
+            layer.register_forward_hook(save("input", use_input=True)),
+            layer.input_layernorm.register_forward_hook(save("input-norm")),
+            mixer.register_forward_hook(save("mixer")),
+            layer.post_attention_layernorm.register_forward_hook(
+                save("mixer-residual", use_input=True)
+            ),
+            layer.post_attention_layernorm.register_forward_hook(save("post-norm")),
+            layer.mlp.register_forward_hook(save("mlp")),
+            layer.register_forward_hook(save("output")),
+        ]
+        try:
+            with self._torch.inference_mode():
+                inputs = self._torch.tensor([list(token_ids)], device=self.device)
+                self.model(input_ids=inputs, use_cache=False)
+        finally:
+            for handle in handles:
+                handle.remove()
+        return captured
+
+
+def diagnose_hidden_states(
+    model: QwenForCausalLM,
+    reference: TransformersReference,
+    token_id: int,
+) -> list[ActivationComparison]:
+    """Compare one-token decoder activations without introducing cache drift."""
+    state = model.new_state()
+    embedding = model.model_io.embed(token_id)
+    colibri_states: list[list[float]] = [embedding]
+
+    if model.device_decode_available:
+        accelerator = model._device_accelerator()
+        hidden = accelerator.device_vector(embedding)
+        for layer, layer_state in zip(
+            model.decoder.layers, state.decoder_state.layer_states
+        ):
+            hidden = layer.forward_device(hidden, layer_state, accelerator)
+            colibri_states.append(hidden.get().tolist())
+    else:
+        hidden = embedding
+        for layer, layer_state in zip(
+            model.decoder.layers, state.decoder_state.layer_states
+        ):
+            result = layer.forward(hidden, layer_state)
+            hidden = result.output
+            colibri_states.append(hidden)
+
+    normalized = model.model_io.normalize(colibri_states[-1])
+    reference_states = reference.hidden_states([token_id])
+    if len(reference_states) == len(colibri_states):
+        comparable = colibri_states[:-1] + [normalized]
+        stages = ["embedding"] + [
+            f"layer-{index:03d}" for index in range(len(colibri_states) - 2)
+        ] + ["final-norm"]
+    elif len(reference_states) == len(colibri_states) + 1:
+        comparable = colibri_states + [normalized]
+        stages = ["embedding"] + [
+            f"layer-{index:03d}" for index in range(len(colibri_states) - 1)
+        ] + ["final-norm"]
+    else:
+        raise ValueError(
+            "unexpected Transformers hidden-state count: "
+            f"{len(reference_states)} for {len(model.decoder.layers)} layers"
+        )
+    return [
+        compare_activation_vectors(colibri, reference_values, stage=stage)
+        for stage, colibri, reference_values in zip(
+            stages, comparable, reference_states
+        )
+    ]
+
+
+def diagnose_layer_components(
+    model: QwenForCausalLM,
+    reference: TransformersReference,
+    token_id: int,
+    layer_index: int,
+) -> list[ActivationComparison]:
+    if not 0 <= layer_index < len(model.decoder.layers):
+        raise ValueError(f"layer index out of range: {layer_index}")
+    state = model.new_state()
+    embedding = model.model_io.embed(token_id)
+    layer = model.decoder.layers[layer_index]
+
+    if model.device_decode_available:
+        accelerator = model._device_accelerator()
+        hidden = accelerator.device_vector(embedding)
+        for prior, prior_state in zip(
+            model.decoder.layers[:layer_index],
+            state.decoder_state.layer_states[:layer_index],
+        ):
+            hidden = prior.forward_device(hidden, prior_state, accelerator)
+        layer_state = state.decoder_state.layer_states[layer_index]
+        mixer_layer = layer.token_mixer
+        components: dict[str, Any] = {"input": hidden}
+        components["input-norm"] = accelerator.rms_norm_device(
+            hidden,
+            mixer_layer._input_norm_weights,
+            mixer_layer.rms_norm_eps,
+        )
+        if layer.layer_type != "full_attention":
+            raise ValueError("component diagnostic currently requires a full-attention layer")
+        mixer, _ = accelerator.full_attention(
+            mixer_layer,
+            hidden,
+            0,
+            layer_state.token_mixer_state,
+            residual=False,
+            return_attention_weights=False,
+            return_device=True,
+        )
+        components["mixer"] = mixer
+        mixed = hidden + mixer
+        components["mixer-residual"] = mixed
+        components["post-norm"] = accelerator.rms_norm_device(
+            mixed,
+            layer.moe._post_attention_norm_weights,
+            layer.moe.rms_norm_eps,
+        )
+        output = accelerator.moe_residual_device(layer.moe, mixed, layer_state)
+        components["mlp"] = output - mixed
+        components["output"] = output
+        colibri = {
+            name: value.get().tolist() for name, value in components.items()
+        }
+    else:
+        raise ValueError("component diagnostic currently requires CUDA")
+
+    reference_components = reference.layer_components([token_id], layer_index)
+    return [
+        compare_activation_vectors(
+            colibri[name], reference_components[name], stage=name
+        )
+        for name in (
+            "input",
+            "input-norm",
+            "mixer",
+            "mixer-residual",
+            "post-norm",
+            "mlp",
+            "output",
+        )
+    ]
 
 
 def validate_against_reference(

@@ -43,6 +43,7 @@ The runtime can inspect and convert real Qwen checkpoints and generate decoded t
 - Native Qwen function calling with OpenAI tool-call responses
 - Optional bearer authentication and browser CORS
 - Packed BF16 and Q4 CUDA matrix-vector kernels
+- Expert-major CUDA prompt batching with one shared-expert batch
 - Bounded LRU VRAM weight cache with CPU fallback
 - NumPy and portable Python execution paths
 - Checksummed versioned tensor containers
@@ -203,6 +204,15 @@ CUDA keeps packed BF16 and Q4 weights in a bounded priority-aware VRAM cache and
 
 The generator skips unnecessary vocabulary projections during prompt prefill and only evaluates the LM head for the final prompt token. CUDA full attention keeps RoPE, KV-cache updates, grouped-query attention, gating, and residual execution on the GPU. Fused RMSNorm and routing kernels reduce launch count. Layer-major CUDA prefill batches static projections and routing across prompt tokens and synchronizes selected expert IDs once per layer instead of once per token and layer. In local RTX 5070 Ti Laptop GPU benchmarks using Qwen3.5-35B-A3B with experts preloaded into RAM, the original runtime produced 1.10 output tokens per second, grouped CUDA reached 4.27, device-resident decode reached 4.80, Q4 static weights reached 6.56, and fused normalization/routing reached 6.92 output tokens per second when total response time includes prompt processing. The corrected warmed decode harness measures about 16-18 generated tokens per second with GPU sampling included. A warmed 256-token prefill improved from 13.75 to 18.05 tokens per second after batched routing. Q4 static attention, DeltaNet, embeddings, and LM-head files occupy about 1.24 GiB, protected CUDA weights use about 1.08 GiB, and short measured runs had no weight-cache evictions. Treat these single-run numbers as directional; prompt length, early EOS, storage speed, power limits, and available VRAM materially affect throughput.
 
+Expert-major MoE dispatch groups prompt assignments by routed expert and runs the
+shared expert over the complete token batch. On the same RTX 5070 Ti, warmed
+256-token Q4 prefill improved from 37.93 to 39.25 tokens per second (about
+3.5%), while 64-token prefill regressed from 47.89 to 43.34. The runtime
+therefore uses tokenwise grouped dispatch below 128 tokens and expert-major
+dispatch at or above 128 tokens. Set `COLIBRI_EXPERT_MAJOR_PREFILL` to `0` or
+`1` to force either path, or tune the crossover with
+`COLIBRI_EXPERT_MAJOR_MIN_TOKENS`.
+
 Pinned-memory expert upload and a request-local cross-layer transition predictor
 are available experimentally. Enable them with
 `$env:COLIBRI_EXPERT_PREFETCH = "1"` in PowerShell or
@@ -232,11 +242,34 @@ pip install -e ".[validation]"
 python -m colibri_next.cli validate-transformers models/colibri-qwen36 models/Qwen3.6-35B-A3B --token-ids 1,2,3 --generate-tokens 4 --device cuda --gpu-cache-mib 8192 --reference-device cuda --reference-dtype bfloat16
 ~~~
 
+When the reference checkpoint does not fit in one GPU, use
+`--reference-device auto --reference-offload-dir models/transformers-offload`
+to let Accelerate place weights across GPU, RAM, and disk. The offload directory
+must have enough free space for the portion of the checkpoint that does not fit
+in accelerator and system memory. Use `--reference-gpu-memory-mib` and
+`--reference-cpu-memory-mib` to reserve capacity for Colibrì and the operating
+system.
+
+Add `--layerwise` with exactly one token ID to compare the embedding, decoder
+hidden states, and final normalization. This locates the first divergent layer
+after an end-to-end parity failure. Use `--component-layer N` to split a
+full-attention layer into normalization, token-mixer, MoE, and residual stages.
+
 The validator compares the complete next-token logit vectors, top-k membership,
 cosine similarity, and greedy token at every step. Generated steps are
 teacher-forced with the Transformers greedy token, so a mismatch does not put the
 two runtimes on different contexts. Use `--trust-remote-code` only for checkpoints
 whose repository code you have reviewed.
+
+In a local Qwen3.5-35B-A3B validation, a model with BF16 embeddings, attention,
+DeltaNet, and LM head plus Q4 experts matched all five Transformers greedy
+predictions for token `1` and four teacher-forced continuations. Logit cosine
+similarity ranged from 0.9803 to 0.9968. Quantizing the static weights to Q4
+changed the first greedy prediction and reduced cosine similarity to 0.7165.
+Layerwise diagnostics traced the sharp loss to residual cancellation amplifying
+accumulated quantization error. Treat Q4-static conversion as a throughput and
+memory optimization that can alter generation; use BF16 static tensors when
+reference fidelity is more important.
 
 ## Local server
 
@@ -364,7 +397,7 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 ## Next milestones
 
 1. Run and publish full-checkpoint Transformers parity results.
-2. Batch prompt tokens by selected expert and add fused DeltaNet scans.
+2. Add fused DeltaNet prompt scans and benchmark expert-major prefill dispatch.
 3. Improve expert prediction and reuse pinned staging buffers.
 4. Add CUDA graph replay and persistent fused layer kernels.
 5. Optimize Q8 activation and DP4A expert kernels after graph capture.
@@ -373,6 +406,3 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 ## Scope
 
 The project now executes complete mixed Qwen models from text prompts through decoded output. The current implementation supports portable CPU execution and optional bounded-memory NVIDIA CUDA acceleration.
-
-
-

@@ -3,7 +3,13 @@ import struct
 import unittest
 
 from colibri_next.bf16 import BF16Tensor
-from colibri_next.cuda import CudaUnavailableError, configure_cuda, disable_cuda
+from colibri_next.cuda import (
+    CudaUnavailableError,
+    _group_selected_experts,
+    _use_expert_major_prefill,
+    configure_cuda,
+    disable_cuda,
+)
 from colibri_next.kernels import Q4SwiGLUExpert
 from colibri_next.q4 import Q4BlockTensor
 
@@ -14,6 +20,22 @@ def bf16_bytes(values: list[float]) -> bytes:
         bits = struct.unpack("<I", struct.pack("<f", value))[0]
         output.extend(struct.pack("<H", bits >> 16))
     return bytes(output)
+
+
+class ExpertGroupingTests(unittest.TestCase):
+    def test_groups_token_routes_by_expert(self) -> None:
+        self.assertEqual(
+            _group_selected_experts([[3, 7], [7, 2], [3, 2]]),
+            {
+                3: [(0, 0), (2, 0)],
+                7: [(0, 1), (1, 0)],
+                2: [(1, 1), (2, 1)],
+            },
+        )
+
+    def test_adaptive_dispatch_uses_long_prompt_batching(self) -> None:
+        self.assertFalse(_use_expert_major_prefill(64))
+        self.assertTrue(_use_expert_major_prefill(128))
 
 
 class CudaKernelTests(unittest.TestCase):
@@ -71,6 +93,45 @@ class CudaKernelTests(unittest.TestCase):
         for expected_value, actual_value in zip(expected, actual):
             self.assertAlmostEqual(expected_value, actual_value, delta=0.01)
         self.assertGreater(self.accelerator.q8_grouped_moe_calls, 0)
+
+    def test_q4_expert_sequence_matches_individual_execution(self) -> None:
+        hidden_size = 32
+        intermediate_size = 32
+        gate_shape = (intermediate_size * 2, hidden_size)
+        down_shape = (hidden_size, intermediate_size)
+        expert = Q4SwiGLUExpert(
+            Q4BlockTensor.from_bf16(
+                bf16_bytes(
+                    [
+                        math.sin(index * 0.017) * 0.2
+                        for index in range(math.prod(gate_shape))
+                    ]
+                ),
+                gate_shape,
+            ),
+            Q4BlockTensor.from_bf16(
+                bf16_bytes(
+                    [
+                        math.cos(index * 0.023) * 0.15
+                        for index in range(math.prod(down_shape))
+                    ]
+                ),
+                down_shape,
+            ),
+        )
+        vectors = [
+            [math.cos((token + 1) * (index + 1) * 0.03) for index in range(hidden_size)]
+            for token in range(3)
+        ]
+        actual = self.accelerator._q4_swiglu_sequence_device(
+            expert,
+            self.accelerator.cp.asarray(vectors, dtype=self.accelerator.cp.float32),
+            protect_weights=False,
+        ).get()
+        for token, vector in enumerate(vectors):
+            expected = expert.forward(vector, prefer_numpy=False)
+            for expected_value, actual_value in zip(expected, actual[token]):
+                self.assertAlmostEqual(expected_value, float(actual_value), places=3)
 
     def test_packed_q4_matvec_matches_cpu(self) -> None:
         shape = (7, 37)

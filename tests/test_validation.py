@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import MagicMock
 
 from colibri_next.validation import (
+    compare_activation_vectors,
     compare_logit_vectors,
     validate_against_reference,
 )
@@ -39,6 +41,16 @@ def _logits(token_ids: list[int]) -> list[float]:
 
 
 class ValidationTests(unittest.TestCase):
+    def test_compare_activation_vectors_reports_stage_metrics(self) -> None:
+        result = compare_activation_vectors(
+            [1.0, 2.0], [1.0, 2.5], stage="layer-000"
+        )
+
+        self.assertEqual(result.stage, "layer-000")
+        self.assertEqual(result.max_absolute_error, 0.5)
+        self.assertEqual(result.mean_absolute_error, 0.25)
+        self.assertGreater(result.cosine_similarity, 0.99)
+
     def test_compare_logit_vectors_reports_parity_metrics(self) -> None:
         result = compare_logit_vectors(
             [1.0, 3.0, 2.0],
@@ -72,6 +84,18 @@ class ValidationTests(unittest.TestCase):
             compare_logit_vectors(
                 [1.0], [1.0, 2.0], position=0, input_token=0
             )
+
+    def test_comparison_does_not_truth_test_device_vectors(self) -> None:
+        vector = MagicMock()
+        vector.__len__.return_value = 2
+        vector.__iter__.return_value = iter([1.0, 2.0])
+        vector.__bool__.side_effect = AssertionError("must not truth test")
+
+        result = compare_logit_vectors(
+            vector, [1.0, 2.0], position=0, input_token=1
+        )
+
+        self.assertTrue(result.greedy_match)
 
 
 if __name__ == "__main__":
