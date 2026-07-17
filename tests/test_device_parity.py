@@ -133,6 +133,55 @@ class DeviceDecodeParityTests(unittest.TestCase):
                 os.environ.pop("COLIBRI_BATCHED_ATTENTION_PREFILL", None)
                 disable_cuda()
 
+    def test_verify_and_snapshot_support_speculative_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            create_decoder_checkpoint(source)
+            convert_model(source, output, "bf16")
+            model = QwenForCausalLM.from_model_directory(output)
+            accelerator = configure_cuda(cache_mib=64)
+            try:
+                # Reference: sequential single-token decode.
+                reference_state = model.new_state()
+                model.prefill_device(PROMPT_IDS, reference_state)
+                draft = [0, 1]
+                reference_logits = []
+                for token_id in draft:
+                    result = model.forward_token_device(
+                        token_id, reference_state
+                    )
+                    reference_logits.append(
+                        accelerator.device_to_host(result.logits)
+                    )
+
+                state = model.new_state()
+                model.prefill_device(PROMPT_IDS, state)
+                snapshot = state.decoder_state.snapshot()
+                tokens_before = state.tokens
+
+                # verify_device must match sequential decode at every position.
+                logits, hidden = model.verify_device(draft, state)
+                self.assertEqual(int(logits.shape[0]), len(draft))
+                self.assertEqual(int(hidden.shape[0]), len(draft))
+                for position, expected in enumerate(reference_logits):
+                    actual = accelerator.device_to_host(logits[position])
+                    for want, got in zip(expected, actual):
+                        self.assertAlmostEqual(got, want, delta=TOLERANCE)
+
+                # Rollback must reproduce the pre-verify behaviour exactly.
+                state.decoder_state.restore(snapshot)
+                self.assertEqual(state.tokens, tokens_before)
+                replay, _ = model.verify_device(draft, state)
+                replay_host = accelerator.device_to_host(replay[-1])
+                original_host = accelerator.device_to_host(logits[-1])
+                for want, got in zip(original_host, replay_host):
+                    self.assertAlmostEqual(got, want, delta=TOLERANCE)
+            finally:
+                disable_cuda()
+
     def _assert_device_parity(
         self, quantization: str, *, cpu_moe_layers: int = 0
     ) -> None:

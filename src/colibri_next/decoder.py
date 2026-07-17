@@ -54,6 +54,66 @@ class DecoderState:
         self.layer_states = layer_states
         self.route_predictor = TransitionPredictor()
 
+    def snapshot(self) -> list[tuple]:
+        """Capture enough state to roll back speculative tokens.
+
+        Attention KV caches append monotonically, so their snapshot is just
+        the length; DeltaNet conv/recurrent tensors mutate in place and are
+        copied (device-side when present, host-side otherwise).
+        """
+        snapshots: list[tuple] = []
+        for state in self.layer_states:
+            mixer = state.token_mixer_state
+            routes = (
+                state.last_selected_experts,
+                state.sequence_selected_experts,
+            )
+            if isinstance(mixer, AttentionKVCache):
+                snapshots.append(("attention", mixer.tokens, routes))
+            else:
+                if mixer.cuda_conv_state is not None:
+                    conv = mixer.cuda_conv_state.copy()
+                    recurrent = mixer.cuda_recurrent_state.copy()
+                    device = True
+                else:
+                    conv = mixer.conv_state.copy()
+                    recurrent = mixer.recurrent_state.copy()
+                    device = False
+                snapshots.append(
+                    ("delta", mixer.tokens, routes, device, conv, recurrent)
+                )
+        return snapshots
+
+    def restore(self, snapshots: list[tuple]) -> None:
+        if len(snapshots) != len(self.layer_states):
+            raise ValueError("snapshot layer count does not match state")
+        for state, snapshot in zip(self.layer_states, snapshots):
+            mixer = state.token_mixer_state
+            kind, tokens, routes = snapshot[0], snapshot[1], snapshot[2]
+            if kind == "attention":
+                if not isinstance(mixer, AttentionKVCache):
+                    raise ValueError("snapshot kind does not match state")
+                mixer.tokens = tokens
+                for head in mixer.keys:
+                    del head[tokens:]
+                for head in mixer.values:
+                    del head[tokens:]
+            else:
+                if isinstance(mixer, AttentionKVCache):
+                    raise ValueError("snapshot kind does not match state")
+                device, conv, recurrent = snapshot[3], snapshot[4], snapshot[5]
+                mixer.tokens = tokens
+                if device:
+                    mixer.cuda_conv_state[...] = conv
+                    mixer.cuda_recurrent_state[...] = recurrent
+                else:
+                    mixer.conv_state[...] = conv
+                    mixer.recurrent_state[...] = recurrent
+                    mixer.cuda_conv_state = None
+                    mixer.cuda_recurrent_state = None
+            state.last_selected_experts = routes[0]
+            state.sequence_selected_experts = routes[1]
+
     @property
     def tokens(self) -> int:
         if not self.layer_states:

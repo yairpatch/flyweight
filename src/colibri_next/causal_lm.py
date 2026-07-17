@@ -159,6 +159,35 @@ class QwenForCausalLM:
         accelerator.device_resident_decode_tokens += len(token_ids)
         return DeviceCausalLMResult(token_ids[-1], hidden, logits)
 
+    def verify_device(
+        self, token_ids: list[int], state: CausalLMState
+    ) -> tuple[Any, Any]:
+        """Forward a token batch returning logits at every position.
+
+        Returns ``(logits, decoder_hidden)`` as device arrays of shape
+        ``(tokens, vocab)`` and ``(tokens, hidden)``; ``decoder_hidden`` is
+        the pre-final-norm decoder output that the MTP draft head consumes.
+        """
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        accelerator = self._device_accelerator()
+        embeddings = accelerator.device_vector(
+            [self.model_io.embed(token_id) for token_id in token_ids]
+        )
+        decoder_hidden = self.decoder.prefill_device(
+            embeddings, state.decoder_state, accelerator
+        )
+        normalized = accelerator.rms_norm_rows_device(
+            decoder_hidden,
+            self.model_io._norm_weights,
+            self.model_io.rms_norm_eps,
+        )
+        logits = accelerator.matrix_matmul_device(
+            self.model_io.lm_head, normalized
+        )
+        accelerator.device_resident_decode_tokens += len(token_ids)
+        return logits, decoder_hidden
+
     def _device_accelerator(self) -> Any:
         from .cuda import active_cuda
 
