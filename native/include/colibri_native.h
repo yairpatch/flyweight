@@ -44,4 +44,25 @@ COLIBRI_API int colibri_q4_moe(
     std::int32_t intermediate_size
 );
 
+// Expert-major Q4 SwiGLU mixture-of-experts over a batch of tokens. The
+// caller lists each (expert, token, weight) assignment sorted by expert, so
+// every unique expert's weights are streamed from RAM once per call instead
+// of once per routed token. Outputs receive the weighted expert sums per
+// token (the residual is the caller's job).
+COLIBRI_API int colibri_q4_moe_grouped(
+    const std::uint8_t* const* gate_up_packed,
+    const std::uint16_t* const* gate_up_scales,
+    const std::uint8_t* const* down_packed,
+    const std::uint16_t* const* down_scales,
+    const std::int32_t* assignment_expert,
+    const std::int32_t* assignment_token,
+    const float* assignment_weight,
+    const float* inputs,
+    float* outputs,
+    std::int32_t assignments,
+    std::int32_t tokens,
+    std::int32_t hidden_size,
+    std::int32_t intermediate_size
+);
+
 }

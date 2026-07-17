@@ -1436,33 +1436,77 @@ class CudaAccelerator:
         logits = normalized @ router_np.T
         probabilities = np.exp(logits - logits.max(axis=1, keepdims=True))
         probabilities /= probabilities.sum(axis=1, keepdims=True)
-        shared_weights = 1.0 / (1.0 + np.exp(-(normalized @ gate_np)))
-        outputs = np.empty_like(host)
-        routes = []
-        for token in range(host.shape[0]):
-            token_probabilities = probabilities[token]
-            selected = np.argpartition(token_probabilities, -layer.top_k)[
-                -layer.top_k :
-            ]
-            selected = selected[
-                np.argsort(token_probabilities[selected])[::-1]
-            ]
-            weights = token_probabilities[selected]
-            weights /= weights.sum()
-            selected_ids = [int(expert_id) for expert_id in selected]
-            routes.append(tuple(selected_ids))
-            output = backend.q4_moe(
-                [layer._expert(expert_id) for expert_id in selected_ids],
-                weights.tolist(),
-                layer.shared_expert,
-                float(shared_weights[token]),
-                normalized[token],
-                as_array=True,
+        shared_weights = (
+            1.0 / (1.0 + np.exp(-(normalized @ gate_np)))
+        ).astype(np.float32)
+        tokens = int(host.shape[0])
+        top_k = layer.top_k
+        selected = np.argpartition(probabilities, -top_k, axis=1)[:, -top_k:]
+        selected_probabilities = np.take_along_axis(
+            probabilities, selected, axis=1
+        )
+        order = np.argsort(-selected_probabilities, axis=1)
+        selected = np.take_along_axis(selected, order, axis=1)
+        weights = np.take_along_axis(selected_probabilities, order, axis=1)
+        weights = (weights / weights.sum(axis=1, keepdims=True)).astype(
+            np.float32
+        )
+        if route_state is not None:
+            routes = tuple(
+                tuple(int(expert_id) for expert_id in row) for row in selected
             )
-            outputs[token] = output + host[token]
-        if route_state is not None and routes:
-            route_state.sequence_selected_experts = tuple(routes)
+            route_state.sequence_selected_experts = routes
             route_state.last_selected_experts = routes[-1]
+        if getattr(backend, "_grouped_moe", False):
+            # Expert-major: sort assignments by expert so each unique expert's
+            # weights are streamed from RAM once per call, then append the
+            # shared expert (which every token uses) as the final group.
+            flat_experts = selected.ravel()
+            flat_order = np.argsort(flat_experts, kind="stable")
+            unique_ids = np.unique(flat_experts)
+            assignment_expert = np.searchsorted(
+                unique_ids, flat_experts[flat_order]
+            ).astype(np.int32)
+            assignment_token = (flat_order // top_k).astype(np.int32)
+            assignment_weight = weights.ravel()[flat_order]
+            shared_index = len(unique_ids)
+            assignment_expert = np.concatenate(
+                (
+                    assignment_expert,
+                    np.full(tokens, shared_index, dtype=np.int32),
+                )
+            )
+            assignment_token = np.concatenate(
+                (assignment_token, np.arange(tokens, dtype=np.int32))
+            )
+            assignment_weight = np.concatenate(
+                (assignment_weight, shared_weights)
+            )
+            experts = [
+                layer._expert(int(expert_id)) for expert_id in unique_ids
+            ]
+            experts.append(layer.shared_expert)
+            outputs = backend.q4_moe_grouped(
+                experts,
+                assignment_expert,
+                assignment_token,
+                assignment_weight,
+                normalized,
+            )
+            outputs += host
+        else:
+            outputs = np.empty_like(host)
+            for token in range(tokens):
+                selected_ids = [int(expert_id) for expert_id in selected[token]]
+                output = backend.q4_moe(
+                    [layer._expert(expert_id) for expert_id in selected_ids],
+                    weights[token].tolist(),
+                    layer.shared_expert,
+                    float(shared_weights[token]),
+                    normalized[token],
+                    as_array=True,
+                )
+                outputs[token] = output + host[token]
         return self.device_vector(outputs)
 
     def _host_moe_weights(self, layer: Any) -> tuple[Any, Any, Any]:

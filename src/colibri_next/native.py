@@ -64,6 +64,24 @@ class NativeBackend:
                 ctypes.c_int32,
             ]
             library.colibri_q4_moe.restype = ctypes.c_int
+        self._grouped_moe = self.version >= 3
+        if self._grouped_moe:
+            library.colibri_q4_moe_grouped.argtypes = [
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint16)),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint16)),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+            ]
+            library.colibri_q4_moe_grouped.restype = ctypes.c_int
         self.feature_mask = int(library.colibri_cpu_features())
         self._executor = ThreadPoolExecutor(
             max_workers=min(16, os.cpu_count() or 1),
@@ -137,16 +155,87 @@ class NativeBackend:
         out: object = None,
     ) -> object:
         np = _numpy()
-        count = len(all_experts)
         hidden_size = all_experts[0].hidden_size
         intermediate_size = all_experts[0].intermediate_size
+        pointer_arrays = self._expert_pointer_arrays(all_experts)
+        weight_array = np.ascontiguousarray(weights, dtype=np.float32)
+        output = (
+            out
+            if out is not None
+            else np.empty(hidden_size, dtype=np.float32)
+        )
+        status = self.library.colibri_q4_moe(
+            *pointer_arrays,
+            weight_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            input_vector.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            len(all_experts),
+            hidden_size,
+            intermediate_size,
+        )
+        if status != 0:
+            raise RuntimeError(f"native Q4 MoE failed with status {status}")
+        return output
+
+    def q4_moe_grouped(
+        self,
+        experts: list[Q4SwiGLUExpert],
+        assignment_expert: object,
+        assignment_token: object,
+        assignment_weight: object,
+        inputs: object,
+    ) -> object:
+        """Expert-major MoE over a token batch; one native call per layer.
+
+        ``experts`` are the unique experts referenced by ``assignment_expert``
+        (which must arrive sorted by expert so the kernel streams each
+        expert's weights once). Returns the (tokens, hidden) weighted expert
+        sums without the residual.
+        """
+        if not self._grouped_moe:
+            raise RuntimeError("grouped MoE requires native library v3+")
+        np = _numpy()
+        hidden_size = experts[0].hidden_size
+        intermediate_size = experts[0].intermediate_size
+        pointer_arrays = self._expert_pointer_arrays(experts)
+        expert_ids = np.ascontiguousarray(assignment_expert, dtype=np.int32)
+        token_ids = np.ascontiguousarray(assignment_token, dtype=np.int32)
+        weight_values = np.ascontiguousarray(
+            assignment_weight, dtype=np.float32
+        )
+        input_matrix = np.ascontiguousarray(inputs, dtype=np.float32)
+        tokens = int(input_matrix.shape[0])
+        outputs = np.empty((tokens, hidden_size), dtype=np.float32)
+        status = self.library.colibri_q4_moe_grouped(
+            *pointer_arrays,
+            expert_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            token_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            weight_values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            input_matrix.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            outputs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            int(expert_ids.size),
+            tokens,
+            hidden_size,
+            intermediate_size,
+        )
+        if status != 0:
+            raise RuntimeError(
+                f"native grouped Q4 MoE failed with status {status}"
+            )
+        return outputs
+
+    def _expert_pointer_arrays(
+        self, experts: list[Q4SwiGLUExpert]
+    ) -> tuple[object, object, object, object]:
+        np = _numpy()
+        count = len(experts)
         u8 = ctypes.POINTER(ctypes.c_uint8)
         u16 = ctypes.POINTER(ctypes.c_uint16)
         gate_up_packed = (u8 * count)()
         gate_up_scales = (u16 * count)()
         down_packed = (u8 * count)()
         down_scales = (u16 * count)()
-        for index, expert in enumerate(all_experts):
+        for index, expert in enumerate(experts):
             pointers = getattr(expert, "_native_pointers", None)
             if pointers is None:
                 gate_up = expert.gate_up
@@ -167,27 +256,7 @@ class NativeBackend:
             gate_up_scales[index] = pointers[1]
             down_packed[index] = pointers[2]
             down_scales[index] = pointers[3]
-        weight_array = np.ascontiguousarray(weights, dtype=np.float32)
-        output = (
-            out
-            if out is not None
-            else np.empty(hidden_size, dtype=np.float32)
-        )
-        status = self.library.colibri_q4_moe(
-            gate_up_packed,
-            gate_up_scales,
-            down_packed,
-            down_scales,
-            weight_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            input_vector.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            count,
-            hidden_size,
-            intermediate_size,
-        )
-        if status != 0:
-            raise RuntimeError(f"native Q4 MoE failed with status {status}")
-        return output
+        return gate_up_packed, gate_up_scales, down_packed, down_scales
 
     def _q4_matvec_array(self, tensor: Q4BlockTensor, vector: object) -> object:
         np = _numpy()

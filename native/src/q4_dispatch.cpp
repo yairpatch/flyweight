@@ -90,7 +90,7 @@ const Q4MatvecKernel kQ4Kernel = select_kernel(kCpuFeatures);
 }
 
 extern "C" std::uint32_t colibri_native_version() {
-    return 2;
+    return 3;
 }
 
 extern "C" std::uint32_t colibri_cpu_features() {
@@ -315,6 +315,130 @@ extern "C" int colibri_q4_moe(
             ];
         }
         output[index] = total;
+    }
+    return 0;
+}
+
+extern "C" int colibri_q4_moe_grouped(
+    const std::uint8_t* const* gate_up_packed,
+    const std::uint16_t* const* gate_up_scales,
+    const std::uint8_t* const* down_packed,
+    const std::uint16_t* const* down_scales,
+    const std::int32_t* assignment_expert,
+    const std::int32_t* assignment_token,
+    const float* assignment_weight,
+    const float* inputs,
+    float* outputs,
+    std::int32_t assignments,
+    std::int32_t tokens,
+    std::int32_t hidden_size,
+    std::int32_t intermediate_size
+) {
+    if (gate_up_packed == nullptr || gate_up_scales == nullptr
+        || down_packed == nullptr || down_scales == nullptr
+        || assignment_expert == nullptr || assignment_token == nullptr
+        || assignment_weight == nullptr || inputs == nullptr
+        || outputs == nullptr || assignments <= 0 || tokens <= 0
+        || hidden_size <= 0 || intermediate_size <= 0) {
+        return -1;
+    }
+    const std::int32_t gate_rows = 2 * intermediate_size;
+
+    // Per-assignment expert outputs, reduced per token afterwards so no two
+    // threads ever contend on the same output row.
+    std::vector<float> expert_outputs(
+        static_cast<std::size_t>(assignments) * hidden_size
+    );
+    // CSR of assignments per token for the reduction phase.
+    std::vector<std::int32_t> token_counts(tokens + 1, 0);
+    for (std::int32_t index = 0; index < assignments; ++index) {
+        const std::int32_t token = assignment_token[index];
+        if (token < 0 || token >= tokens) {
+            return -1;
+        }
+        ++token_counts[token + 1];
+    }
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        token_counts[token + 1] += token_counts[token];
+    }
+    std::vector<std::int32_t> token_assignments(assignments);
+    {
+        std::vector<std::int32_t> cursor(
+            token_counts.begin(), token_counts.end() - 1
+        );
+        for (std::int32_t index = 0; index < assignments; ++index) {
+            token_assignments[cursor[assignment_token[index]]++] = index;
+        }
+    }
+
+#if defined(_OPENMP)
+    int team = omp_get_max_threads();
+    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        const int physical = omp_get_num_procs() / 2;
+        if (physical >= 1 && team > physical) {
+            team = physical;
+        }
+    }
+#endif
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(team)
+#endif
+    {
+        std::vector<float> gate(gate_rows);
+        std::vector<float> activated(intermediate_size);
+        // Assignments arrive sorted by expert, so consecutive iterations
+        // reuse the same expert weights out of cache.
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic, 4)
+#endif
+        for (std::int32_t index = 0; index < assignments; ++index) {
+            const std::int32_t expert = assignment_expert[index];
+            const float* input = inputs
+                + static_cast<std::size_t>(assignment_token[index])
+                * hidden_size;
+            kQ4Kernel(
+                gate_up_packed[expert],
+                gate_up_scales[expert],
+                input,
+                gate.data(),
+                gate_rows,
+                hidden_size
+            );
+            for (std::int32_t column = 0; column < intermediate_size; ++column) {
+                const float value = gate[column];
+                const float silu = value / (1.0f + std::exp(-value));
+                activated[column] = silu * gate[intermediate_size + column];
+            }
+            kQ4Kernel(
+                down_packed[expert],
+                down_scales[expert],
+                activated.data(),
+                expert_outputs.data()
+                    + static_cast<std::size_t>(index) * hidden_size,
+                hidden_size,
+                intermediate_size
+            );
+        }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            float* output = outputs
+                + static_cast<std::size_t>(token) * hidden_size;
+            for (std::int32_t column = 0; column < hidden_size; ++column) {
+                output[column] = 0.0f;
+            }
+            for (std::int32_t slot = token_counts[token];
+                 slot < token_counts[token + 1]; ++slot) {
+                const std::int32_t index = token_assignments[slot];
+                const float weight = assignment_weight[index];
+                const float* source = expert_outputs.data()
+                    + static_cast<std::size_t>(index) * hidden_size;
+                for (std::int32_t column = 0; column < hidden_size; ++column) {
+                    output[column] += weight * source[column];
+                }
+            }
+        }
     }
     return 0;
 }
