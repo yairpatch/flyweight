@@ -30,6 +30,11 @@ class DeviceCausalLMResult:
 class CausalLMState:
     def __init__(self, decoder_state: DecoderState):
         self.decoder_state = decoder_state
+        # Speculative-decoding companions: the MTP draft head's KV cache and
+        # the pre-final-norm decoder hidden of the last forwarded position.
+        # Living on the state, they travel through the prefix cache for free.
+        self.mtp_cache: Any = None
+        self.mtp_hidden: Any = None
 
     @property
     def tokens(self) -> int:
@@ -37,6 +42,8 @@ class CausalLMState:
 
     def clear(self) -> None:
         self.decoder_state.clear()
+        self.mtp_cache = None
+        self.mtp_hidden = None
 
 
 class QwenForCausalLM:
@@ -47,6 +54,9 @@ class QwenForCausalLM:
         self.model_io = model_io
         self.hidden_size = decoder.hidden_size
         self.vocab_size = model_io.vocab_size
+        self.root: Path | None = None
+        self.mtp: Any = None
+        self._mtp_attempted = False
         if model_io.hidden_size != self.hidden_size:
             raise ValueError("model I/O and decoder hidden sizes do not match")
 
@@ -54,10 +64,22 @@ class QwenForCausalLM:
     def from_model_directory(
         cls, root: Path | str, *, rows_per_chunk: int = 4096
     ) -> "QwenForCausalLM":
-        return cls(
+        model = cls(
             QwenDecoderStack.from_model_directory(root),
             QwenModelIO.from_model_directory(root, rows_per_chunk=rows_per_chunk),
         )
+        model.root = Path(root)
+        return model
+
+    def load_mtp(self) -> Any:
+        """Load the MTP draft head if the model directory ships one."""
+        if not self._mtp_attempted:
+            self._mtp_attempted = True
+            if self.root is not None and (self.root / "mtp.coli").is_file():
+                from .mtp import QwenMtpHead
+
+                self.mtp = QwenMtpHead.from_model_directory(self.root)
+        return self.mtp
 
     @property
     def cpu_moe_layers(self) -> int:
@@ -158,6 +180,38 @@ class QwenForCausalLM:
         )
         accelerator.device_resident_decode_tokens += len(token_ids)
         return DeviceCausalLMResult(token_ids[-1], hidden, logits)
+
+    def prefill_device_with_hidden(
+        self, token_ids: list[int], state: CausalLMState
+    ) -> tuple[DeviceCausalLMResult, Any]:
+        """Prefill returning last-position logits plus all decoder hiddens.
+
+        Unlike :meth:`verify_device` the LM head runs only on the final
+        position, so long prompts do not materialize a (tokens, vocab)
+        logits matrix.
+        """
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        accelerator = self._device_accelerator()
+        embeddings = accelerator.device_vector(
+            [self.model_io.embed(token_id) for token_id in token_ids]
+        )
+        decoder_hidden = self.decoder.prefill_device(
+            embeddings, state.decoder_state, accelerator
+        )
+        hidden = accelerator.rms_norm_device(
+            decoder_hidden[-1],
+            self.model_io._norm_weights,
+            self.model_io.rms_norm_eps,
+        )
+        logits = accelerator.matrix_matvec_device(
+            self.model_io.lm_head, hidden
+        )
+        accelerator.device_resident_decode_tokens += len(token_ids)
+        return (
+            DeviceCausalLMResult(token_ids[-1], hidden, logits),
+            decoder_hidden,
+        )
 
     def verify_device(
         self, token_ids: list[int], state: CausalLMState

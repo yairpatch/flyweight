@@ -204,9 +204,53 @@ class TextGenerator:
         accelerator = (
             active_cuda() if self.model.device_decode_available else None
         )
+        # Speculative decoding is opt-in for now: rounds are verified
+        # bit-identical to sequential decoding, but on this codebase the
+        # per-forward GPU dispatch cost still eats the batching win, so it
+        # roughly breaks even until that comes down.
+        use_mtp = (
+            accelerator is not None
+            and max_new_tokens > 1
+            and os.environ.get("COLIBRI_MTP", "0") == "1"
+            and self.model.load_mtp() is not None
+        )
         remaining_ids = prompt_ids[cached_tokens:]
         if remaining_ids:
-            if accelerator is not None:
+            if use_mtp:
+                prompt_result, decoder_hidden = (
+                    self.model.prefill_device_with_hidden(remaining_ids, state)
+                )
+                mtp = self.model.mtp
+                if cached_tokens == 0 or state.mtp_cache is None:
+                    state.mtp_cache = mtp.new_cache()
+                    state.mtp_cache.tokens = 0
+                    pair_tokens = list(remaining_ids[1:])
+                    pair_hiddens = decoder_hidden[:-1]
+                    start_position = 0
+                elif state.mtp_hidden is not None:
+                    cp = accelerator.cp
+                    pair_tokens = list(remaining_ids)
+                    pair_hiddens = cp.concatenate(
+                        (
+                            state.mtp_hidden.reshape(1, -1),
+                            decoder_hidden[:-1],
+                        )
+                    )
+                    start_position = cached_tokens - 1
+                else:
+                    use_mtp = False
+                if use_mtp and pair_tokens:
+                    mtp.prefill_cache(
+                        accelerator,
+                        pair_tokens,
+                        pair_hiddens,
+                        state.mtp_cache,
+                        self.model.model_io,
+                        start_position=start_position,
+                    )
+                if use_mtp:
+                    state.mtp_hidden = decoder_hidden[-1]
+            elif accelerator is not None:
                 prompt_result = self.model.prefill_device(remaining_ids, state)
             else:
                 prompt_result = self.model.prefill(remaining_ids, state)
@@ -214,10 +258,28 @@ class TextGenerator:
         else:
             assert cached is not None
             logits = entry.logits
+        if use_mtp and (state.mtp_cache is None or state.mtp_hidden is None):
+            use_mtp = False
         processed_ids = list(prompt_ids)
         generated: list[int] = []
         stopped = False
         previous_text = ""
+        if use_mtp:
+            yield from self._speculative_steps(
+                state=state,
+                sampler=sampler,
+                accelerator=accelerator,
+                logits=logits,
+                prompt_tuple=prompt_tuple,
+                processed_ids=processed_ids,
+                max_new_tokens=max_new_tokens,
+            )
+            return
+        if accelerator is not None:
+            # A non-speculative pass will not maintain the draft cache; drop
+            # it so a later speculative resume cannot use stale entries.
+            state.mtp_cache = None
+            state.mtp_hidden = None
         for index in range(max_new_tokens):
             token_id = (
                 sampler.sample_device(logits, accelerator)
@@ -253,6 +315,125 @@ class TextGenerator:
                 else:
                     logits = self.model.forward_token(token_id, state).logits
                 processed_ids.append(token_id)
+        self._store_prefix_state(tuple(processed_ids), state, logits)
+        yield GenerationStep(
+            token_id=None,
+            text_delta="",
+            prompt_ids=prompt_tuple,
+            generated_ids=tuple(generated),
+            text=previous_text,
+            stopped_on_eos=stopped,
+            finished=True,
+            state_tokens=state.tokens,
+        )
+
+    def _speculative_steps(
+        self,
+        *,
+        state: Any,
+        sampler: LogitsSampler,
+        accelerator: Any,
+        logits: Any,
+        prompt_tuple: tuple[int, ...],
+        processed_ids: list[int],
+        max_new_tokens: int,
+    ) -> Iterator[GenerationStep]:
+        """MTP speculative decode: draft k tokens, verify in one forward.
+
+        Every committed token is sampled from the main model's logits, so the
+        output stream is identical to sequential decoding for the same seed;
+        drafts only decide how many positions each forward can batch.
+        """
+        mtp = self.model.mtp
+        model_io = self.model.model_io
+        cache = state.mtp_cache
+        hidden = state.mtp_hidden
+        draft_budget = max(1, int(os.environ.get("COLIBRI_MTP_DRAFTS", "2")))
+        generated: list[int] = []
+        stopped = False
+        previous_text = ""
+
+        def emit(token_id: int) -> GenerationStep:
+            nonlocal previous_text, stopped
+            generated.append(token_id)
+            text = self.tokenizer.decode(generated, skip_special_tokens=True)
+            text_delta = (
+                text[len(previous_text) :]
+                if text.startswith(previous_text)
+                else text
+            )
+            previous_text = text
+            stopped = token_id in self.tokenizer.eos_token_ids
+            return GenerationStep(
+                token_id=token_id,
+                text_delta=text_delta,
+                prompt_ids=prompt_tuple,
+                generated_ids=tuple(generated),
+                text=text,
+                stopped_on_eos=stopped,
+                finished=False,
+                state_tokens=state.tokens,
+            )
+
+        pending = sampler.sample_device(logits, accelerator)
+        yield emit(pending)
+        while len(generated) < max_new_tokens and not stopped:
+            drafts_wanted = min(draft_budget, max_new_tokens - len(generated))
+            base_position = state.tokens - 1
+            snapshot = state.decoder_state.snapshot()
+            true_cache_length = cache.tokens
+            drafts: list[int] = []
+            draft_token, draft_hidden = pending, hidden
+            draft_position = base_position
+            for _ in range(drafts_wanted):
+                draft_logits, draft_hidden = mtp.forward(
+                    accelerator,
+                    draft_token,
+                    draft_hidden,
+                    draft_position,
+                    cache,
+                    model_io,
+                )
+                draft_token = int(draft_logits.argmax())
+                drafts.append(draft_token)
+                draft_position += 1
+            batch = [pending, *drafts]
+            batch_logits, batch_hidden = self.model.verify_device(batch, state)
+            commit: list[int] = []
+            for index in range(len(batch)):
+                target = sampler.sample_device(batch_logits[index], accelerator)
+                commit.append(target)
+                if not (index < len(drafts) and target == drafts[index]):
+                    break
+            valid = len(commit)
+            if valid < len(batch):
+                state.decoder_state.restore(snapshot)
+                self.model.verify_device(batch[:valid], state)
+            cache.tokens = true_cache_length
+            previous_hidden, position = hidden, base_position
+            for index in range(valid):
+                mtp.advance(
+                    accelerator,
+                    batch[index],
+                    previous_hidden,
+                    position,
+                    cache,
+                    model_io,
+                )
+                previous_hidden = batch_hidden[index]
+                position += 1
+            hidden = batch_hidden[valid - 1]
+            logits = batch_logits[valid - 1]
+            processed_ids.extend(batch[:valid])
+            pending = commit[-1]
+            for token_id in commit:
+                if len(generated) >= max_new_tokens:
+                    break
+                yield emit(token_id)
+                if stopped:
+                    break
+        state.mtp_cache = cache
+        state.mtp_hidden = hidden
         self._store_prefix_state(tuple(processed_ids), state, logits)
         yield GenerationStep(
             token_id=None,

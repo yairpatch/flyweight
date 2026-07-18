@@ -122,6 +122,12 @@ class CudaAccelerator:
             self._q4_matmul_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "q4_matmul"
             )
+            self._bf16_matmul_small_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "bf16_matmul_small"
+            )
+            self._q4_matmul_small_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q4_matmul_small"
+            )
             self._rms_norm_rows_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "rms_norm_rows"
             )
@@ -211,10 +217,14 @@ class CudaAccelerator:
         tokens = int(vectors.shape[0])
         cp = self.cp
         output = cp.empty((tokens, rows), dtype=cp.float32)
+        small = tokens <= 8
         if isinstance(tensor, Q4BlockTensor):
             packed, scales = self._q4_arrays(tensor, protected=protected)
-            self._q4_matmul_kernel(
-                (rows, tokens),
+            kernel = (
+                self._q4_matmul_small_kernel if small else self._q4_matmul_kernel
+            )
+            kernel(
+                (rows,) if small else (rows, tokens),
                 (THREADS_PER_BLOCK,),
                 (packed, scales, vectors, output, rows, columns, tokens),
             )
@@ -228,8 +238,11 @@ class CudaAccelerator:
             ),
             protected=True,
         )
-        self._bf16_matmul_kernel(
-            (rows, tokens),
+        kernel = (
+            self._bf16_matmul_small_kernel if small else self._bf16_matmul_kernel
+        )
+        kernel(
+            (rows,) if small else (rows, tokens),
             (THREADS_PER_BLOCK,),
             (weights, vectors, output, rows, columns, tokens),
         )
@@ -969,15 +982,26 @@ class CudaAccelerator:
         normalized = self.rms_norm_rows_device(
             hidden, layer._input_norm_weights, layer.rms_norm_eps
         )
-        mixed_qkv, z, beta_logits, decay_logits = [
-            self.matrix_matmul_device(tensor, normalized)
-            for tensor in (
-                layer.in_proj_qkv,
-                layer.in_proj_z,
-                layer.in_proj_b,
-                layer.in_proj_a,
+        combined = self._combined_in_proj(layer)
+        if combined is not None:
+            projected = self.matrix_matmul_device(combined, normalized)
+            offsets = layer._combined_in_proj_offsets
+            mixed_qkv = cp.ascontiguousarray(projected[:, : offsets[0]])
+            z = cp.ascontiguousarray(projected[:, offsets[0] : offsets[1]])
+            beta_logits = cp.ascontiguousarray(
+                projected[:, offsets[1] : offsets[2]]
             )
-        ]
+            decay_logits = cp.ascontiguousarray(projected[:, offsets[2] :])
+        else:
+            mixed_qkv, z, beta_logits, decay_logits = [
+                self.matrix_matmul_device(tensor, normalized)
+                for tensor in (
+                    layer.in_proj_qkv,
+                    layer.in_proj_z,
+                    layer.in_proj_b,
+                    layer.in_proj_a,
+                )
+            ]
         if state.cuda_conv_state is None:
             state.cuda_conv_state = cp.asarray(
                 state.conv_state, dtype=cp.float32
@@ -1112,14 +1136,16 @@ class CudaAccelerator:
         output = self.matrix_matmul_device(layer.out_proj, cores)
         return output + hidden
 
-    def _matrix_matvec_device(self, tensor: Any, vector: Any) -> Any:
+    def _matrix_matvec_device(
+        self, tensor: Any, vector: Any, *, protected: bool = True
+    ) -> Any:
         from .q4 import Q4BlockTensor
 
         rows, columns = tensor.shape
         cp = self.cp
         output = cp.empty(rows, dtype=cp.float32)
         if isinstance(tensor, Q4BlockTensor):
-            packed, scales = self._q4_arrays(tensor, protected=True)
+            packed, scales = self._q4_arrays(tensor, protected=protected)
             self._q4_kernel(
                 (rows,),
                 (THREADS_PER_BLOCK,),
@@ -1133,7 +1159,7 @@ class CudaAccelerator:
             lambda: (
                 cp.asarray(memoryview(tensor.data), dtype=cp.uint8).view(cp.uint16),
             ),
-            protected=True,
+            protected=protected,
         )
         self._bf16_kernel(
             (rows,),
@@ -1433,12 +1459,20 @@ class CudaAccelerator:
             np.mean(host * host, axis=1, keepdims=True) + layer.rms_norm_eps
         )
         normalized = (host * inverse_rms * norm_np).astype(np.float32)
-        logits = normalized @ router_np.T
+        if normalized.shape[0] < 16:
+            # Tiny speculative-verify batches: BLAS thread fan-out on a small
+            # matmul costs far more than the arithmetic, so use einsum like
+            # the single-token path does.
+            logits = np.einsum("th,eh->te", normalized, router_np)
+            shared_logits = np.einsum("th,h->t", normalized, gate_np)
+        else:
+            logits = normalized @ router_np.T
+            shared_logits = normalized @ gate_np
         probabilities = np.exp(logits - logits.max(axis=1, keepdims=True))
         probabilities /= probabilities.sum(axis=1, keepdims=True)
-        shared_weights = (
-            1.0 / (1.0 + np.exp(-(normalized @ gate_np)))
-        ).astype(np.float32)
+        shared_weights = (1.0 / (1.0 + np.exp(-shared_logits))).astype(
+            np.float32
+        )
         tokens = int(host.shape[0])
         top_k = layer.top_k
         selected = np.argpartition(probabilities, -top_k, axis=1)[:, -top_k:]
@@ -2563,6 +2597,71 @@ void bf16_matmul(
     }
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[token * rows + row] = partial;
+}
+
+extern "C" __global__
+void bf16_matmul_small(
+    const unsigned short* weights,
+    const float* vectors,
+    float* output,
+    const int rows,
+    const int columns,
+    const int tokens
+) {
+    // Small token batches (speculative verify): read each weight element
+    // once and accumulate every token in registers, instead of re-streaming
+    // the weight matrix per token like the (rows, tokens)-grid kernel.
+    const int row = blockIdx.x;
+    if (row >= rows || tokens > 8) return;
+    float partial[8];
+    for (int token = 0; token < 8; ++token) partial[token] = 0.0f;
+    const int weight_start = row * columns;
+    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned int bits =
+            ((unsigned int)weights[weight_start + column]) << 16;
+        const float weight = __uint_as_float(bits);
+        for (int token = 0; token < tokens; ++token) {
+            partial[token] += weight * vectors[token * columns + column];
+        }
+    }
+    for (int token = 0; token < tokens; ++token) {
+        const float total = block_reduce_sum(partial[token]);
+        if (threadIdx.x == 0) output[token * rows + row] = total;
+        __syncthreads();
+    }
+}
+
+extern "C" __global__
+void q4_matmul_small(
+    const unsigned char* packed,
+    const __half* scales,
+    const float* vectors,
+    float* output,
+    const int rows,
+    const int columns,
+    const int tokens
+) {
+    const int row = blockIdx.x;
+    if (row >= rows || tokens > 8) return;
+    float partial[8];
+    for (int token = 0; token < 8; ++token) partial[token] = 0.0f;
+    const int weight_start = row * columns;
+    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+        const int index = weight_start + column;
+        const int block = index >> 5;
+        const int within_block = index & 31;
+        const unsigned char byte = packed[block * 16 + (within_block >> 1)];
+        const int nibble = (within_block & 1) ? (byte >> 4) : (byte & 15);
+        const float weight = (float)(nibble - 8) * __half2float(scales[block]);
+        for (int token = 0; token < tokens; ++token) {
+            partial[token] += weight * vectors[token * columns + column];
+        }
+    }
+    for (int token = 0; token < tokens; ++token) {
+        const float total = block_reduce_sum(partial[token]);
+        if (threadIdx.x == 0) output[token * rows + row] = total;
+        __syncthreads();
+    }
 }
 
 extern "C" __global__
