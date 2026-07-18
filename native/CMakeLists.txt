@@ -8,7 +8,12 @@ add_library(
     src/q4_scalar.cpp
     src/q4_avx2.cpp
     src/q4_avx512.cpp
+    src/gpu_driver.cpp
 )
+
+if(NOT WIN32)
+    target_link_libraries(colibri_native PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 target_compile_features(colibri_native PRIVATE cxx_std_20)
 target_include_directories(colibri_native PRIVATE include)

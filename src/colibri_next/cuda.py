@@ -26,6 +26,19 @@ def _group_selected_experts(
     return groups
 
 
+def ctypes_address(array: object) -> int:
+    import ctypes
+
+    return ctypes.cast(array, ctypes.c_void_p).value
+
+
+def ctypes_element(array: object) -> int:
+    """Value of the first pointer stored in a single-entry ctypes array."""
+    import ctypes
+
+    return ctypes.cast(array[0], ctypes.c_void_p).value
+
+
 def _use_expert_major_prefill(tokens: int) -> bool:
     mode = os.environ.get("COLIBRI_EXPERT_MAJOR_PREFILL", "auto")
     if mode not in {"0", "1", "auto"}:
@@ -113,6 +126,9 @@ class CudaAccelerator:
         ] = OrderedDict()
         self._rope_cache: dict[tuple[int, float, int], tuple[Any, Any]] = {}
         self._moe_transfer_cache: dict[int, tuple[Any, Any, Any]] = {}
+        self._delta_segment_state = "unknown"
+        self._delta_segment_tables: dict[tuple, dict] = {}
+        self._delta_segment_scratch_cache: dict | None = None
         with cp.cuda.Device(device_id):
             self._prefetch_stream = cp.cuda.Stream(non_blocking=True)
             self._bf16_kernel = cp.RawKernel(_KERNEL_SOURCE, "bf16_matvec")
@@ -825,14 +841,14 @@ class CudaAccelerator:
         normalized = self.rms_norm_device(
             hidden_device, layer._input_norm_weights, layer.rms_norm_eps
         )
-        combined = self._combined_in_proj(layer)
-        if combined is not None:
-            projected = self._matrix_matvec_device(combined, normalized)
-            offsets = layer._combined_in_proj_offsets
-            mixed_qkv = projected[: offsets[0]]
-            z = projected[offsets[0] : offsets[1]]
-            beta_logits = projected[offsets[1] : offsets[2]]
-            decay_logits = projected[offsets[2] :]
+        qz, ba = self._combined_in_proj(layer)
+        if qz is not None:
+            projected = self._matrix_matvec_device(qz, normalized)
+            gates = self._matrix_matvec_device(ba, normalized)
+            mixed_qkv = projected[: layer.conv_dim]
+            z = projected[layer.conv_dim :]
+            beta_logits = gates[: layer.num_value_heads]
+            decay_logits = gates[layer.num_value_heads :]
         else:
             mixed_qkv, z, beta_logits, decay_logits = [
                 self._matrix_matvec_device(tensor, normalized)
@@ -896,48 +912,50 @@ class CudaAccelerator:
             return output
         return output.get().tolist()
 
-    def _combined_in_proj(self, layer: Any) -> Any:
-        """Row-concatenate the four DeltaNet input projections once per layer."""
-        combined = getattr(layer, "_combined_in_proj_cache", "unset")
-        if combined != "unset":
-            return combined
-        from .bf16 import BF16Tensor
-        from .q4 import Q4BlockTensor
+    def _combined_in_proj(self, layer: Any) -> tuple[Any, Any]:
+        """Row-concatenate the DeltaNet input projections once per layer.
 
-        tensors = (
-            layer.in_proj_qkv,
-            layer.in_proj_z,
-            layer.in_proj_b,
-            layer.in_proj_a,
-        )
-        columns = tensors[0].shape[1]
-        rows = sum(tensor.shape[0] for tensor in tensors)
-        aligned = columns % 32 == 0 and all(
-            tensor.shape[1] == columns for tensor in tensors
-        )
-        if all(isinstance(tensor, BF16Tensor) for tensor in tensors):
-            combined = BF16Tensor(
-                shape=(rows, columns),
-                data=b"".join(tensor.data for tensor in tensors),
-            )
-        elif aligned and all(
-            isinstance(tensor, Q4BlockTensor) for tensor in tensors
-        ):
-            combined = Q4BlockTensor(
-                shape=(rows, columns),
-                packed=b"".join(tensor.packed for tensor in tensors),
-                scales=b"".join(tensor.scales for tensor in tensors),
-            )
-        else:
-            combined = None
-        boundaries = []
-        offset = 0
-        for tensor in tensors[:-1]:
-            offset += tensor.shape[0]
-            boundaries.append(offset)
-        layer._combined_in_proj_offsets = tuple(boundaries)
-        layer._combined_in_proj_cache = combined
-        return combined
+        Returns ``(qz, ba)``: the fused qkv+z projection and the fused
+        beta+decay projection, or ``(None, None)`` when the tensor types
+        cannot be concatenated. The pairs are combined separately because
+        checkpoints quantize the large qkv/z projections while keeping the
+        tiny b/a projections at BF16.
+        """
+        cached = getattr(layer, "_combined_in_proj_cache", None)
+        if cached is not None:
+            return cached
+
+        def concatenate(first: Any, second: Any) -> Any:
+            from .bf16 import BF16Tensor
+            from .q4 import Q4BlockTensor
+
+            columns = first.shape[1]
+            if second.shape[1] != columns:
+                return None
+            rows = first.shape[0] + second.shape[0]
+            if isinstance(first, BF16Tensor) and isinstance(
+                second, BF16Tensor
+            ):
+                return BF16Tensor(
+                    shape=(rows, columns), data=first.data + second.data
+                )
+            if (
+                columns % 32 == 0
+                and isinstance(first, Q4BlockTensor)
+                and isinstance(second, Q4BlockTensor)
+            ):
+                return Q4BlockTensor(
+                    shape=(rows, columns),
+                    packed=first.packed + second.packed,
+                    scales=first.scales + second.scales,
+                )
+            return None
+
+        qz = concatenate(layer.in_proj_qkv, layer.in_proj_z)
+        ba = concatenate(layer.in_proj_b, layer.in_proj_a)
+        cached = (qz, ba) if qz is not None and ba is not None else (None, None)
+        layer._combined_in_proj_cache = cached
+        return cached
 
     def _combined_qkv(self, layer: Any) -> Any:
         """Row-concatenate the attention Q/K/V projections once per layer."""
@@ -982,16 +1000,18 @@ class CudaAccelerator:
         normalized = self.rms_norm_rows_device(
             hidden, layer._input_norm_weights, layer.rms_norm_eps
         )
-        combined = self._combined_in_proj(layer)
-        if combined is not None:
-            projected = self.matrix_matmul_device(combined, normalized)
-            offsets = layer._combined_in_proj_offsets
-            mixed_qkv = cp.ascontiguousarray(projected[:, : offsets[0]])
-            z = cp.ascontiguousarray(projected[:, offsets[0] : offsets[1]])
+        qz, ba = self._combined_in_proj(layer)
+        if qz is not None:
+            projected = self.matrix_matmul_device(qz, normalized)
+            gates = self.matrix_matmul_device(ba, normalized)
+            mixed_qkv = cp.ascontiguousarray(projected[:, : layer.conv_dim])
+            z = cp.ascontiguousarray(projected[:, layer.conv_dim :])
             beta_logits = cp.ascontiguousarray(
-                projected[:, offsets[1] : offsets[2]]
+                gates[:, : layer.num_value_heads]
             )
-            decay_logits = cp.ascontiguousarray(projected[:, offsets[2] :])
+            decay_logits = cp.ascontiguousarray(
+                gates[:, layer.num_value_heads :]
+            )
         else:
             mixed_qkv, z, beta_logits, decay_logits = [
                 self.matrix_matmul_device(tensor, normalized)
@@ -1543,6 +1563,253 @@ class CudaAccelerator:
                 outputs[token] = output + host[token]
         return self.device_vector(outputs)
 
+    def delta_segment_ready(self) -> bool:
+        """Whether the native C decode driver can run DeltaNet+MoE segments."""
+        if self._delta_segment_state == "off":
+            return False
+        if self._delta_segment_state == "ready":
+            return True
+        if os.environ.get("COLIBRI_C_DECODE", "1") == "0":
+            self._delta_segment_state = "off"
+            return False
+        from .native import active_native
+
+        backend = active_native()
+        if backend is None or not getattr(backend, "_gpu_driver", False):
+            self._delta_segment_state = "off"
+            return False
+        include_dirs = []
+        cuda_path = self.cp.cuda.get_cuda_path()
+        if cuda_path:
+            include_dirs.append(str(Path(cuda_path) / "include"))
+        try:
+            ready = backend.gpu_prepare(
+                _KERNEL_SOURCE, self.device_id, include_dirs
+            )
+        except RuntimeError:
+            ready = False
+        self._delta_segment_state = "ready" if ready else "off"
+        return ready
+
+    def delta_moe_segment(
+        self, layers: list[Any], layer_states: list[Any], hidden: Any
+    ) -> Any | None:
+        """Run consecutive CPU-offloaded DeltaNet layers through the C driver.
+
+        Returns the new hidden device array, or None when any layer cannot be
+        pointer-resolved (caller falls back to the per-layer Python path).
+        """
+        from .native import active_native
+
+        backend = active_native()
+        key = (id(layers[0]), id(layer_states[0]), len(layers))
+        entry = self._delta_segment_tables.get(key)
+        if entry is None or not all(
+            entry["states"][index] is layer_states[index].token_mixer_state.cuda_conv_state
+            for index in range(len(layers))
+        ):
+            entry = self._build_delta_segment(layers, layer_states, backend)
+            if entry is None:
+                return None
+            self._delta_segment_tables[key] = entry
+        scratch_hidden = entry["params_refs"]["hidden"]
+        scratch_hidden[...] = hidden
+        backend.delta_moe_segment(
+            entry["params"], entry["table"], len(layers)
+        )
+        for layer_state in layer_states:
+            layer_state.token_mixer_state.tokens += 1
+        return scratch_hidden
+
+    def _build_delta_segment(
+        self, layers: list[Any], layer_states: list[Any], backend: Any
+    ) -> dict | None:
+        from .bf16 import BF16Tensor
+        from .native import DeltaLayerStruct, DeltaParamsStruct
+        from .q4 import Q4BlockTensor
+
+        cp = self.cp
+        first = layers[0].token_mixer
+        qz_rows = first.conv_dim + first.value_dim
+        ba_rows = 2 * first.num_value_heads
+        params_refs = self._delta_segment_scratch(first, qz_rows, ba_rows)
+        table = (DeltaLayerStruct * len(layers))()
+        keep_alive: list[Any] = []
+        states: list[Any] = []
+        for index, (layer, layer_state) in enumerate(
+            zip(layers, layer_states)
+        ):
+            mixer = layer.token_mixer
+            moe = layer.moe
+            mixer_state = layer_state.token_mixer_state
+            if (
+                mixer.conv_dim != first.conv_dim
+                or mixer.value_dim != first.value_dim
+                or mixer_state.cuda_conv_state is None
+                or len(moe._experts) != moe.expert_count
+            ):
+                return None
+            qz, ba = self._combined_in_proj(mixer)
+            if (
+                not isinstance(qz, Q4BlockTensor)
+                or not isinstance(ba, BF16Tensor)
+                or not isinstance(mixer.out_proj, Q4BlockTensor)
+            ):
+                return None
+            in_packed, in_scales = self._q4_arrays(qz, protected=True)
+            (ba_weights,) = self._cached_arrays(
+                "bf16",
+                ba,
+                len(ba.data),
+                lambda ba=ba: (
+                    cp.asarray(memoryview(ba.data), dtype=cp.uint8).view(
+                        cp.uint16
+                    ),
+                ),
+                protected=True,
+            )
+            out_packed, out_scales = self._q4_arrays(
+                mixer.out_proj, protected=True
+            )
+            input_norm = self._float32_array(mixer._input_norm_weights)
+            conv_weights = self._float32_array(mixer._conv_weights)
+            a_log = self._float32_array(mixer._a_log)
+            dt_bias = self._float32_array(mixer._dt_bias)
+            delta_norm = self._float32_array(mixer._norm_weights)
+            post_norm = self._float32_array(
+                moe._post_attention_norm_weights
+            )
+            router_gate_tensor = getattr(moe, "_router_gate_cache", None)
+            if router_gate_tensor is None:
+                router_gate_tensor = BF16Tensor(
+                    shape=(
+                        moe.router.shape[0] + 1,
+                        moe.router.shape[1],
+                    ),
+                    data=moe.router.data + moe.shared_gate.data,
+                )
+                moe._router_gate_cache = router_gate_tensor
+            (router_gate,) = self._cached_arrays(
+                "bf16",
+                router_gate_tensor,
+                len(router_gate_tensor.data),
+                lambda t=router_gate_tensor: (
+                    cp.asarray(memoryview(t.data), dtype=cp.uint8).view(
+                        cp.uint16
+                    ),
+                ),
+                protected=True,
+            )
+            experts = [
+                moe._expert(expert_id)
+                for expert_id in range(moe.expert_count)
+            ]
+            pointer_arrays = backend._expert_pointer_arrays(experts)
+            shared_pointers = backend._expert_pointer_arrays(
+                [moe.shared_expert]
+            )
+            struct = table[index]
+            struct.qz_packed = in_packed.data.ptr
+            struct.qz_scales = in_scales.data.ptr
+            struct.ba_weights = ba_weights.data.ptr
+            struct.out_proj_packed = out_packed.data.ptr
+            struct.out_proj_scales = out_scales.data.ptr
+            struct.input_norm = input_norm.data.ptr
+            struct.conv_weights = conv_weights.data.ptr
+            struct.a_log = a_log.data.ptr
+            struct.dt_bias = dt_bias.data.ptr
+            struct.delta_norm = delta_norm.data.ptr
+            struct.conv_state = mixer_state.cuda_conv_state.data.ptr
+            struct.recurrent_state = mixer_state.cuda_recurrent_state.data.ptr
+            struct.router_gate = router_gate.data.ptr
+            struct.post_attention_norm = post_norm.data.ptr
+            struct.expert_gate_packed = ctypes_address(pointer_arrays[0])
+            struct.expert_gate_scales = ctypes_address(pointer_arrays[1])
+            struct.expert_down_packed = ctypes_address(pointer_arrays[2])
+            struct.expert_down_scales = ctypes_address(pointer_arrays[3])
+            # The shared-expert fields are direct data pointers, not pointer
+            # tables: dereference the single-entry arrays.
+            struct.shared_gate_up_packed = ctypes_element(shared_pointers[0])
+            struct.shared_gate_up_scales = ctypes_element(shared_pointers[1])
+            struct.shared_down_packed = ctypes_element(shared_pointers[2])
+            struct.shared_down_scales = ctypes_element(shared_pointers[3])
+            keep_alive.append(
+                (
+                    in_packed, in_scales, ba_weights, out_packed, out_scales,
+                    input_norm, conv_weights, a_log, dt_bias, delta_norm,
+                    post_norm, router_gate, router_gate_tensor,
+                    pointer_arrays, shared_pointers, experts,
+                )
+            )
+            states.append(mixer_state.cuda_conv_state)
+        params = DeltaParamsStruct(
+            hidden_size=first.hidden_size,
+            conv_dim=first.conv_dim,
+            conv_kernel=first.conv_kernel_size,
+            value_dim=first.value_dim,
+            num_key_heads=first.num_key_heads,
+            num_value_heads=first.num_value_heads,
+            key_head_dim=first.key_head_dim,
+            value_head_dim=first.value_head_dim,
+            qz_rows=qz_rows,
+            ba_rows=ba_rows,
+            num_experts=layers[0].moe.expert_count,
+            top_k=layers[0].moe.top_k,
+            moe_intermediate=layers[0].moe.shared_expert.intermediate_size,
+            rms_norm_eps=float(first.rms_norm_eps),
+            hidden=params_refs["hidden"].data.ptr,
+            normalized=params_refs["normalized"].data.ptr,
+            projected=params_refs["projected"].data.ptr,
+            gates=params_refs["gates"].data.ptr,
+            convolved=params_refs["convolved"].data.ptr,
+            cores=params_refs["cores"].data.ptr,
+            mixed=params_refs["mixed"].data.ptr,
+            moe_normalized=params_refs["moe_normalized"].data.ptr,
+            router_logits=params_refs["router_logits"].data.ptr,
+            hidden_host=params_refs["hidden_host"].ctypes.data,
+            normalized_host=params_refs["normalized_host"].ctypes.data,
+            moe_host=params_refs["moe_host"].ctypes.data,
+            logits_host=params_refs["logits_host"].ctypes.data,
+        )
+        return {
+            "params": params,
+            "params_refs": params_refs,
+            "table": table,
+            "keep_alive": keep_alive,
+            "states": states,
+        }
+
+    def _delta_segment_scratch(
+        self, mixer: Any, qz_rows: int, ba_rows: int
+    ) -> dict:
+        if self._delta_segment_scratch_cache is not None:
+            return self._delta_segment_scratch_cache
+        import numpy as np
+
+        cp = self.cp
+        hidden_size = mixer.hidden_size
+
+        def pinned(size: int) -> Any:
+            memory = cp.cuda.alloc_pinned_memory(size * 4)
+            return np.frombuffer(memory, dtype=np.float32, count=size)
+
+        self._delta_segment_scratch_cache = {
+            "hidden": cp.empty(hidden_size, dtype=cp.float32),
+            "normalized": cp.empty(hidden_size, dtype=cp.float32),
+            "projected": cp.empty(qz_rows, dtype=cp.float32),
+            "gates": cp.empty(ba_rows, dtype=cp.float32),
+            "convolved": cp.empty(mixer.conv_dim, dtype=cp.float32),
+            "cores": cp.empty(mixer.value_dim, dtype=cp.float32),
+            "mixed": cp.empty(hidden_size, dtype=cp.float32),
+            "moe_normalized": cp.empty(hidden_size, dtype=cp.float32),
+            "router_logits": cp.empty(1024, dtype=cp.float32),
+            "hidden_host": pinned(hidden_size),
+            "normalized_host": pinned(hidden_size),
+            "moe_host": pinned(hidden_size),
+            "logits_host": pinned(1024),
+        }
+        return self._delta_segment_scratch_cache
+
     def _host_moe_weights(self, layer: Any) -> tuple[Any, Any, Any]:
         """Cache the layer's router/gate/norm weights as float32 host arrays."""
         cached = getattr(layer, "_host_moe_weights_cache", None)
@@ -1989,6 +2256,8 @@ class CudaAccelerator:
         self._cache.clear()
         self._rope_cache.clear()
         self._moe_transfer_cache.clear()
+        self._delta_segment_tables.clear()
+        self._delta_segment_scratch_cache = None
         self.cache_bytes = 0
         with self.cp.cuda.Device(self.device_id):
             self.cp.get_default_memory_pool().free_all_blocks()

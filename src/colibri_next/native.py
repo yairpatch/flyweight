@@ -19,6 +19,69 @@ class NativeUnavailableError(RuntimeError):
     pass
 
 
+class DeltaLayerStruct(ctypes.Structure):
+    """Mirror of ColibriDeltaLayer in colibri_native.h."""
+
+    _fields_ = [
+        ("qz_packed", ctypes.c_uint64),
+        ("qz_scales", ctypes.c_uint64),
+        ("ba_weights", ctypes.c_uint64),
+        ("out_proj_packed", ctypes.c_uint64),
+        ("out_proj_scales", ctypes.c_uint64),
+        ("input_norm", ctypes.c_uint64),
+        ("conv_weights", ctypes.c_uint64),
+        ("a_log", ctypes.c_uint64),
+        ("dt_bias", ctypes.c_uint64),
+        ("delta_norm", ctypes.c_uint64),
+        ("conv_state", ctypes.c_uint64),
+        ("recurrent_state", ctypes.c_uint64),
+        ("router_gate", ctypes.c_uint64),
+        ("post_attention_norm", ctypes.c_uint64),
+        ("expert_gate_packed", ctypes.c_void_p),
+        ("expert_gate_scales", ctypes.c_void_p),
+        ("expert_down_packed", ctypes.c_void_p),
+        ("expert_down_scales", ctypes.c_void_p),
+        ("shared_gate_up_packed", ctypes.c_void_p),
+        ("shared_gate_up_scales", ctypes.c_void_p),
+        ("shared_down_packed", ctypes.c_void_p),
+        ("shared_down_scales", ctypes.c_void_p),
+    ]
+
+
+class DeltaParamsStruct(ctypes.Structure):
+    """Mirror of ColibriDeltaParams in colibri_native.h."""
+
+    _fields_ = [
+        ("hidden_size", ctypes.c_int32),
+        ("conv_dim", ctypes.c_int32),
+        ("conv_kernel", ctypes.c_int32),
+        ("value_dim", ctypes.c_int32),
+        ("num_key_heads", ctypes.c_int32),
+        ("num_value_heads", ctypes.c_int32),
+        ("key_head_dim", ctypes.c_int32),
+        ("value_head_dim", ctypes.c_int32),
+        ("qz_rows", ctypes.c_int32),
+        ("ba_rows", ctypes.c_int32),
+        ("num_experts", ctypes.c_int32),
+        ("top_k", ctypes.c_int32),
+        ("moe_intermediate", ctypes.c_int32),
+        ("rms_norm_eps", ctypes.c_float),
+        ("hidden", ctypes.c_uint64),
+        ("normalized", ctypes.c_uint64),
+        ("projected", ctypes.c_uint64),
+        ("gates", ctypes.c_uint64),
+        ("convolved", ctypes.c_uint64),
+        ("cores", ctypes.c_uint64),
+        ("mixed", ctypes.c_uint64),
+        ("moe_normalized", ctypes.c_uint64),
+        ("router_logits", ctypes.c_uint64),
+        ("hidden_host", ctypes.c_void_p),
+        ("normalized_host", ctypes.c_void_p),
+        ("moe_host", ctypes.c_void_p),
+        ("logits_host", ctypes.c_void_p),
+    ]
+
+
 class NativeBackend:
     def __init__(self, path: Path | str | None = None):
         library_path = Path(path) if path is not None else _library_path()
@@ -49,6 +112,11 @@ class NativeBackend:
         self.path = library_path
         self.library = library
         self.version = int(library.colibri_native_version())
+        self.feature_mask = int(library.colibri_cpu_features())
+        self._executor = ThreadPoolExecutor(
+            max_workers=min(16, os.cpu_count() or 1),
+            thread_name_prefix="colibri-native",
+        )
         self._fused_moe = self.version >= 2
         if self._fused_moe:
             library.colibri_q4_moe.argtypes = [
@@ -82,11 +150,67 @@ class NativeBackend:
                 ctypes.c_int32,
             ]
             library.colibri_q4_moe_grouped.restype = ctypes.c_int
-        self.feature_mask = int(library.colibri_cpu_features())
-        self._executor = ThreadPoolExecutor(
-            max_workers=min(16, os.cpu_count() or 1),
-            thread_name_prefix="colibri-native",
+        self._gpu_driver = hasattr(library, "colibri_delta_moe_segment")
+        if self._gpu_driver:
+            library.colibri_gpu_available.restype = ctypes.c_int
+            library.colibri_gpu_init.argtypes = [ctypes.c_int32]
+            library.colibri_gpu_init.restype = ctypes.c_int
+            library.colibri_gpu_compile.argtypes = [
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_char_p),
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_char_p,
+                ctypes.c_int32,
+            ]
+            library.colibri_gpu_compile.restype = ctypes.c_int
+            library.colibri_delta_moe_segment.argtypes = [
+                ctypes.POINTER(DeltaParamsStruct),
+                ctypes.POINTER(DeltaLayerStruct),
+                ctypes.c_int32,
+            ]
+            library.colibri_delta_moe_segment.restype = ctypes.c_int
+        self._gpu_compiled = False
+
+    def gpu_prepare(
+        self, kernel_source: str, device: int, include_dirs: list[str]
+    ) -> bool:
+        """Initialize the CUDA driver and compile the kernel module once."""
+        if self._gpu_compiled:
+            return True
+        if not self._gpu_driver or self.library.colibri_gpu_available() != 1:
+            return False
+        if self.library.colibri_gpu_init(device) != 0:
+            return False
+        options = [f"-I{directory}".encode() for directory in include_dirs]
+        option_array = (ctypes.c_char_p * len(options))(*options)
+        log = ctypes.create_string_buffer(16384)
+        status = self.library.colibri_gpu_compile(
+            kernel_source.encode(),
+            option_array,
+            len(options),
+            device,
+            log,
+            len(log),
         )
+        if status != 0:
+            raise RuntimeError(
+                f"native kernel compile failed ({status}): "
+                f"{log.value.decode(errors='replace')[:2000]}"
+            )
+        self._gpu_compiled = True
+        return True
+
+    def delta_moe_segment(
+        self, params: DeltaParamsStruct, layers: object, count: int
+    ) -> None:
+        status = self.library.colibri_delta_moe_segment(
+            ctypes.byref(params), layers, count
+        )
+        if status != 0:
+            raise RuntimeError(
+                f"native delta segment failed with status {status}"
+            )
 
     @property
     def features(self) -> tuple[str, ...]:

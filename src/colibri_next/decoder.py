@@ -388,9 +388,32 @@ class QwenDecoderStack:
         output = hidden
         previous_route: list[ExpertKey] | None = None
         last_index = len(self.layers) - 1
-        for index, (layer, layer_state) in enumerate(
-            zip(self.layers, state.layer_states)
-        ):
+        segment_ready = (
+            hasattr(accelerator, "delta_segment_ready")
+            and accelerator.delta_segment_ready()
+        )
+        index = 0
+        total = len(self.layers)
+        while index < total:
+            layer = self.layers[index]
+            layer_state = state.layer_states[index]
+            if segment_ready and self._segmentable(layer):
+                run_end = index
+                while run_end < total and self._segmentable(
+                    self.layers[run_end]
+                ):
+                    run_end += 1
+                segment_output = accelerator.delta_moe_segment(
+                    self.layers[index:run_end],
+                    state.layer_states[index:run_end],
+                    output,
+                )
+                if segment_output is not None:
+                    output = segment_output
+                    previous_route = None
+                    index = run_end
+                    continue
+                segment_ready = False
             on_cuda = layer.moe.expert_device == "cuda"
             if on_cuda:
                 predicted = layer_state.last_selected_experts
@@ -424,8 +447,16 @@ class QwenDecoderStack:
                 previous_route = current_route
             else:
                 previous_route = None
+            index += 1
         state.tokens
         return output
+
+    @staticmethod
+    def _segmentable(layer: "QwenDecoderLayer") -> bool:
+        return (
+            layer.layer_type == "linear_attention"
+            and layer.moe.expert_device == "cpu"
+        )
 
     def prefill_device(
         self, hidden: Any, state: DecoderState, accelerator: Any
