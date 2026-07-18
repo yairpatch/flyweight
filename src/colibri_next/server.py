@@ -274,11 +274,17 @@ class InferenceService:
                         if step.finished:
                             final_step = step
                         elif step.text_delta:
-                            yield self._chat_chunk(
+                            chunk = self._chat_chunk(
                                 completion_id,
                                 created,
                                 {"content": step.text_delta},
                             )
+                            # Keep the standard OpenAI chunk shape while exposing
+                            # a small provider extension for live UI metrics.
+                            chunk["colibri"] = {
+                                "generated_tokens": len(step.generated_ids),
+                            }
+                            yield chunk
                 if final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
                 finish_reason = "stop" if final_step.stopped_on_eos else "length"
@@ -1079,34 +1085,50 @@ def create_handler(
             try:
                 for event in events:
                     data = event if isinstance(event, str) else json.dumps(event, ensure_ascii=False)
-                    event_name = (
-                        event.get("type") if isinstance(event, dict) else None
+                    self._write_sse_event(data, event if isinstance(event, dict) else None)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            except APIError as error:
+                # Once SSE headers are sent, a JSON error response is no longer
+                # possible. Send the error as the final SSE event instead.
+                self.log_error("stream request failed: %s", error.message)
+                try:
+                    self._write_sse_event(json.dumps(_error_payload(error)))
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+            except Exception as error:
+                # Generation happens while the iterator is consumed, after the
+                # HTTP status line has already been written. Keep clients such
+                # as Cline and OpenCode from waiting on a silent/truncated stream.
+                self.log_error("unhandled stream error: %s", error)
+                try:
+                    self._write_sse_event(
+                        json.dumps(
+                            _error_payload(
+                                APIError(500, "internal server error", "server_error")
+                            )
+                        )
                     )
-                    prefix = f"event: {event_name}\n" if event_name else ""
-                    self.wfile.write(
-                        f"{prefix}data: {data}\n\n".encode("utf-8")
-                    )
-                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
             finally:
                 close = getattr(events, "close", None)
                 if close is not None:
                     close()
 
+        def _write_sse_event(
+            self, data: str, event: Mapping[str, Any] | None = None
+        ) -> None:
+            event_name = event.get("type") if event is not None else None
+            prefix = f"event: {event_name}\n" if event_name else ""
+            self.wfile.write(f"{prefix}data: {data}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
         def _send_cors_headers(self) -> None:
             self.send_header("Access-Control-Allow-Origin", service.cors_origin)
             self.send_header("Vary", "Origin")
         def _send_error(self, error: APIError) -> None:
-            self._send_json(
-                error.status,
-                {
-                    "error": {
-                        "message": error.message,
-                        "type": error.error_type,
-                        "param": error.parameter,
-                        "code": None,
-                    }
-                },
-            )
+            self._send_json(error.status, _error_payload(error))
 
         def _send_static(self, path: str) -> None:
             filename, content_type = UI_ASSETS[path]
@@ -1198,8 +1220,16 @@ def _chat_messages(
         system_parts.insert(0, _tool_prompt(tools, payload.get("tool_choice")))
     if system_parts:
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
-    if not messages or messages[-1]["role"] != "user":
-        raise APIError(400, "the last message must have role 'user' or 'tool'", parameter="messages")
+    # OpenAI-compatible clients may end a request with an assistant message
+    # when they are asking the model to continue/prefill that turn. The chat
+    # formatter adds the assistant generation marker after the supplied
+    # history, so this is a valid prompt for the local runtime as well.
+    if not messages or messages[-1]["role"] not in ("user", "assistant"):
+        raise APIError(
+            400,
+            "the last message must have role 'user', 'assistant', or 'tool'",
+            parameter="messages",
+        )
     return messages, bool(tools)
 
 
@@ -1664,7 +1694,22 @@ def _optional_integer(payload: Mapping[str, Any], key: str) -> int | None:
 
 
 def _float_option(payload: Mapping[str, Any], key: str, default: float) -> float:
-    value = payload.get(key, default)
+    # OpenAI-compatible clients commonly serialize unset optional values as
+    # JSON null. Treat that the same as an omitted option.
+    value = payload.get(key)
+    if value is None:
+        value = default
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise APIError(400, f"{key} must be a number", parameter=key)
     return float(value)
+
+
+def _error_payload(error: APIError) -> dict[str, Any]:
+    return {
+        "error": {
+            "message": error.message,
+            "type": error.error_type,
+            "param": error.parameter,
+            "code": None,
+        }
+    }

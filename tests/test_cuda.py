@@ -6,6 +6,8 @@ from colibri_next.bf16 import BF16Tensor
 from colibri_next.cuda import (
     CudaUnavailableError,
     _group_selected_experts,
+    _attention_prefill_chunk_size,
+    _use_batched_attention_prefill,
     _use_expert_major_prefill,
     configure_cuda,
     disable_cuda,
@@ -36,6 +38,11 @@ class ExpertGroupingTests(unittest.TestCase):
     def test_adaptive_dispatch_uses_long_prompt_batching(self) -> None:
         self.assertFalse(_use_expert_major_prefill(64))
         self.assertTrue(_use_expert_major_prefill(128))
+
+    def test_long_attention_prefill_avoids_quadratic_batch(self) -> None:
+        self.assertTrue(_use_batched_attention_prefill(512))
+        self.assertFalse(_use_batched_attention_prefill(513))
+        self.assertEqual(_attention_prefill_chunk_size(), 512)
 
 
 class CudaKernelTests(unittest.TestCase):

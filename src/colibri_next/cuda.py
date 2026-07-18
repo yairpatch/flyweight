@@ -51,6 +51,34 @@ def _use_expert_major_prefill(tokens: int) -> bool:
     return mode == "1" or (mode == "auto" and tokens >= minimum)
 
 
+def _use_batched_attention_prefill(tokens: int) -> bool:
+    """Limit the quadratic attention workspace for long server prompts.
+
+    The fully batched path materializes attention scores for every prompt
+    token against every cached key. That is fast for short prompts but can
+    require multiple gigabytes for extension conversations. Long prompts are
+    therefore split into bounded attention tiles unless explicitly forced.
+    """
+    mode = os.environ.get("COLIBRI_BATCHED_ATTENTION_PREFILL", "auto")
+    if mode not in {"0", "1", "auto"}:
+        raise ValueError(
+            "COLIBRI_BATCHED_ATTENTION_PREFILL must be '0', '1', or 'auto'"
+        )
+    if mode == "0" or (mode == "1"):
+        return mode == "1"
+    limit = int(os.environ.get("COLIBRI_BATCHED_ATTENTION_MAX_TOKENS", "512"))
+    if limit <= 0:
+        raise ValueError("COLIBRI_BATCHED_ATTENTION_MAX_TOKENS must be positive")
+    return tokens <= limit
+
+
+def _attention_prefill_chunk_size() -> int:
+    size = int(os.environ.get("COLIBRI_ATTENTION_PREFILL_CHUNK", "512"))
+    if size <= 0:
+        raise ValueError("COLIBRI_ATTENTION_PREFILL_CHUNK must be positive")
+    return size
+
+
 class CudaUnavailableError(RuntimeError):
     pass
 
@@ -469,23 +497,26 @@ class CudaAccelerator:
     def full_attention_sequence(
         self, layer: Any, hidden: Any, position: int, cache: Any
     ) -> Any:
-        if os.environ.get("COLIBRI_BATCHED_ATTENTION_PREFILL", "1") != "0":
+        tokens = int(hidden.shape[0])
+        if _use_batched_attention_prefill(tokens):
             return self._full_attention_sequence_batched(
                 layer, hidden, position, cache
             )
+        # Keep prompt prefill batched, but bound the quadratic attention
+        # workspace. The previous fallback processed one token at a time,
+        # which was memory-safe but made long extension conversations slow.
         outputs = []
-        for offset in range(int(hidden.shape[0])):
-            output, _ = self.full_attention(
-                layer,
-                hidden[offset],
-                position + offset,
-                cache,
-                residual=True,
-                return_attention_weights=False,
-                return_device=True,
+        chunk_size = _attention_prefill_chunk_size()
+        for start in range(0, tokens, chunk_size):
+            outputs.append(
+                self._full_attention_sequence_batched(
+                    layer,
+                    hidden[start : start + chunk_size],
+                    position + start,
+                    cache,
+                )
             )
-            outputs.append(output)
-        return self.cp.stack(outputs)
+        return self.cp.concatenate(outputs, axis=0)
 
     def _full_attention_sequence_batched(
         self, layer: Any, hidden: Any, position: int, cache: Any

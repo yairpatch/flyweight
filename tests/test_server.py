@@ -143,6 +143,33 @@ class InferenceServiceTests(unittest.TestCase):
         )
         self.assertEqual(self.generator.calls[0][1]["max_new_tokens"], 7)
 
+    def test_chat_completion_accepts_null_optional_sampling_options(self) -> None:
+        response = self.service.chat_completion(
+            {
+                "model": "qwen-local",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "temperature": None,
+                "top_p": None,
+            }
+        )
+        self.assertEqual(response["choices"][0]["message"]["content"], "Hello!")
+
+    def test_chat_completion_accepts_assistant_prefill(self) -> None:
+        response = self.service.chat_completion(
+            {
+                "model": "qwen-local",
+                "messages": [
+                    {"role": "user", "content": "Complete this answer"},
+                    {"role": "assistant", "content": "The answer is"},
+                ],
+            }
+        )
+        self.assertEqual(response["choices"][0]["message"]["content"], "Hello!")
+        self.assertEqual(
+            self.generator.calls[-1][0][-1],
+            {"role": "assistant", "content": "The answer is"},
+        )
+
     def test_health_reports_cpu_moe_placement(self) -> None:
         service = InferenceService(
             "qwen-local", self.generator, cpu_moe_layers=12
@@ -194,6 +221,13 @@ class InferenceServiceTests(unittest.TestCase):
         )
         self.assertEqual(events[0]["object"], "chat.completion.chunk")
         self.assertEqual(events[0]["choices"][0]["delta"]["role"], "assistant")
+        live_chunks = [
+            event for event in events if isinstance(event, dict) and event.get("colibri")
+        ]
+        self.assertEqual(
+            [event["colibri"]["generated_tokens"] for event in live_chunks],
+            [1, 2],
+        )
         deltas = [
             event["choices"][0]["delta"].get("content", "")
             for event in events
@@ -325,7 +359,7 @@ class InferenceServiceTests(unittest.TestCase):
     def test_rejects_invalid_history_and_tools(self) -> None:
         with self.assertRaises(APIError):
             self.service.chat_completion(
-                {"messages": [{"role": "assistant", "content": "Hi"}]}
+                {"messages": [{"role": "system", "content": "Hi"}]}
             )
         with self.assertRaises(APIError) as tools_error:
             self.service.chat_completion(

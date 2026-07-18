@@ -129,8 +129,18 @@ class DeviceDecodeParityTests(unittest.TestCase):
                 for expected, actual in zip(loop_logits, batched_logits):
                     self.assertAlmostEqual(actual, expected, delta=TOLERANCE)
                 self.assertEqual(batched_state.tokens, loop_state.tokens)
+
+                os.environ["COLIBRI_BATCHED_ATTENTION_PREFILL"] = "auto"
+                os.environ["COLIBRI_BATCHED_ATTENTION_MAX_TOKENS"] = "2"
+                chunked_state = model.new_state()
+                chunked = model.prefill_device(PROMPT_IDS, chunked_state)
+                chunked_logits = accelerator.device_to_host(chunked.logits)
+                for expected, actual in zip(loop_logits, chunked_logits):
+                    self.assertAlmostEqual(actual, expected, delta=TOLERANCE)
+                self.assertEqual(chunked_state.tokens, loop_state.tokens)
             finally:
                 os.environ.pop("COLIBRI_BATCHED_ATTENTION_PREFILL", None)
+                os.environ.pop("COLIBRI_BATCHED_ATTENTION_MAX_TOKENS", None)
                 disable_cuda()
 
     def test_verify_and_snapshot_support_speculative_rollback(self) -> None:

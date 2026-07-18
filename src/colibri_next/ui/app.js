@@ -18,6 +18,7 @@ const elements = {
   sidebarOpen: document.querySelector("#sidebar-open"),
   sidebarClose: document.querySelector("#sidebar-close"),
   sidebarScrim: document.querySelector("#sidebar-scrim"),
+  brand: document.querySelector(".brand"),
   newChat: document.querySelector("#new-chat"),
   conversationSearch: document.querySelector("#conversation-search"),
   conversationList: document.querySelector("#conversation-list"),
@@ -314,13 +315,6 @@ function renderMessage(message) {
   time.textContent = formatTime(message.createdAt);
   meta.append(author, time);
 
-  if (message.metrics) {
-    const metrics = document.createElement("span");
-    metrics.className = "message-metrics";
-    metrics.textContent = message.metrics;
-    meta.append(metrics);
-  }
-
   if (message.content) {
     const copy = document.createElement("button");
     copy.type = "button";
@@ -335,6 +329,12 @@ function renderMessage(message) {
   content.className = "message-content";
   renderMessageContent(content, message);
   body.append(meta, content);
+  if (message.metrics) {
+    const metrics = document.createElement("span");
+    metrics.className = "message-metrics";
+    metrics.textContent = message.metrics;
+    body.append(metrics);
+  }
   article.append(avatar, body);
   return article;
 }
@@ -360,13 +360,13 @@ function renderMessageContent(content, message) {
 }
 
 function updateStreamingMessage(message) {
-  const content = elements.messages.querySelector(
-    `[data-message-id="${message.id}"] .message-content`,
-  );
+  const article = elements.messages.querySelector(`[data-message-id="${message.id}"]`);
+  const content = article?.querySelector(".message-content");
   if (!content) {
     renderConversation();
     return;
   }
+  updateMessageMetrics(article, message);
   const cursor = content.querySelector(".stream-cursor");
   if (!cursor || !message.generating) {
     renderMessageContent(content, message);
@@ -383,6 +383,20 @@ function updateStreamingMessage(message) {
   for (const toolCall of message.toolCalls || []) {
     content.append(renderToolCall(toolCall));
   }
+}
+
+function updateMessageMetrics(article, message) {
+  let metrics = article.querySelector(".message-body > .message-metrics");
+  if (!message.metrics) {
+    metrics?.remove();
+    return;
+  }
+  if (!metrics) {
+    metrics = document.createElement("span");
+    metrics.className = "message-metrics";
+    article.querySelector(".message-body")?.append(metrics);
+  }
+  metrics.textContent = message.metrics;
 }
 
 function renderRichText(container, text) {
@@ -621,6 +635,11 @@ async function sendMessage(promptOverride = null) {
       if (chunk.usage) {
         usage = chunk.usage;
       }
+      const generatedTokens = chunk.colibri?.generated_tokens;
+      if (Number.isFinite(generatedTokens)) {
+        const seconds = (performance.now() - started) / 1000;
+        assistant.metrics = formatGenerationMetrics(generatedTokens, seconds, true);
+      }
       const delta = chunk.choices?.[0]?.delta;
       if (!delta) {
         return;
@@ -637,7 +656,7 @@ async function sendMessage(promptOverride = null) {
     const seconds = (performance.now() - started) / 1000;
     const outputTokens = usage?.completion_tokens;
     assistant.metrics = outputTokens
-      ? `${outputTokens} tokens · ${seconds.toFixed(1)}s`
+      ? formatGenerationMetrics(outputTokens, seconds, false)
       : `${seconds.toFixed(1)}s`;
   } catch (error) {
     if (error.name === "AbortError") {
@@ -663,6 +682,11 @@ async function sendMessage(promptOverride = null) {
     scrollToBottom();
     pollRuntime();
   }
+}
+
+function formatGenerationMetrics(tokens, seconds, live) {
+  const rate = seconds > 0 ? (tokens / seconds).toFixed(1) : "0.0";
+  return `${tokens} tokens · ${rate} tok/s${live ? " · live" : ""}`;
 }
 
 function messageForAPI(message) {
@@ -981,6 +1005,13 @@ function toast(message, kind = "info") {
 }
 
 function bindEvents() {
+  elements.brand.addEventListener("click", (event) => {
+    event.preventDefault();
+    if (state.generating) {
+      stopGeneration();
+    }
+    createConversation();
+  });
   elements.newChat.addEventListener("click", () => {
     if (state.generating) {
       stopGeneration();
