@@ -176,6 +176,9 @@ class CudaAccelerator:
             self._delta_conv_sequence_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "delta_conv_sequence"
             )
+            self._delta_conv_step_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "delta_conv_step"
+            )
             self._delta_recurrent_sequence_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "delta_recurrent_sequence"
             )
@@ -870,15 +873,17 @@ class CudaAccelerator:
             layer.conv_dim, layer.conv_kernel_size
         )
         convolved = cp.empty((1, layer.conv_dim), dtype=cp.float32)
-        self._delta_conv_sequence_kernel(
-            (layer.conv_dim,),
-            (1,),
+        conv_blocks = (
+            layer.conv_dim + THREADS_PER_BLOCK - 1
+        ) // THREADS_PER_BLOCK
+        self._delta_conv_step_kernel(
+            (conv_blocks,),
+            (THREADS_PER_BLOCK,),
             (
-                mixed_qkv.reshape(1, -1),
+                mixed_qkv,
                 conv_weights,
                 state.cuda_conv_state,
                 convolved,
-                1,
                 layer.conv_dim,
                 layer.conv_kernel_size,
             ),
@@ -1608,6 +1613,10 @@ class CudaAccelerator:
             entry["states"][index] is layer_states[index].token_mixer_state.cuda_conv_state
             for index in range(len(layers))
         ):
+            stale = self._delta_segment_tables.pop(key, None)
+            if stale is not None:
+                for handle in stale.get("graphs", ()):
+                    backend.delta_graph_destroy(handle)
             entry = self._build_delta_segment(layers, layer_states, backend)
             if entry is None:
                 return None
@@ -1770,13 +1779,27 @@ class CudaAccelerator:
             normalized_host=params_refs["normalized_host"].ctypes.data,
             moe_host=params_refs["moe_host"].ctypes.data,
             logits_host=params_refs["logits_host"].ctypes.data,
+            bundle_floats=params_refs["bundle_floats"],
         )
+        graphs: list[int] = []
+        # Replaying a different graph exec per layer measured ~5x slower than
+        # plain launches (exec upload thrash), so graphs stay opt-in.
+        build_graphs = os.environ.get("COLIBRI_SEG_GRAPHS") == "1"
+        for index in range(len(layers)):
+            handle = (
+                backend.delta_graph_build(params, table[index])
+                if build_graphs
+                else 0
+            )
+            table[index].graph = handle
+            graphs.append(handle)
         return {
             "params": params,
             "params_refs": params_refs,
             "table": table,
             "keep_alive": keep_alive,
             "states": states,
+            "graphs": graphs,
         }
 
     def _delta_segment_scratch(
@@ -1793,6 +1816,12 @@ class CudaAccelerator:
             memory = cp.cuda.alloc_pinned_memory(size * 4)
             return np.frombuffer(memory, dtype=np.float32, count=size)
 
+        # mixed | moe_normalized | router_logits live in one allocation (as
+        # do their pinned host mirrors) so the C driver can pull all three
+        # back in a single transfer per layer.
+        bundle_floats = hidden_size * 2 + 1024
+        bundle_device = cp.empty(bundle_floats, dtype=cp.float32)
+        bundle_host = pinned(bundle_floats)
         self._delta_segment_scratch_cache = {
             "hidden": cp.empty(hidden_size, dtype=cp.float32),
             "normalized": cp.empty(hidden_size, dtype=cp.float32),
@@ -1800,13 +1829,16 @@ class CudaAccelerator:
             "gates": cp.empty(ba_rows, dtype=cp.float32),
             "convolved": cp.empty(mixer.conv_dim, dtype=cp.float32),
             "cores": cp.empty(mixer.value_dim, dtype=cp.float32),
-            "mixed": cp.empty(hidden_size, dtype=cp.float32),
-            "moe_normalized": cp.empty(hidden_size, dtype=cp.float32),
-            "router_logits": cp.empty(1024, dtype=cp.float32),
-            "hidden_host": pinned(hidden_size),
-            "normalized_host": pinned(hidden_size),
+            "mixed": bundle_device[:hidden_size],
+            "moe_normalized": bundle_device[hidden_size : hidden_size * 2],
+            "router_logits": bundle_device[hidden_size * 2 :],
+            "bundle_device": bundle_device,
+            "hidden_host": bundle_host[:hidden_size],
+            "normalized_host": bundle_host[hidden_size : hidden_size * 2],
+            "logits_host": bundle_host[hidden_size * 2 :],
+            "bundle_host": bundle_host,
             "moe_host": pinned(hidden_size),
-            "logits_host": pinned(1024),
+            "bundle_floats": bundle_floats,
         }
         return self._delta_segment_scratch_cache
 
@@ -2405,6 +2437,32 @@ __device__ __forceinline__ float block_reduce_sum(float value) {
         }
     }
     return value;
+}
+
+extern "C" __global__
+void delta_conv_step(
+    const float* mixed_qkv,
+    const float* weights,
+    float* state,
+    float* output,
+    const int channels,
+    const int kernel_size
+) {
+    // Single-token variant: no cross-token recurrence, so one thread per
+    // channel instead of one single-thread block per channel.
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    float* channel_state = state + channel * kernel_size;
+    const float* channel_weights = weights + channel * kernel_size;
+    for (int index = 0; index + 1 < kernel_size; ++index) {
+        channel_state[index] = channel_state[index + 1];
+    }
+    channel_state[kernel_size - 1] = mixed_qkv[channel];
+    float value = 0.0f;
+    for (int index = 0; index < kernel_size; ++index) {
+        value += channel_state[index] * channel_weights[index];
+    }
+    output[channel] = value / (1.0f + expf(-value));
 }
 
 extern "C" __global__

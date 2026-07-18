@@ -114,6 +114,9 @@ typedef struct ColibriDeltaLayer {
     const std::uint16_t* shared_gate_up_scales;
     const std::uint8_t* shared_down_packed;
     const std::uint16_t* shared_down_scales;
+    // Instantiated CUDA graph replaying this layer's kernel chain (0 = launch
+    // kernels individually). Built via colibri_delta_graph_build.
+    std::uint64_t graph;
 } ColibriDeltaLayer;
 
 typedef struct ColibriDeltaParams {
@@ -144,6 +147,10 @@ typedef struct ColibriDeltaParams {
     float* normalized_host;
     float* moe_host;
     float* logits_host;
+    // When positive, mixed|moe_normalized|router_logits are contiguous on
+    // the device (and their host mirrors likewise), and one copy of this
+    // many floats replaces the three separate transfers.
+    std::int32_t bundle_floats;
 } ColibriDeltaParams;
 
 COLIBRI_API int colibri_delta_moe_segment(
@@ -151,5 +158,11 @@ COLIBRI_API int colibri_delta_moe_segment(
     const ColibriDeltaLayer* layers,
     std::int32_t count
 );
+COLIBRI_API int colibri_delta_graph_build(
+    const ColibriDeltaParams* params,
+    const ColibriDeltaLayer* layer,
+    std::uint64_t* handle
+);
+COLIBRI_API int colibri_delta_graph_destroy(std::uint64_t handle);
 
 }

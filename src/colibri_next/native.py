@@ -45,6 +45,7 @@ class DeltaLayerStruct(ctypes.Structure):
         ("shared_gate_up_scales", ctypes.c_void_p),
         ("shared_down_packed", ctypes.c_void_p),
         ("shared_down_scales", ctypes.c_void_p),
+        ("graph", ctypes.c_uint64),
     ]
 
 
@@ -79,6 +80,7 @@ class DeltaParamsStruct(ctypes.Structure):
         ("normalized_host", ctypes.c_void_p),
         ("moe_host", ctypes.c_void_p),
         ("logits_host", ctypes.c_void_p),
+        ("bundle_floats", ctypes.c_int32),
     ]
 
 
@@ -170,7 +172,29 @@ class NativeBackend:
                 ctypes.c_int32,
             ]
             library.colibri_delta_moe_segment.restype = ctypes.c_int
+            library.colibri_delta_graph_build.argtypes = [
+                ctypes.POINTER(DeltaParamsStruct),
+                ctypes.POINTER(DeltaLayerStruct),
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            library.colibri_delta_graph_build.restype = ctypes.c_int
+            library.colibri_delta_graph_destroy.argtypes = [ctypes.c_uint64]
+            library.colibri_delta_graph_destroy.restype = ctypes.c_int
         self._gpu_compiled = False
+
+    def delta_graph_build(
+        self, params: "DeltaParamsStruct", layer: "DeltaLayerStruct"
+    ) -> int:
+        """Instantiate a CUDA graph for one layer; returns 0 on failure."""
+        handle = ctypes.c_uint64(0)
+        status = self.library.colibri_delta_graph_build(
+            ctypes.byref(params), ctypes.byref(layer), ctypes.byref(handle)
+        )
+        return int(handle.value) if status == 0 else 0
+
+    def delta_graph_destroy(self, handle: int) -> None:
+        if handle:
+            self.library.colibri_delta_graph_destroy(handle)
 
     def gpu_prepare(
         self, kernel_source: str, device: int, include_dirs: list[str]
