@@ -1736,7 +1736,10 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
     // through single-token decode to produce next_token. MTP needs per-token
     // prompt pairs from decode, so it keeps the one-token path.
     if(runtime->prefill_rows>1&&!runtime->options.mtp_drafts&&prompt_count>1){
-        while(prompt_count-1-index>=2&&!runtime->cancelled){
+        // index+3<=prompt_count is prompt_count-1-index>=2 without the unsigned
+        // underflow that fired when a cache/snapshot reuse left index==prompt_count
+        // (it read 1024 tokens past the prompt -> "input token out of range").
+        while(index+3<=prompt_count&&!runtime->cancelled){
             const auto chunk=static_cast<int>(std::min<uint64_t>(runtime->prefill_rows,prompt_count-1-index));
             qwen_prefill_rows(*runtime,prompt+index,chunk);
             index+=chunk;
