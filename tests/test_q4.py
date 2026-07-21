@@ -3,6 +3,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from colibri_next.kernels import Q4SwiGLUExpert
 from colibri_next.q4 import BLOCK_SIZE, Q4BlockTensor
@@ -56,6 +57,32 @@ class Q4TensorTests(unittest.TestCase):
 
 
 class Q4SwiGLUKernelTests(unittest.TestCase):
+    def test_cpu_override_does_not_dispatch_to_active_cuda(self) -> None:
+        gate = Q4BlockTensor.from_bf16(
+            bf16_bytes([0.1] * (BLOCK_SIZE * 2 * BLOCK_SIZE)),
+            (BLOCK_SIZE * 2, BLOCK_SIZE),
+        )
+        down = Q4BlockTensor.from_bf16(
+            bf16_bytes([0.2] * (BLOCK_SIZE * BLOCK_SIZE)),
+            (BLOCK_SIZE, BLOCK_SIZE),
+        )
+        expert = Q4SwiGLUExpert(gate, down)
+        hidden = [0.1] * BLOCK_SIZE
+
+        class UnexpectedCudaDispatch:
+            def q4_swiglu(self, *_args):
+                raise AssertionError("CPU override dispatched to CUDA")
+
+        with patch(
+            "colibri_next.cuda.active_cuda",
+            return_value=UnexpectedCudaDispatch(),
+        ):
+            actual = expert.forward(hidden, allow_cuda=False)
+
+        expected = expert.forward(hidden, prefer_numpy=False)
+        for actual_value, expected_value in zip(actual, expected):
+            self.assertAlmostEqual(actual_value, expected_value, places=6)
+
     def test_container_executes_quantized_swiglu_expert(self) -> None:
         hidden_size = BLOCK_SIZE
         intermediate_size = BLOCK_SIZE

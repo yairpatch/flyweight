@@ -43,21 +43,31 @@ class Q4SwiGLUExpert:
         if self.down.shape != expected_down:
             raise ValueError(f"down projection shape {self.down.shape} != {expected_down}")
 
-    def forward(self, hidden: list[float], *, prefer_numpy: bool = True) -> list[float]:
+    def forward(
+        self,
+        hidden: list[float],
+        *,
+        prefer_numpy: bool = True,
+        allow_cuda: bool = True,
+    ) -> list[float]:
         self.validate()
         if prefer_numpy:
             from .cuda import active_cuda
 
             accelerator = active_cuda()
-            if accelerator is not None:
+            if accelerator is not None and allow_cuda:
                 return accelerator.q4_swiglu(self.gate_up, self.down, hidden)
-        gate_up = self.gate_up.matvec(hidden, prefer_numpy=prefer_numpy)
+        gate_up = self.gate_up.matvec(
+            hidden, prefer_numpy=prefer_numpy, allow_cuda=allow_cuda
+        )
         intermediate = self.intermediate_size
         activated = [
             _silu(gate_up[index]) * gate_up[intermediate + index]
             for index in range(intermediate)
         ]
-        return self.down.matvec(activated, prefer_numpy=prefer_numpy)
+        return self.down.matvec(
+            activated, prefer_numpy=prefer_numpy, allow_cuda=allow_cuda
+        )
 
 
 def _silu(value: float) -> float:

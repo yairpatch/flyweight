@@ -17,6 +17,8 @@ from colibri_next.server import (
     ColibriHTTPServer,
     InferenceService,
     create_handler,
+    _is_decode_event,
+    _parse_tool_calls,
 )
 
 
@@ -31,6 +33,7 @@ class StubTokenizer:
 
     def decode(self, tokens, *, skip_special_tokens=True):
         return "".join(chr(token) for token in tokens)
+
 
 class StubGenerator:
     def __init__(self) -> None:
@@ -48,14 +51,11 @@ class StubGenerator:
         )
 
     def generate_text(self, prompt, **options) -> GenerationResult:
-        return self.generate_messages(
-            [{"role": "user", "content": prompt}], **options
-        )
+        return self.generate_messages([{"role": "user", "content": prompt}], **options)
 
     def stream_text(self, prompt, **options):
-        return self.stream_messages(
-            [{"role": "user", "content": prompt}], **options
-        )
+        return self.stream_messages([{"role": "user", "content": prompt}], **options)
+
     def stream_messages(self, messages, **options):
         self.calls.append((messages, options))
         yield GenerationStep(
@@ -105,12 +105,69 @@ class ToolStubGenerator(StubGenerator):
             state_tokens=4,
         )
 
+    def stream_messages(self, messages, **options):
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        for index, char in enumerate(text):
+            yield GenerationStep(
+                token_id=index,
+                text_delta=char,
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(range(index + 1)),
+                text=text[: index + 1],
+                stopped_on_eos=False,
+                finished=False,
+                state_tokens=index + 1,
+            )
+        yield GenerationStep(
+            token_id=None,
+            text_delta="",
+            prompt_ids=(1, 2, 3),
+            generated_ids=tuple(range(len(text) + 1)),
+            text=text,
+            stopped_on_eos=True,
+            finished=True,
+            state_tokens=len(text) + 1,
+        )
+
+
+class ToolCallParsingTests(unittest.TestCase):
+    def test_parses_hermes_xml_format(self) -> None:
+        content, calls = _parse_tool_calls(
+            "sure\n<tool_call>\n<function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+        )
+        self.assertEqual(content, "sure")
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
+        )
+
+    def test_parses_json_format(self) -> None:
+        # Qwen3/DeepSeek/GLM style: JSON object inside the <tool_call> block.
+        content, calls = _parse_tool_calls(
+            'thinking\n<tool_call>\n{"name": "get_weather", '
+            '"arguments": {"city": "Paris"}}\n</tool_call>'
+        )
+        self.assertEqual(content, "thinking")
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
+        )
+
+    def test_plain_text_has_no_tool_calls(self) -> None:
+        content, calls = _parse_tool_calls("just a normal answer")
+        self.assertEqual(content, "just a normal answer")
+        self.assertEqual(calls, [])
+
+
 class InferenceServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.generator = StubGenerator()
-        self.service = InferenceService(
-            "qwen-local", self.generator, max_new_tokens=32
-        )
+        self.service = InferenceService("qwen-local", self.generator, max_new_tokens=32)
 
     def test_chat_completion_supports_developer_and_text_parts(self) -> None:
         response = self.service.chat_completion(
@@ -170,10 +227,25 @@ class InferenceServiceTests(unittest.TestCase):
             {"role": "assistant", "content": "The answer is"},
         )
 
-    def test_health_reports_cpu_moe_placement(self) -> None:
-        service = InferenceService(
-            "qwen-local", self.generator, cpu_moe_layers=12
+    def test_client_model_id_is_a_routing_hint_by_default(self) -> None:
+        response = self.service.chat_completion(
+            {
+                "model": "claude-fable-5",
+                "messages": [{"role": "user", "content": "Hi"}],
+            }
         )
+        self.assertEqual(response["choices"][0]["message"]["content"], "Hello!")
+        strict = InferenceService("qwen-local", self.generator, strict_model=True)
+        with self.assertRaises(APIError):
+            strict.chat_completion(
+                {
+                    "model": "claude-fable-5",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                }
+            )
+
+    def test_health_reports_cpu_moe_placement(self) -> None:
+        service = InferenceService("qwen-local", self.generator, cpu_moe_layers=12)
         self.assertEqual(service.health()["cpu_moe_layers"], 12)
 
     def test_context_window_limits_combined_prompt_and_output(self) -> None:
@@ -190,24 +262,39 @@ class InferenceServiceTests(unittest.TestCase):
             }
         )
         self.assertEqual(accepted["object"], "chat.completion")
-        with self.assertRaisesRegex(APIError, "at most 4 output tokens"):
-            service.chat_completion(
-                {
-                    "messages": [{"role": "user", "content": "123456"}],
-                    "max_tokens": 5,
-                }
-            )
+        # A 6-token prompt in a 10-token window leaves room for 4 output tokens;
+        # requesting more is clamped rather than rejected (agentic clients treat
+        # max_tokens as an upper bound).
+        clamped = service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "123456"}],
+                "max_tokens": 5,
+            }
+        )
+        self.assertEqual(clamped["object"], "chat.completion")
+        self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 4)
         self.assertEqual(service.properties()["context_window"], 10)
 
-    def test_context_window_limits_legacy_text_completion(self) -> None:
+    def test_context_window_clamps_legacy_text_completion(self) -> None:
         service = InferenceService(
             "qwen-local",
             self.generator,
             max_new_tokens=8,
             context_window=8,
         )
-        with self.assertRaisesRegex(APIError, "at most 3 output tokens"):
-            service.completion({"prompt": "12345", "max_tokens": 4})
+        # 5-token prompt in an 8-token window leaves room for 3 output tokens.
+        service.completion({"prompt": "12345", "max_tokens": 4})
+        self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 3)
+
+    def test_prompt_filling_context_window_is_rejected(self) -> None:
+        service = InferenceService(
+            "qwen-local",
+            self.generator,
+            max_new_tokens=8,
+            context_window=4,
+        )
+        with self.assertRaisesRegex(APIError, "filling the"):
+            service.completion({"prompt": "12345", "max_tokens": 1})
 
     def test_chat_stream_emits_deltas_usage_and_done(self) -> None:
         events = list(
@@ -222,12 +309,19 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(events[0]["object"], "chat.completion.chunk")
         self.assertEqual(events[0]["choices"][0]["delta"]["role"], "assistant")
         live_chunks = [
-            event for event in events if isinstance(event, dict) and event.get("colibri")
+            event
+            for event in events
+            if isinstance(event, dict) and event.get("colibri")
         ]
         self.assertEqual(
             [event["colibri"]["generated_tokens"] for event in live_chunks],
             [1, 2],
         )
+        decode_elapsed = [
+            event["colibri"]["decode_elapsed_seconds"] for event in live_chunks
+        ]
+        self.assertEqual(decode_elapsed[0], 0.0)
+        self.assertGreaterEqual(decode_elapsed[1], decode_elapsed[0])
         deltas = [
             event["choices"][0]["delta"].get("content", "")
             for event in events
@@ -250,6 +344,159 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(response["status"], "completed")
         self.assertEqual(response["output"][0]["content"][0]["text"], "Hello!")
         self.assertEqual(response["usage"]["total_tokens"], 5)
+
+    def test_anthropic_messages_api_returns_anthropic_shape(self) -> None:
+        response = self.service.anthropic_message(
+            {
+                "model": "claude-fable-5",
+                "system": "Be concise",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 4,
+            }
+        )
+        self.assertEqual(response["type"], "message")
+        self.assertEqual(response["role"], "assistant")
+        self.assertEqual(response["content"][0]["type"], "text")
+        self.assertEqual(response["content"][0]["text"], "Hello!")
+
+        events = list(
+            self.service.stream_anthropic_message(
+                {
+                    "model": "claude-fable-5",
+                    "messages": [{"role": "user", "content": "Say hi"}],
+                    "max_tokens": 4,
+                }
+            )
+        )
+        self.assertEqual(events[0]["type"], "message_start")
+        self.assertTrue(any(event["type"] == "content_block_delta" for event in events))
+        self.assertEqual(events[-1]["type"], "message_stop")
+
+    def test_anthropic_stream_text_then_tool_use_gets_separate_blocks(self) -> None:
+        chat_events = [
+            {"choices": [{"index": 0, "delta": {"content": "Let me check."}}]},
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "toolu_abc",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city":',
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "toolu_abc",
+                                    "function": {"arguments": ' "Paris"}'},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+            "[DONE]",
+        ]
+
+        def fake_stream(payload, **kwargs):
+            for ev in chat_events:
+                yield ev
+
+        self.service.stream_chat_completion = fake_stream
+        events = list(
+            self.service.stream_anthropic_message(
+                {"model": "qwen-local", "messages": [{"role": "user", "content": "hi"}]}
+            )
+        )
+
+        starts = [e for e in events if e["type"] == "content_block_start"]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[0]["index"], 0)
+        self.assertEqual(starts[0]["content_block"]["type"], "text")
+        self.assertEqual(starts[1]["index"], 1)
+        self.assertEqual(starts[1]["content_block"]["type"], "tool_use")
+        self.assertEqual(starts[1]["content_block"]["id"], "toolu_abc")
+        self.assertEqual(starts[1]["content_block"]["name"], "get_weather")
+
+        tool_deltas = [
+            e for e in events if e["type"] == "content_block_delta" and e["index"] == 1
+        ]
+        self.assertEqual(tool_deltas[0]["delta"]["type"], "input_json_delta")
+        self.assertEqual(
+            "".join(d["delta"]["partial_json"] for d in tool_deltas),
+            '{"city": "Paris"}',
+        )
+
+        text_deltas = [
+            e for e in events if e["type"] == "content_block_delta" and e["index"] == 0
+        ]
+        self.assertEqual(
+            "".join(d["delta"]["text"] for d in text_deltas), "Let me check."
+        )
+
+        stops = [e for e in events if e["type"] == "content_block_stop"]
+        self.assertEqual([e["index"] for e in stops], [0, 1])
+
+    def test_anthropic_messages_accepts_embedded_system_and_tool_roles(self) -> None:
+        response = self.service.anthropic_message(
+            {
+                "model": "claude-fable-5",
+                "messages": [
+                    {"role": "system", "content": "Be concise"},
+                    {"role": "user", "content": "Use the tool"},
+                    {"role": "tool", "content": "Tool result"},
+                ],
+                "max_tokens": 4,
+            }
+        )
+        self.assertEqual(response["type"], "message")
+
+    def test_anthropic_canonical_tools_are_forwarded(self) -> None:
+        service = InferenceService("qwen-local", ToolStubGenerator())
+        response = service.anthropic_message(
+            {
+                "model": "claude-fable-5",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    }
+                ],
+                "tool_choice": {"type": "any"},
+                "max_tokens": 4,
+            }
+        )
+        self.assertEqual(response["stop_reason"], "tool_use")
+        self.assertEqual(response["content"][0]["type"], "tool_use")
 
     def test_function_calling_uses_native_qwen_format(self) -> None:
         service = InferenceService("qwen-local", ToolStubGenerator())
@@ -277,7 +524,9 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(call["function"]["name"], "get_weather")
         self.assertEqual(json.loads(call["function"]["arguments"]), {"city": "Paris"})
 
-        stream_events = list(service.stream_chat_completion({**payload, "stream": True}))
+        stream_events = list(
+            service.stream_chat_completion({**payload, "stream": True})
+        )
         tool_chunks = [
             event
             for event in stream_events
@@ -289,6 +538,7 @@ class InferenceServiceTests(unittest.TestCase):
             tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "get_weather",
         )
+
     def test_responses_function_tools_stream_and_continue(self) -> None:
         service = InferenceService("qwen-local", ToolStubGenerator())
         tool = {
@@ -318,9 +568,7 @@ class InferenceServiceTests(unittest.TestCase):
         event_types = [event["type"] for event in events]
         self.assertIn("response.function_call_arguments.delta", event_types)
         self.assertIn("response.function_call_arguments.done", event_types)
-        self.assertEqual(
-            events[-1]["response"]["output"][0]["type"], "function_call"
-        )
+        self.assertEqual(events[-1]["response"]["output"][0]["type"], "function_call")
 
         service.response(
             {
@@ -350,12 +598,15 @@ class InferenceServiceTests(unittest.TestCase):
         )
         second_messages = self.generator.calls[1][0]
         self.assertEqual(second["previous_response_id"], first["id"])
-        self.assertEqual(second_messages[-2], {"role": "assistant", "content": "Hello!"})
+        self.assertEqual(
+            second_messages[-2], {"role": "assistant", "content": "Hello!"}
+        )
         self.assertEqual(self.service.retrieve_response(first["id"])["id"], first["id"])
         deleted = self.service.delete_response(first["id"])
         self.assertTrue(deleted["deleted"])
         with self.assertRaises(APIError):
             self.service.retrieve_response(first["id"])
+
     def test_rejects_invalid_history_and_tools(self) -> None:
         with self.assertRaises(APIError):
             self.service.chat_completion(
@@ -370,14 +621,30 @@ class InferenceServiceTests(unittest.TestCase):
             )
         self.assertEqual(tools_error.exception.parameter, "tools")
 
+    def test_decode_event_detection_ignores_protocol_events(self) -> None:
+        self.assertFalse(
+            _is_decode_event(
+                {"object": "chat.completion.chunk", "choices": [{"delta": {}}]}
+            )
+        )
+        self.assertTrue(
+            _is_decode_event(
+                {
+                    "object": "chat.completion.chunk",
+                    "choices": [{"delta": {"content": "Hi"}}],
+                }
+            )
+        )
+        self.assertTrue(
+            _is_decode_event({"type": "response.output_text.delta", "delta": "Hi"})
+        )
+
 
 class HTTPServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.generator = StubGenerator()
         self.service = InferenceService("qwen-local", self.generator)
-        self.server = ColibriHTTPServer(
-            ("127.0.0.1", 0), create_handler(self.service)
-        )
+        self.server = ColibriHTTPServer(("127.0.0.1", 0), create_handler(self.service))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.connection = http.client.HTTPConnection(
@@ -403,7 +670,9 @@ class HTTPServerTests(unittest.TestCase):
         html = response.read().decode("utf-8")
         self.assertEqual(response.status, 200)
         self.assertTrue(response.getheader("Content-Type").startswith("text/html"))
-        self.assertIn("default-src 'self'", response.getheader("Content-Security-Policy"))
+        self.assertIn(
+            "default-src 'self'", response.getheader("Content-Security-Policy")
+        )
         self.assertIn("Colibri Chat", html)
 
         self.connection.request("GET", "/app.js")
@@ -413,7 +682,8 @@ class HTTPServerTests(unittest.TestCase):
         self.assertTrue(
             response.getheader("Content-Type").startswith("text/javascript")
         )
-        self.assertIn('/v1/chat/completions', javascript)
+        self.assertIn("/v1/chat/completions", javascript)
+        self.assertIn("decodeIntervals", javascript)
 
         self.connection.request("GET", "/preview.html")
         response = self.connection.getresponse()
@@ -457,6 +727,18 @@ class HTTPServerTests(unittest.TestCase):
         _, properties = self.request_json("GET", "/props")
         self.assertEqual(properties["max_output_tokens"], 64)
 
+    def test_cli_compatibility_probes(self) -> None:
+        self.connection.request("HEAD", "/")
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.read(), b"")
+
+        _, profile = self.request_json("GET", "/v1/me")
+        self.assertEqual(profile["object"], "user")
+
+        _, profile = self.request_json("POST", "/v1/me", {})
+        self.assertEqual(profile["id"], "local")
+
     def test_chat_stream_uses_sse_framing(self) -> None:
         body = json.dumps(
             {
@@ -474,9 +756,13 @@ class HTTPServerTests(unittest.TestCase):
         response = self.connection.getresponse()
         stream_body = response.read().decode("utf-8")
         self.assertEqual(response.status, 200)
-        self.assertTrue(response.getheader("Content-Type").startswith("text/event-stream"))
+        self.assertTrue(
+            response.getheader("Content-Type").startswith("text/event-stream")
+        )
         self.assertIn('"object": "chat.completion.chunk"', stream_body)
         self.assertIn("data: [DONE]", stream_body)
+
+
 class AuthenticationTests(unittest.TestCase):
     def test_bearer_auth_and_cors_preflight(self) -> None:
         server = ColibriHTTPServer(
@@ -528,6 +814,7 @@ class AuthenticationTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+
 @unittest.skipIf(OpenAI is None, "OpenAI SDK is not installed")
 class OpenAISDKTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -563,9 +850,7 @@ class OpenAISDKTests(unittest.TestCase):
             stream=True,
         )
         streamed_text = "".join(
-            chunk.choices[0].delta.content or ""
-            for chunk in stream
-            if chunk.choices
+            chunk.choices[0].delta.content or "" for chunk in stream if chunk.choices
         )
         self.assertEqual(streamed_text, "Hello!")
 
@@ -588,10 +873,13 @@ class OpenAISDKTests(unittest.TestCase):
         )
         self.assertEqual(completion.choices[0].text, "Hello!")
 
+
 class ServerCLITests(unittest.TestCase):
     @patch("colibri_next.cli.serve_http")
     @patch("colibri_next.cli.InferenceService.from_model_directory")
-    def test_serve_command_loads_once_and_starts_http(self, load_model, serve_http) -> None:
+    def test_serve_command_loads_once_and_starts_http(
+        self, load_model, serve_http
+    ) -> None:
         load_model.return_value = Mock(model_name="demo-model")
         with redirect_stderr(StringIO()):
             result = main(

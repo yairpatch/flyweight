@@ -132,13 +132,19 @@ class Q4BlockTensor:
             raise ValueError("rows_per_chunk must be positive")
         return self.matvec(vector, prefer_numpy=prefer_numpy)
 
-    def matvec(self, vector: list[float], *, prefer_numpy: bool = True) -> list[float]:
+    def matvec(
+        self,
+        vector: list[float],
+        *,
+        prefer_numpy: bool = True,
+        allow_cuda: bool = True,
+    ) -> list[float]:
         if len(self.shape) != 2:
             raise ValueError(f"matvec requires a rank-2 tensor, got {self.shape}")
         rows, columns = self.shape
         if len(vector) != columns:
             raise ValueError(f"expected vector width {columns}, got {len(vector)}")
-        if prefer_numpy:
+        if prefer_numpy and allow_cuda:
             from .cuda import active_cuda
 
             accelerator = active_cuda()

@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from colibri_next.attention import QwenFullAttentionLayer
+from colibri_next.attention import AttentionKVCache, QwenFullAttentionLayer
 from colibri_next.attention_converter import QwenAttentionConverter
 from colibri_next.cli import main
 from colibri_next.converter import QwenCheckpointConverter
@@ -98,6 +98,26 @@ def rms_norm(vector: list[float], epsilon: float) -> list[float]:
 
 
 class QwenAttentionTests(unittest.TestCase):
+    def test_cache_clear_releases_device_storage_metadata(self) -> None:
+        cache = AttentionKVCache(2, 4)
+        cache.tokens = 3
+        cache.cuda_keys = object()
+        cache.cuda_values = object()
+        cache.cuda_key_scales = object()
+        cache.cuda_value_scales = object()
+        cache.cuda_cache_type = "q8"
+        cache.cuda_capacity = 256
+
+        cache.clear()
+
+        self.assertEqual(cache.length, 0)
+        self.assertIsNone(cache.cuda_keys)
+        self.assertIsNone(cache.cuda_values)
+        self.assertIsNone(cache.cuda_key_scales)
+        self.assertIsNone(cache.cuda_value_scales)
+        self.assertIsNone(cache.cuda_cache_type)
+        self.assertEqual(cache.cuda_capacity, 0)
+
     def test_converter_writes_attention_container_and_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -263,4 +283,3 @@ class QwenAttentionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

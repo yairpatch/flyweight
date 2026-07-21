@@ -131,6 +131,21 @@ class SamplingTests(unittest.TestCase):
 
 
 class TextGenerationTests(unittest.TestCase):
+    def test_legacy_prefill_adapter_accepts_progress_reporting(self) -> None:
+        model = CacheTestModel()
+        generator = TextGenerator(model, CacheTestTokenizer())
+        progress: list[tuple[int, int]] = []
+
+        result = generator._generate_ids(
+            [3, 0],
+            max_new_tokens=1,
+            sampling=None,
+            progress=lambda completed, total: progress.append((completed, total)),
+        )
+
+        self.assertEqual(result.state_tokens, 2)
+        self.assertEqual(progress, [(0, 2)])
+
     def test_followup_prefills_only_uncached_suffix(self) -> None:
         model = CacheTestModel()
         generator = TextGenerator(

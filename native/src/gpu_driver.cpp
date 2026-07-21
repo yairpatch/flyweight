@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -27,6 +29,7 @@ using CUcontext = void*;
 using CUmodule = void*;
 using CUfunction = void*;
 using CUstream = void*;
+using CUevent = void*;
 using CUdeviceptr = unsigned long long;
 
 using nvrtcResult = int;
@@ -51,8 +54,23 @@ struct CudaApi {
     ) = nullptr;
     CUresult (*cuMemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
     CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
+    CUresult (*cuMemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream) = nullptr;
+    CUresult (*cuMemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream) = nullptr;
+    CUresult (*cuMemAlloc)(CUdeviceptr*, size_t) = nullptr;
+    CUresult (*cuMemFree)(CUdeviceptr) = nullptr;
+    CUresult (*cuMemHostAlloc)(void**, size_t, unsigned int) = nullptr;
+    CUresult (*cuMemFreeHost)(void*) = nullptr;
+    CUresult (*cuMemHostRegister)(void*, size_t, unsigned int) = nullptr;
+    CUresult (*cuMemHostUnregister)(void*) = nullptr;
+    CUresult (*cuMemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream) = nullptr;
     CUresult (*cuStreamSynchronize)(CUstream) = nullptr;
     CUresult (*cuStreamCreate)(CUstream*, unsigned int) = nullptr;
+    CUresult (*cuStreamDestroy)(CUstream) = nullptr;
+    CUresult (*cuEventCreate)(CUevent*, unsigned int) = nullptr;
+    CUresult (*cuEventRecord)(CUevent, CUstream) = nullptr;
+    CUresult (*cuStreamWaitEvent)(CUstream, CUevent, unsigned int) = nullptr;
+    CUresult (*cuEventSynchronize)(CUevent) = nullptr;
+    CUresult (*cuEventDestroy)(CUevent) = nullptr;
     CUresult (*cuStreamBeginCapture)(CUstream, int) = nullptr;
     CUresult (*cuStreamEndCapture)(CUstream, void**) = nullptr;
     CUresult (*cuGraphInstantiateWithFlags)(
@@ -95,9 +113,20 @@ struct Kernels {
     CUfunction delta_conv_step = nullptr;
     CUfunction delta_recurrent = nullptr;
     CUfunction scaled_add = nullptr;
+    CUfunction q4_batched = nullptr;
+    CUfunction q4_silu = nullptr;
+    CUfunction q4_weighted = nullptr;
+    CUfunction attention = nullptr;
+    CUfunction kv_append = nullptr;
+    CUfunction q8_matvec_transposed = nullptr;
+    CUfunction route_topk = nullptr;
+    CUfunction q5_grouped_swiglu = nullptr;
+    CUfunction q6_grouped_accumulate = nullptr;
+    CUfunction q8_grouped_accumulate = nullptr;
 };
 
 Kernels g_kernels;
+std::unordered_map<std::string, CUfunction> g_functions;
 
 template <typename T>
 bool load_symbol(void* library, const char* name, T& target) {
@@ -141,8 +170,24 @@ bool load_apis() {
     ok &= load_symbol(cuda, "cuLaunchKernel", g_api.cuLaunchKernel);
     ok &= load_symbol(cuda, "cuMemcpyDtoH_v2", g_api.cuMemcpyDtoH);
     ok &= load_symbol(cuda, "cuMemcpyHtoD_v2", g_api.cuMemcpyHtoD);
+    ok &= load_symbol(cuda, "cuMemcpyDtoHAsync_v2", g_api.cuMemcpyDtoHAsync);
+    ok &= load_symbol(cuda, "cuMemcpyHtoDAsync_v2", g_api.cuMemcpyHtoDAsync);
+    ok &= load_symbol(cuda, "cuMemAlloc_v2", g_api.cuMemAlloc);
+    ok &= load_symbol(cuda, "cuMemFree_v2", g_api.cuMemFree);
+    ok &= load_symbol(cuda, "cuMemHostAlloc", g_api.cuMemHostAlloc);
+    ok &= load_symbol(cuda, "cuMemFreeHost", g_api.cuMemFreeHost);
+    // Optional: DMA page-ins straight from a registered mmap (not fatal if absent).
+    load_symbol(cuda, "cuMemHostRegister_v2", g_api.cuMemHostRegister);
+    load_symbol(cuda, "cuMemHostUnregister", g_api.cuMemHostUnregister);
+    ok &= load_symbol(cuda, "cuMemsetD8Async", g_api.cuMemsetD8Async);
     ok &= load_symbol(cuda, "cuStreamSynchronize", g_api.cuStreamSynchronize);
     ok &= load_symbol(cuda, "cuStreamCreate", g_api.cuStreamCreate);
+    ok &= load_symbol(cuda, "cuStreamDestroy_v2", g_api.cuStreamDestroy);
+    ok &= load_symbol(cuda, "cuEventCreate", g_api.cuEventCreate);
+    ok &= load_symbol(cuda, "cuEventRecord", g_api.cuEventRecord);
+    ok &= load_symbol(cuda, "cuStreamWaitEvent", g_api.cuStreamWaitEvent);
+    ok &= load_symbol(cuda, "cuEventSynchronize", g_api.cuEventSynchronize);
+    ok &= load_symbol(cuda, "cuEventDestroy_v2", g_api.cuEventDestroy);
     ok &= load_symbol(
         cuda, "cuStreamBeginCapture_v2", g_api.cuStreamBeginCapture
     );
@@ -460,11 +505,43 @@ extern "C" int colibri_gpu_compile(
         {"delta_conv_step", &g_kernels.delta_conv_step},
         {"delta_recurrent_sequence", &g_kernels.delta_recurrent},
         {"scaled_add", &g_kernels.scaled_add},
+        {"q4_batched_matvec", &g_kernels.q4_batched},
+        {"q4_silu_batched", &g_kernels.q4_silu},
+        {"q4_batched_weighted_matvec", &g_kernels.q4_weighted},
+        {"kv_attention", &g_kernels.attention},
+        {"kv_append", &g_kernels.kv_append},
+        {"q8_matvec_transposed_warp", &g_kernels.q8_matvec_transposed},
+        {"route_topk", &g_kernels.route_topk},
+        {"q5k_grouped_swiglu", &g_kernels.q5_grouped_swiglu},
+        {"q6k_grouped_accumulate", &g_kernels.q6_grouped_accumulate},
+        {"q8_grouped_accumulate", &g_kernels.q8_grouped_accumulate},
     };
     for (const Entry& entry : entries) {
         if (g_api.cuModuleGetFunction(entry.slot, g_module, entry.name) != 0) {
             return -5;
         }
+        g_functions[entry.name] = *entry.slot;
+    }
+    for (const char* name : {
+             "qwen_q8_embedding", "qwen_f32_matvec",
+             "qwen_delta_recurrent", "qwen_attention_query",
+             "qwen_attention_key", "qwen_attention_gate",
+             "kv_attention_scores", "kv_attention_values",
+             "qwen_shared_scale", "qwen_argmax", "qwen_concat_pair",
+             "qwen_shared_scale_bf16", "qwen_copy_vector", "silu_mul",
+             "q8_swiglu_transposed_warp", "q8_lm_head_argmax_warp",
+             "qwen_q8_embedding_rows", "qwen_f32_matmul_rows",
+             "qwen_q8_matmul_rows", "qwen_q8_swiglu_rows",
+             "qwen_shared_scale_rows", "qwen_q8_lm_head_argmax_rows",
+             "qwen_delta_recurrent_rows", "route_topk_rows", "rms_norm_rows",
+             "q5k_grouped_swiglu_rows", "q6k_grouped_accumulate_rows",
+             "q8_grouped_accumulate_rows", "kv_attention_prefill",
+             "q8_matmul_tiled", "delta_conv_chunk",
+             "qwen_delta_recurrent_chunk"
+         }) {
+        CUfunction function = nullptr;
+        if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)
+            g_functions[name] = function;
     }
     return 0;
 }
@@ -489,11 +566,397 @@ extern "C" int colibri_gpu_rms_norm(
     return 0;
 }
 
+extern "C" int colibri_gpu_q4_matvec(
+    std::uint64_t packed,
+    std::uint64_t scales,
+    std::uint64_t input,
+    std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t rows,
+    std::int32_t columns
+) {
+    if (g_kernels.q4_matvec == nullptr || g_context == nullptr
+        || packed == 0 || scales == 0 || input == 0 || output == 0
+        || rows <= 0 || columns <= 0
+        || g_api.cuCtxSetCurrent(g_context) != 0) {
+        return -1;
+    }
+    void* args[] = {
+        &packed, &scales, &input, &output, &rows, &columns,
+    };
+    return launch(
+        g_kernels.q4_matvec,
+        static_cast<unsigned int>(rows), 1, kThreadsPerBlock, args,
+        0, reinterpret_cast<CUstream>(stream)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_scaled_add(
+    std::uint64_t target,
+    std::uint64_t source,
+    float scale,
+    std::int32_t elements
+) {
+    if (g_kernels.scaled_add == nullptr || target == 0 || source == 0
+        || elements <= 0) {
+        return -1;
+    }
+    void* args[] = {&target, &source, &scale, &elements};
+    const auto blocks = static_cast<unsigned int>(
+        (elements + static_cast<std::int32_t>(kThreadsPerBlock) - 1)
+        / static_cast<std::int32_t>(kThreadsPerBlock)
+    );
+    return launch(g_kernels.scaled_add, blocks, 1, kThreadsPerBlock, args)
+        == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_attention(
+    std::uint64_t query,
+    std::uint64_t keys,
+    std::uint64_t values,
+    std::uint64_t output,
+    std::int32_t heads,
+    std::int32_t kv_heads,
+    std::int32_t head_dim,
+    std::int32_t tokens,
+    float scale
+) {
+    if (g_kernels.attention == nullptr || query == 0 || keys == 0
+        || values == 0 || output == 0 || heads <= 0 || kv_heads <= 0
+        || head_dim <= 0 || tokens <= 0 || heads % kv_heads != 0) {
+        return -1;
+    }
+    std::int32_t capacity = tokens;
+    void* args[] = {
+        &query, &keys, &values, &output, &heads, &kv_heads,
+        &head_dim, &tokens, &capacity, &scale,
+    };
+    return launch(
+        g_kernels.attention,
+        static_cast<unsigned int>(heads), 1, kThreadsPerBlock, args
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_attention_cache(
+    std::uint64_t query, std::uint64_t keys, std::uint64_t values,
+    std::uint64_t output, std::int32_t heads, std::int32_t kv_heads,
+    std::int32_t head_dim, std::int32_t tokens, std::int32_t capacity,
+    float scale
+) {
+    if (g_kernels.attention == nullptr || query == 0 || keys == 0
+        || values == 0 || output == 0 || heads <= 0 || kv_heads <= 0
+        || head_dim <= 0 || tokens <= 0 || capacity < tokens
+        || heads % kv_heads != 0) return -1;
+    void* args[] = {&query, &keys, &values, &output, &heads, &kv_heads,
+                    &head_dim, &tokens, &capacity, &scale};
+    return launch(g_kernels.attention, static_cast<unsigned int>(heads), 1,
+                  kThreadsPerBlock, args) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_kv_append(
+    std::uint64_t current_keys, std::uint64_t current_values,
+    std::uint64_t cache_keys, std::uint64_t cache_values,
+    std::int32_t kv_heads, std::int32_t head_dim,
+    std::int32_t position, std::int32_t capacity
+) {
+    if (g_kernels.kv_append == nullptr || current_keys == 0
+        || current_values == 0 || cache_keys == 0 || cache_values == 0
+        || kv_heads <= 0 || head_dim <= 0 || position < 0
+        || position >= capacity) return -1;
+    void* args[] = {&current_keys, &current_values, &cache_keys,
+                    &cache_values, &kv_heads, &head_dim, &position,
+                    &capacity};
+    return launch(g_kernels.kv_append,
+                  static_cast<unsigned int>(kv_heads), 1,
+                  kThreadsPerBlock, args) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_q4_moe(
+    std::uint64_t gate_up_packed,
+    std::uint64_t gate_up_scales,
+    std::uint64_t down_packed,
+    std::uint64_t down_scales,
+    std::uint64_t weights,
+    std::uint64_t input,
+    std::uint64_t gate_output,
+    std::uint64_t activated,
+    std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t expert_count,
+    std::int32_t hidden_size,
+    std::int32_t intermediate_size
+) {
+    if (g_kernels.q4_silu == nullptr
+        || g_kernels.q4_weighted == nullptr
+        || gate_up_packed == 0 || gate_up_scales == 0 || down_packed == 0
+        || down_scales == 0 || weights == 0 || input == 0
+        || gate_output == 0 || activated == 0 || output == 0
+        || expert_count <= 0 || hidden_size <= 0 || intermediate_size <= 0
+        || g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) {
+        return -1;
+    }
+    void* gate_args[] = {
+        &gate_up_packed, &gate_up_scales, &input, &activated,
+        &intermediate_size, &hidden_size, &expert_count,
+    };
+    if (launch(
+            g_kernels.q4_silu,
+            static_cast<unsigned int>(intermediate_size),
+            static_cast<unsigned int>(expert_count), kThreadsPerBlock,
+            gate_args, 0, reinterpret_cast<CUstream>(stream)
+        ) != 0) {
+        return -2;
+    }
+    void* down_args[] = {
+        &down_packed, &down_scales, &activated, &weights, &output,
+        &hidden_size, &intermediate_size, &expert_count,
+    };
+    if (launch(
+            g_kernels.q4_weighted,
+            static_cast<unsigned int>(hidden_size), 1, kThreadsPerBlock,
+            down_args, 0, reinterpret_cast<CUstream>(stream)
+        ) != 0) {
+        return -3;
+    }
+    return 0;
+}
+
 extern "C" int colibri_gpu_sync() {
     if (!g_api.loaded) {
         return -1;
     }
     return g_api.cuStreamSynchronize(nullptr) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
+    if (g_context == nullptr || pointer == nullptr || bytes == 0
+        || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
+    CUdeviceptr allocation = 0;
+    if (g_api.cuMemAlloc(&allocation, static_cast<size_t>(bytes)) != 0) return -2;
+    *pointer = static_cast<std::uint64_t>(allocation);
+    return 0;
+}
+
+extern "C" int colibri_gpu_free(std::uint64_t pointer) {
+    if (pointer == 0) return 0;
+    if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
+    return g_api.cuMemFree(static_cast<CUdeviceptr>(pointer)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_host_alloc(std::uint64_t bytes, void** pointer) {
+    if (pointer == nullptr || bytes == 0) return -1;
+    return g_api.cuMemHostAlloc(pointer, static_cast<size_t>(bytes), 0) == 0
+        ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_host_free(void* pointer) {
+    if (pointer == nullptr) return 0;
+    return g_api.cuMemFreeHost(pointer) == 0 ? 0 : -1;
+}
+
+// Page-lock an existing host range (e.g. the model mmap) so cuMemcpyHtoDAsync
+// DMAs straight from it with no CPU staging copy. Read-only file mappings need
+// the READ_ONLY flag; fall back to portable/plain for older drivers.
+extern "C" int colibri_gpu_host_register(const void* pointer, std::uint64_t bytes) {
+    if (pointer == nullptr || bytes == 0) return -1;
+    if (g_api.cuMemHostRegister == nullptr) return -3;
+    void* host = const_cast<void*>(pointer);
+    // READ_ONLY (0x08) is unsupported on many drivers (CUDA_ERROR_NOT_SUPPORTED);
+    // PORTABLE (0x01) works once the mapping is writable copy-on-write.
+    for (unsigned int flags : {0x08u, 0x01u, 0x00u}) {
+        if (g_api.cuMemHostRegister(host, static_cast<size_t>(bytes), flags) == 0) return 0;
+    }
+    return -2;
+}
+
+extern "C" int colibri_gpu_host_unregister(const void* pointer) {
+    if (pointer == nullptr) return 0;
+    if (g_api.cuMemHostUnregister == nullptr) return -3;
+    return g_api.cuMemHostUnregister(const_cast<void*>(pointer)) == 0 ? 0 : -1;
+}
+
+extern "C" int colibri_gpu_upload(
+    std::uint64_t destination, const void* source, std::uint64_t bytes,
+    std::uint64_t stream
+) {
+    if (destination == 0 || source == nullptr || bytes == 0) return -1;
+    return g_api.cuMemcpyHtoDAsync(
+        static_cast<CUdeviceptr>(destination), source, static_cast<size_t>(bytes),
+        reinterpret_cast<CUstream>(stream)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_upload_sync(
+    std::uint64_t destination, const void* source, std::uint64_t bytes
+) {
+    if (destination == 0 || source == nullptr || bytes == 0) return -1;
+    return g_api.cuMemcpyHtoD(
+        static_cast<CUdeviceptr>(destination), source, static_cast<size_t>(bytes)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_download(
+    void* destination, std::uint64_t source, std::uint64_t bytes,
+    std::uint64_t stream
+) {
+    if (destination == nullptr || source == 0 || bytes == 0) return -1;
+    return g_api.cuMemcpyDtoHAsync(
+        destination, static_cast<CUdeviceptr>(source), static_cast<size_t>(bytes),
+        reinterpret_cast<CUstream>(stream)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_memset(
+    std::uint64_t destination, std::uint8_t value, std::uint64_t bytes,
+    std::uint64_t stream
+) {
+    if (destination == 0 || bytes == 0) return -1;
+    return g_api.cuMemsetD8Async(
+        static_cast<CUdeviceptr>(destination), value, static_cast<size_t>(bytes),
+        reinterpret_cast<CUstream>(stream)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_stream_create(std::uint64_t* stream) {
+    if (stream == nullptr) return -1;
+    CUstream created = nullptr;
+    if (g_api.cuStreamCreate(&created, 1) != 0) return -2;
+    *stream = reinterpret_cast<std::uint64_t>(created);
+    return 0;
+}
+
+extern "C" int colibri_gpu_stream_destroy(std::uint64_t stream) {
+    if (stream == 0) return 0;
+    return g_api.cuStreamDestroy(reinterpret_cast<CUstream>(stream)) == 0
+        ? 0 : -1;
+}
+
+extern "C" int colibri_gpu_stream_sync(std::uint64_t stream) {
+    return g_api.cuStreamSynchronize(reinterpret_cast<CUstream>(stream)) == 0
+        ? 0 : -1;
+}
+
+extern "C" int colibri_gpu_event_create(std::uint64_t* event) {
+    if (event == nullptr) return -1;
+    CUevent created = nullptr;
+    if (g_api.cuEventCreate(&created, 2 /* disable timing */) != 0) return -2;
+    *event = reinterpret_cast<std::uint64_t>(created);
+    return 0;
+}
+
+extern "C" int colibri_gpu_event_record(
+    std::uint64_t event, std::uint64_t stream
+) {
+    if (event == 0) return -1;
+    return g_api.cuEventRecord(
+        reinterpret_cast<CUevent>(event), reinterpret_cast<CUstream>(stream)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_event_sync(std::uint64_t event) {
+    if (event == 0) return -1;
+    return g_api.cuEventSynchronize(reinterpret_cast<CUevent>(event)) == 0
+        ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_stream_wait_event(
+    std::uint64_t stream, std::uint64_t event
+) {
+    if (event == 0) return -1;
+    return g_api.cuStreamWaitEvent(
+        reinterpret_cast<CUstream>(stream), reinterpret_cast<CUevent>(event), 0
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_event_destroy(std::uint64_t event) {
+    if (event == 0) return 0;
+    return g_api.cuEventDestroy(reinterpret_cast<CUevent>(event)) == 0
+        ? 0 : -1;
+}
+
+extern "C" int colibri_gpu_q8_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    if (!g_kernels.q8_matvec_transposed || !packed || !input || !output
+        || input_size <= 0 || output_size <= 0) return -1;
+    void* args[] = {&packed, &input, &output, &input_size, &output_size};
+    const auto blocks = static_cast<unsigned int>((output_size + 7) / 8);
+    return launch(g_kernels.q8_matvec_transposed, blocks, 1, 256, args, 0,
+                  reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_route_topk(
+    std::uint64_t logits, std::uint64_t selected, std::uint64_t weights,
+    std::int32_t experts, std::int32_t top_k, std::uint64_t stream
+) {
+    if (!g_kernels.route_topk || !logits || !selected || !weights
+        || experts <= 0 || top_k <= 0 || top_k > experts) return -1;
+    void* args[] = {&logits, &selected, &weights, &experts, &top_k};
+    return launch(g_kernels.route_topk, 1, 1, 256, args,
+                  static_cast<unsigned int>(experts * sizeof(float)),
+                  reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_q5_grouped_swiglu(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t input, std::uint64_t activated,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) {
+    if (!g_kernels.q5_grouped_swiglu || !gate_pointers || !up_pointers
+        || !input || !activated || input_size <= 0 || output_size <= 0
+        || experts <= 0) return -1;
+    void* args[] = {&gate_pointers, &up_pointers, &input, &activated,
+                    &input_size, &output_size, &experts};
+    return launch(g_kernels.q5_grouped_swiglu,
+                  static_cast<unsigned int>(output_size),
+                  static_cast<unsigned int>(experts), 256, args, 0,
+                  reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+int grouped_accumulate(
+    CUfunction kernel, std::uint64_t down_pointers,
+    std::uint64_t activated, std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) {
+    if (!kernel || !down_pointers || !activated || !output || !weights
+        || input_size <= 0 || output_size <= 0 || experts <= 0) return -1;
+    void* args[] = {&down_pointers, &activated, &output, &weights,
+                    &input_size, &output_size, &experts};
+    return launch(kernel, static_cast<unsigned int>(output_size), 1, 256,
+                  args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_q6_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) { return grouped_accumulate(g_kernels.q6_grouped_accumulate, down_pointers,
+    activated, output, weights, input_size, output_size, experts, stream); }
+
+extern "C" int colibri_gpu_q8_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) { return grouped_accumulate(g_kernels.q8_grouped_accumulate, down_pointers,
+    activated, output, weights, input_size, output_size, experts, stream); }
+
+extern "C" int colibri_gpu_launch_named(
+    const char* name, std::uint32_t grid_x, std::uint32_t grid_y,
+    std::uint32_t block_x, std::uint32_t shared_bytes,
+    std::uint64_t stream, void** arguments
+) {
+    if (name == nullptr || arguments == nullptr || grid_x == 0 || grid_y == 0
+        || block_x == 0) return -1;
+    const auto found = g_functions.find(name);
+    if (found == g_functions.end()) return -2;
+    return launch(found->second, grid_x, grid_y, block_x, arguments,
+                  shared_bytes, reinterpret_cast<CUstream>(stream)) == 0
+        ? 0 : -3;
 }
 
 extern "C" int colibri_delta_moe_segment(

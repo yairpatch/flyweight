@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import statistics
 import sys
 import time
 from dataclasses import asdict
@@ -41,6 +42,44 @@ from .validation import (
     diagnose_layer_components,
     validate_against_reference,
 )
+from .v2 import V2Model
+from .v2_qwen import (
+    QwenDeltaLayer,
+    QwenFullAttentionLayer as V2QwenFullAttentionLayer,
+    QwenMoELayer as V2QwenMoELayer,
+    QwenV2Decoder,
+)
+
+
+def _steady_state_counters(start, end):
+    """Report native runtime counter deltas over the measured window only.
+
+    The raw ``runtime`` counters accumulate across prompt ingestion (cold,
+    all-miss) and warmup, which swamps the steady-state decode signal.  Diffing
+    a snapshot taken at the warmup/measured boundary against the final counters
+    isolates the timed iterations.
+    """
+    if start is None:
+        return None
+    fields = (
+        "decode_calls", "decode_nanoseconds", "route_wait_nanoseconds",
+        "expert_page_nanoseconds", "tail_wait_nanoseconds",
+        "expert_cache_hits", "expert_cache_misses", "expert_cache_evictions",
+    )
+    delta = {field: end[field] - start[field] for field in fields}
+    calls = delta["decode_calls"] or 1
+    lookups = delta["expert_cache_hits"] + delta["expert_cache_misses"]
+    return {
+        "decode_calls": delta["decode_calls"],
+        "route_wait_ns_per_token": delta["route_wait_nanoseconds"] / calls,
+        "expert_page_ns_per_token": delta["expert_page_nanoseconds"] / calls,
+        "tail_wait_ns_per_token": delta["tail_wait_nanoseconds"] / calls,
+        "decode_ns_per_token": delta["decode_nanoseconds"] / calls,
+        "expert_cache_hits": delta["expert_cache_hits"],
+        "expert_cache_misses": delta["expert_cache_misses"],
+        "expert_cache_evictions": delta["expert_cache_evictions"],
+        "expert_cache_hit_rate": delta["expert_cache_hits"] / (lookups or 1),
+    }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -212,6 +251,85 @@ def _parser() -> argparse.ArgumentParser:
     _add_expert_preload_argument(generate_text, default="none")
     _add_cpu_moe_argument(generate_text)
 
+    generate_v2 = subcommands.add_parser(
+        "generate-text-v2", help="generate with the opt-in native v2 runtime"
+    )
+    generate_v2.add_argument("model", type=Path)
+    generate_v2.add_argument("--prompt", required=True)
+    generate_v2.add_argument("--max-new-tokens", type=int, default=8)
+    generate_v2.add_argument("--context-window", type=int, default=4096)
+
+    inspect_v2 = subcommands.add_parser(
+        "inspect-gguf-v2", help="inspect a GGUF using the native v2 reader"
+    )
+    inspect_v2.add_argument("model", type=Path)
+
+    benchmark_v2 = subcommands.add_parser(
+        "benchmark-v2", help="benchmark the real Qwen v2 CUDA decoder"
+    )
+    benchmark_v2.add_argument("model", type=Path)
+    benchmark_v2.add_argument("--tokens", default="0")
+    benchmark_v2.add_argument("--prompt")
+    benchmark_v2.add_argument("--chat", action="store_true")
+    benchmark_v2.add_argument("--warmup", type=int, default=3)
+    benchmark_v2.add_argument("--iterations", type=int, default=10)
+    benchmark_v2.add_argument("--gpu-cache-mib", type=int, default=0)
+    benchmark_v2.add_argument("--context", type=int, default=2048)
+    benchmark_v2.add_argument(
+        "--runtime", choices=("native", "cupy-reference"), default="native",
+    )
+    benchmark_v2.add_argument(
+        "--moe-device", choices=("gpu", "cpu", "hybrid"), default="gpu",
+        help="execute routed experts by GPU streaming or native CPU kernels",
+    )
+    benchmark_v2.add_argument("--mtp-drafts", type=int, default=0)
+
+    probe_qwen_v2 = subcommands.add_parser(
+        "probe-qwen-v2", help="run one real Qwen v2 block and routed MoE from GGUF"
+    )
+    probe_qwen_v2.add_argument("model", type=Path)
+    probe_qwen_v2.add_argument("--layer", type=int, default=0)
+    probe_qwen_v2.add_argument("--token-id", type=int, default=0)
+    probe_qwen_v2.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+
+    stack_qwen_v2 = subcommands.add_parser(
+        "probe-qwen-stack-v2", help="run one token through the complete Qwen v2 block stack"
+    )
+    stack_qwen_v2.add_argument("model", type=Path)
+    stack_qwen_v2.add_argument("--token-id", type=int, default=0)
+    stack_qwen_v2.add_argument("--prompt")
+    stack_qwen_v2.add_argument("--chat", action="store_true", help="wrap prompt in the Qwen user/assistant chat template")
+    stack_qwen_v2.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    stack_qwen_v2.add_argument(
+        "--gpu-cache-mib", type=int, default=0,
+        help="bounded CUDA weight cache in MiB (0 selects from free VRAM)",
+    )
+
+    native_qwen_v2 = subcommands.add_parser(
+        "probe-qwen-native-v2",
+        help="run the one-call C++/CUDA Qwen v2 decoder (no CuPy execution)",
+    )
+    native_qwen_v2.add_argument("model", type=Path)
+    native_qwen_v2.add_argument("--token-id", type=int, default=0)
+    native_qwen_v2.add_argument("--prompt")
+    native_qwen_v2.add_argument("--chat", action="store_true")
+    native_qwen_v2.add_argument("--generate-tokens", type=int, default=2)
+    native_qwen_v2.add_argument("--context", type=int, default=2048)
+    native_qwen_v2.add_argument(
+        "--gpu-cache-mib", type=int, default=0,
+        help="total v2 CUDA budget in MiB (0 = auto-fit to free VRAM)")
+    native_qwen_v2.add_argument(
+        "--moe-device", choices=("gpu", "cpu", "hybrid"), default="gpu",
+        help="execute routed experts by GPU streaming or native CPU kernels",
+    )
+    native_qwen_v2.add_argument("--mtp-drafts", type=int, default=0)
+    stack_qwen_v2.add_argument(
+        "--profile", action="store_true",
+        help="synchronize token boundaries and report prompt/decode timings",
+    )
+    stack_qwen_v2.add_argument("--top-k", type=int, default=10)
+    stack_qwen_v2.add_argument("--generate-tokens", type=int, default=0)
+
     serve_command = subcommands.add_parser(
         "serve", help="run a persistent OpenAI-compatible local server"
     )
@@ -219,6 +337,17 @@ def _parser() -> argparse.ArgumentParser:
     serve_command.add_argument("--host", default="127.0.0.1")
     serve_command.add_argument("--port", type=int, default=8000)
     serve_command.add_argument("--model-name")
+    serve_command.add_argument(
+        "--kv-cache-type",
+        choices=("f32", "q8"),
+        default=None,
+        help="attention KV-cache storage type",
+    )
+    serve_command.add_argument(
+        "--strict-model",
+        action="store_true",
+        help="reject request model IDs that differ from the loaded model name",
+    )
     serve_command.add_argument(
         "--api-key", default=os.environ.get("COLIBRI_API_KEY")
     )
@@ -239,6 +368,44 @@ def _parser() -> argparse.ArgumentParser:
     _add_expert_preload_argument(serve_command, default="auto")
     _add_cpu_moe_argument(serve_command)
 
+    serve_v2 = subcommands.add_parser(
+        "serve-v2", help="run the OpenAI-compatible server on native v2 GGUF"
+    )
+    serve_v2.add_argument("model", type=Path)
+    serve_v2.add_argument("--host", default="127.0.0.1")
+    serve_v2.add_argument("--port", type=int, default=8000)
+    serve_v2.add_argument("--model-name")
+    serve_v2.add_argument("--device", type=int, default=0)
+    serve_v2.add_argument(
+        "--strict-model",
+        action="store_true",
+        help="reject request model IDs that differ from the loaded model name",
+    )
+    serve_v2.add_argument(
+        "--mtp-drafts", type=int, default=0,
+        help="native MTP draft depth (0 disables speculative decoding)",
+    )
+    serve_v2.add_argument(
+        "--api-key", default=os.environ.get("COLIBRI_API_KEY")
+    )
+    serve_v2.add_argument("--cors-origin", default="*")
+    serve_v2.add_argument("--context-window", type=int, default=32_768)
+    # Agentic clients (Claude Code etc.) request large output budgets and treat
+    # them as an upper bound; the service clamps requests to this ceiling.
+    serve_v2.add_argument("--max-new-tokens", type=int, default=4096)
+    serve_v2.add_argument(
+        "--gpu-cache-mib",
+        type=int,
+        default=0,
+        help="total native v2 CUDA allocation budget in MiB (0 = auto-fit to free VRAM)",
+    )
+    serve_v2.add_argument(
+        "--moe-device",
+        choices=("gpu", "cpu", "hybrid"),
+        default="hybrid",
+        help="routed-expert execution policy",
+    )
+
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
     create.add_argument("--layers", type=int, default=6)
@@ -257,6 +424,462 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "inspect-gguf-v2":
+        with V2Model(args.model) as model:
+            print(json.dumps({"model": model.info, "tensors": list(model.tensors())}, indent=2))
+        return 0
+    if args.command == "generate-text-v2":
+        with V2Model(args.model) as model, model.session(args.context_window) as session:
+            session.prompt(list(args.prompt.encode("utf-8")))
+            generated = [session.decode() for _ in range(args.max_new_tokens)]
+            print(json.dumps({"text": "", "generated_tokens": generated, "execution": "native-v2", "stats": session.stats}, indent=2))
+        return 0
+    if args.command == "benchmark-v2":
+        if args.iterations < 3:
+            raise SystemExit("benchmark-v2 requires at least 3 measured iterations")
+        if args.warmup < 1:
+            raise SystemExit("benchmark-v2 requires at least 1 warmup iteration")
+        if args.context <= 0:
+            raise SystemExit("benchmark-v2 requires a positive context")
+        if args.runtime == "native":
+            with V2Model(args.model) as model:
+                cache_mib = args.gpu_cache_mib  # 0 = auto-fit to free VRAM
+                prompt_text = args.prompt
+                if args.chat:
+                    if prompt_text is None:
+                        raise SystemExit("--chat requires --prompt")
+                    prompt_text = (
+                        f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
+                        "<|im_start|>assistant\n<think>\n"
+                    )
+                prompt_tokens = (
+                    model.tokenize(prompt_text)
+                    if prompt_text is not None
+                    else [int(value) for value in args.tokens.split(",") if value.strip()]
+                )
+                if not prompt_tokens:
+                    raise SystemExit("benchmark prompt must contain at least one token")
+                with model.native_qwen_runtime(
+                    context_limit=args.context,
+                        gpu_cache_bytes=cache_mib * 1024**2,
+                        moe_device=args.moe_device,
+                        mtp_drafts=args.mtp_drafts,
+                ) as runtime:
+                    prepare_started = time.perf_counter()
+                    runtime.prepare()
+                    prepare_seconds = time.perf_counter() - prepare_started
+                    prompt_started = time.perf_counter()
+                    current_token = 0
+                    for token in prompt_tokens:
+                        current_token = runtime.decode(token)
+                    prompt_seconds = time.perf_counter() - prompt_started
+                    if args.mtp_drafts:
+                        warm_outputs: list[int] = []
+                        warm_started = time.perf_counter()
+                        runtime.generate(
+                            prompt_tokens,
+                            args.warmup + 1,
+                            warm_outputs.append,
+                        )
+                        warm_elapsed = time.perf_counter() - warm_started
+                        measured_prompt = [
+                            *prompt_tokens,
+                            *warm_outputs[:-1],
+                        ]
+                        measured_outputs: list[int] = []
+                        measured_started = 0.0
+
+                        def receive_measured(token: int) -> None:
+                            nonlocal measured_started
+                            measured_outputs.append(token)
+                            if len(measured_outputs) == 1:
+                                measured_started = time.perf_counter()
+
+                        steady_start = runtime.info
+                        runtime.generate(
+                            measured_prompt,
+                            args.iterations + 1,
+                            receive_measured,
+                        )
+                        measured_total = time.perf_counter() - measured_started
+                        runtime_info = runtime.info
+                        generated = [
+                            *warm_outputs[1:],
+                            *measured_outputs[1:],
+                        ]
+                        steady_state = _steady_state_counters(
+                            steady_start, runtime_info
+                        )
+                        average = measured_total / args.iterations
+                        print(json.dumps({
+                            "execution": (
+                                f"native-v2-cpp-cuda-{args.moe_device}-moe-mtp"
+                                if args.moe_device != "gpu"
+                                else "native-v2-cpp-cuda-mtp"
+                            ),
+                            "measurement": "aggregate native generation wall time",
+                            "device": runtime_info["device"],
+                            "prepare_seconds": prepare_seconds,
+                            "prompt_tokens": len(prompt_tokens),
+                            "prompt_seconds": prompt_seconds,
+                            "prompt_tokens_per_second": (
+                                len(prompt_tokens) / prompt_seconds
+                            ),
+                            "first_token_latency_seconds": (
+                                warm_elapsed / args.warmup
+                            ),
+                            "warmup_iterations": args.warmup,
+                            "iterations": args.iterations,
+                            "decode_batch_seconds": measured_total,
+                            "decode_median_seconds": average,
+                            "decode_variance_seconds2": 0.0,
+                            "decode_tokens_per_second": (
+                                args.iterations / measured_total
+                            ),
+                            "decode_median_tokens_per_second": 1.0 / average,
+                            "generated_tokens": generated,
+                            "generated_text": model.decode_tokens(generated),
+                            "steady_state": steady_state,
+                            "runtime": runtime_info,
+                        }, indent=2))
+                        return 0
+                    generated = []
+                    warmup_seconds = []
+                    measured_seconds = []
+                    steady_start = None
+                    for step in range(args.warmup + args.iterations):
+                        if step == args.warmup:
+                            steady_start = runtime.info
+                        step_started = time.perf_counter()
+                        current_token = runtime.decode(current_token)
+                        elapsed = time.perf_counter() - step_started
+                        generated.append(current_token)
+                        (warmup_seconds if step < args.warmup else measured_seconds).append(elapsed)
+                    runtime_info = runtime.info
+                measured_total = sum(measured_seconds)
+                steady_state = _steady_state_counters(steady_start, runtime_info)
+                print(json.dumps({
+                    "execution": (
+                        f"native-v2-cpp-cuda-{args.moe_device}-moe"
+                        if args.moe_device != "gpu" else "native-v2-cpp-cuda"
+                    ),
+                    "device": runtime_info["device"],
+                    "prepare_seconds": prepare_seconds,
+                    "prompt_tokens": len(prompt_tokens),
+                    "prompt_seconds": prompt_seconds,
+                    "prompt_tokens_per_second": len(prompt_tokens) / prompt_seconds,
+                    "first_token_latency_seconds": warmup_seconds[0],
+                    "warmup_iterations": args.warmup,
+                    "iterations": args.iterations,
+                    "decode_seconds": measured_seconds,
+                    "decode_median_seconds": statistics.median(measured_seconds),
+                    "decode_variance_seconds2": statistics.pvariance(measured_seconds),
+                    "decode_tokens_per_second": args.iterations / measured_total,
+                    "decode_median_tokens_per_second": 1.0 / statistics.median(measured_seconds),
+                    "generated_tokens": generated,
+                    "generated_text": model.decode_tokens(generated),
+                    "steady_state": steady_state,
+                    "runtime": runtime_info,
+                }, indent=2))
+            return 0
+        cuda_enabled = False
+        try:
+            with V2Model(args.model) as model:
+                decoder = QwenV2Decoder(model)
+                state = decoder.new_state()
+                cache_mib = args.gpu_cache_mib
+                if cache_mib <= 0:
+                    free_mib = V2Model.gpu_info()["free_memory"] // (1024 * 1024)
+                    cache_mib = max(1024, min(6144, free_mib - 4096))
+                accelerator = configure_cuda(cache_mib=cache_mib)
+                cuda_enabled = True
+                prompt_text = args.prompt
+                if args.chat:
+                    if prompt_text is None:
+                        raise SystemExit("--chat requires --prompt")
+                    prompt_text = (
+                        f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
+                        "<|im_start|>assistant\n<think>\n"
+                    )
+                prompt_tokens = (
+                    model.tokenize(prompt_text)
+                    if prompt_text is not None
+                    else [int(value) for value in args.tokens.split(",") if value.strip()]
+                )
+                if not prompt_tokens:
+                    raise SystemExit("benchmark prompt must contain at least one token")
+                prompt_started = time.perf_counter()
+                for token in prompt_tokens[:-1]:
+                    decoder.forward_token_cuda(token, state, accelerator)
+                accelerator.cp.cuda.runtime.deviceSynchronize()
+                prompt_seconds = time.perf_counter() - prompt_started
+
+                current_token = prompt_tokens[-1]
+                generated = []
+                warmup_seconds = []
+                measured_seconds = []
+                for step in range(args.warmup + args.iterations):
+                    step_started = time.perf_counter()
+                    hidden, _ = decoder.forward_token_cuda(
+                        current_token, state, accelerator
+                    )
+                    logits = decoder.logits_cuda(hidden, accelerator)
+                    current_token = int(accelerator.cp.argmax(logits).get())
+                    elapsed = time.perf_counter() - step_started
+                    generated.append(current_token)
+                    if step < args.warmup:
+                        warmup_seconds.append(elapsed)
+                    else:
+                        measured_seconds.append(elapsed)
+                measured_total = sum(measured_seconds)
+                output = {
+                    "execution": "native-v2-cuda",
+                    "device": accelerator.device_name,
+                    "prompt_tokens": len(prompt_tokens),
+                    "prompt_tokens_processed": max(0, len(prompt_tokens) - 1),
+                    "prompt_seconds": prompt_seconds,
+                    "prompt_tokens_per_second": (
+                        (len(prompt_tokens) - 1) / prompt_seconds
+                        if prompt_seconds and len(prompt_tokens) > 1 else 0.0
+                    ),
+                    "first_token_latency_seconds": warmup_seconds[0],
+                    "warmup_iterations": args.warmup,
+                    "iterations": args.iterations,
+                    "decode_seconds": measured_seconds,
+                    "decode_median_seconds": statistics.median(measured_seconds),
+                    "decode_variance_seconds2": statistics.pvariance(measured_seconds),
+                    "decode_tokens_per_second": (
+                        args.iterations / measured_total if measured_total else 0.0
+                    ),
+                    "generated_tokens": generated,
+                    "generated_text": model.decode_tokens(generated),
+                    "cuda_stats": accelerator.stats(),
+                }
+                print(json.dumps(output, indent=2))
+        finally:
+            if cuda_enabled:
+                disable_cuda()
+        return 0
+    if args.command == "probe-qwen-v2":
+        cuda_enabled = False
+        with V2Model(args.model) as model:
+            model.validate_qwen()
+            width = int(model.config["hidden_size"])
+            hidden = model.qwen_embedding(args.token_id, width)
+            try:
+                model.qwen_layer_tensor(args.layer, "attention_q")
+            except Exception:
+                block = QwenDeltaLayer(model, args.layer)
+                state = block.new_state()
+                if args.device == "cuda":
+                    accelerator = configure_cuda(cache_mib=512)
+                    cuda_enabled = True
+                    hidden = block.forward_cuda(hidden, state, accelerator).get().tolist()
+                else:
+                    hidden = block.forward_residual(hidden, state)
+                block_kind = "deltanet"
+            else:
+                block = V2QwenFullAttentionLayer(model, args.layer)
+                state = block.new_state()
+                if args.device == "cuda":
+                    accelerator = configure_cuda(cache_mib=512)
+                    cuda_enabled = True
+                    hidden = block.forward_cuda(hidden, state, accelerator).get().tolist()
+                else:
+                    hidden = block.forward_residual(hidden, state)
+                block_kind = "attention"
+            mixer_hidden = list(hidden)
+            moe = V2QwenMoELayer(model, args.layer)
+            if args.device == "cuda":
+                output_device, experts, weights = moe.forward_cuda(hidden, accelerator)
+                output = output_device.get().tolist()
+            else:
+                output, experts, weights = moe.forward_residual(hidden)
+            print(json.dumps({
+                "execution": f"native-v2-{args.device}",
+                "device": args.device,
+                "layer": args.layer,
+                "block": block_kind,
+                "token_id": args.token_id,
+                "hidden_size": len(output),
+                "experts": experts,
+                "weights": weights,
+                "output_first": output[:8],
+                "output_min": min(output),
+                "output_max": max(output),
+                "mixer_first": mixer_hidden[:8],
+                "mixer_min": min(mixer_hidden),
+                "mixer_max": max(mixer_hidden),
+                "shared_first": (moe.last_cuda_shared if args.device == "cuda" else moe.last_cpu_shared).get().tolist()[:8]
+                if args.device == "cuda" else (moe.last_cpu_shared.tolist()[:8]),
+                "routed_first": (moe.last_cuda_routed if args.device == "cuda" else moe.last_cpu_routed).get().tolist()[:8]
+                if args.device == "cuda" else (moe.last_cpu_routed.tolist()[:8]),
+                "expert_gate_first": (moe.last_cuda_expert[0] if args.device == "cuda" else moe.last_cpu_expert[0]).get().tolist()[:8]
+                if args.device == "cuda" else moe.last_cpu_expert[0].tolist()[:8],
+                "expert_activated_first": (moe.last_cuda_expert[1] if args.device == "cuda" else moe.last_cpu_expert[1]).get().tolist()[:8]
+                if args.device == "cuda" else moe.last_cpu_expert[1].tolist()[:8],
+                "expert_down_first": (moe.last_cuda_expert[2] if args.device == "cuda" else moe.last_cpu_expert[2]).get().tolist()[:8]
+                if args.device == "cuda" else moe.last_cpu_expert[2].tolist()[:8],
+            }, indent=2))
+        if cuda_enabled:
+            disable_cuda()
+        return 0
+    if args.command == "probe-qwen-native-v2":
+        if args.generate_tokens < 0:
+            raise SystemExit("--generate-tokens must be non-negative")
+        if args.context <= 0 or args.gpu_cache_mib <= 0:
+            raise SystemExit("--context and --gpu-cache-mib must be positive")
+        with V2Model(args.model) as model:
+            prompt_text = args.prompt
+            if args.chat:
+                if prompt_text is None:
+                    raise SystemExit("--chat requires --prompt")
+                prompt_text = (
+                    f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
+                    "<|im_start|>assistant\n<think>\n"
+                )
+            prompt_tokens = (
+                model.tokenize(prompt_text)
+                if prompt_text is not None else [args.token_id]
+            )
+            if not prompt_tokens:
+                raise SystemExit("native Qwen prompt must contain at least one token")
+            generated: list[int] = []
+            step_seconds: list[float] = []
+            started = time.perf_counter()
+            with model.native_qwen_runtime(
+                context_limit=args.context,
+                    gpu_cache_bytes=args.gpu_cache_mib * 1024**2,
+                    moe_device=args.moe_device,
+                    mtp_drafts=args.mtp_drafts,
+            ) as runtime:
+                prepare_started = time.perf_counter()
+                runtime.prepare()
+                prepare_seconds = time.perf_counter() - prepare_started
+                next_token = 0
+                for token in prompt_tokens:
+                    step_started = time.perf_counter()
+                    next_token = runtime.decode(token)
+                    step_seconds.append(time.perf_counter() - step_started)
+                for index in range(args.generate_tokens):
+                    generated.append(next_token)
+                    if index + 1 < args.generate_tokens:
+                        step_started = time.perf_counter()
+                        next_token = runtime.decode(next_token)
+                        step_seconds.append(time.perf_counter() - step_started)
+                runtime_info = runtime.info
+            print(json.dumps({
+                "execution": (
+                    f"native-v2-cpp-cuda-{args.moe_device}-moe"
+                    if args.moe_device != "gpu" else "native-v2-cpp-cuda"
+                ),
+                "prompt": prompt_text,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": generated,
+                "generated_pieces": [model.token_text(token) for token in generated],
+                "generated_text": model.decode_tokens(generated),
+                "prepare_seconds": prepare_seconds,
+                "step_seconds": step_seconds,
+                "decode_median_seconds": statistics.median(step_seconds),
+                "decode_tokens_per_second": (
+                    1.0 / statistics.median(step_seconds)
+                    if step_seconds and statistics.median(step_seconds) else 0.0
+                ),
+                "elapsed_seconds": time.perf_counter() - started,
+                "runtime": runtime_info,
+            }, indent=2))
+        return 0
+    if args.command == "probe-qwen-stack-v2":
+        cuda_enabled = False
+        with V2Model(args.model) as model:
+            decoder = QwenV2Decoder(model)
+            state = decoder.new_state()
+            accelerator = None
+            if args.device == "cuda":
+                cache_mib = args.gpu_cache_mib
+                if cache_mib <= 0:
+                    free_mib = V2Model.gpu_info()["free_memory"] // (1024 * 1024)
+                    cache_mib = max(1024, min(6144, free_mib - 4096))
+                accelerator = configure_cuda(cache_mib=cache_mib)
+                accelerator.enable_profiling(args.profile)
+                cuda_enabled = True
+            generated = []
+            prompt_text = args.prompt
+            if args.chat:
+                if prompt_text is None:
+                    raise SystemExit("--chat requires --prompt")
+                prompt_text = f"<|im_start|>user\n{prompt_text}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            prompt_tokens = model.tokenize(prompt_text) if prompt_text is not None else [args.token_id]
+            started = time.perf_counter()
+            prompt_step_seconds = []
+            decode_step_seconds = []
+            for prompt_token in prompt_tokens[:-1]:
+                step_started = time.perf_counter()
+                if args.device == "cuda":
+                    decoder.forward_token_cuda(prompt_token, state, accelerator)
+                    if args.profile:
+                        accelerator.cp.cuda.runtime.deviceSynchronize()
+                else:
+                    decoder.forward_token(prompt_token, state)
+                if args.profile:
+                    prompt_step_seconds.append(time.perf_counter() - step_started)
+            current_token = prompt_tokens[-1]
+            values, routes, logits = None, (), None
+            for step in range(args.generate_tokens + 1):
+                step_started = time.perf_counter()
+                if args.device == "cuda":
+                    hidden, routes = decoder.forward_token_cuda(current_token, state, accelerator)
+                    logits_device = decoder.logits_cuda(hidden, accelerator)
+                    next_token = int(accelerator.cp.argmax(logits_device).get())
+                    if step == args.generate_tokens:
+                        values = hidden.get().tolist()
+                        top = accelerator.cp.argsort(logits_device)[-args.top_k:][::-1]
+                        top_tokens = top.get().tolist()
+                        top_logits = logits_device[top].get().tolist()
+                else:
+                    values, routes = decoder.forward_token(current_token, state)
+                    logits = model.qwen_lm_head(values, int(model.config["vocabulary_size"]))
+                    next_token = max(range(len(logits)), key=logits.__getitem__)
+                    if step == args.generate_tokens:
+                        top_tokens = sorted(range(len(logits)), key=logits.__getitem__, reverse=True)[:args.top_k]
+                        top_logits = [logits[index] for index in top_tokens]
+                if step < args.generate_tokens:
+                    generated.append(next_token)
+                    current_token = next_token
+                if args.profile:
+                    if accelerator is not None:
+                        accelerator.cp.cuda.runtime.deviceSynchronize()
+                    decode_step_seconds.append(time.perf_counter() - step_started)
+            print(json.dumps({
+                "execution": f"native-v2-{args.device}",
+                "device": args.device,
+                "token_id": args.token_id,
+                "prompt": prompt_text,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": generated,
+                "generated_pieces": [model.token_text(token) for token in generated],
+                "generated_text": model.decode_tokens(generated),
+                "layers": decoder.layers,
+                "hidden_size": len(values),
+                "routes_recorded": len(routes),
+                "top_tokens": top_tokens,
+                "top_logits": top_logits,
+                "hidden_first": values[:8],
+                "hidden_min": min(values),
+                "hidden_max": max(values),
+                "elapsed_seconds": time.perf_counter() - started,
+                "profile": {
+                    "prompt_step_seconds": prompt_step_seconds,
+                    "decode_step_seconds": decode_step_seconds,
+                    "cold_prompt_seconds": prompt_step_seconds[0] if prompt_step_seconds else 0.0,
+                    "warm_prompt_median_seconds": statistics.median(prompt_step_seconds[1:]) if len(prompt_step_seconds) > 1 else 0.0,
+                    "decode_median_seconds": statistics.median(decode_step_seconds) if decode_step_seconds else 0.0,
+                } if args.profile else None,
+                "cuda_stats": accelerator.stats() if accelerator is not None else None,
+            }, indent=2))
+        if cuda_enabled:
+            disable_cuda()
+        return 0
     if args.command == "inspect-hardware":
         topology = probe_hardware(args.storage_path)
         output = topology.to_json()
@@ -397,6 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
             cors_origin=args.cors_origin,
             expert_preload=args.expert_preload,
             cpu_moe_layers=args.cpu_moe_layers,
+            strict_model=args.strict_model,
             expert_preload_progress=_expert_preload_progress
             if args.expert_preload != "none"
             else None,
@@ -412,6 +1036,43 @@ def main(argv: list[str] | None = None) -> int:
             serve_http(service, host=args.host, port=args.port)
         except KeyboardInterrupt:
             print("Server stopped.", file=sys.stderr)
+        return 0
+
+    if args.command == "serve-v2":
+        from .v2_server import NativeV2InferenceService
+
+        if args.gpu_cache_mib < 0:
+            raise SystemExit("--gpu-cache-mib must be >= 0 (0 = auto-fit to free VRAM)")
+        print(
+            f"Loading native v2 GGUF from {args.model}...",
+            file=sys.stderr,
+            flush=True,
+        )
+        service = NativeV2InferenceService(
+            args.model,
+            model_name=args.model_name,
+            device=args.device,
+            context_window=args.context_window,
+            max_new_tokens=args.max_new_tokens,
+            gpu_cache_mib=args.gpu_cache_mib,
+                moe_device=args.moe_device,
+                mtp_drafts=args.mtp_drafts,
+                api_key=args.api_key,
+            cors_origin=args.cors_origin,
+            strict_model=args.strict_model,
+        )
+        print(
+            f"Serving {service.model_name} at http://{args.host}:{args.port} "
+            f"(native v2, {args.moe_device} MoE)",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            serve_http(service, host=args.host, port=args.port)
+        except KeyboardInterrupt:
+            print("Server stopped.", file=sys.stderr)
+        finally:
+            service.close()
         return 0
 
     if args.command == "generate-text":
@@ -825,7 +1486,9 @@ def _add_device_arguments(parser: argparse.ArgumentParser) -> None:
 def _configure_execution(args: argparse.Namespace) -> None:
     if args.device == "cuda":
         accelerator = configure_cuda(
-            cache_mib=args.gpu_cache_mib, device_id=args.cuda_device
+            cache_mib=args.gpu_cache_mib,
+            device_id=args.cuda_device,
+            kv_cache_type=getattr(args, "kv_cache_type", "f32"),
         )
         print(
             f"CUDA enabled: {accelerator.device_name} "

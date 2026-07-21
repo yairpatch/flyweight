@@ -42,7 +42,7 @@ class ExpertGroupingTests(unittest.TestCase):
     def test_long_attention_prefill_avoids_quadratic_batch(self) -> None:
         self.assertTrue(_use_batched_attention_prefill(512))
         self.assertFalse(_use_batched_attention_prefill(513))
-        self.assertEqual(_attention_prefill_chunk_size(), 512)
+        self.assertEqual(_attention_prefill_chunk_size(), 256)
 
 
 class CudaKernelTests(unittest.TestCase):
@@ -64,6 +64,25 @@ class CudaKernelTests(unittest.TestCase):
         tensor = BF16Tensor(shape, bf16_bytes(values))
         expected = tensor.matvec(vector, prefer_numpy=False)
         actual = tensor.matvec(vector)
+        for expected_value, actual_value in zip(expected, actual):
+            self.assertAlmostEqual(expected_value, actual_value, places=4)
+
+    def test_q8_transposed_matvec_matches_gguf_layout(self) -> None:
+        input_size, output_size = 5, 7
+        quantized = [((index * 3) % 17) - 8 for index in range(input_size * output_size)]
+        packed = bytearray()
+        for start in range(0, len(quantized), 32):
+            block = quantized[start : start + 32]
+            packed.extend(struct.pack("<e", 1.0))
+            packed.extend(struct.pack("<32b", *(block + [0] * (32 - len(block)))))
+        vector = [math.sin(index * 0.17) for index in range(input_size)]
+        actual = self.accelerator.q8_matvec_transposed(
+            bytes(packed), input_size, output_size, vector
+        )
+        expected = [
+            sum(quantized[output * input_size + input] * vector[input] for input in range(input_size))
+            for output in range(output_size)
+        ]
         for expected_value, actual_value in zip(expected, actual):
             self.assertAlmostEqual(expected_value, actual_value, places=4)
 

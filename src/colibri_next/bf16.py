@@ -49,13 +49,19 @@ class BF16Tensor:
             for (bits,) in struct.iter_unpack("<H", data)
         ]
 
-    def matvec(self, vector: list[float], *, prefer_numpy: bool = True) -> list[float]:
+    def matvec(
+        self,
+        vector: list[float],
+        *,
+        prefer_numpy: bool = True,
+        allow_cuda: bool = True,
+    ) -> list[float]:
         if len(self.shape) != 2:
             raise ValueError(f"matvec requires rank-2 BF16 tensor, got {self.shape}")
         rows, columns = self.shape
         if len(vector) != columns:
             raise ValueError(f"expected vector width {columns}, got {len(vector)}")
-        if prefer_numpy:
+        if prefer_numpy and allow_cuda:
             from .cuda import active_cuda
 
             accelerator = active_cuda()
@@ -106,5 +112,4 @@ class BF16Tensor:
             matrix = (chunk.astype(np.uint32) << 16).view(np.float32)
             output.extend((matrix @ input_vector).tolist())
         return output
-
 

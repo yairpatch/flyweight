@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .attention import AttentionKVCache, QwenFullAttentionLayer
+from .cuda import _attention_prefill_chunk_size
 from .expert import ExpertKey
 from .gated_delta import GatedDeltaState, QwenGatedDeltaLayer
 from .moe import QwenMoELayer
@@ -459,17 +460,46 @@ class QwenDecoderStack:
         )
 
     def prefill_device(
-        self, hidden: Any, state: DecoderState, accelerator: Any
+        self,
+        hidden: Any,
+        state: DecoderState,
+        accelerator: Any,
+        progress: Callable[[int, int], None] | None = None,
     ) -> Any:
         if hidden.ndim != 2 or hidden.shape[1] != self.hidden_size:
             raise ValueError("decoder sequence has the wrong hidden width")
         if len(state.layer_states) != len(self.layers):
             raise ValueError("decoder state layer count does not match stack")
         output = hidden
-        for layer, layer_state in zip(self.layers, state.layer_states):
-            output = layer.forward_sequence_device(
-                output, layer_state, accelerator
-            )
+        chunk_size = _attention_prefill_chunk_size()
+        for layer_state in state.layer_states:
+            layer_state.sequence_selected_experts = ()
+        for layer_index, (layer, layer_state) in enumerate(
+            zip(self.layers, state.layer_states)
+        ):
+            report_progress = progress if layer_index == len(self.layers) - 1 else None
+            if output.shape[0] <= chunk_size:
+                output = layer.forward_sequence_device(
+                    output, layer_state, accelerator
+                )
+                if report_progress is not None:
+                    report_progress(int(hidden.shape[0]), int(hidden.shape[0]))
+            else:
+                chunks = []
+                for start in range(0, int(output.shape[0]), chunk_size):
+                    chunks.append(
+                        layer.forward_sequence_device(
+                            output[start : start + chunk_size],
+                            layer_state,
+                            accelerator,
+                        )
+                    )
+                    if report_progress is not None:
+                        report_progress(
+                            min(start + chunk_size, int(hidden.shape[0])),
+                            int(hidden.shape[0]),
+                        )
+                output = accelerator.cp.concatenate(chunks, axis=0)
         state.tokens
         route_sequences = [
             layer_state.sequence_selected_experts

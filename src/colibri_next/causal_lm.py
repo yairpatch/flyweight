@@ -159,7 +159,10 @@ class QwenForCausalLM:
         return DeviceCausalLMResult(token_id, hidden, logits)
 
     def prefill_device(
-        self, token_ids: list[int], state: CausalLMState
+        self,
+        token_ids: list[int],
+        state: CausalLMState,
+        progress: Callable[[int, int], None] | None = None,
     ) -> DeviceCausalLMResult:
         if not token_ids:
             raise ValueError("token_ids must not be empty")
@@ -168,7 +171,7 @@ class QwenForCausalLM:
             [self.model_io.embed(token_id) for token_id in token_ids]
         )
         hidden = self.decoder.prefill_device(
-            embeddings, state.decoder_state, accelerator
+            embeddings, state.decoder_state, accelerator, progress=progress
         )[-1]
         hidden = accelerator.rms_norm_device(
             hidden,
@@ -182,7 +185,10 @@ class QwenForCausalLM:
         return DeviceCausalLMResult(token_ids[-1], hidden, logits)
 
     def prefill_device_with_hidden(
-        self, token_ids: list[int], state: CausalLMState
+        self,
+        token_ids: list[int],
+        state: CausalLMState,
+        progress: Callable[[int, int], None] | None = None,
     ) -> tuple[DeviceCausalLMResult, Any]:
         """Prefill returning last-position logits plus all decoder hiddens.
 
@@ -197,7 +203,7 @@ class QwenForCausalLM:
             [self.model_io.embed(token_id) for token_id in token_ids]
         )
         decoder_hidden = self.decoder.prefill_device(
-            embeddings, state.decoder_state, accelerator
+            embeddings, state.decoder_state, accelerator, progress=progress
         )
         hidden = accelerator.rms_norm_device(
             decoder_hidden[-1],
@@ -251,14 +257,20 @@ class QwenForCausalLM:
         return accelerator
 
     def prefill(
-        self, token_ids: list[int], state: CausalLMState
+        self,
+        token_ids: list[int],
+        state: CausalLMState,
+        progress: Callable[[int, int], None] | None = None,
     ) -> CausalLMResult:
         if not token_ids:
             raise ValueError("token_ids must not be empty")
         for token_id in token_ids[:-1]:
             embedding = self.model_io.embed(token_id)
             self.decoder.forward_token(embedding, state.decoder_state)
-        return self.forward_token(token_ids[-1], state)
+        result = self.forward_token(token_ids[-1], state)
+        if progress is not None:
+            progress(len(token_ids), len(token_ids))
+        return result
 
     def forward_ids(
         self, token_ids: list[int], state: CausalLMState

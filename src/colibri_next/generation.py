@@ -1,14 +1,39 @@
 from __future__ import annotations
 
+import inspect
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .causal_lm import QwenForCausalLM
 from .cuda import active_cuda
 from .sampling import LogitsSampler, SamplingConfig
 from .tokenizer import HuggingFaceTokenizer
+
+
+def _call_prefill(
+    method: Callable[..., Any],
+    token_ids: list[int],
+    state: Any,
+    progress: Callable[[int, int], None] | None,
+) -> Any:
+    """Call model prefill while preserving compatibility with older adapters."""
+    if progress is None:
+        return method(token_ids, state)
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        # C-extension or proxy methods may not expose a signature. The current
+        # model protocol supports progress, so prefer the new call shape.
+        return method(token_ids, state, progress=progress)
+    if any(
+        parameter.name == "progress"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        return method(token_ids, state, progress=progress)
+    return method(token_ids, state)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +110,7 @@ class TextGenerator:
         sampling: SamplingConfig | None = None,
         system: str | None = None,
         enable_thinking: bool = False,
+        progress: Callable[[int, int], None] | None = None,
     ) -> GenerationResult:
         prompt_ids = self.tokenizer.encode_chat(
             prompt,
@@ -95,6 +121,7 @@ class TextGenerator:
             prompt_ids,
             max_new_tokens=max_new_tokens,
             sampling=sampling,
+            progress=progress,
         )
 
     def generate_messages(
@@ -104,6 +131,7 @@ class TextGenerator:
         max_new_tokens: int = 8,
         sampling: SamplingConfig | None = None,
         enable_thinking: bool = False,
+        progress: Callable[[int, int], None] | None = None,
     ) -> GenerationResult:
         prompt_ids = self.tokenizer.encode_messages(
             messages, enable_thinking=enable_thinking
@@ -112,6 +140,7 @@ class TextGenerator:
             prompt_ids,
             max_new_tokens=max_new_tokens,
             sampling=sampling,
+            progress=progress,
         )
 
     def stream_messages(
@@ -121,6 +150,7 @@ class TextGenerator:
         max_new_tokens: int = 8,
         sampling: SamplingConfig | None = None,
         enable_thinking: bool = False,
+        progress: Callable[[int, int], None] | None = None,
     ) -> Iterator[GenerationStep]:
         prompt_ids = self.tokenizer.encode_messages(
             messages, enable_thinking=enable_thinking
@@ -129,6 +159,7 @@ class TextGenerator:
             prompt_ids,
             max_new_tokens=max_new_tokens,
             sampling=sampling,
+            progress=progress,
         )
 
     def generate_text(
@@ -137,11 +168,13 @@ class TextGenerator:
         *,
         max_new_tokens: int = 8,
         sampling: SamplingConfig | None = None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> GenerationResult:
         return self._generate_ids(
             self.tokenizer.encode(prompt),
             max_new_tokens=max_new_tokens,
             sampling=sampling,
+            progress=progress,
         )
 
     def stream_text(
@@ -150,11 +183,13 @@ class TextGenerator:
         *,
         max_new_tokens: int = 8,
         sampling: SamplingConfig | None = None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> Iterator[GenerationStep]:
         return self._stream_ids(
             self.tokenizer.encode(prompt),
             max_new_tokens=max_new_tokens,
             sampling=sampling,
+            progress=progress,
         )
     def _generate_ids(
         self,
@@ -162,12 +197,14 @@ class TextGenerator:
         *,
         max_new_tokens: int,
         sampling: SamplingConfig | None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> GenerationResult:
         final_step = None
         for step in self._stream_ids(
             prompt_ids,
             max_new_tokens=max_new_tokens,
             sampling=sampling,
+            progress=progress,
         ):
             if step.finished:
                 final_step = step
@@ -187,6 +224,7 @@ class TextGenerator:
         *,
         max_new_tokens: int,
         sampling: SamplingConfig | None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> Iterator[GenerationStep]:
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
@@ -215,10 +253,22 @@ class TextGenerator:
             and self.model.load_mtp() is not None
         )
         remaining_ids = prompt_ids[cached_tokens:]
+        if progress is not None:
+            progress(cached_tokens, len(prompt_ids))
+
+        def report_prefill(done: int, _total: int) -> None:
+            if progress is not None:
+                progress(cached_tokens + done, len(prompt_ids))
+
         if remaining_ids:
             if use_mtp:
                 prompt_result, decoder_hidden = (
-                    self.model.prefill_device_with_hidden(remaining_ids, state)
+                    _call_prefill(
+                        self.model.prefill_device_with_hidden,
+                        remaining_ids,
+                        state,
+                        report_prefill,
+                    )
                 )
                 mtp = self.model.mtp
                 if cached_tokens == 0 or state.mtp_cache is None:
@@ -251,9 +301,19 @@ class TextGenerator:
                 if use_mtp:
                     state.mtp_hidden = decoder_hidden[-1]
             elif accelerator is not None:
-                prompt_result = self.model.prefill_device(remaining_ids, state)
+                prompt_result = _call_prefill(
+                    self.model.prefill_device,
+                    remaining_ids,
+                    state,
+                    report_prefill,
+                )
             else:
-                prompt_result = self.model.prefill(remaining_ids, state)
+                prompt_result = _call_prefill(
+                    self.model.prefill,
+                    remaining_ids,
+                    state,
+                    report_prefill,
+                )
             logits = prompt_result.logits
         else:
             assert cached is not None

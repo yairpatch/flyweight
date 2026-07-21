@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,10 +75,37 @@ def _use_batched_attention_prefill(tokens: int) -> bool:
 
 
 def _attention_prefill_chunk_size() -> int:
-    size = int(os.environ.get("COLIBRI_ATTENTION_PREFILL_CHUNK", "512"))
+    size = int(os.environ.get("COLIBRI_ATTENTION_PREFILL_CHUNK", "256"))
     if size <= 0:
         raise ValueError("COLIBRI_ATTENTION_PREFILL_CHUNK must be positive")
     return size
+
+
+def _kv_cache_type(cache: Any) -> str:
+    cache_type = getattr(cache, "cuda_cache_type", None)
+    if cache_type is None:
+        accelerator = active_cuda()
+        cache_type = getattr(accelerator, "kv_cache_type", None)
+        if cache_type is None:
+            cache_type = os.environ.get("COLIBRI_KV_CACHE_TYPE", "f32").lower()
+        if cache_type not in {"f32", "q8"}:
+            raise ValueError("COLIBRI_KV_CACHE_TYPE must be 'f32' or 'q8'")
+        cache.cuda_cache_type = cache_type
+    return cache_type
+
+
+def _quantize_kv(values: Any, cp: Any) -> tuple[Any, Any]:
+    """Symmetrically quantize [..., head_dim] values with row scales."""
+    scales = cp.max(cp.abs(values), axis=-1) / cp.float32(127.0)
+    scales = cp.maximum(scales, cp.float32(1e-8))
+    quantized = cp.clip(
+        cp.rint(values / scales[..., None]), -127, 127
+    ).astype(cp.int8)
+    return quantized, scales
+
+
+def _dequantize_kv(values: Any, scales: Any, cp: Any) -> Any:
+    return values.astype(cp.float32) * scales[..., None]
 
 
 class CudaUnavailableError(RuntimeError):
@@ -89,6 +118,7 @@ class _CacheEntry:
     arrays: tuple[Any, ...]
     byte_size: int
     protected: bool
+    priority_until: int = 0
 
 
 @dataclass(slots=True)
@@ -97,12 +127,26 @@ class _PendingPrefetch:
     pinned_buffers: tuple[Any, ...]
 
 
+@dataclass(slots=True)
+class _InFlightBuffers:
+    event: Any
+    arrays: tuple[Any, ...]
+
+
 class CudaAccelerator:
     """CuPy CUDA execution with a bounded packed-weight cache."""
 
-    def __init__(self, *, cache_mib: int = 8192, device_id: int = 0):
+    def __init__(
+        self,
+        *,
+        cache_mib: int = 8192,
+        device_id: int = 0,
+        kv_cache_type: str | None = None,
+    ):
         if cache_mib <= 0:
             raise ValueError("cache_mib must be positive")
+        if kv_cache_type is not None and kv_cache_type not in {"f32", "q8"}:
+            raise ValueError("kv_cache_type must be 'f32' or 'q8'")
         os.environ.setdefault(
             "CUPY_CACHE_DIR",
             str(Path(tempfile.gettempdir()) / "colibri-next-cupy-cache"),
@@ -124,11 +168,22 @@ class CudaAccelerator:
             )
         self.cp = cp
         self.device_id = device_id
+        self.kv_cache_type = kv_cache_type
         self.cache_limit_bytes = cache_mib * 1024 * 1024
         self.cache_bytes = 0
         self.cache_hits = 0
         self.cache_misses = 0
         self.cache_evictions = 0
+        self.cache_eviction_scans = 0
+        self.cache_eviction_entries_examined = 0
+        self.cache_priority_promotions = 0
+        self._cache_priority_epoch = 0
+        self.profiling = False
+        self._profile_events: dict[str, list[tuple[Any, Any]]] = {}
+        self._profile_host_seconds: dict[str, float] = {}
+        self._profile_host_calls: dict[str, int] = {}
+        self.profile_upload_seconds = 0.0
+        self.profile_upload_calls = 0
         self.device_resident_decode_tokens = 0
         self.batched_prefill_tokens = 0
         self.batched_moe_tokens = 0
@@ -152,9 +207,24 @@ class CudaAccelerator:
         self._pending_prefetches: OrderedDict[
             tuple[str, int], _PendingPrefetch
         ] = OrderedDict()
+        self._expert_load_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="colibri-expert-load"
+        )
+        self._pending_expert_loads: dict[tuple[int, int], Future[Any]] = {}
+        self.expert_load_requests = 0
+        self.expert_load_completions = 0
+        self._inflight_buffers: list[_InFlightBuffers] = []
+        self._moe_address_cache: OrderedDict[
+            tuple[int, ...], Any
+        ] = OrderedDict()
+        self._resident_moe_table: dict[str, Any] | None = None
+        self.moe_address_cache_hits = 0
+        self.moe_address_cache_misses = 0
         self._rope_cache: dict[tuple[int, float, int], tuple[Any, Any]] = {}
         self._moe_transfer_cache: dict[int, tuple[Any, Any, Any]] = {}
+        self._v2_weight_cache: dict[tuple[int, int], Any] = {}
         self._delta_segment_state = "unknown"
+        self._native_moe_state = "unknown"
         self._delta_segment_tables: dict[tuple, dict] = {}
         self._delta_segment_scratch_cache: dict | None = None
         with cp.cuda.Device(device_id):
@@ -181,6 +251,30 @@ class CudaAccelerator:
                 _KERNEL_SOURCE, "route_topk_rows"
             )
             self._q4_kernel = cp.RawKernel(_KERNEL_SOURCE, "q4_matvec")
+            self._q8_transposed_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q8_matvec_transposed_warp"
+            )
+            self._q5k_transposed_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q5k_matvec_transposed"
+            )
+            self._q6k_transposed_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q6k_matvec_transposed"
+            )
+            self._q5k_swiglu_transposed_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q5k_swiglu_transposed"
+            )
+            self._q6k_accumulate_transposed_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q6k_accumulate_transposed"
+            )
+            self._q5k_grouped_swiglu_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q5k_grouped_swiglu"
+            )
+            self._q6k_grouped_accumulate_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q6k_grouped_accumulate"
+            )
+            self._q8_grouped_accumulate_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q8_grouped_accumulate"
+            )
             self._silu_mul_kernel = cp.RawKernel(_KERNEL_SOURCE, "silu_mul")
             self._scaled_add_kernel = cp.RawKernel(_KERNEL_SOURCE, "scaled_add")
             self._q4_batched_kernel = cp.RawKernel(
@@ -191,6 +285,12 @@ class CudaAccelerator:
             )
             self._q4_weighted_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "q4_batched_weighted_matvec"
+            )
+            self._q4_selected_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q4_selected_batched_matvec"
+            )
+            self._q4_selected_weighted_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q4_selected_weighted_matvec"
             )
             self._quantize_q8_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "quantize_q8_blocks"
@@ -210,6 +310,61 @@ class CudaAccelerator:
             self._delta_recurrent_sequence_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "delta_recurrent_sequence"
             )
+
+    def enable_profiling(self, enabled: bool = True) -> None:
+        self.profiling = enabled
+        if enabled:
+            self._profile_events.clear()
+            self._profile_host_seconds.clear()
+            self._profile_host_calls.clear()
+            self.profile_upload_seconds = 0.0
+            self.profile_upload_calls = 0
+
+    def profile_start(self) -> Any | None:
+        if not self.profiling:
+            return None
+        event = self.cp.cuda.Event()
+        event.record()
+        return event
+
+    def profile_end(self, name: str, start: Any | None) -> None:
+        if start is None:
+            return
+        end = self.cp.cuda.Event()
+        end.record()
+        self._profile_events.setdefault(name, []).append((start, end))
+
+    def profile_host(self, name: str, seconds: float) -> None:
+        if not self.profiling:
+            return
+        self._profile_host_seconds[name] = (
+            self._profile_host_seconds.get(name, 0.0) + seconds
+        )
+        self._profile_host_calls[name] = self._profile_host_calls.get(name, 0) + 1
+
+    def _profile_stats(self) -> dict[str, Any]:
+        regions = {}
+        for name, events in self._profile_events.items():
+            milliseconds = sum(
+                self.cp.cuda.get_elapsed_time(start, end)
+                for start, end in events
+            )
+            regions[name] = {
+                "calls": len(events),
+                "milliseconds": milliseconds,
+            }
+        return {
+            "regions": regions,
+            "host_regions": {
+                name: {
+                    "calls": self._profile_host_calls[name],
+                    "milliseconds": seconds * 1000.0,
+                }
+                for name, seconds in self._profile_host_seconds.items()
+            },
+            "weight_upload_calls": self.profile_upload_calls,
+            "weight_upload_milliseconds": self.profile_upload_seconds * 1000.0,
+        }
 
     @property
     def device_name(self) -> str:
@@ -461,8 +616,20 @@ class CudaAccelerator:
             grouped_queries = queries.reshape(
                 layer.num_key_value_heads, groups, layer.head_dim
             )
-            cached_keys = cache.cuda_keys[:, : cache.tokens, :]
-            cached_values = cache.cuda_values[:, : cache.tokens, :]
+            if _kv_cache_type(cache) == "q8":
+                cached_keys = _dequantize_kv(
+                    cache.cuda_keys[:, : cache.tokens, :],
+                    cache.cuda_key_scales[:, : cache.tokens],
+                    cp,
+                )
+                cached_values = _dequantize_kv(
+                    cache.cuda_values[:, : cache.tokens, :],
+                    cache.cuda_value_scales[:, : cache.tokens],
+                    cp,
+                )
+            else:
+                cached_keys = cache.cuda_keys[:, : cache.tokens, :]
+                cached_values = cache.cuda_values[:, : cache.tokens, :]
             scores = cp.einsum(
                 "hgd,htd->hgt", grouped_queries, cached_keys
             ) * cp.float32(layer.head_dim**-0.5)
@@ -590,8 +757,20 @@ class CudaAccelerator:
             grouped_queries = queries.reshape(
                 tokens, kv_heads, groups, head_dim
             )
-            cached_keys = cache.cuda_keys[:, : cache.tokens, :]
-            cached_values = cache.cuda_values[:, : cache.tokens, :]
+            if _kv_cache_type(cache) == "q8":
+                cached_keys = _dequantize_kv(
+                    cache.cuda_keys[:, : cache.tokens, :],
+                    cache.cuda_key_scales[:, : cache.tokens],
+                    cp,
+                )
+                cached_values = _dequantize_kv(
+                    cache.cuda_values[:, : cache.tokens, :],
+                    cache.cuda_value_scales[:, : cache.tokens],
+                    cp,
+                )
+            else:
+                cached_keys = cache.cuda_keys[:, : cache.tokens, :]
+                cached_values = cache.cuda_values[:, : cache.tokens, :]
             scores = cp.einsum(
                 "tkgd,ksd->tkgs", grouped_queries, cached_keys
             ) * cp.float32(head_dim**-0.5)
@@ -645,15 +824,23 @@ class CudaAccelerator:
         self, cache: Any, keys: Any, values: Any
     ) -> None:
         cp = self.cp
+        cache_type = _kv_cache_type(cache)
         tokens = int(keys.shape[0])
         required = cache.tokens + tokens
         if cache.cuda_keys is None:
             cache.cuda_capacity = max(256, required)
+            dtype = cp.int8 if cache_type == "q8" else cp.float32
             cache.cuda_keys = cp.empty(
                 (cache.num_key_value_heads, cache.cuda_capacity, cache.head_dim),
-                dtype=cp.float32,
+                dtype=dtype,
             )
             cache.cuda_values = cp.empty_like(cache.cuda_keys)
+            if cache_type == "q8":
+                cache.cuda_key_scales = cp.empty(
+                    (cache.num_key_value_heads, cache.cuda_capacity),
+                    dtype=cp.float32,
+                )
+                cache.cuda_value_scales = cp.empty_like(cache.cuda_key_scales)
         elif required > cache.cuda_capacity:
             capacity = cache.cuda_capacity
             while capacity < required:
@@ -669,16 +856,35 @@ class CudaAccelerator:
             grown_values[:, : cache.tokens, :] = cache.cuda_values[
                 :, : cache.tokens, :
             ]
+            if cache_type == "q8":
+                grown_key_scales = cp.empty(
+                    (cache.num_key_value_heads, capacity), dtype=cp.float32
+                )
+                grown_value_scales = cp.empty_like(grown_key_scales)
+                grown_key_scales[:, : cache.tokens] = cache.cuda_key_scales[
+                    :, : cache.tokens
+                ]
+                grown_value_scales[:, : cache.tokens] = cache.cuda_value_scales[
+                    :, : cache.tokens
+                ]
+                cache.cuda_key_scales = grown_key_scales
+                cache.cuda_value_scales = grown_value_scales
             cache.cuda_keys = grown_keys
             cache.cuda_values = grown_values
             cache.cuda_capacity = capacity
         base = cache.tokens
-        cache.cuda_keys[:, base : base + tokens, :] = cp.transpose(
-            keys, (1, 0, 2)
-        )
-        cache.cuda_values[:, base : base + tokens, :] = cp.transpose(
-            values, (1, 0, 2)
-        )
+        keys = cp.transpose(keys, (1, 0, 2))
+        values = cp.transpose(values, (1, 0, 2))
+        if cache_type == "q8":
+            quantized_keys, key_scales = _quantize_kv(keys, cp)
+            quantized_values, value_scales = _quantize_kv(values, cp)
+            cache.cuda_keys[:, base : base + tokens, :] = quantized_keys
+            cache.cuda_values[:, base : base + tokens, :] = quantized_values
+            cache.cuda_key_scales[:, base : base + tokens] = key_scales
+            cache.cuda_value_scales[:, base : base + tokens] = value_scales
+        else:
+            cache.cuda_keys[:, base : base + tokens, :] = keys
+            cache.cuda_values[:, base : base + tokens, :] = values
         cache.tokens += tokens
 
     def _rope_factors(
@@ -717,17 +923,25 @@ class CudaAccelerator:
         self, cache: Any, keys: Any, values: Any
     ) -> None:
         cp = self.cp
+        cache_type = _kv_cache_type(cache)
         if cache.cuda_keys is None:
             cache.cuda_capacity = max(256, cache.tokens + 1)
+            dtype = cp.int8 if cache_type == "q8" else cp.float32
             cache.cuda_keys = cp.empty(
                 (
                     cache.num_key_value_heads,
                     cache.cuda_capacity,
                     cache.head_dim,
                 ),
-                dtype=cp.float32,
+                dtype=dtype,
             )
             cache.cuda_values = cp.empty_like(cache.cuda_keys)
+            if cache_type == "q8":
+                cache.cuda_key_scales = cp.empty(
+                    (cache.num_key_value_heads, cache.cuda_capacity),
+                    dtype=cp.float32,
+                )
+                cache.cuda_value_scales = cp.empty_like(cache.cuda_key_scales)
         elif cache.tokens >= cache.cuda_capacity:
             capacity = cache.cuda_capacity * 2
             grown_keys = cp.empty(
@@ -741,11 +955,32 @@ class CudaAccelerator:
             grown_values[:, : cache.tokens, :] = cache.cuda_values[
                 :, : cache.tokens, :
             ]
+            if cache_type == "q8":
+                grown_key_scales = cp.empty(
+                    (cache.num_key_value_heads, capacity), dtype=cp.float32
+                )
+                grown_value_scales = cp.empty_like(grown_key_scales)
+                grown_key_scales[:, : cache.tokens] = cache.cuda_key_scales[
+                    :, : cache.tokens
+                ]
+                grown_value_scales[:, : cache.tokens] = cache.cuda_value_scales[
+                    :, : cache.tokens
+                ]
+                cache.cuda_key_scales = grown_key_scales
+                cache.cuda_value_scales = grown_value_scales
             cache.cuda_keys = grown_keys
             cache.cuda_values = grown_values
             cache.cuda_capacity = capacity
-        cache.cuda_keys[:, cache.tokens, :] = keys
-        cache.cuda_values[:, cache.tokens, :] = values
+        if cache_type == "q8":
+            quantized_keys, key_scales = _quantize_kv(keys, cp)
+            quantized_values, value_scales = _quantize_kv(values, cp)
+            cache.cuda_keys[:, cache.tokens, :] = quantized_keys
+            cache.cuda_values[:, cache.tokens, :] = quantized_values
+            cache.cuda_key_scales[:, cache.tokens] = key_scales
+            cache.cuda_value_scales[:, cache.tokens] = value_scales
+        else:
+            cache.cuda_keys[:, cache.tokens, :] = keys
+            cache.cuda_values[:, cache.tokens, :] = values
         cache.tokens += 1
 
     def gated_delta(
@@ -1226,10 +1461,11 @@ class CudaAccelerator:
 
     def _float32_array(self, values: list[float]) -> Any:
         cp = self.cp
+        elements = int(getattr(values, "size", len(values)))
         (array,) = self._cached_arrays(
             "float32",
             values,
-            len(values) * 4,
+            elements * 4,
             lambda: (cp.asarray(values, dtype=cp.float32),),
             protected=True,
         )
@@ -1248,6 +1484,312 @@ class CudaAccelerator:
                 (packed, scales, input_vector, output, rows, columns),
             )
             return output.get().tolist()
+
+    def q8_matvec_transposed(
+        self,
+        raw: bytes,
+        input_size: int,
+        output_size: int,
+        vector: Any,
+        *,
+        return_device: bool = False,
+        cache_weight: bool = False,
+        protect_weight: bool = False,
+    ) -> Any:
+        """Multiply a GGML Q8_0 [input, output] tensor by a vector.
+
+        GGUF's Qwen matrices use the first dimension as the input width. The
+        quantized bytes therefore remain laid out as ``matrix[input, output]``
+        even though this operation emits one value per output column.
+        """
+        if input_size <= 0 or output_size <= 0:
+            raise ValueError("Q8 matvec dimensions must be positive")
+        cp = self.cp
+        with cp.cuda.Device(self.device_id):
+            if cache_weight:
+                (packed,) = self._cached_arrays(
+                    "v2_q8",
+                    raw,
+                    len(raw),
+                    lambda: (cp.asarray(memoryview(raw), dtype=cp.uint8),),
+                    protected=protect_weight,
+                )
+            else:
+                packed = cp.asarray(memoryview(raw), dtype=cp.uint8)
+            input_device = cp.asarray(vector, dtype=cp.float32).reshape(-1)
+            if int(input_device.size) != input_size:
+                raise ValueError("Q8 matvec input width does not match tensor")
+            output = cp.empty(output_size, dtype=cp.float32)
+            blocks = (input_size * output_size + 31) // 32
+            if int(packed.size) < blocks * 34:
+                raise ValueError("Q8 tensor byte length is too small")
+            self._q8_transposed_kernel(
+                ((output_size + 7) // 8,),
+                (THREADS_PER_BLOCK,),
+                (packed, input_device, output, input_size, output_size),
+            )
+            return output if return_device else output.get().tolist()
+
+    def route_topk_device(self, logits: Any, top_k: int) -> tuple[Any, Any]:
+        """Select and renormalize routed experts in one CUDA launch."""
+        cp = self.cp
+        values = cp.asarray(logits, dtype=cp.float32).reshape(-1)
+        experts = int(values.size)
+        if top_k <= 0 or top_k > experts:
+            raise ValueError("top-k must be between one and the expert count")
+        selected = cp.empty(top_k, dtype=cp.int32)
+        routing_weights = cp.empty(top_k, dtype=cp.float32)
+        self._route_topk_kernel(
+            (1,),
+            (THREADS_PER_BLOCK,),
+            (values, selected, routing_weights, experts, top_k),
+            shared_mem=experts * 4,
+        )
+        return selected, routing_weights
+
+    def q5k_matvec_transposed(
+        self, raw: bytes, input_size: int, output_size: int, vector: Any, *,
+        return_device: bool = False, cache_weight: bool = False,
+    ) -> Any:
+        return self._k_matvec_transposed(
+            raw, input_size, output_size, vector, self._q5k_transposed_kernel,
+            176, return_device=return_device, cache_weight=cache_weight,
+        )
+
+    def q6k_matvec_transposed(
+        self, raw: bytes, input_size: int, output_size: int, vector: Any, *,
+        return_device: bool = False, cache_weight: bool = False,
+    ) -> Any:
+        return self._k_matvec_transposed(
+            raw, input_size, output_size, vector, self._q6k_transposed_kernel,
+            210, return_device=return_device, cache_weight=cache_weight,
+        )
+
+    def _k_matvec_transposed(
+        self, raw: bytes, input_size: int, output_size: int, vector: Any,
+        kernel: Any, bytes_per_block: int, *, return_device: bool,
+        cache_weight: bool,
+    ) -> Any:
+        cp = self.cp
+        with cp.cuda.Device(self.device_id):
+            if cache_weight:
+                (packed,) = self._cached_arrays(
+                    "v2_k",
+                    raw,
+                    len(raw),
+                    lambda: (cp.asarray(memoryview(raw), dtype=cp.uint8),),
+                )
+            else:
+                packed = cp.asarray(memoryview(raw), dtype=cp.uint8)
+            input_device = cp.asarray(vector, dtype=cp.float32).reshape(-1)
+            if int(input_device.size) != input_size:
+                raise ValueError("K-block matvec input width does not match tensor")
+            output = cp.empty(output_size, dtype=cp.float32)
+            blocks = (input_size * output_size + 255) // 256
+            if int(packed.size) < blocks * bytes_per_block:
+                raise ValueError("K-block tensor byte length is too small")
+            kernel(
+                (output_size,), (THREADS_PER_BLOCK,),
+                (packed, input_device, output, input_size, output_size),
+            )
+            return output if return_device else output.get().tolist()
+
+    def q5k_q6k_swiglu_accumulate(
+        self,
+        gate_raw: bytes,
+        up_raw: bytes,
+        down_raw: bytes,
+        input_size: int,
+        intermediate_size: int,
+        output_size: int,
+        vector: Any,
+        output: Any,
+        weights: Any,
+        weight_index: int,
+    ) -> None:
+        """Execute one Q5_K/Q5_K/Q6_K expert in two CUDA launches."""
+        cp = self.cp
+        with cp.cuda.Device(self.device_id):
+            packed = []
+            for raw in (gate_raw, up_raw, down_raw):
+                (array,) = self._cached_arrays(
+                    "v2_k", raw, len(raw),
+                    lambda raw=raw: (
+                        cp.asarray(memoryview(raw), dtype=cp.uint8),
+                    ),
+                )
+                packed.append(array)
+            input_device = cp.asarray(vector, dtype=cp.float32).reshape(-1)
+            activated = cp.empty(intermediate_size, dtype=cp.float32)
+            self._q5k_swiglu_transposed_kernel(
+                (intermediate_size,),
+                (THREADS_PER_BLOCK,),
+                (
+                    packed[0], packed[1], input_device, activated,
+                    input_size, intermediate_size,
+                ),
+            )
+            self._q6k_accumulate_transposed_kernel(
+                (output_size,),
+                (THREADS_PER_BLOCK,),
+                (
+                    packed[2], activated, output, weights, weight_index,
+                    intermediate_size, output_size,
+                ),
+            )
+
+    def prefetch_v2_k_weights(self, raws: tuple[bytes, ...]) -> Any:
+        """Upload one expert's K-quantized weights on the transfer stream."""
+        cp = self.cp
+        event = cp.cuda.Event()
+        with cp.cuda.Device(self.device_id), self._prefetch_stream:
+            for raw in raws:
+                key = ("v2_k", id(raw))
+                entry = self._cache.get(key)
+                if entry is not None and entry.owner is raw:
+                    self.expert_prefetch_hits += 1
+                self.expert_prefetch_requests += 1
+                self.expert_prefetch_bytes += len(raw)
+                self._cached_arrays(
+                    "v2_k", raw, len(raw),
+                    lambda raw=raw: (
+                        cp.asarray(memoryview(raw), dtype=cp.uint8),
+                    ),
+                )
+            event.record(self._prefetch_stream)
+        return event
+
+    def _cached_v2_expert_group(
+        self, group: tuple[bytes, bytes, bytes]
+    ) -> tuple[Any, Any, Any]:
+        """Cache one expert as a single staged gate/up/down allocation."""
+        import numpy as np
+
+        cp = self.cp
+        sizes = tuple(len(raw) for raw in group)
+        total = sum(sizes)
+
+        def upload() -> tuple[Any, Any, Any]:
+            pinned = cp.cuda.alloc_pinned_memory(total)
+            host = np.frombuffer(pinned, dtype=np.uint8, count=total)
+            offset = 0
+            for raw, size in zip(group, sizes):
+                host[offset:offset + size] = np.frombuffer(
+                    raw, dtype=np.uint8, count=size
+                )
+                offset += size
+            device = cp.empty(total, dtype=cp.uint8)
+            device.set(host, stream=cp.cuda.get_current_stream())
+            self._retain_until_stream_complete((pinned,))
+            gate_end = sizes[0]
+            up_end = gate_end + sizes[1]
+            return (
+                device[:gate_end],
+                device[gate_end:up_end],
+                device[up_end:],
+            )
+
+        arrays = self._cached_arrays(
+            "v2_expert", group[0], total, upload
+        )
+        return arrays[0], arrays[1], arrays[2]
+
+    def prefetch_v2_expert_groups(
+        self, groups: list[tuple[bytes, bytes, bytes]]
+    ) -> Any | None:
+        """Upload route-hinted expert bundles on the transfer stream."""
+        if not self.expert_prefetch_enabled or not groups:
+            return None
+        cp = self.cp
+        event = cp.cuda.Event()
+        prefetched_keys = []
+        with cp.cuda.Device(self.device_id), self._prefetch_stream:
+            for group in groups:
+                key = ("v2_expert", id(group[0]))
+                prefetched_keys.append(key)
+                entry = self._cache.get(key)
+                self.expert_prefetch_requests += 1
+                self.expert_prefetch_bytes += sum(len(raw) for raw in group)
+                if entry is not None and entry.owner is group[0]:
+                    self.expert_prefetch_hits += 1
+                self._cached_v2_expert_group(group)
+            event.record(self._prefetch_stream)
+        for key in prefetched_keys:
+            self._pending_prefetches[key] = _PendingPrefetch(event, ())
+        return event
+
+    def q5k_q6k_grouped_swiglu_accumulate(
+        self,
+        groups: list[tuple[bytes, bytes, bytes]],
+        input_size: int,
+        intermediate_size: int,
+        output_size: int,
+        vector: Any,
+        output: Any,
+        weights: Any,
+        *,
+        down_ggml_type: int = 14,
+    ) -> None:
+        """Execute selected Q5 gate/up experts with grouped Q6/Q8 down."""
+        if not groups:
+            return
+        if down_ggml_type not in {8, 14}:
+            raise ValueError("grouped expert down type must be Q8_0 or Q6_K")
+        self.batched_moe_tokens += 1
+        self.batched_expert_groups += len(groups)
+        cp = self.cp
+        with cp.cuda.Device(self.device_id):
+            gate_arrays, up_arrays, down_arrays = [], [], []
+            cache_started = time.perf_counter()
+            for group in groups:
+                uploaded = self._cached_v2_expert_group(group)
+                gate_arrays.append(uploaded[0])
+                up_arrays.append(uploaded[1])
+                down_arrays.append(uploaded[2])
+            self.profile_host(
+                "routed_weight_cache", time.perf_counter() - cache_started
+            )
+            pointers_started = time.perf_counter()
+            gate_ptrs = cp.asarray(
+                [array.data.ptr for array in gate_arrays], dtype=cp.uint64
+            )
+            up_ptrs = cp.asarray(
+                [array.data.ptr for array in up_arrays], dtype=cp.uint64
+            )
+            down_ptrs = cp.asarray(
+                [array.data.ptr for array in down_arrays], dtype=cp.uint64
+            )
+            activated = cp.empty(
+                (len(groups), intermediate_size), dtype=cp.float32
+            )
+            self.profile_host(
+                "routed_pointer_setup", time.perf_counter() - pointers_started
+            )
+            gate_up_profile = self.profile_start()
+            self._q5k_grouped_swiglu_kernel(
+                (intermediate_size, len(groups)),
+                (THREADS_PER_BLOCK,),
+                (
+                    gate_ptrs, up_ptrs, cp.asarray(vector, dtype=cp.float32),
+                    activated, input_size, intermediate_size, len(groups),
+                ),
+            )
+            self.profile_end("routed_gate_up", gate_up_profile)
+            down_profile = self.profile_start()
+            down_kernel = (
+                self._q8_grouped_accumulate_kernel
+                if down_ggml_type == 8
+                else self._q6k_grouped_accumulate_kernel
+            )
+            down_kernel(
+                (output_size,),
+                (THREADS_PER_BLOCK,),
+                (
+                    down_ptrs, activated, output, weights,
+                    intermediate_size, output_size, len(groups),
+                ),
+            )
+            self.profile_end("routed_down", down_profile)
 
     def q4_swiglu(
         self,
@@ -1369,6 +1911,9 @@ class CudaAccelerator:
             layer._post_attention_norm_weights,
             layer.rms_norm_eps,
         )
+        resident_table = None
+        if os.environ.get("COLIBRI_MOE_LAYER_RESIDENT", "0") == "1":
+            resident_table = self._resident_moe_table_for(layer)
         router_logits = self._matrix_matvec_device(layer.router, normalized)
         selected = cp.empty(layer.top_k, dtype=cp.int32)
         routing_weights = cp.empty(layer.top_k, dtype=cp.float32)
@@ -1384,6 +1929,23 @@ class CudaAccelerator:
             ),
             shared_mem=int(router_logits.size) * 4,
         )
+        if resident_table is not None:
+            shared_logit = self._matrix_matvec_device(
+                layer.shared_gate, normalized
+            )[0]
+            shared_weight = cp.float32(1.0) / (
+                cp.float32(1.0) + cp.exp(-shared_logit)
+            )
+            if route_state is not None:
+                route_state.last_selected_experts = ()
+            output = self._resident_moe_device(
+                resident_table,
+                selected,
+                routing_weights,
+                shared_weight,
+                normalized,
+            )
+            return hidden + output
         selected_ids = selected.get().tolist()
         if route_state is not None:
             route_state.last_selected_experts = tuple(
@@ -1421,7 +1983,13 @@ class CudaAccelerator:
 
         backend = active_native()
         if backend is None:
-            result = layer.forward_residual(hidden.get().tolist())
+            # CUDA remains active for the rest of the decoder, so explicitly
+            # suppress accelerator dispatch in this CPU fallback. Otherwise
+            # Q4BlockTensor/Q4SwiGLUExpert would send the supposedly CPU
+            # offloaded expert work back through the global CUDA accelerator.
+            result = layer.forward_residual(
+                hidden.get().tolist(), allow_cuda=False
+            )
             if route_state is not None:
                 route_state.last_selected_experts = result.selected_experts
             return self.device_vector(result.output)
@@ -1504,7 +2072,7 @@ class CudaAccelerator:
                 outputs.append(result.output)
                 routes.append(result.selected_experts)
             if route_state is not None and routes:
-                route_state.sequence_selected_experts = tuple(routes)
+                route_state.sequence_selected_experts += tuple(routes)
                 route_state.last_selected_experts = routes[-1]
             return self.device_vector(outputs)
         import numpy as np
@@ -1545,7 +2113,7 @@ class CudaAccelerator:
             routes = tuple(
                 tuple(int(expert_id) for expert_id in row) for row in selected
             )
-            route_state.sequence_selected_experts = routes
+            route_state.sequence_selected_experts += routes
             route_state.last_selected_experts = routes[-1]
         if getattr(backend, "_grouped_moe", False):
             # Expert-major: sort assignments by expert so each unique expert's
@@ -1626,6 +2194,33 @@ class CudaAccelerator:
             ready = False
         self._delta_segment_state = "ready" if ready else "off"
         return ready
+
+    def _native_q4_moe_backend(self) -> Any | None:
+        if self._native_moe_state == "off":
+            return None
+        from .native import active_native
+
+        backend = active_native()
+        if self._native_moe_state == "ready":
+            return backend
+        if os.environ.get("COLIBRI_NATIVE_CUDA_MOE", "0") == "0":
+            self._native_moe_state = "off"
+            return None
+        if backend is None or not getattr(backend, "_gpu_driver", False):
+            self._native_moe_state = "off"
+            return None
+        include_dirs = []
+        cuda_path = self.cp.cuda.get_cuda_path()
+        if cuda_path:
+            include_dirs.append(str(Path(cuda_path) / "include"))
+        try:
+            ready = backend.gpu_prepare(
+                _KERNEL_SOURCE, self.device_id, include_dirs
+            )
+        except RuntimeError:
+            ready = False
+        self._native_moe_state = "ready" if ready else "off"
+        return backend if ready else None
 
     def delta_moe_segment(
         self, layers: list[Any], layer_states: list[Any], hidden: Any
@@ -1931,13 +2526,12 @@ class CudaAccelerator:
         )
         selected_ids = selected.get().tolist()
         if route_state is not None and selected_ids:
-            route_state.sequence_selected_experts = tuple(
+            routes = tuple(
                 tuple(int(expert_id) for expert_id in route)
                 for route in selected_ids
             )
-            route_state.last_selected_experts = (
-                route_state.sequence_selected_experts[-1]
-            )
+            route_state.sequence_selected_experts += routes
+            route_state.last_selected_experts = routes[-1]
         shared_logits = self.matrix_matmul_device(
             layer.shared_gate, normalized
         ).reshape(-1)
@@ -2023,23 +2617,39 @@ class CudaAccelerator:
         gate_scales = []
         down_packed = []
         down_scales = []
+        device_arrays: list[Any] = []
+        address_key = tuple(
+            value
+            for expert in experts
+            for value in (id(expert.gate_up), id(expert.down))
+        )
         for index, expert in enumerate(experts):
             protected = index + 1 == expert_count
             packed, scales = self._q4_arrays(
                 expert.gate_up, protected=protected
             )
+            device_arrays.extend((packed, scales))
             gate_packed.append(packed.data.ptr)
             gate_scales.append(scales.data.ptr)
             packed, scales = self._q4_arrays(
                 expert.down, protected=protected
             )
+            device_arrays.extend((packed, scales))
             down_packed.append(packed.data.ptr)
             down_scales.append(scales.data.ptr)
         with cp.cuda.Device(self.device_id):
-            addresses = cp.asarray(
-                [gate_packed, gate_scales, down_packed, down_scales],
-                dtype=cp.uint64,
-            )
+            addresses = self._moe_address_cache.get(address_key)
+            if addresses is None:
+                self.moe_address_cache_misses += 1
+                addresses = cp.asarray(
+                    [gate_packed, gate_scales, down_packed, down_scales],
+                    dtype=cp.uint64,
+                )
+                if self._moe_address_table_cacheable(address_key):
+                    self._moe_address_cache[address_key] = addresses
+            else:
+                self.moe_address_cache_hits += 1
+                self._moe_address_cache.move_to_end(address_key)
             input_vector = cp.asarray(vector, dtype=cp.float32)
             gate_output = cp.empty(expert_count * gate_rows, dtype=cp.float32)
             use_q8 = (
@@ -2047,6 +2657,33 @@ class CudaAccelerator:
                 and hidden_size % 32 == 0
                 and intermediate_size % 32 == 0
             )
+            native_backend = (
+                None if use_q8 else self._native_q4_moe_backend()
+            )
+            if native_backend is not None:
+                activation_count = expert_count * intermediate_size
+                activated = cp.empty(activation_count, dtype=cp.float32)
+                output = cp.empty(output_size, dtype=cp.float32)
+                device_weights = cp.asarray(weights, dtype=cp.float32)
+                native_backend.gpu_q4_moe(
+                    addresses[0].data.ptr,
+                    addresses[1].data.ptr,
+                    addresses[2].data.ptr,
+                    addresses[3].data.ptr,
+                    device_weights.data.ptr,
+                    input_vector.data.ptr,
+                    gate_output.data.ptr,
+                    activated.data.ptr,
+                    output.data.ptr,
+                    cp.cuda.get_current_stream().ptr,
+                    expert_count,
+                    hidden_size,
+                    intermediate_size,
+                )
+                if return_device:
+                    self._retain_until_stream_complete(tuple(device_arrays))
+                    return output
+                return output.get().tolist()
             if use_q8:
                 hidden_blocks = hidden_size // 32
                 quantized_input = cp.empty(hidden_size, dtype=cp.int8)
@@ -2150,6 +2787,7 @@ class CudaAccelerator:
                     ),
                 )
             if return_device:
+                self._retain_until_stream_complete(tuple(device_arrays))
                 return output
             return output.get().tolist()
 
@@ -2211,6 +2849,7 @@ class CudaAccelerator:
     def _q4_arrays(
         self, tensor: Q4BlockTensor, *, protected: bool = False
     ) -> tuple[Any, Any]:
+        self._reap_expert_loads()
         cp = self.cp
         byte_size = len(tensor.packed) + len(tensor.scales)
         key = ("q4", id(tensor))
@@ -2230,6 +2869,166 @@ class CudaAccelerator:
         self._wait_for_prefetch(key)
         return arrays
 
+    def _release_resident_moe_table(self) -> None:
+        table = self._resident_moe_table
+        if table is None:
+            return
+        for tensor_id in table["tensor_ids"]:
+            entry = self._cache.get(("q4", tensor_id))
+            if entry is not None:
+                entry.protected = False
+        self._resident_moe_table = None
+
+    def _resident_moe_table_for(self, layer: Any) -> dict[str, Any] | None:
+        if layer.expert_device != "cuda":
+            return None
+        current = self._resident_moe_table
+        if current is not None and current["layer"] is layer:
+            return current
+        self._release_resident_moe_table()
+        experts = [
+            layer._expert(index) for index in range(layer.expert_count)
+        ] + [layer.shared_expert]
+        gate_packed: list[int] = []
+        gate_scales: list[int] = []
+        down_packed: list[int] = []
+        down_scales: list[int] = []
+        arrays: list[Any] = []
+        tensor_ids: list[int] = []
+        for expert in experts:
+            gate, scales = self._q4_arrays(expert.gate_up, protected=True)
+            down, down_scale = self._q4_arrays(expert.down, protected=True)
+            arrays.extend((gate, scales, down, down_scale))
+            tensor_ids.extend(
+                (id(expert.gate_up), id(expert.down))
+            )
+            gate_packed.append(gate.data.ptr)
+            gate_scales.append(scales.data.ptr)
+            down_packed.append(down.data.ptr)
+            down_scales.append(down_scale.data.ptr)
+        if not all(
+            ("q4", tensor_id) in self._cache for tensor_id in tensor_ids
+        ):
+            self._release_resident_moe_table()
+            return None
+        cp = self.cp
+        table = {
+            "layer": layer,
+            "expert_count": layer.expert_count,
+            "top_k": layer.top_k,
+            "gate_rows": experts[0].gate_up.shape[0],
+            "hidden_size": experts[0].hidden_size,
+            "intermediate_size": experts[0].intermediate_size,
+            "arrays": tuple(arrays),
+            "tensor_ids": tuple(tensor_ids),
+            "gate_addresses": cp.asarray(
+                gate_packed, dtype=cp.uint64
+            ),
+            "gate_scale_addresses": cp.asarray(
+                gate_scales, dtype=cp.uint64
+            ),
+            "down_addresses": cp.asarray(
+                down_packed, dtype=cp.uint64
+            ),
+            "down_scale_addresses": cp.asarray(
+                down_scales, dtype=cp.uint64
+            ),
+        }
+        self._resident_moe_table = table
+        return table
+
+    def _resident_moe_device(
+        self,
+        table: dict[str, Any],
+        selected: Any,
+        routing_weights: Any,
+        shared_weight: Any,
+        vector: Any,
+    ) -> Any:
+        cp = self.cp
+        selected_count = table["top_k"] + 1
+        selected_all = cp.empty(selected_count, dtype=cp.int32)
+        selected_all[:-1] = selected
+        selected_all[-1] = table["expert_count"]
+        weights = cp.empty(selected_count, dtype=cp.float32)
+        weights[:-1] = routing_weights
+        weights[-1] = shared_weight
+        gate_output = cp.empty(
+            selected_count * table["gate_rows"], dtype=cp.float32
+        )
+        activated = cp.empty(
+            selected_count * table["intermediate_size"], dtype=cp.float32
+        )
+        output = cp.empty(table["hidden_size"], dtype=cp.float32)
+        self._q4_selected_kernel(
+            (table["gate_rows"], selected_count),
+            (THREADS_PER_BLOCK,),
+            (
+                table["gate_addresses"],
+                table["gate_scale_addresses"],
+                selected_all,
+                vector,
+                gate_output,
+                table["gate_rows"],
+                table["hidden_size"],
+                selected_count,
+            ),
+        )
+        activation_count = activated.size
+        self._silu_mul_batched_kernel(
+            ((activation_count + THREADS_PER_BLOCK - 1) // THREADS_PER_BLOCK,),
+            (THREADS_PER_BLOCK,),
+            (
+                gate_output,
+                activated,
+                table["intermediate_size"],
+                activation_count,
+            ),
+        )
+        self._q4_selected_weighted_kernel(
+            (table["hidden_size"],),
+            (THREADS_PER_BLOCK,),
+            (
+                table["down_addresses"],
+                table["down_scale_addresses"],
+                selected_all,
+                activated,
+                weights,
+                output,
+                table["hidden_size"],
+                table["intermediate_size"],
+                selected_count,
+            ),
+        )
+        return output
+
+    def _reap_expert_loads(self) -> None:
+        completed = [
+            key for key, future in self._pending_expert_loads.items()
+            if future.done()
+        ]
+        for key in completed:
+            future = self._pending_expert_loads.pop(key)
+            try:
+                layer, expert = future.result()
+            except Exception:
+                continue
+            self.expert_load_completions += 1
+            self.prefetch_q4(expert.gate_up)
+            self.prefetch_q4(expert.down)
+
+    def _schedule_expert_load(self, layer: Any, expert_id: int) -> None:
+        key = (id(layer), int(expert_id))
+        if key in self._pending_expert_loads:
+            return
+
+        def load() -> Any:
+            expert = layer._expert(int(expert_id))
+            return layer, expert
+
+        self._pending_expert_loads[key] = self._expert_load_executor.submit(load)
+        self.expert_load_requests += 1
+
     def prefetch_moe(
         self, layer: Any, selected_experts: tuple[int, ...]
     ) -> None:
@@ -2240,9 +3039,11 @@ class CudaAccelerator:
             or self.expert_prefetch_budget == 0
         ):
             return
+        self._reap_expert_loads()
         for expert_id in selected_experts[: self.expert_prefetch_budget]:
             expert = layer._experts.get(int(expert_id))
             if expert is None:
+                self._schedule_expert_load(layer, int(expert_id))
                 continue
             self.prefetch_q4(expert.gate_up)
             self.prefetch_q4(expert.down)
@@ -2258,6 +3059,10 @@ class CudaAccelerator:
         entry = self._cache.get(key)
         if entry is not None and entry.owner is tensor:
             self.expert_prefetch_hits += 1
+            entry.priority_until = max(
+                entry.priority_until, self._cache_priority_epoch + 8
+            )
+            self.cache_priority_promotions += 1
             self._cache.move_to_end(key)
             return False
         byte_size = len(tensor.packed) + len(tensor.scales)
@@ -2283,7 +3088,9 @@ class CudaAccelerator:
             event = cp.cuda.Event()
             event.record(self._prefetch_stream)
         arrays = (packed, scales_bytes.view(cp.float16))
-        self._cache[key] = _CacheEntry(tensor, arrays, byte_size, False)
+        self._cache[key] = _CacheEntry(
+            tensor, arrays, byte_size, False, self._cache_priority_epoch + 8
+        )
         self.cache_bytes += byte_size
         self.cache_misses += 1
         self.expert_prefetch_requests += 1
@@ -2312,15 +3119,54 @@ class CudaAccelerator:
         for key in completed:
             self._pending_prefetches.pop(key, None)
 
+    def _reap_inflight_buffers(self) -> None:
+        self._inflight_buffers = [
+            entry for entry in self._inflight_buffers if not entry.event.done
+        ]
+
+    def _retain_until_stream_complete(self, arrays: tuple[Any, ...]) -> None:
+        if not arrays:
+            return
+        with self.cp.cuda.Device(self.device_id):
+            event = self.cp.cuda.Event()
+            event.record(self.cp.cuda.get_current_stream())
+        self._inflight_buffers.append(_InFlightBuffers(event, arrays))
+
+    def _moe_address_table_cacheable(self, address_key: tuple[int, ...]) -> bool:
+        return all(
+            self._cache.get(("q4", tensor_id)) is not None
+            for tensor_id in address_key
+        )
+
+    def _invalidate_moe_address_tables(self, tensor_id: int) -> None:
+        stale = [
+            key for key in self._moe_address_cache if tensor_id in key
+        ]
+        for key in stale:
+            self._moe_address_cache.pop(key, None)
+
     def clear(self) -> None:
-        self._prefetch_stream.synchronize()
+        self._expert_load_executor.shutdown(
+            wait=True, cancel_futures=True
+        )
+        self._pending_expert_loads.clear()
+        with self.cp.cuda.Device(self.device_id):
+            self.cp.cuda.get_current_stream().synchronize()
+            self._prefetch_stream.synchronize()
         self._pending_prefetches.clear()
+        self._inflight_buffers.clear()
+        self._release_resident_moe_table()
+        self._moe_address_cache.clear()
         self._unused_prefetches.clear()
         self._cache.clear()
         self._rope_cache.clear()
         self._moe_transfer_cache.clear()
+        self._v2_weight_cache.clear()
         self._delta_segment_tables.clear()
         self._delta_segment_scratch_cache = None
+        self._profile_events.clear()
+        self._profile_host_seconds.clear()
+        self._profile_host_calls.clear()
         self.cache_bytes = 0
         with self.cp.cuda.Device(self.device_id):
             self.cp.get_default_memory_pool().free_all_blocks()
@@ -2342,6 +3188,16 @@ class CudaAccelerator:
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "cache_evictions": self.cache_evictions,
+            "cache_eviction_scans": self.cache_eviction_scans,
+            "cache_eviction_entries_examined": (
+                self.cache_eviction_entries_examined
+            ),
+            "cache_priority_promotions": self.cache_priority_promotions,
+            "cache_priority_entries": sum(
+                1
+                for entry in self._cache.values()
+                if entry.priority_until > self._cache_priority_epoch
+            ),
             "device_resident_decode_tokens": self.device_resident_decode_tokens,
             "batched_prefill_tokens": self.batched_prefill_tokens,
             "batched_moe_tokens": self.batched_moe_tokens,
@@ -2364,34 +3220,72 @@ class CudaAccelerator:
             "expert_prefetch_uses": self.expert_prefetch_uses,
             "expert_prefetch_mib": self.expert_prefetch_bytes // (1024 * 1024),
             "expert_prefetch_pending": len(self._pending_prefetches),
+            "expert_load_pending": len(self._pending_expert_loads),
+            "expert_load_requests": self.expert_load_requests,
+            "expert_load_completions": self.expert_load_completions,
+            "inflight_buffer_groups": len(self._inflight_buffers),
+            "moe_address_cache_entries": len(self._moe_address_cache),
+            "moe_address_cache_hits": self.moe_address_cache_hits,
+            "moe_address_cache_misses": self.moe_address_cache_misses,
+            "resident_moe_layer": (
+                self._resident_moe_table["layer"].layer
+                if self._resident_moe_table is not None
+                else -1
+            ),
+            "profile": self._profile_stats() if self.profiling else None,
         }
 
     def _reserve_cache(
         self, byte_size: int, *, allow_protected: bool
     ) -> bool:
         self._reap_prefetches()
+        self._reap_inflight_buffers()
+        self._cache_priority_epoch += 1
         while self._cache and self.cache_bytes + byte_size > self.cache_limit_bytes:
-            eviction_key = next(
-                (
-                    candidate_key
-                    for candidate_key, candidate in self._cache.items()
-                    if not candidate.protected
-                    and candidate_key not in self._pending_prefetches
-                ),
-                None,
-            )
+            self.cache_eviction_scans += 1
+            eviction_key = None
+            priority_fallback = None
+            for candidate_key, candidate in self._cache.items():
+                self.cache_eviction_entries_examined += 1
+                if (
+                    candidate.protected
+                    or candidate_key in self._pending_prefetches
+                ):
+                    continue
+                if candidate.priority_until <= self._cache_priority_epoch:
+                    eviction_key = candidate_key
+                    break
+                if priority_fallback is None:
+                    priority_fallback = candidate_key
+            if eviction_key is None:
+                eviction_key = priority_fallback
             if eviction_key is None and allow_protected:
-                eviction_key = next(
-                    (
-                        candidate_key
-                        for candidate_key in self._cache
-                        if candidate_key not in self._pending_prefetches
-                    ),
-                    None,
-                )
+                priority_fallback = None
+                for candidate_key, candidate in self._cache.items():
+                    self.cache_eviction_entries_examined += 1
+                    if (
+                        not candidate.protected
+                        or candidate_key in self._pending_prefetches
+                    ):
+                        continue
+                    if candidate.priority_until <= self._cache_priority_epoch:
+                        eviction_key = candidate_key
+                        break
+                    if priority_fallback is None:
+                        priority_fallback = candidate_key
+                if eviction_key is None:
+                    eviction_key = priority_fallback
             if eviction_key is None:
                 return False
             evicted = self._cache.pop(eviction_key)
+            if eviction_key[0] == "q4":
+                self._invalidate_moe_address_tables(eviction_key[1])
+                if (
+                    self._resident_moe_table is not None
+                    and eviction_key[1]
+                    in self._resident_moe_table["tensor_ids"]
+                ):
+                    self._release_resident_moe_table()
             self._unused_prefetches.discard(eviction_key)
             self.cache_bytes -= evicted.byte_size
             self.cache_evictions += 1
@@ -2412,13 +3306,21 @@ class CudaAccelerator:
             self.cache_hits += 1
             if protected and not entry.protected:
                 entry.protected = True
+            if kind == "q4":
+                entry.priority_until = 0
             self._cache.move_to_end(key)
             return entry.arrays
         self.cache_misses += 1
         can_cache = byte_size <= self.cache_limit_bytes and self._reserve_cache(
             byte_size, allow_protected=True
         )
-        arrays = upload()
+        if self.profiling:
+            started = time.perf_counter()
+            arrays = upload()
+            self.profile_upload_seconds += time.perf_counter() - started
+            self.profile_upload_calls += 1
+        else:
+            arrays = upload()
         if can_cache:
             self._cache[key] = _CacheEntry(
                 owner, arrays, byte_size, protected
@@ -2430,11 +3332,17 @@ class CudaAccelerator:
 _accelerator: CudaAccelerator | None = None
 
 
-def configure_cuda(*, cache_mib: int = 8192, device_id: int = 0) -> CudaAccelerator:
+def configure_cuda(
+    *, cache_mib: int = 8192, device_id: int = 0, kv_cache_type: str | None = None
+) -> CudaAccelerator:
     global _accelerator
     if _accelerator is not None:
         _accelerator.clear()
-    _accelerator = CudaAccelerator(cache_mib=cache_mib, device_id=device_id)
+    _accelerator = CudaAccelerator(
+        cache_mib=cache_mib,
+        device_id=device_id,
+        kv_cache_type=kv_cache_type,
+    )
     return _accelerator
 
 
@@ -3140,6 +4048,39 @@ void q4_batched_matvec(
 }
 
 extern "C" __global__
+void q4_selected_batched_matvec(
+    const unsigned long long* packed_addresses,
+    const unsigned long long* scale_addresses,
+    const int* selected_ids,
+    const float* vector,
+    float* output,
+    const int rows,
+    const int columns,
+    const int selected_count
+) {
+    const int row = blockIdx.x;
+    const int selected = blockIdx.y;
+    if (row >= rows || selected >= selected_count) return;
+    const int expert = selected_ids[selected];
+    const unsigned char* packed =
+        (const unsigned char*)packed_addresses[expert];
+    const __half* scales = (const __half*)scale_addresses[expert];
+    float partial = 0.0f;
+    const int start = row * columns;
+    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+        const int index = start + column;
+        const int block = index >> 5;
+        const int within_block = index & 31;
+        const unsigned char byte = packed[block * 16 + (within_block >> 1)];
+        const int nibble = (within_block & 1) ? (byte >> 4) : (byte & 15);
+        partial += (float)(nibble - 8)
+            * __half2float(scales[block]) * vector[column];
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[selected * rows + row] = partial;
+}
+
+extern "C" __global__
 void silu_mul_batched(
     const float* gate_up,
     float* output,
@@ -3158,6 +4099,62 @@ void silu_mul_batched(
         : exponential / (1.0f + exponential);
     output[index] = gate * sigmoid
         * gate_up[gate_offset + intermediate_size + within_expert];
+}
+
+extern "C" __global__
+void q4_silu_batched(
+    const unsigned long long* packed_addresses,
+    const unsigned long long* scale_addresses,
+    const float* vector,
+    float* output,
+    const int intermediate_size,
+    const int columns,
+    const int expert_count
+) {
+    const int intermediate = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (intermediate >= intermediate_size || expert >= expert_count) return;
+    const unsigned char* packed =
+        (const unsigned char*)packed_addresses[expert];
+    const __half* scales = (const __half*)scale_addresses[expert];
+    float gate_partial = 0.0f;
+    float up_partial = 0.0f;
+    const int gate_row = intermediate;
+    const int up_row = intermediate_size + intermediate;
+    const int gate_start = gate_row * columns;
+    const int up_start = up_row * columns;
+    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+        const int gate_index = gate_start + column;
+        const int gate_block = gate_index >> 5;
+        const int gate_within = gate_index & 31;
+        const unsigned char gate_byte =
+            packed[gate_block * 16 + (gate_within >> 1)];
+        const int gate_nibble = (gate_within & 1)
+            ? (gate_byte >> 4) : (gate_byte & 15);
+        gate_partial += (float)(gate_nibble - 8)
+            * __half2float(scales[gate_block]) * vector[column];
+
+        const int up_index = up_start + column;
+        const int up_block = up_index >> 5;
+        const int up_within = up_index & 31;
+        const unsigned char up_byte =
+            packed[up_block * 16 + (up_within >> 1)];
+        const int up_nibble = (up_within & 1)
+            ? (up_byte >> 4) : (up_byte & 15);
+        up_partial += (float)(up_nibble - 8)
+            * __half2float(scales[up_block]) * vector[column];
+    }
+    gate_partial = block_reduce_sum(gate_partial);
+    up_partial = block_reduce_sum(up_partial);
+    if (threadIdx.x == 0) {
+        const float exponential = gate_partial >= 0.0f
+            ? expf(-gate_partial) : expf(gate_partial);
+        const float sigmoid = gate_partial >= 0.0f
+            ? 1.0f / (1.0f + exponential)
+            : exponential / (1.0f + exponential);
+        output[expert * intermediate_size + intermediate] =
+            gate_partial * sigmoid * up_partial;
+    }
 }
 
 extern "C" __global__
@@ -3197,6 +4194,44 @@ void q4_batched_weighted_matvec(
 }
 
 extern "C" __global__
+void q4_selected_weighted_matvec(
+    const unsigned long long* packed_addresses,
+    const unsigned long long* scale_addresses,
+    const int* selected_ids,
+    const float* vectors,
+    const float* routing_weights,
+    float* output,
+    const int rows,
+    const int columns,
+    const int selected_count
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    float partial = 0.0f;
+    const int start = row * columns;
+    for (int selected = 0; selected < selected_count; ++selected) {
+        const int expert = selected_ids[selected];
+        const unsigned char* packed =
+            (const unsigned char*)packed_addresses[expert];
+        const __half* scales = (const __half*)scale_addresses[expert];
+        const float* vector = vectors + selected * columns;
+        const float route = routing_weights[selected];
+        for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+            const int index = start + column;
+            const int block = index >> 5;
+            const int within_block = index & 31;
+            const unsigned char byte = packed[block * 16 + (within_block >> 1)];
+            const int nibble = (within_block & 1) ? (byte >> 4) : (byte & 15);
+            const float weight = (float)(nibble - 8)
+                * __half2float(scales[block]);
+            partial += route * weight * vector[column];
+        }
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
 void q4_matvec(
     const unsigned char* packed,
     const __half* scales,
@@ -3220,5 +4255,347 @@ void q4_matvec(
     }
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void q8_matvec_transposed(
+    const unsigned char* packed,
+    const float* vector,
+    float* output,
+    const int input_size,
+    const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        // GGML dimension 0 is contiguous: each logical output row contains
+        // input_size values even though GGUF reports [input, output].
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        const float scale = __half2float(
+            *((const __half*)(packed + block * 34))
+        );
+        const signed char value = *((const signed char*)(packed + block * 34 + 2 + within));
+        partial += ((float)value * scale) * vector[input];
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void q8_matvec_transposed_warp(
+    const unsigned char* packed,
+    const float* vector,
+    float* output,
+    const int input_size,
+    const int output_size
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = lane; input < input_size; input += 32) {
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        const float scale = __half2float(
+            *((const __half*)(packed + block * 34))
+        );
+        const signed char value = *((const signed char*)(
+            packed + block * 34 + 2 + within
+        ));
+        partial += ((float)value * scale) * vector[input];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+__device__ __forceinline__ void q5k_scale_min(
+    const unsigned char* scales, int index, int* scale, int* minimum
+) {
+    if (index < 4) {
+        *scale = scales[index] & 63;
+        *minimum = scales[index + 4] & 63;
+    } else {
+        *scale = (scales[index + 4] & 15) | ((scales[index - 4] >> 6) << 4);
+        *minimum = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+    }
+}
+
+__device__ __forceinline__ float q5k_value(
+    const unsigned char* packed, int absolute
+) {
+    const int block = absolute / 256;
+    const int within = absolute & 255;
+    const unsigned char* base = packed + block * 176;
+    const float d = __half2float(*((const __half*)(base)));
+    const float dmin = __half2float(*((const __half*)(base + 2)));
+    const unsigned char* scales = base + 4;
+    const int group = within / 64;
+    const int offset = within & 63;
+    const int sub = offset / 32;
+    const int qindex = group * 32 + (offset & 31);
+    const unsigned char low = base[48 + qindex];
+    const unsigned char high = base[16 + (offset & 31)];
+    const int bit = (high >> (2 * group + sub)) & 1;
+    const int quant = ((offset < 32) ? (low & 15) : (low >> 4)) + 16 * bit;
+    int scale, minimum;
+    q5k_scale_min(scales, group * 2 + sub, &scale, &minimum);
+    return d * (float)scale * (float)quant - dmin * (float)minimum;
+}
+
+extern "C" __global__
+void q5k_matvec_transposed(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += q5k_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void q5k_swiglu_transposed(
+    const unsigned char* gate_packed,
+    const unsigned char* up_packed,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += q5k_value(gate_packed, absolute) * value;
+        up += q5k_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[row] = (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void q5k_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate_packed =
+        (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += q5k_value(gate_packed, absolute) * value;
+        up += q5k_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[expert * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+__device__ __forceinline__ float q6k_value(
+    const unsigned char* packed, int absolute
+) {
+    const int block = absolute / 256;
+    const int within = absolute & 255;
+    const unsigned char* base = packed + block * 210;
+    const unsigned char* ql = base;
+    const unsigned char* qh = base + 128;
+    const signed char* scales = (const signed char*)(base + 192);
+    const float d = __half2float(*((const __half*)(base + 208)));
+    const int half = within / 128;
+    const int offset = within & 127;
+    const int lane = offset / 32;
+    const int l = offset & 31;
+    const int qindex = l + ((lane == 0 || lane == 2) ? 0 : 32);
+    const unsigned char qbyte = ql[half * 64 + qindex];
+    const unsigned char high = qh[half * 32 + l];
+    const int nibble = (lane == 0 || lane == 1) ? (qbyte & 15) : (qbyte >> 4);
+    const int quant = (nibble | (((high >> (lane * 2)) & 3) << 4)) - 32;
+    const int scale_index = half * 8 + (l / 16) + lane * 2;
+    return d * (float)scales[scale_index] * (float)quant;
+}
+
+extern "C" __global__
+void q6k_matvec_transposed(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += q6k_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void q6k_accumulate_transposed(
+    const unsigned char* packed,
+    const float* vector,
+    float* output,
+    const float* weights,
+    const int weight_index,
+    const int input_size,
+    const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += q6k_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += weights[weight_index] * partial;
+}
+
+extern "C" __global__
+void q6k_grouped_accumulate(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int expert = 0; expert < experts; ++expert) {
+            const unsigned char* packed =
+                (const unsigned char*)down_ptrs[expert];
+            combined += weights[expert]
+                * q6k_value(packed, row * input_size + input)
+                * activated[expert * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
+extern "C" __global__
+void q8_grouped_accumulate(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        float combined = 0.0f;
+        for (int expert = 0; expert < experts; ++expert) {
+            const unsigned char* packed =
+                (const unsigned char*)down_ptrs[expert];
+            const float scale = __half2float(
+                *((const __half*)(packed + block * 34))
+            );
+            const signed char value = *((const signed char*)(
+                packed + block * 34 + 2 + within
+            ));
+            combined += weights[expert] * ((float)value * scale)
+                * activated[expert * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
+extern "C" __global__
+void kv_attention(
+    const float* query,
+    const float* keys,
+    const float* values,
+    float* output,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const float scale
+) {
+    const int head = blockIdx.x;
+    if (head >= heads || threadIdx.x != 0) return;
+    const int group = heads / kv_heads;
+    const int kv_head = head / group;
+    const float* q = query + head * head_dim;
+    float maximum = -3.402823466e+38F;
+    for (int token = 0; token < tokens; ++token) {
+        float score = 0.0f;
+        const float* k = keys + (kv_head * capacity + token) * head_dim;
+        for (int d = 0; d < head_dim; ++d) score += q[d] * k[d];
+        maximum = fmaxf(maximum, score * scale);
+    }
+    float denominator = 0.0f;
+    for (int d = 0; d < head_dim; ++d) output[head * head_dim + d] = 0.0f;
+    for (int token = 0; token < tokens; ++token) {
+        float score = 0.0f;
+        const float* k = keys + (kv_head * capacity + token) * head_dim;
+        for (int d = 0; d < head_dim; ++d) score += q[d] * k[d];
+        const float weight = expf(score * scale - maximum);
+        denominator += weight;
+        const float* v = values + (kv_head * capacity + token) * head_dim;
+        for (int d = 0; d < head_dim; ++d) output[head * head_dim + d] += weight * v[d];
+    }
+    for (int d = 0; d < head_dim; ++d) output[head * head_dim + d] /= denominator;
+}
+
+extern "C" __global__
+void kv_append(
+    const float* current_keys,
+    const float* current_values,
+    float* cache_keys,
+    float* cache_values,
+    const int kv_heads,
+    const int head_dim,
+    const int position,
+    const int capacity
+) {
+    const int head = blockIdx.x;
+    if (head >= kv_heads) return;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        cache_keys[(head * capacity + position) * head_dim + d] =
+            current_keys[head * head_dim + d];
+        cache_values[(head * capacity + position) * head_dim + d] =
+            current_values[head * head_dim + d];
+    }
 }
 """

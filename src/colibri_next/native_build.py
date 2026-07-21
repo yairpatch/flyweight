@@ -37,19 +37,17 @@ def build_native(*, clean: bool = False) -> Path:
         check=True,
         env=environment,
     )
-    candidates = (
-        output / "colibri_native.dll",
-        output / "colibri_native.so",
-        output / "colibri_native.dylib",
-        build / "colibri_native.dll",
-        build / "colibri_native.so",
-        build / "colibri_native.dylib",
+    suffixes = (".dll", ".dylib", ".so") if os.name == "nt" else (".so", ".dylib", ".dll")
+    candidates = tuple(output / f"colibri_native{suffix}" for suffix in suffixes) + tuple(
+        build / f"colibri_native{suffix}" for suffix in suffixes
     )
     for candidate in candidates:
         if candidate.is_file():
             destination = output / candidate.name
             if candidate != destination:
                 shutil.copy2(candidate, destination)
+            # CMake builds the v2 target alongside v1. Returning the v1 path
+            # preserves the existing build_native API.
             return destination
     raise FileNotFoundError("native build completed without a runtime library")
 

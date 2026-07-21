@@ -33,6 +33,9 @@ class AttentionKVCache:
         self.tokens = 0
         self.cuda_keys: Any = None
         self.cuda_values: Any = None
+        self.cuda_key_scales: Any = None
+        self.cuda_value_scales: Any = None
+        self.cuda_cache_type: str | None = None
         self.cuda_capacity = 0
 
     @property
@@ -59,6 +62,15 @@ class AttentionKVCache:
         for keys, values in zip(self.keys, self.values):
             keys.clear()
             values.clear()
+        # Device storage is owned by this logical cache. Drop every device
+        # reference as well so prefix-cache eviction and state clearing can
+        # release VRAM and cannot reuse arrays from a previous cache mode.
+        self.cuda_keys = None
+        self.cuda_values = None
+        self.cuda_key_scales = None
+        self.cuda_value_scales = None
+        self.cuda_cache_type = None
+        self.cuda_capacity = 0
 
 
 class QwenFullAttentionLayer:

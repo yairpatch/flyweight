@@ -86,7 +86,134 @@ COLIBRI_API int colibri_gpu_rms_norm(
     float epsilon,
     std::int32_t one_centered
 );
+COLIBRI_API int colibri_gpu_q4_matvec(
+    std::uint64_t packed,
+    std::uint64_t scales,
+    std::uint64_t input,
+    std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t rows,
+    std::int32_t columns
+);
+COLIBRI_API int colibri_gpu_scaled_add(
+    std::uint64_t target,
+    std::uint64_t source,
+    float scale,
+    std::int32_t elements
+);
+COLIBRI_API int colibri_gpu_attention(
+    std::uint64_t query,
+    std::uint64_t keys,
+    std::uint64_t values,
+    std::uint64_t output,
+    std::int32_t heads,
+    std::int32_t kv_heads,
+    std::int32_t head_dim,
+    std::int32_t tokens,
+    float scale
+);
+COLIBRI_API int colibri_gpu_attention_cache(
+    std::uint64_t query,
+    std::uint64_t keys,
+    std::uint64_t values,
+    std::uint64_t output,
+    std::int32_t heads,
+    std::int32_t kv_heads,
+    std::int32_t head_dim,
+    std::int32_t tokens,
+    std::int32_t capacity,
+    float scale
+);
+COLIBRI_API int colibri_gpu_kv_append(
+    std::uint64_t current_keys,
+    std::uint64_t current_values,
+    std::uint64_t cache_keys,
+    std::uint64_t cache_values,
+    std::int32_t kv_heads,
+    std::int32_t head_dim,
+    std::int32_t position,
+    std::int32_t capacity
+);
+COLIBRI_API int colibri_gpu_q4_moe(
+    std::uint64_t gate_up_packed,
+    std::uint64_t gate_up_scales,
+    std::uint64_t down_packed,
+    std::uint64_t down_scales,
+    std::uint64_t weights,
+    std::uint64_t input,
+    std::uint64_t gate_output,
+    std::uint64_t activated,
+    std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t expert_count,
+    std::int32_t hidden_size,
+    std::int32_t intermediate_size
+);
 COLIBRI_API int colibri_gpu_sync();
+COLIBRI_API int colibri_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer);
+COLIBRI_API int colibri_gpu_free(std::uint64_t pointer);
+COLIBRI_API int colibri_gpu_host_alloc(std::uint64_t bytes, void** pointer);
+COLIBRI_API int colibri_gpu_host_free(void* pointer);
+COLIBRI_API int colibri_gpu_host_register(const void* pointer, std::uint64_t bytes);
+COLIBRI_API int colibri_gpu_host_unregister(const void* pointer);
+COLIBRI_API int colibri_gpu_upload(
+    std::uint64_t destination, const void* source, std::uint64_t bytes,
+    std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_upload_sync(
+    std::uint64_t destination, const void* source, std::uint64_t bytes
+);
+COLIBRI_API int colibri_gpu_download(
+    void* destination, std::uint64_t source, std::uint64_t bytes,
+    std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_memset(
+    std::uint64_t destination, std::uint8_t value, std::uint64_t bytes,
+    std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_stream_create(std::uint64_t* stream);
+COLIBRI_API int colibri_gpu_stream_destroy(std::uint64_t stream);
+COLIBRI_API int colibri_gpu_stream_sync(std::uint64_t stream);
+COLIBRI_API int colibri_gpu_event_create(std::uint64_t* event);
+COLIBRI_API int colibri_gpu_event_record(
+    std::uint64_t event, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_event_sync(std::uint64_t event);
+COLIBRI_API int colibri_gpu_stream_wait_event(
+    std::uint64_t stream, std::uint64_t event
+);
+COLIBRI_API int colibri_gpu_event_destroy(std::uint64_t event);
+COLIBRI_API int colibri_gpu_q8_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_route_topk(
+    std::uint64_t logits, std::uint64_t selected, std::uint64_t weights,
+    std::int32_t experts, std::int32_t top_k, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q5_grouped_swiglu(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t input, std::uint64_t activated,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q6_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q8_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_launch_named(
+    const char* name, std::uint32_t grid_x, std::uint32_t grid_y,
+    std::uint32_t block_x, std::uint32_t shared_bytes,
+    std::uint64_t stream, void** arguments
+);
 
 // One CPU-offloaded DeltaNet decoder layer, fully pointer-resolved so the
 // per-token loop needs no interpreter. Device pointers are raw CUdeviceptr

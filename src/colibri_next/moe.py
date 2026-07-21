@@ -85,8 +85,10 @@ class QwenMoELayer:
             raise ValueError(f"unsupported expert device: {device}")
         self.expert_device = device
 
-    def route(self, hidden: list[float]) -> tuple[list[float], list[int], list[float]]:
-        logits = self.router.matvec(hidden)
+    def route(
+        self, hidden: list[float], *, allow_cuda: bool = True
+    ) -> tuple[list[float], list[int], list[float]]:
+        logits = self.router.matvec(hidden, allow_cuda=allow_cuda)
         maximum = max(logits)
         probabilities = [math.exp(logit - maximum) for logit in logits]
         denominator = sum(probabilities)
@@ -98,16 +100,18 @@ class QwenMoELayer:
         weights = [probabilities[index] / selected_total for index in selected]
         return logits, selected, weights
 
-    def forward(self, hidden: list[float]) -> MoEResult:
-        logits, selected, weights = self.route(hidden)
-        shared_logit = self.shared_gate.matvec(hidden)[0]
+    def forward(
+        self, hidden: list[float], *, allow_cuda: bool = True
+    ) -> MoEResult:
+        logits, selected, weights = self.route(hidden, allow_cuda=allow_cuda)
+        shared_logit = self.shared_gate.matvec(hidden, allow_cuda=allow_cuda)[0]
         shared_weight = _sigmoid(shared_logit)
 
         from .cuda import active_cuda
 
         accelerator = active_cuda()
         experts = [self._expert(expert_id) for expert_id in selected]
-        if accelerator is not None and self.expert_device == "cuda":
+        if accelerator is not None and self.expert_device == "cuda" and allow_cuda:
             output = accelerator.q4_moe(
                 experts,
                 weights,
@@ -136,14 +140,14 @@ class QwenMoELayer:
                 routed = [0.0] * self.hidden_size
                 for expert, weight in zip(experts, weights):
                     expert_output = expert.forward(
-                        hidden, prefer_numpy=prefer_numpy
+                        hidden, prefer_numpy=prefer_numpy, allow_cuda=allow_cuda
                     )
                     routed = [
                         current + weight * value
                         for current, value in zip(routed, expert_output)
                     ]
                 shared_output = self.shared_expert.forward(
-                    hidden, prefer_numpy=prefer_numpy
+                    hidden, prefer_numpy=prefer_numpy, allow_cuda=allow_cuda
                 )
                 output = [
                     routed_value + shared_weight * shared_value
@@ -156,9 +160,11 @@ class QwenMoELayer:
             router_logits=tuple(logits),
         )
 
-    def forward_residual(self, hidden: list[float]) -> MoEResult:
+    def forward_residual(
+        self, hidden: list[float], *, allow_cuda: bool = True
+    ) -> MoEResult:
         normalized = self.normalize(hidden)
-        result = self.forward(normalized)
+        result = self.forward(normalized, allow_cuda=allow_cuda)
         return MoEResult(
             output=[residual + value for residual, value in zip(hidden, result.output)],
             selected_experts=result.selected_experts,

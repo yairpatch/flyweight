@@ -1,6 +1,34 @@
 cmake_minimum_required(VERSION 3.24)
 project(colibri_native LANGUAGES CXX)
 
+include(CTest)
+
+add_executable(colibri_v2_provider_contract tests/provider_contract.cpp)
+target_compile_features(colibri_v2_provider_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_v2_provider_contract PRIVATE include)
+if(BUILD_TESTING)
+    add_test(NAME colibri_v2_provider_contract COMMAND colibri_v2_provider_contract)
+endif()
+
+add_library(
+    colibri_v2
+    SHARED
+    src/v2_runtime.cpp
+    src/gpu_driver.cpp
+    src/q4_dispatch.cpp
+    src/q4_scalar.cpp
+    src/q4_avx2.cpp
+    src/q4_avx512.cpp
+    src/qwen_cpu_avx512.cpp
+)
+target_compile_features(colibri_v2 PRIVATE cxx_std_20)
+target_include_directories(colibri_v2 PRIVATE include)
+target_compile_definitions(colibri_v2 PRIVATE COLIBRI_NATIVE_BUILD)
+if(NOT WIN32)
+    target_compile_options(colibri_v2 PRIVATE -O3 -fvisibility=hidden)
+endif()
+set_target_properties(colibri_v2 PROPERTIES PREFIX "" OUTPUT_NAME "colibri_v2")
+
 add_library(
     colibri_native
     SHARED
@@ -12,6 +40,11 @@ add_library(
 )
 
 if(NOT WIN32)
+    target_link_libraries(colibri_v2 PRIVATE ${CMAKE_DL_LIBS})
+    target_compile_options(colibri_v2 PRIVATE -O3 -fvisibility=hidden)
+    set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    set_source_files_properties(src/q4_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mfma;-mf16c")
+    set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mfma;-mf16c")
     target_link_libraries(colibri_native PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
@@ -21,6 +54,7 @@ target_compile_definitions(colibri_native PRIVATE COLIBRI_NATIVE_BUILD)
 
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
+    target_link_libraries(colibri_v2 PRIVATE OpenMP::OpenMP_CXX)
     target_link_libraries(colibri_native PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
@@ -28,6 +62,7 @@ if(MSVC)
     target_compile_options(colibri_native PRIVATE /O2 /EHsc /permissive-)
     set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/q4_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
 else()
     target_compile_options(colibri_native PRIVATE -O3 -fvisibility=hidden)
     set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")

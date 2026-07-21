@@ -20,3 +20,9 @@ hardware-profile.json
 *.coli
 *.safetensors
 *.gguf
+
+# native build outputs (rebuilt via `python -m colibri_next.native_build`)
+src/colibri_next/_native/*.so
+src/colibri_next/_native/colibri_v2_provider_contract
+# opencode agent workspace
+.opencode/

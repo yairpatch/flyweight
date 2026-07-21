@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -165,15 +167,79 @@ class QwenCheckpointConverter:
                     f"expert extraction requires {expected_bytes + safety_margin} free bytes "
                     f"including safety margin, but only {available_bytes} are available"
                 )
-            self._extract_experts(
-                output_path,
-                quantization=quantization,
-                overwrite=overwrite,
-                progress=progress,
+            staging = Path(
+                tempfile.mkdtemp(prefix=".experts-", dir=output_path)
             )
+            try:
+                self._extract_experts(
+                    staging,
+                    quantization=quantization,
+                    overwrite=True,
+                    progress=progress,
+                )
+                self._replace_expert_directory(
+                    output_path / "experts", staging / "experts"
+                )
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+        elif overwrite:
+            # The new manifest describes source-stacked experts. Remove a
+            # previous split-expert tree so it cannot be mistaken for output
+            # from this conversion.
+            shutil.rmtree(output_path / "experts", ignore_errors=True)
         manifest_path = output_path / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        self._write_manifest(manifest_path, manifest)
         return manifest
+
+    @staticmethod
+    def _replace_expert_directory(destination: Path, staging: Path) -> None:
+        backup: Path | None = None
+        try:
+            if destination.exists():
+                descriptor, backup_name = tempfile.mkstemp(
+                    prefix=f".{destination.name}.backup-",
+                    dir=destination.parent,
+                )
+                os.close(descriptor)
+                os.unlink(backup_name)
+                backup = Path(backup_name)
+                os.replace(destination, backup)
+            os.replace(staging, destination)
+        except BaseException:
+            if destination.exists():
+                shutil.rmtree(destination, ignore_errors=True)
+            if backup is not None and backup.exists():
+                os.replace(backup, destination)
+            raise
+        finally:
+            if backup is not None:
+                shutil.rmtree(backup, ignore_errors=True)
+
+    @staticmethod
+    def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_name = handle.name
+                handle.write(json.dumps(manifest, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, path)
+            temporary_name = None
+        finally:
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
 
     def _base_manifest(
         self, *, extract_experts: bool, quantization: str
@@ -336,4 +402,3 @@ class QwenCheckpointConverter:
             )
         if down_shape != expected_down:
             raise ValueError(f"layer {layer} down_proj shape {down_shape} != {expected_down}")
-

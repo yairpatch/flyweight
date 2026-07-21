@@ -593,7 +593,10 @@ async function sendMessage(promptOverride = null) {
   render();
   scrollToBottom();
 
-  const started = performance.now();
+  const requestStarted = performance.now();
+  let firstTokenAt = null;
+  let lastTokenAt = null;
+  let decodeSeconds = 0;
   try {
     const payloadMessages = conversation.messages
       .slice(0, -1)
@@ -637,8 +640,19 @@ async function sendMessage(promptOverride = null) {
       }
       const generatedTokens = chunk.colibri?.generated_tokens;
       if (Number.isFinite(generatedTokens)) {
-        const seconds = (performance.now() - started) / 1000;
-        assistant.metrics = formatGenerationMetrics(generatedTokens, seconds, true);
+        const now = performance.now();
+        firstTokenAt ??= now;
+        lastTokenAt = now;
+        const serverDecodeSeconds = chunk.colibri?.decode_elapsed_seconds;
+        decodeSeconds = Number.isFinite(serverDecodeSeconds)
+          ? serverDecodeSeconds
+          : (lastTokenAt - firstTokenAt) / 1000;
+        assistant.metrics = formatGenerationMetrics(
+          generatedTokens,
+          decodeSeconds,
+          true,
+          (now - requestStarted) / 1000,
+        );
       }
       const delta = chunk.choices?.[0]?.delta;
       if (!delta) {
@@ -653,11 +667,13 @@ async function sendMessage(promptOverride = null) {
         scrollToBottom();
       }
     });
-    const seconds = (performance.now() - started) / 1000;
+    const totalSeconds = (performance.now() - requestStarted) / 1000;
     const outputTokens = usage?.completion_tokens;
     assistant.metrics = outputTokens
-      ? formatGenerationMetrics(outputTokens, seconds, false)
-      : `${seconds.toFixed(1)}s`;
+      ? formatGenerationMetrics(
+          outputTokens, decodeSeconds, false, totalSeconds,
+        )
+      : `${totalSeconds.toFixed(1)}s`;
   } catch (error) {
     if (error.name === "AbortError") {
       if (!assistant.content && !assistant.toolCalls.length) {
@@ -684,9 +700,17 @@ async function sendMessage(promptOverride = null) {
   }
 }
 
-function formatGenerationMetrics(tokens, seconds, live) {
-  const rate = seconds > 0 ? (tokens / seconds).toFixed(1) : "0.0";
-  return `${tokens} tokens · ${rate} tok/s${live ? " · live" : ""}`;
+function formatGenerationMetrics(tokens, decodeSeconds, live, totalSeconds) {
+  // The first token ends prompt evaluation/TTFT. Decode throughput therefore
+  // measures the remaining token intervals, matching native benchmark-v2.
+  const decodeIntervals = Math.max(0, tokens - 1);
+  const rate = decodeIntervals > 0 && decodeSeconds > 0
+    ? `${(decodeIntervals / decodeSeconds).toFixed(1)} tok/s`
+    : "measuring decode…";
+  const total = Number.isFinite(totalSeconds)
+    ? ` · ${totalSeconds.toFixed(1)}s total`
+    : "";
+  return `${tokens} tokens · ${rate}${live ? " · live" : ""}${total}`;
 }
 
 function messageForAPI(message) {

@@ -166,6 +166,32 @@ class NativeBackend:
                 ctypes.c_int32,
             ]
             library.colibri_gpu_compile.restype = ctypes.c_int
+            library.colibri_gpu_q4_matvec.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int32,
+                ctypes.c_int32,
+            ]
+            library.colibri_gpu_q4_matvec.restype = ctypes.c_int
+            library.colibri_gpu_q4_moe.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+            ]
+            library.colibri_gpu_q4_moe.restype = ctypes.c_int
             library.colibri_delta_moe_segment.argtypes = [
                 ctypes.POINTER(DeltaParamsStruct),
                 ctypes.POINTER(DeltaLayerStruct),
@@ -181,6 +207,69 @@ class NativeBackend:
             library.colibri_delta_graph_destroy.argtypes = [ctypes.c_uint64]
             library.colibri_delta_graph_destroy.restype = ctypes.c_int
         self._gpu_compiled = False
+
+    def gpu_q4_matvec(
+        self,
+        packed: int,
+        scales: int,
+        input_vector: int,
+        output: int,
+        stream: int,
+        rows: int,
+        columns: int,
+    ) -> None:
+        status = self.library.colibri_gpu_q4_matvec(
+            ctypes.c_uint64(packed),
+            ctypes.c_uint64(scales),
+            ctypes.c_uint64(input_vector),
+            ctypes.c_uint64(output),
+            ctypes.c_uint64(stream),
+            ctypes.c_int32(rows),
+            ctypes.c_int32(columns),
+        )
+        if status != 0:
+            raise RuntimeError(
+                f"native CUDA Q4 matvec failed with status {status}"
+            )
+
+    def gpu_q4_moe(
+        self,
+        gate_up_packed: int,
+        gate_up_scales: int,
+        down_packed: int,
+        down_scales: int,
+        weights: int,
+        input_vector: int,
+        gate_output: int,
+        activated: int,
+        output: int,
+        stream: int,
+        expert_count: int,
+        hidden_size: int,
+        intermediate_size: int,
+    ) -> None:
+        status = self.library.colibri_gpu_q4_moe(
+            *(
+                ctypes.c_uint64(value)
+                for value in (
+                    gate_up_packed,
+                    gate_up_scales,
+                    down_packed,
+                    down_scales,
+                    weights,
+                    input_vector,
+                    gate_output,
+                    activated,
+                    output,
+                    stream,
+                )
+            ),
+            ctypes.c_int32(expert_count),
+            ctypes.c_int32(hidden_size),
+            ctypes.c_int32(intermediate_size),
+        )
+        if status != 0:
+            raise RuntimeError(f"native CUDA Q4 MoE failed with status {status}")
 
     def delta_graph_build(
         self, params: "DeltaParamsStruct", layer: "DeltaLayerStruct"

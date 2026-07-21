@@ -281,6 +281,21 @@ reference fidelity is more important.
 
 ## Local server
 
+Serve a GGUF directly with the native v2 C++/CUDA runtime and hybrid expert
+execution:
+
+~~~console
+python -m colibri_next.cli serve-v2 models/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf --context-window 32768 --gpu-cache-mib 8192 --moe-device hybrid --host 127.0.0.1 --port 8000
+~~~
+
+`serve-v2` keeps model execution, prompt ingestion, and the greedy token loop
+inside the native runtime. Python handles HTTP compatibility and receives
+generated tokens through the C ABI streaming callback. Native v2 currently
+supports greedy requests (`temperature: 0`) and serializes requests through
+one persistent model session.
+
+The converted-model v1 server remains available as a reference backend:
+
 Start one persistent model process with an 8 GiB CUDA weight cache:
 
 ~~~console
@@ -329,6 +344,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ~~~
 
 The server supports streaming and non-streaming `POST /v1/chat/completions`, `POST /v1/responses`, and legacy `POST /v1/completions`; stateful Responses continuation, retrieval, and deletion; Chat Completions and Responses function tools using Qwen's native tool format; `GET /v1/models`; and llama.cpp-style `/tokenize`, `/detokenize`, `/props`, and `/slots` endpoints. It keeps the CUDA cache warm and serializes generation on one GPU. The first request compiles CUDA kernels and fills VRAM, so later requests are faster.
+
+The active attention KV cache uses float32 by default. For lower VRAM usage,
+start the server with `--kv-cache-type q8`. This stores each
+key/value head and token as int8 with a separate scale and dequantizes it for
+attention. Float32 remains the safer default; compare a short generation
+before enabling q8 for production workloads.
 
 Completed generations retain a bounded decoder prefix state. When a later chat
 request begins with the same tokenized history, the server reuses its attention
@@ -433,3 +454,17 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 ## Scope
 
 The project now executes complete mixed Qwen models from text prompts through decoded output. The current implementation supports portable CPU execution and optional bounded-memory NVIDIA CUDA acceleration.
+
+## Native v2 runtime (opt-in)
+
+The separate `colibri_v2` C++20 library memory-maps GGUF files and exposes
+model metadata, tensor offsets, session lifetime, cancellation, deterministic
+stepping, callbacks, and runtime statistics through a small C ABI. Python
+bindings are available as `colibri_next.v2`.
+
+Build it with `PYTHONPATH=src python -m colibri_next.native_build`, then use
+`inspect-gguf-v2`, `probe-qwen-native-v2`, `benchmark-v2`, or `serve-v2`.
+The Qwen3.6 MoE path executes direct GGUF weights through native C++/CUDA,
+keeps recurrent and KV state on GPU, and supports GPU, CPU, or hybrid routed
+expert execution. v1 remains available as the converted-model reference and
+fallback backend.

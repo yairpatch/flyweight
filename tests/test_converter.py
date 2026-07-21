@@ -167,6 +167,27 @@ class QwenConverterTests(unittest.TestCase):
             self.assertEqual(gate.shape, (4, 2))
             self.assertEqual(len(gate.dequantize()), 8)
 
+    def test_overwrite_replaces_split_experts_without_stale_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "converted"
+            source.mkdir()
+            create_checkpoint(source)
+            converter = QwenCheckpointConverter(source)
+            converter.convert(output, extract_experts=True)
+
+            stale = output / "experts" / "layer-999" / "expert-9999.coli"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale")
+
+            converter.convert(output, extract_experts=True, overwrite=True)
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(
+                (output / "experts" / "layer-001" / "expert-0001.coli").exists()
+            )
+
     def test_manifest_only_does_not_require_weight_shards(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
