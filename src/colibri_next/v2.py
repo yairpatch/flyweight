@@ -1123,9 +1123,9 @@ class V2QwenRuntime:
         if not 0.0 <= expert_top_p <= 1.0:
             raise ValueError("expert_top_p must be within [0, 1] (0 = disabled)")
         # KV cache precision per llama.cpp's -ctk/-ctv (Phase 1: f32, f16).
-        cache_types = {"f32": 0, "f16": 1, "bf16": 2}
+        cache_types = {"f32": 0, "f16": 1, "bf16": 2, "q8_0": 3}
         if cache_type_k not in cache_types or cache_type_v not in cache_types:
-            raise ValueError("cache_type_k/v must be 'f32', 'f16', or 'bf16'")
+            raise ValueError("cache_type_k/v must be 'f32', 'f16', 'bf16', or 'q8_0'")
         self.model, self._lib = model, model._lib
         self._handle = ctypes.c_void_p()
         options = _QwenRuntimeOptions(

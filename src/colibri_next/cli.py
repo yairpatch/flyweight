@@ -407,13 +407,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     serve_v2.add_argument(
         "--cache-type-k",
-        choices=("f32", "f16", "bf16"),
+        choices=("f32", "f16", "bf16", "q8_0"),
         default="f16",
         help="KV cache K precision (llama.cpp -ctk); f16 halves KV VRAM",
     )
     serve_v2.add_argument(
         "--cache-type-v",
-        choices=("f32", "f16", "bf16"),
+        choices=("f32", "f16", "bf16", "q8_0"),
         default="f16",
         help="KV cache V precision (llama.cpp -ctv); f16 halves KV VRAM",
     )

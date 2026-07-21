@@ -718,6 +718,67 @@ KV_PREFILL(kv_attention_prefill_f16, __half, __half)
 KV_PREFILL(kv_attention_prefill_bf16, __nv_bfloat16, __nv_bfloat16)
 #undef KV_PREFILL
 
+// q8_0 fused prefill (diagonal K==V==q8_0). Same online-softmax as the templated
+// path but K/V rows are (head_dim/32)-block byte rows read via kv_ld_q8.
+extern "C" __global__ void kv_attention_prefill_q8(
+    const float* queries, const unsigned char* keys, const unsigned char* values,
+    float* output, const int heads, const int kv_heads,
+    const int head_dim, const int base_position, const int rows,
+    const int capacity, const float scale
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int tile = (blockIdx.y * warps + warp) * 4;
+    if (tile >= rows) return;
+    const int group = heads / kv_heads;
+    const int kv_head = head / group;
+    const int dims = head_dim / 32;
+    const int count = min(4, rows - tile);
+    float q[4][8], acc[4][8], m[4], l[4];
+    for (int i = 0; i < 4; ++i) {
+        m[i] = -3.402823466e+38F; l[i] = 0.0f;
+        for (int d = 0; d < 8; ++d) {
+            acc[i][d] = 0.0f;
+            q[i][d] = (i < count && d < dims)
+                ? queries[(tile + i) * heads * head_dim + head * head_dim + lane + 32 * d]
+                : 0.0f;
+        }
+    }
+    const int last = base_position + tile + count - 1;
+    for (int position = 0; position <= last; ++position) {
+        float k[8], v[8];
+        const unsigned char* key_row = keys + ((long long)kv_head * capacity + position) * dims * 34;
+        const unsigned char* value_row = values + ((long long)kv_head * capacity + position) * dims * 34;
+        for (int d = 0; d < 8; ++d) {
+            k[d] = d < dims ? kv_ld_q8(key_row, lane + 32 * d) : 0.0f;
+            v[d] = d < dims ? kv_ld_q8(value_row, lane + 32 * d) : 0.0f;
+        }
+        for (int i = 0; i < count; ++i) {
+            if (position > base_position + tile + i) continue;
+            float partial = 0.0f;
+            for (int d = 0; d < 8; ++d) partial += q[i][d] * k[d];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                partial += __shfl_xor_sync(0xffffffff, partial, offset);
+            const float score = partial * scale;
+            const float peak = fmaxf(m[i], score);
+            const float rescale = expf(m[i] - peak);
+            const float weight = expf(score - peak);
+            l[i] = l[i] * rescale + weight;
+            for (int d = 0; d < 8; ++d) acc[i][d] = acc[i][d] * rescale + weight * v[d];
+            m[i] = peak;
+        }
+    }
+    for (int i = 0; i < count; ++i) {
+        const float inverse = 1.0f / l[i];
+        for (int d = 0; d < dims; ++d)
+            output[(tile + i) * heads * head_dim + head * head_dim + lane + 32 * d]
+                = acc[i][d] * inverse;
+    }
+}
+
 extern "C" __global__
 void qwen_argmax(const float* values, unsigned int* output, const int elements) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;

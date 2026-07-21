@@ -839,8 +839,8 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
     if(runtime->options.expert_top_p<0.0f||runtime->options.expert_top_p>1.0f)throw std::runtime_error("native Qwen expert_top_p must be within [0, 1]");
-    if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>2)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), or 2 (bf16)");
-    if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>2)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), or 2 (bf16)");
+    if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>3)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
+    if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>3)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.mtp_drafts&&(runtime->options.cache_type_k||runtime->options.cache_type_v))throw std::runtime_error("native Qwen MTP currently requires f32 KV cache");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
     build_qwen_plan(*runtime);
@@ -947,8 +947,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // configured cache precision (f32=4B, f16=2B/elem); DeltaNet conv/recurrent
         // state stays f32. Each region is 16-byte aligned so mixed f16/f32 regions
         // never leave a following f32 access misaligned.
-        const std::uint64_t kv_k=runtime->options.cache_type_k==0?4:2; // f32=4B, f16/bf16=2B per element
-        const std::uint64_t kv_v=runtime->options.cache_type_v==0?4:2;
+        // KV region bytes per element count and cache type (q8_0 = 34B/32-elem block).
+        auto kv_bytes=[](std::uint64_t elems,int type){return type==3?(elems/32)*34:elems*(type==0?4:2);};
+        const int ck_type=runtime->options.cache_type_k, cv_type=runtime->options.cache_type_v;
         std::uint64_t state_cursor=0;
         auto reserve=[&](std::uint64_t bytes)->std::uint64_t{const auto at=state_cursor;state_cursor=(state_cursor+bytes+15)/16*16;return at;};
         std::uint64_t max_vector=runtime->model->config.vocabulary_size;
@@ -959,8 +960,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 const auto&key=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".attn_k.weight")];
                 const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
                 const auto cache_floats=runtime->model->config.attention_kv_heads*runtime->options.context_limit*head_dim;
-                layer.state_first=reserve(cache_floats*kv_k);
-                layer.state_second=reserve(cache_floats*kv_v);
+                layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
+                layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
             }else{
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
@@ -974,8 +975,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             const auto&key=runtime->model->tensors[layer.static_tensors[2]];
             const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
             const auto cache_floats=runtime->model->config.attention_kv_heads*runtime->options.context_limit*head_dim;
-            layer.state_first=reserve(cache_floats*kv_k);
-            layer.state_second=reserve(cache_floats*kv_v);
+            layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
+            layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
             runtime->mtp_target_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
             runtime->mtp_draft_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
             runtime->mtp_snapshot_offset=state_cursor;
@@ -1402,12 +1403,13 @@ void qwen_prefill_snapshot_copy(
 // KV cache kernel selection by configured precision (0=f32, 1=f16, 2=bf16).
 // K and V are independent: append is one kv_store_<t> launch per cache; scores
 // read K, values read V; the fused prefill only runs when K==V (else per-token).
-inline std::uint64_t kv_elem_bytes(int type){return type==0?4:2;}
-inline const char* kv_store_kernel(int type){return type==2?"kv_store_bf16":type==1?"kv_store_f16":"kv_store_f32";}
-inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";}
-inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
+// KV byte size for `elems` elements at a given type (q8_0 = 34 bytes per 32-elem block).
+inline std::uint64_t kv_region_bytes(std::uint64_t elems,int type){return type==3?(elems/32)*34:elems*(type==0?4:2);}
+inline const char* kv_store_kernel(int t){return t==3?"kv_store_q8":t==2?"kv_store_bf16":t==1?"kv_store_f16":"kv_store_f32";}
+inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_scores_q8":t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";}
+inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==3?"kv_attention_values_q8":t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
 inline bool kv_fused_prefill_ok(const ColibriV2QwenRuntime& r){return r.options.cache_type_k==r.options.cache_type_v;}
-inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==2?"kv_attention_prefill_bf16":t==1?"kv_attention_prefill_f16":"kv_attention_prefill";}
+inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_prefill_q8":t==2?"kv_attention_prefill_bf16":t==1?"kv_attention_prefill_f16":"kv_attention_prefill";}
 
 #include "v2_mtp_verifier.inc"
 

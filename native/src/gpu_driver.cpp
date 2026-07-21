@@ -538,10 +538,10 @@ extern "C" int colibri_gpu_compile(
              "q8_grouped_accumulate_rows", "kv_attention_prefill",
              "q8_matmul_tiled", "delta_conv_chunk",
              "qwen_delta_recurrent_chunk",
-             "kv_store_f32", "kv_store_f16", "kv_store_bf16",
-             "kv_attention_scores_f16", "kv_attention_scores_bf16",
-             "kv_attention_values_f16", "kv_attention_values_bf16",
-             "kv_attention_prefill_f16", "kv_attention_prefill_bf16"
+             "kv_store_f32", "kv_store_f16", "kv_store_bf16", "kv_store_q8",
+             "kv_attention_scores_f16", "kv_attention_scores_bf16", "kv_attention_scores_q8",
+             "kv_attention_values_f16", "kv_attention_values_bf16", "kv_attention_values_q8",
+             "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8"
          }) {
         CUfunction function = nullptr;
         if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)

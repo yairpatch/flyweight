@@ -1471,6 +1471,40 @@ KV_STORE(kv_store_f16, __half)
 KV_STORE(kv_store_bf16, __nv_bfloat16)
 #undef KV_STORE
 
+// ---- q8_0 blocked KV codec: 32 elems/block = [f16 scale | 32 int8], 34 bytes.
+// A cache row is (head_dim/32) blocks; element e lives in block e/32 at e%32.
+__device__ __forceinline__ float kv_ld_q8(const unsigned char* row, int elem) {
+    const unsigned char* blk = row + (elem >> 5) * 34;
+    const float scale = __half2float(*((const __half*)blk));
+    return scale * (float)(((const signed char*)(blk + 2))[elem & 31]);
+}
+// Quantize and store one (K or V) cache row for the current token; one thread
+// per 32-block computes the block absmax -> f16 scale -> symmetric int8.
+extern "C" __global__ void kv_store_q8(
+    const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) {
+    const int head = blockIdx.x;
+    if (head >= kv_heads) return;
+    const int blocks = head_dim / 32;
+    unsigned char* row = cache + ((long long)head * capacity + position) * blocks * 34;
+    const float* src = current + head * head_dim;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const float* blk = src + b * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(blk[i]));
+        const float scale = amax / 127.0f;
+        const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        unsigned char* dst = row + b * 34;
+        *((__half*)dst) = __float2half(scale);
+        signed char* q = (signed char*)(dst + 2);
+        for (int i = 0; i < 32; ++i) {
+            int v = __float2int_rn(blk[i] * inv);
+            q[i] = (signed char)max(-127, min(127, v));
+        }
+    }
+}
+
 template<typename KT>
 __device__ void kv_scores_impl(
     const float* query, const KT* keys, float* scores,
@@ -1503,6 +1537,21 @@ extern "C" __global__ void kv_attention_scores_bf16(
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity, const float scale
 ) { kv_scores_impl<__nv_bfloat16>(query, keys, scores, heads, kv_heads, head_dim, tokens, capacity, scale); }
+extern "C" __global__ void kv_attention_scores_q8(
+    const float* query, const unsigned char* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y * blockDim.x + threadIdx.x;
+    if (head >= heads || token >= tokens) return;
+    const int group = heads / kv_heads, kv_head = head / group, blocks = head_dim / 32;
+    const float* q = query + head * head_dim;
+    const unsigned char* k = keys + ((long long)kv_head * capacity + token) * blocks * 34;
+    float s = 0.0f;
+    for (int d = 0; d < head_dim; ++d) s += q[d] * kv_ld_q8(k, d);
+    scores[head * tokens + token] = s * scale;
+}
 
 template<typename VT>
 __device__ void kv_values_impl(
@@ -1555,6 +1604,39 @@ extern "C" __global__ void kv_attention_values_bf16(
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
 ) { kv_values_impl<__nv_bfloat16>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
+extern "C" __global__ void kv_attention_values_q8(
+    const float* scores, const unsigned char* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const int group = heads / kv_heads, kv_head = head / group, blocks = head_dim / 32;
+    const float* head_scores = scores + head * tokens;
+    float local_maximum = -3.402823466e+38F;
+    for (int token = threadIdx.x; token < tokens; token += blockDim.x)
+        local_maximum = fmaxf(local_maximum, head_scores[token]);
+    const float reduced_maximum = block_reduce_max(local_maximum);
+    __shared__ float maximum;
+    if (threadIdx.x == 0) maximum = reduced_maximum;
+    __syncthreads();
+    float local_denominator = 0.0f;
+    for (int token = threadIdx.x; token < tokens; token += blockDim.x)
+        local_denominator += expf(head_scores[token] - maximum);
+    const float reduced_denominator = block_reduce_sum(local_denominator);
+    __shared__ float inverse_denominator;
+    if (threadIdx.x == 0) inverse_denominator = 1.0f / reduced_denominator;
+    __syncthreads();
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float result = 0.0f;
+        for (int token = 0; token < tokens; ++token) {
+            const float weight = expf(head_scores[token] - maximum);
+            const unsigned char* vrow = values + ((long long)kv_head * capacity + token) * blocks * 34;
+            result += weight * kv_ld_q8(vrow, d);
+        }
+        output[head * head_dim + d] = result * inverse_denominator;
+    }
+}
 
 // Portable compatibility entry point used by the small C ABI parity tests.
 // The native Qwen decode path uses the parallel score/value kernels above.
