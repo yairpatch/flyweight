@@ -790,7 +790,9 @@ class InferenceService:
             for event in chat_events:
                 if event == "[DONE]":
                     for open_index in sorted(
-                        i for i in [text_block_index, *tool_blocks.values()]
+                        i
+                        for i in [text_block_index, *tool_blocks.values()]
+                        if i is not None
                     ):
                         yield {"type": "content_block_stop", "index": open_index}
                     yield {
