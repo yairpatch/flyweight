@@ -265,7 +265,20 @@ class InferenceService:
                 # the end from the accumulated text.
                 final_step: GenerationStep | None = None
                 accumulated = ""
+                streamed = 0  # end of clean (non-tool) text already sent as content
+                tool_start: int | None = None  # index of a <tool_call> marker once seen
                 decode_started: float | None = None
+                marker = "<tool_call>"
+                holdback = len(marker) - 1
+
+                def _content_chunk(text: str, tokens: int, elapsed: float):
+                    chunk = self._chat_chunk(completion_id, created, {"content": text})
+                    chunk["colibri"] = {
+                        "generated_tokens": tokens,
+                        "decode_elapsed_seconds": elapsed,
+                    }
+                    return chunk
+
                 with self._generation_lock:
                     for step in self.generator.stream_messages(
                         request.messages,
@@ -283,16 +296,25 @@ class InferenceService:
                         now = time.perf_counter()
                         if decode_started is None:
                             decode_started = now
-                        chunk = self._chat_chunk(
-                            completion_id,
-                            created,
-                            {"content": step.text_delta} if step.text_delta else {},
-                        )
-                        chunk["colibri"] = {
-                            "generated_tokens": len(step.generated_ids),
-                            "decode_elapsed_seconds": now - decode_started,
-                        }
-                        yield chunk
+                        if tool_start is not None:
+                            continue  # inside a tool-call block: emit no content
+                        # Stream clean text, but stop at (and never leak) the tool-call
+                        # markup so OpenAI clients such as Cline receive it as structured
+                        # tool_calls, not as assistant text.
+                        found = accumulated.find(marker, streamed)
+                        if found != -1:
+                            delta = accumulated[streamed:found]
+                            streamed = found
+                            tool_start = found
+                        else:
+                            # Hold back a possible partial marker at the tail.
+                            safe = len(accumulated) - holdback
+                            delta = accumulated[streamed:safe] if safe > streamed else ""
+                            streamed += len(delta)
+                        if delta:
+                            yield _content_chunk(
+                                delta, len(step.generated_ids), now - decode_started
+                            )
                 if final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
                 _, tool_calls = _parse_tool_calls(accumulated)
@@ -306,6 +328,12 @@ class InferenceService:
                                 for index, call in enumerate(tool_calls)
                             ]
                         },
+                    )
+                elif streamed < len(accumulated):
+                    # No parseable tool call (or a truncated one): flush the text we
+                    # held back / suppressed so the turn is never silently empty.
+                    yield self._chat_chunk(
+                        completion_id, created, {"content": accumulated[streamed:]}
                     )
                 finish_reason = (
                     "tool_calls"
