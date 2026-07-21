@@ -1499,13 +1499,20 @@ def create_handler(
                 self.rfile.read(length)
 
         def _send_sse(self, events: Iterator[dict[str, Any] | str]) -> None:
+            # HTTP/1.1 chunked transfer-encoding rather than close-delimited: each
+            # SSE event is a self-framed chunk, so the stream stays intact and the
+            # keep-alive connection is cleanly reusable. Close-delimiting (Connection:
+            # close) races with pooled HTTP clients (httpx/undici in Claude Code,
+            # Cline, Codex): the next request reuses the socket across the close and
+            # the leftover stream bytes corrupt it ("streams then garbled").
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
             self._send_cors_headers()
-            self.send_header("Connection", "close")
+            self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            self.close_connection = True
+            stream_ok = True
             decoding_logged = False
             event_count = 0
             decode_tokens = 0
@@ -1557,6 +1564,7 @@ def create_handler(
                     sys.stderr.flush()
                 self.log_message("request completed: streaming events=%d", event_count)
             except (BrokenPipeError, ConnectionResetError):
+                stream_ok = False
                 self.close_connection = True
             except APIError as error:
                 # Once SSE headers are sent, a JSON error response is no longer
@@ -1565,6 +1573,7 @@ def create_handler(
                 try:
                     self._write_sse_event(json.dumps(_error_payload(error)))
                 except (BrokenPipeError, ConnectionResetError):
+                    stream_ok = False
                     self.close_connection = True
             except Exception as error:
                 # Generation happens while the iterator is consumed, after the
@@ -1580,18 +1589,29 @@ def create_handler(
                         )
                     )
                 except (BrokenPipeError, ConnectionResetError):
+                    stream_ok = False
                     self.close_connection = True
             finally:
                 close = getattr(events, "close", None)
                 if close is not None:
                     close()
+                if stream_ok:
+                    try:
+                        self.wfile.write(b"0\r\n\r\n")  # terminating chunk
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        self.close_connection = True
 
         def _write_sse_event(
             self, data: str, event: Mapping[str, Any] | None = None
         ) -> None:
             event_name = event.get("type") if event is not None else None
             prefix = f"event: {event_name}\n" if event_name else ""
-            self.wfile.write(f"{prefix}data: {data}\n\n".encode("utf-8"))
+            payload = f"{prefix}data: {data}\n\n".encode("utf-8")
+            # One HTTP chunk per SSE event: "<hex length>\r\n<payload>\r\n".
+            self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
+            self.wfile.write(payload)
+            self.wfile.write(b"\r\n")
             self.wfile.flush()
 
         def _send_cors_headers(self) -> None:
