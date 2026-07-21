@@ -4,6 +4,7 @@ namespace colibri::v2 {
 inline constexpr char qwen_cuda_source[] = R"COLIBRI_CUDA(
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 __device__ __forceinline__ float block_reduce_sum(float value) {
     const int lane = threadIdx.x & 31;
@@ -1442,8 +1443,33 @@ void q8_grouped_accumulate_rows(
 // the K/V cache in whatever precision it was allocated at.
 __device__ __forceinline__ float kv_ld(const float* p, long long i) { return p[i]; }
 __device__ __forceinline__ float kv_ld(const __half* p, long long i) { return __half2float(p[i]); }
+__device__ __forceinline__ float kv_ld(const __nv_bfloat16* p, long long i) { return __bfloat162float(p[i]); }
 __device__ __forceinline__ void kv_st(float* p, long long i, float v) { p[i] = v; }
 __device__ __forceinline__ void kv_st(__half* p, long long i, float v) { p[i] = __float2half(v); }
+__device__ __forceinline__ void kv_st(__nv_bfloat16* p, long long i, float v) { p[i] = __float2bfloat16(v); }
+
+// Store one (K or V) cache row for the current token; launched once per cache so
+// K and V precisions are independent and each type is a single kernel (no KxV
+// combinatorics). blockIdx.x = kv_head.
+template<typename T>
+__device__ void kv_store_impl(
+    const float* current, T* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) {
+    const int head = blockIdx.x;
+    if (head >= kv_heads) return;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        kv_st(cache, ((long long)head * capacity + position) * head_dim + d,
+              current[head * head_dim + d]);
+}
+#define KV_STORE(name, T) \
+extern "C" __global__ void name(const float* current, T* cache, \
+    const int kv_heads, const int head_dim, const int position, const int capacity \
+) { kv_store_impl<T>(current, cache, kv_heads, head_dim, position, capacity); }
+KV_STORE(kv_store_f32, float)
+KV_STORE(kv_store_f16, __half)
+KV_STORE(kv_store_bf16, __nv_bfloat16)
+#undef KV_STORE
 
 template<typename KT>
 __device__ void kv_scores_impl(
@@ -1472,6 +1498,11 @@ extern "C" __global__ void kv_attention_scores_f16(
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity, const float scale
 ) { kv_scores_impl<__half>(query, keys, scores, heads, kv_heads, head_dim, tokens, capacity, scale); }
+extern "C" __global__ void kv_attention_scores_bf16(
+    const float* query, const __nv_bfloat16* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) { kv_scores_impl<__nv_bfloat16>(query, keys, scores, heads, kv_heads, head_dim, tokens, capacity, scale); }
 
 template<typename VT>
 __device__ void kv_values_impl(
@@ -1519,6 +1550,11 @@ extern "C" __global__ void kv_attention_values_f16(
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
 ) { kv_values_impl<__half>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
+extern "C" __global__ void kv_attention_values_bf16(
+    const float* scores, const __nv_bfloat16* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity
+) { kv_values_impl<__nv_bfloat16>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
 
 // Portable compatibility entry point used by the small C ABI parity tests.
 // The native Qwen decode path uses the parallel score/value kernels above.
@@ -1585,10 +1621,7 @@ extern "C" __global__ void name( \
     KT* cache_keys, VT* cache_values, \
     const int kv_heads, const int head_dim, const int position, const int capacity \
 ) { kv_append_impl<KT, VT>(current_keys, current_values, cache_keys, cache_values, kv_heads, head_dim, position, capacity); }
-KV_APPEND(kv_append, float, float)
-KV_APPEND(kv_append_f16_f16, __half, __half)
-KV_APPEND(kv_append_f16_f32, __half, float)
-KV_APPEND(kv_append_f32_f16, float, __half)
+KV_APPEND(kv_append, float, float) // combined f32 append, used only by the MTP path
 #undef KV_APPEND
 )COLIBRI_CUDA";
 }

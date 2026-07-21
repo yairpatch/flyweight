@@ -141,11 +141,13 @@ void qwen_forward_rows(
                 void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
                 launch("qwen_attention_key",kv_heads,1,256,k_args);
                 auto value=third+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
-                void*append_args[]={&key,&value,&cache_keys,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
-                launch(kv_append_kernel(runtime),kv_heads,1,256,append_args);
+                void*k_store_args[]={&key,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
+                launch(kv_store_kernel(runtime.options.cache_type_k),kv_heads,1,256,k_store_args);
+                void*v_store_args[]={&value,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
+                launch(kv_store_kernel(runtime.options.cache_type_v),kv_heads,1,256,v_store_args);
             }
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
-            if(head_dim%32==0&&head_dim<=256){
+            if(head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
                 // One warp streams the KV cache once for 4 query rows: cache
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.

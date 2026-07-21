@@ -839,8 +839,8 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
     if(runtime->options.expert_top_p<0.0f||runtime->options.expert_top_p>1.0f)throw std::runtime_error("native Qwen expert_top_p must be within [0, 1]");
-    if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>1)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32) or 1 (f16)");
-    if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>1)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32) or 1 (f16)");
+    if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>2)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), or 2 (bf16)");
+    if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>2)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), or 2 (bf16)");
     if(runtime->options.mtp_drafts&&(runtime->options.cache_type_k||runtime->options.cache_type_v))throw std::runtime_error("native Qwen MTP currently requires f32 KV cache");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
     build_qwen_plan(*runtime);
@@ -947,8 +947,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // configured cache precision (f32=4B, f16=2B/elem); DeltaNet conv/recurrent
         // state stays f32. Each region is 16-byte aligned so mixed f16/f32 regions
         // never leave a following f32 access misaligned.
-        const std::uint64_t kv_k=runtime->options.cache_type_k==1?2:4;
-        const std::uint64_t kv_v=runtime->options.cache_type_v==1?2:4;
+        const std::uint64_t kv_k=runtime->options.cache_type_k==0?4:2; // f32=4B, f16/bf16=2B per element
+        const std::uint64_t kv_v=runtime->options.cache_type_v==0?4:2;
         std::uint64_t state_cursor=0;
         auto reserve=[&](std::uint64_t bytes)->std::uint64_t{const auto at=state_cursor;state_cursor=(state_cursor+bytes+15)/16*16;return at;};
         std::uint64_t max_vector=runtime->model->config.vocabulary_size;
@@ -1399,17 +1399,15 @@ void qwen_prefill_snapshot_copy(
     }
 }
 
-// KV cache kernel selection by configured precision (Phase 1: f32, f16).
-inline const char* kv_append_kernel(const ColibriV2QwenRuntime& r){
-    const bool k=r.options.cache_type_k==1,v=r.options.cache_type_v==1;
-    return k?(v?"kv_append_f16_f16":"kv_append_f16_f32"):(v?"kv_append_f32_f16":"kv_append");
-}
-inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){return r.options.cache_type_k==1?"kv_attention_scores_f16":"kv_attention_scores";}
-inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){return r.options.cache_type_v==1?"kv_attention_values_f16":"kv_attention_values";}
-inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){
-    const bool k=r.options.cache_type_k==1,v=r.options.cache_type_v==1;
-    return k?(v?"kv_attention_prefill_f16_f16":"kv_attention_prefill_f16_f32"):(v?"kv_attention_prefill_f32_f16":"kv_attention_prefill");
-}
+// KV cache kernel selection by configured precision (0=f32, 1=f16, 2=bf16).
+// K and V are independent: append is one kv_store_<t> launch per cache; scores
+// read K, values read V; the fused prefill only runs when K==V (else per-token).
+inline std::uint64_t kv_elem_bytes(int type){return type==0?4:2;}
+inline const char* kv_store_kernel(int type){return type==2?"kv_store_bf16":type==1?"kv_store_f16":"kv_store_f32";}
+inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";}
+inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
+inline bool kv_fused_prefill_ok(const ColibriV2QwenRuntime& r){return r.options.cache_type_k==r.options.cache_type_v;}
+inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==2?"kv_attention_prefill_bf16":t==1?"kv_attention_prefill_f16":"kv_attention_prefill";}
 
 #include "v2_mtp_verifier.inc"
 
@@ -1512,8 +1510,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             launch_named("qwen_attention_key",kv_heads,1,256,k_args);
             std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
             int capacity=static_cast<int>(runtime->options.context_limit);
-            void*append_args[]={&keys,const_cast<std::uint64_t*>(&third),&cache_keys,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&position),&capacity};
-            launch_named(kv_append_kernel(*runtime),kv_heads,1,256,append_args);
+            void*k_store_args[]={&keys,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&position),&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_k),kv_heads,1,256,k_store_args);
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&position),&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_v),kv_heads,1,256,v_store_args);
             std::uint64_t attended=second;int tokens=position+1;float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
             void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&scale};
             launch_named(kv_scores_kernel(*runtime),heads,(tokens+255)/256,256,score_args);

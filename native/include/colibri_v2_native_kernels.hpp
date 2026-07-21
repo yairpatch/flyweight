@@ -711,10 +711,11 @@ extern "C" __global__ void name( \
     const int head_dim, const int base_position, const int rows, \
     const int capacity, const float scale \
 ) { kv_prefill_impl<KT, VT>(queries, keys, values, output, heads, kv_heads, head_dim, base_position, rows, capacity, scale); }
+// Fused prefill only for matched K/V precision; the host uses the per-token
+// score/value path when cache_type_k != cache_type_v.
 KV_PREFILL(kv_attention_prefill, float, float)
-KV_PREFILL(kv_attention_prefill_f16_f16, __half, __half)
-KV_PREFILL(kv_attention_prefill_f16_f32, __half, float)
-KV_PREFILL(kv_attention_prefill_f32_f16, float, __half)
+KV_PREFILL(kv_attention_prefill_f16, __half, __half)
+KV_PREFILL(kv_attention_prefill_bf16, __nv_bfloat16, __nv_bfloat16)
 #undef KV_PREFILL
 
 extern "C" __global__
