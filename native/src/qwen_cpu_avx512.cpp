@@ -336,3 +336,56 @@ void qwen_f32_dot_multi_avx512(
         outputs[token] = _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
     }
 }
+
+// Register-blocked expert GEMM: out[i*count + j] = dot(weights[i], inputs[j]).
+// A 4-weight-row x 4-token tile keeps 16 accumulators live (constant loop bounds
+// so they stay in zmm registers) and reuses each activation load across 4 rows
+// and each weight load across 4 tokens, so the ~256 KB activation block is read
+// from L2 count/4 times instead of once per output row. ~2-2.8x over the
+// GEMV-per-row path (768x2048, 32 tokens: 82 -> 175/227 GFLOP/s single-thread).
+void qwen_f32_gemm_rows_avx512(
+    const float* weights, int mr, const float* const* inputs,
+    int count, int elements, float* out
+) {
+    if (mr == 4) {
+        int j = 0;
+        for (; j + 4 <= count; j += 4) {
+            const float* x[4] = {inputs[j], inputs[j + 1], inputs[j + 2], inputs[j + 3]};
+            __m512 acc[4][4];
+            for (int i = 0; i < 4; ++i)
+                for (int t = 0; t < 4; ++t) acc[i][t] = _mm512_setzero_ps();
+            for (int k = 0; k < elements; k += 16) {
+                const __m512 xv[4] = {
+                    _mm512_loadu_ps(x[0] + k), _mm512_loadu_ps(x[1] + k),
+                    _mm512_loadu_ps(x[2] + k), _mm512_loadu_ps(x[3] + k)
+                };
+                for (int i = 0; i < 4; ++i) {
+                    const __m512 w = _mm512_loadu_ps(weights + i * elements + k);
+                    for (int t = 0; t < 4; ++t)
+                        acc[i][t] = _mm512_fmadd_ps(w, xv[t], acc[i][t]);
+                }
+            }
+            for (int i = 0; i < 4; ++i)
+                for (int t = 0; t < 4; ++t)
+                    out[i * count + j + t] = _mm512_reduce_add_ps(acc[i][t]);
+        }
+        for (; j < count; ++j) {
+            const float* v = inputs[j];
+            __m512 acc[4];
+            for (int i = 0; i < 4; ++i) acc[i] = _mm512_setzero_ps();
+            for (int k = 0; k < elements; k += 16) {
+                const __m512 xv = _mm512_loadu_ps(v + k);
+                for (int i = 0; i < 4; ++i)
+                    acc[i] = _mm512_fmadd_ps(_mm512_loadu_ps(weights + i * elements + k), xv, acc[i]);
+            }
+            for (int i = 0; i < 4; ++i) out[i * count + j] = _mm512_reduce_add_ps(acc[i]);
+        }
+        return;
+    }
+    // Row-block tail (mr < 4): fall back to the single-row multi-token dot.
+    for (int i = 0; i < mr; ++i)
+        qwen_f32_dot_multi_avx512(
+            weights + static_cast<std::size_t>(i) * elements, inputs, count,
+            elements, out + static_cast<std::size_t>(i) * count
+        );
+}

@@ -572,6 +572,15 @@ void qwen_f32_dot_multi(const float*row,const float*const*inputs,int count,int e
     }
 }
 
+// Register-blocked expert GEMM over a block of <=4 weight rows: out[i*count+j].
+void qwen_f32_gemm_rows(const float*weights,int mr,const float*const*inputs,int count,int elements,float*out){
+    if((colibri_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_gemm_rows_avx512(weights,mr,inputs,count,elements,out);return;}
+    for(int i=0;i<mr;++i){
+        const float*row=weights+static_cast<std::size_t>(i)*elements;float*o=out+static_cast<std::size_t>(i)*count;
+        for(int j=0;j<count;++j){const float*v=inputs[j];float sum=0.0f;for(int k=0;k<elements;++k)sum+=row[k]*v[k];o[j]=sum;}
+    }
+}
+
 void qwen_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,const std::int32_t*selected,const float*weights,int routed_count,const float*input,float*activated,float*output){const int experts=runtime.model->config.expert_count,hidden=runtime.model->config.hidden_size,intermediate=runtime.moe_intermediate;if(routed_count<0||routed_count>256)throw std::runtime_error("native CPU MoE routed count is unsupported");for(int role=0;role<3;++role){const auto type=runtime.model->tensors[layer.expert_tensors[role]].type;if(type!=13&&type!=14&&type!=8)throw std::runtime_error("unsupported native CPU expert quantization");}std::array<const std::uint8_t*,256>gate{},up{},down{};for(int rank=0;rank<routed_count;++rank){if(selected[rank]<0||selected[rank]>=experts)throw std::runtime_error("native CPU MoE selected an invalid expert");for(int role=0;role<3;++role){const auto&t=runtime.model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto*pointer=runtime.model->data+t.offset+static_cast<std::uint64_t>(selected[rank])*bytes;if(role==0)gate[rank]=pointer;else if(role==1)up[rank]=pointer;else down[rank]=pointer;}}
 #pragma omp parallel for schedule(static)
 for(int task=0;task<routed_count*intermediate;++task){const int rank=task/intermediate,row=task%intermediate;const float gate_value=qwen_quant_dot(gate[rank],runtime.model->tensors[layer.expert_tensors[0]].type,input,hidden,row);const float up_value=qwen_quant_dot(up[rank],runtime.model->tensors[layer.expert_tensors[1]].type,input,hidden,row);const float clipped=std::max(-80.0f,std::min(80.0f,gate_value));activated[task]=gate_value/(1.0f+std::exp(-clipped))*up_value;}
@@ -629,59 +638,52 @@ void qwen_cpu_moe_rows(
     group_experts.reserve(256);
     for(int expert=0;expert<experts;++expert)if(counts[expert])group_experts.push_back(expert);
     const int group_count=static_cast<int>(group_experts.size());
-#pragma omp parallel for schedule(dynamic,16)
-    for(int task=0;task<group_count*intermediate;++task){
-        const int group=task/intermediate,row=task%intermediate;
+    // Process weight rows in blocks of 4 so the register-blocked GEMM reuses
+    // each activation load across 4 output rows (see qwen_f32_gemm_rows_avx512).
+    constexpr int kRowBlock=4;
+    const int gate_blocks=(intermediate+kRowBlock-1)/kRowBlock;
+#pragma omp parallel for schedule(dynamic,4)
+    for(int task=0;task<group_count*gate_blocks;++task){
+        const int group=task/gate_blocks;const int row0=(task%gate_blocks)*kRowBlock;
+        const int mr=std::min(kRowBlock,intermediate-row0);
         const int expert=group_experts[group];
         const int begin=offsets[expert],count=counts[expert];
         const auto*gate_data=expert_data(0,expert);
         const auto*up_data=expert_data(1,expert);
-        if(count==1){
-            const int token_rank=occurrences[begin];
-            const float*vector=vectors[begin];
-            const float gate_value=qwen_quant_dot(gate_data,gate_type,vector,hidden,row);
-            const float up_value=qwen_quant_dot(up_data,up_type,vector,hidden,row);
-            const float clipped=std::max(-80.0f,std::min(80.0f,gate_value));
-            activated[static_cast<std::size_t>(token_rank)*intermediate+row]=gate_value/(1.0f+std::exp(-clipped))*up_value;
-            continue;
+        thread_local std::vector<float> gate_block,up_block,gate_values,up_values;
+        gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+        gate_values.resize(static_cast<std::size_t>(kRowBlock)*count);up_values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        for(int i=0;i<mr;++i){
+            qwen_dequant_row(gate_data,gate_type,hidden,row0+i,gate_block.data()+static_cast<std::size_t>(i)*hidden);
+            qwen_dequant_row(up_data,up_type,hidden,row0+i,up_block.data()+static_cast<std::size_t>(i)*hidden);
         }
-        thread_local std::vector<float> gate_row,up_row,gate_values,up_values;
-        gate_row.resize(hidden);up_row.resize(hidden);
-        gate_values.resize(count);up_values.resize(count);
-        qwen_dequant_row(gate_data,gate_type,hidden,row,gate_row.data());
-        qwen_dequant_row(up_data,up_type,hidden,row,up_row.data());
-        qwen_f32_dot_multi(gate_row.data(),&vectors[begin],count,hidden,gate_values.data());
-        qwen_f32_dot_multi(up_row.data(),&vectors[begin],count,hidden,up_values.data());
-        for(int occurrence=0;occurrence<count;++occurrence){
+        qwen_f32_gemm_rows(gate_block.data(),mr,&vectors[begin],count,hidden,gate_values.data());
+        qwen_f32_gemm_rows(up_block.data(),mr,&vectors[begin],count,hidden,up_values.data());
+        for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence){
             const int token_rank=occurrences[begin+occurrence];
-            const float gate_value=gate_values[occurrence];
+            const float gate_value=gate_values[static_cast<std::size_t>(i)*count+occurrence];
             const float clipped=std::max(-80.0f,std::min(80.0f,gate_value));
-            activated[static_cast<std::size_t>(token_rank)*intermediate+row]=gate_value/(1.0f+std::exp(-clipped))*up_values[occurrence];
+            activated[static_cast<std::size_t>(token_rank)*intermediate+(row0+i)]=gate_value/(1.0f+std::exp(-clipped))*up_values[static_cast<std::size_t>(i)*count+occurrence];
         }
     }
     std::vector<const float*> activated_vectors(offsets[experts]);
     for(int slot=0;slot<offsets[experts];++slot)
         activated_vectors[slot]=activated+static_cast<std::size_t>(occurrences[slot])*intermediate;
-#pragma omp parallel for schedule(dynamic,16)
-    for(int task=0;task<group_count*hidden;++task){
-        const int group=task/hidden,row=task%hidden;
+    const int down_blocks=(hidden+kRowBlock-1)/kRowBlock;
+#pragma omp parallel for schedule(dynamic,4)
+    for(int task=0;task<group_count*down_blocks;++task){
+        const int group=task/down_blocks;const int row0=(task%down_blocks)*kRowBlock;
+        const int mr=std::min(kRowBlock,hidden-row0);
         const int expert=group_experts[group];
         const int begin=offsets[expert],count=counts[expert];
         const auto*down_data=expert_data(2,expert);
-        if(count==1){
-            const int token_rank=occurrences[begin];
-            down_values[static_cast<std::size_t>(token_rank)*hidden+row]=weights[token_rank]*qwen_quant_dot(
-                down_data,down_type,activated_vectors[begin],intermediate,row
-            );
-            continue;
-        }
-        thread_local std::vector<float> down_row,values;
-        down_row.resize(intermediate);values.resize(count);
-        qwen_dequant_row(down_data,down_type,intermediate,row,down_row.data());
-        qwen_f32_dot_multi(down_row.data(),&activated_vectors[begin],count,intermediate,values.data());
-        for(int occurrence=0;occurrence<count;++occurrence){
+        thread_local std::vector<float> down_block,values;
+        down_block.resize(static_cast<std::size_t>(kRowBlock)*intermediate);values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        for(int i=0;i<mr;++i)qwen_dequant_row(down_data,down_type,intermediate,row0+i,down_block.data()+static_cast<std::size_t>(i)*intermediate);
+        qwen_f32_gemm_rows(down_block.data(),mr,&activated_vectors[begin],count,intermediate,values.data());
+        for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence){
             const int token_rank=occurrences[begin+occurrence];
-            down_values[static_cast<std::size_t>(token_rank)*hidden+row]=weights[token_rank]*values[occurrence];
+            down_values[static_cast<std::size_t>(token_rank)*hidden+(row0+i)]=weights[token_rank]*values[static_cast<std::size_t>(i)*count+occurrence];
         }
     }
 #pragma omp parallel for schedule(static)

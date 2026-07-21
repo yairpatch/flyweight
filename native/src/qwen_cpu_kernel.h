@@ -25,3 +25,12 @@ void qwen_f32_dot_multi_avx512(
     int elements,
     float* outputs
 );
+
+void qwen_f32_gemm_rows_avx512(
+    const float* weights,
+    int mr,
+    const float* const* inputs,
+    int count,
+    int elements,
+    float* out
+);
