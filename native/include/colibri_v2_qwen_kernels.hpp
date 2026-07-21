@@ -1437,17 +1437,19 @@ void q8_grouped_accumulate_rows(
     if (threadIdx.x == 0) output[token * output_size + row] += partial;
 }
 
-extern "C" __global__
-void kv_attention_scores(
-    const float* query,
-    const float* keys,
-    float* scores,
-    const int heads,
-    const int kv_heads,
-    const int head_dim,
-    const int tokens,
-    const int capacity,
-    const float scale
+// ---- KV cache element codecs (Phase 1: f32, f16) --------------------------
+// Overloaded by cache pointer type so the templated kernels below read/write
+// the K/V cache in whatever precision it was allocated at.
+__device__ __forceinline__ float kv_ld(const float* p, long long i) { return p[i]; }
+__device__ __forceinline__ float kv_ld(const __half* p, long long i) { return __half2float(p[i]); }
+__device__ __forceinline__ void kv_st(float* p, long long i, float v) { p[i] = v; }
+__device__ __forceinline__ void kv_st(__half* p, long long i, float v) { p[i] = __float2half(v); }
+
+template<typename KT>
+__device__ void kv_scores_impl(
+    const float* query, const KT* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
 ) {
     const int head = blockIdx.x;
     const int token = blockIdx.y * blockDim.x + threadIdx.x;
@@ -1455,22 +1457,27 @@ void kv_attention_scores(
     const int group = heads / kv_heads;
     const int kv_head = head / group;
     const float* q = query + head * head_dim;
-    const float* k = keys + (kv_head * capacity + token) * head_dim;
+    const KT* k = keys + ((long long)kv_head * capacity + token) * head_dim;
     float score = 0.0f;
-    for (int d = 0; d < head_dim; ++d) score += q[d] * k[d];
+    for (int d = 0; d < head_dim; ++d) score += q[d] * kv_ld(k, d);
     scores[head * tokens + token] = score * scale;
 }
+extern "C" __global__ void kv_attention_scores(
+    const float* query, const float* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) { kv_scores_impl<float>(query, keys, scores, heads, kv_heads, head_dim, tokens, capacity, scale); }
+extern "C" __global__ void kv_attention_scores_f16(
+    const float* query, const __half* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) { kv_scores_impl<__half>(query, keys, scores, heads, kv_heads, head_dim, tokens, capacity, scale); }
 
-extern "C" __global__
-void kv_attention_values(
-    const float* scores,
-    const float* values,
-    float* output,
-    const int heads,
-    const int kv_heads,
-    const int head_dim,
-    const int tokens,
-    const int capacity
+template<typename VT>
+__device__ void kv_values_impl(
+    const float* scores, const VT* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity
 ) {
     const int head = blockIdx.x;
     if (head >= heads) return;
@@ -1497,13 +1504,21 @@ void kv_attention_values(
         float result = 0.0f;
         for (int token = 0; token < tokens; ++token) {
             const float weight = expf(head_scores[token] - maximum);
-            result += weight * values[
-                (kv_head * capacity + token) * head_dim + d
-            ];
+            result += weight * kv_ld(values, (long long)(kv_head * capacity + token) * head_dim + d);
         }
         output[head * head_dim + d] = result * inverse_denominator;
     }
 }
+extern "C" __global__ void kv_attention_values(
+    const float* scores, const float* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity
+) { kv_values_impl<float>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
+extern "C" __global__ void kv_attention_values_f16(
+    const float* scores, const __half* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity
+) { kv_values_impl<__half>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
 
 // Portable compatibility entry point used by the small C ABI parity tests.
 // The native Qwen decode path uses the parallel score/value kernels above.
@@ -1550,25 +1565,30 @@ void kv_attention(
     }
 }
 
-extern "C" __global__
-void kv_append(
-    const float* current_keys,
-    const float* current_values,
-    float* cache_keys,
-    float* cache_values,
-    const int kv_heads,
-    const int head_dim,
-    const int position,
-    const int capacity
+template<typename KT, typename VT>
+__device__ void kv_append_impl(
+    const float* current_keys, const float* current_values,
+    KT* cache_keys, VT* cache_values,
+    const int kv_heads, const int head_dim, const int position, const int capacity
 ) {
     const int head = blockIdx.x;
     if (head >= kv_heads) return;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        cache_keys[(head * capacity + position) * head_dim + d] =
-            current_keys[head * head_dim + d];
-        cache_values[(head * capacity + position) * head_dim + d] =
-            current_values[head * head_dim + d];
+        const long long slot = ((long long)head * capacity + position) * head_dim + d;
+        kv_st(cache_keys, slot, current_keys[head * head_dim + d]);
+        kv_st(cache_values, slot, current_values[head * head_dim + d]);
     }
 }
+#define KV_APPEND(name, KT, VT) \
+extern "C" __global__ void name( \
+    const float* current_keys, const float* current_values, \
+    KT* cache_keys, VT* cache_values, \
+    const int kv_heads, const int head_dim, const int position, const int capacity \
+) { kv_append_impl<KT, VT>(current_keys, current_values, cache_keys, cache_values, kv_heads, head_dim, position, capacity); }
+KV_APPEND(kv_append, float, float)
+KV_APPEND(kv_append_f16_f16, __half, __half)
+KV_APPEND(kv_append_f16_f32, __half, float)
+KV_APPEND(kv_append_f32_f16, float, __half)
+#undef KV_APPEND
 )COLIBRI_CUDA";
 }

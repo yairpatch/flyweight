@@ -299,6 +299,8 @@ class NativeV2InferenceService(InferenceService):
         gpu_cache_mib: int = 0,  # 0 = auto-fit the GPU expert cache to free VRAM
         moe_device: str = "hybrid",
         mtp_drafts: int = 0,
+        cache_type_k: str = "f16",
+        cache_type_v: str = "f16",
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -312,6 +314,8 @@ class NativeV2InferenceService(InferenceService):
                 gpu_cache_bytes=gpu_cache_mib * 1024**2,
                 moe_device=moe_device,
                 mtp_drafts=mtp_drafts,
+                cache_type_k=cache_type_k,
+                cache_type_v=cache_type_v,
             )
             self.v2_runtime.prepare()
         except Exception:

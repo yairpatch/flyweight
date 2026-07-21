@@ -104,6 +104,8 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("context_limit", ctypes.c_uint64),
         ("gpu_cache_bytes", ctypes.c_uint64),
         ("expert_top_p", ctypes.c_float),
+        ("cache_type_k", ctypes.c_int32),
+        ("cache_type_v", ctypes.c_int32),
     ]
 
 
@@ -796,6 +798,8 @@ class V2Model:
         mtp_drafts: int = 0,
         expert_top_k: int = 0,
         expert_top_p: float = 0.0,
+        cache_type_k: str = "f16",
+        cache_type_v: str = "f16",
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -806,6 +810,8 @@ class V2Model:
             mtp_drafts=mtp_drafts,
             expert_top_k=expert_top_k,
             expert_top_p=expert_top_p,
+            cache_type_k=cache_type_k,
+            cache_type_v=cache_type_v,
         )
 
     @staticmethod
@@ -1100,6 +1106,8 @@ class V2QwenRuntime:
         mtp_drafts: int = 0,
         expert_top_k: int = 0,
         expert_top_p: float = 0.0,
+        cache_type_k: str = "f16",
+        cache_type_v: str = "f16",
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1114,6 +1122,10 @@ class V2QwenRuntime:
             raise ValueError("expert_top_k must be non-negative (0 = model default)")
         if not 0.0 <= expert_top_p <= 1.0:
             raise ValueError("expert_top_p must be within [0, 1] (0 = disabled)")
+        # KV cache precision per llama.cpp's -ctk/-ctv (Phase 1: f32, f16).
+        cache_types = {"f32": 0, "f16": 1}
+        if cache_type_k not in cache_types or cache_type_v not in cache_types:
+            raise ValueError("cache_type_k/v must be 'f32' or 'f16'")
         self.model, self._lib = model, model._lib
         self._handle = ctypes.c_void_p()
         options = _QwenRuntimeOptions(
@@ -1124,6 +1136,8 @@ class V2QwenRuntime:
             context_limit,
             gpu_cache_bytes,
             expert_top_p,
+            cache_types[cache_type_k],
+            cache_types[cache_type_v],
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

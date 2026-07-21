@@ -839,6 +839,9 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
     if(runtime->options.expert_top_p<0.0f||runtime->options.expert_top_p>1.0f)throw std::runtime_error("native Qwen expert_top_p must be within [0, 1]");
+    if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>1)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32) or 1 (f16)");
+    if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>1)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32) or 1 (f16)");
+    if(runtime->options.mtp_drafts&&(runtime->options.cache_type_k||runtime->options.cache_type_v))throw std::runtime_error("native Qwen MTP currently requires f32 KV cache");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
     build_qwen_plan(*runtime);
     if(runtime->options.mtp_drafts&&!runtime->mtp_available)throw std::runtime_error("native Qwen MTP was requested but the model has no draft block");
@@ -940,7 +943,14 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         }
         for(std::uint64_t index=0;index<persistent.size();++index)if(persistent[index])runtime->static_arena_bytes+=device_align(runtime->model->tensors[index].size);
 
-        std::uint64_t state_floats=0;
+        // Byte cursor into the state arena. Attention KV regions size per the
+        // configured cache precision (f32=4B, f16=2B/elem); DeltaNet conv/recurrent
+        // state stays f32. Each region is 16-byte aligned so mixed f16/f32 regions
+        // never leave a following f32 access misaligned.
+        const std::uint64_t kv_k=runtime->options.cache_type_k==1?2:4;
+        const std::uint64_t kv_v=runtime->options.cache_type_v==1?2:4;
+        std::uint64_t state_cursor=0;
+        auto reserve=[&](std::uint64_t bytes)->std::uint64_t{const auto at=state_cursor;state_cursor=(state_cursor+bytes+15)/16*16;return at;};
         std::uint64_t max_vector=runtime->model->config.vocabulary_size;
         for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
             auto&layer=runtime->layers[layer_number];
@@ -949,14 +959,14 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 const auto&key=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".attn_k.weight")];
                 const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
                 const auto cache_floats=runtime->model->config.attention_kv_heads*runtime->options.context_limit*head_dim;
-                layer.state_first=state_floats*sizeof(float);state_floats+=cache_floats;
-                layer.state_second=state_floats*sizeof(float);state_floats+=cache_floats;
+                layer.state_first=reserve(cache_floats*kv_k);
+                layer.state_second=reserve(cache_floats*kv_v);
             }else{
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
                 const auto&norm=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
-                layer.state_first=state_floats*sizeof(float);state_floats+=conv.shape[0]*conv.shape[1];
-                layer.state_second=state_floats*sizeof(float);state_floats+=a.shape[0]*norm.shape[0]*norm.shape[0];
+                layer.state_first=reserve(conv.shape[0]*conv.shape[1]*sizeof(float));
+                layer.state_second=reserve(a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float));
             }
         }
         if(runtime->options.mtp_drafts){
@@ -964,28 +974,24 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             const auto&key=runtime->model->tensors[layer.static_tensors[2]];
             const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
             const auto cache_floats=runtime->model->config.attention_kv_heads*runtime->options.context_limit*head_dim;
-            layer.state_first=state_floats*sizeof(float);state_floats+=cache_floats;
-            layer.state_second=state_floats*sizeof(float);state_floats+=cache_floats;
-            runtime->mtp_target_hidden_offset=state_floats*sizeof(float);
-            state_floats+=runtime->model->config.hidden_size;
-            runtime->mtp_draft_hidden_offset=state_floats*sizeof(float);
-            state_floats+=runtime->model->config.hidden_size;
-            runtime->mtp_snapshot_offset=state_floats*sizeof(float);
-            const auto snapshot_start=state_floats;
+            layer.state_first=reserve(cache_floats*kv_k);
+            layer.state_second=reserve(cache_floats*kv_v);
+            runtime->mtp_target_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
+            runtime->mtp_draft_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
+            runtime->mtp_snapshot_offset=state_cursor;
+            const auto snapshot_start=state_cursor;
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
                 auto&target=runtime->layers[layer_number];
                 if(target.attention)continue;
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
                 const auto&norm=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
-                target.snapshot_first=state_floats*sizeof(float);
-                state_floats+=conv.shape[0]*conv.shape[1];
-                target.snapshot_second=state_floats*sizeof(float);
-                state_floats+=a.shape[0]*norm.shape[0]*norm.shape[0];
+                target.snapshot_first=reserve(conv.shape[0]*conv.shape[1]*sizeof(float));
+                target.snapshot_second=reserve(a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float));
             }
-            runtime->mtp_snapshot_bytes=(state_floats-snapshot_start)*sizeof(float);
+            runtime->mtp_snapshot_bytes=state_cursor-snapshot_start;
         }
-        runtime->state_bytes=device_align(state_floats*sizeof(float));
+        runtime->state_bytes=device_align(state_cursor);
         const auto attention_score_bytes =
             static_cast<std::uint64_t>(runtime->model->config.attention_heads) *
             runtime->options.context_limit * sizeof(float);
@@ -1393,6 +1399,18 @@ void qwen_prefill_snapshot_copy(
     }
 }
 
+// KV cache kernel selection by configured precision (Phase 1: f32, f16).
+inline const char* kv_append_kernel(const ColibriV2QwenRuntime& r){
+    const bool k=r.options.cache_type_k==1,v=r.options.cache_type_v==1;
+    return k?(v?"kv_append_f16_f16":"kv_append_f16_f32"):(v?"kv_append_f32_f16":"kv_append");
+}
+inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){return r.options.cache_type_k==1?"kv_attention_scores_f16":"kv_attention_scores";}
+inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){return r.options.cache_type_v==1?"kv_attention_values_f16":"kv_attention_values";}
+inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){
+    const bool k=r.options.cache_type_k==1,v=r.options.cache_type_v==1;
+    return k?(v?"kv_attention_prefill_f16_f16":"kv_attention_prefill_f16_f32"):(v?"kv_attention_prefill_f32_f16":"kv_attention_prefill");
+}
+
 #include "v2_mtp_verifier.inc"
 
 int colibri_v2_qwen_runtime_synchronize(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime||!runtime->stream)throw std::runtime_error("native Qwen runtime is not prepared");if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA synchronization failed");return 0;});}
@@ -1495,12 +1513,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
             int capacity=static_cast<int>(runtime->options.context_limit);
             void*append_args[]={&keys,const_cast<std::uint64_t*>(&third),&cache_keys,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&position),&capacity};
-            launch_named("kv_append",kv_heads,1,256,append_args);
+            launch_named(kv_append_kernel(*runtime),kv_heads,1,256,append_args);
             std::uint64_t attended=second;int tokens=position+1;float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
             void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&scale};
-            launch_named("kv_attention_scores",heads,(tokens+255)/256,256,score_args);
+            launch_named(kv_scores_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
             void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity};
-            launch_named("kv_attention_values",heads,1,256,value_args);
+            launch_named(kv_values_kernel(*runtime),heads,1,256,value_args);
             std::uint64_t gated=third;int elements=heads*head_dim;
             void*gate_args[]={&attended,&gates,&gated,&elements};
             launch_named("qwen_attention_gate",(elements+255)/256,1,256,gate_args);

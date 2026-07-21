@@ -83,6 +83,8 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint64_t context_limit;
     uint64_t gpu_cache_bytes;
     float expert_top_p; /* 0 or >=1 disables; else keep experts to cumulative router prob p */
+    int32_t cache_type_k; /* KV cache K precision: 0=f32, 1=f16 */
+    int32_t cache_type_v; /* KV cache V precision: 0=f32, 1=f16 */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {

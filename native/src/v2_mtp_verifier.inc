@@ -142,7 +142,7 @@ void qwen_forward_rows(
                 launch("qwen_attention_key",kv_heads,1,256,k_args);
                 auto value=third+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 void*append_args[]={&key,&value,&cache_keys,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
-                launch("kv_append",kv_heads,1,256,append_args);
+                launch(kv_append_kernel(runtime),kv_heads,1,256,append_args);
             }
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
             if(head_dim%32==0&&head_dim<=256){
@@ -151,7 +151,7 @@ void qwen_forward_rows(
                 // dominated long-context prefill.
                 int base=static_cast<int>(runtime.position);
                 void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale};
-                launch("kv_attention_prefill",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
+                launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
                 void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
                 launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
@@ -161,10 +161,10 @@ void qwen_forward_rows(
                 int position=static_cast<int>(runtime.position)+token;
                 int tokens=position+1;
                 void*score_args[]={&query,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&scale};
-                launch("kv_attention_scores",heads,(tokens+255)/256,256,score_args);
+                launch(kv_scores_kernel(runtime),heads,(tokens+255)/256,256,score_args);
                 auto attended=second+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity};
-                launch("kv_attention_values",heads,1,256,value_args);
+                launch(kv_values_kernel(runtime),heads,1,256,value_args);
                 auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);int elements=query_elements;
                 void*token_gate_args[]={&attended,&gate,&gated,&elements};launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
             }

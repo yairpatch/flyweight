@@ -405,6 +405,18 @@ def _parser() -> argparse.ArgumentParser:
         default="hybrid",
         help="routed-expert execution policy",
     )
+    serve_v2.add_argument(
+        "--cache-type-k",
+        choices=("f32", "f16"),
+        default="f16",
+        help="KV cache K precision (llama.cpp -ctk); f16 halves KV VRAM",
+    )
+    serve_v2.add_argument(
+        "--cache-type-v",
+        choices=("f32", "f16"),
+        default="f16",
+        help="KV cache V precision (llama.cpp -ctv); f16 halves KV VRAM",
+    )
 
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
@@ -1057,6 +1069,8 @@ def main(argv: list[str] | None = None) -> int:
             gpu_cache_mib=args.gpu_cache_mib,
                 moe_device=args.moe_device,
                 mtp_drafts=args.mtp_drafts,
+                cache_type_k=args.cache_type_k,
+                cache_type_v=args.cache_type_v,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,

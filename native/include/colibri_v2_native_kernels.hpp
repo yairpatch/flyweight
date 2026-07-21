@@ -637,9 +637,9 @@ void q8_matmul_tiled(
     }
 }
 
-extern "C" __global__
-void kv_attention_prefill(
-    const float* queries, const float* keys, const float* values,
+template<typename KT, typename VT>
+__device__ void kv_prefill_impl(
+    const float* queries, const KT* keys, const VT* values,
     float* output, const int heads, const int kv_heads,
     const int head_dim, const int base_position, const int rows,
     const int capacity, const float scale
@@ -675,11 +675,11 @@ void kv_attention_prefill(
     const int last = base_position + tile + count - 1;
     for (int position = 0; position <= last; ++position) {
         float k[8], v[8];
-        const float* key_row = keys + ((long long)kv_head * capacity + position) * head_dim;
-        const float* value_row = values + ((long long)kv_head * capacity + position) * head_dim;
+        const KT* key_row = keys + ((long long)kv_head * capacity + position) * head_dim;
+        const VT* value_row = values + ((long long)kv_head * capacity + position) * head_dim;
         for (int d = 0; d < 8; ++d) {
-            k[d] = d < dims ? key_row[lane + 32 * d] : 0.0f;
-            v[d] = d < dims ? value_row[lane + 32 * d] : 0.0f;
+            k[d] = d < dims ? kv_ld(key_row, lane + 32 * d) : 0.0f;
+            v[d] = d < dims ? kv_ld(value_row, lane + 32 * d) : 0.0f;
         }
         for (int i = 0; i < count; ++i) {
             if (position > base_position + tile + i) continue;
@@ -704,6 +704,18 @@ void kv_attention_prefill(
                 = acc[i][d] * inverse;
     }
 }
+#define KV_PREFILL(name, KT, VT) \
+extern "C" __global__ void name( \
+    const float* queries, const KT* keys, const VT* values, \
+    float* output, const int heads, const int kv_heads, \
+    const int head_dim, const int base_position, const int rows, \
+    const int capacity, const float scale \
+) { kv_prefill_impl<KT, VT>(queries, keys, values, output, heads, kv_heads, head_dim, base_position, rows, capacity, scale); }
+KV_PREFILL(kv_attention_prefill, float, float)
+KV_PREFILL(kv_attention_prefill_f16_f16, __half, __half)
+KV_PREFILL(kv_attention_prefill_f16_f32, __half, float)
+KV_PREFILL(kv_attention_prefill_f32_f16, float, __half)
+#undef KV_PREFILL
 
 extern "C" __global__
 void qwen_argmax(const float* values, unsigned int* output, const int elements) {
