@@ -417,6 +417,42 @@ def _parser() -> argparse.ArgumentParser:
         default="f16",
         help="KV cache V precision (llama.cpp -ctv); f16 halves KV VRAM",
     )
+    serve_v2.add_argument(
+        "--prefill-checkpoint-interval",
+        type=int,
+        default=256,
+        help="position of the first mid-prefill recurrent-state checkpoint; "
+        "later ones are geometric (interval<<k). 0 disables checkpointing so a "
+        "diverging prefix (agentic clients injecting reminders/tool results) "
+        "reprefills from token 0 instead of resuming near the divergence point.",
+    )
+    serve_v2.add_argument(
+        "--prefill-checkpoint-slots",
+        type=int,
+        default=4,
+        help="total prefix-reuse snapshot slots (one reserved for the exact "
+        "end-of-prompt snapshot); more slots widen checkpoint coverage at the "
+        "cost of GPU VRAM shared with the expert cache",
+    )
+    serve_v2.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        dest="parallel_sequences",
+        help="independent decode slots (llama.cpp --parallel); each has its own "
+        "KV cache so interleaved side-requests (subagents, title/quota calls) "
+        "don't evict the main conversation's prefix. Costs ~1 KV cache per slot "
+        "(~20 KB/token); 1 = single-sequence (default)",
+    )
+    serve_v2.add_argument(
+        "--prompt-cache-mib",
+        type=int,
+        default=0,
+        help="host RAM budget (MiB) for the prompt cache (llama.cpp-style): when "
+        "a slot is recycled its state is spilled to RAM and restored on a later "
+        "matching request instead of reprefilling cold. Needs --parallel >= 2; "
+        "each cached conversation costs one slot's state (~20 KB/token). 0 = off",
+    )
 
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
@@ -1071,6 +1107,10 @@ def main(argv: list[str] | None = None) -> int:
                 mtp_drafts=args.mtp_drafts,
                 cache_type_k=args.cache_type_k,
                 cache_type_v=args.cache_type_v,
+                prefill_checkpoint_interval=args.prefill_checkpoint_interval,
+                prefill_checkpoint_slots=args.prefill_checkpoint_slots,
+                parallel_sequences=args.parallel_sequences,
+                prompt_cache_mib=args.prompt_cache_mib,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,

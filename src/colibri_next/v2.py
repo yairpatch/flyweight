@@ -106,6 +106,10 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("expert_top_p", ctypes.c_float),
         ("cache_type_k", ctypes.c_int32),
         ("cache_type_v", ctypes.c_int32),
+        ("prefill_checkpoint_interval", ctypes.c_uint32),
+        ("prefill_checkpoint_slots", ctypes.c_uint32),
+        ("parallel_sequences", ctypes.c_uint32),
+        ("prompt_cache_mib", ctypes.c_uint32),
     ]
 
 
@@ -162,10 +166,30 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("decode_ready", ctypes.c_int32),
         ("route_expert_sum", ctypes.c_uint64),
         ("expert_compute_nanoseconds", ctypes.c_uint64),
+        ("prefix_cache_reprefilled_tokens", ctypes.c_uint64),
+        ("prefix_cache_last_prompt_tokens", ctypes.c_uint64),
+        ("prefix_cache_last_reused_tokens", ctypes.c_uint64),
+        ("prefix_cache_last_lcp_live", ctypes.c_uint64),
+        ("prefix_cache_last_lcp_snapshot", ctypes.c_uint64),
+        ("prompt_cache_entries", ctypes.c_uint64),
+        ("prompt_cache_used_bytes", ctypes.c_uint64),
     ]
 
 
 _TokenCallback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p)
+
+
+class _QwenTaskEvent(ctypes.Structure):
+    _fields_ = [
+        ("task_id", ctypes.c_uint64),
+        ("token", ctypes.c_uint32),
+        ("kind", ctypes.c_uint32),
+    ]
+
+
+TASK_EVENT_TOKEN = 0
+TASK_EVENT_DONE = 1
+TASK_EVENT_ERROR = 2
 
 _cached_library: ctypes.CDLL | None = None
 
@@ -294,6 +318,28 @@ def _library() -> ctypes.CDLL:
                 ctypes.c_void_p,
             ]
             lib.colibri_v2_qwen_runtime_generate.restype = ctypes.c_int
+            lib.colibri_v2_qwen_task_submit.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            lib.colibri_v2_qwen_task_submit.restype = ctypes.c_int
+            lib.colibri_v2_qwen_engine_step.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_QwenTaskEvent),
+                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            lib.colibri_v2_qwen_engine_step.restype = ctypes.c_int
+            lib.colibri_v2_qwen_task_cancel.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint64,
+            ]
+            lib.colibri_v2_qwen_task_cancel.restype = ctypes.c_int
             lib.colibri_v2_gpu_probe.argtypes = [
                 ctypes.c_int32,
                 ctypes.POINTER(_GpuInfo),
@@ -763,7 +809,15 @@ class V2Model:
         )
         return int(token.value)
 
-    def decode_tokens(self, tokens: list[int]) -> str:
+    def decode_token_bytes(self, tokens: list[int]) -> bytes:
+        """Raw UTF-8 bytes for a token sequence (byte-level BPE unmapped).
+
+        A single BPE token frequently holds only part of a multi-byte UTF-8
+        character, so per-token *string* decoding replaces the halves with
+        U+FFFD. Streaming callers must accumulate these bytes through an
+        incremental UTF-8 decoder instead of decoding token-by-token (that bug
+        corrupted emoji/box-drawing characters in generated files).
+        """
         direct = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
         inverse = {value: value for value in direct}
         extra = 0
@@ -783,7 +837,10 @@ class V2Model:
                     encoded.extend(character.encode("utf-8"))
                 else:
                     encoded.append(inverse[codepoint])
-        return bytes(encoded).decode("utf-8", errors="replace")
+        return bytes(encoded)
+
+    def decode_tokens(self, tokens: list[int]) -> str:
+        return self.decode_token_bytes(tokens).decode("utf-8", errors="replace")
 
     def session(self, context_limit: int = 4096) -> "V2Session":
         return V2Session(self, context_limit)
@@ -800,6 +857,10 @@ class V2Model:
         expert_top_p: float = 0.0,
         cache_type_k: str = "f16",
         cache_type_v: str = "f16",
+        prefill_checkpoint_interval: int = 256,
+        prefill_checkpoint_slots: int = 4,
+        parallel_sequences: int = 1,
+        prompt_cache_mib: int = 0,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -812,6 +873,10 @@ class V2Model:
             expert_top_p=expert_top_p,
             cache_type_k=cache_type_k,
             cache_type_v=cache_type_v,
+            prefill_checkpoint_interval=prefill_checkpoint_interval,
+            prefill_checkpoint_slots=prefill_checkpoint_slots,
+            parallel_sequences=parallel_sequences,
+            prompt_cache_mib=prompt_cache_mib,
         )
 
     @staticmethod
@@ -1108,12 +1173,28 @@ class V2QwenRuntime:
         expert_top_p: float = 0.0,
         cache_type_k: str = "f16",
         cache_type_v: str = "f16",
+        prefill_checkpoint_interval: int = 256,
+        prefill_checkpoint_slots: int = 4,
+        parallel_sequences: int = 1,
+        prompt_cache_mib: int = 0,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
         # manual budget.
         if device < 0 or context_limit < 0 or gpu_cache_bytes < 0:
             raise ValueError("native Qwen runtime options must be non-negative")
+        # Mid-prefill recurrent-state checkpoints: interval=0 disables them (only
+        # the end-of-prompt snapshot is kept). slots is the total snapshot pool.
+        if prefill_checkpoint_interval < 0 or prefill_checkpoint_slots < 0:
+            raise ValueError("prefill checkpoint options must be non-negative")
+        # Independent decode slots (llama.cpp --parallel): each is a full KV +
+        # DeltaNet state arena, so side-requests don't evict the main conversation.
+        if parallel_sequences < 1:
+            raise ValueError("parallel_sequences must be >= 1")
+        # Host RAM budget (MiB) for spilling evicted slot state so recycled
+        # conversations restore from RAM instead of reprefilling; 0 disables.
+        if prompt_cache_mib < 0:
+            raise ValueError("prompt_cache_mib must be non-negative")
         if moe_device not in {"gpu", "cpu", "hybrid"}:
             raise ValueError("moe_device must be 'gpu', 'cpu', or 'hybrid'")
         if mtp_drafts < 0 or mtp_drafts > 8:
@@ -1138,6 +1219,10 @@ class V2QwenRuntime:
             expert_top_p,
             cache_types[cache_type_k],
             cache_types[cache_type_v],
+            prefill_checkpoint_interval,
+            prefill_checkpoint_slots,
+            parallel_sequences,
+            prompt_cache_mib,
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(
@@ -1222,6 +1307,50 @@ class V2QwenRuntime:
         )
         if callback_error:
             raise callback_error[0]
+
+    def task_submit(
+        self,
+        prompt_tokens: list[int],
+        max_tokens: int,
+        stop_tokens: tuple[int, ...] | list[int] = (),
+    ) -> int:
+        """Queue a request on the cooperative engine; returns its task id."""
+        if not prompt_tokens:
+            raise ValueError("prompt_tokens must not be empty")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        values = (ctypes.c_uint32 * len(prompt_tokens))(*prompt_tokens)
+        stops = (ctypes.c_uint32 * len(stop_tokens))(*stop_tokens) if stop_tokens else None
+        task_id = ctypes.c_uint64()
+        self.model._check(
+            self._lib.colibri_v2_qwen_task_submit(
+                self._handle,
+                values,
+                len(prompt_tokens),
+                max_tokens,
+                stops,
+                len(stop_tokens),
+                ctypes.byref(task_id),
+            )
+        )
+        return int(task_id.value)
+
+    def engine_step(self, capacity: int = 256) -> list[tuple[int, int, int]]:
+        """Run one engine scheduling cycle; returns (task_id, token, kind) events."""
+        events = (_QwenTaskEvent * capacity)()
+        count = ctypes.c_uint64()
+        self.model._check(
+            self._lib.colibri_v2_qwen_engine_step(
+                self._handle, events, capacity, ctypes.byref(count)
+            )
+        )
+        return [
+            (int(e.task_id), int(e.token), int(e.kind))
+            for e in events[: count.value]
+        ]
+
+    def task_cancel(self, task_id: int) -> None:
+        self.model._check(self._lib.colibri_v2_qwen_task_cancel(self._handle, task_id))
 
 
 class V2Session:

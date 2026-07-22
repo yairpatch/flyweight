@@ -1,19 +1,99 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import codecs
+import threading
 from pathlib import Path
-from queue import Queue
-from threading import Thread
+from queue import SimpleQueue
 from typing import Callable, Iterator, Mapping, Sequence
 
 from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
 from .server import APIError, InferenceService
-from .v2 import V2Error, V2Model, V2QwenRuntime
-
-_generation_pool = ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="colibri-v2-generate"
+from .v2 import (
+    TASK_EVENT_DONE,
+    TASK_EVENT_ERROR,
+    TASK_EVENT_TOKEN,
+    V2Error,
+    V2Model,
+    V2QwenRuntime,
 )
+
+
+class _NativeEngine:
+    """Drives the native cooperative engine from one thread and fans per-task
+    events out to per-request queues, so concurrent HTTP requests interleave
+    (a short request no longer waits behind a long prefill) while all CUDA work
+    stays on a single thread."""
+
+    def __init__(self, runtime: V2QwenRuntime):
+        self.runtime = runtime
+        self._lock = threading.Lock()
+        self._queues: dict[int, SimpleQueue] = {}
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def submit(
+        self, prompt_ids: list[int], max_new_tokens: int, stop_tokens: tuple[int, ...]
+    ) -> tuple[int, SimpleQueue]:
+        queue: SimpleQueue = SimpleQueue()
+        with self._lock:
+            task_id = self.runtime.task_submit(prompt_ids, max_new_tokens, stop_tokens)
+            self._queues[task_id] = queue
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run, name="colibri-v2-engine", daemon=True
+                )
+                self._thread.start()
+        self._wake.set()
+        return task_id, queue
+
+    def cancel(self, task_id: int) -> None:
+        try:
+            self.runtime.task_cancel(task_id)
+        except V2Error:
+            pass  # runtime may already be closed; the task queue is dropped below
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                idle = not self._queues
+            if idle:
+                self._wake.clear()
+                self._wake.wait()
+                continue
+            try:
+                events = self.runtime.engine_step()
+            except Exception as error:
+                # Engine-level failure: fail every waiting request, not just one.
+                with self._lock:
+                    queues, self._queues = self._queues, {}
+                for queue in queues.values():
+                    queue.put(("error", str(error)))
+                continue
+            if not events:
+                # Tasks exist but none progressed (e.g. waiting for a busy
+                # slot); avoid a hot spin.
+                threading.Event().wait(0.002)
+                continue
+            for task_id, token, kind in events:
+                with self._lock:
+                    queue = self._queues.get(task_id)
+                if queue is None:
+                    continue
+                if kind == TASK_EVENT_TOKEN:
+                    queue.put(("token", token))
+                elif kind == TASK_EVENT_DONE:
+                    queue.put(("done", None))
+                    with self._lock:
+                        self._queues.pop(task_id, None)
+                elif kind == TASK_EVENT_ERROR:
+                    queue.put(("error", "native v2 engine task failed"))
+                    with self._lock:
+                        self._queues.pop(task_id, None)
+
+    def forget(self, task_id: int) -> None:
+        with self._lock:
+            self._queues.pop(task_id, None)
 
 
 class NativeV2Tokenizer:
@@ -39,6 +119,10 @@ class NativeV2Tokenizer:
             else token_ids
         )
         return self.model.decode_tokens(values)
+
+    def token_bytes(self, token_id: int) -> bytes:
+        """Raw bytes of one token, for incremental (streaming) UTF-8 decoding."""
+        return self.model.decode_token_bytes([token_id])
 
     def format_messages(
         self,
@@ -86,6 +170,8 @@ class NativeV2Generator:
         self.model = model
         self.runtime = runtime
         self.tokenizer = tokenizer
+        self.engine = _NativeEngine(runtime)
+        self._chat_lock = threading.Lock()
         self._chat_messages: tuple[tuple[str, str], ...] | None = None
         self._chat_prompt_ids: tuple[int, ...] = ()
         self._chat_generated_ids: tuple[int, ...] = ()
@@ -135,18 +221,22 @@ class NativeV2Generator:
         normalized = tuple(
             (message["role"], message["content"].strip()) for message in messages
         )
-        prompt_ids = self._continued_chat_prompt(normalized, thinking)
+        with self._chat_lock:
+            prompt_ids = self._continued_chat_prompt(normalized, thinking)
         final: GenerationStep | None = None
         for step in self._stream(prompt_ids, **options):
             if step.finished:
                 final = step
             yield step
         if final is not None:
-            self._chat_messages = normalized
-            self._chat_prompt_ids = tuple(prompt_ids)
-            self._chat_generated_ids = final.generated_ids
-            self._chat_text = final.text
-            self._chat_thinking = thinking
+            # Concurrent conversations race for this continuation state; last
+            # writer wins and the losers simply fall back to snapshot reuse.
+            with self._chat_lock:
+                self._chat_messages = normalized
+                self._chat_prompt_ids = tuple(prompt_ids)
+                self._chat_generated_ids = final.generated_ids
+                self._chat_text = final.text
+                self._chat_thinking = thinking
 
     def _continued_chat_prompt(
         self, messages: tuple[tuple[str, str], ...], thinking: bool
@@ -221,30 +311,27 @@ class NativeV2Generator:
         generated: list[int] = []
         previous_text = ""
         stopped = False
-        events: Queue[tuple[str, object]] = Queue()
-
-        def receive(token: int) -> bool:
-            events.put(("token", token))
-            return token not in self.tokenizer.eos_token_ids
-
-        def run_native() -> None:
-            try:
-                self.runtime.generate(prompt_ids, max_new_tokens, receive)
-            except BaseException as error:
-                events.put(("error", error))
-            finally:
-                events.put(("done", None))
-
-        future = _generation_pool.submit(run_native)
+        # Streamed tokens are decoded through an INCREMENTAL UTF-8 decoder: a
+        # BPE token often carries only part of a multi-byte character, and
+        # decoding token-by-token turned those halves into U+FFFD - corrupted
+        # text that then flowed into tool calls and files written on disk.
+        # The incremental decoder buffers partial sequences across tokens and
+        # only emits complete characters.
+        utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+        # The cooperative engine interleaves this task with any other in-flight
+        # requests (each on its own KV slot); EOS is detected natively via the
+        # stop-token list so no token is decoded past it.
+        task_id, queue = self.engine.submit(
+            prompt_ids, max_new_tokens, self.tokenizer.eos_token_ids
+        )
         try:
             progress_reported = False
             while True:
-                kind, value = events.get()
+                kind, value = queue.get()
                 if kind == "done":
                     break
                 if kind == "error":
-                    assert isinstance(value, BaseException)
-                    raise value
+                    raise RuntimeError(str(value))
                 token = int(value)
                 if progress_callback is not None and not progress_reported:
                     progress_callback(len(prompt_ids), len(prompt_ids))
@@ -252,7 +339,10 @@ class NativeV2Generator:
                 generated.append(token)
                 stopped = token in self.tokenizer.eos_token_ids
                 try:
-                    delta = self.tokenizer.decode([token], skip_special_tokens=True)
+                    delta = (
+                        "" if stopped
+                        else utf8.decode(self.tokenizer.token_bytes(token))
+                    )
                 except Exception:
                     # A single undecodable token must never abort the whole
                     # stream; keep the previously decoded text and continue.
@@ -270,9 +360,13 @@ class NativeV2Generator:
                 )
                 if stopped:
                     continue
+            # Flush any dangling partial UTF-8 sequence (a truncated character
+            # at the very end of generation becomes a single visible U+FFFD).
+            tail = utf8.decode(b"", True)
+            previous_text += tail
             yield GenerationStep(
                 None,
-                "",
+                tail,
                 tuple(prompt_ids),
                 tuple(generated),
                 previous_text,
@@ -281,10 +375,10 @@ class NativeV2Generator:
                 len(prompt_ids) + len(generated),
             )
         except GeneratorExit:
-            self.runtime.cancel()
+            self.engine.cancel(task_id)
             raise
         finally:
-            future.cancel()
+            self.engine.forget(task_id)
 
 
 class NativeV2InferenceService(InferenceService):
@@ -301,6 +395,10 @@ class NativeV2InferenceService(InferenceService):
         mtp_drafts: int = 0,
         cache_type_k: str = "f16",
         cache_type_v: str = "f16",
+        prefill_checkpoint_interval: int = 256,
+        prefill_checkpoint_slots: int = 4,
+        parallel_sequences: int = 1,
+        prompt_cache_mib: int = 0,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -316,6 +414,10 @@ class NativeV2InferenceService(InferenceService):
                 mtp_drafts=mtp_drafts,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,
+                prefill_checkpoint_interval=prefill_checkpoint_interval,
+                prefill_checkpoint_slots=prefill_checkpoint_slots,
+                parallel_sequences=parallel_sequences,
+                prompt_cache_mib=prompt_cache_mib,
             )
             self.v2_runtime.prepare()
         except Exception:
@@ -337,6 +439,10 @@ class NativeV2InferenceService(InferenceService):
         self.moe_device = moe_device
         self.mtp_drafts = mtp_drafts
         self.gpu_cache_mib = gpu_cache_mib
+        # The native cooperative engine interleaves concurrent requests itself
+        # (per-slot KV, single CUDA thread), so the HTTP layer must not
+        # serialize them.
+        self._serialize_generation = False
 
     def close(self) -> None:
         if self.v2_runtime is not None:

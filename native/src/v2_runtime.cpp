@@ -113,6 +113,74 @@ struct QwenPrefillSnapshot {
     bool valid = false;
 };
 
+// One decode sequence: its own attention-KV + DeltaNet state arena plus the
+// bookkeeping that pins prefix reuse to it. Agentic clients multiplex several
+// logical conversations (main agent, subagents, title/quota side-calls) onto
+// the runtime; giving each its own arena means a short side-request routed to
+// another slot no longer overwrites the main conversation's KV and forces a
+// full reprefill next turn. The active slot's fields are mirrored onto the
+// runtime (so the compute kernels, which read runtime.state at fixed offsets,
+// are untouched); qwen_switch_sequence saves/loads them on a slot change.
+struct QwenSequence {
+    std::uint64_t state = 0;            // device KV+DeltaNet arena for this slot
+    std::uint64_t position = 0;
+    std::uint32_t last_output_token = 0;
+    std::vector<std::uint32_t> processed_tokens;
+    std::vector<QwenPrefillSnapshot> prefill_snapshots; // per-slot reuse checkpoints
+    std::uint64_t prefill_snapshot_clock = 0;
+    std::uint64_t clock = 0;            // LRU stamp across slots
+};
+
+// A reuse checkpoint spilled to host RAM alongside a QwenHostPrompt.
+struct QwenHostSnapshot {
+    std::vector<std::uint32_t> tokens;
+    void* state = nullptr;             // host copy of the DeltaNet checkpoint buffer
+    std::uint32_t last_output = 0;
+};
+
+// A conversation's full slot state spilled to host RAM (llama.cpp's prompt
+// cache). When an LRU slot is recycled for a new conversation, its arena and
+// reuse checkpoints are DtoH-copied here instead of discarded, so a later
+// request that continues it restores from RAM rather than reprefilling ~30k
+// tokens cold. The checkpoints matter: the end-of-prompt one (tokens = prompt)
+// is what lets the next turn reuse past the prompt boundary regardless of how
+// the client re-renders the prior assistant reply.
+struct QwenHostPrompt {
+    std::vector<std::uint32_t> tokens;
+    void* state = nullptr;             // host copy of the slot's KV+DeltaNet arena
+    std::vector<QwenHostSnapshot> snapshots;
+    std::uint64_t position = 0;
+    std::uint32_t last_output_token = 0;
+    std::uint64_t bytes = 0;           // total host bytes held (arena + snapshots)
+    std::uint64_t clock = 0;           // LRU stamp within the host cache
+};
+
+// Resumable prompt-processing state shared by the blocking generate path and
+// the cooperative engine: where reuse let the prefill start, the token that is
+// already known (on a full-reuse hit), and the mid-prefill checkpoint targets.
+struct QwenPromptPlan {
+    std::uint64_t prompt_start = 0;
+    std::uint32_t next_token = 0;
+    std::vector<std::uint64_t> targets;
+    std::size_t next_target = 0;
+};
+
+// One in-flight engine request. phase: 0 = pending (waiting for a slot),
+// 1 = prefilling, 2 = decoding.
+struct QwenEngineTask {
+    std::uint64_t id = 0;
+    std::vector<std::uint32_t> prompt;
+    std::vector<std::uint32_t> stop_tokens;
+    std::uint64_t max_tokens = 0;
+    QwenPromptPlan plan;
+    std::uint64_t index = 0;
+    std::uint32_t next_token = 0;
+    std::uint64_t emitted = 0;
+    std::size_t slot = 0;
+    int phase = 0;
+    bool cancelled = false;
+};
+
 struct ColibriV2QwenRuntime {
     ColibriV2Model* model = nullptr;
     ColibriV2QwenRuntimeOptions options{};
@@ -153,6 +221,11 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefix_cache_hits = 0;
     std::uint64_t prefix_cache_misses = 0;
     std::uint64_t prefix_cache_reused_tokens = 0;
+    std::uint64_t prefix_cache_reprefilled_tokens = 0;
+    std::uint64_t prefix_cache_last_prompt_tokens = 0;
+    std::uint64_t prefix_cache_last_reused_tokens = 0;
+    std::uint64_t prefix_cache_last_lcp_live = 0;
+    std::uint64_t prefix_cache_last_lcp_snapshot = 0;
     std::uint64_t mtp_draft_tokens = 0;
     std::uint64_t mtp_accepted_tokens = 0;
     std::uint64_t mtp_rejected_tokens = 0;
@@ -175,14 +248,39 @@ struct ColibriV2QwenRuntime {
     std::uint64_t host_staging_bytes = 0;
     std::uint32_t forward_rows_capacity = 0;
     std::uint32_t prefill_rows = 0;
-    std::array<QwenPrefillSnapshot, 2> prefill_snapshots{};
+    std::vector<QwenPrefillSnapshot> prefill_snapshots{std::vector<QwenPrefillSnapshot>(2)};
     std::uint64_t prefill_snapshot_bytes = 0;
+    std::uint32_t prefill_checkpoint_interval = 0; // tokens before the first mid-prefill checkpoint; 0 disables
     std::uint64_t prefill_snapshot_clock = 0;
     std::uint64_t stream = 0;
     std::uint64_t route_event = 0;
     std::uint64_t position = 0;
     std::uint32_t last_output_token = 0;
     std::vector<std::uint32_t> processed_tokens;
+    // Parallel decode slots (see QwenSequence). sequences[active_sequence] owns
+    // the arena that runtime.state currently points at; its bookkeeping is the
+    // live runtime.{position,last_output_token,processed_tokens}. Default 1 slot
+    // reproduces the legacy single-sequence runtime exactly.
+    std::vector<QwenSequence> sequences;
+    std::size_t active_sequence = 0;
+    std::uint64_t sequence_clock = 0;
+    std::uint32_t parallel_sequences = 1;
+    // Host-backed prompt cache (see QwenHostPrompt). limit=0 disables it.
+    std::vector<QwenHostPrompt> host_prompts;
+    std::uint64_t host_cache_limit_bytes = 0;
+    std::uint64_t host_cache_used_bytes = 0;
+    std::uint64_t host_cache_clock = 0;
+    // Cooperative engine (see colibri_v2_qwen_engine_step). engine_pending /
+    // engine_cancel_requests / engine_next_task_id are guarded by engine_mutex
+    // (submit/cancel arrive from request threads); engine_tasks / slot_owner
+    // are touched only by the single engine-stepping thread.
+    std::vector<struct QwenEngineTask> engine_pending;
+    std::vector<std::uint64_t> engine_cancel_requests;
+    std::uint64_t engine_next_task_id = 1;
+    std::vector<struct QwenEngineTask> engine_tasks;
+    std::vector<long long> slot_owner;
+    std::size_t engine_cursor = 0;
+    std::mutex engine_mutex;
     bool cancelled = false;
     bool cache_admission_enabled = true;
     bool mtp_has_target_hidden = false;
@@ -283,6 +381,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
         runtime.dma_paging = false;
     }
     colibri_gpu_host_free(runtime.host_staging);
+    // The active slot's checkpoint pool is mirrored in runtime.prefill_snapshots;
+    // inactive slots keep theirs in sequences[i]. Each buffer lives in exactly
+    // one of the two, so freeing both frees every buffer once.
     for (auto& snapshot : runtime.prefill_snapshots) {
         colibri_gpu_free(snapshot.device);
         snapshot = QwenPrefillSnapshot{};
@@ -290,7 +391,18 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.prefill_snapshot_bytes = 0;
     colibri_gpu_free(runtime.expert_cache);
     colibri_gpu_free(runtime.expert_staging);
-    colibri_gpu_free(runtime.state);
+    // runtime.state aliases sequences[active].state; free each slot's arena +
+    // its checkpoint pool once.
+    for (auto& seq : runtime.sequences) {
+        for (auto& snapshot : seq.prefill_snapshots) colibri_gpu_free(snapshot.device);
+        colibri_gpu_free(seq.state);
+        seq.state = 0;
+    }
+    runtime.sequences.clear();
+    runtime.active_sequence = 0;
+    for (auto& e : runtime.host_prompts) std::free(e.state);
+    runtime.host_prompts.clear();
+    runtime.host_cache_used_bytes = 0;
     colibri_gpu_free(runtime.workspace);
     colibri_gpu_free(runtime.static_arena);
     colibri_gpu_event_destroy(runtime.route_event);
@@ -855,6 +967,25 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
     }
+    // Mid-prefill recurrent-state checkpoints let a follow-up request whose
+    // prompt diverges mid-stream (agentic clients mutate the prefix: injected
+    // reminders, re-rendered tool calls) resume from the nearest checkpoint <=
+    // the divergence point instead of reprefilling the whole prompt. `interval`
+    // is the position of the first checkpoint; the rest are geometric
+    // (interval<<k) so early coverage (the stable system+tools prefix) is dense.
+    // `slots` is the total snapshot pool (one reserved for the exact
+    // end-of-prompt snapshot). interval=0 disables mid checkpoints (end
+    // snapshots only, legacy behavior); slots=0 falls back to the default.
+    runtime->prefill_checkpoint_interval=runtime->options.prefill_checkpoint_interval;
+    const std::size_t checkpoint_slots=runtime->options.prefill_checkpoint_slots
+        ? std::clamp<std::size_t>(runtime->options.prefill_checkpoint_slots,1,256):4;
+    runtime->prefill_snapshots.assign(checkpoint_slots,QwenPrefillSnapshot{});
+    // Independent decode slots (llama.cpp --parallel): 0/1 = single-sequence.
+    runtime->parallel_sequences=std::clamp<std::uint32_t>(
+        runtime->options.parallel_sequences?runtime->options.parallel_sequences:1,1,16);
+    // Host RAM budget for the spilled-slot prompt cache (0 disables).
+    runtime->host_cache_limit_bytes=
+        static_cast<std::uint64_t>(runtime->options.prompt_cache_mib)*1024ull*1024;
     runtime->cuda_ready=false;
     runtime->decode_ready=false;
     *out=runtime.release();
@@ -892,6 +1023,13 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->prefix_cache_hits=runtime->prefix_cache_hits;
     out->prefix_cache_misses=runtime->prefix_cache_misses;
     out->prefix_cache_reused_tokens=runtime->prefix_cache_reused_tokens;
+    out->prefix_cache_reprefilled_tokens=runtime->prefix_cache_reprefilled_tokens;
+    out->prefix_cache_last_prompt_tokens=runtime->prefix_cache_last_prompt_tokens;
+    out->prefix_cache_last_reused_tokens=runtime->prefix_cache_last_reused_tokens;
+    out->prefix_cache_last_lcp_live=runtime->prefix_cache_last_lcp_live;
+    out->prefix_cache_last_lcp_snapshot=runtime->prefix_cache_last_lcp_snapshot;
+    out->prompt_cache_entries=runtime->host_prompts.size();
+    out->prompt_cache_used_bytes=runtime->host_cache_used_bytes;
     out->mtp_tensor_bytes=runtime->mtp_tensor_bytes;
     out->mtp_draft_tokens=runtime->mtp_draft_tokens;
     out->mtp_accepted_tokens=runtime->mtp_accepted_tokens;
@@ -1057,7 +1195,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             snapshot_floats+=conv.shape[0]*conv.shape[1]+a.shape[0]*norm.shape[0]*norm.shape[0];
         }
         runtime->prefill_snapshot_bytes=snapshot_floats?device_align(snapshot_floats*sizeof(float)):0;
-        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+runtime->state_bytes+runtime->expert_staging_bytes+runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
+        // One KV+DeltaNet state arena per parallel decode slot. MTP manages its
+        // own state inside the arena, so it stays single-slot.
+        const std::size_t slot_count=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+        runtime->sequences.assign(slot_count,QwenSequence{});
+        runtime->slot_owner.assign(slot_count,-1);
+        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
         // gpu_cache_bytes is the TOTAL GPU budget (base allocations + expert
         // cache). 0 = auto-fit: probe free VRAM and use most of it, leaving a
         // headroom margin. Any positive value is an exact manual budget.
@@ -1074,7 +1217,16 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 if(gi.free_memory>margin)gpu_budget=gi.free_memory-margin;
             }
         }
-        if(!auto_fit&&gpu_budget&&base_total>gpu_budget)throw std::runtime_error("native Qwen CUDA allocations exceed the requested GPU cache budget");
+        if(!auto_fit&&gpu_budget&&base_total>gpu_budget){
+            auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
+            throw std::runtime_error(
+                "native Qwen base CUDA allocations ("+mib(base_total)+" MiB = static weights "
+                +mib(runtime->static_arena_bytes)+" + workspace "+mib(runtime->workspace_bytes)+" + "
+                +std::to_string(slot_count)+"x KV slot "+mib(runtime->state_bytes)+" ("
+                +mib(slot_count*runtime->state_bytes)+") + staging "+mib(runtime->expert_staging_bytes)
+                +") exceed the --gpu-cache-mib budget ("+mib(gpu_budget)
+                +" MiB), before any expert cache. Lower --parallel or --context-window, or raise --gpu-cache-mib.");
+        }
         if(runtime->options.moe_device!=1&&gpu_budget>base_total){
             auto available=gpu_budget-base_total;
             auto cache=(available/runtime->expert_slot_bytes)*runtime->expert_slot_bytes;
@@ -1086,11 +1238,21 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         }
         if(colibri_gpu_alloc(runtime->static_arena_bytes,&runtime->static_arena)!=0||
            colibri_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
-           colibri_gpu_alloc(runtime->state_bytes,&runtime->state)!=0||
            colibri_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0||
            colibri_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0)throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
+        for(auto&seq:runtime->sequences)if(colibri_gpu_alloc(runtime->state_bytes,&seq.state)!=0)throw std::runtime_error("failed to allocate native Qwen sequence state");
+        runtime->state=runtime->sequences[0].state;
+        runtime->active_sequence=0;
         if(runtime->expert_cache_bytes&&colibri_gpu_alloc(runtime->expert_cache_bytes,&runtime->expert_cache)!=0)throw std::runtime_error("failed to allocate native Qwen expert cache");
-        if(runtime->prefill_snapshot_bytes)for(auto&snapshot:runtime->prefill_snapshots)if(colibri_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
+        if(runtime->prefill_snapshot_bytes){
+            // Slot 0's checkpoint pool lives in runtime->prefill_snapshots (the
+            // active mirror); slots 1..N-1 own theirs in sequences[i].
+            for(auto&snapshot:runtime->prefill_snapshots)if(colibri_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
+            for(std::size_t i=1;i<runtime->sequences.size();++i){
+                runtime->sequences[i].prefill_snapshots.assign(runtime->prefill_snapshots.size(),QwenPrefillSnapshot{});
+                for(auto&snapshot:runtime->sequences[i].prefill_snapshots)if(colibri_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
+            }
+        }
         runtime->expert_slots.resize(runtime->expert_cache_bytes/runtime->expert_slot_bytes);
         runtime->expert_history.resize(
             qwen_cache_layer_count(*runtime) *
@@ -1703,9 +1865,274 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     runtime->decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-decode_started).count();
     return 0;
 });}
-int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,ColibriV2TokenCallback callback,void*user){return guarded([&]{
-    if(!runtime||!prompt||!prompt_count||!max_tokens||!callback)throw std::runtime_error("invalid native Qwen generation arguments");
-    if(prompt_count+max_tokens>runtime->options.context_limit)throw std::runtime_error("native Qwen generation exceeds the context limit");
+
+// Leading tokens shared by a slot's committed tokens and the new prompt.
+static std::uint64_t qwen_sequence_match(
+        const std::vector<std::uint32_t>& tokens,
+        const std::uint32_t* prompt, std::uint64_t prompt_count) {
+    const std::uint64_t limit = std::min<std::uint64_t>(tokens.size(), prompt_count);
+    std::uint64_t i = 0;
+    while (i < limit && tokens[i] == prompt[i]) ++i;
+    return i;
+}
+
+// Save the live (active) working set into its slot and load `target`'s. The KV
+// arena is per-slot, so only the pointer + host bookkeeping move -- no device
+// copy. Snapshots stay global; the reuse KV-safety guard keeps them correct
+// across slots by tying reuse to the (per-slot) processed_tokens.
+static void qwen_switch_sequence(ColibriV2QwenRuntime& runtime, std::size_t target) {
+    if (target == runtime.active_sequence) return;
+    QwenSequence& cur = runtime.sequences[runtime.active_sequence];
+    cur.position = runtime.position;
+    cur.last_output_token = runtime.last_output_token;
+    cur.processed_tokens.swap(runtime.processed_tokens);
+    cur.prefill_snapshots.swap(runtime.prefill_snapshots);
+    cur.prefill_snapshot_clock = runtime.prefill_snapshot_clock;
+    QwenSequence& next = runtime.sequences[target];
+    runtime.state = next.state;
+    runtime.position = next.position;
+    runtime.last_output_token = next.last_output_token;
+    runtime.processed_tokens.swap(next.processed_tokens);
+    runtime.prefill_snapshots.swap(next.prefill_snapshots);
+    runtime.prefill_snapshot_clock = next.prefill_snapshot_clock;
+    runtime.active_sequence = target;
+}
+
+// KV region bytes for `elems` elements at a cache precision (mirrors the
+// prepare-time sizing lambda; q8_0 = 34B per 32-elem block).
+static std::uint64_t qwen_kv_region_bytes(std::uint64_t elems, int type) {
+    return type == 3 ? (elems / 32) * 34 : elems * (type == 0 ? 4 : 2);
+}
+
+// The device ranges of a slot arena that hold live conversation state at
+// `position`: per attention layer, each kv-head's used [0, position) prefix of
+// the K and V slabs (layout is head-major: head*capacity + pos, so the used
+// prefix is contiguous per head); per DeltaNet layer, the full conv+recurrent
+// state. Bytes beyond `position` in the KV slabs are never read (attention is
+// position-bounded), so spill/restore can skip them: a spill copies
+// position/capacity of the KV instead of the whole arena.
+static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_ranges(
+        const ColibriV2QwenRuntime& runtime, std::uint64_t position) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto kv_heads = runtime.model->config.attention_kv_heads;
+    const int ck = runtime.options.cache_type_k, cv = runtime.options.cache_type_v;
+    for (std::uint32_t layer_number = 0; layer_number < runtime.layers.size(); ++layer_number) {
+        const auto& layer = runtime.layers[layer_number];
+        if (layer.attention) {
+            const auto& key = runtime.model->tensors[tensor_index(
+                *runtime.model, "blk." + std::to_string(layer_number) + ".attn_k.weight")];
+            const auto head_dim = key.shape[1] / kv_heads;
+            for (int cache = 0; cache < 2; ++cache) {
+                const auto base = cache ? layer.state_second : layer.state_first;
+                const int type = cache ? cv : ck;
+                const auto slab = qwen_kv_region_bytes(runtime.options.context_limit * head_dim, type);
+                const auto used = qwen_kv_region_bytes(position * head_dim, type);
+                if (!used) continue;
+                for (std::uint64_t head = 0; head < kv_heads; ++head)
+                    ranges.emplace_back(base + head * slab, used);
+            }
+        } else {
+            const auto& conv = runtime.model->tensors[layer.static_tensors[6]];
+            const auto& a = runtime.model->tensors[layer.static_tensors[8]];
+            const auto& norm = runtime.model->tensors[layer.static_tensors[9]];
+            ranges.emplace_back(layer.state_first, conv.shape[0] * conv.shape[1] * sizeof(float));
+            ranges.emplace_back(layer.state_second, a.shape[0] * norm.shape[0] * norm.shape[0] * sizeof(float));
+        }
+    }
+    return ranges;
+}
+
+static void qwen_free_host_prompt(ColibriV2QwenRuntime& runtime, std::size_t idx) {
+    QwenHostPrompt& e = runtime.host_prompts[idx];
+    std::free(e.state);
+    for (auto& s : e.snapshots) std::free(s.state);
+    runtime.host_cache_used_bytes -= e.bytes;
+    runtime.host_prompts.erase(runtime.host_prompts.begin() + idx);
+}
+
+static void qwen_evict_host_lru(ColibriV2QwenRuntime& runtime) {
+    if (runtime.host_prompts.empty()) return;
+    std::size_t lru = 0;
+    for (std::size_t i = 1; i < runtime.host_prompts.size(); ++i)
+        if (runtime.host_prompts[i].clock < runtime.host_prompts[lru].clock) lru = i;
+    qwen_free_host_prompt(runtime, lru);
+}
+
+// Spill an inactive slot's full arena (KV + DeltaNet state) and its reuse
+// checkpoints to host RAM, so a later request that continues this conversation
+// restores from RAM instead of reprefilling ~30k tokens cold. Only substantial
+// conversations are worth caching; short side-requests are skipped.
+static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t slot) {
+    if (!runtime.host_cache_limit_bytes || !runtime.state_bytes) return;
+    const QwenSequence& seq = runtime.sequences[slot];
+    if (seq.processed_tokens.size() < 2048) return;
+    for (auto& e : runtime.host_prompts)
+        if (e.tokens == seq.processed_tokens) { e.clock = ++runtime.host_cache_clock; return; }
+    // Pack only the live ranges (used KV prefixes + DeltaNet state) instead of
+    // the whole arena: at small positions the spill is a fraction of state_bytes.
+    const auto ranges = qwen_used_state_ranges(runtime, seq.position);
+    std::uint64_t packed_bytes = 0;
+    for (const auto& r : ranges) packed_bytes += r.second;
+    std::uint64_t valid_snaps = 0;
+    for (const auto& s : seq.prefill_snapshots) if (s.valid) ++valid_snaps;
+    const std::uint64_t need = packed_bytes + valid_snaps * runtime.prefill_snapshot_bytes;
+    if (need > runtime.host_cache_limit_bytes) return;
+    while (runtime.host_cache_used_bytes + need > runtime.host_cache_limit_bytes
+           && !runtime.host_prompts.empty())
+        qwen_evict_host_lru(runtime);
+    if (runtime.host_cache_used_bytes + need > runtime.host_cache_limit_bytes) return;
+    void* buf = std::malloc(packed_bytes);
+    if (!buf) return;
+    std::uint64_t cursor = 0;
+    bool copy_failed = false;
+    for (const auto& r : ranges) {
+        if (colibri_gpu_download(static_cast<char*>(buf) + cursor,
+                seq.state + r.first, r.second, runtime.stream) != 0) { copy_failed = true; break; }
+        cursor += r.second;
+    }
+    if (copy_failed || colibri_gpu_stream_sync(runtime.stream) != 0) { std::free(buf); return; }
+    QwenHostPrompt e;
+    e.tokens = seq.processed_tokens;
+    e.state = buf;
+    e.position = seq.position;
+    e.last_output_token = seq.last_output_token;
+    e.bytes = packed_bytes;
+    for (const auto& s : seq.prefill_snapshots) {
+        if (!s.valid || s.tokens.empty()) continue;
+        void* sbuf = std::malloc(runtime.prefill_snapshot_bytes);
+        if (!sbuf) break;  // partial checkpoint set is fine; arena reuse still works
+        if (colibri_gpu_download(sbuf, s.device, runtime.prefill_snapshot_bytes, runtime.stream) != 0
+            || colibri_gpu_stream_sync(runtime.stream) != 0) { std::free(sbuf); break; }
+        e.snapshots.push_back({s.tokens, sbuf, s.last_output});
+        e.bytes += runtime.prefill_snapshot_bytes;
+    }
+    e.clock = ++runtime.host_cache_clock;
+    runtime.host_cache_used_bytes += e.bytes;
+    runtime.host_prompts.push_back(std::move(e));
+}
+
+// Restore a host-cached conversation into an (inactive) victim slot: HtoD the
+// saved arena, its checkpoints, and bookkeeping. Any leftover victim checkpoints
+// beyond the restored set are invalidated.
+static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
+        std::size_t entry_idx, std::size_t victim) {
+    QwenHostPrompt& e = runtime.host_prompts[entry_idx];
+    QwenSequence& seq = runtime.sequences[victim];
+    // The packed layout is a pure function of (runtime config, position), so the
+    // ranges recomputed here match the spill order exactly.
+    const auto ranges = qwen_used_state_ranges(runtime, e.position);
+    std::uint64_t cursor = 0;
+    for (const auto& r : ranges) {
+        if (colibri_gpu_upload(seq.state + r.first,
+                static_cast<const char*>(e.state) + cursor, r.second, runtime.stream) != 0)
+            return false;
+        cursor += r.second;
+    }
+    if (colibri_gpu_stream_sync(runtime.stream) != 0) return false;
+    seq.processed_tokens = std::move(e.tokens);
+    seq.position = e.position;
+    seq.last_output_token = e.last_output_token;
+    std::size_t slot_i = 0;
+    for (auto& hs : e.snapshots) {
+        if (slot_i >= seq.prefill_snapshots.size()) break;
+        auto& dst = seq.prefill_snapshots[slot_i++];
+        if (colibri_gpu_upload(dst.device, hs.state, runtime.prefill_snapshot_bytes, runtime.stream) != 0
+            || colibri_gpu_stream_sync(runtime.stream) != 0)
+            break;
+        dst.tokens = std::move(hs.tokens);
+        dst.last_output = hs.last_output;
+        dst.valid = true;
+        dst.clock = ++seq.prefill_snapshot_clock;
+    }
+    for (std::size_t i = slot_i; i < seq.prefill_snapshots.size(); ++i)
+        seq.prefill_snapshots[i].valid = false;
+    qwen_free_host_prompt(runtime, entry_idx);
+    return true;
+}
+
+// Route a prompt to the slot/host entry it continues; recycle the LRU slot
+// otherwise. A slot/entry only "owns" the prompt if the match covers most of
+// its committed tokens, so a short side-request sharing the system prefix can't
+// evict a big conversation. The host cache (>=2 slots) lets an LRU-recycled
+// conversation survive in RAM and be restored later instead of reprefiling cold.
+static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
+        const std::uint32_t* prompt, std::uint64_t prompt_count) {
+    const bool host_cache = runtime.host_cache_limit_bytes && runtime.sequences.size() >= 2;
+    if (runtime.sequences.size() <= 1 && !host_cache) return;
+    constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
+    std::size_t best = kNone;
+    std::uint64_t best_match = 0;
+    auto consider = [&](std::size_t i, const std::vector<std::uint32_t>& tokens) {
+        const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
+        if (m > best_match && m * 2 >= tokens.size()) { best_match = m; best = i; }
+    };
+    consider(runtime.active_sequence, runtime.processed_tokens);
+    for (std::size_t i = 0; i < runtime.sequences.size(); ++i)
+        if (i != runtime.active_sequence) consider(i, runtime.sequences[i].processed_tokens);
+    std::size_t best_host = kNone;
+    std::uint64_t best_host_match = 0;
+    if (host_cache)
+        for (std::size_t i = 0; i < runtime.host_prompts.size(); ++i) {
+            const auto& t = runtime.host_prompts[i].tokens;
+            const std::uint64_t m = qwen_sequence_match(t, prompt, prompt_count);
+            if (m > best_host_match && m * 2 >= t.size()) { best_host_match = m; best_host = i; }
+        }
+    auto lru_slot = [&]() {
+        std::size_t v = 0;
+        for (std::size_t i = 1; i < runtime.sequences.size(); ++i)
+            if (runtime.sequences[i].clock < runtime.sequences[v].clock) v = i;
+        return v;  // != active: the active slot is the most-recently-stamped
+    };
+    if (std::getenv("COLIBRI_ROUTE_TRACE"))
+        std::fprintf(stderr, "[route] active=%zu best=%zd match=%llu host_best=%zd host_match=%llu entries=%zu\n",
+            runtime.active_sequence, best==kNone?-1:(ssize_t)best, (unsigned long long)best_match,
+            best_host==kNone?-1:(ssize_t)best_host, (unsigned long long)best_host_match,
+            runtime.host_prompts.size());
+    if (best != kNone && best_match >= best_host_match) {
+        if (best != runtime.active_sequence) qwen_switch_sequence(runtime, best);
+    } else if (best_host != kNone) {
+        const std::size_t victim = lru_slot();
+        qwen_spill_slot_to_host(runtime, victim);
+        qwen_restore_host_to_slot(runtime, best_host, victim);
+        qwen_switch_sequence(runtime, victim);
+    } else {
+        const std::size_t victim = lru_slot();
+        if (host_cache) qwen_spill_slot_to_host(runtime, victim);
+        if (victim != runtime.active_sequence) qwen_switch_sequence(runtime, victim);
+        if (std::getenv("COLIBRI_ROUTE_TRACE"))
+            std::fprintf(stderr, "[route] victim=%zu spilled_entries=%zu\n", victim, runtime.host_prompts.size());
+    }
+    runtime.sequences[runtime.active_sequence].clock = ++runtime.sequence_clock;
+}
+
+// Prompt admission: diagnostics, exact-prefix reuse (live or snapshot, with the
+// KV-safety guard), reset on miss, reuse stats, and the spread checkpoint
+// targets. Shared verbatim by the blocking generate path and the engine so the
+// two cannot drift. Disables expert-cache admission (prompt tokens must not
+// pollute it); callers re-enable it when prefill completes.
+static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
+        const uint32_t* prompt, uint64_t prompt_count, QwenPromptPlan& plan) {
+    // Prefix-reuse diagnostics (computed before any state mutation below). The
+    // longest common prefix against the live processed_tokens and against the
+    // best snapshot shows where this prompt diverges from what is cached: a
+    // small LCP means early prefix churn (system/tool schema), a large LCP with
+    // a miss means divergence only near the tail. Reuse itself still requires an
+    // *exact* prefix (DeltaNet recurrent state cannot be rewound mid-sequence).
+    auto lcp_with=[&](const std::uint32_t*tokens,std::uint64_t count)->std::uint64_t{
+        const std::uint64_t limit=std::min<std::uint64_t>(count,prompt_count);
+        std::uint64_t i=0;
+        while(i<limit&&tokens[i]==prompt[i])++i;
+        return i;
+    };
+    runtime->prefix_cache_last_prompt_tokens=prompt_count;
+    runtime->prefix_cache_last_lcp_live=runtime->processed_tokens.empty()?0:
+        lcp_with(runtime->processed_tokens.data(),runtime->processed_tokens.size());
+    std::uint64_t best_snapshot_lcp=0;
+    for(const auto&candidate:runtime->prefill_snapshots){
+        if(!candidate.valid||candidate.tokens.empty())continue;
+        best_snapshot_lcp=std::max(best_snapshot_lcp,lcp_with(candidate.tokens.data(),candidate.tokens.size()));
+    }
+    runtime->prefix_cache_last_lcp_snapshot=best_snapshot_lcp;
     std::uint64_t prompt_start=0;
     bool reusable=!runtime->processed_tokens.empty()&&
         runtime->processed_tokens.size()<=prompt_count;
@@ -1715,7 +2142,6 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
             prompt
         );
     }
-    int status=0;
     uint32_t next_token=0;
     if(reusable){
         prompt_start=runtime->processed_tokens.size();
@@ -1727,10 +2153,18 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
         // The live state diverged (typically: the client re-encoded the
         // previous assistant reply differently than it was generated), but a
         // prefill snapshot may still match the conversation prefix exactly.
+        // Only attention KV that already holds this exact prefix is valid: the
+        // KV cache reflects the live processed_tokens (recurrent DeltaNet state
+        // is restored from the snapshot, but attention KV is not copied). So a
+        // snapshot is reusable only when its tokens are a prefix of BOTH the new
+        // prompt AND the sequence currently in the KV cache. Skipping the latter
+        // check would splice stale KV from a diverged conversation.
         QwenPrefillSnapshot*snapshot=nullptr;
         for(auto&candidate:runtime->prefill_snapshots){
             if(!candidate.valid||candidate.tokens.empty()||candidate.tokens.size()>prompt_count)continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt))continue;
+            if(candidate.tokens.size()>runtime->processed_tokens.size())continue;
+            if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),runtime->processed_tokens.begin()))continue;
             if(!snapshot||candidate.tokens.size()>snapshot->tokens.size())snapshot=&candidate;
         }
         if(snapshot){
@@ -1746,45 +2180,135 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
             runtime->cancelled=false;
         }else{
             ++runtime->prefix_cache_misses;
-            status=colibri_v2_qwen_runtime_reset(runtime);if(status)return status;
+            const int status=colibri_v2_qwen_runtime_reset(runtime);if(status)return status;
         }
     }
+    runtime->prefix_cache_last_reused_tokens=prompt_start;
+    runtime->prefix_cache_reprefilled_tokens+=prompt_count-prompt_start;
     runtime->cache_admission_enabled=false;
-    uint64_t index=prompt_start;
-    // Chunked prefill: batch prompt tokens through the rows forward so weight
-    // reads amortize across the chunk; the final prompt token still runs
-    // through single-token decode to produce next_token. MTP needs per-token
-    // prompt pairs from decode, so it keeps the one-token path.
-    if(runtime->prefill_rows>1&&!runtime->options.mtp_drafts&&prompt_count>1){
-        // index+3<=prompt_count is prompt_count-1-index>=2 without the unsigned
-        // underflow that fired when a cache/snapshot reuse left index==prompt_count
-        // (it read 1024 tokens past the prompt -> "input token out of range").
-        while(index+3<=prompt_count&&!runtime->cancelled){
-            const auto chunk=static_cast<int>(std::min<uint64_t>(runtime->prefill_rows,prompt_count-1-index));
-            qwen_prefill_rows(*runtime,prompt+index,chunk);
-            index+=chunk;
-        }
+    // Mid-prefill checkpoint targets, spread EVENLY across this prompt (like
+    // llama.cpp's spread context checkpoints) so a mid-conversation divergence
+    // always finds a checkpoint within one spacing of the divergence point.
+    // Spacing adapts to the prompt: max(interval, prompt/(mids+1)), so short
+    // prompts keep dense early coverage while a 30k prompt spreads its slots
+    // over the whole range instead of clustering at 256/512/1024 (measured live:
+    // geometric placement reused only 1024 of a 13313-token shared prefix). The
+    // last slot is reserved for the exact end-of-prompt snapshot saved below.
+    // Targets already covered by the reused prefix are skipped.
+    plan.targets.clear();
+    if(runtime->prefill_snapshot_bytes&&!runtime->options.mtp_drafts&&
+       runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1){
+        const std::size_t mid_slots=runtime->prefill_snapshots.size()-1;
+        const std::uint64_t spacing=std::max<std::uint64_t>(
+            runtime->prefill_checkpoint_interval,prompt_count/(mid_slots+1));
+        for(std::uint64_t pos=spacing;
+            pos<prompt_count&&plan.targets.size()<mid_slots;pos+=spacing)
+            plan.targets.push_back(pos);
     }
-    for(;index<prompt_count;index++){status=colibri_v2_qwen_runtime_decode(runtime,prompt[index],&next_token);if(status)return status;}
+    plan.next_target=0;
+    while(plan.next_target<plan.targets.size()&&plan.targets[plan.next_target]<=prompt_start)++plan.next_target;
+    plan.prompt_start=prompt_start;
+    plan.next_token=next_token;
+    return 0;
+}
+
+// Save every checkpoint target the prefill has reached.
+static void qwen_prompt_checkpoints(ColibriV2QwenRuntime* runtime,
+        const uint32_t* prompt, QwenPromptPlan& plan) {
+    while(plan.next_target<plan.targets.size()&&runtime->position>=plan.targets[plan.next_target]){
+        auto&slot=runtime->prefill_snapshots[plan.next_target];
+        qwen_prefill_snapshot_copy(*runtime,slot.device,false);
+        slot.tokens.assign(prompt,prompt+runtime->position);
+        slot.last_output=0; // mid-prefill resume keeps prefilling; last_output unused
+        slot.valid=true;
+        slot.clock=++runtime->prefill_snapshot_clock;
+        ++plan.next_target;
+    }
+}
+
+// One bounded prefill unit: a single rows-chunk (clamped to the next checkpoint
+// target) while enough prompt remains, then the single-token tail (bounded per
+// unit so a unit's latency stays small even when chunking is disabled). Sets
+// `done` once the whole prompt has been processed and next_token is known.
+// Chunked prefill batches prompt tokens through the rows forward so weight
+// reads amortize across the chunk; the final prompt token still runs through
+// single-token decode to produce next_token. MTP needs per-token prompt pairs
+// from decode, so it keeps the one-token path.
+static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prompt,
+        uint64_t prompt_count, QwenPromptPlan& plan, uint64_t& index,
+        uint32_t& next_token, bool& done) {
+    done=false;
+    // index+3<=prompt_count is prompt_count-1-index>=2 without the unsigned
+    // underflow that fired when a cache/snapshot reuse left index==prompt_count
+    // (it read 1024 tokens past the prompt -> "input token out of range").
+    if(runtime->prefill_rows>1&&!runtime->options.mtp_drafts&&prompt_count>1&&
+       index+3<=prompt_count&&!runtime->cancelled){
+        uint64_t rows=std::min<uint64_t>(runtime->prefill_rows,prompt_count-1-index);
+        // Stop the chunk exactly at the next checkpoint target so checkpoints
+        // land at precise positions instead of only at chunk boundaries (a
+        // 1024-row chunk would otherwise overshoot an early divergence point).
+        if(plan.next_target<plan.targets.size()){
+            const uint64_t target=plan.targets[plan.next_target];
+            if(target>index&&target-index<rows)rows=target-index;
+        }
+        qwen_prefill_rows(*runtime,prompt+index,static_cast<int>(rows));
+        index+=rows;
+        qwen_prompt_checkpoints(runtime,prompt,plan);
+        if(index+3<=prompt_count&&!runtime->cancelled)return 0; // more chunks pending
+    }
+    uint64_t budget=64; // bounds the one-token path when chunking is off
+    for(;index<prompt_count&&budget;--budget,index++){
+        const int status=colibri_v2_qwen_runtime_decode(runtime,prompt[index],&next_token);
+        if(status)return status;
+        qwen_prompt_checkpoints(runtime,prompt,plan);
+    }
+    done=(index>=prompt_count);
+    return 0;
+}
+
+// Save this prompt's end-of-prefill state so the next turn only prefills its
+// suffix, and re-enable expert-cache admission for decode.
+static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
+        const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token) {
     runtime->cache_admission_enabled=true;
-    if(runtime->prefill_snapshot_bytes&&!runtime->options.mtp_drafts){
-        // Save this prompt's end-of-prefill state so the next turn only
-        // prefills its suffix. Prefer the slot already tracking this
-        // conversation (its tokens are a prefix of ours), else a free slot,
-        // else evict the least recently matched.
-        QwenPrefillSnapshot*slot=nullptr;
-        for(auto&candidate:runtime->prefill_snapshots)
-            if(candidate.valid&&candidate.tokens.size()<=prompt_count&&std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt)){slot=&candidate;break;}
-        if(!slot)for(auto&candidate:runtime->prefill_snapshots)if(!candidate.valid){slot=&candidate;break;}
-        if(!slot){slot=&runtime->prefill_snapshots[0];for(auto&candidate:runtime->prefill_snapshots)if(candidate.clock<slot->clock)slot=&candidate;}
-        if(!(slot->valid&&slot->tokens.size()==prompt_count)){
-            qwen_prefill_snapshot_copy(*runtime,slot->device,false);
-            slot->tokens.assign(prompt,prompt+prompt_count);
-            slot->last_output=next_token;
-            slot->valid=true;
-        }
-        slot->clock=++runtime->prefill_snapshot_clock;
+    if(!runtime->prefill_snapshot_bytes||runtime->options.mtp_drafts)return;
+    // Prefer the reserved slot when mid checkpoints exist, else the slot already
+    // tracking this conversation, else a free slot, else the LRU.
+    QwenPrefillSnapshot*slot=nullptr;
+    if(runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1){
+        // Mid-prefill checkpoints own slots [0,size-1); the exact end-of-prompt
+        // snapshot has the reserved last slot so it never evicts a mid.
+        slot=&runtime->prefill_snapshots.back();
     }
+    if(!slot)for(auto&candidate:runtime->prefill_snapshots)
+        if(candidate.valid&&candidate.tokens.size()<=prompt_count&&std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt)){slot=&candidate;break;}
+    if(!slot)for(auto&candidate:runtime->prefill_snapshots)if(!candidate.valid){slot=&candidate;break;}
+    if(!slot){slot=&runtime->prefill_snapshots[0];for(auto&candidate:runtime->prefill_snapshots)if(candidate.clock<slot->clock)slot=&candidate;}
+    if(!(slot->valid&&slot->tokens.size()==prompt_count)){
+        qwen_prefill_snapshot_copy(*runtime,slot->device,false);
+        slot->tokens.assign(prompt,prompt+prompt_count);
+        slot->last_output=next_token;
+        slot->valid=true;
+    }
+    slot->clock=++runtime->prefill_snapshot_clock;
+}
+
+int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,ColibriV2TokenCallback callback,void*user){return guarded([&]{
+    if(!runtime||!prompt||!prompt_count||!max_tokens||!callback)throw std::runtime_error("invalid native Qwen generation arguments");
+    if(prompt_count+max_tokens>runtime->options.context_limit)throw std::runtime_error("native Qwen generation exceeds the context limit");
+    if(!runtime->engine_tasks.empty()||!runtime->engine_pending.empty())throw std::runtime_error("the cooperative engine is active; blocking generate is unavailable");
+    // Pick the decode slot for this prompt before any reuse/diagnostics run.
+    qwen_route_sequence(*runtime, prompt, prompt_count);
+    QwenPromptPlan plan;
+    int status=qwen_prompt_begin(runtime,prompt,prompt_count,plan);if(status)return status;
+    uint64_t index=plan.prompt_start;
+    uint32_t next_token=plan.next_token;
+    bool prefill_done=false;
+    while(!prefill_done){
+        status=qwen_prefill_unit(runtime,prompt,prompt_count,plan,index,next_token,prefill_done);
+        if(status)return status;
+    }
+    qwen_prompt_finish(runtime,prompt,prompt_count,next_token);
     if(runtime->options.mtp_drafts){
         uint64_t emitted=0;
         if(callback(next_token,user)!=0)return 0;
@@ -1882,6 +2406,161 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
     }
     return 0;
 });}
+
+int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,uint64_t*task_id){return guarded([&]{
+    if(!runtime||!prompt||!prompt_count||!max_tokens||!task_id)throw std::runtime_error("invalid native Qwen task arguments");
+    if(prompt_count+max_tokens>runtime->options.context_limit)throw std::runtime_error("native Qwen generation exceeds the context limit");
+    if(runtime->options.mtp_drafts)throw std::runtime_error("the cooperative engine does not support MTP");
+    QwenEngineTask task;
+    task.prompt.assign(prompt,prompt+prompt_count);
+    if(stop_tokens&&stop_count)task.stop_tokens.assign(stop_tokens,stop_tokens+stop_count);
+    task.max_tokens=max_tokens;
+    std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+    task.id=runtime->engine_next_task_id++;
+    *task_id=task.id;
+    runtime->engine_pending.push_back(std::move(task));
+    return 0;
+});}
+
+int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime*runtime,uint64_t task_id){return guarded([&]{
+    if(!runtime||!task_id)throw std::runtime_error("invalid native Qwen task handle");
+    std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+    runtime->engine_cancel_requests.push_back(task_id);
+    return 0;
+});}
+
+// Route a pending task to a slot the way qwen_route_sequence does, but aware of
+// slot ownership: a slot owned by another running task is untouchable, and if
+// the busiest match for this prompt IS an owned slot (same conversation already
+// generating), the task waits instead of duplicating the conversation elsewhere.
+static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask& task) {
+    const auto* prompt = task.prompt.data();
+    const std::uint64_t prompt_count = task.prompt.size();
+    constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
+    auto tokens_of = [&](std::size_t i) -> const std::vector<std::uint32_t>& {
+        return i == runtime.active_sequence ? runtime.processed_tokens
+                                            : runtime.sequences[i].processed_tokens;
+    };
+    auto owned = [&](std::size_t i) { return runtime.slot_owner[i] >= 0; };
+    std::size_t best = kNone;
+    std::uint64_t best_match = 0, busy_match = 0;
+    for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
+        const auto& tokens = tokens_of(i);
+        const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
+        if (!(m && m * 2 >= tokens.size())) continue;
+        if (owned(i)) busy_match = std::max(busy_match, m);
+        else if (m > best_match) { best_match = m; best = i; }
+    }
+    std::size_t free_lru = kNone;
+    for (std::size_t i = 0; i < runtime.sequences.size(); ++i)
+        if (!owned(i) && (free_lru == kNone ||
+            runtime.sequences[i].clock < runtime.sequences[free_lru].clock)) free_lru = i;
+    if (free_lru == kNone) return false;  // every slot busy: wait
+    const bool host_cache = runtime.host_cache_limit_bytes != 0;
+    std::size_t best_host = kNone;
+    std::uint64_t best_host_match = 0;
+    if (host_cache)
+        for (std::size_t i = 0; i < runtime.host_prompts.size(); ++i) {
+            const auto& t = runtime.host_prompts[i].tokens;
+            const std::uint64_t m = qwen_sequence_match(t, prompt, prompt_count);
+            if (m > best_host_match && m * 2 >= t.size()) { best_host_match = m; best_host = i; }
+        }
+    // The conversation is already live on a busy slot and nothing free/host
+    // beats it: wait for that task to finish rather than forking the history.
+    if (busy_match > best_match && busy_match > best_host_match) return false;
+    std::size_t chosen;
+    if (best != kNone && best_match >= best_host_match) {
+        chosen = best;
+    } else if (best_host != kNone) {
+        qwen_spill_slot_to_host(runtime, free_lru);
+        qwen_restore_host_to_slot(runtime, best_host, free_lru);
+        chosen = free_lru;
+    } else {
+        if (host_cache) qwen_spill_slot_to_host(runtime, free_lru);
+        chosen = free_lru;
+    }
+    qwen_switch_sequence(runtime, chosen);
+    runtime.sequences[chosen].clock = ++runtime.sequence_clock;
+    runtime.slot_owner[chosen] = static_cast<long long>(task.id);
+    task.slot = chosen;
+    if (qwen_prompt_begin(&runtime, prompt, prompt_count, task.plan) != 0)
+        throw std::runtime_error("native Qwen prompt admission failed");
+    task.index = task.plan.prompt_start;
+    task.next_token = task.plan.next_token;
+    if (task.index >= prompt_count) {  // full reuse: nothing to prefill
+        qwen_prompt_finish(&runtime, prompt, prompt_count, task.next_token);
+        task.phase = 2;
+    } else {
+        task.phase = 1;
+    }
+    return true;
+}
+
+int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEvent*events,uint64_t capacity,uint64_t*count){return guarded([&]{
+    if(!runtime||!events||!capacity||!count)throw std::runtime_error("invalid native Qwen engine arguments");
+    if(!runtime->decode_ready)throw std::runtime_error("native Qwen runtime is not prepared for decode");
+    *count=0;
+    {   // Admit new submissions and cancellation requests.
+        std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+        for(auto&task:runtime->engine_pending)runtime->engine_tasks.push_back(std::move(task));
+        runtime->engine_pending.clear();
+        for(const auto id:runtime->engine_cancel_requests)
+            for(auto&task:runtime->engine_tasks)if(task.id==id)task.cancelled=true;
+        runtime->engine_cancel_requests.clear();
+    }
+    if(runtime->engine_tasks.empty())return 0;
+    auto emit=[&](std::uint64_t id,std::uint32_t token,std::uint32_t kind){
+        events[*count]=ColibriV2QwenTaskEvent{id,token,kind};++*count;
+    };
+    std::vector<std::uint64_t> finished;
+    const std::size_t total=runtime->engine_tasks.size();
+    for(std::size_t visit=0;visit<total&&*count+2<=capacity;++visit){
+        auto&task=runtime->engine_tasks[(runtime->engine_cursor+visit)%total];
+        try{
+            if(task.cancelled&&task.phase!=2){finished.push_back(task.id);emit(task.id,0,1);continue;}
+            if(task.phase==0&&!qwen_engine_try_start(*runtime,task))continue;
+            if(task.phase==1){
+                qwen_switch_sequence(*runtime,task.slot);
+                runtime->cache_admission_enabled=false;
+                bool done=false;
+                const int status=qwen_prefill_unit(runtime,task.prompt.data(),task.prompt.size(),task.plan,task.index,task.next_token,done);
+                if(status)throw std::runtime_error("native Qwen prefill failed");
+                if(done){
+                    qwen_prompt_finish(runtime,task.prompt.data(),task.prompt.size(),task.next_token);
+                    task.phase=2;
+                }
+                continue;
+            }
+            // phase 2: emit the buffered token, then either finish or compute
+            // the next one -- the same order as the blocking decode loop, so a
+            // single-task engine run is bit-identical to blocking generate.
+            qwen_switch_sequence(*runtime,task.slot);
+            runtime->cache_admission_enabled=true;
+            emit(task.id,task.next_token,0);
+            ++task.emitted;
+            const bool stopped=std::find(task.stop_tokens.begin(),task.stop_tokens.end(),task.next_token)!=task.stop_tokens.end();
+            if(stopped||task.cancelled||task.emitted>=task.max_tokens){
+                finished.push_back(task.id);emit(task.id,0,1);continue;
+            }
+            const int status=colibri_v2_qwen_runtime_decode(runtime,task.next_token,&task.next_token);
+            if(status)throw std::runtime_error("native Qwen decode failed");
+        }catch(const std::exception&){
+            // Isolate the failure: this task dies, the others keep running.
+            finished.push_back(task.id);emit(task.id,0,2);
+        }
+    }
+    if(total)runtime->engine_cursor=(runtime->engine_cursor+1)%total;
+    for(const auto id:finished){
+        for(std::size_t i=0;i<runtime->slot_owner.size();++i)
+            if(runtime->slot_owner[i]==static_cast<long long>(id))runtime->slot_owner[i]=-1;
+        runtime->engine_tasks.erase(
+            std::remove_if(runtime->engine_tasks.begin(),runtime->engine_tasks.end(),
+                [&](const QwenEngineTask&t){return t.id==id;}),
+            runtime->engine_tasks.end());
+    }
+    return 0;
+});}
+
 int colibri_v2_session_create(ColibriV2Model*m,uint64_t limit,ColibriV2Session**out){return guarded([&]{if(!m||!out||!limit)throw std::runtime_error("invalid session arguments");*out=new ColibriV2Session{m,limit};return 0;});}
 void colibri_v2_session_destroy(ColibriV2Session*s){delete s;}
 int colibri_v2_session_prompt(ColibriV2Session*s,const uint32_t*t,uint64_t n){return guarded([&]{if(!s||(!t&&n)||s->history.size()+n>s->limit)throw std::runtime_error("context limit exceeded");s->history.insert(s->history.end(),t,t+n);s->prompt+=n;return 0;});}

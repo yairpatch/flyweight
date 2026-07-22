@@ -10,12 +10,24 @@ from colibri_next.v2_server import NativeV2Generator, NativeV2Tokenizer
 
 class StubV2Model:
     pieces = {20: "Hello", 30: " world", 99: "<|im_end|>"}
+    # Raw UTF-8 bytes per token; 40/41 split one character ("⚽" = e2 9a bd)
+    # across two tokens, as byte-level BPE routinely does.
+    piece_bytes = {
+        20: b"Hello",
+        30: b" world",
+        40: b"\xe2\x9a",
+        41: b"\xbd",
+        99: b"<|im_end|>",
+    }
 
     def tokenize(self, text: str) -> list[int]:
         return [1, 2]
 
     def decode_tokens(self, tokens: list[int]) -> str:
         return "".join(self.pieces.get(token, "") for token in tokens)
+
+    def decode_token_bytes(self, tokens: list[int]) -> bytes:
+        return b"".join(self.piece_bytes.get(token, b"") for token in tokens)
 
     def token_id(self, text: str) -> int:
         if text in ("<|im_end|>", "<|endoftext|>"):
@@ -60,6 +72,39 @@ class StubV2Runtime:
     def cancel(self) -> None:
         self.cancels += 1
 
+    # Cooperative-engine API mirroring the native semantics (prefill the whole
+    # prompt, then per step: emit token; stop on stop-token or max; else decode
+    # the emitted token as the next input).
+    def task_submit(self, prompt, max_tokens, stop_tokens=()):
+        self._tasks = getattr(self, "_tasks", {})
+        self._next_task = getattr(self, "_next_task", 0) + 1
+        self._tasks[self._next_task] = (list(prompt), max_tokens, tuple(stop_tokens))
+        return self._next_task
+
+    def engine_step(self, capacity: int = 256):
+        events = []
+        for task_id, (prompt, max_tokens, stops) in list(
+            getattr(self, "_tasks", {}).items()
+        ):
+            self.reset()
+            next_token = 0
+            for token in prompt:
+                next_token = self.decode(token)
+            emitted = 0
+            while True:
+                events.append((task_id, next_token, 0))
+                emitted += 1
+                if next_token in stops or emitted >= max_tokens:
+                    break
+                next_token = self.decode(next_token)
+            events.append((task_id, 0, 1))
+            del self._tasks[task_id]
+        return events
+
+    def task_cancel(self, task_id: int) -> None:
+        self.cancels += 1
+        getattr(self, "_tasks", {}).pop(task_id, None)
+
 
 class NativeV2ServerTests(unittest.TestCase):
     def make_generator(self, outputs: list[int]):
@@ -82,6 +127,16 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(result.text, "Hello world")
         self.assertEqual(runtime.inputs, [1, 2, 20])
         self.assertEqual(runtime.resets, 1)
+
+    def test_multibyte_character_split_across_tokens_decodes_intact(self) -> None:
+        # Byte-level BPE splits "⚽" (e2 9a bd) across tokens 40+41. Per-token
+        # string decoding turned each half into U+FFFD, and that corruption was
+        # written into files by tool calls. The incremental UTF-8 decoder must
+        # reassemble the character.
+        generator, _ = self.make_generator([0, 40, 41, 99])
+        result = generator.generate_text("Hi", max_new_tokens=8)
+        self.assertEqual(result.text, "⚽")
+        self.assertNotIn("�", result.text)
 
     def test_native_generator_stops_on_eos(self) -> None:
         generator, runtime = self.make_generator([10, 99])

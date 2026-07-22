@@ -85,6 +85,10 @@ typedef struct ColibriV2QwenRuntimeOptions {
     float expert_top_p; /* 0 or >=1 disables; else keep experts to cumulative router prob p */
     int32_t cache_type_k; /* KV cache K precision: 0=f32, 1=f16 */
     int32_t cache_type_v; /* KV cache V precision: 0=f32, 1=f16 */
+    uint32_t prefill_checkpoint_interval; /* position of the first mid-prefill checkpoint; 0 disables (end snapshots only) */
+    uint32_t prefill_checkpoint_slots; /* total prefix-reuse snapshot slots; 0 = default (4) */
+    uint32_t parallel_sequences; /* independent KV/decode slots (llama.cpp --parallel); 0/1 = single-sequence */
+    uint32_t prompt_cache_mib; /* host RAM budget for spilled slot state (llama.cpp prompt cache); 0 disables */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -135,7 +139,30 @@ typedef struct ColibriV2QwenRuntimeInfo {
     int32_t decode_ready;
     uint64_t route_expert_sum; /* sum of experts routed across all decode layers */
     uint64_t expert_compute_nanoseconds; /* CPU-side expert matmul (qwen_cpu_moe) time */
+    /* Prefix-reuse diagnostics: quantify how much prompt is reprefilled per turn
+       and where the new prompt diverges from what is already cached. On a hybrid
+       DeltaNet model the recurrent state cannot be rewound, so reuse only happens
+       at exact-prefix boundaries (live state or a snapshot); these fields reveal
+       whether misses are early (prefix churn) or only at the tail. */
+    uint64_t prefix_cache_reprefilled_tokens; /* cumulative prompt tokens actually prefilled */
+    uint64_t prefix_cache_last_prompt_tokens;  /* prompt length of the most recent generate */
+    uint64_t prefix_cache_last_reused_tokens;  /* tokens reused (prompt_start) last generate */
+    uint64_t prefix_cache_last_lcp_live;       /* longest common prefix vs live processed_tokens */
+    uint64_t prefix_cache_last_lcp_snapshot;   /* longest common prefix vs the best snapshot */
+    uint64_t prompt_cache_entries;      /* host prompt cache: conversations held */
+    uint64_t prompt_cache_used_bytes;   /* host prompt cache: RAM in use */
 } ColibriV2QwenRuntimeInfo;
+
+/* Cooperative multi-request engine: tasks are submitted from any thread; ONE
+   thread drives all CUDA work by calling colibri_v2_qwen_engine_step in a loop.
+   Each step runs one bounded unit (a prefill chunk or one decode token) per
+   runnable task in round-robin order, so a short request interleaves with a
+   long prefill instead of queueing behind it. */
+typedef struct ColibriV2QwenTaskEvent {
+    uint64_t task_id;
+    uint32_t token;
+    uint32_t kind; /* 0 = token emitted, 1 = task finished, 2 = task error */
+} ColibriV2QwenTaskEvent;
 
 typedef int (*ColibriV2TokenCallback)(uint32_t token, void* user_data);
 
@@ -165,6 +192,9 @@ COLIBRI_V2_API int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime* runtime
 COLIBRI_V2_API int colibri_v2_qwen_runtime_synchronize(ColibriV2QwenRuntime* runtime);
 COLIBRI_V2_API int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime* runtime, uint32_t input_token, uint32_t* output_token);
 COLIBRI_V2_API int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, ColibriV2TokenCallback callback, void* user_data);
+COLIBRI_V2_API int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, uint64_t* task_id);
+COLIBRI_V2_API int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime* runtime, ColibriV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
+COLIBRI_V2_API int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime* runtime, uint64_t task_id);
 
 COLIBRI_V2_API int colibri_v2_session_create(ColibriV2Model* model, uint64_t context_limit, ColibriV2Session** out);
 COLIBRI_V2_API void colibri_v2_session_destroy(ColibriV2Session* session);
