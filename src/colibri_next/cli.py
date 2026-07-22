@@ -331,6 +331,10 @@ def _parser() -> argparse.ArgumentParser:
         "--expert-paging", choices=("auto", "staged", "direct"), default="auto",
         help="hybrid expert transfer policy (auto uses direct DMA only with host-memory headroom)",
     )
+    benchmark_v2.add_argument(
+        "--cpu-prefetch-mib", type=int, default=0,
+        help="host page-cache budget for prompt-hot CPU/hybrid experts (0 = off)",
+    )
 
     probe_qwen_v2 = subcommands.add_parser(
         "probe-qwen-v2", help="run one real Qwen v2 block and routed MoE from GGUF"
@@ -516,6 +520,10 @@ def _parser() -> argparse.ArgumentParser:
         "--expert-paging", choices=("auto", "staged", "direct"), default="auto",
         help="hybrid expert transfer policy; direct trades startup time/RAM pinning for throughput",
     )
+    serve_v2.add_argument(
+        "--cpu-prefetch-mib", type=int, default=0,
+        help="host page-cache budget for prompt-hot CPU/hybrid experts (0 = off)",
+    )
 
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
@@ -556,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("benchmark-v2 requires --parallel >= 1")
         if args.prompt_cache_mib < 0:
             raise SystemExit("benchmark-v2 requires --prompt-cache-mib >= 0")
+        if args.cpu_prefetch_mib < 0:
+            raise SystemExit("benchmark-v2 requires --cpu-prefetch-mib >= 0")
         if args.expert_top_k < 0:
             raise SystemExit("benchmark-v2 requires --expert-top-k >= 0")
         if not 0 <= args.prefill_cache_seed <= 256:
@@ -602,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
                     prompt_cache_mib=args.prompt_cache_mib,
                     prefill_cache_seed=args.prefill_cache_seed,
                     expert_paging=args.expert_paging,
+                    cpu_prefetch_mib=args.cpu_prefetch_mib,
                 ) as runtime:
                     prepare_started = time.perf_counter()
                     runtime.prepare()
@@ -1184,6 +1195,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.gpu_cache_mib < 0:
             raise SystemExit("--gpu-cache-mib must be >= 0 (0 = auto-fit to free VRAM)")
+        if args.cpu_prefetch_mib < 0:
+            raise SystemExit("--cpu-prefetch-mib must be >= 0")
         if not 0 <= args.prefill_cache_seed <= 256:
             raise SystemExit("--prefill-cache-seed must be within [0, 256]")
         _validate_mtp_cache_types(
@@ -1212,6 +1225,7 @@ def main(argv: list[str] | None = None) -> int:
                 swa_full=args.swa_full,
                 prefill_cache_seed=args.prefill_cache_seed,
                 expert_paging=args.expert_paging,
+                cpu_prefetch_mib=args.cpu_prefetch_mib,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,

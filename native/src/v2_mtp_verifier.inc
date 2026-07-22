@@ -234,6 +234,13 @@ void qwen_forward_rows(
                 runtime.route_expert_sum+=static_cast<std::uint64_t>(keep);
             }
         }else runtime.route_expert_sum+=static_cast<std::uint64_t>(rows)*top_k;
+        if(runtime.options.moe_device==1&&!runtime.cache_admission_enabled)
+            for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
+                const int route=token*top_k+rank;
+                if(weights_host[route]!=0.0f)
+                    record_expert_access(runtime,layer_number,
+                        static_cast<std::uint32_t>(selected_host[route]));
+            }
         std::fill(gpu_weights.begin(),gpu_weights.end(),0.0f);
         std::fill(gpu_counts.begin(),gpu_counts.end(),0);
         if(runtime.options.moe_device!=1&&!runtime.expert_slots.empty()){

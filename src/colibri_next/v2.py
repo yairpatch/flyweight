@@ -115,6 +115,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("swa_full", ctypes.c_uint32),
         ("prefill_cache_seed", ctypes.c_uint32),
         ("expert_paging", ctypes.c_uint32),
+        ("cpu_prefetch_mib", ctypes.c_uint32),
     ]
 
 
@@ -186,6 +187,9 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("direct_paging", ctypes.c_uint64),
         ("paging_registration_nanoseconds", ctypes.c_uint64),
         ("host_available_bytes", ctypes.c_uint64),
+        ("cpu_prefetch_experts", ctypes.c_uint64),
+        ("cpu_prefetch_bytes", ctypes.c_uint64),
+        ("cpu_prefetch_nanoseconds", ctypes.c_uint64),
     ]
 
 
@@ -903,6 +907,7 @@ class V2Model:
         swa_full: bool = False,
         prefill_cache_seed: int = 0,
         expert_paging: str = "auto",
+        cpu_prefetch_mib: int = 0,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -922,6 +927,7 @@ class V2Model:
             swa_full=swa_full,
             prefill_cache_seed=prefill_cache_seed,
             expert_paging=expert_paging,
+            cpu_prefetch_mib=cpu_prefetch_mib,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -1236,6 +1242,7 @@ class V2QwenRuntime:
         swa_full: bool = False,
         prefill_cache_seed: int = 0,
         expert_paging: str = "auto",
+        cpu_prefetch_mib: int = 0,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1258,6 +1265,8 @@ class V2QwenRuntime:
             raise ValueError("prefill_cache_seed must be between 0 and 256")
         if expert_paging not in {"auto", "staged", "direct"}:
             raise ValueError("expert_paging must be 'auto', 'staged', or 'direct'")
+        if cpu_prefetch_mib < 0:
+            raise ValueError("cpu_prefetch_mib must be non-negative")
         if moe_device not in {"gpu", "cpu", "hybrid"}:
             raise ValueError("moe_device must be 'gpu', 'cpu', or 'hybrid'")
         if mtp_drafts < 0 or mtp_drafts > 8:
@@ -1289,6 +1298,7 @@ class V2QwenRuntime:
             int(swa_full),
             prefill_cache_seed,
             {"auto": 0, "staged": 1, "direct": 2}[expert_paging],
+            cpu_prefetch_mib,
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

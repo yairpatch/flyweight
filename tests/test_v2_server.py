@@ -230,6 +230,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.mtp_drafts, 0)
         self.assertEqual(args.prefill_cache_seed, 0)
         self.assertEqual(args.expert_paging, "auto")
+        self.assertEqual(args.cpu_prefetch_mib, 0)
 
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
         args = _parser().parse_args([
@@ -242,6 +243,7 @@ class NativeV2ServerTests(unittest.TestCase):
             "--prompt-cache-mib", "512",
             "--prefill-cache-seed", "8",
             "--expert-paging", "direct",
+            "--cpu-prefetch-mib", "768",
         ])
         self.assertEqual(args.cache_type_k, "f32")
         self.assertEqual(args.cache_type_v, "q8_0")
@@ -251,6 +253,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.prompt_cache_mib, 512)
         self.assertEqual(args.prefill_cache_seed, 8)
         self.assertEqual(args.expert_paging, "direct")
+        self.assertEqual(args.cpu_prefetch_mib, 768)
 
 
 if __name__ == "__main__":

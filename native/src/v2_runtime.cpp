@@ -261,6 +261,10 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_cache_seed_nanoseconds = 0;
     std::uint64_t paging_registration_nanoseconds = 0;
     std::uint64_t host_available_bytes = 0;
+    std::uint64_t cpu_prefetch_experts = 0;
+    std::uint64_t cpu_prefetch_bytes = 0;
+    std::uint64_t cpu_prefetch_nanoseconds = 0;
+    std::uint8_t cpu_prefetch_checksum = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
     std::uint32_t forward_rows_capacity = 0;
@@ -1320,6 +1324,9 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->direct_paging=runtime->dma_paging?1:0;
     out->paging_registration_nanoseconds=runtime->paging_registration_nanoseconds;
     out->host_available_bytes=runtime->host_available_bytes;
+    out->cpu_prefetch_experts=runtime->cpu_prefetch_experts;
+    out->cpu_prefetch_bytes=runtime->cpu_prefetch_bytes;
+    out->cpu_prefetch_nanoseconds=runtime->cpu_prefetch_nanoseconds;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;return 0;});}
@@ -2397,6 +2404,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(runtime->options.moe_device!=0&&(runtime->options.expert_top_k>0||(runtime->options.expert_top_p>0.0f&&runtime->options.expert_top_p<1.0f)))
             route_count=apply_expert_router_policy(selected_host,cpu_weights,top_k,static_cast<int>(runtime->options.expert_top_k),runtime->options.expert_top_p);
         runtime->route_expert_sum+=static_cast<std::uint64_t>(route_count);
+        if(runtime->options.moe_device==1&&!runtime->cache_admission_enabled)
+            for(int rank=0;rank<route_count;++rank)
+                record_expert_access(*runtime,layer_number,
+                    static_cast<std::uint32_t>(selected_host[rank]));
         const auto pager_started=std::chrono::steady_clock::now();
         if(runtime->options.moe_device==1){
             if(cpu_output_offset+hidden_size*sizeof(float)>runtime->expert_staging_bytes)throw std::runtime_error("native CPU MoE workspace overflow");
@@ -3048,11 +3059,89 @@ static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
             std::chrono::steady_clock::now()-started).count();
 }
 
+// Warm the file-backed pages for prompt-hot CPU experts before the first
+// generated token. Selection is round-robin by rank across layers: every layer
+// runs once per token, so allowing one layer to consume the entire byte budget
+// would make a poor first-token working set. The pages remain ordinary,
+// reclaimable OS cache; no second copy of the model is allocated.
+static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
+    if(runtime.gemma4||runtime.options.mtp_drafts||
+       runtime.options.moe_device==0||!runtime.options.cpu_prefetch_mib)return;
+#if defined(_WIN32)
+    return;
+#else
+    constexpr std::uint64_t mib=1024ULL*1024ULL;
+    constexpr std::uint64_t reserve=2ULL*1024ULL*1024ULL*1024ULL;
+    std::uint64_t budget=static_cast<std::uint64_t>(runtime.options.cpu_prefetch_mib)*mib;
+    const auto available=available_host_memory();
+    if(available<=reserve)return;
+    budget=std::min(budget,available-reserve);
+    if(!budget)return;
+    const auto experts=runtime.model->config.expert_count;
+    struct Candidate { std::uint32_t expert; std::uint32_t frequency; std::uint64_t last_used; };
+    std::vector<std::vector<Candidate>> ranked(runtime.layers.size());
+    for(std::uint32_t layer=0;layer<runtime.layers.size();++layer){
+        auto& list=ranked[layer];
+        for(std::uint32_t expert=0;expert<experts;++expert){
+            const auto& history=runtime.expert_history[static_cast<std::size_t>(layer)*experts+expert];
+            if(history.frequency)list.push_back({expert,history.frequency,history.last_used});
+        }
+        std::sort(list.begin(),list.end(),[](const Candidate&a,const Candidate&b){
+            return a.frequency!=b.frequency?a.frequency>b.frequency:a.last_used>b.last_used;
+        });
+    }
+    struct Range { std::uint64_t offset,bytes; };
+    std::vector<Range> ranges;
+    std::uint64_t selected_bytes=0,selected_experts=0;
+    for(std::size_t rank=0;;++rank){
+        bool any=false;
+        for(std::uint32_t layer=0;layer<runtime.layers.size();++layer){
+            if(rank>=ranked[layer].size())continue;
+            any=true;
+            const auto expert=ranked[layer][rank].expert;
+            const auto& plan=runtime.layers[layer];
+            std::uint64_t bundle=0;
+            for(int role=0;role<3;++role)
+                bundle+=runtime.model->tensors[plan.expert_tensors[role]].size/experts;
+            if(bundle>budget-selected_bytes)continue;
+            for(int role=0;role<3;++role){
+                const auto& tensor=runtime.model->tensors[plan.expert_tensors[role]];
+                const auto bytes=tensor.size/experts;
+                ranges.push_back({tensor.offset+static_cast<std::uint64_t>(expert)*bytes,bytes});
+            }
+            selected_bytes+=bundle;++selected_experts;
+        }
+        if(!any||selected_bytes==budget)break;
+    }
+    if(ranges.empty())return;
+    std::sort(ranges.begin(),ranges.end(),[](const Range&a,const Range&b){return a.offset<b.offset;});
+    const auto started=std::chrono::steady_clock::now();
+    for(const auto& range:ranges)
+        if(runtime.model->fd>=0)
+            (void)posix_fadvise(runtime.model->fd,static_cast<off_t>(range.offset),
+                               static_cast<off_t>(range.bytes),POSIX_FADV_WILLNEED);
+    const long page_value=sysconf(_SC_PAGESIZE);
+    const std::uint64_t page=page_value>0?static_cast<std::uint64_t>(page_value):4096ULL;
+    std::uint8_t checksum=runtime.cpu_prefetch_checksum;
+    for(const auto& range:ranges){
+        const volatile std::uint8_t* data=runtime.model->data+range.offset;
+        for(std::uint64_t offset=0;offset<range.bytes;offset+=page)checksum^=data[offset];
+        checksum^=data[range.bytes-1];
+    }
+    runtime.cpu_prefetch_checksum=checksum;
+    runtime.cpu_prefetch_experts+=selected_experts;
+    runtime.cpu_prefetch_bytes+=selected_bytes;
+    runtime.cpu_prefetch_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-started).count();
+#endif
+}
+
 // Save this prompt's end-of-prefill state so the next turn only prefills its
 // suffix, and re-enable expert-cache admission for decode.
 static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token) {
     runtime->cache_admission_enabled=true;
+    qwen_prefetch_cpu_experts(*runtime);
     qwen_seed_prefill_experts(*runtime);
     if(!runtime->prefill_snapshot_bytes||runtime->options.mtp_drafts)return;
     // Prefer the reserved slot when mid checkpoints exist, else the slot already

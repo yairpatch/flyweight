@@ -534,6 +534,15 @@ machines, or `--expert-paging direct` to require the faster path and fail if the
 driver cannot register it. Runtime diagnostics report `direct_paging`,
 `paging_registration_nanoseconds`, and the detected `host_available_bytes`.
 
+For CPU and hybrid Qwen serving, `--cpu-prefetch-mib` records the experts used
+by prompt prefill and warms a bounded, prompt-specific working set in the OS
+page cache before generation. Selection is balanced across layers and capped
+against currently available host memory with 2 GiB left free. It remains
+opt-in while cold-cache behavior is measured across SSDs, HDDs, and memory
+budgets; for example, pass `--cpu-prefetch-mib 512` to the server. Runtime
+diagnostics expose `cpu_prefetch_experts`,
+`cpu_prefetch_bytes`, and `cpu_prefetch_nanoseconds`.
+
 On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
 AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep
 vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to

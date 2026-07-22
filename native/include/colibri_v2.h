@@ -93,6 +93,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t swa_full; /* keep full-size SWA KV caches for unrestricted prefix reuse */
     uint32_t prefill_cache_seed; /* hottest prompt-routed experts to seed per layer; 0 disables */
     uint32_t expert_paging; /* 0=auto, 1=staged copy, 2=direct registered-host DMA */
+    uint32_t cpu_prefetch_mib; /* prompt-trained host expert page warmup budget; 0 disables */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -163,6 +164,9 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t direct_paging; /* direct registered-host expert paging is active */
     uint64_t paging_registration_nanoseconds; /* one-time host registration cost */
     uint64_t host_available_bytes; /* available host memory observed during prepare */
+    uint64_t cpu_prefetch_experts; /* prompt-hot expert bundles warmed in host page cache */
+    uint64_t cpu_prefetch_bytes; /* expert bytes covered by host page warmup */
+    uint64_t cpu_prefetch_nanoseconds; /* wall time spent warming host expert pages */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

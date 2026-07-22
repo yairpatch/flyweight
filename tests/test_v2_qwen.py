@@ -138,6 +138,17 @@ class QwenV2ReferenceTests(unittest.TestCase):
         finally:
             model.close()
 
+    def test_native_runtime_rejects_negative_cpu_prefetch(self):
+        try:
+            model = V2Model(self.MODEL)
+        except Exception as error:
+            raise unittest.SkipTest(str(error)) from error
+        try:
+            with self.assertRaisesRegex(ValueError, "cpu_prefetch_mib"):
+                model.native_qwen_runtime(cpu_prefetch_mib=-1)
+        finally:
+            model.close()
+
     def test_real_delta_layer_state_is_persistent_and_resettable(self):
         try:
             model = V2Model(self.MODEL)
