@@ -82,6 +82,9 @@ struct QwenLayerPlan {
     bool attention = false;
     std::uint32_t attention_window = 0; // 0 = global attention
     std::uint64_t cache_capacity = 0;
+    std::uint32_t attention_heads = 0, kv_heads = 0, head_dim = 0;
+    std::uint32_t rotary_dim = 0, expert_tensor_count = 3;
+    float rope_theta = 0.0f;
     std::vector<std::uint64_t> static_tensors;
     std::array<std::uint64_t, 3> expert_tensors{};
     std::uint64_t state_first = 0;
@@ -185,6 +188,7 @@ struct QwenEngineTask {
 
 struct ColibriV2QwenRuntime {
     ColibriV2Model* model = nullptr;
+    bool gemma4 = false;
     ColibriV2QwenRuntimeOptions options{};
     std::vector<QwenLayerPlan> layers;
     QwenLayerPlan mtp_layer_plan;
@@ -193,6 +197,7 @@ struct ColibriV2QwenRuntime {
     std::uint64_t token_embeddings = 0;
     std::uint64_t final_norm = 0;
     std::uint64_t lm_head = 0;
+    std::uint64_t rope_factors = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t static_tensor_bytes = 0;
     std::uint64_t expert_tensor_bytes = 0;
     std::uint64_t mtp_tensor_bytes = 0;
@@ -449,16 +454,37 @@ int parse(ColibriV2Model& m) {
     uint64_t count=r.get<uint64_t>(); m.metadata=r.get<uint64_t>();
     auto read_uint = [&](uint32_t type)->uint64_t { if(type==4)return r.get<uint32_t>(); if(type==10)return r.get<uint64_t>(); throw std::runtime_error("GGUF architecture value is not an integer"); };
     auto read_float = [&](uint32_t type)->float { if(type==6)return r.get<float>(); if(type==12)return static_cast<float>(r.get<double>()); throw std::runtime_error("GGUF architecture value is not a float"); };
+    auto read_uint_array = [&](uint32_t type)->std::vector<std::uint32_t> {
+        if(type!=9)throw std::runtime_error("GGUF architecture value is not an array");
+        const auto element_type=r.get<uint32_t>();const auto count=r.get<uint64_t>();
+        if(element_type!=4&&element_type!=5&&element_type!=10&&element_type!=11)
+            throw std::runtime_error("GGUF architecture array is not integer");
+        std::vector<std::uint32_t> values;values.reserve(static_cast<std::size_t>(count));
+        for(std::uint64_t i=0;i<count;++i){
+            std::int64_t value=0;
+            if(element_type==4)value=r.get<std::uint32_t>();
+            else if(element_type==5)value=r.get<std::int32_t>();
+            else if(element_type==10)value=static_cast<std::int64_t>(r.get<std::uint64_t>());
+            else value=r.get<std::int64_t>();
+            if(value<0||static_cast<std::uint64_t>(value)>std::numeric_limits<std::uint32_t>::max())
+                throw std::runtime_error("GGUF architecture array value is out of range");
+            values.push_back(static_cast<std::uint32_t>(value));
+        }
+        return values;
+    };
     auto set_config = [&](const std::string& key, uint32_t type)->bool {
         if(type!=4 && type!=10)return false;
         auto suffix=[&](const char* text){size_t n=std::strlen(text);return key.size()>=n && key.compare(key.size()-n,n,text)==0;};
         uint32_t* target=nullptr;
         if(suffix(".embedding_length"))target=&m.config.hidden_size;
+        else if(suffix(".embedding_length_per_layer_input"))target=&m.config.per_layer_embedding_size;
         else if(suffix(".block_count"))target=&m.config.layer_count;
+        else if(suffix(".attention.shared_kv_layers"))target=&m.config.shared_kv_layers;
         else if(suffix(".attention.head_count_kv"))target=&m.config.attention_kv_heads;
         else if(suffix(".attention.head_count"))target=&m.config.attention_heads;
         else if(suffix(".context_length"))target=&m.config.context_length;
-        else if(suffix(".feed_forward_length") || suffix(".expert_feed_forward_length"))target=&m.config.intermediate_size;
+        else if(suffix(".expert_feed_forward_length"))target=&m.config.expert_intermediate_size;
+        else if(suffix(".feed_forward_length"))target=&m.config.dense_intermediate_size;
         else if(suffix(".expert_count"))target=&m.config.expert_count;
         else if(suffix(".expert_used_count"))target=&m.config.expert_used_count;
         else if(key=="tokenizer.ggml.vocab_size")target=&m.config.vocabulary_size;
@@ -474,6 +500,7 @@ int parse(ColibriV2Model& m) {
         else if (key=="tokenizer.ggml.merges" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_merges=r.get<uint64_t>();m.merges.reserve(static_cast<size_t>(count_merges));for(uint64_t merge_index=0;merge_index<count_merges;merge_index++){if(element_type==8)m.merges.push_back(r.str());else r.value(element_type);}}
         else if (key.size()>=21 && key.compare(key.size()-21,21,".rope.dimension_count")==0 && (type==4 || type==10)) m.config.rotary_dimension=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=24 && key.compare(key.size()-24,24,".full_attention_interval")==0 && (type==4 || type==10)) m.config.full_attention_interval=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=24 && key.compare(key.size()-24,24,".attention.head_count_kv")==0 && type==9) m.config.attention_kv_heads_by_layer=read_uint_array(type);
         else if (key.size()>=25 && key.compare(key.size()-25,25,".attention.sliding_window")==0 && (type==4 || type==10)) m.config.sliding_window=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.sliding_window_pattern")==0 && type==9) {
             const auto element_type=r.get<uint32_t>();
@@ -483,6 +510,13 @@ int parse(ColibriV2Model& m) {
             for(std::uint64_t element=0;element<elements;++element)m.config.sliding_window_pattern.push_back(r.get<std::uint8_t>()?1:0);
         }
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.layer_norm_rms_epsilon")==0 && (type==6 || type==12)) m.config.rms_norm_epsilon=read_float(type);
+        else if (key.size()>=21 && key.compare(key.size()-21,21,".attention.key_length")==0 && (type==4 || type==10)) m.config.key_length=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=23 && key.compare(key.size()-23,23,".attention.value_length")==0 && (type==4 || type==10)) m.config.value_length=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=25 && key.compare(key.size()-25,25,".attention.key_length_swa")==0 && (type==4 || type==10)) m.config.key_length_swa=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=27 && key.compare(key.size()-27,27,".attention.value_length_swa")==0 && (type==4 || type==10)) m.config.value_length_swa=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=25 && key.compare(key.size()-25,25,".rope.dimension_count_swa")==0 && (type==4 || type==10)) m.config.rotary_dimension_swa=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=19 && key.compare(key.size()-19,19,".rope.freq_base_swa")==0 && (type==6 || type==12)) m.config.rope_freq_base_swa=read_float(type);
+        else if (key.size()>=24 && key.compare(key.size()-24,24,".final_logit_softcapping")==0 && (type==6 || type==12)) m.config.final_logit_softcap=read_float(type);
         else if (key.size()>=15 && key.compare(key.size()-15,15,".rope.freq_base")==0 && (type==6 || type==12)) m.config.rope_freq_base=read_float(type);
         else if (set_config(key,type)) {}
         else r.value(type);
@@ -509,6 +543,9 @@ int parse(ColibriV2Model& m) {
     }
     if(!m.config.sliding_window_pattern.empty()&&m.config.sliding_window_pattern.size()<m.config.layer_count)
         throw std::runtime_error("GGUF sliding-window pattern is shorter than the model layer count");
+    if(!m.config.attention_kv_heads_by_layer.empty()&&m.config.attention_kv_heads_by_layer.size()<m.config.layer_count)
+        throw std::runtime_error("GGUF per-layer KV-head array is shorter than the model layer count");
+    if(!m.config.intermediate_size)m.config.intermediate_size=m.config.expert_intermediate_size?m.config.expert_intermediate_size:m.config.dense_intermediate_size;
     uint64_t data_offset=align_to(static_cast<uint64_t>(r.p-m.data),m.alignment ? m.alignment : 32); if(data_offset>m.size) throw std::runtime_error("GGUF tensor data is outside the file"); for(auto& t:m.tensors) { if(t.offset>m.size-data_offset) throw std::runtime_error("GGUF tensor offset out of bounds"); t.offset += data_offset; }
     for(size_t i=0;i<m.tensors.size();i++) { auto& t=m.tensors[i]; uint64_t next=m.size; for(auto const& other:m.tensors) if(other.offset>t.offset) next=std::min(next,other.offset); t.size=next-t.offset; }
     // Tokenizer lookup tables, built once per model: rebuilding these
@@ -579,6 +616,11 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
                      "attn_q.weight", "attn_k.weight", "attn_v.weight",
                      "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
                  }) add_static_tensor(runtime, layer, prefix + suffix);
+            layer.attention_heads=model.config.attention_heads;
+            layer.kv_heads=model.config.attention_kv_heads;
+            layer.head_dim=static_cast<std::uint32_t>(model.tensors[layer.static_tensors[2]].shape[1]/layer.kv_heads);
+            layer.rotary_dim=model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim;
+            layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:1000000.0f;
         } else {
             for (const char* suffix : {
                      "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
@@ -645,6 +687,62 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
     runtime.moe_intermediate=static_cast<std::uint32_t>(shared_gate.shape[1]);
 }
 
+void build_gemma4_plan(ColibriV2QwenRuntime& runtime) {
+    auto& model=*runtime.model;
+    runtime.gemma4=true;
+    runtime.token_embeddings=tensor_index(model,"token_embd.weight");
+    runtime.final_norm=tensor_index(model,"output_norm.weight");
+    runtime.lm_head=runtime.token_embeddings;
+    runtime.static_tensor_bytes+=model.tensors[runtime.token_embeddings].size;
+    runtime.static_tensor_bytes+=model.tensors[runtime.final_norm].size;
+    if(has_tensor(model,"rope_freqs.weight")){
+        runtime.rope_factors=tensor_index(model,"rope_freqs.weight");
+        runtime.static_tensor_bytes+=model.tensors[runtime.rope_factors].size;
+    }
+    runtime.layers.reserve(model.config.layer_count);
+    for(std::uint32_t layer_index=0;layer_index<model.config.layer_count;++layer_index){
+        const std::string prefix="blk."+std::to_string(layer_index)+".";
+        QwenLayerPlan layer;layer.attention=true;
+        layer.attention_window=attention_window(model,layer_index);
+        layer.attention_heads=model.config.attention_heads;
+        layer.kv_heads=model.config.attention_kv_heads_by_layer.empty()
+            ?model.config.attention_kv_heads:model.config.attention_kv_heads_by_layer[layer_index];
+        layer.head_dim=layer.attention_window
+            ?(model.config.key_length_swa?model.config.key_length_swa:model.config.rotary_dimension_swa)
+            :(model.config.key_length?model.config.key_length:model.config.rotary_dimension);
+        layer.rotary_dim=layer.attention_window
+            ?(model.config.rotary_dimension_swa?model.config.rotary_dimension_swa:layer.head_dim)
+            :(model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim);
+        layer.rope_theta=layer.attention_window
+            ?(model.config.rope_freq_base_swa?model.config.rope_freq_base_swa:10000.0f)
+            :(model.config.rope_freq_base?model.config.rope_freq_base:1000000.0f);
+        for(const char* suffix:{"attn_norm.weight","attn_q.weight","attn_k.weight"})
+            add_static_tensor(runtime,layer,prefix+suffix);
+        // Gemma 4 global attention can be configured with K == V. Those
+        // checkpoints intentionally omit attn_v.weight; re-projecting with K
+        // gives the unnormalized value states before K takes its learned norm.
+        if(has_tensor(model,prefix+"attn_v.weight"))
+            add_static_tensor(runtime,layer,prefix+"attn_v.weight");
+        else
+            layer.static_tensors.push_back(layer.static_tensors[2]);
+        for(const char* suffix:{
+            "attn_output.weight","attn_q_norm.weight","attn_k_norm.weight",
+            "post_attention_norm.weight","ffn_norm.weight","ffn_gate.weight",
+            "ffn_up.weight","ffn_down.weight","post_ffw_norm_1.weight",
+            "ffn_gate_inp.scale","ffn_gate_inp.weight","pre_ffw_norm_2.weight",
+            "post_ffw_norm_2.weight","post_ffw_norm.weight","layer_output_scale.weight"
+        })add_static_tensor(runtime,layer,prefix+suffix);
+        layer.expert_tensors[0]=tensor_index(model,prefix+"ffn_gate_up_exps.weight");
+        layer.expert_tensors[1]=tensor_index(model,prefix+"ffn_down_exps.weight");
+        layer.expert_tensors[2]=tensor_index(model,prefix+"ffn_down_exps.scale");
+        layer.expert_tensor_count=3;
+        for(auto index:layer.expert_tensors)runtime.expert_tensor_bytes+=model.tensors[index].size;
+        for(auto index:layer.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
+        runtime.layers.push_back(std::move(layer));
+    }
+    runtime.moe_intermediate=model.config.expert_intermediate_size;
+}
+
 float qwen_half_value(std::uint16_t bits) {
     const std::uint32_t sign=(bits&0x8000u)<<16;
     std::uint32_t exponent=(bits>>10)&0x1fu,fraction=bits&0x3ffu,result=0;
@@ -658,9 +756,12 @@ float qwen_q5_value(const std::uint8_t*packed,std::uint64_t absolute){const auto
 float qwen_q6_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/256;const int within=static_cast<int>(absolute&255);const auto*base=packed+block*210;const auto*ql=base;const auto*qh=base+128;const auto*scales=reinterpret_cast<const std::int8_t*>(base+192);std::uint16_t d_bits=0;std::memcpy(&d_bits,base+208,2);const int half=within/128,offset=within&127,lane=offset/32,l=offset&31,qindex=l+((lane==0||lane==2)?0:32);const auto qbyte=ql[half*64+qindex],high=qh[half*32+l];const int nibble=(lane==0||lane==1)?(qbyte&15):(qbyte>>4);const int quant=(nibble|(((high>>(lane*2))&3)<<4))-32;const int scale_index=half*8+(l/16)+lane*2;return qwen_half_value(d_bits)*scales[scale_index]*quant;}
 float qwen_q8_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/32,within=absolute&31;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,packed+block*34,2);std::int8_t value=0;std::memcpy(&value,packed+block*34+2+within,1);return qwen_half_value(scale_bits)*value;}
 float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*input,int elements,std::uint64_t row){
-    if((colibri_cpu_features()&2u)!=0&&elements%256==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+    if(type!=2&&(colibri_cpu_features()&2u)!=0&&elements%256==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
     float result=0.0f;
-    if(type==13){
+    if(type==2){
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/32)*18;
+        for(int block=0;block<elements/32;++block){const auto*base=row_data+block*18;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);const float scale=qwen_half_value(scale_bits);const auto*vector=input+block*32;for(int lane=0;lane<16;++lane){const auto byte=base[2+lane];result+=scale*((byte&15)-8)*vector[lane];result+=scale*((byte>>4)-8)*vector[lane+16];}}
+    }else if(type==13){
         const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*176;
         for(int block=0;block<elements/256;++block){
             const auto*base=row_data+block*176;std::uint16_t d_bits=0,dmin_bits=0;
@@ -694,6 +795,37 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         for(int block=0;block<elements/32;++block){const auto*base=row_data+block*34;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);const float scale=qwen_half_value(scale_bits);const auto*values=reinterpret_cast<const std::int8_t*>(base+2);const auto*vector=input+block*32;for(int lane=0;lane<32;++lane)result+=scale*values[lane]*vector[lane];}
     }else throw std::runtime_error("unsupported native CPU expert quantization");
     return result;
+}
+
+void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
+        const std::int32_t*selected,const float*weights,const float*input,
+        float*activated,float*output){
+    const int experts=runtime.model->config.expert_count,top_k=runtime.model->config.expert_used_count;
+    const int hidden=runtime.model->config.hidden_size,intermediate=runtime.moe_intermediate;
+    const auto&gate_up_tensor=runtime.model->tensors[layer.expert_tensors[0]];
+    const auto&down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
+    const auto&scale_tensor=runtime.model->tensors[layer.expert_tensors[2]];
+    if(gate_up_tensor.type!=2||down_tensor.type!=2||scale_tensor.type!=0)
+        throw std::runtime_error("native Gemma 4 expects Q4_0 experts and f32 expert scales");
+    const auto gate_up_bytes=gate_up_tensor.size/experts,down_bytes=down_tensor.size/experts;
+    const auto*expert_scales=reinterpret_cast<const float*>(runtime.model->data+scale_tensor.offset);
+    #pragma omp parallel for schedule(static)
+    for(int task=0;task<top_k*intermediate;++task){
+        const int rank=task/intermediate,row=task%intermediate,expert=selected[rank];
+        if(expert<0||expert>=experts)continue;
+        const auto*gate_up=runtime.model->data+gate_up_tensor.offset+static_cast<std::uint64_t>(expert)*gate_up_bytes;
+        const float gate=qwen_quant_dot(gate_up,2,input,hidden,row);
+        const float up=qwen_quant_dot(gate_up,2,input,hidden,row+intermediate);
+        const float cubic=gate*gate*gate;
+        const float gelu=0.5f*gate*(1.0f+std::tanh(0.7978845608028654f*(gate+0.044715f*cubic)));
+        activated[task]=gelu*up;
+    }
+    #pragma omp parallel for schedule(static)
+    for(int row=0;row<hidden;++row){
+        float sum=0.0f;
+        for(int rank=0;rank<top_k;++rank){const int expert=selected[rank];if(expert<0||expert>=experts)continue;const auto*down=runtime.model->data+down_tensor.offset+static_cast<std::uint64_t>(expert)*down_bytes;sum+=weights[rank]*expert_scales[expert]*qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);}
+        output[row]=sum;
+    }
 }
 
 // Dequantize one weight row to f32 so it can be reused across every token
@@ -976,7 +1108,8 @@ int colibri_v2_tensor_read_slice(const ColibriV2Model*m,uint64_t i,uint64_t offs
 int colibri_v2_tensor_view(const ColibriV2Model*m,uint64_t i,uint64_t offset,uint64_t bytes,const void**out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("invalid tensor view");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor view is out of bounds");*out=m->data+t.offset+offset;return 0;});}
 int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOptions*options,ColibriV2QwenRuntime**out){return guarded([&]{
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
-    if(m->config.architecture.find("qwen")!=0)throw std::runtime_error("model architecture is not Qwen");
+    const bool gemma4=m->config.architecture=="gemma4";
+    if(m->config.architecture.find("qwen")!=0&&!gemma4)throw std::runtime_error("native runtime supports Qwen and Gemma 4 models");
     if(!m->config.hidden_size||!m->config.layer_count||!m->config.expert_count||!m->config.expert_used_count)throw std::runtime_error("Qwen runtime config is incomplete");
     auto runtime=std::make_unique<ColibriV2QwenRuntime>();
     runtime->model=m;
@@ -984,20 +1117,25 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.device<0)throw std::runtime_error("Qwen runtime device must be non-negative");
     if(runtime->options.moe_device<0||runtime->options.moe_device>2)throw std::runtime_error("Qwen runtime MoE device is invalid");
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
+    if(gemma4&&runtime->options.mtp_drafts)throw std::runtime_error("native Gemma 4 MTP is not implemented");
+    if(gemma4&&runtime->options.moe_device!=1)throw std::runtime_error("native Gemma 4 currently requires --moe-device cpu");
+    if(gemma4&&runtime->options.parallel_sequences>1)throw std::runtime_error("native Gemma 4 currently supports one sequence");
+    if(gemma4&&m->config.per_layer_embedding_size)throw std::runtime_error("native Gemma 4 per-layer embeddings are not implemented");
+    if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
     if(runtime->options.expert_top_p<0.0f||runtime->options.expert_top_p>1.0f)throw std::runtime_error("native Qwen expert_top_p must be within [0, 1]");
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>3)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>3)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.mtp_drafts&&(runtime->options.cache_type_k||runtime->options.cache_type_v))throw std::runtime_error("native Qwen MTP currently requires f32 KV cache");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
-    build_qwen_plan(*runtime);
+    if(gemma4)build_gemma4_plan(*runtime);else build_qwen_plan(*runtime);
     if(runtime->options.mtp_drafts&&!runtime->mtp_available)throw std::runtime_error("native Qwen MTP was requested but the model has no draft block");
     // Prompt tokens are processed through the batched rows forward in chunks
     // of this size. Bigger chunks amortize expert weight reads further (the
     // CPU MoE reads each routed expert once per chunk); the cost is ~200MB
     // of workspace + pinned staging at 1024. 0 or 1 falls back to
     // one-token-at-a-time decode.
-    runtime->prefill_rows=1024;
+    runtime->prefill_rows=gemma4?1:1024;
     if(const char*env=std::getenv("COLIBRI_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
@@ -1112,6 +1250,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         persistent[runtime->token_embeddings]=true;
         persistent[runtime->final_norm]=true;
         persistent[runtime->lm_head]=true;
+        if(runtime->rope_factors!=std::numeric_limits<std::uint64_t>::max())
+            persistent[runtime->rope_factors]=true;
         for(const auto&layer:runtime->layers)for(auto tensor:layer.static_tensors)persistent[tensor]=true;
         if(runtime->options.mtp_drafts){
             for(auto tensor:runtime->mtp_layer_plan.static_tensors)persistent[tensor]=true;
@@ -1134,12 +1274,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             for(auto index:layer.static_tensors){const auto&t=runtime->model->tensors[index];if(t.shape.size()==2)max_vector=std::max(max_vector,t.shape[1]);}
             if(layer.attention){
                 const auto&key=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".attn_k.weight")];
-                const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
+                const auto head_dim=layer.head_dim;
                 const auto batch_room=std::max<std::uint64_t>(runtime->prefill_rows,9);
                 layer.cache_capacity=layer.attention_window&&!runtime->options.swa_full
                     ?std::min<std::uint64_t>(runtime->options.context_limit,static_cast<std::uint64_t>(layer.attention_window)+batch_room)
                     :runtime->options.context_limit;
-                const auto cache_floats=runtime->model->config.attention_kv_heads*layer.cache_capacity*head_dim;
+                const auto cache_floats=layer.kv_heads*layer.cache_capacity*head_dim;
                 layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
                 layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
             }else{
@@ -1663,6 +1803,214 @@ inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.opti
 
 #include "v2_mtp_verifier.inc"
 
+static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_token,
+                         std::uint32_t& output_token) {
+    const auto decode_started=std::chrono::steady_clock::now();
+    const int hidden_size=static_cast<int>(runtime.model->config.hidden_size);
+    const int experts=static_cast<int>(runtime.model->config.expert_count);
+    const int top_k=static_cast<int>(runtime.model->config.expert_used_count);
+    const int dense_intermediate=static_cast<int>(runtime.model->config.dense_intermediate_size);
+    const float epsilon=runtime.model->config.rms_norm_epsilon
+        ?runtime.model->config.rms_norm_epsilon:1.0e-6f;
+    std::uint64_t cursor=runtime.workspace;
+    const auto workspace_end=runtime.workspace+runtime.workspace_bytes;
+    auto take=[&](std::uint64_t bytes){const auto result=cursor;cursor+=device_align(bytes);if(cursor>workspace_end)throw std::runtime_error("native Gemma 4 workspace is too small");return result;};
+    std::uint64_t hidden=take(hidden_size*sizeof(float));
+    std::uint64_t residual=take(hidden_size*sizeof(float));
+    const std::uint64_t normalized=take(hidden_size*sizeof(float));
+    const std::uint64_t first=take(runtime.scratch_elements*sizeof(float));
+    const std::uint64_t second=take(runtime.scratch_elements*sizeof(float));
+    const std::uint64_t third=take(runtime.scratch_elements*sizeof(float));
+    const std::uint64_t fourth=take(runtime.scratch_elements*sizeof(float));
+    const std::uint64_t router_logits=take(experts*sizeof(float));
+    const std::uint64_t selected_device=take(top_k*sizeof(std::int32_t));
+    const std::uint64_t route_weights=take(top_k*sizeof(float));
+    const std::uint64_t argmax_device=take(sizeof(std::uint64_t));
+    const std::uint64_t attention_scores=take(
+        static_cast<std::uint64_t>(runtime.model->config.attention_heads)*
+        runtime.options.context_limit*sizeof(float));
+    auto* staging=static_cast<std::uint8_t*>(runtime.host_staging);
+    auto* selected_host=reinterpret_cast<std::int32_t*>(staging);
+    const auto weights_offset=device_align(top_k*sizeof(std::int32_t));
+    const auto input_offset=weights_offset+device_align(top_k*sizeof(float));
+    const auto activated_offset=input_offset+device_align(hidden_size*sizeof(float));
+    const auto output_offset=activated_offset+
+        device_align(static_cast<std::uint64_t>(top_k)*runtime.moe_intermediate*sizeof(float));
+    auto* cpu_weights=reinterpret_cast<float*>(staging+weights_offset);
+    auto* cpu_input=reinterpret_cast<float*>(staging+input_offset);
+    auto* cpu_activated=reinterpret_cast<float*>(staging+activated_offset);
+    auto* cpu_output=reinterpret_cast<float*>(staging+output_offset);
+    if(output_offset+hidden_size*sizeof(float)>runtime.host_staging_bytes)
+        throw std::runtime_error("native Gemma 4 CPU MoE workspace overflow");
+    auto launch=[&](const char* name,std::uint32_t grid_x,std::uint32_t grid_y,
+                    std::uint32_t block_x,void** arguments,std::uint32_t shared=0){
+        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,runtime.stream,arguments)!=0)
+            throw std::runtime_error(std::string("native Gemma 4 CUDA kernel failed: ")+name);
+    };
+    auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
+        int one_centered=0;
+        void* args[]={&input,&weights,&output,const_cast<int*>(&hidden_size),
+                      const_cast<float*>(&epsilon),&one_centered};
+        launch("rms_norm",1,1,256,args);
+    };
+    auto q4=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,
+                int input_size,int output_size){
+        void* args[]={&matrix,&input,&output,&input_size,&output_size};
+        launch("gemma_q4_0_matvec",(output_size+7)/8,1,256,args);
+    };
+    auto f32=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,
+                 int input_size,int output_size){
+        void* args[]={&matrix,&input,&output,&input_size,&output_size};
+        launch("qwen_f32_matvec",output_size,1,256,args);
+    };
+    auto add=[&](std::uint64_t target,std::uint64_t source){
+        float scale=1.0f;int count=hidden_size;
+        void* args[]={&target,&source,&scale,&count};
+        launch("scaled_add",(hidden_size+255)/256,1,256,args);
+    };
+    {
+        const auto embedding=runtime.device_tensors[runtime.token_embeddings];
+        const int token=static_cast<int>(input_token);
+        const float scale=std::sqrt(static_cast<float>(hidden_size));
+        void* args[]={const_cast<std::uint64_t*>(&embedding),&hidden,
+                      const_cast<int*>(&token),const_cast<int*>(&hidden_size),
+                      const_cast<float*>(&scale)};
+        launch("gemma_q4_0_embedding",(hidden_size+255)/256,1,256,args);
+    }
+    for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
+        auto& layer=runtime.layers[layer_number];
+        auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
+
+        // Attention: learned pre/post RMS norms, per-head Q/K normalization,
+        // unscaled dot products, and a layer-specific local/global KV shape.
+        rms(hidden,tensor(0),normalized);
+        const int heads=static_cast<int>(layer.attention_heads);
+        const int kv_heads=static_cast<int>(layer.kv_heads);
+        const int head_dim=static_cast<int>(layer.head_dim);
+        const int q_elements=heads*head_dim,kv_elements=kv_heads*head_dim;
+        q4(tensor(1),normalized,first,hidden_size,q_elements);
+        q4(tensor(2),normalized,second,hidden_size,kv_elements);
+        q4(tensor(3),normalized,third,hidden_size,kv_elements);
+        const int rotary=static_cast<int>(layer.rotary_dim);
+        const int position=static_cast<int>(runtime.position);
+        const float theta=layer.rope_theta;
+        const std::uint64_t rope_factors=layer.attention_window||
+            runtime.rope_factors==std::numeric_limits<std::uint64_t>::max()
+            ?0:runtime.device_tensors[runtime.rope_factors];
+        auto qnorm=tensor(5),knorm=tensor(6);
+        void* q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,
+                        const_cast<std::uint64_t*>(&fourth),const_cast<int*>(&heads),
+                        const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                        const_cast<int*>(&position),const_cast<float*>(&theta),
+                        const_cast<float*>(&epsilon),const_cast<std::uint64_t*>(&rope_factors)};
+        launch("gemma_head_norm_rope",heads,1,256,q_args);
+        void* k_args[]={const_cast<std::uint64_t*>(&second),&knorm,
+                        const_cast<std::uint64_t*>(&first),const_cast<int*>(&kv_heads),
+                        const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                        const_cast<int*>(&position),const_cast<float*>(&theta),
+                        const_cast<float*>(&epsilon),const_cast<std::uint64_t*>(&rope_factors)};
+        launch("gemma_head_norm_rope",kv_heads,1,256,k_args);
+        void* v_norm_args[]={const_cast<std::uint64_t*>(&third),
+                             const_cast<std::uint64_t*>(&second),const_cast<int*>(&kv_heads),
+                             const_cast<int*>(&head_dim),const_cast<float*>(&epsilon)};
+        launch("gemma_head_rms",kv_heads,1,256,v_norm_args);
+        std::uint64_t cache_keys=runtime.state+layer.state_first;
+        std::uint64_t cache_values=runtime.state+layer.state_second;
+        const auto view=attention_cache_view(layer,runtime.position);
+        int slot=view.slot,capacity=view.capacity;
+        void* k_store_args[]={const_cast<std::uint64_t*>(&first),&cache_keys,
+                              const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                              &slot,&capacity};
+        launch(kv_store_kernel(runtime.options.cache_type_k),kv_heads,1,256,k_store_args);
+        void* v_store_args[]={const_cast<std::uint64_t*>(&second),&cache_values,
+                              const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                              &slot,&capacity};
+        launch(kv_store_kernel(runtime.options.cache_type_v),kv_heads,1,256,v_store_args);
+        int tokens=view.tokens,first_slot=view.first;float attention_scale=1.0f;
+        void* score_args[]={const_cast<std::uint64_t*>(&fourth),&cache_keys,
+                            const_cast<std::uint64_t*>(&attention_scores),
+                            const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                            const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,
+                            &attention_scale};
+        launch(kv_scores_ring_kernel(runtime),heads,(tokens+255)/256,256,score_args);
+        void* value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,
+                            const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),
+                            const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                            &tokens,&capacity,&first_slot};
+        launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
+        q4(tensor(4),third,residual,q_elements,hidden_size);
+        rms(residual,tensor(7),normalized);
+        add(hidden,normalized);
+
+        // Dense GEGLU path.
+        rms(hidden,tensor(8),normalized);
+        auto dense_gate=tensor(9),dense_up=tensor(10);
+        void* dense_args[]={&dense_gate,&dense_up,const_cast<std::uint64_t*>(&normalized),
+                            const_cast<std::uint64_t*>(&first),const_cast<int*>(&hidden_size),
+                            const_cast<int*>(&dense_intermediate)};
+        launch("gemma_q4_0_geglu",(dense_intermediate+7)/8,1,256,dense_args);
+        q4(tensor(11),first,second,dense_intermediate,hidden_size);
+        rms(second,tensor(12),third);
+
+        // Router consumes the pre-FFN residual. Experts consume their own
+        // learned normalization of that same residual and execute on CPU.
+        auto router_scale=tensor(13);
+        void* router_input_args[]={&hidden,&router_scale,
+                                   const_cast<std::uint64_t*>(&normalized),
+                                   const_cast<int*>(&hidden_size),
+                                   const_cast<float*>(&epsilon)};
+        launch("gemma_router_input",1,1,256,router_input_args);
+        f32(tensor(14),normalized,router_logits,hidden_size,experts);
+        if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,
+                                 experts,top_k,runtime.stream)!=0)
+            throw std::runtime_error("native Gemma 4 routing failed");
+        rms(hidden,tensor(15),normalized);
+        if(colibri_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||
+           colibri_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||
+           colibri_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)
+            throw std::runtime_error("native Gemma 4 CPU MoE input transfer failed");
+        if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0||
+           colibri_gpu_event_sync(runtime.route_event)!=0)
+            throw std::runtime_error("native Gemma 4 route synchronization failed");
+        const auto compute_started=std::chrono::steady_clock::now();
+        gemma_cpu_moe(runtime,layer,selected_host,cpu_weights,cpu_input,
+                      cpu_activated,cpu_output);
+        runtime.expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-compute_started).count();
+        runtime.route_expert_sum+=top_k;
+        if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
+            throw std::runtime_error("native Gemma 4 CPU MoE output upload failed");
+        rms(fourth,tensor(16),first);
+        add(third,first);
+        rms(third,tensor(17),residual);
+        add(hidden,residual);
+        auto layer_scale=tensor(18);
+        void* scale_args[]={&hidden,&layer_scale,const_cast<int*>(&hidden_size)};
+        launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
+    }
+    rms(hidden,runtime.device_tensors[runtime.final_norm],normalized);
+    const int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);
+    if(colibri_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)
+        throw std::runtime_error("native Gemma 4 argmax reset failed");
+    auto lm_head=runtime.device_tensors[runtime.lm_head];
+    void* argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),
+                         const_cast<std::uint64_t*>(&argmax_device),
+                         const_cast<int*>(&hidden_size),const_cast<int*>(&vocabulary)};
+    launch("gemma_q4_0_lm_argmax",(vocabulary+7)/8,1,256,argmax_args);
+    auto* packed_winner=reinterpret_cast<std::uint64_t*>(staging);
+    if(colibri_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime.stream)!=0||
+       colibri_gpu_stream_sync(runtime.stream)!=0)
+        throw std::runtime_error("native Gemma 4 output synchronization failed");
+    output_token=0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
+    runtime.last_output_token=output_token;
+    runtime.processed_tokens.push_back(input_token);
+    ++runtime.position;
+    ++runtime.decode_calls;
+    runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-decode_started).count();
+    return 0;
+}
+
 int colibri_v2_qwen_runtime_synchronize(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime||!runtime->stream)throw std::runtime_error("native Qwen runtime is not prepared");if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA synchronization failed");return 0;});}
 int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_token,uint32_t*output_token){return guarded([&]{
     if(!runtime||!output_token)throw std::runtime_error("invalid native Qwen decode arguments");
@@ -1670,6 +2018,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     if(runtime->cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
     if(runtime->position>=runtime->options.context_limit)throw std::runtime_error("native Qwen context limit exceeded");
     if(input_token>=runtime->model->config.vocabulary_size)throw std::runtime_error("native Qwen input token is out of range");
+    if(runtime->gemma4)return gemma4_decode(*runtime,input_token,*output_token);
     qwen_mtp_append_prompt_pair(*runtime,input_token);
     const auto decode_started=std::chrono::steady_clock::now();
     const int hidden_size=static_cast<int>(runtime->model->config.hidden_size);
@@ -2003,14 +2352,14 @@ static std::uint64_t qwen_kv_region_bytes(std::uint64_t elems, int type) {
 static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_ranges(
         const ColibriV2QwenRuntime& runtime, std::uint64_t position) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    const auto kv_heads = runtime.model->config.attention_kv_heads;
     const int ck = runtime.options.cache_type_k, cv = runtime.options.cache_type_v;
     for (std::uint32_t layer_number = 0; layer_number < runtime.layers.size(); ++layer_number) {
         const auto& layer = runtime.layers[layer_number];
         if (layer.attention) {
             const auto& key = runtime.model->tensors[tensor_index(
                 *runtime.model, "blk." + std::to_string(layer_number) + ".attn_k.weight")];
-            const auto head_dim = key.shape[1] / kv_heads;
+            const auto head_dim = layer.head_dim;
+            const auto kv_heads = layer.kv_heads;
             for (int cache = 0; cache < 2; ++cache) {
                 const auto base = cache ? layer.state_second : layer.state_first;
                 const int type = cache ? cv : ck;

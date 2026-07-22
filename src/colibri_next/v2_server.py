@@ -101,11 +101,12 @@ class NativeV2Tokenizer:
 
     def __init__(self, model: V2Model):
         self.model = model
+        self.architecture = str(model.info["architecture"])
         eos: list[int] = []
-        for text in ("<|im_end|>", "<|endoftext|>"):
+        for text in ("<|im_end|>", "<|endoftext|>", "<turn|>", "<eos>"):
             try:
                 eos.append(model.token_id(text))
-            except V2Error:
+            except (V2Error, KeyError):
                 pass
         self.eos_token_ids = tuple(dict.fromkeys(eos))
 
@@ -132,6 +133,8 @@ class NativeV2Tokenizer:
     ) -> str:
         if not messages:
             raise ValueError("messages must not be empty")
+        if self.architecture == "gemma4":
+            return self._format_gemma4(messages, enable_thinking=enable_thinking)
         sections: list[str] = []
         for message in messages:
             role = message["role"]
@@ -148,6 +151,40 @@ class NativeV2Tokenizer:
             sections.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
         sections.append("<|im_start|>assistant\n")
         sections.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
+        return "".join(sections)
+
+    @staticmethod
+    def _format_gemma4(
+        messages: Sequence[Mapping[str, str]], *, enable_thinking: bool
+    ) -> str:
+        """Render the text-only subset of Gemma 4's GGUF chat template."""
+        sections = ["<bos>"]
+        start = 0
+        if enable_thinking or messages[0]["role"] in ("system", "developer"):
+            sections.append("<|turn>system\n")
+            if enable_thinking:
+                sections.append("<|think|>\n")
+            if messages[0]["role"] in ("system", "developer"):
+                content = messages[0]["content"].strip()
+                if not content:
+                    raise ValueError("chat message content must not be empty")
+                sections.append(content)
+                start = 1
+            sections.append("<turn|>\n")
+        for message in messages[start:]:
+            role = message["role"]
+            if role not in ("user", "assistant"):
+                raise ValueError(
+                    "Gemma 4 text chat currently supports system, developer, user, and assistant messages"
+                )
+            content = message["content"].strip()
+            if not content:
+                raise ValueError("chat message content must not be empty")
+            rendered_role = "model" if role == "assistant" else role
+            sections.append(f"<|turn>{rendered_role}\n{content}<turn|>\n")
+        sections.append("<|turn>model\n")
+        if not enable_thinking:
+            sections.append("<|channel>thought\n<channel|>")
         return "".join(sections)
 
     def encode_messages(
@@ -407,11 +444,15 @@ class NativeV2InferenceService(InferenceService):
         self.v2_model = V2Model(model_path)
         self.v2_runtime: V2QwenRuntime | None = None
         try:
-            self.v2_runtime = self.v2_model.native_qwen_runtime(
+            effective_moe_device = (
+                "cpu" if self.v2_model.info["architecture"] == "gemma4"
+                else moe_device
+            )
+            self.v2_runtime = self.v2_model.native_runtime(
                 device=device,
                 context_limit=context_window,
                 gpu_cache_bytes=gpu_cache_mib * 1024**2,
-                moe_device=moe_device,
+                moe_device=effective_moe_device,
                 mtp_drafts=mtp_drafts,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,

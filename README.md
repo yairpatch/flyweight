@@ -474,6 +474,12 @@ Native v2 also reads GGUF's generic `attention.sliding_window` and
 compact circular KV cache sized to the trained window plus one prefill batch;
 global layers retain the full context cache. `serve-v2 --swa-full` keeps
 full-size storage for sliding layers when unrestricted prefix-cache rollback is
-more important than VRAM savings. This is generic cache infrastructure; model
-adapters still need to provide the architecture's attention projections and
-RoPE rules before a new architecture such as Gemma 4 can execute.
+more important than VRAM savings.
+
+Gemma 4 QAT MoE text GGUFs without per-layer embeddings or shared-KV tail
+layers are supported by the native CUDA runtime, including mixed
+local/global head geometry, proportional global RoPE, optional K=V global
+attention, QAT Q4_0 projections, dense GEGLU, and routed MoE layers. Routed
+Gemma 4 experts currently execute on CPU (`moe_device="cpu"`); persistent
+attention, dense, router, and embedding weights remain on GPU. Use
+`model.native_runtime(...)` for architecture-neutral construction.

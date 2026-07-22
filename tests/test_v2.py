@@ -2,7 +2,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from colibri_next.v2 import V2Model, V2Error
 
@@ -14,23 +14,33 @@ def gguf_string(value: str) -> bytes:
 
 class V2RuntimeTests(unittest.TestCase):
     def make_model(
-        self, sliding_pattern: tuple[bool, ...] | None = None
+        self,
+        sliding_pattern: tuple[bool, ...] | None = None,
+        architecture: str = "qwen3moe",
+        kv_heads: tuple[int, ...] | None = None,
     ) -> tuple[Path, bytes]:
+        prefix = architecture
         metadata_items = [
-            gguf_string("general.architecture") + struct.pack("<I", 8) + gguf_string("qwen3moe"),
+            gguf_string("general.architecture") + struct.pack("<I", 8) + gguf_string(architecture),
             gguf_string("general.name") + struct.pack("<I", 8) + gguf_string("test"),
-            gguf_string("qwen3moe.embedding_length") + struct.pack("<II", 4, 16),
-            gguf_string("qwen3moe.block_count") + struct.pack("<II", 4, len(sliding_pattern) if sliding_pattern else 1),
-            gguf_string("qwen3moe.attention.head_count") + struct.pack("<II", 4, 2),
-            gguf_string("qwen3moe.rope.dimension_count") + struct.pack("<II", 4, 64),
-            gguf_string("qwen3moe.full_attention_interval") + struct.pack("<II", 4, 4),
-            gguf_string("qwen3moe.attention.layer_norm_rms_epsilon") + struct.pack("<If", 6, 1e-6),
-            gguf_string("qwen3moe.rope.freq_base") + struct.pack("<If", 6, 10_000_000.0),
+            gguf_string(f"{prefix}.embedding_length") + struct.pack("<II", 4, 16),
+            gguf_string(f"{prefix}.block_count") + struct.pack("<II", 4, len(sliding_pattern) if sliding_pattern else 1),
+            gguf_string(f"{prefix}.attention.head_count") + struct.pack("<II", 4, 2),
+            gguf_string(f"{prefix}.rope.dimension_count") + struct.pack("<II", 4, 64),
+            gguf_string(f"{prefix}.full_attention_interval") + struct.pack("<II", 4, 4),
+            gguf_string(f"{prefix}.attention.layer_norm_rms_epsilon") + struct.pack("<If", 6, 1e-6),
+            gguf_string(f"{prefix}.rope.freq_base") + struct.pack("<If", 6, 10_000_000.0),
         ]
+        if kv_heads is not None:
+            metadata_items.append(
+                gguf_string(f"{prefix}.attention.head_count_kv")
+                + struct.pack("<IIQ", 9, 5, len(kv_heads))
+                + struct.pack(f"<{len(kv_heads)}i", *kv_heads)
+            )
         if sliding_pattern is not None:
             metadata_items.extend((
-                gguf_string("qwen3moe.attention.sliding_window") + struct.pack("<II", 4, 128),
-                gguf_string("qwen3moe.attention.sliding_window_pattern")
+                gguf_string(f"{prefix}.attention.sliding_window") + struct.pack("<II", 4, 128),
+                gguf_string(f"{prefix}.attention.sliding_window_pattern")
                 + struct.pack("<IIQ", 9, 7, len(sliding_pattern))
                 + bytes(sliding_pattern),
             ))
@@ -102,6 +112,35 @@ class V2RuntimeTests(unittest.TestCase):
                 )
         finally:
             path.unlink()
+
+    def test_parses_gemma4_signed_per_layer_kv_head_array(self):
+        pattern = (True, True, False)
+        path, _ = self.make_model(pattern, architecture="gemma4", kv_heads=(8, 8, 2))
+        try:
+            with V2Model(path) as model:
+                self.assertEqual(model.info["architecture"], "gemma4")
+                self.assertEqual(model.config["attention_windows"], (128, 128, 0))
+        finally:
+            path.unlink()
+
+    def test_generic_runtime_selects_cpu_experts_for_gemma4(self):
+        model = object.__new__(V2Model)
+        with patch.object(
+            V2Model, "info", new_callable=PropertyMock,
+            return_value={"architecture": "gemma4"},
+        ), patch.object(V2Model, "native_qwen_runtime", return_value="runtime") as create:
+            self.assertEqual(model.native_runtime(context_limit=32), "runtime")
+            create.assert_called_once_with(context_limit=32, moe_device="cpu")
+
+    def test_gemma4_decode_converts_word_boundary_markers_to_spaces(self):
+        model = object.__new__(V2Model)
+        model._architecture = "gemma4"
+        pieces = {1: "Experts", 2: "▁(MoE)", 3: "▁works", 4: "."}
+        with patch.object(V2Model, "token_text", lambda _model, token: pieces[token]):
+            self.assertEqual(
+                model.decode_tokens([1, 2, 3, 4]),
+                "Experts (MoE) works.",
+            )
 
     def test_tokenize_recognizes_non_pipe_qwen_control_tokens(self):
         model = object.__new__(V2Model)

@@ -953,6 +953,113 @@ void q8_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+// Direct GGML Q4_0 readers used by Gemma 4 QAT checkpoints. Each 32-value
+// block is [f16 scale | 16 packed nibbles], with low nibbles for values 0..15
+// and high nibbles for 16..31.
+__device__ __forceinline__ float ggml_q4_0_load(const unsigned char* packed, long long absolute) {
+    const unsigned char* block=packed+(absolute>>5)*18;
+    const int within=(int)(absolute&31);
+    const unsigned char byte=block[2+(within&15)];
+    const int quant=within<16?(byte&15):(byte>>4);
+    return (float)(quant-8)*__half2float(*((const __half*)block));
+}
+
+extern "C" __global__ void gemma_q4_0_matvec(
+    const unsigned char* packed,const float* vector,float* output,
+    const int input_size,const int output_size
+) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
+    if(row>=output_size)return;
+    float sum=0.0f;
+    for(int input=lane;input<input_size;input+=32)
+        sum+=ggml_q4_0_load(packed,(long long)row*input_size+input)*vector[input];
+    for(int offset=16;offset;offset>>=1)sum+=__shfl_down_sync(0xffffffff,sum,offset);
+    if(lane==0)output[row]=sum;
+}
+
+extern "C" __global__ void gemma_q4_0_embedding(
+    const unsigned char* packed,float* output,const int token,
+    const int hidden,const float scale
+) {
+    for(int d=blockIdx.x*blockDim.x+threadIdx.x;d<hidden;d+=blockDim.x*gridDim.x)
+        output[d]=ggml_q4_0_load(packed,(long long)token*hidden+d)*scale;
+}
+
+__device__ __forceinline__ float gemma_gelu(float x) {
+    return 0.5f*x*(1.0f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x)));
+}
+
+extern "C" __global__ void gemma_q4_0_geglu(
+    const unsigned char* gate,const unsigned char* up,const float* input,float* output,
+    const int input_size,const int intermediate
+) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
+    if(row>=intermediate)return;
+    float g=0.0f,u=0.0f;
+    for(int i=lane;i<input_size;i+=32){
+        const float x=input[i];
+        g+=ggml_q4_0_load(gate,(long long)row*input_size+i)*x;
+        u+=ggml_q4_0_load(up,(long long)row*input_size+i)*x;
+    }
+    for(int offset=16;offset;offset>>=1){g+=__shfl_down_sync(0xffffffff,g,offset);u+=__shfl_down_sync(0xffffffff,u,offset);}
+    if(lane==0)output[row]=gemma_gelu(g)*u;
+}
+
+extern "C" __global__ void gemma_head_norm_rope(
+    const float* projected,const float* weights,float* output,
+    const int heads,const int head_dim,const int rotary_dim,const int position,
+    const float theta,const float epsilon,const float* freq_factors
+) {
+    const int head=blockIdx.x;if(head>=heads)return;
+    const float* src=projected+head*head_dim;float* dst=output+head*head_dim;
+    float sum=0.0f;for(int d=threadIdx.x;d<head_dim;d+=blockDim.x)sum+=src[d]*src[d];
+    sum=block_reduce_sum(sum);__shared__ float inv;if(threadIdx.x==0)inv=rsqrtf(sum/head_dim+epsilon);__syncthreads();
+    const int half=rotary_dim/2;
+    for(int d=threadIdx.x;d<head_dim;d+=blockDim.x){
+        float value=src[d]*inv*weights[d];
+        if(d<rotary_dim){
+            const int pair=d<half?d:d-half;const int other=d<half?d+half:d-half;
+            const float other_value=src[other]*inv*weights[other];
+            const float factor=freq_factors?freq_factors[pair]:1.0f;
+            const float angle=(float)position/(powf(theta,2.0f*pair/rotary_dim)*factor);
+            value=d<half?value*cosf(angle)-other_value*sinf(angle):other_value*sinf(angle)+value*cosf(angle);
+        }
+        dst[d]=value;
+    }
+}
+
+extern "C" __global__ void gemma_head_rms(
+    const float* input,float* output,const int heads,const int head_dim,const float epsilon
+) {
+    const int head=blockIdx.x;if(head>=heads)return;const float*src=input+head*head_dim;float*dst=output+head*head_dim;
+    float sum=0.0f;for(int d=threadIdx.x;d<head_dim;d+=blockDim.x)sum+=src[d]*src[d];
+    sum=block_reduce_sum(sum);__shared__ float inv;if(threadIdx.x==0)inv=rsqrtf(sum/head_dim+epsilon);__syncthreads();
+    for(int d=threadIdx.x;d<head_dim;d+=blockDim.x)dst[d]=src[d]*inv;
+}
+
+extern "C" __global__ void gemma_router_input(
+    const float* input,const float* scale,float* output,const int elements,const float epsilon
+) {
+    float sum=0.0f;for(int i=threadIdx.x;i<elements;i+=blockDim.x)sum+=input[i]*input[i];
+    sum=block_reduce_sum(sum);__shared__ float factor;if(threadIdx.x==0)factor=rsqrtf(sum/elements+epsilon)*rsqrtf((float)elements);__syncthreads();
+    for(int i=threadIdx.x;i<elements;i+=blockDim.x)output[i]=input[i]*scale[i]*factor;
+}
+
+extern "C" __global__ void gemma_scale_vector(float* values,const float* scale,const int elements) {
+    const float factor=scale[0];for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<elements;i+=blockDim.x*gridDim.x)values[i]*=factor;
+}
+
+extern "C" __global__ void gemma_q4_0_lm_argmax(
+    const unsigned char* packed,const float* input,unsigned long long* winner,
+    const int hidden,const int vocabulary
+) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,token=blockIdx.x*8+warp;
+    if(token>=vocabulary)return;float sum=0.0f;
+    for(int i=lane;i<hidden;i+=32)sum+=ggml_q4_0_load(packed,(long long)token*hidden+i)*input[i];
+    for(int offset=16;offset;offset>>=1)sum+=__shfl_down_sync(0xffffffff,sum,offset);
+    if(lane==0){const unsigned int ordered=__float_as_uint(sum)^(sum>=0.0f?0x80000000u:0xffffffffu);const unsigned long long candidate=((unsigned long long)ordered<<32)|(0xffffffffu-(unsigned int)token);atomicMax(winner,candidate);}
+}
+
 extern "C" __global__
 void q8_matvec_transposed_warp(
     const unsigned char* packed,

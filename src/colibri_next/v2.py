@@ -10,7 +10,7 @@ import ctypes
 import os
 import re
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 
 class V2Error(RuntimeError):
@@ -520,6 +520,7 @@ class V2Model:
                 str(self.path).encode(), ctypes.byref(self._handle)
             )
         )
+        self._architecture = str(self.info["architecture"])
 
     def _check(self, status: int) -> None:
         if status:
@@ -852,6 +853,13 @@ class V2Model:
         encoded = bytearray()
         for token in tokens:
             piece = self.token_text(token)
+            # Gemma 4's generated vocabulary pieces can carry SentencePiece's
+            # visible word-boundary marker. Prompt tokenization may represent
+            # the same boundary as a standalone space token, so round-trip
+            # tests alone do not expose this; generated text must explicitly
+            # map every marker back to an ASCII space.
+            if getattr(self, "_architecture", "") == "gemma4":
+                piece = piece.replace("▁", " ")
             if piece.startswith("<|") and piece.endswith("|>"):
                 encoded.extend(piece.encode("utf-8"))
                 continue
@@ -904,6 +912,17 @@ class V2Model:
             prompt_cache_mib=prompt_cache_mib,
             swa_full=swa_full,
         )
+
+    def native_runtime(self, **options: Any) -> "V2QwenRuntime":
+        """Create the native runtime for any supported GGUF architecture.
+
+        Gemma 4 currently keeps routed expert weights on CPU, so the generic
+        entry point selects that backend unless the caller explicitly chooses
+        one. ``native_qwen_runtime`` remains as a compatibility alias.
+        """
+        if self.info["architecture"] == "gemma4":
+            options.setdefault("moe_device", "cpu")
+        return self.native_qwen_runtime(**options)
 
     @staticmethod
     def gpu_info(device: int = 0) -> dict[str, int]:
@@ -1179,7 +1198,7 @@ class V2Model:
 
 
 class V2QwenRuntime:
-    """Owns the native Qwen execution plan and, eventually, its CUDA state.
+    """Owns a native Qwen or Gemma 4 execution plan and its CUDA state.
 
     The model must outlive this object.  ``decode_ready`` is deliberately
     exposed so callers cannot confuse the catalog/planning milestone with the
@@ -1297,7 +1316,7 @@ class V2QwenRuntime:
         self.model._check(self._lib.colibri_v2_qwen_runtime_synchronize(self._handle))
 
     def decode(self, input_token: int) -> int:
-        """Run one complete greedy Qwen token step inside native C++/CUDA."""
+        """Run one complete greedy token step inside native C++/CUDA."""
         output = ctypes.c_uint32()
         self.model._check(
             self._lib.colibri_v2_qwen_runtime_decode(

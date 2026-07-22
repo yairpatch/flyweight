@@ -307,7 +307,8 @@ def _parser() -> argparse.ArgumentParser:
 
     native_qwen_v2 = subcommands.add_parser(
         "probe-qwen-native-v2",
-        help="run the one-call C++/CUDA Qwen v2 decoder (no CuPy execution)",
+        aliases=("probe-native-v2",),
+        help="run the one-call C++/CUDA native v2 decoder (Qwen or Gemma 4)",
     )
     native_qwen_v2.add_argument("model", type=Path)
     native_qwen_v2.add_argument("--token-id", type=int, default=0)
@@ -319,8 +320,8 @@ def _parser() -> argparse.ArgumentParser:
         "--gpu-cache-mib", type=int, default=0,
         help="total v2 CUDA budget in MiB (0 = auto-fit to free VRAM)")
     native_qwen_v2.add_argument(
-        "--moe-device", choices=("gpu", "cpu", "hybrid"), default="gpu",
-        help="execute routed experts by GPU streaming or native CPU kernels",
+        "--moe-device", choices=("gpu", "cpu", "hybrid"), default=None,
+        help="expert backend (default: CPU for Gemma 4, GPU otherwise)",
     )
     native_qwen_v2.add_argument("--mtp-drafts", type=int, default=0)
     stack_qwen_v2.add_argument(
@@ -778,34 +779,38 @@ def main(argv: list[str] | None = None) -> int:
         if cuda_enabled:
             disable_cuda()
         return 0
-    if args.command == "probe-qwen-native-v2":
+    if args.command in ("probe-qwen-native-v2", "probe-native-v2"):
         if args.generate_tokens < 0:
             raise SystemExit("--generate-tokens must be non-negative")
-        if args.context <= 0 or args.gpu_cache_mib <= 0:
-            raise SystemExit("--context and --gpu-cache-mib must be positive")
+        if args.context <= 0 or args.gpu_cache_mib < 0:
+            raise SystemExit("--context must be positive and --gpu-cache-mib non-negative")
         with V2Model(args.model) as model:
+            moe_device = args.moe_device or (
+                "cpu" if model.info["architecture"] == "gemma4" else "gpu"
+            )
             prompt_text = args.prompt
             if args.chat:
                 if prompt_text is None:
                     raise SystemExit("--chat requires --prompt")
-                prompt_text = (
-                    f"<|im_start|>user\n{prompt_text}<|im_end|>\n"
-                    "<|im_start|>assistant\n<think>\n"
+                from .v2_server import NativeV2Tokenizer
+                prompt_text = NativeV2Tokenizer(model).format_messages(
+                    [{"role": "user", "content": prompt_text}],
+                    enable_thinking=True,
                 )
             prompt_tokens = (
                 model.tokenize(prompt_text)
                 if prompt_text is not None else [args.token_id]
             )
             if not prompt_tokens:
-                raise SystemExit("native Qwen prompt must contain at least one token")
+                raise SystemExit("native prompt must contain at least one token")
             generated: list[int] = []
             step_seconds: list[float] = []
             started = time.perf_counter()
-            with model.native_qwen_runtime(
+            with model.native_runtime(
                 context_limit=args.context,
-                    gpu_cache_bytes=args.gpu_cache_mib * 1024**2,
-                    moe_device=args.moe_device,
-                    mtp_drafts=args.mtp_drafts,
+                gpu_cache_bytes=args.gpu_cache_mib * 1024**2,
+                moe_device=moe_device,
+                mtp_drafts=args.mtp_drafts,
             ) as runtime:
                 prepare_started = time.perf_counter()
                 runtime.prepare()
@@ -824,8 +829,8 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_info = runtime.info
             print(json.dumps({
                 "execution": (
-                    f"native-v2-cpp-cuda-{args.moe_device}-moe"
-                    if args.moe_device != "gpu" else "native-v2-cpp-cuda"
+                    f"native-v2-cpp-cuda-{moe_device}-moe"
+                    if moe_device != "gpu" else "native-v2-cpp-cuda"
                 ),
                 "prompt": prompt_text,
                 "prompt_tokens": prompt_tokens,

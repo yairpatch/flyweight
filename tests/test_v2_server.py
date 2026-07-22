@@ -9,6 +9,7 @@ from colibri_next.v2_server import NativeV2Generator, NativeV2Tokenizer
 
 
 class StubV2Model:
+    info = {"architecture": "qwen3moe"}
     pieces = {20: "Hello", 30: " world", 99: "<|im_end|>"}
     # Raw UTF-8 bytes per token; 40/41 split one character ("⚽" = e2 9a bd)
     # across two tokens, as byte-level BPE routinely does.
@@ -127,6 +128,22 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(result.text, "Hello world")
         self.assertEqual(runtime.inputs, [1, 2, 20])
         self.assertEqual(runtime.resets, 1)
+
+    def test_gemma4_chat_format_uses_turn_and_channel_tokens(self) -> None:
+        tokenizer = object.__new__(NativeV2Tokenizer)
+        tokenizer.architecture = "gemma4"
+        prompt = tokenizer.format_messages(
+            [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Hello"},
+            ]
+        )
+        self.assertEqual(
+            prompt,
+            "<bos><|turn>system\nBe concise.<turn|>\n"
+            "<|turn>user\nHello<turn|>\n"
+            "<|turn>model\n<|channel>thought\n<channel|>",
+        )
 
     def test_multibyte_character_split_across_tokens_decodes_intact(self) -> None:
         # Byte-level BPE splits "⚽" (e2 9a bd) across tokens 40+41. Per-token
