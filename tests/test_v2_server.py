@@ -244,6 +244,7 @@ class NativeV2ServerTests(unittest.TestCase):
             "--prefill-cache-seed", "8",
             "--expert-paging", "direct",
             "--cpu-prefetch-mib", "768",
+            "--cold-cache",
         ])
         self.assertEqual(args.cache_type_k, "f32")
         self.assertEqual(args.cache_type_v, "q8_0")
@@ -254,6 +255,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.prefill_cache_seed, 8)
         self.assertEqual(args.expert_paging, "direct")
         self.assertEqual(args.cpu_prefetch_mib, 768)
+        self.assertTrue(args.cold_cache)
 
 
 if __name__ == "__main__":

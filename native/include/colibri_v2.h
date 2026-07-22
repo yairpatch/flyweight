@@ -167,6 +167,8 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t cpu_prefetch_experts; /* prompt-hot expert bundles warmed in host page cache */
     uint64_t cpu_prefetch_bytes; /* expert bytes covered by host page warmup */
     uint64_t cpu_prefetch_nanoseconds; /* wall time spent warming host expert pages */
+    uint64_t cpu_prefetch_pages; /* mapped pages inspected for host expert warmup */
+    uint64_t cpu_prefetch_cold_pages; /* inspected pages nonresident before warmup */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

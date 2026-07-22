@@ -190,6 +190,8 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("cpu_prefetch_experts", ctypes.c_uint64),
         ("cpu_prefetch_bytes", ctypes.c_uint64),
         ("cpu_prefetch_nanoseconds", ctypes.c_uint64),
+        ("cpu_prefetch_pages", ctypes.c_uint64),
+        ("cpu_prefetch_cold_pages", ctypes.c_uint64),
     ]
 
 

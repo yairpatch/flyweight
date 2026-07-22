@@ -1,8 +1,11 @@
+import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from colibri_next.cli import (
     _benchmark_native_prefill,
+    _drop_file_cache,
     _steady_state_counters,
     _validate_mtp_cache_types,
 )
@@ -39,6 +42,17 @@ class NativeV2BenchmarkTests(unittest.TestCase):
         end.update({"decode_calls": 2, "expert_compute_nanoseconds": 600})
         result = _steady_state_counters(start, end)
         self.assertEqual(result["expert_compute_ns_per_token"], 300)
+
+    def test_cold_cache_advises_and_closes_model(self) -> None:
+        with (
+            patch("colibri_next.cli.os.open", return_value=17) as open_file,
+            patch("colibri_next.cli.os.posix_fadvise") as advise,
+            patch("colibri_next.cli.os.close") as close_file,
+        ):
+            _drop_file_cache(Path("model.gguf"))
+        open_file.assert_called_once_with(Path("model.gguf"), os.O_RDONLY)
+        advise.assert_called_once_with(17, 0, 0, os.POSIX_FADV_DONTNEED)
+        close_file.assert_called_once_with(17)
 
     def test_mtp_requires_f32_kv(self) -> None:
         _validate_mtp_cache_types(0, "f16", "f16")

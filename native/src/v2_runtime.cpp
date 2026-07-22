@@ -264,6 +264,8 @@ struct ColibriV2QwenRuntime {
     std::uint64_t cpu_prefetch_experts = 0;
     std::uint64_t cpu_prefetch_bytes = 0;
     std::uint64_t cpu_prefetch_nanoseconds = 0;
+    std::uint64_t cpu_prefetch_pages = 0;
+    std::uint64_t cpu_prefetch_cold_pages = 0;
     std::uint8_t cpu_prefetch_checksum = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
@@ -1327,6 +1329,8 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->cpu_prefetch_experts=runtime->cpu_prefetch_experts;
     out->cpu_prefetch_bytes=runtime->cpu_prefetch_bytes;
     out->cpu_prefetch_nanoseconds=runtime->cpu_prefetch_nanoseconds;
+    out->cpu_prefetch_pages=runtime->cpu_prefetch_pages;
+    out->cpu_prefetch_cold_pages=runtime->cpu_prefetch_cold_pages;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;return 0;});}
@@ -3116,21 +3120,52 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
     if(ranges.empty())return;
     std::sort(ranges.begin(),ranges.end(),[](const Range&a,const Range&b){return a.offset<b.offset;});
     const auto started=std::chrono::steady_clock::now();
-    for(const auto& range:ranges)
-        if(runtime.model->fd>=0)
-            (void)posix_fadvise(runtime.model->fd,static_cast<off_t>(range.offset),
-                               static_cast<off_t>(range.bytes),POSIX_FADV_WILLNEED);
     const long page_value=sysconf(_SC_PAGESIZE);
     const std::uint64_t page=page_value>0?static_cast<std::uint64_t>(page_value):4096ULL;
-    std::uint8_t checksum=runtime.cpu_prefetch_checksum;
+    struct ColdPage { const volatile std::uint8_t* address; };
+    std::vector<std::uintptr_t> inspected;
+    std::vector<ColdPage> cold;
+    inspected.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
+    cold.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
     for(const auto& range:ranges){
-        const volatile std::uint8_t* data=runtime.model->data+range.offset;
-        for(std::uint64_t offset=0;offset<range.bytes;offset+=page)checksum^=data[offset];
-        checksum^=data[range.bytes-1];
+        const auto begin=reinterpret_cast<std::uintptr_t>(runtime.model->data+range.offset);
+        const auto end=begin+range.bytes;
+        const auto aligned_begin=begin-(begin%page);
+        const auto aligned_end=((end+page-1)/page)*page;
+        const auto count=(aligned_end-aligned_begin)/page;
+#if defined(__linux__)
+        std::vector<unsigned char> resident(static_cast<std::size_t>(count));
+        const bool known=mincore(reinterpret_cast<void*>(aligned_begin),
+                                 aligned_end-aligned_begin,resident.data())==0;
+#endif
+        for(std::uint64_t index=0;index<count;++index){
+            const auto address=aligned_begin+index*page;
+            inspected.push_back(address);
+#if defined(__linux__)
+            if(known&&(resident[static_cast<std::size_t>(index)]&1U))continue;
+#endif
+            cold.push_back({reinterpret_cast<const volatile std::uint8_t*>(address)});
+        }
     }
+    std::sort(inspected.begin(),inspected.end());
+    inspected.erase(std::unique(inspected.begin(),inspected.end()),inspected.end());
+    std::sort(cold.begin(),cold.end(),[](const ColdPage&a,const ColdPage&b){
+        return a.address<b.address;
+    });
+    cold.erase(std::unique(cold.begin(),cold.end(),[](const ColdPage&a,const ColdPage&b){
+        return a.address==b.address;
+    }),cold.end());
+    for(const auto& range:ranges)
+        if(!cold.empty()&&runtime.model->fd>=0)
+            (void)posix_fadvise(runtime.model->fd,static_cast<off_t>(range.offset),
+                               static_cast<off_t>(range.bytes),POSIX_FADV_WILLNEED);
+    std::uint8_t checksum=runtime.cpu_prefetch_checksum;
+    for(const auto& item:cold)checksum^=*item.address;
     runtime.cpu_prefetch_checksum=checksum;
     runtime.cpu_prefetch_experts+=selected_experts;
     runtime.cpu_prefetch_bytes+=selected_bytes;
+    runtime.cpu_prefetch_pages+=inspected.size();
+    runtime.cpu_prefetch_cold_pages+=cold.size();
     runtime.cpu_prefetch_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now()-started).count();
 #endif

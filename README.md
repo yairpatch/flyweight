@@ -541,7 +541,12 @@ against currently available host memory with 2 GiB left free. It remains
 opt-in while cold-cache behavior is measured across SSDs, HDDs, and memory
 budgets; for example, pass `--cpu-prefetch-mib 512` to the server. Runtime
 diagnostics expose `cpu_prefetch_experts`,
-`cpu_prefetch_bytes`, and `cpu_prefetch_nanoseconds`.
+`cpu_prefetch_bytes`, `cpu_prefetch_nanoseconds`, `cpu_prefetch_pages`, and
+`cpu_prefetch_cold_pages`. Already-resident pages are measured but not touched.
+For reproducible cold-start comparisons, run separate benchmark processes with
+`--cold-cache --cpu-prefetch-mib 0` and then `--cold-cache
+--cpu-prefetch-mib 512`. Cache eviction is best-effort and affects the shared
+OS page cache for that GGUF, so do not use it beside a production server.
 
 On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
 AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep

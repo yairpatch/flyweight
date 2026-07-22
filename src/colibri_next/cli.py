@@ -107,6 +107,17 @@ def _benchmark_native_prefill(runtime, prompt_tokens: list[int]) -> tuple[int, f
     return first_tokens[0], elapsed
 
 
+def _drop_file_cache(path: Path) -> None:
+    """Best-effort eviction of clean GGUF pages for reproducible cold A/B runs."""
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        raise RuntimeError("--cold-cache requires POSIX_FADV_DONTNEED support")
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(descriptor)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="colibri-next",
@@ -334,6 +345,10 @@ def _parser() -> argparse.ArgumentParser:
     benchmark_v2.add_argument(
         "--cpu-prefetch-mib", type=int, default=0,
         help="host page-cache budget for prompt-hot CPU/hybrid experts (0 = off)",
+    )
+    benchmark_v2.add_argument(
+        "--cold-cache", action="store_true",
+        help="best-effort eviction of clean GGUF pages before a cold-start A/B run",
     )
 
     probe_qwen_v2 = subcommands.add_parser(
@@ -578,6 +593,8 @@ def main(argv: list[str] | None = None) -> int:
             args.mtp_drafts, args.cache_type_k, args.cache_type_v
         )
         if args.runtime == "native":
+            if args.cold_cache:
+                _drop_file_cache(args.model)
             with V2Model(args.model) as model:
                 cache_mib = args.gpu_cache_mib  # 0 = auto-fit to free VRAM
                 prompt_text = args.prompt
@@ -665,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
                                 else "native-v2-cpp-cuda-mtp"
                             ),
                             "measurement": "aggregate native generation wall time",
+                            "cold_cache": args.cold_cache,
                             "device": runtime_info["device"],
                             "prepare_seconds": prepare_seconds,
                             "prompt_tokens": len(prompt_tokens),
@@ -710,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
                         if args.moe_device != "gpu" else "native-v2-cpp-cuda"
                     ),
                     "measurement": "batched prefill plus steady single-token decode",
+                    "cold_cache": args.cold_cache,
                     "device": runtime_info["device"],
                     "prepare_seconds": prepare_seconds,
                     "prompt_tokens": len(prompt_tokens),
