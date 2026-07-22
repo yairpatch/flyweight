@@ -502,6 +502,12 @@ architecture-specific layer-overlap driver. With `--parallel 2` or higher,
 Each slot multiplies KV memory, so keep compact SWA enabled at long contexts;
 `--swa-full` with multiple 58K-token slots generally exceeds consumer VRAM.
 
+For two concurrent Qwen requests with CPU MoE, the native scheduler groups
+routes by expert and evaluates shared experts with a packed two-input AVX-512
+kernel. The packed weights are streamed once instead of once per sequence;
+experts selected by only one request retain the ordinary direct kernel. Set
+`COLIBRI_BATCHED_CPU_MOE=0` to use the serial expert phases for comparison.
+
 For native Qwen performance work, `benchmark-v2` measures production batched
 prefill separately from steady single-token decode and reports route, expert
 paging, CPU expert, and cache-hit counters. KV precision and expert policy can

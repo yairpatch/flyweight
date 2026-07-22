@@ -14,11 +14,13 @@ add_executable(
     colibri_qwen_avx2_contract
     tests/qwen_avx2_contract.cpp
     src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx512.cpp
 )
 target_compile_features(colibri_qwen_avx2_contract PRIVATE cxx_std_20)
 target_include_directories(colibri_qwen_avx2_contract PRIVATE src)
 if(NOT MSVC)
     set_source_files_properties(src/qwen_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mfma;-mf16c")
 endif()
 if(BUILD_TESTING)
     add_test(NAME colibri_qwen_avx2_contract COMMAND colibri_qwen_avx2_contract)

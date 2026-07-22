@@ -17,7 +17,7 @@ void set_half(std::uint8_t*pointer,std::uint16_t bits){
     std::memcpy(pointer,&bits,sizeof(bits));
 }
 
-bool quant_contract(std::uint32_t type,int row_bytes){
+bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
     constexpr int elements=256,rows=3;
     std::vector<std::uint8_t> packed(static_cast<std::size_t>(rows)*row_bytes);
     for(std::size_t i=0;i<packed.size();++i)
@@ -28,8 +28,8 @@ bool quant_contract(std::uint32_t type,int row_bytes){
         else if(type==14)set_half(base+208,0x3c00);
         else for(int block=0;block<8;++block)set_half(base+block*34,0x3c00);
     }
-    std::vector<float> input(elements),dequant(elements),q8_input(elements);
-    for(int i=0;i<elements;++i)input[i]=std::sin(i*0.071f)*0.75f;
+    std::vector<float> input(elements),second(elements),dequant(elements),q8_input(elements);
+    for(int i=0;i<elements;++i){input[i]=std::sin(i*0.071f)*0.75f;second[i]=std::cos(i*0.037f)*0.5f;}
     QwenQ8KBlock q8{};
     qwen_quantize_q8_k_avx2(input.data(),elements,&q8);
     for(int i=0;i<elements;++i)q8_input[i]=q8.scale*q8.values[i];
@@ -40,6 +40,13 @@ bool quant_contract(std::uint32_t type,int row_bytes){
         const float actual=qwen_quant_dot_avx2(
             packed.data(),type,input.data(),elements,row);
         if(!close(reference,actual))return false;
+        if(avx512){
+            float second_reference=0.0f;
+            for(int i=0;i<elements;++i)second_reference+=dequant[i]*second[i];
+            float pair_first=0.0f,pair_second=0.0f;
+            qwen_quant_dot_pair_avx512(packed.data(),type,input.data(),second.data(),elements,row,&pair_first,&pair_second);
+            if(!close(reference,pair_first)||!close(second_reference,pair_second))return false;
+        }
         float q8_reference=0.0f;
         for(int i=0;i<elements;++i)q8_reference+=dequant[i]*q8_input[i];
         const float q8_actual=qwen_quant_dot_q8_k_avx2(
@@ -74,9 +81,12 @@ int main(){
 #if defined(__x86_64__) || defined(_M_X64)
 #if !defined(_MSC_VER)
     if(!__builtin_cpu_supports("avx2")||!__builtin_cpu_supports("fma"))return 0;
+    const bool avx512=__builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw");
+#else
+    const bool avx512=false;
 #endif
-    if(!quant_contract(13,176)||!quant_contract(14,210)||
-       !quant_contract(8,8*34)||!f32_contract())return 1;
+    if(!quant_contract(13,176,avx512)||!quant_contract(14,210,avx512)||
+       !quant_contract(8,8*34,avx512)||!f32_contract())return 1;
 #endif
     return 0;
 }
