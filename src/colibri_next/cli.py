@@ -786,7 +786,7 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--context must be positive and --gpu-cache-mib non-negative")
         with V2Model(args.model) as model:
             moe_device = args.moe_device or (
-                "cpu" if model.info["architecture"] == "gemma4" else "gpu"
+                "hybrid" if model.info["architecture"] == "gemma4" else "gpu"
             )
             prompt_text = args.prompt
             if args.chat:

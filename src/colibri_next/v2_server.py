@@ -444,10 +444,9 @@ class NativeV2InferenceService(InferenceService):
         self.v2_model = V2Model(model_path)
         self.v2_runtime: V2QwenRuntime | None = None
         try:
-            effective_moe_device = (
-                "cpu" if self.v2_model.info["architecture"] == "gemma4"
-                else moe_device
-            )
+            effective_moe_device = moe_device
+            if self.v2_model.info["architecture"] == "gemma4" and moe_device == "gpu":
+                effective_moe_device = "hybrid"
             self.v2_runtime = self.v2_model.native_runtime(
                 device=device,
                 context_limit=context_window,

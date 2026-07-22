@@ -916,12 +916,12 @@ class V2Model:
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
         """Create the native runtime for any supported GGUF architecture.
 
-        Gemma 4 currently keeps routed expert weights on CPU, so the generic
-        entry point selects that backend unless the caller explicitly chooses
-        one. ``native_qwen_runtime`` remains as a compatibility alias.
+        Gemma 4 uses the bounded hybrid expert cache by default; callers can
+        explicitly select ``moe_device="cpu"`` when GPU cache residency is not
+        desired. ``native_qwen_runtime`` remains as a compatibility alias.
         """
         if self.info["architecture"] == "gemma4":
-            options.setdefault("moe_device", "cpu")
+            options.setdefault("moe_device", "hybrid")
         return self.native_qwen_runtime(**options)
 
     @staticmethod

@@ -480,6 +480,16 @@ Gemma 4 QAT MoE text GGUFs without per-layer embeddings or shared-KV tail
 layers are supported by the native CUDA runtime, including mixed
 local/global head geometry, proportional global RoPE, optional K=V global
 attention, QAT Q4_0 projections, dense GEGLU, and routed MoE layers. Routed
-Gemma 4 experts currently execute on CPU (`moe_device="cpu"`); persistent
-attention, dense, router, and embedding weights remain on GPU. Use
-`model.native_runtime(...)` for architecture-neutral construction.
+Gemma 4 experts support CPU execution (`moe_device="cpu"`) or a bounded hybrid
+cache (`moe_device="hybrid"`): resident routed experts execute through grouped
+Q4_0 CUDA kernels while misses execute on CPU and are admitted for later
+tokens. Persistent attention, dense, router, and embedding weights remain on
+GPU. Use `model.native_runtime(...)` for architecture-neutral construction.
+
+For example, a 4 GiB total CUDA budget enables a bounded expert cache while
+keeping the remaining Gemma 4 experts in host memory:
+
+```bash
+PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
+  --moe-device hybrid --gpu-cache-mib 4096 --context-window 32768
+```

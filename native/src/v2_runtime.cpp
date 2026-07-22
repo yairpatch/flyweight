@@ -798,9 +798,9 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
 }
 
 void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
-        const std::int32_t*selected,const float*weights,const float*input,
+        const std::int32_t*selected,const float*weights,int routed_count,const float*input,
         float*activated,float*output){
-    const int experts=runtime.model->config.expert_count,top_k=runtime.model->config.expert_used_count;
+    const int experts=runtime.model->config.expert_count;
     const int hidden=runtime.model->config.hidden_size,intermediate=runtime.moe_intermediate;
     const auto&gate_up_tensor=runtime.model->tensors[layer.expert_tensors[0]];
     const auto&down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
@@ -810,7 +810,7 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
     const auto gate_up_bytes=gate_up_tensor.size/experts,down_bytes=down_tensor.size/experts;
     const auto*expert_scales=reinterpret_cast<const float*>(runtime.model->data+scale_tensor.offset);
     #pragma omp parallel for schedule(static)
-    for(int task=0;task<top_k*intermediate;++task){
+    for(int task=0;task<routed_count*intermediate;++task){
         const int rank=task/intermediate,row=task%intermediate,expert=selected[rank];
         if(expert<0||expert>=experts)continue;
         const auto*gate_up=runtime.model->data+gate_up_tensor.offset+static_cast<std::uint64_t>(expert)*gate_up_bytes;
@@ -823,7 +823,7 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
     #pragma omp parallel for schedule(static)
     for(int row=0;row<hidden;++row){
         float sum=0.0f;
-        for(int rank=0;rank<top_k;++rank){const int expert=selected[rank];if(expert<0||expert>=experts)continue;const auto*down=runtime.model->data+down_tensor.offset+static_cast<std::uint64_t>(expert)*down_bytes;sum+=weights[rank]*expert_scales[expert]*qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);}
+        for(int rank=0;rank<routed_count;++rank){const int expert=selected[rank];if(expert<0||expert>=experts)continue;const auto*down=runtime.model->data+down_tensor.offset+static_cast<std::uint64_t>(expert)*down_bytes;sum+=weights[rank]*expert_scales[expert]*qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);}
         output[row]=sum;
     }
 }
@@ -1118,7 +1118,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.moe_device<0||runtime->options.moe_device>2)throw std::runtime_error("Qwen runtime MoE device is invalid");
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(gemma4&&runtime->options.mtp_drafts)throw std::runtime_error("native Gemma 4 MTP is not implemented");
-    if(gemma4&&runtime->options.moe_device!=1)throw std::runtime_error("native Gemma 4 currently requires --moe-device cpu");
+    if(gemma4&&runtime->options.moe_device==0)throw std::runtime_error("native Gemma 4 supports --moe-device cpu or hybrid");
     if(gemma4&&runtime->options.parallel_sequences>1)throw std::runtime_error("native Gemma 4 currently supports one sequence");
     if(gemma4&&m->config.per_layer_embedding_size)throw std::runtime_error("native Gemma 4 per-layer embeddings are not implemented");
     if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
@@ -1822,6 +1822,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
     const std::uint64_t second=take(runtime.scratch_elements*sizeof(float));
     const std::uint64_t third=take(runtime.scratch_elements*sizeof(float));
     const std::uint64_t fourth=take(runtime.scratch_elements*sizeof(float));
+    const std::uint64_t activated=take(static_cast<std::uint64_t>(top_k)*runtime.moe_intermediate*sizeof(float));
     const std::uint64_t router_logits=take(experts*sizeof(float));
     const std::uint64_t selected_device=take(top_k*sizeof(std::int32_t));
     const std::uint64_t route_weights=take(top_k*sizeof(float));
@@ -1972,14 +1973,109 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
         if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0||
            colibri_gpu_event_sync(runtime.route_event)!=0)
             throw std::runtime_error("native Gemma 4 route synchronization failed");
-        const auto compute_started=std::chrono::steady_clock::now();
-        gemma_cpu_moe(runtime,layer,selected_host,cpu_weights,cpu_input,
-                      cpu_activated,cpu_output);
-        runtime.expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now()-compute_started).count();
         runtime.route_expert_sum+=top_k;
-        if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
-            throw std::runtime_error("native Gemma 4 CPU MoE output upload failed");
+        if(runtime.options.moe_device==1){
+            const auto compute_started=std::chrono::steady_clock::now();
+            gemma_cpu_moe(runtime,layer,selected_host,cpu_weights,top_k,cpu_input,
+                          cpu_activated,cpu_output);
+            runtime.expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()-compute_started).count();
+            if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
+                throw std::runtime_error("native Gemma 4 CPU MoE output upload failed");
+        }else{
+            const auto pager_started=std::chrono::steady_clock::now();
+            std::array<std::int32_t,256> cpu_selected{};
+            std::array<float,256> cpu_compact_weights{},gpu_compact_weights{};
+            std::array<std::uint64_t,256> gate_up_pointers{},down_pointers{};
+            int cpu_count=0,gpu_count=0;
+            const auto& gate_up_tensor=runtime.model->tensors[layer.expert_tensors[0]];
+            const auto& down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
+            const auto& scale_tensor=runtime.model->tensors[layer.expert_tensors[2]];
+            const auto gate_up_bytes=gate_up_tensor.size/experts;
+            const auto down_bytes=down_tensor.size/experts;
+            const auto scale_bytes=scale_tensor.size/experts;
+            const auto* expert_scales=reinterpret_cast<const float*>(runtime.model->data+scale_tensor.offset);
+            std::uint64_t paging_cursor=device_align(output_offset+hidden_size*sizeof(float));
+            for(int rank=0;rank<top_k;++rank){
+                const int expert=selected_host[rank];
+                if(expert<0||expert>=experts)throw std::runtime_error("native Gemma 4 selected an invalid expert");
+                const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|static_cast<std::uint32_t>(expert);
+                auto resident=runtime.expert_residency.find(cache_key);
+                if(resident!=runtime.expert_residency.end()){
+                    const auto slot_index=resident->second;
+                    auto& cache_slot=runtime.expert_slots[slot_index];
+                    cache_slot.last_used=record_expert_access(runtime,layer_number,expert).last_used;
+                    const auto base=runtime.expert_cache+slot_index*runtime.expert_slot_bytes;
+                    gate_up_pointers[gpu_count]=base;
+                    down_pointers[gpu_count]=base+gate_up_bytes;
+                    gpu_compact_weights[gpu_count]=cpu_weights[rank]*expert_scales[expert];
+                    ++gpu_count;++runtime.expert_cache_hits;
+                    continue;
+                }
+                ++runtime.expert_cache_misses;
+                cpu_selected[cpu_count]=expert;
+                cpu_compact_weights[cpu_count]=cpu_weights[rank];
+                ++cpu_count;
+                if(runtime.expert_slots.empty())continue;
+                const auto slot_index=select_expert_cache_slot(runtime,layer_number,expert,true);
+                if(slot_index==kNoExpertSlot)continue;
+                auto& cache_slot=runtime.expert_slots[slot_index];
+                cache_slot.key=cache_key;cache_slot.valid=true;cache_slot.last_used=runtime.expert_clock;
+                runtime.expert_residency[cache_key]=slot_index;
+                const auto bundle_bytes=gate_up_bytes+down_bytes+scale_bytes;
+                if(paging_cursor+bundle_bytes>runtime.host_staging_bytes)
+                    throw std::runtime_error("native Gemma 4 hybrid paging workspace overflow");
+                std::memcpy(staging+paging_cursor,runtime.model->data+gate_up_tensor.offset+static_cast<std::uint64_t>(expert)*gate_up_bytes,gate_up_bytes);
+                std::memcpy(staging+paging_cursor+gate_up_bytes,runtime.model->data+down_tensor.offset+static_cast<std::uint64_t>(expert)*down_bytes,down_bytes);
+                std::memcpy(staging+paging_cursor+gate_up_bytes+down_bytes,runtime.model->data+scale_tensor.offset+static_cast<std::uint64_t>(expert)*scale_bytes,scale_bytes);
+                const auto base=runtime.expert_cache+slot_index*runtime.expert_slot_bytes;
+                if(colibri_gpu_upload(base,staging+paging_cursor,bundle_bytes,runtime.stream)!=0)
+                    throw std::runtime_error("native Gemma 4 hybrid expert upload failed");
+                paging_cursor+=device_align(bundle_bytes);
+            }
+            if(colibri_gpu_memset(fourth,0,hidden_size*sizeof(float),runtime.stream)!=0)
+                throw std::runtime_error("native Gemma 4 hybrid output reset failed");
+            if(gpu_count){
+                const auto table_bytes=device_align(static_cast<std::uint64_t>(gpu_count)*(
+                    2*sizeof(std::uint64_t)+sizeof(float)));
+                const auto table_host=device_align(paging_cursor);
+                if(table_host+table_bytes>runtime.host_staging_bytes||table_bytes>runtime.expert_staging_bytes)
+                    throw std::runtime_error("native Gemma 4 hybrid pointer workspace overflow");
+                std::memcpy(staging+table_host,gate_up_pointers.data(),gpu_count*sizeof(std::uint64_t));
+                std::memcpy(staging+table_host+gpu_count*sizeof(std::uint64_t),down_pointers.data(),gpu_count*sizeof(std::uint64_t));
+                std::memcpy(staging+table_host+2*gpu_count*sizeof(std::uint64_t),gpu_compact_weights.data(),gpu_count*sizeof(float));
+                const auto table_device=runtime.expert_staging+runtime.expert_staging_bytes-table_bytes;
+                if(colibri_gpu_upload(table_device,staging+table_host,table_bytes,runtime.stream)!=0)
+                    throw std::runtime_error("native Gemma 4 hybrid pointer upload failed");
+                const auto gate_table=table_device;
+                const auto down_table=gate_table+gpu_count*sizeof(std::uint64_t);
+                const auto weight_table=down_table+gpu_count*sizeof(std::uint64_t);
+                const int intermediate=static_cast<int>(runtime.moe_intermediate);
+                void* gate_args[]={const_cast<std::uint64_t*>(&gate_table),
+                                   const_cast<std::uint64_t*>(&normalized),
+                                   const_cast<std::uint64_t*>(&activated),
+                                   const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),&gpu_count};
+                launch("gemma_q4_0_grouped_geglu",(intermediate+7)/8,gpu_count,256,gate_args);
+                void* down_args[]={const_cast<std::uint64_t*>(&down_table),
+                                   const_cast<std::uint64_t*>(&activated),
+                                   const_cast<std::uint64_t*>(&fourth),
+                                   const_cast<std::uint64_t*>(&weight_table),
+                                   const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),&gpu_count};
+                launch("gemma_q4_0_grouped_accumulate",(hidden_size+7)/8,1,256,down_args);
+            }
+            if(cpu_count){
+                const auto compute_started=std::chrono::steady_clock::now();
+                gemma_cpu_moe(runtime,layer,cpu_selected.data(),cpu_compact_weights.data(),
+                              cpu_count,cpu_input,cpu_activated,cpu_output);
+                runtime.expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-compute_started).count();
+                if(colibri_gpu_upload(first,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
+                    throw std::runtime_error("native Gemma 4 hybrid CPU output upload failed");
+                add(fourth,first);
+            }
+            runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()-pager_started).count();
+        }
         rms(fourth,tensor(16),first);
         add(third,first);
         rms(third,tensor(17),residual);

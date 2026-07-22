@@ -123,14 +123,24 @@ class V2RuntimeTests(unittest.TestCase):
         finally:
             path.unlink()
 
-    def test_generic_runtime_selects_cpu_experts_for_gemma4(self):
+    def test_generic_runtime_selects_hybrid_experts_for_gemma4(self):
         model = object.__new__(V2Model)
         with patch.object(
             V2Model, "info", new_callable=PropertyMock,
             return_value={"architecture": "gemma4"},
         ), patch.object(V2Model, "native_qwen_runtime", return_value="runtime") as create:
             self.assertEqual(model.native_runtime(context_limit=32), "runtime")
-            create.assert_called_once_with(context_limit=32, moe_device="cpu")
+            create.assert_called_once_with(context_limit=32, moe_device="hybrid")
+
+        with patch.object(
+            V2Model, "info", new_callable=PropertyMock,
+            return_value={"architecture": "gemma4"},
+        ), patch.object(V2Model, "native_qwen_runtime", return_value="runtime") as create:
+            self.assertEqual(
+                model.native_runtime(context_limit=32, moe_device="hybrid"),
+                "runtime",
+            )
+            create.assert_called_once_with(context_limit=32, moe_device="hybrid")
 
     def test_gemma4_decode_converts_word_boundary_markers_to_spaces(self):
         model = object.__new__(V2Model)

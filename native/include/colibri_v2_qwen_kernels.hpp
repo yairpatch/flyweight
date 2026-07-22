@@ -1005,6 +1005,44 @@ extern "C" __global__ void gemma_q4_0_geglu(
     if(lane==0)output[row]=gemma_gelu(g)*u;
 }
 
+extern "C" __global__ void gemma_q4_0_grouped_geglu(
+    const unsigned long long* gate_up_tables,const float* input,float* output,
+    const int input_size,const int intermediate,const int expert_count
+) {
+    const int expert=blockIdx.y;
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
+    if(expert>=expert_count||row>=intermediate)return;
+    const unsigned char* gate_up=(const unsigned char*)gate_up_tables[expert];
+    float g=0.0f,u=0.0f;
+    for(int i=lane;i<input_size;i+=32){
+        const float x=input[i];
+        g+=ggml_q4_0_load(gate_up,(long long)row*input_size+i)*x;
+        u+=ggml_q4_0_load(gate_up,(long long)(row+intermediate)*input_size+i)*x;
+    }
+    for(int offset=16;offset;offset>>=1){g+=__shfl_down_sync(0xffffffff,g,offset);u+=__shfl_down_sync(0xffffffff,u,offset);}
+    if(lane==0)output[(long long)expert*intermediate+row]=gemma_gelu(g)*u;
+}
+
+extern "C" __global__ void gemma_q4_0_grouped_accumulate(
+    const unsigned long long* down_tables,const float* activated,float* output,
+    const float* routing_weights,const int intermediate,const int hidden,
+    const int expert_count
+) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
+    if(row>=hidden)return;
+    float total=0.0f;
+    for(int expert=0;expert<expert_count;++expert){
+        const unsigned char* down=(const unsigned char*)down_tables[expert];
+        const float* vector=activated+(long long)expert*intermediate;
+        float sum=0.0f;
+        for(int i=lane;i<intermediate;i+=32)
+            sum+=ggml_q4_0_load(down,(long long)row*intermediate+i)*vector[i];
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down_sync(0xffffffff,sum,offset);
+        if(lane==0)total+=routing_weights[expert]*sum;
+    }
+    if(lane==0)output[row]+=total;
+}
+
 extern "C" __global__ void gemma_head_norm_rope(
     const float* projected,const float* weights,float* output,
     const int heads,const int head_dim,const int rotary_dim,const int position,
