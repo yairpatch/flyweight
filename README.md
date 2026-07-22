@@ -527,3 +527,10 @@ amortized by a long-running server. Use `--expert-paging staged` on constrained
 machines, or `--expert-paging direct` to require the faster path and fail if the
 driver cannot register it. Runtime diagnostics report `direct_paging`,
 `paging_registration_nanoseconds`, and the detected `host_available_bytes`.
+
+On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
+AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep
+vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to
+scalar math. Developers can set `COLIBRI_CPU_BACKEND=scalar|avx2|avx512` before
+process startup to reproduce backend-specific correctness and performance;
+CPUID masking prevents selecting instructions unsupported by the host.

@@ -10,6 +10,20 @@ if(BUILD_TESTING)
     add_test(NAME colibri_v2_provider_contract COMMAND colibri_v2_provider_contract)
 endif()
 
+add_executable(
+    colibri_qwen_avx2_contract
+    tests/qwen_avx2_contract.cpp
+    src/qwen_cpu_avx2.cpp
+)
+target_compile_features(colibri_qwen_avx2_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_avx2_contract PRIVATE src)
+if(NOT MSVC)
+    set_source_files_properties(src/qwen_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+endif()
+if(BUILD_TESTING)
+    add_test(NAME colibri_qwen_avx2_contract COMMAND colibri_qwen_avx2_contract)
+endif()
+
 add_library(
     colibri_v2
     SHARED
@@ -19,6 +33,7 @@ add_library(
     src/q4_scalar.cpp
     src/q4_avx2.cpp
     src/q4_avx512.cpp
+    src/qwen_cpu_avx2.cpp
     src/qwen_cpu_avx512.cpp
 )
 target_compile_features(colibri_v2 PRIVATE cxx_std_20)
@@ -44,6 +59,7 @@ if(NOT WIN32)
     target_compile_options(colibri_v2 PRIVATE -O3 -fvisibility=hidden)
     set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/q4_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mfma;-mf16c")
+    set_source_files_properties(src/qwen_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mfma;-mf16c")
     target_link_libraries(colibri_native PRIVATE ${CMAKE_DL_LIBS})
 endif()
@@ -62,6 +78,7 @@ if(MSVC)
     target_compile_options(colibri_native PRIVATE /O2 /EHsc /permissive-)
     set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/q4_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(src/qwen_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
 else()
     target_compile_options(colibri_native PRIVATE -O3 -fvisibility=hidden)

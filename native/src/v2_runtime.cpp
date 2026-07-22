@@ -787,6 +787,7 @@ float qwen_q6_value(const std::uint8_t*packed,std::uint64_t absolute){const auto
 float qwen_q8_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/32,within=absolute&31;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,packed+block*34,2);std::int8_t value=0;std::memcpy(&value,packed+block*34+2+within,1);return qwen_half_value(scale_bits)*value;}
 float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*input,int elements,std::uint64_t row){
     if(type!=2&&(colibri_cpu_features()&2u)!=0&&elements%256==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+    if(type!=2&&(colibri_cpu_features()&1u)!=0&&elements%256==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     float result=0.0f;
     if(type==2){
         const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/32)*18;
@@ -863,6 +864,7 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
 // once per batch instead of once per token.
 void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,std::uint64_t row,float*output){
     if((colibri_cpu_features()&2u)!=0&&elements%256==0){qwen_dequant_row_avx512(packed,type,elements,row,output);return;}
+    if((colibri_cpu_features()&1u)!=0&&elements%256==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     const auto base=row*static_cast<std::uint64_t>(elements);
     if(type==13)for(int index=0;index<elements;++index)output[index]=qwen_q5_value(packed,base+index);
     else if(type==14)for(int index=0;index<elements;++index)output[index]=qwen_q6_value(packed,base+index);
@@ -872,6 +874,7 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
 
 void qwen_f32_dot_multi(const float*row,const float*const*inputs,int count,int elements,float*outputs){
     if((colibri_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_dot_multi_avx512(row,inputs,count,elements,outputs);return;}
+    if((colibri_cpu_features()&1u)!=0&&elements%16==0){qwen_f32_dot_multi_avx2(row,inputs,count,elements,outputs);return;}
     for(int token=0;token<count;++token){
         const float*vector=inputs[token];
         float sum=0.0f;
@@ -883,6 +886,7 @@ void qwen_f32_dot_multi(const float*row,const float*const*inputs,int count,int e
 // Register-blocked expert GEMM over a block of <=4 weight rows: out[i*count+j].
 void qwen_f32_gemm_rows(const float*weights,int mr,const float*const*inputs,int count,int elements,float*out){
     if((colibri_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_gemm_rows_avx512(weights,mr,inputs,count,elements,out);return;}
+    if((colibri_cpu_features()&1u)!=0&&elements%16==0){qwen_f32_gemm_rows_avx2(weights,mr,inputs,count,elements,out);return;}
     for(int i=0;i<mr;++i){
         const float*row=weights+static_cast<std::size_t>(i)*elements;float*o=out+static_cast<std::size_t>(i)*count;
         for(int j=0;j<count;++j){const float*v=inputs[j];float sum=0.0f;for(int k=0;k<elements;++k)sum+=row[k]*v[k];o[j]=sum;}

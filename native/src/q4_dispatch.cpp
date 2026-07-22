@@ -2,6 +2,7 @@
 #include "q4_kernel.h"
 
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <vector>
 
@@ -85,7 +86,19 @@ Q4MatvecKernel select_kernel(std::uint32_t features) {
 }
 
 const std::uint32_t kCpuFeatures = detect_features();
-const Q4MatvecKernel kQ4Kernel = select_kernel(kCpuFeatures);
+
+std::uint32_t effective_features() {
+    const char* backend=std::getenv("COLIBRI_CPU_BACKEND");
+    if(backend==nullptr)return kCpuFeatures;
+    if(std::strcmp(backend,"scalar")==0)return 0;
+    if(std::strcmp(backend,"avx2")==0)return kCpuFeatures&kFeatureAvx2;
+    if(std::strcmp(backend,"avx512")==0)return kCpuFeatures&(
+        kFeatureAvx2|kFeatureAvx512);
+    return kCpuFeatures;
+}
+
+const std::uint32_t kEffectiveCpuFeatures = effective_features();
+const Q4MatvecKernel kQ4Kernel = select_kernel(kEffectiveCpuFeatures);
 
 }
 
@@ -94,7 +107,7 @@ extern "C" std::uint32_t colibri_native_version() {
 }
 
 extern "C" std::uint32_t colibri_cpu_features() {
-    return kCpuFeatures;
+    return kEffectiveCpuFeatures;
 }
 
 extern "C" int colibri_q4_matvec(
