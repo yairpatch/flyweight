@@ -1052,11 +1052,11 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
 #ifdef MAP_POPULATE
     if(lock_model) map_flags|=MAP_POPULATE; // prefault every page so decode never page-faults on a cold expert
 #endif
-    // cuMemHostRegister rejects PROT_READ file mappings (CUDA_ERROR_INVALID_VALUE);
-    // map copy-on-write writable when DMA paging is requested so it can be pinned.
-    const bool dma_paging=std::getenv("COLIBRI_V2_DMA_PAGING")!=nullptr;
-    const int map_prot=dma_paging?(PROT_READ|PROT_WRITE):PROT_READ;
-    m->data=static_cast<const uint8_t*>(mmap(nullptr,m->size,map_prot,map_flags,m->fd,0)); if(m->data==MAP_FAILED) throw std::runtime_error("cannot map GGUF");
+    // MAP_PRIVATE keeps the GGUF immutable on disk, while PROT_WRITE makes the
+    // mapping eligible for CUDA host registration selected later by runtime
+    // options. Model open necessarily happens before `--expert-paging` is
+    // applied, so mapping permissions cannot depend on that option.
+    m->data=static_cast<const uint8_t*>(mmap(nullptr,m->size,PROT_READ|PROT_WRITE,map_flags,m->fd,0)); if(m->data==MAP_FAILED) throw std::runtime_error("cannot map GGUF");
     if(lock_model&&mlock(m->data,m->size)!=0) std::fprintf(stderr,"colibri_v2: mlock(%zu bytes) failed: %s; continuing without pinning (raise RLIMIT_MEMLOCK to pin)\n",m->size,std::strerror(errno));
 #else
     (void)path; throw std::runtime_error("Windows v2 mapping is not implemented");
