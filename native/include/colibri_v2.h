@@ -91,6 +91,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t parallel_sequences; /* independent KV/decode slots (llama.cpp --parallel); 0/1 = single-sequence */
     uint32_t prompt_cache_mib; /* host RAM budget for spilled slot state (llama.cpp prompt cache); 0 disables */
     uint32_t swa_full; /* keep full-size SWA KV caches for unrestricted prefix reuse */
+    uint32_t prefill_cache_seed; /* hottest prompt-routed experts to seed per layer; 0 disables */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -156,6 +157,8 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t prefix_cache_last_lcp_snapshot;   /* longest common prefix vs the best snapshot */
     uint64_t prompt_cache_entries;      /* host prompt cache: conversations held */
     uint64_t prompt_cache_used_bytes;   /* host prompt cache: RAM in use */
+    uint64_t prefill_cache_seeded_experts; /* experts bulk-loaded from prompt route history */
+    uint64_t prefill_cache_seed_nanoseconds; /* wall time spent bulk-seeding experts */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

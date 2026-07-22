@@ -501,3 +501,20 @@ architecture-specific layer-overlap driver. With `--parallel 2` or higher,
 `--prompt-cache-mib` can spill inactive slots to host RAM for later reuse.
 Each slot multiplies KV memory, so keep compact SWA enabled at long contexts;
 `--swa-full` with multiple 58K-token slots generally exceeds consumer VRAM.
+
+For native Qwen performance work, `benchmark-v2` measures production batched
+prefill separately from steady single-token decode and reports route, expert
+paging, CPU expert, and cache-hit counters. KV precision and expert policy can
+be reproduced explicitly, for example:
+
+```bash
+PYTHONPATH=src python -m colibri_next.cli benchmark-v2 model.gguf \
+  --prompt "Explain sliding-window attention." --chat \
+  --moe-device hybrid --cache-type-k f16 --cache-type-v f16
+```
+
+`--prefill-cache-seed N` experimentally records Qwen routing frequency during
+prefill without admitting pages, then bulk-loads the hottest `N` experts per
+layer before generation. `COLIBRI_PREFILL_CACHE_SEED` can override the API/CLI
+setting for experiments. It is opt-in while its time-to-first-token versus
+early-generation tradeoff is evaluated across hardware and prompt workloads.

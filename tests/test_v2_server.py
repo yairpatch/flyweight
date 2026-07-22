@@ -228,6 +228,26 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.gpu_cache_mib, 0)
         self.assertEqual(args.context_window, 32768)
         self.assertEqual(args.mtp_drafts, 0)
+        self.assertEqual(args.prefill_cache_seed, 0)
+
+    def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
+        args = _parser().parse_args([
+            "benchmark-v2", "model.gguf",
+            "--cache-type-k", "f32",
+            "--cache-type-v", "q8_0",
+            "--expert-top-k", "6",
+            "--expert-top-p", "0.9",
+            "--parallel", "2",
+            "--prompt-cache-mib", "512",
+            "--prefill-cache-seed", "8",
+        ])
+        self.assertEqual(args.cache_type_k, "f32")
+        self.assertEqual(args.cache_type_v, "q8_0")
+        self.assertEqual(args.expert_top_k, 6)
+        self.assertAlmostEqual(args.expert_top_p, 0.9)
+        self.assertEqual(args.parallel_sequences, 2)
+        self.assertEqual(args.prompt_cache_mib, 512)
+        self.assertEqual(args.prefill_cache_seed, 8)
 
 
 if __name__ == "__main__":

@@ -241,6 +241,10 @@ void qwen_forward_rows(
                 const int route=token*top_k+rank;
                 if(weights_host[route]==0.0f)continue;
                 const int expert=selected_host[route];
+                if(expert<0||expert>=experts)
+                    throw std::runtime_error("native Qwen rows forward selected an invalid expert");
+                if(!runtime.cache_admission_enabled)
+                    record_expert_access(runtime,layer_number,expert);
                 const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|static_cast<std::uint32_t>(expert);
                 const auto resident=runtime.expert_residency.find(cache_key);
                 if(resident==runtime.expert_residency.end()){++runtime.expert_cache_misses;continue;}

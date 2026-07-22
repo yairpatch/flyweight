@@ -437,6 +437,7 @@ class NativeV2InferenceService(InferenceService):
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
         swa_full: bool = False,
+        prefill_cache_seed: int = 0,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -460,6 +461,7 @@ class NativeV2InferenceService(InferenceService):
                 parallel_sequences=parallel_sequences,
                 prompt_cache_mib=prompt_cache_mib,
                 swa_full=swa_full,
+                prefill_cache_seed=prefill_cache_seed,
             )
             self.v2_runtime.prepare()
         except Exception:

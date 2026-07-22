@@ -251,6 +251,8 @@ struct ColibriV2QwenRuntime {
     std::uint64_t tail_wait_nanoseconds = 0;
     std::uint64_t route_expert_sum = 0;
     std::uint64_t expert_compute_nanoseconds = 0;
+    std::uint64_t prefill_cache_seeded_experts = 0;
+    std::uint64_t prefill_cache_seed_nanoseconds = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
     std::uint32_t forward_rows_capacity = 0;
@@ -338,6 +340,9 @@ std::size_t select_expert_cache_slot(
     std::uint32_t expert, bool allow_rejection
 ) {
     if (!runtime.cache_admission_enabled) {
+        // Prompt prefill must not churn the device cache, but its routes are
+        // valuable training data for a later bulk seed of the hottest experts.
+        record_expert_access(runtime, layer, expert);
         ++runtime.expert_cache_prompt_bypasses;
         return kNoExpertSlot;
     }
@@ -996,7 +1001,7 @@ int plan_memory(ColibriV2MemoryPlan& out, uint64_t budget, uint64_t static_weigh
 }
 
 extern "C" {
-uint32_t colibri_v2_version() { return 1; }
+uint32_t colibri_v2_version() { return 2; }
 const char* colibri_v2_last_error() { return error.c_str(); }
 int colibri_v2_gpu_probe(int32_t device, ColibriV2GpuInfo* out) { return guarded([&]{ if(!out||device<0) throw std::runtime_error("invalid GPU probe arguments"); return gpu_probe(*out,device); }); }
 int colibri_v2_memory_plan(uint64_t budget,uint64_t static_weights,uint64_t kv_state,uint64_t workspace,uint64_t active,uint64_t staging,ColibriV2MemoryPlan*out){return guarded([&]{if(!out)throw std::runtime_error("memory plan output is required");return plan_memory(*out,budget,static_weights,kv_state,workspace,active,staging);});}
@@ -1123,6 +1128,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
     if(runtime->options.expert_top_p<0.0f||runtime->options.expert_top_p>1.0f)throw std::runtime_error("native Qwen expert_top_p must be within [0, 1]");
+    if(runtime->options.prefill_cache_seed>256)throw std::runtime_error("native Qwen prefill_cache_seed supports at most 256 experts per layer");
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>3)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>3)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.mtp_drafts&&(runtime->options.cache_type_k||runtime->options.cache_type_v))throw std::runtime_error("native Qwen MTP currently requires f32 KV cache");
@@ -1227,6 +1233,8 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->decode_ready=runtime->decode_ready?1:0;
     out->route_expert_sum=runtime->route_expert_sum;
     out->expert_compute_nanoseconds=runtime->expert_compute_nanoseconds;
+    out->prefill_cache_seeded_experts=runtime->prefill_cache_seeded_experts;
+    out->prefill_cache_seed_nanoseconds=runtime->prefill_cache_seed_nanoseconds;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;return 0;});}
@@ -2807,11 +2815,96 @@ static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prom
     return 0;
 }
 
+// Experimental prompt-trained expert-cache seed. Batched prefill records route
+// frequency without admitting pages; after the prompt is complete, load only
+// the hottest N experts per layer in bulk. This avoids prefill-time cache churn
+// while giving the first generated token a warm, prompt-specific working set.
+// The runtime option enables it; COLIBRI_PREFILL_CACHE_SEED can override that
+// value for profiling experiments.
+static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
+    const char* setting=std::getenv("COLIBRI_PREFILL_CACHE_SEED");
+    long requested=static_cast<long>(runtime.options.prefill_cache_seed);
+    if(setting)requested=std::strtol(setting,nullptr,10);
+    if(runtime.gemma4||runtime.options.mtp_drafts||
+       runtime.options.moe_device!=2||runtime.expert_slots.empty())return;
+    if(requested<=0)return;
+    const std::size_t per_layer=static_cast<std::size_t>(std::clamp<long>(requested,1,256));
+    const auto started=std::chrono::steady_clock::now();
+    auto* staging=static_cast<std::uint8_t*>(runtime.host_staging);
+    const auto experts=runtime.model->config.expert_count;
+    const auto cache_layers=qwen_cache_layer_count(runtime);
+    std::uint64_t seeded=0;
+    struct PendingUpload{std::uint64_t device,host_offset,bytes;};
+    std::vector<PendingUpload> pending;
+    std::uint64_t cursor=0;
+    auto flush=[&](){
+        for(const auto& upload:pending)
+            if(colibri_gpu_upload(upload.device,staging+upload.host_offset,
+                                  upload.bytes,runtime.stream)!=0)
+                throw std::runtime_error("native Qwen prefill cache seed upload failed");
+        if(!pending.empty()&&colibri_gpu_stream_sync(runtime.stream)!=0)
+            throw std::runtime_error("native Qwen prefill cache seed synchronization failed");
+        pending.clear();cursor=0;
+    };
+    for(std::uint32_t layer=0;layer<runtime.layers.size();++layer){
+        const auto slot_begin=runtime.expert_slots.size()*layer/cache_layers;
+        const auto slot_end=runtime.expert_slots.size()*(layer+1)/cache_layers;
+        const auto layer_budget=std::min(per_layer,slot_end-slot_begin);
+        std::vector<std::uint32_t> candidates;
+        candidates.reserve(experts);
+        for(std::uint32_t expert=0;expert<experts;++expert){
+            const auto key=(static_cast<std::uint64_t>(layer)<<32)|expert;
+            const auto& history=runtime.expert_history[static_cast<std::size_t>(layer)*experts+expert];
+            if(history.frequency&&runtime.expert_residency.find(key)==runtime.expert_residency.end())
+                candidates.push_back(expert);
+        }
+        std::sort(candidates.begin(),candidates.end(),[&](std::uint32_t left,std::uint32_t right){
+            const auto& a=runtime.expert_history[static_cast<std::size_t>(layer)*experts+left];
+            const auto& b=runtime.expert_history[static_cast<std::size_t>(layer)*experts+right];
+            return a.frequency!=b.frequency?a.frequency>b.frequency:a.last_used>b.last_used;
+        });
+        if(candidates.size()>layer_budget)candidates.resize(layer_budget);
+        const auto& plan=runtime.layers[layer];
+        for(const auto expert:candidates){
+            const auto slot_index=select_expert_cache_slot(runtime,layer,expert,false);
+            if(slot_index==kNoExpertSlot)continue;
+            std::uint64_t bundle_bytes=0;
+            for(int role=0;role<3;++role)
+                bundle_bytes+=runtime.model->tensors[plan.expert_tensors[role]].size/experts;
+            if(bundle_bytes>runtime.host_staging_bytes)
+                throw std::runtime_error("native Qwen prefill cache seed expert exceeds staging capacity");
+            if(cursor+bundle_bytes>runtime.host_staging_bytes)flush();
+            const auto bundle_start=cursor;
+            for(int role=0;role<3;++role){
+                const auto& tensor=runtime.model->tensors[plan.expert_tensors[role]];
+                const auto bytes=tensor.size/experts;
+                const auto offset=static_cast<std::uint64_t>(expert)*bytes;
+                std::memcpy(staging+cursor,runtime.model->data+tensor.offset+offset,bytes);
+                cursor+=bytes;
+            }
+            const auto key=(static_cast<std::uint64_t>(layer)<<32)|expert;
+            auto& slot=runtime.expert_slots[slot_index];
+            if(slot.valid)runtime.expert_residency.erase(slot.key);
+            slot.key=key;slot.valid=true;slot.last_used=++runtime.expert_clock;
+            runtime.expert_residency[key]=slot_index;
+            pending.push_back({runtime.expert_cache+slot_index*runtime.expert_slot_bytes,
+                               bundle_start,bundle_bytes});
+            ++seeded;
+        }
+        flush();
+    }
+    runtime.prefill_cache_seeded_experts+=seeded;
+    runtime.prefill_cache_seed_nanoseconds+=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-started).count();
+}
+
 // Save this prompt's end-of-prefill state so the next turn only prefills its
 // suffix, and re-enable expert-cache admission for decode.
 static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token) {
     runtime->cache_admission_enabled=true;
+    qwen_seed_prefill_experts(*runtime);
     if(!runtime->prefill_snapshot_bytes||runtime->options.mtp_drafts)return;
     // Prefer the reserved slot when mid checkpoints exist, else the slot already
     // tracking this conversation, else a free slot, else the LRU.

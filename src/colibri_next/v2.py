@@ -113,6 +113,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("parallel_sequences", ctypes.c_uint32),
         ("prompt_cache_mib", ctypes.c_uint32),
         ("swa_full", ctypes.c_uint32),
+        ("prefill_cache_seed", ctypes.c_uint32),
     ]
 
 
@@ -179,6 +180,8 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefix_cache_last_lcp_snapshot", ctypes.c_uint64),
         ("prompt_cache_entries", ctypes.c_uint64),
         ("prompt_cache_used_bytes", ctypes.c_uint64),
+        ("prefill_cache_seeded_experts", ctypes.c_uint64),
+        ("prefill_cache_seed_nanoseconds", ctypes.c_uint64),
     ]
 
 
@@ -894,6 +897,7 @@ class V2Model:
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
         swa_full: bool = False,
+        prefill_cache_seed: int = 0,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -911,6 +915,7 @@ class V2Model:
             parallel_sequences=parallel_sequences,
             prompt_cache_mib=prompt_cache_mib,
             swa_full=swa_full,
+            prefill_cache_seed=prefill_cache_seed,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -1223,6 +1228,7 @@ class V2QwenRuntime:
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
         swa_full: bool = False,
+        prefill_cache_seed: int = 0,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1241,6 +1247,8 @@ class V2QwenRuntime:
         # conversations restore from RAM instead of reprefilling; 0 disables.
         if prompt_cache_mib < 0:
             raise ValueError("prompt_cache_mib must be non-negative")
+        if prefill_cache_seed < 0 or prefill_cache_seed > 256:
+            raise ValueError("prefill_cache_seed must be between 0 and 256")
         if moe_device not in {"gpu", "cpu", "hybrid"}:
             raise ValueError("moe_device must be 'gpu', 'cpu', or 'hybrid'")
         if mtp_drafts < 0 or mtp_drafts > 8:
@@ -1270,6 +1278,7 @@ class V2QwenRuntime:
             parallel_sequences,
             prompt_cache_mib,
             int(swa_full),
+            prefill_cache_seed,
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

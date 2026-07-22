@@ -64,6 +64,7 @@ def _steady_state_counters(start, end):
     fields = (
         "decode_calls", "decode_nanoseconds", "route_wait_nanoseconds",
         "expert_page_nanoseconds", "tail_wait_nanoseconds",
+        "expert_compute_nanoseconds",
         "expert_cache_hits", "expert_cache_misses", "expert_cache_evictions",
     )
     delta = {field: end[field] - start[field] for field in fields}
@@ -74,12 +75,36 @@ def _steady_state_counters(start, end):
         "route_wait_ns_per_token": delta["route_wait_nanoseconds"] / calls,
         "expert_page_ns_per_token": delta["expert_page_nanoseconds"] / calls,
         "tail_wait_ns_per_token": delta["tail_wait_nanoseconds"] / calls,
+        "expert_compute_ns_per_token": (
+            delta["expert_compute_nanoseconds"] / calls
+        ),
         "decode_ns_per_token": delta["decode_nanoseconds"] / calls,
         "expert_cache_hits": delta["expert_cache_hits"],
         "expert_cache_misses": delta["expert_cache_misses"],
         "expert_cache_evictions": delta["expert_cache_evictions"],
         "expert_cache_hit_rate": delta["expert_cache_hits"] / (lookups or 1),
     }
+
+
+def _validate_mtp_cache_types(
+    mtp_drafts: int, cache_type_k: str, cache_type_v: str
+) -> None:
+    if mtp_drafts and (cache_type_k != "f32" or cache_type_v != "f32"):
+        raise SystemExit(
+            "--mtp-drafts currently requires --cache-type-k f32 "
+            "and --cache-type-v f32"
+        )
+
+
+def _benchmark_native_prefill(runtime, prompt_tokens: list[int]) -> tuple[int, float]:
+    """Run the production batched prefill path and return its first token."""
+    first_tokens: list[int] = []
+    started = time.perf_counter()
+    runtime.generate(prompt_tokens, 1, first_tokens.append)
+    elapsed = time.perf_counter() - started
+    if len(first_tokens) != 1:
+        raise RuntimeError("native prefill did not produce exactly one token")
+    return first_tokens[0], elapsed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -283,6 +308,25 @@ def _parser() -> argparse.ArgumentParser:
         help="execute routed experts by GPU streaming or native CPU kernels",
     )
     benchmark_v2.add_argument("--mtp-drafts", type=int, default=0)
+    benchmark_v2.add_argument(
+        "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0"),
+        default="f16",
+    )
+    benchmark_v2.add_argument(
+        "--cache-type-v", choices=("f32", "f16", "bf16", "q8_0"),
+        default="f16",
+    )
+    benchmark_v2.add_argument("--expert-top-k", type=int, default=0)
+    benchmark_v2.add_argument("--expert-top-p", type=float, default=0.0)
+    benchmark_v2.add_argument(
+        "--parallel", type=int, default=1, dest="parallel_sequences",
+        help="allocate this many independent sequence slots",
+    )
+    benchmark_v2.add_argument("--prompt-cache-mib", type=int, default=0)
+    benchmark_v2.add_argument(
+        "--prefill-cache-seed", type=int, default=0,
+        help="bulk-load this many prompt-hot experts per layer before decode",
+    )
 
     probe_qwen_v2 = subcommands.add_parser(
         "probe-qwen-v2", help="run one real Qwen v2 block and routed MoE from GGUF"
@@ -460,6 +504,10 @@ def _parser() -> argparse.ArgumentParser:
         help="allocate full-size caches for sliding-attention layers; uses more "
         "VRAM but preserves unrestricted prefix-cache rollback",
     )
+    serve_v2.add_argument(
+        "--prefill-cache-seed", type=int, default=0,
+        help="experimental Qwen prompt-trained expert seed per layer (0 = off)",
+    )
 
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
@@ -496,6 +544,21 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("benchmark-v2 requires at least 1 warmup iteration")
         if args.context <= 0:
             raise SystemExit("benchmark-v2 requires a positive context")
+        if args.parallel_sequences < 1:
+            raise SystemExit("benchmark-v2 requires --parallel >= 1")
+        if args.prompt_cache_mib < 0:
+            raise SystemExit("benchmark-v2 requires --prompt-cache-mib >= 0")
+        if args.expert_top_k < 0:
+            raise SystemExit("benchmark-v2 requires --expert-top-k >= 0")
+        if not 0 <= args.prefill_cache_seed <= 256:
+            raise SystemExit(
+                "benchmark-v2 requires --prefill-cache-seed within [0, 256]"
+            )
+        if not 0.0 <= args.expert_top_p <= 1.0:
+            raise SystemExit("benchmark-v2 requires --expert-top-p within [0, 1]")
+        _validate_mtp_cache_types(
+            args.mtp_drafts, args.cache_type_k, args.cache_type_v
+        )
         if args.runtime == "native":
             with V2Model(args.model) as model:
                 cache_mib = args.gpu_cache_mib  # 0 = auto-fit to free VRAM
@@ -514,20 +577,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if not prompt_tokens:
                     raise SystemExit("benchmark prompt must contain at least one token")
+                if len(prompt_tokens) + args.warmup + args.iterations > args.context:
+                    raise SystemExit(
+                        "benchmark prompt, warmup, and measured tokens exceed --context"
+                    )
                 with model.native_qwen_runtime(
                     context_limit=args.context,
-                        gpu_cache_bytes=cache_mib * 1024**2,
-                        moe_device=args.moe_device,
-                        mtp_drafts=args.mtp_drafts,
+                    gpu_cache_bytes=cache_mib * 1024**2,
+                    moe_device=args.moe_device,
+                    mtp_drafts=args.mtp_drafts,
+                    expert_top_k=args.expert_top_k,
+                    expert_top_p=args.expert_top_p,
+                    cache_type_k=args.cache_type_k,
+                    cache_type_v=args.cache_type_v,
+                    parallel_sequences=args.parallel_sequences,
+                    prompt_cache_mib=args.prompt_cache_mib,
+                    prefill_cache_seed=args.prefill_cache_seed,
                 ) as runtime:
                     prepare_started = time.perf_counter()
                     runtime.prepare()
                     prepare_seconds = time.perf_counter() - prepare_started
-                    prompt_started = time.perf_counter()
-                    current_token = 0
-                    for token in prompt_tokens:
-                        current_token = runtime.decode(token)
-                    prompt_seconds = time.perf_counter() - prompt_started
+                    current_token, prompt_seconds = _benchmark_native_prefill(
+                        runtime, prompt_tokens
+                    )
                     if args.mtp_drafts:
                         warm_outputs: list[int] = []
                         warm_started = time.perf_counter()
@@ -580,9 +652,8 @@ def main(argv: list[str] | None = None) -> int:
                             "prompt_tokens_per_second": (
                                 len(prompt_tokens) / prompt_seconds
                             ),
-                            "first_token_latency_seconds": (
-                                warm_elapsed / args.warmup
-                            ),
+                            "first_token_latency_seconds": prompt_seconds,
+                            "warmup_decode_seconds": warm_elapsed,
                             "warmup_iterations": args.warmup,
                             "iterations": args.iterations,
                             "decode_batch_seconds": measured_total,
@@ -618,12 +689,14 @@ def main(argv: list[str] | None = None) -> int:
                         f"native-v2-cpp-cuda-{args.moe_device}-moe"
                         if args.moe_device != "gpu" else "native-v2-cpp-cuda"
                     ),
+                    "measurement": "batched prefill plus steady single-token decode",
                     "device": runtime_info["device"],
                     "prepare_seconds": prepare_seconds,
                     "prompt_tokens": len(prompt_tokens),
                     "prompt_seconds": prompt_seconds,
                     "prompt_tokens_per_second": len(prompt_tokens) / prompt_seconds,
-                    "first_token_latency_seconds": warmup_seconds[0],
+                    "first_token_latency_seconds": prompt_seconds,
+                    "first_warm_decode_seconds": warmup_seconds[0],
                     "warmup_iterations": args.warmup,
                     "iterations": args.iterations,
                     "decode_seconds": measured_seconds,
@@ -1102,6 +1175,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.gpu_cache_mib < 0:
             raise SystemExit("--gpu-cache-mib must be >= 0 (0 = auto-fit to free VRAM)")
+        if not 0 <= args.prefill_cache_seed <= 256:
+            raise SystemExit("--prefill-cache-seed must be within [0, 256]")
+        _validate_mtp_cache_types(
+            args.mtp_drafts, args.cache_type_k, args.cache_type_v
+        )
         print(
             f"Loading native v2 GGUF from {args.model}...",
             file=sys.stderr,
@@ -1123,6 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
                 parallel_sequences=args.parallel_sequences,
                 prompt_cache_mib=args.prompt_cache_mib,
                 swa_full=args.swa_full,
+                prefill_cache_seed=args.prefill_cache_seed,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,
