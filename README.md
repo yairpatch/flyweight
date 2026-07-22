@@ -518,3 +518,12 @@ prefill without admitting pages, then bulk-loads the hottest `N` experts per
 layer before generation. `COLIBRI_PREFILL_CACHE_SEED` can override the API/CLI
 setting for experiments. It is opt-in while its time-to-first-token versus
 early-generation tradeoff is evaluated across hardware and prompt workloads.
+
+Hybrid MoE uses `--expert-paging auto` by default. When the CUDA driver supports
+registered host memory and the machine has enough available RAM for the model
+plus a safety margin, auto mode pages experts directly from the mapped GGUF and
+avoids an extra CPU copy. Registration adds one-time startup latency but is
+amortized by a long-running server. Use `--expert-paging staged` on constrained
+machines, or `--expert-paging direct` to require the faster path and fail if the
+driver cannot register it. Runtime diagnostics report `direct_paging`,
+`paging_registration_nanoseconds`, and the detected `host_available_bytes`.

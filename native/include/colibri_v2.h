@@ -92,6 +92,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t prompt_cache_mib; /* host RAM budget for spilled slot state (llama.cpp prompt cache); 0 disables */
     uint32_t swa_full; /* keep full-size SWA KV caches for unrestricted prefix reuse */
     uint32_t prefill_cache_seed; /* hottest prompt-routed experts to seed per layer; 0 disables */
+    uint32_t expert_paging; /* 0=auto, 1=staged copy, 2=direct registered-host DMA */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -159,6 +160,9 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t prompt_cache_used_bytes;   /* host prompt cache: RAM in use */
     uint64_t prefill_cache_seeded_experts; /* experts bulk-loaded from prompt route history */
     uint64_t prefill_cache_seed_nanoseconds; /* wall time spent bulk-seeding experts */
+    uint64_t direct_paging; /* direct registered-host expert paging is active */
+    uint64_t paging_registration_nanoseconds; /* one-time host registration cost */
+    uint64_t host_available_bytes; /* available host memory observed during prepare */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

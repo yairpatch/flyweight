@@ -327,6 +327,10 @@ def _parser() -> argparse.ArgumentParser:
         "--prefill-cache-seed", type=int, default=0,
         help="bulk-load this many prompt-hot experts per layer before decode",
     )
+    benchmark_v2.add_argument(
+        "--expert-paging", choices=("auto", "staged", "direct"), default="auto",
+        help="hybrid expert transfer policy (auto uses direct DMA only with host-memory headroom)",
+    )
 
     probe_qwen_v2 = subcommands.add_parser(
         "probe-qwen-v2", help="run one real Qwen v2 block and routed MoE from GGUF"
@@ -508,6 +512,10 @@ def _parser() -> argparse.ArgumentParser:
         "--prefill-cache-seed", type=int, default=0,
         help="experimental Qwen prompt-trained expert seed per layer (0 = off)",
     )
+    serve_v2.add_argument(
+        "--expert-paging", choices=("auto", "staged", "direct"), default="auto",
+        help="hybrid expert transfer policy; direct trades startup time/RAM pinning for throughput",
+    )
 
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
@@ -593,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
                     parallel_sequences=args.parallel_sequences,
                     prompt_cache_mib=args.prompt_cache_mib,
                     prefill_cache_seed=args.prefill_cache_seed,
+                    expert_paging=args.expert_paging,
                 ) as runtime:
                     prepare_started = time.perf_counter()
                     runtime.prepare()
@@ -1202,6 +1211,7 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_cache_mib=args.prompt_cache_mib,
                 swa_full=args.swa_full,
                 prefill_cache_seed=args.prefill_cache_seed,
+                expert_paging=args.expert_paging,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,

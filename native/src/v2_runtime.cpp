@@ -253,6 +253,8 @@ struct ColibriV2QwenRuntime {
     std::uint64_t expert_compute_nanoseconds = 0;
     std::uint64_t prefill_cache_seeded_experts = 0;
     std::uint64_t prefill_cache_seed_nanoseconds = 0;
+    std::uint64_t paging_registration_nanoseconds = 0;
+    std::uint64_t host_available_bytes = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
     std::uint32_t forward_rows_capacity = 0;
@@ -305,7 +307,7 @@ struct ColibriV2QwenRuntime {
     bool mtp_has_target_hidden = false;
     bool cuda_ready = false;
     bool decode_ready = false;
-    bool dma_paging = false;       // opt-in: DMA expert page-ins straight from the registered mmap
+    bool dma_paging = false;       // expert page-ins go straight from the registered mmap
     bool model_registered = false; // whether we cuMemHostRegister'd model->data
 };
 
@@ -451,6 +453,29 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
 }
 
 uint64_t align_to(uint64_t n, uint32_t a) { return (n + a - 1) / a * a; }
+
+std::uint64_t available_host_memory() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength=sizeof(status);
+    return GlobalMemoryStatusEx(&status)?status.ullAvailPhys:0;
+#elif defined(__linux__)
+    // MemAvailable includes reclaimable page cache. That matters for mmap'd
+    // GGUFs: after one pass most model bytes are cached, while AVPHYS counts
+    // only free pages and would incorrectly disable direct paging.
+    std::ifstream memory("/proc/meminfo");
+    std::string key,unit;
+    std::uint64_t kib=0;
+    while(memory>>key>>kib>>unit)
+        if(key=="MemAvailable:")return kib*1024;
+    return 0;
+#elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
+    const auto pages=sysconf(_SC_AVPHYS_PAGES),page_size=sysconf(_SC_PAGESIZE);
+    return pages>0&&page_size>0?static_cast<std::uint64_t>(pages)*page_size:0;
+#else
+    return 0;
+#endif
+}
 void copy_text(char* dst, size_t cap, const std::string& value) { if (!cap) return; std::strncpy(dst, value.c_str(), cap-1); dst[cap-1]=0; }
 
 int parse(ColibriV2Model& m) {
@@ -1001,7 +1026,7 @@ int plan_memory(ColibriV2MemoryPlan& out, uint64_t budget, uint64_t static_weigh
 }
 
 extern "C" {
-uint32_t colibri_v2_version() { return 2; }
+uint32_t colibri_v2_version() { return 3; }
 const char* colibri_v2_last_error() { return error.c_str(); }
 int colibri_v2_gpu_probe(int32_t device, ColibriV2GpuInfo* out) { return guarded([&]{ if(!out||device<0) throw std::runtime_error("invalid GPU probe arguments"); return gpu_probe(*out,device); }); }
 int colibri_v2_memory_plan(uint64_t budget,uint64_t static_weights,uint64_t kv_state,uint64_t workspace,uint64_t active,uint64_t staging,ColibriV2MemoryPlan*out){return guarded([&]{if(!out)throw std::runtime_error("memory plan output is required");return plan_memory(*out,budget,static_weights,kv_state,workspace,active,staging);});}
@@ -1235,6 +1260,9 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->expert_compute_nanoseconds=runtime->expert_compute_nanoseconds;
     out->prefill_cache_seeded_experts=runtime->prefill_cache_seeded_experts;
     out->prefill_cache_seed_nanoseconds=runtime->prefill_cache_seed_nanoseconds;
+    out->direct_paging=runtime->dma_paging?1:0;
+    out->paging_registration_nanoseconds=runtime->paging_registration_nanoseconds;
+    out->host_available_bytes=runtime->host_available_bytes;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;return 0;});}
@@ -1494,12 +1522,34 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
            colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0||
            colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("failed to initialize native Qwen CUDA arenas");
     }catch(...){release_qwen_device(*runtime);throw;}
-        if(runtime->options.moe_device==2&&std::getenv("COLIBRI_V2_DMA_PAGING")){
-            if(colibri_gpu_host_register(runtime->model->data,runtime->model->size)==0){
+        if(runtime->options.expert_paging>2)
+            throw std::runtime_error("native Qwen expert paging mode is invalid");
+        runtime->host_available_bytes=available_host_memory();
+        const bool forced_direct=runtime->options.expert_paging==2||
+            std::getenv("COLIBRI_V2_DMA_PAGING");
+        const auto registration_headroom=std::max<std::uint64_t>(
+            4ull*1024*1024*1024,runtime->model->size/4);
+        const bool auto_direct=runtime->options.expert_paging==0&&
+            runtime->host_available_bytes>=runtime->model->size+registration_headroom;
+        if(runtime->options.moe_device==2&&(forced_direct||auto_direct)){
+            const auto registration_started=std::chrono::steady_clock::now();
+            const int registration=colibri_gpu_host_register(
+                runtime->model->data,runtime->model->size);
+            runtime->paging_registration_nanoseconds=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-registration_started).count();
+            if(registration==0){
                 runtime->model_registered=true;runtime->dma_paging=true;
-                std::fprintf(stderr,"[colibri-v2] DMA expert paging on (registered %.1f GiB mmap)\n",runtime->model->size/1073741824.0);
+                std::fprintf(stderr,
+                    "[colibri-v2] direct expert paging on (registered %.1f GiB mmap in %.2fs)\n",
+                    runtime->model->size/1073741824.0,
+                    runtime->paging_registration_nanoseconds/1e9);
+            }else if(forced_direct){
+                throw std::runtime_error(
+                    "direct expert paging requested, but CUDA host registration failed");
             }else{
-                std::fprintf(stderr,"[colibri-v2] cuMemHostRegister failed; using memcpy paging\n");
+                std::fprintf(stderr,
+                    "[colibri-v2] direct expert paging unavailable; using staged copies\n");
             }
         }
         runtime->decode_ready=true;

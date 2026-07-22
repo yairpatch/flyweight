@@ -127,6 +127,17 @@ class QwenV2ReferenceTests(unittest.TestCase):
         finally:
             model.close()
 
+    def test_native_runtime_rejects_invalid_expert_paging(self):
+        try:
+            model = V2Model(self.MODEL)
+        except Exception as error:
+            raise unittest.SkipTest(str(error)) from error
+        try:
+            with self.assertRaisesRegex(ValueError, "expert_paging"):
+                model.native_qwen_runtime(expert_paging="pinned-everywhere")
+        finally:
+            model.close()
+
     def test_real_delta_layer_state_is_persistent_and_resettable(self):
         try:
             model = V2Model(self.MODEL)
