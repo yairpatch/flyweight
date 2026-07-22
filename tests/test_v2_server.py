@@ -231,6 +231,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.prefill_cache_seed, 0)
         self.assertEqual(args.expert_paging, "auto")
         self.assertEqual(args.cpu_prefetch_mib, 0)
+        self.assertFalse(args.cpu_prefetch_auto)
 
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
         args = _parser().parse_args([
@@ -256,6 +257,14 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.expert_paging, "direct")
         self.assertEqual(args.cpu_prefetch_mib, 768)
         self.assertTrue(args.cold_cache)
+        self.assertFalse(args.cpu_prefetch_auto)
+
+    def test_benchmark_v2_exposes_auto_cpu_prefetch(self) -> None:
+        args = _parser().parse_args([
+            "benchmark-v2", "model.gguf", "--cpu-prefetch-auto",
+        ])
+        self.assertEqual(args.cpu_prefetch_mib, 0)
+        self.assertTrue(args.cpu_prefetch_auto)
 
 
 if __name__ == "__main__":

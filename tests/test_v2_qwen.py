@@ -149,6 +149,19 @@ class QwenV2ReferenceTests(unittest.TestCase):
         finally:
             model.close()
 
+    def test_native_runtime_rejects_conflicting_cpu_prefetch_modes(self):
+        try:
+            model = V2Model(self.MODEL)
+        except Exception as error:
+            raise unittest.SkipTest(str(error)) from error
+        try:
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                model.native_qwen_runtime(
+                    cpu_prefetch_mib=64, cpu_prefetch_auto=True
+                )
+        finally:
+            model.close()
+
     def test_real_delta_layer_state_is_persistent_and_resettable(self):
         try:
             model = V2Model(self.MODEL)

@@ -266,6 +266,9 @@ struct ColibriV2QwenRuntime {
     std::uint64_t cpu_prefetch_nanoseconds = 0;
     std::uint64_t cpu_prefetch_pages = 0;
     std::uint64_t cpu_prefetch_cold_pages = 0;
+    std::uint64_t cpu_prefetch_loaded_pages = 0;
+    std::uint64_t cpu_prefetch_auto_skips = 0;
+    std::uint64_t cpu_prefetch_last_budget_bytes = 0;
     std::uint8_t cpu_prefetch_checksum = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
@@ -1217,6 +1220,8 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
     if(runtime->options.expert_top_p<0.0f||runtime->options.expert_top_p>1.0f)throw std::runtime_error("native Qwen expert_top_p must be within [0, 1]");
     if(runtime->options.prefill_cache_seed>256)throw std::runtime_error("native Qwen prefill_cache_seed supports at most 256 experts per layer");
+    if(runtime->options.cpu_prefetch_auto>1)throw std::runtime_error("native Qwen cpu_prefetch_auto must be boolean");
+    if(runtime->options.cpu_prefetch_mib&&runtime->options.cpu_prefetch_auto)throw std::runtime_error("native Qwen CPU prefetch modes are mutually exclusive");
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>3)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>3)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.mtp_drafts&&(runtime->options.cache_type_k||runtime->options.cache_type_v))throw std::runtime_error("native Qwen MTP currently requires f32 KV cache");
@@ -1331,6 +1336,9 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->cpu_prefetch_nanoseconds=runtime->cpu_prefetch_nanoseconds;
     out->cpu_prefetch_pages=runtime->cpu_prefetch_pages;
     out->cpu_prefetch_cold_pages=runtime->cpu_prefetch_cold_pages;
+    out->cpu_prefetch_loaded_pages=runtime->cpu_prefetch_loaded_pages;
+    out->cpu_prefetch_auto_skips=runtime->cpu_prefetch_auto_skips;
+    out->cpu_prefetch_last_budget_bytes=runtime->cpu_prefetch_last_budget_bytes;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;return 0;});}
@@ -3069,18 +3077,26 @@ static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
 // would make a poor first-token working set. The pages remain ordinary,
 // reclaimable OS cache; no second copy of the model is allocated.
 static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
-    if(runtime.gemma4||runtime.options.mtp_drafts||
-       runtime.options.moe_device==0||!runtime.options.cpu_prefetch_mib)return;
+    const bool automatic=runtime.options.cpu_prefetch_auto!=0;
+    if(runtime.gemma4||runtime.options.mtp_drafts||runtime.options.moe_device==0||
+       (!runtime.options.cpu_prefetch_mib&&!automatic))return;
 #if defined(_WIN32)
     return;
 #else
     constexpr std::uint64_t mib=1024ULL*1024ULL;
     constexpr std::uint64_t reserve=2ULL*1024ULL*1024ULL*1024ULL;
-    std::uint64_t budget=static_cast<std::uint64_t>(runtime.options.cpu_prefetch_mib)*mib;
     const auto available=available_host_memory();
     if(available<=reserve)return;
+    std::uint64_t budget=0;
+    if(automatic){
+        // Keep automatic I/O modest on low-budget machines: inspect at most
+        // 1/64 of currently available RAM, clamped to [64, 256] MiB. Explicit
+        // budgets retain their exact requested upper bound.
+        budget=std::clamp<std::uint64_t>(available/64,64*mib,256*mib);
+    }else budget=static_cast<std::uint64_t>(runtime.options.cpu_prefetch_mib)*mib;
     budget=std::min(budget,available-reserve);
     if(!budget)return;
+    runtime.cpu_prefetch_last_budget_bytes=budget;
     const auto experts=runtime.model->config.expert_count;
     struct Candidate { std::uint32_t expert; std::uint32_t frequency; std::uint64_t last_used; };
     std::vector<std::vector<Candidate>> ranked(runtime.layers.size());
@@ -3125,6 +3141,7 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
     struct ColdPage { const volatile std::uint8_t* address; };
     std::vector<std::uintptr_t> inspected;
     std::vector<ColdPage> cold;
+    bool residency_known=true;
     inspected.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
     cold.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
     for(const auto& range:ranges){
@@ -3137,6 +3154,9 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
         std::vector<unsigned char> resident(static_cast<std::size_t>(count));
         const bool known=mincore(reinterpret_cast<void*>(aligned_begin),
                                  aligned_end-aligned_begin,resident.data())==0;
+        if(!known)residency_known=false;
+#else
+        residency_known=false;
 #endif
         for(std::uint64_t index=0;index<count;++index){
             const auto address=aligned_begin+index*page;
@@ -3155,6 +3175,15 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
     cold.erase(std::unique(cold.begin(),cold.end(),[](const ColdPage&a,const ColdPage&b){
         return a.address==b.address;
     }),cold.end());
+    const auto observed_cold_pages=cold.size();
+    if(automatic){
+        const bool enough_pages=observed_cold_pages*page>=8*mib;
+        const bool enough_pressure=observed_cold_pages*10>=inspected.size();
+        if(!residency_known||!enough_pages||!enough_pressure){
+            cold.clear();
+            ++runtime.cpu_prefetch_auto_skips;
+        }
+    }
     for(const auto& range:ranges)
         if(!cold.empty()&&runtime.model->fd>=0)
             (void)posix_fadvise(runtime.model->fd,static_cast<off_t>(range.offset),
@@ -3165,7 +3194,8 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
     runtime.cpu_prefetch_experts+=selected_experts;
     runtime.cpu_prefetch_bytes+=selected_bytes;
     runtime.cpu_prefetch_pages+=inspected.size();
-    runtime.cpu_prefetch_cold_pages+=cold.size();
+    runtime.cpu_prefetch_cold_pages+=observed_cold_pages;
+    runtime.cpu_prefetch_loaded_pages+=cold.size();
     runtime.cpu_prefetch_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now()-started).count();
 #endif

@@ -440,6 +440,7 @@ class NativeV2InferenceService(InferenceService):
         prefill_cache_seed: int = 0,
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
+        cpu_prefetch_auto: bool = False,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -466,6 +467,7 @@ class NativeV2InferenceService(InferenceService):
                 prefill_cache_seed=prefill_cache_seed,
                 expert_paging=expert_paging,
                 cpu_prefetch_mib=cpu_prefetch_mib,
+                cpu_prefetch_auto=cpu_prefetch_auto,
             )
             self.v2_runtime.prepare()
         except Exception:

@@ -548,6 +548,15 @@ For reproducible cold-start comparisons, run separate benchmark processes with
 --cpu-prefetch-mib 512`. Cache eviction is best-effort and affects the shared
 OS page cache for that GGUF, so do not use it beside a production server.
 
+`--cpu-prefetch-auto` derives a 64-256 MiB candidate budget from currently
+available RAM. It performs I/O only when at least 8 MiB and 10% of the selected
+pages are nonresident; otherwise it records an auto-skip. This keeps the feature
+inactive on machines where prompt execution already warmed the useful experts.
+Inspect `cpu_prefetch_loaded_pages`, `cpu_prefetch_auto_skips`, and
+`cpu_prefetch_last_budget_bytes` when tuning a deployment. Explicit
+`--cpu-prefetch-mib` and automatic mode are mutually exclusive. Auto mode
+skips safely when the platform cannot report mapped-page residency.
+
 On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
 AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep
 vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to

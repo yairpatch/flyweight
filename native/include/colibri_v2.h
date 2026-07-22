@@ -94,6 +94,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t prefill_cache_seed; /* hottest prompt-routed experts to seed per layer; 0 disables */
     uint32_t expert_paging; /* 0=auto, 1=staged copy, 2=direct registered-host DMA */
     uint32_t cpu_prefetch_mib; /* prompt-trained host expert page warmup budget; 0 disables */
+    uint32_t cpu_prefetch_auto; /* size from host memory and skip unless enough pages are cold */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -169,6 +170,9 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t cpu_prefetch_nanoseconds; /* wall time spent warming host expert pages */
     uint64_t cpu_prefetch_pages; /* mapped pages inspected for host expert warmup */
     uint64_t cpu_prefetch_cold_pages; /* inspected pages nonresident before warmup */
+    uint64_t cpu_prefetch_loaded_pages; /* cold pages actually faulted into host memory */
+    uint64_t cpu_prefetch_auto_skips; /* auto-mode prompts skipped for low cold-page pressure */
+    uint64_t cpu_prefetch_last_budget_bytes; /* most recent effective candidate-set budget */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

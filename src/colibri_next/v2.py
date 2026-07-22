@@ -116,6 +116,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("prefill_cache_seed", ctypes.c_uint32),
         ("expert_paging", ctypes.c_uint32),
         ("cpu_prefetch_mib", ctypes.c_uint32),
+        ("cpu_prefetch_auto", ctypes.c_uint32),
     ]
 
 
@@ -192,6 +193,9 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("cpu_prefetch_nanoseconds", ctypes.c_uint64),
         ("cpu_prefetch_pages", ctypes.c_uint64),
         ("cpu_prefetch_cold_pages", ctypes.c_uint64),
+        ("cpu_prefetch_loaded_pages", ctypes.c_uint64),
+        ("cpu_prefetch_auto_skips", ctypes.c_uint64),
+        ("cpu_prefetch_last_budget_bytes", ctypes.c_uint64),
     ]
 
 
@@ -910,6 +914,7 @@ class V2Model:
         prefill_cache_seed: int = 0,
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
+        cpu_prefetch_auto: bool = False,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -930,6 +935,7 @@ class V2Model:
             prefill_cache_seed=prefill_cache_seed,
             expert_paging=expert_paging,
             cpu_prefetch_mib=cpu_prefetch_mib,
+            cpu_prefetch_auto=cpu_prefetch_auto,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -1245,6 +1251,7 @@ class V2QwenRuntime:
         prefill_cache_seed: int = 0,
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
+        cpu_prefetch_auto: bool = False,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1269,6 +1276,8 @@ class V2QwenRuntime:
             raise ValueError("expert_paging must be 'auto', 'staged', or 'direct'")
         if cpu_prefetch_mib < 0:
             raise ValueError("cpu_prefetch_mib must be non-negative")
+        if cpu_prefetch_mib and cpu_prefetch_auto:
+            raise ValueError("cpu_prefetch_mib and cpu_prefetch_auto are mutually exclusive")
         if moe_device not in {"gpu", "cpu", "hybrid"}:
             raise ValueError("moe_device must be 'gpu', 'cpu', or 'hybrid'")
         if mtp_drafts < 0 or mtp_drafts > 8:
@@ -1301,6 +1310,7 @@ class V2QwenRuntime:
             prefill_cache_seed,
             {"auto": 0, "staged": 1, "direct": 2}[expert_paging],
             cpu_prefetch_mib,
+            int(cpu_prefetch_auto),
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(
