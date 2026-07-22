@@ -399,6 +399,7 @@ class NativeV2InferenceService(InferenceService):
         prefill_checkpoint_slots: int = 4,
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
+        swa_full: bool = False,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -418,6 +419,7 @@ class NativeV2InferenceService(InferenceService):
                 prefill_checkpoint_slots=prefill_checkpoint_slots,
                 parallel_sequences=parallel_sequences,
                 prompt_cache_mib=prompt_cache_mib,
+                swa_full=swa_full,
             )
             self.v2_runtime.prepare()
         except Exception:

@@ -55,6 +55,8 @@ class _ModelConfig(ctypes.Structure):
         ("vocabulary_size", ctypes.c_uint32),
         ("rotary_dimension", ctypes.c_uint32),
         ("full_attention_interval", ctypes.c_uint32),
+        ("sliding_window", ctypes.c_uint32),
+        ("sliding_window_pattern_length", ctypes.c_uint32),
         ("rms_norm_epsilon", ctypes.c_float),
         ("rope_freq_base", ctypes.c_float),
     ]
@@ -110,6 +112,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("prefill_checkpoint_slots", ctypes.c_uint32),
         ("parallel_sequences", ctypes.c_uint32),
         ("prompt_cache_mib", ctypes.c_uint32),
+        ("swa_full", ctypes.c_uint32),
     ]
 
 
@@ -120,6 +123,9 @@ class _QwenRuntimeInfo(ctypes.Structure):
             "layers",
             "deltanet_layers",
             "attention_layers",
+            "swa_layers",
+            "sliding_window",
+            "swa_full",
             "hidden_size",
             "expert_count",
             "expert_used_count",
@@ -209,6 +215,12 @@ def _library() -> ctypes.CDLL:
                 ctypes.POINTER(_ModelConfig),
             ]
             lib.colibri_v2_model_config.restype = ctypes.c_int
+            lib.colibri_v2_model_attention_window.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            lib.colibri_v2_model_attention_window.restype = ctypes.c_int
             lib.colibri_v2_qwen_validate.argtypes = [ctypes.c_void_p]
             lib.colibri_v2_qwen_validate.restype = ctypes.c_int
             lib.colibri_v2_qwen_tensor_role.argtypes = [
@@ -585,13 +597,13 @@ class V2Model:
         return self._tensor_catalog
 
     @property
-    def config(self) -> dict[str, int | str]:
+    def config(self) -> dict[str, int | float | str | tuple[bool, ...] | tuple[int, ...]]:
         value = _ModelConfig()
         self._check(
             self._lib.colibri_v2_model_config(self._handle, ctypes.byref(value))
         )
         float_fields = {"rms_norm_epsilon", "rope_freq_base"}
-        return {
+        config = {
             field: (
                 getattr(value, field).decode(errors="replace")
                 if field == "architecture"
@@ -601,6 +613,18 @@ class V2Model:
             )
             for field, _ in _ModelConfig._fields_
         }
+        windows: list[int] = []
+        for layer in range(value.layer_count):
+            window = ctypes.c_uint32()
+            self._check(
+                self._lib.colibri_v2_model_attention_window(
+                    self._handle, layer, ctypes.byref(window)
+                )
+            )
+            windows.append(int(window.value))
+        config["attention_windows"] = tuple(windows)
+        config["sliding_window_pattern"] = tuple(bool(window) for window in windows)
+        return config
 
     def tensor(self, name: str) -> dict[str, object]:
         if self._tensor_catalog is not None:
@@ -861,6 +885,7 @@ class V2Model:
         prefill_checkpoint_slots: int = 4,
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
+        swa_full: bool = False,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -877,6 +902,7 @@ class V2Model:
             prefill_checkpoint_slots=prefill_checkpoint_slots,
             parallel_sequences=parallel_sequences,
             prompt_cache_mib=prompt_cache_mib,
+            swa_full=swa_full,
         )
 
     @staticmethod
@@ -1177,6 +1203,7 @@ class V2QwenRuntime:
         prefill_checkpoint_slots: int = 4,
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
+        swa_full: bool = False,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1223,6 +1250,7 @@ class V2QwenRuntime:
             prefill_checkpoint_slots,
             parallel_sequences,
             prompt_cache_mib,
+            int(swa_full),
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

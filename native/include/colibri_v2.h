@@ -45,7 +45,8 @@ typedef struct ColibriV2ModelConfig {
     uint32_t hidden_size, layer_count, attention_heads, attention_kv_heads;
     uint32_t context_length, intermediate_size, expert_count;
     uint32_t expert_used_count, vocabulary_size;
-    uint32_t rotary_dimension, full_attention_interval;
+    uint32_t rotary_dimension, full_attention_interval, sliding_window;
+    uint32_t sliding_window_pattern_length;
     float rms_norm_epsilon, rope_freq_base;
 } ColibriV2ModelConfig;
 
@@ -89,12 +90,16 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t prefill_checkpoint_slots; /* total prefix-reuse snapshot slots; 0 = default (4) */
     uint32_t parallel_sequences; /* independent KV/decode slots (llama.cpp --parallel); 0/1 = single-sequence */
     uint32_t prompt_cache_mib; /* host RAM budget for spilled slot state (llama.cpp prompt cache); 0 disables */
+    uint32_t swa_full; /* keep full-size SWA KV caches for unrestricted prefix reuse */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
     uint32_t layers;
     uint32_t deltanet_layers;
     uint32_t attention_layers;
+    uint32_t swa_layers;
+    uint32_t sliding_window;
+    uint32_t swa_full;
     uint32_t hidden_size;
     uint32_t expert_count;
     uint32_t expert_used_count;
@@ -170,6 +175,8 @@ COLIBRI_V2_API int colibri_v2_model_open(const char* path, ColibriV2Model** out)
 COLIBRI_V2_API void colibri_v2_model_close(ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_model_info(const ColibriV2Model* model, ColibriV2ModelInfo* out);
 COLIBRI_V2_API int colibri_v2_model_config(const ColibriV2Model* model, ColibriV2ModelConfig* out);
+/* Returns the layer's trained attention window. 0 means global attention. */
+COLIBRI_V2_API int colibri_v2_model_attention_window(const ColibriV2Model* model, uint32_t layer, uint32_t* out);
 COLIBRI_V2_API int colibri_v2_tensor_info(const ColibriV2Model* model, uint64_t index, ColibriV2TensorInfo* out);
 COLIBRI_V2_API int colibri_v2_tensor_find(const ColibriV2Model* model, const char* name, ColibriV2TensorInfo* out);
 COLIBRI_V2_API int colibri_v2_qwen_validate(const ColibriV2Model* model);

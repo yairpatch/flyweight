@@ -13,20 +13,30 @@ def gguf_string(value: str) -> bytes:
 
 
 class V2RuntimeTests(unittest.TestCase):
-    def make_model(self) -> tuple[Path, bytes]:
-        metadata = b"".join((
+    def make_model(
+        self, sliding_pattern: tuple[bool, ...] | None = None
+    ) -> tuple[Path, bytes]:
+        metadata_items = [
             gguf_string("general.architecture") + struct.pack("<I", 8) + gguf_string("qwen3moe"),
             gguf_string("general.name") + struct.pack("<I", 8) + gguf_string("test"),
             gguf_string("qwen3moe.embedding_length") + struct.pack("<II", 4, 16),
-            gguf_string("qwen3moe.block_count") + struct.pack("<II", 4, 1),
+            gguf_string("qwen3moe.block_count") + struct.pack("<II", 4, len(sliding_pattern) if sliding_pattern else 1),
             gguf_string("qwen3moe.attention.head_count") + struct.pack("<II", 4, 2),
             gguf_string("qwen3moe.rope.dimension_count") + struct.pack("<II", 4, 64),
             gguf_string("qwen3moe.full_attention_interval") + struct.pack("<II", 4, 4),
             gguf_string("qwen3moe.attention.layer_norm_rms_epsilon") + struct.pack("<If", 6, 1e-6),
             gguf_string("qwen3moe.rope.freq_base") + struct.pack("<If", 6, 10_000_000.0),
-        ))
+        ]
+        if sliding_pattern is not None:
+            metadata_items.extend((
+                gguf_string("qwen3moe.attention.sliding_window") + struct.pack("<II", 4, 128),
+                gguf_string("qwen3moe.attention.sliding_window_pattern")
+                + struct.pack("<IIQ", 9, 7, len(sliding_pattern))
+                + bytes(sliding_pattern),
+            ))
+        metadata = b"".join(metadata_items)
         tensor = gguf_string("token_embd.weight") + struct.pack("<IQQIQ", 2, 2, 2, 0, 0)
-        header = b"GGUF" + struct.pack("<IQQ", 3, 1, 9)
+        header = b"GGUF" + struct.pack("<IQQ", 3, 1, len(metadata_items))
         body = header + metadata + tensor
         body += b"\0" * ((32 - len(body) % 32) % 32)
         payload = b"\x01\x02\x03\x04"
@@ -73,6 +83,23 @@ class V2RuntimeTests(unittest.TestCase):
                 session.cancel()
                 with self.assertRaises(V2Error):
                     session.decode()
+        finally:
+            path.unlink()
+
+    def test_parses_generic_interleaved_sliding_window_pattern(self):
+        path, _ = self.make_model((True, True, False, True, False, False))
+        try:
+            with V2Model(path) as model:
+                config = model.config
+                self.assertEqual(config["sliding_window"], 128)
+                self.assertEqual(config["sliding_window_pattern_length"], 6)
+                self.assertEqual(
+                    config["attention_windows"], (128, 128, 0, 128, 0, 0)
+                )
+                self.assertEqual(
+                    config["sliding_window_pattern"],
+                    (True, True, False, True, False, False),
+                )
         finally:
             path.unlink()
 

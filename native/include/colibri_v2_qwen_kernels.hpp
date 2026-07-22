@@ -1553,6 +1553,52 @@ extern "C" __global__ void kv_attention_scores_q8(
     scores[head * tokens + token] = s * scale;
 }
 
+// Logical token 0 can live anywhere in a compact circular SWA cache.  Keeping
+// this separate from the linear kernels preserves their ABI and fast path for
+// global-attention layers.
+template<typename KT>
+__device__ void kv_scores_ring_impl(
+    const float* query, const KT* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first, const float scale
+) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y * blockDim.x + threadIdx.x;
+    if (head >= heads || token >= tokens) return;
+    const int group = heads / kv_heads, kv_head = head / group;
+    const int slot = (first + token) % capacity;
+    const float* q = query + head * head_dim;
+    const KT* k = keys + ((long long)kv_head * capacity + slot) * head_dim;
+    float score = 0.0f;
+    for (int d = 0; d < head_dim; ++d) score += q[d] * kv_ld(k, d);
+    scores[head * tokens + token] = score * scale;
+}
+#define KV_SCORES_RING(name, T) \
+extern "C" __global__ void name(const float* query, const T* keys, float* scores, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first, const float scale) { \
+    kv_scores_ring_impl<T>(query, keys, scores, heads, kv_heads, head_dim, tokens, capacity, first, scale); \
+}
+KV_SCORES_RING(kv_attention_scores_ring, float)
+KV_SCORES_RING(kv_attention_scores_f16_ring, __half)
+KV_SCORES_RING(kv_attention_scores_bf16_ring, __nv_bfloat16)
+#undef KV_SCORES_RING
+extern "C" __global__ void kv_attention_scores_q8_ring(
+    const float* query, const unsigned char* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first, const float scale
+) {
+    const int head=blockIdx.x, token=blockIdx.y*blockDim.x+threadIdx.x;
+    if(head>=heads||token>=tokens)return;
+    const int kv_head=head/(heads/kv_heads), blocks=head_dim/32;
+    const int slot=(first+token)%capacity;
+    const float* q=query+head*head_dim;
+    const unsigned char* k=keys+((long long)kv_head*capacity+slot)*blocks*34;
+    float score=0.0f;
+    for(int d=0;d<head_dim;++d)score+=q[d]*kv_ld_q8(k,d);
+    scores[head*tokens+token]=score*scale;
+}
+
 template<typename VT>
 __device__ void kv_values_impl(
     const float* scores, const VT* values, float* output,
@@ -1635,6 +1681,79 @@ extern "C" __global__ void kv_attention_values_q8(
             result += weight * kv_ld_q8(vrow, d);
         }
         output[head * head_dim + d] = result * inverse_denominator;
+    }
+}
+
+template<typename VT>
+__device__ void kv_values_ring_impl(
+    const float* scores, const VT* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first
+) {
+    const int head=blockIdx.x;
+    if(head>=heads)return;
+    const int kv_head=head/(heads/kv_heads);
+    const float* head_scores=scores+head*tokens;
+    float local_maximum=-3.402823466e+38F;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_maximum=fmaxf(local_maximum,head_scores[token]);
+    const float reduced_maximum=block_reduce_max(local_maximum);
+    __shared__ float maximum;
+    if(threadIdx.x==0)maximum=reduced_maximum;
+    __syncthreads();
+    float local_denominator=0.0f;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_denominator+=expf(head_scores[token]-maximum);
+    const float reduced_denominator=block_reduce_sum(local_denominator);
+    __shared__ float inverse_denominator;
+    if(threadIdx.x==0)inverse_denominator=1.0f/reduced_denominator;
+    __syncthreads();
+    for(int d=threadIdx.x;d<head_dim;d+=blockDim.x){
+        float result=0.0f;
+        for(int token=0;token<tokens;++token){
+            const int slot=(first+token)%capacity;
+            result+=expf(head_scores[token]-maximum)*kv_ld(values,(long long)(kv_head*capacity+slot)*head_dim+d);
+        }
+        output[head*head_dim+d]=result*inverse_denominator;
+    }
+}
+#define KV_VALUES_RING(name, T) \
+extern "C" __global__ void name(const float* scores, const T* values, float* output, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first) { \
+    kv_values_ring_impl<T>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity, first); \
+}
+KV_VALUES_RING(kv_attention_values_ring, float)
+KV_VALUES_RING(kv_attention_values_f16_ring, __half)
+KV_VALUES_RING(kv_attention_values_bf16_ring, __nv_bfloat16)
+#undef KV_VALUES_RING
+extern "C" __global__ void kv_attention_values_q8_ring(
+    const float* scores, const unsigned char* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first
+) {
+    const int head=blockIdx.x;
+    if(head>=heads)return;
+    const int kv_head=head/(heads/kv_heads), blocks=head_dim/32;
+    const float* head_scores=scores+head*tokens;
+    float local_maximum=-3.402823466e+38F;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_maximum=fmaxf(local_maximum,head_scores[token]);
+    const float reduced_maximum=block_reduce_max(local_maximum);
+    __shared__ float maximum;
+    if(threadIdx.x==0)maximum=reduced_maximum;
+    __syncthreads();
+    float local_denominator=0.0f;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_denominator+=expf(head_scores[token]-maximum);
+    const float reduced_denominator=block_reduce_sum(local_denominator);
+    __shared__ float inverse_denominator;
+    if(threadIdx.x==0)inverse_denominator=1.0f/reduced_denominator;
+    __syncthreads();
+    for(int d=threadIdx.x;d<head_dim;d+=blockDim.x){
+        float result=0.0f;
+        for(int token=0;token<tokens;++token){
+            const int slot=(first+token)%capacity;
+            const unsigned char* row=values+((long long)kv_head*capacity+slot)*blocks*34;
+            result+=expf(head_scores[token]-maximum)*kv_ld_q8(row,d);
+        }
+        output[head*head_dim+d]=result*inverse_denominator;
     }
 }
 

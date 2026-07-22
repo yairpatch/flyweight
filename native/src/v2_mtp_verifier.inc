@@ -128,7 +128,7 @@ void qwen_forward_rows(
             auto qnorm=tensor(5),knorm=tensor(6);
             const auto queries=fourth,gates=fourth+static_cast<std::uint64_t>(rows)*query_elements*sizeof(float);
             auto cache_keys=runtime.state+layer.state_first,cache_values=runtime.state+layer.state_second;
-            int capacity=static_cast<int>(runtime.options.context_limit);
+            int capacity=static_cast<int>(layer.cache_capacity);
             for(int token=0;token<rows;++token){
                 auto projected=first+static_cast<std::uint64_t>(token)*q_size*sizeof(float);
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
@@ -141,13 +141,14 @@ void qwen_forward_rows(
                 void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
                 launch("qwen_attention_key",kv_heads,1,256,k_args);
                 auto value=third+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
-                void*k_store_args[]={&key,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
+                int slot=static_cast<int>(static_cast<std::uint64_t>(position)%layer.cache_capacity);
+                void*k_store_args[]={&key,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
                 launch(kv_store_kernel(runtime.options.cache_type_k),kv_heads,1,256,k_store_args);
-                void*v_store_args[]={&value,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
+                void*v_store_args[]={&value,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
                 launch(kv_store_kernel(runtime.options.cache_type_v),kv_heads,1,256,v_store_args);
             }
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
-            if(head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
+            if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
                 // One warp streams the KV cache once for 4 query rows: cache
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.
@@ -161,12 +162,13 @@ void qwen_forward_rows(
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 int position=static_cast<int>(runtime.position)+token;
-                int tokens=position+1;
-                void*score_args[]={&query,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&scale};
-                launch(kv_scores_kernel(runtime),heads,(tokens+255)/256,256,score_args);
+                const auto view=attention_cache_view(layer,static_cast<std::uint64_t>(position));
+                int tokens=view.tokens,first_slot=view.first;
+                void*score_args[]={&query,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+                launch(kv_scores_ring_kernel(runtime),heads,(tokens+255)/256,256,score_args);
                 auto attended=second+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
-                void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity};
-                launch(kv_values_kernel(runtime),heads,1,256,value_args);
+                void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+                launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
                 auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);int elements=query_elements;
                 void*token_gate_args[]={&attended,&gate,&gated,&elements};launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
             }

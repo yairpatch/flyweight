@@ -453,6 +453,12 @@ def _parser() -> argparse.ArgumentParser:
         "matching request instead of reprefilling cold. Needs --parallel >= 2; "
         "each cached conversation costs one slot's state (~20 KB/token). 0 = off",
     )
+    serve_v2.add_argument(
+        "--swa-full",
+        action="store_true",
+        help="allocate full-size caches for sliding-attention layers; uses more "
+        "VRAM but preserves unrestricted prefix-cache rollback",
+    )
 
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
@@ -1111,6 +1117,7 @@ def main(argv: list[str] | None = None) -> int:
                 prefill_checkpoint_slots=args.prefill_checkpoint_slots,
                 parallel_sequences=args.parallel_sequences,
                 prompt_cache_mib=args.prompt_cache_mib,
+                swa_full=args.swa_full,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,

@@ -541,6 +541,8 @@ extern "C" int colibri_gpu_compile(
              "kv_store_f32", "kv_store_f16", "kv_store_bf16", "kv_store_q8",
              "kv_attention_scores_f16", "kv_attention_scores_bf16", "kv_attention_scores_q8",
              "kv_attention_values_f16", "kv_attention_values_bf16", "kv_attention_values_q8",
+             "kv_attention_scores_ring", "kv_attention_scores_f16_ring", "kv_attention_scores_bf16_ring", "kv_attention_scores_q8_ring",
+             "kv_attention_values_ring", "kv_attention_values_f16_ring", "kv_attention_values_bf16_ring", "kv_attention_values_q8_ring",
              "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8"
          }) {
         CUfunction function = nullptr;

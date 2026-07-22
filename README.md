@@ -468,3 +468,12 @@ The Qwen3.6 MoE path executes direct GGUF weights through native C++/CUDA,
 keeps recurrent and KV state on GPU, and supports GPU, CPU, or hybrid routed
 expert execution. v1 remains available as the converted-model reference and
 fallback backend.
+
+Native v2 also reads GGUF's generic `attention.sliding_window` and
+`attention.sliding_window_pattern` metadata. Sliding-attention layers use a
+compact circular KV cache sized to the trained window plus one prefill batch;
+global layers retain the full context cache. `serve-v2 --swa-full` keeps
+full-size storage for sliding layers when unrestricted prefix-cache rollback is
+more important than VRAM savings. This is generic cache infrastructure; model
+adapters still need to provide the architecture's attention projections and
+RoPE rules before a new architecture such as Gemma 4 can execute.

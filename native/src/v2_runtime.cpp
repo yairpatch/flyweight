@@ -80,6 +80,8 @@ struct ColibriV2KvCache { std::uint64_t keys, values; std::int32_t capacity, kv_
 
 struct QwenLayerPlan {
     bool attention = false;
+    std::uint32_t attention_window = 0; // 0 = global attention
+    std::uint64_t cache_capacity = 0;
     std::vector<std::uint64_t> static_tensors;
     std::array<std::uint64_t, 3> expert_tensors{};
     std::uint64_t state_first = 0;
@@ -472,6 +474,14 @@ int parse(ColibriV2Model& m) {
         else if (key=="tokenizer.ggml.merges" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_merges=r.get<uint64_t>();m.merges.reserve(static_cast<size_t>(count_merges));for(uint64_t merge_index=0;merge_index<count_merges;merge_index++){if(element_type==8)m.merges.push_back(r.str());else r.value(element_type);}}
         else if (key.size()>=21 && key.compare(key.size()-21,21,".rope.dimension_count")==0 && (type==4 || type==10)) m.config.rotary_dimension=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=24 && key.compare(key.size()-24,24,".full_attention_interval")==0 && (type==4 || type==10)) m.config.full_attention_interval=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=25 && key.compare(key.size()-25,25,".attention.sliding_window")==0 && (type==4 || type==10)) m.config.sliding_window=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.sliding_window_pattern")==0 && type==9) {
+            const auto element_type=r.get<uint32_t>();
+            const auto elements=r.get<uint64_t>();
+            if(element_type!=7)throw std::runtime_error("GGUF sliding-window pattern must be boolean");
+            m.config.sliding_window_pattern.reserve(static_cast<std::size_t>(elements));
+            for(std::uint64_t element=0;element<elements;++element)m.config.sliding_window_pattern.push_back(r.get<std::uint8_t>()?1:0);
+        }
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.layer_norm_rms_epsilon")==0 && (type==6 || type==12)) m.config.rms_norm_epsilon=read_float(type);
         else if (key.size()>=15 && key.compare(key.size()-15,15,".rope.freq_base")==0 && (type==6 || type==12)) m.config.rope_freq_base=read_float(type);
         else if (set_config(key,type)) {}
@@ -497,6 +507,8 @@ int parse(ColibriV2Model& m) {
             throw std::runtime_error("invalid Qwen MTP tensor layer index");
         }
     }
+    if(!m.config.sliding_window_pattern.empty()&&m.config.sliding_window_pattern.size()<m.config.layer_count)
+        throw std::runtime_error("GGUF sliding-window pattern is shorter than the model layer count");
     uint64_t data_offset=align_to(static_cast<uint64_t>(r.p-m.data),m.alignment ? m.alignment : 32); if(data_offset>m.size) throw std::runtime_error("GGUF tensor data is outside the file"); for(auto& t:m.tensors) { if(t.offset>m.size-data_offset) throw std::runtime_error("GGUF tensor offset out of bounds"); t.offset += data_offset; }
     for(size_t i=0;i<m.tensors.size();i++) { auto& t=m.tensors[i]; uint64_t next=m.size; for(auto const& other:m.tensors) if(other.offset>t.offset) next=std::min(next,other.offset); t.size=next-t.offset; }
     // Tokenizer lookup tables, built once per model: rebuilding these
@@ -504,6 +516,13 @@ int parse(ColibriV2Model& m) {
     for(int rank=0;rank<static_cast<int>(m.merges.size());rank++)m.merge_ranks[m.merges[rank]]=rank;
     for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++)m.vocabulary_ids.emplace(m.vocabulary[id],id);
     return 0;
+}
+
+std::uint32_t attention_window(const ColibriV2Model& model, std::uint32_t layer) {
+    if(layer>=model.config.layer_count)throw std::runtime_error("attention layer index is out of range");
+    if(!model.config.sliding_window)return 0;
+    const auto& pattern=model.config.sliding_window_pattern;
+    return pattern.empty()||pattern[layer]?model.config.sliding_window:0;
 }
 
 int fill(const Tensor& t, ColibriV2TensorInfo& out) { std::memset(&out,0,sizeof(out)); out.dimensions=static_cast<uint32_t>(t.shape.size()); std::copy(t.shape.begin(),t.shape.end(),out.shape); out.ggml_type=t.type; out.offset=t.offset; out.size=t.size; copy_text(out.name,sizeof(out.name),t.name); return 0; }
@@ -553,6 +572,7 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
         const std::string prefix = "blk." + std::to_string(layer_index) + ".";
         QwenLayerPlan layer;
         layer.attention = has_tensor(model, prefix + "attn_q.weight");
+        if(layer.attention)layer.attention_window=attention_window(model,layer_index);
         add_static_tensor(runtime, layer, prefix + "attn_norm.weight");
         if (layer.attention) {
             for (const char* suffix : {
@@ -886,7 +906,8 @@ void colibri_v2_model_close(ColibriV2Model* m) { if(!m)return;
 #endif
     delete m; }
 int colibri_v2_model_info(const ColibriV2Model* m, ColibriV2ModelInfo* out) { return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model info handle"); std::memset(out,0,sizeof(*out));out->gguf_version=m->version;out->tensor_count=m->tensor_count();out->metadata_count=m->metadata;out->file_size=m->size;out->alignment=m->alignment;copy_text(out->architecture,sizeof(out->architecture),m->architecture);copy_text(out->name,sizeof(out->name),m->name);copy_text(out->format,sizeof(out->format),m->format());return 0;}); }
-int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;return 0;});}
+int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;return 0;});}
+int colibri_v2_model_attention_window(const ColibriV2Model* m,uint32_t layer,uint32_t*out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model attention-window handle");*out=attention_window(*m,layer);return 0;});}
 int colibri_v2_tensor_info(const ColibriV2Model* m,uint64_t i,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("tensor index out of range");return fill(m->tensors[i],*out);});}
 int colibri_v2_tensor_find(const ColibriV2Model* m,const char* name,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!name||!out)throw std::runtime_error("invalid tensor lookup");for(auto const&t:m->tensors)if(t.name==name)return fill(t,*out);throw std::runtime_error("tensor not found");});}
 int colibri_v2_qwen_validate(const ColibriV2Model*m){return guarded([&]{if(!m)throw std::runtime_error("invalid model handle");if(m->config.architecture.find("qwen")!=0)throw std::runtime_error("model architecture is not Qwen");if(!m->config.hidden_size||!m->config.layer_count||!m->config.attention_heads)throw std::runtime_error("Qwen config is incomplete");return 0;});}
@@ -1011,6 +1032,9 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     std::memset(out,0,sizeof(*out));
     out->layers=static_cast<uint32_t>(runtime->layers.size());
     out->attention_layers=static_cast<uint32_t>(std::count_if(runtime->layers.begin(),runtime->layers.end(),[](const QwenLayerPlan&layer){return layer.attention;}));
+    out->swa_layers=static_cast<uint32_t>(std::count_if(runtime->layers.begin(),runtime->layers.end(),[](const QwenLayerPlan&layer){return layer.attention_window!=0;}));
+    out->sliding_window=runtime->model->config.sliding_window;
+    out->swa_full=runtime->options.swa_full?1:0;
     out->deltanet_layers=out->layers-out->attention_layers;
     out->hidden_size=runtime->model->config.hidden_size;
     out->expert_count=runtime->model->config.expert_count;
@@ -1111,7 +1135,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(layer.attention){
                 const auto&key=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".attn_k.weight")];
                 const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
-                const auto cache_floats=runtime->model->config.attention_kv_heads*runtime->options.context_limit*head_dim;
+                const auto batch_room=std::max<std::uint64_t>(runtime->prefill_rows,9);
+                layer.cache_capacity=layer.attention_window&&!runtime->options.swa_full
+                    ?std::min<std::uint64_t>(runtime->options.context_limit,static_cast<std::uint64_t>(layer.attention_window)+batch_room)
+                    :runtime->options.context_limit;
+                const auto cache_floats=runtime->model->config.attention_kv_heads*layer.cache_capacity*head_dim;
                 layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
                 layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
             }else{
@@ -1124,6 +1152,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         }
         if(runtime->options.mtp_drafts){
             auto&layer=runtime->mtp_layer_plan;
+            layer.cache_capacity=runtime->options.context_limit;
             const auto&key=runtime->model->tensors[layer.static_tensors[2]];
             const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
             const auto cache_floats=runtime->model->config.attention_kv_heads*runtime->options.context_limit*head_dim;
@@ -1610,6 +1639,25 @@ inline std::uint64_t kv_region_bytes(std::uint64_t elems,int type){return type==
 inline const char* kv_store_kernel(int t){return t==3?"kv_store_q8":t==2?"kv_store_bf16":t==1?"kv_store_f16":"kv_store_f32";}
 inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_scores_q8":t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";}
 inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==3?"kv_attention_values_q8":t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
+inline const char* kv_scores_ring_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_scores_q8_ring":t==2?"kv_attention_scores_bf16_ring":t==1?"kv_attention_scores_f16_ring":"kv_attention_scores_ring";}
+inline const char* kv_values_ring_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==3?"kv_attention_values_q8_ring":t==2?"kv_attention_values_bf16_ring":t==1?"kv_attention_values_f16_ring":"kv_attention_values_ring";}
+
+struct AttentionCacheView { int slot, first, tokens, capacity; };
+inline AttentionCacheView attention_cache_view(const QwenLayerPlan& layer,std::uint64_t position){
+    const auto capacity=static_cast<int>(layer.cache_capacity);
+    const auto visible=layer.attention_window
+        ?std::min<std::uint64_t>(position+1,layer.attention_window):position+1;
+    const auto first_absolute=position+1-visible;
+    return {static_cast<int>(position%layer.cache_capacity),static_cast<int>(first_absolute%layer.cache_capacity),static_cast<int>(visible),capacity};
+}
+inline bool swa_snapshot_is_resident(const ColibriV2QwenRuntime& runtime,std::uint64_t snapshot_position,std::uint64_t live_position){
+    if(snapshot_position>live_position)return false;
+    for(const auto& layer:runtime.layers)if(layer.attention_window&&layer.cache_capacity<runtime.options.context_limit){
+        const auto rollback_room=layer.cache_capacity-layer.attention_window;
+        if(live_position-snapshot_position>rollback_room)return false;
+    }
+    return true;
+}
 inline bool kv_fused_prefill_ok(const ColibriV2QwenRuntime& r){return r.options.cache_type_k==r.options.cache_type_v;}
 inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_prefill_q8":t==2?"kv_attention_prefill_bf16":t==1?"kv_attention_prefill_f16":"kv_attention_prefill";}
 
@@ -1713,16 +1761,17 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,&keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),const_cast<int*>(&position),const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
             launch_named("qwen_attention_key",kv_heads,1,256,k_args);
             std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
-            int capacity=static_cast<int>(runtime->options.context_limit);
-            void*k_store_args[]={&keys,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&position),&capacity};
+            const auto view=attention_cache_view(layer,runtime->position);
+            int slot=view.slot,capacity=view.capacity;
+            void*k_store_args[]={&keys,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
             launch_named(kv_store_kernel(runtime->options.cache_type_k),kv_heads,1,256,k_store_args);
-            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&position),&capacity};
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
             launch_named(kv_store_kernel(runtime->options.cache_type_v),kv_heads,1,256,v_store_args);
-            std::uint64_t attended=second;int tokens=position+1;float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
-            void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&scale};
-            launch_named(kv_scores_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
-            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity};
-            launch_named(kv_values_kernel(*runtime),heads,1,256,value_args);
+            std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+            launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
+            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+            launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
             std::uint64_t gated=third;int elements=heads*head_dim;
             void*gate_args[]={&attended,&gates,&gated,&elements};
             launch_named("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
@@ -1965,8 +2014,8 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
             for (int cache = 0; cache < 2; ++cache) {
                 const auto base = cache ? layer.state_second : layer.state_first;
                 const int type = cache ? cv : ck;
-                const auto slab = qwen_kv_region_bytes(runtime.options.context_limit * head_dim, type);
-                const auto used = qwen_kv_region_bytes(position * head_dim, type);
+                const auto slab = qwen_kv_region_bytes(layer.cache_capacity * head_dim, type);
+                const auto used = qwen_kv_region_bytes(std::min<std::uint64_t>(position,layer.cache_capacity) * head_dim, type);
                 if (!used) continue;
                 for (std::uint64_t head = 0; head < kv_heads; ++head)
                     ranges.emplace_back(base + head * slab, used);
@@ -2202,6 +2251,7 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
         QwenPrefillSnapshot*snapshot=nullptr;
         for(auto&candidate:runtime->prefill_snapshots){
             if(!candidate.valid||candidate.tokens.empty()||candidate.tokens.size()>prompt_count)continue;
+            if(!swa_snapshot_is_resident(*runtime,candidate.tokens.size(),runtime->position))continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt))continue;
             if(candidate.tokens.size()>runtime->processed_tokens.size())continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),runtime->processed_tokens.begin()))continue;
@@ -2612,17 +2662,18 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 void* k_args[] = {const_cast<std::uint64_t*>(&s.second), &knorm, &keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&rotary), const_cast<int*>(&position), const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
                 launch_named("qwen_attention_key", kv_heads, 1, 256, k_args);
                 std::uint64_t cache_keys = s.state + layer.state_first, cache_values = s.state + layer.state_second;
-                int capacity = static_cast<int>(runtime->options.context_limit);
-                void* k_store_args[] = {&keys, &cache_keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&position), &capacity};
+                const auto view=attention_cache_view(layer,s.position);
+                int slot=view.slot,capacity=view.capacity;
+                void* k_store_args[] = {&keys, &cache_keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &slot, &capacity};
                 launch_named(kv_store_kernel(runtime->options.cache_type_k), kv_heads, 1, 256, k_store_args);
-                void* v_store_args[] = {const_cast<std::uint64_t*>(&s.third), &cache_values, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&position), &capacity};
+                void* v_store_args[] = {const_cast<std::uint64_t*>(&s.third), &cache_values, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &slot, &capacity};
                 launch_named(kv_store_kernel(runtime->options.cache_type_v), kv_heads, 1, 256, v_store_args);
-                std::uint64_t attended = s.second; int tokens = position + 1;
+                std::uint64_t attended = s.second; int tokens=view.tokens,first_slot=view.first;
                 float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-                void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &scale};
-                launch_named(kv_scores_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
-                void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity};
-                launch_named(kv_values_kernel(*runtime), heads, 1, 256, value_args);
+                void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot, &scale};
+                launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
+                void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot};
+                launch_named(kv_values_ring_kernel(*runtime), heads, 1, 256, value_args);
                 std::uint64_t gated = s.third; int elements = heads * head_dim;
                 void* gate_args[] = {&attended, &gates, &gated, &elements};
                 launch_named("qwen_attention_gate", (elements + 255) / 256, 1, 256, gate_args);
