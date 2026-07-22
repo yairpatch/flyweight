@@ -1119,7 +1119,6 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(gemma4&&runtime->options.mtp_drafts)throw std::runtime_error("native Gemma 4 MTP is not implemented");
     if(gemma4&&runtime->options.moe_device==0)throw std::runtime_error("native Gemma 4 supports --moe-device cpu or hybrid");
-    if(gemma4&&runtime->options.parallel_sequences>1)throw std::runtime_error("native Gemma 4 currently supports one sequence");
     if(gemma4&&m->config.per_layer_embedding_size)throw std::runtime_error("native Gemma 4 per-layer embeddings are not implemented");
     if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
@@ -1184,7 +1183,10 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->context_limit=runtime->options.context_limit;
     out->static_tensor_bytes=runtime->static_tensor_bytes;
     out->expert_tensor_bytes=runtime->expert_tensor_bytes;
-    out->gpu_allocated_bytes=runtime->static_arena_bytes+runtime->workspace_bytes+runtime->state_bytes+runtime->expert_staging_bytes+runtime->expert_cache_bytes;
+    const std::uint64_t sequence_slots=std::max<std::size_t>(1,runtime->sequences.size());
+    out->gpu_allocated_bytes=runtime->static_arena_bytes+runtime->workspace_bytes+
+        sequence_slots*runtime->state_bytes+runtime->expert_staging_bytes+
+        runtime->expert_cache_bytes+sequence_slots*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
     out->workspace_bytes=runtime->workspace_bytes;
     out->state_bytes=runtime->state_bytes;
     out->expert_staging_bytes=runtime->expert_staging_bytes;
@@ -1377,7 +1379,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->host_staging_bytes=std::max(runtime->expert_staging_bytes,device_align(forward_host_bytes));
         runtime->multi_decode_capacity=1;
         const std::uint64_t decode_slots=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
-        if(decode_slots>1&&runtime->options.moe_device!=0){
+        // Gemma 4 supports independent sequence slots, but its hybrid expert
+        // path currently schedules those slots sequentially. The Qwen
+        // layer-overlapped multi-decode driver assumes separate gate/up/down
+        // expert tensors and must not consume Gemma's fused Q4_0 bundles.
+        if(decode_slots>1&&runtime->options.moe_device!=0&&!runtime->gemma4){
             const std::uint64_t by_workspace=runtime->workspace_bytes/runtime->decode_slice_bytes;
             runtime->multi_decode_capacity=static_cast<std::uint32_t>(
                 std::min(std::min(decode_slots,by_workspace),std::uint64_t{4}));

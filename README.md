@@ -493,3 +493,11 @@ keeping the remaining Gemma 4 experts in host memory:
 PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
   --moe-device hybrid --gpu-cache-mib 4096 --context-window 32768
 ```
+
+`--parallel N` allocates an independent Gemma 4 KV slot for each concurrent
+conversation. Requests are interleaved safely through the cooperative engine;
+Gemma slots currently decode sequentially rather than using Qwen's
+architecture-specific layer-overlap driver. With `--parallel 2` or higher,
+`--prompt-cache-mib` can spill inactive slots to host RAM for later reuse.
+Each slot multiplies KV memory, so keep compact SWA enabled at long contexts;
+`--swa-full` with multiple 58K-token slots generally exceeds consumer VRAM.

@@ -137,10 +137,20 @@ class V2RuntimeTests(unittest.TestCase):
             return_value={"architecture": "gemma4"},
         ), patch.object(V2Model, "native_qwen_runtime", return_value="runtime") as create:
             self.assertEqual(
-                model.native_runtime(context_limit=32, moe_device="hybrid"),
+                model.native_runtime(
+                    context_limit=32,
+                    moe_device="hybrid",
+                    parallel_sequences=2,
+                    prompt_cache_mib=64,
+                ),
                 "runtime",
             )
-            create.assert_called_once_with(context_limit=32, moe_device="hybrid")
+            create.assert_called_once_with(
+                context_limit=32,
+                moe_device="hybrid",
+                parallel_sequences=2,
+                prompt_cache_mib=64,
+            )
 
     def test_gemma4_decode_converts_word_boundary_markers_to_spaces(self):
         model = object.__new__(V2Model)
