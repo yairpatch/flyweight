@@ -534,3 +534,9 @@ vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to
 scalar math. Developers can set `COLIBRI_CPU_BACKEND=scalar|avx2|avx512` before
 process startup to reproduce backend-specific correctness and performance;
 CPUID masking prevents selecting instructions unsupported by the host.
+
+For kernel-level diagnosis, developers can set `COLIBRI_CUDA_PROFILE=1` before
+starting a native Qwen process. Each single-token decode then reports CUDA
+event timings for DeltaNet or attention work before MoE, the shared expert,
+the routed-expert pipeline, and the final LM head. The profiler is disabled by
+default and allocates no timing events in normal server or benchmark runs.

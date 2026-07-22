@@ -71,6 +71,7 @@ struct CudaApi {
     CUresult (*cuStreamWaitEvent)(CUstream, CUevent, unsigned int) = nullptr;
     CUresult (*cuEventSynchronize)(CUevent) = nullptr;
     CUresult (*cuEventDestroy)(CUevent) = nullptr;
+    CUresult (*cuEventElapsedTime)(float*, CUevent, CUevent) = nullptr;
     CUresult (*cuStreamBeginCapture)(CUstream, int) = nullptr;
     CUresult (*cuStreamEndCapture)(CUstream, void**) = nullptr;
     CUresult (*cuGraphInstantiateWithFlags)(
@@ -188,6 +189,7 @@ bool load_apis() {
     ok &= load_symbol(cuda, "cuStreamWaitEvent", g_api.cuStreamWaitEvent);
     ok &= load_symbol(cuda, "cuEventSynchronize", g_api.cuEventSynchronize);
     ok &= load_symbol(cuda, "cuEventDestroy_v2", g_api.cuEventDestroy);
+    ok &= load_symbol(cuda, "cuEventElapsedTime", g_api.cuEventElapsedTime);
     ok &= load_symbol(
         cuda, "cuStreamBeginCapture_v2", g_api.cuStreamBeginCapture
     );
@@ -854,6 +856,14 @@ extern "C" int colibri_gpu_event_create(std::uint64_t* event) {
     return 0;
 }
 
+extern "C" int colibri_gpu_timed_event_create(std::uint64_t* event) {
+    if (event == nullptr) return -1;
+    CUevent created = nullptr;
+    if (g_api.cuEventCreate(&created, 0) != 0) return -2;
+    *event = reinterpret_cast<std::uint64_t>(created);
+    return 0;
+}
+
 extern "C" int colibri_gpu_event_record(
     std::uint64_t event, std::uint64_t stream
 ) {
@@ -882,6 +892,16 @@ extern "C" int colibri_gpu_event_destroy(std::uint64_t event) {
     if (event == 0) return 0;
     return g_api.cuEventDestroy(reinterpret_cast<CUevent>(event)) == 0
         ? 0 : -1;
+}
+
+extern "C" int colibri_gpu_event_elapsed(
+    std::uint64_t start, std::uint64_t end, float* milliseconds
+) {
+    if (start == 0 || end == 0 || milliseconds == nullptr) return -1;
+    return g_api.cuEventElapsedTime(
+        milliseconds, reinterpret_cast<CUevent>(start),
+        reinterpret_cast<CUevent>(end)
+    ) == 0 ? 0 : -2;
 }
 
 extern "C" int colibri_gpu_q8_matvec_transposed(

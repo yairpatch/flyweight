@@ -175,6 +175,7 @@ COLIBRI_API int colibri_gpu_stream_create(std::uint64_t* stream);
 COLIBRI_API int colibri_gpu_stream_destroy(std::uint64_t stream);
 COLIBRI_API int colibri_gpu_stream_sync(std::uint64_t stream);
 COLIBRI_API int colibri_gpu_event_create(std::uint64_t* event);
+COLIBRI_API int colibri_gpu_timed_event_create(std::uint64_t* event);
 COLIBRI_API int colibri_gpu_event_record(
     std::uint64_t event, std::uint64_t stream
 );
@@ -183,6 +184,9 @@ COLIBRI_API int colibri_gpu_stream_wait_event(
     std::uint64_t stream, std::uint64_t event
 );
 COLIBRI_API int colibri_gpu_event_destroy(std::uint64_t event);
+COLIBRI_API int colibri_gpu_event_elapsed(
+    std::uint64_t start, std::uint64_t end, float* milliseconds
+);
 COLIBRI_API int colibri_gpu_q8_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream

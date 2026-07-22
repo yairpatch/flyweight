@@ -104,6 +104,12 @@ struct QwenExpertHistory {
     std::uint64_t last_used = 0;
 };
 
+struct QwenCudaLayerProfile {
+    std::uint64_t pre_start=0,pre_end=0;
+    std::uint64_t shared_start=0,shared_end=0;
+    std::uint64_t expert_start=0,expert_end=0;
+};
+
 // DeltaNet conv+recurrent states captured at the end of a prompt prefill,
 // keyed by the exact prompt token sequence. Lets a follow-up request reuse
 // the whole conversation prefix even though the recurrent state cannot be
@@ -265,6 +271,9 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_snapshot_clock = 0;
     std::uint64_t stream = 0;
     std::uint64_t route_event = 0;
+    bool cuda_profile = false;
+    std::vector<QwenCudaLayerProfile> cuda_layer_profiles;
+    std::uint64_t cuda_tail_start = 0, cuda_tail_end = 0;
     std::uint64_t position = 0;
     std::uint32_t last_output_token = 0;
     std::vector<std::uint32_t> processed_tokens;
@@ -434,6 +443,19 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     colibri_gpu_event_destroy(runtime.staging_event);
     runtime.staging_event = 0;
     colibri_gpu_event_destroy(runtime.route_event);
+    for(auto&profile:runtime.cuda_layer_profiles){
+        colibri_gpu_event_destroy(profile.pre_start);
+        colibri_gpu_event_destroy(profile.pre_end);
+        colibri_gpu_event_destroy(profile.shared_start);
+        colibri_gpu_event_destroy(profile.shared_end);
+        colibri_gpu_event_destroy(profile.expert_start);
+        colibri_gpu_event_destroy(profile.expert_end);
+    }
+    runtime.cuda_layer_profiles.clear();
+    colibri_gpu_event_destroy(runtime.cuda_tail_start);
+    colibri_gpu_event_destroy(runtime.cuda_tail_end);
+    runtime.cuda_tail_start=runtime.cuda_tail_end=0;
+    runtime.cuda_profile=false;
     colibri_gpu_stream_destroy(runtime.stream);
     runtime.device_tensors.clear();
     runtime.host_staging = nullptr;
@@ -897,7 +919,8 @@ void qwen_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,c
 #pragma omp parallel for schedule(static)
 for(int task=0;task<routed_count*intermediate;++task){const int rank=task/intermediate,row=task%intermediate;const float gate_value=qwen_quant_dot(gate[rank],runtime.model->tensors[layer.expert_tensors[0]].type,input,hidden,row);const float up_value=qwen_quant_dot(up[rank],runtime.model->tensors[layer.expert_tensors[1]].type,input,hidden,row);const float clipped=std::max(-80.0f,std::min(80.0f,gate_value));activated[task]=gate_value/(1.0f+std::exp(-clipped))*up_value;}
 #pragma omp parallel for schedule(static)
-for(int row=0;row<hidden;++row){float value=0.0f;for(int rank=0;rank<routed_count;++rank)value+=weights[rank]*qwen_quant_dot(down[rank],runtime.model->tensors[layer.expert_tensors[2]].type,activated+rank*intermediate,intermediate,row);output[row]=value;}}
+for(int row=0;row<hidden;++row){float value=0.0f;for(int rank=0;rank<routed_count;++rank)value+=weights[rank]*qwen_quant_dot(down[rank],runtime.model->tensors[layer.expert_tensors[2]].type,activated+rank*intermediate,intermediate,row);output[row]=value;}
+}
 
 void qwen_cpu_moe_rows(
     const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
@@ -1287,6 +1310,23 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     runtime->cuda_ready=true;
     if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
     if(colibri_gpu_event_create(&runtime->route_event)!=0){release_qwen_device(*runtime);throw std::runtime_error("failed to create native Qwen route event");}
+    if(const char*profile=std::getenv("COLIBRI_CUDA_PROFILE");profile&&profile[0]&&profile[0]!='0'){
+        runtime->cuda_profile=true;
+        runtime->cuda_layer_profiles.resize(runtime->layers.size());
+        auto create_profile_event=[&](std::uint64_t&event){
+            if(colibri_gpu_timed_event_create(&event)!=0){
+                release_qwen_device(*runtime);
+                throw std::runtime_error("failed to create native Qwen CUDA profiling event");
+            }
+        };
+        for(auto&events:runtime->cuda_layer_profiles){
+            create_profile_event(events.pre_start);create_profile_event(events.pre_end);
+            create_profile_event(events.shared_start);create_profile_event(events.shared_end);
+            create_profile_event(events.expert_start);create_profile_event(events.expert_end);
+        }
+        create_profile_event(runtime->cuda_tail_start);
+        create_profile_event(runtime->cuda_tail_end);
+    }
     try {
         std::vector<bool> persistent(runtime->model->tensors.size(),false);
         persistent[runtime->token_embeddings]=true;
@@ -2221,6 +2261,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     auto q8=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){if(colibri_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,runtime->stream)!=0)throw std::runtime_error("native Qwen Q8 projection failed");};
     auto f32=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec",output_size,1,256,args);};
     auto add=[&](std::uint64_t target,std::uint64_t source){float scale=1.0f;int count=hidden_size;void*args[]={&target,&source,&scale,&count};launch_named("scaled_add",(hidden_size+255)/256,1,256,args);};
+    auto profile_record=[&](std::uint64_t event){if(runtime->cuda_profile&&colibri_gpu_event_record(event,runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA profiling event failed");};
     {
         const auto embedding=runtime->device_tensors[runtime->token_embeddings];
         const int token=static_cast<int>(input_token);int width=hidden_size;
@@ -2229,6 +2270,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     }
     for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
         auto&layer=runtime->layers[layer_number];
+        auto*profile=runtime->cuda_profile?&runtime->cuda_layer_profiles[layer_number]:nullptr;
+        if(profile)profile_record(profile->pre_start);
         auto tensor=[&](std::size_t role){return runtime->device_tensors[layer.static_tensors.at(role)];};
         rms(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
@@ -2303,6 +2346,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(colibri_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime->stream)!=0)throw std::runtime_error("native Qwen route transfer failed");
         if(runtime->options.moe_device!=0&&(colibri_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime->stream)!=0||colibri_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime->stream)!=0))throw std::runtime_error("native Qwen CPU MoE input transfer failed");
         if(colibri_gpu_event_record(runtime->route_event,runtime->stream)!=0)throw std::runtime_error("native Qwen route event failed");
+        if(profile){profile_record(profile->pre_end);profile_record(profile->shared_start);}
         const int intermediate=static_cast<int>(runtime->moe_intermediate);
         auto shared_gate_matrix=tensor(moe_base+2),shared_up_matrix=tensor(moe_base+3);
         void*silu_args[]={&shared_gate_matrix,&shared_up_matrix,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&second),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate)};
@@ -2310,9 +2354,11 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         q8(tensor(moe_base+4),second,third,intermediate,hidden_size);
         auto shared_gate=tensor(moe_base+5);void*shared_args[]={const_cast<std::uint64_t*>(&normalized),&shared_gate,const_cast<std::uint64_t*>(&third),const_cast<int*>(&hidden_size)};
         launch_named("qwen_shared_scale",1,1,256,shared_args);
+        if(profile)profile_record(profile->shared_end);
         const auto route_wait_started=std::chrono::steady_clock::now();
         if(colibri_gpu_event_sync(runtime->route_event)!=0)throw std::runtime_error("native Qwen route event failed");
         runtime->route_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
+        if(profile)profile_record(profile->expert_start);
         // Optional adaptive expert pruning (top-p / hard top-k). Runs only for
         // the CPU/hybrid paths, whose expert weights are the host `cpu_weights`
         // this reorders/renormalizes; the streamed-GPU path keeps its device
@@ -2440,8 +2486,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         }
         runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
         add(residual,third);
+        if(profile)profile_record(profile->expert_end);
         std::swap(hidden,residual);
     }
+    if(runtime->cuda_profile)profile_record(runtime->cuda_tail_start);
     if(runtime->options.mtp_drafts){
         auto target_hidden=runtime->state+runtime->mtp_target_hidden_offset;
         void*copy_args[]={const_cast<std::uint64_t*>(&hidden),&target_hidden,const_cast<int*>(&hidden_size)};
@@ -2456,9 +2504,26 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     launch_named("q8_lm_head_argmax_warp",(vocabulary+7)/8,1,256,argmax_args);
     auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);
     if(colibri_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime->stream)!=0)throw std::runtime_error("native Qwen output transfer failed");
+    if(runtime->cuda_profile)profile_record(runtime->cuda_tail_end);
     const auto tail_wait_started=std::chrono::steady_clock::now();
     if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
     runtime->tail_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tail_wait_started).count();
+    if(runtime->cuda_profile){
+        float delta_ms=0.0f,attention_ms=0.0f,shared_ms=0.0f,expert_ms=0.0f,tail_ms=0.0f;
+        std::uint32_t delta_layers=0,attention_layers=0;
+        auto elapsed=[](std::uint64_t start,std::uint64_t end){float value=0.0f;if(colibri_gpu_event_elapsed(start,end,&value)!=0)throw std::runtime_error("native Qwen CUDA profiling measurement failed");return value;};
+        for(std::size_t index=0;index<runtime->layers.size();++index){
+            const auto&events=runtime->cuda_layer_profiles[index];
+            const float pre=elapsed(events.pre_start,events.pre_end);
+            if(runtime->layers[index].attention){attention_ms+=pre;++attention_layers;}else{delta_ms+=pre;++delta_layers;}
+            shared_ms+=elapsed(events.shared_start,events.shared_end);
+            expert_ms+=elapsed(events.expert_start,events.expert_end);
+        }
+        tail_ms=elapsed(runtime->cuda_tail_start,runtime->cuda_tail_end);
+        std::fprintf(stderr,"[cuda-profile] position=%llu delta=%.3fms/%u attention=%.3fms/%u shared=%.3fms expert=%.3fms tail=%.3fms total=%.3fms\n",
+            static_cast<unsigned long long>(runtime->position),delta_ms,delta_layers,attention_ms,attention_layers,
+            shared_ms,expert_ms,tail_ms,delta_ms+attention_ms+shared_ms+expert_ms+tail_ms);
+    }
     *output_token=0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
     runtime->last_output_token=*output_token;
     runtime->processed_tokens.push_back(input_token);
