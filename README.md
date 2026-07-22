@@ -534,11 +534,11 @@ vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to
 scalar math. Developers can set `COLIBRI_CPU_BACKEND=scalar|avx2|avx512` before
 process startup to reproduce backend-specific correctness and performance;
 CPUID masking prevents selecting instructions unsupported by the host.
-On AVX2-capable hosts, single-token Qwen CPU/hybrid MoE quantizes each input
-activation to Q8_K once and reuses it across the Q5_K, Q6_K, or Q8_0 expert
-rows. Hosts without AVX2 keep the floating-point compatibility path. Set
-`COLIBRI_Q8_ACTIVATIONS=0` for output or performance comparisons with that
-fallback.
+`COLIBRI_Q8_ACTIVATIONS=1` enables an experimental single-token Qwen CPU/hybrid
+MoE path that quantizes each input activation to Q8_K once and reuses it across
+the Q5_K, Q6_K, or Q8_0 expert rows. It requires AVX2 and remains opt-in because
+the extra quantization did not improve warm decode on the tested bandwidth-bound
+CPU. The floating-point expert path remains the default on every host.
 
 For kernel-level diagnosis, developers can set `COLIBRI_CUDA_PROFILE=1` before
 starting a native Qwen process. Each single-token decode then reports CUDA
