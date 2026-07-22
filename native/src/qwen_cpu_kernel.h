@@ -2,6 +2,14 @@
 
 #include <cstdint>
 
+struct QwenQ8KBlock {
+    float scale;
+    std::int8_t values[256];
+    std::int16_t sums[16];
+};
+
+static_assert(sizeof(QwenQ8KBlock) == 292);
+
 float qwen_quant_dot_avx512(
     const std::uint8_t* packed,
     std::uint32_t type,
@@ -14,6 +22,20 @@ float qwen_quant_dot_avx2(
     const std::uint8_t* packed,
     std::uint32_t type,
     const float* input,
+    int elements,
+    std::uint64_t row
+);
+
+void qwen_quantize_q8_k_avx2(
+    const float* input,
+    int elements,
+    QwenQ8KBlock* output
+);
+
+float qwen_quant_dot_q8_k_avx2(
+    const std::uint8_t* packed,
+    std::uint32_t type,
+    const QwenQ8KBlock* input,
     int elements,
     std::uint64_t row
 );

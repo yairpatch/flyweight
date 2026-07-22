@@ -28,8 +28,11 @@ bool quant_contract(std::uint32_t type,int row_bytes){
         else if(type==14)set_half(base+208,0x3c00);
         else for(int block=0;block<8;++block)set_half(base+block*34,0x3c00);
     }
-    std::vector<float> input(elements),dequant(elements);
+    std::vector<float> input(elements),dequant(elements),q8_input(elements);
     for(int i=0;i<elements;++i)input[i]=std::sin(i*0.071f)*0.75f;
+    QwenQ8KBlock q8{};
+    qwen_quantize_q8_k_avx2(input.data(),elements,&q8);
+    for(int i=0;i<elements;++i)q8_input[i]=q8.scale*q8.values[i];
     for(int row=0;row<rows;++row){
         qwen_dequant_row_avx2(packed.data(),type,elements,row,dequant.data());
         float reference=0.0f;
@@ -37,6 +40,11 @@ bool quant_contract(std::uint32_t type,int row_bytes){
         const float actual=qwen_quant_dot_avx2(
             packed.data(),type,input.data(),elements,row);
         if(!close(reference,actual))return false;
+        float q8_reference=0.0f;
+        for(int i=0;i<elements;++i)q8_reference+=dequant[i]*q8_input[i];
+        const float q8_actual=qwen_quant_dot_q8_k_avx2(
+            packed.data(),type,&q8,elements,row);
+        if(!close(q8_reference,q8_actual))return false;
     }
     return true;
 }
