@@ -281,6 +281,16 @@ struct ColibriV2QwenRuntime {
     std::vector<long long> slot_owner;
     std::size_t engine_cursor = 0;
     std::mutex engine_mutex;
+    // Multi-sequence decode (engine Phase B): per-slot route events let each
+    // sequence's router readback complete independently; the staging event
+    // fences reuse of the shared expert-paging staging area against its async
+    // (stream-queued) consumers. Capacity is how many per-sequence workspace
+    // slices fit; host block is one sequence's private host staging.
+    std::vector<std::uint64_t> slot_events;
+    std::uint64_t staging_event = 0;
+    std::uint64_t decode_slice_bytes = 0;
+    std::uint64_t decode_host_block_bytes = 0;
+    std::uint32_t multi_decode_capacity = 1;
     bool cancelled = false;
     bool cache_admission_enabled = true;
     bool mtp_has_target_hidden = false;
@@ -405,6 +415,10 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.host_cache_used_bytes = 0;
     colibri_gpu_free(runtime.workspace);
     colibri_gpu_free(runtime.static_arena);
+    for (auto& event : runtime.slot_events) colibri_gpu_event_destroy(event);
+    runtime.slot_events.clear();
+    colibri_gpu_event_destroy(runtime.staging_event);
+    runtime.staging_event = 0;
     colibri_gpu_event_destroy(runtime.route_event);
     colibri_gpu_stream_destroy(runtime.stream);
     runtime.device_tensors.clear();
@@ -1174,6 +1188,16 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             device_align(rows*top_k*sizeof(std::uint64_t))*3+
             device_align(rows*top_k*sizeof(float))+
             device_align(rows*sizeof(std::int32_t));
+        // Multi-sequence decode slices one decode workspace per sequence out of
+        // the (rows-forward-sized) workspace; capacity is bounded by what fits.
+        runtime->decode_slice_bytes=decode_workspace_bytes;
+        runtime->decode_host_block_bytes=
+            device_align(top_k*sizeof(std::int32_t))+
+            device_align(top_k*sizeof(float))+
+            device_align(hidden*sizeof(float))+
+            device_align(top_k*runtime->moe_intermediate*sizeof(float))+
+            device_align(hidden*sizeof(float))+
+            device_align(sizeof(std::uint64_t));
         runtime->workspace_bytes=device_align(std::max<std::uint64_t>(
             16ULL*1024*1024,
             std::max({max_vector*sizeof(float)*8, decode_workspace_bytes, forward_workspace_bytes})
@@ -1182,6 +1206,18 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         for(const auto&layer:runtime->layers){std::uint64_t bytes=0;for(auto tensor:layer.expert_tensors)bytes+=runtime->model->tensors[tensor].size/runtime->model->config.expert_count;one_expert=std::max(one_expert,bytes);}
         runtime->expert_staging_bytes=device_align(one_expert*runtime->model->config.expert_used_count*2);
         runtime->host_staging_bytes=std::max(runtime->expert_staging_bytes,device_align(forward_host_bytes));
+        runtime->multi_decode_capacity=1;
+        const std::uint64_t decode_slots=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+        if(decode_slots>1&&runtime->options.moe_device!=0){
+            const std::uint64_t by_workspace=runtime->workspace_bytes/runtime->decode_slice_bytes;
+            runtime->multi_decode_capacity=static_cast<std::uint32_t>(
+                std::min(std::min(decode_slots,by_workspace),std::uint64_t{4}));
+            // Sequence-private host blocks sit BEFORE the shared paging area, so
+            // the paging area keeps its full expert_staging_bytes capacity.
+            if(runtime->multi_decode_capacity>1)
+                runtime->host_staging_bytes=std::max(runtime->host_staging_bytes,
+                    runtime->multi_decode_capacity*runtime->decode_host_block_bytes+runtime->expert_staging_bytes);
+        }
         runtime->expert_slot_bytes=device_align(one_expert);
         // Prefill snapshot slots hold every DeltaNet layer's conv+recurrent
         // state; MTP manages its own snapshots inside the state arena, so
@@ -1200,6 +1236,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         const std::size_t slot_count=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
         runtime->sequences.assign(slot_count,QwenSequence{});
         runtime->slot_owner.assign(slot_count,-1);
+        runtime->slot_events.assign(slot_count,0);
+        for(auto&event:runtime->slot_events)
+            if(colibri_gpu_event_create(&event)!=0)throw std::runtime_error("failed to create native Qwen slot events");
+        if(colibri_gpu_event_create(&runtime->staging_event)!=0)throw std::runtime_error("failed to create native Qwen staging event");
         const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
         // gpu_cache_bytes is the TOTAL GPU budget (base allocations + expert
         // cache). 0 = auto-fit: probe free VRAM and use most of it, leaving a
@@ -2429,6 +2469,291 @@ int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime*runtime,uint64_t task_id){r
     return 0;
 });}
 
+// Move the active slot's mirrored bookkeeping (position/last_output/processed
+// tokens) back into sequences[active] (park) or out again (unpark), so code can
+// address every slot uniformly through sequences[] without switching.
+static void qwen_park_active(ColibriV2QwenRuntime& rt, bool park) {
+    QwenSequence& a = rt.sequences[rt.active_sequence];
+    if (park) {
+        a.position = rt.position;
+        a.last_output_token = rt.last_output_token;
+        a.processed_tokens.swap(rt.processed_tokens);
+    } else {
+        rt.position = a.position;
+        rt.last_output_token = a.last_output_token;
+        rt.processed_tokens.swap(a.processed_tokens);
+    }
+}
+
+// Decode ONE token for each of `n` sequences with layer-level CPU/GPU overlap.
+// Everything runs on the single stream with the existing single-row kernels;
+// the win is scheduling: per layer, every sequence's GPU pre-MoE work (norms,
+// attention/DeltaNet, router + async readback, shared experts) is queued FIRST,
+// so while the CPU runs sequence A's expert phase (route policy, paging,
+// qwen_cpu_moe) the GPU is already executing sequence B's queued work. Decode
+// is dominated by that CPU phase, so overlap approaches aggregate 2x at n=2.
+// Per-sequence workspace/host slices keep buffers independent; the shared
+// expert-paging staging area is fenced with staging_event against its async
+// stream-queued consumers. Requires the caller to have parked the active
+// mirror; requires moe_device != 0 and no MTP.
+static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
+        const std::size_t* slots, const std::uint32_t* inputs, std::uint32_t* outputs) {
+    const auto decode_started = std::chrono::steady_clock::now();
+    const int hidden_size = static_cast<int>(runtime->model->config.hidden_size);
+    const int experts = static_cast<int>(runtime->model->config.expert_count);
+    const int configured_top_k = static_cast<int>(runtime->model->config.expert_used_count);
+    const int top_k = (runtime->options.expert_top_k > 0 && static_cast<int>(runtime->options.expert_top_k) < configured_top_k)
+        ? static_cast<int>(runtime->options.expert_top_k) : configured_top_k;
+    const float epsilon = runtime->model->config.rms_norm_epsilon ? runtime->model->config.rms_norm_epsilon : 1.0e-6f;
+    const int intermediate = static_cast<int>(runtime->moe_intermediate);
+    auto* staging = static_cast<std::uint8_t*>(runtime->host_staging);
+    const std::uint64_t shared_base = n * runtime->decode_host_block_bytes;
+    struct Seq {
+        std::size_t slot; std::uint32_t input; std::uint64_t state, position;
+        std::uint64_t hidden, residual, normalized, first, second, third, fourth,
+            activated, router_logits, selected_device, route_weights, logits,
+            argmax_device, attention_scores;
+        std::int32_t* selected_host; float *cpu_weights, *cpu_input, *cpu_activated, *cpu_output;
+        std::uint64_t* winner_host;
+    };
+    std::vector<Seq> seqs(n);
+    std::uint64_t cursor = runtime->workspace;
+    const auto workspace_end = runtime->workspace + runtime->workspace_bytes;
+    auto take = [&](std::uint64_t bytes) { const auto r = cursor; cursor += device_align(bytes); if (cursor > workspace_end) throw std::runtime_error("native Qwen multi-decode workspace overflow"); return r; };
+    for (std::size_t i = 0; i < n; ++i) {
+        Seq& s = seqs[i];
+        s.slot = slots[i]; s.input = inputs[i];
+        s.state = runtime->sequences[s.slot].state;
+        s.position = runtime->sequences[s.slot].position;
+        if (s.position >= runtime->options.context_limit) throw std::runtime_error("native Qwen context limit exceeded");
+        if (s.input >= runtime->model->config.vocabulary_size) throw std::runtime_error("native Qwen input token is out of range");
+        s.hidden = take(hidden_size * sizeof(float));
+        s.residual = take(hidden_size * sizeof(float));
+        s.normalized = take(hidden_size * sizeof(float));
+        s.first = take(runtime->scratch_elements * sizeof(float));
+        s.second = take(runtime->scratch_elements * sizeof(float));
+        s.third = take(runtime->scratch_elements * sizeof(float));
+        s.fourth = take(runtime->scratch_elements * sizeof(float));
+        s.activated = take(top_k * runtime->moe_intermediate * sizeof(float));
+        s.router_logits = take(experts * sizeof(float));
+        s.selected_device = take(top_k * sizeof(std::int32_t));
+        s.route_weights = take(top_k * sizeof(float));
+        s.logits = take(runtime->model->config.vocabulary_size * sizeof(float));
+        s.argmax_device = take(sizeof(std::uint64_t));
+        s.attention_scores = take(static_cast<std::uint64_t>(runtime->model->config.attention_heads) * runtime->options.context_limit * sizeof(float));
+        auto* block = staging + i * runtime->decode_host_block_bytes;
+        std::uint64_t off = 0;
+        auto htake = [&](std::uint64_t bytes) { auto* p = block + off; off += device_align(bytes); return p; };
+        s.selected_host = reinterpret_cast<std::int32_t*>(htake(top_k * sizeof(std::int32_t)));
+        s.cpu_weights = reinterpret_cast<float*>(htake(top_k * sizeof(float)));
+        s.cpu_input = reinterpret_cast<float*>(htake(hidden_size * sizeof(float)));
+        s.cpu_activated = reinterpret_cast<float*>(htake(top_k * runtime->moe_intermediate * sizeof(float)));
+        s.cpu_output = reinterpret_cast<float*>(htake(hidden_size * sizeof(float)));
+        s.winner_host = reinterpret_cast<std::uint64_t*>(htake(sizeof(std::uint64_t)));
+    }
+    auto launch_named = [&](const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t bx, void** args) { if (colibri_gpu_launch_named(name, gx, gy, bx, 0, runtime->stream, args) != 0) throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ") + name); };
+    auto rms = [&](std::uint64_t input, std::uint64_t weights, std::uint64_t output) { int one_centered = 0; void* args[] = {&input, &weights, &output, const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon), &one_centered}; launch_named("rms_norm", 1, 1, 256, args); };
+    auto q8 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { if (colibri_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) != 0) throw std::runtime_error("native Qwen Q8 projection failed"); };
+    auto f32 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { void* args[] = {&matrix, &input, &output, &in_size, &out_size}; launch_named("qwen_f32_matvec", out_size, 1, 256, args); };
+    auto add = [&](std::uint64_t target, std::uint64_t source) { float scale = 1.0f; int count = hidden_size; void* args[] = {&target, &source, &scale, &count}; launch_named("scaled_add", (hidden_size + 255) / 256, 1, 256, args); };
+    for (auto& s : seqs) {
+        const auto embedding = runtime->device_tensors[runtime->token_embeddings];
+        const int token = static_cast<int>(s.input); int width = hidden_size;
+        void* args[] = {const_cast<std::uint64_t*>(&embedding), const_cast<std::uint64_t*>(&s.hidden), const_cast<int*>(&token), &width};
+        launch_named("qwen_q8_embedding", (hidden_size + 255) / 256, 1, 256, args);
+    }
+    for (std::uint32_t layer_number = 0; layer_number < runtime->layers.size(); ++layer_number) {
+        auto& layer = runtime->layers[layer_number];
+        auto tensor = [&](std::size_t role) { return runtime->device_tensors[layer.static_tensors.at(role)]; };
+        const std::size_t moe_base = layer.attention ? 7 : 10;
+        // Pass A: queue every sequence's GPU work up to (and including) the
+        // router readback + shared experts, recording that sequence's event.
+        for (auto& s : seqs) {
+            rms(s.hidden, tensor(0), s.normalized);
+            if (!layer.attention) {
+                int channels = static_cast<int>(runtime->model->tensors[layer.static_tensors[1]].shape[1]);
+                int gate_elements = static_cast<int>(runtime->model->tensors[layer.static_tensors[2]].shape[1]);
+                int value_heads = static_cast<int>(runtime->model->tensors[layer.static_tensors[8]].shape[0]);
+                int head_dim = static_cast<int>(runtime->model->tensors[layer.static_tensors[9]].shape[0]);
+                int value_dim = value_heads * head_dim;
+                int key_heads = (channels - value_dim) / (2 * head_dim);
+                q8(tensor(1), s.normalized, s.first, hidden_size, channels);
+                q8(tensor(2), s.normalized, s.second, hidden_size, gate_elements);
+                f32(tensor(4), s.normalized, s.third, hidden_size, value_heads);
+                f32(tensor(5), s.normalized, s.third + value_heads * sizeof(float), hidden_size, value_heads);
+                int kernel_size = static_cast<int>(runtime->model->tensors[layer.static_tensors[6]].shape[0]);
+                std::uint64_t conv_state = s.state + layer.state_first;
+                auto conv_weights = tensor(6);
+                void* conv_args[] = {const_cast<std::uint64_t*>(&s.first), &conv_weights, &conv_state, const_cast<std::uint64_t*>(&s.fourth), &channels, &kernel_size};
+                launch_named("delta_conv_step", (channels + 255) / 256, 1, 256, conv_args);
+                std::uint64_t recurrent_state = s.state + layer.state_second;
+                auto decay = tensor(8), dt = tensor(7), norm = tensor(9);
+                std::uint64_t beta = s.third + value_heads * sizeof(float);
+                void* recurrent_args[] = {const_cast<std::uint64_t*>(&s.fourth), const_cast<std::uint64_t*>(&s.second), &beta, const_cast<std::uint64_t*>(&s.third), &decay, &dt, &norm, &recurrent_state, const_cast<std::uint64_t*>(&s.first), &key_heads, &value_heads, &head_dim, const_cast<float*>(&epsilon)};
+                launch_named("qwen_delta_recurrent", value_heads, 1, 256, recurrent_args);
+                q8(tensor(3), s.first, s.residual, value_dim, hidden_size);
+                add(s.residual, s.hidden);
+            } else {
+                const int heads = static_cast<int>(runtime->model->config.attention_heads);
+                const int kv_heads = static_cast<int>(runtime->model->config.attention_kv_heads);
+                const int head_dim = static_cast<int>(runtime->model->tensors[layer.static_tensors[2]].shape[1] / kv_heads);
+                const int q_size = heads * 2 * head_dim, kv_size = kv_heads * head_dim;
+                q8(tensor(1), s.normalized, s.first, hidden_size, q_size);
+                q8(tensor(2), s.normalized, s.second, hidden_size, kv_size);
+                q8(tensor(3), s.normalized, s.third, hidden_size, kv_size);
+                const int rotary = static_cast<int>(runtime->model->config.rotary_dimension ? runtime->model->config.rotary_dimension : head_dim);
+                const int position = static_cast<int>(s.position);
+                const float theta = runtime->model->config.rope_freq_base ? runtime->model->config.rope_freq_base : 1000000.0f;
+                auto qnorm = tensor(5), knorm = tensor(6);
+                std::uint64_t queries = s.fourth, gates = s.fourth + q_size / 2 * sizeof(float);
+                void* q_args[] = {const_cast<std::uint64_t*>(&s.first), &qnorm, &queries, &gates, const_cast<int*>(&heads), const_cast<int*>(&head_dim), const_cast<int*>(&rotary), const_cast<int*>(&position), const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
+                launch_named("qwen_attention_query", heads, 1, 256, q_args);
+                std::uint64_t keys = s.first;
+                void* k_args[] = {const_cast<std::uint64_t*>(&s.second), &knorm, &keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&rotary), const_cast<int*>(&position), const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
+                launch_named("qwen_attention_key", kv_heads, 1, 256, k_args);
+                std::uint64_t cache_keys = s.state + layer.state_first, cache_values = s.state + layer.state_second;
+                int capacity = static_cast<int>(runtime->options.context_limit);
+                void* k_store_args[] = {&keys, &cache_keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&position), &capacity};
+                launch_named(kv_store_kernel(runtime->options.cache_type_k), kv_heads, 1, 256, k_store_args);
+                void* v_store_args[] = {const_cast<std::uint64_t*>(&s.third), &cache_values, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&position), &capacity};
+                launch_named(kv_store_kernel(runtime->options.cache_type_v), kv_heads, 1, 256, v_store_args);
+                std::uint64_t attended = s.second; int tokens = position + 1;
+                float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &scale};
+                launch_named(kv_scores_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
+                void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity};
+                launch_named(kv_values_kernel(*runtime), heads, 1, 256, value_args);
+                std::uint64_t gated = s.third; int elements = heads * head_dim;
+                void* gate_args[] = {&attended, &gates, &gated, &elements};
+                launch_named("qwen_attention_gate", (elements + 255) / 256, 1, 256, gate_args);
+                q8(tensor(4), gated, s.residual, elements, hidden_size);
+                add(s.residual, s.hidden);
+            }
+            rms(s.residual, tensor(moe_base), s.normalized);
+            f32(tensor(moe_base + 1), s.normalized, s.router_logits, hidden_size, experts);
+            if (colibri_gpu_route_topk(s.router_logits, s.selected_device, s.route_weights, experts, top_k, runtime->stream) != 0) throw std::runtime_error("native Qwen routing failed");
+            if (colibri_gpu_download(s.selected_host, s.selected_device, top_k * sizeof(std::int32_t), runtime->stream) != 0 ||
+                colibri_gpu_download(s.cpu_weights, s.route_weights, top_k * sizeof(float), runtime->stream) != 0 ||
+                colibri_gpu_download(s.cpu_input, s.normalized, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native Qwen route transfer failed");
+            if (colibri_gpu_event_record(runtime->slot_events[s.slot], runtime->stream) != 0) throw std::runtime_error("native Qwen route event failed");
+            auto shared_gate_matrix = tensor(moe_base + 2), shared_up_matrix = tensor(moe_base + 3);
+            void* silu_args[] = {&shared_gate_matrix, &shared_up_matrix, const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.second), const_cast<int*>(&hidden_size), const_cast<int*>(&intermediate)};
+            launch_named("q8_swiglu_transposed_warp", (intermediate + 7) / 8, 1, 256, silu_args);
+            q8(tensor(moe_base + 4), s.second, s.third, intermediate, hidden_size);
+            auto shared_gate = tensor(moe_base + 5);
+            void* shared_args[] = {const_cast<std::uint64_t*>(&s.normalized), &shared_gate, const_cast<std::uint64_t*>(&s.third), const_cast<int*>(&hidden_size)};
+            launch_named("qwen_shared_scale", 1, 1, 256, shared_args);
+        }
+        // Pass B: serial CPU expert phases; while sequence i runs on the CPU,
+        // the GPU is still executing the queued pass-A work of the later ones.
+        for (auto& s : seqs) {
+            const auto route_wait_started = std::chrono::steady_clock::now();
+            if (colibri_gpu_event_sync(runtime->slot_events[s.slot]) != 0) throw std::runtime_error("native Qwen route event failed");
+            runtime->route_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - route_wait_started).count();
+            int route_count = top_k;
+            if (runtime->options.expert_top_k > 0 || (runtime->options.expert_top_p > 0.0f && runtime->options.expert_top_p < 1.0f))
+                route_count = apply_expert_router_policy(s.selected_host, s.cpu_weights, top_k, static_cast<int>(runtime->options.expert_top_k), runtime->options.expert_top_p);
+            runtime->route_expert_sum += static_cast<std::uint64_t>(route_count);
+            const auto pager_started = std::chrono::steady_clock::now();
+            if (runtime->options.moe_device == 1) {
+                const auto compute_started = std::chrono::steady_clock::now();
+                qwen_cpu_moe(*runtime, layer, s.selected_host, s.cpu_weights, route_count, s.cpu_input, s.cpu_activated, s.cpu_output);
+                runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
+                if (colibri_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native CPU MoE output upload failed");
+                add(s.third, s.fourth);
+            } else {
+                if (runtime->expert_slots.empty()) throw std::runtime_error("native hybrid MoE requires an expert cache budget");
+                // The shared paging area's previous contents may still be
+                // consumed by stream-queued uploads; fence before rewriting.
+                if (colibri_gpu_event_sync(runtime->staging_event) != 0) throw std::runtime_error("native Qwen staging event failed");
+                auto* pag = staging + shared_base;
+                std::array<std::int32_t, 256> cpu_selected{};
+                std::array<float, 256> cpu_compact_weights{}, gpu_compact_weights{};
+                std::array<std::uint64_t, 256> gate_pointers{}, up_pointers{}, down_pointers{};
+                int cpu_count = 0, gpu_count = 0;
+                std::uint64_t staging_cursor = 0;
+                struct PendingUpload { std::uint64_t device, host_offset, bytes; };
+                std::array<PendingUpload, 256> pending{}; int pending_count = 0;
+                for (int rank = 0; rank < route_count; ++rank) {
+                    const int expert = s.selected_host[rank];
+                    if (expert < 0 || expert >= experts) throw std::runtime_error("native hybrid MoE selected an invalid expert");
+                    const auto cache_key = (static_cast<std::uint64_t>(layer_number) << 32) | static_cast<std::uint32_t>(expert);
+                    auto resident = runtime->expert_residency.find(cache_key);
+                    if (resident != runtime->expert_residency.end()) {
+                        const auto slot_index = resident->second; auto& slot = runtime->expert_slots[slot_index];
+                        if (runtime->cache_admission_enabled) slot.last_used = record_expert_access(*runtime, layer_number, expert).last_used; else slot.last_used = ++runtime->expert_clock;
+                        ++runtime->expert_cache_hits;
+                        const auto device_base = runtime->expert_cache + slot_index * runtime->expert_slot_bytes; std::uint64_t role_offset = 0;
+                        for (int role = 0; role < 3; ++role) { const auto bytes = runtime->model->tensors[layer.expert_tensors[role]].size / experts; const auto pointer = device_base + role_offset; if (role == 0) gate_pointers[gpu_count] = pointer; else if (role == 1) up_pointers[gpu_count] = pointer; else down_pointers[gpu_count] = pointer; role_offset += bytes; }
+                        gpu_compact_weights[gpu_count++] = s.cpu_weights[rank]; continue;
+                    }
+                    ++runtime->expert_cache_misses; cpu_selected[cpu_count] = expert; cpu_compact_weights[cpu_count++] = s.cpu_weights[rank];
+                    const auto slot_index = select_expert_cache_slot(*runtime, layer_number, expert, true);
+                    if (slot_index == kNoExpertSlot) continue;
+                    auto& slot = runtime->expert_slots[slot_index]; slot.key = cache_key; slot.valid = true; slot.last_used = ++runtime->expert_clock; runtime->expert_residency[cache_key] = slot_index;
+                    const auto slot_base = runtime->expert_cache + slot_index * runtime->expert_slot_bytes;
+                    if (runtime->dma_paging) {
+                        std::uint64_t role_offset = 0;
+                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (colibri_gpu_upload(slot_base + role_offset, runtime->model->data + t.offset + offset, bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE DMA cache upload failed"); role_offset += bytes; }
+                    } else {
+                        const auto bundle_start = staging_cursor;
+                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (staging_cursor + bytes > runtime->expert_staging_bytes) throw std::runtime_error("native hybrid MoE staging overflow"); std::memcpy(pag + staging_cursor, runtime->model->data + t.offset + offset, bytes); staging_cursor += bytes; }
+                        pending[pending_count++] = {slot_base, bundle_start, staging_cursor - bundle_start};
+                    }
+                }
+                if (gpu_count) {
+                    const auto table_bytes = static_cast<std::uint64_t>(gpu_count) * (3 * sizeof(std::uint64_t) + sizeof(float));
+                    const auto table_host = device_align(staging_cursor); const auto table_device = runtime->expert_staging + runtime->expert_staging_bytes - device_align(table_bytes);
+                    if (table_host + table_bytes > runtime->expert_staging_bytes) throw std::runtime_error("native hybrid MoE pointer staging overflow");
+                    std::memcpy(pag + table_host, gate_pointers.data(), gpu_count * sizeof(std::uint64_t));
+                    std::memcpy(pag + table_host + gpu_count * sizeof(std::uint64_t), up_pointers.data(), gpu_count * sizeof(std::uint64_t));
+                    std::memcpy(pag + table_host + 2 * gpu_count * sizeof(std::uint64_t), down_pointers.data(), gpu_count * sizeof(std::uint64_t));
+                    std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t), gpu_compact_weights.data(), gpu_count * sizeof(float));
+                    if (colibri_gpu_upload(table_device, pag + table_host, table_bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE table upload failed");
+                    const auto gate_table = table_device, up_table = gate_table + gpu_count * sizeof(std::uint64_t), down_table = up_table + gpu_count * sizeof(std::uint64_t), weight_table = down_table + gpu_count * sizeof(std::uint64_t);
+                    if (colibri_gpu_q5_grouped_swiglu(gate_table, up_table, s.normalized, s.activated, hidden_size, intermediate, gpu_count, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE gate/up failed");
+                    const auto down_type = runtime->model->tensors[layer.expert_tensors[2]].type;
+                    const int status = down_type == 8 ? colibri_gpu_q8_grouped_accumulate(down_table, s.activated, s.third, weight_table, intermediate, hidden_size, gpu_count, runtime->stream) : colibri_gpu_q6_grouped_accumulate(down_table, s.activated, s.third, weight_table, intermediate, hidden_size, gpu_count, runtime->stream);
+                    if (status != 0) throw std::runtime_error("native hybrid MoE down projection failed");
+                }
+                for (int index = 0; index < pending_count; ++index) if (colibri_gpu_upload(pending[index].device, pag + pending[index].host_offset, pending[index].bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE cache upload failed");
+                if (colibri_gpu_event_record(runtime->staging_event, runtime->stream) != 0) throw std::runtime_error("native Qwen staging event failed");
+                if (cpu_count) {
+                    const auto compute_started = std::chrono::steady_clock::now();
+                    qwen_cpu_moe(*runtime, layer, cpu_selected.data(), cpu_compact_weights.data(), cpu_count, s.cpu_input, s.cpu_activated, s.cpu_output);
+                    runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
+                    if (colibri_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native hybrid MoE output upload failed");
+                    add(s.third, s.fourth);
+                }
+            }
+            runtime->expert_page_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pager_started).count();
+            add(s.residual, s.third);
+            std::swap(s.hidden, s.residual);
+        }
+    }
+    for (auto& s : seqs) {
+        rms(s.hidden, runtime->device_tensors[runtime->final_norm], s.normalized);
+        int vocabulary = static_cast<int>(runtime->model->config.vocabulary_size);
+        if (colibri_gpu_memset(s.argmax_device, 0, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen argmax reset failed");
+        auto lm_head = runtime->device_tensors[runtime->lm_head];
+        void* argmax_args[] = {&lm_head, const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.argmax_device), const_cast<int*>(&hidden_size), &vocabulary};
+        launch_named("q8_lm_head_argmax_warp", (vocabulary + 7) / 8, 1, 256, argmax_args);
+        if (colibri_gpu_download(s.winner_host, s.argmax_device, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen output transfer failed");
+    }
+    const auto tail_wait_started = std::chrono::steady_clock::now();
+    if (colibri_gpu_stream_sync(runtime->stream) != 0) throw std::runtime_error("native Qwen output synchronization failed");
+    runtime->tail_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tail_wait_started).count();
+    for (std::size_t i = 0; i < n; ++i) {
+        outputs[i] = 0xffffffffu - static_cast<std::uint32_t>(*seqs[i].winner_host);
+        auto& sequence = runtime->sequences[seqs[i].slot];
+        sequence.last_output_token = outputs[i];
+        sequence.processed_tokens.push_back(inputs[i]);
+        ++sequence.position;
+    }
+    runtime->decode_calls += n;
+    runtime->decode_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - decode_started).count();
+}
+
 // Route a pending task to a slot the way qwen_route_sequence does, but aware of
 // slot ownership: a slot owned by another running task is untouchable, and if
 // the busiest match for this prompt IS an owned slot (same conversation already
@@ -2513,6 +2838,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
         events[*count]=ColibriV2QwenTaskEvent{id,token,kind};++*count;
     };
     std::vector<std::uint64_t> finished;
+    std::vector<QwenEngineTask*> pending_decode;
     const std::size_t total=runtime->engine_tasks.size();
     for(std::size_t visit=0;visit<total&&*count+2<=capacity;++visit){
         auto&task=runtime->engine_tasks[(runtime->engine_cursor+visit)%total];
@@ -2531,22 +2857,53 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                 }
                 continue;
             }
-            // phase 2: emit the buffered token, then either finish or compute
-            // the next one -- the same order as the blocking decode loop, so a
-            // single-task engine run is bit-identical to blocking generate.
-            qwen_switch_sequence(*runtime,task.slot);
-            runtime->cache_admission_enabled=true;
+            // phase 2: emit the buffered token, then either finish or defer
+            // computing the next one -- the emit-then-compute order matches the
+            // blocking decode loop, so a single-task engine run stays
+            // bit-identical to blocking generate.
             emit(task.id,task.next_token,0);
             ++task.emitted;
             const bool stopped=std::find(task.stop_tokens.begin(),task.stop_tokens.end(),task.next_token)!=task.stop_tokens.end();
             if(stopped||task.cancelled||task.emitted>=task.max_tokens){
                 finished.push_back(task.id);emit(task.id,0,1);continue;
             }
-            const int status=colibri_v2_qwen_runtime_decode(runtime,task.next_token,&task.next_token);
-            if(status)throw std::runtime_error("native Qwen decode failed");
+            pending_decode.push_back(&task);
         }catch(const std::exception&){
             // Isolate the failure: this task dies, the others keep running.
             finished.push_back(task.id);emit(task.id,0,2);
+        }
+    }
+    // Compute the deferred next tokens. Two or more sequences go through the
+    // multi-sequence driver (layer-level CPU/GPU overlap); a single one keeps
+    // the plain decode path.
+    if(!pending_decode.empty()){
+        runtime->cache_admission_enabled=true;
+        std::size_t batched=0;
+        if(pending_decode.size()>=2&&runtime->multi_decode_capacity>=2&&runtime->options.moe_device!=0){
+            batched=std::min<std::size_t>(pending_decode.size(),runtime->multi_decode_capacity);
+            std::vector<std::size_t> slots(batched);
+            std::vector<std::uint32_t> batch_inputs(batched),batch_outputs(batched);
+            for(std::size_t i=0;i<batched;++i){slots[i]=pending_decode[i]->slot;batch_inputs[i]=pending_decode[i]->next_token;}
+            qwen_park_active(*runtime,true);
+            try{
+                qwen_decode_multi(runtime,batched,slots.data(),batch_inputs.data(),batch_outputs.data());
+                qwen_park_active(*runtime,false);
+                for(std::size_t i=0;i<batched;++i)pending_decode[i]->next_token=batch_outputs[i];
+            }catch(const std::exception&){
+                qwen_park_active(*runtime,false);
+                // The whole batch shares one stream of work; fail all of it.
+                for(std::size_t i=0;i<batched;++i){finished.push_back(pending_decode[i]->id);emit(pending_decode[i]->id,0,2);}
+            }
+        }
+        for(std::size_t i=batched;i<pending_decode.size();++i){
+            auto*task=pending_decode[i];
+            try{
+                qwen_switch_sequence(*runtime,task->slot);
+                const int status=colibri_v2_qwen_runtime_decode(runtime,task->next_token,&task->next_token);
+                if(status)throw std::runtime_error("native Qwen decode failed");
+            }catch(const std::exception&){
+                finished.push_back(task->id);emit(task->id,0,2);
+            }
         }
     }
     if(total)runtime->engine_cursor=(runtime->engine_cursor+1)%total;

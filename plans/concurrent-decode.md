@@ -83,7 +83,17 @@ Gates:
 3. Two interleaved decodes: outputs bit-identical to sequential runs of the same
    prompts (interleave must not corrupt either sequence).
 
-## Phase B — multi-sequence decode via CPU/GPU overlap (throughput)
+## Phase B — multi-sequence decode via CPU/GPU overlap ✅ SHIPPED 2026-07-22
+
+Gates: N=2 concurrent outputs bit-identical to sequential; aggregate 1.46x at
+N=2 (2x64 tokens, hybrid MoE, live 35B Q5); N=1/blocking path untouched.
+Implemented as designed: `qwen_decode_multi` + per-slot events + staging fence
++ per-seq workspace/host slices + mirror park; engine_step defers phase-2
+decodes and batches >=2 through the driver (moe_device!=0, capacity-capped).
+Remaining upside is B2 (true row batching) if the GPU phase becomes the
+bottleneck.
+
+### Design (implemented)
 
 REVISED after a full read of `colibri_v2_qwen_runtime_decode` (2026-07-22): the
 original "kernels gain a row dimension" plan is NOT the right first move. Everything
