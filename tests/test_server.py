@@ -134,6 +134,37 @@ class ToolStubGenerator(StubGenerator):
         )
 
 
+class TruncatedToolStubGenerator(StubGenerator):
+    """Emits a <tool_call> that never closes and stops without EOS, mimicking a
+    tool call cut off by the output-token ceiling (the AskUserQuestion leak)."""
+
+    TEXT = "I can help.\n<tool_call>\n<function=question>\n<parameter=questions>\n[{"
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        for index, char in enumerate(self.TEXT):
+            yield GenerationStep(
+                token_id=index,
+                text_delta=char,
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(range(index + 1)),
+                text=self.TEXT[: index + 1],
+                stopped_on_eos=False,
+                finished=False,
+                state_tokens=index + 1,
+            )
+        yield GenerationStep(
+            token_id=None,
+            text_delta="",
+            prompt_ids=(1, 2, 3),
+            generated_ids=tuple(range(len(self.TEXT) + 1)),
+            text=self.TEXT,
+            stopped_on_eos=False,  # truncated, not a clean stop
+            finished=True,
+            state_tokens=len(self.TEXT) + 1,
+        )
+
+
 class ToolCallParsingTests(unittest.TestCase):
     def test_parses_hermes_xml_format(self) -> None:
         content, calls = _parse_tool_calls(
@@ -161,6 +192,31 @@ class ToolCallParsingTests(unittest.TestCase):
     def test_plain_text_has_no_tool_calls(self) -> None:
         content, calls = _parse_tool_calls("just a normal answer")
         self.assertEqual(content, "just a normal answer")
+        self.assertEqual(calls, [])
+
+    def test_truncated_tool_call_does_not_leak_markup(self) -> None:
+        # Model hit the token ceiling mid tool-call: the <tool_call> block never
+        # closes. It must not leak raw markup as content (the AskUserQuestion
+        # leak); content is only the clean prose before the marker.
+        content, calls = _parse_tool_calls(
+            "I can help.\n<tool_call>\n<function=question>\n"
+            '<parameter=questions>\n[{"question": "Which framework?"'
+        )
+        self.assertEqual(content, "I can help.")
+        self.assertEqual(calls, [])
+
+    def test_malformed_closed_tool_call_does_not_leak_markup(self) -> None:
+        # A complete but unparseable block (invalid JSON body) is also suppressed
+        # rather than surfaced as assistant text.
+        content, calls = _parse_tool_calls(
+            "here goes\n<tool_call>\n{not valid json}\n</tool_call>"
+        )
+        self.assertEqual(content, "here goes")
+        self.assertEqual(calls, [])
+
+    def test_tool_call_only_output_yields_empty_content(self) -> None:
+        content, calls = _parse_tool_calls("<tool_call>\n<function=question>\n")
+        self.assertIsNone(content)
         self.assertEqual(calls, [])
 
 
@@ -538,6 +594,76 @@ class InferenceServiceTests(unittest.TestCase):
             tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "get_weather",
         )
+
+    def test_empty_content_tool_call_history_is_accepted(self) -> None:
+        # opencode/Cline send assistant tool-call turns as {"content": "",
+        # "tool_calls": [...]} and empty tool outputs; neither must 400.
+        response = self.service.chat_completion(
+            {
+                "model": "qwen-local",
+                "messages": [
+                    {"role": "user", "content": "weather in Paris?"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city": "Paris"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "content": "", "tool_call_id": "call_1"},
+                    {"role": "user", "content": "thanks"},
+                ],
+            }
+        )
+        self.assertEqual(response["choices"][0]["message"]["content"], "Hello!")
+        # The empty-content assistant turn is rendered as its tool call, not dropped.
+        history = self.generator.calls[-1][0]
+        assistant_turn = next(m for m in history if m["role"] == "assistant")
+        self.assertIn("<tool_call>", assistant_turn["content"])
+        self.assertIn("get_weather", assistant_turn["content"])
+
+    def test_truncated_tool_call_stream_suppresses_markup(self) -> None:
+        service = InferenceService("qwen-local", TruncatedToolStubGenerator())
+        payload = {
+            "messages": [{"role": "user", "content": "Build me an OS"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "question",
+                        "description": "Ask the user",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "stream": True,
+        }
+        events = list(service.stream_chat_completion(payload))
+        content = "".join(
+            event["choices"][0]["delta"].get("content", "")
+            for event in events
+            if isinstance(event, dict) and event.get("choices")
+        )
+        # Clean prose before the marker is fine; raw tool-call markup must never
+        # reach the client as assistant text.
+        self.assertNotIn("<tool_call>", content)
+        self.assertNotIn("<function=", content)
+        self.assertNotIn("<parameter=", content)
+        self.assertEqual(content.strip(), "I can help.")
+        finish_reasons = [
+            event["choices"][0].get("finish_reason")
+            for event in events
+            if isinstance(event, dict) and event.get("choices")
+        ]
+        # Truncated (no EOS) tool call reports "length", signalling the cutoff.
+        self.assertIn("length", finish_reasons)
 
     def test_responses_function_tools_stream_and_continue(self) -> None:
         service = InferenceService("qwen-local", ToolStubGenerator())

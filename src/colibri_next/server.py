@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import re
@@ -52,6 +53,7 @@ TEXT_PART_TYPES = frozenset(("text", "input_text", "output_text"))
 # <tool_call>...</tool_call> block and decode the body as either the Hermes
 # style (<function=name><parameter=k>v</parameter></function>) or the JSON
 # style ({"name": ..., "arguments": {...}}) used by Qwen3, DeepSeek, GLM, etc.
+TOOL_CALL_MARKER = "<tool_call>"
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 TOOL_FUNCTION_PATTERN = re.compile(r"<function=([^>\n]+)>", re.DOTALL)
 TOOL_PARAMETER_PATTERN = re.compile(
@@ -118,10 +120,19 @@ class InferenceService:
         self.preloaded_experts = 0
         self.expert_storage_bytes = 0
         self._generation_lock = threading.Lock()
+        # Generators that multiplex concurrent requests natively (the v2
+        # cooperative engine) set this False so requests interleave instead of
+        # queueing behind one long generation.
+        self._serialize_generation = True
         self._response_lock = threading.Lock()
         self._response_records: OrderedDict[
             str, tuple[dict[str, Any], list[dict[str, str]]]
         ] = OrderedDict()
+
+    def _generation_guard(self):
+        if self._serialize_generation:
+            return self._generation_lock
+        return contextlib.nullcontext()
 
     @classmethod
     def from_model_directory(
@@ -219,7 +230,7 @@ class InferenceService:
         if _boolean_option(payload, "stream", False):
             raise APIError(400, "use the streaming response path", parameter="stream")
         request = self._prepare_chat(payload)
-        with self._generation_lock:
+        with self._generation_guard():
             result = self.generator.generate_messages(
                 request.messages,
                 max_new_tokens=request.max_new_tokens,
@@ -268,7 +279,7 @@ class InferenceService:
                 streamed = 0  # end of clean (non-tool) text already sent as content
                 tool_start: int | None = None  # index of a <tool_call> marker once seen
                 decode_started: float | None = None
-                marker = "<tool_call>"
+                marker = TOOL_CALL_MARKER
                 holdback = len(marker) - 1
 
                 def _content_chunk(text: str, tokens: int, elapsed: float):
@@ -279,7 +290,7 @@ class InferenceService:
                     }
                     return chunk
 
-                with self._generation_lock:
+                with self._generation_guard():
                     for step in self.generator.stream_messages(
                         request.messages,
                         max_new_tokens=request.max_new_tokens,
@@ -329,12 +340,16 @@ class InferenceService:
                             ]
                         },
                     )
-                elif streamed < len(accumulated):
-                    # No parseable tool call (or a truncated one): flush the text we
-                    # held back / suppressed so the turn is never silently empty.
+                elif tool_start is None and streamed < len(accumulated):
+                    # No tool-call marker: flush the tail we held back in case it
+                    # was a partial marker, so the turn is never silently empty.
                     yield self._chat_chunk(
                         completion_id, created, {"content": accumulated[streamed:]}
                     )
+                # else: a <tool_call> marker was seen but produced no parseable
+                # call (truncated by max_tokens or malformed). Suppress the raw
+                # markup from streamed[..] -- the finish_reason below reports
+                # "length"/"stop" so the client knows the tool call was cut off.
                 finish_reason = (
                     "tool_calls"
                     if tool_calls
@@ -345,7 +360,7 @@ class InferenceService:
             else:
                 final_step: GenerationStep | None = None
                 decode_started: float | None = None
-                with self._generation_lock:
+                with self._generation_guard():
                     for step in self.generator.stream_messages(
                         request.messages,
                         max_new_tokens=request.max_new_tokens,
@@ -404,7 +419,7 @@ class InferenceService:
         if _boolean_option(payload, "stream", False):
             raise APIError(400, "use the streaming response path", parameter="stream")
         request = self._prepare_text(payload)
-        with self._generation_lock:
+        with self._generation_guard():
             result = self.generator.generate_text(
                 request.prompt,
                 max_new_tokens=request.max_new_tokens,
@@ -426,7 +441,7 @@ class InferenceService:
 
         def events() -> Iterator[dict[str, Any] | str]:
             final_step: GenerationStep | None = None
-            with self._generation_lock:
+            with self._generation_guard():
                 for step in self.generator.stream_text(
                     request.prompt,
                     max_new_tokens=request.max_new_tokens,
@@ -526,7 +541,7 @@ class InferenceService:
             max_key="max_output_tokens",
             tools_enabled=bool(tools),
         )
-        with self._generation_lock:
+        with self._generation_guard():
             result = self.generator.generate_messages(
                 request.messages,
                 max_new_tokens=request.max_new_tokens,
@@ -572,7 +587,7 @@ class InferenceService:
             sequence += 1
 
             if request.tools_enabled:
-                with self._generation_lock:
+                with self._generation_guard():
                     result = self.generator.generate_messages(
                         request.messages,
                         max_new_tokens=request.max_new_tokens,
@@ -630,7 +645,7 @@ class InferenceService:
             }
             sequence += 1
             final_step: GenerationStep | None = None
-            with self._generation_lock:
+            with self._generation_guard():
                 for step in self.generator.stream_messages(
                     request.messages,
                     max_new_tokens=request.max_new_tokens,
@@ -1727,10 +1742,14 @@ def _chat_messages(payload: Mapping[str, Any]) -> tuple[list[dict[str, str]], bo
                 400, f"messages[{index}].role is invalid", parameter="messages"
             )
         if role in ("system", "developer"):
-            system_parts.append(_text_content(message.get("content"), index))
+            system_text = _optional_text_content(message.get("content"), index)
+            if system_text:
+                system_parts.append(system_text)
             continue
         if role == "tool":
-            content = _text_content(message.get("content"), index)
+            # A tool may legitimately produce no output; keep the (possibly
+            # empty) tool_response block so the turn structure is preserved.
+            content = _optional_text_content(message.get("content"), index)
             messages.append(
                 {
                     "role": "user",
@@ -1738,8 +1757,7 @@ def _chat_messages(payload: Mapping[str, Any]) -> tuple[list[dict[str, str]], bo
                 }
             )
             continue
-        content_value = message.get("content")
-        content = "" if content_value is None else _text_content(content_value, index)
+        content = _optional_text_content(message.get("content"), index)
         if role == "assistant" and message.get("tool_calls"):
             content = _render_tool_calls(content, message["tool_calls"], index)
         if not content:
@@ -2008,13 +2026,10 @@ def _tool_value(value: Any) -> str:
 
 def _parse_tool_calls(text: str) -> tuple[str | None, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
-    first_start: int | None = None
     for match in TOOL_CALL_BLOCK_PATTERN.finditer(text):
         name, arguments = _decode_tool_call_body(match.group(1))
         if name is None:
             continue
-        if first_start is None:
-            first_start = match.start()
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex}",
@@ -2025,7 +2040,13 @@ def _parse_tool_calls(text: str) -> tuple[str | None, list[dict[str, Any]]]:
                 },
             }
         )
-    content = text[:first_start].strip() if first_start is not None else text
+    # Content is whatever precedes the first tool-call marker. Bound it on the
+    # literal marker rather than on successfully-parsed blocks so a truncated
+    # (no closing </tool_call>) or malformed tool call never leaks its raw
+    # markup into assistant content -- the caller sees empty content plus a
+    # "length"/"stop" finish reason instead of a wall of <tool_call> tags.
+    marker = text.find(TOOL_CALL_MARKER)
+    content = (text[:marker] if marker != -1 else text).strip()
     return (content or None), calls
 
 
@@ -2362,6 +2383,23 @@ def _text_content(value: Any, message_index: int) -> str:
         f"messages[{message_index}].content must be text",
         parameter="messages",
     )
+
+
+def _optional_text_content(value: Any, message_index: int) -> str:
+    """Like _text_content but tolerates missing/empty content (returns "").
+
+    Agentic clients (opencode, Cline, ...) send empty content on assistant
+    tool-call turns ({"content": "", "tool_calls": [...]}) and for tools that
+    produce no output; those are valid and must not 400 the whole request.
+    A non-empty but non-text payload still raises via _text_content.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value if value.strip() else ""
+    if isinstance(value, list) and not value:
+        return ""
+    return _text_content(value, message_index)
 
 
 def _reject_unsupported_generation_options(payload: Mapping[str, Any]) -> None:
