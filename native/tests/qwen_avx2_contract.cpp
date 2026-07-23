@@ -57,6 +57,22 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
             float oct_outputs[8]{};
             qwen_quant_dot_oct_avx512(packed.data(),type,oct_inputs,elements,row,oct_outputs);
             for(int token=0;token<8;++token){float expected=0.0f;for(int i=0;i<elements;++i)expected+=dequant[i]*oct_inputs[token][i];if(!close(expected,oct_outputs[token]))return false;}
+            std::vector<std::uint8_t> other=packed;
+            for(std::size_t i=0;i<other.size();++i)
+                other[i]^=static_cast<std::uint8_t>((i*29+7)&255);
+            auto*other_base=other.data()+static_cast<std::size_t>(row)*row_bytes;
+            if(type==13){set_half(other_base,0x3a00);set_half(other_base+2,0x3400);}
+            else if(type==14)set_half(other_base+208,0x3a00);
+            else for(int block=0;block<8;++block)set_half(other_base+block*34,0x3a00);
+            const float other_reference=qwen_quant_dot_avx512(
+                other.data(),type,input.data(),elements,row);
+            float two_rows_first=0.0f,two_rows_second=0.0f;
+            qwen_quant_dot_two_rows_avx512(
+                packed.data()+static_cast<std::size_t>(row)*row_bytes,
+                other.data()+static_cast<std::size_t>(row)*row_bytes,
+                type,input.data(),elements,&two_rows_first,&two_rows_second);
+            if(!close(reference,two_rows_first)||
+               !close(other_reference,two_rows_second))return false;
         }
         float q8_reference=0.0f;
         for(int i=0;i<elements;++i)q8_reference+=dequant[i]*q8_input[i];

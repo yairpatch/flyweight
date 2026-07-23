@@ -890,14 +890,25 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
 }
 
 void qwen_quant_dot_two_rows(
-    const std::uint8_t* first_row,
-    const std::uint8_t* second_row,
+    const std::uint8_t* first_matrix,
+    const std::uint8_t* second_matrix,
     std::uint32_t type,
     const float* input,
     int elements,
+    std::uint64_t row,
     float& first_output,
     float& second_output
 ) {
+    std::uint64_t row_bytes = 0;
+    if (type == 13) {
+        row_bytes = static_cast<std::uint64_t>(elements / 256) * 176;
+    } else if (type == 14) {
+        row_bytes = static_cast<std::uint64_t>(elements / 256) * 210;
+    } else if (type == 8) {
+        row_bytes = static_cast<std::uint64_t>(elements / 32) * 34;
+    }
+    const auto* first_row = first_matrix + row * row_bytes;
+    const auto* second_row = second_matrix + row * row_bytes;
     if ((colibri_cpu_features() & 2u) != 0) {
         const bool supported =
             (type == 8 && elements % 32 == 0)
@@ -910,8 +921,8 @@ void qwen_quant_dot_two_rows(
             return;
         }
     }
-    first_output = qwen_quant_dot(first_row, type, input, elements, 0);
-    second_output = qwen_quant_dot(second_row, type, input, elements, 0);
+    first_output = qwen_quant_dot(first_matrix, type, input, elements, row);
+    second_output = qwen_quant_dot(second_matrix, type, input, elements, row);
 }
 
 void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
@@ -1068,7 +1079,7 @@ void qwen_cpu_moe(
         } else if (gate_type == up_type) {
             qwen_quant_dot_two_rows(
                 gate[rank], up[rank], gate_type, input, hidden,
-                gate_value, up_value
+                row, gate_value, up_value
             );
         } else {
             gate_value = qwen_quant_dot(gate[rank], gate_type, input, hidden, row);
@@ -1177,16 +1188,16 @@ void qwen_cpu_moe_rows(
                     if(count==1){
                         qwen_quant_dot_two_rows(
                             gate_data, up_data, gate_type, vectors[begin],
-                            hidden, gate_values[0], up_values[0]
+                            hidden, row0+i, gate_values[0], up_values[0]
                         );
                     }else{
                         qwen_quant_dot_two_rows(
                             gate_data, up_data, gate_type, vectors[begin],
-                            hidden, gate_values[0], up_values[0]
+                            hidden, row0+i, gate_values[0], up_values[0]
                         );
                         qwen_quant_dot_two_rows(
                             gate_data, up_data, gate_type, vectors[begin+1],
-                            hidden, gate_values[1], up_values[1]
+                            hidden, row0+i, gate_values[1], up_values[1]
                         );
                     }
                 }else{
