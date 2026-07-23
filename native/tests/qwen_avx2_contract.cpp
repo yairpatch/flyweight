@@ -28,8 +28,8 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
         else if(type==14)set_half(base+208,0x3c00);
         else for(int block=0;block<8;++block)set_half(base+block*34,0x3c00);
     }
-    std::vector<float> input(elements),second(elements),third(elements),fourth(elements),dequant(elements),q8_input(elements);
-    for(int i=0;i<elements;++i){input[i]=std::sin(i*0.071f)*0.75f;second[i]=std::cos(i*0.037f)*0.5f;third[i]=std::sin(i*0.023f)*0.3f;fourth[i]=std::cos(i*0.019f)*0.9f;}
+    std::vector<float> input(elements),second(elements),third(elements),fourth(elements),fifth(elements),sixth(elements),seventh(elements),eighth(elements),dequant(elements),q8_input(elements);
+    for(int i=0;i<elements;++i){input[i]=std::sin(i*0.071f)*0.75f;second[i]=std::cos(i*0.037f)*0.5f;third[i]=std::sin(i*0.023f)*0.3f;fourth[i]=std::cos(i*0.019f)*0.9f;fifth[i]=std::sin(i*0.017f)*0.4f;sixth[i]=std::cos(i*0.011f)*0.6f;seventh[i]=std::sin(i*0.007f)*0.8f;eighth[i]=std::cos(i*0.005f)*0.2f;}
     QwenQ8KBlock q8{};
     qwen_quantize_q8_k_avx2(input.data(),elements,&q8);
     for(int i=0;i<elements;++i)q8_input[i]=q8.scale*q8.values[i];
@@ -53,6 +53,10 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
             float quad_outputs[4]{};
             qwen_quant_dot_quad_avx512(packed.data(),type,quad_inputs,elements,row,quad_outputs);
             for(int token=0;token<4;++token){float expected=0.0f;for(int i=0;i<elements;++i)expected+=dequant[i]*quad_inputs[token][i];if(!close(expected,quad_outputs[token]))return false;}
+            const float*oct_inputs[8]={input.data(),second.data(),third.data(),fourth.data(),fifth.data(),sixth.data(),seventh.data(),eighth.data()};
+            float oct_outputs[8]{};
+            qwen_quant_dot_oct_avx512(packed.data(),type,oct_inputs,elements,row,oct_outputs);
+            for(int token=0;token<8;++token){float expected=0.0f;for(int i=0;i<elements;++i)expected+=dequant[i]*oct_inputs[token][i];if(!close(expected,oct_outputs[token]))return false;}
         }
         float q8_reference=0.0f;
         for(int i=0;i<elements;++i)q8_reference+=dequant[i]*q8_input[i];

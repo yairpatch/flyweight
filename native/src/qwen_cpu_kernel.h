@@ -46,6 +46,15 @@ void qwen_quant_dot_quad_avx512(
     float outputs[4]
 );
 
+void qwen_quant_dot_oct_avx512(
+    const std::uint8_t* packed,
+    std::uint32_t type,
+    const float* const inputs[8],
+    int elements,
+    std::uint64_t row,
+    float outputs[8]
+);
+
 void qwen_quant_dot_quad_avx2(
     const std::uint8_t* packed,
     std::uint32_t type,

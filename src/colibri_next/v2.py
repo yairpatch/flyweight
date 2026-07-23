@@ -202,6 +202,7 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefill_route_wait_nanoseconds", ctypes.c_uint64),
         ("prefill_expert_nanoseconds", ctypes.c_uint64),
         ("prefill_direct_quant", ctypes.c_uint64),
+        ("prefill_direct_quant_width", ctypes.c_uint64),
     ]
 
 

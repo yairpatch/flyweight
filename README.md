@@ -566,7 +566,8 @@ On AVX2 and AVX-512 hosts, batched Qwen CPU prefill uses a four-token direct qua
 Q5_K/Q6_K/Q8_0 dot tile. It shares each packed-weight decode across four routed
 tokens and avoids the temporary FP32 weight expansion. Set
 `COLIBRI_PREFILL_DIRECT_QUANT=0` to restore the older dequantize-once FP32 GEMM
-for comparison. `prefill_direct_quant` reports which path is enabled.
+for comparison. AVX2 shares four tokens per decode; AVX-512 shares eight.
+`prefill_direct_quant` and `prefill_direct_quant_width` report the active path.
 
 On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
 AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep
