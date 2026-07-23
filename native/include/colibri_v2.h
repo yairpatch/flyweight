@@ -178,7 +178,7 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t prefill_nanoseconds; /* total batched rows wall time */
     uint64_t prefill_route_wait_nanoseconds; /* batched route readback synchronization */
     uint64_t prefill_expert_nanoseconds; /* batched CPU/hybrid expert phase wall time */
-    uint64_t prefill_direct_quant; /* AVX-512 four-token quantized expert path is enabled */
+    uint64_t prefill_direct_quant; /* AVX2/AVX-512 four-token quantized expert path is enabled */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

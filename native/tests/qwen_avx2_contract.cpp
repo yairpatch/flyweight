@@ -40,13 +40,16 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
         const float actual=qwen_quant_dot_avx2(
             packed.data(),type,input.data(),elements,row);
         if(!close(reference,actual))return false;
+        const float*quad_inputs[4]={input.data(),second.data(),third.data(),fourth.data()};
+        float avx2_quad[4]{};
+        qwen_quant_dot_quad_avx2(packed.data(),type,quad_inputs,elements,row,avx2_quad);
+        for(int token=0;token<4;++token){float expected=0.0f;for(int i=0;i<elements;++i)expected+=dequant[i]*quad_inputs[token][i];if(!close(expected,avx2_quad[token]))return false;}
         if(avx512){
             float second_reference=0.0f;
             for(int i=0;i<elements;++i)second_reference+=dequant[i]*second[i];
             float pair_first=0.0f,pair_second=0.0f;
             qwen_quant_dot_pair_avx512(packed.data(),type,input.data(),second.data(),elements,row,&pair_first,&pair_second);
             if(!close(reference,pair_first)||!close(second_reference,pair_second))return false;
-            const float*quad_inputs[4]={input.data(),second.data(),third.data(),fourth.data()};
             float quad_outputs[4]{};
             qwen_quant_dot_quad_avx512(packed.data(),type,quad_inputs,elements,row,quad_outputs);
             for(int token=0;token<4;++token){float expected=0.0f;for(int i=0;i<elements;++i)expected+=dequant[i]*quad_inputs[token][i];if(!close(expected,quad_outputs[token]))return false;}

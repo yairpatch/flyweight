@@ -562,7 +562,7 @@ Native Qwen diagnostics also separate batched prompt work into
 `prefill_expert_nanoseconds`, with `prefill_calls` and `prefill_tokens` for
 normalization. These counters exclude the final one-token logits step.
 
-On AVX-512 hosts, batched Qwen CPU prefill uses a four-token direct quantized
+On AVX2 and AVX-512 hosts, batched Qwen CPU prefill uses a four-token direct quantized
 Q5_K/Q6_K/Q8_0 dot tile. It shares each packed-weight decode across four routed
 tokens and avoids the temporary FP32 weight expansion. Set
 `COLIBRI_PREFILL_DIRECT_QUANT=0` to restore the older dequantize-once FP32 GEMM

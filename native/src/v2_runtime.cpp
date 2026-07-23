@@ -941,6 +941,9 @@ void qwen_quant_dot_quad(
     if((colibri_cpu_features()&2u)!=0&&elements%256==0){
         qwen_quant_dot_quad_avx512(packed,type,inputs,elements,row,outputs);return;
     }
+    if((colibri_cpu_features()&1u)!=0&&elements%256==0){
+        qwen_quant_dot_quad_avx2(packed,type,inputs,elements,row,outputs);return;
+    }
     qwen_quant_dot_pair(packed,type,inputs[0],inputs[1],elements,row,outputs[0],outputs[1]);
     qwen_quant_dot_pair(packed,type,inputs[2],inputs[3],elements,row,outputs[2],outputs[3]);
 }
@@ -969,7 +972,7 @@ void qwen_cpu_moe_rows(
     const int hidden=runtime.model->config.hidden_size;
     const int intermediate=runtime.moe_intermediate;
     const char*direct_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
-    const bool direct_quant=(colibri_cpu_features()&2u)!=0&&
+    const bool direct_quant=(colibri_cpu_features()&3u)!=0&&
         (!direct_setting||direct_setting[0]!='0');
     if(rows<=0||rows>4096||routed_count<=0||routed_count>256)
         throw std::runtime_error("native CPU batched MoE shape is unsupported");
@@ -1393,7 +1396,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->prefill_route_wait_nanoseconds=runtime->prefill_route_wait_nanoseconds;
     out->prefill_expert_nanoseconds=runtime->prefill_expert_nanoseconds;
     const char*direct_quant_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
-    out->prefill_direct_quant=(colibri_cpu_features()&2u)!=0&&
+    out->prefill_direct_quant=(colibri_cpu_features()&3u)!=0&&
         (!direct_quant_setting||direct_quant_setting[0]!='0');
     return 0;
 });}
