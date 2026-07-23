@@ -37,6 +37,16 @@ void qwen_quant_dot_pair_avx512(
     float* second_output
 );
 
+void qwen_quant_dot_two_rows_avx512(
+    const std::uint8_t* first_row,
+    const std::uint8_t* second_row,
+    std::uint32_t type,
+    const float* input,
+    int elements,
+    float* first_output,
+    float* second_output
+);
+
 void qwen_quant_dot_quad_avx512(
     const std::uint8_t* packed,
     std::uint32_t type,

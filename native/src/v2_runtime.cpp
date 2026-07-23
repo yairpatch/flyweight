@@ -97,6 +97,7 @@ struct QwenExpertSlot {
     std::uint64_t key = 0;
     std::uint64_t last_used = 0;
     bool valid = false;
+    bool pinned = false;
 };
 
 struct QwenExpertHistory {
@@ -293,6 +294,7 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_router_end_event = 0;
     bool prefill_profile = false;
     bool cuda_profile = false;
+    bool fused_q8_attention = true;
     std::vector<QwenCudaLayerProfile> cuda_layer_profiles;
     std::uint64_t cuda_tail_start = 0, cuda_tail_end = 0;
     std::uint64_t position = 0;
@@ -393,6 +395,7 @@ std::size_t select_expert_cache_slot(
         return static_cast<std::size_t>(free_slot - runtime.expert_slots.begin());
     }
     auto victim = std::min_element(begin, end, [&](const QwenExpertSlot& left, const QwenExpertSlot& right) {
+        if (left.pinned != right.pinned) return !left.pinned;
         const auto left_expert = static_cast<std::uint32_t>(left.key);
         const auto right_expert = static_cast<std::uint32_t>(right.key);
         const auto& left_history = runtime.expert_history[static_cast<std::size_t>(layer) * runtime.model->config.expert_count + left_expert];
@@ -401,6 +404,10 @@ std::size_t select_expert_cache_slot(
             ? left_history.frequency < right_history.frequency
             : left.last_used < right.last_used;
     });
+    if (victim->pinned) {
+        ++runtime.expert_cache_rejections;
+        return kNoExpertSlot;
+    }
     const auto victim_expert = static_cast<std::uint32_t>(victim->key);
     const auto& victim_history = runtime.expert_history[
         static_cast<std::size_t>(layer) * runtime.model->config.expert_count + victim_expert
@@ -882,6 +889,31 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
     first_output=qwen_quant_dot(packed,type,first,elements,row);second_output=qwen_quant_dot(packed,type,second,elements,row);
 }
 
+void qwen_quant_dot_two_rows(
+    const std::uint8_t* first_row,
+    const std::uint8_t* second_row,
+    std::uint32_t type,
+    const float* input,
+    int elements,
+    float& first_output,
+    float& second_output
+) {
+    if ((colibri_cpu_features() & 2u) != 0) {
+        const bool supported =
+            (type == 8 && elements % 32 == 0)
+            || ((type == 13 || type == 14) && elements % 256 == 0);
+        if (supported) {
+            qwen_quant_dot_two_rows_avx512(
+                first_row, second_row, type, input, elements,
+                &first_output, &second_output
+            );
+            return;
+        }
+    }
+    first_output = qwen_quant_dot(first_row, type, input, elements, 0);
+    second_output = qwen_quant_dot(second_row, type, input, elements, 0);
+}
+
 void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         const std::int32_t*selected,const float*weights,int routed_count,const float*input,
         float*activated,float*output){
@@ -968,18 +1000,107 @@ void qwen_quant_dot_oct(
     qwen_quant_dot_oct_avx512(packed,type,inputs,elements,row,outputs);
 }
 
-void qwen_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,const std::int32_t*selected,const float*weights,int routed_count,const float*input,float*activated,float*output){const int experts=runtime.model->config.expert_count,hidden=runtime.model->config.hidden_size,intermediate=runtime.moe_intermediate;if(routed_count<0||routed_count>256)throw std::runtime_error("native CPU MoE routed count is unsupported");for(int role=0;role<3;++role){const auto type=runtime.model->tensors[layer.expert_tensors[role]].type;if(type!=13&&type!=14&&type!=8)throw std::runtime_error("unsupported native CPU expert quantization");}std::array<const std::uint8_t*,256>gate{},up{},down{};for(int rank=0;rank<routed_count;++rank){if(selected[rank]<0||selected[rank]>=experts)throw std::runtime_error("native CPU MoE selected an invalid expert");for(int role=0;role<3;++role){const auto&t=runtime.model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto*pointer=runtime.model->data+t.offset+static_cast<std::uint64_t>(selected[rank])*bytes;if(role==0)gate[rank]=pointer;else if(role==1)up[rank]=pointer;else down[rank]=pointer;}}
-const char*q8_setting=std::getenv("COLIBRI_Q8_ACTIVATIONS");
-const auto cpu_features=colibri_cpu_features();
-const bool use_q8=(cpu_features&1u)!=0&&hidden%256==0&&intermediate%256==0&&q8_setting&&q8_setting[0]=='1';
-thread_local std::vector<QwenQ8KBlock> input_q8,activated_q8;
-if(use_q8){input_q8.resize(hidden/256);activated_q8.resize(static_cast<std::size_t>(routed_count)*(intermediate/256));qwen_quantize_q8_k_avx2(input,hidden,input_q8.data());}
-const auto*input_q8_data=input_q8.data();auto*activated_q8_data=activated_q8.data();
-#pragma omp parallel for schedule(static)
-for(int task=0;task<routed_count*intermediate;++task){const int rank=task/intermediate,row=task%intermediate;const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type,up_type=runtime.model->tensors[layer.expert_tensors[1]].type;const float gate_value=use_q8?qwen_quant_dot_q8_k_avx2(gate[rank],gate_type,input_q8_data,hidden,row):qwen_quant_dot(gate[rank],gate_type,input,hidden,row);const float up_value=use_q8?qwen_quant_dot_q8_k_avx2(up[rank],up_type,input_q8_data,hidden,row):qwen_quant_dot(up[rank],up_type,input,hidden,row);const float clipped=std::max(-80.0f,std::min(80.0f,gate_value));activated[task]=gate_value/(1.0f+std::exp(-clipped))*up_value;}
-if(use_q8)for(int rank=0;rank<routed_count;++rank)qwen_quantize_q8_k_avx2(activated+rank*intermediate,intermediate,activated_q8_data+static_cast<std::size_t>(rank)*(intermediate/256));
-#pragma omp parallel for schedule(static)
-for(int row=0;row<hidden;++row){float value=0.0f;const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;for(int rank=0;rank<routed_count;++rank){const float expert_value=use_q8?qwen_quant_dot_q8_k_avx2(down[rank],down_type,activated_q8_data+static_cast<std::size_t>(rank)*(intermediate/256),intermediate,row):qwen_quant_dot(down[rank],down_type,activated+rank*intermediate,intermediate,row);value+=weights[rank]*expert_value;}output[row]=value;}
+void qwen_cpu_moe(
+    const ColibriV2QwenRuntime& runtime,
+    const QwenLayerPlan& layer,
+    const std::int32_t* selected,
+    const float* weights,
+    int routed_count,
+    const float* input,
+    float* activated,
+    float* output
+) {
+    const int experts = runtime.model->config.expert_count;
+    const int hidden = runtime.model->config.hidden_size;
+    const int intermediate = runtime.moe_intermediate;
+    if (routed_count < 0 || routed_count > 256) {
+        throw std::runtime_error("native CPU MoE routed count is unsupported");
+    }
+    for (int role = 0; role < 3; ++role) {
+        const auto type = runtime.model->tensors[layer.expert_tensors[role]].type;
+        if (type != 13 && type != 14 && type != 8) {
+            throw std::runtime_error("unsupported native CPU expert quantization");
+        }
+    }
+    std::array<const std::uint8_t*, 256> gate{}, up{}, down{};
+    for (int rank = 0; rank < routed_count; ++rank) {
+        if (selected[rank] < 0 || selected[rank] >= experts) {
+            throw std::runtime_error("native CPU MoE selected an invalid expert");
+        }
+        for (int role = 0; role < 3; ++role) {
+            const auto& t = runtime.model->tensors[layer.expert_tensors[role]];
+            const auto bytes = t.size / experts;
+            const auto* pointer = runtime.model->data + t.offset
+                + static_cast<std::uint64_t>(selected[rank]) * bytes;
+            if (role == 0) gate[rank] = pointer;
+            else if (role == 1) up[rank] = pointer;
+            else down[rank] = pointer;
+        }
+    }
+    const auto gate_type = runtime.model->tensors[layer.expert_tensors[0]].type;
+    const auto up_type = runtime.model->tensors[layer.expert_tensors[1]].type;
+    const auto down_type = runtime.model->tensors[layer.expert_tensors[2]].type;
+    const char* q8_setting = std::getenv("COLIBRI_Q8_ACTIVATIONS");
+    const auto cpu_features = colibri_cpu_features();
+    const bool use_q8 = (cpu_features & 1u) != 0 && hidden % 256 == 0
+        && intermediate % 256 == 0 && q8_setting && q8_setting[0] == '1';
+    thread_local std::vector<QwenQ8KBlock> input_q8, activated_q8;
+    if (use_q8) {
+        input_q8.resize(hidden / 256);
+        activated_q8.resize(static_cast<std::size_t>(routed_count) * (intermediate / 256));
+        qwen_quantize_q8_k_avx2(input, hidden, input_q8.data());
+    }
+    const auto* input_q8_data = input_q8.data();
+    auto* activated_q8_data = activated_q8.data();
+    #pragma omp parallel for schedule(static)
+    for (int task = 0; task < routed_count * intermediate; ++task) {
+        const int rank = task / intermediate;
+        const int row = task % intermediate;
+        float gate_value = 0.0f;
+        float up_value = 0.0f;
+        if (use_q8) {
+            gate_value = qwen_quant_dot_q8_k_avx2(
+                gate[rank], gate_type, input_q8_data, hidden, row
+            );
+            up_value = qwen_quant_dot_q8_k_avx2(
+                up[rank], up_type, input_q8_data, hidden, row
+            );
+        } else if (gate_type == up_type) {
+            qwen_quant_dot_two_rows(
+                gate[rank], up[rank], gate_type, input, hidden,
+                gate_value, up_value
+            );
+        } else {
+            gate_value = qwen_quant_dot(gate[rank], gate_type, input, hidden, row);
+            up_value = qwen_quant_dot(up[rank], up_type, input, hidden, row);
+        }
+        const float clipped = std::max(-80.0f, std::min(80.0f, gate_value));
+        activated[task] = gate_value / (1.0f + std::exp(-clipped)) * up_value;
+    }
+    if (use_q8) {
+        for (int rank = 0; rank < routed_count; ++rank) {
+            qwen_quantize_q8_k_avx2(
+                activated + static_cast<std::size_t>(rank) * intermediate,
+                intermediate,
+                activated_q8_data + static_cast<std::size_t>(rank) * (intermediate / 256)
+            );
+        }
+    }
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < hidden; ++row) {
+        float value = 0.0f;
+        for (int rank = 0; rank < routed_count; ++rank) {
+            const float expert_value = use_q8
+                ? qwen_quant_dot_q8_k_avx2(
+                    down[rank], down_type,
+                    activated_q8_data + static_cast<std::size_t>(rank) * (intermediate / 256),
+                    intermediate, row
+                )
+                : qwen_quant_dot(down[rank], down_type, activated + rank * intermediate, intermediate, row);
+            value += weights[rank] * expert_value;
+        }
+        output[row] = value;
+    }
 }
 
 void qwen_cpu_moe_rows(
@@ -1052,8 +1173,31 @@ void qwen_cpu_moe_rows(
         if(count<=2){
             for(int i=0;i<mr;++i){
                 float gate_values[2]{},up_values[2]{};
-                if(count==1){gate_values[0]=qwen_quant_dot(gate_data,gate_type,vectors[begin],hidden,row0+i);up_values[0]=qwen_quant_dot(up_data,up_type,vectors[begin],hidden,row0+i);}
-                else{qwen_quant_dot_pair(gate_data,gate_type,vectors[begin],vectors[begin+1],hidden,row0+i,gate_values[0],gate_values[1]);qwen_quant_dot_pair(up_data,up_type,vectors[begin],vectors[begin+1],hidden,row0+i,up_values[0],up_values[1]);}
+                if(gate_type==up_type){
+                    if(count==1){
+                        qwen_quant_dot_two_rows(
+                            gate_data, up_data, gate_type, vectors[begin],
+                            hidden, gate_values[0], up_values[0]
+                        );
+                    }else{
+                        qwen_quant_dot_two_rows(
+                            gate_data, up_data, gate_type, vectors[begin],
+                            hidden, gate_values[0], up_values[0]
+                        );
+                        qwen_quant_dot_two_rows(
+                            gate_data, up_data, gate_type, vectors[begin+1],
+                            hidden, gate_values[1], up_values[1]
+                        );
+                    }
+                }else{
+                    if(count==1){
+                        gate_values[0]=qwen_quant_dot(gate_data,gate_type,vectors[begin],hidden,row0+i);
+                        up_values[0]=qwen_quant_dot(up_data,up_type,vectors[begin],hidden,row0+i);
+                    }else{
+                        qwen_quant_dot_pair(gate_data,gate_type,vectors[begin],vectors[begin+1],hidden,row0+i,gate_values[0],gate_values[1]);
+                        qwen_quant_dot_pair(up_data,up_type,vectors[begin],vectors[begin+1],hidden,row0+i,up_values[0],up_values[1]);
+                    }
+                }
                 for(int occurrence=0;occurrence<count;++occurrence){const int token_rank=occurrences[begin+occurrence];const float gate_value=gate_values[occurrence],clipped=std::max(-80.0f,std::min(80.0f,gate_value));activated[static_cast<std::size_t>(token_rank)*intermediate+(row0+i)]=gate_value/(1.0f+std::exp(-clipped))*up_values[occurrence];}
             }
             continue;
@@ -1457,6 +1601,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
     runtime->prefill_profile=std::getenv("COLIBRI_PREFILL_PROFILE")&&
         std::getenv("COLIBRI_PREFILL_PROFILE")[0]=='1';
+    if(const char*fused=std::getenv("COLIBRI_FUSED_Q8_ATTENTION"))
+        runtime->fused_q8_attention=fused[0]!='0';
     const int route_event_status=runtime->prefill_profile
         ?colibri_gpu_timed_event_create(&runtime->route_event)
         :colibri_gpu_event_create(&runtime->route_event);
@@ -2482,10 +2628,30 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
             launch_named(kv_store_kernel(runtime->options.cache_type_v),kv_heads,1,256,v_store_args);
             std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
-            void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-            launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
-            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
-            launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            if(runtime->fused_q8_attention&&
+               runtime->options.cache_type_k==3&&
+               runtime->options.cache_type_v==3&&
+               head_dim==128&&
+               (tokens+1023)/1024<=512&&
+               static_cast<std::uint64_t>((tokens+1023)/1024)*130<=
+                   runtime->options.context_limit){
+                const int tile_count=(tokens+1023)/1024;
+                void*fused_args[]={&queries,&cache_keys,&cache_values,
+                    const_cast<std::uint64_t*>(&attention_scores),
+                    const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                    const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+                launch_named("kv_attention_fused_q8_tiles",heads,tile_count,256,
+                             fused_args);
+                void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
+                    &attended,const_cast<int*>(&heads),
+                    const_cast<int*>(&head_dim),const_cast<int*>(&tile_count)};
+                launch_named("kv_attention_fused_merge",heads,1,256,merge_args);
+            }else{
+                void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+                launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
+                void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+                launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            }
             std::uint64_t gated=third;int elements=heads*head_dim;
             void*gate_args[]={&attended,&gates,&gated,&elements};
             launch_named("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
@@ -3109,6 +3275,10 @@ static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
     if(runtime.gemma4||runtime.options.mtp_drafts||
        runtime.options.moe_device!=2||runtime.expert_slots.empty())return;
     if(requested<=0)return;
+    // Pins belong to the current prompt. Release the previous prompt's
+    // working set before installing a new one, while retaining its pages as
+    // ordinary LRU candidates when they remain useful.
+    for(auto& slot:runtime.expert_slots)slot.pinned=false;
     const std::size_t per_layer=static_cast<std::size_t>(std::clamp<long>(requested,1,256));
     const auto started=std::chrono::steady_clock::now();
     auto* staging=static_cast<std::uint8_t*>(runtime.host_staging);
@@ -3166,7 +3336,7 @@ static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
             const auto key=(static_cast<std::uint64_t>(layer)<<32)|expert;
             auto& slot=runtime.expert_slots[slot_index];
             if(slot.valid)runtime.expert_residency.erase(slot.key);
-            slot.key=key;slot.valid=true;slot.last_used=++runtime.expert_clock;
+            slot.key=key;slot.valid=true;slot.pinned=true;slot.last_used=++runtime.expert_clock;
             runtime.expert_residency[key]=slot_index;
             pending.push_back({runtime.expert_cache+slot_index*runtime.expert_slot_bytes,
                                bundle_start,bundle_bytes});
@@ -3626,10 +3796,34 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 launch_named(kv_store_kernel(runtime->options.cache_type_v), kv_heads, 1, 256, v_store_args);
                 std::uint64_t attended = s.second; int tokens=view.tokens,first_slot=view.first;
                 float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-                void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot, &scale};
-                launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
-                void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot};
-                launch_named(kv_values_ring_kernel(*runtime), heads, 1, 256, value_args);
+                if(runtime->fused_q8_attention&&
+                   runtime->options.cache_type_k==3&&
+                   runtime->options.cache_type_v==3&&
+                   head_dim==128&&
+                   (tokens+1023)/1024<=512&&
+                   static_cast<std::uint64_t>((tokens+1023)/1024)*130<=
+                       runtime->options.context_limit){
+                    const int tile_count=(tokens+1023)/1024;
+                    void* fused_args[] = {&queries, &cache_keys, &cache_values,
+                        const_cast<std::uint64_t*>(&s.attention_scores),
+                        const_cast<int*>(&heads),
+                        const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
+                        &tokens, &capacity, &first_slot, &scale};
+                    launch_named("kv_attention_fused_q8_tiles", heads,
+                                 tile_count, 256, fused_args);
+                    void* merge_args[] = {
+                        const_cast<std::uint64_t*>(&s.attention_scores),
+                        &attended, const_cast<int*>(&heads),
+                        const_cast<int*>(&head_dim),
+                        const_cast<int*>(&tile_count)};
+                    launch_named("kv_attention_fused_merge", heads, 1, 256,
+                                 merge_args);
+                }else{
+                    void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot, &scale};
+                    launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
+                    void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot};
+                    launch_named(kv_values_ring_kernel(*runtime), heads, 1, 256, value_args);
+                }
                 std::uint64_t gated = s.third; int elements = heads * head_dim;
                 void* gate_args[] = {&attended, &gates, &gated, &elements};
                 launch_named("qwen_attention_gate", (elements + 255) / 256, 1, 256, gate_args);

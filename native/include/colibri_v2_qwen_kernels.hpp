@@ -1746,7 +1746,7 @@ extern "C" __global__ void kv_attention_scores_q8_ring(
 
 template<typename VT>
 __device__ void kv_values_impl(
-    const float* scores, const VT* values, float* output,
+    float* scores, const VT* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
 ) {
@@ -1754,7 +1754,7 @@ __device__ void kv_values_impl(
     if (head >= heads) return;
     const int group = heads / kv_heads;
     const int kv_head = head / group;
-    const float* head_scores = scores + head * tokens;
+    float* head_scores = scores + head * tokens;
     float local_maximum = -3.402823466e+38F;
     for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
         local_maximum = fmaxf(local_maximum, head_scores[token]);
@@ -1765,45 +1765,51 @@ __device__ void kv_values_impl(
     __syncthreads();
     float local_denominator = 0.0f;
     for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
-        local_denominator += expf(head_scores[token] - maximum);
+        const float weight = expf(head_scores[token] - maximum);
+        head_scores[token] = weight;
+        local_denominator += weight;
     }
     const float reduced_denominator = block_reduce_sum(local_denominator);
     __shared__ float inverse_denominator;
     if (threadIdx.x == 0) inverse_denominator = 1.0f / reduced_denominator;
     __syncthreads();
+    for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
+        head_scores[token] *= inverse_denominator;
+    }
+    __syncthreads();
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float result = 0.0f;
         for (int token = 0; token < tokens; ++token) {
-            const float weight = expf(head_scores[token] - maximum);
-            result += weight * kv_ld(values, (long long)(kv_head * capacity + token) * head_dim + d);
+            result += head_scores[token] *
+                kv_ld(values, (long long)(kv_head * capacity + token) * head_dim + d);
         }
-        output[head * head_dim + d] = result * inverse_denominator;
+        output[head * head_dim + d] = result;
     }
 }
 extern "C" __global__ void kv_attention_values(
-    const float* scores, const float* values, float* output,
+    float* scores, const float* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
 ) { kv_values_impl<float>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
 extern "C" __global__ void kv_attention_values_f16(
-    const float* scores, const __half* values, float* output,
+    float* scores, const __half* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
 ) { kv_values_impl<__half>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
 extern "C" __global__ void kv_attention_values_bf16(
-    const float* scores, const __nv_bfloat16* values, float* output,
+    float* scores, const __nv_bfloat16* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
 ) { kv_values_impl<__nv_bfloat16>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
 extern "C" __global__ void kv_attention_values_q8(
-    const float* scores, const unsigned char* values, float* output,
+    float* scores, const unsigned char* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
 ) {
     const int head = blockIdx.x;
     if (head >= heads) return;
     const int group = heads / kv_heads, kv_head = head / group, blocks = head_dim / 32;
-    const float* head_scores = scores + head * tokens;
+    float* head_scores = scores + head * tokens;
     float local_maximum = -3.402823466e+38F;
     for (int token = threadIdx.x; token < tokens; token += blockDim.x)
         local_maximum = fmaxf(local_maximum, head_scores[token]);
@@ -1821,9 +1827,8 @@ extern "C" __global__ void kv_attention_values_q8(
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float result = 0.0f;
         for (int token = 0; token < tokens; ++token) {
-            const float weight = expf(head_scores[token] - maximum);
             const unsigned char* vrow = values + ((long long)kv_head * capacity + token) * blocks * 34;
-            result += weight * kv_ld_q8(vrow, d);
+            result += expf(head_scores[token] - maximum) * kv_ld_q8(vrow, d);
         }
         output[head * head_dim + d] = result * inverse_denominator;
     }
@@ -1831,14 +1836,14 @@ extern "C" __global__ void kv_attention_values_q8(
 
 template<typename VT>
 __device__ void kv_values_ring_impl(
-    const float* scores, const VT* values, float* output,
+    float* scores, const VT* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity, const int first
 ) {
     const int head=blockIdx.x;
     if(head>=heads)return;
     const int kv_head=head/(heads/kv_heads);
-    const float* head_scores=scores+head*tokens;
+    float* head_scores=scores+head*tokens;
     float local_maximum=-3.402823466e+38F;
     for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_maximum=fmaxf(local_maximum,head_scores[token]);
     const float reduced_maximum=block_reduce_max(local_maximum);
@@ -1846,22 +1851,29 @@ __device__ void kv_values_ring_impl(
     if(threadIdx.x==0)maximum=reduced_maximum;
     __syncthreads();
     float local_denominator=0.0f;
-    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_denominator+=expf(head_scores[token]-maximum);
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x){
+        const float weight=expf(head_scores[token]-maximum);
+        head_scores[token]=weight;
+        local_denominator+=weight;
+    }
     const float reduced_denominator=block_reduce_sum(local_denominator);
     __shared__ float inverse_denominator;
     if(threadIdx.x==0)inverse_denominator=1.0f/reduced_denominator;
+    __syncthreads();
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)
+        head_scores[token]*=inverse_denominator;
     __syncthreads();
     for(int d=threadIdx.x;d<head_dim;d+=blockDim.x){
         float result=0.0f;
         for(int token=0;token<tokens;++token){
             const int slot=(first+token)%capacity;
-            result+=expf(head_scores[token]-maximum)*kv_ld(values,(long long)(kv_head*capacity+slot)*head_dim+d);
+            result+=head_scores[token]*kv_ld(values,(long long)(kv_head*capacity+slot)*head_dim+d);
         }
-        output[head*head_dim+d]=result*inverse_denominator;
+        output[head*head_dim+d]=result;
     }
 }
 #define KV_VALUES_RING(name, T) \
-extern "C" __global__ void name(const float* scores, const T* values, float* output, \
+extern "C" __global__ void name(float* scores, const T* values, float* output, \
     const int heads, const int kv_heads, const int head_dim, const int tokens, \
     const int capacity, const int first) { \
     kv_values_ring_impl<T>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity, first); \
@@ -1871,14 +1883,14 @@ KV_VALUES_RING(kv_attention_values_f16_ring, __half)
 KV_VALUES_RING(kv_attention_values_bf16_ring, __nv_bfloat16)
 #undef KV_VALUES_RING
 extern "C" __global__ void kv_attention_values_q8_ring(
-    const float* scores, const unsigned char* values, float* output,
+    float* scores, const unsigned char* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity, const int first
 ) {
     const int head=blockIdx.x;
     if(head>=heads)return;
     const int kv_head=head/(heads/kv_heads), blocks=head_dim/32;
-    const float* head_scores=scores+head*tokens;
+    float* head_scores=scores+head*tokens;
     float local_maximum=-3.402823466e+38F;
     for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_maximum=fmaxf(local_maximum,head_scores[token]);
     const float reduced_maximum=block_reduce_max(local_maximum);
@@ -1886,19 +1898,202 @@ extern "C" __global__ void kv_attention_values_q8_ring(
     if(threadIdx.x==0)maximum=reduced_maximum;
     __syncthreads();
     float local_denominator=0.0f;
-    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_denominator+=expf(head_scores[token]-maximum);
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x){
+        const float weight=expf(head_scores[token]-maximum);
+        head_scores[token]=weight;
+        local_denominator+=weight;
+    }
     const float reduced_denominator=block_reduce_sum(local_denominator);
     __shared__ float inverse_denominator;
     if(threadIdx.x==0)inverse_denominator=1.0f/reduced_denominator;
+    __syncthreads();
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)
+        head_scores[token]*=inverse_denominator;
     __syncthreads();
     for(int d=threadIdx.x;d<head_dim;d+=blockDim.x){
         float result=0.0f;
         for(int token=0;token<tokens;++token){
             const int slot=(first+token)%capacity;
             const unsigned char* row=values+((long long)kv_head*capacity+slot)*blocks*34;
-            result+=expf(head_scores[token]-maximum)*kv_ld_q8(row,d);
+            result+=head_scores[token]*kv_ld_q8(row,d);
         }
-        output[head*head_dim+d]=result*inverse_denominator;
+        output[head*head_dim+d]=result;
+    }
+}
+
+// Tiled single-token Q8 attention.  Every block computes an online-softmax
+// state for one [head, 1024-token] tile.  A second small kernel merges those
+// states.  Compared with the split score/value path this keeps long-context
+// occupancy (many tiles are independent), avoids the [heads, tokens] score
+// round trip, and reads each value only while its score is live.
+//
+// Qwen currently uses head_dim=128.  Other shapes retain the generic split
+// kernels, keeping this fast path's local and shared storage fixed-size.
+extern "C" __global__ void kv_attention_fused_q8_tiles(
+    const float* query,
+    const unsigned char* keys,
+    const unsigned char* values,
+    float* partial,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const int first,
+    const float scale
+) {
+    constexpr int warp_count = 8;
+    constexpr int maximum_head_dim = 128;
+    constexpr int tokens_per_tile = 1024;
+    const int head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (head >= heads || head_dim > maximum_head_dim || (head_dim & 31) != 0)
+        return;
+
+    const int tile_begin = tile * tokens_per_tile;
+    const int tile_end = min(tokens, tile_begin + tokens_per_tile);
+    const int kv_head = head / (heads / kv_heads);
+    const int blocks = head_dim / 32;
+    const float* q = query + head * head_dim;
+    float accumulator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float maximum = -3.402823466e+38F;
+    float denominator = 0.0f;
+
+    for (int token = tile_begin + warp;
+         token < tile_end;
+         token += warp_count) {
+        int slot = first + token;
+        if (slot >= capacity) slot -= capacity;
+        const unsigned char* key_row =
+            keys + ((long long)kv_head * capacity + slot) * blocks * 34;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            const int dimension = lane + part * 32;
+            if (dimension < head_dim)
+                dot += q[dimension] * kv_ld_q8(key_row, dimension);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        const float score =
+            __shfl_sync(0xffffffff, dot, 0) * scale;
+        const float next_maximum = fmaxf(maximum, score);
+        const float old_scale = maximum == -3.402823466e+38F
+            ? 0.0f : expf(maximum - next_maximum);
+        const float token_scale = expf(score - next_maximum);
+        denominator = denominator * old_scale + token_scale;
+
+        const unsigned char* value_row =
+            values + ((long long)kv_head * capacity + slot) * blocks * 34;
+        #pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            const int dimension = lane + part * 32;
+            if (dimension < head_dim) {
+                accumulator[part] = accumulator[part] * old_scale
+                    + token_scale * kv_ld_q8(value_row, dimension);
+            }
+        }
+        maximum = next_maximum;
+    }
+
+    __shared__ float warp_maximum[warp_count];
+    __shared__ float warp_denominator[warp_count];
+    __shared__ float warp_scale[warp_count];
+    __shared__ float merged_maximum;
+    __shared__ float merged_denominator;
+    __shared__ float partial_output[warp_count][maximum_head_dim];
+    if (lane == 0) {
+        warp_maximum[warp] = maximum;
+        warp_denominator[warp] = denominator;
+    }
+    #pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        const int dimension = lane + part * 32;
+        if (dimension < head_dim)
+            partial_output[warp][dimension] = accumulator[part];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float tile_maximum = warp_maximum[0];
+        #pragma unroll
+        for (int index = 1; index < warp_count; ++index)
+            tile_maximum = fmaxf(tile_maximum, warp_maximum[index]);
+        float tile_denominator = 0.0f;
+        #pragma unroll
+        for (int index = 0; index < warp_count; ++index) {
+            const float factor = warp_denominator[index] == 0.0f
+                ? 0.0f : expf(warp_maximum[index] - tile_maximum);
+            warp_scale[index] = factor;
+            tile_denominator += warp_denominator[index] * factor;
+        }
+        merged_maximum = tile_maximum;
+        merged_denominator = tile_denominator;
+    }
+    __syncthreads();
+
+    const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
+    float* record = partial
+        + ((long long)head * tile_count + tile) * (maximum_head_dim + 2);
+    if (threadIdx.x == 0) {
+        record[0] = merged_maximum;
+        record[1] = merged_denominator;
+    }
+    for (int dimension = threadIdx.x;
+         dimension < head_dim;
+         dimension += blockDim.x) {
+        float result = 0.0f;
+        #pragma unroll
+        for (int index = 0; index < warp_count; ++index)
+            result += partial_output[index][dimension] * warp_scale[index];
+        record[dimension + 2] = result;
+    }
+}
+
+extern "C" __global__ void kv_attention_fused_merge(
+    const float* partial,
+    float* output,
+    const int heads,
+    const int head_dim,
+    const int tile_count
+) {
+    constexpr int maximum_head_dim = 128;
+    constexpr int maximum_tiles = 512;
+    const int head = blockIdx.x;
+    if (head >= heads || head_dim > maximum_head_dim ||
+        tile_count <= 0 || tile_count > maximum_tiles)
+        return;
+    const int stride = maximum_head_dim + 2;
+    const float* head_partial =
+        partial + (long long)head * tile_count * stride;
+    __shared__ float tile_scale[maximum_tiles];
+    __shared__ float inverse_denominator;
+    if (threadIdx.x == 0) {
+        float maximum = head_partial[0];
+        for (int tile = 1; tile < tile_count; ++tile)
+            maximum = fmaxf(maximum, head_partial[tile * stride]);
+        float denominator = 0.0f;
+        for (int tile = 0; tile < tile_count; ++tile) {
+            const float factor =
+                expf(head_partial[tile * stride] - maximum);
+            tile_scale[tile] = factor;
+            denominator += head_partial[tile * stride + 1] * factor;
+        }
+        inverse_denominator = 1.0f / denominator;
+    }
+    __syncthreads();
+    for (int dimension = threadIdx.x;
+         dimension < head_dim;
+         dimension += blockDim.x) {
+        float result = 0.0f;
+        for (int tile = 0; tile < tile_count; ++tile) {
+            result += head_partial[tile * stride + dimension + 2]
+                * tile_scale[tile];
+        }
+        output[head * head_dim + dimension] =
+            result * inverse_denominator;
     }
 }
 

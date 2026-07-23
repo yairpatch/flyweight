@@ -519,11 +519,38 @@ PYTHONPATH=src python -m colibri_next.cli benchmark-v2 model.gguf \
   --moe-device hybrid --cache-type-k f16 --cache-type-v f16
 ```
 
+For Claude Code and OpenCode, benchmark `--moe-device cpu` as well as
+`hybrid`: a bounded GPU expert cache is not automatically faster when routed
+experts churn or GPU grouped kernels contend with long-context attention. On
+the 12 GiB reference system, CPU experts were faster and substantially more
+stable at 10K context. Agent clients also issue concurrent title, subagent, and
+main-conversation requests, so use `--parallel 2` (or more when memory permits)
+with `--prompt-cache-mib`; a host prompt-cache budget has no effect with the
+single default slot. Q8 KV is the memory-oriented choice for 58K contexts,
+while f16 was only slightly faster in the same reference benchmark.
+
+One practical low-memory agent configuration is:
+
+```bash
+PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
+  --context-window 58000 --moe-device cpu \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --parallel 2 --prompt-cache-mib 4096 --cpu-prefetch-auto
+```
+
+Unset `COLIBRI_PREFILL_PROFILE` and `COLIBRI_CUDA_PROFILE` for production
+serving; both are diagnostic modes. Request-log prompt rates include time
+waiting for a sequence slot, so use the native `prefill_nanoseconds` and
+`decode_nanoseconds` counters when comparing kernels under concurrent load.
+
 `--prefill-cache-seed N` experimentally records Qwen routing frequency during
 prefill without admitting pages, then bulk-loads the hottest `N` experts per
-layer before generation. `COLIBRI_PREFILL_CACHE_SEED` can override the API/CLI
-setting for experiments. It is opt-in while its time-to-first-token versus
-early-generation tradeoff is evaluated across hardware and prompt workloads.
+layer before generation. Those prompt-hot pages are pinned for the following
+decode so normal LRU admissions cannot immediately evict the working set;
+pinning is released when the next prompt is seeded. `COLIBRI_PREFILL_CACHE_SEED`
+can override the API/CLI setting for experiments. It is opt-in while its
+time-to-first-token versus early-generation tradeoff is evaluated across
+hardware and prompt workloads.
 
 Hybrid MoE uses `--expert-paging auto` by default. When the CUDA driver supports
 registered host memory and the machine has enough available RAM for the model

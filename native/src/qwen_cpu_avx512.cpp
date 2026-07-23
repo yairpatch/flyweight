@@ -169,6 +169,235 @@ void q8_dot_pair(const std::uint8_t*row_data,const float*first,const float*secon
     out_first=_mm512_reduce_add_ps(_mm512_add_ps(a0,a1));out_second=_mm512_reduce_add_ps(_mm512_add_ps(b0,b1));
 }
 
+void q5_dot_two_rows(
+    const std::uint8_t* first_row,
+    const std::uint8_t* second_row,
+    const float* input,
+    int elements,
+    float& out_first,
+    float& out_second
+) {
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps();
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m128i bit_mask = _mm_set1_epi8(1);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base0 = first_row + block * 176;
+        const auto* base1 = second_row + block * 176;
+        const float d0 = half_value(base0);
+        const float dmin0 = half_value(base0 + 2);
+        const float d1 = half_value(base1);
+        const float dmin1 = half_value(base1 + 2);
+        const auto* scales0 = base0 + 4;
+        const auto* scales1 = base1 + 4;
+        const auto* high0 = base0 + 16;
+        const auto* high1 = base1 + 16;
+        const auto* low0 = base0 + 48;
+        const auto* low1 = base1 + 48;
+        const auto* vector = input + block * 256;
+        for (int group = 0; group < 4; ++group) {
+            for (int sub = 0; sub < 2; ++sub) {
+                const int scale_index = group * 2 + sub;
+                int scale0, minimum0, scale1, minimum1;
+                if (scale_index < 4) {
+                    scale0 = scales0[scale_index] & 63;
+                    minimum0 = scales0[scale_index + 4] & 63;
+                    scale1 = scales1[scale_index] & 63;
+                    minimum1 = scales1[scale_index + 4] & 63;
+                } else {
+                    scale0 = (scales0[scale_index + 4] & 15)
+                        | ((scales0[scale_index - 4] >> 6) << 4);
+                    minimum0 = (scales0[scale_index + 4] >> 4)
+                        | ((scales0[scale_index] >> 6) << 4);
+                    scale1 = (scales1[scale_index + 4] & 15)
+                        | ((scales1[scale_index - 4] >> 6) << 4);
+                    minimum1 = (scales1[scale_index + 4] >> 4)
+                        | ((scales1[scale_index] >> 6) << 4);
+                }
+                const __m512 ds0 = _mm512_set1_ps(d0 * scale0);
+                const __m512 dm0 = _mm512_set1_ps(dmin0 * minimum0);
+                const __m512 ds1 = _mm512_set1_ps(d1 * scale1);
+                const __m512 dm1 = _mm512_set1_ps(dmin1 * minimum1);
+                const int shift = 2 * group + sub;
+                for (int lanes = 0; lanes < 32; lanes += 16) {
+                    __m128i q0 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(low0 + group * 32 + lanes)
+                    );
+                    __m128i q1 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(low1 + group * 32 + lanes)
+                    );
+                    q0 = sub == 0 ? _mm_and_si128(q0, nibble_mask)
+                                  : _mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask);
+                    q1 = sub == 0 ? _mm_and_si128(q1, nibble_mask)
+                                  : _mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask);
+                    __m128i bits0 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(high0 + lanes)
+                    );
+                    __m128i bits1 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(high1 + lanes)
+                    );
+                    bits0 = _mm_and_si128(_mm_srli_epi16(bits0, shift), bit_mask);
+                    bits1 = _mm_and_si128(_mm_srli_epi16(bits1, shift), bit_mask);
+                    q0 = _mm_add_epi8(q0, _mm_slli_epi16(bits0, 4));
+                    q1 = _mm_add_epi8(q1, _mm_slli_epi16(bits1, 4));
+                    const __m512 values = _mm512_loadu_ps(
+                        vector + group * 64 + sub * 32 + lanes
+                    );
+                    const __m512 weights0 = _mm512_sub_ps(
+                        _mm512_mul_ps(bytes_to_float(q0), ds0), dm0
+                    );
+                    const __m512 weights1 = _mm512_sub_ps(
+                        _mm512_mul_ps(bytes_to_float(q1), ds1), dm1
+                    );
+                    if (lanes == 0) {
+                        a0 = _mm512_fmadd_ps(weights0, values, a0);
+                        b0 = _mm512_fmadd_ps(weights1, values, b0);
+                    } else {
+                        a1 = _mm512_fmadd_ps(weights0, values, a1);
+                        b1 = _mm512_fmadd_ps(weights1, values, b1);
+                    }
+                }
+            }
+        }
+    }
+    out_first = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+    out_second = _mm512_reduce_add_ps(_mm512_add_ps(b0, b1));
+}
+
+void q6_dot_two_rows(
+    const std::uint8_t* first_row,
+    const std::uint8_t* second_row,
+    const float* input,
+    int elements,
+    float& out_first,
+    float& out_second
+) {
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps();
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m128i high_mask = _mm_set1_epi8(3);
+    const __m512 offset = _mm512_set1_ps(32.0f);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base0 = first_row + block * 210;
+        const auto* base1 = second_row + block * 210;
+        const auto* ql0 = base0;
+        const auto* ql1 = base1;
+        const auto* qh0 = base0 + 128;
+        const auto* qh1 = base1 + 128;
+        const auto* scales0 = reinterpret_cast<const std::int8_t*>(base0 + 192);
+        const auto* scales1 = reinterpret_cast<const std::int8_t*>(base1 + 192);
+        const float d0 = half_value(base0 + 208);
+        const float d1 = half_value(base1 + 208);
+        for (int half = 0; half < 2; ++half) {
+            for (int segment = 0; segment < 4; ++segment) {
+                const int q_offset = (segment == 0 || segment == 2) ? 0 : 32;
+                for (int lanes = 0; lanes < 32; lanes += 16) {
+                    __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                        ql0 + half * 64 + q_offset + lanes
+                    ));
+                    __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                        ql1 + half * 64 + q_offset + lanes
+                    ));
+                    q0 = segment < 2 ? _mm_and_si128(q0, nibble_mask)
+                                     : _mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask);
+                    q1 = segment < 2 ? _mm_and_si128(q1, nibble_mask)
+                                     : _mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask);
+                    __m128i high0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                        qh0 + half * 32 + lanes
+                    ));
+                    __m128i high1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                        qh1 + half * 32 + lanes
+                    ));
+                    high0 = _mm_and_si128(
+                        _mm_srli_epi16(high0, segment * 2), high_mask
+                    );
+                    high1 = _mm_and_si128(
+                        _mm_srli_epi16(high1, segment * 2), high_mask
+                    );
+                    q0 = _mm_add_epi8(q0, _mm_slli_epi16(high0, 4));
+                    q1 = _mm_add_epi8(q1, _mm_slli_epi16(high1, 4));
+                    const int scale_index = half * 8 + lanes / 16 + segment * 2;
+                    const __m512 weights0 = _mm512_mul_ps(
+                        _mm512_sub_ps(bytes_to_float(q0), offset),
+                        _mm512_set1_ps(d0 * scales0[scale_index])
+                    );
+                    const __m512 weights1 = _mm512_mul_ps(
+                        _mm512_sub_ps(bytes_to_float(q1), offset),
+                        _mm512_set1_ps(d1 * scales1[scale_index])
+                    );
+                    const int index = block * 256 + half * 128 + segment * 32 + lanes;
+                    const __m512 values = _mm512_loadu_ps(input + index);
+                    if (lanes == 0) {
+                        a0 = _mm512_fmadd_ps(weights0, values, a0);
+                        b0 = _mm512_fmadd_ps(weights1, values, b0);
+                    } else {
+                        a1 = _mm512_fmadd_ps(weights0, values, a1);
+                        b1 = _mm512_fmadd_ps(weights1, values, b1);
+                    }
+                }
+            }
+        }
+    }
+    out_first = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+    out_second = _mm512_reduce_add_ps(_mm512_add_ps(b0, b1));
+}
+
+void q8_dot_two_rows(
+    const std::uint8_t* first_row,
+    const std::uint8_t* second_row,
+    const float* input,
+    int elements,
+    float& out_first,
+    float& out_second
+) {
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps();
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base0 = first_row + block * 34;
+        const auto* base1 = second_row + block * 34;
+        const __m512 scale0 = _mm512_set1_ps(half_value(base0));
+        const __m512 scale1 = _mm512_set1_ps(half_value(base1));
+        const __m256i quantized0 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(base0 + 2)
+        );
+        const __m256i quantized1 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(base1 + 2)
+        );
+        const __m512 q00 = _mm512_mul_ps(
+            _mm512_cvtepi32_ps(
+                _mm512_cvtepi8_epi32(_mm256_castsi256_si128(quantized0))
+            ),
+            scale0
+        );
+        const __m512 q01 = _mm512_mul_ps(
+            _mm512_cvtepi32_ps(
+                _mm512_cvtepi8_epi32(_mm256_extracti128_si256(quantized0, 1))
+            ),
+            scale0
+        );
+        const __m512 q10 = _mm512_mul_ps(
+            _mm512_cvtepi32_ps(
+                _mm512_cvtepi8_epi32(_mm256_castsi256_si128(quantized1))
+            ),
+            scale1
+        );
+        const __m512 q11 = _mm512_mul_ps(
+            _mm512_cvtepi32_ps(
+                _mm512_cvtepi8_epi32(_mm256_extracti128_si256(quantized1, 1))
+            ),
+            scale1
+        );
+        const __m512 values0 = _mm512_loadu_ps(input + block * 32);
+        const __m512 values1 = _mm512_loadu_ps(input + block * 32 + 16);
+        a0 = _mm512_fmadd_ps(q00, values0, a0);
+        a1 = _mm512_fmadd_ps(q01, values1, a1);
+        b0 = _mm512_fmadd_ps(q10, values0, b0);
+        b1 = _mm512_fmadd_ps(q11, values1, b1);
+    }
+    out_first = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+    out_second = _mm512_reduce_add_ps(_mm512_add_ps(b0, b1));
+}
+
 void q5_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
     __m512 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm512_setzero_ps();
     const __m128i nibble_mask=_mm_set1_epi8(15),bit_mask=_mm_set1_epi8(1);
@@ -336,6 +565,24 @@ void q8_dequant(const std::uint8_t* row_data, float* output, int elements) {
 }
 
 } // namespace
+
+void qwen_quant_dot_two_rows_avx512(
+    const std::uint8_t* first_row,
+    const std::uint8_t* second_row,
+    std::uint32_t type,
+    const float* input,
+    int elements,
+    float* first_output,
+    float* second_output
+) {
+    if (type == 13) {
+        q5_dot_two_rows(first_row, second_row, input, elements, *first_output, *second_output);
+    } else if (type == 14) {
+        q6_dot_two_rows(first_row, second_row, input, elements, *first_output, *second_output);
+    } else {
+        q8_dot_two_rows(first_row, second_row, input, elements, *first_output, *second_output);
+    }
+}
 
 float qwen_quant_dot_avx512(
     const std::uint8_t* packed,
