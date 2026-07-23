@@ -295,6 +295,10 @@ struct ColibriV2QwenRuntime {
     bool prefill_profile = false;
     bool cuda_profile = false;
     bool fused_q8_attention = true;
+    // Interleaving two distant expert matrices hurts mmap/TLB locality on
+    // memory-bound CPU MoE. Keep the experimental kernel opt-in until it can
+    // demonstrate a win across representative hardware and expert routing.
+    bool fused_moe_gate_up = false;
     std::vector<QwenCudaLayerProfile> cuda_layer_profiles;
     std::uint64_t cuda_tail_start = 0, cuda_tail_end = 0;
     std::uint64_t position = 0;
@@ -1076,7 +1080,7 @@ void qwen_cpu_moe(
             up_value = qwen_quant_dot_q8_k_avx2(
                 up[rank], up_type, input_q8_data, hidden, row
             );
-        } else if (gate_type == up_type) {
+        } else if (runtime.fused_moe_gate_up && gate_type == up_type) {
             qwen_quant_dot_two_rows(
                 gate[rank], up[rank], gate_type, input, hidden,
                 row, gate_value, up_value
@@ -1184,7 +1188,7 @@ void qwen_cpu_moe_rows(
         if(count<=2){
             for(int i=0;i<mr;++i){
                 float gate_values[2]{},up_values[2]{};
-                if(gate_type==up_type){
+                if(runtime.fused_moe_gate_up&&gate_type==up_type){
                     if(count==1){
                         qwen_quant_dot_two_rows(
                             gate_data, up_data, gate_type, vectors[begin],
@@ -1614,6 +1618,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         std::getenv("COLIBRI_PREFILL_PROFILE")[0]=='1';
     if(const char*fused=std::getenv("COLIBRI_FUSED_Q8_ATTENTION"))
         runtime->fused_q8_attention=fused[0]!='0';
+    if(const char*fused=std::getenv("COLIBRI_FUSED_MOE_GATE_UP"))
+        runtime->fused_moe_gate_up=fused[0]!='0';
     const int route_event_status=runtime->prefill_profile
         ?colibri_gpu_timed_event_create(&runtime->route_event)
         :colibri_gpu_event_create(&runtime->route_event);
