@@ -993,7 +993,7 @@ void qwen_cpu_moe_rows(
     const int intermediate=runtime.moe_intermediate;
     const char*direct_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
     const bool direct_quant=(colibri_cpu_features()&3u)!=0&&
-        (!direct_setting||direct_setting[0]!='0');
+        direct_setting&&direct_setting[0]=='1';
     const bool direct_oct=direct_quant&&(colibri_cpu_features()&2u)!=0;
     if(rows<=0||rows>4096||routed_count<=0||routed_count>256)
         throw std::runtime_error("native CPU batched MoE shape is unsupported");
@@ -1429,7 +1429,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->prefill_expert_nanoseconds=runtime->prefill_expert_nanoseconds;
     const char*direct_quant_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
     out->prefill_direct_quant=(colibri_cpu_features()&3u)!=0&&
-        (!direct_quant_setting||direct_quant_setting[0]!='0');
+        direct_quant_setting&&direct_quant_setting[0]=='1';
     out->prefill_direct_quant_width=out->prefill_direct_quant?
         ((colibri_cpu_features()&2u)!=0?8:4):0;
     out->prefill_profile=runtime->prefill_profile?1:0;
@@ -1455,13 +1455,16 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     if(colibri_gpu_compile(cuda_source.c_str(),compile_options.data(),static_cast<int32_t>(compile_options.size()),runtime->options.device,compile_log.data(),compile_log.size())!=0)throw std::runtime_error(std::string("failed to compile native Qwen CUDA kernels: ")+compile_log.data());
     runtime->cuda_ready=true;
     if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
-    if(colibri_gpu_event_create(&runtime->route_event)!=0){release_qwen_device(*runtime);throw std::runtime_error("failed to create native Qwen route event");}
     runtime->prefill_profile=std::getenv("COLIBRI_PREFILL_PROFILE")&&
         std::getenv("COLIBRI_PREFILL_PROFILE")[0]=='1';
+    const int route_event_status=runtime->prefill_profile
+        ?colibri_gpu_timed_event_create(&runtime->route_event)
+        :colibri_gpu_event_create(&runtime->route_event);
+    if(route_event_status!=0){release_qwen_device(*runtime);throw std::runtime_error("failed to create native Qwen route event");}
     if(runtime->prefill_profile&&(
-       colibri_gpu_event_create(&runtime->prefill_layer_start_event)!=0||
-       colibri_gpu_event_create(&runtime->prefill_core_end_event)!=0||
-       colibri_gpu_event_create(&runtime->prefill_router_end_event)!=0)){
+       colibri_gpu_timed_event_create(&runtime->prefill_layer_start_event)!=0||
+       colibri_gpu_timed_event_create(&runtime->prefill_core_end_event)!=0||
+       colibri_gpu_timed_event_create(&runtime->prefill_router_end_event)!=0)){
         release_qwen_device(*runtime);
         throw std::runtime_error("failed to create native Qwen prefill profiling events");
     }
@@ -3889,8 +3892,10 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                 finished.push_back(task.id);emit(task.id,0,1);continue;
             }
             pending_decode.push_back(&task);
-        }catch(const std::exception&){
+        }catch(const std::exception&error){
             // Isolate the failure: this task dies, the others keep running.
+            std::fprintf(stderr,"[colibri-v2] engine task %llu failed: %s\n",
+                static_cast<unsigned long long>(task.id),error.what());
             finished.push_back(task.id);emit(task.id,0,2);
         }
     }
@@ -3910,9 +3915,10 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                 qwen_decode_multi(runtime,batched,slots.data(),batch_inputs.data(),batch_outputs.data());
                 qwen_park_active(*runtime,false);
                 for(std::size_t i=0;i<batched;++i)pending_decode[i]->next_token=batch_outputs[i];
-            }catch(const std::exception&){
+            }catch(const std::exception&error){
                 qwen_park_active(*runtime,false);
                 // The whole batch shares one stream of work; fail all of it.
+                std::fprintf(stderr,"[colibri-v2] engine decode batch failed: %s\n",error.what());
                 for(std::size_t i=0;i<batched;++i){finished.push_back(pending_decode[i]->id);emit(pending_decode[i]->id,0,2);}
             }
         }

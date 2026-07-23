@@ -76,6 +76,7 @@ class _GenerationRequest:
     sampling: SamplingConfig
     enable_thinking: bool
     tools_enabled: bool = False
+    tools: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +239,7 @@ class InferenceService:
                 enable_thinking=request.enable_thinking,
                 progress=progress,
             )
-        return self._chat_response(result)
+        return self._chat_response(result, tools=request.tools)
 
     def stream_chat_completion(
         self,
@@ -328,7 +329,7 @@ class InferenceService:
                             )
                 if final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
-                _, tool_calls = _parse_tool_calls(accumulated)
+                _, tool_calls = _parse_tool_calls(accumulated, tools=request.tools)
                 if tool_calls:
                     yield self._chat_chunk(
                         completion_id,
@@ -989,12 +990,14 @@ class InferenceService:
 
     def _prepare_chat(self, payload: Mapping[str, Any]) -> _GenerationRequest:
         messages, tools_enabled = _chat_messages(payload)
+        tools = tuple(_selected_tools(payload)) if tools_enabled else ()
         return self._prepare_generation(
             payload,
             messages,
             max_key="max_completion_tokens",
             fallback_max_key="max_tokens",
             tools_enabled=tools_enabled,
+            tools=tools,
         )
 
     def _prepare_generation(
@@ -1005,6 +1008,7 @@ class InferenceService:
         max_key: str,
         fallback_max_key: str | None = None,
         tools_enabled: bool = False,
+        tools: tuple[dict[str, Any], ...] = (),
     ) -> _GenerationRequest:
         self._validate_model(payload.get("model"))
         _reject_unsupported_generation_options(payload)
@@ -1040,7 +1044,12 @@ class InferenceService:
             requested_max, prompt_tokens, parameter=max_key
         )
         return _GenerationRequest(
-            messages, max_new_tokens, sampling, enable_thinking, tools_enabled
+            messages,
+            max_new_tokens,
+            sampling,
+            enable_thinking,
+            tools_enabled,
+            tools,
         )
 
     def _fit_max_new_tokens(
@@ -1099,8 +1108,13 @@ class InferenceService:
                 parameter="model",
             )
 
-    def _chat_response(self, result: GenerationResult) -> dict[str, Any]:
-        content, tool_calls = _parse_tool_calls(result.text)
+    def _chat_response(
+        self,
+        result: GenerationResult,
+        *,
+        tools: tuple[dict[str, Any], ...] = (),
+    ) -> dict[str, Any]:
+        content, tool_calls = _parse_tool_calls(result.text, tools=tools)
         finish_reason = (
             "tool_calls"
             if tool_calls
@@ -1256,7 +1270,7 @@ class InferenceService:
             "instructions": payload.get("instructions"),
             "max_output_tokens": payload.get("max_output_tokens"),
             "model": self.model_name,
-            "output": _response_output(result, message_id, parse_tools=bool(tools)),
+            "output": _response_output(result, message_id, tools=tools),
             "parallel_tool_calls": False,
             "previous_response_id": payload.get("previous_response_id"),
             "store": _boolean_option(payload, "store", True),
@@ -2024,12 +2038,19 @@ def _tool_value(value: Any) -> str:
     return str(value)
 
 
-def _parse_tool_calls(text: str) -> tuple[str | None, list[dict[str, Any]]]:
+def _parse_tool_calls(
+    text: str,
+    *,
+    tools: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+) -> tuple[str | None, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     for match in TOOL_CALL_BLOCK_PATTERN.finditer(text):
         name, arguments = _decode_tool_call_body(match.group(1))
         if name is None:
             continue
+        schema = _tool_argument_schema(tools, name)
+        if schema is not None:
+            arguments = _normalize_schema_value(arguments, schema)
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex}",
@@ -2048,6 +2069,103 @@ def _parse_tool_calls(text: str) -> tuple[str | None, list[dict[str, Any]]]:
     marker = text.find(TOOL_CALL_MARKER)
     content = (text[:marker] if marker != -1 else text).strip()
     return (content or None), calls
+
+
+def _tool_argument_schema(
+    tools: tuple[dict[str, Any], ...] | list[dict[str, Any]], name: str
+) -> dict[str, Any] | None:
+    for tool in tools:
+        function = tool.get("function")
+        if not isinstance(function, dict) or function.get("name") != name:
+            continue
+        parameters = function.get("parameters")
+        return parameters if isinstance(parameters, dict) else None
+    return None
+
+
+def _normalize_schema_value(value: Any, schema: Mapping[str, Any]) -> Any:
+    """Normalize an inferred tool value using its JSON schema.
+
+    Hermes parameters carry only text, so ``<parameter=taskId>1`` is
+    ambiguous.  Parsing that text as JSON produces an integer even when the
+    client declared ``taskId`` as a string.  The declared schema is the source
+    of truth; recursively restore unambiguous scalar types before returning the
+    tool call to the client.
+    """
+    schema_type = schema.get("type")
+    allowed_types = (
+        tuple(item for item in schema_type if isinstance(item, str))
+        if isinstance(schema_type, list)
+        else ((schema_type,) if isinstance(schema_type, str) else ())
+    )
+    if not allowed_types:
+        variants = schema.get("anyOf", schema.get("oneOf"))
+        if isinstance(variants, list):
+            candidates = [item for item in variants if isinstance(item, dict)]
+            for candidate in candidates:
+                candidate_type = candidate.get("type")
+                if (
+                    candidate_type == "string"
+                    and not isinstance(value, (dict, list))
+                ) or (
+                    candidate_type == "object" and isinstance(value, dict)
+                ) or (
+                    candidate_type == "array" and isinstance(value, list)
+                ):
+                    return _normalize_schema_value(value, candidate)
+        enum = schema.get("enum")
+        if isinstance(enum, list) and enum and all(
+            isinstance(item, str) for item in enum
+        ):
+            allowed_types = ("string",)
+
+    if value is None and "null" in allowed_types:
+        return None
+
+    if "string" in allowed_types and not isinstance(value, (dict, list)):
+        if isinstance(value, str):
+            return value
+        if value is True:
+            return "true"
+        if value is False:
+            return "false"
+        if value is None:
+            return "null"
+        return str(value)
+
+    if "object" in allowed_types and isinstance(value, dict):
+        properties = schema.get("properties")
+        property_schemas = properties if isinstance(properties, dict) else {}
+        additional = schema.get("additionalProperties")
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            item_schema = property_schemas.get(key)
+            if not isinstance(item_schema, dict) and isinstance(additional, dict):
+                item_schema = additional
+            normalized[key] = (
+                _normalize_schema_value(item, item_schema)
+                if isinstance(item_schema, dict)
+                else item
+            )
+        return normalized
+
+    if "array" in allowed_types and isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            return [_normalize_schema_value(item, items) for item in value]
+        return value
+
+    if isinstance(value, str):
+        if "integer" in allowed_types and re.fullmatch(r"[+-]?\d+", value):
+            return int(value)
+        if "number" in allowed_types:
+            try:
+                return float(value)
+            except ValueError:
+                pass
+        if "boolean" in allowed_types and value.lower() in {"true", "false"}:
+            return value.lower() == "true"
+    return value
 
 
 def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
@@ -2138,10 +2256,10 @@ def _response_output(
     result: GenerationResult,
     message_id: str,
     *,
-    parse_tools: bool,
+    tools: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     content, tool_calls = (
-        _parse_tool_calls(result.text) if parse_tools else (result.text, [])
+        _parse_tool_calls(result.text, tools=tools) if tools else (result.text, [])
     )
     output: list[dict[str, Any]] = []
     if content is not None or not tool_calls:

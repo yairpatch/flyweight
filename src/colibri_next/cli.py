@@ -1272,9 +1272,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             serve_http(service, host=args.host, port=args.port)
         except KeyboardInterrupt:
-            print("Server stopped.", file=sys.stderr)
+            print("Stopping server...", file=sys.stderr, flush=True)
         finally:
             service.close()
+        print("Server stopped.", file=sys.stderr, flush=True)
         return 0
 
     if args.command == "generate-text":

@@ -134,6 +134,23 @@ class ToolStubGenerator(StubGenerator):
         )
 
 
+class BareStringIdToolStubGenerator(ToolStubGenerator):
+    def generate_messages(self, messages, **options) -> GenerationResult:
+        self.calls.append((messages, options))
+        return GenerationResult(
+            prompt_ids=(1, 2, 3),
+            generated_ids=(4, 5),
+            text=(
+                "<tool_call>\n<function=TaskUpdate>\n"
+                "<parameter=status>\ncompleted\n</parameter>\n"
+                "<parameter=taskId>\n1\n</parameter>\n"
+                "</function>\n</tool_call>"
+            ),
+            stopped_on_eos=True,
+            state_tokens=4,
+        )
+
+
 class TruncatedToolStubGenerator(StubGenerator):
     """Emits a <tool_call> that never closes and stops without EOS, mimicking a
     tool call cut off by the output-token ceiling (the AskUserQuestion leak)."""
@@ -187,6 +204,69 @@ class ToolCallParsingTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["name"], "get_weather")
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
+        )
+
+    def test_schema_restores_string_ids_from_unquoted_hermes_values(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "TaskUpdate",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "taskId": {"type": "string"},
+                            "status": {"type": "string"},
+                        },
+                        "required": ["taskId", "status"],
+                    },
+                },
+            }
+        ]
+        _, calls = _parse_tool_calls(
+            "<tool_call>\n<function=TaskUpdate>\n"
+            "<parameter=status>\ncompleted\n</parameter>\n"
+            "<parameter=taskId>\n1\n</parameter>\n"
+            "</function>\n</tool_call>",
+            tools=tools,
+        )
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"status": "completed", "taskId": "1"},
+        )
+
+    def test_schema_normalization_recurses_through_arrays_and_objects(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "configure",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "enabled": {"type": "boolean"},
+                                    },
+                                },
+                            }
+                        },
+                    },
+                },
+            }
+        ]
+        _, calls = _parse_tool_calls(
+            '<tool_call>{"name":"configure","arguments":'
+            '{"items":[{"id":7,"enabled":"true"}]}}</tool_call>',
+            tools=tools,
+        )
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"items": [{"id": "7", "enabled": True}]},
         )
 
     def test_plain_text_has_no_tool_calls(self) -> None:
@@ -553,6 +633,35 @@ class InferenceServiceTests(unittest.TestCase):
         )
         self.assertEqual(response["stop_reason"], "tool_use")
         self.assertEqual(response["content"][0]["type"], "tool_use")
+
+    def test_anthropic_tool_arguments_follow_input_schema(self) -> None:
+        service = InferenceService("qwen-local", BareStringIdToolStubGenerator())
+        response = service.anthropic_message(
+            {
+                "model": "claude-fable-5",
+                "messages": [{"role": "user", "content": "Complete task 1"}],
+                "tools": [
+                    {
+                        "name": "TaskUpdate",
+                        "description": "Update a task",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "taskId": {"type": "string"},
+                                "status": {"type": "string"},
+                            },
+                            "required": ["taskId", "status"],
+                        },
+                    }
+                ],
+                "max_tokens": 16,
+            }
+        )
+        self.assertEqual(response["stop_reason"], "tool_use")
+        self.assertEqual(
+            response["content"][0]["input"],
+            {"status": "completed", "taskId": "1"},
+        )
 
     def test_function_calling_uses_native_qwen_format(self) -> None:
         service = InferenceService("qwen-local", ToolStubGenerator())

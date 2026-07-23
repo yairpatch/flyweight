@@ -31,12 +31,15 @@ class _NativeEngine:
         self._queues: dict[int, SimpleQueue] = {}
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._closing = False
 
     def submit(
         self, prompt_ids: list[int], max_new_tokens: int, stop_tokens: tuple[int, ...]
     ) -> tuple[int, SimpleQueue]:
         queue: SimpleQueue = SimpleQueue()
         with self._lock:
+            if self._closing:
+                raise RuntimeError("native v2 engine is shutting down")
             task_id = self.runtime.task_submit(prompt_ids, max_new_tokens, stop_tokens)
             self._queues[task_id] = queue
             if self._thread is None or not self._thread.is_alive():
@@ -56,9 +59,15 @@ class _NativeEngine:
     def _run(self) -> None:
         while True:
             with self._lock:
+                if self._closing:
+                    return
                 idle = not self._queues
+                if idle:
+                    # Clear while holding the same lock used by submit/close:
+                    # otherwise a wake arriving between the idle check and
+                    # clear can be lost, leaving shutdown stuck in wait().
+                    self._wake.clear()
             if idle:
-                self._wake.clear()
                 self._wake.wait()
                 continue
             try:
@@ -94,6 +103,24 @@ class _NativeEngine:
     def forget(self, task_id: int) -> None:
         with self._lock:
             self._queues.pop(task_id, None)
+
+    def close(self) -> None:
+        """Cancel active requests and stop touching the runtime before teardown."""
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            queues, self._queues = self._queues, {}
+            thread = self._thread
+        for task_id, queue in queues.items():
+            try:
+                self.runtime.task_cancel(task_id)
+            except V2Error:
+                pass
+            queue.put(("error", "native v2 engine is shutting down"))
+        self._wake.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
 
 
 class NativeV2Tokenizer:
@@ -225,6 +252,9 @@ class NativeV2Generator:
             "evictions": 0,
             "reused_tokens": int(info["prefix_cache_reused_tokens"]),
         }
+
+    def close(self) -> None:
+        self.engine.close()
 
     @staticmethod
     def _require_greedy(sampling: SamplingConfig | None) -> None:
@@ -495,6 +525,9 @@ class NativeV2InferenceService(InferenceService):
         self._serialize_generation = False
 
     def close(self) -> None:
+        generator_close = getattr(self.generator, "close", None)
+        if callable(generator_close):
+            generator_close()
         if self.v2_runtime is not None:
             self.v2_runtime.close()
             self.v2_runtime = None

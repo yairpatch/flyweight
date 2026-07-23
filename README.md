@@ -562,12 +562,13 @@ Native Qwen diagnostics also separate batched prompt work into
 `prefill_expert_nanoseconds`, with `prefill_calls` and `prefill_tokens` for
 normalization. These counters exclude the final one-token logits step.
 
-On AVX2 and AVX-512 hosts, batched Qwen CPU prefill uses a four-token direct quantized
-Q5_K/Q6_K/Q8_0 dot tile. It shares each packed-weight decode across four routed
-tokens and avoids the temporary FP32 weight expansion. Set
-`COLIBRI_PREFILL_DIRECT_QUANT=0` to restore the older dequantize-once FP32 GEMM
-for comparison. AVX2 shares four tokens per decode; AVX-512 shares eight.
-`prefill_direct_quant` and `prefill_direct_quant_width` report the active path.
+On AVX2 and AVX-512 hosts, `COLIBRI_PREFILL_DIRECT_QUANT=1` enables an
+experimental direct quantized Q5_K/Q6_K/Q8_0 prefill path. It shares each
+packed-weight decode across routed tokens and avoids temporary FP32 weight
+expansion, but sparse per-expert route groups can make it slower than the
+default dequantize-once FP32 GEMM. AVX2 shares four tokens per decode; AVX-512
+shares eight. `prefill_direct_quant` and `prefill_direct_quant_width` report the
+active path.
 
 Set `COLIBRI_PREFILL_PROFILE=1` before starting a native Qwen process to split
 the GPU side of batched prefill into `prefill_gpu_core_nanoseconds`,

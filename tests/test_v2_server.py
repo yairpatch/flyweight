@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 
 from colibri_next.cli import _parser
@@ -107,6 +108,22 @@ class StubV2Runtime:
         getattr(self, "_tasks", {}).pop(task_id, None)
 
 
+class BlockingV2Runtime(StubV2Runtime):
+    def __init__(self):
+        super().__init__([10])
+        self.entered = threading.Event()
+        self.cancelled = threading.Event()
+
+    def engine_step(self, capacity: int = 256):
+        self.entered.set()
+        self.cancelled.wait(2)
+        return []
+
+    def task_cancel(self, task_id: int) -> None:
+        super().task_cancel(task_id)
+        self.cancelled.set()
+
+
 class NativeV2ServerTests(unittest.TestCase):
     def make_generator(self, outputs: list[int]):
         model = StubV2Model()
@@ -188,6 +205,25 @@ class NativeV2ServerTests(unittest.TestCase):
                 "reused_tokens": 42,
             },
         )
+
+    def test_close_cancels_tasks_and_joins_engine_before_runtime_teardown(self) -> None:
+        model = StubV2Model()
+        runtime = BlockingV2Runtime()
+        generator = NativeV2Generator(  # type: ignore[arg-type]
+            model, runtime, NativeV2Tokenizer(model)  # type: ignore[arg-type]
+        )
+        _, queue = generator.engine.submit([1, 2], 8, ())
+        self.assertTrue(runtime.entered.wait(1))
+
+        generator.close()
+
+        self.assertEqual(runtime.cancels, 1)
+        self.assertEqual(queue.get(timeout=1)[0], "error")
+        self.assertIsNotNone(generator.engine._thread)
+        self.assertFalse(generator.engine._thread.is_alive())
+        with self.assertRaisesRegex(RuntimeError, "shutting down"):
+            generator.engine.submit([1, 2], 8, ())
+        generator.close()  # idempotent
 
     def test_native_chat_continuation_preserves_generated_token_ids(self) -> None:
         generator, _ = self.make_generator([10, 20, 30])
