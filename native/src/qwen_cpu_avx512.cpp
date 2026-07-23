@@ -169,6 +169,33 @@ void q8_dot_pair(const std::uint8_t*row_data,const float*first,const float*secon
     out_first=_mm512_reduce_add_ps(_mm512_add_ps(a0,a1));out_second=_mm512_reduce_add_ps(_mm512_add_ps(b0,b1));
 }
 
+void q5_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
+    __m512 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm512_setzero_ps();
+    const __m128i nibble_mask=_mm_set1_epi8(15),bit_mask=_mm_set1_epi8(1);
+    for(int block=0;block<elements/256;++block){const auto*base=row_data+block*176;const float d=half_value(base),dmin=half_value(base+2);const auto*scales=base+4;const auto*high=base+16;const auto*low=base+48;
+        for(int group=0;group<4;++group)for(int sub=0;sub<2;++sub){const int index=group*2+sub;int scale,minimum;if(index<4){scale=scales[index]&63;minimum=scales[index+4]&63;}else{scale=(scales[index+4]&15)|((scales[index-4]>>6)<<4);minimum=(scales[index+4]>>4)|((scales[index]>>6)<<4);}const __m512 ds=_mm512_set1_ps(d*scale),dm=_mm512_set1_ps(dmin*minimum);const int shift=2*group+sub,offset=block*256+group*64+sub*32;
+            for(int lanes=0;lanes<32;lanes+=16){__m128i q=_mm_loadu_si128(reinterpret_cast<const __m128i*>(low+group*32+lanes));q=sub==0?_mm_and_si128(q,nibble_mask):_mm_and_si128(_mm_srli_epi16(q,4),nibble_mask);__m128i bits=_mm_loadu_si128(reinterpret_cast<const __m128i*>(high+lanes));bits=_mm_and_si128(_mm_srli_epi16(bits,shift),bit_mask);q=_mm_add_epi8(q,_mm_slli_epi16(bits,4));const __m512 weights=_mm512_sub_ps(_mm512_mul_ps(bytes_to_float(q),ds),dm);for(int token=0;token<4;++token)sums[token][lanes/16]=_mm512_fmadd_ps(weights,_mm512_loadu_ps(inputs[token]+offset+lanes),sums[token][lanes/16]);}
+        }
+    }
+    for(int token=0;token<4;++token)outputs[token]=_mm512_reduce_add_ps(_mm512_add_ps(sums[token][0],sums[token][1]));
+}
+
+void q6_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
+    __m512 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm512_setzero_ps();const __m128i nibble_mask=_mm_set1_epi8(15),high_mask=_mm_set1_epi8(3);const __m512 offset32=_mm512_set1_ps(32.0f);
+    for(int block=0;block<elements/256;++block){const auto*base=row_data+block*210;const auto*ql=base;const auto*qh=base+128;const auto*scales=reinterpret_cast<const std::int8_t*>(base+192);const float d=half_value(base+208);
+        for(int half=0;half<2;++half)for(int segment=0;segment<4;++segment){const int q_offset=(segment==0||segment==2)?0:32;
+            for(int lanes=0;lanes<32;lanes+=16){__m128i q=_mm_loadu_si128(reinterpret_cast<const __m128i*>(ql+half*64+q_offset+lanes));q=segment<2?_mm_and_si128(q,nibble_mask):_mm_and_si128(_mm_srli_epi16(q,4),nibble_mask);__m128i high=_mm_loadu_si128(reinterpret_cast<const __m128i*>(qh+half*32+lanes));high=_mm_and_si128(_mm_srli_epi16(high,segment*2),high_mask);q=_mm_add_epi8(q,_mm_slli_epi16(high,4));const int scale_index=half*8+lanes/16+segment*2,index=block*256+half*128+segment*32+lanes;const __m512 weights=_mm512_mul_ps(_mm512_sub_ps(bytes_to_float(q),offset32),_mm512_set1_ps(d*scales[scale_index]));for(int token=0;token<4;++token)sums[token][lanes/16]=_mm512_fmadd_ps(weights,_mm512_loadu_ps(inputs[token]+index),sums[token][lanes/16]);}
+        }
+    }
+    for(int token=0;token<4;++token)outputs[token]=_mm512_reduce_add_ps(_mm512_add_ps(sums[token][0],sums[token][1]));
+}
+
+void q8_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
+    __m512 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm512_setzero_ps();
+    for(int block=0;block<elements/32;++block){const auto*base=row_data+block*34;const __m512 scale=_mm512_set1_ps(half_value(base));const __m256i quantized=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(base+2));const __m512 weights[2]={_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(quantized))),scale),_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(quantized,1))),scale)};for(int token=0;token<4;++token)for(int half=0;half<2;++half)sums[token][half]=_mm512_fmadd_ps(weights[half],_mm512_loadu_ps(inputs[token]+block*32+half*16),sums[token][half]);}
+    for(int token=0;token<4;++token)outputs[token]=_mm512_reduce_add_ps(_mm512_add_ps(sums[token][0],sums[token][1]));
+}
+
 void q5_dequant(const std::uint8_t* row_data, float* output, int elements) {
     const __m128i nibble_mask = _mm_set1_epi8(15);
     const __m128i bit_mask = _mm_set1_epi8(1);
@@ -310,6 +337,15 @@ void qwen_quant_dot_pair_avx512(
     if(type==13)q5_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*176,first,second,elements,*first_output,*second_output);
     else if(type==14)q6_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*210,first,second,elements,*first_output,*second_output);
     else q8_dot_pair(packed+row*static_cast<std::uint64_t>(elements/32)*34,first,second,elements,*first_output,*second_output);
+}
+
+void qwen_quant_dot_quad_avx512(
+    const std::uint8_t*packed,std::uint32_t type,const float*const inputs[4],
+    int elements,std::uint64_t row,float outputs[4]
+){
+    if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
+    else if(type==14)q6_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
+    else q8_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
 }
 
 void qwen_dequant_row_avx512(

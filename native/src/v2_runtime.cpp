@@ -269,6 +269,11 @@ struct ColibriV2QwenRuntime {
     std::uint64_t cpu_prefetch_loaded_pages = 0;
     std::uint64_t cpu_prefetch_auto_skips = 0;
     std::uint64_t cpu_prefetch_last_budget_bytes = 0;
+    std::uint64_t prefill_calls = 0;
+    std::uint64_t prefill_tokens = 0;
+    std::uint64_t prefill_nanoseconds = 0;
+    std::uint64_t prefill_route_wait_nanoseconds = 0;
+    std::uint64_t prefill_expert_nanoseconds = 0;
     std::uint8_t cpu_prefetch_checksum = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
@@ -929,6 +934,17 @@ void qwen_f32_gemm_rows(const float*weights,int mr,const float*const*inputs,int 
     }
 }
 
+void qwen_quant_dot_quad(
+    const std::uint8_t*packed,std::uint32_t type,const float*const inputs[4],
+    int elements,std::uint64_t row,float outputs[4]
+){
+    if((colibri_cpu_features()&2u)!=0&&elements%256==0){
+        qwen_quant_dot_quad_avx512(packed,type,inputs,elements,row,outputs);return;
+    }
+    qwen_quant_dot_pair(packed,type,inputs[0],inputs[1],elements,row,outputs[0],outputs[1]);
+    qwen_quant_dot_pair(packed,type,inputs[2],inputs[3],elements,row,outputs[2],outputs[3]);
+}
+
 void qwen_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,const std::int32_t*selected,const float*weights,int routed_count,const float*input,float*activated,float*output){const int experts=runtime.model->config.expert_count,hidden=runtime.model->config.hidden_size,intermediate=runtime.moe_intermediate;if(routed_count<0||routed_count>256)throw std::runtime_error("native CPU MoE routed count is unsupported");for(int role=0;role<3;++role){const auto type=runtime.model->tensors[layer.expert_tensors[role]].type;if(type!=13&&type!=14&&type!=8)throw std::runtime_error("unsupported native CPU expert quantization");}std::array<const std::uint8_t*,256>gate{},up{},down{};for(int rank=0;rank<routed_count;++rank){if(selected[rank]<0||selected[rank]>=experts)throw std::runtime_error("native CPU MoE selected an invalid expert");for(int role=0;role<3;++role){const auto&t=runtime.model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto*pointer=runtime.model->data+t.offset+static_cast<std::uint64_t>(selected[rank])*bytes;if(role==0)gate[rank]=pointer;else if(role==1)up[rank]=pointer;else down[rank]=pointer;}}
 const char*q8_setting=std::getenv("COLIBRI_Q8_ACTIVATIONS");
 const auto cpu_features=colibri_cpu_features();
@@ -952,6 +968,9 @@ void qwen_cpu_moe_rows(
     const int experts=runtime.model->config.expert_count;
     const int hidden=runtime.model->config.hidden_size;
     const int intermediate=runtime.moe_intermediate;
+    const char*direct_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
+    const bool direct_quant=(colibri_cpu_features()&2u)!=0&&
+        (!direct_setting||direct_setting[0]!='0');
     if(rows<=0||rows>4096||routed_count<=0||routed_count>256)
         throw std::runtime_error("native CPU batched MoE shape is unsupported");
     const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
@@ -1015,6 +1034,22 @@ void qwen_cpu_moe_rows(
             }
             continue;
         }
+        if(direct_quant){
+            for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;occurrence+=4){
+                const int tile=std::min(4,count-occurrence);
+                float gate_values[4]{},up_values[4]{};
+                if(tile==4){
+                    const float*tile_vectors[4]={vectors[begin+occurrence],vectors[begin+occurrence+1],vectors[begin+occurrence+2],vectors[begin+occurrence+3]};
+                    qwen_quant_dot_quad(gate_data,gate_type,tile_vectors,hidden,row0+i,gate_values);
+                    qwen_quant_dot_quad(up_data,up_type,tile_vectors,hidden,row0+i,up_values);
+                }else for(int token=0;token<tile;++token){
+                    gate_values[token]=qwen_quant_dot(gate_data,gate_type,vectors[begin+occurrence+token],hidden,row0+i);
+                    up_values[token]=qwen_quant_dot(up_data,up_type,vectors[begin+occurrence+token],hidden,row0+i);
+                }
+                for(int token=0;token<tile;++token){const int token_rank=occurrences[begin+occurrence+token];const float gate_value=gate_values[token],clipped=std::max(-80.0f,std::min(80.0f,gate_value));activated[static_cast<std::size_t>(token_rank)*intermediate+(row0+i)]=gate_value/(1.0f+std::exp(-clipped))*up_values[token];}
+            }
+            continue;
+        }
         thread_local std::vector<float> gate_block,up_block,gate_values,up_values;
         gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
         gate_values.resize(static_cast<std::size_t>(kRowBlock)*count);up_values.resize(static_cast<std::size_t>(kRowBlock)*count);
@@ -1048,6 +1083,19 @@ void qwen_cpu_moe_rows(
                 if(count==1)values[0]=qwen_quant_dot(down_data,down_type,activated_vectors[begin],intermediate,row0+i);
                 else qwen_quant_dot_pair(down_data,down_type,activated_vectors[begin],activated_vectors[begin+1],intermediate,row0+i,values[0],values[1]);
                 for(int occurrence=0;occurrence<count;++occurrence){const int token_rank=occurrences[begin+occurrence];down_values[static_cast<std::size_t>(token_rank)*hidden+(row0+i)]=weights[token_rank]*values[occurrence];}
+            }
+            continue;
+        }
+        if(direct_quant){
+            for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;occurrence+=4){
+                const int tile=std::min(4,count-occurrence);
+                float values[4]{};
+                if(tile==4){
+                    const float*tile_vectors[4]={activated_vectors[begin+occurrence],activated_vectors[begin+occurrence+1],activated_vectors[begin+occurrence+2],activated_vectors[begin+occurrence+3]};
+                    qwen_quant_dot_quad(down_data,down_type,tile_vectors,intermediate,row0+i,values);
+                }else for(int token=0;token<tile;++token)
+                    values[token]=qwen_quant_dot(down_data,down_type,activated_vectors[begin+occurrence+token],intermediate,row0+i);
+                for(int token=0;token<tile;++token){const int token_rank=occurrences[begin+occurrence+token];down_values[static_cast<std::size_t>(token_rank)*hidden+(row0+i)]=weights[token_rank]*values[token];}
             }
             continue;
         }
@@ -1339,6 +1387,14 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->cpu_prefetch_loaded_pages=runtime->cpu_prefetch_loaded_pages;
     out->cpu_prefetch_auto_skips=runtime->cpu_prefetch_auto_skips;
     out->cpu_prefetch_last_budget_bytes=runtime->cpu_prefetch_last_budget_bytes;
+    out->prefill_calls=runtime->prefill_calls;
+    out->prefill_tokens=runtime->prefill_tokens;
+    out->prefill_nanoseconds=runtime->prefill_nanoseconds;
+    out->prefill_route_wait_nanoseconds=runtime->prefill_route_wait_nanoseconds;
+    out->prefill_expert_nanoseconds=runtime->prefill_expert_nanoseconds;
+    const char*direct_quant_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
+    out->prefill_direct_quant=(colibri_cpu_features()&2u)!=0&&
+        (!direct_quant_setting||direct_quant_setting[0]!='0');
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;return 0;});}

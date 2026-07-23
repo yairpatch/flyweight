@@ -173,6 +173,12 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t cpu_prefetch_loaded_pages; /* cold pages actually faulted into host memory */
     uint64_t cpu_prefetch_auto_skips; /* auto-mode prompts skipped for low cold-page pressure */
     uint64_t cpu_prefetch_last_budget_bytes; /* most recent effective candidate-set budget */
+    uint64_t prefill_calls; /* batched prompt chunks executed */
+    uint64_t prefill_tokens; /* prompt tokens executed by the batched rows path */
+    uint64_t prefill_nanoseconds; /* total batched rows wall time */
+    uint64_t prefill_route_wait_nanoseconds; /* batched route readback synchronization */
+    uint64_t prefill_expert_nanoseconds; /* batched CPU/hybrid expert phase wall time */
+    uint64_t prefill_direct_quant; /* AVX-512 four-token quantized expert path is enabled */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

@@ -557,6 +557,17 @@ Inspect `cpu_prefetch_loaded_pages`, `cpu_prefetch_auto_skips`, and
 `--cpu-prefetch-mib` and automatic mode are mutually exclusive. Auto mode
 skips safely when the platform cannot report mapped-page residency.
 
+Native Qwen diagnostics also separate batched prompt work into
+`prefill_nanoseconds`, `prefill_route_wait_nanoseconds`, and
+`prefill_expert_nanoseconds`, with `prefill_calls` and `prefill_tokens` for
+normalization. These counters exclude the final one-token logits step.
+
+On AVX-512 hosts, batched Qwen CPU prefill uses a four-token direct quantized
+Q5_K/Q6_K/Q8_0 dot tile. It shares each packed-weight decode across four routed
+tokens and avoids the temporary FP32 weight expansion. Set
+`COLIBRI_PREFILL_DIRECT_QUANT=0` to restore the older dequantize-once FP32 GEMM
+for comparison. `prefill_direct_quant` reports which path is enabled.
+
 On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
 AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep
 vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to

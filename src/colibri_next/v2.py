@@ -196,6 +196,12 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("cpu_prefetch_loaded_pages", ctypes.c_uint64),
         ("cpu_prefetch_auto_skips", ctypes.c_uint64),
         ("cpu_prefetch_last_budget_bytes", ctypes.c_uint64),
+        ("prefill_calls", ctypes.c_uint64),
+        ("prefill_tokens", ctypes.c_uint64),
+        ("prefill_nanoseconds", ctypes.c_uint64),
+        ("prefill_route_wait_nanoseconds", ctypes.c_uint64),
+        ("prefill_expert_nanoseconds", ctypes.c_uint64),
+        ("prefill_direct_quant", ctypes.c_uint64),
     ]
 
 

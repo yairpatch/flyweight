@@ -220,6 +220,8 @@ void qwen_forward_rows(
         if(colibri_gpu_event_sync(runtime.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
         const auto route_wait_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
         runtime.route_wait_nanoseconds+=route_wait_elapsed;
+        if(!runtime.cache_admission_enabled)
+            runtime.prefill_route_wait_nanoseconds+=route_wait_elapsed;
         static const bool trace_layers=std::getenv("COLIBRI_PREFILL_TRACE")!=nullptr;
         if(trace_layers)std::fprintf(stderr,"[trace] layer %2u %s rows=%d sync=%.1fms\n",layer_number,layer.attention?"attn ":"delta",rows,route_wait_elapsed/1e6);
         const auto pager_started=std::chrono::steady_clock::now();
@@ -302,7 +304,11 @@ void qwen_forward_rows(
             void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
             launch(down_type==8?"q8_grouped_accumulate_rows":"q6k_grouped_accumulate_rows",hidden_size,rows,256,down_args);
         }
+        const auto cpu_expert_started=std::chrono::steady_clock::now();
         qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);
+        if(!runtime.cache_admission_enabled)
+            runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()-cpu_expert_started).count();
         if(colibri_gpu_upload(first,output_host,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward expert upload failed");
         runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
         add_rows(fourth,first);add_rows(third,fourth);add_rows(residual,third);std::swap(hidden,residual);
@@ -339,4 +345,8 @@ void qwen_prefill_rows(
     runtime.position+=static_cast<std::uint64_t>(rows);
     runtime.decode_calls+=static_cast<std::uint64_t>(rows);
     runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
+    ++runtime.prefill_calls;
+    runtime.prefill_tokens+=static_cast<std::uint64_t>(rows);
+    runtime.prefill_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-started).count();
 }

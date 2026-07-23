@@ -28,8 +28,8 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
         else if(type==14)set_half(base+208,0x3c00);
         else for(int block=0;block<8;++block)set_half(base+block*34,0x3c00);
     }
-    std::vector<float> input(elements),second(elements),dequant(elements),q8_input(elements);
-    for(int i=0;i<elements;++i){input[i]=std::sin(i*0.071f)*0.75f;second[i]=std::cos(i*0.037f)*0.5f;}
+    std::vector<float> input(elements),second(elements),third(elements),fourth(elements),dequant(elements),q8_input(elements);
+    for(int i=0;i<elements;++i){input[i]=std::sin(i*0.071f)*0.75f;second[i]=std::cos(i*0.037f)*0.5f;third[i]=std::sin(i*0.023f)*0.3f;fourth[i]=std::cos(i*0.019f)*0.9f;}
     QwenQ8KBlock q8{};
     qwen_quantize_q8_k_avx2(input.data(),elements,&q8);
     for(int i=0;i<elements;++i)q8_input[i]=q8.scale*q8.values[i];
@@ -46,6 +46,10 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
             float pair_first=0.0f,pair_second=0.0f;
             qwen_quant_dot_pair_avx512(packed.data(),type,input.data(),second.data(),elements,row,&pair_first,&pair_second);
             if(!close(reference,pair_first)||!close(second_reference,pair_second))return false;
+            const float*quad_inputs[4]={input.data(),second.data(),third.data(),fourth.data()};
+            float quad_outputs[4]{};
+            qwen_quant_dot_quad_avx512(packed.data(),type,quad_inputs,elements,row,quad_outputs);
+            for(int token=0;token<4;++token){float expected=0.0f;for(int i=0;i<elements;++i)expected+=dequant[i]*quad_inputs[token][i];if(!close(expected,quad_outputs[token]))return false;}
         }
         float q8_reference=0.0f;
         for(int i=0;i<elements;++i)q8_reference+=dequant[i]*q8_input[i];
