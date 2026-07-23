@@ -203,6 +203,10 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefill_expert_nanoseconds", ctypes.c_uint64),
         ("prefill_direct_quant", ctypes.c_uint64),
         ("prefill_direct_quant_width", ctypes.c_uint64),
+        ("prefill_profile", ctypes.c_uint64),
+        ("prefill_gpu_core_nanoseconds", ctypes.c_uint64),
+        ("prefill_gpu_router_nanoseconds", ctypes.c_uint64),
+        ("prefill_gpu_transfer_nanoseconds", ctypes.c_uint64),
     ]
 
 

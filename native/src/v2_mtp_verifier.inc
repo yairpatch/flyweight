@@ -84,6 +84,9 @@ void qwen_forward_rows(
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
         auto&layer=runtime.layers[layer_number];
+        const bool profile_prefill=runtime.prefill_profile&&!runtime.cache_admission_enabled;
+        if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)
+            throw std::runtime_error("native Qwen prefill layer-start profiling event failed");
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
         phase(layer_number,"pre");
         rms_rows(hidden,tensor(0),normalized);
@@ -175,12 +178,16 @@ void qwen_forward_rows(
             q8_rows(tensor(4),third,residual,query_elements,hidden_size);
             add_rows(residual,hidden);moe_base=7;
         }
+        if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
+            throw std::runtime_error("native Qwen prefill core profiling event failed");
         rms_rows(residual,tensor(moe_base),normalized);
         phase(layer_number,"moerms");
         f32_rows(tensor(moe_base+1),normalized,router_logits,hidden_size,experts);
         phase(layer_number,"router");
         void*route_args[]={const_cast<std::uint64_t*>(&router_logits),const_cast<std::uint64_t*>(&selected_device),const_cast<std::uint64_t*>(&route_weights),&rows,const_cast<int*>(&experts),const_cast<int*>(&top_k)};
         launch("route_topk_rows",rows,1,256,route_args,experts*sizeof(float));
+        if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_router_end_event,runtime.stream)!=0)
+            throw std::runtime_error("native Qwen prefill router profiling event failed");
         const auto selected_bytes=static_cast<std::uint64_t>(rows)*top_k*sizeof(std::int32_t);
         const auto weights_host_offset=device_align(selected_bytes);
         const auto weights_bytes=static_cast<std::uint64_t>(rows)*top_k*sizeof(float);
@@ -218,6 +225,16 @@ void qwen_forward_rows(
         launch("qwen_shared_scale_rows",rows,1,256,scale_args);
         const auto route_wait_started=std::chrono::steady_clock::now();
         if(colibri_gpu_event_sync(runtime.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
+        if(profile_prefill){
+            float core_ms=0.0f,router_ms=0.0f,transfer_ms=0.0f;
+            if(colibri_gpu_event_elapsed(runtime.prefill_layer_start_event,runtime.prefill_core_end_event,&core_ms)!=0||
+               colibri_gpu_event_elapsed(runtime.prefill_core_end_event,runtime.prefill_router_end_event,&router_ms)!=0||
+               colibri_gpu_event_elapsed(runtime.prefill_router_end_event,runtime.route_event,&transfer_ms)!=0)
+                throw std::runtime_error("native Qwen prefill profiling measurement failed");
+            runtime.prefill_gpu_core_nanoseconds+=static_cast<std::uint64_t>(core_ms*1.0e6f);
+            runtime.prefill_gpu_router_nanoseconds+=static_cast<std::uint64_t>(router_ms*1.0e6f);
+            runtime.prefill_gpu_transfer_nanoseconds+=static_cast<std::uint64_t>(transfer_ms*1.0e6f);
+        }
         const auto route_wait_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
         runtime.route_wait_nanoseconds+=route_wait_elapsed;
         if(!runtime.cache_admission_enabled)

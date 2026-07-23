@@ -274,6 +274,9 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_nanoseconds = 0;
     std::uint64_t prefill_route_wait_nanoseconds = 0;
     std::uint64_t prefill_expert_nanoseconds = 0;
+    std::uint64_t prefill_gpu_core_nanoseconds = 0;
+    std::uint64_t prefill_gpu_router_nanoseconds = 0;
+    std::uint64_t prefill_gpu_transfer_nanoseconds = 0;
     std::uint8_t cpu_prefetch_checksum = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
@@ -285,6 +288,10 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_snapshot_clock = 0;
     std::uint64_t stream = 0;
     std::uint64_t route_event = 0;
+    std::uint64_t prefill_layer_start_event = 0;
+    std::uint64_t prefill_core_end_event = 0;
+    std::uint64_t prefill_router_end_event = 0;
+    bool prefill_profile = false;
     bool cuda_profile = false;
     std::vector<QwenCudaLayerProfile> cuda_layer_profiles;
     std::uint64_t cuda_tail_start = 0, cuda_tail_end = 0;
@@ -457,6 +464,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     colibri_gpu_event_destroy(runtime.staging_event);
     runtime.staging_event = 0;
     colibri_gpu_event_destroy(runtime.route_event);
+    colibri_gpu_event_destroy(runtime.prefill_layer_start_event);
+    colibri_gpu_event_destroy(runtime.prefill_core_end_event);
+    colibri_gpu_event_destroy(runtime.prefill_router_end_event);
     for(auto&profile:runtime.cuda_layer_profiles){
         colibri_gpu_event_destroy(profile.pre_start);
         colibri_gpu_event_destroy(profile.pre_end);
@@ -477,6 +487,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.expert_cache = 0;
     runtime.static_arena = runtime.stream = 0;
     runtime.route_event = 0;
+    runtime.prefill_layer_start_event=runtime.prefill_core_end_event=
+        runtime.prefill_router_end_event=0;
+    runtime.prefill_profile=false;
     runtime.static_arena_bytes = runtime.workspace_bytes = 0;
     runtime.state_bytes = runtime.expert_staging_bytes = 0;
     runtime.host_staging_bytes = 0;
@@ -1419,6 +1432,10 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
         (!direct_quant_setting||direct_quant_setting[0]!='0');
     out->prefill_direct_quant_width=out->prefill_direct_quant?
         ((colibri_cpu_features()&2u)!=0?8:4):0;
+    out->prefill_profile=runtime->prefill_profile?1:0;
+    out->prefill_gpu_core_nanoseconds=runtime->prefill_gpu_core_nanoseconds;
+    out->prefill_gpu_router_nanoseconds=runtime->prefill_gpu_router_nanoseconds;
+    out->prefill_gpu_transfer_nanoseconds=runtime->prefill_gpu_transfer_nanoseconds;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;return 0;});}
@@ -1439,6 +1456,15 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     runtime->cuda_ready=true;
     if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
     if(colibri_gpu_event_create(&runtime->route_event)!=0){release_qwen_device(*runtime);throw std::runtime_error("failed to create native Qwen route event");}
+    runtime->prefill_profile=std::getenv("COLIBRI_PREFILL_PROFILE")&&
+        std::getenv("COLIBRI_PREFILL_PROFILE")[0]=='1';
+    if(runtime->prefill_profile&&(
+       colibri_gpu_event_create(&runtime->prefill_layer_start_event)!=0||
+       colibri_gpu_event_create(&runtime->prefill_core_end_event)!=0||
+       colibri_gpu_event_create(&runtime->prefill_router_end_event)!=0)){
+        release_qwen_device(*runtime);
+        throw std::runtime_error("failed to create native Qwen prefill profiling events");
+    }
     if(const char*profile=std::getenv("COLIBRI_CUDA_PROFILE");profile&&profile[0]&&profile[0]!='0'){
         runtime->cuda_profile=true;
         runtime->cuda_layer_profiles.resize(runtime->layers.size());

@@ -569,6 +569,12 @@ tokens and avoids the temporary FP32 weight expansion. Set
 for comparison. AVX2 shares four tokens per decode; AVX-512 shares eight.
 `prefill_direct_quant` and `prefill_direct_quant_width` report the active path.
 
+Set `COLIBRI_PREFILL_PROFILE=1` before starting a native Qwen process to split
+the GPU side of batched prefill into `prefill_gpu_core_nanoseconds`,
+`prefill_gpu_router_nanoseconds`, and `prefill_gpu_transfer_nanoseconds`.
+Profiling allocates three CUDA events and records them once per layer; it is off
+by default so production requests avoid that measurement overhead.
+
 On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
 AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep
 vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to

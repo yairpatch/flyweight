@@ -180,6 +180,10 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t prefill_expert_nanoseconds; /* batched CPU/hybrid expert phase wall time */
     uint64_t prefill_direct_quant; /* direct quantized expert path is enabled */
     uint64_t prefill_direct_quant_width; /* routed tokens sharing each packed-weight decode */
+    uint64_t prefill_profile; /* detailed CUDA prefill profiling is enabled */
+    uint64_t prefill_gpu_core_nanoseconds; /* DeltaNet/attention CUDA work before MoE */
+    uint64_t prefill_gpu_router_nanoseconds; /* MoE norm, router projection, and top-k */
+    uint64_t prefill_gpu_transfer_nanoseconds; /* selected routes, weights, and activations DtoH */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
