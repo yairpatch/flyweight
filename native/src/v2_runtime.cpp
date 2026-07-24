@@ -362,6 +362,9 @@ struct ColibriV2QwenRuntime {
     // slices fit; host block is one sequence's private host staging.
     std::vector<std::uint64_t> slot_events;
     std::uint64_t staging_event = 0;
+    std::uint64_t prefetch_stream = 0;
+    std::uint64_t prefetch_event = 0;
+    bool prefetch_pending = false;
     std::uint64_t decode_slice_bytes = 0;
     std::uint64_t decode_host_block_bytes = 0;
     std::uint32_t multi_decode_capacity = 1;
@@ -633,6 +636,32 @@ static void qwen_observe_and_prefetch_next_layer(
             }
         }
 #endif
+        if (runtime.options.moe_device == 0 && !runtime.expert_slots.empty()) {
+            const auto slot_index = select_expert_cache_slot(runtime, layer + 1, expert, true);
+            if (slot_index == kNoExpertSlot) continue;
+            auto& slot = runtime.expert_slots[slot_index];
+            if (runtime.dma_paging) {
+                const auto slot_base = runtime.expert_cache + slot_index * runtime.expert_slot_bytes;
+                std::uint64_t role_offset = 0;
+                for (int role = 0; role < 3; ++role) {
+                    const auto& tensor = runtime.model->tensors[next.expert_tensors[role]];
+                    const auto bytes = tensor.size / experts;
+                    const auto offset = static_cast<std::uint64_t>(expert) * bytes;
+                    if (colibri_gpu_upload(slot_base + role_offset, runtime.model->data + tensor.offset + offset, bytes, runtime.prefetch_stream) != 0)
+                        throw std::runtime_error("native Qwen GPU prefetch DMA upload failed");
+                    role_offset += bytes;
+                }
+                slot.key = key;
+                slot.valid = true;
+                slot.last_used = ++runtime.expert_clock;
+                runtime.expert_residency[key] = slot_index;
+                runtime.prefetch_pending = true;
+            }
+        }
+    }
+    if (runtime.prefetch_stream && runtime.expert_residency.size()) {
+        if (colibri_gpu_event_record(runtime.prefetch_event, runtime.prefetch_stream) != 0)
+            throw std::runtime_error("native Qwen prefetch event record failed");
     }
 }
 
@@ -758,6 +787,8 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.slot_events.clear();
     colibri_gpu_event_destroy(runtime.staging_event);
     runtime.staging_event = 0;
+    colibri_gpu_event_destroy(runtime.prefetch_event);
+    runtime.prefetch_event = 0;
     colibri_gpu_event_destroy(runtime.route_event);
     colibri_gpu_event_destroy(runtime.prefill_layer_start_event);
     colibri_gpu_event_destroy(runtime.prefill_core_end_event);
@@ -775,6 +806,8 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     colibri_gpu_event_destroy(runtime.cuda_tail_end);
     runtime.cuda_tail_start=runtime.cuda_tail_end=0;
     runtime.cuda_profile=false;
+    colibri_gpu_stream_destroy(runtime.prefetch_stream);
+    runtime.prefetch_stream = 0;
     colibri_gpu_stream_destroy(runtime.stream);
     runtime.device_tensors.clear();
     runtime.host_staging = nullptr;
@@ -1812,9 +1845,8 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.cpu_prefetch_auto>1)throw std::runtime_error("native Qwen cpu_prefetch_auto must be boolean");
     if(runtime->options.cpu_prefetch_mib&&runtime->options.cpu_prefetch_auto)throw std::runtime_error("native Qwen CPU prefetch modes are mutually exclusive");
     if(runtime->options.next_layer_prefetch>64)throw std::runtime_error("native Qwen next-layer prefetch supports at most 64 experts");
-    if(gemma4&&runtime->options.next_layer_prefetch)throw std::runtime_error("native Gemma 4 next-layer prefetch is not implemented");
-    if(runtime->options.next_layer_prefetch&&runtime->options.moe_device==0)throw std::runtime_error("native Qwen next-layer prefetch requires CPU or hybrid MoE");
-    if(runtime->options.next_layer_prefetch&&runtime->options.mtp_drafts)throw std::runtime_error("native Qwen next-layer prefetch does not support MTP yet");
+     if(gemma4&&runtime->options.next_layer_prefetch)throw std::runtime_error("native Gemma 4 next-layer prefetch is not implemented");
+     if(runtime->options.next_layer_prefetch&&runtime->options.mtp_drafts)throw std::runtime_error("native Qwen next-layer prefetch does not support MTP yet");
     if(runtime->options.next_layer_prefetch&&runtime->options.parallel_sequences>1)throw std::runtime_error("native Qwen next-layer prefetch currently requires one sequence slot");
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>3)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>3)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), or 3 (q8_0)");
@@ -1978,6 +2010,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     if(colibri_gpu_compile(cuda_source.c_str(),compile_options.data(),static_cast<int32_t>(compile_options.size()),runtime->options.device,compile_log.data(),compile_log.size())!=0)throw std::runtime_error(std::string("failed to compile native Qwen CUDA kernels: ")+compile_log.data());
     runtime->cuda_ready=true;
     if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
+    if(colibri_gpu_stream_create(&runtime->prefetch_stream)!=0){colibri_gpu_stream_destroy(runtime->stream);throw std::runtime_error("failed to create native Qwen prefetch stream");}
     runtime->prefill_profile=std::getenv("COLIBRI_PREFILL_PROFILE")&&
         std::getenv("COLIBRI_PREFILL_PROFILE")[0]=='1';
     if(const char*fused=std::getenv("COLIBRI_FUSED_Q8_ATTENTION"))
@@ -2180,6 +2213,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         for(auto&event:runtime->slot_events)
             if(colibri_gpu_event_create(&event)!=0)throw std::runtime_error("failed to create native Qwen slot events");
         if(colibri_gpu_event_create(&runtime->staging_event)!=0)throw std::runtime_error("failed to create native Qwen staging event");
+        if(colibri_gpu_event_create(&runtime->prefetch_event)!=0){colibri_gpu_event_destroy(runtime->staging_event);throw std::runtime_error("failed to create native Qwen prefetch event");}
         const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
         // gpu_cache_bytes is the TOTAL GPU budget (base allocations + expert
         // cache). 0 = auto-fit: probe free VRAM and use most of it, leaving a
@@ -3084,15 +3118,16 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(runtime->options.moe_device!=0&&(runtime->options.expert_top_k>0||(runtime->options.expert_top_p>0.0f&&runtime->options.expert_top_p<1.0f)))
             route_count=apply_expert_router_policy(selected_host,cpu_weights,top_k,static_cast<int>(runtime->options.expert_top_k),runtime->options.expert_top_p);
         runtime->route_expert_sum+=static_cast<std::uint64_t>(route_count);
-        if(runtime->options.moe_device!=0)
-            qwen_observe_and_prefetch_next_layer(
-                *runtime,layer_number,selected_host,route_count
-            );
+        qwen_observe_and_prefetch_next_layer(
+            *runtime,layer_number,selected_host,route_count
+        );
         if(runtime->options.moe_device==1&&!runtime->cache_admission_enabled)
             for(int rank=0;rank<route_count;++rank)
                 record_expert_access(*runtime,layer_number,
                     static_cast<std::uint32_t>(selected_host[rank]));
         const auto pager_started=std::chrono::steady_clock::now();
+        if(runtime->prefetch_pending&&runtime->prefetch_event&&colibri_gpu_stream_wait_event(runtime->stream,runtime->prefetch_event)!=0)throw std::runtime_error("native Qwen prefetch wait failed");
+        runtime->prefetch_pending=false;
         if(runtime->options.moe_device==1){
             if(cpu_output_offset+hidden_size*sizeof(float)>runtime->expert_staging_bytes)throw std::runtime_error("native CPU MoE workspace overflow");
             const auto compute_started=std::chrono::steady_clock::now();
