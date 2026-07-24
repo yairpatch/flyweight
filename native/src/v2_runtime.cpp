@@ -539,6 +539,10 @@ struct QwenExpertHistorySaveGuard {
     ~QwenExpertHistorySaveGuard() { qwen_save_expert_history(runtime); }
 };
 
+static std::size_t select_expert_cache_slot(
+    ColibriV2QwenRuntime& runtime, std::uint32_t layer,
+    std::uint32_t expert, bool allow_rejection
+);
 static void qwen_observe_and_prefetch_next_layer(
     ColibriV2QwenRuntime& runtime, std::uint32_t layer,
     const std::int32_t* selected, int selected_count
