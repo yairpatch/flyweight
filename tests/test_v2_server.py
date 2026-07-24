@@ -329,6 +329,17 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.cpu_prefetch_mib, 0)
         self.assertTrue(args.cpu_prefetch_auto)
 
+    def test_serve_v2_cli_accepts_gpu_next_layer_prefetch_with_direct_paging(self) -> None:
+        args = _parser().parse_args([
+            "serve-v2", "model.gguf",
+            "--moe-device", "gpu",
+            "--expert-paging", "direct",
+            "--next-layer-prefetch", "4",
+        ])
+        self.assertEqual(args.moe_device, "gpu")
+        self.assertEqual(args.expert_paging, "direct")
+        self.assertEqual(args.next_layer_prefetch, 4)
+
 
 if __name__ == "__main__":
     unittest.main()

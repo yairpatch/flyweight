@@ -215,6 +215,8 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("next_layer_prefetch_hits", ctypes.c_uint64),
         ("next_layer_prefetch_bytes", ctypes.c_uint64),
         ("next_layer_prefetch_trained_pairs", ctypes.c_uint64),
+        ("gpu_prefetch_bytes", ctypes.c_uint64),
+        ("gpu_prefetch_hits", ctypes.c_uint64),
     ]
 
 
@@ -1326,8 +1328,6 @@ class V2QwenRuntime:
             raise ValueError("cpu_prefetch_mib and cpu_prefetch_auto are mutually exclusive")
         if not 0 <= next_layer_prefetch <= 64:
             raise ValueError("next_layer_prefetch must be between 0 and 64")
-        if next_layer_prefetch and moe_device == "gpu":
-            raise ValueError("next_layer_prefetch requires CPU or hybrid MoE")
         if next_layer_prefetch and mtp_drafts:
             raise ValueError("next_layer_prefetch does not support MTP yet")
         if next_layer_prefetch and parallel_sequences > 1:

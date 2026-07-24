@@ -4436,6 +4436,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 route_count = apply_expert_router_policy(s.selected_host, s.cpu_weights, top_k, static_cast<int>(runtime->options.expert_top_k), runtime->options.expert_top_p);
             runtime->route_expert_sum += static_cast<std::uint64_t>(route_count);
             const auto pager_started = std::chrono::steady_clock::now();
+            if(runtime->prefetch_pending&&runtime->prefetch_event&&colibri_gpu_stream_wait_event(runtime->stream,runtime->prefetch_event)!=0)throw std::runtime_error("native Qwen prefetch wait failed");
+            runtime->prefetch_pending=false;
             if (runtime->options.moe_device == 1) {
                 const auto compute_started = std::chrono::steady_clock::now();
                 qwen_cpu_moe(*runtime, layer, s.selected_host, s.cpu_weights, route_count, s.cpu_input, s.cpu_activated, s.cpu_output);
