@@ -565,7 +565,11 @@ class InferenceServiceTests(unittest.TestCase):
         self.service.stream_chat_completion = fake_stream
         events = list(
             self.service.stream_anthropic_message(
-                {"model": "qwen-local", "messages": [{"role": "user", "content": "hi"}]}
+                {
+                    "model": "qwen-local",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 4,
+                }
             )
         )
 
@@ -610,6 +614,92 @@ class InferenceServiceTests(unittest.TestCase):
             }
         )
         self.assertEqual(response["type"], "message")
+
+    def test_anthropic_tool_results_precede_same_turn_user_text(self) -> None:
+        self.service.anthropic_message(
+            {
+                "messages": [
+                    {"role": "user", "content": "Run it"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "run",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "done",
+                            },
+                            {"type": "text", "text": "What next?"},
+                        ],
+                    },
+                ],
+                "max_tokens": 4,
+            }
+        )
+        translated = self.generator.calls[-1][0]
+        self.assertIn(
+            "<tool_response>\ndone\n</tool_response>", translated[-2]["content"]
+        )
+        self.assertEqual(translated[-1]["content"], "What next?")
+
+    def test_anthropic_protocol_validation_and_options(self) -> None:
+        with self.assertRaisesRegex(APIError, "max_tokens"):
+            self.service.anthropic_message(
+                {"messages": [{"role": "user", "content": "Hi"}]}
+            )
+        with self.assertRaisesRegex(APIError, "unsupported block"):
+            self.service.anthropic_message(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "image", "source": {}}],
+                        }
+                    ],
+                    "max_tokens": 4,
+                }
+            )
+        self.service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "thinking": {"type": "enabled"},
+                "tools": [{"name": "run", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "none"},
+                "max_tokens": 4,
+            }
+        )
+        _, options = self.generator.calls[-1]
+        self.assertTrue(options["enable_thinking"])
+
+    def test_anthropic_length_finish_maps_to_max_tokens(self) -> None:
+        generator = StubGenerator()
+        generator.generate_messages = Mock(
+            return_value=GenerationResult(
+                prompt_ids=(1,),
+                generated_ids=(2,),
+                text="unfinished",
+                stopped_on_eos=False,
+                state_tokens=2,
+            )
+        )
+        service = InferenceService("qwen-local", generator)
+        response = service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Continue"}],
+                "max_tokens": 1,
+            }
+        )
+        self.assertEqual(response["stop_reason"], "max_tokens")
 
     def test_anthropic_canonical_tools_are_forwarded(self) -> None:
         service = InferenceService("qwen-local", ToolStubGenerator())
@@ -997,6 +1087,17 @@ class HTTPServerTests(unittest.TestCase):
         self.assertIn('"object": "chat.completion.chunk"', stream_body)
         self.assertIn("data: [DONE]", stream_body)
 
+    def test_anthropic_errors_use_anthropic_envelope(self) -> None:
+        response, payload = self.request_json(
+            "POST",
+            "/v1/messages",
+            {"messages": [{"role": "user", "content": "Hi"}]},
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertNotIn("param", payload["error"])
+
 
 class AuthenticationTests(unittest.TestCase):
     def test_bearer_auth_and_cors_preflight(self) -> None:
@@ -1043,6 +1144,9 @@ class AuthenticationTests(unittest.TestCase):
                 response.getheader("Access-Control-Allow-Origin"),
                 "http://localhost:3000",
             )
+            allowed_headers = response.getheader("Access-Control-Allow-Headers")
+            self.assertIn("x-api-key", allowed_headers)
+            self.assertIn("anthropic-version", allowed_headers)
         finally:
             connection.close()
             server.shutdown()

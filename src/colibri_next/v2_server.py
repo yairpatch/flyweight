@@ -34,13 +34,26 @@ class _NativeEngine:
         self._closing = False
 
     def submit(
-        self, prompt_ids: list[int], max_new_tokens: int, stop_tokens: tuple[int, ...]
+        self,
+        prompt_ids: list[int],
+        max_new_tokens: int,
+        stop_tokens: tuple[int, ...],
+        sampling: SamplingConfig | None = None,
     ) -> tuple[int, SimpleQueue]:
         queue: SimpleQueue = SimpleQueue()
+        sampling_config = sampling or SamplingConfig()
         with self._lock:
             if self._closing:
                 raise RuntimeError("native v2 engine is shutting down")
-            task_id = self.runtime.task_submit(prompt_ids, max_new_tokens, stop_tokens)
+            task_id = self.runtime.task_submit(
+                prompt_ids,
+                max_new_tokens,
+                stop_tokens,
+                temperature=sampling_config.temperature,
+                top_k=sampling_config.top_k,
+                top_p=sampling_config.top_p,
+                seed=sampling_config.seed,
+            )
             self._queues[task_id] = queue
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
@@ -226,7 +239,7 @@ class NativeV2Tokenizer:
 
 
 class NativeV2Generator:
-    """Greedy single-stream generator over the one-token native C ABI."""
+    """Streaming generator backed by the cooperative native Qwen engine."""
 
     def __init__(
         self, model: V2Model, runtime: V2QwenRuntime, tokenizer: NativeV2Tokenizer
@@ -255,14 +268,6 @@ class NativeV2Generator:
 
     def close(self) -> None:
         self.engine.close()
-
-    @staticmethod
-    def _require_greedy(sampling: SamplingConfig | None) -> None:
-        # The native v2 decode path is greedy (argmax). Client sampling params
-        # (temperature/top_p/top_k) are accepted and ignored rather than
-        # rejected, so agentic clients that always send temperature (Claude
-        # Code defaults to 1.0) still work instead of getting a 400.
-        return
 
     def generate_messages(
         self, messages: Sequence[Mapping[str, str]], **options: object
@@ -370,7 +375,9 @@ class NativeV2Generator:
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
         sampling = options.get("sampling")
-        self._require_greedy(sampling if isinstance(sampling, SamplingConfig) else None)
+        sampling_config = (
+            sampling if isinstance(sampling, SamplingConfig) else SamplingConfig()
+        )
         progress = options.get("progress")
         progress_callback = progress if callable(progress) else None
         if not prompt_ids:
@@ -389,7 +396,10 @@ class NativeV2Generator:
         # requests (each on its own KV slot); EOS is detected natively via the
         # stop-token list so no token is decoded past it.
         task_id, queue = self.engine.submit(
-            prompt_ids, max_new_tokens, self.tokenizer.eos_token_ids
+            prompt_ids,
+            max_new_tokens,
+            self.tokenizer.eos_token_ids,
+            sampling_config,
         )
         try:
             progress_reported = False
@@ -471,6 +481,7 @@ class NativeV2InferenceService(InferenceService):
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
+        next_layer_prefetch: int = 0,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -498,6 +509,7 @@ class NativeV2InferenceService(InferenceService):
                 expert_paging=expert_paging,
                 cpu_prefetch_mib=cpu_prefetch_mib,
                 cpu_prefetch_auto=cpu_prefetch_auto,
+                next_layer_prefetch=next_layer_prefetch,
             )
             self.v2_runtime.prepare()
         except Exception:
@@ -516,7 +528,13 @@ class NativeV2InferenceService(InferenceService):
             cors_origin=cors_origin,
             strict_model=strict_model,
         )
-        self.moe_device = moe_device
+        # Native auto-fit may downgrade hybrid to CPU when the base CUDA
+        # allocations leave no room for an expert-cache working set.
+        self.moe_device = {
+            0: "gpu",
+            1: "cpu",
+            2: "hybrid",
+        }[int(self.v2_runtime.info["moe_device"])]
         self.mtp_drafts = mtp_drafts
         self.gpu_cache_mib = gpu_cache_mib
         # The native cooperative engine interleaves concurrent requests itself

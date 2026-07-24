@@ -77,9 +77,20 @@ class StubV2Runtime:
     # Cooperative-engine API mirroring the native semantics (prefill the whole
     # prompt, then per step: emit token; stop on stop-token or max; else decode
     # the emitted token as the next input).
-    def task_submit(self, prompt, max_tokens, stop_tokens=()):
+    def task_submit(
+        self,
+        prompt,
+        max_tokens,
+        stop_tokens=(),
+        *,
+        temperature=0.0,
+        top_k=20,
+        top_p=0.95,
+        seed=None,
+    ):
         self._tasks = getattr(self, "_tasks", {})
         self._next_task = getattr(self, "_next_task", 0) + 1
+        self._last_sampling = (temperature, top_k, top_p, seed)
         self._tasks[self._next_task] = (list(prompt), max_tokens, tuple(stop_tokens))
         return self._next_task
 
@@ -162,6 +173,19 @@ class NativeV2ServerTests(unittest.TestCase):
             "<|turn>model\n<|channel>thought\n<channel|>",
         )
 
+    def test_qwen_chat_format_controls_thinking_mode(self) -> None:
+        tokenizer = object.__new__(NativeV2Tokenizer)
+        tokenizer.architecture = "qwen3moe"
+        messages = [{"role": "user", "content": "Explain MoE simply."}]
+
+        thinking = tokenizer.format_messages(messages, enable_thinking=True)
+        direct = tokenizer.format_messages(messages, enable_thinking=False)
+
+        self.assertTrue(thinking.endswith("<|im_start|>assistant\n<think>\n"))
+        self.assertTrue(
+            direct.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        )
+
     def test_multibyte_character_split_across_tokens_decodes_intact(self) -> None:
         # Byte-level BPE splits "⚽" (e2 9a bd) across tokens 40+41. Per-token
         # string decoding turned each half into U+FFFD, and that corruption was
@@ -180,17 +204,17 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertTrue(result.stopped_on_eos)
         self.assertEqual(runtime.inputs, [1, 2])
 
-    def test_native_generator_accepts_and_ignores_sampling(self) -> None:
-        # The native path is greedy; sampling params are accepted and ignored
-        # (clamped to greedy) rather than rejected, so agentic clients that
-        # always send a temperature still work.
-        generator, _ = self.make_generator([10, 20])
+    def test_native_generator_forwards_sampling_to_engine(self) -> None:
+        generator, runtime = self.make_generator([10, 20])
         result = generator.generate_text(
             "Hi",
             max_new_tokens=1,
-            sampling=SamplingConfig(temperature=0.5),
+            sampling=SamplingConfig(
+                temperature=0.5, top_k=7, top_p=0.8, seed=42
+            ),
         )
         self.assertIsNotNone(result)
+        self.assertEqual(runtime._last_sampling, (0.5, 7, 0.8, 42))
 
     def test_native_generator_reports_runtime_prefix_cache(self) -> None:
         generator, _ = self.make_generator([10])
@@ -268,6 +292,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.expert_paging, "auto")
         self.assertEqual(args.cpu_prefetch_mib, 0)
         self.assertFalse(args.cpu_prefetch_auto)
+        self.assertEqual(args.next_layer_prefetch, 0)
 
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
         args = _parser().parse_args([
@@ -281,6 +306,7 @@ class NativeV2ServerTests(unittest.TestCase):
             "--prefill-cache-seed", "8",
             "--expert-paging", "direct",
             "--cpu-prefetch-mib", "768",
+            "--next-layer-prefetch", "6",
             "--cold-cache",
         ])
         self.assertEqual(args.cache_type_k, "f32")
@@ -292,6 +318,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.prefill_cache_seed, 8)
         self.assertEqual(args.expert_paging, "direct")
         self.assertEqual(args.cpu_prefetch_mib, 768)
+        self.assertEqual(args.next_layer_prefetch, 6)
         self.assertTrue(args.cold_cache)
         self.assertFalse(args.cpu_prefetch_auto)
 

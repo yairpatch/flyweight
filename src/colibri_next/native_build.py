@@ -54,8 +54,11 @@ def build_native(*, clean: bool = False) -> Path:
 
 def _build_environment() -> dict[str, str]:
     environment = os.environ.copy()
-    if os.name != "nt" or shutil.which("cl", path=environment.get("PATH")):
+    if os.name != "nt":
         return environment
+    # Always prefer the x64 toolchain via vcvars64. An x86/Developer prompt puts
+    # a 32-bit cl.exe on PATH, which cannot compile the F16C intrinsics used by
+    # the AVX2 kernels (e.g. _cvtsh_ss), so trusting an existing cl is unsafe.
     candidates = (
         Path(
             r"C:\Program Files\Microsoft Visual Studio\2022\Community"
@@ -72,6 +75,9 @@ def _build_environment() -> dict[str, str]:
     )
     vcvars = next((candidate for candidate in candidates if candidate.is_file()), None)
     if vcvars is None:
+        # Fall back to an existing x64 cl on PATH if one is already configured.
+        if shutil.which("cl", path=environment.get("PATH")):
+            return environment
         raise FileNotFoundError(
             "Visual Studio C++ Build Tools were not found; install the Desktop "
             "development with C++ workload"
@@ -89,8 +95,6 @@ def _build_environment() -> dict[str, str]:
         if "=" not in line:
             continue
         name, value = line.split("=", 1)
-        if name == "Path":
-            continue
         if name.casefold() == "path":
             for existing in tuple(environment):
                 if existing.casefold() == "path":

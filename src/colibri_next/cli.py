@@ -351,6 +351,10 @@ def _parser() -> argparse.ArgumentParser:
         help="size expert warmup from RAM and skip it below 10%/8 MiB cold-page pressure",
     )
     benchmark_v2.add_argument(
+        "--next-layer-prefetch", type=int, default=0,
+        help="transition-predicted next-layer expert page hints (0 = off, max 64)",
+    )
+    benchmark_v2.add_argument(
         "--cold-cache", action="store_true",
         help="best-effort eviction of clean GGUF pages before a cold-start A/B run",
     )
@@ -547,6 +551,10 @@ def _parser() -> argparse.ArgumentParser:
         "--cpu-prefetch-auto", action="store_true",
         help="hardware-sized expert warmup gated by measured cold-page pressure",
     )
+    serve_v2.add_argument(
+        "--next-layer-prefetch", type=int, default=0,
+        help="transition-predicted next-layer expert page hints (0 = off, max 64)",
+    )
 
     create = subcommands.add_parser("create-demo", help="create deterministic experts")
     create.add_argument("path", type=Path)
@@ -597,6 +605,10 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(
                 "benchmark-v2 requires --prefill-cache-seed within [0, 256]"
             )
+        if not 0 <= args.next_layer_prefetch <= 64:
+            raise SystemExit(
+                "benchmark-v2 requires --next-layer-prefetch within [0, 64]"
+            )
         if not 0.0 <= args.expert_top_p <= 1.0:
             raise SystemExit("benchmark-v2 requires --expert-top-p within [0, 1]")
         _validate_mtp_cache_types(
@@ -641,6 +653,7 @@ def main(argv: list[str] | None = None) -> int:
                     expert_paging=args.expert_paging,
                     cpu_prefetch_mib=args.cpu_prefetch_mib,
                     cpu_prefetch_auto=args.cpu_prefetch_auto,
+                    next_layer_prefetch=args.next_layer_prefetch,
                 ) as runtime:
                     prepare_started = time.perf_counter()
                     runtime.prepare()
@@ -1231,6 +1244,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("use either --cpu-prefetch-mib or --cpu-prefetch-auto")
         if not 0 <= args.prefill_cache_seed <= 256:
             raise SystemExit("--prefill-cache-seed must be within [0, 256]")
+        if not 0 <= args.next_layer_prefetch <= 64:
+            raise SystemExit("--next-layer-prefetch must be within [0, 64]")
         _validate_mtp_cache_types(
             args.mtp_drafts, args.cache_type_k, args.cache_type_v
         )
@@ -1259,13 +1274,14 @@ def main(argv: list[str] | None = None) -> int:
                 expert_paging=args.expert_paging,
                 cpu_prefetch_mib=args.cpu_prefetch_mib,
                 cpu_prefetch_auto=args.cpu_prefetch_auto,
+                next_layer_prefetch=args.next_layer_prefetch,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,
         )
         print(
             f"Serving {service.model_name} at http://{args.host}:{args.port} "
-            f"(native v2, {args.moe_device} MoE)",
+            f"(native v2, {service.moe_device} MoE)",
             file=sys.stderr,
             flush=True,
         )

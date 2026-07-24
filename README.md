@@ -584,6 +584,30 @@ Inspect `cpu_prefetch_loaded_pages`, `cpu_prefetch_auto_skips`, and
 `--cpu-prefetch-mib` and automatic mode are mutually exclusive. Auto mode
 skips safely when the platform cannot report mapped-page residency.
 
+The native runtime also persists its per-layer expert frequency and recency
+history beside the model as `<model>.expert-history`. The small, versioned
+sidecar is bound to the model's tensor layout, decayed once when a new process
+loads it, and atomically replaced after completed generation work. It contains
+only expert-routing counters—never prompts, tokens, or generated text. Learned
+history improves the first request's prompt-hot cache seeding and CPU page
+warmup instead of making every server restart learn the same workload again.
+Set `COLIBRI_EXPERT_HISTORY=off` to disable persistence or set it to an explicit
+file path when the model directory is read-only. Runtime diagnostics expose
+`expert_history_loaded_entries` and `expert_history_saves`; incompatible,
+truncated, or model-mismatched sidecars are ignored.
+
+`--next-layer-prefetch N` enables an experimental, value-preserving decode
+prefetcher for CPU and hybrid Qwen execution. It learns which experts in layer
+L tend to precede experts in layer L+1, predicts at most `N` next-layer experts,
+and issues bounded OS page-cache hints while the current layer's expert work is
+running. It never changes router output, admits speculative entries into the
+GPU cache, or evicts demand-resident experts. The first token trains the
+transition table; later tokens can prefetch. Compare
+`next_layer_prefetch_hits / next_layer_prefetch_predictions` together with
+decode time and `next_layer_prefetch_bytes`; a high byte count without useful
+hits means the budget is too broad for that workload. The feature currently
+supports the single-sequence Qwen decode path and remains off by default.
+
 Native Qwen diagnostics also separate batched prompt work into
 `prefill_nanoseconds`, `prefill_route_wait_nanoseconds`, and
 `prefill_expert_nanoseconds`, with `prefill_calls` and `prefill_tokens` for

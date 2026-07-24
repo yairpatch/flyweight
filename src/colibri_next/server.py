@@ -751,13 +751,17 @@ class InferenceService:
                 }
             )
         finish_reason = choice.get("finish_reason")
+        stop_reason = {
+            "tool_calls": "tool_use",
+            "length": "max_tokens",
+        }.get(finish_reason, "end_turn")
         return {
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
             "role": "assistant",
             "model": payload.get("model", self.model_name),
             "content": content,
-            "stop_reason": "tool_use" if finish_reason == "tool_calls" else "end_turn",
+            "stop_reason": stop_reason,
             "stop_sequence": None,
             "usage": {
                 "input_tokens": response["usage"]["prompt_tokens"],
@@ -838,11 +842,10 @@ class InferenceService:
                 choice = choices[0]
                 delta = choice.get("delta", {})
                 if choice.get("finish_reason"):
-                    stop_reason = (
-                        "tool_use"
-                        if choice["finish_reason"] == "tool_calls"
-                        else "end_turn"
-                    )
+                    stop_reason = {
+                        "tool_calls": "tool_use",
+                        "length": "max_tokens",
+                    }.get(choice["finish_reason"], "end_turn")
                 text = delta.get("content")
                 if text:
                     if text_block_index is None:
@@ -1311,7 +1314,8 @@ def create_handler(
                 "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"
             )
             self.send_header(
-                "Access-Control-Allow-Headers", "Authorization, Content-Type"
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, x-api-key, anthropic-version",
             )
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -1437,7 +1441,11 @@ def create_handler(
                     self.log_message("request completed: %s", path)
                     return
                 if path == "/v1/messages/count_tokens":
-                    messages_payload = _anthropic_to_chat_payload(payload)
+                    # Anthropic's count_tokens request has no max_tokens field;
+                    # provide a throwaway value solely for shared translation.
+                    messages_payload = _anthropic_to_chat_payload(
+                        {**payload, "max_tokens": payload.get("max_tokens", 1)}
+                    )
                     self._send_json(
                         200,
                         service.count_response_input(
@@ -1630,7 +1638,7 @@ def create_handler(
                 # possible. Send the error as the final SSE event instead.
                 self.log_error("stream request failed: %s", error.message)
                 try:
-                    self._write_sse_event(json.dumps(_error_payload(error)))
+                    self._write_sse_event(json.dumps(self._error_body(error)))
                 except (BrokenPipeError, ConnectionResetError):
                     stream_ok = False
                     self.close_connection = True
@@ -1642,7 +1650,7 @@ def create_handler(
                 try:
                     self._write_sse_event(
                         json.dumps(
-                            _error_payload(
+                            self._error_body(
                                 APIError(500, "internal server error", "server_error")
                             )
                         )
@@ -1678,7 +1686,21 @@ def create_handler(
             self.send_header("Vary", "Origin")
 
         def _send_error(self, error: APIError) -> None:
-            self._send_json(error.status, _error_payload(error))
+            self._send_json(error.status, self._error_body(error))
+
+        def _error_body(self, error: APIError) -> dict[str, Any]:
+            if urlsplit(self.path).path in {
+                "/v1/messages",
+                "/v1/messages/count_tokens",
+            }:
+                return {
+                    "type": "error",
+                    "error": {
+                        "type": error.error_type,
+                        "message": error.message,
+                    },
+                }
+            return _error_payload(error)
 
         def _send_static(self, path: str, *, head_only: bool = False) -> None:
             filename, content_type = UI_ASSETS[path]
@@ -1797,8 +1819,19 @@ def _chat_messages(payload: Mapping[str, Any]) -> tuple[list[dict[str, str]], bo
 
 
 def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if payload.get("max_tokens") is None:
+        raise APIError(400, "max_tokens is required", parameter="max_tokens")
+    if payload.get("stop_sequences") not in (None, [], ""):
+        raise APIError(
+            400,
+            "stop_sequences is not supported",
+            parameter="stop_sequences",
+        )
+    thinking = payload.get("thinking")
+    if thinking is not None and not isinstance(thinking, dict):
+        raise APIError(400, "thinking must be an object", parameter="thinking")
     messages: list[dict[str, Any]] = []
-    system = _anthropic_text(payload.get("system"))
+    system = _anthropic_text_strict(payload.get("system"), "system")
     if system:
         messages.append({"role": "system", "content": system})
     value = payload.get("messages")
@@ -1809,7 +1842,9 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise APIError(400, f"messages[{index}] is invalid", parameter="messages")
         role = message.get("role")
         if role in {"system", "developer"}:
-            system_text = _anthropic_text(message.get("content"))
+            system_text = _anthropic_text_strict(
+                message.get("content"), f"messages[{index}].content"
+            )
             if system_text:
                 messages.append({"role": "system", "content": system_text})
             continue
@@ -1817,7 +1852,9 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             messages.append(
                 {
                     "role": "tool",
-                    "content": _anthropic_text(message.get("content")),
+                    "content": _anthropic_text_strict(
+                        message.get("content"), f"messages[{index}].content"
+                    ),
                 }
             )
             continue
@@ -1859,8 +1896,23 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 )
             elif block_type == "tool_result" and role == "user":
                 tool_results.append(
-                    {"role": "tool", "content": _anthropic_text(block.get("content"))}
+                    {
+                        "role": "tool",
+                        "content": _anthropic_text_strict(
+                            block.get("content"),
+                            f"messages[{index}].content",
+                        ),
+                    }
                 )
+            else:
+                raise APIError(
+                    400,
+                    f"messages[{index}].content contains an unsupported block",
+                    parameter="messages",
+                )
+        # A tool result answers the preceding assistant turn, so it must reach
+        # the prompt before any new user text carried by the same message.
+        messages.extend(tool_results)
         if text_parts or tool_calls:
             item: dict[str, Any] = {
                 "role": role,
@@ -1869,7 +1921,8 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             if tool_calls:
                 item["tool_calls"] = tool_calls
             messages.append(item)
-        messages.extend(tool_results)
+        elif not tool_results:
+            messages.append({"role": role, "content": ""})
     result: dict[str, Any] = {
         "model": payload.get("model"),
         "messages": messages,
@@ -1877,6 +1930,9 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "temperature": payload.get("temperature"),
         "top_p": payload.get("top_p"),
         "top_k": payload.get("top_k"),
+        "enable_thinking": bool(
+            isinstance(thinking, dict) and thinking.get("type") == "enabled"
+        ),
     }
     tools = payload.get("tools") or []
     if not isinstance(tools, list):
@@ -1915,10 +1971,14 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         choice_type = choice.get("type")
         if choice_type == "any":
             result["tool_choice"] = "required"
+        elif choice_type == "none":
+            result["tool_choice"] = "none"
         elif choice_type == "tool":
             result["tool_choice"] = {"function": {"name": choice.get("name")}}
-        else:
+        elif choice_type == "auto":
             result["tool_choice"] = "auto"
+        else:
+            raise APIError(400, "tool_choice is invalid", parameter="tool_choice")
     elif choice is not None:
         result["tool_choice"] = choice
     return result
@@ -1938,6 +1998,29 @@ def _anthropic_text(value: Any) -> str:
                 parts.append(_anthropic_text(block.get("content")))
         return "".join(parts)
     return ""
+
+
+def _anthropic_text_strict(value: Any, parameter: str) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        raise APIError(400, f"{parameter} must be text blocks", parameter=parameter)
+    parts: list[str] = []
+    for block in value:
+        if (
+            not isinstance(block, dict)
+            or block.get("type") not in {"text", "input_text", "output_text"}
+            or not isinstance(block.get("text"), str)
+        ):
+            raise APIError(
+                400,
+                f"{parameter} contains an unsupported content block",
+                parameter=parameter,
+            )
+        parts.append(block["text"])
+    return "".join(parts)
 
 
 def _selected_tools(payload: Mapping[str, Any]) -> list[dict[str, Any]]:

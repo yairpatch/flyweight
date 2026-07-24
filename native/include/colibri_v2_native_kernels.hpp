@@ -285,7 +285,8 @@ void qwen_delta_recurrent_rows(
     __shared__ float core_values[256];
     __shared__ float inverse_rms;
     for (int token = 0; token < rows; ++token) {
-        const float* row = convolved + token * (total_key_dim * 2 + value_heads * head_dim);
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        const float* row = convolved + token * (total_key_dim * 2 + value_heads * head_dim);
         if (lane == 0) {
             float query_square = 0.0f, key_square = 0.0f;
             for (int index = 0; index < head_dim; ++index) {
@@ -547,7 +548,8 @@ void qwen_delta_recurrent_chunk(
         }
         __syncthreads();
         shared_key[lane] = key_raw * key_inverse_norm;
-        shared_query[lane] = query_raw * query_inverse_norm;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        shared_query[lane] = query_raw * query_inverse_norm;
         __syncthreads();
         const float value = row[total_key_dim * 2 + head * 128 + lane];
         float memory = 0.0f;

@@ -334,7 +334,8 @@ __device__ __forceinline__ float block_reduce_max(float value) {
 
 extern "C" __global__
 void rms_norm(
-    const float* input,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    const float* input,
     const float* weights,
     float* output,
     const int elements,
@@ -691,7 +692,8 @@ void q4_batched_matvec(
     const unsigned long long* scale_addresses,
     const float* vector,
     float* output,
-    const int rows,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    const int rows,
     const int columns,
     const int expert_count
 ) {
@@ -995,7 +997,8 @@ extern "C" __global__ void gemma_q4_0_geglu(
 ) {
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
     if(row>=intermediate)return;
-    float g=0.0f,u=0.0f;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    float g=0.0f,u=0.0f;
     for(int i=lane;i<input_size;i+=32){
         const float x=input[i];
         g+=ggml_q4_0_load(gate,(long long)row*input_size+i)*x;
@@ -1273,7 +1276,8 @@ __device__ __forceinline__ float q5k_value(
     const unsigned char low = base[48 + qindex];
     const unsigned char high = base[16 + (offset & 31)];
     const int bit = (high >> (2 * group + sub)) & 1;
-    const int quant = ((offset < 32) ? (low & 15) : (low >> 4)) + 16 * bit;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    const int quant = ((offset < 32) ? (low & 15) : (low >> 4)) + 16 * bit;
     int scale, minimum;
     q5k_scale_min(scales, group * 2 + sub, &scale, &minimum);
     return d * (float)scale * (float)quant - dmin * (float)minimum;
@@ -1422,6 +1426,75 @@ void q6k_matvec_transposed(
         partial += q6k_value(packed, row * input_size + input) * vector[input];
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void q6k_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate_packed =
+        (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += q6k_value(gate_packed, absolute) * value;
+        up += q6k_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[expert * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void q6k_grouped_swiglu_rows(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* gate_packed =
+        (const unsigned char*)gate_ptrs[route];
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += q6k_value(gate_packed, absolute) * value;
+        up += q6k_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[route * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
 }
 
 extern "C" __global__
@@ -1599,7 +1672,8 @@ __device__ __forceinline__ void kv_st(__nv_bfloat16* p, long long i, float v) { 
 template<typename T>
 __device__ void kv_store_impl(
     const float* current, T* cache,
-    const int kv_heads, const int head_dim, const int position, const int capacity
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    const int kv_heads, const int head_dim, const int position, const int capacity
 ) {
     const int head = blockIdx.x;
     if (head >= kv_heads) return;
@@ -1849,7 +1923,8 @@ __device__ void kv_values_ring_impl(
     const float reduced_maximum=block_reduce_max(local_maximum);
     __shared__ float maximum;
     if(threadIdx.x==0)maximum=reduced_maximum;
-    __syncthreads();
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    __syncthreads();
     float local_denominator=0.0f;
     for(int token=threadIdx.x;token<tokens;token+=blockDim.x){
         const float weight=expf(head_scores[token]-maximum);
@@ -2152,7 +2227,8 @@ __device__ void kv_append_impl(
     if (head >= kv_heads) return;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         const long long slot = ((long long)head * capacity + position) * head_dim + d;
-        kv_st(cache_keys, slot, current_keys[head * head_dim + d]);
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        kv_st(cache_keys, slot, current_keys[head * head_dim + d]);
         kv_st(cache_values, slot, current_values[head * head_dim + d]);
     }
 }

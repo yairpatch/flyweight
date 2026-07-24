@@ -162,6 +162,33 @@ class QwenV2ReferenceTests(unittest.TestCase):
         finally:
             model.close()
 
+    def test_native_runtime_rejects_invalid_next_layer_prefetch(self):
+        try:
+            model = V2Model(self.MODEL)
+        except Exception as error:
+            raise unittest.SkipTest(str(error)) from error
+        try:
+            with self.assertRaisesRegex(ValueError, "next_layer_prefetch"):
+                model.native_qwen_runtime(next_layer_prefetch=65)
+        finally:
+            model.close()
+
+    def test_native_runtime_exposes_next_layer_prefetch_telemetry(self):
+        try:
+            model = V2Model(self.MODEL)
+        except Exception as error:
+            raise unittest.SkipTest(str(error)) from error
+        try:
+            with model.native_qwen_runtime(
+                moe_device="cpu", next_layer_prefetch=6
+            ) as runtime:
+                self.assertEqual(runtime.info["next_layer_prefetch_predictions"], 0)
+                self.assertEqual(runtime.info["next_layer_prefetch_hits"], 0)
+                self.assertEqual(runtime.info["next_layer_prefetch_bytes"], 0)
+                self.assertEqual(runtime.info["next_layer_prefetch_trained_pairs"], 0)
+        finally:
+            model.close()
+
     def test_real_delta_layer_state_is_persistent_and_resettable(self):
         try:
             model = V2Model(self.MODEL)

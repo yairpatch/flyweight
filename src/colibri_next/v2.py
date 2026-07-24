@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -117,6 +118,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("expert_paging", ctypes.c_uint32),
         ("cpu_prefetch_mib", ctypes.c_uint32),
         ("cpu_prefetch_auto", ctypes.c_uint32),
+        ("next_layer_prefetch", ctypes.c_uint32),
     ]
 
 
@@ -207,6 +209,12 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefill_gpu_core_nanoseconds", ctypes.c_uint64),
         ("prefill_gpu_router_nanoseconds", ctypes.c_uint64),
         ("prefill_gpu_transfer_nanoseconds", ctypes.c_uint64),
+        ("expert_history_loaded_entries", ctypes.c_uint64),
+        ("expert_history_saves", ctypes.c_uint64),
+        ("next_layer_prefetch_predictions", ctypes.c_uint64),
+        ("next_layer_prefetch_hits", ctypes.c_uint64),
+        ("next_layer_prefetch_bytes", ctypes.c_uint64),
+        ("next_layer_prefetch_trained_pairs", ctypes.c_uint64),
     ]
 
 
@@ -233,7 +241,16 @@ def _library() -> ctypes.CDLL:
     if _cached_library is not None:
         return _cached_library
     root = Path(__file__).with_name("_native")
-    for name in ("colibri_v2.so", "colibri_v2.dylib", "colibri_v2.dll"):
+    # Prefer the current platform's library extension first. A stale .so left in
+    # _native (e.g. from a Linux build) must not shadow the Windows .dll, or
+    # ctypes raises WinError 193 trying to load an ELF image.
+    if os.name == "nt":
+        names = ("colibri_v2.dll", "colibri_v2.dylib", "colibri_v2.so")
+    elif sys.platform == "darwin":
+        names = ("colibri_v2.dylib", "colibri_v2.so", "colibri_v2.dll")
+    else:
+        names = ("colibri_v2.so", "colibri_v2.dylib", "colibri_v2.dll")
+    for name in names:
         path = root / name
         if path.is_file():
             lib = ctypes.CDLL(str(path))
@@ -368,6 +385,21 @@ def _library() -> ctypes.CDLL:
                 ctypes.POINTER(ctypes.c_uint64),
             ]
             lib.colibri_v2_qwen_task_submit.restype = ctypes.c_int
+            lib.colibri_v2_qwen_task_submit_sampling.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_uint64,
+                ctypes.c_float,
+                ctypes.c_uint32,
+                ctypes.c_float,
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            lib.colibri_v2_qwen_task_submit_sampling.restype = ctypes.c_int
             lib.colibri_v2_qwen_engine_step.argtypes = [
                 ctypes.c_void_p,
                 ctypes.POINTER(_QwenTaskEvent),
@@ -926,6 +958,7 @@ class V2Model:
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
+        next_layer_prefetch: int = 0,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -947,6 +980,7 @@ class V2Model:
             expert_paging=expert_paging,
             cpu_prefetch_mib=cpu_prefetch_mib,
             cpu_prefetch_auto=cpu_prefetch_auto,
+            next_layer_prefetch=next_layer_prefetch,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -1263,6 +1297,7 @@ class V2QwenRuntime:
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
+        next_layer_prefetch: int = 0,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1289,6 +1324,14 @@ class V2QwenRuntime:
             raise ValueError("cpu_prefetch_mib must be non-negative")
         if cpu_prefetch_mib and cpu_prefetch_auto:
             raise ValueError("cpu_prefetch_mib and cpu_prefetch_auto are mutually exclusive")
+        if not 0 <= next_layer_prefetch <= 64:
+            raise ValueError("next_layer_prefetch must be between 0 and 64")
+        if next_layer_prefetch and moe_device == "gpu":
+            raise ValueError("next_layer_prefetch requires CPU or hybrid MoE")
+        if next_layer_prefetch and mtp_drafts:
+            raise ValueError("next_layer_prefetch does not support MTP yet")
+        if next_layer_prefetch and parallel_sequences > 1:
+            raise ValueError("next_layer_prefetch currently requires parallel_sequences=1")
         if moe_device not in {"gpu", "cpu", "hybrid"}:
             raise ValueError("moe_device must be 'gpu', 'cpu', or 'hybrid'")
         if mtp_drafts < 0 or mtp_drafts > 8:
@@ -1322,6 +1365,7 @@ class V2QwenRuntime:
             {"auto": 0, "staged": 1, "direct": 2}[expert_paging],
             cpu_prefetch_mib,
             int(cpu_prefetch_auto),
+            next_layer_prefetch,
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(
@@ -1412,6 +1456,11 @@ class V2QwenRuntime:
         prompt_tokens: list[int],
         max_tokens: int,
         stop_tokens: tuple[int, ...] | list[int] = (),
+        *,
+        temperature: float = 0.0,
+        top_k: int = 20,
+        top_p: float = 0.95,
+        seed: int | None = None,
     ) -> int:
         """Queue a request on the cooperative engine; returns its task id."""
         if not prompt_tokens:
@@ -1422,13 +1471,18 @@ class V2QwenRuntime:
         stops = (ctypes.c_uint32 * len(stop_tokens))(*stop_tokens) if stop_tokens else None
         task_id = ctypes.c_uint64()
         self.model._check(
-            self._lib.colibri_v2_qwen_task_submit(
+            self._lib.colibri_v2_qwen_task_submit_sampling(
                 self._handle,
                 values,
                 len(prompt_tokens),
                 max_tokens,
                 stops,
                 len(stop_tokens),
+                temperature,
+                top_k,
+                top_p,
+                0 if seed is None else seed & ((1 << 64) - 1),
+                int(seed is not None),
                 ctypes.byref(task_id),
             )
         )

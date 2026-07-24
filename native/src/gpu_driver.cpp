@@ -8,6 +8,7 @@
 #include "colibri_native.h"
 
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,11 @@
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
+#else
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace {
@@ -132,28 +138,72 @@ std::unordered_map<std::string, CUfunction> g_functions;
 template <typename T>
 bool load_symbol(void* library, const char* name, T& target) {
 #if defined(_WIN32)
-    (void)library;
-    (void)name;
-    (void)target;
-    return false;
+    target = reinterpret_cast<T>(
+        GetProcAddress(static_cast<HMODULE>(library), name));
+    return target != nullptr;
 #else
     target = reinterpret_cast<T>(dlsym(library, name));
     return target != nullptr;
 #endif
 }
 
-bool load_apis() {
 #if defined(_WIN32)
-    return false;
-#else
+// NVRTC ships with the CUDA Toolkit (not the driver), so its bin directory is
+// usually absent from the default DLL search path. Try bare names first, then
+// resolve through CUDA_PATH.
+void* win_load_nvrtc() {
+    const wchar_t* names[] = {
+        L"nvrtc64_130_0.dll", L"nvrtc64_120_0.dll", L"nvrtc64_112_0.dll",
+        L"nvrtc64_111_0.dll", L"nvrtc64_110_0.dll",
+    };
+    // Prefer a full path from CUDA_PATH with LOAD_WITH_ALTERED_SEARCH_PATH so the
+    // loader resolves nvrtc's own companion (nvrtc-builtins64_*.dll) from the
+    // toolkit bin directory rather than the default search path.
+    wchar_t base[4096];
+    DWORD length = GetEnvironmentVariableW(L"CUDA_PATH", base, 4096);
+    if (length > 0 && length < 4096) {
+        // nvrtc lazily LoadLibrary's its companion nvrtc-builtins64_*.dll by bare
+        // name at compile time. Python calls SetDefaultDllDirectories, dropping
+        // PATH from the search, so register the toolkit bin directories as user
+        // search dirs (searched under LOAD_LIBRARY_SEARCH_USER_DIRS) to make the
+        // builtins resolvable.
+        const wchar_t* subdirs[] = {L"\\bin\\x64", L"\\bin"};
+        for (const wchar_t* subdir : subdirs)
+            AddDllDirectory((std::wstring(base) + subdir).c_str());
+        const wchar_t* files[] = {L"\\bin\\x64\\", L"\\bin\\"};
+        for (const wchar_t* subdir : files)
+            for (const wchar_t* name : names) {
+                std::wstring path = std::wstring(base) + subdir + name;
+                HMODULE handle = LoadLibraryExW(
+                    path.c_str(), nullptr,
+                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+                if (handle) return handle;
+            }
+    }
+    for (const wchar_t* name : names) {
+        HMODULE handle = LoadLibraryW(name);
+        if (handle) return handle;
+    }
+    return nullptr;
+}
+#endif
+
+bool load_apis() {
     if (g_api.loaded) {
         return true;
     }
-    void* cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+    void* cuda = nullptr;
+    void* nvrtc = nullptr;
+#if defined(_WIN32)
+    cuda = reinterpret_cast<void*>(LoadLibraryW(L"nvcuda.dll"));
+    nvrtc = win_load_nvrtc();
+#else
+    cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
     if (cuda == nullptr) {
         cuda = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
     }
-    void* nvrtc = dlopen("libnvrtc.so", RTLD_NOW | RTLD_GLOBAL);
+    nvrtc = dlopen("libnvrtc.so", RTLD_NOW | RTLD_GLOBAL);
+#endif
     if (cuda == nullptr || nvrtc == nullptr) {
         return false;
     }
@@ -211,13 +261,12 @@ bool load_apis() {
     ok &= load_symbol(nvrtc, "nvrtcDestroyProgram", g_api.nvrtcDestroyProgram);
     g_api.loaded = ok;
     return ok;
-#endif
 }
 
 // Phase profiling under COLIBRI_SEG_DEBUG: 0=start 1=mixer 2=route 3=copies
 // 4=experts 5=writeback.
 double g_phase_totals[6] = {};
-timespec g_phase_last = {};
+std::chrono::steady_clock::time_point g_phase_last{};
 
 void phase_mark(int phase) {
     static const bool enabled =
@@ -225,12 +274,10 @@ void phase_mark(int phase) {
     if (!enabled) {
         return;
     }
-    timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    const auto now = std::chrono::steady_clock::now();
     if (phase > 0) {
         g_phase_totals[phase] +=
-            (now.tv_sec - g_phase_last.tv_sec) * 1e3
-            + (now.tv_nsec - g_phase_last.tv_nsec) / 1e6;
+            std::chrono::duration<double, std::milli>(now - g_phase_last).count();
     }
     g_phase_last = now;
 }
@@ -462,6 +509,34 @@ extern "C" int colibri_gpu_compile(
     );
     std::vector<const char*> all_options;
     all_options.push_back(arch);
+    // nvrtc has no default header search path for the CUDA toolkit headers
+    // (cuda_fp16.h etc.). Point it at CUDA_PATH\include so the kernels compile.
+    std::string include_flag;
+#if defined(_WIN32)
+    {
+        wchar_t base[4096];
+        DWORD length = GetEnvironmentVariableW(L"CUDA_PATH", base, 4096);
+        if (length > 0 && length < 4096) {
+            std::wstring winclude = std::wstring(base) + L"\\include";
+            int need = WideCharToMultiByte(
+                CP_UTF8, 0, winclude.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            if (need > 1) {
+                std::string include(static_cast<size_t>(need - 1), '\0');
+                WideCharToMultiByte(
+                    CP_UTF8, 0, winclude.c_str(), -1, include.data(), need,
+                    nullptr, nullptr);
+                include_flag = "-I" + include;
+            }
+        }
+    }
+#else
+    if (const char* cuda_path = std::getenv("CUDA_PATH")) {
+        include_flag = std::string("-I") + cuda_path + "/include";
+    }
+#endif
+    if (!include_flag.empty()) {
+        all_options.push_back(include_flag.c_str());
+    }
     for (std::int32_t index = 0; index < option_count; ++index) {
         all_options.push_back(options[index]);
     }
@@ -536,7 +611,8 @@ extern "C" int colibri_gpu_compile(
              "qwen_q8_matmul_rows", "qwen_q8_swiglu_rows",
              "qwen_shared_scale_rows", "qwen_q8_lm_head_argmax_rows",
              "qwen_delta_recurrent_rows", "route_topk_rows", "rms_norm_rows",
-             "q5k_grouped_swiglu_rows", "q6k_grouped_accumulate_rows",
+             "q5k_grouped_swiglu_rows", "q6k_grouped_swiglu",
+             "q6k_grouped_swiglu_rows", "q6k_grouped_accumulate_rows",
              "q8_grouped_accumulate_rows", "kv_attention_prefill",
              "q8_matmul_tiled", "delta_conv_chunk",
              "qwen_delta_recurrent_chunk",

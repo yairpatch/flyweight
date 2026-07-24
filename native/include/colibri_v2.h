@@ -95,6 +95,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t expert_paging; /* 0=auto, 1=staged copy, 2=direct registered-host DMA */
     uint32_t cpu_prefetch_mib; /* prompt-trained host expert page warmup budget; 0 disables */
     uint32_t cpu_prefetch_auto; /* size from host memory and skip unless enough pages are cold */
+    uint32_t next_layer_prefetch; /* transition-predicted experts to page-hint; 0 disables */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -184,6 +185,12 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t prefill_gpu_core_nanoseconds; /* DeltaNet/attention CUDA work before MoE */
     uint64_t prefill_gpu_router_nanoseconds; /* MoE norm, router projection, and top-k */
     uint64_t prefill_gpu_transfer_nanoseconds; /* selected routes, weights, and activations DtoH */
+    uint64_t expert_history_loaded_entries; /* nonzero persisted expert counters restored */
+    uint64_t expert_history_saves; /* successful atomic sidecar replacements */
+    uint64_t next_layer_prefetch_predictions; /* predicted expert IDs issued */
+    uint64_t next_layer_prefetch_hits; /* predictions present in the next real route */
+    uint64_t next_layer_prefetch_bytes; /* expert tensor bytes covered by page hints */
+    uint64_t next_layer_prefetch_trained_pairs; /* cross-layer route pairs observed */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
@@ -228,6 +235,7 @@ COLIBRI_V2_API int colibri_v2_qwen_runtime_synchronize(ColibriV2QwenRuntime* run
 COLIBRI_V2_API int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime* runtime, uint32_t input_token, uint32_t* output_token);
 COLIBRI_V2_API int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, ColibriV2TokenCallback callback, void* user_data);
 COLIBRI_V2_API int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, uint64_t* task_id);
+COLIBRI_V2_API int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, uint64_t seed, uint32_t has_seed, uint64_t* task_id);
 COLIBRI_V2_API int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime* runtime, ColibriV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 COLIBRI_V2_API int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime* runtime, uint64_t task_id);
 

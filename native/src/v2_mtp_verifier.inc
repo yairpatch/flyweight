@@ -316,7 +316,8 @@ void qwen_forward_rows(
         bool any_gpu=false;for(int token=0;token<rows;++token)any_gpu=any_gpu||gpu_counts[token]>0;
         if(any_gpu){
             void*gate_up_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&gpu_activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),&rows};
-            launch("q5k_grouped_swiglu_rows",intermediate,rows*top_k,256,gate_up_args);
+            const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
+            launch(gate_type==14?"q6k_grouped_swiglu_rows":"q5k_grouped_swiglu_rows",intermediate,rows*top_k,256,gate_up_args);
             const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
             void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
             launch(down_type==8?"q8_grouped_accumulate_rows":"q6k_grouped_accumulate_rows",hidden_size,rows,256,down_args);
