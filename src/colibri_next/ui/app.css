@@ -344,6 +344,18 @@ svg {
   white-space: nowrap;
 }
 
+.rename-input {
+  min-width: 0;
+  flex: 1;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
 .conversation-delete {
   position: absolute;
   right: 6px;
@@ -480,6 +492,35 @@ svg {
   margin-top: 4px;
   color: var(--muted);
   font-size: 10px;
+}
+
+.model-selector-wrap {
+  display: inline-flex;
+}
+
+.model-selector {
+  appearance: none;
+  padding: 1px 14px 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239898a5' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 4px center;
+}
+
+.model-selector:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.model-selector:focus {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 1px;
 }
 
 .status-dot {
@@ -761,6 +802,63 @@ svg {
   margin-bottom: 0;
 }
 
+.message-content h1, .message-content h2, .message-content h3,
+.message-content h4, .message-content h5, .message-content h6 {
+  margin: 18px 0 8px;
+  color: var(--text);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.message-content h1 { font-size: 1.4em; }
+.message-content h2 { font-size: 1.25em; }
+.message-content h3 { font-size: 1.12em; }
+.message-content h4, .message-content h5, .message-content h6 { font-size: 1em; }
+
+.message-content blockquote {
+  margin: 12px 0;
+  padding: 8px 14px;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  background: var(--accent-soft);
+  color: var(--muted-strong);
+}
+
+.message-content blockquote p:last-child { margin-bottom: 0; }
+
+.message-content ul, .message-content ol {
+  margin: 10px 0;
+  padding-left: 22px;
+}
+
+.message-content li {
+  margin: 4px 0;
+}
+
+.message-content hr {
+  margin: 16px 0;
+  border: 0;
+  border-top: 1px solid var(--line-strong);
+}
+
+.message-content a {
+  color: var(--accent-bright);
+  text-decoration: none;
+}
+
+.message-content a:hover {
+  text-decoration: underline;
+}
+
+.message-content strong {
+  color: var(--text);
+  font-weight: 620;
+}
+
+.message-content em {
+  font-style: italic;
+}
+
 .message-content pre {
   position: relative;
   margin: 14px 0;
@@ -808,18 +906,62 @@ svg {
   text-transform: uppercase;
 }
 
-.code-preview {
-  margin: -8px 0 14px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  background: #fff;
+.code-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(8px);
+  animation: preview-in 180ms ease both;
+}
+
+@keyframes preview-in {
+  from { opacity: 0; }
+}
+
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.preview-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 620;
+}
+
+.preview-close {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+  place-items: center;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.preview-close:hover {
+  background: var(--panel-raised);
+  color: var(--text);
+}
+
+.preview-close svg {
+  width: 18px;
+  height: 18px;
 }
 
 .code-preview-frame {
   display: block;
+  flex: 1;
   width: 100%;
-  height: 300px;
   border: 0;
   background: #fff;
 }
@@ -846,6 +988,20 @@ svg {
   line-height: 1.65;
   white-space: pre;
 }
+
+.hl-keyword { color: #c792ea; }
+.hl-string { color: #c3e88d; }
+.hl-comment { color: #546e7a; font-style: italic; }
+.hl-number { color: #f78c6c; }
+.hl-type { color: #ffcb6b; }
+.hl-attr { color: #89ddff; }
+
+:root[data-theme="light"] .hl-keyword { color: #8839ef; }
+:root[data-theme="light"] .hl-string { color: #40a02b; }
+:root[data-theme="light"] .hl-comment { color: #9ca0b0; }
+:root[data-theme="light"] .hl-number { color: #fe640b; }
+:root[data-theme="light"] .hl-type { color: #df8e1d; }
+:root[data-theme="light"] .hl-attr { color: #1e66f5; }
 
 .message-copy {
   display: grid;
@@ -912,6 +1068,10 @@ svg {
 }
 
 .error-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   padding: 11px 13px;
   border: 1px solid rgba(255, 111, 125, 0.22);
   border-radius: 10px;
@@ -919,6 +1079,84 @@ svg {
   color: var(--danger);
   font-size: 11px;
   line-height: 1.5;
+}
+
+.retry-button {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  cursor: pointer;
+  border: 1px solid rgba(255, 111, 125, 0.3);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.retry-button:hover {
+  background: rgba(255, 111, 125, 0.12);
+}
+
+.message-actions {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.message:hover .message-actions {
+  opacity: 1;
+}
+
+.msg-action {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  cursor: pointer;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.msg-action:hover {
+  background: var(--panel-raised);
+  color: var(--text);
+}
+
+.msg-action svg {
+  width: 13px;
+  height: 13px;
+}
+
+.edit-textarea {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.55;
+  resize: vertical;
+  outline: none;
+}
+
+.edit-textarea:focus {
+  border-color: rgba(124, 92, 255, 0.45);
+  box-shadow: 0 0 0 3px rgba(124, 92, 255, 0.07);
+}
+
+.edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .composer-area {

@@ -25,6 +25,8 @@ const elements = {
   conversationTitle: document.querySelector("#conversation-title"),
   statusDot: document.querySelector("#status-dot"),
   modelStatus: document.querySelector("#model-status"),
+  modelSelectorWrap: document.querySelector("#model-selector-wrap"),
+  modelSelector: document.querySelector("#model-selector"),
   runtimePill: document.querySelector("#runtime-pill"),
   deviceLabel: document.querySelector("#device-label"),
   cacheLabel: document.querySelector("#cache-label"),
@@ -41,6 +43,7 @@ const elements = {
   exportChat: document.querySelector("#export-chat"),
   themeToggle: document.querySelector("#theme-toggle"),
   openSettings: document.querySelector("#open-settings"),
+  importChat: document.querySelector("#import-chat"),
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsForm: document.querySelector("#settings-form"),
   apiKey: document.querySelector("#api-key"),
@@ -61,6 +64,7 @@ const state = {
   settings: loadSettings(),
   apiKey: readSession(API_KEY),
   model: null,
+  models: [],
   health: null,
   maxOutputTokens: 64,
   controller: null,
@@ -123,6 +127,14 @@ function clampNumber(value, minimum, maximum, fallback) {
 
 function clampInteger(value, minimum, maximum, fallback) {
   return Math.round(clampNumber(value, minimum, maximum, fallback));
+}
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
 }
 
 function readSession(key) {
@@ -219,6 +231,69 @@ function deleteConversation(id) {
   render();
 }
 
+function startRenameConversation(conversation, nameElement) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "rename-input";
+  input.value = conversation.title;
+  nameElement.replaceWith(input);
+  input.focus();
+  input.select();
+  const commit = () => {
+    const val = input.value.trim();
+    if (val && val !== conversation.title) {
+      conversation.title = val;
+      if (conversation.id === state.activeId) {
+        elements.conversationTitle.textContent = val;
+      }
+      persistConversations();
+    }
+    renderConversationList();
+  };
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); input.blur(); }
+    if (e.key === "Escape") { input.value = conversation.title; input.blur(); }
+  });
+}
+
+function importConversation() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".json";
+  input.addEventListener("change", () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!data || !Array.isArray(data.messages)) {
+          toast("Invalid conversation file.", "error");
+          return;
+        }
+        const conversation = {
+          id: identifier(),
+          title: data.title || "Imported conversation",
+          createdAt: data.createdAt || Date.now(),
+          updatedAt: data.updatedAt || Date.now(),
+          messages: data.messages.filter((m) => m && typeof m.role === "string"),
+        };
+        state.conversations.unshift(conversation);
+        state.activeId = conversation.id;
+        persistConversations();
+        render();
+        closeSidebar();
+        toast("Conversation imported.");
+      } catch {
+        toast("Failed to parse conversation file.", "error");
+      }
+    };
+    reader.readAsText(file);
+  });
+  input.click();
+}
+
 function clearConversation() {
   const conversation = activeConversation();
   if (!conversation || !conversation.messages.length) {
@@ -262,12 +337,28 @@ function renderConversationList() {
     button.type = "button";
     button.className = `conversation-item${conversation.id === state.activeId ? " active" : ""}`;
     button.setAttribute("aria-current", conversation.id === state.activeId ? "page" : "false");
-    button.addEventListener("click", () => selectConversation(conversation.id));
+
+    let clickTimer = null;
+    button.addEventListener("click", () => {
+      if (clickTimer) return;
+      clickTimer = setTimeout(() => {
+        clickTimer = null;
+        selectConversation(conversation.id);
+      }, 200);
+    });
 
     const icon = svgIcon("message");
     const name = document.createElement("span");
     name.className = "conversation-name";
     name.textContent = conversation.title;
+    button.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      if (clickTimer) {
+        clearTimeout(clickTimer);
+        clickTimer = null;
+      }
+      startRenameConversation(conversation, name);
+    });
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "conversation-delete";
@@ -325,6 +416,28 @@ function renderMessage(message) {
     meta.append(copy);
   }
 
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+  if (message.role === "user" && !message.generating) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "msg-action";
+    edit.setAttribute("aria-label", "Edit message");
+    edit.append(svgIcon("edit"));
+    edit.addEventListener("click", () => startEditMessage(message));
+    actions.append(edit);
+  }
+  if (message.role === "assistant" && !message.generating && !message.error) {
+    const regen = document.createElement("button");
+    regen.type = "button";
+    regen.className = "msg-action";
+    regen.setAttribute("aria-label", "Regenerate");
+    regen.append(svgIcon("refresh"));
+    regen.addEventListener("click", () => regenerateFrom(message));
+    actions.append(regen);
+  }
+  if (actions.childNodes.length) meta.append(actions);
+
   const content = document.createElement("div");
   content.className = "message-content";
   renderMessageContent(content, message);
@@ -351,11 +464,87 @@ function renderMessageContent(content, message) {
   if (message.error) {
     const error = document.createElement("div");
     error.className = "error-card";
-    error.textContent = message.error;
+    const errText = document.createElement("span");
+    errText.textContent = message.error;
+    const retryBtn = document.createElement("button");
+    retryBtn.type = "button";
+    retryBtn.className = "retry-button";
+    retryBtn.textContent = "Retry";
+    retryBtn.addEventListener("click", () => retryFromMessage(message));
+    error.append(errText, retryBtn);
     content.append(error);
   }
   for (const toolCall of message.toolCalls || []) {
     content.append(renderToolCall(toolCall));
+  }
+}
+
+function startEditMessage(message) {
+  const article = elements.messages.querySelector(`[data-message-id="${message.id}"]`);
+  const contentEl = article?.querySelector(".message-content");
+  if (!contentEl) return;
+  contentEl.replaceChildren();
+  const textarea = document.createElement("textarea");
+  textarea.className = "edit-textarea";
+  textarea.value = message.content;
+  textarea.rows = Math.min(Math.max(message.content.split("\n").length + 1, 2), 12);
+  const btnRow = document.createElement("div");
+  btnRow.className = "edit-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "primary-button";
+  save.textContent = "Save";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "text-button";
+  cancel.textContent = "Cancel";
+  save.addEventListener("click", () => {
+    const newContent = textarea.value.trim();
+    if (newContent && newContent !== message.content) {
+      message.content = newContent;
+      persistConversations();
+    }
+    renderConversation();
+  });
+  cancel.addEventListener("click", () => renderConversation());
+  textarea.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      save.click();
+    }
+    if (e.key === "Escape") cancel.click();
+  });
+  btnRow.append(cancel, save);
+  contentEl.append(textarea, btnRow);
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+function regenerateFrom(assistantMessage) {
+  const conversation = activeConversation();
+  if (!conversation || state.generating) return;
+  const msgIndex = conversation.messages.findIndex((m) => m.id === assistantMessage.id);
+  if (msgIndex < 0) return;
+  conversation.messages = conversation.messages.slice(0, msgIndex);
+  conversation.updatedAt = Date.now();
+  persistConversations();
+  const lastUser = [...conversation.messages].reverse().find((m) => m.role === "user");
+  if (lastUser) {
+    sendMessage(lastUser.content);
+  }
+}
+
+function retryFromMessage(errorMessage) {
+  const conversation = activeConversation();
+  if (!conversation || state.generating) return;
+  const errIndex = conversation.messages.findIndex((m) => m.id === errorMessage.id);
+  if (errIndex < 0) return;
+  conversation.messages = conversation.messages.slice(0, errIndex);
+  conversation.updatedAt = Date.now();
+  persistConversations();
+  const lastUser = [...conversation.messages].reverse().find((m) => m.role === "user");
+  if (lastUser) {
+    sendMessage(lastUser.content);
   }
 }
 
@@ -378,10 +567,102 @@ function updateStreamingMessage(message) {
     }
   }
   const text = document.createDocumentFragment();
-  renderRichText(text, message.content || "");
+  appendStreamText(text, message.content || "");
   content.insertBefore(text, cursor);
   for (const toolCall of message.toolCalls || []) {
     content.append(renderToolCall(toolCall));
+  }
+}
+
+function appendStreamText(container, text) {
+  if (!text) return;
+  const openFences = [...text.matchAll(/```([^\n`]*)/g)];
+  let incompleteCode = null;
+  if (openFences.length > 0) {
+    const lastOpen = openFences[openFences.length - 1];
+    const afterOpen = text.slice(lastOpen.index + lastOpen[0].length);
+    const closeIdx = afterOpen.search(/```/);
+    if (closeIdx === -1) {
+      incompleteCode = {
+        lang: lastOpen[1].trim(),
+        code: afterOpen,
+        start: lastOpen.index,
+      };
+    }
+  }
+  const textPart = incompleteCode ? text.slice(0, incompleteCode.start) : text;
+  if (textPart) {
+    const paragraphs = textPart.split(/\n{2,}/);
+    for (const paragraphText of paragraphs) {
+      if (!paragraphText) continue;
+      const p = document.createElement("p");
+      const lines = paragraphText.split("\n");
+      lines.forEach((line, idx) => {
+        appendStreamInline(p, line);
+        if (idx + 1 < lines.length) p.append(document.createElement("br"));
+      });
+      container.append(p);
+    }
+  }
+  if (incompleteCode) {
+    const pre = document.createElement("pre");
+    const header = document.createElement("div");
+    header.className = "code-header";
+    const label = document.createElement("span");
+    label.textContent = incompleteCode.lang || "code";
+    const badge = document.createElement("span");
+    badge.className = "streaming-badge";
+    badge.textContent = "streaming";
+    header.append(label, badge);
+    const code = document.createElement("code");
+    if (incompleteCode.lang) {
+      code.className = `language-${incompleteCode.lang.toLowerCase()}`;
+    }
+    code.textContent = incompleteCode.code;
+    pre.append(header, code);
+    container.append(pre);
+  }
+}
+
+function appendStreamInline(parent, text) {
+  if (!text) return;
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      parent.append(document.createTextNode(text.slice(cursor, match.index)));
+    }
+    const fragment = match[0];
+    if (fragment.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = fragment.slice(1, -1);
+      parent.append(code);
+    } else if (fragment.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = fragment.slice(2, -2);
+      parent.append(strong);
+    } else if (fragment.startsWith("*")) {
+      const em = document.createElement("em");
+      em.textContent = fragment.slice(1, -1);
+      parent.append(em);
+    } else if (fragment.startsWith("[")) {
+      const linkMatch = fragment.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      if (linkMatch) {
+        const a = document.createElement("a");
+        a.textContent = linkMatch[1];
+        a.href = linkMatch[2];
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        parent.append(a);
+      } else {
+        parent.append(document.createTextNode(fragment));
+      }
+    }
+    cursor = pattern.lastIndex;
+  }
+  if (cursor < text.length) {
+    parent.append(document.createTextNode(text.slice(cursor)));
   }
 }
 
@@ -407,18 +688,114 @@ function renderRichText(container, text) {
   let cursor = 0;
   let match;
   while ((match = fencePattern.exec(text)) !== null) {
-    appendTextBlock(container, text.slice(cursor, match.index));
+    appendMarkdownBlock(container, text.slice(cursor, match.index));
     appendCodeBlock(container, match[1].trim(), match[2].replace(/\n$/, ""));
     cursor = fencePattern.lastIndex;
   }
   const remainder = text.slice(cursor);
   const open = remainder.match(/```([^\n`]*)\n([\s\S]*)$/);
   if (open) {
-    appendTextBlock(container, remainder.slice(0, open.index));
+    appendMarkdownBlock(container, remainder.slice(0, open.index));
     appendCodeBlock(container, open[1].trim(), open[2].replace(/\n$/, ""));
     return;
   }
-  appendTextBlock(container, remainder);
+  appendMarkdownBlock(container, remainder);
+}
+
+function appendMarkdownBlock(container, text) {
+  if (!text) return;
+  const lines = text.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^#{1,6}\s/.test(line)) {
+      const level = line.match(/^(#{1,6})\s/)[1].length;
+      const el = document.createElement(`h${level}`);
+      appendInline(el, line.replace(/^#{1,6}\s+/, ""));
+      container.append(el);
+      i++;
+    } else if (/^>\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^>\s/.test(lines[i])) {
+        items.push(lines[i].replace(/^>\s+/, ""));
+        i++;
+      }
+      const bq = document.createElement("blockquote");
+      appendMarkdownBlock(bq, items.join("\n"));
+      container.append(bq);
+    } else if (/^[-*]\s/.test(line)) {
+      const ul = document.createElement("ul");
+      while (i < lines.length && /^[-*]\s/.test(lines[i])) {
+        const li = document.createElement("li");
+        appendInline(li, lines[i].replace(/^[-*]\s+/, ""));
+        ul.append(li);
+        i++;
+      }
+      container.append(ul);
+    } else if (/^\d+\.\s/.test(line)) {
+      const ol = document.createElement("ol");
+      while (i < lines.length && /^\d+\.\s/.test(lines[i])) {
+        const li = document.createElement("li");
+        appendInline(li, lines[i].replace(/^\d+\.\s+/, ""));
+        ol.append(li);
+        i++;
+      }
+      container.append(ol);
+    } else if (/^[-*_]{3,}\s*$/.test(line)) {
+      container.append(document.createElement("hr"));
+      i++;
+    } else if (line.trim() === "") {
+      i++;
+    } else {
+      const paraLines = [];
+      while (i < lines.length && lines[i].trim() !== "" && !/^[#>|]/.test(lines[i]) && !/^[-*]\s/.test(lines[i]) && !/^\d+\.\s/.test(lines[i]) && !/^[-*_]{3,}\s*$/.test(lines[i])) {
+        paraLines.push(lines[i]);
+        i++;
+      }
+      if (paraLines.length) {
+        const p = document.createElement("p");
+        paraLines.forEach((pl, idx) => {
+          appendInline(p, pl);
+          if (idx + 1 < paraLines.length) p.append(document.createElement("br"));
+        });
+        container.append(p);
+      }
+    }
+  }
+}
+
+function appendInline(parent, text) {
+  let remaining = text;
+  const pattern = /(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\))/g;
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(remaining)) !== null) {
+    if (match.index > cursor) {
+      parent.append(document.createTextNode(remaining.slice(cursor, match.index)));
+    }
+    if (match[2]) {
+      const strong = document.createElement("strong");
+      strong.textContent = match[2];
+      parent.append(strong);
+    } else if (match[3]) {
+      const em = document.createElement("em");
+      em.textContent = match[3];
+      parent.append(em);
+    } else if (match[4]) {
+      const code = document.createElement("code");
+      code.textContent = match[4];
+      parent.append(code);
+    } else if (match[5] && match[6]) {
+      const a = document.createElement("a");
+      a.textContent = match[5];
+      a.href = match[6];
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      parent.append(a);
+    }
+    cursor = pattern.lastIndex;
+  }
+  parent.append(document.createTextNode(remaining.slice(cursor)));
 }
 
 const RUNNABLE_LANGUAGES = new Set(["html", "htm", "svg", "js", "javascript"]);
@@ -439,6 +816,12 @@ function appendCodeBlock(container, language, code) {
     run.addEventListener("click", () => togglePreview(pre, run, language, code));
     actions.append(run);
   }
+  const download = document.createElement("button");
+  download.type = "button";
+  download.className = "download-code";
+  download.textContent = "Download";
+  download.addEventListener("click", () => downloadCode(code, language));
+  actions.append(download);
   const copy = document.createElement("button");
   copy.type = "button";
   copy.className = "copy-code";
@@ -447,27 +830,159 @@ function appendCodeBlock(container, language, code) {
   actions.append(copy);
   header.append(label, actions);
   const codeElement = document.createElement("code");
-  codeElement.textContent = code;
+  if (language) {
+    codeElement.className = `language-${language.toLowerCase()}`;
+  }
+  highlightCode(codeElement, code, language);
   pre.append(header, codeElement);
   container.append(pre);
 }
 
+const CODE_EXTENSIONS = {
+  javascript: "js", js: "js", typescript: "ts", ts: "ts",
+  python: "py", py: "py", html: "html", htm: "html",
+  css: "css", rust: "rs", go: "go", c: "c", cpp: "cpp",
+  java: "java", ruby: "rb", bash: "sh", shell: "sh",
+  json: "json", xml: "xml", svg: "svg", sql: "sql",
+  markdown: "md", md: "md", yaml: "yaml", yml: "yaml",
+};
+
+function downloadCode(code, language) {
+  const ext = CODE_EXTENSIONS[(language || "").toLowerCase()] || "txt";
+  const blob = new Blob([code], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `code.${ext}`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+const HL_RULES = {
+  js: [
+    { pattern: /(\/\/.*$)/gm, cls: "hl-comment" },
+    { pattern: /(\/\*[\s\S]*?\*\/)/g, cls: "hl-comment" },
+    { pattern: /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, cls: "hl-string" },
+    { pattern: /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|class|extends|import|from|export|default|async|await|try|catch|throw|finally|typeof|instanceof|in|of|null|undefined|true|false)\b/g, cls: "hl-keyword" },
+    { pattern: /\b(\d+\.?\d*)\b/g, cls: "hl-number" },
+    { pattern: /\b([A-Z][a-zA-Z0-9]*)\b/g, cls: "hl-type" },
+  ],
+  python: [
+    { pattern: /(#.*$)/gm, cls: "hl-comment" },
+    { pattern: /("""[\s\S]*?"""|'''[\s\S]*?''')/g, cls: "hl-string" },
+    { pattern: /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g, cls: "hl-string" },
+    { pattern: /\b(def|class|return|if|elif|else|for|while|break|continue|import|from|as|with|try|except|finally|raise|lambda|yield|global|nonlocal|pass|del|in|not|and|or|is|None|True|False|self|print)\b/g, cls: "hl-keyword" },
+    { pattern: /\b(\d+\.?\d*)\b/g, cls: "hl-number" },
+    { pattern: /\b([A-Z][a-zA-Z0-9]*)\b/g, cls: "hl-type" },
+  ],
+  html: [
+    { pattern: /(<!--[\s\S]*?-->)/g, cls: "hl-comment" },
+    { pattern: /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g, cls: "hl-string" },
+    { pattern: /(&lt;\/?[a-zA-Z][a-zA-Z0-9]*)/g, cls: "hl-keyword" },
+    { pattern: /\b([a-zA-Z-]+)=/g, cls: "hl-attr" },
+  ],
+  css: [
+    { pattern: /(\/\*[\s\S]*?\*\/)/g, cls: "hl-comment" },
+    { pattern: /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g, cls: "hl-string" },
+    { pattern: /(#[0-9a-fA-F]{3,8})\b/g, cls: "hl-number" },
+    { pattern: /\b([a-zA-Z-]+)\s*(?=:)/g, cls: "hl-keyword" },
+    { pattern: /\b(\d+\.?\d*(px|em|rem|%|vh|vw|s|ms)?)\b/g, cls: "hl-number" },
+  ],
+  rust: [
+    { pattern: /(\/\/.*$)/gm, cls: "hl-comment" },
+    { pattern: /(\/\*[\s\S]*?\*\/)/g, cls: "hl-comment" },
+    { pattern: /("(?:[^"\\]|\\.)*")/g, cls: "hl-string" },
+    { pattern: /\b(fn|let|mut|const|struct|enum|impl|trait|pub|use|mod|crate|self|super|return|if|else|for|while|loop|break|continue|match|as|in|ref|move|async|await|where|type|dyn|unsafe|extern|true|false)\b/g, cls: "hl-keyword" },
+    { pattern: /\b(\d+\.?\d*)\b/g, cls: "hl-number" },
+    { pattern: /\b([A-Z][a-zA-Z0-9]*)\b/g, cls: "hl-type" },
+  ],
+  go: [
+    { pattern: /(\/\/.*$)/gm, cls: "hl-comment" },
+    { pattern: /(\/\*[\s\S]*?\*\/)/g, cls: "hl-comment" },
+    { pattern: /("(?:[^"\\]|\\.)*"|`[^`]*`)/g, cls: "hl-string" },
+    { pattern: /\b(func|return|if|else|for|range|switch|case|default|break|continue|go|defer|select|chan|map|struct|interface|package|import|var|const|type|struct|true|false|null)\b/g, cls: "hl-keyword" },
+    { pattern: /\b(\d+\.?\d*)\b/g, cls: "hl-number" },
+    { pattern: /\b([A-Z][a-zA-Z0-9]*)\b/g, cls: "hl-type" },
+  ],
+};
+
+function highlightCode(el, code, lang) {
+  const key = (lang || "").toLowerCase();
+  const rules = HL_RULES[key] || HL_RULES.js;
+  const escaped = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let result = escaped;
+  const replacements = [];
+  for (const rule of rules) {
+    const re = new RegExp(rule.pattern.source, rule.pattern.flags);
+    let m;
+    while ((m = re.exec(result)) !== null) {
+      replacements.push({ start: m.index, end: m.index + m[0].length, text: m[0], cls: rule.cls });
+    }
+  }
+  replacements.sort((a, b) => a.start - b.start);
+  const merged = [];
+  let lastEnd = 0;
+  for (const r of replacements) {
+    if (r.start >= lastEnd) {
+      merged.push(r);
+      lastEnd = r.end;
+    }
+  }
+  let out = "";
+  let pos = 0;
+  for (const r of merged) {
+    if (r.start > pos) out += escaped.slice(pos, r.start);
+    out += `<span class="${r.cls}">${r.text}</span>`;
+    pos = r.end;
+  }
+  if (pos < escaped.length) out += escaped.slice(pos);
+  el.innerHTML = out;
+}
+
 function togglePreview(pre, button, language, code) {
-  const existing = pre.nextElementSibling;
-  if (existing?.classList.contains("code-preview")) {
+  const existing = document.querySelector(".code-preview-overlay");
+  if (existing) {
     existing.remove();
     button.textContent = "Run";
     return;
   }
-  const preview = document.createElement("div");
-  preview.className = "code-preview";
+  const overlay = document.createElement("div");
+  overlay.className = "code-preview-overlay";
+  const toolbar = document.createElement("div");
+  toolbar.className = "preview-toolbar";
+  const title = document.createElement("span");
+  title.className = "preview-title";
+  title.textContent = language || "Preview";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "preview-close";
+  close.setAttribute("aria-label", "Close preview");
+  close.append(svgIcon("close"));
+  close.addEventListener("click", () => {
+    overlay.remove();
+    button.textContent = "Run";
+  });
+  toolbar.append(title, close);
   const frame = document.createElement("iframe");
   frame.className = "code-preview-frame";
   frame.setAttribute("sandbox", "allow-scripts allow-modals");
   frame.setAttribute("title", "Code preview");
   frame.src = `preview.html#${encodeURIComponent(previewDocument(language, code))}`;
-  preview.append(frame);
-  pre.after(preview);
+  overlay.append(toolbar, frame);
+  document.body.append(overlay);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) {
+      overlay.remove();
+      button.textContent = "Run";
+    }
+  });
+  document.addEventListener("keydown", function escHandler(e) {
+    if (e.key === "Escape") {
+      overlay.remove();
+      button.textContent = "Run";
+      document.removeEventListener("keydown", escHandler);
+    }
+  });
   button.textContent = "Hide";
 }
 
@@ -483,40 +998,7 @@ function previewDocument(language, code) {
   return code;
 }
 
-function appendTextBlock(container, text) {
-  if (!text) {
-    return;
-  }
-  const paragraphs = text.split(/\n{2,}/);
-  for (const paragraphText of paragraphs) {
-    if (!paragraphText) {
-      continue;
-    }
-    const paragraph = document.createElement("p");
-    const lines = paragraphText.split("\n");
-    lines.forEach((line, index) => {
-      appendInlineCode(paragraph, line);
-      if (index + 1 < lines.length) {
-        paragraph.append(document.createElement("br"));
-      }
-    });
-    container.append(paragraph);
-  }
-}
 
-function appendInlineCode(parent, text) {
-  const pattern = /`([^`]+)`/g;
-  let cursor = 0;
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    parent.append(document.createTextNode(text.slice(cursor, match.index)));
-    const code = document.createElement("code");
-    code.textContent = match[1];
-    parent.append(code);
-    cursor = pattern.lastIndex;
-  }
-  parent.append(document.createTextNode(text.slice(cursor)));
-}
 
 function renderToolCall(toolCall) {
   const card = document.createElement("section");
@@ -547,6 +1029,9 @@ function svgIcon(name) {
     trash: '<path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13"/>',
     copy: '<rect x="8" y="8" width="10" height="10" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
     tool: '<path d="m14.7 6.3 3-3a5 5 0 0 1-6.4 6.4L5.5 15.5a2.1 2.1 0 0 0 3 3l5.8-5.8a5 5 0 0 1 6.4-6.4l-3 3"/>',
+    edit: '<path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
+    refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+    close: '<path d="m6 6 12 12M18 6 6 18"/>',
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
@@ -826,7 +1311,15 @@ async function pollRuntime() {
     ]);
     if (modelResponse?.ok) {
       const models = await modelResponse.json();
-      state.model = models.data?.[0]?.id || null;
+      const modelList = models.data || [];
+      state.models = modelList;
+      if (modelList.length > 1) {
+        state.model = state.model || modelList[0]?.id || null;
+        renderModelSelector();
+      } else {
+        state.model = modelList[0]?.id || null;
+        elements.modelSelectorWrap.hidden = true;
+      }
     }
     if (propertiesResponse.ok) {
       const properties = await propertiesResponse.json();
@@ -879,6 +1372,22 @@ function setRuntimeStatus(status) {
   elements.cacheLabel.textContent = execution.device === "cuda"
     ? `${execution.cache_used_mib || 0} / ${execution.cache_limit_mib || 0} MB`
     : "Portable";
+}
+
+function renderModelSelector() {
+  if (state.models.length <= 1) {
+    elements.modelSelectorWrap.hidden = true;
+    return;
+  }
+  elements.modelSelectorWrap.hidden = false;
+  elements.modelSelector.innerHTML = "";
+  for (const m of state.models) {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.id;
+    if (m.id === state.model) opt.selected = true;
+    elements.modelSelector.append(opt);
+  }
 }
 
 function openSettings() {
@@ -1042,7 +1551,7 @@ function bindEvents() {
     }
     createConversation();
   });
-  elements.conversationSearch.addEventListener("input", renderConversationList);
+  elements.conversationSearch.addEventListener("input", debounce(renderConversationList, 150));
   elements.sidebarOpen.addEventListener("click", openSidebar);
   elements.sidebarClose.addEventListener("click", closeSidebar);
   elements.sidebarScrim.addEventListener("click", closeSidebar);
@@ -1057,6 +1566,7 @@ function bindEvents() {
   elements.chatScroll.addEventListener("scroll", handleScroll, { passive: true });
   elements.openSettings.addEventListener("click", openSettings);
   elements.quickSettings.addEventListener("click", openSettings);
+  elements.importChat.addEventListener("click", importConversation);
   elements.thinkingChip.addEventListener("click", toggleThinking);
   elements.saveSettings.addEventListener("click", (event) => {
     event.preventDefault();
@@ -1066,6 +1576,11 @@ function bindEvents() {
   elements.clearChat.addEventListener("click", clearConversation);
   elements.exportChat.addEventListener("click", exportConversation);
   elements.themeToggle.addEventListener("click", toggleTheme);
+  elements.modelSelector.addEventListener("change", () => {
+    state.model = elements.modelSelector.value;
+    setRuntimeStatus(state.health?.busy ? "busy" : "online");
+    toast(`Switched to ${state.model}`);
+  });
   document.querySelectorAll(".suggestion").forEach((button) => {
     button.addEventListener("click", () => sendMessage(button.dataset.prompt));
   });
