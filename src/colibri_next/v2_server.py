@@ -85,12 +85,23 @@ class _NativeEngine:
                 continue
             try:
                 events = self.runtime.engine_step()
+            except OSError as error:
+                # Windows SEH exceptions (e.g. C++ exceptions escaping
+                # ctypes) surface as OSError with a Windows error code.
+                # These indicate a bug in the native code (an unhandled
+                # C++ exception or memory corruption).  Surface the
+                # Windows error text so it is diagnosable.
+                with self._lock:
+                    queues, self._queues = self._queues, {}
+                for queue in queues.values():
+                    queue.put(("error", f"native engine failure: {error}"))
+                continue
             except Exception as error:
                 # Engine-level failure: fail every waiting request, not just one.
                 with self._lock:
                     queues, self._queues = self._queues, {}
                 for queue in queues.values():
-                    queue.put(("error", str(error)))
+                    queue.put(("error", f"native engine failure: {error}"))
                 continue
             if not events:
                 # Tasks exist but none progressed (e.g. waiting for a busy

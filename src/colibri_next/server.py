@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -1349,6 +1350,12 @@ def create_handler(
                 response_id = unquote(path[len("/v1/responses/") :])
                 try:
                     self._send_json(200, service.retrieve_response(response_id))
+                except OSError as error:
+                    # Native runtime failures (e.g. C++ exceptions escaping
+                    # ctypes) surface as OSError with a Windows error code.
+                    # Log the detail so operators can diagnose the root cause.
+                    self.log_error("native runtime error: %s", error)
+                    self.close_connection = True
                 except APIError as error:
                     self._send_error(error)
                 return
@@ -1490,7 +1497,11 @@ def create_handler(
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
             except Exception:
-                self.log_error("unhandled request error")
+                # The client only ever sees "internal server error", so the
+                # traceback has to reach the log or the failure is undebuggable.
+                self.log_error(
+                    "unhandled request error: %s", traceback.format_exc()
+                )
                 self._send_error(APIError(500, "internal server error", "server_error"))
 
         def _authenticate(self) -> None:
@@ -1633,6 +1644,13 @@ def create_handler(
             except (BrokenPipeError, ConnectionResetError):
                 stream_ok = False
                 self.close_connection = True
+            except OSError as error:
+                # Native runtime failures (e.g. C++ exceptions escaping
+                # ctypes) surface as OSError with a Windows error code.
+                # Surface the detail so operators can diagnose it.
+                self.log_error("native runtime stream error: %s", error)
+                stream_ok = False
+                self.close_connection = True
             except APIError as error:
                 # Once SSE headers are sent, a JSON error response is no longer
                 # possible. Send the error as the final SSE event instead.
@@ -1643,9 +1661,11 @@ def create_handler(
                     stream_ok = False
                     self.close_connection = True
             except Exception as error:
-                # Generation happens while the iterator is consumed, after the
-                # HTTP status line has already been written. Keep clients such
-                # as Cline and OpenCode from waiting on a silent/truncated stream.
+                # This catches genuine Python bugs (AttributeError,
+                # TypeError, ...) that occur while the iterator is being
+                # consumed after the HTTP status line has already been
+                # written. Keep clients such as Cline and OpenCode from
+                # waiting on a silent/truncated stream.
                 self.log_error("unhandled stream error: %s", error)
                 try:
                     self._write_sse_event(
