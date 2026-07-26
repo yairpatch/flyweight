@@ -649,6 +649,11 @@ static void qwen_observe_and_prefetch_next_layer(
         if (runtime.expert_residency.find(key) != runtime.expert_residency.end()) {
             continue;
         }
+        // Faulting the mapping in is only worth it when the page-in still goes
+        // through the host. Under direct paging the mmap is CUDA-registered, so
+        // its pages are already pinned and resident, and this walk is 432 stray
+        // reads per role per expert on the critical path for nothing.
+        if (!runtime.dma_paging) {
 #if !defined(_WIN32)
         if (runtime.model->fd >= 0) {
             for (int role = 0; role < 3; ++role) {
@@ -678,6 +683,7 @@ static void qwen_observe_and_prefetch_next_layer(
             runtime.next_layer_prefetch_bytes += bytes;
         }
 #endif
+        }
         if (runtime.options.moe_device == 0 && !runtime.expert_slots.empty()) {
             const auto slot_index = select_expert_cache_slot(runtime, layer + 1, expert, true);
             if (slot_index == kNoExpertSlot) continue;
@@ -692,6 +698,7 @@ static void qwen_observe_and_prefetch_next_layer(
                     if (colibri_gpu_upload(slot_base + role_offset, runtime.model->data + tensor.offset + offset, bytes, runtime.prefetch_stream) != 0)
                         throw std::runtime_error("native Qwen GPU prefetch DMA upload failed");
                     role_offset += bytes;
+                    runtime.next_layer_prefetch_bytes += bytes;
                 }
                 slot.key = key;
                 slot.valid = true;
@@ -2558,7 +2565,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             4ull*1024*1024*1024,runtime->model->size/4);
         const bool auto_direct=runtime->options.expert_paging==0&&
             runtime->host_available_bytes>=runtime->model->size+registration_headroom;
-        if(runtime->options.moe_device==2&&(forced_direct||auto_direct)){
+        // Both GPU-side MoE paths page experts in from the mmap, so both benefit
+        // from registering it; only the pure-CPU path never touches the device
+        // cache. This used to read `moe_device==2`, which left the streamed-GPU
+        // path staging every miss through a host memcpy and made the GPU branch
+        // of the next-layer prefetcher (which tests moe_device==0) dead code.
+        if(runtime->options.moe_device!=1&&(forced_direct||auto_direct)){
             const auto registration_started=std::chrono::steady_clock::now();
             const int registration=colibri_gpu_host_register(
                 runtime->model->data,runtime->model->size);
@@ -3509,6 +3521,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(runtime->options.moe_device!=0&&(runtime->options.expert_top_k>0||(runtime->options.expert_top_p>0.0f&&runtime->options.expert_top_p<1.0f)))
             route_count=apply_expert_router_policy(selected_host,cpu_weights,top_k,static_cast<int>(runtime->options.expert_top_k),runtime->options.expert_top_p);
         runtime->route_expert_sum+=static_cast<std::uint64_t>(route_count);
+        // Consume the previous layer's prefetch before issuing this one. The
+        // uploads pending here were predicted for *this* layer, so this is where
+        // they have to land; waiting after the call below would instead have made
+        // the main stream block on the layer-ahead prefetch it had just queued,
+        // serializing the copy engine against the very kernels it runs ahead of.
+        const auto pager_started=std::chrono::steady_clock::now();
+        if(runtime->prefetch_pending&&runtime->prefetch_event&&colibri_gpu_stream_wait_event(runtime->stream,runtime->prefetch_event)!=0)throw std::runtime_error("native Qwen prefetch wait failed");
+        runtime->prefetch_pending=false;
         qwen_observe_and_prefetch_next_layer(
             *runtime,layer_number,selected_host,route_count
         );
@@ -3516,9 +3536,6 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             for(int rank=0;rank<route_count;++rank)
                 record_expert_access(*runtime,layer_number,
                     static_cast<std::uint32_t>(selected_host[rank]));
-        const auto pager_started=std::chrono::steady_clock::now();
-        if(runtime->prefetch_pending&&runtime->prefetch_event&&colibri_gpu_stream_wait_event(runtime->stream,runtime->prefetch_event)!=0)throw std::runtime_error("native Qwen prefetch wait failed");
-        runtime->prefetch_pending=false;
         if(runtime->options.moe_device==1){
             if(cpu_output_offset+hidden_size*sizeof(float)>runtime->expert_staging_bytes)throw std::runtime_error("native CPU MoE workspace overflow");
             const auto compute_started=std::chrono::steady_clock::now();
@@ -3636,11 +3653,20 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     const auto slot_index=select_expert_cache_slot(*runtime,layer_number,expert,true);
                     if(slot_index!=kNoExpertSlot){
                         auto&slot=runtime->expert_slots[slot_index];slot.key=cache_key;slot.valid=true;slot.last_used=++runtime->expert_clock;runtime->expert_residency[cache_key]=slot_index;
-                        std::uint64_t bundle_bytes=0;
-                        for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor+bundle_bytes,runtime->model->data+t.offset+offset,bytes);bundle_bytes+=bytes;}
                         device_base=runtime->expert_cache+slot_index*runtime->expert_slot_bytes;
-                        if(staging_cursor+bundle_bytes>runtime->expert_staging_bytes||colibri_gpu_upload(device_base,staging+staging_cursor,bundle_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert upload failed");
-                        staging_cursor+=bundle_bytes;
+                        if(runtime->dma_paging){
+                            // The mmap is CUDA-registered, so each role goes straight from
+                            // the file mapping into the cache slot. That removes the host
+                            // memcpy from the critical path -- the CPU has already synced on
+                            // route_event by here, so every byte it copies is GPU idle time.
+                            std::uint64_t role_offset=0;
+                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(device_base+role_offset,runtime->model->data+t.offset+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert DMA upload failed");role_offset+=bytes;}
+                        }else{
+                            std::uint64_t bundle_bytes=0;
+                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor+bundle_bytes,runtime->model->data+t.offset+offset,bytes);bundle_bytes+=bytes;}
+                            if(staging_cursor+bundle_bytes>runtime->expert_staging_bytes||colibri_gpu_upload(device_base,staging+staging_cursor,bundle_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert upload failed");
+                            staging_cursor+=bundle_bytes;
+                        }
                         std::uint64_t role_offset=0;
                         for(int role=0;role<3;++role){const auto bytes=runtime->model->tensors[layer.expert_tensors[role]].size/experts;const auto pointer=device_base+role_offset;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;role_offset+=bytes;}
                     }else{
