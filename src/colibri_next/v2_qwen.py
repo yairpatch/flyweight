@@ -600,6 +600,11 @@ class QwenMoELayer:
             and self.expert_gate_info["ggml_type"] == 13
             and self.expert_up_info["ggml_type"] == 13
             and self.expert_down_info["ggml_type"] in {8, 14}
+        ) or (
+            not self.capture_debug
+            and self.expert_gate_info["ggml_type"] == 40
+            and self.expert_up_info["ggml_type"] == 40
+            and self.expert_down_info["ggml_type"] == 40
         )
         expert_groups = []
         routed_profile = accelerator.profile_start()
@@ -625,6 +630,24 @@ class QwenMoELayer:
                 output,
                 weights,
                 down_ggml_type=int(self.expert_down_info["ggml_type"]),
+                gate_ggml_type=int(self.expert_gate_info["ggml_type"]),
+            )
+
+        expert_matvec_methods = {
+            8: accelerator.q8_matvec_transposed,
+            12: accelerator.q4k_matvec_transposed,
+            13: accelerator.q5k_matvec_transposed,
+            14: accelerator.q6k_matvec_transposed,
+            40: accelerator.nvfp4_matvec_transposed,
+        }
+
+        def expert_matvec(info, raw, vec):
+            method = expert_matvec_methods.get(info["ggml_type"])
+            if method is None:
+                raise ValueError(f"unsupported CUDA expert type {info['ggml_type']}")
+            return method(
+                raw, int(info["shape"][0]), int(info["shape"][1]), vec,
+                return_device=True, cache_weight=True,
             )
 
         for index in range(self.top_k):
@@ -634,30 +657,10 @@ class QwenMoELayer:
             gate_raw = self._expert_bytes(self.expert_gate_info, expert)
             up_raw = self._expert_bytes(self.expert_up_info, expert)
             down_raw = self._expert_bytes(self.expert_down_info, expert)
-            gate = accelerator.q5k_matvec_transposed(
-                gate_raw, int(self.expert_gate_info["shape"][0]), int(self.expert_gate_info["shape"][1]), normalized, return_device=True,
-                cache_weight=True,
-            ) if self.expert_gate_info["ggml_type"] == 13 else accelerator.q8_matvec_transposed(
-                gate_raw, int(self.expert_gate_info["shape"][0]), int(self.expert_gate_info["shape"][1]), normalized, return_device=True, cache_weight=True,
-            )
-            up = accelerator.q5k_matvec_transposed(
-                up_raw, int(self.expert_up_info["shape"][0]), int(self.expert_up_info["shape"][1]), normalized, return_device=True,
-                cache_weight=True,
-            ) if self.expert_up_info["ggml_type"] == 13 else accelerator.q8_matvec_transposed(
-                up_raw, int(self.expert_up_info["shape"][0]), int(self.expert_up_info["shape"][1]), normalized, return_device=True, cache_weight=True,
-            )
+            gate = expert_matvec(self.expert_gate_info, gate_raw, normalized)
+            up = expert_matvec(self.expert_up_info, up_raw, normalized)
             activated = gate / (cp.float32(1.0) + cp.exp(-cp.clip(gate, -80.0, 80.0))) * up
-            down_method = {
-                8: accelerator.q8_matvec_transposed,
-                13: accelerator.q5k_matvec_transposed,
-                14: accelerator.q6k_matvec_transposed,
-            }.get(self.expert_down_info["ggml_type"])
-            if down_method is None:
-                raise ValueError(f"unsupported CUDA expert type {self.expert_down_info['ggml_type']}")
-            down = down_method(
-                down_raw, int(self.expert_down_info["shape"][0]), int(self.expert_down_info["shape"][1]), activated, return_device=True,
-                cache_weight=True,
-            )
+            down = expert_matvec(self.expert_down_info, down_raw, activated)
             if index == 0:
                 self.last_cuda_expert = (gate.copy(), activated.copy(), down.copy())
             output += weights[index] * down
@@ -851,10 +854,24 @@ class QwenV2Decoder:
             self._lm_head_raw = self.model.view_tensor(self._lm_head_info["name"])
         head = self._lm_head_info
         raw = self._lm_head_raw
-        logits = accelerator.q8_matvec_transposed(
-            raw, int(head["shape"][0]), int(head["shape"][1]), normalized,
-            return_device=True, cache_weight=True, protect_weight=True,
-        )
+        lm_type = int(head["ggml_type"])
+        if lm_type == 8:
+            logits = accelerator.q8_matvec_transposed(
+                raw, int(head["shape"][0]), int(head["shape"][1]), normalized,
+                return_device=True, cache_weight=True, protect_weight=True,
+            )
+        else:
+            lm_matvec = {
+                12: accelerator.q4k_matvec_transposed,
+                13: accelerator.q5k_matvec_transposed,
+                14: accelerator.q6k_matvec_transposed,
+            }.get(lm_type)
+            if lm_matvec is None:
+                raise ValueError(f"unsupported lm_head type {lm_type}")
+            logits = lm_matvec(
+                raw, int(head["shape"][0]), int(head["shape"][1]), normalized,
+                return_device=True, cache_weight=True,
+            )
         accelerator.profile_end("lm_head", lm_head_profile)
         return logits
 
@@ -880,10 +897,14 @@ def _decode_ggml(raw: bytes, kind: int, start: int, count: int):
     if kind == 30:
         bits = np.frombuffer(raw, dtype="<u2", count=count, offset=start * 2).astype(np.uint32) << 16
         return bits.view(np.float32)
+    if kind == 12:
+        return _decode_q4k(raw, start, count)
     if kind == 13:
         return _decode_q5k(raw, start, count)
     if kind == 14:
         return _decode_q6k(raw, start, count)
+    if kind == 40:
+        return _decode_nvfp4(raw, start, count)
     raise ValueError(f"unsupported GGML expert type {kind}")
 
 
@@ -901,6 +922,28 @@ def _scale_min(scales, index):
     if index < 4:
         return scales[index] & 63, scales[index + 4] & 63
     return (scales[index + 4] & 15) | ((scales[index - 4] >> 6) << 4), (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4)
+
+
+def _decode_q4k(raw, start, count):
+    # Q4_K is Q5_K without the 5th (high) bit: same super-block scales/mins,
+    # but the qh block is absent so ql starts at +16 and quants are 4-bit.
+    block_size, bytes_per_block = 256, 144  # d(2)+dmin(2)+scales(12)+qs(128)
+    output = np.empty(count, dtype=np.float32)
+    for local in range(count):
+        absolute = start + local
+        block, within = divmod(absolute, block_size)
+        base = block * bytes_per_block
+        d = float(np.frombuffer(raw, dtype="<f2", count=1, offset=base)[0])
+        dmin = float(np.frombuffer(raw, dtype="<f2", count=1, offset=base + 2)[0])
+        scales = raw[base + 4:base + 16]
+        group, offset = divmod(within, 64)
+        sub = offset // 32
+        qindex = group * 32 + offset % 32
+        low = raw[base + 16 + qindex]
+        scale, minimum = _scale_min(scales, group * 2 + sub)
+        quant = (low & 15) if offset < 32 else (low >> 4)
+        output[local] = d * scale * quant - dmin * minimum
+    return output
 
 
 def _decode_q5k(raw, start, count):
@@ -946,4 +989,35 @@ def _decode_q6k(raw, start, count):
         quant = (nibble | (((high >> high_shift) & 3) << 4)) - 32
         scale_index = half * 8 + (l // 16) + lane * 2
         output[local] = d * scales[scale_index] * quant
+    return output
+
+
+_NVFP4_LUT = np.array([
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+], dtype=np.float32)
+
+def _ue4m3_to_float(bits):
+    s = (bits >> 7) & 1
+    e = (bits >> 3) & 0xF
+    m = bits & 7
+    if e == 0:
+        val = (m / 8.0) * (2.0 ** -6)
+    elif e == 0xF:
+        val = float('inf') if m == 0 else float('nan')
+    else:
+        val = (2.0 ** (e - 7)) * (1.0 + m / 8.0)
+    return -val if s else val
+
+
+def _decode_nvfp4(raw, start, count):
+    output = np.empty(count, dtype=np.float32)
+    for local in range(count):
+        absolute = start + local
+        sub, within = divmod(absolute, 16)
+        base = sub * 9
+        scale = _ue4m3_to_float(raw[base])
+        nibble_pair = raw[base + 1 + (within >> 1)]
+        val = (nibble_pair >> 4) if (within & 1) else (nibble_pair & 0x0F)
+        output[local] = scale * _NVFP4_LUT[val]
     return output

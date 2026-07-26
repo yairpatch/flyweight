@@ -254,6 +254,9 @@ class CudaAccelerator:
             self._q8_transposed_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "q8_matvec_transposed_warp"
             )
+            self._q4k_transposed_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "q4k_matvec_transposed"
+            )
             self._q5k_transposed_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "q5k_matvec_transposed"
             )
@@ -274,6 +277,15 @@ class CudaAccelerator:
             )
             self._q8_grouped_accumulate_kernel = cp.RawKernel(
                 _KERNEL_SOURCE, "q8_grouped_accumulate"
+            )
+            self._nvfp4_grouped_swiglu_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "nvfp4_grouped_swiglu"
+            )
+            self._nvfp4_grouped_accumulate_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "nvfp4_grouped_accumulate"
+            )
+            self._nvfp4_matvec_transposed_kernel = cp.RawKernel(
+                _KERNEL_SOURCE, "nvfp4_matvec_transposed"
             )
             self._silu_mul_kernel = cp.RawKernel(_KERNEL_SOURCE, "silu_mul")
             self._scaled_add_kernel = cp.RawKernel(_KERNEL_SOURCE, "scaled_add")
@@ -1547,6 +1559,15 @@ class CudaAccelerator:
         )
         return selected, routing_weights
 
+    def q4k_matvec_transposed(
+        self, raw: bytes, input_size: int, output_size: int, vector: Any, *,
+        return_device: bool = False, cache_weight: bool = False,
+    ) -> Any:
+        return self._k_matvec_transposed(
+            raw, input_size, output_size, vector, self._q4k_transposed_kernel,
+            144, return_device=return_device, cache_weight=cache_weight,
+        )
+
     def q5k_matvec_transposed(
         self, raw: bytes, input_size: int, output_size: int, vector: Any, *,
         return_device: bool = False, cache_weight: bool = False,
@@ -1563,6 +1584,15 @@ class CudaAccelerator:
         return self._k_matvec_transposed(
             raw, input_size, output_size, vector, self._q6k_transposed_kernel,
             210, return_device=return_device, cache_weight=cache_weight,
+        )
+
+    def nvfp4_matvec_transposed(
+        self, raw: bytes, input_size: int, output_size: int, vector: Any, *,
+        return_device: bool = False, cache_weight: bool = False,
+    ) -> Any:
+        return self._k_matvec_transposed(
+            raw, input_size, output_size, vector, self._nvfp4_matvec_transposed_kernel,
+            18, return_device=return_device, cache_weight=cache_weight,
         )
 
     def _k_matvec_transposed(
@@ -1729,12 +1759,23 @@ class CudaAccelerator:
         weights: Any,
         *,
         down_ggml_type: int = 14,
+        gate_ggml_type: int = 13,
     ) -> None:
-        """Execute selected Q5 gate/up experts with grouped Q6/Q8 down."""
+        """Execute selected Q5/Q6/NVFP4 gate/up experts with grouped Q6/Q8/NVFP4 down."""
         if not groups:
             return
-        if down_ggml_type not in {8, 14}:
-            raise ValueError("grouped expert down type must be Q8_0 or Q6_K")
+        if gate_ggml_type == 40:
+            gate_up_kernel = self._nvfp4_grouped_swiglu_kernel
+        elif gate_ggml_type == 14:
+            gate_up_kernel = self._q5k_grouped_swiglu_kernel
+        else:
+            gate_up_kernel = self._q5k_grouped_swiglu_kernel
+        if down_ggml_type == 8:
+            down_kernel = self._q8_grouped_accumulate_kernel
+        elif down_ggml_type == 40:
+            down_kernel = self._nvfp4_grouped_accumulate_kernel
+        else:
+            down_kernel = self._q6k_grouped_accumulate_kernel
         self.batched_moe_tokens += 1
         self.batched_expert_groups += len(groups)
         cp = self.cp
@@ -1766,7 +1807,7 @@ class CudaAccelerator:
                 "routed_pointer_setup", time.perf_counter() - pointers_started
             )
             gate_up_profile = self.profile_start()
-            self._q5k_grouped_swiglu_kernel(
+            gate_up_kernel(
                 (intermediate_size, len(groups)),
                 (THREADS_PER_BLOCK,),
                 (
@@ -1776,11 +1817,6 @@ class CudaAccelerator:
             )
             self.profile_end("routed_gate_up", gate_up_profile)
             down_profile = self.profile_start()
-            down_kernel = (
-                self._q8_grouped_accumulate_kernel
-                if down_ggml_type == 8
-                else self._q6k_grouped_accumulate_kernel
-            )
             down_kernel(
                 (output_size,),
                 (THREADS_PER_BLOCK,),
@@ -4419,6 +4455,40 @@ void q5k_grouped_swiglu(
             (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
 }
 
+__device__ __forceinline__ float q4k_value(
+    const unsigned char* packed, int absolute
+) {
+    // Q4_K: like Q5_K but no qh block, so ql starts at +16 and quants are 4-bit.
+    const int block = absolute / 256;
+    const int within = absolute & 255;
+    const unsigned char* base = packed + block * 144;
+    const float d = __half2float(*((const __half*)(base)));
+    const float dmin = __half2float(*((const __half*)(base + 2)));
+    const unsigned char* scales = base + 4;
+    const int group = within / 64;
+    const int offset = within & 63;
+    const int sub = offset / 32;
+    const unsigned char low = base[16 + group * 32 + (offset & 31)];
+    const int quant = (offset < 32) ? (low & 15) : (low >> 4);
+    int scale, minimum;
+    q5k_scale_min(scales, group * 2 + sub, &scale, &minimum);
+    return d * (float)scale * (float)quant - dmin * (float)minimum;
+}
+
+extern "C" __global__
+void q4k_matvec_transposed(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += q4k_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
 __device__ __forceinline__ float q6k_value(
     const unsigned char* packed, int absolute
 ) {
@@ -4531,6 +4601,104 @@ void q8_grouped_accumulate(
                 packed + block * 34 + 2 + within
             ));
             combined += weights[expert] * ((float)value * scale)
+                * activated[expert * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
+// ---- NVFP4 kernels (GGML type 40) -----------------------------------------
+__device__ __forceinline__ float ue4m3_to_float(unsigned char bits) {
+    const int s = (bits >> 7) & 1;
+    const int e = (bits >> 3) & 0xF;
+    const int m = bits & 7;
+    float val;
+    if (e == 0) val = ldexpf(m / 8.0f, -6);
+    else if (e == 0xF) val = (m == 0) ? __int_as_float(0x7f800000) : __int_as_float(0x7fffffff);
+    else val = ldexpf(1.0f + m / 8.0f, e - 7);
+    return s ? -val : val;
+}
+__device__ __forceinline__ float nvfp4_value(
+    const unsigned char* packed, int absolute
+) {
+    const int sub = absolute / 16;
+    const int within = absolute & 15;
+    const unsigned char* base = packed + sub * 9;
+    const float scale = ue4m3_to_float(base[0]);
+    const unsigned char nibble_pair = base[1 + (within >> 1)];
+    const int val = (within & 1) ? (nibble_pair >> 4) : (nibble_pair & 0x0F);
+    const float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    return scale * lut[val];
+}
+
+extern "C" __global__
+void nvfp4_matvec_transposed(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += nvfp4_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void nvfp4_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate_packed = (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[expert];
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += nvfp4_value(gate_packed, absolute) * value;
+        up += nvfp4_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[expert * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void nvfp4_grouped_accumulate(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int expert = 0; expert < experts; ++expert) {
+            const unsigned char* packed = (const unsigned char*)down_ptrs[expert];
+            combined += weights[expert]
+                * nvfp4_value(packed, row * input_size + input)
                 * activated[expert * input_size + input];
         }
         partial += combined;
