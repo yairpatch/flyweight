@@ -561,20 +561,105 @@ function updateStreamingMessage(message) {
     renderMessageContent(content, message);
     return;
   }
+
+  const text = message.content || "";
+  const thinkingClose = text.indexOf("</think>");
+  const thinkingOpen = text.indexOf("<think>");
+
+  let existingIndicator = content.querySelector(".thinking-streaming");
+  let wasExpanded = existingIndicator?.querySelector(".thinking-body")?.style.display !== "none"
+    && existingIndicator?.querySelector(".thinking-body") !== null;
+
   for (const child of [...content.childNodes]) {
-    if (child !== cursor) {
+    if (child !== cursor && child !== existingIndicator) {
       child.remove();
     }
   }
-  const text = document.createDocumentFragment();
-  appendStreamText(text, message.content || "");
-  content.insertBefore(text, cursor);
+
+  if (thinkingClose !== -1) {
+    if (existingIndicator) existingIndicator.remove();
+    const thinkingStart = text.indexOf("<think>");
+    if (thinkingStart !== -1 && thinkingStart < thinkingClose) {
+      const thinkingContent = text.slice(thinkingStart + 8, thinkingClose);
+      content.insertBefore(renderThinkingBlock(thinkingContent), cursor);
+    }
+    const afterThinking = text.slice(thinkingClose + 9);
+    if (afterThinking) {
+      const frag = document.createDocumentFragment();
+      appendStreamMarkdown(frag, afterThinking);
+      content.insertBefore(frag, cursor);
+    }
+  } else if (thinkingOpen !== -1) {
+    const thinkingContent = text.slice(thinkingOpen + 8);
+    if (existingIndicator) {
+      const body = existingIndicator.querySelector(".thinking-body");
+      if (body) {
+        body.textContent = thinkingContent.trim() || "Waiting for thoughts...";
+      }
+    } else {
+      content.insertBefore(renderThinkingIndicator(thinkingContent), cursor);
+    }
+  } else {
+    if (existingIndicator) existingIndicator.remove();
+    const frag = document.createDocumentFragment();
+    appendStreamMarkdown(frag, text);
+    content.insertBefore(frag, cursor);
+  }
+
   for (const toolCall of message.toolCalls || []) {
     content.append(renderToolCall(toolCall));
   }
 }
 
-function appendStreamText(container, text) {
+function renderThinkingBlock(content) {
+  const details = document.createElement("details");
+  details.className = "thinking-block";
+  const summary = document.createElement("summary");
+  summary.className = "thinking-summary";
+  summary.textContent = "Thought process";
+  const body = document.createElement("div");
+  body.className = "thinking-body";
+  const p = document.createElement("p");
+  p.textContent = content.trim();
+  body.append(p);
+  details.append(summary, body);
+  return details;
+}
+
+function renderThinkingIndicator(content) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "thinking-streaming";
+  
+  const header = document.createElement("div");
+  header.className = "thinking-stream-header";
+  header.append(svgIcon("brain"));
+  const label = document.createElement("span");
+  label.textContent = "Thinking";
+  const dots = document.createElement("span");
+  dots.className = "thinking-ellipsis";
+  dots.textContent = "...";
+  header.append(label, dots);
+  
+  const chevron = document.createElement("span");
+  chevron.className = "thinking-chevron";
+  chevron.textContent = "\u25B6";
+  header.append(chevron);
+  
+  const body = document.createElement("div");
+  body.className = "thinking-stream-body";
+  body.style.display = "none";
+  
+  header.addEventListener("click", () => {
+    const open = body.style.display !== "none";
+    body.style.display = open ? "none" : "block";
+    chevron.classList.toggle("open", !open);
+  });
+  
+  wrapper.append(header, body);
+  return wrapper;
+}
+
+function appendStreamMarkdown(container, text) {
   if (!text) return;
   const openFences = [...text.matchAll(/```([^\n`]*)/g)];
   let incompleteCode = null;
@@ -684,6 +769,19 @@ function renderRichText(container, text) {
   if (!text) {
     return;
   }
+  const thinkingPattern = /<think>([\s\S]*?)<\/think>/g;
+  let tCursor = 0;
+  let tMatch;
+  while ((tMatch = thinkingPattern.exec(text)) !== null) {
+    renderRichTextSegment(container, text.slice(tCursor, tMatch.index));
+    container.append(renderThinkingBlock(tMatch[1]));
+    tCursor = thinkingPattern.lastIndex;
+  }
+  renderRichTextSegment(container, text.slice(tCursor));
+}
+
+function renderRichTextSegment(container, text) {
+  if (!text) return;
   const fencePattern = /```([^\n`]*)\n?([\s\S]*?)```/g;
   let cursor = 0;
   let match;
@@ -1032,6 +1130,7 @@ function svgIcon(name) {
     edit: '<path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
     refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
     close: '<path d="m6 6 12 12M18 6 6 18"/>',
+    brain: '<path d="M9 18h6M10 22h4M8.2 14.8A7 7 0 1 1 15.8 14.8c-.7.5-.8 1.2-.8 2.2H9c0-1-.1-1.7-.8-2.2Z"/>',
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");

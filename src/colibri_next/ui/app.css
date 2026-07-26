@@ -859,6 +859,135 @@ svg {
   font-style: italic;
 }
 
+.thinking-block {
+  margin: 12px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  overflow: hidden;
+}
+
+.thinking-summary {
+  padding: 8px 12px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 620;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.thinking-summary::before {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 150ms ease;
+}
+
+.thinking-block[open] .thinking-summary::before {
+  transform: rotate(90deg);
+}
+
+.thinking-summary::-webkit-details-marker {
+  display: none;
+}
+
+.thinking-body {
+  padding: 0 12px 10px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.6;
+  border-top: 1px solid var(--line);
+}
+
+.thinking-body p {
+  margin: 8px 0 0;
+}
+
+.thinking-streaming {
+  margin: 10px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  overflow: hidden;
+}
+
+.thinking-stream-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  color: var(--accent-bright);
+  font-size: 12px;
+  font-weight: 620;
+  user-select: none;
+  transition: background 150ms ease;
+}
+
+.thinking-stream-header:hover {
+  background: var(--accent-soft);
+}
+
+.thinking-stream-header svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--accent-bright);
+}
+
+.thinking-chevron {
+  margin-left: auto;
+  font-size: 9px;
+  transition: transform 200ms ease;
+}
+
+.thinking-chevron.open {
+  transform: rotate(90deg);
+}
+
+.thinking-ellipsis {
+  display: inline-block;
+  width: 1.2em;
+  text-align: left;
+  overflow: hidden;
+  animation: thinking-dots 1.4s steps(4, end) infinite;
+  vertical-align: bottom;
+}
+
+@keyframes thinking-dots {
+  0% { width: 0; }
+  100% { width: 1.2em; }
+}
+
+.thinking-stream-body {
+  padding: 0 12px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  border-top: 1px solid var(--line);
+  font-style: italic;
+  white-space: pre-wrap;
+}
+
+.streaming-badge {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(124, 92, 255, 0.14);
+  color: var(--accent-bright);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 .message-content pre {
   position: relative;
   margin: 14px 0;
