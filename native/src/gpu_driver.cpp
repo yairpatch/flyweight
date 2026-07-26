@@ -611,6 +611,8 @@ extern "C" int colibri_gpu_compile(
     }
     for (const char* name : {
              "qwen_q8_embedding", "qwen_f32_matvec",
+             "bf16_matvec_warp", "qwen_f32_matvec_warp",
+             "q6k_matvec_transposed_warp",
              "qwen_delta_recurrent", "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",
              "kv_attention_scores", "kv_attention_values",
@@ -1035,11 +1037,17 @@ extern "C" int colibri_gpu_q6k_matvec_transposed(
     if (!packed || !input || !output || input_size <= 0 || output_size <= 0)
         return -1;
     CUfunction function = nullptr;
-    auto it = g_functions.find("q6k_matvec_transposed");
+    bool warp_mapped = false;
+    auto it = g_functions.find("q6k_matvec_transposed_warp");
+    if (it == g_functions.end()) it = g_functions.find("q6k_matvec_transposed");
+    else warp_mapped = true;
     if (it != g_functions.end()) function = it->second;
     if (!function) return -1;
     void* args[] = {&packed, &input, &output, &input_size, &output_size};
-    return launch(function, static_cast<unsigned int>(output_size), 1, 256,
+    const auto blocks = warp_mapped
+        ? static_cast<unsigned int>((output_size + 7) / 8)
+        : static_cast<unsigned int>(output_size);
+    return launch(function, blocks, 1, 256,
                   args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 

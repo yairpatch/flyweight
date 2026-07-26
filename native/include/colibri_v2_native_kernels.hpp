@@ -113,6 +113,37 @@ void qwen_f32_matvec(
 }
 
 extern "C" __global__
+void qwen_f32_matvec_warp(
+    const float* matrix, const float* input, float* output,
+    const int input_size, const int output_size
+) {
+    // Warp per row, eight rows per block: no shared-memory reduction, and
+    // float4 loads move 512 B per warp memory instruction instead of 128 B.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    const float* row_matrix = matrix + (long long)row * (long long)input_size;
+    float partial = 0.0f;
+    if ((input_size & 3) == 0
+        && (((unsigned long long)row_matrix) & 15ull) == 0ull
+        && (((unsigned long long)input) & 15ull) == 0ull) {
+        const int steps = input_size >> 2;
+        for (int step = lane; step < steps; step += 32) {
+            const float4 w = ((const float4*)row_matrix)[step];
+            const float4 v = ((const float4*)input)[step];
+            partial += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+        }
+    } else {
+        for (int column = lane; column < input_size; column += 32)
+            partial += row_matrix[column] * input[column];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+extern "C" __global__
 void qwen_f32_matmul_rows(
     const float* matrix, const float* input, float* output,
     const int input_size, const int output_size, const int rows

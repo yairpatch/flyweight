@@ -490,6 +490,70 @@ void bf16_matvec(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+// Eight bf16 weights against eight f32 activations, decoded from one 128-bit
+// load. A bf16 is the top half of the f32 with the same bits, so the low
+// element of each 32-bit word is `word << 16` and the high element is
+// `word & 0xffff0000`; no conversion instruction is needed.
+__device__ __forceinline__ float bf16_dot8(const uint4 packed, const float* v) {
+    const float4 lo = *(const float4*)v;
+    const float4 hi = *(const float4*)(v + 4);
+    float sum = __uint_as_float(packed.x << 16) * lo.x;
+    sum += __uint_as_float(packed.x & 0xffff0000u) * lo.y;
+    sum += __uint_as_float(packed.y << 16) * lo.z;
+    sum += __uint_as_float(packed.y & 0xffff0000u) * lo.w;
+    sum += __uint_as_float(packed.z << 16) * hi.x;
+    sum += __uint_as_float(packed.z & 0xffff0000u) * hi.y;
+    sum += __uint_as_float(packed.w << 16) * hi.z;
+    sum += __uint_as_float(packed.w & 0xffff0000u) * hi.w;
+    return sum;
+}
+
+// True when a row of `columns` bf16 weights can be walked with 128-bit loads:
+// every row start stays 16-byte aligned and the activations line up with it.
+__device__ __forceinline__ bool bf16_vectorizable(
+    const unsigned short* weights, const float* vector, const int columns
+) {
+    return (columns & 7) == 0
+        && (((unsigned long long)weights) & 15ull) == 0ull
+        && (((unsigned long long)vector) & 15ull) == 0ull;
+}
+
+extern "C" __global__
+void bf16_matvec_warp(
+    const unsigned short* weights,
+    const float* vector,
+    float* output,
+    const int rows,
+    const int columns
+) {
+    // One warp per row, eight rows per 256-thread block. Against the
+    // block-per-row form above this drops the shared-memory reduction and its
+    // two barriers, and the 128-bit loads move 512 B per warp memory
+    // instruction where the scalar `unsigned short` read moved 64 B.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= rows) return;
+    // 64-bit: this also serves the LM head, where rows*columns overruns int.
+    const unsigned short* row_weights =
+        weights + (long long)row * (long long)columns;
+    float partial = 0.0f;
+    if (bf16_vectorizable(row_weights, vector, columns)) {
+        const uint4* packed = (const uint4*)row_weights;
+        const int steps = columns >> 3;
+        for (int step = lane; step < steps; step += 32)
+            partial += bf16_dot8(packed[step], vector + step * 8);
+    } else {
+        for (int column = lane; column < columns; column += 32) {
+            const unsigned int bits = ((unsigned int)row_weights[column]) << 16;
+            partial += __uint_as_float(bits) * vector[column];
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
 extern "C" __global__
 void bf16_matmul(
     const unsigned short* weights,
@@ -1199,11 +1263,19 @@ void bf16_lm_head_argmax_warp(
     __syncthreads();
     if (row < output_size) {
         float partial = 0.0f;
-        const long long start = (long long)row * (long long)input_size;
-        for (int input = lane; input < input_size; input += 32) {
-            const unsigned int bits =
-                ((unsigned int)weights[start + input]) << 16;
-            partial += __uint_as_float(bits) * vector[input];
+        const unsigned short* row_weights =
+            weights + (long long)row * (long long)input_size;
+        if (bf16_vectorizable(row_weights, vector, input_size)) {
+            const uint4* packed = (const uint4*)row_weights;
+            const int steps = input_size >> 3;
+            for (int step = lane; step < steps; step += 32)
+                partial += bf16_dot8(packed[step], vector + step * 8);
+        } else {
+            for (int input = lane; input < input_size; input += 32) {
+                const unsigned int bits =
+                    ((unsigned int)row_weights[input]) << 16;
+                partial += __uint_as_float(bits) * vector[input];
+            }
         }
         for (int offset = 16; offset > 0; offset >>= 1)
             partial += __shfl_down_sync(0xffffffff, partial, offset);
@@ -1749,6 +1821,26 @@ void q6k_matvec_transposed(
 }
 
 extern "C" __global__
+void q6k_matvec_transposed_warp(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    // Warp per row, eight rows per block. Q6_K's 210-byte blocks interleave
+    // low nibbles, high bits and scales, so there is no 128-bit load to be
+    // had here; the win is dropping the shared-memory reduction and barriers.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = lane; input < input_size; input += 32)
+        partial += q6k_value(packed, row * input_size + input) * vector[input];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+extern "C" __global__
 void q6k_lm_head_argmax_warp(
     const unsigned char* packed,
     const float* vector,
@@ -2032,6 +2124,24 @@ __device__ __forceinline__ float ue4m3_to_float(unsigned char bits) {
     else val = ldexpf(1.0f + m / 8.0f, e - 7);
     return s ? -val : val;
 }
+// S(1) E(2) M(1) -> float, bias 1:
+//   0x0=0.0  0x1=0.5  0x2=1.0  0x3=1.5  0x4=2.0  0x5=3.0  0x6=4.0  0x7=6.0
+// This was a `const float lut[16]` local to nvfp4_value, which nvcc placed in
+// local memory and re-initialised on every call -- four st.local.v4 (64 B)
+// per decoded weight, inside the expert GEMV inner loop. Assembling the f32
+// bits instead keeps it in registers. Verify with `nvcc -ptx` that no NVFP4
+// kernel contains `.local` before changing this.
+__device__ __forceinline__ float fp4_e2m1_to_float(int val) {
+    const unsigned int magnitude = (unsigned int)(val & 7);
+    const unsigned int exponent = magnitude >> 1;
+    // exponent==0 is the subnormal pair {0.0, 0.5}; otherwise the f32 exponent
+    // is (exponent - 1) + 127 and the mantissa bit selects the x1.5 variant.
+    const unsigned int bits = exponent
+        ? (((exponent + 126u) << 23) | ((magnitude & 1u) << 22))
+        : (magnitude ? 0x3F000000u : 0u);
+    return __uint_as_float(bits | ((unsigned int)(val & 8) << 28));
+}
+
 __device__ __forceinline__ float nvfp4_value(
     const unsigned char* packed, int absolute
 ) {
@@ -2043,14 +2153,7 @@ __device__ __forceinline__ float nvfp4_value(
     const float scale = ue4m3_to_float(base[sub]);
     const unsigned char byte = base[4 + sub * 8 + (within & 7)];
     const int val = (within < 8) ? (byte & 0x0F) : (byte >> 4);
-    // LUT: S(1) E(2) M(1) -> float. Bias=1.
-    // 0x0=0.0  0x1=0.5  0x2=1.0  0x3=1.5
-    // 0x4=2.0  0x5=3.0  0x6=4.0  0x7=6.0
-    const float lut[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-    return scale * lut[val];
+    return scale * fp4_e2m1_to_float(val);
 }
 
 extern "C" __global__
