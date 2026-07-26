@@ -428,6 +428,143 @@ void qwen_delta_recurrent(
     }
 }
 
+// Sum partials[0..count) and hand the total to every thread. The whole block
+// must reach this; entries between `count` and the enclosing power of two are
+// zeroed here so the tree never reads uninitialised shared memory, and the
+// closing pair of barriers lets the caller refill `partials` straight after.
+__device__ __forceinline__ float delta_block_sum(float* partials, const int count) {
+    int width = 1;
+    while (width < count) width <<= 1;
+    for (int index = (int)threadIdx.x + count; index < width; index += (int)blockDim.x)
+        partials[index] = 0.0f;
+    for (int stride = width >> 1; stride > 0; stride >>= 1) {
+        __syncthreads();
+        if ((int)threadIdx.x < stride)
+            partials[threadIdx.x] += partials[threadIdx.x + stride];
+    }
+    __syncthreads();
+    const float total = partials[0];
+    __syncthreads();
+    return total;
+}
+
+extern "C" __global__
+void qwen_delta_recurrent_split(
+    const float* convolved, const float* gates,
+    const float* beta_logits, const float* decay_logits,
+    const float* decay_coefficients, const float* dt_bias,
+    const float* norm_weights, float* state, float* output,
+    const int key_heads, const int value_heads,
+    const int head_dim, const float epsilon
+) {
+    // Same recurrence as qwen_delta_recurrent, mapped differently. There, one
+    // thread per output dim walked all head_dim keys on its own, half the block
+    // sat out the loops entirely, and three reductions ran serially under
+    // `if (lane == 0)`. Here the block is head_dim output dims by `slices` key
+    // groups: the key loop is `slices` times shorter, every thread works, and
+    // the reductions are block-wide. The state layout is unchanged, so
+    // consecutive dims still read consecutive addresses.
+    extern __shared__ float delta_shared[];
+    const int head = blockIdx.x;
+    if (head >= value_heads) return;
+    const int slices = blockDim.x / head_dim;
+    const int dim = threadIdx.x % head_dim;
+    const int slice = threadIdx.x / head_dim;
+    const int key_head = head % key_heads;
+    const int total_key_dim = key_heads * head_dim;
+    const int key_offset = key_head * head_dim;
+
+    float* shared_query = delta_shared;
+    float* shared_key = shared_query + head_dim;
+    float* shared_delta = shared_key + head_dim;
+    float* shared_core = shared_delta + head_dim;
+    float* partials = shared_core + head_dim;
+
+    __shared__ float query_inverse_norm;
+    __shared__ float key_inverse_norm;
+    __shared__ float decay_scale;
+    __shared__ float beta;
+    __shared__ float inverse_rms;
+
+    // Query and key are read once into shared memory; the original reloaded
+    // both from global on every one of the 2 * head_dim loop iterations.
+    if (slice == 0) {
+        shared_query[dim] = convolved[key_offset + dim];
+        shared_key[dim] = convolved[total_key_dim + key_offset + dim];
+    }
+    __syncthreads();
+    partials[threadIdx.x] = (int)threadIdx.x < head_dim
+        ? shared_query[threadIdx.x] * shared_query[threadIdx.x] : 0.0f;
+    const float query_square = delta_block_sum(partials, head_dim);
+    partials[threadIdx.x] = (int)threadIdx.x < head_dim
+        ? shared_key[threadIdx.x] * shared_key[threadIdx.x] : 0.0f;
+    const float key_square = delta_block_sum(partials, head_dim);
+    if (threadIdx.x == 0) {
+        query_inverse_norm = rsqrtf(query_square + 1.0e-6f)
+            * rsqrtf((float)head_dim);
+        key_inverse_norm = rsqrtf(key_square + 1.0e-6f);
+        beta = 1.0f / (1.0f + expf(-beta_logits[head]));
+        const float softplus_input = decay_logits[head] + dt_bias[head];
+        const float softplus = softplus_input > 20.0f
+            ? softplus_input : log1pf(expf(softplus_input));
+        decay_scale = expf(decay_coefficients[head] * softplus);
+    }
+    __syncthreads();
+    if (slice == 0) shared_key[dim] *= key_inverse_norm;
+    __syncthreads();
+
+    // Decay the state and read the memory out of it, one key group per slice.
+    float memory_partial = 0.0f;
+    for (int key_index = slice; key_index < head_dim; key_index += slices) {
+        const int state_index = (head * head_dim + key_index) * head_dim + dim;
+        const float decayed = state[state_index] * decay_scale;
+        state[state_index] = decayed;
+        memory_partial += decayed * shared_key[key_index];
+    }
+    partials[threadIdx.x] = memory_partial;
+    __syncthreads();
+    if (slice == 0) {
+        float memory = memory_partial;
+        for (int other = 1; other < slices; ++other)
+            memory += partials[other * head_dim + dim];
+        const float value = convolved[total_key_dim * 2 + head * head_dim + dim];
+        shared_delta[dim] = (value - memory) * beta;
+    }
+    __syncthreads();
+    const float delta = shared_delta[dim];
+
+    // Write the outer product back into the state and read the core out of it.
+    float core_partial = 0.0f;
+    for (int key_index = slice; key_index < head_dim; key_index += slices) {
+        const int state_index = (head * head_dim + key_index) * head_dim + dim;
+        const float updated = state[state_index] + shared_key[key_index] * delta;
+        state[state_index] = updated;
+        core_partial += updated * shared_query[key_index] * query_inverse_norm;
+    }
+    __syncthreads();
+    partials[threadIdx.x] = core_partial;
+    __syncthreads();
+    if (slice == 0) {
+        float core = core_partial;
+        for (int other = 1; other < slices; ++other)
+            core += partials[other * head_dim + dim];
+        shared_core[dim] = core;
+    }
+    __syncthreads();
+    partials[threadIdx.x] = (int)threadIdx.x < head_dim
+        ? shared_core[threadIdx.x] * shared_core[threadIdx.x] : 0.0f;
+    const float square = delta_block_sum(partials, head_dim);
+    if (threadIdx.x == 0)
+        inverse_rms = rsqrtf(square / (float)head_dim + epsilon);
+    __syncthreads();
+    if (slice == 0) {
+        const int output_index = head * head_dim + dim;
+        const float gate = gates[output_index];
+        output[output_index] = shared_core[dim] * inverse_rms * norm_weights[dim]
+            * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+    }
+}
+
 extern "C" __global__
 void qwen_delta_recurrent_rows(
     const float* convolved, const float* gates,

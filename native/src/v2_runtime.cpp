@@ -120,6 +120,10 @@ struct QwenExpertHistory {
 
 struct QwenCudaLayerProfile {
     std::uint64_t pre_start=0,pre_end=0;
+    // Carved out of the pre phase so the gated-delta recurrence can be told
+    // apart from the bf16 projections it sits between; the two have completely
+    // different cures and the phase total does not distinguish them.
+    std::uint64_t recurrent_start=0,recurrent_end=0;
     std::uint64_t shared_start=0,shared_end=0;
     std::uint64_t expert_start=0,expert_end=0;
 };
@@ -846,6 +850,8 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     for(auto&profile:runtime.cuda_layer_profiles){
         colibri_gpu_event_destroy(profile.pre_start);
         colibri_gpu_event_destroy(profile.pre_end);
+        colibri_gpu_event_destroy(profile.recurrent_start);
+        colibri_gpu_event_destroy(profile.recurrent_end);
         colibri_gpu_event_destroy(profile.shared_start);
         colibri_gpu_event_destroy(profile.shared_end);
         colibri_gpu_event_destroy(profile.expert_start);
@@ -2297,6 +2303,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         };
         for(auto&events:runtime->cuda_layer_profiles){
             create_profile_event(events.pre_start);create_profile_event(events.pre_end);
+            create_profile_event(events.recurrent_start);create_profile_event(events.recurrent_end);
             create_profile_event(events.shared_start);create_profile_event(events.shared_end);
             create_profile_event(events.expert_start);create_profile_event(events.expert_end);
         }
@@ -3387,7 +3394,24 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
             std::uint64_t beta=third+value_heads*sizeof(float);
             void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta,const_cast<std::uint64_t*>(&third),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
-            launch_named("qwen_delta_recurrent",value_heads,1,256,recurrent_args);
+            // Split the key loop across `slices` groups of head_dim threads. Four
+            // groups is the most a 1024-thread block allows at head_dim 128, which
+            // is what every Qwen3.6 checkpoint uses; wider heads get fewer, and
+            // anything past a 1024-thread block falls back to the serial kernel.
+            // COLIBRI_DELTA_SERIAL forces that fallback for A/B measurement --
+            // the split form is 2.9x here (1.92 -> 0.67 ms/token over 30 layers).
+            if(profile)profile_record(profile->recurrent_start);
+            int recurrent_slices=head_dim>0?1024/head_dim:0;
+            if(recurrent_slices>4)recurrent_slices=4;
+            if(recurrent_slices>=1&&!std::getenv("COLIBRI_DELTA_SERIAL")){
+                const int recurrent_block=head_dim*recurrent_slices;
+                const std::uint32_t recurrent_shared=
+                    static_cast<std::uint32_t>((4*head_dim+recurrent_block)*sizeof(float));
+                launch_named("qwen_delta_recurrent_split",value_heads,1,recurrent_block,recurrent_args,recurrent_shared);
+            }else{
+                launch_named("qwen_delta_recurrent",value_heads,1,256,recurrent_args);
+            }
+            if(profile)profile_record(profile->recurrent_end);
             if(std::getenv("COLIBRI_LM_DIAG")&&layer_number==0){
                 float v[4]={};colibri_gpu_stream_sync(runtime->stream);
                 if(colibri_gpu_download(v,fourth,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
@@ -3744,19 +3768,19 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
     runtime->tail_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tail_wait_started).count();
     if(runtime->cuda_profile){
-        float delta_ms=0.0f,attention_ms=0.0f,shared_ms=0.0f,expert_ms=0.0f,tail_ms=0.0f;
+        float delta_ms=0.0f,attention_ms=0.0f,shared_ms=0.0f,expert_ms=0.0f,tail_ms=0.0f,recurrent_ms=0.0f;
         std::uint32_t delta_layers=0,attention_layers=0;
         auto elapsed=[](std::uint64_t start,std::uint64_t end){float value=0.0f;if(colibri_gpu_event_elapsed(start,end,&value)!=0)throw std::runtime_error("native Qwen CUDA profiling measurement failed");return value;};
         for(std::size_t index=0;index<runtime->layers.size();++index){
             const auto&events=runtime->cuda_layer_profiles[index];
             const float pre=elapsed(events.pre_start,events.pre_end);
-            if(runtime->layers[index].attention){attention_ms+=pre;++attention_layers;}else{delta_ms+=pre;++delta_layers;}
+            if(runtime->layers[index].attention){attention_ms+=pre;++attention_layers;}else{delta_ms+=pre;++delta_layers;recurrent_ms+=elapsed(events.recurrent_start,events.recurrent_end);}
             shared_ms+=elapsed(events.shared_start,events.shared_end);
             expert_ms+=elapsed(events.expert_start,events.expert_end);
         }
         tail_ms=elapsed(runtime->cuda_tail_start,runtime->cuda_tail_end);
-        std::fprintf(stderr,"[cuda-profile] position=%llu delta=%.3fms/%u attention=%.3fms/%u shared=%.3fms expert=%.3fms tail=%.3fms total=%.3fms\n",
-            static_cast<unsigned long long>(runtime->position),delta_ms,delta_layers,attention_ms,attention_layers,
+        std::fprintf(stderr,"[cuda-profile] position=%llu delta=%.3fms/%u (recurrent=%.3fms) attention=%.3fms/%u shared=%.3fms expert=%.3fms tail=%.3fms total=%.3fms\n",
+            static_cast<unsigned long long>(runtime->position),delta_ms,delta_layers,recurrent_ms,attention_ms,attention_layers,
             shared_ms,expert_ms,tail_ms,delta_ms+attention_ms+shared_ms+expert_ms+tail_ms);
     }
     *output_token=0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
