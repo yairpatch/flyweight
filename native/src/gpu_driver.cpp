@@ -128,8 +128,13 @@ struct Kernels {
     CUfunction q8_matvec_transposed = nullptr;
     CUfunction route_topk = nullptr;
     CUfunction q5_grouped_swiglu = nullptr;
+    CUfunction q4k_grouped_swiglu = nullptr;
+    CUfunction q4k_grouped_accumulate = nullptr;
+    CUfunction q5k_grouped_accumulate = nullptr;
     CUfunction q6_grouped_accumulate = nullptr;
     CUfunction q8_grouped_accumulate = nullptr;
+    CUfunction nvfp4_grouped_swiglu = nullptr;
+    CUfunction nvfp4_grouped_accumulate = nullptr;
 };
 
 Kernels g_kernels;
@@ -590,8 +595,13 @@ extern "C" int colibri_gpu_compile(
         {"q8_matvec_transposed_warp", &g_kernels.q8_matvec_transposed},
         {"route_topk", &g_kernels.route_topk},
         {"q5k_grouped_swiglu", &g_kernels.q5_grouped_swiglu},
+        {"q4k_grouped_swiglu", &g_kernels.q4k_grouped_swiglu},
+        {"q4k_grouped_accumulate", &g_kernels.q4k_grouped_accumulate},
+        {"q5k_grouped_accumulate", &g_kernels.q5k_grouped_accumulate},
         {"q6k_grouped_accumulate", &g_kernels.q6_grouped_accumulate},
         {"q8_grouped_accumulate", &g_kernels.q8_grouped_accumulate},
+        {"nvfp4_grouped_swiglu", &g_kernels.nvfp4_grouped_swiglu},
+        {"nvfp4_grouped_accumulate", &g_kernels.nvfp4_grouped_accumulate},
     };
     for (const Entry& entry : entries) {
         if (g_api.cuModuleGetFunction(entry.slot, g_module, entry.name) != 0) {
@@ -609,11 +619,21 @@ extern "C" int colibri_gpu_compile(
              "q8_swiglu_transposed_warp", "q8_lm_head_argmax_warp",
              "qwen_q8_embedding_rows", "qwen_f32_matmul_rows",
              "qwen_q8_matmul_rows", "qwen_q8_swiglu_rows",
-             "qwen_shared_scale_rows", "qwen_q8_lm_head_argmax_rows",
+              "qwen_shared_scale_rows", "qwen_q8_lm_head_argmax_rows",
+              "qwen_shared_scale_rows_bf16", "bf16_matmul_rows",
              "qwen_delta_recurrent_rows", "route_topk_rows", "rms_norm_rows",
-             "q5k_grouped_swiglu_rows", "q6k_grouped_swiglu",
+              "q5k_grouped_swiglu_rows", "q5k_grouped_accumulate_rows", "q6k_grouped_swiglu",
+              "q4k_grouped_swiglu_rows", "q4k_grouped_accumulate_rows",
+              "q4k_matvec_transposed", "q4k_lm_head_argmax_warp",
+              "q6k_lm_head_argmax_warp", "q6k_matvec_transposed",
              "q6k_grouped_swiglu_rows", "q6k_grouped_accumulate_rows",
-             "q8_grouped_accumulate_rows", "kv_attention_prefill",
+             "q8_grouped_accumulate_rows", "nvfp4_grouped_swiglu_rows",
+             "nvfp4_grouped_accumulate_rows", "nvfp4_matvec_transposed",
+             "nvfp4_swiglu_transposed", "kv_attention_prefill",
+             "qwen_bf16_embedding", "qwen_bf16_embedding_rows",
+             "qwen_f32_embedding", "qwen_f32_embedding_rows",
+             "bf16_lm_head_argmax_warp", "qwen_bf16_lm_head_argmax_rows",
+             "nvfp4_matmul_rows",
              "q8_matmul_tiled", "delta_conv_chunk",
              "qwen_delta_recurrent_chunk",
              "kv_store_f32", "kv_store_f16", "kv_store_bf16", "kv_store_q8",
@@ -993,6 +1013,50 @@ extern "C" int colibri_gpu_q8_matvec_transposed(
                   reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
+extern "C" int colibri_gpu_q4k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    if (!packed || !input || !output || input_size <= 0 || output_size <= 0)
+        return -1;
+    CUfunction function = nullptr;
+    auto it = g_functions.find("q4k_matvec_transposed");
+    if (it != g_functions.end()) function = it->second;
+    if (!function) return -1;
+    void* args[] = {&packed, &input, &output, &input_size, &output_size};
+    return launch(function, static_cast<unsigned int>(output_size), 1, 256,
+                  args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_q6k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    if (!packed || !input || !output || input_size <= 0 || output_size <= 0)
+        return -1;
+    CUfunction function = nullptr;
+    auto it = g_functions.find("q6k_matvec_transposed");
+    if (it != g_functions.end()) function = it->second;
+    if (!function) return -1;
+    void* args[] = {&packed, &input, &output, &input_size, &output_size};
+    return launch(function, static_cast<unsigned int>(output_size), 1, 256,
+                  args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_bf16_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    if (!g_kernels.bf16_matvec || !packed || !input || !output
+        || input_size <= 0 || output_size <= 0) return -1;
+    // bf16_matvec takes (rows, columns), i.e. the output/input sizes in the
+    // opposite order from the quantized transposed matvecs.
+    void* args[] = {&packed, &input, &output, &output_size, &input_size};
+    return launch(g_kernels.bf16_matvec, static_cast<unsigned int>(output_size),
+                  1, 256, args, 0,
+                  reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
 extern "C" int colibri_gpu_route_topk(
     std::uint64_t logits, std::uint64_t selected, std::uint64_t weights,
     std::int32_t experts, std::int32_t top_k, std::uint64_t stream
@@ -1044,12 +1108,53 @@ extern "C" int colibri_gpu_q6_grouped_accumulate(
 ) { return grouped_accumulate(g_kernels.q6_grouped_accumulate, down_pointers,
     activated, output, weights, input_size, output_size, experts, stream); }
 
+extern "C" int colibri_gpu_q4k_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) { return grouped_accumulate(g_kernels.q4k_grouped_accumulate, down_pointers,
+    activated, output, weights, input_size, output_size, experts, stream); }
+
+extern "C" int colibri_gpu_q5k_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) { return grouped_accumulate(g_kernels.q5k_grouped_accumulate, down_pointers,
+    activated, output, weights, input_size, output_size, experts, stream); }
+
 extern "C" int colibri_gpu_q8_grouped_accumulate(
     std::uint64_t down_pointers, std::uint64_t activated,
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t experts, std::uint64_t stream
 ) { return grouped_accumulate(g_kernels.q8_grouped_accumulate, down_pointers,
+    activated, output, weights, input_size, output_size, experts, stream); }
+
+extern "C" int colibri_gpu_nvfp4_grouped_swiglu(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t input, std::uint64_t activated,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) {
+    if (!g_kernels.nvfp4_grouped_swiglu || !gate_pointers || !up_pointers
+        || !input || !activated || input_size <= 0 || output_size <= 0
+        || experts <= 0) return -1;
+    void* args[] = {&gate_pointers, &up_pointers, &input, &activated,
+                    &input_size, &output_size, &experts};
+    return launch(g_kernels.nvfp4_grouped_swiglu,
+                  static_cast<unsigned int>(output_size),
+                  static_cast<unsigned int>(experts), 256, args, 0,
+                  reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_nvfp4_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+) { return grouped_accumulate(g_kernels.nvfp4_grouped_accumulate, down_pointers,
     activated, output, weights, input_size, output_size, experts, stream); }
 
 extern "C" int colibri_gpu_launch_named(

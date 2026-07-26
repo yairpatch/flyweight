@@ -480,7 +480,8 @@ void bf16_matvec(
     const int row = blockIdx.x;
     if (row >= rows) return;
     float partial = 0.0f;
-    const int start = row * columns;
+    // 64-bit: this also serves the LM head, where rows*columns overruns int.
+    const long long start = (long long)row * (long long)columns;
     for (int column = threadIdx.x; column < columns; column += blockDim.x) {
         const unsigned int bits = ((unsigned int)weights[start + column]) << 16;
         partial += __uint_as_float(bits) * vector[column];
@@ -1180,6 +1181,51 @@ void q8_swiglu_transposed_warp(
 }
 
 extern "C" __global__
+void bf16_lm_head_argmax_warp(
+    const unsigned short* weights,
+    const float* vector,
+    unsigned long long* winners,
+    const int input_size,
+    const int output_size
+) {
+    // Same warp-per-row / block-fold structure as q8_lm_head_argmax_warp; only
+    // the weight decode differs. bf16 lm_heads previously fell through to the
+    // Q8_0 kernel, which reads the table as 34-byte blocks and returns noise.
+    __shared__ unsigned long long warp_best[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (lane == 0) warp_best[warp] = 0ull;
+    __syncthreads();
+    if (row < output_size) {
+        float partial = 0.0f;
+        const long long start = (long long)row * (long long)input_size;
+        for (int input = lane; input < input_size; input += 32) {
+            const unsigned int bits =
+                ((unsigned int)weights[start + input]) << 16;
+            partial += __uint_as_float(bits) * vector[input];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+        if (lane == 0) {
+            const unsigned int bits = __float_as_uint(partial);
+            const unsigned int ordered = bits ^ (
+                ((int)bits < 0) ? 0xffffffffu : 0x80000000u
+            );
+            warp_best[warp] =
+                ((unsigned long long)ordered << 32)
+                | (unsigned int)(0xffffffffu - (unsigned int)row);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long best = warp_best[0];
+        for (int i = 1; i < 8; ++i) best = max(best, warp_best[i]);
+        atomicMax(winners, best);
+    }
+}
+
+extern "C" __global__
 void q8_lm_head_argmax_warp(
     const unsigned char* packed,
     const float* vector,
@@ -1391,6 +1437,280 @@ void q5k_grouped_swiglu_rows(
             (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
 }
 
+extern "C" __global__
+void q5k_grouped_accumulate(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int expert = 0; expert < experts; ++expert) {
+            const unsigned char* packed =
+                (const unsigned char*)down_ptrs[expert];
+            combined += weights[expert]
+                * q5k_value(packed, row * input_size + input)
+                * activated[expert * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
+extern "C" __global__
+void q5k_grouped_accumulate_rows(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int* counts,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (row >= output_size || token >= rows) return;
+    const int base = token * top_k;
+    const int count = counts[token];
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int rank = 0; rank < count; ++rank) {
+            const int route = base + rank;
+            const unsigned char* packed =
+                (const unsigned char*)down_ptrs[route];
+            combined += weights[route]
+                * q5k_value(packed, row * input_size + input)
+                * activated[route * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[token * output_size + row] += partial;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+__device__ __forceinline__ float q4k_value(
+    const unsigned char* packed, int absolute
+) {
+    // Q4_K: like Q5_K but with no 5th-bit (qh) array, so qs starts at +16 and
+    // the quant is a plain 4-bit nibble. Shares Q5_K's 6-bit scale/min packing.
+    const int block = absolute / 256;
+    const int within = absolute & 255;
+    const unsigned char* base = packed + block * 144;
+    const float d = __half2float(*((const __half*)(base)));
+    const float dmin = __half2float(*((const __half*)(base + 2)));
+    const unsigned char* scales = base + 4;
+    const int group = within / 64;
+    const int offset = within & 63;
+    const int sub = offset / 32;
+    const int qindex = group * 32 + (offset & 31);
+    const unsigned char low = base[16 + qindex];
+    const int quant = (offset < 32) ? (low & 15) : (low >> 4);
+    int scale, minimum;
+    q5k_scale_min(scales, group * 2 + sub, &scale, &minimum);
+    return d * (float)scale * (float)quant - dmin * (float)minimum;
+}
+
+extern "C" __global__
+void q4k_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate_packed =
+        (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += q4k_value(gate_packed, absolute) * value;
+        up += q4k_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[expert * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void q4k_grouped_swiglu_rows(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* gate_packed =
+        (const unsigned char*)gate_ptrs[route];
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += q4k_value(gate_packed, absolute) * value;
+        up += q4k_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[route * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void q4k_grouped_accumulate(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int expert = 0; expert < experts; ++expert) {
+            const unsigned char* packed =
+                (const unsigned char*)down_ptrs[expert];
+            combined += weights[expert]
+                * q4k_value(packed, row * input_size + input)
+                * activated[expert * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
+extern "C" __global__
+void q4k_grouped_accumulate_rows(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int* counts,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (row >= output_size || token >= rows) return;
+    const int base = token * top_k;
+    const int count = counts[token];
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int rank = 0; rank < count; ++rank) {
+            const int route = base + rank;
+            const unsigned char* packed =
+                (const unsigned char*)down_ptrs[route];
+            combined += weights[route]
+                * q4k_value(packed, row * input_size + input)
+                * activated[route * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[token * output_size + row] += partial;
+}
+
+extern "C" __global__
+void q4k_matvec_transposed(
+    const unsigned char* packed,
+    const float* vector,
+    float* output,
+    const int input_size,
+    const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += q4k_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void q4k_lm_head_argmax_warp(
+    const unsigned char* packed,
+    const float* vector,
+    unsigned long long* winners,
+    const int input_size,
+    const int output_size
+) {
+    __shared__ unsigned long long warp_best[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (lane == 0) warp_best[warp] = 0ull;
+    __syncthreads();
+    if (row < output_size) {
+        float partial = 0.0f;
+        for (int input = lane; input < input_size; input += 32)
+            partial += q4k_value(packed, row * input_size + input) * vector[input];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+        if (lane == 0) {
+            const unsigned int bits = __float_as_uint(partial);
+            const unsigned int ordered = bits ^ (
+                ((int)bits < 0) ? 0xffffffffu : 0x80000000u
+            );
+            warp_best[warp] =
+                ((unsigned long long)ordered << 32)
+                | (unsigned int)(0xffffffffu - (unsigned int)row);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long best = warp_best[0];
+        for (int i = 1; i < 8; ++i) best = max(best, warp_best[i]);
+        atomicMax(winners, best);
+    }
+}
+
+)COLIBRI_CUDA" R"COLIBRI_CUDA(
+
 __device__ __forceinline__ float q6k_value(
     const unsigned char* packed, int absolute
 ) {
@@ -1426,6 +1746,44 @@ void q6k_matvec_transposed(
         partial += q6k_value(packed, row * input_size + input) * vector[input];
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void q6k_lm_head_argmax_warp(
+    const unsigned char* packed,
+    const float* vector,
+    unsigned long long* winners,
+    const int input_size,
+    const int output_size
+) {
+    __shared__ unsigned long long warp_best[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (lane == 0) warp_best[warp] = 0ull;
+    __syncthreads();
+    if (row < output_size) {
+        float partial = 0.0f;
+        for (int input = lane; input < input_size; input += 32)
+            partial += q6k_value(packed, row * input_size + input) * vector[input];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+        if (lane == 0) {
+            const unsigned int bits = __float_as_uint(partial);
+            const unsigned int ordered = bits ^ (
+                ((int)bits < 0) ? 0xffffffffu : 0x80000000u
+            );
+            warp_best[warp] =
+                ((unsigned long long)ordered << 32)
+                | (unsigned int)(0xffffffffu - (unsigned int)row);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long best = warp_best[0];
+        for (int i = 1; i < 8; ++i) best = max(best, warp_best[i]);
+        atomicMax(winners, best);
+    }
 }
 
 extern "C" __global__
@@ -1648,6 +2006,254 @@ void q8_grouped_accumulate_rows(
                 packed + block * 34 + 2 + within
             ));
             combined += weights[route] * ((float)value * scale)
+                * activated[route * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[token * output_size + row] += partial;
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// ---- NVFP4 (GGML type 40): E2M1 4-bit float (1 sign + 2 exp + 1 mantissa, bias=1) -
+// 36 bytes per 64 elements: d[4] E4M3 scales then qs[32] packed nibbles, with
+// scale i governing bytes 4+8i..11+8i (16 elements). Nibbles are split-half like
+// q4_0/q4_K: qs[lane] holds element `lane` low, `lane+8` high, within the
+// sub-block. Must stay in lockstep with qwen_nvfp4_value() in v2_runtime.cpp.
+__device__ __forceinline__ float ue4m3_to_float(unsigned char bits) {
+    // OCP FN E4M3: e==0xF is finite (max 448 at 0x7E); only 0x7F/0xFF are NaN.
+    // Real checkpoints do use e==0xF, so decoding it as infinity yields NaN rows.
+    const int s = (bits >> 7) & 1;
+    const int e = (bits >> 3) & 0xF;
+    const int m = bits & 7;
+    float val;
+    if (e == 0xF && m == 7) val = __int_as_float(0x7fffffff);
+    else if (e == 0) val = ldexpf(m / 8.0f, -6);
+    else val = ldexpf(1.0f + m / 8.0f, e - 7);
+    return s ? -val : val;
+}
+__device__ __forceinline__ float nvfp4_value(
+    const unsigned char* packed, int absolute
+) {
+    const int block = absolute >> 6;
+    const int offset = absolute & 63;
+    const int sub = offset >> 4;
+    const int within = offset & 15;
+    const unsigned char* base = packed + block * 36;
+    const float scale = ue4m3_to_float(base[sub]);
+    const unsigned char byte = base[4 + sub * 8 + (within & 7)];
+    const int val = (within < 8) ? (byte & 0x0F) : (byte >> 4);
+    // LUT: S(1) E(2) M(1) -> float. Bias=1.
+    // 0x0=0.0  0x1=0.5  0x2=1.0  0x3=1.5
+    // 0x4=2.0  0x5=3.0  0x6=4.0  0x7=6.0
+    const float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    return scale * lut[val];
+}
+
+extern "C" __global__
+void nvfp4_matvec_transposed(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size, const float scale
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += nvfp4_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    // `scale` is the tensor's weight_scale_2. It cannot be folded into the E4M3
+    // block scales: it runs ~3e-5, far under E4M3's smallest subnormal (2^-9),
+    // so folding would flush most blocks to zero. Apply it in f32 instead.
+    if (threadIdx.x == 0) output[row] = partial * scale;
+}
+
+extern "C" __global__
+void nvfp4_swiglu_transposed(
+    const unsigned char* gate_packed,
+    const unsigned char* up_packed,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const float gate_scale,
+    const float up_scale
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += nvfp4_value(gate_packed, absolute) * value;
+        up += nvfp4_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    // The scales must be applied before SiLU: the gate path is non-linear, so
+    // they cannot be deferred to the down projection the way a plain factor can.
+    gate *= gate_scale;
+    up *= up_scale;
+    if (threadIdx.x == 0)
+        activated[row] = (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void nvfp4_matmul_rows(
+    const unsigned char* packed,
+    const float* input,
+    float* output,
+    const int input_size,
+    const int output_size,
+    const int rows,
+    const float scale
+) {
+    const int output_row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (output_row >= output_size || token >= rows) return;
+    const float* vector = input + (long long)token * (long long)input_size;
+    float partial = 0.0f;
+    for (int column = threadIdx.x; column < input_size; column += blockDim.x)
+        partial += nvfp4_value(packed, output_row * input_size + column)
+            * vector[column];
+    partial = block_reduce_sum(partial);
+    // weight_scale_2 in f32, same reason as nvfp4_matvec_transposed.
+    if (threadIdx.x == 0)
+        output[(long long)token * (long long)output_size + output_row] =
+            partial * scale;
+}
+
+extern "C" __global__
+void nvfp4_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts,
+    const float* gate_scales,
+    const float* up_scales
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate_packed = (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[expert];
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += nvfp4_value(gate_packed, absolute) * value;
+        up += nvfp4_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    // Per-expert weight_scale_2, indexed in lockstep with the pointer tables.
+    // Applied here in f32 because E4M3 cannot represent it (see nvfp4_value).
+    if (gate_scales) gate *= gate_scales[expert];
+    if (up_scales) up *= up_scales[expert];
+    if (threadIdx.x == 0)
+        activated[expert * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void nvfp4_grouped_swiglu_rows(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows,
+    const float* gate_scales,
+    const float* up_scales
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* gate_packed = (const unsigned char*)gate_ptrs[route];
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        const int absolute = row * input_size + input;
+        gate += nvfp4_value(gate_packed, absolute) * value;
+        up += nvfp4_value(up_packed, absolute) * value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    // Per-route weight_scale_2 (see nvfp4_grouped_swiglu).
+    if (gate_scales) gate *= gate_scales[route];
+    if (up_scales) up *= up_scales[route];
+    if (threadIdx.x == 0)
+        activated[route * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void nvfp4_grouped_accumulate(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int expert = 0; expert < experts; ++expert) {
+            const unsigned char* packed = (const unsigned char*)down_ptrs[expert];
+            combined += weights[expert]
+                * nvfp4_value(packed, row * input_size + input)
+                * activated[expert * input_size + input];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] += partial;
+}
+
+extern "C" __global__
+void nvfp4_grouped_accumulate_rows(
+    const unsigned long long* down_ptrs,
+    const float* activated,
+    float* output,
+    const float* weights,
+    const int* counts,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (row >= output_size || token >= rows) return;
+    const int base = token * top_k;
+    const int count = counts[token];
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        float combined = 0.0f;
+        for (int rank = 0; rank < count; ++rank) {
+            const int route = base + rank;
+            const unsigned char* packed = (const unsigned char*)down_ptrs[route];
+            combined += weights[route]
+                * nvfp4_value(packed, row * input_size + input)
                 * activated[route * input_size + input];
         }
         partial += combined;

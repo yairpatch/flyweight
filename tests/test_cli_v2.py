@@ -6,8 +6,8 @@ from unittest.mock import patch
 from colibri_next.cli import (
     _benchmark_native_prefill,
     _drop_file_cache,
+    _parser,
     _steady_state_counters,
-    _validate_mtp_cache_types,
 )
 
 
@@ -54,11 +54,17 @@ class NativeV2BenchmarkTests(unittest.TestCase):
         advise.assert_called_once_with(17, 0, 0, os.POSIX_FADV_DONTNEED)
         close_file.assert_called_once_with(17)
 
-    def test_mtp_requires_f32_kv(self) -> None:
-        _validate_mtp_cache_types(0, "f16", "f16")
-        _validate_mtp_cache_types(1, "f32", "f32")
-        with self.assertRaisesRegex(SystemExit, "currently requires"):
-            _validate_mtp_cache_types(1, "f16", "f32")
+    def test_mtp_accepts_quantized_kv(self) -> None:
+        """The MTP path stores and reads its KV at the configured precision."""
+        for command in ("benchmark-v2", "probe-native-v2", "serve-v2"):
+            with self.subTest(command=command):
+                args = _parser().parse_args(
+                    [command, "model.gguf", "--mtp-drafts", "1",
+                     "--cache-type-k", "q8_0", "--cache-type-v", "f16"]
+                )
+                self.assertEqual(args.mtp_drafts, 1)
+                self.assertEqual(args.cache_type_k, "q8_0")
+                self.assertEqual(args.cache_type_v, "f16")
 
 
 if __name__ == "__main__":

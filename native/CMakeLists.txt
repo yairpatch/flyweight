@@ -3,6 +3,15 @@ project(colibri_native LANGUAGES CXX)
 
 include(CTest)
 
+if(MSVC)
+    # The whole public ABI is extern "C", and /EHsc (CMake's default) tells MSVC
+    # those functions never throw -- so it drops the unwind state around calls
+    # into them and a std::runtime_error unwinds straight past the guarded()
+    # try/catch and out of the DLL as SEH 0xE06D7363, losing the message. /EHs
+    # keeps the same C++ semantics but assumes extern "C" can throw.
+    string(REPLACE "/EHsc" "/EHs" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
 add_executable(colibri_v2_provider_contract tests/provider_contract.cpp)
 target_compile_features(colibri_v2_provider_contract PRIVATE cxx_std_20)
 target_include_directories(colibri_v2_provider_contract PRIVATE include)
@@ -77,7 +86,7 @@ if(OpenMP_CXX_FOUND)
 endif()
 
 if(MSVC)
-    target_compile_options(colibri_native PRIVATE /O2 /EHsc /permissive-)
+    target_compile_options(colibri_native PRIVATE /O2 /EHs /permissive-)
     set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/q4_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/qwen_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")

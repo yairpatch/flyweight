@@ -86,16 +86,6 @@ def _steady_state_counters(start, end):
     }
 
 
-def _validate_mtp_cache_types(
-    mtp_drafts: int, cache_type_k: str, cache_type_v: str
-) -> None:
-    if mtp_drafts and (cache_type_k != "f32" or cache_type_v != "f32"):
-        raise SystemExit(
-            "--mtp-drafts currently requires --cache-type-k f32 "
-            "and --cache-type-v f32"
-        )
-
-
 def _benchmark_native_prefill(runtime, prompt_tokens: list[int]) -> tuple[int, float]:
     """Run the production batched prefill path and return its first token."""
     first_tokens: list[int] = []
@@ -348,7 +338,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     benchmark_v2.add_argument(
         "--cpu-prefetch-auto", action="store_true",
-        help="size expert warmup from RAM and skip it below 10%/8 MiB cold-page pressure",
+        # argparse runs help through %-expansion, so a literal percent must be doubled.
+        help="size expert warmup from RAM and skip it below 10%%/8 MiB cold-page pressure",
     )
     benchmark_v2.add_argument(
         "--next-layer-prefetch", type=int, default=0,
@@ -399,6 +390,14 @@ def _parser() -> argparse.ArgumentParser:
         help="expert backend (default: CPU for Gemma 4, GPU otherwise)",
     )
     native_qwen_v2.add_argument("--mtp-drafts", type=int, default=0)
+    native_qwen_v2.add_argument(
+        "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0"),
+        default="f16",
+    )
+    native_qwen_v2.add_argument(
+        "--cache-type-v", choices=("f32", "f16", "bf16", "q8_0"),
+        default="f16",
+    )
     stack_qwen_v2.add_argument(
         "--profile", action="store_true",
         help="synchronize token boundaries and report prompt/decode timings",
@@ -611,9 +610,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         if not 0.0 <= args.expert_top_p <= 1.0:
             raise SystemExit("benchmark-v2 requires --expert-top-p within [0, 1]")
-        _validate_mtp_cache_types(
-            args.mtp_drafts, args.cache_type_k, args.cache_type_v
-        )
         if args.runtime == "native":
             if args.cold_cache:
                 _drop_file_cache(args.model)
@@ -947,6 +943,8 @@ def main(argv: list[str] | None = None) -> int:
                 gpu_cache_bytes=args.gpu_cache_mib * 1024**2,
                 moe_device=moe_device,
                 mtp_drafts=args.mtp_drafts,
+                cache_type_k=args.cache_type_k,
+                cache_type_v=args.cache_type_v,
             ) as runtime:
                 prepare_started = time.perf_counter()
                 runtime.prepare()
@@ -1246,9 +1244,6 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--prefill-cache-seed must be within [0, 256]")
         if not 0 <= args.next_layer_prefetch <= 64:
             raise SystemExit("--next-layer-prefetch must be within [0, 64]")
-        _validate_mtp_cache_types(
-            args.mtp_drafts, args.cache_type_k, args.cache_type_v
-        )
         print(
             f"Loading native v2 GGUF from {args.model}...",
             file=sys.stderr,

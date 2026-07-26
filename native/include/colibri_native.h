@@ -191,6 +191,18 @@ COLIBRI_API int colibri_gpu_q8_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 );
+COLIBRI_API int colibri_gpu_q4k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q6k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_bf16_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
 COLIBRI_API int colibri_gpu_route_topk(
     std::uint64_t logits, std::uint64_t selected, std::uint64_t weights,
     std::int32_t experts, std::int32_t top_k, std::uint64_t stream
@@ -207,7 +219,31 @@ COLIBRI_API int colibri_gpu_q6_grouped_accumulate(
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t experts, std::uint64_t stream
 );
+COLIBRI_API int colibri_gpu_q4k_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q5k_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+);
 COLIBRI_API int colibri_gpu_q8_grouped_accumulate(
+    std::uint64_t down_pointers, std::uint64_t activated,
+    std::uint64_t output, std::uint64_t weights,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_nvfp4_grouped_swiglu(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t input, std::uint64_t activated,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t experts, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_nvfp4_grouped_accumulate(
     std::uint64_t down_pointers, std::uint64_t activated,
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,

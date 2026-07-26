@@ -38,6 +38,66 @@ void qwen_q8_embedding_rows(
     }
 }
 
+// bf16 embedding tables are stored as plain rows, not Q8_0 blocks. Reading them
+// with qwen_q8_embedding reinterprets pairs of bf16 values as a block scale plus
+// int8 codes, which yields ~100x-magnitude noise that swamps the whole residual
+// stream, so the table type must pick the matching kernel.
+extern "C" __global__
+void qwen_bf16_embedding(
+    const unsigned char* packed, float* output,
+    const int token, const int hidden
+) {
+    const unsigned short* row =
+        (const unsigned short*)packed + (long long)token * (long long)hidden;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < hidden; index += blockDim.x * gridDim.x) {
+        output[index] = __uint_as_float(((unsigned int)row[index]) << 16);
+    }
+}
+
+extern "C" __global__
+void qwen_bf16_embedding_rows(
+    const unsigned char* packed, const unsigned int* tokens, float* output,
+    const int rows, const int hidden
+) {
+    const int row = blockIdx.y;
+    if (row >= rows) return;
+    const unsigned short* source =
+        (const unsigned short*)packed + (long long)tokens[row] * (long long)hidden;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < hidden; index += blockDim.x * gridDim.x) {
+        output[row * hidden + index] =
+            __uint_as_float(((unsigned int)source[index]) << 16);
+    }
+}
+
+extern "C" __global__
+void qwen_f32_embedding(
+    const unsigned char* packed, float* output,
+    const int token, const int hidden
+) {
+    const float* row = (const float*)packed + (long long)token * (long long)hidden;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < hidden; index += blockDim.x * gridDim.x) {
+        output[index] = row[index];
+    }
+}
+
+extern "C" __global__
+void qwen_f32_embedding_rows(
+    const unsigned char* packed, const unsigned int* tokens, float* output,
+    const int rows, const int hidden
+) {
+    const int row = blockIdx.y;
+    if (row >= rows) return;
+    const float* source =
+        (const float*)packed + (long long)tokens[row] * (long long)hidden;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < hidden; index += blockDim.x * gridDim.x) {
+        output[row * hidden + index] = source[index];
+    }
+}
+
 extern "C" __global__
 void qwen_f32_matvec(
     const float* matrix, const float* input, float* output,
@@ -64,6 +124,25 @@ void qwen_f32_matmul_rows(
     const float* vector = input + token * input_size;
     for (int column = threadIdx.x; column < input_size; column += blockDim.x)
         partial += matrix[output_row * input_size + column] * vector[column];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[token * output_size + output_row] = partial;
+}
+
+extern "C" __global__
+void bf16_matmul_rows(
+    const unsigned short* matrix, const float* input, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    const int output_row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (output_row >= output_size || token >= rows) return;
+    float partial = 0.0f;
+    const float* vector = input + token * input_size;
+    const int weight_start = output_row * input_size;
+    for (int column = threadIdx.x; column < input_size; column += blockDim.x) {
+        const unsigned int bits = ((unsigned int)matrix[weight_start + column]) << 16;
+        partial += __uint_as_float(bits) * vector[column];
+    }
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[token * output_size + output_row] = partial;
 }
@@ -152,6 +231,28 @@ void qwen_shared_scale_rows(
 }
 
 extern "C" __global__
+void qwen_shared_scale_rows_bf16(
+    const float* input, const unsigned short* gate, float* shared,
+    const int rows, const int elements
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* vector = input + row * elements;
+    float* output = shared + row * elements;
+    float partial = 0.0f;
+    for (int index = threadIdx.x; index < elements; index += blockDim.x) {
+        const unsigned int bits = ((unsigned int)gate[index]) << 16;
+        partial += vector[index] * __uint_as_float(bits);
+    }
+    partial = block_reduce_sum(partial);
+    __shared__ float scale;
+    if (threadIdx.x == 0) scale = 1.0f / (1.0f + expf(-partial));
+    __syncthreads();
+    for (int index = threadIdx.x; index < elements; index += blockDim.x)
+        output[index] *= scale;
+}
+
+extern "C" __global__
 void qwen_q8_lm_head_argmax_rows(
     const unsigned char* packed, const float* vectors,
     unsigned long long* winners, const int input_size,
@@ -171,6 +272,39 @@ void qwen_q8_lm_head_argmax_rows(
         const float scale = __half2float(*((const __half*)(packed + block * 34)));
         const signed char value = *((const signed char*)(packed + block * 34 + 2 + within));
         partial += (float)value * scale * vector[column];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) {
+        const unsigned int bits = __float_as_uint(partial);
+        const unsigned int ordered = bits ^ (((int)bits < 0) ? 0xffffffffu : 0x80000000u);
+        const unsigned long long candidate =
+            ((unsigned long long)ordered << 32) | (unsigned int)(0xffffffffu - output_row);
+        atomicMax(winners + token, candidate);
+    }
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// bf16 output tables, as shipped by the NVFP4 Qwen3.6 checkpoints. Same warp
+// layout as the Q8_0 variant above, only the weight decode differs.
+extern "C" __global__
+void qwen_bf16_lm_head_argmax_rows(
+    const unsigned short* weights, const float* vectors,
+    unsigned long long* winners, const int input_size,
+    const int output_size, const int rows
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int output_row = blockIdx.x * 8 + warp;
+    const int token = blockIdx.y;
+    if (output_row >= output_size || token >= rows) return;
+    const float* vector = vectors + (long long)token * (long long)input_size;
+    const long long start = (long long)output_row * (long long)input_size;
+    float partial = 0.0f;
+    for (int column = lane; column < input_size; column += 32) {
+        const unsigned int bits = ((unsigned int)weights[start + column]) << 16;
+        partial += __uint_as_float(bits) * vector[column];
     }
     for (int offset = 16; offset > 0; offset >>= 1)
         partial += __shfl_down_sync(0xffffffff, partial, offset);
