@@ -6,6 +6,8 @@
 #include <cstring>
 #include <immintrin.h>
 
+#include "qwen_kquant.h"
+
 namespace {
 
 float half_value(const std::uint8_t* pointer) {
@@ -35,11 +37,404 @@ int dot_i8_8(__m128i left, __m128i right) {
 int dot_i8_16(const std::int8_t* left, const std::int8_t* right) {
     const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(left));
     const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(right));
-    return dot_i8_8(a, b) + dot_i8_8(_mm_srli_si128(a, 8), _mm_srli_si128(b, 8));
+    const __m256i products = _mm256_mullo_epi16(
+        _mm256_cvtepi8_epi16(a), _mm256_cvtepi8_epi16(b));
+    const __m256i pairs = _mm256_madd_epi16(products, _mm256_set1_epi16(1));
+    __m128i sum = _mm_add_epi32(
+        _mm256_castsi256_si128(pairs), _mm256_extracti128_si256(pairs, 1));
+    sum = _mm_hadd_epi32(sum, sum);
+    sum = _mm_hadd_epi32(sum, sum);
+    return _mm_cvtsi128_si32(sum);
+}
+
+__m128i quantize_i8_16(const float* values, __m256 inverse) {
+    const __m256i minimum = _mm256_set1_epi32(-127);
+    const __m256i maximum = _mm256_set1_epi32(127);
+    __m256i low = _mm256_cvtps_epi32(
+        _mm256_mul_ps(_mm256_loadu_ps(values), inverse));
+    __m256i high = _mm256_cvtps_epi32(
+        _mm256_mul_ps(_mm256_loadu_ps(values + 8), inverse));
+    low = _mm256_min_epi32(maximum, _mm256_max_epi32(minimum, low));
+    high = _mm256_min_epi32(maximum, _mm256_max_epi32(minimum, high));
+
+    // packs_epi32 works independently in each 128-bit lane. Reorder its four
+    // 64-bit groups so the final pack stores values 0..15 contiguously.
+    const __m256i packed16 = _mm256_permute4x64_epi64(
+        _mm256_packs_epi32(low, high), 0xd8);
+    return _mm_packs_epi16(
+        _mm256_castsi256_si128(packed16),
+        _mm256_extracti128_si256(packed16, 1));
+}
+
+std::int16_t sum_i8_16(__m128i values) {
+    const __m256i widened = _mm256_cvtepi8_epi16(values);
+    const __m256i pairs = _mm256_madd_epi16(
+        widened, _mm256_set1_epi16(1));
+    __m128i sum = _mm_add_epi32(
+        _mm256_castsi256_si128(pairs), _mm256_extracti128_si256(pairs, 1));
+    sum = _mm_hadd_epi32(sum, sum);
+    sum = _mm_hadd_epi32(sum, sum);
+    return static_cast<std::int16_t>(_mm_cvtsi128_si32(sum));
 }
 
 __m256 bytes_to_float(__m128i values) {
     return _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(values));
+}
+
+float ue4m3_value(std::uint8_t bits) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x80u) << 24;
+    const std::uint32_t exponent = (bits >> 3) & 0x0fu;
+    const std::uint32_t mantissa = bits & 7u;
+    if (exponent == 0) {
+        const float value = static_cast<float>(mantissa) * (1.0f / 512.0f);
+        return (bits & 0x80u) ? -value : value;
+    }
+    std::uint32_t widened = sign | ((exponent + 120u) << 23)
+        | (mantissa << 20);
+    if (exponent == 15 && mantissa == 7) widened = sign | 0x7fc00000u;
+    float value;
+    std::memcpy(&value, &widened, sizeof(value));
+    return value;
+}
+
+__m128i nvfp4_codes(const std::uint8_t* packed) {
+    // Signed values scaled by two:
+    // {0,.5,1,1.5,2,3,4,6} -> {0,1,2,3,4,6,8,12}.
+    const __m128i lut = _mm_setr_epi8(
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12
+    );
+    const __m128i bytes = _mm_loadl_epi64(
+        reinterpret_cast<const __m128i*>(packed));
+    const __m128i low = _mm_shuffle_epi8(
+        lut, _mm_and_si128(bytes, _mm_set1_epi8(15)));
+    const __m128i high = _mm_shuffle_epi8(
+        lut, _mm_and_si128(_mm_srli_epi16(bytes, 4), _mm_set1_epi8(15)));
+    return _mm_unpacklo_epi64(low, high);
+}
+
+float nvfp4_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 64; ++block) {
+        const auto* base = row_data + block * 36;
+        for (int sub = 0; sub < 4; ++sub) {
+            const __m128i codes = nvfp4_codes(base + 4 + sub * 8);
+            const __m256 factor = _mm256_set1_ps(
+                ue4m3_value(base[sub]) * 0.5f);
+            const int offset = block * 64 + sub * 16;
+            const __m256 low = _mm256_cvtepi32_ps(
+                _mm256_cvtepi8_epi32(codes));
+            const __m256 high = _mm256_cvtepi32_ps(
+                _mm256_cvtepi8_epi32(_mm_srli_si128(codes, 8)));
+            sum0 = _mm256_fmadd_ps(
+                _mm256_mul_ps(low, factor),
+                _mm256_loadu_ps(input + offset), sum0);
+            sum1 = _mm256_fmadd_ps(
+                _mm256_mul_ps(high, factor),
+                _mm256_loadu_ps(input + offset + 8), sum1);
+        }
+    }
+    return horizontal_sum(_mm256_add_ps(sum0, sum1));
+}
+
+void nvfp4_dot_quad(
+    const std::uint8_t* row_data, const float* const inputs[4],
+    int elements, float outputs[4]
+) {
+    __m256 sums[4][2];
+    for (auto& pair : sums) for (auto& sum : pair) sum = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 64; ++block) {
+        const auto* base = row_data + block * 36;
+        for (int sub = 0; sub < 4; ++sub) {
+            const __m128i codes = nvfp4_codes(base + 4 + sub * 8);
+            const __m256 factor = _mm256_set1_ps(
+                ue4m3_value(base[sub]) * 0.5f);
+            const __m256 low = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(codes)), factor);
+            const __m256 high = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(codes, 8))),
+                factor);
+            const int offset = block * 64 + sub * 16;
+            for (int token = 0; token < 4; ++token) {
+                sums[token][0] = _mm256_fmadd_ps(
+                    low, _mm256_loadu_ps(inputs[token] + offset),
+                    sums[token][0]);
+                sums[token][1] = _mm256_fmadd_ps(
+                    high, _mm256_loadu_ps(inputs[token] + offset + 8),
+                    sums[token][1]);
+            }
+        }
+    }
+    for (int token = 0; token < 4; ++token)
+        outputs[token] = horizontal_sum(
+            _mm256_add_ps(sums[token][0], sums[token][1]));
+}
+
+void nvfp4_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 64; ++block) {
+        const auto* base = row_data + block * 36;
+        for (int sub = 0; sub < 4; ++sub) {
+            const __m128i codes = nvfp4_codes(base + 4 + sub * 8);
+            const __m256 factor = _mm256_set1_ps(
+                ue4m3_value(base[sub]) * 0.5f);
+            const int offset = block * 64 + sub * 16;
+            _mm256_storeu_ps(
+                output + offset,
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(codes)), factor));
+            _mm256_storeu_ps(
+                output + offset + 8,
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                        _mm_srli_si128(codes, 8))), factor));
+        }
+    }
+}
+
+// Q2_K and Q3_K decode 16-element groups; AVX2 covers each as two 8-wide
+// halves. One quant load per (half, sub) feeds all four bit-offset groups.
+float q2_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+    const __m128i two_bit_mask = _mm_set1_epi8(3);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kQ2KBlockBytes;
+        const float d = half_value(base + 80), dmin = half_value(base + 82);
+        const auto* quants = base + 16;
+        const auto* vector = input + block * 256;
+        for (int half = 0; half < 2; ++half) {
+            for (int sub = 0; sub < 2; ++sub) {
+                const __m128i packed = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(quants + half * 32 + sub * 16));
+                for (int group = 0; group < 4; ++group) {
+                    const auto scale_byte = base[half * 8 + group * 2 + sub];
+                    const __m256 ds = _mm256_set1_ps(d * (scale_byte & 15));
+                    const __m256 dm = _mm256_set1_ps(dmin * (scale_byte >> 4));
+                    const __m128i q = _mm_and_si128(
+                        _mm_srli_epi16(packed, 2 * group), two_bit_mask);
+                    const float* values = vector + half * 128 + group * 32 + sub * 16;
+                    sum0 = _mm256_fmadd_ps(
+                        _mm256_sub_ps(_mm256_mul_ps(bytes_to_float(q), ds), dm),
+                        _mm256_loadu_ps(values), sum0);
+                    sum1 = _mm256_fmadd_ps(
+                        _mm256_sub_ps(
+                            _mm256_mul_ps(bytes_to_float(_mm_srli_si128(q, 8)), ds), dm),
+                        _mm256_loadu_ps(values + 8), sum1);
+                }
+            }
+        }
+    }
+    return horizontal_sum(_mm256_add_ps(sum0, sum1));
+}
+
+float q3_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+    const __m128i two_bit_mask = _mm_set1_epi8(3);
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i four = _mm_set1_epi8(4);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kQ3KBlockBytes;
+        const float d = half_value(base + 108);
+        const auto* quants = base + 32;
+        const auto* scales = base + 96;
+        const auto* vector = input + block * 256;
+        for (int half = 0; half < 2; ++half) {
+            for (int sub = 0; sub < 2; ++sub) {
+                const __m128i packed = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(quants + half * 32 + sub * 16));
+                const __m128i mask_bytes = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(base + sub * 16));
+                for (int group = 0; group < 4; ++group) {
+                    const __m256 ds = _mm256_set1_ps(
+                        d * (qwen_q3k_scale(scales, half * 8 + group * 2 + sub) - 32));
+                    const __m128i low = _mm_and_si128(
+                        _mm_srli_epi16(packed, 2 * group), two_bit_mask);
+                    // A set mask bit means "do not subtract 4", so comparing
+                    // against zero selects the lanes that still owe the offset.
+                    const __m128i bit =
+                        _mm_set1_epi8(static_cast<char>(1 << (half * 4 + group)));
+                    const __m128i owes =
+                        _mm_cmpeq_epi8(_mm_and_si128(mask_bytes, bit), zero);
+                    const __m128i offset = _mm_and_si128(owes, four);
+                    const float* values = vector + half * 128 + group * 32 + sub * 16;
+                    sum0 = _mm256_fmadd_ps(
+                        _mm256_mul_ps(
+                            _mm256_sub_ps(bytes_to_float(low), bytes_to_float(offset)), ds),
+                        _mm256_loadu_ps(values), sum0);
+                    sum1 = _mm256_fmadd_ps(
+                        _mm256_mul_ps(
+                            _mm256_sub_ps(bytes_to_float(_mm_srli_si128(low, 8)),
+                                          bytes_to_float(_mm_srli_si128(offset, 8))), ds),
+                        _mm256_loadu_ps(values + 8), sum1);
+                }
+            }
+        }
+    }
+    return horizontal_sum(_mm256_add_ps(sum0, sum1));
+}
+
+void q2_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    const __m128i two_bit_mask = _mm_set1_epi8(3);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kQ2KBlockBytes;
+        const float d = half_value(base + 80), dmin = half_value(base + 82);
+        const auto* quants = base + 16;
+        float* out = output + block * 256;
+        for (int half = 0; half < 2; ++half) {
+            for (int sub = 0; sub < 2; ++sub) {
+                const __m128i packed = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(quants + half * 32 + sub * 16));
+                for (int group = 0; group < 4; ++group) {
+                    const auto scale_byte = base[half * 8 + group * 2 + sub];
+                    const __m256 ds = _mm256_set1_ps(d * (scale_byte & 15));
+                    const __m256 dm = _mm256_set1_ps(dmin * (scale_byte >> 4));
+                    const __m128i q = _mm_and_si128(
+                        _mm_srli_epi16(packed, 2 * group), two_bit_mask);
+                    float* slot = out + half * 128 + group * 32 + sub * 16;
+                    _mm256_storeu_ps(slot,
+                        _mm256_sub_ps(_mm256_mul_ps(bytes_to_float(q), ds), dm));
+                    _mm256_storeu_ps(slot + 8,
+                        _mm256_sub_ps(
+                            _mm256_mul_ps(bytes_to_float(_mm_srli_si128(q, 8)), ds), dm));
+                }
+            }
+        }
+    }
+}
+
+void q3_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    const __m128i two_bit_mask = _mm_set1_epi8(3);
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i four = _mm_set1_epi8(4);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kQ3KBlockBytes;
+        const float d = half_value(base + 108);
+        const auto* quants = base + 32;
+        const auto* scales = base + 96;
+        float* out = output + block * 256;
+        for (int half = 0; half < 2; ++half) {
+            for (int sub = 0; sub < 2; ++sub) {
+                const __m128i packed = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(quants + half * 32 + sub * 16));
+                const __m128i mask_bytes = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(base + sub * 16));
+                for (int group = 0; group < 4; ++group) {
+                    const __m256 ds = _mm256_set1_ps(
+                        d * (qwen_q3k_scale(scales, half * 8 + group * 2 + sub) - 32));
+                    const __m128i low = _mm_and_si128(
+                        _mm_srli_epi16(packed, 2 * group), two_bit_mask);
+                    const __m128i bit =
+                        _mm_set1_epi8(static_cast<char>(1 << (half * 4 + group)));
+                    const __m128i owes =
+                        _mm_cmpeq_epi8(_mm_and_si128(mask_bytes, bit), zero);
+                    const __m128i offset = _mm_and_si128(owes, four);
+                    float* slot = out + half * 128 + group * 32 + sub * 16;
+                    _mm256_storeu_ps(slot, _mm256_mul_ps(
+                        _mm256_sub_ps(bytes_to_float(low), bytes_to_float(offset)), ds));
+                    _mm256_storeu_ps(slot + 8, _mm256_mul_ps(
+                        _mm256_sub_ps(bytes_to_float(_mm_srli_si128(low, 8)),
+                                      bytes_to_float(_mm_srli_si128(offset, 8))), ds));
+                }
+            }
+        }
+    }
+}
+
+float q4_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * 144;
+        const float d = half_value(base), dmin = half_value(base + 2);
+        const auto* scales = base + 4;
+        const auto* quants = base + 16;
+        const auto* vector = input + block * 256;
+        for (int group = 0; group < 4; ++group) for (int sub = 0; sub < 2; ++sub) {
+            const int index = group * 2 + sub;
+            int scale, minimum;
+            if (index < 4) {
+                scale = scales[index] & 63;
+                minimum = scales[index + 4] & 63;
+            } else {
+                scale = (scales[index + 4] & 15) | ((scales[index - 4] >> 6) << 4);
+                minimum = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+            }
+            const __m256 ds = _mm256_set1_ps(d * scale);
+            const __m256 dm = _mm256_set1_ps(dmin * minimum);
+            const int offset = block * 256 + group * 64 + sub * 32;
+            for (int lanes = 0; lanes < 32; lanes += 8) {
+                __m128i q = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(
+                    quants + group * 32 + lanes));
+                q = sub == 0 ? _mm_and_si128(q, nibble_mask)
+                             : _mm_and_si128(_mm_srli_epi16(q, 4), nibble_mask);
+                const __m256 weights = _mm256_sub_ps(
+                    _mm256_mul_ps(bytes_to_float(q), ds), dm);
+                const __m256 values = _mm256_loadu_ps(input + offset + lanes);
+                if ((lanes & 8) == 0) sum0 = _mm256_fmadd_ps(weights, values, sum0);
+                else sum1 = _mm256_fmadd_ps(weights, values, sum1);
+            }
+        }
+    }
+    return horizontal_sum(_mm256_add_ps(sum0, sum1));
+}
+
+template<int Count>
+void q4_dot_rows(
+    const std::uint8_t* row_data, std::uint64_t row_bytes,
+    const float* input, int elements, float* outputs
+) {
+    __m256 sums[Count][2];
+    for (auto& pair : sums) for (auto& sum : pair) sum = _mm256_setzero_ps();
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    for (int block = 0; block < elements / 256; ++block) {
+        const std::uint8_t* bases[Count];
+        const std::uint8_t* scales[Count];
+        const std::uint8_t* quants[Count];
+        float d[Count], dmin[Count];
+        for (int row = 0; row < Count; ++row) {
+            bases[row] = row_data + static_cast<std::uint64_t>(row) * row_bytes
+                + static_cast<std::uint64_t>(block) * 144;
+            d[row] = half_value(bases[row]);
+            dmin[row] = half_value(bases[row] + 2);
+            scales[row] = bases[row] + 4;
+            quants[row] = bases[row] + 16;
+        }
+        for (int group = 0; group < 4; ++group) for (int sub = 0; sub < 2; ++sub) {
+            const int index = group * 2 + sub;
+            __m256 ds[Count], dm[Count];
+            for (int row = 0; row < Count; ++row) {
+                int scale, minimum;
+                if (index < 4) {
+                    scale = scales[row][index] & 63;
+                    minimum = scales[row][index + 4] & 63;
+                } else {
+                    scale = (scales[row][index + 4] & 15)
+                        | ((scales[row][index - 4] >> 6) << 4);
+                    minimum = (scales[row][index + 4] >> 4)
+                        | ((scales[row][index] >> 6) << 4);
+                }
+                ds[row] = _mm256_set1_ps(d[row] * scale);
+                dm[row] = _mm256_set1_ps(dmin[row] * minimum);
+            }
+            const int offset = block * 256 + group * 64 + sub * 32;
+            for (int lanes = 0; lanes < 32; lanes += 8) {
+                const __m256 values = _mm256_loadu_ps(input + offset + lanes);
+                const int accumulator = (lanes & 8) / 8;
+                for (int row = 0; row < Count; ++row) {
+                    __m128i q = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(
+                        quants[row] + group * 32 + lanes));
+                    q = sub == 0 ? _mm_and_si128(q, nibble_mask)
+                                 : _mm_and_si128(_mm_srli_epi16(q, 4), nibble_mask);
+                    const __m256 weights = _mm256_sub_ps(
+                        _mm256_mul_ps(bytes_to_float(q), ds[row]), dm[row]);
+                    sums[row][accumulator] = _mm256_fmadd_ps(
+                        weights, values, sums[row][accumulator]);
+                }
+            }
+        }
+    }
+    for (int row = 0; row < Count; ++row)
+        outputs[row] = horizontal_sum(_mm256_add_ps(sums[row][0], sums[row][1]));
 }
 
 float q5_dot(const std::uint8_t* row_data, const float* input, int elements) {
@@ -144,6 +539,16 @@ float q8_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return horizontal_sum(_mm256_add_ps(sum0, sum1));
 }
 
+void q4_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
+    __m256 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm256_setzero_ps();const __m128i nibble_mask=_mm_set1_epi8(15);
+    for(int block=0;block<elements/256;++block){const auto*base=row_data+block*144;const float d=half_value(base),dmin=half_value(base+2);const auto*scales=base+4;const auto*quants=base+16;
+        for(int group=0;group<4;++group)for(int sub=0;sub<2;++sub){const int index=group*2+sub;int scale,minimum;if(index<4){scale=scales[index]&63;minimum=scales[index+4]&63;}else{scale=(scales[index+4]&15)|((scales[index-4]>>6)<<4);minimum=(scales[index+4]>>4)|((scales[index]>>6)<<4);}const __m256 ds=_mm256_set1_ps(d*scale),dm=_mm256_set1_ps(dmin*minimum);const int offset=block*256+group*64+sub*32;
+            for(int lanes=0;lanes<32;lanes+=8){__m128i q=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(quants+group*32+lanes));q=sub==0?_mm_and_si128(q,nibble_mask):_mm_and_si128(_mm_srli_epi16(q,4),nibble_mask);const __m256 weights=_mm256_sub_ps(_mm256_mul_ps(bytes_to_float(q),ds),dm);for(int token=0;token<4;++token)sums[token][(lanes&8)/8]=_mm256_fmadd_ps(weights,_mm256_loadu_ps(inputs[token]+offset+lanes),sums[token][(lanes&8)/8]);}
+        }
+    }
+    for(int token=0;token<4;++token)outputs[token]=horizontal_sum(_mm256_add_ps(sums[token][0],sums[token][1]));
+}
+
 void q5_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
     __m256 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm256_setzero_ps();const __m128i nibble_mask=_mm_set1_epi8(15),bit_mask=_mm_set1_epi8(1);
     for(int block=0;block<elements/256;++block){const auto*base=row_data+block*176;const float d=half_value(base),dmin=half_value(base+2);const auto*scales=base+4;const auto*high=base+16;const auto*low=base+48;
@@ -168,6 +573,26 @@ void q8_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int ele
     __m256 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm256_setzero_ps();
     for(int block=0;block<elements/32;++block){const auto*base=row_data+block*34;const __m256 scale=_mm256_set1_ps(half_value(base));for(int lanes=0;lanes<32;lanes+=8){const __m128i bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(base+2+lanes));const __m256 weights=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)),scale);for(int token=0;token<4;++token)sums[token][(lanes&8)/8]=_mm256_fmadd_ps(weights,_mm256_loadu_ps(inputs[token]+block*32+lanes),sums[token][(lanes&8)/8]);}}
     for(int token=0;token<4;++token)outputs[token]=horizontal_sum(_mm256_add_ps(sums[token][0],sums[token][1]));
+}
+
+void q4_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * 144;
+        const float d = half_value(base), dmin = half_value(base + 2);
+        const auto* scales = base + 4; const auto* quants = base + 16;
+        for (int group = 0; group < 4; ++group) for (int sub = 0; sub < 2; ++sub) {
+            const int index=group*2+sub; int scale,minimum;
+            if(index<4){scale=scales[index]&63;minimum=scales[index+4]&63;}
+            else{scale=(scales[index+4]&15)|((scales[index-4]>>6)<<4);minimum=(scales[index+4]>>4)|((scales[index]>>6)<<4);}
+            const __m256 ds=_mm256_set1_ps(d*scale),dm=_mm256_set1_ps(dmin*minimum);
+            for(int lanes=0;lanes<32;lanes+=8){
+                __m128i q=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(quants+group*32+lanes));
+                q=sub==0?_mm_and_si128(q,nibble_mask):_mm_and_si128(_mm_srli_epi16(q,4),nibble_mask);
+                _mm256_storeu_ps(output+block*256+group*64+sub*32+lanes,_mm256_sub_ps(_mm256_mul_ps(bytes_to_float(q),ds),dm));
+            }
+        }
+    }
 }
 
 void q5_dequant(const std::uint8_t* row_data, float* output, int elements) {
@@ -220,17 +645,43 @@ void q8_dequant(const std::uint8_t* row_data, float* output, int elements) {
 } // namespace
 
 float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const float* input,int elements,std::uint64_t row){
+    if(type==10)return q2_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ2KBlockBytes,input,elements);
+    if(type==11)return q3_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ3KBlockBytes,input,elements);
+    if(type==12)return q4_dot(packed+row*static_cast<std::uint64_t>(elements/256)*144,input,elements);
     if(type==13)return q5_dot(packed+row*static_cast<std::uint64_t>(elements/256)*176,input,elements);
     if(type==14)return q6_dot(packed+row*static_cast<std::uint64_t>(elements/256)*210,input,elements);
+    if(type==40)return nvfp4_dot(packed+row*static_cast<std::uint64_t>(elements/64)*36,input,elements);
     return q8_dot(packed+row*static_cast<std::uint64_t>(elements/32)*34,input,elements);
+}
+
+void qwen_quant_dot_rows_avx2(
+    const std::uint8_t* packed, std::uint32_t type, const float* input,
+    int elements, std::uint64_t first_row, int row_count, float* outputs
+) {
+    if (type != 12 || row_count < 1 || row_count > 4) {
+        for (int row = 0; row < row_count; ++row)
+            outputs[row] = qwen_quant_dot_avx2(
+                packed, type, input, elements, first_row + row);
+        return;
+    }
+    const auto row_bytes = static_cast<std::uint64_t>(elements / 256) * 144;
+    const auto* first = packed + first_row * row_bytes;
+    switch (row_count) {
+        case 1: q4_dot_rows<1>(first, row_bytes, input, elements, outputs); break;
+        case 2: q4_dot_rows<2>(first, row_bytes, input, elements, outputs); break;
+        case 3: q4_dot_rows<3>(first, row_bytes, input, elements, outputs); break;
+        case 4: q4_dot_rows<4>(first, row_bytes, input, elements, outputs); break;
+    }
 }
 
 void qwen_quant_dot_quad_avx2(
     const std::uint8_t*packed,std::uint32_t type,const float*const inputs[4],
     int elements,std::uint64_t row,float outputs[4]
 ){
-    if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
+    if(type==12)q4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*144,inputs,elements,outputs);
+    else if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
+    else if(type==40)nvfp4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);
     else q8_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
 }
 
@@ -250,11 +701,13 @@ void qwen_quantize_q8_k_avx2(
         if(max_value==0.0f){quantized.scale=0.0f;std::memset(quantized.values,0,sizeof(quantized.values));std::memset(quantized.sums,0,sizeof(quantized.sums));continue;}
         quantized.scale=max_value/127.0f;
         const float inverse=1.0f/quantized.scale;
-        for(int index=0;index<256;++index){
-            const int value=static_cast<int>(std::nearbyint(values[index]*inverse));
-            quantized.values[index]=static_cast<std::int8_t>(std::max(-127,std::min(127,value)));
+        const __m256 inverse_vector = _mm256_set1_ps(inverse);
+        for(int index=0;index<256;index+=16){
+            const __m128i packed = quantize_i8_16(values + index, inverse_vector);
+            _mm_storeu_si128(
+                reinterpret_cast<__m128i*>(quantized.values + index), packed);
+            quantized.sums[index / 16] = sum_i8_16(packed);
         }
-        for(int group=0;group<16;++group){int sum=0;for(int lane=0;lane<16;++lane)sum+=quantized.values[group*16+lane];quantized.sums[group]=static_cast<std::int16_t>(sum);}
     }
 }
 
@@ -307,8 +760,12 @@ float qwen_quant_dot_q8_k_avx2(
 }
 
 void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int elements,std::uint64_t row,float* output){
-    if(type==13)q5_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*176,output,elements);
+    if(type==10)q2_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kQ2KBlockBytes,output,elements);
+    else if(type==11)q3_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kQ3KBlockBytes,output,elements);
+    else if(type==12)q4_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*144,output,elements);
+    else if(type==13)q5_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*176,output,elements);
     else if(type==14)q6_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*210,output,elements);
+    else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);
     else q8_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*34,output,elements);
 }
 

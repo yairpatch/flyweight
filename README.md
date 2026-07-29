@@ -203,7 +203,7 @@ python -m colibri_next.cli benchmark-logits models/colibri-qwen36 --token-ids 1,
 
 CUDA keeps packed BF16 and Q4 weights in a bounded priority-aware VRAM cache and executes them without full dequantization. Routed and shared experts use grouped gate, activation, and weighted-down kernels, attention projections are batched, and Gated DeltaNet recurrent updates remain on the GPU. During generation, decoder hidden states, RMSNorm, residuals, routing probabilities, LM-head logits, and sampling stay device-resident; only selected expert IDs and the sampled token cross to the host. Evicted expert allocations are reused through CuPy's memory pool instead of forcing allocator-wide synchronization. Omit `--device cuda` for the portable CPU path; lower `--gpu-cache-mib` on smaller GPUs.
 
-The generator skips unnecessary vocabulary projections during prompt prefill and only evaluates the LM head for the final prompt token. CUDA full attention keeps RoPE, KV-cache updates, grouped-query attention, gating, and residual execution on the GPU. Fused RMSNorm and routing kernels reduce launch count. Layer-major CUDA prefill batches static projections and routing across prompt tokens and synchronizes selected expert IDs once per layer instead of once per token and layer. In local RTX 5070 Ti Laptop GPU benchmarks using Qwen3.5-35B-A3B with experts preloaded into RAM, the original runtime produced 1.10 output tokens per second, grouped CUDA reached 4.27, device-resident decode reached 4.80, Q4 static weights reached 6.56, and fused normalization/routing reached 6.92 output tokens per second when total response time includes prompt processing. The corrected warmed decode harness measures about 16-18 generated tokens per second with GPU sampling included. A warmed 256-token prefill improved from 13.75 to 18.05 tokens per second after batched routing. Q4 static attention, DeltaNet, embeddings, and LM-head files occupy about 1.24 GiB, protected CUDA weights use about 1.08 GiB, and short measured runs had no weight-cache evictions. Treat these single-run numbers as directional; prompt length, early EOS, storage speed, power limits, and available VRAM materially affect throughput.
+The generator skips unnecessary vocabulary projections during prompt prefill and only evaluates the LM head for the final prompt token. CUDA full attention keeps RoPE, KV-cache updates, grouped-query attention, gating, and residual execution on the GPU. Single-token F16, BF16, and Q8 KV attention uses tiled online softmax, avoiding the full `[heads, context]` score round trip and exposing independent context tiles to the GPU. Contiguous F16 contexts of at least 4096 tokens use batched tensor-core GQA attention through cuBLAS, sharing each KV head across its query-head group without adding sequence-state memory; set `COLIBRI_CUBLAS_ATTENTION=0` to use the fused CUDA fallback. Fused RMSNorm and routing kernels reduce launch count. Layer-major CUDA prefill batches static projections and routing across prompt tokens and synchronizes selected expert IDs once per layer instead of once per token and layer. In local RTX 5070 Ti Laptop GPU benchmarks using Qwen3.5-35B-A3B with experts preloaded into RAM, the original runtime produced 1.10 output tokens per second, grouped CUDA reached 4.27, device-resident decode reached 4.80, Q4 static weights reached 6.56, and fused normalization/routing reached 6.92 output tokens per second when total response time includes prompt processing. The corrected warmed decode harness measures about 16-18 generated tokens per second with GPU sampling included. A warmed 256-token prefill improved from 13.75 to 18.05 tokens per second after batched routing. Q4 static attention, DeltaNet, embeddings, and LM-head files occupy about 1.24 GiB, protected CUDA weights use about 1.08 GiB, and short measured runs had no weight-cache evictions. Treat these single-run numbers as directional; prompt length, early EOS, storage speed, power limits, and available VRAM materially affect throughput.
 
 Expert-major MoE dispatch groups prompt assignments by routed expert and runs the
 shared expert over the complete token batch. On the same RTX 5070 Ti, warmed
@@ -436,7 +436,8 @@ LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner 
 - Full CUDA graph replay and persistent fused layer kernels are not implemented
 - CUDA is the only implemented accelerator backend
 - Image, audio, embeddings, fine-tuning, and hosted OpenAI tools are not implemented
-- Tool calls are buffered before streaming because the native XML call must be parsed as a complete unit
+- Native tool markup is held back until one complete call parses, then generation
+  is cancelled and the structured tool event is emitted immediately
 - DeltaNet recurrence is fused but inherently sequential within each value head;
   routed expert execution remains token-sequential below the expert-major threshold
 - Response history and decoder prefix states are process-local; response records
@@ -519,6 +520,13 @@ PYTHONPATH=src python -m colibri_next.cli benchmark-v2 model.gguf \
   --moe-device hybrid --cache-type-k f16 --cache-type-v f16
 ```
 
+The native v2 commands default to `--gpu-cache-mib 0`, which sizes the total
+CUDA allocation from currently free VRAM while retaining safety headroom.
+Prefer auto-fit unless VRAM must be reserved for another process: a smaller
+manual budget directly reduces the resident expert cache and can make
+single-token MoE decode paging-bound. Runtime diagnostics report the selected
+`gpu_allocated_bytes`, `expert_cache_bytes`, and `expert_cache_slots`.
+
 For Claude Code and OpenCode, benchmark `--moe-device cpu` as well as
 `hybrid`: a bounded GPU expert cache is not automatically faster when routed
 experts churn or GPU grouped kernels contend with long-context attention. On
@@ -528,15 +536,38 @@ main-conversation requests, so use `--parallel 2` (or more when memory permits)
 with `--prompt-cache-mib`; a host prompt-cache budget has no effect with the
 single default slot. Q8 KV is the memory-oriented choice for 58K contexts,
 while f16 was only slightly faster in the same reference benchmark.
+The API generator keeps a bounded continuation record per conversation, so a
+short concurrent request cannot overwrite the main chat's generated token IDs.
+Structured OpenAI/Anthropic tool calls are matched semantically on round-trip;
+UUID/JSON formatting changes or omitted private reasoning no longer turn the
+next agent step into a cold full-history prefill.
 
 One practical low-memory agent configuration is:
 
 ```bash
 PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
+  --model-name colibri-qwen36 \
   --context-window 58000 --moe-device cpu \
+  --cpu-threads 12 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --parallel 2 --prompt-cache-mib 4096 --cpu-prefetch-auto
 ```
+
+Claude Code chooses its auto-compaction threshold from the requested model
+name. A Claude-branded alias can therefore make it assume a larger context
+than this local runtime actually has. Use the custom server model name and
+tell Claude Code the same context limit:
+
+```bash
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=58000 \
+  claude --model colibri-qwen36
+```
+
+Do not lower the server's `--max-new-tokens` to a small interactive-response
+limit for agent use: the same ceiling applies to the summary generated by
+`/compact`. The default 4096 leaves compaction enough output room. The
+Anthropic `count_tokens` endpoint includes translated tool schemas, so the
+client and generation path account for the same prompt.
 
 Unset `COLIBRI_PREFILL_PROFILE` and `COLIBRI_CUDA_PROFILE` for production
 serving; both are diagnostic modes. Request-log prompt rates include time
@@ -596,6 +627,12 @@ file path when the model directory is read-only. Runtime diagnostics expose
 `expert_history_loaded_entries` and `expert_history_saves`; incompatible,
 truncated, or model-mismatched sidecars are ignored.
 
+Hybrid Qwen expert-cache admission is conservative by default: a missed expert
+must become more frequent than the least-frequent resident before replacing it.
+This avoids repeated multi-megabyte uploads when many experts have equal low
+frequency. Set `COLIBRI_EXPERT_CACHE_STRICT_ADMISSION=0` to restore the legacy
+recency tie-break for workloads that require faster cache adaptation.
+
 `--next-layer-prefetch N` enables an experimental, value-preserving decode
 prefetcher for CPU and hybrid Qwen execution. It learns which experts in layer
 L tend to precede experts in layer L+1, predicts at most `N` next-layer experts,
@@ -605,8 +642,11 @@ GPU cache, or evicts demand-resident experts. The first token trains the
 transition table; later tokens can prefetch. Compare
 `next_layer_prefetch_hits / next_layer_prefetch_predictions` together with
 decode time and `next_layer_prefetch_bytes`; a high byte count without useful
-hits means the budget is too broad for that workload. The feature currently
-supports the single-sequence Qwen decode path and remains off by default.
+hits means the budget is too broad for that workload. Route history and
+speculative cache reservations are sequence-local, so the predictor supports
+parallel Qwen decode slots without one conversation training or evicting
+another conversation's in-flight prediction. The feature remains off by
+default.
 
 Native Qwen diagnostics also separate batched prompt work into
 `prefill_nanoseconds`, `prefill_route_wait_nanoseconds`, and
@@ -621,6 +661,46 @@ default dequantize-once FP32 GEMM. AVX2 shares four tokens per decode; AVX-512
 shares eight. `prefill_direct_quant` and `prefill_direct_quant_width` report the
 active path.
 
+On Blackwell GPUs, NVFP4 shared-expert projections in batched prefill and MTP
+verification use cuBLASLt block-scaled FP4 Tensor Cores for batches of at least
+16 rows. The runtime repacks GGUF type-40 blocks into separate E2M1 values and
+tiled UE4M3-per-16 scales, quantizes FP32 activations to the matching format,
+and falls back to the ordinary CUDA kernel when the toolkit, GPU, or requested
+shape does not support native FP4. Set `COLIBRI_NVFP4_TENSOR_CORES=0` to force
+the prefill fallback for A/B measurements. Routed single-token MoE decode
+stacks all selected gate/up matrices into one native FP4 GEMM and concatenates
+the down matrices along K into a second GEMM whose input already contains the
+route weights. Single-token decode keeps the faster grouped matvec path by
+default; set `COLIBRI_NVFP4_DECODE_TENSOR_CORES=1` to enable the experimental
+tensor-core path. Runtime info reports `nvfp4_tensor_core_moe_calls`,
+`nvfp4_tensor_core_moe_fallbacks`, and the most recent
+`nvfp4_tensor_core_moe_last_status`; set
+`COLIBRI_NVFP4_TENSOR_CORE_TRACE=1` to print the cuBLASLt fallback status.
+Single-token NVFP4 routed experts use the one-row matvec by default. Set
+`COLIBRI_NVFP4_TILED=1` to select the experimental eight-row warp-tiled kernel
+for comparison.
+
+Native MTP is cost-adaptive by default. For a requested `--mtp-drafts N`, the
+runtime measures four ordinary decode tokens and four speculative rounds on the
+live model, prompt, cache state, and GPU. It keeps MTP only when realized wall
+time per committed token is at least 5% lower; otherwise it prints an adaptive
+fallback notice and continues with ordinary value-identical decode. Depth one
+therefore calibrates as ordinary decode because it cannot amortize a target
+verification pass. Set `COLIBRI_MTP_ADAPTIVE=0` to force the requested draft
+depth for acceptance studies and controlled MTP kernel benchmarks.
+
+Global-attention prefill with matched F16 K/V caches automatically switches
+from the fused online-softmax warp kernel to tiled tensor-core attention once
+the visible prefix reaches 4096 tokens. Query rows are packed in 16-row (or
+workspace-limited) GQA tiles; cuBLAS computes QK and PV, while QK scores and
+softmax reductions remain FP32. The score/probability tiles reuse existing
+forward scratch buffers, so this path does not reduce KV-cache capacity.
+`COLIBRI_CUBLAS_PREFILL_ATTENTION=0` forces the fused warp fallback, while `=1`
+forces tensor-core attention at short prefixes for benchmarking. As with other
+F16 tensor-core/FlashAttention implementations, the packed F16 query and
+probability operands can produce small numerical differences from the FP32
+fallback.
+
 Set `COLIBRI_PREFILL_PROFILE=1` before starting a native Qwen process to split
 the GPU side of batched prefill into `prefill_gpu_core_nanoseconds`,
 `prefill_gpu_router_nanoseconds`, and `prefill_gpu_transfer_nanoseconds`.
@@ -629,10 +709,15 @@ by default so production requests avoid that measurement overhead.
 
 On x86 hosts, hybrid Qwen expert execution dispatches at runtime to AVX-512,
 AVX2, or the scalar compatibility backend. AVX2-only machines therefore keep
-vectorized Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to
+vectorized Q4_K, Q5_K, Q6_K, and Q8_0 expert kernels instead of falling back to
 scalar math. Developers can set `COLIBRI_CPU_BACKEND=scalar|avx2|avx512` before
 process startup to reproduce backend-specific correctness and performance;
 CPUID masking prevents selecting instructions unsupported by the host.
+Single-token Q4_K CPU MoE uses a four-row tile by default so consecutive weight
+rows share activation loads. Set `COLIBRI_Q4_ROW_TILES=0` before process startup
+to restore the single-row traversal for benchmarking or compatibility checks.
+Use `--cpu-threads N` with `serve-v2`, `benchmark-v2`, or `probe-native-v2` to
+set CPU expert workers for that runtime; 0 keeps automatic physical-core sizing.
 `COLIBRI_Q8_ACTIVATIONS=1` enables an experimental single-token Qwen CPU/hybrid
 MoE path that quantizes each input activation to Q8_K once and reuses it across
 the Q5_K, Q6_K, or Q8_0 expert rows. It requires AVX2 and remains opt-in because

@@ -740,6 +740,60 @@ class QwenMoELayer:
         return decoded.reshape(tuple(reversed(decoded.shape))).T.astype(np.float32)
 
 
+class QwenDenseMLPLayer:
+    """CPU reference for a dense Qwen3.5/3.6 SwiGLU block.
+
+    The dense checkpoints replace the router, shared expert and stacked routed
+    experts of the MoE variants with a single ffn_gate/ffn_up/ffn_down triple,
+    so there is nothing to route and the whole block is one SwiGLU.
+    """
+
+    def __init__(self, model: V2Model, layer: int):
+        if np is None:
+            raise RuntimeError("Qwen v2 CPU reference requires numpy")
+        self.model, self.layer = model, layer
+        self.hidden = int(model.config["hidden_size"])
+        self.gate = self._matrix("ffn_gate")
+        self.up = self._matrix("ffn_up")
+        self.down = self._matrix("ffn_down")
+        self.post_attention_norm = self._tensor("post_attention_norm").reshape(-1)
+        self.epsilon = float(model.config.get("rms_norm_epsilon") or 1e-6)
+
+    def forward(self, hidden: list[float]) -> list[float]:
+        vector = np.asarray(hidden, dtype=np.float32)
+        gate = vector @ self.gate
+        up = vector @ self.up
+        activated = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0))) * up
+        return (activated @ self.down).tolist()
+
+    def forward_residual(self, hidden: list[float]) -> list[float]:
+        vector = np.asarray(hidden, dtype=np.float32)
+        normalized = vector / np.sqrt(np.mean(vector * vector) + self.epsilon)
+        normalized *= self.post_attention_norm
+        output = np.asarray(self.forward(normalized.tolist()), dtype=np.float32)
+        return (vector + output).tolist()
+
+    def _info(self, role: str):
+        suffix = {
+            "ffn_gate": "ffn_gate.weight",
+            "ffn_up": "ffn_up.weight",
+            "ffn_down": "ffn_down.weight",
+            "post_attention_norm": "post_attention_norm.weight",
+        }[role]
+        return self.model.tensor(f"blk.{self.layer}.{suffix}")
+
+    def _tensor(self, role: str):
+        info = self._info(role)
+        raw = self.model.view_tensor(info["name"])
+        return _decode_tensor(raw, info["ggml_type"], math.prod(info["shape"])).reshape(info["shape"])
+
+    def _matrix(self, role: str):
+        # GGML keeps dimension 0 contiguous, so a GGUF shape of [input, output]
+        # is physically [output, input] and has to be transposed after decoding.
+        decoded = self._tensor(role)
+        return decoded.reshape(tuple(reversed(decoded.shape))).T.astype(np.float32)
+
+
 @dataclass
 class QwenV2DecoderState:
     mixer_states: list[object]
@@ -767,10 +821,33 @@ class QwenV2Decoder:
         self.layers = int(model.config["layer_count"])
         self.hidden = int(model.config["hidden_size"])
         self._blocks: dict[int, object] = {}
-        self._moe: dict[int, QwenMoELayer] = {}
+        self._moe: dict[int, object] = {}
+        # Dense checkpoints (for example Qwen3.6-27B) carry an ffn_gate triple
+        # per block instead of a router and stacked experts.
+        self.dense_ffn = self._has_tensor("blk.0.ffn_gate.weight")
         self._final_norm = None
         self._lm_head_info = None
         self._lm_head_raw = None
+
+    def _has_tensor(self, name: str) -> bool:
+        try:
+            self.model.tensor(name)
+        except Exception:
+            return False
+        return True
+
+    def _feed_forward(self, layer: int, *, cuda_only: bool):
+        block = self._moe.get(layer)
+        if block is None:
+            block = (
+                QwenDenseMLPLayer(self.model, layer)
+                if self.dense_ffn
+                else QwenMoELayer(
+                    self.model, layer, cuda_only=cuda_only, capture_debug=not cuda_only
+                )
+            )
+            self._moe[layer] = block
+        return block
 
     def new_state(self) -> QwenV2DecoderState:
         return QwenV2DecoderState([None] * self.layers)
@@ -789,12 +866,12 @@ class QwenV2Decoder:
                 hidden = block.forward_residual(hidden, mixer_state)
             else:
                 hidden = block.forward_residual(hidden, mixer_state)
-            moe = self._moe.get(layer)
-            if moe is None:
-                moe = QwenMoELayer(self.model, layer, cuda_only=False)
-                self._moe[layer] = moe
-            hidden, selected, weights = moe.forward_residual(hidden)
-            routes.append((selected, weights))
+            feed_forward = self._feed_forward(layer, cuda_only=False)
+            if isinstance(feed_forward, QwenDenseMLPLayer):
+                hidden = feed_forward.forward_residual(hidden)
+            else:
+                hidden, selected, weights = feed_forward.forward_residual(hidden)
+                routes.append((selected, weights))
         state.tokens += 1
         return hidden, routes
 
@@ -887,6 +964,84 @@ class QwenV2Decoder:
             block = QwenFullAttentionLayer(self.model, layer, cuda_only=cuda_only)
         self._blocks[layer] = block
         return block
+
+
+def _decode_q2k_blocks(raw, blocks: int):
+    """Dequantize whole Q2_K super-blocks.
+
+    Layout per 84-byte block: scales[16] qs[64] d(2) dmin(2). Each scales byte
+    packs a 4-bit scale (low nibble) and 4-bit min (high nibble) for one
+    16-element group. The 256 values are two 128-element halves; within a half
+    the 2-bit quants for group j sit at bit offset 2*j of that half's 32 qs
+    bytes, so the natural axis order is [half, group, sub, element].
+    """
+    data = np.frombuffer(raw, dtype=np.uint8, count=blocks * 84).reshape(blocks, 84)
+    d = data[:, 80:82].copy().view("<f2").astype(np.float32).reshape(blocks, 1, 1, 1, 1)
+    dmin = data[:, 82:84].copy().view("<f2").astype(np.float32).reshape(blocks, 1, 1, 1, 1)
+    scales = data[:, 0:16].reshape(blocks, 2, 4, 2, 1)
+    quants = data[:, 16:80].reshape(blocks, 2, 1, 2, 16)
+    shifts = (2 * np.arange(4, dtype=np.uint8)).reshape(1, 1, 4, 1, 1)
+    values = (quants >> shifts) & 3
+    decoded = d * (scales & 15).astype(np.float32) * values - dmin * (scales >> 4).astype(np.float32)
+    return decoded.reshape(blocks * 256)
+
+
+def _q3k_scales(data, blocks: int):
+    """Unpack the sixteen 6-bit Q3_K scales from their 12-byte encoding.
+
+    The low and high nibbles of bytes 0..7 carry each scale's low 4 bits, and
+    bytes 8..11 supply the top 2 bits.
+    """
+    packed = data[:, 96:108].astype(np.uint16)
+    index = np.arange(16)
+    group, byte = index // 4, index % 4
+    low = packed[:, np.where(group & 1, 4 + byte, byte)]
+    nibble = np.where(group < 2, low & 15, low >> 4)
+    high = (packed[:, 8 + byte] >> (2 * group)) & 3
+    return (nibble | (high << 4)).astype(np.float32).reshape(blocks, 2, 4, 2, 1)
+
+
+def _decode_q3k_blocks(raw, blocks: int):
+    """Dequantize whole Q3_K super-blocks.
+
+    Layout per 110-byte block: hmask[32] qs[64] scales[12] d(2). The quant is a
+    2-bit low part from qs plus an inverted high bit from hmask -- a set mask
+    bit means "do not subtract 4" -- giving a signed 3-bit value.
+    """
+    data = np.frombuffer(raw, dtype=np.uint8, count=blocks * 110).reshape(blocks, 110)
+    d = data[:, 108:110].copy().view("<f2").astype(np.float32).reshape(blocks, 1, 1, 1, 1)
+    quants = data[:, 32:96].reshape(blocks, 2, 1, 2, 16)
+    shifts = (2 * np.arange(4, dtype=np.uint8)).reshape(1, 1, 4, 1, 1)
+    low = (quants >> shifts) & 3
+    masks = (1 << (np.arange(2).reshape(2, 1) * 4 + np.arange(4).reshape(1, 4))).astype(np.uint8)
+    hmask = data[:, 0:32].reshape(blocks, 1, 1, 2, 16)
+    high = np.where(hmask & masks.reshape(1, 2, 4, 1, 1), 0, 4)
+    return (d * (_q3k_scales(data, blocks) - 32) * (low.astype(np.float32) - high)).reshape(blocks * 256)
+
+
+def _decode_tensor(raw, kind: int, count: int):
+    """Decode a whole GGUF tensor to float32, vectorized over super-blocks."""
+    if kind == 0:
+        return np.frombuffer(raw, dtype="<f4", count=count).astype(np.float32)
+    if kind == 30:
+        bits = np.frombuffer(raw, dtype="<u2", count=count).astype(np.uint32) << 16
+        return bits.view(np.float32)
+    if kind == 8:
+        blocks = count // 32
+        data = np.frombuffer(raw, dtype=np.uint8, count=blocks * 34).reshape(blocks, 34)
+        scale = data[:, 0:2].copy().view("<f2").astype(np.float32)
+        return (data[:, 2:34].view(np.int8).astype(np.float32) * scale).reshape(count)
+    if count % 256:
+        raise ValueError(f"K-quant tensor length {count} is not a multiple of 256")
+    blocks = count // 256
+    if kind == 10:
+        return _decode_q2k_blocks(raw, blocks)
+    if kind == 11:
+        return _decode_q3k_blocks(raw, blocks)
+    if kind in (12, 13, 14):
+        decoder = {12: _decode_q4k, 13: _decode_q5k, 14: _decode_q6k}[kind]
+        return decoder(raw, 0, count)
+    raise ValueError(f"unsupported GGUF tensor type {kind}")
 
 
 def _decode_ggml(raw: bytes, kind: int, start: int, count: int):

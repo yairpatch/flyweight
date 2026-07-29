@@ -75,10 +75,31 @@ void qwen_forward_rows(
             case 0:launch("qwen_f32_matmul_rows",output_size,rows,256,args);return;
             case 8:launch("q8_matmul_tiled",(output_size+31)/32,(static_cast<std::uint32_t>(rows)+31)/32,256,args);return;
             case 30:launch("bf16_matmul_rows",output_size,rows,256,args);return;
+            case 10:launch("q2k_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 11:launch("q3k_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 12:launch("q4k_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 13:launch("q5k_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 14:launch("q6k_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 16:launch("iq2xxs_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 18:launch("iq3xxs_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 22:launch("iq2s_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 21:launch("iq3s_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 17:launch("iq2xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 23:launch("iq4xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
             default:break;
         }
-        throw std::runtime_error(
-            "native Qwen rows dense projection type is unsupported: "+std::to_string(type));
+        // Keep an explicit compatibility fallback for future tensor formats.
+        for(int token=0;token<rows;++token){
+            const auto row_input=input+static_cast<std::uint64_t>(token)*input_size*sizeof(float);
+            const auto row_output=output+static_cast<std::uint64_t>(token)*output_size*sizeof(float);
+            if(qwen_gpu_matvec_by_type(type,matrix,row_input,row_output,input_size,output_size,runtime.stream)!=0)
+                throw std::runtime_error(
+                    "native Qwen rows dense projection failed for type "+std::to_string(type)
+                    +" ("+std::to_string(input_size)+"x"+std::to_string(output_size)
+                    +", "+std::to_string(rows)+" rows"
+                    +(matrix?"":", weights are not device-resident")+")");
+        }
+        return;
     };
     auto add_rows=[&](std::uint64_t target,std::uint64_t source){float scale=1.0f;int count=rows*hidden_size;void*args[]={&target,&source,&scale,&count};launch("scaled_add",(count+255)/256,1,256,args);};
     if(colibri_gpu_upload(token_device,input_tokens,rows*sizeof(std::uint32_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows token upload failed");
@@ -174,7 +195,53 @@ void qwen_forward_rows(
                 launch(kv_store_kernel(runtime.options.cache_type_v),kv_heads,1,256,v_store_args);
             }
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
-            if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
+            const char*cublas_prefill_env=
+                std::getenv("COLIBRI_CUBLAS_PREFILL_ATTENTION");
+            const std::uint64_t max_tokens=
+                runtime.position+static_cast<std::uint64_t>(rows);
+            // The warp-online kernel wins for short prefixes because it needs
+            // one launch and no materialized score tile.  Once the visible
+            // prefix reaches 4K, tensor-core QK/PV amortize the tiled cuBLAS
+            // setup and pull progressively farther ahead.  1/0 force either
+            // side for benchmarking and machine-specific tuning.
+            const bool cublas_prefill_forced=
+                cublas_prefill_env&&cublas_prefill_env[0]=='1';
+            const bool cublas_prefill_disabled=
+                cublas_prefill_env&&cublas_prefill_env[0]=='0';
+            const bool cublas_prefill_requested=
+                !cublas_prefill_disabled&&
+                (cublas_prefill_forced||max_tokens>=4096);
+            const std::uint64_t score_row_bytes=
+                static_cast<std::uint64_t>(heads)*max_tokens*sizeof(float);
+            const std::uint64_t score_workspace_bytes=
+                static_cast<std::uint64_t>(rows)*runtime.scratch_elements*sizeof(float);
+            const int cublas_tile_rows=score_row_bytes
+                ?static_cast<int>(std::min<std::uint64_t>(
+                    16,score_workspace_bytes/score_row_bytes)):0;
+            const std::uint64_t packed_query_bytes=device_align(
+                static_cast<std::uint64_t>(16)*heads*head_dim*
+                sizeof(std::uint16_t));
+            const std::uint64_t packed_output_bytes=device_align(
+                static_cast<std::uint64_t>(16)*heads*head_dim*sizeof(float));
+            const bool cublas_workspace_ok=
+                packed_query_bytes+packed_output_bytes<=
+                static_cast<std::uint64_t>(heads)*
+                    runtime.options.context_limit*sizeof(float);
+            const bool cublas_prefill_done=
+                cublas_prefill_requested&&!layer.attention_window&&
+                runtime.options.cache_type_k==1&&
+                runtime.options.cache_type_v==1&&cublas_tile_rows>0&&
+                cublas_workspace_ok&&
+                colibri_gpu_attention_prefill_f16_cublas(
+                    queries,gates,cache_keys,cache_values,
+                    attention_scores,first,second,
+                    attention_scores+packed_query_bytes,third,
+                    runtime.stream,heads,kv_heads,head_dim,rows,capacity,
+                    static_cast<int>(runtime.position),cublas_tile_rows,
+                    scale)==0;
+            if(cublas_prefill_done){
+                // Tensor-core attention wrote the already-gated rows to third.
+            }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
                 // One warp streams the KV cache once for 4 query rows: cache
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.
@@ -205,6 +272,43 @@ void qwen_forward_rows(
             throw std::runtime_error("native Qwen prefill core profiling event failed");
         rms_rows(residual,tensor(moe_base),normalized);
         phase(layer_number,"moerms");
+        if(layer.dense_ffn){
+            // Dense block over the whole row batch: one SwiGLU per token, no
+            // router or experts. `first` holds gate and up back to back.
+            const int dense_intermediate=static_cast<int>(runtime.moe_intermediate);
+            if(layer.ffn_on_host){
+                // Spilled block: its weights are not on the device at all, so
+                // run the SwiGLU on the host one row at a time through the
+                // single-token scratch.
+                auto*scratch=static_cast<float*>(runtime.dense_host);
+                float*host_input=scratch;
+                float*host_output=host_input+hidden_size;
+                const auto host_started=std::chrono::steady_clock::now();
+                for(int token=0;token<rows;++token){
+                    const auto row_in=normalized+static_cast<std::uint64_t>(token)*hidden_size*sizeof(float);
+                    const auto row_out=third+static_cast<std::uint64_t>(token)*hidden_size*sizeof(float);
+                    if(colibri_gpu_download(host_input,row_in,hidden_size*sizeof(float),runtime.stream)!=0||
+                       colibri_gpu_stream_sync(runtime.stream)!=0)
+                        throw std::runtime_error("native dense host FFN rows input transfer failed");
+                    qwen_cpu_dense_ffn(runtime,layer,host_input,host_output);
+                    if(colibri_gpu_upload(row_out,host_output,hidden_size*sizeof(float),runtime.stream)!=0)
+                        throw std::runtime_error("native dense host FFN rows output transfer failed");
+                }
+                runtime.dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-host_started).count();
+                add_rows(residual,third);std::swap(hidden,residual);
+                continue;
+            }
+            const auto up_half=first+static_cast<std::uint64_t>(rows)*dense_intermediate*sizeof(float);
+            dense(moe_base+1,normalized,first,hidden_size,dense_intermediate);
+            dense(moe_base+2,normalized,up_half,hidden_size,dense_intermediate);
+            int dense_count=rows*dense_intermediate;
+            void*dense_silu_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&second),&dense_count};
+            launch("silu_mul",(static_cast<std::uint32_t>(dense_count)+255)/256,1,256,dense_silu_args);
+            dense(moe_base+3,second,third,dense_intermediate,hidden_size);
+            add_rows(residual,third);std::swap(hidden,residual);
+            continue;
+        }
         dense(moe_base+1,normalized,router_logits,hidden_size,experts);
         phase(layer_number,"router");
         void*route_args[]={const_cast<std::uint64_t*>(&router_logits),const_cast<std::uint64_t*>(&selected_device),const_cast<std::uint64_t*>(&route_weights),&rows,const_cast<int*>(&experts),const_cast<int*>(&top_k)};
@@ -244,6 +348,16 @@ void qwen_forward_rows(
             auto up_half=first+swiglu_elements*sizeof(float);
             auto nvfp4_rows=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size,float scale){
                 std::uint64_t matrix=runtime.device_tensors[layer.static_tensors.at(role)];
+                const char* tensor_core_setting =
+                    std::getenv("COLIBRI_NVFP4_TENSOR_CORES");
+                const bool tensor_cores =
+                    (!tensor_core_setting || tensor_core_setting[0] != '0')
+                    && rows >= 16;
+                if (tensor_cores &&
+                    colibri_gpu_nvfp4_matmul_cublas(
+                        matrix, input, output, runtime.stream, input_size,
+                        output_size, rows, scale) == 0)
+                    return;
                 void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows,&scale};
                 launch("nvfp4_matmul_rows",output_size,rows,256,args);
             };

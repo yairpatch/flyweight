@@ -189,6 +189,24 @@ class QwenV2ReferenceTests(unittest.TestCase):
         finally:
             model.close()
 
+    def test_native_runtime_allows_parallel_next_layer_prefetch(self):
+        try:
+            model = V2Model(self.MODEL)
+        except Exception as error:
+            raise unittest.SkipTest(str(error)) from error
+        try:
+            with model.native_qwen_runtime(
+                moe_device="hybrid",
+                parallel_sequences=2,
+                next_layer_prefetch=4,
+            ) as runtime:
+                self.assertEqual(runtime.parallel_sequences, 2)
+                self.assertEqual(
+                    runtime.info["next_layer_prefetch_predictions"], 0
+                )
+        finally:
+            model.close()
+
     def test_real_delta_layer_state_is_persistent_and_resettable(self):
         try:
             model = V2Model(self.MODEL)

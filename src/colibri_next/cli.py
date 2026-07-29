@@ -299,7 +299,12 @@ def _parser() -> argparse.ArgumentParser:
     benchmark_v2.add_argument("--chat", action="store_true")
     benchmark_v2.add_argument("--warmup", type=int, default=3)
     benchmark_v2.add_argument("--iterations", type=int, default=10)
-    benchmark_v2.add_argument("--gpu-cache-mib", type=int, default=0)
+    benchmark_v2.add_argument(
+        "--gpu-cache-mib",
+        type=int,
+        default=0,
+        help="total native v2 CUDA allocation budget in MiB (0 = auto-fit to free VRAM)",
+    )
     benchmark_v2.add_argument("--context", type=int, default=2048)
     benchmark_v2.add_argument(
         "--runtime", choices=("native", "cupy-reference"), default="native",
@@ -309,6 +314,10 @@ def _parser() -> argparse.ArgumentParser:
         help="execute routed experts by GPU streaming or native CPU kernels",
     )
     benchmark_v2.add_argument("--mtp-drafts", type=int, default=0)
+    benchmark_v2.add_argument(
+        '--cpu-threads', type=int, default=0,
+        help='CPU expert worker threads (0 = automatic)',
+    )
     benchmark_v2.add_argument(
         "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0"),
         default="f16",
@@ -391,6 +400,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     native_qwen_v2.add_argument("--mtp-drafts", type=int, default=0)
     native_qwen_v2.add_argument(
+        '--cpu-threads', type=int, default=0,
+        help='CPU expert worker threads (0 = automatic)',
+    )
+    native_qwen_v2.add_argument(
         "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0"),
         default="f16",
     )
@@ -459,6 +472,10 @@ def _parser() -> argparse.ArgumentParser:
     serve_v2.add_argument(
         "--mtp-drafts", type=int, default=0,
         help="native MTP draft depth (0 disables speculative decoding)",
+    )
+    serve_v2.add_argument(
+        '--cpu-threads', type=int, default=0,
+        help='CPU expert worker threads (0 = automatic)',
     )
     serve_v2.add_argument(
         "--api-key", default=os.environ.get("COLIBRI_API_KEY")
@@ -590,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("benchmark-v2 requires at least 1 warmup iteration")
         if args.context <= 0:
             raise SystemExit("benchmark-v2 requires a positive context")
+        if args.cpu_threads < 0:
+            raise SystemExit('benchmark-v2 requires --cpu-threads >= 0')
         if args.parallel_sequences < 1:
             raise SystemExit("benchmark-v2 requires --parallel >= 1")
         if args.prompt_cache_mib < 0:
@@ -650,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
                     cpu_prefetch_mib=args.cpu_prefetch_mib,
                     cpu_prefetch_auto=args.cpu_prefetch_auto,
                     next_layer_prefetch=args.next_layer_prefetch,
+                    cpu_threads=args.cpu_threads,
                 ) as runtime:
                     prepare_started = time.perf_counter()
                     runtime.prepare()
@@ -916,6 +936,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--generate-tokens must be non-negative")
         if args.context <= 0 or args.gpu_cache_mib < 0:
             raise SystemExit("--context must be positive and --gpu-cache-mib non-negative")
+        if args.cpu_threads < 0:
+            raise SystemExit('--cpu-threads must be >= 0')
         with V2Model(args.model) as model:
             moe_device = args.moe_device or (
                 "hybrid" if model.info["architecture"] == "gemma4" else "gpu"
@@ -945,6 +967,7 @@ def main(argv: list[str] | None = None) -> int:
                 mtp_drafts=args.mtp_drafts,
                 cache_type_k=args.cache_type_k,
                 cache_type_v=args.cache_type_v,
+                cpu_threads=args.cpu_threads,
             ) as runtime:
                 prepare_started = time.perf_counter()
                 runtime.prepare()
@@ -1238,6 +1261,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--gpu-cache-mib must be >= 0 (0 = auto-fit to free VRAM)")
         if args.cpu_prefetch_mib < 0:
             raise SystemExit("--cpu-prefetch-mib must be >= 0")
+        if args.cpu_threads < 0:
+            raise SystemExit('--cpu-threads must be >= 0')
         if args.cpu_prefetch_mib and args.cpu_prefetch_auto:
             raise SystemExit("use either --cpu-prefetch-mib or --cpu-prefetch-auto")
         if not 0 <= args.prefill_cache_seed <= 256:
@@ -1270,6 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
                 cpu_prefetch_mib=args.cpu_prefetch_mib,
                 cpu_prefetch_auto=args.cpu_prefetch_auto,
                 next_layer_prefetch=args.next_layer_prefetch,
+                cpu_threads=args.cpu_threads,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,

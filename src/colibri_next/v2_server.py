@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import codecs
+import json
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from queue import SimpleQueue
 from typing import Callable, Iterator, Mapping, Sequence
 
 from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
-from .server import APIError, InferenceService
+from .server import APIError, InferenceService, _parse_tool_calls
 from .v2 import (
     TASK_EVENT_DONE,
     TASK_EVENT_ERROR,
@@ -265,16 +267,37 @@ class NativeV2Generator:
         self._chat_generated_ids: tuple[int, ...] = ()
         self._chat_text = ""
         self._chat_thinking = False
+        # Exact generated token IDs must survive unrelated concurrent requests.
+        # A single "last chat" record let short agent/title/tool side-calls
+        # overwrite the main conversation and forced its next turn to re-tokenize
+        # (usually diverging at structured tool markup). Keep a small LRU keyed
+        # by the request history instead.
+        self._chat_continuations: OrderedDict[
+            tuple[tuple[str, str], ...],
+            tuple[tuple[int, ...], tuple[int, ...], str, bool],
+        ] = OrderedDict()
+        self._chat_continuation_capacity = 32
 
     def prefix_cache_stats(self) -> dict[str, int]:
         info = self.runtime.info
+        capacity = int(getattr(self.runtime, "parallel_sequences", 1))
         return {
             "entries": 1 if info["position"] else 0,
-            "capacity": 1,
+            "capacity": capacity,
             "hits": int(info["prefix_cache_hits"]),
             "misses": int(info["prefix_cache_misses"]),
             "evictions": 0,
             "reused_tokens": int(info["prefix_cache_reused_tokens"]),
+            "last_prompt_tokens": int(
+                info.get("prefix_cache_last_prompt_tokens", 0)
+            ),
+            "last_reused_tokens": int(
+                info.get("prefix_cache_last_reused_tokens", 0)
+            ),
+            "last_lcp_live": int(info.get("prefix_cache_last_lcp_live", 0)),
+            "last_lcp_snapshot": int(
+                info.get("prefix_cache_last_lcp_snapshot", 0)
+            ),
         }
 
     def close(self) -> None:
@@ -320,22 +343,53 @@ class NativeV2Generator:
                 self._chat_generated_ids = final.generated_ids
                 self._chat_text = final.text
                 self._chat_thinking = thinking
+                self._chat_continuations[normalized] = (
+                    tuple(prompt_ids),
+                    final.generated_ids,
+                    final.text,
+                    thinking,
+                )
+                self._chat_continuations.move_to_end(normalized)
+                while (
+                    len(self._chat_continuations)
+                    > self._chat_continuation_capacity
+                ):
+                    self._chat_continuations.popitem(last=False)
 
     def _continued_chat_prompt(
         self, messages: tuple[tuple[str, str], ...], thinking: bool
     ) -> list[int]:
-        previous = self._chat_messages
-        if (
-            previous is not None
-            and thinking == self._chat_thinking
-            and len(messages) > len(previous) + 1
-            and messages[: len(previous)] == previous
-            and messages[len(previous)][0] == "assistant"
-            and messages[len(previous)][1] == self._chat_text.strip()
-        ):
+        candidates = list(self._chat_continuations.items())
+        if self._chat_messages is not None:
+            candidates.append(
+                (
+                    self._chat_messages,
+                    (
+                        self._chat_prompt_ids,
+                        self._chat_generated_ids,
+                        self._chat_text,
+                        self._chat_thinking,
+                    ),
+                )
+            )
+        # Prefer the longest matching history. A shorter conversation can be a
+        # literal prefix of a later turn but cannot reuse as much live state.
+        candidates.sort(key=lambda item: len(item[0]), reverse=True)
+        for previous, record in candidates:
+            prompt_ids, generated_ids, raw_text, record_thinking = record
+            if not (
+                thinking == record_thinking
+                and len(messages) > len(previous) + 1
+                and messages[: len(previous)] == previous
+                and messages[len(previous)][0] == "assistant"
+                and self._assistant_continues_previous(
+                    messages[len(previous)][1], raw_text
+                )
+            ):
+                continue
             remaining = messages[len(previous) + 1 :]
             if remaining:
-                generated = list(self._chat_generated_ids)
+                generated = list(generated_ids)
                 ended = bool(
                     generated and generated[-1] in self.tokenizer.eos_token_ids
                 )
@@ -344,7 +398,7 @@ class NativeV2Generator:
                     {"role": role, "content": content} for role, content in remaining
                 ]
                 return (
-                    list(self._chat_prompt_ids)
+                    list(prompt_ids)
                     + generated
                     + self.tokenizer.encode(separator)
                     + self.tokenizer.encode_messages(
@@ -355,6 +409,43 @@ class NativeV2Generator:
             [{"role": role, "content": content} for role, content in messages],
             enable_thinking=thinking,
         )
+
+    def _assistant_continues_previous(
+        self, candidate: str, raw_text: str | None = None
+    ) -> bool:
+        """Recognize the API's structured round-trip of our last tool call.
+
+        OpenAI/Anthropic clients receive a native ``<tool_call>`` block as
+        structured JSON, then send it back on the next turn.  Rendering that
+        JSON reconstructs equivalent markup, but UUIDs, JSON whitespace and
+        hidden reasoning text need not be byte-identical.  Requiring exact text
+        discarded the generated token IDs and forced a near-full conversation
+        prefill.  Compare parsed calls instead; plain assistant text remains an
+        exact-match check so edited/regenerated replies never reuse stale state.
+        """
+        raw = (self._chat_text if raw_text is None else raw_text).strip()
+        if candidate == raw:
+            return True
+        raw_content, raw_calls = _parse_tool_calls(raw)
+        candidate_content, candidate_calls = _parse_tool_calls(candidate)
+        if not raw_calls or not candidate_calls or len(raw_calls) != len(candidate_calls):
+            return False
+        # A client may omit reasoning that preceded a structured tool call.
+        # If it keeps visible content, require that content to remain exact.
+        if candidate_content and candidate_content != raw_content:
+            return False
+
+        def signature(call: Mapping[str, object]) -> tuple[str, object]:
+            function = call["function"]
+            assert isinstance(function, Mapping)
+            name = function["name"]
+            arguments = function["arguments"]
+            assert isinstance(name, str) and isinstance(arguments, str)
+            return name, json.loads(arguments)
+
+        return [signature(call) for call in candidate_calls] == [
+            signature(call) for call in raw_calls
+        ]
 
     def generate_text(self, prompt: str, **options: object) -> GenerationResult:
         self._chat_messages = None
@@ -493,6 +584,7 @@ class NativeV2InferenceService(InferenceService):
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
+        cpu_threads: int = 0,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -521,6 +613,7 @@ class NativeV2InferenceService(InferenceService):
                 cpu_prefetch_mib=cpu_prefetch_mib,
                 cpu_prefetch_auto=cpu_prefetch_auto,
                 next_layer_prefetch=next_layer_prefetch,
+                cpu_threads=cpu_threads,
             )
             self.v2_runtime.prepare()
         except Exception:

@@ -26,6 +26,26 @@ float qwen_quant_dot_avx2(
     std::uint64_t row
 );
 
+void qwen_quant_dot_rows_avx2(
+    const std::uint8_t* packed,
+    std::uint32_t type,
+    const float* input,
+    int elements,
+    std::uint64_t first_row,
+    int row_count,
+    float* outputs
+);
+
+void qwen_quant_dot_rows_avx512(
+    const std::uint8_t* packed,
+    std::uint32_t type,
+    const float* input,
+    int elements,
+    std::uint64_t first_row,
+    int row_count,
+    float* outputs
+);
+
 void qwen_quant_dot_pair_avx512(
     const std::uint8_t* packed,
     std::uint32_t type,
@@ -81,6 +101,22 @@ void qwen_quantize_q8_k_avx2(
 );
 
 float qwen_quant_dot_q8_k_avx2(
+    const std::uint8_t* packed,
+    std::uint32_t type,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t row
+);
+
+float qwen_quant_dot_q8_k_avx_vnni(
+    const std::uint8_t* packed,
+    std::uint32_t type,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t row
+);
+
+float qwen_quant_dot_q8_k_avx_vnni(
     const std::uint8_t* packed,
     std::uint32_t type,
     const QwenQ8KBlock* input,

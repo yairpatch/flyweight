@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="theme-color" content="#0c0d10">
+  <meta name="theme-color" content="#0a0a0c">
   <title>Colibri Chat</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/app.css">
@@ -37,7 +37,7 @@
       </label>
 
       <div class="history-label">Recent</div>
-      <nav class="conversation-list" id="conversation-list"></nav>
+      <nav class="conversation-list scroll-region" id="conversation-list"></nav>
 
       <div class="sidebar-footer">
         <button class="sidebar-action" id="open-settings" type="button">
@@ -89,7 +89,7 @@
         </div>
       </header>
 
-      <section class="chat-scroll" id="chat-scroll" aria-live="polite">
+      <section class="chat-scroll scroll-region" id="chat-scroll" aria-live="polite">
         <div class="chat-column" id="chat-column">
           <section class="welcome" id="welcome">
             <div class="welcome-mark" aria-hidden="true">
@@ -100,22 +100,22 @@
             <p class="welcome-copy">Start a private conversation with the model running on this computer.</p>
             <div class="suggestion-grid">
               <button class="suggestion" type="button" data-prompt="Explain mixture-of-experts models in simple terms.">
-                <span class="suggestion-icon violet">01</span>
+                <span class="suggestion-icon">01</span>
                 <span><strong>Explain a concept</strong><small>Mixture-of-experts, simply</small></span>
                 <svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
               </button>
               <button class="suggestion" type="button" data-prompt="Write a small Python script that organizes files by extension.">
-                <span class="suggestion-icon cyan">02</span>
+                <span class="suggestion-icon">02</span>
                 <span><strong>Write some code</strong><small>A practical Python utility</small></span>
                 <svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
               </button>
               <button class="suggestion" type="button" data-prompt="Help me brainstorm five unusual ideas for a weekend project.">
-                <span class="suggestion-icon amber">03</span>
+                <span class="suggestion-icon">03</span>
                 <span><strong>Brainstorm ideas</strong><small>A creative weekend project</small></span>
                 <svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
               </button>
               <button class="suggestion" type="button" data-prompt="Create a concise learning plan for understanding CUDA programming.">
-                <span class="suggestion-icon green">04</span>
+                <span class="suggestion-icon">04</span>
                 <span><strong>Make a plan</strong><small>Learn CUDA step by step</small></span>
                 <svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
               </button>
@@ -162,7 +162,7 @@
         </button>
       </div>
 
-      <div class="settings-body">
+      <div class="settings-body scroll-region">
         <label class="field field-wide">
           <span>API key <small>Kept for this browser session only</small></span>
           <input id="api-key" type="password" placeholder="Optional local bearer token" autocomplete="off">

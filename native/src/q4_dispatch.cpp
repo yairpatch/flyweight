@@ -21,6 +21,7 @@ namespace {
 
 constexpr std::uint32_t kFeatureAvx2 = 1u << 0;
 constexpr std::uint32_t kFeatureAvx512 = 1u << 1;
+constexpr std::uint32_t kFeatureAvxVnni = 1u << 2;
 
 // Read XCR0 without the _xgetbv intrinsic, which GCC/Clang refuse to inline
 // unless the translation unit enables the "xsave" target feature. Raw XGETBV
@@ -68,6 +69,18 @@ std::uint32_t detect_features() {
     const bool avx512_os = (xcr0 & 0xE0) == 0xE0;
     if (avx512_hardware && avx512_bw && avx512_os) {
         features |= kFeatureAvx512;
+    }
+    // AVX-VNNI is VEX-encoded and needs only the AVX state checked above.
+    const bool has_subleaf1 = registers[0] >= 1;
+    if (has_subleaf1) {
+#if defined(_MSC_VER)
+        __cpuidex(registers, 7, 1);
+#else
+        __cpuid_count(7, 1, registers[0], registers[1], registers[2], registers[3]);
+#endif
+        if ((registers[0] & (1 << 4)) != 0) {
+            features |= kFeatureAvxVnni;
+        }
     }
     return features;
 #else

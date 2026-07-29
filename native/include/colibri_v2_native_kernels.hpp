@@ -38,6 +38,49 @@ void qwen_q8_embedding_rows(
     }
 }
 
+// K-quant embedding tables. These share the super-block decoders defined in
+// qwen_cuda_source, which is concatenated ahead of this translation unit, so a
+// gather is just an indexed decode. Low-bit dense checkpoints commonly store
+// token_embd as Q4_K or lower rather than Q8_0.
+#define COLIBRI_KQUANT_EMBEDDING(name, decode)                                  \
+extern "C" __global__                                                           \
+void name(                                                                      \
+    const unsigned char* packed, float* output,                                 \
+    const int token, const int hidden                                           \
+) {                                                                             \
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;                     \
+         index < hidden; index += blockDim.x * gridDim.x) {                     \
+        output[index] = decode(packed, token * hidden + index);                 \
+    }                                                                           \
+}                                                                               \
+extern "C" __global__                                                           \
+void name##_rows(                                                               \
+    const unsigned char* packed, const unsigned int* tokens, float* output,     \
+    const int rows, const int hidden                                            \
+) {                                                                             \
+    const int row = blockIdx.y;                                                 \
+    if (row >= rows) return;                                                    \
+    const int token = (int)tokens[row];                                         \
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;                     \
+         index < hidden; index += blockDim.x * gridDim.x) {                     \
+        output[row * hidden + index] = decode(packed, token * hidden + index);  \
+    }                                                                           \
+}
+
+COLIBRI_KQUANT_EMBEDDING(qwen_q2k_embedding, q2k_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_q3k_embedding, q3k_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_q4k_embedding, q4k_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_q5k_embedding, q5k_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_q6k_embedding, q6k_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_iq2xxs_embedding, iq2xxs_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_iq3xxs_embedding, iq3xxs_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_iq2s_embedding, iq2s_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_iq3s_embedding, iq3s_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_iq2xs_embedding, iq2xs_value)
+COLIBRI_KQUANT_EMBEDDING(qwen_iq4xs_embedding, iq4xs_value)
+
+#undef COLIBRI_KQUANT_EMBEDDING
+
 // bf16 embedding tables are stored as plain rows, not Q8_0 blocks. Reading them
 // with qwen_q8_embedding reinterprets pairs of bf16 values as a block scale plus
 // int8 codes, which yields ~100x-magnitude noise that swamps the whole residual

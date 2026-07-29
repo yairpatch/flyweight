@@ -66,6 +66,7 @@ const state = {
   model: null,
   models: [],
   health: null,
+  properties: null,
   maxOutputTokens: 64,
   controller: null,
   generating: false,
@@ -157,12 +158,40 @@ function saveSession(key, value) {
   }
 }
 
+// localStorage holds a few megabytes at most, and both the write here and the
+// parse at startup are synchronous on the main thread. History is capped by
+// size as well as by count so a few long chats cannot stall the next launch.
+const HISTORY_LIMIT = 100;
+const HISTORY_BYTE_BUDGET = 2_000_000;
+
+function historyPayload(limit) {
+  const ordered = [...state.conversations]
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, limit);
+  const retained = [];
+  let bytes = 2;
+  for (const conversation of ordered) {
+    const serialized = JSON.stringify(conversation);
+    if (retained.length && bytes + serialized.length + 1 > HISTORY_BYTE_BUDGET) {
+      break;
+    }
+    retained.push(serialized);
+    bytes += serialized.length + 1;
+  }
+  return `[${retained.join(",")}]`;
+}
+
 function persistConversations() {
-  const compact = state.conversations.slice(0, 100);
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(compact));
+    localStorage.setItem(STORAGE_KEY, historyPayload(HISTORY_LIMIT));
   } catch {
-    toast("Conversation history could not be saved.", "error");
+    // The quota is shared with everything else this origin stored, so retry
+    // with a much shorter history before giving up on the write entirely.
+    try {
+      localStorage.setItem(STORAGE_KEY, historyPayload(5));
+    } catch {
+      toast("Conversation history could not be saved.", "error");
+    }
   }
 }
 
@@ -548,6 +577,91 @@ function retryFromMessage(errorMessage) {
   }
 }
 
+// Streaming repaints are coalesced into a single animation frame, and only the
+// text after the last completed block is rebuilt. Re-rendering the whole
+// message on every token is quadratic and freezes the tab on long answers.
+const stream = {
+  messageId: null,
+  content: null,
+  bodyStart: 0,
+  committedEnd: 0,
+  thinkingSettled: false,
+  tailNodes: [],
+  toolHost: null,
+};
+
+let streamFrame = null;
+let streamMessage = null;
+
+function scheduleStreamRender(message) {
+  streamMessage = message;
+  if (streamFrame !== null) {
+    return;
+  }
+  streamFrame = requestAnimationFrame(() => {
+    streamFrame = null;
+    const pending = streamMessage;
+    streamMessage = null;
+    if (!pending) {
+      return;
+    }
+    updateStreamingMessage(pending);
+    if (state.stickToBottom) {
+      scrollToBottom();
+    }
+  });
+}
+
+function cancelStreamRender() {
+  if (streamFrame !== null) {
+    cancelAnimationFrame(streamFrame);
+    streamFrame = null;
+  }
+  streamMessage = null;
+}
+
+function resetStreamState(messageId = null, content = null) {
+  stream.messageId = messageId;
+  stream.content = content;
+  stream.bodyStart = 0;
+  stream.committedEnd = 0;
+  stream.thinkingSettled = false;
+  stream.tailNodes = [];
+  stream.toolHost = null;
+}
+
+// The furthest point in the answer that can no longer change: the last blank
+// line that sits outside a code fence. Everything before it stays in the DOM
+// untouched for the rest of the generation. Only the text after the previous
+// boundary is scanned, which keeps a repaint proportional to the tail rather
+// than to the whole answer. No fence is ever open at `from`, because a commit
+// only ever happens outside one.
+function stableBoundary(body, from) {
+  let open = false;
+  let boundary = from;
+  let at = from;
+  while (at < body.length) {
+    const fence = body.indexOf("```", at);
+    const blank = body.indexOf("\n\n", at);
+    if (blank !== -1 && (fence === -1 || blank < fence)) {
+      let end = blank;
+      while (end < body.length && body[end] === "\n") {
+        end += 1;
+      }
+      if (!open) {
+        boundary = end;
+      }
+      at = end;
+    } else if (fence !== -1) {
+      open = !open;
+      at = fence + 3;
+    } else {
+      break;
+    }
+  }
+  return boundary;
+}
+
 function updateStreamingMessage(message) {
   const article = elements.messages.querySelector(`[data-message-id="${message.id}"]`);
   const content = article?.querySelector(".message-content");
@@ -558,56 +672,81 @@ function updateStreamingMessage(message) {
   updateMessageMetrics(article, message);
   const cursor = content.querySelector(".stream-cursor");
   if (!cursor || !message.generating) {
+    resetStreamState();
     renderMessageContent(content, message);
     return;
+  }
+  // Anchored to the element as well as the id: a full re-render mid-stream
+  // replaces the node, and the committed offsets would no longer describe it.
+  if (stream.messageId !== message.id || stream.content !== content) {
+    resetStreamState(message.id, content);
+    content.replaceChildren(cursor);
   }
 
   const text = message.content || "";
   const thinkingClose = text.indexOf("</think>");
   const thinkingOpen = text.indexOf("<think>");
-
-  let existingIndicator = content.querySelector(".thinking-streaming");
-  let wasExpanded = existingIndicator?.querySelector(".thinking-body")?.style.display !== "none"
-    && existingIndicator?.querySelector(".thinking-body") !== null;
-
-  for (const child of [...content.childNodes]) {
-    if (child !== cursor && child !== existingIndicator) {
-      child.remove();
-    }
-  }
+  let body = "";
 
   if (thinkingClose !== -1) {
-    if (existingIndicator) existingIndicator.remove();
-    const thinkingStart = text.indexOf("<think>");
-    if (thinkingStart !== -1 && thinkingStart < thinkingClose) {
-      const thinkingContent = text.slice(thinkingStart + 8, thinkingClose);
-      content.insertBefore(renderThinkingBlock(thinkingContent), cursor);
-    }
-    const afterThinking = text.slice(thinkingClose + 9);
-    if (afterThinking) {
-      const frag = document.createDocumentFragment();
-      appendStreamMarkdown(frag, afterThinking);
-      content.insertBefore(frag, cursor);
-    }
-  } else if (thinkingOpen !== -1) {
-    const thinkingContent = text.slice(thinkingOpen + 8);
-    if (existingIndicator) {
-      const body = existingIndicator.querySelector(".thinking-body");
-      if (body) {
-        body.textContent = thinkingContent.trim() || "Waiting for thoughts...";
+    if (!stream.thinkingSettled) {
+      content.querySelector(".thinking-streaming")?.remove();
+      if (thinkingOpen !== -1 && thinkingOpen < thinkingClose) {
+        content.insertBefore(
+          renderThinkingBlock(text.slice(thinkingOpen + 8, thinkingClose)),
+          cursor,
+        );
       }
-    } else {
-      content.insertBefore(renderThinkingIndicator(thinkingContent), cursor);
+      stream.thinkingSettled = true;
+      stream.bodyStart = thinkingClose + 9;
+    }
+    body = text.slice(stream.bodyStart);
+  } else if (thinkingOpen !== -1) {
+    let indicator = content.querySelector(".thinking-streaming");
+    if (!indicator) {
+      indicator = renderThinkingIndicator();
+      content.insertBefore(indicator, cursor);
+    }
+    const thinkingBody = indicator.querySelector(".thinking-stream-body");
+    if (thinkingBody) {
+      thinkingBody.textContent = text.slice(thinkingOpen + 8).trim()
+        || "Waiting for thoughts...";
     }
   } else {
-    if (existingIndicator) existingIndicator.remove();
-    const frag = document.createDocumentFragment();
-    appendStreamMarkdown(frag, text);
-    content.insertBefore(frag, cursor);
+    body = text;
   }
 
-  for (const toolCall of message.toolCalls || []) {
-    content.append(renderToolCall(toolCall));
+  for (const node of stream.tailNodes) {
+    node.remove();
+  }
+  stream.tailNodes = [];
+
+  // Frozen text is rendered once with the full markdown renderer, so finished
+  // code blocks, lists and headings look the same while streaming as they do
+  // once the answer lands. Only the unfinished tail uses the cheap renderer.
+  const boundary = stableBoundary(body, stream.committedEnd);
+  if (boundary > stream.committedEnd) {
+    const settled = document.createDocumentFragment();
+    renderRichTextSegment(settled, body.slice(stream.committedEnd, boundary));
+    content.insertBefore(settled, cursor);
+    stream.committedEnd = boundary;
+  }
+
+  const tail = body.slice(stream.committedEnd);
+  if (tail) {
+    const pending = document.createDocumentFragment();
+    appendStreamMarkdown(pending, tail);
+    stream.tailNodes = [...pending.childNodes];
+    content.insertBefore(pending, cursor);
+  }
+
+  if (message.toolCalls?.length) {
+    if (!stream.toolHost) {
+      stream.toolHost = document.createElement("div");
+      stream.toolHost.className = "stream-tools";
+      content.append(stream.toolHost);
+    }
+    stream.toolHost.replaceChildren(...message.toolCalls.map(renderToolCall));
   }
 }
 
@@ -626,7 +765,7 @@ function renderThinkingBlock(content) {
   return details;
 }
 
-function renderThinkingIndicator(content) {
+function renderThinkingIndicator() {
   const wrapper = document.createElement("div");
   wrapper.className = "thinking-streaming";
   
@@ -661,19 +800,18 @@ function renderThinkingIndicator(content) {
 
 function appendStreamMarkdown(container, text) {
   if (!text) return;
-  const openFences = [...text.matchAll(/```([^\n`]*)/g)];
+  // Only an odd number of fences leaves a code block open. Treating the last
+  // fence as an opener regardless put every paragraph that followed a finished
+  // code block inside a "streaming" code box until the answer completed.
+  const fences = [...text.matchAll(/```([^\n`]*)/g)];
   let incompleteCode = null;
-  if (openFences.length > 0) {
-    const lastOpen = openFences[openFences.length - 1];
-    const afterOpen = text.slice(lastOpen.index + lastOpen[0].length);
-    const closeIdx = afterOpen.search(/```/);
-    if (closeIdx === -1) {
-      incompleteCode = {
-        lang: lastOpen[1].trim(),
-        code: afterOpen,
-        start: lastOpen.index,
-      };
-    }
+  if (fences.length % 2 === 1) {
+    const lastOpen = fences[fences.length - 1];
+    incompleteCode = {
+      lang: lastOpen[1].trim(),
+      code: text.slice(lastOpen.index + lastOpen[0].length),
+      start: lastOpen.index,
+    };
   }
   const textPart = incompleteCode ? text.slice(0, incompleteCode.start) : text;
   if (textPart) {
@@ -1051,15 +1189,22 @@ function togglePreview(pre, button, language, code) {
   const title = document.createElement("span");
   title.className = "preview-title";
   title.textContent = language || "Preview";
+  const dismiss = () => {
+    overlay.remove();
+    button.textContent = "Run";
+    document.removeEventListener("keydown", escapeHandler);
+  };
+  const escapeHandler = (event) => {
+    if (event.key === "Escape") {
+      dismiss();
+    }
+  };
   const close = document.createElement("button");
   close.type = "button";
   close.className = "preview-close";
   close.setAttribute("aria-label", "Close preview");
   close.append(svgIcon("close"));
-  close.addEventListener("click", () => {
-    overlay.remove();
-    button.textContent = "Run";
-  });
+  close.addEventListener("click", dismiss);
   toolbar.append(title, close);
   const frame = document.createElement("iframe");
   frame.className = "code-preview-frame";
@@ -1068,19 +1213,12 @@ function togglePreview(pre, button, language, code) {
   frame.src = `preview.html#${encodeURIComponent(previewDocument(language, code))}`;
   overlay.append(toolbar, frame);
   document.body.append(overlay);
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) {
-      overlay.remove();
-      button.textContent = "Run";
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      dismiss();
     }
   });
-  document.addEventListener("keydown", function escHandler(e) {
-    if (e.key === "Escape") {
-      overlay.remove();
-      button.textContent = "Run";
-      document.removeEventListener("keydown", escHandler);
-    }
-  });
+  document.addEventListener("keydown", escapeHandler);
   button.textContent = "Hide";
 }
 
@@ -1246,10 +1384,7 @@ async function sendMessage(promptOverride = null) {
         assistant.content += delta.content;
       }
       mergeToolCalls(assistant, delta.tool_calls);
-      updateStreamingMessage(assistant);
-      if (state.stickToBottom) {
-        scrollToBottom();
-      }
+      scheduleStreamRender(assistant);
     });
     const totalSeconds = (performance.now() - requestStarted) / 1000;
     const outputTokens = usage?.completion_tokens;
@@ -1273,6 +1408,8 @@ async function sendMessage(promptOverride = null) {
       }
     }
   } finally {
+    cancelStreamRender();
+    resetStreamState();
     assistant.generating = false;
     state.generating = false;
     state.controller = null;
@@ -1337,8 +1474,8 @@ function mergeToolCalls(message, deltas) {
   }
 }
 
-async function readSSE(stream, onData) {
-  const reader = stream.getReader();
+async function readSSE(responseBody, onData) {
+  const reader = responseBody.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
@@ -1393,9 +1530,25 @@ async function responseError(response) {
   }
 }
 
+// A poll that outlives its interval must not start another one. The browser
+// only keeps six connections per origin, so polls queued behind a loading or
+// busy server would otherwise stall the page's own requests.
+let pollInFlight = false;
+
+function pollRequest(path) {
+  return fetch(path, {
+    headers: authHeaders(),
+    signal: AbortSignal.timeout?.(15000),
+  });
+}
+
 async function pollRuntime() {
+  if (pollInFlight) {
+    return;
+  }
+  pollInFlight = true;
   try {
-    const response = await fetch("/health", { headers: authHeaders() });
+    const response = await pollRequest("/health");
     if (!response.ok) {
       if (response.status === 401) {
         setRuntimeStatus("locked");
@@ -1405,8 +1558,8 @@ async function pollRuntime() {
     }
     state.health = await response.json();
     const [modelResponse, propertiesResponse] = await Promise.all([
-      state.model ? null : fetch("/v1/models", { headers: authHeaders() }),
-      fetch("/props", { headers: authHeaders() }),
+      state.model ? null : pollRequest("/v1/models"),
+      state.properties ? null : pollRequest("/props"),
     ]);
     if (modelResponse?.ok) {
       const models = await modelResponse.json();
@@ -1420,8 +1573,11 @@ async function pollRuntime() {
         elements.modelSelectorWrap.hidden = true;
       }
     }
-    if (propertiesResponse.ok) {
+    if (propertiesResponse?.ok) {
       const properties = await propertiesResponse.json();
+      // Context window and output ceiling are fixed for the loaded model, so
+      // this endpoint is read once rather than on every poll.
+      state.properties = properties;
       state.maxOutputTokens = clampInteger(
         Math.min(
           properties.context_window || Number.MAX_SAFE_INTEGER,
@@ -1440,6 +1596,8 @@ async function pollRuntime() {
     setRuntimeStatus(state.health.busy ? "busy" : "online");
   } catch {
     setRuntimeStatus("offline");
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -1704,4 +1862,13 @@ if (!state.conversations.length) {
 }
 resizePrompt();
 pollRuntime();
-setInterval(pollRuntime, 5000);
+setInterval(() => {
+  if (!document.hidden) {
+    pollRuntime();
+  }
+}, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    pollRuntime();
+  }
+});

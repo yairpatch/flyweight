@@ -124,6 +124,42 @@ COLIBRI_API int colibri_gpu_attention_cache(
     std::int32_t capacity,
     float scale
 );
+COLIBRI_API int colibri_gpu_attention_f16_cublas(
+    std::uint64_t query,
+    std::uint64_t query_f16,
+    std::uint64_t keys,
+    std::uint64_t values,
+    std::uint64_t scores_f16,
+    std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t heads,
+    std::int32_t kv_heads,
+    std::int32_t head_dim,
+    std::int32_t tokens,
+    std::int32_t capacity,
+    std::int32_t first,
+    float scale
+);
+COLIBRI_API int colibri_gpu_attention_prefill_f16_cublas(
+    std::uint64_t queries,
+    std::uint64_t gates,
+    std::uint64_t keys,
+    std::uint64_t values,
+    std::uint64_t packed_queries,
+    std::uint64_t scores_f32,
+    std::uint64_t probabilities_f16,
+    std::uint64_t packed_output,
+    std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t heads,
+    std::int32_t kv_heads,
+    std::int32_t head_dim,
+    std::int32_t rows,
+    std::int32_t capacity,
+    std::int32_t base_position,
+    std::int32_t tile_rows,
+    float scale
+);
 COLIBRI_API int colibri_gpu_kv_append(
     std::uint64_t current_keys,
     std::uint64_t current_values,
@@ -174,6 +210,14 @@ COLIBRI_API int colibri_gpu_memset(
 COLIBRI_API int colibri_gpu_stream_create(std::uint64_t* stream);
 COLIBRI_API int colibri_gpu_stream_destroy(std::uint64_t stream);
 COLIBRI_API int colibri_gpu_stream_sync(std::uint64_t stream);
+COLIBRI_API int colibri_gpu_graph_begin(std::uint64_t stream);
+COLIBRI_API int colibri_gpu_graph_end(
+    std::uint64_t stream, std::uint64_t* graph
+);
+COLIBRI_API int colibri_gpu_graph_launch(
+    std::uint64_t graph, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_graph_destroy(std::uint64_t graph);
 COLIBRI_API int colibri_gpu_event_create(std::uint64_t* event);
 COLIBRI_API int colibri_gpu_timed_event_create(std::uint64_t* event);
 COLIBRI_API int colibri_gpu_event_record(
@@ -196,6 +240,42 @@ COLIBRI_API int colibri_gpu_q4k_matvec_transposed(
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 );
 COLIBRI_API int colibri_gpu_q6k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q2k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q3k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_q5k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_iq2xxs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_iq3xxs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_iq2xs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_iq4xs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_iq2s_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
+COLIBRI_API int colibri_gpu_iq3s_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 );
@@ -248,6 +328,28 @@ COLIBRI_API int colibri_gpu_nvfp4_grouped_accumulate(
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t experts, std::uint64_t stream
+);
+// Native Blackwell block-scaled FP4 GEMM. The weight matrix remains in GGUF
+// type-40 layout; the driver repacks it and quantizes the f32 activation rows
+// into cuBLASLt's NVFP4 layout. Nonzero means the caller should use its
+// decode-oriented CUDA fallback.
+COLIBRI_API int colibri_gpu_nvfp4_matmul_cublas(
+    std::uint64_t weights, std::uint64_t input, std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t rows, float scale
+);
+// Native FP4 routed-MoE decode: one stacked gate/up GEMM followed by one
+// concatenated down GEMM. Pointer and scale arrays live on the device.
+COLIBRI_API int colibri_gpu_nvfp4_moe_cublas(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t down_pointers, std::uint64_t input,
+    std::uint64_t activated, std::uint64_t output,
+    std::uint64_t route_weights, std::uint64_t gate_scales,
+    std::uint64_t up_scales, std::uint64_t down_scales,
+    std::uint64_t stream,
+    std::int32_t hidden_size, std::int32_t intermediate_size,
+    std::int32_t experts
 );
 COLIBRI_API int colibri_gpu_launch_named(
     const char* name, std::uint32_t grid_x, std::uint32_t grid_y,

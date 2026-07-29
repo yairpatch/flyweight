@@ -20,9 +20,22 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    colibri_qwen_kquant_contract
+    tests/qwen_kquant_contract.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx512.cpp
+)
+target_compile_features(colibri_qwen_kquant_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_kquant_contract PRIVATE src)
+if(BUILD_TESTING)
+    add_test(NAME colibri_qwen_kquant_contract COMMAND colibri_qwen_kquant_contract)
+endif()
+
+add_executable(
     colibri_qwen_avx2_contract
     tests/qwen_avx2_contract.cpp
     src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx_vnni.cpp
     src/qwen_cpu_avx512.cpp
 )
 target_compile_features(colibri_qwen_avx2_contract PRIVATE cxx_std_20)
@@ -35,6 +48,16 @@ if(BUILD_TESTING)
     add_test(NAME colibri_qwen_avx2_contract COMMAND colibri_qwen_avx2_contract)
 endif()
 
+add_executable(
+    colibri_qwen_cpu_bench
+    tools/bench_q8_cpu.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx_vnni.cpp
+    src/qwen_cpu_avx512.cpp
+)
+target_compile_features(colibri_qwen_cpu_bench PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_cpu_bench PRIVATE src)
+
 add_library(
     colibri_v2
     SHARED
@@ -45,10 +68,11 @@ add_library(
     src/q4_avx2.cpp
     src/q4_avx512.cpp
     src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx_vnni.cpp
     src/qwen_cpu_avx512.cpp
 )
 target_compile_features(colibri_v2 PRIVATE cxx_std_20)
-target_include_directories(colibri_v2 PRIVATE include)
+target_include_directories(colibri_v2 PRIVATE include src)
 target_compile_definitions(colibri_v2 PRIVATE COLIBRI_NATIVE_BUILD)
 if(NOT WIN32)
     target_compile_options(colibri_v2 PRIVATE -O3 -fvisibility=hidden)
@@ -95,6 +119,12 @@ else()
     target_compile_options(colibri_native PRIVATE -O3 -fvisibility=hidden)
     set_source_files_properties(src/q4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/q4_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mfma;-mf16c")
+endif()
+
+if(MSVC)
+    set_source_files_properties(src/qwen_cpu_avx_vnni.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+else()
+    set_source_files_properties(src/qwen_cpu_avx_vnni.cpp PROPERTIES COMPILE_OPTIONS -mavx2;-mavxvnni;-mf16c)
 endif()
 
 set_target_properties(

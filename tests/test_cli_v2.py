@@ -44,14 +44,22 @@ class NativeV2BenchmarkTests(unittest.TestCase):
         self.assertEqual(result["expert_compute_ns_per_token"], 300)
 
     def test_cold_cache_advises_and_closes_model(self) -> None:
+        dontneed = 4
         with (
             patch("colibri_next.cli.os.open", return_value=17) as open_file,
-            patch("colibri_next.cli.os.posix_fadvise") as advise,
+            patch(
+                "colibri_next.cli.os.posix_fadvise", create=True
+            ) as advise,
+            patch(
+                "colibri_next.cli.os.POSIX_FADV_DONTNEED",
+                dontneed,
+                create=True,
+            ),
             patch("colibri_next.cli.os.close") as close_file,
         ):
             _drop_file_cache(Path("model.gguf"))
         open_file.assert_called_once_with(Path("model.gguf"), os.O_RDONLY)
-        advise.assert_called_once_with(17, 0, 0, os.POSIX_FADV_DONTNEED)
+        advise.assert_called_once_with(17, 0, 0, dontneed)
         close_file.assert_called_once_with(17)
 
     def test_mtp_accepts_quantized_kv(self) -> None:

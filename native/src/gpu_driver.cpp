@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,24 @@ using CUdeviceptr = unsigned long long;
 
 using nvrtcResult = int;
 using nvrtcProgram = void*;
+using cublasStatus_t = int;
+using cublasHandle_t = void*;
+using cudaDataType_t = int;
+using cublasComputeType_t = int;
+using cublasOperation_t = int;
+using cublasGemmAlgo_t = int;
+using cublasLtHandle_t = void*;
+using cublasLtMatmulDesc_t = void*;
+using cublasLtMatrixLayout_t = void*;
+using cublasLtMatmulPreference_t = void*;
+struct CublasLtMatmulAlgo { std::uint64_t data[8]; };
+struct CublasLtHeuristicResult {
+    CublasLtMatmulAlgo algo;
+    size_t workspace_size;
+    cublasStatus_t state;
+    float waves_count;
+    int reserved[4];
+};
 
 struct CudaApi {
     CUresult (*cuInit)(unsigned int) = nullptr;
@@ -104,6 +123,73 @@ struct CudaApi {
 };
 
 CudaApi g_api;
+struct CublasApi {
+    cublasStatus_t (*create)(cublasHandle_t*) = nullptr;
+    cublasStatus_t (*destroy)(cublasHandle_t) = nullptr;
+    cublasStatus_t (*set_stream)(cublasHandle_t, CUstream) = nullptr;
+    cublasStatus_t (*gemm_strided_batched_ex)(
+        cublasHandle_t, cublasOperation_t, cublasOperation_t,
+        int, int, int, const void*, const void*, cudaDataType_t, int,
+        long long, const void*, cudaDataType_t, int, long long,
+        const void*, void*, cudaDataType_t, int, long long, int,
+        cublasComputeType_t, cublasGemmAlgo_t
+    ) = nullptr;
+    void* library = nullptr;
+    bool attempted = false;
+};
+CublasApi g_cublas;
+cublasHandle_t g_cublas_handle = nullptr;
+struct CublasLtApi {
+    cublasStatus_t (*create)(cublasLtHandle_t*) = nullptr;
+    cublasStatus_t (*destroy)(cublasLtHandle_t) = nullptr;
+    cublasStatus_t (*matmul_desc_create)(
+        cublasLtMatmulDesc_t*, cublasComputeType_t, cudaDataType_t) = nullptr;
+    cublasStatus_t (*matmul_desc_destroy)(cublasLtMatmulDesc_t) = nullptr;
+    cublasStatus_t (*matmul_desc_set)(
+        cublasLtMatmulDesc_t, int, const void*, size_t) = nullptr;
+    cublasStatus_t (*layout_create)(
+        cublasLtMatrixLayout_t*, cudaDataType_t, std::uint64_t,
+        std::uint64_t, std::int64_t) = nullptr;
+    cublasStatus_t (*layout_destroy)(cublasLtMatrixLayout_t) = nullptr;
+    cublasStatus_t (*preference_create)(cublasLtMatmulPreference_t*) = nullptr;
+    cublasStatus_t (*preference_destroy)(cublasLtMatmulPreference_t) = nullptr;
+    cublasStatus_t (*preference_set)(
+        cublasLtMatmulPreference_t, int, const void*, size_t) = nullptr;
+    cublasStatus_t (*heuristic)(
+        cublasLtHandle_t, cublasLtMatmulDesc_t,
+        cublasLtMatrixLayout_t, cublasLtMatrixLayout_t,
+        cublasLtMatrixLayout_t, cublasLtMatrixLayout_t,
+        cublasLtMatmulPreference_t, int, CublasLtHeuristicResult*, int*) = nullptr;
+    cublasStatus_t (*matmul)(
+        cublasLtHandle_t, cublasLtMatmulDesc_t,
+        const void*, const void*, cublasLtMatrixLayout_t,
+        const void*, cublasLtMatrixLayout_t, const void*,
+        const void*, cublasLtMatrixLayout_t, void*, cublasLtMatrixLayout_t,
+        const CublasLtMatmulAlgo*, void*, size_t, CUstream) = nullptr;
+    void* library = nullptr;
+    bool attempted = false;
+};
+CublasLtApi g_cublas_lt;
+cublasLtHandle_t g_cublas_lt_handle = nullptr;
+struct Nvfp4Scratch {
+    CUdeviceptr weight_values = 0, weight_scales = 0;
+    CUdeviceptr input_values = 0, input_scales = 0;
+    CUdeviceptr projected = 0;
+    size_t weight_values_bytes = 0, weight_scales_bytes = 0;
+    size_t input_values_bytes = 0, input_scales_bytes = 0;
+    size_t projected_bytes = 0;
+    CUstream stream = nullptr;
+};
+Nvfp4Scratch g_nvfp4_scratch;
+struct Nvfp4LtPlan {
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t a_layout = nullptr, b_layout = nullptr;
+    cublasLtMatrixLayout_t c_layout = nullptr, d_layout = nullptr;
+    CublasLtMatmulAlgo algo{};
+};
+std::unordered_map<std::uint64_t, Nvfp4LtPlan> g_nvfp4_plans;
+bool g_nvfp4_validation_done = false;
+std::mutex g_cublas_mutex;
 CUcontext g_context = nullptr;
 CUmodule g_module = nullptr;
 CUstream g_stream = nullptr;
@@ -135,6 +221,8 @@ struct Kernels {
     CUfunction q8_grouped_accumulate = nullptr;
     CUfunction nvfp4_grouped_swiglu = nullptr;
     CUfunction nvfp4_grouped_accumulate = nullptr;
+    CUfunction nvfp4_grouped_swiglu_tiled = nullptr;
+    CUfunction nvfp4_grouped_accumulate_tiled = nullptr;
 };
 
 Kernels g_kernels;
@@ -266,6 +354,130 @@ bool load_apis() {
     ok &= load_symbol(nvrtc, "nvrtcDestroyProgram", g_api.nvrtcDestroyProgram);
     g_api.loaded = ok;
     return ok;
+}
+
+bool load_cublas() {
+    if (g_cublas_handle != nullptr) return true;
+    if (g_cublas.attempted) return false;
+    g_cublas.attempted = true;
+#if defined(_WIN32)
+    const wchar_t* names[] = {
+        L"cublas64_13.dll", L"cublas64_12.dll", L"cublas64_11.dll",
+    };
+    for (const wchar_t* name : names) {
+        g_cublas.library = reinterpret_cast<void*>(LoadLibraryW(name));
+        if (g_cublas.library != nullptr) break;
+    }
+#else
+    const char* names[] = {
+        "libcublas.so.13", "libcublas.so.12", "libcublas.so.11",
+        "libcublas.so",
+    };
+    for (const char* name : names) {
+        g_cublas.library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (g_cublas.library != nullptr) break;
+    }
+#endif
+    if (g_cublas.library == nullptr) return false;
+    bool ok = true;
+    ok &= load_symbol(g_cublas.library, "cublasCreate_v2", g_cublas.create);
+    ok &= load_symbol(g_cublas.library, "cublasDestroy_v2", g_cublas.destroy);
+    ok &= load_symbol(
+        g_cublas.library, "cublasSetStream_v2", g_cublas.set_stream
+    );
+    ok &= load_symbol(
+        g_cublas.library, "cublasGemmStridedBatchedEx",
+        g_cublas.gemm_strided_batched_ex
+    );
+    if (!ok || g_cublas.create(&g_cublas_handle) != 0) {
+        g_cublas_handle = nullptr;
+        return false;
+    }
+    return true;
+}
+
+bool load_cublas_lt() {
+    if (g_cublas_lt_handle != nullptr) return true;
+    if (g_cublas_lt.attempted) return false;
+    g_cublas_lt.attempted = true;
+#if defined(_WIN32)
+    const wchar_t* names[] = {
+        L"cublasLt64_13.dll", L"cublasLt64_12.dll", L"cublasLt64_11.dll",
+    };
+    for (const wchar_t* name : names) {
+        g_cublas_lt.library = reinterpret_cast<void*>(LoadLibraryW(name));
+        if (g_cublas_lt.library != nullptr) break;
+    }
+    if (g_cublas_lt.library == nullptr) {
+        wchar_t base[4096];
+        const DWORD length = GetEnvironmentVariableW(L"CUDA_PATH", base, 4096);
+        if (length > 0 && length < 4096) {
+            for (const wchar_t* subdir : {L"\\bin\\x64\\", L"\\bin\\"}) {
+                for (const wchar_t* name : names) {
+                    const std::wstring path =
+                        std::wstring(base) + subdir + name;
+                    HMODULE handle = LoadLibraryExW(
+                        path.c_str(), nullptr,
+                        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
+                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+                    if (handle) {
+                        g_cublas_lt.library =
+                            reinterpret_cast<void*>(handle);
+                        break;
+                    }
+                }
+                if (g_cublas_lt.library != nullptr) break;
+            }
+        }
+    }
+#else
+    const char* names[] = {
+        "libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so.11",
+        "libcublasLt.so",
+    };
+    for (const char* name : names) {
+        g_cublas_lt.library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (g_cublas_lt.library != nullptr) break;
+    }
+#endif
+    if (g_cublas_lt.library == nullptr) return false;
+    bool ok = true;
+    ok &= load_symbol(g_cublas_lt.library, "cublasLtCreate", g_cublas_lt.create);
+    ok &= load_symbol(g_cublas_lt.library, "cublasLtDestroy", g_cublas_lt.destroy);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmulDescCreate",
+        g_cublas_lt.matmul_desc_create);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmulDescDestroy",
+        g_cublas_lt.matmul_desc_destroy);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmulDescSetAttribute",
+        g_cublas_lt.matmul_desc_set);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatrixLayoutCreate",
+        g_cublas_lt.layout_create);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatrixLayoutDestroy",
+        g_cublas_lt.layout_destroy);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmulPreferenceCreate",
+        g_cublas_lt.preference_create);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmulPreferenceDestroy",
+        g_cublas_lt.preference_destroy);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmulPreferenceSetAttribute",
+        g_cublas_lt.preference_set);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmulAlgoGetHeuristic",
+        g_cublas_lt.heuristic);
+    ok &= load_symbol(
+        g_cublas_lt.library, "cublasLtMatmul", g_cublas_lt.matmul);
+    if (!ok || g_cublas_lt.create(&g_cublas_lt_handle) != 0) {
+        g_cublas_lt_handle = nullptr;
+        return false;
+    }
+    return true;
 }
 
 // Phase profiling under COLIBRI_SEG_DEBUG: 0=start 1=mixer 2=route 3=copies
@@ -602,6 +814,8 @@ extern "C" int colibri_gpu_compile(
         {"q8_grouped_accumulate", &g_kernels.q8_grouped_accumulate},
         {"nvfp4_grouped_swiglu", &g_kernels.nvfp4_grouped_swiglu},
         {"nvfp4_grouped_accumulate", &g_kernels.nvfp4_grouped_accumulate},
+        {"nvfp4_grouped_swiglu_tiled", &g_kernels.nvfp4_grouped_swiglu_tiled},
+        {"nvfp4_grouped_accumulate_tiled", &g_kernels.nvfp4_grouped_accumulate_tiled},
     };
     for (const Entry& entry : entries) {
         if (g_api.cuModuleGetFunction(entry.slot, g_module, entry.name) != 0) {
@@ -612,10 +826,26 @@ extern "C" int colibri_gpu_compile(
     for (const char* name : {
              "qwen_q8_embedding", "qwen_f32_matvec",
              "bf16_matvec_warp", "qwen_f32_matvec_warp",
+             "q2k_matvec_transposed_warp", "q3k_matvec_transposed_warp",
+             "q4k_matvec_transposed_warp", "q5k_matvec_transposed_warp",
              "q6k_matvec_transposed_warp",
+             "iq2xxs_matvec_transposed_warp",
+             "iq2xxs_q8_matvec_transposed_warp",
+             "quantize_q8_blocks", "iq3xxs_matvec_transposed_warp",
+             "iq2s_matvec_transposed_warp", "iq3s_matvec_transposed_warp",
+             "iq2xs_matvec_transposed_warp", "iq4xs_matvec_transposed_warp",
+             "q2k_matmul_rows", "q3k_matmul_rows", "q4k_matmul_rows",
+             "q5k_matmul_rows", "q6k_matmul_rows",
+             "iq2xxs_matmul_rows", "iq3xxs_matmul_rows",
+             "iq2s_matmul_rows", "iq3s_matmul_rows",
+             "iq2xs_matmul_rows", "iq4xs_matmul_rows",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",
+             "qwen_attention_query_f16", "kv_attention_softmax_f16",
+             "qwen_attention_prefill_pack_f16",
+             "kv_attention_prefill_softmax_f16",
+             "qwen_attention_prefill_unpack_gate",
              "kv_attention_scores", "kv_attention_values",
              "qwen_shared_scale", "qwen_argmax", "qwen_concat_pair",
              "qwen_shared_scale_bf16", "qwen_copy_vector", "silu_mul",
@@ -633,8 +863,37 @@ extern "C" int colibri_gpu_compile(
              "q8_grouped_accumulate_rows", "nvfp4_grouped_swiglu_rows",
              "nvfp4_grouped_accumulate_rows", "nvfp4_matvec_transposed",
              "nvfp4_swiglu_transposed", "kv_attention_prefill",
+             "nvfp4_repack_cublaslt", "nvfp4_quantize_cublaslt",
+             "nvfp4_repack_stacked_moe_cublaslt",
+             "nvfp4_stacked_moe_swiglu",
+             "nvfp4_quantize_broadcast16_cublaslt",
+             "nvfp4_repack_concat_down_cublaslt",
+             "nvfp4_quantize_weighted_moe_cublaslt",
+             "nvfp4_moe_add_first_column",
+             "nvfp4_validate_stacked_projection",
+             "nvfp4_validate_down_projection",
              "qwen_bf16_embedding", "qwen_bf16_embedding_rows",
              "qwen_f32_embedding", "qwen_f32_embedding_rows",
+             "q2k_matvec_transposed", "q3k_matvec_transposed", "q5k_matvec_transposed",
+             "f32_lm_head_argmax_warp", "q2k_lm_head_argmax_warp",
+             "iq2xxs_matvec_transposed", "iq2xxs_lm_head_argmax_warp",
+             "iq3xxs_matvec_transposed", "iq3xxs_lm_head_argmax_warp",
+             "iq2s_matvec_transposed", "iq2s_lm_head_argmax_warp",
+             "iq2xs_matvec_transposed", "iq2xs_lm_head_argmax_warp",
+             "iq4xs_matvec_transposed", "iq4xs_lm_head_argmax_warp",
+             "qwen_iq2xs_embedding", "qwen_iq2xs_embedding_rows",
+             "qwen_iq4xs_embedding", "qwen_iq4xs_embedding_rows",
+             "iq3s_matvec_transposed", "iq3s_lm_head_argmax_warp",
+             "qwen_iq2s_embedding", "qwen_iq2s_embedding_rows",
+             "qwen_iq3s_embedding", "qwen_iq3s_embedding_rows",
+             "qwen_iq3xxs_embedding", "qwen_iq3xxs_embedding_rows",
+             "qwen_iq2xxs_embedding", "qwen_iq2xxs_embedding_rows",
+             "q3k_lm_head_argmax_warp", "q5k_lm_head_argmax_warp",
+             "qwen_q2k_embedding", "qwen_q2k_embedding_rows",
+             "qwen_q3k_embedding", "qwen_q3k_embedding_rows",
+             "qwen_q4k_embedding", "qwen_q4k_embedding_rows",
+             "qwen_q5k_embedding", "qwen_q5k_embedding_rows",
+             "qwen_q6k_embedding", "qwen_q6k_embedding_rows",
              "bf16_lm_head_argmax_warp", "qwen_bf16_lm_head_argmax_rows",
              "nvfp4_matmul_rows",
              "q8_matmul_tiled", "delta_conv_chunk",
@@ -644,6 +903,7 @@ extern "C" int colibri_gpu_compile(
              "kv_attention_values_f16", "kv_attention_values_bf16", "kv_attention_values_q8",
              "kv_attention_scores_ring", "kv_attention_scores_f16_ring", "kv_attention_scores_bf16_ring", "kv_attention_scores_q8_ring",
              "kv_attention_values_ring", "kv_attention_values_f16_ring", "kv_attention_values_bf16_ring", "kv_attention_values_q8_ring",
+             "kv_attention_fused_f16_tiles", "kv_attention_fused_bf16_tiles",
              "kv_attention_fused_q8_tiles", "kv_attention_fused_merge",
              "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8",
              "gemma_q4_0_matvec", "gemma_q4_0_embedding", "gemma_q4_0_geglu",
@@ -948,6 +1208,46 @@ extern "C" int colibri_gpu_stream_sync(std::uint64_t stream) {
         ? 0 : -1;
 }
 
+extern "C" int colibri_gpu_graph_begin(std::uint64_t stream) {
+    if (stream == 0 || g_api.cuStreamBeginCapture == nullptr) return -1;
+    return g_api.cuStreamBeginCapture(
+        reinterpret_cast<CUstream>(stream), 2 /* relaxed */
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_graph_end(
+    std::uint64_t stream, std::uint64_t* handle
+) {
+    if (stream == 0 || handle == nullptr || g_api.cuStreamEndCapture == nullptr)
+        return -1;
+    *handle = 0;
+    void* graph = nullptr;
+    if (g_api.cuStreamEndCapture(reinterpret_cast<CUstream>(stream), &graph) != 0
+        || graph == nullptr)
+        return -2;
+    void* executable = nullptr;
+    const int status = g_api.cuGraphInstantiateWithFlags(&executable, graph, 0);
+    g_api.cuGraphDestroy(graph);
+    if (status != 0 || executable == nullptr) return -3;
+    *handle = reinterpret_cast<std::uint64_t>(executable);
+    return 0;
+}
+
+extern "C" int colibri_gpu_graph_launch(
+    std::uint64_t graph, std::uint64_t stream
+) {
+    if (graph == 0 || stream == 0 || g_api.cuGraphLaunch == nullptr) return -1;
+    return g_api.cuGraphLaunch(
+        reinterpret_cast<void*>(graph), reinterpret_cast<CUstream>(stream)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_graph_destroy(std::uint64_t graph) {
+    if (graph == 0) return 0;
+    if (g_api.cuGraphExecDestroy == nullptr) return -1;
+    return g_api.cuGraphExecDestroy(reinterpret_cast<void*>(graph)) == 0 ? 0 : -2;
+}
+
 extern "C" int colibri_gpu_event_create(std::uint64_t* event) {
     if (event == nullptr) return -1;
     CUevent created = nullptr;
@@ -1023,12 +1323,127 @@ extern "C" int colibri_gpu_q4k_matvec_transposed(
     if (!packed || !input || !output || input_size <= 0 || output_size <= 0)
         return -1;
     CUfunction function = nullptr;
-    auto it = g_functions.find("q4k_matvec_transposed");
+    bool warp_mapped = false;
+    auto it = g_functions.find("q4k_matvec_transposed_warp");
+    if (it == g_functions.end()) it = g_functions.find("q4k_matvec_transposed");
+    else warp_mapped = true;
     if (it != g_functions.end()) function = it->second;
     if (!function) return -1;
     void* args[] = {&packed, &input, &output, &input_size, &output_size};
-    return launch(function, static_cast<unsigned int>(output_size), 1, 256,
+    const auto blocks = warp_mapped
+        ? static_cast<unsigned int>((output_size + 7) / 8)
+        : static_cast<unsigned int>(output_size);
+    return launch(function, blocks, 1, 256,
                   args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+namespace {
+
+// Prefer the warp-per-row implementation while retaining the original
+// block-per-row entry point as a compatibility fallback.
+int launch_kquant_matvec(
+    const char* warp_name, const char* fallback_name,
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    if (!packed || !input || !output || input_size <= 0 || output_size <= 0)
+        return -1;
+    bool warp_mapped = std::strcmp(warp_name, fallback_name) != 0;
+    auto it = g_functions.find(warp_mapped ? warp_name : fallback_name);
+    if (it == g_functions.end() && warp_mapped) {
+        warp_mapped = false;
+        it = g_functions.find(fallback_name);
+    }
+    if (it == g_functions.end() || !it->second) return -1;
+    void* args[] = {&packed, &input, &output, &input_size, &output_size};
+    const auto blocks = warp_mapped
+        ? static_cast<unsigned int>((output_size + 7) / 8)
+        : static_cast<unsigned int>(output_size);
+    return launch(it->second, blocks, 1, 256,
+                  args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+} // namespace
+
+extern "C" int colibri_gpu_q2k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "q2k_matvec_transposed_warp", "q2k_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_q3k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "q3k_matvec_transposed_warp", "q3k_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_q5k_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "q5k_matvec_transposed_warp", "q5k_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq2xxs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq2xxs_matvec_transposed", "iq2xxs_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq3xxs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq3xxs_matvec_transposed_warp", "iq3xxs_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq2s_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq2s_matvec_transposed_warp", "iq2s_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq3s_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq3s_matvec_transposed_warp", "iq3s_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq2xs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq2xs_matvec_transposed_warp", "iq2xs_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq4xs_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq4xs_matvec_transposed_warp", "iq4xs_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
 }
 
 extern "C" int colibri_gpu_q6k_matvec_transposed(
@@ -1147,13 +1562,18 @@ extern "C" int colibri_gpu_nvfp4_grouped_swiglu(
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t experts, std::uint64_t stream
 ) {
-    if (!g_kernels.nvfp4_grouped_swiglu || !gate_pointers || !up_pointers
+    const char* tiled_env = std::getenv("COLIBRI_NVFP4_TILED");
+    const bool tiled = tiled_env && tiled_env[0] == '1';
+    const auto kernel = tiled ? g_kernels.nvfp4_grouped_swiglu_tiled
+                              : g_kernels.nvfp4_grouped_swiglu;
+    if (!kernel || !gate_pointers || !up_pointers
         || !input || !activated || input_size <= 0 || output_size <= 0
         || experts <= 0) return -1;
     void* args[] = {&gate_pointers, &up_pointers, &input, &activated,
                     &input_size, &output_size, &experts};
-    return launch(g_kernels.nvfp4_grouped_swiglu,
-                  static_cast<unsigned int>(output_size),
+    return launch(kernel,
+                  static_cast<unsigned int>(
+                      tiled ? (output_size + 7) / 8 : output_size),
                   static_cast<unsigned int>(experts), 256, args, 0,
                   reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
@@ -1163,8 +1583,501 @@ extern "C" int colibri_gpu_nvfp4_grouped_accumulate(
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t experts, std::uint64_t stream
-) { return grouped_accumulate(g_kernels.nvfp4_grouped_accumulate, down_pointers,
-    activated, output, weights, input_size, output_size, experts, stream); }
+) {
+    const char* tiled_env = std::getenv("COLIBRI_NVFP4_TILED");
+    const bool tiled = tiled_env && tiled_env[0] == '1';
+    const auto kernel = tiled ? g_kernels.nvfp4_grouped_accumulate_tiled
+                              : g_kernels.nvfp4_grouped_accumulate;
+    if (!kernel || !down_pointers || !activated
+        || !output || !weights || input_size <= 0 || output_size <= 0
+        || experts <= 0) return -1;
+    void* args[] = {&down_pointers, &activated, &output, &weights,
+                    &input_size, &output_size, &experts};
+    return launch(kernel,
+                  static_cast<unsigned int>(
+                      tiled ? (output_size + 7) / 8 : output_size), 1, 256,
+                  args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+static size_t nvfp4_cublas_scale_bytes(int outer, int inner) {
+    const size_t outer_tiles = (static_cast<size_t>(outer) + 127) / 128;
+    const size_t inner_tiles =
+        ((static_cast<size_t>(inner) + 15) / 16 + 3) / 4;
+    return outer_tiles * inner_tiles * 512;
+}
+
+static void nvfp4_clear_cublas_plans() {
+    for (auto& entry : g_nvfp4_plans) {
+        auto& plan = entry.second;
+        if (plan.d_layout) g_cublas_lt.layout_destroy(plan.d_layout);
+        if (plan.c_layout) g_cublas_lt.layout_destroy(plan.c_layout);
+        if (plan.b_layout) g_cublas_lt.layout_destroy(plan.b_layout);
+        if (plan.a_layout) g_cublas_lt.layout_destroy(plan.a_layout);
+        if (plan.operation) g_cublas_lt.matmul_desc_destroy(plan.operation);
+    }
+    g_nvfp4_plans.clear();
+}
+
+static int nvfp4_run_quantized_gemm(
+    int input_size, int output_size, int rows, float alpha, float beta,
+    std::uint64_t output, CUstream cuda_stream
+) {
+    constexpr int kCudaR32F = 0;
+    constexpr int kCudaR4E2M1 = 33;
+    constexpr int kCompute32F = 68;
+    constexpr int kOpN = 0, kOpT = 1;
+    constexpr int kDescTransA = 3, kDescTransB = 4;
+    constexpr int kDescAScalePointer = 17, kDescBScalePointer = 18;
+    constexpr int kDescAScaleMode = 31, kDescBScaleMode = 32;
+    constexpr int kScaleVec16Ue4m3 = 1;
+    constexpr int kPreferenceMaxWorkspace = 1;
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(input_size))
+         << 40) |
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(output_size))
+         << 16) |
+        static_cast<std::uint16_t>(rows);
+    auto found = g_nvfp4_plans.find(key);
+    if (found == g_nvfp4_plans.end()) {
+        Nvfp4LtPlan plan;
+        cublasLtMatmulPreference_t preference = nullptr;
+        auto cleanup = [&]() {
+            if (preference) g_cublas_lt.preference_destroy(preference);
+            if (plan.d_layout) g_cublas_lt.layout_destroy(plan.d_layout);
+            if (plan.c_layout) g_cublas_lt.layout_destroy(plan.c_layout);
+            if (plan.b_layout) g_cublas_lt.layout_destroy(plan.b_layout);
+            if (plan.a_layout) g_cublas_lt.layout_destroy(plan.a_layout);
+            if (plan.operation)
+                g_cublas_lt.matmul_desc_destroy(plan.operation);
+        };
+        if (g_cublas_lt.matmul_desc_create(
+                &plan.operation, kCompute32F, kCudaR32F) != 0 ||
+            g_cublas_lt.layout_create(
+                &plan.a_layout, kCudaR4E2M1, input_size, output_size,
+                input_size) != 0 ||
+            g_cublas_lt.layout_create(
+                &plan.b_layout, kCudaR4E2M1, input_size, rows,
+                input_size) != 0 ||
+            g_cublas_lt.layout_create(
+                &plan.c_layout, kCudaR32F, output_size, rows,
+                output_size) != 0 ||
+            g_cublas_lt.layout_create(
+                &plan.d_layout, kCudaR32F, output_size, rows,
+                output_size) != 0 ||
+            g_cublas_lt.preference_create(&preference) != 0) {
+            cleanup();
+            return -1;
+        }
+        const void* a_scale_pointer = reinterpret_cast<const void*>(
+            static_cast<std::uintptr_t>(g_nvfp4_scratch.weight_scales));
+        const void* b_scale_pointer = reinterpret_cast<const void*>(
+            static_cast<std::uintptr_t>(g_nvfp4_scratch.input_scales));
+        size_t no_workspace = 0;
+        if (g_cublas_lt.matmul_desc_set(
+                plan.operation, kDescTransA, &kOpT, sizeof(kOpT)) != 0 ||
+            g_cublas_lt.matmul_desc_set(
+                plan.operation, kDescTransB, &kOpN, sizeof(kOpN)) != 0 ||
+            g_cublas_lt.matmul_desc_set(
+                plan.operation, kDescAScaleMode, &kScaleVec16Ue4m3,
+                sizeof(kScaleVec16Ue4m3)) != 0 ||
+            g_cublas_lt.matmul_desc_set(
+                plan.operation, kDescBScaleMode, &kScaleVec16Ue4m3,
+                sizeof(kScaleVec16Ue4m3)) != 0 ||
+            g_cublas_lt.matmul_desc_set(
+                plan.operation, kDescAScalePointer, &a_scale_pointer,
+                sizeof(a_scale_pointer)) != 0 ||
+            g_cublas_lt.matmul_desc_set(
+                plan.operation, kDescBScalePointer, &b_scale_pointer,
+                sizeof(b_scale_pointer)) != 0 ||
+            g_cublas_lt.preference_set(
+                preference, kPreferenceMaxWorkspace, &no_workspace,
+                sizeof(no_workspace)) != 0) {
+            cleanup();
+            return -2;
+        }
+        CublasLtHeuristicResult result{};
+        int result_count = 0;
+        if (g_cublas_lt.heuristic(
+                g_cublas_lt_handle, plan.operation, plan.a_layout,
+                plan.b_layout, plan.c_layout, plan.d_layout, preference, 1,
+                &result, &result_count) != 0 ||
+            result_count != 1 || result.state != 0) {
+            cleanup();
+            return -3;
+        }
+        plan.algo = result.algo;
+        g_cublas_lt.preference_destroy(preference);
+        preference = nullptr;
+        found = g_nvfp4_plans.emplace(key, plan).first;
+    }
+    const auto& plan = found->second;
+    const void* a = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(g_nvfp4_scratch.weight_values));
+    const void* b = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(g_nvfp4_scratch.input_values));
+    void* d = reinterpret_cast<void*>(static_cast<std::uintptr_t>(output));
+    const int status = g_cublas_lt.matmul(
+        g_cublas_lt_handle, plan.operation, &alpha, a, plan.a_layout, b,
+        plan.b_layout, &beta, d, plan.c_layout, d, plan.d_layout, &plan.algo,
+        nullptr, 0, cuda_stream);
+    return status == 0 ? 0 : -4;
+}
+
+extern "C" int colibri_gpu_nvfp4_matmul_cublas(
+    std::uint64_t weights, std::uint64_t input, std::uint64_t output,
+    std::uint64_t stream, std::int32_t input_size,
+    std::int32_t output_size, std::int32_t rows, float scale
+) {
+    std::lock_guard<std::mutex> lock(g_cublas_mutex);
+    if (!weights || !input || !output || input_size <= 0 || output_size <= 0
+        || rows <= 0 || (input_size & 63) || (output_size & 15)
+        || !load_cublas_lt()) return -1;
+    const auto repack = g_functions.find("nvfp4_repack_cublaslt");
+    const auto quantize = g_functions.find("nvfp4_quantize_cublaslt");
+    if (repack == g_functions.end() || quantize == g_functions.end()) return -2;
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    if (g_nvfp4_scratch.stream != nullptr
+        && g_nvfp4_scratch.stream != cuda_stream
+        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -3;
+
+    const auto scale_bytes = [](std::int32_t outer, std::int32_t inner) {
+        const size_t outer_tiles = (static_cast<size_t>(outer) + 127) / 128;
+        const size_t inner_tiles =
+            ((static_cast<size_t>(inner) + 15) / 16 + 3) / 4;
+        return outer_tiles * inner_tiles * 512;
+    };
+    const size_t weight_value_bytes =
+        static_cast<size_t>(output_size) * input_size / 2;
+    const size_t weight_scale_bytes = scale_bytes(output_size, input_size);
+    const size_t input_value_bytes =
+        static_cast<size_t>(rows) * input_size / 2;
+    const size_t input_scale_bytes = scale_bytes(rows, input_size);
+    bool grow =
+        weight_value_bytes > g_nvfp4_scratch.weight_values_bytes ||
+        weight_scale_bytes > g_nvfp4_scratch.weight_scales_bytes ||
+        input_value_bytes > g_nvfp4_scratch.input_values_bytes ||
+        input_scale_bytes > g_nvfp4_scratch.input_scales_bytes;
+    if (grow && g_nvfp4_scratch.stream != nullptr
+        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -4;
+    if (grow) nvfp4_clear_cublas_plans();
+    auto reserve = [&](CUdeviceptr& pointer, size_t& capacity, size_t bytes) {
+        if (bytes <= capacity) return true;
+        if (pointer && g_api.cuMemFree(pointer) != 0) return false;
+        pointer = 0;
+        capacity = 0;
+        if (g_api.cuMemAlloc(&pointer, bytes) != 0) return false;
+        capacity = bytes;
+        return true;
+    };
+    if (!reserve(g_nvfp4_scratch.weight_values,
+                 g_nvfp4_scratch.weight_values_bytes, weight_value_bytes) ||
+        !reserve(g_nvfp4_scratch.weight_scales,
+                 g_nvfp4_scratch.weight_scales_bytes, weight_scale_bytes) ||
+        !reserve(g_nvfp4_scratch.input_values,
+                 g_nvfp4_scratch.input_values_bytes, input_value_bytes) ||
+        !reserve(g_nvfp4_scratch.input_scales,
+                 g_nvfp4_scratch.input_scales_bytes, input_scale_bytes))
+        return -5;
+    g_nvfp4_scratch.stream = cuda_stream;
+
+    std::uint64_t weight_values = g_nvfp4_scratch.weight_values;
+    std::uint64_t weight_scales = g_nvfp4_scratch.weight_scales;
+    void* repack_args[] = {
+        &weights, &weight_values, &weight_scales, &output_size, &input_size};
+    const unsigned int weight_blocks =
+        static_cast<unsigned int>(
+            (static_cast<std::uint64_t>(output_size) * input_size / 64 + 255)
+            / 256);
+    if (launch(repack->second, weight_blocks, 1, 256, repack_args, 0,
+               cuda_stream) != 0) return -6;
+
+    std::uint64_t input_values = g_nvfp4_scratch.input_values;
+    std::uint64_t input_scales = g_nvfp4_scratch.input_scales;
+    void* quantize_args[] = {
+        &input, &input_values, &input_scales, &rows, &input_size};
+    const unsigned int input_blocks =
+        static_cast<unsigned int>(
+            static_cast<std::uint64_t>(rows) * input_size / 16);
+    if (launch(quantize->second, input_blocks, 1, 32, quantize_args, 0,
+               cuda_stream) != 0) return -7;
+
+    // Column-major view:
+    //   A = W as KxM, op(A)=T; B = X as KxN; D = MxN.
+    // D's column-major bytes are the runtime's row-major [N,M] output.
+    constexpr int kCudaR32F = 0;
+    constexpr int kCudaR4E2M1 = 33;
+    constexpr int kCompute32F = 68;
+    constexpr int kOpN = 0, kOpT = 1;
+    constexpr int kDescTransA = 3, kDescTransB = 4;
+    constexpr int kDescAScalePointer = 17, kDescBScalePointer = 18;
+    constexpr int kDescAScaleMode = 31, kDescBScaleMode = 32;
+    constexpr int kScaleVec16Ue4m3 = 1;
+    constexpr int kPreferenceMaxWorkspace = 1;
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t a_layout = nullptr, b_layout = nullptr;
+    cublasLtMatrixLayout_t c_layout = nullptr, d_layout = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+    auto cleanup = [&]() {
+        if (preference) g_cublas_lt.preference_destroy(preference);
+        if (d_layout) g_cublas_lt.layout_destroy(d_layout);
+        if (c_layout) g_cublas_lt.layout_destroy(c_layout);
+        if (b_layout) g_cublas_lt.layout_destroy(b_layout);
+        if (a_layout) g_cublas_lt.layout_destroy(a_layout);
+        if (operation) g_cublas_lt.matmul_desc_destroy(operation);
+    };
+    if (g_cublas_lt.matmul_desc_create(
+            &operation, kCompute32F, kCudaR32F) != 0 ||
+        g_cublas_lt.layout_create(
+            &a_layout, kCudaR4E2M1, input_size, output_size, input_size) != 0 ||
+        g_cublas_lt.layout_create(
+            &b_layout, kCudaR4E2M1, input_size, rows, input_size) != 0 ||
+        g_cublas_lt.layout_create(
+            &c_layout, kCudaR32F, output_size, rows, output_size) != 0 ||
+        g_cublas_lt.layout_create(
+            &d_layout, kCudaR32F, output_size, rows, output_size) != 0 ||
+        g_cublas_lt.preference_create(&preference) != 0) {
+        cleanup();
+        return -8;
+    }
+    const void* a_scale_pointer = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(weight_scales));
+    const void* b_scale_pointer = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(input_scales));
+    size_t no_workspace = 0;
+    if (g_cublas_lt.matmul_desc_set(
+            operation, kDescTransA, &kOpT, sizeof(kOpT)) != 0 ||
+        g_cublas_lt.matmul_desc_set(
+            operation, kDescTransB, &kOpN, sizeof(kOpN)) != 0 ||
+        g_cublas_lt.matmul_desc_set(
+            operation, kDescAScaleMode, &kScaleVec16Ue4m3,
+            sizeof(kScaleVec16Ue4m3)) != 0 ||
+        g_cublas_lt.matmul_desc_set(
+            operation, kDescBScaleMode, &kScaleVec16Ue4m3,
+            sizeof(kScaleVec16Ue4m3)) != 0 ||
+        g_cublas_lt.matmul_desc_set(
+            operation, kDescAScalePointer, &a_scale_pointer,
+            sizeof(a_scale_pointer)) != 0 ||
+        g_cublas_lt.matmul_desc_set(
+            operation, kDescBScalePointer, &b_scale_pointer,
+            sizeof(b_scale_pointer)) != 0 ||
+        g_cublas_lt.preference_set(
+            preference, kPreferenceMaxWorkspace, &no_workspace,
+            sizeof(no_workspace)) != 0) {
+        cleanup();
+        return -9;
+    }
+    CublasLtHeuristicResult result{};
+    int result_count = 0;
+    if (g_cublas_lt.heuristic(
+            g_cublas_lt_handle, operation, a_layout, b_layout, c_layout,
+            d_layout, preference, 1, &result, &result_count) != 0 ||
+        result_count != 1 || result.state != 0) {
+        cleanup();
+        return -10;
+    }
+    const float beta = 0.0f;
+    const void* a = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(weight_values));
+    const void* b = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(input_values));
+    void* d = reinterpret_cast<void*>(static_cast<std::uintptr_t>(output));
+    const int status = g_cublas_lt.matmul(
+        g_cublas_lt_handle, operation, &scale, a, a_layout, b, b_layout,
+        &beta, d, c_layout, d, d_layout, &result.algo, nullptr, 0,
+        cuda_stream);
+    cleanup();
+    return status == 0 ? 0 : -11;
+}
+
+extern "C" int colibri_gpu_nvfp4_moe_cublas(
+    std::uint64_t gate_pointers, std::uint64_t up_pointers,
+    std::uint64_t down_pointers, std::uint64_t input,
+    std::uint64_t activated, std::uint64_t output,
+    std::uint64_t route_weights, std::uint64_t gate_scales,
+    std::uint64_t up_scales, std::uint64_t down_scales,
+    std::uint64_t stream,
+    std::int32_t hidden_size, std::int32_t intermediate_size,
+    std::int32_t experts
+) {
+    std::lock_guard<std::mutex> lock(g_cublas_mutex);
+    if (!gate_pointers || !up_pointers || !down_pointers || !input
+        || !activated || !output || !route_weights || hidden_size <= 0
+        || intermediate_size <= 0 || experts <= 0 || (hidden_size & 63)
+        || (intermediate_size & 63) || !load_cublas_lt()) return -1;
+    const auto stacked_repack =
+        g_functions.find("nvfp4_repack_stacked_moe_cublaslt");
+    const auto swiglu = g_functions.find("nvfp4_stacked_moe_swiglu");
+    const auto down_repack =
+        g_functions.find("nvfp4_repack_concat_down_cublaslt");
+    const auto input_quantize =
+        g_functions.find("nvfp4_quantize_broadcast16_cublaslt");
+    const auto down_quantize =
+        g_functions.find("nvfp4_quantize_weighted_moe_cublaslt");
+    const auto add_first = g_functions.find("nvfp4_moe_add_first_column");
+    const auto validate_gate =
+        g_functions.find("nvfp4_validate_stacked_projection");
+    const auto validate_down =
+        g_functions.find("nvfp4_validate_down_projection");
+    if (stacked_repack == g_functions.end() || swiglu == g_functions.end()
+        || down_repack == g_functions.end()
+        || input_quantize == g_functions.end()
+        || down_quantize == g_functions.end()
+        || add_first == g_functions.end()) return -2;
+    const bool validate =
+        std::getenv("COLIBRI_NVFP4_TENSOR_CORE_VALIDATE")
+        && !g_nvfp4_validation_done
+        && validate_gate != g_functions.end()
+        && validate_down != g_functions.end();
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    if (g_nvfp4_scratch.stream != nullptr
+        && g_nvfp4_scratch.stream != cuda_stream
+        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -3;
+
+    const int gate_rows = 2 * experts * intermediate_size;
+    const int down_input = experts * intermediate_size;
+    const size_t weight_value_bytes = std::max(
+        static_cast<size_t>(gate_rows) * hidden_size / 2,
+        static_cast<size_t>(hidden_size) * down_input / 2);
+    const size_t weight_scale_bytes = std::max(
+        nvfp4_cublas_scale_bytes(gate_rows, hidden_size),
+        nvfp4_cublas_scale_bytes(hidden_size, down_input));
+    const size_t input_value_bytes = std::max(
+        static_cast<size_t>(16) * hidden_size / 2,
+        static_cast<size_t>(16) * down_input / 2);
+    const size_t input_scale_bytes = std::max(
+        nvfp4_cublas_scale_bytes(16, hidden_size),
+        nvfp4_cublas_scale_bytes(16, down_input));
+    const size_t projected_bytes =
+        static_cast<size_t>(gate_rows) * 16 * sizeof(float);
+    const bool grow =
+        weight_value_bytes > g_nvfp4_scratch.weight_values_bytes ||
+        weight_scale_bytes > g_nvfp4_scratch.weight_scales_bytes ||
+        input_value_bytes > g_nvfp4_scratch.input_values_bytes ||
+        input_scale_bytes > g_nvfp4_scratch.input_scales_bytes ||
+        projected_bytes > g_nvfp4_scratch.projected_bytes;
+    if (grow && g_nvfp4_scratch.stream != nullptr
+        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -4;
+    if (grow) nvfp4_clear_cublas_plans();
+    auto reserve = [&](CUdeviceptr& pointer, size_t& capacity, size_t bytes) {
+        if (bytes <= capacity) return true;
+        if (pointer && g_api.cuMemFree(pointer) != 0) return false;
+        pointer = 0;
+        capacity = 0;
+        if (g_api.cuMemAlloc(&pointer, bytes) != 0) return false;
+        capacity = bytes;
+        return true;
+    };
+    if (!reserve(g_nvfp4_scratch.weight_values,
+                 g_nvfp4_scratch.weight_values_bytes, weight_value_bytes) ||
+        !reserve(g_nvfp4_scratch.weight_scales,
+                 g_nvfp4_scratch.weight_scales_bytes, weight_scale_bytes) ||
+        !reserve(g_nvfp4_scratch.input_values,
+                 g_nvfp4_scratch.input_values_bytes, input_value_bytes) ||
+        !reserve(g_nvfp4_scratch.input_scales,
+                 g_nvfp4_scratch.input_scales_bytes, input_scale_bytes) ||
+        !reserve(g_nvfp4_scratch.projected,
+                 g_nvfp4_scratch.projected_bytes, projected_bytes))
+        return -5;
+    g_nvfp4_scratch.stream = cuda_stream;
+
+    std::uint64_t weight_values = g_nvfp4_scratch.weight_values;
+    std::uint64_t weight_scales = g_nvfp4_scratch.weight_scales;
+    void* stacked_args[] = {
+        &gate_pointers, &up_pointers, &weight_values, &weight_scales,
+        &hidden_size, &intermediate_size, &experts};
+    const unsigned int gate_blocks = static_cast<unsigned int>(
+        (static_cast<std::uint64_t>(gate_rows) * hidden_size / 64 + 255) / 256);
+    if (launch(stacked_repack->second, gate_blocks, 1, 256, stacked_args, 0,
+               cuda_stream) != 0) return -6;
+
+    std::uint64_t input_values = g_nvfp4_scratch.input_values;
+    std::uint64_t input_scales = g_nvfp4_scratch.input_scales;
+    void* input_args[] = {
+        &input, &input_values, &input_scales, &hidden_size};
+    if (launch(input_quantize->second, hidden_size, 1, 32, input_args, 0,
+               cuda_stream) != 0) return -7;
+    const std::uint64_t projected = g_nvfp4_scratch.projected;
+    const int gate_gemm_status = nvfp4_run_quantized_gemm(
+        hidden_size, gate_rows, 16, 1.0f, 0.0f, projected, cuda_stream);
+    if (gate_gemm_status != 0) return -80 + gate_gemm_status;
+    if (validate) {
+        std::uint64_t stats =
+            projected + static_cast<std::uint64_t>(gate_rows) * sizeof(float);
+        if (g_api.cuMemsetD8Async(stats, 0, 5 * sizeof(float), cuda_stream) == 0) {
+            void* validate_args[] = {
+                &gate_pointers, &up_pointers, &input,
+                const_cast<std::uint64_t*>(&projected), &stats,
+                &hidden_size, &intermediate_size, &experts};
+            float host[5]{};
+            if (launch(validate_gate->second, gate_rows, 1, 256,
+                       validate_args, 0, cuda_stream) == 0
+                && g_api.cuMemcpyDtoHAsync(
+                       host, stats, sizeof(host), cuda_stream) == 0
+                && g_api.cuStreamSynchronize(cuda_stream) == 0) {
+                std::fprintf(
+                    stderr,
+                    "[nvfp4-validate] gate/up ref_max=%g tc_max=%g "
+                    "max_abs_error=%g first_ref=%g first_tc=%g\n",
+                    host[0], host[1], host[2], host[3], host[4]);
+            }
+        }
+    }
+    void* swiglu_args[] = {
+        const_cast<std::uint64_t*>(&projected), &activated,
+        &intermediate_size, &experts, &gate_scales, &up_scales,
+        &down_scales};
+    if (launch(swiglu->second,
+               static_cast<unsigned int>(
+                   (static_cast<std::uint64_t>(experts) * intermediate_size
+                    + 255) / 256),
+               1, 256, swiglu_args, 0, cuda_stream) != 0) return -9;
+
+    void* down_repack_args[] = {
+        &down_pointers, &weight_values, &weight_scales, &intermediate_size,
+        &hidden_size, &experts};
+    const unsigned int down_blocks = static_cast<unsigned int>(
+        (static_cast<std::uint64_t>(hidden_size) * down_input / 64 + 255)
+        / 256);
+    if (launch(down_repack->second, down_blocks, 1, 256, down_repack_args, 0,
+               cuda_stream) != 0) return -10;
+    void* down_quantize_args[] = {
+        &activated, &route_weights, &down_scales, &input_values, &input_scales,
+        &intermediate_size, &experts};
+    if (launch(down_quantize->second, down_input, 1, 32,
+               down_quantize_args, 0, cuda_stream) != 0) return -11;
+    const int down_gemm_status = nvfp4_run_quantized_gemm(
+        down_input, hidden_size, 16, 1.0f / 32768.0f, 0.0f, projected,
+        cuda_stream);
+    if (down_gemm_status != 0) return -120 + down_gemm_status;
+    if (validate) {
+        std::uint64_t stats =
+            projected + static_cast<std::uint64_t>(hidden_size) * sizeof(float);
+        if (g_api.cuMemsetD8Async(stats, 0, 5 * sizeof(float), cuda_stream) == 0) {
+            void* validate_args[] = {
+                &down_pointers, &activated, &route_weights, &down_scales,
+                const_cast<std::uint64_t*>(&projected), &stats,
+                &intermediate_size, &hidden_size, &experts};
+            float host[5]{};
+            if (launch(validate_down->second, hidden_size, 1, 256,
+                       validate_args, 0, cuda_stream) == 0
+                && g_api.cuMemcpyDtoHAsync(
+                       host, stats, sizeof(host), cuda_stream) == 0
+                && g_api.cuStreamSynchronize(cuda_stream) == 0) {
+                std::fprintf(
+                    stderr,
+                    "[nvfp4-validate] down ref_max=%g tc_max=%g "
+                    "max_abs_error=%g first_ref=%g first_tc=%g\n",
+                    host[0], host[1], host[2], host[3], host[4]);
+            }
+        }
+        g_nvfp4_validation_done = true;
+    }
+    void* add_args[] = {
+        const_cast<std::uint64_t*>(&projected), &output, &hidden_size};
+    return launch(
+        add_first->second, static_cast<unsigned int>((hidden_size + 255) / 256),
+        1, 256, add_args, 0, cuda_stream) == 0 ? 0 : -13;
+}
 
 extern "C" int colibri_gpu_launch_named(
     const char* name, std::uint32_t grid_x, std::uint32_t grid_y,
@@ -1178,6 +2091,175 @@ extern "C" int colibri_gpu_launch_named(
     return launch(found->second, grid_x, grid_y, block_x, arguments,
                   shared_bytes, reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -3;
+}
+
+extern "C" int colibri_gpu_attention_f16_cublas(
+    std::uint64_t query, std::uint64_t query_f16,
+    std::uint64_t keys, std::uint64_t values,
+    std::uint64_t scores_f16, std::uint64_t output,
+    std::uint64_t stream, std::int32_t heads, std::int32_t kv_heads,
+    std::int32_t head_dim, std::int32_t tokens, std::int32_t capacity,
+    std::int32_t first, float scale
+) {
+    std::lock_guard<std::mutex> lock(g_cublas_mutex);
+    if (!query || !query_f16 || !keys || !values || !scores_f16 || !output
+        || heads <= 0 || kv_heads <= 0 || heads % kv_heads != 0
+        || head_dim <= 0 || tokens <= 0 || capacity < tokens || first < 0
+        || first + tokens > capacity || !load_cublas())
+        return -1;
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    if (g_cublas.set_stream(g_cublas_handle, cuda_stream) != 0) return -2;
+    const int group = heads / kv_heads;
+    const int query_elements = heads * head_dim;
+    auto conversion = g_functions.find("qwen_attention_query_f16");
+    auto softmax = g_functions.find("kv_attention_softmax_f16");
+    if (conversion == g_functions.end() || softmax == g_functions.end())
+        return -3;
+    void* conversion_args[] = {&query, &query_f16,
+                               const_cast<int*>(&query_elements)};
+    if (launch(conversion->second, (query_elements + 255) / 256, 1, 256,
+               conversion_args, 0, cuda_stream) != 0)
+        return -4;
+
+    constexpr int kCudaR16F = 2;
+    constexpr int kCudaR32F = 0;
+    constexpr int kCublasOpN = 0;
+    constexpr int kCublasOpT = 1;
+    constexpr int kCompute32F = 68;
+    constexpr int kTensorOp = 99;
+    const float zero = 0.0f;
+    const auto key_base = reinterpret_cast<const void*>(
+        keys + static_cast<std::uint64_t>(first) * head_dim * sizeof(std::uint16_t)
+    );
+    const long long cache_stride =
+        static_cast<long long>(capacity) * head_dim;
+    const long long query_stride = static_cast<long long>(group) * head_dim;
+    const long long score_stride = static_cast<long long>(tokens) * group;
+    if (g_cublas.gemm_strided_batched_ex(
+            g_cublas_handle, kCublasOpT, kCublasOpN,
+            tokens, group, head_dim, &scale,
+            key_base, kCudaR16F, head_dim, cache_stride,
+            reinterpret_cast<const void*>(query_f16), kCudaR16F, head_dim,
+            query_stride, &zero, reinterpret_cast<void*>(scores_f16),
+            kCudaR16F, tokens, score_stride, kv_heads,
+            kCompute32F, kTensorOp) != 0)
+        return -5;
+    void* softmax_args[] = {&scores_f16, &heads, &tokens};
+    if (launch(softmax->second, heads, 1, 256, softmax_args, 0,
+               cuda_stream) != 0)
+        return -6;
+
+    const float one = 1.0f;
+    const auto value_base = reinterpret_cast<const void*>(
+        values + static_cast<std::uint64_t>(first) * head_dim * sizeof(std::uint16_t)
+    );
+    if (g_cublas.gemm_strided_batched_ex(
+            g_cublas_handle, kCublasOpN, kCublasOpN,
+            head_dim, group, tokens, &one,
+            value_base, kCudaR16F, head_dim, cache_stride,
+            reinterpret_cast<const void*>(scores_f16), kCudaR16F, tokens,
+            score_stride, &zero, reinterpret_cast<void*>(output),
+            kCudaR32F, head_dim, query_stride, kv_heads,
+            kCompute32F, kTensorOp) != 0)
+        return -7;
+    return 0;
+}
+
+extern "C" int colibri_gpu_attention_prefill_f16_cublas(
+    std::uint64_t queries, std::uint64_t gates,
+    std::uint64_t keys, std::uint64_t values,
+    std::uint64_t packed_queries, std::uint64_t scores_f32,
+    std::uint64_t probabilities_f16,
+    std::uint64_t packed_output, std::uint64_t output,
+    std::uint64_t stream, std::int32_t heads, std::int32_t kv_heads,
+    std::int32_t head_dim, std::int32_t rows, std::int32_t capacity,
+    std::int32_t base_position, std::int32_t tile_rows_limit, float scale
+) {
+    std::lock_guard<std::mutex> lock(g_cublas_mutex);
+    if (!queries || !gates || !keys || !values || !packed_queries
+        || !scores_f32 || !probabilities_f16 || !packed_output || !output
+        || heads <= 0
+        || kv_heads <= 0 || heads % kv_heads != 0 || head_dim <= 0
+        || rows <= 0 || capacity <= 0 || base_position < 0
+        || base_position + rows > capacity || tile_rows_limit <= 0
+        || !load_cublas())
+        return -1;
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    if (g_cublas.set_stream(g_cublas_handle, cuda_stream) != 0) return -2;
+    auto pack = g_functions.find("qwen_attention_prefill_pack_f16");
+    auto softmax = g_functions.find("kv_attention_prefill_softmax_f16");
+    auto unpack = g_functions.find("qwen_attention_prefill_unpack_gate");
+    if (pack == g_functions.end() || softmax == g_functions.end()
+        || unpack == g_functions.end())
+        return -3;
+
+    constexpr int kCudaR16F = 2;
+    constexpr int kCudaR32F = 0;
+    constexpr int kCublasOpN = 0;
+    constexpr int kCublasOpT = 1;
+    constexpr int kCompute32F = 68;
+    constexpr int kTensorOp = 99;
+    const int group = heads / kv_heads;
+    const long long cache_stride =
+        static_cast<long long>(capacity) * head_dim;
+    const float zero = 0.0f;
+    const float one = 1.0f;
+    const int tile_limit = std::min(16, tile_rows_limit);
+    for (int tile_start = 0; tile_start < rows; tile_start += tile_limit) {
+        int tile_rows = std::min(tile_limit, rows - tile_start);
+        const int columns = tile_rows * group;
+        const int query_elements = tile_rows * heads * head_dim;
+        void* pack_args[] = {
+            &queries, &packed_queries, &tile_start, &tile_rows,
+            &heads, &kv_heads, &head_dim
+        };
+        if (launch(pack->second, (query_elements + 255) / 256, 1, 256,
+                   pack_args, 0, cuda_stream) != 0)
+            return -4;
+        const int tokens = base_position + tile_start + tile_rows;
+        const long long query_stride =
+            static_cast<long long>(columns) * head_dim;
+        const long long score_stride =
+            static_cast<long long>(tokens) * columns;
+        if (g_cublas.gemm_strided_batched_ex(
+                g_cublas_handle, kCublasOpT, kCublasOpN,
+                tokens, columns, head_dim, &scale,
+                reinterpret_cast<const void*>(keys), kCudaR16F, head_dim,
+                cache_stride,
+                reinterpret_cast<const void*>(packed_queries), kCudaR16F,
+                head_dim, query_stride, &zero,
+                reinterpret_cast<void*>(scores_f32), kCudaR32F, tokens,
+                score_stride, kv_heads, kCompute32F, kTensorOp) != 0)
+            return -5;
+        void* softmax_args[] = {
+            &scores_f32, &probabilities_f16, &tile_start, &tile_rows,
+            &heads, &kv_heads, const_cast<int*>(&tokens), &base_position
+        };
+        if (launch(softmax->second, heads, tile_rows, 256, softmax_args, 0,
+                   cuda_stream) != 0)
+            return -6;
+        const long long output_stride =
+            static_cast<long long>(head_dim) * columns;
+        if (g_cublas.gemm_strided_batched_ex(
+                g_cublas_handle, kCublasOpN, kCublasOpN,
+                head_dim, columns, tokens, &one,
+                reinterpret_cast<const void*>(values), kCudaR16F, head_dim,
+                cache_stride,
+                reinterpret_cast<const void*>(probabilities_f16), kCudaR16F,
+                tokens,
+                score_stride, &zero,
+                reinterpret_cast<void*>(packed_output), kCudaR32F, head_dim,
+                output_stride, kv_heads, kCompute32F, kTensorOp) != 0)
+            return -7;
+        void* unpack_args[] = {
+            &packed_output, &gates, &output, &tile_start, &tile_rows,
+            &heads, &kv_heads, &head_dim
+        };
+        if (launch(unpack->second, (query_elements + 255) / 256, 1, 256,
+                   unpack_args, 0, cuda_stream) != 0)
+            return -8;
+    }
+    return 0;
 }
 
 extern "C" int colibri_delta_moe_segment(

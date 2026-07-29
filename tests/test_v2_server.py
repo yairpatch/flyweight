@@ -227,6 +227,10 @@ class NativeV2ServerTests(unittest.TestCase):
                 "misses": 1,
                 "evictions": 0,
                 "reused_tokens": 42,
+                "last_prompt_tokens": 0,
+                "last_reused_tokens": 0,
+                "last_lcp_live": 0,
+                "last_lcp_snapshot": 0,
             },
         )
 
@@ -265,6 +269,62 @@ class NativeV2ServerTests(unittest.TestCase):
         )
         self.assertEqual(continued, [1, 2, 20, 30, 1, 2, 1, 2])
 
+    def test_native_tool_call_round_trip_preserves_generated_token_ids(self) -> None:
+        generator, _ = self.make_generator([10])
+        generator._chat_messages = (("user", "Write it"),)
+        generator._chat_prompt_ids = (7, 8)
+        generator._chat_generated_ids = (20, 30)
+        generator._chat_text = (
+            "Internal reasoning that the API may omit.\n"
+            "<tool_call>\n<function=write_file>\n"
+            "<parameter=path>\n/tmp/example\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        generator._chat_thinking = False
+
+        continued = generator._continued_chat_prompt(
+            (
+                ("user", "Write it"),
+                (
+                    "assistant",
+                    "<tool_call>\n<function=write_file>\n"
+                    "<parameter=path>\n/tmp/example\n</parameter>\n"
+                    "</function>\n</tool_call>",
+                ),
+                ("user", "<tool_response>\ndone\n</tool_response>"),
+            ),
+            False,
+        )
+
+        self.assertEqual(continued, [7, 8, 20, 30, 1, 2, 1, 2])
+
+    def test_concurrent_side_chat_does_not_evict_main_continuation(self) -> None:
+        generator, _ = self.make_generator([10])
+        main = (("user", "Long main conversation"),)
+        generator._chat_continuations[main] = (
+            (7, 8),
+            (20, 30),
+            "Hello world",
+            False,
+        )
+        # A later short request owns the legacy last-writer fields.
+        generator._chat_messages = (("user", "Make a title"),)
+        generator._chat_prompt_ids = (90,)
+        generator._chat_generated_ids = (91,)
+        generator._chat_text = "Title"
+        generator._chat_thinking = False
+
+        continued = generator._continued_chat_prompt(
+            (
+                *main,
+                ("assistant", "Hello world"),
+                ("user", "Continue"),
+            ),
+            False,
+        )
+
+        self.assertEqual(continued, [7, 8, 20, 30, 1, 2, 1, 2])
+
     def test_native_generator_works_through_server_contract(self) -> None:
         generator, _ = self.make_generator([10, 20, 30])
         service = InferenceService(
@@ -293,8 +353,12 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.cpu_prefetch_mib, 0)
         self.assertFalse(args.cpu_prefetch_auto)
         self.assertEqual(args.next_layer_prefetch, 0)
+        self.assertEqual(args.cpu_threads, 0)
 
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
+        defaults = _parser().parse_args(["benchmark-v2", "model.gguf"])
+        self.assertEqual(defaults.gpu_cache_mib, 0)
+
         args = _parser().parse_args([
             "benchmark-v2", "model.gguf",
             "--cache-type-k", "f32",
@@ -307,6 +371,7 @@ class NativeV2ServerTests(unittest.TestCase):
             "--expert-paging", "direct",
             "--cpu-prefetch-mib", "768",
             "--next-layer-prefetch", "6",
+            '--cpu-threads', '12',
             "--cold-cache",
         ])
         self.assertEqual(args.cache_type_k, "f32")
@@ -319,6 +384,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.expert_paging, "direct")
         self.assertEqual(args.cpu_prefetch_mib, 768)
         self.assertEqual(args.next_layer_prefetch, 6)
+        self.assertEqual(args.cpu_threads, 12)
         self.assertTrue(args.cold_cache)
         self.assertFalse(args.cpu_prefetch_auto)
 

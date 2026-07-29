@@ -3,6 +3,7 @@ import json
 import threading
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from io import StringIO
 from unittest.mock import Mock, patch
 
@@ -90,27 +91,37 @@ class StubGenerator:
         )
 
 
+class LengthStubGenerator(StubGenerator):
+    def generate_messages(self, messages, **options) -> GenerationResult:
+        return replace(
+            super().generate_messages(messages, **options), stopped_on_eos=False
+        )
+
+    def stream_messages(self, messages, **options):
+        for step in super().stream_messages(messages, **options):
+            yield replace(step, stopped_on_eos=False)
+
+
 class ToolStubGenerator(StubGenerator):
+    TOOL_TEXT = (
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nParis\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
     def generate_messages(self, messages, **options) -> GenerationResult:
         self.calls.append((messages, options))
         return GenerationResult(
             prompt_ids=(1, 2, 3),
             generated_ids=(4, 5),
-            text=(
-                "<tool_call>\n<function=get_weather>\n"
-                "<parameter=city>\nParis\n</parameter>\n"
-                "</function>\n</tool_call>"
-            ),
+            text=self.TOOL_TEXT,
             stopped_on_eos=True,
             state_tokens=4,
         )
 
     def stream_messages(self, messages, **options):
-        text = (
-            "<tool_call>\n<function=get_weather>\n"
-            "<parameter=city>\nParis\n</parameter>\n"
-            "</function>\n</tool_call>"
-        )
+        self.calls.append((messages, options))
+        text = self.TOOL_TEXT
         for index, char in enumerate(text):
             yield GenerationStep(
                 token_id=index,
@@ -134,18 +145,65 @@ class ToolStubGenerator(StubGenerator):
         )
 
 
+class RunawayToolStubGenerator(ToolStubGenerator):
+    """Keeps generating after a valid tool call unless its iterator is closed."""
+
+    TOOL_TEXT = (
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nParis\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    RUNAWAY_SUFFIX = " this output must never be consumed" * 20
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.consumed = 0
+        self.closed = False
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        text = self.TOOL_TEXT + self.RUNAWAY_SUFFIX
+        try:
+            for index, char in enumerate(text):
+                self.consumed += 1
+                yield GenerationStep(
+                    token_id=index,
+                    text_delta=char,
+                    prompt_ids=(1, 2, 3),
+                    generated_ids=tuple(range(index + 1)),
+                    text=text[: index + 1],
+                    stopped_on_eos=False,
+                    finished=False,
+                    state_tokens=index + 1,
+                )
+            yield GenerationStep(
+                token_id=None,
+                text_delta="",
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(range(len(text))),
+                text=text,
+                stopped_on_eos=False,
+                finished=True,
+                state_tokens=len(text),
+            )
+        finally:
+            self.closed = True
+
+
 class BareStringIdToolStubGenerator(ToolStubGenerator):
+    TOOL_TEXT = (
+        "<tool_call>\n<function=TaskUpdate>\n"
+        "<parameter=status>\ncompleted\n</parameter>\n"
+        "<parameter=taskId>\n1\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
     def generate_messages(self, messages, **options) -> GenerationResult:
         self.calls.append((messages, options))
         return GenerationResult(
             prompt_ids=(1, 2, 3),
             generated_ids=(4, 5),
-            text=(
-                "<tool_call>\n<function=TaskUpdate>\n"
-                "<parameter=status>\ncompleted\n</parameter>\n"
-                "<parameter=taskId>\n1\n</parameter>\n"
-                "</function>\n</tool_call>"
-            ),
+            text=self.TOOL_TEXT,
             stopped_on_eos=True,
             state_tokens=4,
         )
@@ -346,6 +404,39 @@ class InferenceServiceTests(unittest.TestCase):
             }
         )
         self.assertEqual(response["choices"][0]["message"]["content"], "Hello!")
+
+    def test_omitted_output_limits_use_service_ceiling(self) -> None:
+        self.service.chat_completion(
+            {"messages": [{"role": "user", "content": "Hi"}]}
+        )
+        self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 32)
+
+        self.service.response({"input": "Hi"})
+        self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 32)
+
+        self.service.completion({"prompt": "Hi"})
+        self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 32)
+
+    def test_responses_api_reports_token_limit_as_incomplete(self) -> None:
+        service = InferenceService(
+            "qwen-local", LengthStubGenerator(), max_new_tokens=32
+        )
+        response = service.response(
+            {"input": "Hi", "max_output_tokens": 2}
+        )
+        self.assertEqual(response["status"], "incomplete")
+        self.assertEqual(
+            response["incomplete_details"], {"reason": "max_output_tokens"}
+        )
+        self.assertEqual(response["output"][0]["status"], "incomplete")
+
+        events = list(
+            service.stream_response(
+                {"input": "Hi", "max_output_tokens": 2, "stream": True}
+            )
+        )
+        self.assertEqual(events[-1]["type"], "response.incomplete")
+        self.assertEqual(events[-1]["response"]["status"], "incomplete")
 
     def test_chat_completion_accepts_assistant_prefill(self) -> None:
         response = self.service.chat_completion(
@@ -794,6 +885,130 @@ class InferenceServiceTests(unittest.TestCase):
             "get_weather",
         )
 
+    def test_complete_tool_call_stops_runaway_openai_generation(self) -> None:
+        generator = RunawayToolStubGenerator()
+        service = InferenceService("qwen-local", generator)
+        payload = {
+            "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            "stream": True,
+        }
+
+        events = list(service.stream_chat_completion(payload))
+
+        self.assertTrue(generator.closed)
+        self.assertEqual(generator.consumed, len(generator.TOOL_TEXT))
+        finish = next(
+            event["choices"][0]["finish_reason"]
+            for event in events
+            if isinstance(event, dict)
+            and event.get("choices")
+            and event["choices"][0].get("finish_reason")
+        )
+        self.assertEqual(finish, "tool_calls")
+
+    def test_complete_tool_call_stops_runaway_non_stream_generation(self) -> None:
+        generator = RunawayToolStubGenerator()
+        service = InferenceService("qwen-local", generator)
+
+        response = service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(generator.closed)
+        self.assertEqual(generator.consumed, len(generator.TOOL_TEXT))
+        self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_complete_tool_call_stops_runaway_anthropic_generation(self) -> None:
+        generator = RunawayToolStubGenerator()
+        service = InferenceService("qwen-local", generator)
+
+        events = list(
+            service.stream_anthropic_message(
+                {
+                    "model": "qwen-local",
+                    "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                    "tools": [
+                        {
+                            "name": "get_weather",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                    "max_tokens": 4096,
+                    "stream": True,
+                }
+            )
+        )
+
+        self.assertTrue(generator.closed)
+        self.assertEqual(generator.consumed, len(generator.TOOL_TEXT))
+        self.assertTrue(
+            any(
+                event.get("type") == "content_block_start"
+                and event.get("content_block", {}).get("type") == "tool_use"
+                for event in events
+            )
+        )
+
+    def test_complete_tool_call_stops_runaway_responses_generation(self) -> None:
+        generator = RunawayToolStubGenerator()
+        service = InferenceService("qwen-local", generator)
+
+        events = list(
+            service.stream_response(
+                {
+                    "model": "qwen-local",
+                    "input": "Weather in Paris?",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                    "max_output_tokens": 4096,
+                    "stream": True,
+                }
+            )
+        )
+
+        self.assertTrue(generator.closed)
+        self.assertEqual(generator.consumed, len(generator.TOOL_TEXT))
+        self.assertTrue(
+            any(
+                event["type"] == "response.function_call_arguments.done"
+                for event in events
+            )
+        )
+
     def test_empty_content_tool_call_history_is_accepted(self) -> None:
         # opencode/Cline send assistant tool-call turns as {"content": "",
         # "tool_calls": [...]} and empty tool outputs; neither must 400.
@@ -1049,6 +1264,57 @@ class HTTPServerTests(unittest.TestCase):
             "POST", "/v1/responses/input_tokens", {"input": "Hi"}
         )
         self.assertEqual(token_count["input_tokens"], 2)
+        _, anthropic_count = self.request_json(
+            "POST",
+            "/v1/messages/count_tokens",
+            {
+                "model": "qwen-local",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        self.assertEqual(anthropic_count, {"input_tokens": 2})
+        _, anthropic_tool_count = self.request_json(
+            "POST",
+            "/v1/messages/count_tokens",
+            {
+                "model": "qwen-local",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [
+                    {
+                        "name": "Edit",
+                        "description": "Replace exact text in a file.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"},
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+        self.assertGreater(
+            anthropic_tool_count["input_tokens"],
+            anthropic_count["input_tokens"],
+        )
+        self.service.anthropic_message(
+            {
+                "model": "qwen-local",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 2,
+                "tools": [
+                    {
+                        "name": "Edit",
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            }
+        )
+        self.assertIn(
+            "copy old_string byte-for-byte",
+            self.generator.calls[-1][0][0]["content"],
+        )
         _, properties = self.request_json("GET", "/props")
         self.assertEqual(properties["max_output_tokens"], 64)
 

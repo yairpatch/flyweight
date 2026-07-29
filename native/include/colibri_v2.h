@@ -96,6 +96,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t cpu_prefetch_mib; /* prompt-trained host expert page warmup budget; 0 disables */
     uint32_t cpu_prefetch_auto; /* size from host memory and skip unless enough pages are cold */
     uint32_t next_layer_prefetch; /* transition-predicted experts to page-hint; 0 disables */
+    uint32_t cpu_threads; /* OpenMP workers for CPU expert execution; 0 = automatic */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -191,6 +192,12 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t next_layer_prefetch_hits; /* predictions present in the next real route */
     uint64_t next_layer_prefetch_bytes; /* expert tensor bytes covered by page hints */
     uint64_t next_layer_prefetch_trained_pairs; /* cross-layer route pairs observed */
+    uint64_t nvfp4_tensor_core_moe_calls; /* routed decode layers completed by native FP4 GEMM */
+    uint64_t nvfp4_tensor_core_moe_fallbacks; /* attempted routed FP4 layers using CUDA fallback */
+    int64_t nvfp4_tensor_core_moe_last_status; /* zero on success, otherwise the most recent fallback status */
+    uint64_t host_ffn_layers; /* dense blocks whose feed-forward runs on the CPU from the mapping */
+    uint64_t host_ffn_bytes; /* weight bytes kept off the GPU by that spill */
+    uint64_t dense_host_nanoseconds; /* wall time spent in the host-side dense SwiGLU */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

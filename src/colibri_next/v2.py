@@ -119,6 +119,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("cpu_prefetch_mib", ctypes.c_uint32),
         ("cpu_prefetch_auto", ctypes.c_uint32),
         ("next_layer_prefetch", ctypes.c_uint32),
+        ('cpu_threads', ctypes.c_uint32),
     ]
 
 
@@ -215,6 +216,12 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("next_layer_prefetch_hits", ctypes.c_uint64),
         ("next_layer_prefetch_bytes", ctypes.c_uint64),
         ("next_layer_prefetch_trained_pairs", ctypes.c_uint64),
+        ("nvfp4_tensor_core_moe_calls", ctypes.c_uint64),
+        ("nvfp4_tensor_core_moe_fallbacks", ctypes.c_uint64),
+        ("nvfp4_tensor_core_moe_last_status", ctypes.c_int64),
+        ("host_ffn_layers", ctypes.c_uint64),
+        ("host_ffn_bytes", ctypes.c_uint64),
+        ("dense_host_nanoseconds", ctypes.c_uint64),
         ("gpu_prefetch_bytes", ctypes.c_uint64),
         ("gpu_prefetch_hits", ctypes.c_uint64),
     ]
@@ -961,6 +968,7 @@ class V2Model:
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
+        cpu_threads: int = 0,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -983,6 +991,7 @@ class V2Model:
             cpu_prefetch_mib=cpu_prefetch_mib,
             cpu_prefetch_auto=cpu_prefetch_auto,
             next_layer_prefetch=next_layer_prefetch,
+            cpu_threads=cpu_threads,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -1300,6 +1309,7 @@ class V2QwenRuntime:
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
+        cpu_threads: int = 0,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1328,10 +1338,10 @@ class V2QwenRuntime:
             raise ValueError("cpu_prefetch_mib and cpu_prefetch_auto are mutually exclusive")
         if not 0 <= next_layer_prefetch <= 64:
             raise ValueError("next_layer_prefetch must be between 0 and 64")
+        if cpu_threads < 0:
+            raise ValueError('cpu_threads must be non-negative (0 = automatic)')
         if next_layer_prefetch and mtp_drafts:
             raise ValueError("next_layer_prefetch does not support MTP yet")
-        if next_layer_prefetch and parallel_sequences > 1:
-            raise ValueError("next_layer_prefetch currently requires parallel_sequences=1")
         if moe_device not in {"gpu", "cpu", "hybrid"}:
             raise ValueError("moe_device must be 'gpu', 'cpu', or 'hybrid'")
         if mtp_drafts < 0 or mtp_drafts > 8:
@@ -1345,6 +1355,7 @@ class V2QwenRuntime:
         if cache_type_k not in cache_types or cache_type_v not in cache_types:
             raise ValueError("cache_type_k/v must be 'f32', 'f16', 'bf16', or 'q8_0'")
         self.model, self._lib = model, model._lib
+        self.parallel_sequences = parallel_sequences
         self._handle = ctypes.c_void_p()
         options = _QwenRuntimeOptions(
             device,
@@ -1366,6 +1377,7 @@ class V2QwenRuntime:
             cpu_prefetch_mib,
             int(cpu_prefetch_auto),
             next_layer_prefetch,
+            cpu_threads,
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

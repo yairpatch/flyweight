@@ -13,7 +13,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 from .causal_lm import QwenForCausalLM
@@ -55,6 +55,7 @@ TEXT_PART_TYPES = frozenset(("text", "input_text", "output_text"))
 # style (<function=name><parameter=k>v</parameter></function>) or the JSON
 # style ({"name": ..., "arguments": {...}}) used by Qwen3, DeepSeek, GLM, etc.
 TOOL_CALL_MARKER = "<tool_call>"
+TOOL_CALL_END_MARKER = "</tool_call>"
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 TOOL_FUNCTION_PATTERN = re.compile(r"<function=([^>\n]+)>", re.DOTALL)
 TOOL_PARAMETER_PATTERN = re.compile(
@@ -106,8 +107,6 @@ class InferenceService:
             raise ValueError("max_new_tokens must be positive")
         if context_window <= 0:
             raise ValueError("context_window must be positive")
-        if max_new_tokens > context_window:
-            raise ValueError("max_new_tokens must not exceed context_window")
         if cpu_moe_layers < 0:
             raise ValueError("cpu_moe_layers must be non-negative")
         self.model_name = model_name
@@ -233,14 +232,55 @@ class InferenceService:
             raise APIError(400, "use the streaming response path", parameter="stream")
         request = self._prepare_chat(payload)
         with self._generation_guard():
-            result = self.generator.generate_messages(
+            result = self._generate_request(
+                request, tools=request.tools, progress=progress
+            )
+        return self._chat_response(result, tools=request.tools)
+
+    def _generate_request(
+        self,
+        request: _GenerationRequest,
+        *,
+        tools: Sequence[dict[str, Any]],
+        progress: Callable[[int, int], None] | None,
+    ) -> GenerationResult:
+        """Generate one request, stopping as soon as a valid tool call closes.
+
+        Native tool syntax is converted to structured API output only after it
+        parses successfully. Once a complete call has parsed, any further model
+        output is both invalid (the tool prompt requires no suffix) and harmful:
+        clients otherwise wait silently until EOS or the output-token ceiling.
+        Closing the iterator cancels the native task immediately.
+        """
+        if not request.tools_enabled:
+            return self.generator.generate_messages(
                 request.messages,
                 max_new_tokens=request.max_new_tokens,
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
                 progress=progress,
             )
-        return self._chat_response(result, tools=request.tools)
+
+        final_step: GenerationStep | None = None
+        steps = self.generator.stream_messages(
+            request.messages,
+            max_new_tokens=request.max_new_tokens,
+            sampling=request.sampling,
+            enable_thinking=request.enable_thinking,
+            progress=progress,
+        )
+        try:
+            for step in steps:
+                final_step = step
+                if step.finished or _has_complete_tool_call(step.text, tools=tools):
+                    break
+        finally:
+            close = getattr(steps, "close", None)
+            if close is not None:
+                close()
+        if final_step is None:
+            raise RuntimeError("generation stream ended without a final result")
+        return _generation_result(final_step)
 
     def stream_chat_completion(
         self,
@@ -273,13 +313,14 @@ class InferenceService:
             if request.tools_enabled:
                 # Stream text deltas token-by-token so clients (Claude Code,
                 # Codex, ...) see live output and never hang waiting for the
-                # first token. Tool calls can only be parsed once the full
-                # generation is known, so their tool_use block is emitted at
-                # the end from the accumulated text.
+                # first token. Raw tool syntax is held back until one complete,
+                # valid call parses; at that point generation is cancelled and
+                # the structured call is emitted immediately.
                 final_step: GenerationStep | None = None
                 accumulated = ""
                 streamed = 0  # end of clean (non-tool) text already sent as content
                 tool_start: int | None = None  # index of a <tool_call> marker once seen
+                tool_calls: list[dict[str, Any]] = []
                 decode_started: float | None = None
                 marker = TOOL_CALL_MARKER
                 holdback = len(marker) - 1
@@ -293,46 +334,67 @@ class InferenceService:
                     return chunk
 
                 with self._generation_guard():
-                    for step in self.generator.stream_messages(
+                    steps = self.generator.stream_messages(
                         request.messages,
                         max_new_tokens=request.max_new_tokens,
                         sampling=request.sampling,
                         enable_thinking=request.enable_thinking,
                         progress=progress,
-                    ):
-                        if step.finished:
+                    )
+                    try:
+                        for step in steps:
                             final_step = step
-                            continue
-                        if step.token_id is None:
-                            continue
-                        accumulated += step.text_delta or ""
-                        now = time.perf_counter()
-                        if decode_started is None:
-                            decode_started = now
-                        if tool_start is not None:
-                            continue  # inside a tool-call block: emit no content
-                        # Stream clean text, but stop at (and never leak) the tool-call
-                        # markup so OpenAI clients such as Cline receive it as structured
-                        # tool_calls, not as assistant text.
-                        found = accumulated.find(marker, streamed)
-                        if found != -1:
-                            delta = accumulated[streamed:found]
-                            streamed = found
-                            tool_start = found
-                        else:
-                            # Hold back a possible partial marker at the tail.
-                            safe = len(accumulated) - holdback
-                            delta = accumulated[streamed:safe] if safe > streamed else ""
-                            streamed += len(delta)
-                        if delta:
-                            yield _content_chunk(
-                                delta, len(step.generated_ids), now - decode_started
-                            )
+                            if step.finished:
+                                continue
+                            if step.token_id is None:
+                                continue
+                            accumulated += step.text_delta or ""
+                            now = time.perf_counter()
+                            if decode_started is None:
+                                decode_started = now
+                            if tool_start is None:
+                                # Stream clean text, but stop at (and never leak)
+                                # the native marker so clients receive a structured
+                                # tool call rather than raw XML.
+                                found = accumulated.find(marker, streamed)
+                                if found != -1:
+                                    delta = accumulated[streamed:found]
+                                    streamed = found
+                                    tool_start = found
+                                else:
+                                    # Hold back a possible partial marker at the tail.
+                                    safe = len(accumulated) - holdback
+                                    delta = (
+                                        accumulated[streamed:safe]
+                                        if safe > streamed
+                                        else ""
+                                    )
+                                    streamed += len(delta)
+                                if delta:
+                                    yield _content_chunk(
+                                        delta,
+                                        len(step.generated_ids),
+                                        now - decode_started,
+                                    )
+                            if (
+                                tool_start is not None
+                                and TOOL_CALL_END_MARKER in accumulated[tool_start:]
+                            ):
+                                _, tool_calls = _parse_tool_calls(
+                                    accumulated, tools=request.tools
+                                )
+                                if tool_calls:
+                                    break
+                    finally:
+                        close = getattr(steps, "close", None)
+                        if close is not None:
+                            close()
                 if final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
-                _, tool_calls = _parse_tool_calls(accumulated, tools=request.tools)
+                if not tool_calls:
+                    _, tool_calls = _parse_tool_calls(accumulated, tools=request.tools)
                 if tool_calls:
-                    yield self._chat_chunk(
+                    chunk = self._chat_chunk(
                         completion_id,
                         created,
                         {
@@ -342,6 +404,14 @@ class InferenceService:
                             ]
                         },
                     )
+                    if decode_started is not None:
+                        chunk["colibri"] = {
+                            "generated_tokens": len(final_step.generated_ids),
+                            "decode_elapsed_seconds": (
+                                time.perf_counter() - decode_started
+                            ),
+                        }
+                    yield chunk
                 elif tool_start is None and streamed < len(accumulated):
                     # No tool-call marker: flush the tail we held back in case it
                     # was a partial marker, so the turn is never silently empty.
@@ -496,6 +566,20 @@ class InferenceService:
         )
         return {"object": "response.input_tokens", "input_tokens": len(tokens)}
 
+    def count_anthropic_input(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Count the exact prompt produced by the Anthropic compatibility path."""
+        chat_payload = _anthropic_to_chat_payload(
+            {**payload, "max_tokens": payload.get("max_tokens", 1)}
+        )
+        messages, _ = _chat_messages(chat_payload)
+        tokens = self.generator.tokenizer.encode_messages(
+            messages,
+            enable_thinking=_boolean_option(
+                chat_payload, "enable_thinking", False
+            ),
+        )
+        return {"input_tokens": len(tokens)}
+
     def properties(self) -> dict[str, Any]:
         return {
             "model_path": self.model_name,
@@ -544,13 +628,7 @@ class InferenceService:
             tools_enabled=bool(tools),
         )
         with self._generation_guard():
-            result = self.generator.generate_messages(
-                request.messages,
-                max_new_tokens=request.max_new_tokens,
-                sampling=request.sampling,
-                enable_thinking=request.enable_thinking,
-                progress=progress,
-            )
+            result = self._generate_request(request, tools=tools, progress=progress)
         response = self._response_object(payload, result)
         self._store_response(response, history_messages, result)
         return response
@@ -590,12 +668,8 @@ class InferenceService:
 
             if request.tools_enabled:
                 with self._generation_guard():
-                    result = self.generator.generate_messages(
-                        request.messages,
-                        max_new_tokens=request.max_new_tokens,
-                        sampling=request.sampling,
-                        enable_thinking=request.enable_thinking,
-                        progress=progress,
+                    result = self._generate_request(
+                        request, tools=tools, progress=progress
                     )
                 completed_response = self._response_object(
                     payload,
@@ -611,7 +685,11 @@ class InferenceService:
                     sequence = event["sequence_number"] + 1
                 self._store_response(completed_response, history_messages, result)
                 yield {
-                    "type": "response.completed",
+                    "type": (
+                        "response.incomplete"
+                        if completed_response["status"] == "incomplete"
+                        else "response.completed"
+                    ),
                     "sequence_number": sequence,
                     "response": completed_response,
                 }
@@ -699,7 +777,9 @@ class InferenceService:
             sequence += 1
             done_item = {
                 **output_item,
-                "status": "completed",
+                "status": (
+                    "completed" if result.stopped_on_eos else "incomplete"
+                ),
                 "content": [done_part],
             }
             yield {
@@ -718,7 +798,11 @@ class InferenceService:
             )
             self._store_response(completed_response, history_messages, result)
             yield {
-                "type": "response.completed",
+                "type": (
+                    "response.incomplete"
+                    if completed_response["status"] == "incomplete"
+                    else "response.completed"
+                ),
                 "sequence_number": sequence,
                 "response": completed_response,
             }
@@ -974,7 +1058,7 @@ class InferenceService:
                 400, "logprobs are not implemented yet", parameter="logprobs"
             )
         requested_max = _integer_option(
-            payload, "max_tokens", default=min(16, self.max_new_tokens)
+            payload, "max_tokens", default=self.max_new_tokens
         )
         max_new_tokens = self._fit_max_new_tokens(
             requested_max,
@@ -1020,7 +1104,7 @@ class InferenceService:
             payload,
             max_key,
             fallback_key=fallback_max_key,
-            default=min(16, self.max_new_tokens),
+            default=self.max_new_tokens,
         )
         try:
             sampling = SamplingConfig(
@@ -1263,14 +1347,20 @@ class InferenceService:
         message_id = message_id or f"msg_{uuid.uuid4().hex}"
         created_at = created_at or int(time.time())
         tools = _response_tools(payload)
+        _, tool_calls = (
+            _parse_tool_calls(result.text, tools=tools) if tools else (result.text, [])
+        )
+        incomplete = not result.stopped_on_eos and not tool_calls
         return {
             "id": response_id,
             "object": "response",
             "created_at": created_at,
-            "status": "completed",
+            "status": "incomplete" if incomplete else "completed",
             "background": False,
             "error": None,
-            "incomplete_details": None,
+            "incomplete_details": (
+                {"reason": "max_output_tokens"} if incomplete else None
+            ),
             "instructions": payload.get("instructions"),
             "max_output_tokens": payload.get("max_output_tokens"),
             "model": self.model_name,
@@ -1448,20 +1538,7 @@ def create_handler(
                     self.log_message("request completed: %s", path)
                     return
                 if path == "/v1/messages/count_tokens":
-                    # Anthropic's count_tokens request has no max_tokens field;
-                    # provide a throwaway value solely for shared translation.
-                    messages_payload = _anthropic_to_chat_payload(
-                        {**payload, "max_tokens": payload.get("max_tokens", 1)}
-                    )
-                    self._send_json(
-                        200,
-                        service.count_response_input(
-                            {
-                                "input": messages_payload["messages"],
-                                "model": messages_payload.get("model"),
-                            }
-                        ),
-                    )
+                    self._send_json(200, service.count_anthropic_input(payload))
                     self.log_message("request completed: %s", path)
                     return
                 if path == "/v1/messages":
@@ -1499,9 +1576,7 @@ def create_handler(
             except Exception:
                 # The client only ever sees "internal server error", so the
                 # traceback has to reach the log or the failure is undebuggable.
-                self.log_error(
-                    "unhandled request error: %s", traceback.format_exc()
-                )
+                self.log_error("unhandled request error: %s", traceback.format_exc())
                 self._send_error(APIError(500, "internal server error", "server_error"))
 
         def _authenticate(self) -> None:
@@ -2083,6 +2158,18 @@ def _tool_prompt(tools: list[dict[str, Any]], tool_choice: Any) -> str:
         if tool_choice == "required" or isinstance(tool_choice, dict)
         else ""
     )
+    names = {
+        tool.get("function", {}).get("name")
+        for tool in tools
+        if isinstance(tool.get("function"), dict)
+    }
+    edit_guidance = (
+        "\n\nFor the Edit tool, copy old_string byte-for-byte from the latest "
+        "Read result, including indentation and line endings. If an edit "
+        "fails, Read the target again and do not repeat identical arguments."
+        if "Edit" in names
+        else ""
+    )
     return (
         "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
         f"{serialized}\n</tools>\n\n"
@@ -2091,6 +2178,7 @@ def _tool_prompt(tools: list[dict[str, Any]], tool_choice: Any) -> str:
         "<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n"
         "</tool_call>\n\nRequired parameters MUST be specified. You may provide "
         "reasoning before the tool call, but nothing after it."
+        f"{edit_guidance}"
         f"{requirement}"
     )
 
@@ -2174,6 +2262,24 @@ def _parse_tool_calls(
     return (content or None), calls
 
 
+def _has_complete_tool_call(text: str, *, tools: Sequence[dict[str, Any]]) -> bool:
+    """Return true only for closed native markup that parses as a tool call."""
+    if TOOL_CALL_END_MARKER not in text:
+        return False
+    _, calls = _parse_tool_calls(text, tools=list(tools))
+    return bool(calls)
+
+
+def _generation_result(step: GenerationStep) -> GenerationResult:
+    return GenerationResult(
+        prompt_ids=step.prompt_ids,
+        generated_ids=step.generated_ids,
+        text=step.text,
+        stopped_on_eos=step.stopped_on_eos,
+        state_tokens=step.state_tokens,
+    )
+
+
 def _tool_argument_schema(
     tools: tuple[dict[str, Any], ...] | list[dict[str, Any]], name: str
 ) -> dict[str, Any] | None:
@@ -2208,17 +2314,16 @@ def _normalize_schema_value(value: Any, schema: Mapping[str, Any]) -> Any:
             for candidate in candidates:
                 candidate_type = candidate.get("type")
                 if (
-                    candidate_type == "string"
-                    and not isinstance(value, (dict, list))
-                ) or (
-                    candidate_type == "object" and isinstance(value, dict)
-                ) or (
-                    candidate_type == "array" and isinstance(value, list)
+                    (candidate_type == "string" and not isinstance(value, (dict, list)))
+                    or (candidate_type == "object" and isinstance(value, dict))
+                    or (candidate_type == "array" and isinstance(value, list))
                 ):
                     return _normalize_schema_value(value, candidate)
         enum = schema.get("enum")
-        if isinstance(enum, list) and enum and all(
-            isinstance(item, str) for item in enum
+        if (
+            isinstance(enum, list)
+            and enum
+            and all(isinstance(item, str) for item in enum)
         ):
             allowed_types = ("string",)
 
@@ -2364,13 +2469,14 @@ def _response_output(
     content, tool_calls = (
         _parse_tool_calls(result.text, tools=tools) if tools else (result.text, [])
     )
+    incomplete = not result.stopped_on_eos and not tool_calls
     output: list[dict[str, Any]] = []
     if content is not None or not tool_calls:
         output.append(
             {
                 "id": message_id,
                 "type": "message",
-                "status": "completed",
+                "status": "incomplete" if incomplete else "completed",
                 "role": "assistant",
                 "content": [
                     {

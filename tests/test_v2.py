@@ -13,6 +13,47 @@ def gguf_string(value: str) -> bytes:
 
 
 class V2RuntimeTests(unittest.TestCase):
+    def test_nvfp4_prefill_has_blackwell_tensor_core_dispatch_and_fallback(self):
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/colibri_v2_qwen_kernels.hpp"
+        ).read_text()
+        driver = (root / "native/src/gpu_driver.cpp").read_text()
+        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+
+        self.assertIn("nvfp4_repack_cublaslt", kernels)
+        self.assertIn("nvfp4_quantize_cublaslt", kernels)
+        self.assertIn("nvfp4_repack_stacked_moe_cublaslt", kernels)
+        self.assertIn("nvfp4_repack_concat_down_cublaslt", kernels)
+        self.assertIn("nvfp4_copy_gguf_values_cublaslt", kernels)
+        self.assertIn("blockIdx.x * 8 + warp", kernels)
+        self.assertIn("COLIBRI_NVFP4_TILED", runtime)
+        self.assertIn("CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3", kernels)
+        self.assertIn("cublasLtMatmulAlgoGetHeuristic", driver)
+        self.assertIn("colibri_gpu_nvfp4_matmul_cublas", driver)
+        self.assertIn("colibri_gpu_nvfp4_moe_cublas", driver)
+        self.assertIn("kPreferenceMaxWorkspace = 1", driver)
+        self.assertIn("tc_env&&tc_env[0]=='1'", runtime)
+        self.assertIn("COLIBRI_NVFP4_TENSOR_CORES", verifier)
+        self.assertIn('launch("nvfp4_matmul_rows"', verifier)
+
+    def test_native_tiled_attention_covers_f16_bf16_and_q8(self):
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/colibri_v2_qwen_kernels.hpp"
+        ).read_text()
+        driver = (root / "native/src/gpu_driver.cpp").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+
+        for precision in ("f16", "bf16", "q8"):
+            symbol = f"kv_attention_fused_{precision}_tiles"
+            self.assertIn(symbol, kernels)
+            self.assertIn(symbol, driver)
+            self.assertIn(symbol, runtime)
+        self.assertIn("kv_fused_tiles_kernel(*runtime)", runtime)
+        self.assertIn("runtime->fused_attention&&fused_tiles", runtime)
+
     def make_model(
         self,
         sliding_pattern: tuple[bool, ...] | None = None,
