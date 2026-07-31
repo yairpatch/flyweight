@@ -1,0 +1,17 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\cli.py", line 1732, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\cli.py", line 641, in main
+    with model.native_qwen_runtime(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\v2.py", line 965, in native_qwen_runtime
+    return V2QwenRuntime(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\v2.py", line 1370, in __init__
+    model._check(
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\v2.py", line 590, in _check
+    raise V2Error(message.decode(errors="replace"))
+colibri_next.v2.V2Error: required Qwen tensor is missing: blk.0.ffn_gate_exps.scale

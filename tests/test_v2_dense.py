@@ -203,6 +203,7 @@ class DenseNativeTests(unittest.TestCase):
         )
         try:
             self.assertGreater(runtime.info["host_ffn_layers"], 0)
+            self.assertEqual(runtime.info["expert_mode"], "auto")
             task_ids = {
                 runtime.task_submit([5], 2),
                 runtime.task_submit([11], 2),

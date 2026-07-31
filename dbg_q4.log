@@ -1,0 +1,48 @@
+Loading native v2 GGUF from C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q4_K_S.gguf...
+Serving Qwen3.6-35B-A3B-UD-Q4_K_S at http://127.0.0.1:8135 (native v2, cpu MoE)
+127.0.0.1 - - [24/Jul/2026 13:21:15] "GET /health HTTP/1.1" 200 -
+127.0.0.1 - - [24/Jul/2026 13:21:15] request processing: /v1/chat/completions
+[moe-dbg] call=00 sel0=200 w0=0.2383 sum|out|=11.6440
+[moe-dbg] call=01 sel0=233 w0=0.2339 sum|out|=8.7028
+[moe-dbg] call=02 sel0=172 w0=0.2621 sum|out|=7.2001
+[moe-dbg] call=03 sel0=199 w0=0.1928 sum|out|=9.3700
+[moe-dbg] call=04 sel0=154 w0=0.3683 sum|out|=18.0871
+[moe-dbg] call=05 sel0=88 w0=0.2827 sum|out|=11.1852
+[moe-dbg] call=06 sel0=138 w0=0.3457 sum|out|=17.9968
+[moe-dbg] call=07 sel0=14 w0=0.2321 sum|out|=24.8346
+[moe-dbg] call=08 sel0=77 w0=0.1829 sum|out|=21.1607
+[moe-dbg] call=09 sel0=2 w0=0.3216 sum|out|=19.4593
+[moe-dbg] call=10 sel0=91 w0=0.2741 sum|out|=18.9791
+[moe-dbg] call=11 sel0=108 w0=0.2535 sum|out|=18.7984
+[moe-dbg] call=12 sel0=220 w0=0.1945 sum|out|=17.7943
+[moe-dbg] call=13 sel0=89 w0=0.1981 sum|out|=22.2553
+[moe-dbg] call=14 sel0=32 w0=0.2020 sum|out|=22.9061
+[moe-dbg] call=15 sel0=242 w0=0.1672 sum|out|=27.1517
+[moe-dbg] call=16 sel0=9 w0=0.2055 sum|out|=22.5021
+[moe-dbg] call=17 sel0=64 w0=0.2738 sum|out|=22.8477
+[moe-dbg] call=18 sel0=13 w0=0.1984 sum|out|=20.2164
+[moe-dbg] call=19 sel0=167 w0=0.1989 sum|out|=33.9980
+[moe-dbg] call=20 sel0=56 w0=0.1924 sum|out|=19.3787
+[moe-dbg] call=21 sel0=2 w0=0.2259 sum|out|=20.9907
+[moe-dbg] call=22 sel0=35 w0=0.2493 sum|out|=29.2814
+[moe-dbg] call=23 sel0=128 w0=0.1884 sum|out|=18.5551
+[moe-dbg] call=24 sel0=221 w0=0.1986 sum|out|=18.3493
+[moe-dbg] call=25 sel0=89 w0=0.3012 sum|out|=23.0593
+[moe-dbg] call=26 sel0=32 w0=0.2118 sum|out|=32.1031
+[moe-dbg] call=27 sel0=87 w0=0.1965 sum|out|=35.1127
+[moe-dbg] call=28 sel0=9 w0=0.2831 sum|out|=40.9989
+[moe-dbg] call=29 sel0=87 w0=0.1938 sum|out|=29.7458
+[moe-dbg] call=30 sel0=197 w0=0.1496 sum|out|=31.4706
+[moe-dbg] call=31 sel0=164 w0=0.3353 sum|out|=114.4190
+[moe-dbg] call=32 sel0=119 w0=0.2289 sum|out|=62.4731
+[moe-dbg] call=33 sel0=93 w0=0.1981 sum|out|=53.3481
+[moe-dbg] call=34 sel0=86 w0=0.2505 sum|out|=98.9122
+[moe-dbg] call=35 sel0=22 w0=0.1867 sum|out|=58.7090
+[moe-dbg] call=36 sel0=14 w0=0.2455 sum|out|=115.4343
+[moe-dbg] call=37 sel0=182 w0=0.2157 sum|out|=84.8141
+[moe-dbg] call=38 sel0=27 w0=0.1862 sum|out|=96.7483
+[moe-dbg] call=39 sel0=110 w0=0.1730 sum|out|=120.5929
+[load] prompt 13/13 tokens (100.0%)   13.7 tok/s
+[load] prompt ready in  0.95s (13 tokens,   13.7 tok/s)
+127.0.0.1 - - [24/Jul/2026 13:21:16] "POST /v1/chat/completions HTTP/1.1" 200 -
+127.0.0.1 - - [24/Jul/2026 13:21:16] request completed: /v1/chat/completions

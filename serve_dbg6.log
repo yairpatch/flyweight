@@ -1,0 +1,11 @@
+Loading native v2 GGUF from C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q6_K.gguf...
+Serving Qwen3.6-35B-A3B-UD-Q6_K at http://127.0.0.1:8133 (native v2, cpu MoE)
+127.0.0.1 - - [24/Jul/2026 13:16:50] "GET /health HTTP/1.1" 200 -
+127.0.0.1 - - [24/Jul/2026 13:16:51] request processing: /v1/chat/completions
+[moe-dbg] call=0 types(g/u/d)=14/14/14 routed=8 hid=2048 inter=512 use_q8=0 out[0..2]=-0.0064,-0.0008,0.0032 sum|out|=11.674
+[moe-dbg] call=1 types(g/u/d)=14/14/14 routed=8 hid=2048 inter=512 use_q8=0 out[0..2]=-0.0119,-0.0011,-0.0010 sum|out|=8.798
+[moe-dbg] call=2 types(g/u/d)=14/14/14 routed=8 hid=2048 inter=512 use_q8=0 out[0..2]=0.0062,0.0030,0.0032 sum|out|=7.221
+[load] prompt 13/13 tokens (100.0%)    6.8 tok/s
+[load] prompt ready in  1.92s (13 tokens,    6.8 tok/s)
+127.0.0.1 - - [24/Jul/2026 13:16:53] "POST /v1/chat/completions HTTP/1.1" 200 -
+127.0.0.1 - - [24/Jul/2026 13:16:53] request completed: /v1/chat/completions

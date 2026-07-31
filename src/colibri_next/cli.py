@@ -50,6 +50,16 @@ from .v2_qwen import (
     QwenV2Decoder,
 )
 
+EXPERT_MODE_CHOICES = (
+    "cpu",
+    "auto",
+    "resident",
+    "hybrid",
+    "gpu",
+    "legacy-paging",
+    "legacy-hybrid",
+)
+
 
 def _steady_state_counters(start, end):
     """Report native runtime counter deltas over the measured window only.
@@ -106,6 +116,23 @@ def _drop_file_cache(path: Path) -> None:
         os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(descriptor)
+
+
+def _prefill_cache_seed(value: str) -> int | str:
+    normalized = value.lower()
+    if normalized in {"auto", "off"}:
+        return normalized
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected auto, off, or an integer within [0, 256]"
+        ) from error
+    if not 0 <= count <= 256:
+        raise argparse.ArgumentTypeError(
+            "expected auto, off, or an integer within [0, 256]"
+        )
+    return count
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -310,8 +337,19 @@ def _parser() -> argparse.ArgumentParser:
         "--runtime", choices=("native", "cupy-reference"), default="native",
     )
     benchmark_v2.add_argument(
-        "--moe-device", choices=("gpu", "cpu", "hybrid"), default="gpu",
-        help="execute routed experts by GPU streaming or native CPU kernels",
+        "--expert-mode", "--moe-device",
+        dest="expert_mode",
+        choices=EXPERT_MODE_CHOICES,
+        default="auto",
+        help="routed experts: cpu, auto, or strict resident; hybrid/gpu preserve legacy behavior",
+    )
+    benchmark_v2.add_argument(
+        "--hybrid-prefill", choices=("split", "cpu"), default="split",
+        help="legacy-hybrid prefill policy (auto always uses CPU expert prefill)",
+    )
+    benchmark_v2.add_argument(
+        "--expert-residency", choices=("mutable", "immutable"), default=None,
+        help="legacy-hybrid placement policy (auto is always immutable)",
     )
     benchmark_v2.add_argument("--mtp-drafts", type=int, default=0)
     benchmark_v2.add_argument(
@@ -319,11 +357,11 @@ def _parser() -> argparse.ArgumentParser:
         help='CPU expert worker threads (0 = automatic)',
     )
     benchmark_v2.add_argument(
-        "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0"),
+        "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0", "turbo3", "turbo4"),
         default="f16",
     )
     benchmark_v2.add_argument(
-        "--cache-type-v", choices=("f32", "f16", "bf16", "q8_0"),
+        "--cache-type-v", choices=("f32", "f16", "bf16", "q8_0", "turbo3", "turbo4"),
         default="f16",
     )
     benchmark_v2.add_argument("--expert-top-k", type=int, default=0)
@@ -334,8 +372,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     benchmark_v2.add_argument("--prompt-cache-mib", type=int, default=0)
     benchmark_v2.add_argument(
-        "--prefill-cache-seed", type=int, default=0,
-        help="bulk-load this many prompt-hot experts per layer before decode",
+        "--prefill-cache-seed", type=_prefill_cache_seed, default=None,
+        help="post-prefill expert placement: auto, off/0, or experts per layer",
     )
     benchmark_v2.add_argument(
         "--expert-paging", choices=("auto", "staged", "direct"), default="auto",
@@ -395,8 +433,19 @@ def _parser() -> argparse.ArgumentParser:
         "--gpu-cache-mib", type=int, default=0,
         help="total v2 CUDA budget in MiB (0 = auto-fit to free VRAM)")
     native_qwen_v2.add_argument(
-        "--moe-device", choices=("gpu", "cpu", "hybrid"), default=None,
-        help="expert backend (default: CPU for Gemma 4, GPU otherwise)",
+        "--expert-mode", "--moe-device",
+        dest="expert_mode",
+        choices=EXPERT_MODE_CHOICES,
+        default="auto",
+        help="routed experts: cpu, auto, or strict resident",
+    )
+    native_qwen_v2.add_argument(
+        "--hybrid-prefill", choices=("split", "cpu"), default="split",
+        help="legacy-hybrid prefill policy",
+    )
+    native_qwen_v2.add_argument(
+        "--expert-residency", choices=("mutable", "immutable"), default=None,
+        help="legacy-hybrid placement policy",
     )
     native_qwen_v2.add_argument("--mtp-drafts", type=int, default=0)
     native_qwen_v2.add_argument(
@@ -404,11 +453,11 @@ def _parser() -> argparse.ArgumentParser:
         help='CPU expert worker threads (0 = automatic)',
     )
     native_qwen_v2.add_argument(
-        "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0"),
+        "--cache-type-k", choices=("f32", "f16", "bf16", "q8_0", "turbo3", "turbo4"),
         default="f16",
     )
     native_qwen_v2.add_argument(
-        "--cache-type-v", choices=("f32", "f16", "bf16", "q8_0"),
+        "--cache-type-v", choices=("f32", "f16", "bf16", "q8_0", "turbo3", "turbo4"),
         default="f16",
     )
     stack_qwen_v2.add_argument(
@@ -492,22 +541,45 @@ def _parser() -> argparse.ArgumentParser:
         help="total native v2 CUDA allocation budget in MiB (0 = auto-fit to free VRAM)",
     )
     serve_v2.add_argument(
-        "--moe-device",
-        choices=("gpu", "cpu", "hybrid"),
-        default="hybrid",
-        help="routed-expert execution policy",
+        "--expert-mode", "--moe-device",
+        dest="expert_mode",
+        choices=EXPERT_MODE_CHOICES,
+        default="auto",
+        help="routed experts: cpu, auto, or strict resident; hybrid/gpu preserve legacy behavior",
+    )
+    serve_v2.add_argument(
+        "--hybrid-prefill",
+        choices=("split", "cpu"),
+        default="split",
+        help="legacy-hybrid prefill policy",
+    )
+    serve_v2.add_argument(
+        "--expert-residency",
+        choices=("mutable", "immutable"),
+        default=None,
+        help="legacy-hybrid placement policy",
     )
     serve_v2.add_argument(
         "--cache-type-k",
-        choices=("f32", "f16", "bf16", "q8_0"),
+        choices=("f32", "f16", "bf16", "q8_0", "turbo3", "turbo4"),
         default="f16",
-        help="KV cache K precision (llama.cpp -ctk); f16 halves KV VRAM",
+        help="KV cache K precision (llama.cpp -ctk); f16 halves KV VRAM, "
+             "turbo3/turbo4 are TurboQuant at 3.5/4.5 bits per value (~4.6x "
+             "less KV than f16) and need a head_dim that is a power of two "
+             "between 32 and 512. The live window is expanded to f16 in a "
+             "shared buffer so the tensor-core attention kernels still run, "
+             "putting both decode and prefill within ~5%% of f16",
     )
     serve_v2.add_argument(
         "--cache-type-v",
-        choices=("f32", "f16", "bf16", "q8_0"),
+        choices=("f32", "f16", "bf16", "q8_0", "turbo3", "turbo4"),
         default="f16",
-        help="KV cache V precision (llama.cpp -ctv); f16 halves KV VRAM",
+        help="KV cache V precision (llama.cpp -ctv); f16 halves KV VRAM, "
+             "turbo3/turbo4 are TurboQuant at 3.5/4.5 bits per value (~4.6x "
+             "less KV than f16) and need a head_dim that is a power of two "
+             "between 32 and 512. The live window is expanded to f16 in a "
+             "shared buffer so the tensor-core attention kernels still run, "
+             "putting both decode and prefill within ~5%% of f16",
     )
     serve_v2.add_argument(
         "--prefill-checkpoint-interval",
@@ -552,8 +624,8 @@ def _parser() -> argparse.ArgumentParser:
         "VRAM but preserves unrestricted prefix-cache rollback",
     )
     serve_v2.add_argument(
-        "--prefill-cache-seed", type=int, default=0,
-        help="experimental Qwen prompt-trained expert seed per layer (0 = off)",
+        "--prefill-cache-seed", type=_prefill_cache_seed, default=None,
+        help="post-prefill expert placement: auto, off/0, or experts per layer",
     )
     serve_v2.add_argument(
         "--expert-paging", choices=("auto", "staged", "direct"), default="auto",
@@ -619,10 +691,6 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("benchmark-v2 accepts either --cpu-prefetch-mib or --cpu-prefetch-auto")
         if args.expert_top_k < 0:
             raise SystemExit("benchmark-v2 requires --expert-top-k >= 0")
-        if not 0 <= args.prefill_cache_seed <= 256:
-            raise SystemExit(
-                "benchmark-v2 requires --prefill-cache-seed within [0, 256]"
-            )
         if not 0 <= args.next_layer_prefetch <= 64:
             raise SystemExit(
                 "benchmark-v2 requires --next-layer-prefetch within [0, 64]"
@@ -656,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
                 with model.native_qwen_runtime(
                     context_limit=args.context,
                     gpu_cache_bytes=cache_mib * 1024**2,
-                    moe_device=args.moe_device,
+                    expert_mode=args.expert_mode,
                     mtp_drafts=args.mtp_drafts,
                     expert_top_k=args.expert_top_k,
                     expert_top_p=args.expert_top_p,
@@ -670,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
                     cpu_prefetch_auto=args.cpu_prefetch_auto,
                     next_layer_prefetch=args.next_layer_prefetch,
                     cpu_threads=args.cpu_threads,
+                    hybrid_prefill=args.hybrid_prefill,
+                    expert_residency=args.expert_residency,
                 ) as runtime:
                     prepare_started = time.perf_counter()
                     runtime.prepare()
@@ -717,9 +787,8 @@ def main(argv: list[str] | None = None) -> int:
                         average = measured_total / args.iterations
                         print(json.dumps({
                             "execution": (
-                                f"native-v2-cpp-cuda-{args.moe_device}-moe-mtp"
-                                if args.moe_device != "gpu"
-                                else "native-v2-cpp-cuda-mtp"
+                                f"native-v2-cpp-cuda-"
+                                f"{runtime_info['expert_mode']}-experts-mtp"
                             ),
                             "measurement": "aggregate native generation wall time",
                             "cold_cache": args.cold_cache,
@@ -764,8 +833,8 @@ def main(argv: list[str] | None = None) -> int:
                 steady_state = _steady_state_counters(steady_start, runtime_info)
                 print(json.dumps({
                     "execution": (
-                        f"native-v2-cpp-cuda-{args.moe_device}-moe"
-                        if args.moe_device != "gpu" else "native-v2-cpp-cuda"
+                        f"native-v2-cpp-cuda-"
+                        f"{runtime_info['expert_mode']}-experts"
                     ),
                     "measurement": "batched prefill plus steady single-token decode",
                     "cold_cache": args.cold_cache,
@@ -939,9 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cpu_threads < 0:
             raise SystemExit('--cpu-threads must be >= 0')
         with V2Model(args.model) as model:
-            moe_device = args.moe_device or (
-                "hybrid" if model.info["architecture"] == "gemma4" else "gpu"
-            )
+            expert_mode = args.expert_mode
             prompt_text = args.prompt
             if args.chat:
                 if prompt_text is None:
@@ -963,11 +1030,13 @@ def main(argv: list[str] | None = None) -> int:
             with model.native_runtime(
                 context_limit=args.context,
                 gpu_cache_bytes=args.gpu_cache_mib * 1024**2,
-                moe_device=moe_device,
+                expert_mode=expert_mode,
                 mtp_drafts=args.mtp_drafts,
                 cache_type_k=args.cache_type_k,
                 cache_type_v=args.cache_type_v,
                 cpu_threads=args.cpu_threads,
+                hybrid_prefill=args.hybrid_prefill,
+                expert_residency=args.expert_residency,
             ) as runtime:
                 prepare_started = time.perf_counter()
                 runtime.prepare()
@@ -986,8 +1055,8 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_info = runtime.info
             print(json.dumps({
                 "execution": (
-                    f"native-v2-cpp-cuda-{moe_device}-moe"
-                    if moe_device != "gpu" else "native-v2-cpp-cuda"
+                    f"native-v2-cpp-cuda-"
+                    f"{runtime_info['expert_mode']}-experts"
                 ),
                 "prompt": prompt_text,
                 "prompt_tokens": prompt_tokens,
@@ -1265,8 +1334,6 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit('--cpu-threads must be >= 0')
         if args.cpu_prefetch_mib and args.cpu_prefetch_auto:
             raise SystemExit("use either --cpu-prefetch-mib or --cpu-prefetch-auto")
-        if not 0 <= args.prefill_cache_seed <= 256:
-            raise SystemExit("--prefill-cache-seed must be within [0, 256]")
         if not 0 <= args.next_layer_prefetch <= 64:
             raise SystemExit("--next-layer-prefetch must be within [0, 64]")
         print(
@@ -1281,7 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
             context_window=args.context_window,
             max_new_tokens=args.max_new_tokens,
             gpu_cache_mib=args.gpu_cache_mib,
-                moe_device=args.moe_device,
+                expert_mode=args.expert_mode,
                 mtp_drafts=args.mtp_drafts,
                 cache_type_k=args.cache_type_k,
                 cache_type_v=args.cache_type_v,
@@ -1296,13 +1363,28 @@ def main(argv: list[str] | None = None) -> int:
                 cpu_prefetch_auto=args.cpu_prefetch_auto,
                 next_layer_prefetch=args.next_layer_prefetch,
                 cpu_threads=args.cpu_threads,
+                hybrid_prefill=args.hybrid_prefill,
+                expert_residency=args.expert_residency,
                 api_key=args.api_key,
             cors_origin=args.cors_origin,
             strict_model=args.strict_model,
         )
+        placement = service.v2_runtime.info
+        requested = service.requested_expert_mode
+        alias = (
+            f", requested alias {requested}"
+            if requested != service.expert_mode else ""
+        )
+        fallback = (
+            f", fallback: {service.expert_fallback_reason}"
+            if service.expert_fallback_reason else ""
+        )
         print(
             f"Serving {service.model_name} at http://{args.host}:{args.port} "
-            f"(native v2, {service.moe_device} MoE)",
+            f"(native v2, expert mode {service.expert_mode}{alias}, "
+            f"{int(placement['expert_cache_slots'])} GPU expert slots / "
+            f"{int(placement['expert_cache_bytes']) // 1024**2} MiB"
+            f"{fallback})",
             file=sys.stderr,
             flush=True,
         )

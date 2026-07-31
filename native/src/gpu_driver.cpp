@@ -174,10 +174,10 @@ cublasLtHandle_t g_cublas_lt_handle = nullptr;
 struct Nvfp4Scratch {
     CUdeviceptr weight_values = 0, weight_scales = 0;
     CUdeviceptr input_values = 0, input_scales = 0;
-    CUdeviceptr projected = 0;
+    CUdeviceptr projected = 0, expert_pointers = 0;
     size_t weight_values_bytes = 0, weight_scales_bytes = 0;
     size_t input_values_bytes = 0, input_scales_bytes = 0;
-    size_t projected_bytes = 0;
+    size_t projected_bytes = 0, expert_pointers_bytes = 0;
     CUstream stream = nullptr;
 };
 Nvfp4Scratch g_nvfp4_scratch;
@@ -189,6 +189,13 @@ struct Nvfp4LtPlan {
 };
 std::unordered_map<std::uint64_t, Nvfp4LtPlan> g_nvfp4_plans;
 bool g_nvfp4_validation_done = false;
+struct Nvfp4MoeProfile {
+    CUevent events[9]{};
+    bool initialized = false;
+    std::uint64_t calls = 0;
+    double milliseconds[8]{};
+};
+Nvfp4MoeProfile g_nvfp4_moe_profile;
 std::mutex g_cublas_mutex;
 CUcontext g_context = nullptr;
 CUmodule g_module = nullptr;
@@ -845,7 +852,7 @@ extern "C" int colibri_gpu_compile(
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
              "qwen_attention_prefill_pack_f16",
              "kv_attention_prefill_softmax_f16",
-             "qwen_attention_prefill_unpack_gate",
+             "qwen_attention_prefill_unpack_gate", "qwen_attention_prefill_unpack",
              "kv_attention_scores", "kv_attention_values",
              "qwen_shared_scale", "qwen_argmax", "qwen_concat_pair",
              "qwen_shared_scale_bf16", "qwen_copy_vector", "silu_mul",
@@ -866,6 +873,9 @@ extern "C" int colibri_gpu_compile(
              "nvfp4_repack_cublaslt", "nvfp4_quantize_cublaslt",
              "nvfp4_repack_stacked_moe_cublaslt",
              "nvfp4_stacked_moe_swiglu",
+             "nvfp4_persistent_moe_swiglu",
+             "nvfp4_concat_native_gate_up_cublaslt",
+             "nvfp4_concat_native_down_cublaslt",
              "nvfp4_quantize_broadcast16_cublaslt",
              "nvfp4_repack_concat_down_cublaslt",
              "nvfp4_quantize_weighted_moe_cublaslt",
@@ -903,6 +913,13 @@ extern "C" int colibri_gpu_compile(
              "kv_attention_values_f16", "kv_attention_values_bf16", "kv_attention_values_q8",
              "kv_attention_scores_ring", "kv_attention_scores_f16_ring", "kv_attention_scores_bf16_ring", "kv_attention_scores_q8_ring",
              "kv_attention_values_ring", "kv_attention_values_f16_ring", "kv_attention_values_bf16_ring", "kv_attention_values_q8_ring",
+             "kv_store_turbo3_k", "kv_store_turbo3_v", "kv_store_turbo4_k", "kv_store_turbo4_v",
+             "kv_attention_scores_turbo3", "kv_attention_scores_turbo4",
+             "kv_attention_values_turbo3", "kv_attention_values_turbo4",
+             "kv_attention_scores_turbo3_ring", "kv_attention_scores_turbo4_ring",
+             "kv_attention_values_turbo3_ring", "kv_attention_values_turbo4_ring",
+             "kv_dequant_turbo3_f16", "kv_dequant_turbo4_f16",
+             "turbo_rotate_rows", "turbo_unrotate_rows",
              "kv_attention_fused_f16_tiles", "kv_attention_fused_bf16_tiles",
              "kv_attention_fused_q8_tiles", "kv_attention_fused_merge",
              "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8",
@@ -1620,7 +1637,9 @@ static void nvfp4_clear_cublas_plans() {
 
 static int nvfp4_run_quantized_gemm(
     int input_size, int output_size, int rows, float alpha, float beta,
-    std::uint64_t output, CUstream cuda_stream
+    std::uint64_t output, CUstream cuda_stream,
+    std::uint64_t weight_values = 0, std::uint64_t weight_scales = 0,
+    std::uint64_t input_values = 0, std::uint64_t input_scales = 0
 ) {
     constexpr int kCudaR32F = 0;
     constexpr int kCudaR4E2M1 = 33;
@@ -1669,9 +1688,11 @@ static int nvfp4_run_quantized_gemm(
             return -1;
         }
         const void* a_scale_pointer = reinterpret_cast<const void*>(
-            static_cast<std::uintptr_t>(g_nvfp4_scratch.weight_scales));
+            static_cast<std::uintptr_t>(weight_scales
+                ? weight_scales : g_nvfp4_scratch.weight_scales));
         const void* b_scale_pointer = reinterpret_cast<const void*>(
-            static_cast<std::uintptr_t>(g_nvfp4_scratch.input_scales));
+            static_cast<std::uintptr_t>(input_scales
+                ? input_scales : g_nvfp4_scratch.input_scales));
         size_t no_workspace = 0;
         if (g_cublas_lt.matmul_desc_set(
                 plan.operation, kDescTransA, &kOpT, sizeof(kOpT)) != 0 ||
@@ -1711,10 +1732,25 @@ static int nvfp4_run_quantized_gemm(
         found = g_nvfp4_plans.emplace(key, plan).first;
     }
     const auto& plan = found->second;
+    if (!weight_values) weight_values = g_nvfp4_scratch.weight_values;
+    if (!weight_scales) weight_scales = g_nvfp4_scratch.weight_scales;
+    if (!input_values) input_values = g_nvfp4_scratch.input_values;
+    if (!input_scales) input_scales = g_nvfp4_scratch.input_scales;
+    const void* a_scale_pointer = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(weight_scales));
+    const void* b_scale_pointer = reinterpret_cast<const void*>(
+        static_cast<std::uintptr_t>(input_scales));
+    if (g_cublas_lt.matmul_desc_set(
+            plan.operation, kDescAScalePointer, &a_scale_pointer,
+            sizeof(a_scale_pointer)) != 0 ||
+        g_cublas_lt.matmul_desc_set(
+            plan.operation, kDescBScalePointer, &b_scale_pointer,
+            sizeof(b_scale_pointer)) != 0)
+        return -5;
     const void* a = reinterpret_cast<const void*>(
-        static_cast<std::uintptr_t>(g_nvfp4_scratch.weight_values));
+        static_cast<std::uintptr_t>(weight_values));
     const void* b = reinterpret_cast<const void*>(
-        static_cast<std::uintptr_t>(g_nvfp4_scratch.input_values));
+        static_cast<std::uintptr_t>(input_values));
     void* d = reinterpret_cast<void*>(static_cast<std::uintptr_t>(output));
     const int status = g_cublas_lt.matmul(
         g_cublas_lt_handle, plan.operation, &alpha, a, plan.a_layout, b,
@@ -1904,6 +1940,23 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
         || !activated || !output || !route_weights || hidden_size <= 0
         || intermediate_size <= 0 || experts <= 0 || (hidden_size & 63)
         || (intermediate_size & 63) || !load_cublas_lt()) return -1;
+    const bool profile =
+        std::getenv("COLIBRI_NVFP4_TENSOR_CORE_PROFILE") != nullptr;
+    if (profile && !g_nvfp4_moe_profile.initialized) {
+        bool initialized = true;
+        for (auto& event : g_nvfp4_moe_profile.events) {
+            if (g_api.cuEventCreate(&event, 0) != 0) {
+                initialized = false;
+                break;
+            }
+        }
+        g_nvfp4_moe_profile.initialized = initialized;
+    }
+    auto profile_record = [&](int index) {
+        if (profile && g_nvfp4_moe_profile.initialized)
+            g_api.cuEventRecord(g_nvfp4_moe_profile.events[index],
+                                reinterpret_cast<CUstream>(stream));
+    };
     const auto stacked_repack =
         g_functions.find("nvfp4_repack_stacked_moe_cublaslt");
     const auto swiglu = g_functions.find("nvfp4_stacked_moe_swiglu");
@@ -1979,6 +2032,7 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
                  g_nvfp4_scratch.projected_bytes, projected_bytes))
         return -5;
     g_nvfp4_scratch.stream = cuda_stream;
+    profile_record(0);
 
     std::uint64_t weight_values = g_nvfp4_scratch.weight_values;
     std::uint64_t weight_scales = g_nvfp4_scratch.weight_scales;
@@ -1989,6 +2043,7 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
         (static_cast<std::uint64_t>(gate_rows) * hidden_size / 64 + 255) / 256);
     if (launch(stacked_repack->second, gate_blocks, 1, 256, stacked_args, 0,
                cuda_stream) != 0) return -6;
+    profile_record(1);
 
     std::uint64_t input_values = g_nvfp4_scratch.input_values;
     std::uint64_t input_scales = g_nvfp4_scratch.input_scales;
@@ -1996,10 +2051,12 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
         &input, &input_values, &input_scales, &hidden_size};
     if (launch(input_quantize->second, hidden_size, 1, 32, input_args, 0,
                cuda_stream) != 0) return -7;
+    profile_record(2);
     const std::uint64_t projected = g_nvfp4_scratch.projected;
     const int gate_gemm_status = nvfp4_run_quantized_gemm(
         hidden_size, gate_rows, 16, 1.0f, 0.0f, projected, cuda_stream);
     if (gate_gemm_status != 0) return -80 + gate_gemm_status;
+    profile_record(3);
     if (validate) {
         std::uint64_t stats =
             projected + static_cast<std::uint64_t>(gate_rows) * sizeof(float);
@@ -2031,6 +2088,7 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
                    (static_cast<std::uint64_t>(experts) * intermediate_size
                     + 255) / 256),
                1, 256, swiglu_args, 0, cuda_stream) != 0) return -9;
+    profile_record(4);
 
     void* down_repack_args[] = {
         &down_pointers, &weight_values, &weight_scales, &intermediate_size,
@@ -2040,15 +2098,18 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
         / 256);
     if (launch(down_repack->second, down_blocks, 1, 256, down_repack_args, 0,
                cuda_stream) != 0) return -10;
+    profile_record(5);
     void* down_quantize_args[] = {
         &activated, &route_weights, &down_scales, &input_values, &input_scales,
         &intermediate_size, &experts};
     if (launch(down_quantize->second, down_input, 1, 32,
                down_quantize_args, 0, cuda_stream) != 0) return -11;
+    profile_record(6);
     const int down_gemm_status = nvfp4_run_quantized_gemm(
         down_input, hidden_size, 16, 1.0f / 32768.0f, 0.0f, projected,
         cuda_stream);
     if (down_gemm_status != 0) return -120 + down_gemm_status;
+    profile_record(7);
     if (validate) {
         std::uint64_t stats =
             projected + static_cast<std::uint64_t>(hidden_size) * sizeof(float);
@@ -2074,9 +2135,329 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
     }
     void* add_args[] = {
         const_cast<std::uint64_t*>(&projected), &output, &hidden_size};
+    const int add_status = launch(
+        add_first->second, static_cast<unsigned int>((hidden_size + 255) / 256),
+        1, 256, add_args, 0, cuda_stream);
+    if (add_status != 0) return -13;
+    profile_record(8);
+    if (profile && g_nvfp4_moe_profile.initialized
+        && g_api.cuEventSynchronize(g_nvfp4_moe_profile.events[8]) == 0) {
+        for (int phase = 0; phase < 8; ++phase) {
+            float elapsed = 0.0f;
+            if (g_api.cuEventElapsedTime(
+                    &elapsed, g_nvfp4_moe_profile.events[phase],
+                    g_nvfp4_moe_profile.events[phase + 1]) == 0)
+                g_nvfp4_moe_profile.milliseconds[phase] += elapsed;
+        }
+        ++g_nvfp4_moe_profile.calls;
+        if ((g_nvfp4_moe_profile.calls % 40) == 0) {
+            static const char* names[8] = {
+                "gate_repack", "input_quant", "gate_gemm", "swiglu",
+                "down_repack", "down_quant", "down_gemm", "add"};
+            std::fprintf(stderr, "[nvfp4-tc-profile] calls=%llu",
+                         static_cast<unsigned long long>(
+                             g_nvfp4_moe_profile.calls));
+            for (int phase = 0; phase < 8; ++phase) {
+                std::fprintf(
+                    stderr, " %s_ms=%.4f", names[phase],
+                    g_nvfp4_moe_profile.milliseconds[phase] / 40.0);
+                g_nvfp4_moe_profile.milliseconds[phase] = 0.0;
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+    return 0;
+}
+
+static size_t nvfp4_native_expert_bytes(
+    int hidden_size, int intermediate_size
+) {
+    const size_t gate_up_values =
+        static_cast<size_t>(intermediate_size) * hidden_size;
+    const size_t gate_up_scales =
+        nvfp4_cublas_scale_bytes(2 * intermediate_size, hidden_size);
+    const size_t down_values =
+        static_cast<size_t>(hidden_size) * intermediate_size / 2;
+    const size_t down_scales =
+        nvfp4_cublas_scale_bytes(hidden_size, intermediate_size);
+    return gate_up_values + gate_up_scales + down_values + down_scales;
+}
+
+extern "C" int colibri_gpu_nvfp4_prepare_expert(
+    std::uint64_t gate, std::uint64_t up, std::uint64_t down,
+    std::uint64_t native, std::uint64_t stream,
+    std::int32_t hidden_size, std::int32_t intermediate_size
+) {
+    if (!gate || !up || !down || !native || hidden_size <= 0
+        || intermediate_size <= 0 || (hidden_size & 63)
+        || (intermediate_size & 127)) return -1;
+    const auto repack = g_functions.find("nvfp4_repack_cublaslt");
+    if (repack == g_functions.end()) return -2;
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    const size_t one_values =
+        static_cast<size_t>(intermediate_size) * hidden_size / 2;
+    const size_t one_scales =
+        nvfp4_cublas_scale_bytes(intermediate_size, hidden_size);
+    const size_t gate_up_values = 2 * one_values;
+    const size_t gate_up_scales = 2 * one_scales;
+    const size_t down_values =
+        static_cast<size_t>(hidden_size) * intermediate_size / 2;
+    const std::uint64_t gate_values = native;
+    const std::uint64_t up_values = native + one_values;
+    const std::uint64_t gate_scales = native + gate_up_values;
+    const std::uint64_t up_scales = gate_scales + one_scales;
+    const std::uint64_t down_values_ptr =
+        native + gate_up_values + gate_up_scales;
+    const std::uint64_t down_scales =
+        down_values_ptr + down_values;
+    auto run = [&](std::uint64_t source, std::uint64_t values,
+                   std::uint64_t scales, int rows, int columns) {
+        void* args[] = {
+            &source, &values, &scales, &rows, &columns};
+        const unsigned int blocks = static_cast<unsigned int>(
+            (static_cast<std::uint64_t>(rows) * columns / 64 + 255) / 256);
+        return launch(
+            repack->second, blocks, 1, 256, args, 0, cuda_stream);
+    };
+    if (run(gate, gate_values, gate_scales,
+            intermediate_size, hidden_size) != 0) return -3;
+    if (run(up, up_values, up_scales,
+            intermediate_size, hidden_size) != 0) return -4;
+    if (run(down, down_values_ptr, down_scales,
+            hidden_size, intermediate_size) != 0) return -5;
+    return nvfp4_native_expert_bytes(hidden_size, intermediate_size) > 0
+        ? 0 : -6;
+}
+
+extern "C" int colibri_gpu_nvfp4_moe_persistent(
+    const std::uint64_t* native_experts, std::uint64_t route_weights,
+    std::uint64_t gate_scales, std::uint64_t up_scales,
+    std::uint64_t down_scales, std::uint64_t input,
+    std::uint64_t activated, std::uint64_t output, std::uint64_t stream,
+    std::int32_t hidden_size, std::int32_t intermediate_size,
+    std::int32_t experts
+) {
+    std::lock_guard<std::mutex> lock(g_cublas_mutex);
+    if (!native_experts || !route_weights || !input || !activated || !output
+        || hidden_size <= 0 || intermediate_size <= 0 || experts <= 0
+        || (hidden_size & 63) || (intermediate_size & 127)
+        || !load_cublas_lt()) return -1;
+    const auto quantize =
+        g_functions.find("nvfp4_quantize_broadcast16_cublaslt");
+    const auto weighted_quantize =
+        g_functions.find("nvfp4_quantize_weighted_moe_cublaslt");
+    const auto swiglu =
+        g_functions.find("nvfp4_persistent_moe_swiglu");
+    const auto concat_gate =
+        g_functions.find("nvfp4_concat_native_gate_up_cublaslt");
+    const auto concat_down =
+        g_functions.find("nvfp4_concat_native_down_cublaslt");
+    const auto add_first =
+        g_functions.find("nvfp4_moe_add_first_column");
+    if (quantize == g_functions.end() ||
+        weighted_quantize == g_functions.end() ||
+        swiglu == g_functions.end() || add_first == g_functions.end())
+        return -2;
+    const char* grouped_env =
+        std::getenv("COLIBRI_NVFP4_PERSISTENT_GROUPED");
+    const bool grouped = grouped_env && grouped_env[0] == '1';
+    if (grouped && (concat_gate == g_functions.end() ||
+                    concat_down == g_functions.end())) return -2;
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    const int max_input =
+        std::max(hidden_size, experts * intermediate_size);
+    const size_t input_value_bytes =
+        static_cast<size_t>(16) * max_input / 2;
+    const size_t input_scale_bytes =
+        nvfp4_cublas_scale_bytes(16, max_input);
+    const size_t gate_projected_bytes =
+        static_cast<size_t>(experts) * 2 * intermediate_size * 16
+        * sizeof(float);
+    const size_t down_projected_bytes =
+        static_cast<size_t>(hidden_size) * 16 * sizeof(float);
+    const size_t projected_bytes =
+        std::max(gate_projected_bytes, down_projected_bytes);
+    const size_t one_values =
+        static_cast<size_t>(intermediate_size) * hidden_size / 2;
+    const size_t gate_up_values = 2 * one_values;
+    const size_t gate_up_scales =
+        nvfp4_cublas_scale_bytes(2 * intermediate_size, hidden_size);
+    const size_t down_values =
+        static_cast<size_t>(hidden_size) * intermediate_size / 2;
+    const size_t gate_weight_values =
+        static_cast<size_t>(experts) * gate_up_values;
+    const size_t down_weight_values =
+        static_cast<size_t>(hidden_size) * experts * intermediate_size / 2;
+    const size_t weight_value_bytes =
+        std::max(gate_weight_values, down_weight_values);
+    const size_t gate_weight_scales =
+        nvfp4_cublas_scale_bytes(
+            experts * 2 * intermediate_size, hidden_size);
+    const size_t down_weight_scales =
+        nvfp4_cublas_scale_bytes(
+            hidden_size, experts * intermediate_size);
+    const size_t weight_scale_bytes =
+        std::max(gate_weight_scales, down_weight_scales);
+    const size_t expert_pointer_bytes =
+        static_cast<size_t>(experts) * sizeof(std::uint64_t);
+    const bool grow =
+        weight_value_bytes > g_nvfp4_scratch.weight_values_bytes ||
+        weight_scale_bytes > g_nvfp4_scratch.weight_scales_bytes ||
+        input_value_bytes > g_nvfp4_scratch.input_values_bytes ||
+        input_scale_bytes > g_nvfp4_scratch.input_scales_bytes ||
+        projected_bytes > g_nvfp4_scratch.projected_bytes ||
+        expert_pointer_bytes > g_nvfp4_scratch.expert_pointers_bytes;
+    if (grow && g_nvfp4_scratch.stream != nullptr
+        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -3;
+    if (grow) nvfp4_clear_cublas_plans();
+    auto reserve = [&](CUdeviceptr& pointer, size_t& capacity, size_t bytes) {
+        if (bytes <= capacity) return true;
+        if (pointer && g_api.cuMemFree(pointer) != 0) return false;
+        pointer = 0;
+        capacity = 0;
+        if (g_api.cuMemAlloc(&pointer, bytes) != 0) return false;
+        capacity = bytes;
+        return true;
+    };
+    if (!reserve(g_nvfp4_scratch.weight_values,
+                 g_nvfp4_scratch.weight_values_bytes, weight_value_bytes) ||
+        !reserve(g_nvfp4_scratch.weight_scales,
+                 g_nvfp4_scratch.weight_scales_bytes, weight_scale_bytes) ||
+        !reserve(g_nvfp4_scratch.input_values,
+                 g_nvfp4_scratch.input_values_bytes, input_value_bytes) ||
+        !reserve(g_nvfp4_scratch.input_scales,
+                 g_nvfp4_scratch.input_scales_bytes, input_scale_bytes) ||
+        !reserve(g_nvfp4_scratch.projected,
+                 g_nvfp4_scratch.projected_bytes, projected_bytes) ||
+        !reserve(g_nvfp4_scratch.expert_pointers,
+                 g_nvfp4_scratch.expert_pointers_bytes,
+                 expert_pointer_bytes))
+        return -4;
+    g_nvfp4_scratch.stream = cuda_stream;
+
+    std::uint64_t weight_values = g_nvfp4_scratch.weight_values;
+    std::uint64_t weight_scales = g_nvfp4_scratch.weight_scales;
+    std::uint64_t input_values = g_nvfp4_scratch.input_values;
+    std::uint64_t input_scales = g_nvfp4_scratch.input_scales;
+    std::uint64_t projected = g_nvfp4_scratch.projected;
+    std::uint64_t expert_pointers = g_nvfp4_scratch.expert_pointers;
+    if (grouped) {
+        if (g_api.cuMemcpyHtoDAsync(
+                g_nvfp4_scratch.expert_pointers, native_experts,
+                expert_pointer_bytes, cuda_stream) != 0) return -5;
+        std::uint64_t gate_value_bytes_arg = gate_up_values;
+        std::uint64_t gate_scale_bytes_arg = gate_up_scales;
+        void* concat_gate_args[] = {
+            &expert_pointers, &weight_values, &weight_scales,
+            &gate_value_bytes_arg, &gate_scale_bytes_arg, &experts};
+        const size_t gate_copy_bytes =
+            std::max(gate_weight_values,
+                     static_cast<size_t>(experts) * gate_up_scales);
+        if (launch(
+                concat_gate->second,
+                static_cast<unsigned int>((gate_copy_bytes + 255) / 256),
+                1, 256, concat_gate_args, 0, cuda_stream) != 0) return -6;
+    }
+    void* input_args[] = {
+        &input, &input_values, &input_scales, &hidden_size};
+    if (launch(quantize->second, hidden_size, 1, 32, input_args, 0,
+               cuda_stream) != 0) return -7;
+    if (grouped) {
+        const int gate_status = nvfp4_run_quantized_gemm(
+            hidden_size, experts * 2 * intermediate_size, 16, 1.0f, 0.0f,
+            projected, cuda_stream, weight_values, weight_scales,
+            input_values, input_scales);
+        if (gate_status != 0) return -20 + gate_status;
+    } else {
+        for (int expert = 0; expert < experts; ++expert) {
+            const std::uint64_t expert_values = native_experts[expert];
+            const std::uint64_t expert_scales =
+                expert_values + gate_up_values;
+            const std::uint64_t expert_output = projected
+                + static_cast<std::uint64_t>(expert) *
+                  2 * intermediate_size * 16 * sizeof(float);
+            const int status = nvfp4_run_quantized_gemm(
+                hidden_size, 2 * intermediate_size, 16, 1.0f, 0.0f,
+                expert_output, cuda_stream, expert_values, expert_scales,
+                input_values, input_scales);
+            if (status != 0) return -20 + status;
+        }
+    }
+    int grouped_layout = grouped ? 1 : 0;
+    void* swiglu_args[] = {
+        &projected, &activated, &intermediate_size, &experts,
+        &gate_scales, &up_scales, &down_scales, &grouped_layout};
+    if (launch(
+            swiglu->second,
+            static_cast<unsigned int>(
+                (static_cast<std::uint64_t>(experts) * intermediate_size
+                 + 255) / 256),
+            1, 256, swiglu_args, 0, cuda_stream) != 0) return -8;
+
+    const float alpha = 1.0f / 32768.0f;
+    if (grouped) {
+        void* down_input_args[] = {
+            &activated, &route_weights, &down_scales, &input_values,
+            &input_scales, &intermediate_size, &experts};
+        const unsigned int down_input_blocks =
+            static_cast<unsigned int>(
+                static_cast<std::uint64_t>(experts) * intermediate_size);
+        if (launch(weighted_quantize->second, down_input_blocks, 1, 32,
+                   down_input_args, 0, cuda_stream) != 0) return -9;
+        std::uint64_t down_offset = gate_up_values + gate_up_scales;
+        std::uint64_t down_scale_offset = down_offset + down_values;
+        void* concat_down_args[] = {
+            &expert_pointers, &weight_values, &weight_scales,
+            &intermediate_size, &hidden_size, &experts,
+            &down_offset, &down_scale_offset};
+        const size_t down_scale_items =
+            static_cast<size_t>(hidden_size) * experts *
+            (intermediate_size / 16);
+        const size_t down_copy_items =
+            std::max(down_weight_values, down_scale_items);
+        if (launch(
+                concat_down->second,
+                static_cast<unsigned int>((down_copy_items + 255) / 256),
+                1, 256, concat_down_args, 0, cuda_stream) != 0) return -10;
+        const int down_status = nvfp4_run_quantized_gemm(
+            experts * intermediate_size, hidden_size, 16, alpha, 0.0f,
+            projected, cuda_stream, weight_values, weight_scales,
+            input_values, input_scales);
+        if (down_status != 0) return -40 + down_status;
+    } else {
+        for (int expert = 0; expert < experts; ++expert) {
+            std::uint64_t expert_input = activated
+                + static_cast<std::uint64_t>(expert) * intermediate_size *
+                  sizeof(float);
+            std::uint64_t expert_weight =
+                route_weights +
+                static_cast<std::uint64_t>(expert) * sizeof(float);
+            std::uint64_t expert_down_scale = down_scales
+                ? down_scales +
+                    static_cast<std::uint64_t>(expert) * sizeof(float) : 0;
+            int one_expert = 1;
+            void* down_input_args[] = {
+                &expert_input, &expert_weight, &expert_down_scale,
+                &input_values, &input_scales, &intermediate_size,
+                &one_expert};
+            if (launch(weighted_quantize->second, intermediate_size, 1, 32,
+                       down_input_args, 0, cuda_stream) != 0) return -9;
+            const std::uint64_t expert_values = native_experts[expert]
+                + gate_up_values + gate_up_scales;
+            const std::uint64_t expert_scales =
+                expert_values + down_values;
+            const float beta = expert == 0 ? 0.0f : 1.0f;
+            const int status = nvfp4_run_quantized_gemm(
+                intermediate_size, hidden_size, 16, alpha, beta,
+                projected, cuda_stream, expert_values, expert_scales,
+                input_values, input_scales);
+            if (status != 0) return -40 + status;
+        }
+    }
+    void* add_args[] = {&projected, &output, &hidden_size};
     return launch(
         add_first->second, static_cast<unsigned int>((hidden_size + 255) / 256),
-        1, 256, add_args, 0, cuda_stream) == 0 ? 0 : -13;
+        1, 256, add_args, 0, cuda_stream) == 0 ? 0 : -11;
 }
 
 extern "C" int colibri_gpu_launch_named(
@@ -2173,7 +2554,8 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     std::uint64_t packed_output, std::uint64_t output,
     std::uint64_t stream, std::int32_t heads, std::int32_t kv_heads,
     std::int32_t head_dim, std::int32_t rows, std::int32_t capacity,
-    std::int32_t base_position, std::int32_t tile_rows_limit, float scale
+    std::int32_t base_position, std::int32_t tile_rows_limit, float scale,
+    std::int32_t apply_gate
 ) {
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!queries || !gates || !keys || !values || !packed_queries
@@ -2188,7 +2570,11 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     if (g_cublas.set_stream(g_cublas_handle, cuda_stream) != 0) return -2;
     auto pack = g_functions.find("qwen_attention_prefill_pack_f16");
     auto softmax = g_functions.find("kv_attention_prefill_softmax_f16");
-    auto unpack = g_functions.find("qwen_attention_prefill_unpack_gate");
+    // Turbo values arrive rotated, so that caller takes the ungated variant and
+    // applies the gate itself after the inverse rotation.
+    auto unpack = g_functions.find(
+        apply_gate ? "qwen_attention_prefill_unpack_gate"
+                   : "qwen_attention_prefill_unpack");
     if (pack == g_functions.end() || softmax == g_functions.end()
         || unpack == g_functions.end())
         return -3;

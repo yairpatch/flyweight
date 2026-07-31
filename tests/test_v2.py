@@ -1,10 +1,18 @@
+import ctypes
 import struct
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import PropertyMock, patch
 
-from colibri_next.v2 import V2Model, V2Error
+from colibri_next.v2 import (
+    V2Model,
+    V2Error,
+    V2QwenRuntime,
+    _normalize_prefill_cache_seed,
+    _QwenRuntimeOptions,
+    _resolve_expert_mode,
+)
 
 
 def gguf_string(value: str) -> bytes:
@@ -13,6 +21,115 @@ def gguf_string(value: str) -> bytes:
 
 
 class V2RuntimeTests(unittest.TestCase):
+    def test_expert_mode_aliases_resolve_to_canonical_policies(self):
+        self.assertEqual(_resolve_expert_mode("cpu"), ("cpu", 1, False))
+        self.assertEqual(_resolve_expert_mode("auto"), ("auto", 2, False))
+        self.assertEqual(
+            _resolve_expert_mode("hybrid"), ("legacy-hybrid", 2, False)
+        )
+        self.assertEqual(
+            _resolve_expert_mode("resident"), ("resident", 0, True)
+        )
+        self.assertEqual(
+            _resolve_expert_mode("gpu"), ("legacy-paging", 0, False)
+        )
+        self.assertEqual(
+            _resolve_expert_mode("legacy-paging"),
+            ("legacy-paging", 0, False),
+        )
+        with self.assertRaisesRegex(ValueError, "expert_mode"):
+            _resolve_expert_mode("accelerator")
+
+    def test_expert_mode_and_legacy_name_must_agree(self):
+        with self.assertRaisesRegex(ValueError, "different policies"):
+            V2QwenRuntime(
+                object(), expert_mode="auto", moe_device="cpu"
+            )
+
+    def test_expert_mode_aliases_build_identical_native_options(self):
+        class FakeLibrary:
+            def __init__(self):
+                self.options = b""
+
+            def colibri_v2_qwen_runtime_create(
+                self, _model, options, _runtime
+            ):
+                self.options = ctypes.string_at(
+                    options, ctypes.sizeof(_QwenRuntimeOptions)
+                )
+                return 0
+
+        class FakeModel:
+            def __init__(self):
+                self._lib = FakeLibrary()
+                self._handle = ctypes.c_void_p(1)
+
+            def _check(self, status):
+                self.assert_status = status
+
+        def native_options(mode):
+            model = FakeModel()
+            runtime = V2QwenRuntime(model, expert_mode=mode)
+            return model._lib.options, runtime
+
+        auto_options, auto = native_options("auto")
+        hybrid_options, hybrid = native_options("hybrid")
+        legacy_hybrid_options, legacy_hybrid = native_options("legacy-hybrid")
+        self.assertEqual(hybrid_options, legacy_hybrid_options)
+        self.assertEqual(auto.expert_mode, "auto")
+        self.assertEqual(hybrid.expert_mode, "legacy-hybrid")
+        self.assertEqual(legacy_hybrid.expert_mode, "legacy-hybrid")
+
+        resident_options, resident = native_options("resident")
+        gpu_options, gpu = native_options("gpu")
+        paging_options, paging = native_options("legacy-paging")
+        self.assertEqual(gpu_options, paging_options)
+        self.assertEqual(resident.expert_mode, "resident")
+        self.assertEqual(gpu.expert_mode, "legacy-paging")
+        self.assertEqual(paging.expert_mode, "legacy-paging")
+
+        auto_native = _QwenRuntimeOptions.from_buffer_copy(auto_options)
+        hybrid_native = _QwenRuntimeOptions.from_buffer_copy(hybrid_options)
+        resident_native = _QwenRuntimeOptions.from_buffer_copy(resident_options)
+        self.assertEqual(auto_native.moe_device, 2)
+        self.assertEqual(auto_native.hybrid_prefill_cpu, 1)
+        self.assertEqual(auto_native.immutable_residency, 1)
+        self.assertEqual(auto_native.strict_resident, 0)
+        self.assertEqual(hybrid_native.moe_device, 2)
+        self.assertEqual(hybrid_native.prefill_cache_seed_auto, 0)
+        self.assertEqual(hybrid_native.immutable_residency, 0)
+        self.assertEqual(resident_native.moe_device, 0)
+        self.assertEqual(resident_native.strict_resident, 1)
+
+    def test_prefill_cache_seed_normalization(self):
+        self.assertEqual(_normalize_prefill_cache_seed("auto"), (0, True))
+        self.assertEqual(_normalize_prefill_cache_seed("off"), (0, False))
+        self.assertEqual(_normalize_prefill_cache_seed(0), (0, False))
+        self.assertEqual(_normalize_prefill_cache_seed(4), (4, False))
+        for invalid in (-1, 257, "4", True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "prefill_cache_seed"):
+                    _normalize_prefill_cache_seed(invalid)
+
+    def test_hybrid_policies_are_validated_and_forwarded(self):
+        model = object.__new__(V2Model)
+        with patch("colibri_next.v2.V2QwenRuntime", return_value="runtime") as create:
+            self.assertEqual(
+                model.native_qwen_runtime(
+                    hybrid_prefill="cpu", expert_residency="immutable"
+                ),
+                "runtime",
+            )
+            self.assertEqual(create.call_args.kwargs["hybrid_prefill"], "cpu")
+            self.assertEqual(
+                create.call_args.kwargs["expert_residency"], "immutable"
+            )
+
+        with self.assertRaisesRegex(ValueError, "hybrid_prefill"):
+            V2QwenRuntime(object(), hybrid_prefill="invalid")
+        with self.assertRaisesRegex(ValueError, "expert_residency"):
+            V2QwenRuntime(object(), expert_residency="invalid")
+
     def test_nvfp4_prefill_has_blackwell_tensor_core_dispatch_and_fallback(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
@@ -33,6 +150,10 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("cublasLtMatmulAlgoGetHeuristic", driver)
         self.assertIn("colibri_gpu_nvfp4_matmul_cublas", driver)
         self.assertIn("colibri_gpu_nvfp4_moe_cublas", driver)
+        self.assertIn("COLIBRI_NVFP4_TENSOR_CORE_PROFILE", driver)
+        self.assertIn("COLIBRI_NVFP4_PERSISTENT", runtime)
+        self.assertIn("colibri_gpu_nvfp4_moe_persistent", runtime)
+        self.assertIn("COLIBRI_NVFP4_PERSISTENT_GROUPED", driver)
         self.assertIn("kPreferenceMaxWorkspace = 1", driver)
         self.assertIn("tc_env&&tc_env[0]=='1'", runtime)
         self.assertIn("COLIBRI_NVFP4_TENSOR_CORES", verifier)
@@ -45,6 +166,9 @@ class V2RuntimeTests(unittest.TestCase):
         ).read_text()
         driver = (root / "native/src/gpu_driver.cpp").read_text()
         runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        policy = (
+            root / "native/include/colibri_v2_attention_policy.hpp"
+        ).read_text()
 
         for precision in ("f16", "bf16", "q8"):
             symbol = f"kv_attention_fused_{precision}_tiles"
@@ -53,6 +177,123 @@ class V2RuntimeTests(unittest.TestCase):
             self.assertIn(symbol, runtime)
         self.assertIn("kv_fused_tiles_kernel(*runtime)", runtime)
         self.assertIn("runtime->fused_attention&&fused_tiles", runtime)
+        self.assertIn("kDefaultCublasMinTokens = 128", policy)
+        self.assertGreaterEqual(
+            runtime.count("qwen_cublas_attention_eligible("), 3
+        )
+        self.assertNotIn("tokens>=4096", runtime)
+
+    def test_turbo_cache_types_reach_the_native_options(self):
+        class FakeLibrary:
+            def __init__(self):
+                self.options = b""
+
+            def colibri_v2_qwen_runtime_create(
+                self, _model, options, _runtime
+            ):
+                self.options = ctypes.string_at(
+                    options, ctypes.sizeof(_QwenRuntimeOptions)
+                )
+                return 0
+
+        class FakeModel:
+            def __init__(self):
+                self._lib = FakeLibrary()
+                self._handle = ctypes.c_void_p(1)
+
+            def _check(self, status):
+                self.assert_status = status
+
+        # The native side keys every KV kernel off these codes, so a rename or a
+        # reordering here silently sends the runtime to the wrong codec.
+        for name, code in (
+            ("f32", 0), ("f16", 1), ("bf16", 2),
+            ("q8_0", 3), ("turbo3", 4), ("turbo4", 5),
+        ):
+            with self.subTest(cache_type=name):
+                model = FakeModel()
+                V2QwenRuntime(model, cache_type_k=name, cache_type_v=name)
+                native = _QwenRuntimeOptions.from_buffer_copy(model._lib.options)
+                self.assertEqual(native.cache_type_k, code)
+                self.assertEqual(native.cache_type_v, code)
+
+        # K and V are independent, and turbo3 keys with turbo4 values is a
+        # configuration the harness measurements pointed at.
+        model = FakeModel()
+        V2QwenRuntime(model, cache_type_k="turbo3", cache_type_v="turbo4")
+        mixed = _QwenRuntimeOptions.from_buffer_copy(model._lib.options)
+        self.assertEqual((mixed.cache_type_k, mixed.cache_type_v), (4, 5))
+
+        for invalid in ("turbo", "turbo2", "turbo5", "fp8"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "cache_type"):
+                    V2QwenRuntime(FakeModel(), cache_type_k=invalid)
+
+    def test_native_turbo_kv_path_is_wired_end_to_end(self):
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/colibri_v2_qwen_kernels.hpp"
+        ).read_text()
+        driver = (root / "native/src/gpu_driver.cpp").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        rows = (root / "native/src/v2_mtp_verifier.inc").read_text()
+
+        # Every turbo kernel has to be defined, registered by name in the driver
+        # lookup table, and reachable from a runtime dispatch. Missing the
+        # driver table is the easy one to forget: it fails only at launch.
+        for width in ("turbo3", "turbo4"):
+            for symbol in (
+                f"kv_store_{width}_k",
+                f"kv_store_{width}_v",
+                f"kv_attention_scores_{width}",
+                f"kv_attention_scores_{width}_ring",
+                f"kv_attention_values_{width}",
+                f"kv_attention_values_{width}_ring",
+                f"kv_dequant_{width}_f16",
+            ):
+                with self.subTest(symbol=symbol):
+                    self.assertIn(symbol, kernels)
+                    self.assertIn(symbol, driver)
+                    self.assertIn(symbol, runtime)
+        for symbol in ("turbo_rotate_rows", "turbo_unrotate_rows"):
+            self.assertIn(symbol, kernels)
+            self.assertIn(symbol, driver)
+            self.assertIn(symbol, runtime)
+
+        # Keys rotate under sign stream 0 and values under 1. If the two ever
+        # agree, scores and the value fold silently use the wrong basis.
+        self.assertIn("kv_store_turbo_impl<3>(current, cache, kv_heads, head_dim,"
+                      " position, capacity, 0u)", kernels)
+        self.assertIn("kv_store_turbo_impl<3>(current, cache, kv_heads, head_dim,"
+                      " position, capacity, 1u)", kernels)
+        self.assertIn("turbo_sign_d(d, 0u)", kernels)
+        self.assertIn("turbo_sign_d(d, 1u)", kernels)
+
+        # The staged prefill must take the ungated cuBLAS unpack: turbo values
+        # are still rotated there, and the gate is a sigmoid, so gating before
+        # the inverse rotation would be wrong.
+        self.assertIn("qwen_attention_prefill_unpack", kernels)
+        self.assertIn("qwen_attention_prefill_unpack_gate", kernels)
+        self.assertIn("apply_gate", driver)
+        self.assertIn("qwen_turbo_prefill_stage", runtime)
+        self.assertIn("qwen_turbo_prefill_stage(", rows)
+        self.assertIn("qwen_turbo_cublas_attention", runtime)
+
+        # The Walsh-Hadamard butterfly needs a power-of-two head_dim, and the
+        # rotated row is staged in a fixed shared-memory scratch.
+        self.assertIn("TURBO_MAX_DIM 512", kernels)
+        self.assertIn("head_dim&(head_dim-1)", runtime)
+        self.assertIn("kv_type_is_turbo", runtime)
+
+    def test_turbo_block_sizes_match_the_cpu_reference(self):
+        root = Path(__file__).resolve().parents[1]
+        reference = (root / "native/src/turboquant.h").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        # 2 bytes of f16 scale plus 32 packed indices: 3.5 and 4.5 bits/value.
+        # The arena sizing and the codec must agree or the cache overruns.
+        self.assertIn("return 2 + turbo_bits(type) * kTurboBlock / 8;", reference)
+        self.assertIn("kTurbo3BlockSize = 14", runtime)
+        self.assertIn("kTurbo4BlockSize = 18", runtime)
 
     def make_model(
         self,
@@ -164,14 +405,14 @@ class V2RuntimeTests(unittest.TestCase):
         finally:
             path.unlink()
 
-    def test_generic_runtime_selects_hybrid_experts_for_gemma4(self):
+    def test_generic_runtime_defaults_to_auto_for_gemma4(self):
         model = object.__new__(V2Model)
         with patch.object(
             V2Model, "info", new_callable=PropertyMock,
             return_value={"architecture": "gemma4"},
         ), patch.object(V2Model, "native_qwen_runtime", return_value="runtime") as create:
             self.assertEqual(model.native_runtime(context_limit=32), "runtime")
-            create.assert_called_once_with(context_limit=32, moe_device="hybrid")
+            create.assert_called_once_with(context_limit=32)
 
         with patch.object(
             V2Model, "info", new_callable=PropertyMock,

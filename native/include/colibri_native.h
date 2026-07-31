@@ -158,7 +158,10 @@ COLIBRI_API int colibri_gpu_attention_prefill_f16_cublas(
     std::int32_t capacity,
     std::int32_t base_position,
     std::int32_t tile_rows,
-    float scale
+    float scale,
+    /* 0 skips the fused output gate, for callers that must post-process the
+       attention result before applying an elementwise nonlinearity. */
+    std::int32_t apply_gate
 );
 COLIBRI_API int colibri_gpu_kv_append(
     std::uint64_t current_keys,
@@ -348,6 +351,22 @@ COLIBRI_API int colibri_gpu_nvfp4_moe_cublas(
     std::uint64_t route_weights, std::uint64_t gate_scales,
     std::uint64_t up_scales, std::uint64_t down_scales,
     std::uint64_t stream,
+    std::int32_t hidden_size, std::int32_t intermediate_size,
+    std::int32_t experts
+);
+// Convert one cached GGUF expert bundle to persistent Tensor-Core layout.
+COLIBRI_API int colibri_gpu_nvfp4_prepare_expert(
+    std::uint64_t gate, std::uint64_t up, std::uint64_t down,
+    std::uint64_t native, std::uint64_t stream,
+    std::int32_t hidden_size, std::int32_t intermediate_size
+);
+// Single-token routed MoE over persistent native expert slots. Pointer and
+// scale arrays are host-resident and remain valid for the duration of the call.
+COLIBRI_API int colibri_gpu_nvfp4_moe_persistent(
+    const std::uint64_t* native_experts, std::uint64_t route_weights,
+    std::uint64_t gate_scales, std::uint64_t up_scales,
+    std::uint64_t down_scales, std::uint64_t input,
+    std::uint64_t activated, std::uint64_t output, std::uint64_t stream,
     std::int32_t hidden_size, std::int32_t intermediate_size,
     std::int32_t experts
 );

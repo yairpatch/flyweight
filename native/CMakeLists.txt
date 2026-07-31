@@ -19,6 +19,56 @@ if(BUILD_TESTING)
     add_test(NAME colibri_v2_provider_contract COMMAND colibri_v2_provider_contract)
 endif()
 
+add_executable(colibri_qwen_workspace_contract tests/qwen_workspace_contract.cpp)
+target_compile_features(colibri_qwen_workspace_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_workspace_contract PRIVATE include)
+if(BUILD_TESTING)
+    add_test(NAME colibri_qwen_workspace_contract COMMAND colibri_qwen_workspace_contract)
+endif()
+
+add_executable(
+    colibri_qwen_attention_policy_contract
+    tests/qwen_attention_policy_contract.cpp
+)
+target_compile_features(
+    colibri_qwen_attention_policy_contract PRIVATE cxx_std_20
+)
+target_include_directories(
+    colibri_qwen_attention_policy_contract PRIVATE include
+)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_qwen_attention_policy_contract
+        COMMAND colibri_qwen_attention_policy_contract
+    )
+endif()
+
+add_executable(
+    colibri_qwen_expert_policy_contract
+    tests/qwen_expert_policy_contract.cpp
+)
+target_compile_features(colibri_qwen_expert_policy_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_expert_policy_contract PRIVATE include)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_qwen_expert_policy_contract
+        COMMAND colibri_qwen_expert_policy_contract
+    )
+endif()
+
+add_executable(
+    colibri_qwen_expert_seed_contract
+    tests/qwen_expert_seed_contract.cpp
+)
+target_compile_features(colibri_qwen_expert_seed_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_expert_seed_contract PRIVATE include)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_qwen_expert_seed_contract
+        COMMAND colibri_qwen_expert_seed_contract
+    )
+endif()
+
 add_executable(
     colibri_qwen_kquant_contract
     tests/qwen_kquant_contract.cpp
@@ -29,6 +79,19 @@ target_compile_features(colibri_qwen_kquant_contract PRIVATE cxx_std_20)
 target_include_directories(colibri_qwen_kquant_contract PRIVATE src)
 if(BUILD_TESTING)
     add_test(NAME colibri_qwen_kquant_contract COMMAND colibri_qwen_kquant_contract)
+endif()
+
+add_executable(
+    colibri_turboquant_contract
+    tests/turboquant_contract.cpp
+)
+target_compile_features(colibri_turboquant_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_turboquant_contract PRIVATE src)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_turboquant_contract
+        COMMAND colibri_turboquant_contract
+    )
 endif()
 
 add_executable(
@@ -57,6 +120,10 @@ add_executable(
 )
 target_compile_features(colibri_qwen_cpu_bench PRIVATE cxx_std_20)
 target_include_directories(colibri_qwen_cpu_bench PRIVATE src)
+
+add_executable(colibri_turboquant_bench tools/bench_turboquant.cpp)
+target_compile_features(colibri_turboquant_bench PRIVATE cxx_std_20)
+target_include_directories(colibri_turboquant_bench PRIVATE src)
 
 add_library(
     colibri_v2
@@ -124,7 +191,10 @@ endif()
 if(MSVC)
     set_source_files_properties(src/qwen_cpu_avx_vnni.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
 else()
-    set_source_files_properties(src/qwen_cpu_avx_vnni.cpp PROPERTIES COMPILE_OPTIONS -mavx2;-mavxvnni;-mf16c)
+    set_source_files_properties(
+        src/qwen_cpu_avx_vnni.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni;-mf16c"
+    )
 endif()
 
 set_target_properties(

@@ -7,11 +7,20 @@ from colibri_next.cli import (
     _benchmark_native_prefill,
     _drop_file_cache,
     _parser,
+    _prefill_cache_seed,
     _steady_state_counters,
 )
 
 
 class NativeV2BenchmarkTests(unittest.TestCase):
+    def test_prefill_cache_seed_accepts_auto_off_and_bounded_counts(self) -> None:
+        self.assertEqual(_prefill_cache_seed("auto"), "auto")
+        self.assertEqual(_prefill_cache_seed("OFF"), "off")
+        self.assertEqual(_prefill_cache_seed("0"), 0)
+        self.assertEqual(_prefill_cache_seed("4"), 4)
+        with self.assertRaisesRegex(Exception, r"\[0, 256\]"):
+            _prefill_cache_seed("257")
+
     def test_prefill_benchmark_uses_blocking_generate(self) -> None:
         class Runtime:
             def __init__(self):

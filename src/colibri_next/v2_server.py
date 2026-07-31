@@ -570,7 +570,8 @@ class NativeV2InferenceService(InferenceService):
         context_window: int = 32768,
         max_new_tokens: int = 4096,
         gpu_cache_mib: int = 0,  # 0 = auto-fit the GPU expert cache to free VRAM
-        moe_device: str = "hybrid",
+        expert_mode: str | None = None,
+        moe_device: str | None = None,
         mtp_drafts: int = 0,
         cache_type_k: str = "f16",
         cache_type_v: str = "f16",
@@ -579,12 +580,14 @@ class NativeV2InferenceService(InferenceService):
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
         swa_full: bool = False,
-        prefill_cache_seed: int = 0,
+        prefill_cache_seed: int | str | None = None,
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
         cpu_threads: int = 0,
+        hybrid_prefill: str = "split",
+        expert_residency: str | None = None,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -592,14 +595,12 @@ class NativeV2InferenceService(InferenceService):
         self.v2_model = V2Model(model_path)
         self.v2_runtime: V2QwenRuntime | None = None
         try:
-            effective_moe_device = moe_device
-            if self.v2_model.info["architecture"] == "gemma4" and moe_device == "gpu":
-                effective_moe_device = "hybrid"
             self.v2_runtime = self.v2_model.native_runtime(
                 device=device,
                 context_limit=context_window,
                 gpu_cache_bytes=gpu_cache_mib * 1024**2,
-                moe_device=effective_moe_device,
+                expert_mode=expert_mode,
+                moe_device=moe_device,
                 mtp_drafts=mtp_drafts,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,
@@ -614,6 +615,8 @@ class NativeV2InferenceService(InferenceService):
                 cpu_prefetch_auto=cpu_prefetch_auto,
                 next_layer_prefetch=next_layer_prefetch,
                 cpu_threads=cpu_threads,
+                hybrid_prefill=hybrid_prefill,
+                expert_residency=expert_residency,
             )
             self.v2_runtime.prepare()
         except Exception:
@@ -632,13 +635,15 @@ class NativeV2InferenceService(InferenceService):
             cors_origin=cors_origin,
             strict_model=strict_model,
         )
-        # Native auto-fit may downgrade hybrid to CPU when the base CUDA
-        # allocations leave no room for an expert-cache working set.
-        self.moe_device = {
-            0: "gpu",
-            1: "cpu",
-            2: "hybrid",
-        }[int(self.v2_runtime.info["moe_device"])]
+        runtime_info = self.v2_runtime.info
+        self.requested_expert_mode = str(runtime_info["requested_expert_mode"])
+        self.expert_mode = str(runtime_info["expert_mode"])
+        self.expert_fallback_reason = str(
+            runtime_info["expert_fallback_reason"]
+        )
+        # Compatibility attribute retained for callers that displayed the old
+        # low-level device name.
+        self.moe_device = self.expert_mode
         self.mtp_drafts = mtp_drafts
         self.gpu_cache_mib = gpu_cache_mib
         # The native cooperative engine interleaves concurrent requests itself
@@ -662,6 +667,9 @@ class NativeV2InferenceService(InferenceService):
         value["execution"] = {
             "backend": "native-v2-cpp-cuda",
             **self.v2_runtime.info,
+            "expert_mode": self.expert_mode,
+            "requested_expert_mode": self.requested_expert_mode,
+            "expert_fallback_reason": self.expert_fallback_reason,
             "moe_device": self.moe_device,
             "mtp_drafts": self.mtp_drafts,
             "gpu_cache_mib": self.gpu_cache_mib,

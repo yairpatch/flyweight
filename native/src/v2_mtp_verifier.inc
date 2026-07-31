@@ -16,37 +16,47 @@ void qwen_forward_rows(
     const int experts=static_cast<int>(runtime.model->config.expert_count);
     const int top_k=static_cast<int>(runtime.model->config.expert_used_count);
     const int intermediate=static_cast<int>(runtime.moe_intermediate);
+    const auto expert_phase=output_tokens
+        ?colibri::v2::ExpertExecutionPhase::verification
+        :colibri::v2::ExpertExecutionPhase::prefill;
+    auto expert_policy=qwen_expert_policy(runtime,expert_phase);
+    expert_policy.hybrid_prefill_cpu=
+        expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
+        runtime.options.hybrid_prefill_cpu!=0;
     const float epsilon=runtime.model->config.rms_norm_epsilon?runtime.model->config.rms_norm_epsilon:1.0e-6f;
     for(int row=0;row<rows;++row)
         if(input_tokens[row]>=runtime.model->config.vocabulary_size)
             throw std::runtime_error("native Qwen input token is out of range");
-    std::uint64_t cursor=runtime.workspace;
-    const auto workspace_end=runtime.workspace+runtime.workspace_bytes;
-    auto take=[&](std::uint64_t bytes){const auto result=cursor;cursor+=device_align(bytes);if(cursor>workspace_end)throw std::runtime_error("native Qwen rows forward workspace is too small");return result;};
-    std::uint64_t hidden=take(static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float));
-    std::uint64_t residual=take(static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float));
-    const auto normalized=take(static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float));
-    const auto first=take(static_cast<std::uint64_t>(rows)*runtime.scratch_elements*sizeof(float));
-    const auto second=take(static_cast<std::uint64_t>(rows)*runtime.scratch_elements*sizeof(float));
-    const auto third=take(static_cast<std::uint64_t>(rows)*runtime.scratch_elements*sizeof(float));
-    const auto fourth=take(static_cast<std::uint64_t>(rows)*runtime.scratch_elements*sizeof(float));
-    const auto router_logits=take(static_cast<std::uint64_t>(rows)*experts*sizeof(float));
-    const auto selected_device=take(static_cast<std::uint64_t>(rows)*top_k*sizeof(std::int32_t));
-    const auto route_weights=take(static_cast<std::uint64_t>(rows)*top_k*sizeof(float));
-    const auto gpu_activated=take(static_cast<std::uint64_t>(rows)*top_k*intermediate*sizeof(float));
+    const auto&workspace_layout=runtime.rows_workspace_layout;
+    const auto&host_layout=runtime.rows_host_layout;
+    if(workspace_layout.bytes>runtime.workspace_bytes)
+        throw std::runtime_error("native Qwen rows forward workspace is too small");
+    if(host_layout.bytes>runtime.host_staging_bytes)
+        throw std::runtime_error("native Qwen rows forward host workspace overflow");
+    std::uint64_t hidden=workspace_layout.hidden.address(runtime.workspace);
+    std::uint64_t residual=workspace_layout.residual.address(runtime.workspace);
+    const auto normalized=workspace_layout.normalized.address(runtime.workspace);
+    const auto first=workspace_layout.first.address(runtime.workspace);
+    const auto second=workspace_layout.second.address(runtime.workspace);
+    const auto third=workspace_layout.third.address(runtime.workspace);
+    const auto fourth=workspace_layout.fourth.address(runtime.workspace);
+    const auto router_logits=workspace_layout.router_logits.address(runtime.workspace);
+    const auto selected_device=workspace_layout.selected_device.address(runtime.workspace);
+    const auto route_weights=workspace_layout.route_weights.address(runtime.workspace);
+    const auto gpu_activated=workspace_layout.gpu_activated.address(runtime.workspace);
     const auto gpu_table_entries=static_cast<std::uint64_t>(rows)*top_k;
-    const auto gpu_gate_table=take(gpu_table_entries*sizeof(std::uint64_t));
-    const auto gpu_up_table=take(gpu_table_entries*sizeof(std::uint64_t));
-    const auto gpu_down_table=take(gpu_table_entries*sizeof(std::uint64_t));
-    const auto gpu_weight_table=take(gpu_table_entries*sizeof(float));
+    const auto gpu_gate_table=workspace_layout.gpu_gate_table.address(runtime.workspace);
+    const auto gpu_up_table=workspace_layout.gpu_up_table.address(runtime.workspace);
+    const auto gpu_down_table=workspace_layout.gpu_down_table.address(runtime.workspace);
+    const auto gpu_weight_table=workspace_layout.gpu_weight_table.address(runtime.workspace);
     // NVFP4 weight_scale_2 per route, mirroring the decode path: gate/up before
     // SiLU, the linear down scale folded into `up`.
-    const auto gpu_gate_scale_table=take(gpu_table_entries*sizeof(float));
-    const auto gpu_up_scale_table=take(gpu_table_entries*sizeof(float));
-    const auto gpu_count_table=take(static_cast<std::uint64_t>(rows)*sizeof(std::int32_t));
-    const auto token_device=take(static_cast<std::uint64_t>(rows)*sizeof(std::uint32_t));
-    const auto winners=take(static_cast<std::uint64_t>(rows)*sizeof(std::uint64_t));
-    const auto attention_scores=take(static_cast<std::uint64_t>(runtime.model->config.attention_heads)*runtime.options.context_limit*sizeof(float));
+    const auto gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(runtime.workspace);
+    const auto gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(runtime.workspace);
+    const auto gpu_count_table=workspace_layout.gpu_count_table.address(runtime.workspace);
+    const auto token_device=workspace_layout.token_device.address(runtime.workspace);
+    const auto winners=workspace_layout.winners.address(runtime.workspace);
+    const auto attention_scores=workspace_layout.attention_scores.address(runtime.workspace);
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,std::uint32_t bx,void**args,std::uint32_t shared=0){
         if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
@@ -69,7 +79,7 @@ void qwen_forward_rows(
     // activation instead of failing.
     auto dense_rows=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         std::uint64_t matrix=runtime.device_tensors[index];
-        const auto type=runtime.model->tensors[index].type;
+        const auto type=qwen_device_type(runtime,index);
         void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
         switch(type){
             case 0:launch("qwen_f32_matmul_rows",output_size,rows,256,args);return;
@@ -103,11 +113,15 @@ void qwen_forward_rows(
     };
     auto add_rows=[&](std::uint64_t target,std::uint64_t source){float scale=1.0f;int count=rows*hidden_size;void*args[]={&target,&source,&scale,&count};launch("scaled_add",(count+255)/256,1,256,args);};
     if(colibri_gpu_upload(token_device,input_tokens,rows*sizeof(std::uint32_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows token upload failed");
-    const auto embedding=runtime.device_tensors[runtime.token_embeddings];
-    void*embedding_args[]={const_cast<std::uint64_t*>(&embedding),const_cast<std::uint64_t*>(&token_device),&hidden,&rows,const_cast<int*>(&hidden_size)};
-    launch(qwen_embedding_kernel(runtime.model->tensors[runtime.token_embeddings].type,true),(hidden_size+255)/256,rows,256,embedding_args);
+    const auto embedding=qwen_stage_embedding_rows(runtime,input_tokens,rows);
+    // Staged rows arrive in chunk order, so they are gathered by the identity
+    // permutation rather than by the real token ids in token_device.
+    const auto embedding_index=runtime.embeddings_host_resident
+        ?runtime.embedding_row_index:token_device;
+    void*embedding_args[]={const_cast<std::uint64_t*>(&embedding),const_cast<std::uint64_t*>(&embedding_index),&hidden,&rows,const_cast<int*>(&hidden_size)};
+    launch(qwen_embedding_kernel(qwen_device_type(runtime,runtime.token_embeddings),true),(hidden_size+255)/256,rows,256,embedding_args);
     auto*staging=static_cast<std::uint8_t*>(runtime.host_staging);
-    const bool prune_experts=runtime.options.moe_device!=0&&
+    const bool prune_experts=expert_policy.route_pruning_allowed()&&
         (runtime.options.expert_top_k>0||(runtime.options.expert_top_p>0.0f&&runtime.options.expert_top_p<1.0f));
     std::vector<float>gpu_weights(gpu_table_entries);
     std::vector<float>gpu_gate_scales(gpu_table_entries),gpu_up_scales(gpu_table_entries);
@@ -127,7 +141,8 @@ void qwen_forward_rows(
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
         auto&layer=runtime.layers[layer_number];
-        const bool profile_prefill=runtime.prefill_profile&&!runtime.cache_admission_enabled;
+        const bool profile_prefill=
+            runtime.prefill_profile&&expert_policy.records_prefill_frequency();
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill layer-start profiling event failed");
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
@@ -190,9 +205,9 @@ void qwen_forward_rows(
                 auto value=third+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 int slot=static_cast<int>(static_cast<std::uint64_t>(position)%layer.cache_capacity);
                 void*k_store_args[]={&key,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
-                launch(kv_store_kernel(runtime.options.cache_type_k),kv_heads,1,256,k_store_args);
+                launch(kv_store_kernel(runtime.options.cache_type_k,true),kv_heads,1,256,k_store_args);
                 void*v_store_args[]={&value,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
-                launch(kv_store_kernel(runtime.options.cache_type_v),kv_heads,1,256,v_store_args);
+                launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,v_store_args);
             }
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
             const char*cublas_prefill_env=
@@ -238,7 +253,7 @@ void qwen_forward_rows(
                     attention_scores+packed_query_bytes,third,
                     runtime.stream,heads,kv_heads,head_dim,rows,capacity,
                     static_cast<int>(runtime.position),cublas_tile_rows,
-                    scale)==0;
+                    scale,1)==0;
             if(cublas_prefill_done){
                 // Tensor-core attention wrote the already-gated rows to third.
             }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
@@ -250,6 +265,36 @@ void qwen_forward_rows(
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
                 void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
+                launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
+            }else if(std::uint64_t stage_keys=0,stage_values=0;
+                     qwen_turbo_prefill_stage(
+                         runtime,layer,queries,cache_keys,cache_values,
+                         heads,kv_heads,head_dim,rows,
+                         static_cast<int>(runtime.position),
+                         stage_keys,stage_values)){
+                // The staged window is dense and ring-free, so it is indexed
+                // with capacity == window. cuBLAS runs ungated here because the
+                // values are still rotated: the gate is a sigmoid and has to
+                // wait until after the inverse rotation below.
+                const int window=static_cast<int>(runtime.position)+rows;
+                int base=static_cast<int>(runtime.position),staged_capacity=window;
+                int vectors=rows*heads,value_stream=1,elements=rows*query_elements;
+                const bool staged_cublas=
+                    cublas_prefill_requested&&cublas_tile_rows>0&&
+                    cublas_workspace_ok&&
+                    colibri_gpu_attention_prefill_f16_cublas(
+                        queries,gates,stage_keys,stage_values,
+                        attention_scores,first,second,
+                        attention_scores+packed_query_bytes,third,
+                        runtime.stream,heads,kv_heads,head_dim,rows,window,
+                        base,cublas_tile_rows,scale,0)==0;
+                if(!staged_cublas){
+                    void*attention_args[]={const_cast<std::uint64_t*>(&queries),&stage_keys,&stage_values,const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&staged_capacity,&scale};
+                    launch("kv_attention_prefill_f16",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
+                }
+                void*unrotate_args[]={const_cast<std::uint64_t*>(&third),&vectors,const_cast<int*>(&head_dim),&value_stream};
+                launch("turbo_unrotate_rows",static_cast<std::uint32_t>(vectors),1,256,unrotate_args);
+                void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
                 launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
             }else for(int token=0;token<rows;++token){
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
@@ -315,24 +360,30 @@ void qwen_forward_rows(
         launch("route_topk_rows",rows,1,256,route_args,experts*sizeof(float));
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_router_end_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill router profiling event failed");
-        const auto selected_bytes=static_cast<std::uint64_t>(rows)*top_k*sizeof(std::int32_t);
-        const auto weights_host_offset=device_align(selected_bytes);
-        const auto weights_bytes=static_cast<std::uint64_t>(rows)*top_k*sizeof(float);
-        const auto input_host_offset=weights_host_offset+device_align(weights_bytes);
-        const auto input_bytes=static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-        const auto activated_host_offset=input_host_offset+device_align(input_bytes);
-        const auto activated_bytes=static_cast<std::uint64_t>(rows)*top_k*intermediate*sizeof(float);
-        const auto down_host_offset=activated_host_offset+device_align(activated_bytes);
-        const auto down_bytes=static_cast<std::uint64_t>(rows)*top_k*hidden_size*sizeof(float);
-        const auto output_host_offset=down_host_offset+device_align(down_bytes);
-        const auto output_bytes=static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-        if(output_host_offset+output_bytes>runtime.host_staging_bytes)throw std::runtime_error("native Qwen rows forward host workspace overflow");
-        auto*selected_host=reinterpret_cast<std::int32_t*>(staging);
-        auto*weights_host=reinterpret_cast<float*>(staging+weights_host_offset);
-        auto*input_host=reinterpret_cast<float*>(staging+input_host_offset);
-        auto*activated_host=reinterpret_cast<float*>(staging+activated_host_offset);
-        auto*down_host=reinterpret_cast<float*>(staging+down_host_offset);
-        auto*output_host=reinterpret_cast<float*>(staging+output_host_offset);
+        const auto selected_bytes=
+            static_cast<std::uint64_t>(rows)*top_k*sizeof(std::int32_t);
+        const auto weights_bytes=
+            static_cast<std::uint64_t>(rows)*top_k*sizeof(float);
+        const auto input_bytes=
+            static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
+        const auto activated_bytes=
+            static_cast<std::uint64_t>(rows)*top_k*intermediate*sizeof(float);
+        const auto down_bytes=
+            static_cast<std::uint64_t>(rows)*top_k*hidden_size*sizeof(float);
+        const auto output_bytes=
+            static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
+        auto*selected_host=reinterpret_cast<std::int32_t*>(
+            staging+host_layout.selected.offset);
+        auto*weights_host=reinterpret_cast<float*>(
+            staging+host_layout.weights.offset);
+        auto*input_host=reinterpret_cast<float*>(
+            staging+host_layout.input.offset);
+        auto*activated_host=reinterpret_cast<float*>(
+            staging+host_layout.activated.offset);
+        auto*down_host=reinterpret_cast<float*>(
+            staging+host_layout.down_input.offset);
+        auto*output_host=reinterpret_cast<float*>(
+            staging+host_layout.output.offset);
         if(colibri_gpu_download(selected_host,selected_device,selected_bytes,runtime.stream)!=0||colibri_gpu_download(weights_host,route_weights,weights_bytes,runtime.stream)!=0||colibri_gpu_download(input_host,normalized,input_bytes,runtime.stream)!=0)
             throw std::runtime_error("native Qwen rows forward route transfer failed");
         if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward route event failed");
@@ -395,7 +446,7 @@ void qwen_forward_rows(
         }
         const auto route_wait_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
         runtime.route_wait_nanoseconds+=route_wait_elapsed;
-        if(!runtime.cache_admission_enabled)
+        if(expert_policy.records_prefill_frequency())
             runtime.prefill_route_wait_nanoseconds+=route_wait_elapsed;
         static const bool trace_layers=std::getenv("COLIBRI_PREFILL_TRACE")!=nullptr;
         if(trace_layers)std::fprintf(stderr,"[trace] layer %2u %s rows=%d sync=%.1fms\n",layer_number,layer.attention?"attn ":"delta",rows,route_wait_elapsed/1e6);
@@ -411,32 +462,40 @@ void qwen_forward_rows(
                 runtime.route_expert_sum+=static_cast<std::uint64_t>(keep);
             }
         }else runtime.route_expert_sum+=static_cast<std::uint64_t>(rows)*top_k;
-        if(runtime.options.moe_device==1&&!runtime.cache_admission_enabled)
+        if(!expert_policy.routed_gpu_execution_allowed()&&
+           expert_policy.records_prefill_frequency())
             for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
                 const int route=token*top_k+rank;
                 if(weights_host[route]!=0.0f)
                     record_expert_access(runtime,layer_number,
                         static_cast<std::uint32_t>(selected_host[route]));
             }
-        std::fill(gpu_weights.begin(),gpu_weights.end(),0.0f);
-        std::fill(gpu_gate_scales.begin(),gpu_gate_scales.end(),1.0f);
-        std::fill(gpu_up_scales.begin(),gpu_up_scales.end(),1.0f);
-        std::fill(gpu_counts.begin(),gpu_counts.end(),0);
-        if(runtime.options.moe_device!=1&&!runtime.expert_slots.empty()){
+        const bool gpu_rows_allowed=
+            expert_policy.routed_gpu_execution_allowed()&&
+            !runtime.expert_slots.empty();
+        const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
+        if(gpu_table_path){
+            std::fill(gpu_weights.begin(),gpu_weights.end(),0.0f);
+            std::fill(gpu_gate_scales.begin(),gpu_gate_scales.end(),1.0f);
+            std::fill(gpu_up_scales.begin(),gpu_up_scales.end(),1.0f);
+            std::fill(gpu_counts.begin(),gpu_counts.end(),0);
+        }
+        if(gpu_rows_allowed){
             for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
                 const int route=token*top_k+rank;
                 if(weights_host[route]==0.0f)continue;
                 const int expert=selected_host[route];
                 if(expert<0||expert>=experts)
                     throw std::runtime_error("native Qwen rows forward selected an invalid expert");
-                if(!runtime.cache_admission_enabled)
+                if(expert_policy.records_prefill_frequency())
                     record_expert_access(runtime,layer_number,expert);
                 const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|static_cast<std::uint32_t>(expert);
                 const auto resident=runtime.expert_residency.find(cache_key);
                 if(resident==runtime.expert_residency.end()){++runtime.expert_cache_misses;continue;}
-                ++runtime.expert_cache_hits;
+                auto& slot=runtime.expert_slots[resident->second];
+                record_expert_cache_hit(runtime,slot);
                 const auto slot_index=resident->second;
-                runtime.expert_slots[slot_index].last_used=++runtime.expert_clock;
+                slot.last_used=++runtime.expert_clock;
                 const int compact=token*top_k+gpu_counts[token]++;
                 const auto device_base=runtime.expert_cache+slot_index*runtime.expert_slot_bytes;
                 std::uint64_t role_offset=0;
@@ -453,55 +512,55 @@ void qwen_forward_rows(
                 weights_host[route]=0.0f;
             }
         }
-        if(colibri_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward GPU expert reset failed");
-        const auto table_host_offset=output_host_offset+device_align(output_bytes);
-        const auto pointer_bytes=gpu_table_entries*sizeof(std::uint64_t);
-        const auto scale_bytes=gpu_table_entries*sizeof(float);
-        const auto gpu_weights_host_offset=table_host_offset+3*device_align(pointer_bytes);
-        const auto gpu_gate_scale_host_offset=gpu_weights_host_offset+device_align(scale_bytes);
-        const auto gpu_up_scale_host_offset=gpu_gate_scale_host_offset+device_align(scale_bytes);
-        const auto gpu_counts_host_offset=gpu_up_scale_host_offset+device_align(scale_bytes);
-        const auto table_host_end=gpu_counts_host_offset+static_cast<std::uint64_t>(rows)*sizeof(std::int32_t);
-        if(table_host_end>runtime.host_staging_bytes)throw std::runtime_error("native Qwen rows forward pointer workspace overflow");
-        auto*gate_host=staging+table_host_offset;
-        auto*up_host=gate_host+device_align(pointer_bytes);
-        auto*down_pointer_host=up_host+device_align(pointer_bytes);
-        auto*gpu_weight_host=staging+gpu_weights_host_offset;
-        auto*gpu_gate_scale_host=staging+gpu_gate_scale_host_offset;
-        auto*gpu_up_scale_host=staging+gpu_up_scale_host_offset;
-        auto*gpu_count_host=staging+gpu_counts_host_offset;
-        std::memcpy(gate_host,gate_pointers.data(),pointer_bytes);
-        std::memcpy(up_host,up_pointers.data(),pointer_bytes);
-        std::memcpy(down_pointer_host,down_pointers.data(),pointer_bytes);
-        std::memcpy(gpu_weight_host,gpu_weights.data(),scale_bytes);
-        std::memcpy(gpu_gate_scale_host,gpu_gate_scales.data(),scale_bytes);
-        std::memcpy(gpu_up_scale_host,gpu_up_scales.data(),scale_bytes);
-        std::memcpy(gpu_count_host,gpu_counts.data(),rows*sizeof(std::int32_t));
-        if(colibri_gpu_upload(gpu_gate_table,gate_host,pointer_bytes,runtime.stream)!=0||
-           colibri_gpu_upload(gpu_up_table,up_host,pointer_bytes,runtime.stream)!=0||
-           colibri_gpu_upload(gpu_down_table,down_pointer_host,pointer_bytes,runtime.stream)!=0||
-           colibri_gpu_upload(gpu_weight_table,gpu_weight_host,scale_bytes,runtime.stream)!=0||
-           colibri_gpu_upload(gpu_gate_scale_table,gpu_gate_scale_host,scale_bytes,runtime.stream)!=0||
-           colibri_gpu_upload(gpu_up_scale_table,gpu_up_scale_host,scale_bytes,runtime.stream)!=0||
-           colibri_gpu_upload(gpu_count_table,gpu_count_host,rows*sizeof(std::int32_t),runtime.stream)!=0)
-            throw std::runtime_error("native Qwen rows forward pointer upload failed");
-        bool any_gpu=false;for(int token=0;token<rows;++token)any_gpu=any_gpu||gpu_counts[token]>0;
-        if(any_gpu){
-            void*gate_up_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&gpu_activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),&rows,const_cast<std::uint64_t*>(&gpu_gate_scale_table),const_cast<std::uint64_t*>(&gpu_up_scale_table)};
-            const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
-            launch(gate_type==40?"nvfp4_grouped_swiglu_rows":gate_type==14?"q6k_grouped_swiglu_rows":gate_type==12?"q4k_grouped_swiglu_rows":"q5k_grouped_swiglu_rows",intermediate,rows*top_k,256,gate_up_args);
-            const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
-            void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
-            launch(down_type==8?"q8_grouped_accumulate_rows":down_type==40?"nvfp4_grouped_accumulate_rows":down_type==12?"q4k_grouped_accumulate_rows":down_type==13?"q5k_grouped_accumulate_rows":"q6k_grouped_accumulate_rows",hidden_size,rows,256,down_args);
+        bool any_gpu=false;
+        if(gpu_rows_allowed)
+            for(int token=0;token<rows;++token)
+                any_gpu=any_gpu||gpu_counts[token]>0;
+        if(gpu_table_path){
+            if(colibri_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward GPU expert reset failed");
+            const auto pointer_bytes=gpu_table_entries*sizeof(std::uint64_t);
+            const auto scale_bytes=gpu_table_entries*sizeof(float);
+            auto*gate_host=staging+host_layout.gate_table.offset;
+            auto*up_host=staging+host_layout.up_table.offset;
+            auto*down_pointer_host=staging+host_layout.down_table.offset;
+            auto*gpu_weight_host=staging+host_layout.weight_table.offset;
+            auto*gpu_gate_scale_host=staging+host_layout.gate_scale_table.offset;
+            auto*gpu_up_scale_host=staging+host_layout.up_scale_table.offset;
+            auto*gpu_count_host=staging+host_layout.counts.offset;
+            std::memcpy(gate_host,gate_pointers.data(),pointer_bytes);
+            std::memcpy(up_host,up_pointers.data(),pointer_bytes);
+            std::memcpy(down_pointer_host,down_pointers.data(),pointer_bytes);
+            std::memcpy(gpu_weight_host,gpu_weights.data(),scale_bytes);
+            std::memcpy(gpu_gate_scale_host,gpu_gate_scales.data(),scale_bytes);
+            std::memcpy(gpu_up_scale_host,gpu_up_scales.data(),scale_bytes);
+            std::memcpy(gpu_count_host,gpu_counts.data(),rows*sizeof(std::int32_t));
+            if(colibri_gpu_upload(gpu_gate_table,gate_host,pointer_bytes,runtime.stream)!=0||
+               colibri_gpu_upload(gpu_up_table,up_host,pointer_bytes,runtime.stream)!=0||
+               colibri_gpu_upload(gpu_down_table,down_pointer_host,pointer_bytes,runtime.stream)!=0||
+               colibri_gpu_upload(gpu_weight_table,gpu_weight_host,scale_bytes,runtime.stream)!=0||
+               colibri_gpu_upload(gpu_gate_scale_table,gpu_gate_scale_host,scale_bytes,runtime.stream)!=0||
+               colibri_gpu_upload(gpu_up_scale_table,gpu_up_scale_host,scale_bytes,runtime.stream)!=0||
+               colibri_gpu_upload(gpu_count_table,gpu_count_host,rows*sizeof(std::int32_t),runtime.stream)!=0)
+                throw std::runtime_error("native Qwen rows forward pointer upload failed");
+            if(any_gpu){
+                void*gate_up_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&gpu_activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),&rows,const_cast<std::uint64_t*>(&gpu_gate_scale_table),const_cast<std::uint64_t*>(&gpu_up_scale_table)};
+                const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
+                launch(gate_type==40?"nvfp4_grouped_swiglu_rows":gate_type==14?"q6k_grouped_swiglu_rows":gate_type==12?"q4k_grouped_swiglu_rows":"q5k_grouped_swiglu_rows",intermediate,rows*top_k,256,gate_up_args);
+                const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
+                void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
+                launch(down_type==8?"q8_grouped_accumulate_rows":down_type==40?"nvfp4_grouped_accumulate_rows":down_type==12?"q4k_grouped_accumulate_rows":down_type==13?"q5k_grouped_accumulate_rows":"q6k_grouped_accumulate_rows",hidden_size,rows,256,down_args);
+            }
         }
         const auto cpu_expert_started=std::chrono::steady_clock::now();
         qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);
-        if(!runtime.cache_admission_enabled)
+        if(expert_policy.records_prefill_frequency())
             runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now()-cpu_expert_started).count();
         if(colibri_gpu_upload(first,output_host,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward expert upload failed");
         runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
-        add_rows(fourth,first);add_rows(third,fourth);add_rows(residual,third);std::swap(hidden,residual);
+        if(gpu_table_path){add_rows(fourth,first);add_rows(third,fourth);}
+        else add_rows(third,first);
+        add_rows(residual,third);std::swap(hidden,residual);
     }
     if(output_tokens){
         rms_rows(hidden,runtime.device_tensors[runtime.final_norm],normalized);

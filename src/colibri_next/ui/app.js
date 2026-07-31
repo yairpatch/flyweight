@@ -941,6 +941,13 @@ function renderRichTextSegment(container, text) {
 function appendMarkdownBlock(container, text) {
   if (!text) return;
   const lines = text.split("\n");
+  const startsHandledBlock = (line) => (
+    /^#{1,6}\s/.test(line)
+    || /^>\s/.test(line)
+    || /^[-*]\s/.test(line)
+    || /^\d+\.\s/.test(line)
+    || /^[-*_]{3,}\s*$/.test(line)
+  );
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
@@ -984,7 +991,19 @@ function appendMarkdownBlock(container, text) {
       i++;
     } else {
       const paraLines = [];
-      while (i < lines.length && lines[i].trim() !== "" && !/^[#>|]/.test(lines[i]) && !/^[-*]\s/.test(lines[i]) && !/^\d+\.\s/.test(lines[i]) && !/^[-*_]{3,}\s*$/.test(lines[i])) {
+      while (
+        i < lines.length
+        && lines[i].trim() !== ""
+        && !startsHandledBlock(lines[i])
+      ) {
+        paraLines.push(lines[i]);
+        i++;
+      }
+      // Defensive forward progress: a newly added block detector must never
+      // strand the parser on a line without a matching handler. That turns one
+      // generated Markdown token into an infinite animation-frame loop and
+      // freezes the entire tab.
+      if (!paraLines.length && i < lines.length) {
         paraLines.push(lines[i]);
         i++;
       }
@@ -1625,10 +1644,23 @@ function setRuntimeStatus(status) {
     return;
   }
   elements.runtimePill.hidden = false;
-  elements.deviceLabel.textContent = execution.device === "cuda" ? "CUDA" : "CPU";
-  elements.cacheLabel.textContent = execution.device === "cuda"
-    ? `${execution.cache_used_mib || 0} / ${execution.cache_limit_mib || 0} MB`
-    : "Portable";
+  const nativeCuda = execution.backend === "native-v2-cpp-cuda";
+  const usesCuda = nativeCuda || execution.device === "cuda";
+  elements.deviceLabel.textContent = usesCuda ? "CUDA" : "CPU";
+  if (execution.expert_mode) {
+    const cacheMiB = Math.round((execution.expert_cache_bytes || 0) / (1024 * 1024));
+    const alias = execution.requested_expert_mode
+      && execution.requested_expert_mode !== execution.expert_mode
+      ? ` (${execution.requested_expert_mode})`
+      : "";
+    elements.cacheLabel.textContent = `${execution.expert_mode}${alias} experts · ${cacheMiB} MB GPU`;
+    elements.cacheLabel.title = execution.expert_fallback_reason || "";
+  } else {
+    elements.cacheLabel.textContent = execution.device === "cuda"
+      ? `${execution.cache_used_mib || 0} / ${execution.cache_limit_mib || 0} MB`
+      : "Portable";
+    elements.cacheLabel.title = "";
+  }
 }
 
 function renderModelSelector() {

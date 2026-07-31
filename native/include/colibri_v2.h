@@ -97,6 +97,10 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t cpu_prefetch_auto; /* size from host memory and skip unless enough pages are cold */
     uint32_t next_layer_prefetch; /* transition-predicted experts to page-hint; 0 disables */
     uint32_t cpu_threads; /* OpenMP workers for CPU expert execution; 0 = automatic */
+    uint32_t hybrid_prefill_cpu; /* 0 = split resident GPU/CPU; 1 = routed experts on CPU */
+    uint32_t immutable_residency; /* hybrid decode: 0 = mutable; 1 = freeze per request/engine epoch */
+    uint32_t prefill_cache_seed_auto; /* immutable hybrid: bounded automatic post-prefill placement */
+    uint32_t strict_resident; /* streamed GPU: require and prepare the complete routed-expert set */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -198,6 +202,15 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t host_ffn_layers; /* dense blocks whose feed-forward runs on the CPU from the mapping */
     uint64_t host_ffn_bytes; /* weight bytes kept off the GPU by that spill */
     uint64_t dense_host_nanoseconds; /* wall time spent in the host-side dense SwiGLU */
+    uint64_t expert_cache_deferred_admissions; /* misses recorded while residency is frozen */
+    uint64_t expert_residency_epochs; /* immutable request/engine epochs started */
+    uint64_t expert_residency_frozen; /* current immutable-residency state */
+    uint64_t prefill_cache_seed_bytes; /* expert bytes uploaded by post-prefill placement */
+    uint64_t prefill_cache_seed_selected_experts; /* resident or uploaded experts selected */
+    uint64_t prefill_cache_seed_hits; /* later decode routes served by the pinned seed */
+    uint64_t prefill_cache_seed_avoided_misses; /* frozen CPU fallbacks avoided by seed hits */
+    uint64_t prefill_cache_seed_auto_skips; /* auto decisions retaining the prior map */
+    uint64_t prefill_cache_seed_budget_stops; /* auto phases stopped at byte/time bound */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
@@ -241,6 +254,9 @@ COLIBRI_V2_API int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime* runtime
 COLIBRI_V2_API int colibri_v2_qwen_runtime_synchronize(ColibriV2QwenRuntime* runtime);
 COLIBRI_V2_API int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime* runtime, uint32_t input_token, uint32_t* output_token);
 COLIBRI_V2_API int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, ColibriV2TokenCallback callback, void* user_data);
+/* Writes one attention layer's live KV window as f32 for the TurboQuant
+   quality harness: int32 count, int32 head_dim, then the keys and the values. */
+COLIBRI_V2_API int colibri_v2_qwen_runtime_dump_kv(ColibriV2QwenRuntime* runtime, uint32_t layer_index, const char* path);
 COLIBRI_V2_API int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, uint64_t* task_id);
 COLIBRI_V2_API int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, uint64_t seed, uint32_t has_seed, uint64_t* task_id);
 COLIBRI_V2_API int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime* runtime, ColibriV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);

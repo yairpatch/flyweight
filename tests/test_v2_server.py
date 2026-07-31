@@ -6,7 +6,11 @@ import unittest
 from colibri_next.cli import _parser
 from colibri_next.sampling import SamplingConfig
 from colibri_next.server import APIError, InferenceService
-from colibri_next.v2_server import NativeV2Generator, NativeV2Tokenizer
+from colibri_next.v2_server import (
+    NativeV2Generator,
+    NativeV2InferenceService,
+    NativeV2Tokenizer,
+)
 
 
 class StubV2Model:
@@ -144,6 +148,40 @@ class NativeV2ServerTests(unittest.TestCase):
             model, runtime, tokenizer
         )
         return generator, runtime
+
+    def test_health_exposes_resolved_expert_policy(self) -> None:
+        class Runtime:
+            info = {
+                "expert_mode": "cpu",
+                "requested_expert_mode": "auto",
+                "expert_fallback_reason": "working set did not fit",
+                "moe_device": 1,
+                "position": 0,
+                "prefix_cache_hits": 0,
+                "prefix_cache_misses": 0,
+                "prefix_cache_reused_tokens": 0,
+            }
+
+        service = object.__new__(NativeV2InferenceService)
+        InferenceService.__init__(
+            service,
+            "native-test",
+            self.make_generator([20])[0],
+            context_window=128,
+        )
+        service.v2_runtime = Runtime()
+        service.expert_mode = "cpu"
+        service.requested_expert_mode = "auto"
+        service.expert_fallback_reason = "working set did not fit"
+        service.moe_device = "cpu"
+        service.mtp_drafts = 0
+        service.gpu_cache_mib = 0
+        execution = service.health()["execution"]
+        self.assertEqual(execution["expert_mode"], "cpu")
+        self.assertEqual(execution["requested_expert_mode"], "auto")
+        self.assertEqual(
+            execution["expert_fallback_reason"], "working set did not fit"
+        )
 
     def test_native_generator_prefills_and_greedily_decodes(self) -> None:
         generator, runtime = self.make_generator([10, 20, 30])
@@ -341,19 +379,21 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(response["choices"][0]["message"]["content"], "Hello world")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
 
-    def test_serve_v2_cli_defaults_to_hybrid_autofit(self) -> None:
+    def test_serve_v2_cli_defaults_to_auto_expert_mode(self) -> None:
         args = _parser().parse_args(["serve-v2", "model.gguf"])
-        self.assertEqual(args.moe_device, "hybrid")
+        self.assertEqual(args.expert_mode, "auto")
         # 0 = auto-fit the GPU expert cache to free VRAM (manual MiB still settable).
         self.assertEqual(args.gpu_cache_mib, 0)
         self.assertEqual(args.context_window, 32768)
         self.assertEqual(args.mtp_drafts, 0)
-        self.assertEqual(args.prefill_cache_seed, 0)
+        self.assertIsNone(args.prefill_cache_seed)
         self.assertEqual(args.expert_paging, "auto")
         self.assertEqual(args.cpu_prefetch_mib, 0)
         self.assertFalse(args.cpu_prefetch_auto)
         self.assertEqual(args.next_layer_prefetch, 0)
         self.assertEqual(args.cpu_threads, 0)
+        self.assertEqual(args.hybrid_prefill, "split")
+        self.assertIsNone(args.expert_residency)
 
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
         defaults = _parser().parse_args(["benchmark-v2", "model.gguf"])
@@ -371,6 +411,8 @@ class NativeV2ServerTests(unittest.TestCase):
             "--expert-paging", "direct",
             "--cpu-prefetch-mib", "768",
             "--next-layer-prefetch", "6",
+            "--hybrid-prefill", "cpu",
+            "--expert-residency", "immutable",
             '--cpu-threads', '12',
             "--cold-cache",
         ])
@@ -385,6 +427,8 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.cpu_prefetch_mib, 768)
         self.assertEqual(args.next_layer_prefetch, 6)
         self.assertEqual(args.cpu_threads, 12)
+        self.assertEqual(args.hybrid_prefill, "cpu")
+        self.assertEqual(args.expert_residency, "immutable")
         self.assertTrue(args.cold_cache)
         self.assertFalse(args.cpu_prefetch_auto)
 
@@ -395,16 +439,24 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.cpu_prefetch_mib, 0)
         self.assertTrue(args.cpu_prefetch_auto)
 
-    def test_serve_v2_cli_accepts_gpu_next_layer_prefetch_with_direct_paging(self) -> None:
+    def test_serve_v2_cli_accepts_legacy_gpu_alias(self) -> None:
         args = _parser().parse_args([
             "serve-v2", "model.gguf",
             "--moe-device", "gpu",
             "--expert-paging", "direct",
             "--next-layer-prefetch", "4",
         ])
-        self.assertEqual(args.moe_device, "gpu")
+        self.assertEqual(args.expert_mode, "gpu")
         self.assertEqual(args.expert_paging, "direct")
         self.assertEqual(args.next_layer_prefetch, 4)
+
+    def test_serve_v2_cli_accepts_canonical_expert_modes(self) -> None:
+        for mode in ("cpu", "auto", "resident"):
+            with self.subTest(mode=mode):
+                args = _parser().parse_args(
+                    ["serve-v2", "model.gguf", "--expert-mode", mode]
+                )
+                self.assertEqual(args.expert_mode, mode)
 
 
 if __name__ == "__main__":

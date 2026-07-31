@@ -18,6 +18,45 @@ class V2Error(RuntimeError):
     pass
 
 
+_EXPERT_MODE_ALIASES = {
+    "cpu": "cpu",
+    "auto": "auto",
+    "hybrid": "legacy-hybrid",
+    "resident": "resident",
+    "gpu": "legacy-paging",
+    "legacy-paging": "legacy-paging",
+    "legacy-hybrid": "legacy-hybrid",
+}
+
+
+def _resolve_expert_mode(value: str) -> tuple[str, int, bool]:
+    try:
+        resolved = _EXPERT_MODE_ALIASES[value]
+    except (KeyError, TypeError) as error:
+        choices = "', '".join(_EXPERT_MODE_ALIASES)
+        raise ValueError(f"expert_mode must be one of '{choices}'") from error
+    native_mode = {
+        "resident": 0,
+        "legacy-paging": 0,
+        "cpu": 1,
+        "auto": 2,
+        "legacy-hybrid": 2,
+    }[resolved]
+    return resolved, native_mode, resolved == "resident"
+
+
+def _normalize_prefill_cache_seed(value: int | str) -> tuple[int, bool]:
+    if value == "auto":
+        return 0, True
+    if value == "off":
+        return 0, False
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("prefill_cache_seed must be 'auto', 'off', or an integer")
+    if not 0 <= value <= 256:
+        raise ValueError("prefill_cache_seed must be between 0 and 256")
+    return value, False
+
+
 class _Info(ctypes.Structure):
     _fields_ = [
         ("gguf_version", ctypes.c_uint32),
@@ -119,7 +158,11 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("cpu_prefetch_mib", ctypes.c_uint32),
         ("cpu_prefetch_auto", ctypes.c_uint32),
         ("next_layer_prefetch", ctypes.c_uint32),
-        ('cpu_threads', ctypes.c_uint32),
+        ("cpu_threads", ctypes.c_uint32),
+        ("hybrid_prefill_cpu", ctypes.c_uint32),
+        ("immutable_residency", ctypes.c_uint32),
+        ("prefill_cache_seed_auto", ctypes.c_uint32),
+        ("strict_resident", ctypes.c_uint32),
     ]
 
 
@@ -222,6 +265,15 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("host_ffn_layers", ctypes.c_uint64),
         ("host_ffn_bytes", ctypes.c_uint64),
         ("dense_host_nanoseconds", ctypes.c_uint64),
+        ("expert_cache_deferred_admissions", ctypes.c_uint64),
+        ("expert_residency_epochs", ctypes.c_uint64),
+        ("expert_residency_frozen", ctypes.c_uint64),
+        ("prefill_cache_seed_bytes", ctypes.c_uint64),
+        ("prefill_cache_seed_selected_experts", ctypes.c_uint64),
+        ("prefill_cache_seed_hits", ctypes.c_uint64),
+        ("prefill_cache_seed_avoided_misses", ctypes.c_uint64),
+        ("prefill_cache_seed_auto_skips", ctypes.c_uint64),
+        ("prefill_cache_seed_budget_stops", ctypes.c_uint64),
         ("gpu_prefetch_bytes", ctypes.c_uint64),
         ("gpu_prefetch_hits", ctypes.c_uint64),
     ]
@@ -263,314 +315,328 @@ def _library() -> ctypes.CDLL:
         path = root / name
         if path.is_file():
             lib = ctypes.CDLL(str(path))
-            lib.colibri_v2_last_error.restype = ctypes.c_char_p
-            lib.colibri_v2_model_config.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(_ModelConfig),
-            ]
-            lib.colibri_v2_model_config.restype = ctypes.c_int
-            lib.colibri_v2_model_attention_window.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.POINTER(ctypes.c_uint32),
-            ]
-            lib.colibri_v2_model_attention_window.restype = ctypes.c_int
-            lib.colibri_v2_qwen_validate.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_qwen_validate.restype = ctypes.c_int
-            lib.colibri_v2_qwen_tensor_role.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_char_p,
-                ctypes.POINTER(_TensorInfo),
-            ]
-            lib.colibri_v2_qwen_tensor_role.restype = ctypes.c_int
-            lib.colibri_v2_qwen_layer_tensor.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.c_char_p,
-                ctypes.POINTER(_TensorInfo),
-            ]
-            lib.colibri_v2_qwen_layer_tensor.restype = ctypes.c_int
-            lib.colibri_v2_qwen_embedding.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.POINTER(ctypes.c_float),
-                ctypes.c_uint64,
-            ]
-            lib.colibri_v2_qwen_embedding.restype = ctypes.c_int
-            lib.colibri_v2_qwen_lm_head.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_float),
-                ctypes.POINTER(ctypes.c_float),
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-            ]
-            lib.colibri_v2_qwen_lm_head.restype = ctypes.c_int
-            lib.colibri_v2_qwen_token_text.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.c_char_p,
-                ctypes.c_uint64,
-            ]
-            lib.colibri_v2_qwen_token_text.restype = ctypes.c_int
-            lib.colibri_v2_token_id.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_uint32),
-            ]
-            lib.colibri_v2_token_id.restype = ctypes.c_int
-            lib.colibri_v2_tokenize.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_uint32),
-                ctypes.c_uint64,
-                ctypes.POINTER(ctypes.c_uint64),
-            ]
-            lib.colibri_v2_tokenize.restype = ctypes.c_int
-            lib.colibri_v2_tensor_read.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-            ]
-            lib.colibri_v2_tensor_read.restype = ctypes.c_int
-            lib.colibri_v2_tensor_read_slice.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-            ]
-            lib.colibri_v2_tensor_read_slice.restype = ctypes.c_int
-            lib.colibri_v2_tensor_view.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.POINTER(ctypes.c_void_p),
-            ]
-            lib.colibri_v2_tensor_view.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_create.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(_QwenRuntimeOptions),
-                ctypes.POINTER(ctypes.c_void_p),
-            ]
-            lib.colibri_v2_qwen_runtime_create.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_destroy.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_qwen_runtime_info.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(_QwenRuntimeInfo),
-            ]
-            lib.colibri_v2_qwen_runtime_info.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_reset.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_qwen_runtime_reset.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_cancel.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_qwen_runtime_cancel.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_prepare.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_qwen_runtime_prepare.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_synchronize.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_qwen_runtime_synchronize.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_decode.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.POINTER(ctypes.c_uint32),
-            ]
-            lib.colibri_v2_qwen_runtime_decode.restype = ctypes.c_int
-            lib.colibri_v2_qwen_runtime_generate.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_uint32),
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                _TokenCallback,
-                ctypes.c_void_p,
-            ]
-            lib.colibri_v2_qwen_runtime_generate.restype = ctypes.c_int
-            lib.colibri_v2_qwen_task_submit.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_uint32),
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.POINTER(ctypes.c_uint32),
-                ctypes.c_uint64,
-                ctypes.POINTER(ctypes.c_uint64),
-            ]
-            lib.colibri_v2_qwen_task_submit.restype = ctypes.c_int
-            lib.colibri_v2_qwen_task_submit_sampling.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_uint32),
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.POINTER(ctypes.c_uint32),
-                ctypes.c_uint64,
-                ctypes.c_float,
-                ctypes.c_uint32,
-                ctypes.c_float,
-                ctypes.c_uint64,
-                ctypes.c_uint32,
-                ctypes.POINTER(ctypes.c_uint64),
-            ]
-            lib.colibri_v2_qwen_task_submit_sampling.restype = ctypes.c_int
-            lib.colibri_v2_qwen_engine_step.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(_QwenTaskEvent),
-                ctypes.c_uint64,
-                ctypes.POINTER(ctypes.c_uint64),
-            ]
-            lib.colibri_v2_qwen_engine_step.restype = ctypes.c_int
-            lib.colibri_v2_qwen_task_cancel.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-            ]
-            lib.colibri_v2_qwen_task_cancel.restype = ctypes.c_int
-            lib.colibri_v2_gpu_probe.argtypes = [
-                ctypes.c_int32,
-                ctypes.POINTER(_GpuInfo),
-            ]
-            lib.colibri_v2_gpu_probe.restype = ctypes.c_int
-            lib.colibri_v2_gpu_available.restype = ctypes.c_int
-            lib.colibri_v2_gpu_init.argtypes = [ctypes.c_int32]
-            lib.colibri_v2_gpu_init.restype = ctypes.c_int
-            lib.colibri_v2_gpu_compile.argtypes = [
-                ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_char_p),
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_char_p,
-                ctypes.c_int32,
-            ]
-            lib.colibri_v2_gpu_compile.restype = ctypes.c_int
-            lib.colibri_v2_memory_plan.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.POINTER(_MemoryPlan),
-            ]
-            lib.colibri_v2_memory_plan.restype = ctypes.c_int
-            lib.colibri_v2_gpu_rms_norm.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_float,
-                ctypes.c_int32,
-            ]
-            lib.colibri_v2_gpu_rms_norm.restype = ctypes.c_int
-            lib.colibri_v2_gpu_q4_matvec.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_int32,
-            ]
-            lib.colibri_v2_gpu_q4_matvec.restype = ctypes.c_int
-            lib.colibri_v2_gpu_dense_projection.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_float,
-                ctypes.c_int32,
-            ]
-            lib.colibri_v2_gpu_dense_projection.restype = ctypes.c_int
-            lib.colibri_v2_gpu_dense_residual.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_float,
-                ctypes.c_int32,
-            ]
-            lib.colibri_v2_gpu_dense_residual.restype = ctypes.c_int
-            lib.colibri_v2_gpu_attention.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_float,
-            ]
-            lib.colibri_v2_gpu_attention.restype = ctypes.c_int
-            lib.colibri_v2_gpu_decoder_attention_step.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_float,
-                ctypes.c_int32,
-            ]
-            lib.colibri_v2_gpu_decoder_attention_step.restype = ctypes.c_int
-            lib.colibri_v2_kv_cache_create.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.POINTER(ctypes.c_void_p),
-            ]
-            lib.colibri_v2_kv_cache_create.restype = ctypes.c_int
-            lib.colibri_v2_kv_cache_destroy.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_kv_cache_reset.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_kv_cache_reset.restype = ctypes.c_int
-            lib.colibri_v2_kv_cache_position.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_int32),
-            ]
-            lib.colibri_v2_kv_cache_position.restype = ctypes.c_int
-            lib.colibri_v2_gpu_decoder_attention_cached.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int32,
-                ctypes.c_int32,
-                ctypes.c_float,
-                ctypes.c_int32,
-            ]
-            lib.colibri_v2_gpu_decoder_attention_cached.restype = ctypes.c_int
-            lib.colibri_v2_session_attach_kv_cache.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-            ]
-            lib.colibri_v2_session_attach_kv_cache.restype = ctypes.c_int
-            lib.colibri_v2_session_detach_kv_cache.argtypes = [ctypes.c_void_p]
-            lib.colibri_v2_session_detach_kv_cache.restype = ctypes.c_int
+            try:
+                lib.colibri_v2_last_error.restype = ctypes.c_char_p
+                lib.colibri_v2_model_config.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_ModelConfig),
+                ]
+                lib.colibri_v2_model_config.restype = ctypes.c_int
+                lib.colibri_v2_model_attention_window.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.colibri_v2_model_attention_window.restype = ctypes.c_int
+                lib.colibri_v2_qwen_validate.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_qwen_validate.restype = ctypes.c_int
+                lib.colibri_v2_qwen_tensor_role.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(_TensorInfo),
+                ]
+                lib.colibri_v2_qwen_tensor_role.restype = ctypes.c_int
+                lib.colibri_v2_qwen_layer_tensor.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(_TensorInfo),
+                ]
+                lib.colibri_v2_qwen_layer_tensor.restype = ctypes.c_int
+                lib.colibri_v2_qwen_embedding.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_uint64,
+                ]
+                lib.colibri_v2_qwen_embedding.restype = ctypes.c_int
+                lib.colibri_v2_qwen_lm_head.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                ]
+                lib.colibri_v2_qwen_lm_head.restype = ctypes.c_int
+                lib.colibri_v2_qwen_token_text.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_char_p,
+                    ctypes.c_uint64,
+                ]
+                lib.colibri_v2_qwen_token_text.restype = ctypes.c_int
+                lib.colibri_v2_token_id.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.colibri_v2_token_id.restype = ctypes.c_int
+                lib.colibri_v2_tokenize.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_tokenize.restype = ctypes.c_int
+                lib.colibri_v2_tensor_read.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                ]
+                lib.colibri_v2_tensor_read.restype = ctypes.c_int
+                lib.colibri_v2_tensor_read_slice.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                ]
+                lib.colibri_v2_tensor_read_slice.restype = ctypes.c_int
+                lib.colibri_v2_tensor_view.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ]
+                lib.colibri_v2_tensor_view.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_create.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_QwenRuntimeOptions),
+                    ctypes.POINTER(ctypes.c_void_p),
+                ]
+                lib.colibri_v2_qwen_runtime_create.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_destroy.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_qwen_runtime_info.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_QwenRuntimeInfo),
+                ]
+                lib.colibri_v2_qwen_runtime_info.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_reset.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_qwen_runtime_reset.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_cancel.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_qwen_runtime_cancel.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_dump_kv.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p,
+                ]
+                lib.colibri_v2_qwen_runtime_dump_kv.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_prepare.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_qwen_runtime_prepare.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_synchronize.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_qwen_runtime_synchronize.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_decode.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.colibri_v2_qwen_runtime_decode.restype = ctypes.c_int
+                lib.colibri_v2_qwen_runtime_generate.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    _TokenCallback,
+                    ctypes.c_void_p,
+                ]
+                lib.colibri_v2_qwen_runtime_generate.restype = ctypes.c_int
+                lib.colibri_v2_qwen_task_submit.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_qwen_task_submit.restype = ctypes.c_int
+                lib.colibri_v2_qwen_task_submit_sampling.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_float,
+                    ctypes.c_uint32,
+                    ctypes.c_float,
+                    ctypes.c_uint64,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_qwen_task_submit_sampling.restype = ctypes.c_int
+                lib.colibri_v2_qwen_engine_step.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_QwenTaskEvent),
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_qwen_engine_step.restype = ctypes.c_int
+                lib.colibri_v2_qwen_task_cancel.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                ]
+                lib.colibri_v2_qwen_task_cancel.restype = ctypes.c_int
+                lib.colibri_v2_gpu_probe.argtypes = [
+                    ctypes.c_int32,
+                    ctypes.POINTER(_GpuInfo),
+                ]
+                lib.colibri_v2_gpu_probe.restype = ctypes.c_int
+                lib.colibri_v2_gpu_available.restype = ctypes.c_int
+                lib.colibri_v2_gpu_init.argtypes = [ctypes.c_int32]
+                lib.colibri_v2_gpu_init.restype = ctypes.c_int
+                lib.colibri_v2_gpu_compile.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_char_p),
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_char_p,
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_gpu_compile.restype = ctypes.c_int
+                lib.colibri_v2_memory_plan.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(_MemoryPlan),
+                ]
+                lib.colibri_v2_memory_plan.restype = ctypes.c_int
+                lib.colibri_v2_gpu_rms_norm.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_float,
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_gpu_rms_norm.restype = ctypes.c_int
+                lib.colibri_v2_gpu_q4_matvec.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_gpu_q4_matvec.restype = ctypes.c_int
+                lib.colibri_v2_gpu_dense_projection.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_float,
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_gpu_dense_projection.restype = ctypes.c_int
+                lib.colibri_v2_gpu_dense_residual.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_float,
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_gpu_dense_residual.restype = ctypes.c_int
+                lib.colibri_v2_gpu_attention.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_float,
+                ]
+                lib.colibri_v2_gpu_attention.restype = ctypes.c_int
+                lib.colibri_v2_gpu_decoder_attention_step.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_float,
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_gpu_decoder_attention_step.restype = ctypes.c_int
+                lib.colibri_v2_kv_cache_create.argtypes = [
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ]
+                lib.colibri_v2_kv_cache_create.restype = ctypes.c_int
+                lib.colibri_v2_kv_cache_destroy.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_kv_cache_reset.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_kv_cache_reset.restype = ctypes.c_int
+                lib.colibri_v2_kv_cache_position.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int32),
+                ]
+                lib.colibri_v2_kv_cache_position.restype = ctypes.c_int
+                lib.colibri_v2_gpu_decoder_attention_cached.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_float,
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_gpu_decoder_attention_cached.restype = ctypes.c_int
+                lib.colibri_v2_session_attach_kv_cache.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                ]
+                lib.colibri_v2_session_attach_kv_cache.restype = ctypes.c_int
+                lib.colibri_v2_session_detach_kv_cache.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_session_detach_kv_cache.restype = ctypes.c_int
+            except AttributeError as error:
+                # A library in _native that predates a C API change fails
+                # here with a bare ctypes AttributeError naming the missing
+                # symbol. Say what that actually means: the checked-in
+                # binaries go stale whenever the native API grows.
+                raise V2Error(
+                    f"native v2 library at {path} is out of date ({error}); "
+                    "rebuild it with python -m colibri_next.native_build"
+                ) from error
             _cached_library = lib
             return lib
     raise V2Error(
@@ -952,7 +1018,8 @@ class V2Model:
         device: int = 0,
         context_limit: int = 0,
         gpu_cache_bytes: int = 0,
-        moe_device: str = "gpu",
+        moe_device: str | None = None,
+        expert_mode: str | None = None,
         mtp_drafts: int = 0,
         expert_top_k: int = 0,
         expert_top_p: float = 0.0,
@@ -963,12 +1030,14 @@ class V2Model:
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
         swa_full: bool = False,
-        prefill_cache_seed: int = 0,
+        prefill_cache_seed: int | str | None = None,
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
         cpu_threads: int = 0,
+        hybrid_prefill: str = "split",
+        expert_residency: str | None = None,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -976,6 +1045,7 @@ class V2Model:
             context_limit=context_limit,
             gpu_cache_bytes=gpu_cache_bytes,
             moe_device=moe_device,
+            expert_mode=expert_mode,
             mtp_drafts=mtp_drafts,
             expert_top_k=expert_top_k,
             expert_top_p=expert_top_p,
@@ -992,17 +1062,16 @@ class V2Model:
             cpu_prefetch_auto=cpu_prefetch_auto,
             next_layer_prefetch=next_layer_prefetch,
             cpu_threads=cpu_threads,
+            hybrid_prefill=hybrid_prefill,
+            expert_residency=expert_residency,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
         """Create the native runtime for any supported GGUF architecture.
 
-        Gemma 4 uses the bounded hybrid expert cache by default; callers can
-        explicitly select ``moe_device="cpu"`` when GPU cache residency is not
-        desired. ``native_qwen_runtime`` remains as a compatibility alias.
+        ``expert_mode="auto"`` is the default for routed models.
+        ``native_qwen_runtime`` remains as a compatibility alias.
         """
-        if self.info["architecture"] == "gemma4":
-            options.setdefault("moe_device", "hybrid")
         return self.native_qwen_runtime(**options)
 
     @staticmethod
@@ -1293,7 +1362,8 @@ class V2QwenRuntime:
         device: int = 0,
         context_limit: int = 0,
         gpu_cache_bytes: int = 0,
-        moe_device: str = "gpu",
+        moe_device: str | None = None,
+        expert_mode: str | None = None,
         mtp_drafts: int = 0,
         expert_top_k: int = 0,
         expert_top_p: float = 0.0,
@@ -1304,12 +1374,14 @@ class V2QwenRuntime:
         parallel_sequences: int = 1,
         prompt_cache_mib: int = 0,
         swa_full: bool = False,
-        prefill_cache_seed: int = 0,
+        prefill_cache_seed: int | str | None = None,
         expert_paging: str = "auto",
         cpu_prefetch_mib: int = 0,
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
         cpu_threads: int = 0,
+        hybrid_prefill: str = "split",
+        expert_residency: str | None = None,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1328,8 +1400,26 @@ class V2QwenRuntime:
         # conversations restore from RAM instead of reprefilling; 0 disables.
         if prompt_cache_mib < 0:
             raise ValueError("prompt_cache_mib must be non-negative")
-        if prefill_cache_seed < 0 or prefill_cache_seed > 256:
-            raise ValueError("prefill_cache_seed must be between 0 and 256")
+        if expert_mode is not None and moe_device is not None:
+            if _resolve_expert_mode(expert_mode)[0] != _resolve_expert_mode(
+                moe_device
+            )[0]:
+                raise ValueError("expert_mode and moe_device select different policies")
+        requested_expert_mode = expert_mode or moe_device or "auto"
+        resolved_expert_mode, native_expert_mode, strict_resident = (
+            _resolve_expert_mode(requested_expert_mode)
+        )
+        legacy_policy = resolved_expert_mode in {
+            "legacy-hybrid",
+            "legacy-paging",
+        }
+        if prefill_cache_seed is None:
+            prefill_cache_seed = "off" if legacy_policy else "auto"
+        if expert_residency is None:
+            expert_residency = "mutable" if legacy_policy else "immutable"
+        prefill_cache_seed_count, prefill_cache_seed_auto = (
+            _normalize_prefill_cache_seed(prefill_cache_seed)
+        )
         if expert_paging not in {"auto", "staged", "direct"}:
             raise ValueError("expert_paging must be 'auto', 'staged', or 'direct'")
         if cpu_prefetch_mib < 0:
@@ -1340,10 +1430,18 @@ class V2QwenRuntime:
             raise ValueError("next_layer_prefetch must be between 0 and 64")
         if cpu_threads < 0:
             raise ValueError('cpu_threads must be non-negative (0 = automatic)')
+        if hybrid_prefill not in {"split", "cpu"}:
+            raise ValueError("hybrid_prefill must be 'split' or 'cpu'")
+        if expert_residency not in {"mutable", "immutable"}:
+            raise ValueError("expert_residency must be 'mutable' or 'immutable'")
         if next_layer_prefetch and mtp_drafts:
             raise ValueError("next_layer_prefetch does not support MTP yet")
-        if moe_device not in {"gpu", "cpu", "hybrid"}:
-            raise ValueError("moe_device must be 'gpu', 'cpu', or 'hybrid'")
+        effective_hybrid_prefill = (
+            "cpu" if resolved_expert_mode == "auto" else hybrid_prefill
+        )
+        effective_expert_residency = (
+            "immutable" if resolved_expert_mode == "auto" else expert_residency
+        )
         if mtp_drafts < 0 or mtp_drafts > 8:
             raise ValueError("mtp_drafts must be between 0 and 8")
         if expert_top_k < 0:
@@ -1351,15 +1449,24 @@ class V2QwenRuntime:
         if not 0.0 <= expert_top_p <= 1.0:
             raise ValueError("expert_top_p must be within [0, 1] (0 = disabled)")
         # KV cache precision per llama.cpp's -ctk/-ctv (Phase 1: f32, f16).
-        cache_types = {"f32": 0, "f16": 1, "bf16": 2, "q8_0": 3}
+        # turbo3/turbo4 are TurboQuant (arXiv:2504.19874): a fixed rotation plus
+        # a Lloyd-Max codebook, at 3.5 and 4.5 bits per value. They need a
+        # head_dim that is a power of two between 32 and 512.
+        cache_types = {
+            "f32": 0, "f16": 1, "bf16": 2, "q8_0": 3, "turbo3": 4, "turbo4": 5,
+        }
         if cache_type_k not in cache_types or cache_type_v not in cache_types:
-            raise ValueError("cache_type_k/v must be 'f32', 'f16', 'bf16', or 'q8_0'")
+            raise ValueError(
+                "cache_type_k/v must be one of " + ", ".join(sorted(cache_types))
+            )
         self.model, self._lib = model, model._lib
         self.parallel_sequences = parallel_sequences
+        self.requested_expert_mode = requested_expert_mode
+        self.expert_mode = resolved_expert_mode
         self._handle = ctypes.c_void_p()
         options = _QwenRuntimeOptions(
             device,
-            {"gpu": 0, "cpu": 1, "hybrid": 2}[moe_device],
+            native_expert_mode,
             mtp_drafts,
             expert_top_k,
             context_limit,
@@ -1372,12 +1479,16 @@ class V2QwenRuntime:
             parallel_sequences,
             prompt_cache_mib,
             int(swa_full),
-            prefill_cache_seed,
+            prefill_cache_seed_count,
             {"auto": 0, "staged": 1, "direct": 2}[expert_paging],
             cpu_prefetch_mib,
             int(cpu_prefetch_auto),
             next_layer_prefetch,
             cpu_threads,
+            int(effective_hybrid_prefill == "cpu"),
+            int(effective_expert_residency == "immutable"),
+            int(prefill_cache_seed_auto),
+            int(strict_resident),
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(
@@ -1397,24 +1508,59 @@ class V2QwenRuntime:
         self.close()
 
     @property
-    def info(self) -> dict[str, int | bool]:
+    def info(self) -> dict[str, object]:
         value = _QwenRuntimeInfo()
         self.model._check(
             self._lib.colibri_v2_qwen_runtime_info(self._handle, ctypes.byref(value))
         )
         boolean_fields = {"cuda_ready", "decode_ready"}
-        return {
+        result: dict[str, object] = {
             field: bool(getattr(value, field))
             if field in boolean_fields
             else int(getattr(value, field))
             for field, _ in _QwenRuntimeInfo._fields_
         }
+        native_mode = int(result["moe_device"])
+        fallback_reason = ""
+        resolved_mode = self.expert_mode
+        if self.expert_mode in {"auto", "legacy-hybrid"} and native_mode == 1:
+            resolved_mode = "cpu"
+            fallback_reason = (
+                "automatic GPU expert working set did not fit; using CPU experts"
+            )
+        result.update(
+            {
+                "requested_expert_mode": self.requested_expert_mode,
+                "expert_mode": resolved_mode,
+                "expert_mode_alias": (
+                    self.requested_expert_mode
+                    if self.requested_expert_mode != self.expert_mode
+                    else ""
+                ),
+                "expert_fallback_reason": fallback_reason,
+            }
+        )
+        return result
 
     def reset(self) -> None:
         self.model._check(self._lib.colibri_v2_qwen_runtime_reset(self._handle))
 
     def cancel(self) -> None:
         self.model._check(self._lib.colibri_v2_qwen_runtime_cancel(self._handle))
+
+    def dump_kv(self, layer: int, path: str) -> None:
+        """Write one attention layer's live KV window for bench_turboquant.
+
+        Decodes whatever precision the cache runs at to f32, so the dump shows
+        the distribution the codec would really see. Requires at least one
+        decoded token, and the layer must be an attention layer rather than a
+        Gated DeltaNet one.
+        """
+        self.model._check(
+            self._lib.colibri_v2_qwen_runtime_dump_kv(
+                self._handle, ctypes.c_uint32(layer), str(path).encode("utf-8")
+            )
+        )
 
     def prepare(self) -> None:
         """Allocate native CUDA arenas and upload persistent model weights."""

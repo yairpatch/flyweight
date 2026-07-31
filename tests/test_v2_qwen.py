@@ -61,7 +61,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
         except Exception as error:
             raise unittest.SkipTest(str(error)) from error
         try:
-            with self.assertRaisesRegex(ValueError, "moe_device"):
+            with self.assertRaisesRegex(ValueError, "expert_mode"):
                 model.native_qwen_runtime(moe_device="accelerator")
         finally:
             model.close()

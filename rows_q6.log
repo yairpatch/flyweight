@@ -1,0 +1,17 @@
+Loading native v2 GGUF from C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q6_K.gguf...
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\cli.py", line 1732, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\cli.py", line 1257, in main
+    service = NativeV2InferenceService(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\v2_server.py", line 504, in __init__
+    self.v2_runtime.prepare()
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\v2.py", line 1394, in prepare
+    self.model._check(self._lib.colibri_v2_qwen_runtime_prepare(self._handle))
+  File "C:\Users\thegr\Downloads\colibri-next\src\colibri_next\v2.py", line 573, in _check
+    raise V2Error(message.decode(errors="replace"))
+colibri_next.v2.V2Error: failed to allocate native Qwen CUDA arenas

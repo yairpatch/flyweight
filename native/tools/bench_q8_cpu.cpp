@@ -43,7 +43,7 @@ bool has_avx512(){
     if((_xgetbv(0)&0xe6)!=0xe6)return false;__cpuidex(registers,7,0);
     return (registers[1]&(1<<16))!=0&&(registers[1]&(1<<30))!=0;
 #else
-    return __builtin_cpu_supports(avx512f)&&__builtin_cpu_supports(avx512bw);
+    return __builtin_cpu_supports("avx512f")&&__builtin_cpu_supports("avx512bw");
 #endif
 }
 

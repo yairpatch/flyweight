@@ -1,0 +1,14 @@
+Loading native v2 GGUF from C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q6_K.gguf...
+Serving Qwen3.6-35B-A3B-UD-Q6_K at http://127.0.0.1:8138 (native v2, cpu MoE)
+127.0.0.1 - - [24/Jul/2026 13:39:50] "GET /health HTTP/1.1" 200 -
+127.0.0.1 - - [24/Jul/2026 13:39:51] request processing: /v1/chat/completions
+[tok-dbg] step=1 in=271 -> out=760
+[tok-dbg] step=2 in=760 -> out=6511
+[load] prompt 17/17 tokens (100.0%)    5.1 tok/s
+[load] prompt ready in  3.36s (17 tokens,    5.1 tok/s)
+[tok-dbg] step=3 in=6511 -> out=314
+[tok-dbg] step=4 in=314 -> out=9338
+[tok-dbg] step=5 in=9338 -> out=369
+[tok-dbg] step=6 in=369 -> out=2972
+127.0.0.1 - - [24/Jul/2026 13:39:55] "POST /v1/chat/completions HTTP/1.1" 200 -
+127.0.0.1 - - [24/Jul/2026 13:39:55] request completed: /v1/chat/completions

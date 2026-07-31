@@ -1,5 +1,7 @@
 import http.client
+import itertools
 import json
+import re
 import threading
 import unittest
 from contextlib import redirect_stderr
@@ -1352,6 +1354,42 @@ class HTTPServerTests(unittest.TestCase):
         )
         self.assertIn('"object": "chat.completion.chunk"', stream_body)
         self.assertIn("data: [DONE]", stream_body)
+
+    def test_stream_console_rate_counts_intervals_not_tokens(self) -> None:
+        # N streamed tokens span N-1 intervals: the first token ends prompt
+        # evaluation and is not part of decode. Dividing tokens by that span
+        # instead overstates the rate (2x at the stub's two tokens) and makes
+        # the console disagree with the browser, which divides by intervals in
+        # formatGenerationMetrics(). A 0.5 s tick keeps the printed elapsed
+        # exact at two decimals so the two can be compared.
+        ticks = itertools.count(1000.0, 0.5)
+        body = json.dumps(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            }
+        )
+        captured = StringIO()
+        with patch("time.perf_counter", lambda: next(ticks)):
+            with redirect_stderr(captured):
+                self.connection.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                self.connection.getresponse().read()
+        done = re.search(
+            r"\[gen \] done (\d+) tokens in\s*([\d.]+)s \(\s*([\d.]+) tok/s\)",
+            captured.getvalue(),
+        )
+        self.assertIsNotNone(done, captured.getvalue())
+        tokens, elapsed, rate = (
+            int(done.group(1)), float(done.group(2)), float(done.group(3))
+        )
+        self.assertGreater(tokens, 1)
+        self.assertGreater(elapsed, 0.0)
+        self.assertAlmostEqual(rate, (tokens - 1) / elapsed, delta=0.05)
 
     def test_anthropic_errors_use_anthropic_envelope(self) -> None:
         response, payload = self.request_json(

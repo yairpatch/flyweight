@@ -3496,6 +3496,128 @@ void nvfp4_stacked_moe_swiglu(
         (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
 }
 
+// Persistent-cache variant. The grouped gate/up GEMM has
+// [experts*2*output_size,16] column-major output. Only column zero is consumed
+// by single-token decode.
+extern "C" __global__
+void nvfp4_persistent_moe_swiglu(
+    const float* projected,
+    float* activated,
+    const int output_size,
+    const int experts,
+    const float* gate_scales,
+    const float* up_scales,
+    const float* down_scales,
+    const int grouped_layout
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements = experts * output_size;
+    if (index >= elements) return;
+    const int expert = index / output_size;
+    const int row = index - expert * output_size;
+    const float* expert_projected = projected +
+        (unsigned long long)expert * 2ull * output_size *
+            (grouped_layout ? 1ull : 16ull);
+    float gate = expert_projected[row];
+    float up = expert_projected[output_size + row];
+    if (gate_scales) gate *= gate_scales[expert];
+    if (up_scales) {
+        const float down_scale = down_scales ? down_scales[expert] : 1.0f;
+        up *= down_scale != 0.0f
+            ? up_scales[expert] / down_scale : up_scales[expert];
+    }
+    activated[index] =
+        (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void nvfp4_concat_native_gate_up_cublaslt(
+    const unsigned long long* native_ptrs,
+    unsigned char* values,
+    unsigned char* scales,
+    const unsigned long long value_bytes,
+    const unsigned long long scale_bytes,
+    const int experts
+) {
+    const unsigned long long value_total = value_bytes * experts;
+    const unsigned long long scale_total = scale_bytes * experts;
+    const unsigned long long count =
+        value_total > scale_total ? value_total : scale_total;
+    for (unsigned long long index =
+             (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < count;
+         index += (unsigned long long)blockDim.x * gridDim.x) {
+        if (index < value_total) {
+            const int expert = (int)(index / value_bytes);
+            const unsigned long long offset =
+                index - (unsigned long long)expert * value_bytes;
+            const unsigned char* source =
+                reinterpret_cast<const unsigned char*>(native_ptrs[expert]);
+            values[index] = source[offset];
+        }
+        if (index < scale_total) {
+            const int expert = (int)(index / scale_bytes);
+            const unsigned long long offset =
+                index - (unsigned long long)expert * scale_bytes;
+            const unsigned char* source =
+                reinterpret_cast<const unsigned char*>(native_ptrs[expert])
+                + value_bytes;
+            scales[index] = source[offset];
+        }
+    }
+}
+
+extern "C" __global__
+void nvfp4_concat_native_down_cublaslt(
+    const unsigned long long* native_ptrs,
+    unsigned char* values,
+    unsigned char* scales,
+    const int input_size,
+    const int output_size,
+    const int experts,
+    const unsigned long long down_offset,
+    const unsigned long long down_scale_offset
+) {
+    const int source_value_bytes = input_size >> 1;
+    const int combined_value_bytes = experts * source_value_bytes;
+    const unsigned long long value_count =
+        (unsigned long long)output_size * combined_value_bytes;
+    for (unsigned long long index =
+             (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < value_count;
+         index += (unsigned long long)blockDim.x * gridDim.x) {
+        const int row = (int)(index / combined_value_bytes);
+        const int combined = (int)(index -
+            (unsigned long long)row * combined_value_bytes);
+        const int expert = combined / source_value_bytes;
+        const int offset = combined - expert * source_value_bytes;
+        const unsigned char* source =
+            reinterpret_cast<const unsigned char*>(native_ptrs[expert])
+            + down_offset;
+        values[index] =
+            source[(unsigned long long)row * source_value_bytes + offset];
+    }
+    const int source_inner_scales = input_size >> 4;
+    const int combined_inner_scales = experts * source_inner_scales;
+    const unsigned long long scale_count =
+        (unsigned long long)output_size * combined_inner_scales;
+    for (unsigned long long index =
+             (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < scale_count;
+         index += (unsigned long long)blockDim.x * gridDim.x) {
+        const int row = (int)(index / combined_inner_scales);
+        const int combined = (int)(index -
+            (unsigned long long)row * combined_inner_scales);
+        const int expert = combined / source_inner_scales;
+        const int inner = combined - expert * source_inner_scales;
+        const unsigned char* source =
+            reinterpret_cast<const unsigned char*>(native_ptrs[expert])
+            + down_scale_offset;
+        scales[nvfp4_scale_offset(row, combined, combined_inner_scales)] =
+            source[nvfp4_scale_offset(row, inner, source_inner_scales)];
+    }
+}
+
 extern "C" __global__
 void nvfp4_validate_stacked_projection(
     const unsigned long long* gate_ptrs,
@@ -4091,6 +4213,380 @@ extern "C" __global__ void kv_store_q8(
     }
 }
 
+// ---- TurboQuant blocked KV codec (arXiv:2504.19874), 32 elems/block =
+// [f16 scale | 32 packed indices], 14 bytes at 3-bit and 18 at 4-bit.
+//
+// The vector is rotated by a fixed orthogonal R = H*S (sign flip then
+// Walsh-Hadamard) before quantizing, which spreads outlier channels evenly so
+// one Gaussian codebook fits every head. Because R is shared by every vector
+// in the cache it never has to be undone per entry:
+//   scores: <q,k> == <Rq,Rk>, so a block rotates its query once into shared
+//           memory and dots it against the stored keys directly.
+//   values: sum p_i v_i == R^-1(sum p_i (R v_i)), so the weighted sum is
+//           accumulated rotated and inverse-rotated once per head.
+// This is what keeps the kernel signatures identical to the other cache types.
+//
+// Codebooks are the Lloyd-Max optimal scalar quantizers for the unit Gaussian,
+// which is what the rotated coordinates converge to; they must stay identical
+// to native/src/turboquant.h, whose contract test pins them against the paper.
+__device__ const float kTurboCb3[8] = {
+    -2.15194570f, -1.34390928f, -0.75600528f, -0.24509418f,
+    0.24509418f, 0.75600528f, 1.34390928f, 2.15194570f
+};
+__device__ const float kTurboCb4[16] = {
+    -2.73258956f, -2.06901721f, -1.61804637f, -1.25623118f,
+    -0.94234045f, -0.65675911f, -0.38804829f, -0.12839503f,
+    0.12839503f, 0.38804829f, 0.65675911f, 0.94234045f,
+    1.25623118f, 1.61804637f, 2.06901721f, 2.73258956f
+};
+template<int BITS> __device__ __forceinline__ float turbo_cb(int i);
+template<> __device__ __forceinline__ float turbo_cb<3>(int i) { return kTurboCb3[i]; }
+template<> __device__ __forceinline__ float turbo_cb<4>(int i) { return kTurboCb4[i]; }
+// 2 bytes of f16 scale plus 32 indices of BITS bits.
+template<int BITS> __device__ __forceinline__ int turbo_block_bytes() { return 2 + BITS * 4; }
+
+// Deterministic +-1 per coordinate so encode and decode agree without storing
+// the rotation. Must match turbo_sign in native/src/turboquant.h.
+__device__ __forceinline__ float turbo_sign_d(int index, unsigned stream) {
+    unsigned h = (unsigned)index * 0x9e3779b9u + stream * 0x85ebca6bu + 0x165667b1u;
+    h ^= h >> 15; h *= 0x2545f491u; h ^= h >> 13;
+    return (h & 1u) ? -1.0f : 1.0f;
+}
+// An index never spans more than two bytes because BITS <= 4.
+__device__ __forceinline__ void turbo_pack_d(unsigned char* p, int slot, int bits, unsigned v) {
+    const int bit = slot * bits, byte = bit >> 3, sh = bit & 7;
+    p[byte] |= (unsigned char)(v << sh);
+    if (sh + bits > 8) p[byte + 1] |= (unsigned char)(v >> (8 - sh));
+}
+__device__ __forceinline__ unsigned turbo_unpack_d(const unsigned char* p, int slot, int bits) {
+    const int bit = slot * bits, byte = bit >> 3, sh = bit & 7;
+    unsigned v = (unsigned)p[byte] >> sh;
+    if (sh + bits > 8) v |= (unsigned)p[byte + 1] << (8 - sh);
+    return v & ((1u << bits) - 1u);
+}
+template<int BITS>
+__device__ __forceinline__ float kv_ld_turbo(const unsigned char* row, int elem) {
+    const unsigned char* blk = row + (elem >> 5) * turbo_block_bytes<BITS>();
+    return __half2float(*((const __half*)blk))
+        * turbo_cb<BITS>(turbo_unpack_d(blk + 2, elem & 31, BITS));
+}
+// Orthonormal in-place Walsh-Hadamard over shared memory, cooperatively across
+// the block. Orthonormal means it is its own inverse and preserves norms, which
+// is what makes the two identities above exact.
+__device__ __forceinline__ void turbo_fwht_shared(float* v, int dim) {
+    for (int span = 1; span < dim; span <<= 1) {
+        for (int i = threadIdx.x; i < (dim >> 1); i += blockDim.x) {
+            const int block = i / span, offset = i % span;
+            const int a = block * 2 * span + offset, b = a + span;
+            const float lo = v[a], hi = v[b];
+            v[a] = lo + hi; v[b] = lo - hi;
+        }
+        __syncthreads();
+    }
+    const float norm = rsqrtf((float)dim);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) v[i] *= norm;
+    __syncthreads();
+}
+// Encode one already-rotated 32-block. The scale is picked from the block RMS
+// and then refit by least squares against the chosen codewords, which removes
+// the systematic shrinkage a fixed codebook otherwise induces and costs nothing
+// at decode. Two passes rather than a 32-entry index array keeps this off local
+// memory.
+template<int BITS>
+__device__ __forceinline__ void turbo_encode_block_d(const float* v, unsigned char* dst) {
+    const int levels = 1 << BITS, bytes = turbo_block_bytes<BITS>();
+    for (int i = 0; i < bytes; ++i) dst[i] = 0;
+    float energy = 0.0f;
+    for (int i = 0; i < 32; ++i) energy += v[i] * v[i];
+    const float rms = sqrtf(energy / 32.0f);
+    if (!(rms > 0.0f)) return;  // all-zero block: zero scale decodes to zeros
+    const float inv = 1.0f / rms;
+    float num = 0.0f, den = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        const float x = v[i] * inv;
+        int best = 0; float bd = fabsf(x - turbo_cb<BITS>(0));
+        for (int l = 1; l < levels; ++l) {
+            const float d = fabsf(x - turbo_cb<BITS>(l));
+            if (d < bd) { bd = d; best = l; }
+        }
+        const float c = turbo_cb<BITS>(best);
+        num += v[i] * c; den += c * c;
+    }
+    *((__half*)dst) = __float2half(den > 0.0f ? num / den : rms);
+    for (int i = 0; i < 32; ++i) {
+        const float x = v[i] * inv;
+        int best = 0; float bd = fabsf(x - turbo_cb<BITS>(0));
+        for (int l = 1; l < levels; ++l) {
+            const float d = fabsf(x - turbo_cb<BITS>(l));
+            if (d < bd) { bd = d; best = l; }
+        }
+        turbo_pack_d(dst + 2, i, BITS, (unsigned)best);
+    }
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// head_dim is guarded to a power of two <= 512 wherever a turbo cache type is
+// selected, so the scratch below always holds a whole rotated row.
+#define TURBO_MAX_DIM 512
+
+// Rotate and store one (K or V) cache row for the current token.
+template<int BITS>
+__device__ void kv_store_turbo_impl(
+    const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity,
+    const unsigned stream
+) {
+    const int head = blockIdx.x;
+    if (head >= kv_heads) return;
+    __shared__ float rotated[TURBO_MAX_DIM];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        rotated[d] = current[head * head_dim + d] * turbo_sign_d(d, stream);
+    __syncthreads();
+    turbo_fwht_shared(rotated, head_dim);
+    const int blocks = head_dim / 32, bytes = turbo_block_bytes<BITS>();
+    unsigned char* row = cache + ((long long)head * capacity + position) * blocks * bytes;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x)
+        turbo_encode_block_d<BITS>(rotated + b * 32, row + b * bytes);
+}
+// Keys rotate under stream 0 and values under stream 1, matching the harness
+// and the CPU reference.
+extern "C" __global__ void kv_store_turbo3_k(const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) { kv_store_turbo_impl<3>(current, cache, kv_heads, head_dim, position, capacity, 0u); }
+extern "C" __global__ void kv_store_turbo3_v(const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) { kv_store_turbo_impl<3>(current, cache, kv_heads, head_dim, position, capacity, 1u); }
+extern "C" __global__ void kv_store_turbo4_k(const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) { kv_store_turbo_impl<4>(current, cache, kv_heads, head_dim, position, capacity, 0u); }
+extern "C" __global__ void kv_store_turbo4_v(const float* current, unsigned char* cache,
+    const int kv_heads, const int head_dim, const int position, const int capacity
+) { kv_store_turbo_impl<4>(current, cache, kv_heads, head_dim, position, capacity, 1u); }
+
+// Every thread in a scores block shares blockIdx.x = head, so the block rotates
+// its query into shared memory once and amortizes it over the whole token tile.
+// The head guard is uniform across the block; the token guard has to wait until
+// after the last __syncthreads or the cooperative transform would deadlock.
+template<int BITS, bool RING>
+__device__ void kv_scores_turbo_impl(
+    const float* query, const unsigned char* keys, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first, const float scale
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    __shared__ float rq[TURBO_MAX_DIM];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        rq[d] = query[head * head_dim + d] * turbo_sign_d(d, 0u);
+    __syncthreads();
+    turbo_fwht_shared(rq, head_dim);
+    const int token = blockIdx.y * blockDim.x + threadIdx.x;
+    if (token >= tokens) return;
+    const int kv_head = head / (heads / kv_heads);
+    const int blocks = head_dim / 32, bytes = turbo_block_bytes<BITS>();
+    const int slot = RING ? (first + token) % capacity : token;
+    const unsigned char* k = keys + ((long long)kv_head * capacity + slot) * blocks * bytes;
+    float sum = 0.0f;
+    for (int d = 0; d < head_dim; ++d) sum += rq[d] * kv_ld_turbo<BITS>(k, d);
+    scores[head * tokens + token] = sum * scale;
+}
+#define KV_SCORES_TURBO(name, BITS) \
+extern "C" __global__ void name(const float* query, const unsigned char* keys, float* scores, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const float scale) { \
+    kv_scores_turbo_impl<BITS, false>(query, keys, scores, heads, kv_heads, head_dim, \
+        tokens, capacity, 0, scale); \
+}
+KV_SCORES_TURBO(kv_attention_scores_turbo3, 3)
+KV_SCORES_TURBO(kv_attention_scores_turbo4, 4)
+#undef KV_SCORES_TURBO
+#define KV_SCORES_TURBO_RING(name, BITS) \
+extern "C" __global__ void name(const float* query, const unsigned char* keys, float* scores, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first, const float scale) { \
+    kv_scores_turbo_impl<BITS, true>(query, keys, scores, heads, kv_heads, head_dim, \
+        tokens, capacity, first, scale); \
+}
+KV_SCORES_TURBO_RING(kv_attention_scores_turbo3_ring, 3)
+KV_SCORES_TURBO_RING(kv_attention_scores_turbo4_ring, 4)
+#undef KV_SCORES_TURBO_RING
+
+// One block per head, so the weighted sum is accumulated in the rotated domain
+// in shared memory and inverse-rotated once at the end: R^-1 = R^T = S*H, i.e.
+// Walsh-Hadamard first, then the sign flip.
+template<int BITS, bool RING>
+__device__ void kv_values_turbo_impl(
+    float* scores, const unsigned char* values, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const int first
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const int kv_head = head / (heads / kv_heads);
+    const int blocks = head_dim / 32, bytes = turbo_block_bytes<BITS>();
+    float* head_scores = scores + head * tokens;
+    float local_maximum = -3.402823466e+38F;
+    for (int token = threadIdx.x; token < tokens; token += blockDim.x)
+        local_maximum = fmaxf(local_maximum, head_scores[token]);
+    const float reduced_maximum = block_reduce_max(local_maximum);
+    __shared__ float maximum;
+    if (threadIdx.x == 0) maximum = reduced_maximum;
+    __syncthreads();
+    float local_denominator = 0.0f;
+    for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
+        const float weight = expf(head_scores[token] - maximum);
+        head_scores[token] = weight;
+        local_denominator += weight;
+    }
+    const float reduced_denominator = block_reduce_sum(local_denominator);
+    __shared__ float inverse_denominator;
+    if (threadIdx.x == 0) inverse_denominator = 1.0f / reduced_denominator;
+    __syncthreads();
+    for (int token = threadIdx.x; token < tokens; token += blockDim.x)
+        head_scores[token] *= inverse_denominator;
+    __syncthreads();
+
+    // The weighted sum is the hot loop: every thread walks the whole cache, so
+    // anything left inside it costs O(tokens). Three things are hoisted out:
+    //
+    //  * the codebook moves to shared memory, off the global path;
+    //  * a thread owns one fixed d for the whole loop, so its block offset,
+    //    byte offset and bit shift are loop-invariant and computed once;
+    //  * the ring wrap becomes two contiguous runs instead of a % per token,
+    //    which also lets the row pointer advance by a fixed stride.
+    //
+    // The index read is branchless. `spill` is 1 only for the slots whose bits
+    // straddle a byte, so when it is 0 the second load re-reads the same byte
+    // and the mask ignores the duplicated high half. Both reads stay inside the
+    // block: at BITS=3 the widest access is byte 12..13 of 14, at BITS=4 it is
+    // byte 17 of 18. That keeps the whole warp on one path instead of splitting
+    // it, which is what made this loop slow.
+    __shared__ float codebook[1 << BITS];
+    if (threadIdx.x < (1 << BITS)) codebook[threadIdx.x] = turbo_cb<BITS>(threadIdx.x);
+    __syncthreads();
+    __shared__ float accumulated[TURBO_MAX_DIM];
+    const int row_bytes = blocks * bytes;
+    const unsigned char* cache_base =
+        values + (long long)kv_head * capacity * row_bytes;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const int block_offset = (d >> 5) * bytes;
+        const int bit = (d & 31) * BITS;
+        const int byte_offset = block_offset + 2 + (bit >> 3);
+        const int shift = bit & 7;
+        const int spill = (shift + BITS > 8) ? 1 : 0;
+        constexpr unsigned mask = (1u << BITS) - 1u;
+        float result = 0.0f;
+        int token = 0, slot = RING ? first : 0;
+        while (token < tokens) {
+            const int run = RING ? min(tokens - token, capacity - slot) : tokens - token;
+            const unsigned char* row = cache_base + (long long)slot * row_bytes;
+            for (int i = 0; i < run; ++i, row += row_bytes) {
+                const float scale = __half2float(*(const __half*)(row + block_offset));
+                const unsigned low = row[byte_offset], high = row[byte_offset + spill];
+                result += head_scores[token + i] * scale
+                    * codebook[((low | (high << 8)) >> shift) & mask];
+            }
+            token += run;
+            slot = 0;
+        }
+        accumulated[d] = result;
+    }
+    __syncthreads();
+    turbo_fwht_shared(accumulated, head_dim);
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        output[head * head_dim + d] = accumulated[d] * turbo_sign_d(d, 1u);
+}
+#define KV_VALUES_TURBO(name, BITS) \
+extern "C" __global__ void name(float* scores, const unsigned char* values, float* output, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity) { \
+    kv_values_turbo_impl<BITS, false>(scores, values, output, heads, kv_heads, head_dim, \
+        tokens, capacity, 0); \
+}
+KV_VALUES_TURBO(kv_attention_values_turbo3, 3)
+KV_VALUES_TURBO(kv_attention_values_turbo4, 4)
+#undef KV_VALUES_TURBO
+// Expand a turbo cache window into contiguous f16 so the cuBLAS attention path
+// can run on it. The rotation is deliberately NOT undone: keys stay rotated and
+// are matched against a rotated query, and values stay rotated with the single
+// inverse applied to the attention output afterwards. Undoing it per entry here
+// would cost a Walsh-Hadamard per token and defeat the point.
+//
+// The ring is unwrapped on the way out, so the caller passes capacity == tokens
+// and first == 0 to cuBLAS and no wrap logic is needed downstream.
+// Output layout is [kv_head][tokens][head_dim], one warp per token.
+template<int BITS>
+__device__ void kv_dequant_turbo_impl(
+    const unsigned char* cache, __half* out,
+    const int kv_heads, const int head_dim, const int tokens,
+    const int capacity, const int first
+) {
+    constexpr int tokens_per_block = 8;
+    const int kv_head = blockIdx.x;
+    if (kv_head >= kv_heads) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int token = blockIdx.y * tokens_per_block + warp;
+    if (token >= tokens) return;
+    const int row_bytes = (head_dim / 32) * turbo_block_bytes<BITS>();
+    int slot = first + token;
+    if (slot >= capacity) slot -= capacity;
+    const unsigned char* row = cache + ((long long)kv_head * capacity + slot) * row_bytes;
+    __half* destination = out + ((long long)kv_head * tokens + token) * head_dim;
+    for (int d = lane; d < head_dim; d += 32)
+        destination[d] = __float2half(kv_ld_turbo<BITS>(row, d));
+}
+#define KV_DEQUANT_TURBO(name, BITS) \
+extern "C" __global__ void name(const unsigned char* cache, __half* out, \
+    const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first) { \
+    kv_dequant_turbo_impl<BITS>(cache, out, kv_heads, head_dim, tokens, capacity, first); \
+}
+KV_DEQUANT_TURBO(kv_dequant_turbo3_f16, 3)
+KV_DEQUANT_TURBO(kv_dequant_turbo4_f16, 4)
+#undef KV_DEQUANT_TURBO
+
+// Rotate (stream 0, for queries) or inverse-rotate (stream 1, for the attention
+// output) `rows` vectors of `dim` floats in place, one block per row. Forward is
+// R = H*S, inverse is R^-1 = R^T = S*H, so the two differ only in the order of
+// the sign flip and the transform.
+extern "C" __global__ void turbo_rotate_rows(
+    float* data, const int rows, const int dim, const int stream_id
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    __shared__ float scratch[TURBO_MAX_DIM];
+    float* base = data + (long long)row * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        scratch[i] = base[i] * turbo_sign_d(i, (unsigned)stream_id);
+    __syncthreads();
+    turbo_fwht_shared(scratch, dim);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) base[i] = scratch[i];
+}
+extern "C" __global__ void turbo_unrotate_rows(
+    float* data, const int rows, const int dim, const int stream_id
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    __shared__ float scratch[TURBO_MAX_DIM];
+    float* base = data + (long long)row * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) scratch[i] = base[i];
+    __syncthreads();
+    turbo_fwht_shared(scratch, dim);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        base[i] = scratch[i] * turbo_sign_d(i, (unsigned)stream_id);
+}
+
+#define KV_VALUES_TURBO_RING(name, BITS) \
+extern "C" __global__ void name(float* scores, const unsigned char* values, float* output, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first) { \
+    kv_values_turbo_impl<BITS, true>(scores, values, output, heads, kv_heads, head_dim, \
+        tokens, capacity, first); \
+}
+KV_VALUES_TURBO_RING(kv_attention_values_turbo3_ring, 3)
+KV_VALUES_TURBO_RING(kv_attention_values_turbo4_ring, 4)
+#undef KV_VALUES_TURBO_RING
+
 template<typename KT>
 __device__ void kv_scores_impl(
     const float* query, const KT* keys, float* scores,
@@ -4519,9 +5015,15 @@ extern "C" __global__ void kv_attention_prefill_softmax_f16(
         output[token] = __float2half(__half2float(output[token]) * inverse);
 }
 
-// Convert the column-major PV result back to row/head order and apply Qwen's
-// attention gate while the value is already in a register.
-extern "C" __global__ void qwen_attention_prefill_unpack_gate(
+// Convert the column-major PV result back to row/head order, optionally
+// applying Qwen's attention gate while the value is already in a register.
+//
+// GATE=false exists for the turbo cache path: its values are stored rotated, so
+// the result has to be inverse-rotated before any elementwise nonlinearity, and
+// the gate is a sigmoid. Fusing the gate here would apply it one step too early
+// and silently corrupt the output.
+template<bool GATE>
+__device__ void qwen_attention_prefill_unpack_impl(
     const float* packed, const float* gates, float* output,
     const int tile_start, const int tile_rows, const int heads,
     const int kv_heads, const int head_dim
@@ -4542,9 +5044,29 @@ extern "C" __global__ void qwen_attention_prefill_unpack_gate(
         const long long destination =
             ((long long)tile_start + row) * heads * head_dim
             + (long long)head * head_dim + dimension;
-        const float gate = fminf(80.0f, fmaxf(-80.0f, gates[destination]));
-        output[destination] = value / (1.0f + expf(-gate));
+        if (GATE) {
+            const float gate = fminf(80.0f, fmaxf(-80.0f, gates[destination]));
+            output[destination] = value / (1.0f + expf(-gate));
+        } else {
+            output[destination] = value;
+        }
     }
+}
+extern "C" __global__ void qwen_attention_prefill_unpack_gate(
+    const float* packed, const float* gates, float* output,
+    const int tile_start, const int tile_rows, const int heads,
+    const int kv_heads, const int head_dim
+) {
+    qwen_attention_prefill_unpack_impl<true>(
+        packed, gates, output, tile_start, tile_rows, heads, kv_heads, head_dim);
+}
+extern "C" __global__ void qwen_attention_prefill_unpack(
+    const float* packed, const float* gates, float* output,
+    const int tile_start, const int tile_rows, const int heads,
+    const int kv_heads, const int head_dim
+) {
+    qwen_attention_prefill_unpack_impl<false>(
+        packed, gates, output, tile_start, tile_rows, heads, kv_heads, head_dim);
 }
 
 )COLIBRI_CUDA"

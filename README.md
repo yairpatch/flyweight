@@ -281,11 +281,11 @@ reference fidelity is more important.
 
 ## Local server
 
-Serve a GGUF directly with the native v2 C++/CUDA runtime and hybrid expert
-execution:
+Serve a GGUF directly with the native v2 C++/CUDA runtime and automatic expert
+placement:
 
 ~~~console
-python -m colibri_next.cli serve-v2 models/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf --context-window 32768 --gpu-cache-mib 8192 --moe-device hybrid --host 127.0.0.1 --port 8000
+python -m colibri_next.cli serve-v2 models/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf --context-window 32768 --gpu-cache-mib 8192 --expert-mode auto --host 127.0.0.1 --port 8000
 ~~~
 
 `serve-v2` keeps model execution, prompt ingestion, and the greedy token loop
@@ -478,21 +478,39 @@ full-size storage for sliding layers when unrestricted prefix-cache rollback is
 more important than VRAM savings.
 
 Gemma 4 QAT MoE text GGUFs without per-layer embeddings or shared-KV tail
-layers are supported by the native CUDA runtime, including mixed
-local/global head geometry, proportional global RoPE, optional K=V global
-attention, QAT Q4_0 projections, dense GEGLU, and routed MoE layers. Routed
-Gemma 4 experts support CPU execution (`moe_device="cpu"`) or a bounded hybrid
-cache (`moe_device="hybrid"`): resident routed experts execute through grouped
-Q4_0 CUDA kernels while misses execute on CPU and are admitted for later
-tokens. Persistent attention, dense, router, and embedding weights remain on
-GPU. Use `model.native_runtime(...)` for architecture-neutral construction.
+layers are supported by the native CUDA runtime, including mixed local/global
+head geometry, proportional global RoPE, optional K=V global attention, QAT
+Q4_0 projections, dense GEGLU, and routed MoE layers. Persistent attention,
+dense, router, and embedding weights remain on GPU in every expert mode. Use
+`model.native_runtime(...)` for architecture-neutral construction.
+
+Native v2 has three public expert modes:
+
+| Mode | Routed-expert prefill | Routed-expert decode | Fit behavior |
+| --- | --- | --- | --- |
+| `cpu` | CPU | CPU | Does not allocate a GPU expert cache |
+| `auto` (default) | CPU | Request-stable hot set on GPU; misses on CPU | May resolve to `cpu` if the bounded cache cannot fit |
+| `resident` | GPU | GPU | Preparation fails unless every routed expert fits |
+
+All modes still use the GPU for the static model, attention, routing, shared
+experts, and KV/state; they use system RAM for the memory-mapped GGUF and
+runtime bookkeeping. The mode controls routed-expert placement, not the whole
+model device.
+
+`--moe-device` remains a command-line alias for `--expert-mode`. For backward
+compatibility, the old value `hybrid` preserves split prefill, mutable reactive
+placement, and seed-off defaults; `gpu` preserves the former reactive GPU
+paging path. They resolve to `legacy-hybrid` and `legacy-paging` respectively.
+Use the explicit canonical values `auto` and `resident` for the new policies.
+Startup output, `/health`, and the web runtime badge report the resolved mode
+and any fallback reason.
 
 For example, a 4 GiB total CUDA budget enables a bounded expert cache while
 keeping the remaining Gemma 4 experts in host memory:
 
 ```bash
 PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
-  --moe-device hybrid --gpu-cache-mib 4096 --context-window 32768
+  --expert-mode auto --gpu-cache-mib 4096 --context-window 32768
 ```
 
 `--parallel N` allocates an independent Gemma 4 KV slot for each concurrent
@@ -517,8 +535,43 @@ be reproduced explicitly, for example:
 ```bash
 PYTHONPATH=src python -m colibri_next.cli benchmark-v2 model.gguf \
   --prompt "Explain sliding-window attention." --chat \
-  --moe-device hybrid --cache-type-k f16 --cache-type-v f16
+  --expert-mode auto --cache-type-k f16 --cache-type-v f16
 ```
+
+With f16 K/V caches, decode switches from the small fused attention kernel to
+the cuBLAS tensor-core path at 128 tokens. Override the measured crossover with
+`COLIBRI_CUBLAS_ATTENTION_MIN_TOKENS=N`, or set
+`COLIBRI_CUBLAS_ATTENTION=0` for a fused-only comparison. The paths use
+different floating-point reduction orders, so moving the crossover can change
+greedy tokens near close logit ties even though both implement the same
+attention operation.
+
+`auto` fixes routed-expert prefill to CPU and expert residency to immutable;
+the legacy `--hybrid-prefill` and `--expert-residency` knobs do not override
+those safety properties. At the end of prefill, automatic placement combines
+request-local routing frequency with decayed persistent history, selects up to
+four hot experts per layer, and prepares one request-stable GPU set. The map
+freezes from the first emitted token until the request finishes; hits stay on
+GPU and misses run on CPU without admission, eviction, or expert upload.
+
+```bash
+PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
+  --expert-mode auto
+```
+
+Auto placement skips short cold prompts when there is no useful learned
+history, retains the previous useful set on a skip, and caps each phase at
+1 GiB or 100 ms. Use `--prefill-cache-seed off` (or `0`) to keep the existing
+immutable map unchanged, or a positive integer for an explicit per-layer
+count. For the former reactive behavior, select `--expert-mode legacy-hybrid`
+with `--expert-residency mutable`, or use the compatible spelling
+`--moe-device hybrid`. Select `legacy-paging` or `--moe-device gpu` for the
+former GPU-only paging path.
+
+`resident` never pages or falls back. Its preparation error itemizes the CUDA
+budget required by static weights, KV/state, workspace, staging, snapshots,
+and the complete routed-expert set. Use `auto`, `cpu`, or a larger budget when
+the full placement does not fit.
 
 The native v2 commands default to `--gpu-cache-mib 0`, which sizes the total
 CUDA allocation from currently free VRAM while retaining safety headroom.
@@ -527,8 +580,8 @@ manual budget directly reduces the resident expert cache and can make
 single-token MoE decode paging-bound. Runtime diagnostics report the selected
 `gpu_allocated_bytes`, `expert_cache_bytes`, and `expert_cache_slots`.
 
-For Claude Code and OpenCode, benchmark `--moe-device cpu` as well as
-`hybrid`: a bounded GPU expert cache is not automatically faster when routed
+For Claude Code and OpenCode, benchmark `--expert-mode cpu` as well as
+`auto`: a bounded GPU expert cache is not automatically faster when routed
 experts churn or GPU grouped kernels contend with long-context attention. On
 the 12 GiB reference system, CPU experts were faster and substantially more
 stable at 10K context. Agent clients also issue concurrent title, subagent, and
@@ -547,7 +600,7 @@ One practical low-memory agent configuration is:
 ```bash
 PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
   --model-name colibri-qwen36 \
-  --context-window 58000 --moe-device cpu \
+  --context-window 58000 --expert-mode cpu \
   --cpu-threads 12 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --parallel 2 --prompt-cache-mib 4096 --cpu-prefetch-auto
@@ -574,14 +627,13 @@ serving; both are diagnostic modes. Request-log prompt rates include time
 waiting for a sequence slot, so use the native `prefill_nanoseconds` and
 `decode_nanoseconds` counters when comparing kernels under concurrent load.
 
-`--prefill-cache-seed N` experimentally records Qwen routing frequency during
-prefill without admitting pages, then bulk-loads the hottest `N` experts per
-layer before generation. Those prompt-hot pages are pinned for the following
-decode so normal LRU admissions cannot immediately evict the working set;
-pinning is released when the next prompt is seeded. `COLIBRI_PREFILL_CACHE_SEED`
-can override the API/CLI setting for experiments. It is opt-in while its
-time-to-first-token versus early-generation tradeoff is evaluated across
-hardware and prompt workloads.
+`--prefill-cache-seed auto|off|N` controls Qwen post-prefill expert placement.
+Prefill records routing without reactive admission; the boundary phase reuses
+already-resident hot experts and bulk-loads only missing selections. The set is
+pinned for immutable decode. Diagnostics report seed time, bytes, selected and
+uploaded experts, later pinned-set hits, avoided frozen misses, skips, and
+budget stops. `COLIBRI_PREFILL_CACHE_SEED` accepts the same values and overrides
+the API/CLI setting for profiling.
 
 Hybrid MoE uses `--expert-paging auto` by default. When the CUDA driver supports
 registered host memory and the machine has enough available RAM for the model
@@ -676,9 +728,58 @@ tensor-core path. Runtime info reports `nvfp4_tensor_core_moe_calls`,
 `nvfp4_tensor_core_moe_fallbacks`, and the most recent
 `nvfp4_tensor_core_moe_last_status`; set
 `COLIBRI_NVFP4_TENSOR_CORE_TRACE=1` to print the cuBLASLt fallback status.
+Set `COLIBRI_NVFP4_TENSOR_CORE_PROFILE=1` to print averaged GPU time for
+gate/up repacking, input quantization, both FP4 GEMMs, activation, down
+repacking, down quantization, and accumulation every 40 routed layers.
+Set `COLIBRI_NVFP4_PERSISTENT=1` before runtime preparation to allocate an
+experimental second expert cache in cuBLASLt's native FP4 layout. Experts are
+converted once when admitted, eliminating decode-time weight repacking; the
+extra cache is the same size as the ordinary paged expert cache and is included
+in `gpu_allocated_bytes`. Unsupported shapes and unprepared cache entries fall
+back to the normal decode kernel.
+Set `COLIBRI_NVFP4_PERSISTENT_GROUPED=1` with the persistent cache to compact
+the selected native experts on-device and issue one gate/up plus one down GEMM.
+This is an experimental batch-oriented comparison; on the reference SM120
+laptop, its single-token compaction traffic is slower than the default
+per-expert persistent dispatch.
 Single-token NVFP4 routed experts use the one-row matvec by default. Set
 `COLIBRI_NVFP4_TILED=1` to select the experimental eight-row warp-tiled kernel
 for comparison.
+
+NVFP4 checkpoints quantize only the routed experts and ship every dense weight
+as bf16, which costs ~1.9x Q8_0's bytes for the same values. Those weights are
+re-read in full on every token, so the runtime requantizes them to Q8_0 once
+during preparation and uploads the packed form; the routed experts are left
+untouched, since they are paged from the mapping rather than the static arena
+and are what NVFP4 exists to compress. Every device dispatch reads an effective
+per-tensor type, so nothing downstream distinguishes a requantized weight from
+a checkpoint that shipped Q8_0 in the first place, and the host paths still
+decode the mapping at its original precision. On the reference SM120 laptop
+with Qwen3.6-35B-Fast-NVFP4 this converts 192 tensors and frees 2056 MiB,
+dropping `static_tensor_bytes` from 4.76 to 2.60 GB and lifting the expert
+cache from 3.12 to 5.28 GB (1763 to 2982 slots) for **+8-9% decode** in paired
+runs. Set `COLIBRI_REQUANT_BF16=0` to upload the bf16 weights unchanged.
+
+The token embedding table is a per-token gather, so when the checkpoint ships a
+separate `output.weight` it need not be VRAM-resident. `COLIBRI_EMBED_HOST=1`
+keeps it out of the static arena and stages only the row each token reads: a
+direct DMA out of the registered mapping for single-token decode, and one
+packed upload per chunk for the rows forward. The whole `vocab x hidden` matrix
+goes to the expert cache instead. Tied embeddings always stay resident because
+the LM head multiplies by the full matrix every token. The path is
+value-identical; `static_tensor_bytes` drops by the table size and
+`expert_cache_slots` rises to match.
+
+It is off by default because it is a net loss at the budgets measured so far.
+On the reference SM120 laptop with Qwen3.6-35B-Fast-NVFP4 (bf16 embeddings,
+8 GiB budget) it returns 1.02 GiB, lifting the expert cache from 3.12 to
+4.14 GiB and 1763 to 2338 slots, which does cut misses per token from 106.6 to
+74.5 and expert paging from 5.18 to 4.31 ms -- but host registration does not
+populate the mapping's pages, so each token's row read is a cold major fault on
+the critical path, adding ~1 ms/token to `route_wait` for ~2% net loss in
+paired runs. Note that between-process variance on that machine is ~7% while
+within-process variance is ~2%, so A/B runs need repeated timed regions inside
+one process to resolve an effect this size.
 
 Native MTP is cost-adaptive by default. For a requested `--mtp-drafts N`, the
 runtime measures four ordinary decode tokens and four speculative rounds on the

@@ -1669,7 +1669,13 @@ def create_handler(
             decoding_logged = False
             event_count = 0
             decode_tokens = 0
-            decode_started: float | None = None
+            # Span from the first token to the most recent one, as reported by
+            # the generator. N tokens span N-1 intervals, so the rate below
+            # divides by intervals rather than tokens -- the first token ends
+            # prompt evaluation and is not part of decode. This has to match
+            # formatGenerationMetrics() in ui/app.js, which the browser shows
+            # for the very same generation.
+            decode_elapsed = 0.0
             last_stat = 0.0
             try:
                 for event in events:
@@ -1689,12 +1695,16 @@ def create_handler(
                             elapsed = colibri.get("decode_elapsed_seconds")
                             if isinstance(tokens, int) and isinstance(elapsed, float):
                                 decode_tokens = tokens
-                                if decode_started is None:
-                                    decode_started = time.perf_counter() - elapsed
+                                decode_elapsed = elapsed
                                 now = time.perf_counter()
                                 if now - last_stat >= 1.0:
                                     last_stat = now
-                                    rate = (tokens / elapsed) if elapsed > 0 else 0.0
+                                    intervals = tokens - 1
+                                    rate = (
+                                        intervals / elapsed
+                                        if intervals > 0 and elapsed > 0
+                                        else 0.0
+                                    )
                                     sys.stderr.write(
                                         f"\r[gen ] {tokens} tokens "
                                         f"{rate:6.1f} tok/s {elapsed:5.1f}s"
@@ -1704,15 +1714,18 @@ def create_handler(
                         data, event if isinstance(event, dict) else None
                     )
                 if decode_tokens:
-                    total = (
-                        time.perf_counter() - decode_started
-                        if decode_started is not None
+                    # The last chunk's own span, not the wall time to the end of
+                    # the stream: the tail after the final token is teardown, not
+                    # decode, and counting it understated the rate.
+                    intervals = decode_tokens - 1
+                    rate = (
+                        intervals / decode_elapsed
+                        if intervals > 0 and decode_elapsed > 0
                         else 0.0
                     )
-                    rate = (decode_tokens / total) if total > 0 else 0.0
                     sys.stderr.write(
                         f"\n[gen ] done {decode_tokens} tokens "
-                        f"in {total:5.2f}s ({rate:6.1f} tok/s)\n"
+                        f"in {decode_elapsed:5.2f}s ({rate:6.1f} tok/s)\n"
                     )
                     sys.stderr.flush()
                 self.log_message("request completed: streaming events=%d", event_count)
