@@ -1,30 +1,58 @@
 /* =============================================================================
    Colibri Chat — design tokens
-   Surfaces step from --bg (deepest) up through --panel-soft, --panel and
-   --panel-raised (nearest the eye). The accent is reserved for interactive or
-   active affordances: focus rings, the send button, links, the active
-   conversation and live-generation state. Everything else is neutral.
+
+   Two complete themes, neither derived from the other. `:root` carries the
+   dark palette so a browser with scripting disabled still lands somewhere
+   coherent; `[data-theme]` is written before first paint by the inline script
+   in index.html, so the correct theme is on the element from the very first
+   frame and there is no flash to correct.
+
+   Surfaces step from --panel (the sidebar, furthest back) through --bg to
+   --panel-soft and --panel-raised (nearest the eye). Dark is genuinely dark —
+   a black sidebar over a near-black page — and neutral, with no blue cast.
+   Contrast ratio compresses at this end of the range, so adjacent surfaces are
+   only a few points of perceptual lightness apart; separation is carried by
+   --line borders rather than by the fills, which is why every panel here has
+   one.
+
+   The accent is reserved for interactive or active affordances: focus rings,
+   the send button, links, the active conversation and live-generation state.
+   Everything else is neutral. Every pairing here clears WCAG AA against every
+   surface it is used on.
    ========================================================================== */
 
-:root {
+:root,
+:root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: #0a0a0c;
-  --panel: #101015;
-  --panel-soft: #131318;
-  --panel-raised: #191a20;
-  --line: rgba(255, 255, 255, 0.07);
-  --line-strong: rgba(255, 255, 255, 0.13);
+  --bg: #0a0a0a;
+  --panel: #000000;
+  --panel-soft: #161616;
+  --panel-raised: #1c1c1c;
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.18);
 
-  --text: #edecf1;
-  --muted-strong: #bfbdc9;
-  --muted: #84828f;
+  --text: #ececec;
+  --muted-strong: #c8c8c8;
+  --muted: #9e9e9e;
 
-  --accent: #6f5cf0;
-  --accent-bright: #a294fb;
-  --accent-soft: rgba(111, 92, 240, 0.13);
-  --accent-line: rgba(162, 148, 251, 0.3);
-  --focus-ring: 0 0 0 3px rgba(111, 92, 240, 0.26);
+  --scrim: rgba(0, 0, 0, 0.74);
+
+  /* Selection needs its own step. A dark theme shows it by lifting away from
+     the background and a light theme by deepening into it, so this cannot be
+     an alias of one of the surfaces above. */
+  --selected: #242424;
+
+  /* Monochrome. The primary action is the lightest thing on the page in dark
+     and the darkest in light, so it reads as primary without spending a hue on
+     it. --accent-on is whatever sits on top of that fill. Links keep a colour,
+     because underline alone is a weak affordance inside dense prose. */
+  --accent: #ececec;
+  --accent-on: #0a0a0a;
+  --accent-soft: rgba(255, 255, 255, 0.08);
+  --accent-line: rgba(255, 255, 255, 0.3);
+  --link: #83b0ff;
+  --focus-ring: 0 0 0 3px rgba(255, 255, 255, 0.16);
 
   --success: #3fbe93;
   --success-soft: rgba(63, 190, 147, 0.12);
@@ -34,9 +62,13 @@
   --danger-soft: rgba(242, 112, 124, 0.1);
   --danger-line: rgba(242, 112, 124, 0.26);
 
-  --code-bg: #0c0d11;
-  --code-fg: #cfcdd8;
-  --code-line: rgba(255, 255, 255, 0.07);
+  --code-bg: #000000;
+  --code-fg: #e3e3e3;
+  --code-line: rgba(255, 255, 255, 0.09);
+
+  /* The prompt bubble. Distinct from the panel steps so it reads as speech
+     rather than as another surface of the frame. */
+  --bubble: #1c1c1c;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.3);
@@ -53,22 +85,27 @@
 
   --r-xs: 6px;
   --r-sm: 8px;
-  --r-md: 10px;
-  --r-lg: 14px;
-  --r-xl: 18px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 24px;
   --r-pill: 999px;
 
   /* Type scale. --fs-micro is for uppercase, letter-spaced labels only. */
-  --fs-micro: 10.5px;
-  --fs-xs: 11.5px;
-  --fs-sm: 12.5px;
-  --fs-md: 13.5px;
-  --fs-body: 14.5px;
-  --fs-lg: 16px;
-  --fs-xl: 19px;
+  --fs-micro: 11px;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  /* Long-form answers are read, not scanned. This is the one size in the scale
+     tuned for sustained reading rather than for chrome. */
+  --fs-body: 16px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
 
-  --sidebar-width: 264px;
-  --content-width: 748px;
+  --sidebar-width-base: 264px;
+  /* Collapsed width: wide enough for a 36px control plus breathing room. */
+  --rail-width: 56px;
+  --sidebar-width: var(--sidebar-width-base);
+  --content-width: 768px;
   --topbar-height: 58px;
 
   --font-sans: Inter, "Inter Variable", ui-sans-serif, -apple-system,
@@ -83,22 +120,31 @@
 :root[data-theme="light"] {
   color-scheme: light;
 
-  --bg: #fbfbfd;
-  --panel: #f2f2f6;
-  --panel-soft: #f6f6f9;
+  --bg: #ffffff;
+  --panel: #f9f9f9;
+  --panel-soft: #efefef;
   --panel-raised: #ffffff;
-  --line: rgba(24, 22, 34, 0.09);
-  --line-strong: rgba(24, 22, 34, 0.16);
+  --line: rgba(13, 13, 13, 0.1);
+  --line-strong: rgba(13, 13, 13, 0.18);
 
-  --text: #17161d;
-  --muted-strong: #4e4c58;
-  --muted: #75737f;
+  --text: #0d0d0d;
+  --muted-strong: #3d3d3d;
+  /* Chosen to clear AA against the deepest surface it lands on (--selected at
+     4.53), not just against the page. */
+  --muted: #676767;
 
-  --accent: #5b45d6;
-  --accent-bright: #4a35c4;
-  --accent-soft: rgba(91, 69, 214, 0.09);
-  --accent-line: rgba(91, 69, 214, 0.28);
-  --focus-ring: 0 0 0 3px rgba(91, 69, 214, 0.2);
+  /* Lighter than the dark theme's: a heavy black wash over a white page reads
+     as a power cut rather than as a dimmed layer. */
+  --scrim: rgba(0, 0, 0, 0.42);
+
+  --selected: #e6e6e6;
+
+  --accent: #0d0d0d;
+  --accent-on: #ffffff;
+  --accent-soft: rgba(13, 13, 13, 0.06);
+  --accent-line: rgba(13, 13, 13, 0.3);
+  --link: #0b62d6;
+  --focus-ring: 0 0 0 3px rgba(13, 13, 13, 0.14);
 
   --success: #199c72;
   --success-soft: rgba(25, 156, 114, 0.1);
@@ -108,9 +154,11 @@
   --danger-soft: rgba(214, 59, 76, 0.08);
   --danger-line: rgba(214, 59, 76, 0.24);
 
-  --code-bg: #f4f4f8;
-  --code-fg: #34323d;
-  --code-line: rgba(24, 22, 34, 0.1);
+  --code-bg: #f6f6f8;
+  --code-fg: #2f2f36;
+  --code-line: rgba(13, 13, 13, 0.11);
+
+  --bubble: #f4f4f4;
 
   --shadow-sm: 0 1px 2px rgba(38, 34, 58, 0.06);
   --shadow-md: 0 8px 24px rgba(38, 34, 58, 0.09);
@@ -164,7 +212,7 @@ textarea:focus-visible,
 select:focus-visible,
 a:focus-visible,
 summary:focus-visible {
-  outline: 2px solid var(--accent-bright);
+  outline: 2px solid var(--text);
   outline-offset: 2px;
 }
 
@@ -237,6 +285,7 @@ svg {
   height: 100%;
   min-height: 0;
   overflow: hidden;
+  transition: grid-template-columns 200ms ease;
 }
 
 .brand-row,
@@ -267,7 +316,7 @@ svg {
 }
 
 .icon-button:hover {
-  background: var(--panel-raised);
+  background: var(--panel-soft);
   color: var(--text);
 }
 
@@ -289,7 +338,6 @@ svg {
   flex-direction: column;
   overflow: hidden;
   padding: var(--space-4) var(--space-3) var(--space-3);
-  border-right: 1px solid var(--line);
   background: var(--panel);
 }
 
@@ -314,7 +362,7 @@ svg {
   place-items: center;
   border-radius: var(--r-sm);
   background: var(--accent-soft);
-  color: var(--accent-bright);
+  color: var(--text);
 }
 
 .brand-mark svg,
@@ -328,37 +376,99 @@ svg {
   height: 20px;
 }
 
-.sidebar-close,
+/* Collapsed, the sidebar becomes a rail rather than disappearing: the mark
+   stays put and the controls stack under it, so the way back is exactly where
+   the way out was. Nothing is unmounted — the list is only made invisible, so
+   it keeps its flex space and holds the footer at the bottom, and its scroll
+   position survives. `visibility` is also what takes the hidden rows out of the
+   tab order; a clipped column alone still holds focusable buttons. */
 .sidebar-open {
   display: none;
+}
+
+body.sidebar-hidden {
+  --sidebar-width: var(--rail-width);
+}
+
+body.sidebar-hidden .sidebar {
+  align-items: center;
+  padding: var(--space-3) var(--space-2) var(--space-2);
+}
+
+body.sidebar-hidden .brand-row {
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: 0 0 var(--space-2);
+}
+
+body.sidebar-hidden .brand > span:last-child,
+body.sidebar-hidden .new-chat-button span,
+body.sidebar-hidden .new-chat-button kbd,
+body.sidebar-hidden .sidebar-action span,
+body.sidebar-hidden .history-label {
+  display: none;
+}
+
+body.sidebar-hidden .new-chat-button,
+body.sidebar-hidden .search-box {
+  width: 36px;
+  min-height: 36px;
+  padding: 0;
+  justify-content: center;
+}
+
+body.sidebar-hidden .search-box {
+  height: 36px;
+  cursor: pointer;
+}
+
+body.sidebar-hidden .search-box input {
+  display: none;
+}
+
+body.sidebar-hidden .conversation-list {
+  visibility: hidden;
+}
+
+body.sidebar-hidden .sidebar-footer {
+  flex-direction: column;
+  gap: var(--space-1);
+  border-top: 0;
+}
+
+body.sidebar-hidden .sidebar-action {
+  width: 36px;
+  flex: 0 0 auto;
+  justify-content: center;
+  padding: var(--space-2) 0;
 }
 
 .new-chat-button {
   display: flex;
   width: 100%;
-  min-height: 38px;
+  min-height: 40px;
   align-items: center;
   gap: var(--space-2);
   padding: 0 var(--space-3);
   cursor: pointer;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--panel-raised);
   color: var(--text);
-  font-size: var(--fs-sm);
-  font-weight: 600;
+  font-size: var(--fs-md);
+  font-weight: 550;
   text-align: left;
   transition: border-color 140ms ease, background 140ms ease;
 }
 
 .new-chat-button:hover {
-  border-color: var(--accent-line);
+  border-color: var(--line-strong);
 }
 
 .new-chat-button svg {
   width: 16px;
   height: 16px;
-  color: var(--accent-bright);
+  color: var(--muted-strong);
 }
 
 .new-chat-button kbd {
@@ -374,7 +484,7 @@ svg {
 
 .search-box {
   display: flex;
-  height: 34px;
+  height: 36px;
   align-items: center;
   gap: var(--space-2);
   margin-top: var(--space-2);
@@ -402,7 +512,7 @@ svg {
   outline: 0;
   background: transparent;
   color: var(--text);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
 }
 
 .search-box input::placeholder {
@@ -429,15 +539,16 @@ svg {
   position: relative;
   display: flex;
   width: 100%;
+  min-height: 36px;
   align-items: center;
   gap: var(--space-2);
   margin: 1px 0;
-  padding: var(--space-2) 30px var(--space-2) var(--space-2);
+  padding: var(--space-2) 32px var(--space-2) var(--space-3);
   cursor: pointer;
   border-radius: var(--r-sm);
   background: transparent;
   color: var(--muted-strong);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   text-align: left;
   transition: color 120ms ease, background 120ms ease;
 }
@@ -448,19 +559,9 @@ svg {
 }
 
 .conversation-item.active {
-  background: var(--panel-raised);
+  background: var(--selected);
   color: var(--text);
   font-weight: 550;
-}
-
-.conversation-item.active::before {
-  position: absolute;
-  left: 0;
-  width: 2px;
-  height: 16px;
-  border-radius: var(--r-pill);
-  background: var(--accent-bright);
-  content: "";
 }
 
 .conversation-item > svg {
@@ -544,7 +645,7 @@ svg {
   border-radius: var(--r-sm);
   background: transparent;
   color: var(--muted-strong);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   text-align: left;
   transition: color 120ms ease, background 120ms ease;
 }
@@ -559,16 +660,17 @@ svg {
   height: 16px;
 }
 
-.sun-icon {
+/* The control shows the *preference*, not the resolved theme: on "System" it
+   shows a display, so it is clear the choice is being deferred to the OS
+   rather than that light or dark was picked by hand. */
+.theme-icon {
   display: none;
 }
 
-:root[data-theme="light"] .sun-icon {
+:root[data-theme-preference="system"] .system-icon,
+:root[data-theme-preference="light"] .sun-icon,
+:root[data-theme-preference="dark"] .moon-icon {
   display: block;
-}
-
-:root[data-theme="light"] .moon-icon {
-  display: none;
 }
 
 .sidebar-scrim {
@@ -595,9 +697,8 @@ svg {
   min-height: var(--topbar-height);
   justify-content: space-between;
   gap: var(--space-4);
-  padding: 0 var(--space-5);
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  padding: 0 var(--space-4);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: blur(14px);
 }
 
@@ -607,29 +708,21 @@ svg {
   gap: var(--space-1);
 }
 
-.conversation-heading {
-  min-width: 0;
-  padding-left: var(--space-1);
-}
-
-.conversation-title {
-  overflow: hidden;
-  max-width: min(46vw, 520px);
-  color: var(--text);
-  font-size: var(--fs-md);
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .model-line {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: var(--space-2);
-  margin-top: 3px;
-  color: var(--muted);
-  font-size: var(--fs-xs);
+  padding-inline-start: var(--space-1);
+  color: var(--muted-strong);
+  font-size: var(--fs-md);
+  font-weight: 500;
+}
+
+.model-line > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .model-selector-wrap {
@@ -672,7 +765,7 @@ svg {
 }
 
 .status-dot.busy {
-  background: var(--accent-bright);
+  background: var(--text);
   box-shadow: 0 0 0 3px var(--accent-soft);
   animation: pulse 1.5s ease infinite;
 }
@@ -686,25 +779,23 @@ svg {
   50% { opacity: 0.45; }
 }
 
-.runtime-pill {
+.runtime-chip {
   display: flex;
-  height: 26px;
+  height: 24px;
   align-items: center;
-  gap: var(--space-2);
   margin-right: var(--space-1);
   padding: 0 var(--space-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-pill);
+  border-radius: var(--r-sm);
+  background: var(--panel-soft);
   color: var(--muted);
   font-size: var(--fs-xs);
-  font-weight: 550;
-  letter-spacing: 0.01em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: default;
 }
 
-.runtime-divider {
-  width: 1px;
-  height: 10px;
-  background: var(--line-strong);
+.runtime-chip[hidden] {
+  display: none;
 }
 
 /* =============================================================================
@@ -727,10 +818,13 @@ svg {
 
 /* --- Welcome ------------------------------------------------------------- */
 
+/* Just a mark and a line, centred over the composer. The eyebrow, the
+   standfirst and the four prompt cards were scaffolding around an empty state
+   that only ever needs to say the app is ready. */
 .welcome {
   display: flex;
-  min-height: calc(100vh - 260px);
-  min-height: calc(100svh - 260px);
+  min-height: calc(100vh - 300px);
+  min-height: calc(100svh - 300px);
   flex-direction: column;
   align-items: center;
   justify-content: center;
@@ -744,115 +838,27 @@ svg {
 
 .welcome-mark {
   display: grid;
-  width: 44px;
-  height: 44px;
-  margin-bottom: var(--space-5);
+  width: 40px;
+  height: 40px;
+  margin-bottom: var(--space-4);
   place-items: center;
-  border-radius: var(--r-lg);
+  border-radius: var(--r-md);
   background: var(--accent-soft);
-  color: var(--accent-bright);
+  color: var(--text);
 }
 
 .welcome-mark svg {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
 }
 
 .welcome h1 {
   margin: 0;
-  font-size: clamp(24px, 3.4vw, 32px);
-  font-weight: 600;
-  letter-spacing: -0.035em;
+  font-size: clamp(22px, 3vw, 28px);
+  font-weight: 500;
+  letter-spacing: -0.02em;
 }
 
-.welcome-copy {
-  max-width: 420px;
-  margin: var(--space-3) auto var(--space-6);
-  color: var(--muted);
-  font-size: var(--fs-body);
-  line-height: 1.6;
-}
-
-.suggestion-grid {
-  display: grid;
-  width: min(100%, 620px);
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-2);
-}
-
-.suggestion {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3);
-  cursor: pointer;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: transparent;
-  color: var(--text);
-  text-align: left;
-  transition: border-color 150ms ease, background 150ms ease;
-}
-
-.suggestion:hover {
-  border-color: var(--line-strong);
-  background: var(--panel-soft);
-}
-
-.suggestion > svg {
-  width: 15px;
-  height: 15px;
-  color: var(--muted);
-  opacity: 0;
-  transition: opacity 150ms ease;
-}
-
-.suggestion:hover > svg,
-.suggestion:focus-visible > svg {
-  opacity: 1;
-}
-
-.suggestion-icon {
-  display: grid;
-  width: 28px;
-  height: 28px;
-  place-items: center;
-  border-radius: var(--r-sm);
-  background: var(--panel-soft);
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  transition: color 150ms ease;
-}
-
-.suggestion:hover .suggestion-icon {
-  color: var(--accent-bright);
-}
-
-:root[data-theme="light"] .suggestion-icon {
-  background: var(--panel);
-}
-
-.suggestion strong,
-.suggestion small {
-  display: block;
-}
-
-.suggestion strong {
-  margin-bottom: 2px;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-}
-
-.suggestion small {
-  overflow: hidden;
-  color: var(--muted);
-  font-size: var(--fs-xs);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 /* --- Messages ------------------------------------------------------------ */
 
@@ -864,93 +870,92 @@ svg {
 
 .message {
   position: relative;
-  display: grid;
-  grid-template-columns: 28px minmax(0, 1fr);
-  gap: var(--space-3);
-  animation: message-in 200ms ease both;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
 }
 
-@keyframes message-in {
-  from { opacity: 0; transform: translateY(4px); }
+/* The prompt is a bubble pinned to the end of the line; the answer runs the
+   full width of the column as prose. `flex-end` follows the writing direction,
+   so a right-to-left transcript mirrors as a whole. */
+.message.user {
+  align-items: flex-end;
 }
 
-.message-avatar {
-  display: grid;
-  width: 28px;
-  height: 28px;
-  place-items: center;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--panel-soft);
-  color: var(--muted);
-  font-size: var(--fs-micro);
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-
-.message.assistant .message-avatar {
-  background: var(--panel-raised);
-  color: var(--accent-bright);
+.message.user .message-body {
+  max-width: min(100%, 560px);
 }
 
 .message-body {
-  min-width: 0;
-  padding-top: 1px;
-}
-
-.message-meta {
   display: flex;
-  min-height: 20px;
-  align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
+  flex-direction: column;
 }
 
-.message-author {
-  font-size: var(--fs-sm);
-  font-weight: 650;
-  letter-spacing: -0.005em;
-}
-
-.message-time,
-.message-metrics {
-  color: var(--muted);
-  font-size: var(--fs-xs);
-}
-
-.message-metrics {
-  margin-left: auto;
-}
-
-.message-body > .message-metrics {
-  display: block;
-  margin-top: var(--space-2);
-  margin-left: 0;
+.message.assistant .message-body {
+  width: 100%;
 }
 
 .message-content {
-  color: var(--muted-strong);
+  color: var(--text);
   font-size: var(--fs-body);
-  line-height: 1.72;
-  overflow-wrap: anywhere;
+  line-height: 1.75;
+  text-align: start;
+  overflow-wrap: break-word;
 }
 
-/* The prompt reads as a quoted block rather than another column of prose. */
 .message.user .message-content {
-  width: fit-content;
-  max-width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--panel-soft);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--r-xl);
+  background: var(--bubble);
   color: var(--text);
 }
 
 .message.user .message-content:has(.edit-textarea) {
   width: 100%;
   padding: 0;
-  border-color: transparent;
   background: transparent;
+}
+
+/* --- Message toolbar ----------------------------------------------------- */
+
+.message-toolbar {
+  display: flex;
+  min-height: 26px;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+.message.user .message-toolbar {
+  justify-content: flex-end;
+}
+
+.message-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.message-time,
+.message-metrics {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+.message-metrics:empty {
+  display: none;
+}
+
+/* The timestamp is reference material, not part of reading the answer. */
+.message-time {
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.message:hover .message-time {
+  opacity: 1;
 }
 
 .message-content p {
@@ -984,10 +989,12 @@ svg {
 .message-content h3 { font-size: 1.08em; }
 .message-content h4, .message-content h5, .message-content h6 { font-size: 1em; }
 
+/* Logical properties throughout this section: the rule that opens a blockquote
+   or hangs a bullet has to swap sides with the text, not stay pinned left. */
 .message-content blockquote {
   margin: var(--space-3) 0;
   padding: var(--space-1) var(--space-4);
-  border-left: 2px solid var(--line-strong);
+  border-inline-start: 2px solid var(--line-strong);
   color: var(--muted);
 }
 
@@ -995,12 +1002,12 @@ svg {
 
 .message-content ul, .message-content ol {
   margin: var(--space-3) 0;
-  padding-left: 1.4em;
+  padding-inline-start: 1.4em;
 }
 
 .message-content li {
   margin: var(--space-1) 0;
-  padding-left: 0.2em;
+  padding-inline-start: 0.2em;
 }
 
 .message-content li::marker {
@@ -1013,10 +1020,17 @@ svg {
   border-top: 1px solid var(--line);
 }
 
+/* Isolated runs. A URL, an identifier or a Latin term inside a right-to-left
+   sentence must not drag the punctuation around it to the other side; each of
+   these lays itself out independently of its neighbours. */
+.message-content :is(a, code, strong, em) {
+  unicode-bidi: isolate;
+}
+
 .message-content a {
-  color: var(--accent-bright);
+  color: var(--link);
   text-decoration: underline;
-  text-decoration-color: var(--accent-line);
+  text-decoration-color: color-mix(in srgb, var(--link) 45%, transparent);
   text-underline-offset: 2px;
 }
 
@@ -1035,139 +1049,111 @@ svg {
 
 /* --- Thinking ------------------------------------------------------------ */
 
-.thinking-block,
-.thinking-streaming {
-  margin: var(--space-3) 0;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--panel-soft);
-}
-
-.thinking-summary,
-.thinking-stream-header {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  cursor: pointer;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  user-select: none;
-  list-style: none;
-  transition: background 140ms ease;
+/* One quiet line, not a card. Reasoning is context for the answer, so it takes
+   the visual weight of a caption and stays closed unless it is asked for. */
+.thinking {
+  margin: 0 0 var(--space-4);
 }
 
 .thinking-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) 0;
+  cursor: pointer;
   color: var(--muted);
-}
-
-.thinking-stream-header {
-  color: var(--accent-bright);
-}
-
-.thinking-summary:hover,
-.thinking-stream-header:hover {
-  background: color-mix(in srgb, var(--panel-raised) 60%, transparent);
-}
-
-.thinking-summary::before {
-  display: inline-block;
-  width: 0;
-  height: 0;
-  border-top: 4px solid transparent;
-  border-bottom: 4px solid transparent;
-  border-left: 5px solid currentColor;
-  content: "";
-  transition: transform 150ms ease;
-}
-
-.thinking-block[open] .thinking-summary::before {
-  transform: rotate(90deg);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  user-select: none;
+  list-style: none;
 }
 
 .thinking-summary::-webkit-details-marker {
   display: none;
 }
 
-.thinking-stream-header svg {
-  width: 15px;
-  height: 15px;
-  flex-shrink: 0;
+.thinking-summary:hover {
+  color: var(--muted-strong);
 }
 
 .thinking-chevron {
-  margin-left: auto;
-  color: var(--muted);
-  font-size: var(--fs-micro);
-  transition: transform 200ms ease;
+  width: 13px;
+  height: 13px;
+  opacity: 0.7;
+  transition: transform 180ms ease;
 }
 
-.thinking-chevron.open {
+.thinking[open] .thinking-chevron {
   transform: rotate(90deg);
 }
 
-/* The dots are a separate flex child, so pull them back onto the label. */
-.thinking-ellipsis {
-  display: inline-block;
-  width: 1.2em;
-  margin-left: calc(var(--space-2) * -1);
-  overflow: hidden;
-  text-align: left;
-  vertical-align: bottom;
-  animation: thinking-dots 1.4s steps(4, end) infinite;
+/* A slow sweep across the label while the model is still reasoning. It reads
+   as activity without the twitch of a blinking or counting indicator. */
+.thinking.live .thinking-label {
+  background: linear-gradient(
+    90deg,
+    var(--muted) 30%,
+    var(--text) 50%,
+    var(--muted) 70%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: thinking-shimmer 2.2s linear infinite;
 }
 
-@keyframes thinking-dots {
-  0% { width: 0; }
-  100% { width: 1.2em; }
+@keyframes thinking-shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
 }
 
-.thinking-body,
-.thinking-stream-body {
-  padding: var(--space-3);
-  border-top: 1px solid var(--line);
+.thinking-body {
+  max-height: 260px;
+  margin-top: var(--space-2);
+  padding-inline-start: var(--space-4);
+  overflow-y: auto;
+  border-inline-start: 2px solid var(--line-strong);
   color: var(--muted);
   font-size: var(--fs-sm);
-  line-height: 1.65;
-}
-
-.thinking-body p {
-  margin: 0 0 var(--space-2);
-}
-
-.thinking-body p:last-child {
-  margin-bottom: 0;
-}
-
-.thinking-stream-body {
+  line-height: 1.7;
+  text-align: start;
   white-space: pre-wrap;
+  scrollbar-width: thin;
 }
 
 .streaming-badge {
   padding: 2px var(--space-1);
   border-radius: var(--r-xs);
   background: var(--accent-soft);
-  color: var(--accent-bright);
+  color: var(--muted-strong);
   font-size: var(--fs-micro);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
-.stream-cursor {
-  display: inline-block;
-  width: 2px;
-  height: 1.05em;
-  margin-left: 2px;
-  border-radius: 1px;
-  background: var(--accent-bright);
-  vertical-align: -0.16em;
-  animation: cursor-blink 1s step-end infinite;
+/* A hard blink on a cursor that is also moving is what made the stream tiring
+   to watch: two competing rhythms. This is a soft dot that breathes instead,
+   and it sits at the end of the text in whichever direction the text runs. */
+.stream-cursor[hidden] {
+  display: none;
 }
 
-@keyframes cursor-blink {
-  50% { opacity: 0; }
+.stream-cursor {
+  display: inline-block;
+  width: 0.62em;
+  height: 0.62em;
+  margin-inline-start: 0.18em;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: baseline;
+  animation: cursor-pulse 1.3s ease-in-out infinite;
+}
+
+@keyframes cursor-pulse {
+  0%, 100% { opacity: 0.9; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.82); }
 }
 
 /* Holds the tool cards that are re-rendered while a response streams, without
@@ -1178,8 +1164,13 @@ svg {
 
 /* --- Code ---------------------------------------------------------------- */
 
+/* Code is left-to-right in every language, and `isolate` keeps it from
+   perturbing the paragraph it sits between. */
 .message-content pre {
   position: relative;
+  direction: ltr;
+  unicode-bidi: isolate;
+  text-align: left;
   margin: var(--space-4) 0;
   overflow: auto;
   border: 1px solid var(--code-line);
@@ -1232,8 +1223,7 @@ svg {
 }
 
 .message-content code {
-  padding: 1px 5px;
-  border: 1px solid var(--line);
+  padding: 1.5px 5px;
   border-radius: var(--r-xs);
   background: var(--panel-soft);
   color: var(--text);
@@ -1274,7 +1264,7 @@ svg {
   z-index: 100;
   display: flex;
   flex-direction: column;
-  background: rgba(0, 0, 0, 0.82);
+  background: var(--scrim);
   backdrop-filter: blur(8px);
   animation: preview-in 180ms ease both;
 }
@@ -1311,7 +1301,7 @@ svg {
 }
 
 .preview-close:hover {
-  background: var(--panel-raised);
+  background: var(--panel-soft);
   color: var(--text);
 }
 
@@ -1330,73 +1320,31 @@ svg {
 
 /* --- Message affordances ------------------------------------------------- */
 
-.message-copy {
-  display: grid;
-  width: 24px;
-  height: 24px;
-  cursor: pointer;
-  place-items: center;
-  border-radius: var(--r-xs);
-  background: transparent;
-  color: var(--muted);
-  opacity: 0;
-  transition: color 120ms ease, background 120ms ease, opacity 120ms ease;
-}
-
-.message:hover .message-copy,
-.message-copy:focus-visible {
-  opacity: 1;
-}
-
-.message-copy:hover {
-  background: var(--panel-raised);
-  color: var(--text);
-}
-
-.message-copy svg {
-  width: 13px;
-  height: 13px;
-}
-
-.message-actions {
-  display: flex;
-  gap: 1px;
-  margin-left: auto;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.message:hover .message-actions,
-.message-actions:focus-within {
-  opacity: 1;
-}
-
 .msg-action {
   display: grid;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   cursor: pointer;
   place-items: center;
-  border-radius: var(--r-xs);
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--muted);
   transition: color 120ms ease, background 120ms ease;
 }
 
 .msg-action:hover {
-  background: var(--panel-raised);
+  background: var(--panel-soft);
   color: var(--text);
 }
 
 .msg-action svg {
-  width: 13px;
-  height: 13px;
+  width: 15px;
+  height: 15px;
 }
 
 .tool-card {
   margin-top: var(--space-3);
   padding: var(--space-3);
-  border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--panel-soft);
 }
@@ -1414,7 +1362,7 @@ svg {
 .tool-card-header svg {
   width: 14px;
   height: 14px;
-  color: var(--accent-bright);
+  color: var(--muted-strong);
 }
 
 .tool-card pre {
@@ -1478,7 +1426,7 @@ svg {
 }
 
 .edit-textarea:focus {
-  border-color: var(--accent-line);
+  border-color: var(--line-strong);
   box-shadow: var(--focus-ring);
 }
 
@@ -1494,30 +1442,69 @@ svg {
    ========================================================================== */
 
 .composer-area {
+  position: relative;
   z-index: 10;
   padding: var(--space-2) var(--space-5) var(--space-3);
   background: linear-gradient(to top, var(--bg) 70%, transparent);
+}
+
+/* Scrolling back through a long answer should not mean losing the live end of
+   it. This rides above the composer whenever the transcript is detached. */
+.scroll-bottom {
+  position: absolute;
+  bottom: calc(100% - var(--space-1));
+  left: 50%;
+  display: grid;
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--panel-raised);
+  color: var(--muted-strong);
+  box-shadow: var(--shadow-md);
+  transform: translateX(-50%);
+  transition: color 140ms ease, border-color 140ms ease;
+  animation: scroll-cue-in 160ms ease both;
+}
+
+.scroll-bottom[hidden] {
+  display: none;
+}
+
+.scroll-bottom:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.scroll-bottom svg {
+  width: 16px;
+  height: 16px;
+}
+
+@keyframes scroll-cue-in {
+  from { opacity: 0; transform: translate(-50%, 6px); }
 }
 
 .composer-shell {
   width: min(100%, var(--content-width));
   margin: 0 auto;
   padding: var(--space-3) var(--space-3) var(--space-2) var(--space-4);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line);
   border-radius: var(--r-xl);
   background: var(--panel-raised);
-  box-shadow: var(--shadow-md);
-  transition: border-color 160ms ease, box-shadow 160ms ease;
+  transition: border-color 160ms ease;
 }
 
 .composer-shell:focus-within {
-  border-color: var(--accent-line);
-  box-shadow: var(--shadow-md), var(--focus-ring);
+  border-color: var(--line-strong);
 }
 
 .composer-shell textarea {
   display: block;
   width: 100%;
+  text-align: start;
   max-height: 180px;
   overflow-y: auto;
   border: 0;
@@ -1567,9 +1554,9 @@ svg {
 }
 
 .option-chip[aria-pressed="true"] {
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-  color: var(--accent-bright);
+  border-color: var(--line-strong);
+  background: var(--panel-soft);
+  color: var(--text);
 }
 
 .option-chip svg {
@@ -1579,19 +1566,19 @@ svg {
 
 .send-button {
   display: grid;
-  width: 32px;
-  height: 32px;
+  width: 34px;
+  height: 34px;
   flex: 0 0 auto;
   cursor: pointer;
   place-items: center;
-  border-radius: var(--r-sm);
+  border-radius: 50%;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-on);
   transition: background 140ms ease, opacity 140ms ease;
 }
 
 .send-button:hover {
-  background: color-mix(in srgb, var(--accent) 82%, #fff);
+  background: color-mix(in srgb, var(--accent) 84%, var(--muted));
 }
 
 .send-button:disabled {
@@ -1641,7 +1628,7 @@ svg {
 }
 
 .settings-dialog::backdrop {
-  background: rgba(4, 5, 8, 0.66);
+  background: var(--scrim);
   backdrop-filter: blur(4px);
 }
 
@@ -1728,7 +1715,7 @@ svg {
 
 .field input:focus,
 .field textarea:focus {
-  border-color: var(--accent-line);
+  border-color: var(--line-strong);
   box-shadow: var(--focus-ring);
 }
 
@@ -1794,7 +1781,7 @@ svg {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--panel-raised);
   box-shadow: var(--shadow-sm);
   content: "";
   transition: transform 150ms ease;
@@ -1805,11 +1792,12 @@ svg {
 }
 
 .toggle-field input:checked + .toggle::after {
+  background: var(--accent-on);
   transform: translateX(14px);
 }
 
 .toggle-field input:focus-visible + .toggle {
-  outline: 2px solid var(--accent-bright);
+  outline: 2px solid var(--text);
   outline-offset: 2px;
 }
 
@@ -1842,11 +1830,48 @@ svg {
 
 .primary-button {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-on);
 }
 
 .primary-button:hover {
-  background: color-mix(in srgb, var(--accent) 82%, #fff);
+  background: color-mix(in srgb, var(--accent) 84%, var(--muted));
+}
+
+/* =============================================================================
+   Tooltips
+   ========================================================================== */
+
+/* Placed with a transform from the top-left corner of the viewport, so the
+   script sets one property and the browser does no layout work per move. */
+.tooltip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 200;
+  max-width: 260px;
+  padding: 5px var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--panel-raised);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1.45;
+  /* `pre-line` rather than `nowrap`: the runtime chip's label is several lines.
+     Short labels have nothing to wrap, so they still sit on one. */
+  white-space: pre-line;
+  text-align: start;
+  pointer-events: none;
+  box-shadow: var(--shadow-md);
+  animation: tooltip-in 110ms ease both;
+}
+
+.tooltip[hidden] {
+  display: none;
+}
+
+@keyframes tooltip-in {
+  from { opacity: 0; }
 }
 
 /* =============================================================================
@@ -1915,7 +1940,7 @@ svg {
     display: block;
     visibility: hidden;
     cursor: pointer;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--scrim);
     opacity: 0;
     transition: opacity 220ms ease, visibility 220ms ease;
   }
@@ -1923,6 +1948,57 @@ svg {
   body.sidebar-visible .sidebar-scrim {
     visibility: visible;
     opacity: 1;
+  }
+
+  /* The drawer slides over the page instead of taking a column, so the
+     collapsed desktop width must not follow it here. */
+  body.sidebar-hidden {
+    --sidebar-width: var(--sidebar-width-base);
+  }
+
+  body.sidebar-hidden .sidebar {
+    align-items: stretch;
+    padding: var(--space-4) var(--space-3) var(--space-3);
+  }
+
+  body.sidebar-hidden .brand-row {
+    flex-direction: row;
+    padding: 0 var(--space-1) var(--space-4);
+  }
+
+  body.sidebar-hidden .brand > span:last-child,
+  body.sidebar-hidden .new-chat-button span,
+  body.sidebar-hidden .sidebar-action span,
+  body.sidebar-hidden .history-label {
+    display: block;
+  }
+
+  body.sidebar-hidden .new-chat-button,
+  body.sidebar-hidden .search-box,
+  body.sidebar-hidden .sidebar-action {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  body.sidebar-hidden .new-chat-button {
+    padding: 0 var(--space-3);
+  }
+
+  body.sidebar-hidden .search-box {
+    padding: 0 var(--space-2);
+  }
+
+  body.sidebar-hidden .search-box input {
+    display: block;
+  }
+
+  body.sidebar-hidden .conversation-list {
+    visibility: visible;
+  }
+
+  body.sidebar-hidden .sidebar-footer {
+    flex-direction: row;
+    border-top: 1px solid var(--line);
   }
 
   .sidebar-close,
@@ -1938,7 +2014,7 @@ svg {
     padding: 0 var(--space-3);
   }
 
-  .runtime-pill {
+  .runtime-chip {
     display: none !important;
   }
 
@@ -1955,22 +2031,14 @@ svg {
 
 @media (max-width: 600px) {
   :root {
-    --fs-body: 14px;
+    --fs-body: 15px;
+  }
+
+  .model-line {
+    font-size: var(--fs-sm);
   }
 
   .topbar-actions .icon-button:first-of-type {
-    display: none;
-  }
-
-  .conversation-title {
-    max-width: 47vw;
-  }
-
-  .suggestion-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .suggestion:nth-child(n + 3) {
     display: none;
   }
 
@@ -1979,14 +2047,12 @@ svg {
     min-height: calc(100svh - 220px);
   }
 
-  .message {
-    grid-template-columns: 26px minmax(0, 1fr);
-    gap: var(--space-2);
+  .messages {
+    gap: var(--space-5);
   }
 
-  .message-avatar {
-    width: 26px;
-    height: 26px;
+  .message.user .message-body {
+    max-width: 88%;
   }
 
   .option-chip:first-child {
@@ -2005,9 +2071,7 @@ svg {
 /* Touch pointers have no hover, so row affordances stay visible. */
 @media (hover: none) {
   .conversation-delete,
-  .message-actions,
-  .message-copy,
-  .suggestion > svg {
+  .message-time {
     opacity: 1;
   }
 }

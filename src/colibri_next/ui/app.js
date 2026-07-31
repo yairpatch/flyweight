@@ -1,6 +1,7 @@
 const STORAGE_KEY = "colibri.chat.v1";
 const SETTINGS_KEY = "colibri.settings.v1";
 const THEME_KEY = "colibri.theme";
+const SIDEBAR_KEY = "colibri.sidebar";
 const API_KEY = "colibri.api-key";
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -18,21 +19,21 @@ const elements = {
   sidebarOpen: document.querySelector("#sidebar-open"),
   sidebarClose: document.querySelector("#sidebar-close"),
   sidebarScrim: document.querySelector("#sidebar-scrim"),
-  brand: document.querySelector(".brand"),
+  brand: document.querySelector(".brand-row .brand"),
+  searchBox: document.querySelector("#search-box"),
   newChat: document.querySelector("#new-chat"),
   conversationSearch: document.querySelector("#conversation-search"),
   conversationList: document.querySelector("#conversation-list"),
-  conversationTitle: document.querySelector("#conversation-title"),
   statusDot: document.querySelector("#status-dot"),
   modelStatus: document.querySelector("#model-status"),
   modelSelectorWrap: document.querySelector("#model-selector-wrap"),
   modelSelector: document.querySelector("#model-selector"),
   runtimePill: document.querySelector("#runtime-pill"),
   deviceLabel: document.querySelector("#device-label"),
-  cacheLabel: document.querySelector("#cache-label"),
   chatScroll: document.querySelector("#chat-scroll"),
   welcome: document.querySelector("#welcome"),
   messages: document.querySelector("#messages"),
+  scrollBottom: document.querySelector("#scroll-bottom"),
   promptInput: document.querySelector("#prompt-input"),
   composerShell: document.querySelector("#composer-shell"),
   sendButton: document.querySelector("#send-button"),
@@ -63,6 +64,8 @@ const state = {
   activeId: null,
   settings: loadSettings(),
   apiKey: readSession(API_KEY),
+  theme: "system",
+  sidebarHidden: false,
   model: null,
   models: [],
   health: null,
@@ -199,6 +202,30 @@ function persistSettings() {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
 }
 
+// The entry point for every "new chat" affordance: the logo, the sidebar
+// button and Ctrl+K. An unused conversation is not worth a second one, so
+// asking for a blank chat while already sitting in one does nothing but return
+// the cursor to the composer. Without this, every click of the logo left
+// another identical "New conversation" in the history.
+function startNewConversation() {
+  if (state.generating) {
+    stopGeneration();
+  }
+  const active = activeConversation();
+  if (active && !active.messages.length) {
+    closeSidebar();
+    elements.promptInput.focus();
+    return active;
+  }
+  const blank = state.conversations.find((conversation) => !conversation.messages.length);
+  if (blank) {
+    selectConversation(blank.id);
+    elements.promptInput.focus();
+    return blank;
+  }
+  return createConversation();
+}
+
 function createConversation({ activate = true } = {}) {
   const now = Date.now();
   const conversation = {
@@ -208,6 +235,11 @@ function createConversation({ activate = true } = {}) {
     updatedAt: now,
     messages: [],
   };
+  // Any blank chat left behind elsewhere in the history is dead weight, and
+  // keeping them is how the list fills up with placeholders.
+  state.conversations = state.conversations.filter(
+    (existing) => existing.messages.length || existing.id === state.activeId,
+  );
   state.conversations.unshift(conversation);
   if (activate) {
     state.activeId = conversation.id;
@@ -241,7 +273,7 @@ function selectConversation(id) {
   state.activeId = id;
   render();
   closeSidebar();
-  requestAnimationFrame(scrollToBottom);
+  requestAnimationFrame(() => scrollToBottom());
 }
 
 function deleteConversation(id) {
@@ -264,6 +296,7 @@ function startRenameConversation(conversation, nameElement) {
   const input = document.createElement("input");
   input.type = "text";
   input.className = "rename-input";
+  input.dir = "auto";
   input.value = conversation.title;
   nameElement.replaceWith(input);
   input.focus();
@@ -272,9 +305,6 @@ function startRenameConversation(conversation, nameElement) {
     const val = input.value.trim();
     if (val && val !== conversation.title) {
       conversation.title = val;
-      if (conversation.id === state.activeId) {
-        elements.conversationTitle.textContent = val;
-      }
       persistConversations();
     }
     renderConversationList();
@@ -379,6 +409,7 @@ function renderConversationList() {
     const icon = svgIcon("message");
     const name = document.createElement("span");
     name.className = "conversation-name";
+    name.dir = "auto";
     name.textContent = conversation.title;
     button.addEventListener("dblclick", (event) => {
       event.preventDefault();
@@ -405,7 +436,6 @@ function renderConversationList() {
 function renderConversation() {
   const conversation = activeConversation();
   const messages = conversation?.messages || [];
-  elements.conversationTitle.textContent = conversation?.title || "New conversation";
   elements.welcome.hidden = messages.length > 0;
   elements.messages.replaceChildren();
   for (const message of messages) {
@@ -413,81 +443,95 @@ function renderConversation() {
   }
 }
 
+// The transcript reads as a document rather than a table: the answer is plain
+// prose at full width and the prompt is a single bubble above it. Authorship is
+// carried by shape and placement, so no avatar or byline is needed on any turn.
 function renderMessage(message) {
   const article = document.createElement("article");
   article.className = `message ${message.role}`;
   article.dataset.messageId = message.id;
 
-  const avatar = document.createElement("div");
-  avatar.className = "message-avatar";
-  avatar.textContent = message.role === "assistant" ? "C" : "YOU";
-
   const body = document.createElement("div");
   body.className = "message-body";
-  const meta = document.createElement("div");
-  meta.className = "message-meta";
-  const author = document.createElement("span");
-  author.className = "message-author";
-  author.textContent = message.role === "assistant" ? "Colibri" : "You";
-  const time = document.createElement("time");
-  time.className = "message-time";
-  time.dateTime = new Date(message.createdAt).toISOString();
-  time.textContent = formatTime(message.createdAt);
-  meta.append(author, time);
-
-  if (message.content) {
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.className = "message-copy";
-    copy.setAttribute("aria-label", "Copy message");
-    copy.append(svgIcon("copy"));
-    copy.addEventListener("click", () => copyText(message.content));
-    meta.append(copy);
-  }
-
-  const actions = document.createElement("div");
-  actions.className = "message-actions";
-  if (message.role === "user" && !message.generating) {
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.className = "msg-action";
-    edit.setAttribute("aria-label", "Edit message");
-    edit.append(svgIcon("edit"));
-    edit.addEventListener("click", () => startEditMessage(message));
-    actions.append(edit);
-  }
-  if (message.role === "assistant" && !message.generating && !message.error) {
-    const regen = document.createElement("button");
-    regen.type = "button";
-    regen.className = "msg-action";
-    regen.setAttribute("aria-label", "Regenerate");
-    regen.append(svgIcon("refresh"));
-    regen.addEventListener("click", () => regenerateFrom(message));
-    actions.append(regen);
-  }
-  if (actions.childNodes.length) meta.append(actions);
 
   const content = document.createElement("div");
   content.className = "message-content";
   renderMessageContent(content, message);
-  body.append(meta, content);
-  if (message.metrics) {
-    const metrics = document.createElement("span");
-    metrics.className = "message-metrics";
-    metrics.textContent = message.metrics;
-    body.append(metrics);
-  }
-  article.append(avatar, body);
+
+  body.append(content, renderMessageToolbar(message));
+  article.append(body);
   return article;
+}
+
+function messageAction(icon, label, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "msg-action";
+  button.setAttribute("aria-label", label);
+  button.dataset.tooltip = label;
+  button.append(svgIcon(icon));
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function renderMessageToolbar(message) {
+  const toolbar = document.createElement("div");
+  toolbar.className = "message-toolbar";
+
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+  if (message.content && !message.generating) {
+    actions.append(messageAction("copy", "Copy message", () => copyText(answerText(message))));
+  }
+  if (message.role === "user" && !message.generating) {
+    actions.append(messageAction("edit", "Edit message", () => startEditMessage(message)));
+  }
+  if (message.role === "assistant" && !message.generating && !message.error) {
+    actions.append(messageAction("refresh", "Regenerate", () => regenerateFrom(message)));
+  }
+
+  const metrics = document.createElement("span");
+  metrics.className = "message-metrics";
+  metrics.textContent = message.metrics || "";
+
+  const time = document.createElement("time");
+  time.className = "message-time";
+  time.dateTime = new Date(message.createdAt).toISOString();
+  time.textContent = formatTime(message.createdAt);
+
+  toolbar.append(actions, metrics, time);
+  return toolbar;
+}
+
+// What the reader actually sees, which is what "copy" should hand back — the
+// reasoning trace is collapsed in the transcript and does not belong on the
+// clipboard.
+function answerText(message) {
+  return splitThinking(message, message.content || "")
+    .answer
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .trim();
 }
 
 function renderMessageContent(content, message) {
   content.replaceChildren();
-  renderRichText(content, message.content || "");
+  const parts = splitThinking(message, message.content || "");
+  applyMessageDirection(content, message, parts.answer);
+  if (parts.reasoning !== null && parts.reasoning.trim()) {
+    const panel = renderThinkingPanel();
+    updateThinkingPanel(panel, {
+      reasoning: parts.reasoning,
+      live: Boolean(message.generating) && !parts.settled,
+      seconds: message.thinkingSeconds,
+    });
+    content.append(panel);
+  }
+  renderRichText(content, parts.answer);
   if (message.generating) {
     const cursor = document.createElement("span");
     cursor.className = "stream-cursor";
     cursor.setAttribute("aria-label", "Generating");
+    cursor.hidden = parts.reasoning !== null && !parts.settled;
     content.append(cursor);
   }
   if (message.error) {
@@ -515,6 +559,7 @@ function startEditMessage(message) {
   contentEl.replaceChildren();
   const textarea = document.createElement("textarea");
   textarea.className = "edit-textarea";
+  textarea.dir = "auto";
   textarea.value = message.content;
   textarea.rows = Math.min(Math.max(message.content.split("\n").length + 1, 2), 12);
   const btnRow = document.createElement("div");
@@ -531,6 +576,8 @@ function startEditMessage(message) {
     const newContent = textarea.value.trim();
     if (newContent && newContent !== message.content) {
       message.content = newContent;
+      // The latched direction described the previous wording.
+      message.dir = null;
       persistConversations();
     }
     renderConversation();
@@ -583,49 +630,150 @@ function retryFromMessage(errorMessage) {
 const stream = {
   messageId: null,
   content: null,
-  bodyStart: 0,
   committedEnd: 0,
-  thinkingSettled: false,
+  thinkingPanel: null,
   tailNodes: [],
   toolHost: null,
 };
 
-let streamFrame = null;
-let streamMessage = null;
+// Tokens land in bursts: a prefill pause, then a clump, then another pause.
+// Painting each burst the instant it arrives is what makes the transcript hard
+// to read. The reveal head advances on its own clock instead, draining whatever
+// has been received over a short window, so text appears at a steady pace no
+// matter how uneven decode is. The buffer is bounded by DRAIN_SECONDS, so the
+// reveal never falls meaningfully behind the model.
+const REVEAL_DRAIN_SECONDS = 0.22;
+const REVEAL_MIN_CPS = 26;
+const REVEAL_MAX_CPS = 1200;
 
-function scheduleStreamRender(message) {
-  streamMessage = message;
-  if (streamFrame !== null) {
-    return;
-  }
-  streamFrame = requestAnimationFrame(() => {
-    streamFrame = null;
-    const pending = streamMessage;
-    streamMessage = null;
-    if (!pending) {
-      return;
-    }
-    updateStreamingMessage(pending);
-    if (state.stickToBottom) {
-      scrollToBottom();
-    }
-  });
+const smooth = {
+  message: null,
+  revealed: 0,
+  painted: -1,
+  finishing: false,
+  instant: false,
+  onDone: null,
+  last: 0,
+  frame: null,
+};
+
+function beginSmoothStream(message) {
+  flushSmoothStream();
+  smooth.message = message;
+  smooth.revealed = 0;
+  smooth.painted = -1;
+  smooth.finishing = false;
+  smooth.instant = false;
+  smooth.onDone = null;
+  smooth.last = performance.now();
+  smooth.frame = requestAnimationFrame(smoothTick);
 }
 
-function cancelStreamRender() {
-  if (streamFrame !== null) {
-    cancelAnimationFrame(streamFrame);
-    streamFrame = null;
+function smoothTick(now) {
+  smooth.frame = null;
+  const message = smooth.message;
+  if (!message) {
+    return;
   }
-  streamMessage = null;
+  const target = (message.content || "").length;
+  const elapsed = Math.min(0.25, Math.max(0, (now - smooth.last) / 1000));
+  smooth.last = now;
+  if (smooth.instant) {
+    smooth.revealed = target;
+  } else if (smooth.revealed < target) {
+    const speed = clampNumber(
+      (target - smooth.revealed) / REVEAL_DRAIN_SECONDS,
+      REVEAL_MIN_CPS,
+      REVEAL_MAX_CPS,
+      REVEAL_MIN_CPS,
+    );
+    smooth.revealed = Math.min(target, smooth.revealed + speed * elapsed);
+  }
+
+  const head = Math.floor(smooth.revealed);
+  if (head !== smooth.painted) {
+    smooth.painted = head;
+    // Asked before the text lands, never after: this frame's own lines would
+    // otherwise register as the reader having scrolled away from the bottom.
+    const following = isFollowingStream();
+    if (!updateStreamingMessage(message, revealedText(message, head))) {
+      // The message left the DOM (conversation switched, transcript rebuilt).
+      // Nothing left to animate against, so settle the request immediately.
+      finishSmoothStream();
+      return;
+    }
+    if (following) {
+      scrollToBottom();
+    }
+  }
+
+  if (smooth.finishing && smooth.revealed >= target) {
+    finishSmoothStream();
+    return;
+  }
+  smooth.frame = requestAnimationFrame(smoothTick);
+}
+
+// A slice can land in the middle of a `<think>` tag, and half a tag rendered as
+// prose flickers into view for a frame. Only a trailing run that could still
+// become one of those tags is held back — a lone `<` in prose ("a < b") is not.
+const THINKING_TAGS = ["<think>", "</think>"];
+
+function revealedText(message, head) {
+  const text = (message.content || "").slice(0, head);
+  const open = text.lastIndexOf("<");
+  if (open === -1) {
+    return text;
+  }
+  const tail = text.slice(open);
+  return THINKING_TAGS.some((tag) => tag.startsWith(tail)) ? text.slice(0, open) : text;
+}
+
+function endSmoothStream(done, { instant = false } = {}) {
+  if (!smooth.message) {
+    done?.();
+    return;
+  }
+  smooth.finishing = true;
+  smooth.instant = smooth.instant || instant;
+  smooth.onDone = done;
+}
+
+// Reveals whatever is left at once and settles the request. Used when the
+// transcript is about to be rebuilt under a stream that is still draining.
+function flushSmoothStream() {
+  const done = smooth.onDone;
+  const pending = Boolean(smooth.message);
+  cancelSmoothStream();
+  if (pending) {
+    done?.();
+  }
+}
+
+function finishSmoothStream() {
+  const done = smooth.onDone;
+  cancelSmoothStream();
+  done?.();
+}
+
+function cancelSmoothStream() {
+  if (smooth.frame !== null) {
+    cancelAnimationFrame(smooth.frame);
+  }
+  smooth.frame = null;
+  smooth.message = null;
+  smooth.onDone = null;
+  smooth.revealed = 0;
+  smooth.painted = -1;
+  smooth.finishing = false;
+  smooth.instant = false;
 }
 
 function resetStreamState(messageId = null, content = null) {
   stream.messageId = messageId;
   stream.content = content;
-  stream.bodyStart = 0;
   stream.committedEnd = 0;
-  stream.thinkingSettled = false;
+  stream.thinkingPanel = null;
   stream.tailNodes = [];
   stream.toolHost = null;
 }
@@ -662,19 +810,18 @@ function stableBoundary(body, from) {
   return boundary;
 }
 
-function updateStreamingMessage(message) {
+function updateStreamingMessage(message, visible) {
   const article = elements.messages.querySelector(`[data-message-id="${message.id}"]`);
   const content = article?.querySelector(".message-content");
   if (!content) {
-    renderConversation();
-    return;
+    return false;
   }
   updateMessageMetrics(article, message);
   const cursor = content.querySelector(".stream-cursor");
   if (!cursor || !message.generating) {
     resetStreamState();
     renderMessageContent(content, message);
-    return;
+    return true;
   }
   // Anchored to the element as well as the id: a full re-render mid-stream
   // replaces the node, and the committed offsets would no longer describe it.
@@ -683,38 +830,26 @@ function updateStreamingMessage(message) {
     content.replaceChildren(cursor);
   }
 
-  const text = message.content || "";
-  const thinkingClose = text.indexOf("</think>");
-  const thinkingOpen = text.indexOf("<think>");
-  let body = "";
+  const text = visible ?? message.content ?? "";
+  const parts = splitThinking(message, text);
+  applyMessageDirection(content, message, parts.answer);
 
-  if (thinkingClose !== -1) {
-    if (!stream.thinkingSettled) {
-      content.querySelector(".thinking-streaming")?.remove();
-      if (thinkingOpen !== -1 && thinkingOpen < thinkingClose) {
-        content.insertBefore(
-          renderThinkingBlock(text.slice(thinkingOpen + 8, thinkingClose)),
-          cursor,
-        );
-      }
-      stream.thinkingSettled = true;
-      stream.bodyStart = thinkingClose + 9;
+  if (parts.reasoning !== null) {
+    if (!stream.thinkingPanel) {
+      stream.thinkingPanel = renderThinkingPanel();
+      content.insertBefore(stream.thinkingPanel, content.firstChild);
     }
-    body = text.slice(stream.bodyStart);
-  } else if (thinkingOpen !== -1) {
-    let indicator = content.querySelector(".thinking-streaming");
-    if (!indicator) {
-      indicator = renderThinkingIndicator();
-      content.insertBefore(indicator, cursor);
-    }
-    const thinkingBody = indicator.querySelector(".thinking-stream-body");
-    if (thinkingBody) {
-      thinkingBody.textContent = text.slice(thinkingOpen + 8).trim()
-        || "Waiting for thoughts...";
-    }
-  } else {
-    body = text;
+    updateThinkingPanel(stream.thinkingPanel, {
+      reasoning: parts.reasoning,
+      live: !parts.settled,
+      seconds: message.thinkingSeconds,
+    });
   }
+  // While the model is still reasoning there is no answer for the cursor to
+  // trail, and a dot parked under the "Thinking" line just reads as debris.
+  // The shimmer on that line is the activity indicator until prose starts.
+  cursor.hidden = parts.reasoning !== null && !parts.settled;
+  const body = parts.answer;
 
   for (const node of stream.tailNodes) {
     node.remove();
@@ -748,54 +883,92 @@ function updateStreamingMessage(message) {
     }
     stream.toolHost.replaceChildren(...message.toolCalls.map(renderToolCall));
   }
+  return true;
 }
 
-function renderThinkingBlock(content) {
-  const details = document.createElement("details");
-  details.className = "thinking-block";
+/* =============================================================================
+   Reasoning
+
+   The runtime puts the opening `<think>` in the *prompt* (see
+   `format_messages` in v2_server.py), so a thinking response arrives already
+   inside the block: raw reasoning first, then `</think>`, then the answer. A
+   reader looking for the reply should never have to wade through that, so it
+   lives behind one collapsed line \u2014 a live "Thinking" while it runs, and how
+   long it took once it is done.
+   ========================================================================== */
+
+function splitThinking(message, text) {
+  const open = text.indexOf("<think>");
+  const close = text.indexOf("</think>");
+  if (open !== -1) {
+    // An explicit opening tag, as older stored conversations have.
+    if (close > open) {
+      return {
+        reasoning: text.slice(open + 7, close),
+        answer: text.slice(0, open) + text.slice(close + 8),
+        settled: true,
+      };
+    }
+    return { reasoning: text.slice(open + 7), answer: text.slice(0, open), settled: false };
+  }
+  if (close !== -1) {
+    return { reasoning: text.slice(0, close), answer: text.slice(close + 8), settled: true };
+  }
+  // No closing tag yet. Whether what has arrived so far is reasoning or the
+  // answer is decided by the flag the request was made with, not by guesswork.
+  if (message.thinking) {
+    return { reasoning: text, answer: "", settled: false };
+  }
+  return { reasoning: null, answer: text, settled: true };
+}
+
+function renderThinkingPanel() {
+  const panel = document.createElement("details");
+  panel.className = "thinking";
+
   const summary = document.createElement("summary");
   summary.className = "thinking-summary";
-  summary.textContent = "Thought process";
+  const label = document.createElement("span");
+  label.className = "thinking-label";
+  const chevron = svgIcon("chevron");
+  chevron.classList.add("thinking-chevron");
+  summary.append(label, chevron);
+
   const body = document.createElement("div");
   body.className = "thinking-body";
-  const p = document.createElement("p");
-  p.textContent = content.trim();
-  body.append(p);
-  details.append(summary, body);
-  return details;
+
+  panel.append(summary, body);
+  return panel;
 }
 
-function renderThinkingIndicator() {
-  const wrapper = document.createElement("div");
-  wrapper.className = "thinking-streaming";
-  
-  const header = document.createElement("div");
-  header.className = "thinking-stream-header";
-  header.append(svgIcon("brain"));
-  const label = document.createElement("span");
-  label.textContent = "Thinking";
-  const dots = document.createElement("span");
-  dots.className = "thinking-ellipsis";
-  dots.textContent = "...";
-  header.append(label, dots);
-  
-  const chevron = document.createElement("span");
-  chevron.className = "thinking-chevron";
-  chevron.textContent = "\u25B6";
-  header.append(chevron);
-  
-  const body = document.createElement("div");
-  body.className = "thinking-stream-body";
-  body.style.display = "none";
-  
-  header.addEventListener("click", () => {
-    const open = body.style.display !== "none";
-    body.style.display = open ? "none" : "block";
-    chevron.classList.toggle("open", !open);
-  });
-  
-  wrapper.append(header, body);
-  return wrapper;
+function updateThinkingPanel(panel, { reasoning, live, seconds }) {
+  panel.classList.toggle("live", Boolean(live));
+  const label = panel.querySelector(".thinking-label");
+  const next = thinkingLabel(live, seconds);
+  if (label.textContent !== next) {
+    label.textContent = next;
+  }
+  const body = panel.querySelector(".thinking-body");
+  const trimmed = reasoning.trim();
+  if (body.textContent !== trimmed) {
+    body.textContent = trimmed;
+    applyDirection(body, trimmed);
+    // Expanded mid-thought, the newest line is the one worth seeing.
+    if (live && panel.open) {
+      body.scrollTop = body.scrollHeight;
+    }
+  }
+}
+
+function thinkingLabel(live, seconds) {
+  if (live) {
+    return "Thinking";
+  }
+  if (!Number.isFinite(seconds) || seconds < 1) {
+    return "Thought for a moment";
+  }
+  const whole = Math.round(seconds);
+  return `Thought for ${whole} second${whole === 1 ? "" : "s"}`;
 }
 
 function appendStreamMarkdown(container, text) {
@@ -819,6 +992,7 @@ function appendStreamMarkdown(container, text) {
     for (const paragraphText of paragraphs) {
       if (!paragraphText) continue;
       const p = document.createElement("p");
+      applyDirection(p, paragraphText);
       const lines = paragraphText.split("\n");
       lines.forEach((line, idx) => {
         appendStreamInline(p, line);
@@ -829,6 +1003,9 @@ function appendStreamMarkdown(container, text) {
   }
   if (incompleteCode) {
     const pre = document.createElement("pre");
+    // Source is left-to-right whatever language surrounds it. Without this an
+    // RTL answer mirrors its own code samples.
+    pre.dir = "ltr";
     const header = document.createElement("div");
     header.className = "code-header";
     const label = document.createElement("span");
@@ -890,19 +1067,96 @@ function appendStreamInline(parent, text) {
 }
 
 function updateMessageMetrics(article, message) {
-  let metrics = article.querySelector(".message-body > .message-metrics");
-  if (!message.metrics) {
-    metrics?.remove();
-    return;
+  const metrics = article.querySelector(".message-toolbar > .message-metrics");
+  if (metrics) {
+    metrics.textContent = message.metrics || "";
   }
-  if (!metrics) {
-    metrics = document.createElement("span");
-    metrics.className = "message-metrics";
-    article.querySelector(".message-body")?.append(metrics);
-  }
-  metrics.textContent = message.metrics;
 }
 
+/* =============================================================================
+   Bidirectional text
+
+   `dir="auto"` alone is not enough for chat: it looks only at the first strong
+   character, so one English product name at the head of a Hebrew or Arabic
+   answer lays the whole paragraph out left-to-right, with the punctuation
+   stranded on the wrong side. Direction is decided by weight instead — a
+   paragraph is RTL as soon as a meaningful share of its letters are, which is
+   how mixed technical prose actually reads.
+   ========================================================================== */
+
+// Hebrew, Arabic, Syriac, Thaana, N'Ko, Samaritan and the Arabic presentation
+// forms. Vowel points and diacritics count too: they only ever attach to RTL
+// letters, so they reinforce the reading rather than skew it.
+const RTL_LETTERS = /[\u0591-\u07FF\u0860-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC]/g;
+// Latin, Greek, Cyrillic, Armenian and the scripts that sit above Hebrew.
+const LTR_LETTERS = /[A-Za-z\u00C0-\u02B8\u0370-\u058F\u0900-\u1FFF\u2C00-\uD7FF]/g;
+
+// The share of strong letters that must be RTL for a block to flip. Low enough
+// that a Hebrew sentence quoting an English identifier still reads right-to-
+// left, high enough that an English sentence quoting one Hebrew word does not.
+const RTL_THRESHOLD = 0.34;
+
+// Enough letters to trust the ratio. Below this the reading is provisional and
+// is not cached, so a paragraph that opens with a stray Latin character is not
+// locked into the wrong direction for the rest of the answer.
+const DIRECTION_CONFIDENCE = 8;
+
+function countMatches(text, pattern) {
+  pattern.lastIndex = 0;
+  return text.match(pattern)?.length || 0;
+}
+
+// Long answers are sampled rather than scanned end to end: the opening of a
+// block settles its direction, and this runs on every streamed frame.
+const DIRECTION_SAMPLE = 400;
+
+function detectDirection(text) {
+  if (!text) {
+    return null;
+  }
+  const sample = text.length > DIRECTION_SAMPLE ? text.slice(0, DIRECTION_SAMPLE) : text;
+  const rtl = countMatches(sample, RTL_LETTERS);
+  const ltr = countMatches(sample, LTR_LETTERS);
+  const total = rtl + ltr;
+  if (!total) {
+    return null;
+  }
+  return { dir: rtl / total >= RTL_THRESHOLD ? "rtl" : "ltr", strength: total };
+}
+
+// Only ever sets `dir` when the text actually says something about direction.
+// Blocks that are all digits or punctuation stay unset and inherit the
+// message's direction, which keeps a numbered list from breaking apart.
+function applyDirection(element, text) {
+  const reading = detectDirection(text);
+  if (reading) {
+    element.dir = reading.dir;
+  }
+  return reading?.dir || null;
+}
+
+// The message-level direction is latched once it is confident. Re-deciding it
+// on every streamed frame would swing the whole block from side to side as the
+// first sentence arrives.
+function applyMessageDirection(content, message, text) {
+  if (message.dir) {
+    content.dir = message.dir;
+    return message.dir;
+  }
+  const reading = detectDirection(text);
+  if (!reading) {
+    return null;
+  }
+  content.dir = reading.dir;
+  if (reading.strength >= DIRECTION_CONFIDENCE) {
+    message.dir = reading.dir;
+  }
+  return reading.dir;
+}
+
+// The leading reasoning block is peeled off by splitThinking before this runs.
+// Any further pairs are a model repeating itself mid-answer; they collapse the
+// same way rather than spilling raw reasoning into the prose.
 function renderRichText(container, text) {
   if (!text) {
     return;
@@ -912,7 +1166,9 @@ function renderRichText(container, text) {
   let tMatch;
   while ((tMatch = thinkingPattern.exec(text)) !== null) {
     renderRichTextSegment(container, text.slice(tCursor, tMatch.index));
-    container.append(renderThinkingBlock(tMatch[1]));
+    const panel = renderThinkingPanel();
+    updateThinkingPanel(panel, { reasoning: tMatch[1], live: false, seconds: null });
+    container.append(panel);
     tCursor = thinkingPattern.lastIndex;
   }
   renderRichTextSegment(container, text.slice(tCursor));
@@ -954,7 +1210,9 @@ function appendMarkdownBlock(container, text) {
     if (/^#{1,6}\s/.test(line)) {
       const level = line.match(/^(#{1,6})\s/)[1].length;
       const el = document.createElement(`h${level}`);
-      appendInline(el, line.replace(/^#{1,6}\s+/, ""));
+      const heading = line.replace(/^#{1,6}\s+/, "");
+      applyDirection(el, heading);
+      appendInline(el, heading);
       container.append(el);
       i++;
     } else if (/^>\s/.test(line)) {
@@ -964,25 +1222,36 @@ function appendMarkdownBlock(container, text) {
         i++;
       }
       const bq = document.createElement("blockquote");
+      applyDirection(bq, items.join("\n"));
       appendMarkdownBlock(bq, items.join("\n"));
       container.append(bq);
     } else if (/^[-*]\s/.test(line)) {
       const ul = document.createElement("ul");
+      const items = [];
       while (i < lines.length && /^[-*]\s/.test(lines[i])) {
+        const item = lines[i].replace(/^[-*]\s+/, "");
         const li = document.createElement("li");
-        appendInline(li, lines[i].replace(/^[-*]\s+/, ""));
+        appendDirectedInline(li, item);
         ul.append(li);
+        items.push(item);
         i++;
       }
+      // The marker sits on whichever side the list itself reads from, so the
+      // direction is taken from the list as a whole rather than per item.
+      applyDirection(ul, items.join("\n"));
       container.append(ul);
     } else if (/^\d+\.\s/.test(line)) {
       const ol = document.createElement("ol");
+      const items = [];
       while (i < lines.length && /^\d+\.\s/.test(lines[i])) {
+        const item = lines[i].replace(/^\d+\.\s+/, "");
         const li = document.createElement("li");
-        appendInline(li, lines[i].replace(/^\d+\.\s+/, ""));
+        appendDirectedInline(li, item);
         ol.append(li);
+        items.push(item);
         i++;
       }
+      applyDirection(ol, items.join("\n"));
       container.append(ol);
     } else if (/^[-*_]{3,}\s*$/.test(line)) {
       container.append(document.createElement("hr"));
@@ -1009,6 +1278,7 @@ function appendMarkdownBlock(container, text) {
       }
       if (paraLines.length) {
         const p = document.createElement("p");
+        applyDirection(p, paraLines.join("\n"));
         paraLines.forEach((pl, idx) => {
           appendInline(p, pl);
           if (idx + 1 < paraLines.length) p.append(document.createElement("br"));
@@ -1017,6 +1287,11 @@ function appendMarkdownBlock(container, text) {
       }
     }
   }
+}
+
+function appendDirectedInline(element, text) {
+  applyDirection(element, text);
+  appendInline(element, text);
 }
 
 function appendInline(parent, text) {
@@ -1057,6 +1332,7 @@ const RUNNABLE_LANGUAGES = new Set(["html", "htm", "svg", "js", "javascript"]);
 
 function appendCodeBlock(container, language, code) {
   const pre = document.createElement("pre");
+  pre.dir = "ltr";
   const header = document.createElement("div");
   header.className = "code-header";
   const label = document.createElement("span");
@@ -1265,6 +1541,7 @@ function renderToolCall(toolCall) {
   name.textContent = toolCall.name || "Function call";
   header.append(name);
   const argumentsBlock = document.createElement("pre");
+  argumentsBlock.dir = "ltr";
   argumentsBlock.textContent = prettyJson(toolCall.arguments || "{}");
   card.append(header, argumentsBlock);
   return card;
@@ -1287,7 +1564,9 @@ function svgIcon(name) {
     edit: '<path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
     refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
     close: '<path d="m6 6 12 12M18 6 6 18"/>',
+    down: '<path d="M12 5v13M6 13l6 6 6-6"/>',
     brain: '<path d="M9 18h6M10 22h4M8.2 14.8A7 7 0 1 1 15.8 14.8c-.7.5-.8 1.2-.8 2.2H9c0-1-.1-1.7-.8-2.2Z"/>',
+    chevron: '<path d="m9 6 6 6-6 6"/>',
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
@@ -1304,6 +1583,9 @@ async function sendMessage(promptOverride = null) {
   if (!prompt) {
     return;
   }
+  // A previous answer can still be draining its buffer. Settle it before the
+  // transcript is rebuilt, or its finishing pass would never run.
+  flushSmoothStream();
 
   const conversation = ensureActiveConversation();
   const now = Date.now();
@@ -1323,6 +1605,10 @@ async function sendMessage(promptOverride = null) {
     toolCalls: [],
     createdAt: Date.now(),
     generating: true,
+    // Recorded per message rather than read from settings at render time: the
+    // toggle can be flipped while an answer is still on screen, and that must
+    // not change how an answer already produced is read.
+    thinking: state.settings.thinking,
   };
   conversation.messages.push(assistant);
   conversation.updatedAt = Date.now();
@@ -1333,7 +1619,9 @@ async function sendMessage(promptOverride = null) {
   persistConversations();
   render();
   scrollToBottom();
+  beginSmoothStream(assistant);
 
+  let settled = false;
   const requestStarted = performance.now();
   let firstTokenAt = null;
   let lastTokenAt = null;
@@ -1400,10 +1688,17 @@ async function sendMessage(promptOverride = null) {
         return;
       }
       if (typeof delta.content === "string") {
+        assistant.thinkingStartedAt ??= Date.now();
         assistant.content += delta.content;
+        // Timed off the raw stream, not the reveal, so the reported duration is
+        // the model's and not the animation's.
+        if (assistant.thinking
+          && assistant.thinkingSeconds === undefined
+          && assistant.content.includes("</think>")) {
+          assistant.thinkingSeconds = (Date.now() - assistant.thinkingStartedAt) / 1000;
+        }
       }
       mergeToolCalls(assistant, delta.tool_calls);
-      scheduleStreamRender(assistant);
     });
     const totalSeconds = (performance.now() - requestStarted) / 1000;
     const outputTokens = usage?.completion_tokens;
@@ -1414,12 +1709,14 @@ async function sendMessage(promptOverride = null) {
       : `${totalSeconds.toFixed(1)}s`;
   } catch (error) {
     if (error.name === "AbortError") {
+      settled = true;
       if (!assistant.content && !assistant.toolCalls.length) {
         assistant.error = "Generation stopped.";
       } else {
         assistant.metrics = "Stopped";
       }
     } else {
+      settled = true;
       assistant.error = error.message || "Generation failed.";
       toast(assistant.error, "error");
       if (/API key|401|Unauthorized/i.test(assistant.error)) {
@@ -1427,16 +1724,24 @@ async function sendMessage(promptOverride = null) {
       }
     }
   } finally {
-    cancelStreamRender();
-    resetStreamState();
-    assistant.generating = false;
+    // The request is over, but the reveal may still be a few hundred
+    // milliseconds behind. The composer is released immediately while the tail
+    // of the answer finishes drawing; stopping or failing skips the wait.
     state.generating = false;
     state.controller = null;
-    conversation.updatedAt = Date.now();
-    persistConversations();
-    render();
-    scrollToBottom();
-    pollRuntime();
+    updateSendButton();
+    endSmoothStream(() => {
+      const following = isFollowingStream();
+      resetStreamState();
+      assistant.generating = false;
+      conversation.updatedAt = Date.now();
+      persistConversations();
+      render();
+      if (following) {
+        scrollToBottom();
+      }
+      pollRuntime();
+    }, { instant: settled });
   }
 }
 
@@ -1647,20 +1952,30 @@ function setRuntimeStatus(status) {
   const nativeCuda = execution.backend === "native-v2-cpp-cuda";
   const usesCuda = nativeCuda || execution.device === "cuda";
   elements.deviceLabel.textContent = usesCuda ? "CUDA" : "CPU";
+  // Expert mode and cache figures matter when they are being investigated, not
+  // on every glance at the transcript. The bar keeps the one word that changes
+  // how you read a slow response; the rest is a hover away.
+  elements.runtimePill.dataset.tooltip = runtimeDetail(execution);
+}
+
+function runtimeDetail(execution) {
+  const lines = [];
   if (execution.expert_mode) {
     const cacheMiB = Math.round((execution.expert_cache_bytes || 0) / (1024 * 1024));
     const alias = execution.requested_expert_mode
       && execution.requested_expert_mode !== execution.expert_mode
-      ? ` (${execution.requested_expert_mode})`
+      ? ` (requested ${execution.requested_expert_mode})`
       : "";
-    elements.cacheLabel.textContent = `${execution.expert_mode}${alias} experts · ${cacheMiB} MB GPU`;
-    elements.cacheLabel.title = execution.expert_fallback_reason || "";
+    lines.push(`${execution.expert_mode}${alias} experts · ${cacheMiB} MB GPU`);
+    if (execution.expert_fallback_reason) {
+      lines.push(execution.expert_fallback_reason);
+    }
+  } else if (execution.device === "cuda") {
+    lines.push(`KV cache ${execution.cache_used_mib || 0} / ${execution.cache_limit_mib || 0} MB`);
   } else {
-    elements.cacheLabel.textContent = execution.device === "cuda"
-      ? `${execution.cache_used_mib || 0} / ${execution.cache_limit_mib || 0} MB`
-      : "Portable";
-    elements.cacheLabel.title = "";
+    lines.push("Portable CPU execution");
   }
+  return lines.join("\n");
 }
 
 function renderModelSelector() {
@@ -1740,17 +2055,81 @@ function toggleThinking() {
   renderSettingsSummary();
 }
 
-function toggleTheme() {
-  const current = document.documentElement.dataset.theme || "dark";
-  const theme = current === "dark" ? "light" : "dark";
+/* =============================================================================
+   Theme
+
+   Three states, not two. "System" is the default and a first-class choice that
+   is stored like any other: it keeps tracking the OS for the life of the tab,
+   including a change made while the app is open. The old toggle read the OS
+   once at startup and then latched to whatever it found, so a machine that
+   switched to dark in the evening left this window bright until someone
+   noticed the button.
+
+   index.html resolves and applies the same preference inline before first
+   paint. This module is the authority afterwards; the two agree by reading the
+   same key and following the same rule.
+   ========================================================================== */
+
+const THEME_PREFERENCES = ["system", "light", "dark"];
+const THEME_LABELS = { system: "System", light: "Light", dark: "Dark" };
+const THEME_COLORS = { dark: "#212121", light: "#ffffff" };
+
+const prefersDark = matchMedia("(prefers-color-scheme: dark)");
+
+function loadThemePreference() {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    return THEME_PREFERENCES.includes(saved) ? saved : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function resolveTheme(preference) {
+  if (preference === "system") {
+    return prefersDark.matches ? "dark" : "light";
+  }
+  return preference;
+}
+
+function applyTheme(preference) {
+  const theme = resolveTheme(preference);
   document.documentElement.dataset.theme = theme;
-  localStorage.setItem(THEME_KEY, theme);
+  document.documentElement.dataset.themePreference = preference;
+  // Keeps the browser's own chrome — mobile address bar, window borders on
+  // some platforms — in step with the page instead of framing it in the
+  // opposite theme.
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", THEME_COLORS[theme]);
+  const next = THEME_PREFERENCES[(THEME_PREFERENCES.indexOf(preference) + 1) % THEME_PREFERENCES.length];
+  const label = preference === "system"
+    ? `System (${THEME_LABELS[theme].toLowerCase()})`
+    : THEME_LABELS[preference];
+  elements.themeToggle.setAttribute("aria-label", `Theme: ${label}. Switch to ${THEME_LABELS[next]}.`);
+  elements.themeToggle.dataset.tooltip = `Theme: ${label}`;
+}
+
+function cycleTheme() {
+  const index = THEME_PREFERENCES.indexOf(state.theme);
+  state.theme = THEME_PREFERENCES[(index + 1) % THEME_PREFERENCES.length];
+  try {
+    localStorage.setItem(THEME_KEY, state.theme);
+  } catch {
+    // A preference that cannot be stored still applies for this session.
+  }
+  applyTheme(state.theme);
+  toast(`Theme: ${state.theme === "system"
+    ? `System (${THEME_LABELS[resolveTheme("system")].toLowerCase()})`
+    : THEME_LABELS[state.theme]}`);
 }
 
 function initializeTheme() {
-  const saved = localStorage.getItem(THEME_KEY);
-  const theme = saved || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
-  document.documentElement.dataset.theme = theme;
+  state.theme = loadThemePreference();
+  applyTheme(state.theme);
+  prefersDark.addEventListener("change", () => {
+    if (state.theme === "system") {
+      applyTheme("system");
+    }
+  });
 }
 
 function resizePrompt() {
@@ -1765,22 +2144,270 @@ function updateSendButton() {
   elements.sendButton.setAttribute("aria-label", state.generating ? "Stop generation" : "Send message");
 }
 
-function scrollToBottom() {
-  elements.chatScroll.scrollTop = elements.chatScroll.scrollHeight;
+/* =============================================================================
+   Following the stream
+
+   Reading back through an answer while it is still being written has to win
+   over keeping the newest line in view. Two things make that work: a scroll
+   the app performed is never mistaken for one the reader performed, and an
+   upward gesture detaches immediately rather than waiting to see how far it
+   travelled. Re-attaching is deliberate — the reader returns to the bottom, or
+   presses the button.
+   ========================================================================== */
+
+// Being pinned means sitting on the last line, not merely near it. Anything
+// looser is a window the reader can land inside after a deliberate scroll, and
+// then the next painted frame drags them back out of it. A few pixels of
+// tolerance only absorbs sub-pixel rounding at fractional zoom levels.
+const STICK_THRESHOLD = 4;
+
+// The jump button appears well before that, so a reader who has drifted a
+// little still has an obvious way back.
+const AFFORDANCE_THRESHOLD = 72;
+
+let touchAnchor = null;
+
+function scrollDistanceFromBottom() {
+  return elements.chatScroll.scrollHeight
+    - elements.chatScroll.scrollTop
+    - elements.chatScroll.clientHeight;
+}
+
+// Answers the question the streaming loop needs answered, and it has to be
+// asked *before* the frame's text is inserted: once new lines are in the DOM
+// the reader is no longer at the bottom by definition, and every frame would
+// look like they had scrolled away.
+function isFollowingStream() {
+  return state.stickToBottom && scrollDistanceFromBottom() <= STICK_THRESHOLD;
+}
+
+function scrollToBottom({ smoothly = false } = {}) {
+  // A streaming repaint has to land in the same frame as the text it follows,
+  // so the default is an immediate jump. Smooth scrolling is only for the
+  // deliberate "jump to latest" gesture.
+  if (smoothly) {
+    elements.chatScroll.scrollTo({ top: elements.chatScroll.scrollHeight, behavior: "smooth" });
+  } else {
+    elements.chatScroll.scrollTop = elements.chatScroll.scrollHeight;
+  }
   state.stickToBottom = true;
+  updateScrollAffordance();
 }
 
 function handleScroll() {
-  const distance = elements.chatScroll.scrollHeight
-    - elements.chatScroll.scrollTop
-    - elements.chatScroll.clientHeight;
-  state.stickToBottom = distance < 100;
+  // Following resumes only from the very bottom. Ending up close to it — after
+  // scrolling back through an answer, say — is not a request to be pinned.
+  state.stickToBottom = scrollDistanceFromBottom() <= STICK_THRESHOLD;
+  updateScrollAffordance();
 }
 
-function openSidebar() {
-  elements.body.classList.add("sidebar-visible");
+// Wheel and touch are read directly as well, so the intent registers even when
+// the compositor has not produced a scroll event yet.
+function detachFromBottom() {
+  if (state.stickToBottom) {
+    state.stickToBottom = false;
+    updateScrollAffordance();
+  }
 }
 
+function handleWheel(event) {
+  if (event.deltaY < 0) {
+    detachFromBottom();
+  }
+}
+
+function handleTouchStart(event) {
+  touchAnchor = event.touches[0]?.clientY ?? null;
+}
+
+function handleTouchMove(event) {
+  const y = event.touches[0]?.clientY;
+  if (touchAnchor === null || y === undefined) {
+    return;
+  }
+  // Finger travelling down drags the content down, which is a scroll up.
+  if (y - touchAnchor > 4) {
+    detachFromBottom();
+  }
+  touchAnchor = y;
+}
+
+function updateScrollAffordance() {
+  elements.scrollBottom.hidden = scrollDistanceFromBottom() <= AFFORDANCE_THRESHOLD;
+}
+
+/* =============================================================================
+   Tooltips
+
+   One floating label, moved to whichever control is hovered or focused, rather
+   than a pseudo-element per button. Two reasons it is not CSS: the sidebar and
+   the main panel both clip their overflow for the collapse animation, so a
+   label attached to a button near their edges would be cut off; and a shared
+   element positioned with `fixed` can be nudged back inside the viewport and
+   flipped above the control when there is no room below it.
+
+   This replaces `title`, which browsers draw at the pointer after their own
+   delay in the OS's styling — none of which is ours to place.
+   ========================================================================== */
+
+const TOOLTIP_DELAY = 140;
+const TOOLTIP_GAP = 8;
+const TOOLTIP_MARGIN = 8;
+
+const tooltip = document.createElement("div");
+tooltip.className = "tooltip";
+tooltip.setAttribute("role", "tooltip");
+tooltip.hidden = true;
+document.body.append(tooltip);
+
+let tooltipTimer = null;
+let tooltipTarget = null;
+
+function positionTooltip(target) {
+  const anchor = target.getBoundingClientRect();
+  const label = tooltip.getBoundingClientRect();
+  let top = anchor.bottom + TOOLTIP_GAP;
+  if (top + label.height > window.innerHeight - TOOLTIP_MARGIN) {
+    top = anchor.top - label.height - TOOLTIP_GAP;
+  }
+  const centred = anchor.left + (anchor.width - label.width) / 2;
+  const left = Math.min(
+    Math.max(TOOLTIP_MARGIN, centred),
+    window.innerWidth - label.width - TOOLTIP_MARGIN,
+  );
+  tooltip.style.transform = `translate(${Math.round(left)}px, ${Math.round(top)}px)`;
+}
+
+function showTooltip(target) {
+  const label = target.dataset.tooltip;
+  if (!label) {
+    return;
+  }
+  tooltipTarget = target;
+  tooltip.textContent = label;
+  tooltip.hidden = false;
+  // Measured only once it is laid out, which is why it is unhidden first.
+  positionTooltip(target);
+}
+
+function hideTooltip() {
+  clearTimeout(tooltipTimer);
+  tooltipTimer = null;
+  tooltipTarget = null;
+  tooltip.hidden = true;
+}
+
+function queueTooltip(target) {
+  if (tooltipTarget === target) {
+    return;
+  }
+  clearTimeout(tooltipTimer);
+  // Shown at once when moving between controls, so sweeping along a row of
+  // buttons does not restart the delay on each one.
+  const delay = tooltipTarget ? 0 : TOOLTIP_DELAY;
+  tooltipTarget = null;
+  tooltip.hidden = true;
+  tooltipTimer = setTimeout(() => showTooltip(target), delay);
+}
+
+function bindTooltips() {
+  document.addEventListener("pointerover", (event) => {
+    const target = event.target.closest?.("[data-tooltip]");
+    if (target) {
+      queueTooltip(target);
+    } else if (tooltipTarget || tooltipTimer) {
+      hideTooltip();
+    }
+  });
+  // Keyboard users get the same label, without needing a pointer.
+  document.addEventListener("focusin", (event) => {
+    const target = event.target.closest?.("[data-tooltip]");
+    if (target) {
+      queueTooltip(target);
+    }
+  });
+  document.addEventListener("focusout", hideTooltip);
+  document.addEventListener("pointerdown", hideTooltip);
+  window.addEventListener("blur", hideTooltip);
+  // A label anchored to a control that has since moved is worse than none.
+  window.addEventListener("scroll", hideTooltip, { capture: true, passive: true });
+  window.addEventListener("resize", hideTooltip, { passive: true });
+}
+
+/* =============================================================================
+   Sidebar
+
+   Two different behaviours behind one pair of buttons. Below the layout
+   breakpoint the sidebar is a drawer that slides over the page and is dismissed
+   by picking something, tapping the scrim or pressing Escape — transient, so
+   its state is never stored. On a wide screen it is a column of the layout, and
+   hiding it is a lasting preference about how much room the transcript gets.
+   ========================================================================== */
+
+const mobileLayout = matchMedia("(max-width: 900px)");
+
+function toggleSidebar() {
+  if (mobileLayout.matches) {
+    elements.body.classList.toggle("sidebar-visible");
+    return;
+  }
+  setSidebarHidden(!state.sidebarHidden);
+}
+
+function setSidebarHidden(hidden) {
+  state.sidebarHidden = hidden;
+  elements.body.classList.toggle("sidebar-hidden", hidden);
+  try {
+    localStorage.setItem(SIDEBAR_KEY, hidden ? "hidden" : "visible");
+  } catch {
+    // A layout preference that cannot be stored still applies for this session.
+  }
+  const label = hidden ? "Show sidebar" : "Hide sidebar";
+  for (const control of [elements.sidebarOpen, elements.sidebarClose]) {
+    control.setAttribute("aria-label", label);
+    control.dataset.tooltip = label;
+  }
+  updateRailLabels();
+}
+
+// In the rail the controls are icons with nothing written beside them, so each
+// one carries its name as a tooltip. Expanded, that name is already on screen
+// and a tooltip repeating it is just noise — so the attribute comes and goes
+// with the layout, including when a window resize crosses the breakpoint.
+function updateRailLabels() {
+  const rail = state.sidebarHidden && !mobileLayout.matches;
+  const labelled = [
+    [elements.brand, "Colibri"],
+    [elements.newChat, "New conversation"],
+    [elements.searchBox, "Search chats"],
+    [elements.openSettings, "Settings"],
+    [elements.importChat, "Import"],
+  ];
+  for (const [control, label] of labelled) {
+    if (rail) {
+      control.dataset.tooltip = label;
+    } else {
+      delete control.dataset.tooltip;
+    }
+  }
+}
+
+function initializeSidebar() {
+  let hidden = false;
+  try {
+    hidden = localStorage.getItem(SIDEBAR_KEY) === "hidden";
+  } catch {
+    hidden = false;
+  }
+  setSidebarHidden(hidden);
+  // Crossing the breakpoint swaps the rail for the drawer, and the labels that
+  // suit one are wrong for the other.
+  mobileLayout.addEventListener("change", updateRailLabels);
+}
+
+// Only ever dismisses the mobile drawer. Selecting a conversation calls this,
+// and on a wide screen that must not collapse the column out from under the
+// click that just used it.
 function closeSidebar() {
   elements.body.classList.remove("sidebar-visible");
 }
@@ -1829,20 +2456,21 @@ function toast(message, kind = "info") {
 function bindEvents() {
   elements.brand.addEventListener("click", (event) => {
     event.preventDefault();
-    if (state.generating) {
-      stopGeneration();
-    }
-    createConversation();
+    startNewConversation();
   });
-  elements.newChat.addEventListener("click", () => {
-    if (state.generating) {
-      stopGeneration();
+  // In rail mode the field itself is hidden, so the icon stands in for it.
+  elements.searchBox.addEventListener("click", (event) => {
+    if (!state.sidebarHidden || mobileLayout.matches) {
+      return;
     }
-    createConversation();
+    event.preventDefault();
+    setSidebarHidden(false);
+    elements.conversationSearch.focus();
   });
+  elements.newChat.addEventListener("click", startNewConversation);
   elements.conversationSearch.addEventListener("input", debounce(renderConversationList, 150));
-  elements.sidebarOpen.addEventListener("click", openSidebar);
-  elements.sidebarClose.addEventListener("click", closeSidebar);
+  elements.sidebarOpen.addEventListener("click", toggleSidebar);
+  elements.sidebarClose.addEventListener("click", toggleSidebar);
   elements.sidebarScrim.addEventListener("click", closeSidebar);
   elements.sendButton.addEventListener("click", () => sendMessage());
   elements.promptInput.addEventListener("input", resizePrompt);
@@ -1853,6 +2481,13 @@ function bindEvents() {
     }
   });
   elements.chatScroll.addEventListener("scroll", handleScroll, { passive: true });
+  elements.chatScroll.addEventListener("wheel", handleWheel, { passive: true });
+  elements.chatScroll.addEventListener("touchstart", handleTouchStart, { passive: true });
+  elements.chatScroll.addEventListener("touchmove", handleTouchMove, { passive: true });
+  elements.scrollBottom.addEventListener("click", () => {
+    scrollToBottom({ smoothly: true });
+    elements.promptInput.focus();
+  });
   elements.openSettings.addEventListener("click", openSettings);
   elements.quickSettings.addEventListener("click", openSettings);
   elements.importChat.addEventListener("click", importConversation);
@@ -1864,19 +2499,20 @@ function bindEvents() {
   elements.resetSettings.addEventListener("click", resetSettings);
   elements.clearChat.addEventListener("click", clearConversation);
   elements.exportChat.addEventListener("click", exportConversation);
-  elements.themeToggle.addEventListener("click", toggleTheme);
+  elements.themeToggle.addEventListener("click", cycleTheme);
   elements.modelSelector.addEventListener("change", () => {
     state.model = elements.modelSelector.value;
     setRuntimeStatus(state.health?.busy ? "busy" : "online");
     toast(`Switched to ${state.model}`);
   });
-  document.querySelectorAll(".suggestion").forEach((button) => {
-    button.addEventListener("click", () => sendMessage(button.dataset.prompt));
-  });
   document.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
-      createConversation();
+      startNewConversation();
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
+      event.preventDefault();
+      toggleSidebar();
     }
     if (event.key === "Escape") {
       closeSidebar();
@@ -1885,7 +2521,9 @@ function bindEvents() {
 }
 
 initializeTheme();
+initializeSidebar();
 bindEvents();
+bindTooltips();
 if (!state.conversations.length) {
   createConversation();
 } else {
