@@ -1,7 +1,6 @@
 import unittest
 
 from colibri_next.v2 import V2Error, V2Model
-from colibri_next.v2_qwen import QwenDeltaLayer
 
 
 class QwenV2ReferenceTests(unittest.TestCase):
@@ -206,28 +205,6 @@ class QwenV2ReferenceTests(unittest.TestCase):
                 )
         finally:
             model.close()
-
-    def test_real_delta_layer_state_is_persistent_and_resettable(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
-        try:
-            layer = QwenDeltaLayer(model, 0)
-            state = layer.new_state()
-            hidden = [0.01] * layer.hidden
-            first = layer.forward_residual(hidden, state)
-            second = layer.forward_residual(hidden, state)
-            self.assertEqual(state.tokens, 2)
-            self.assertNotEqual(first, second)
-            state.reset()
-            self.assertEqual(state.tokens, 0)
-            replay = layer.forward_residual(hidden, state)
-            for expected, actual in zip(first, replay):
-                self.assertAlmostEqual(expected, actual, places=5)
-        finally:
-            model.close()
-
 
 if __name__ == "__main__":
     unittest.main()

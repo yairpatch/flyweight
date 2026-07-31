@@ -3,7 +3,7 @@
 #include <cstdint>
 
 #if defined(_WIN32)
-#if defined(COLIBRI_NATIVE_BUILD)
+#if defined(COLIBRI_V2_BUILD)
 #define COLIBRI_API __declspec(dllexport)
 #else
 #define COLIBRI_API __declspec(dllimport)
@@ -14,7 +14,6 @@
 
 extern "C" {
 
-COLIBRI_API std::uint32_t colibri_native_version();
 COLIBRI_API std::uint32_t colibri_cpu_features();
 
 COLIBRI_API int colibri_q4_matvec(

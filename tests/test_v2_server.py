@@ -5,7 +5,7 @@ import unittest
 
 from colibri_next.cli import _parser
 from colibri_next.sampling import SamplingConfig
-from colibri_next.server import APIError, InferenceService
+from colibri_next.server import InferenceService
 from colibri_next.v2_server import (
     NativeV2Generator,
     NativeV2InferenceService,

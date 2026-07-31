@@ -13,16 +13,18 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.parse import unquote, urlsplit
 
-from .causal_lm import QwenForCausalLM
-from .cuda import active_cuda
-from .generation import GenerationResult, GenerationStep, TextGenerator
-from .hardware import available_ram_bytes as probe_available_ram_bytes
-from .native import active_native
+from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
-from .tokenizer import HuggingFaceTokenizer
+
+
+class Generator(Protocol):
+    def generate_messages(self, messages: object, **options: object) -> GenerationResult: ...
+    def stream_messages(self, messages: object, **options: object) -> Iterator[GenerationStep]: ...
+    def generate_text(self, prompt: str, **options: object) -> GenerationResult: ...
+    def stream_text(self, prompt: str, **options: object) -> Iterator[GenerationStep]: ...
 
 
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -89,37 +91,31 @@ class _TextRequest:
 
 
 class InferenceService:
-    """Persistent model service with serialized access to one accelerator."""
+    """Protocol adapter for a persistent native model generator."""
 
     def __init__(
         self,
         model_name: str,
-        generator: TextGenerator,
+        generator: Generator,
         *,
         max_new_tokens: int = 64,
         context_window: int = 4096,
         api_key: str | None = None,
         cors_origin: str = "*",
-        cpu_moe_layers: int = 0,
         strict_model: bool = False,
     ):
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
         if context_window <= 0:
             raise ValueError("context_window must be positive")
-        if cpu_moe_layers < 0:
-            raise ValueError("cpu_moe_layers must be non-negative")
         self.model_name = model_name
         self.generator = generator
         self.max_new_tokens = max_new_tokens
         self.context_window = context_window
         self.api_key = api_key
         self.cors_origin = cors_origin
-        self.cpu_moe_layers = cpu_moe_layers
         self.strict_model = strict_model
         self.loaded_at = int(time.time())
-        self.preloaded_experts = 0
-        self.expert_storage_bytes = 0
         self._generation_lock = threading.Lock()
         # Generators that multiplex concurrent requests natively (the v2
         # cooperative engine) set this False so requests interleave instead of
@@ -135,73 +131,19 @@ class InferenceService:
             return self._generation_lock
         return contextlib.nullcontext()
 
-    @classmethod
-    def from_model_directory(
-        cls,
-        root: Path | str,
-        *,
-        model_name: str | None = None,
-        rows_per_chunk: int = 4096,
-        max_new_tokens: int = 64,
-        context_window: int = 4096,
-        api_key: str | None = None,
-        cors_origin: str = "*",
-        expert_preload: str = "none",
-        cpu_moe_layers: int = 0,
-        strict_model: bool = False,
-        available_ram_bytes: int | None = None,
-        expert_preload_progress: Callable[[int, int], None] | None = None,
-    ) -> "InferenceService":
-        root_path = Path(root)
-        tokenizer = HuggingFaceTokenizer.from_model_directory(root_path)
-        model = QwenForCausalLM.from_model_directory(
-            root_path, rows_per_chunk=rows_per_chunk
-        )
-        model.configure_moe_placement(cpu_moe_layers)
-        if expert_preload == "auto" and available_ram_bytes is None:
-            available_ram_bytes = probe_available_ram_bytes()
-        preloaded_experts = model.preload_experts(
-            mode=expert_preload,
-            available_ram_bytes=available_ram_bytes,
-            progress=expert_preload_progress,
-        )
-        service = cls(
-            model_name or root_path.name,
-            TextGenerator(model, tokenizer),
-            max_new_tokens=max_new_tokens,
-            context_window=context_window,
-            api_key=api_key,
-            cors_origin=cors_origin,
-            cpu_moe_layers=model.cpu_moe_layers,
-            strict_model=strict_model,
-        )
-        service.preloaded_experts = preloaded_experts
-        service.expert_storage_bytes = model.estimated_expert_storage_bytes
-        return service
-
     def health(self) -> dict[str, Any]:
-        accelerator = active_cuda()
-        execution = (
-            accelerator.stats() if accelerator is not None else {"device": "cpu"}
-        )
-        native = active_native()
-        if native is not None:
-            execution["native_cpu_features"] = list(native.features)
         return {
             "status": "ok",
             "model": self.model_name,
             "loaded_at": self.loaded_at,
             "busy": self._generation_lock.locked(),
-            "preloaded_experts": self.preloaded_experts,
-            "expert_storage_bytes": self.expert_storage_bytes,
-            "cpu_moe_layers": self.cpu_moe_layers,
             "context_window": self.context_window,
             "prefix_cache": (
                 self.generator.prefix_cache_stats()
                 if hasattr(self.generator, "prefix_cache_stats")
                 else {"entries": 0, "capacity": 0}
             ),
-            "execution": execution,
+            "execution": {"backend": "native-v2"},
         }
 
     def model(self) -> dict[str, Any]:
@@ -867,7 +809,6 @@ class InferenceService:
 
         def events() -> Iterator[dict[str, Any]]:
             message_id = f"msg_{uuid.uuid4().hex}"
-            sequence = 0
             yield {
                 "type": "message_start",
                 "message": {
@@ -888,7 +829,6 @@ class InferenceService:
             output_tokens = 0
             stop_reason = "end_turn"
             usage: dict[str, Any] | None = None
-            text_block_open = False
             text_block_index = None
             tool_blocks: dict[str, int] = {}
             last_colibri: dict[str, Any] | None = None

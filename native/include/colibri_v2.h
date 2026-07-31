@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #if defined(_WIN32)
-#  if defined(COLIBRI_NATIVE_BUILD)
+#  if defined(COLIBRI_V2_BUILD)
 #    define COLIBRI_V2_API __declspec(dllexport)
 #  else
 #    define COLIBRI_V2_API __declspec(dllimport)

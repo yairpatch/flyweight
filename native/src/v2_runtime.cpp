@@ -1,5 +1,5 @@
 #include "colibri_v2.h"
-#include "colibri_native.h"
+#include "colibri_gpu_driver.h"
 #include "colibri_v2_provider.hpp"
 #include "colibri_v2_config.hpp"
 #include "colibri_v2_attention_policy.hpp"
@@ -77,7 +77,7 @@ struct Reader {
 };
 
 // Execution consumes this descriptor rather than GGUF internals. GGUF is the
-// first WeightProvider; safetensors and other providers can populate the same
+// first WeightProvider; future providers can populate the same
 // tensor contract without changing CUDA/session code.
 struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf"; colibri::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors;
 #if !defined(_WIN32)

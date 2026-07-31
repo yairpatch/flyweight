@@ -6,11 +6,11 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 from queue import SimpleQueue
-from typing import Callable, Iterator, Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
-from .server import APIError, InferenceService, _parse_tool_calls
+from .server import InferenceService, _parse_tool_calls
 from .v2 import (
     TASK_EVENT_DONE,
     TASK_EVENT_ERROR,

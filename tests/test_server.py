@@ -473,9 +473,9 @@ class InferenceServiceTests(unittest.TestCase):
                 }
             )
 
-    def test_health_reports_cpu_moe_placement(self) -> None:
-        service = InferenceService("qwen-local", self.generator, cpu_moe_layers=12)
-        self.assertEqual(service.health()["cpu_moe_layers"], 12)
+    def test_health_reports_native_backend(self) -> None:
+        service = InferenceService("qwen-local", self.generator)
+        self.assertEqual(service.health()["execution"]["backend"], "native-v2")
 
     def test_context_window_limits_combined_prompt_and_output(self) -> None:
         service = InferenceService(
@@ -1519,7 +1519,7 @@ class OpenAISDKTests(unittest.TestCase):
 
 class ServerCLITests(unittest.TestCase):
     @patch("colibri_next.cli.serve_http")
-    @patch("colibri_next.cli.InferenceService.from_model_directory")
+    @patch("colibri_next.v2_server.NativeV2InferenceService")
     def test_serve_command_loads_once_and_starts_http(
         self, load_model, serve_http
     ) -> None:
@@ -1533,16 +1533,15 @@ class ServerCLITests(unittest.TestCase):
                     "9012",
                     "--max-new-tokens",
                     "24",
-                    "--cpu-moe-layers",
-                    "10",
                 ]
             )
         self.assertEqual(result, 0)
         load_model.assert_called_once()
-        self.assertEqual(load_model.call_args.kwargs["cpu_moe_layers"], 10)
+        self.assertEqual(load_model.call_args.kwargs["max_new_tokens"], 24)
         serve_http.assert_called_once_with(
             load_model.return_value, host="127.0.0.1", port=9012
         )
+        load_model.return_value.close.assert_called_once()
 
 
 if __name__ == "__main__":

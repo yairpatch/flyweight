@@ -5,17 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "colibri-next"
 version = "0.2.0"
-description = "Hardware-adaptive hierarchical expert residency for sparse MoE inference"
+description = "Native GGUF inference runtime for Qwen and Gemma models"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 
 [project.optional-dependencies]
-fast = ["numpy>=2.0"]
-generation = ["tokenizers>=0.22"]
 client = ["openai>=2.0"]
-cuda13 = ["cupy-cuda13x>=14.1"]
-validation = ["torch>=2.6", "transformers>=4.51", "accelerate>=1.5"]
 
 [project.scripts]
 colibri-next = "colibri_next.cli:main"
@@ -29,7 +25,7 @@ colibri_next = [
   "ui/*.css",
   "ui/*.js",
   "ui/*.svg",
-  "_native/*.dll",
-  "_native/*.so",
-  "_native/*.dylib",
+  "_native/colibri_v2.dll",
+  "_native/colibri_v2.so",
+  "_native/colibri_v2.dylib",
 ]

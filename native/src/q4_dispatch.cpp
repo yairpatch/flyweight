@@ -1,4 +1,4 @@
-#include "colibri_native.h"
+#include "colibri_gpu_driver.h"
 #include "q4_kernel.h"
 
 #include <cmath>
@@ -113,10 +113,6 @@ std::uint32_t effective_features() {
 const std::uint32_t kEffectiveCpuFeatures = effective_features();
 const Q4MatvecKernel kQ4Kernel = select_kernel(kEffectiveCpuFeatures);
 
-}
-
-extern "C" std::uint32_t colibri_native_version() {
-    return 3;
 }
 
 extern "C" std::uint32_t colibri_cpu_features() {

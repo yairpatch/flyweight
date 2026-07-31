@@ -5,7 +5,7 @@
 // uses) and launches on the legacy default stream, so device pointers taken
 // from CuPy arrays are valid here and ordering with CuPy-issued work is
 // automatic.
-#include "colibri_native.h"
+#include "colibri_gpu_driver.h"
 
 #include <cmath>
 #include <chrono>
