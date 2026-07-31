@@ -28,6 +28,22 @@ _EXPERT_MODE_ALIASES = {
     "legacy-hybrid": "legacy-hybrid",
 }
 
+_SPECIAL_TOKEN_PATTERN = re.compile(r"<[^<>]+>")
+
+
+def _gguf_byte_decoder() -> dict[int, int]:
+    direct = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
+    inverse = {value: value for value in direct}
+    extra = 0
+    for value in range(256):
+        if value not in direct:
+            inverse[256 + extra] = value
+            extra += 1
+    return inverse
+
+
+_GGUF_BYTE_DECODER = _gguf_byte_decoder()
+
 
 def _resolve_expert_mode(value: str) -> tuple[str, int, bool]:
     try:
@@ -99,15 +115,6 @@ class _ModelConfig(ctypes.Structure):
         ("sliding_window_pattern_length", ctypes.c_uint32),
         ("rms_norm_epsilon", ctypes.c_float),
         ("rope_freq_base", ctypes.c_float),
-    ]
-
-
-class _Stats(ctypes.Structure):
-    _fields_ = [
-        ("prompt_tokens", ctypes.c_uint64),
-        ("decoded_tokens", ctypes.c_uint64),
-        ("decode_calls", ctypes.c_uint64),
-        ("bytes_mapped", ctypes.c_uint64),
     ]
 
 
@@ -274,8 +281,10 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefill_cache_seed_avoided_misses", ctypes.c_uint64),
         ("prefill_cache_seed_auto_skips", ctypes.c_uint64),
         ("prefill_cache_seed_budget_stops", ctypes.c_uint64),
-        ("gpu_prefetch_bytes", ctypes.c_uint64),
-        ("gpu_prefetch_hits", ctypes.c_uint64),
+        ("sampling_gpu_topk_calls", ctypes.c_uint64),
+        ("sampling_gpu_topk_bytes", ctypes.c_uint64),
+        ("sampling_full_download_bytes", ctypes.c_uint64),
+        ("sampling_nanoseconds", ctypes.c_uint64),
     ]
 
 
@@ -293,6 +302,7 @@ class _QwenTaskEvent(ctypes.Structure):
 TASK_EVENT_TOKEN = 0
 TASK_EVENT_DONE = 1
 TASK_EVENT_ERROR = 2
+NATIVE_ABI_VERSION = 5
 
 _cached_library: ctypes.CDLL | None = None
 
@@ -317,6 +327,29 @@ def _library() -> ctypes.CDLL:
             lib = ctypes.CDLL(str(path))
             try:
                 lib.colibri_v2_last_error.restype = ctypes.c_char_p
+                lib.colibri_v2_version.argtypes = []
+                lib.colibri_v2_version.restype = ctypes.c_uint32
+                lib.colibri_v2_runtime_options_size.argtypes = []
+                lib.colibri_v2_runtime_options_size.restype = ctypes.c_uint64
+                lib.colibri_v2_runtime_info_size.argtypes = []
+                lib.colibri_v2_runtime_info_size.restype = ctypes.c_uint64
+                version = int(lib.colibri_v2_version())
+                native_options_size = int(lib.colibri_v2_runtime_options_size())
+                native_info_size = int(lib.colibri_v2_runtime_info_size())
+                expected_options_size = ctypes.sizeof(_QwenRuntimeOptions)
+                expected_info_size = ctypes.sizeof(_QwenRuntimeInfo)
+                if (
+                    version != NATIVE_ABI_VERSION
+                    or native_options_size != expected_options_size
+                    or native_info_size != expected_info_size
+                ):
+                    raise V2Error(
+                        "native v2 ABI mismatch: "
+                        f"library version={version}, options={native_options_size}, "
+                        f"info={native_info_size}; Python expects "
+                        f"version={NATIVE_ABI_VERSION}, options={expected_options_size}, "
+                        f"info={expected_info_size}. Rebuild the native library."
+                    )
                 lib.colibri_v2_model_config.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(_ModelConfig),
@@ -621,13 +654,6 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_int32,
                 ]
                 lib.colibri_v2_gpu_decoder_attention_cached.restype = ctypes.c_int
-                lib.colibri_v2_session_attach_kv_cache.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                ]
-                lib.colibri_v2_session_attach_kv_cache.restype = ctypes.c_int
-                lib.colibri_v2_session_detach_kv_cache.argtypes = [ctypes.c_void_p]
-                lib.colibri_v2_session_detach_kv_cache.restype = ctypes.c_int
             except AttributeError as error:
                 # A library in _native that predates a C API change fails
                 # here with a bare ctypes AttributeError naming the missing
@@ -850,7 +876,10 @@ class V2Model:
                 ctypes.byref(pointer),
             )
         )
-        array = (ctypes.c_ubyte * size).from_address(pointer.value)
+        address = pointer.value
+        if address is None:
+            raise V2Error("native tensor view returned a null address")
+        array = (ctypes.c_ubyte * size).from_address(address)
         return memoryview(array).cast("B").toreadonly()
 
     def validate_qwen(self) -> None:
@@ -924,10 +953,9 @@ class V2Model:
         # and ordinary angle-delimited control tokens (``<think>`` and
         # ``</think>``).  Only treat an angle-delimited candidate as special
         # when it exists verbatim in the GGUF vocabulary.
-        special_pattern = re.compile(r"<[^<>]+>")
         pieces: list[int] = []
         position = 0
-        for match in special_pattern.finditer(text):
+        for match in _SPECIAL_TOKEN_PATTERN.finditer(text):
             if match.start() > position:
                 pieces.extend(
                     self._tokenize_plain(text[position : match.start()], capacity)
@@ -978,13 +1006,6 @@ class V2Model:
         incremental UTF-8 decoder instead of decoding token-by-token (that bug
         corrupted emoji/box-drawing characters in generated files).
         """
-        direct = set(range(33, 127)) | set(range(161, 173)) | set(range(174, 256))
-        inverse = {value: value for value in direct}
-        extra = 0
-        for value in range(256):
-            if value not in direct:
-                inverse[256 + extra] = value
-                extra += 1
         encoded = bytearray()
         for token in tokens:
             piece = self.token_text(token)
@@ -1000,17 +1021,14 @@ class V2Model:
                 continue
             for character in piece:
                 codepoint = ord(character)
-                if codepoint not in inverse:
+                if codepoint not in _GGUF_BYTE_DECODER:
                     encoded.extend(character.encode("utf-8"))
                 else:
-                    encoded.append(inverse[codepoint])
+                    encoded.append(_GGUF_BYTE_DECODER[codepoint])
         return bytes(encoded)
 
     def decode_tokens(self, tokens: list[int]) -> str:
         return self.decode_token_bytes(tokens).decode("utf-8", errors="replace")
-
-    def session(self, context_limit: int = 4096) -> "V2Session":
-        return V2Session(self, context_limit)
 
     def native_qwen_runtime(
         self,
@@ -1662,83 +1680,6 @@ class V2QwenRuntime:
 
     def task_cancel(self, task_id: int) -> None:
         self.model._check(self._lib.colibri_v2_qwen_task_cancel(self._handle, task_id))
-
-
-class V2Session:
-    def __init__(self, model: V2Model, context_limit: int):
-        self.model, self._lib = model, model._lib
-        self._handle = ctypes.c_void_p()
-        model._check(
-            self._lib.colibri_v2_session_create(
-                model._handle, context_limit, ctypes.byref(self._handle)
-            )
-        )
-
-    def close(self) -> None:
-        if self._handle:
-            self._lib.colibri_v2_session_destroy(self._handle)
-            self._handle = ctypes.c_void_p()
-
-    def __enter__(self) -> "V2Session":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
-    def prompt(self, tokens: list[int]) -> None:
-        values = (ctypes.c_uint32 * len(tokens))(*tokens)
-        self.model._check(
-            self._lib.colibri_v2_session_prompt(self._handle, values, len(tokens))
-        )
-
-    def decode(self) -> int:
-        token = ctypes.c_uint32()
-        self.model._check(
-            self._lib.colibri_v2_session_decode(
-                self._handle, ctypes.byref(token), None, 0
-            )
-        )
-        return int(token.value)
-
-    def generate(self, count: int, callback) -> None:
-        token_callback_type = ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p
-        )
-        callback_ref = token_callback_type(
-            lambda token, _user: 0 if callback(int(token)) is not False else 1
-        )
-        self.model._check(
-            self._lib.colibri_v2_session_generate(
-                self._handle, count, callback_ref, None
-            )
-        )
-
-    def cancel(self) -> None:
-        self.model._check(self._lib.colibri_v2_session_cancel(self._handle))
-
-    def sync(self) -> None:
-        self.model._check(self._lib.colibri_v2_session_sync(self._handle))
-
-    def attach_kv_cache(self, cache: "V2KvCache") -> None:
-        self.model._check(
-            self._lib.colibri_v2_session_attach_kv_cache(self._handle, cache._handle)
-        )
-
-    def detach_kv_cache(self) -> None:
-        self.model._check(self._lib.colibri_v2_session_detach_kv_cache(self._handle))
-
-    @property
-    def stats(self) -> dict[str, int]:
-        value = _Stats()
-        self.model._check(
-            self._lib.colibri_v2_session_stats(self._handle, ctypes.byref(value))
-        )
-        return {
-            "prompt_tokens": value.prompt_tokens,
-            "decoded_tokens": value.decoded_tokens,
-            "decode_calls": value.decode_calls,
-            "bytes_mapped": value.bytes_mapped,
-        }
 
 
 class V2KvCache:

@@ -22,11 +22,10 @@ def _model(**kwargs) -> tuple[V2Model, DenseQwenSpec, Path]:
 
 
 def _native(model: V2Model, **options):
-    try:
-        runtime = model.native_runtime(context_limit=64, mtp_drafts=0, **options)
-        runtime.prepare()
-    except Exception as error:  # pragma: no cover - depends on the host GPU
-        raise unittest.SkipTest(f"native CUDA runtime is unavailable: {error}")
+    if not V2Model.gpu_info()["available"]:
+        raise unittest.SkipTest("native CUDA runtime is unavailable")
+    runtime = model.native_runtime(context_limit=64, mtp_drafts=0, **options)
+    runtime.prepare()
     return runtime
 
 

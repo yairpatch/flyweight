@@ -7,6 +7,7 @@ inline constexpr char qwen_cuda_source[] = R"COLIBRI_CUDA(
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
+#include <cub/block/block_radix_sort.cuh>
 
 __device__ __forceinline__ float block_reduce_sum(float value) {
     const int lane = threadIdx.x & 31;
@@ -409,6 +410,101 @@ void route_topk(
         }
         for (int rank = 0; rank < top_k; ++rank) {
             routing_weights[rank] /= selected_total;
+        }
+    }
+}
+
+__device__ __forceinline__ unsigned long long sampling_sort_key(
+    const float value, const int token
+) {
+    if (isnan(value) || token < 0) return 0;
+    // Host sorting treats +0 and -0 as equal, so canonicalize zero before
+    // encoding the float into a monotonically ordered unsigned key.
+    const unsigned int bits = __float_as_uint(value == 0.0f ? 0.0f : value);
+    const unsigned int ordered = (bits & 0x80000000U)
+        ? ~bits : (bits ^ 0x80000000U);
+    // Descending composite order: higher logit first, then lower token ID.
+    return (static_cast<unsigned long long>(ordered) << 32) |
+        static_cast<unsigned int>(0x7fffffff - token);
+}
+
+__device__ __forceinline__ float sampling_key_value(
+    const unsigned long long key
+) {
+    const unsigned int ordered = static_cast<unsigned int>(key >> 32);
+    const unsigned int bits = (ordered & 0x80000000U)
+        ? (ordered ^ 0x80000000U) : ~ordered;
+    return __uint_as_float(bits);
+}
+
+// Sort 1,024 vocabulary logits per block and retain only that block's top-k.
+extern "C" __global__
+void sampling_block_topk_logits(
+    const float* logits,
+    int* output_indices,
+    float* output_values,
+    const int count,
+    const int top_k
+) {
+    constexpr int items_per_thread = 4;
+    using Sort = cub::BlockRadixSort<
+        unsigned long long, 256, items_per_thread, int>;
+    __shared__ typename Sort::TempStorage storage;
+    unsigned long long keys[items_per_thread];
+    int tokens[items_per_thread];
+#pragma unroll
+    for (int item = 0; item < items_per_thread; ++item) {
+        const int token = static_cast<int>(blockIdx.x) * 1024 +
+            static_cast<int>(threadIdx.x) * items_per_thread + item;
+        tokens[item] = token < count ? token : -1;
+        keys[item] = token < count
+            ? sampling_sort_key(logits[token], token) : 0;
+    }
+    Sort(storage).SortDescending(keys, tokens);
+#pragma unroll
+    for (int item = 0; item < items_per_thread; ++item) {
+        const int rank = static_cast<int>(threadIdx.x) * items_per_thread + item;
+        if (rank < top_k) {
+            const int output = static_cast<int>(blockIdx.x) * top_k + rank;
+            output_indices[output] = tokens[item];
+            output_values[output] = sampling_key_value(keys[item]);
+        }
+    }
+}
+
+// Merge top-k lists produced by the preceding stage. Repeated launches reduce
+// the candidate set geometrically while retaining exact global top-k order.
+extern "C" __global__
+void sampling_block_topk_pairs(
+    const int* input_indices,
+    const float* input_values,
+    int* output_indices,
+    float* output_values,
+    const int count,
+    const int top_k
+) {
+    constexpr int items_per_thread = 4;
+    using Sort = cub::BlockRadixSort<
+        unsigned long long, 256, items_per_thread, int>;
+    __shared__ typename Sort::TempStorage storage;
+    unsigned long long keys[items_per_thread];
+    int tokens[items_per_thread];
+#pragma unroll
+    for (int item = 0; item < items_per_thread; ++item) {
+        const int input = static_cast<int>(blockIdx.x) * 1024 +
+            static_cast<int>(threadIdx.x) * items_per_thread + item;
+        tokens[item] = input < count ? input_indices[input] : -1;
+        keys[item] = input < count
+            ? sampling_sort_key(input_values[input], tokens[item]) : 0;
+    }
+    Sort(storage).SortDescending(keys, tokens);
+#pragma unroll
+    for (int item = 0; item < items_per_thread; ++item) {
+        const int rank = static_cast<int>(threadIdx.x) * items_per_thread + item;
+        if (rank < top_k) {
+            const int output = static_cast<int>(blockIdx.x) * top_k + rank;
+            output_indices[output] = tokens[item];
+            output_values[output] = sampling_key_value(keys[item]);
         }
     }
 }

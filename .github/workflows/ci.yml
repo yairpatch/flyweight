@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test tooling
+        run: python -m pip install --upgrade pip build mypy pytest ruff wheel
+      - name: Build native runtime
+        run: python -m colibri_next.native_build
+        env:
+          PYTHONPATH: src
+      - name: Native contract tests
+        run: ctest --test-dir build/native --output-on-failure -C Release
+      - name: Lint
+        run: ruff check src tests setup.py
+      - name: Type check
+        run: mypy src/colibri_next
+      - name: Test
+        run: pytest -q
+      - name: Build platform wheel
+        run: python -m build --wheel
+      - name: Inspect wheel contents
+        shell: python
+        run: |
+          import pathlib, zipfile
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          assert "none-any" not in wheel.name, wheel.name
+          names = zipfile.ZipFile(wheel).namelist()
+          libraries = [name for name in names if name.endswith((".so", ".dll", ".dylib"))]
+          assert len(libraries) == 1, libraries

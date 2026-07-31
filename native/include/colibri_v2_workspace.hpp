@@ -5,6 +5,11 @@
 namespace colibri::v2::workspace {
 
 constexpr std::uint64_t kDeviceAlignment = 256;
+constexpr std::uint64_t kSamplingTopKCapacity = 32;
+constexpr std::uint64_t kSamplingSortItemsPerBlock = 1024;
+constexpr std::uint64_t kSamplingSortBlockCapacity = 256;
+constexpr std::uint64_t kSamplingSortCapacity =
+    kSamplingTopKCapacity * kSamplingSortBlockCapacity;
 
 constexpr std::uint64_t align(std::uint64_t bytes) {
     return (bytes + kDeviceAlignment - 1) / kDeviceAlignment * kDeviceAlignment;
@@ -48,6 +53,12 @@ struct QwenDecodeWorkspaceLayout {
     Region selected_device;
     Region route_weights;
     Region logits;
+    Region sampling_selected;
+    Region sampling_logits;
+    Region sampling_sort_indices_a;
+    Region sampling_sort_values_a;
+    Region sampling_sort_indices_b;
+    Region sampling_sort_values_b;
     Region argmax_device;
     Region attention_scores;
     std::uint64_t bytes = 0;
@@ -75,6 +86,18 @@ constexpr QwenDecodeWorkspaceLayout qwen_decode(
     layout.selected_device = builder.add(top_k * sizeof(std::int32_t));
     layout.route_weights = builder.add(top_k * sizeof(float));
     layout.logits = builder.add(vocabulary * sizeof(float));
+    layout.sampling_selected =
+        builder.add(kSamplingTopKCapacity * sizeof(std::int32_t));
+    layout.sampling_logits =
+        builder.add(kSamplingTopKCapacity * sizeof(float));
+    layout.sampling_sort_indices_a =
+        builder.add(kSamplingSortCapacity * sizeof(std::int32_t));
+    layout.sampling_sort_values_a =
+        builder.add(kSamplingSortCapacity * sizeof(float));
+    layout.sampling_sort_indices_b =
+        builder.add(kSamplingSortCapacity * sizeof(std::int32_t));
+    layout.sampling_sort_values_b =
+        builder.add(kSamplingSortCapacity * sizeof(float));
     layout.argmax_device = builder.add(sizeof(std::uint64_t));
     layout.attention_scores =
         builder.add(attention_heads * context * sizeof(float));

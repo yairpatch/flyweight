@@ -17,7 +17,6 @@ extern "C" {
 #endif
 
 typedef struct ColibriV2Model ColibriV2Model;
-typedef struct ColibriV2Session ColibriV2Session;
 typedef struct ColibriV2KvCache ColibriV2KvCache;
 typedef struct ColibriV2QwenRuntime ColibriV2QwenRuntime;
 
@@ -50,13 +49,6 @@ typedef struct ColibriV2ModelConfig {
     float rms_norm_epsilon, rope_freq_base;
 } ColibriV2ModelConfig;
 
-typedef struct ColibriV2Stats {
-    uint64_t prompt_tokens;
-    uint64_t decoded_tokens;
-    uint64_t decode_calls;
-    uint64_t bytes_mapped;
-} ColibriV2Stats;
-
 typedef struct ColibriV2GpuInfo {
     int32_t available;
     int32_t device;
@@ -84,8 +76,8 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint64_t context_limit;
     uint64_t gpu_cache_bytes;
     float expert_top_p; /* 0 or >=1 disables; else keep experts to cumulative router prob p */
-    int32_t cache_type_k; /* KV cache K precision: 0=f32, 1=f16 */
-    int32_t cache_type_v; /* KV cache V precision: 0=f32, 1=f16 */
+    int32_t cache_type_k; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4 */
+    int32_t cache_type_v; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4 */
     uint32_t prefill_checkpoint_interval; /* position of the first mid-prefill checkpoint; 0 disables (end snapshots only) */
     uint32_t prefill_checkpoint_slots; /* total prefix-reuse snapshot slots; 0 = default (4) */
     uint32_t parallel_sequences; /* independent KV/decode slots (llama.cpp --parallel); 0/1 = single-sequence */
@@ -211,6 +203,10 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t prefill_cache_seed_avoided_misses; /* frozen CPU fallbacks avoided by seed hits */
     uint64_t prefill_cache_seed_auto_skips; /* auto decisions retaining the prior map */
     uint64_t prefill_cache_seed_budget_stops; /* auto phases stopped at byte/time bound */
+    uint64_t sampling_gpu_topk_calls; /* sampled tokens reduced to top-k on device */
+    uint64_t sampling_gpu_topk_bytes; /* candidate ID/logit bytes downloaded */
+    uint64_t sampling_full_download_bytes; /* fallback full-vocabulary bytes downloaded */
+    uint64_t sampling_nanoseconds; /* second projection, top-k, transfer, and draw */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
@@ -262,19 +258,10 @@ COLIBRI_V2_API int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime* ru
 COLIBRI_V2_API int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime* runtime, ColibriV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 COLIBRI_V2_API int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime* runtime, uint64_t task_id);
 
-COLIBRI_V2_API int colibri_v2_session_create(ColibriV2Model* model, uint64_t context_limit, ColibriV2Session** out);
-COLIBRI_V2_API void colibri_v2_session_destroy(ColibriV2Session* session);
-COLIBRI_V2_API int colibri_v2_session_prompt(ColibriV2Session* session, const uint32_t* tokens, uint64_t count);
-COLIBRI_V2_API int colibri_v2_session_decode(ColibriV2Session* session, uint32_t* token, float* logits, uint64_t logits_count);
-COLIBRI_V2_API int colibri_v2_session_generate(ColibriV2Session* session, uint64_t max_tokens, ColibriV2TokenCallback callback, void* user_data);
-COLIBRI_V2_API int colibri_v2_session_cancel(ColibriV2Session* session);
-COLIBRI_V2_API int colibri_v2_session_sync(ColibriV2Session* session);
-COLIBRI_V2_API int colibri_v2_session_stats(const ColibriV2Session* session, ColibriV2Stats* out);
-COLIBRI_V2_API int colibri_v2_session_attach_kv_cache(ColibriV2Session* session, ColibriV2KvCache* cache);
-COLIBRI_V2_API int colibri_v2_session_detach_kv_cache(ColibriV2Session* session);
-
 COLIBRI_V2_API const char* colibri_v2_last_error(void);
 COLIBRI_V2_API uint32_t colibri_v2_version(void);
+COLIBRI_V2_API uint64_t colibri_v2_runtime_options_size(void);
+COLIBRI_V2_API uint64_t colibri_v2_runtime_info_size(void);
 COLIBRI_V2_API int colibri_v2_gpu_probe(int32_t device, ColibriV2GpuInfo* out);
 COLIBRI_V2_API int colibri_v2_memory_plan(uint64_t budget, uint64_t static_weights, uint64_t kv_state, uint64_t workspace, uint64_t active_experts, uint64_t staging, ColibriV2MemoryPlan* out);
 COLIBRI_V2_API int colibri_v2_gpu_available(void);

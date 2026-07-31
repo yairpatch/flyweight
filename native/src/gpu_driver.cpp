@@ -220,6 +220,8 @@ struct Kernels {
     CUfunction kv_append = nullptr;
     CUfunction q8_matvec_transposed = nullptr;
     CUfunction route_topk = nullptr;
+    CUfunction sampling_block_topk_logits = nullptr;
+    CUfunction sampling_block_topk_pairs = nullptr;
     CUfunction q5_grouped_swiglu = nullptr;
     CUfunction q4k_grouped_swiglu = nullptr;
     CUfunction q4k_grouped_accumulate = nullptr;
@@ -735,7 +737,7 @@ extern "C" int colibri_gpu_compile(
     all_options.push_back(arch);
     // nvrtc has no default header search path for the CUDA toolkit headers
     // (cuda_fp16.h etc.). Point it at CUDA_PATH\include so the kernels compile.
-    std::string include_flag;
+    std::vector<std::string> include_flags;
 #if defined(_WIN32)
     {
         wchar_t base[4096];
@@ -749,16 +751,19 @@ extern "C" int colibri_gpu_compile(
                 WideCharToMultiByte(
                     CP_UTF8, 0, winclude.c_str(), -1, include.data(), need,
                     nullptr, nullptr);
-                include_flag = "-I" + include;
+                include_flags.push_back("-I" + include);
+                include_flags.push_back("-I" + include + "/cccl");
             }
         }
     }
 #else
     if (const char* cuda_path = std::getenv("CUDA_PATH")) {
-        include_flag = std::string("-I") + cuda_path + "/include";
+        const std::string include = std::string(cuda_path) + "/include";
+        include_flags.push_back("-I" + include);
+        include_flags.push_back("-I" + include + "/cccl");
     }
 #endif
-    if (!include_flag.empty()) {
+    for (const auto& include_flag : include_flags) {
         all_options.push_back(include_flag.c_str());
     }
     for (std::int32_t index = 0; index < option_count; ++index) {
@@ -813,6 +818,8 @@ extern "C" int colibri_gpu_compile(
         {"kv_append", &g_kernels.kv_append},
         {"q8_matvec_transposed_warp", &g_kernels.q8_matvec_transposed},
         {"route_topk", &g_kernels.route_topk},
+        {"sampling_block_topk_logits", &g_kernels.sampling_block_topk_logits},
+        {"sampling_block_topk_pairs", &g_kernels.sampling_block_topk_pairs},
         {"q5k_grouped_swiglu", &g_kernels.q5_grouped_swiglu},
         {"q4k_grouped_swiglu", &g_kernels.q4k_grouped_swiglu},
         {"q4k_grouped_accumulate", &g_kernels.q4k_grouped_accumulate},
@@ -1508,6 +1515,56 @@ extern "C" int colibri_gpu_route_topk(
     return launch(g_kernels.route_topk, 1, 1, 256, args,
                   static_cast<unsigned int>(experts * sizeof(float)),
                   reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+extern "C" int colibri_gpu_sampling_topk(
+    std::uint64_t logits, std::uint64_t selected,
+    std::uint64_t selected_logits, std::uint64_t sort_indices_a,
+    std::uint64_t sort_values_a, std::uint64_t sort_indices_b,
+    std::uint64_t sort_values_b, std::int32_t vocabulary,
+    std::int32_t top_k, std::uint64_t stream
+) {
+    if (!g_kernels.sampling_block_topk_logits
+        || !g_kernels.sampling_block_topk_pairs || !logits || !selected
+        || !selected_logits || !sort_indices_a || !sort_values_a
+        || !sort_indices_b || !sort_values_b
+        || vocabulary <= 0 || top_k <= 0 || top_k > 32
+        || top_k > vocabulary) return -1;
+    constexpr std::int32_t items_per_block = 1024;
+    std::int32_t blocks = (vocabulary + items_per_block - 1) / items_per_block;
+    if (blocks > 256) return -1;
+    auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    void* first_args[] = {
+        &logits, &sort_indices_a, &sort_values_a, &vocabulary, &top_k
+    };
+    if (launch(g_kernels.sampling_block_topk_logits,
+               static_cast<unsigned int>(blocks), 1, 256,
+               first_args, 0, cuda_stream) != 0) return -2;
+    std::int32_t count = blocks * top_k;
+    std::uint64_t input_indices = sort_indices_a;
+    std::uint64_t input_values = sort_values_a;
+    std::uint64_t output_indices = sort_indices_b;
+    std::uint64_t output_values = sort_values_b;
+    while (count > items_per_block) {
+        blocks = (count + items_per_block - 1) / items_per_block;
+        void* merge_args[] = {
+            &input_indices, &input_values, &output_indices, &output_values,
+            &count, &top_k
+        };
+        if (launch(g_kernels.sampling_block_topk_pairs,
+                   static_cast<unsigned int>(blocks), 1, 256,
+                   merge_args, 0, cuda_stream) != 0) return -2;
+        count = blocks * top_k;
+        std::swap(input_indices, output_indices);
+        std::swap(input_values, output_values);
+    }
+    void* final_args[] = {
+        &input_indices, &input_values, &selected, &selected_logits,
+        &count, &top_k
+    };
+    if (launch(g_kernels.sampling_block_topk_pairs, 1, 1, 256,
+               final_args, 0, cuda_stream) != 0) return -2;
+    return 0;
 }
 
 extern "C" int colibri_gpu_q5_grouped_swiglu(

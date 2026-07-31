@@ -86,7 +86,14 @@ PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
 ~~~
 
 Each sequence slot has its own KV and recurrent state. More slots improve
-conversation isolation but consume additional VRAM.
+conversation isolation but consume additional VRAM. Bound both admitted
+inference work and open HTTP connections for public-facing deployments:
+
+~~~bash
+PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
+  --max-concurrent-requests 8 --max-connections 64 \
+  --request-timeout-seconds 30
+~~~
 
 ## API example
 
@@ -152,6 +159,9 @@ Important CLI options include:
 - `--mtp-drafts N`: enable supported Qwen MTP verification
 - `--parallel N`: independent sequence slots
 - `--prompt-cache-mib N`: host cache for spilled sequence state
+- `--max-concurrent-requests N`: reject excess generation work with HTTP 429
+- `--max-connections N`: cap simultaneous HTTP connection threads
+- `--request-timeout-seconds N`: bound idle/read time on client sockets
 - `--prefill-cache-seed auto|off|N`: post-prefill hot-expert placement
 - `--expert-paging auto|staged|direct`: legacy paging transfer policy
 - `--cpu-prefetch-auto`: warm prompt-relevant expert pages when beneficial
@@ -160,6 +170,25 @@ Important CLI options include:
 Runtime diagnostics are exposed through `/health`. Detailed profiling and
 experimental kernel switches use `COLIBRI_*` environment variables; unset
 profiling variables for production serving.
+
+Qwen sampling with `top_k <= 32` reduces candidates on the GPU by default.
+`sampling_gpu_topk_*`, `sampling_full_download_bytes`, and
+`sampling_nanoseconds` expose its behavior; set `COLIBRI_SAMPLING_GPU_TOPK=0`
+only when comparing against the full-vocabulary host fallback.
+
+## Testing
+
+The default suite builds synthetic fixtures and does not require model weights:
+
+~~~bash
+ruff check src tests setup.py
+mypy src/colibri_next
+pytest -q
+~~~
+
+Set `COLIBRI_TEST_MODEL=/path/to/model.gguf` to opt into the real Qwen reference
+tests. A configured model path that is missing or fails to load is treated as a
+test failure; only an unset opt-in and an unavailable CUDA device are skipped.
 
 ## Current limitations
 

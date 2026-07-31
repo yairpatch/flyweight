@@ -1,16 +1,22 @@
+import os
 import unittest
+from pathlib import Path
 
 from colibri_next.v2 import V2Error, V2Model
 
 
 class QwenV2ReferenceTests(unittest.TestCase):
-    MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
+    MODEL = os.environ.get("COLIBRI_TEST_MODEL", "")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not cls.MODEL:
+            raise unittest.SkipTest("set COLIBRI_TEST_MODEL to run real-model tests")
+        if not Path(cls.MODEL).is_file():
+            raise AssertionError(f"COLIBRI_TEST_MODEL does not exist: {cls.MODEL}")
 
     def test_native_runtime_catalogs_real_decoder_stack(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with model.native_qwen_runtime(
                 context_limit=2048, gpu_cache_bytes=6 * 1024**3
@@ -39,10 +45,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_accepts_cpu_moe_mode(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with model.native_qwen_runtime(
                 context_limit=2048,
@@ -55,10 +58,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_rejects_unknown_moe_mode(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with self.assertRaisesRegex(ValueError, "expert_mode"):
                 model.native_qwen_runtime(moe_device="accelerator")
@@ -66,10 +66,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_accepts_hybrid_moe_mode(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with model.native_qwen_runtime(
                 context_limit=2048,
@@ -81,10 +78,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_catalogs_embedded_mtp_separately(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with model.native_qwen_runtime(
                 context_limit=2048,
@@ -105,10 +99,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_rejects_invalid_mtp_depth(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with self.assertRaisesRegex(ValueError, "mtp_drafts"):
                 model.native_qwen_runtime(mtp_drafts=9)
@@ -116,10 +107,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_rejects_invalid_prefill_cache_seed(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with self.assertRaisesRegex(ValueError, "prefill_cache_seed"):
                 model.native_qwen_runtime(prefill_cache_seed=257)
@@ -127,10 +115,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_rejects_invalid_expert_paging(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with self.assertRaisesRegex(ValueError, "expert_paging"):
                 model.native_qwen_runtime(expert_paging="pinned-everywhere")
@@ -138,10 +123,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_rejects_negative_cpu_prefetch(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with self.assertRaisesRegex(ValueError, "cpu_prefetch_mib"):
                 model.native_qwen_runtime(cpu_prefetch_mib=-1)
@@ -149,10 +131,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_rejects_conflicting_cpu_prefetch_modes(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with self.assertRaisesRegex(ValueError, "mutually exclusive"):
                 model.native_qwen_runtime(
@@ -162,10 +141,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_rejects_invalid_next_layer_prefetch(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with self.assertRaisesRegex(ValueError, "next_layer_prefetch"):
                 model.native_qwen_runtime(next_layer_prefetch=65)
@@ -173,10 +149,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_exposes_next_layer_prefetch_telemetry(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with model.native_qwen_runtime(
                 moe_device="cpu", next_layer_prefetch=6
@@ -189,10 +162,7 @@ class QwenV2ReferenceTests(unittest.TestCase):
             model.close()
 
     def test_native_runtime_allows_parallel_next_layer_prefetch(self):
-        try:
-            model = V2Model(self.MODEL)
-        except Exception as error:
-            raise unittest.SkipTest(str(error)) from error
+        model = V2Model(self.MODEL)
         try:
             with model.native_qwen_runtime(
                 moe_device="hybrid",

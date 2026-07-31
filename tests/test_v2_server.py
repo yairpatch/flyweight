@@ -195,6 +195,16 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(runtime.inputs, [1, 2, 20])
         self.assertEqual(runtime.resets, 1)
 
+    def test_stream_steps_use_stable_constant_time_token_snapshots(self) -> None:
+        generator, _ = self.make_generator([10, 20, 30])
+        steps = list(generator.stream_text("Hi", max_new_tokens=2))
+        live = [step for step in steps if not step.finished]
+        self.assertEqual(tuple(live[0].generated_ids), (20,))
+        self.assertEqual(tuple(live[1].generated_ids), (20, 30))
+        self.assertEqual(live[0].text, "")
+        self.assertEqual(steps[-1].generated_ids, (20, 30))
+        self.assertEqual(steps[-1].text, "Hello world")
+
     def test_gemma4_chat_format_uses_turn_and_channel_tokens(self) -> None:
         tokenizer = object.__new__(NativeV2Tokenizer)
         tokenizer.architecture = "gemma4"

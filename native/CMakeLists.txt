@@ -3,6 +3,12 @@ project(colibri_v2 LANGUAGES CXX)
 
 include(CTest)
 
+option(
+    COLIBRI_BUILD_DEVELOPMENT_TARGETS
+    "Build native contract tests and benchmark executables"
+    ON
+)
+
 if(MSVC)
     # The whole public ABI is extern "C", and /EHsc (CMake's default) tells MSVC
     # those functions never throw -- so it drops the unwind state around calls
@@ -12,6 +18,7 @@ if(MSVC)
     string(REPLACE "/EHsc" "/EHs" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 endif()
 
+if(COLIBRI_BUILD_DEVELOPMENT_TARGETS)
 add_executable(colibri_v2_provider_contract tests/provider_contract.cpp)
 target_compile_features(colibri_v2_provider_contract PRIVATE cxx_std_20)
 target_include_directories(colibri_v2_provider_contract PRIVATE include)
@@ -124,6 +131,7 @@ target_include_directories(colibri_qwen_cpu_bench PRIVATE src)
 add_executable(colibri_turboquant_bench tools/bench_turboquant.cpp)
 target_compile_features(colibri_turboquant_bench PRIVATE cxx_std_20)
 target_include_directories(colibri_turboquant_bench PRIVATE src)
+endif()
 
 add_library(
     colibri_v2
@@ -145,6 +153,12 @@ if(NOT WIN32)
     target_compile_options(colibri_v2 PRIVATE -O3 -fvisibility=hidden)
 endif()
 set_target_properties(colibri_v2 PROPERTIES PREFIX "" OUTPUT_NAME "colibri_v2")
+
+install(
+    TARGETS colibri_v2
+    LIBRARY DESTINATION colibri_next/_native
+    RUNTIME DESTINATION colibri_next/_native
+)
 
 if(NOT WIN32)
     target_link_libraries(colibri_v2 PRIVATE ${CMAKE_DL_LIBS})

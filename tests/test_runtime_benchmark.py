@@ -14,6 +14,7 @@ from colibri_next.runtime_benchmark import (
     compare_baselines,
     measure_runtime_sample,
 )
+from colibri_next.v2 import V2Model
 
 
 class _FakeRuntime:
@@ -231,40 +232,35 @@ class RuntimeComparisonTests(unittest.TestCase):
 
 class NativePromptBoundaryTests(unittest.TestCase):
     def test_dense_prefill_boundaries_match_single_token_path(self):
-        try:
-            from tests.dense_gguf_fixture import (
-                DenseQwenSpec,
-                build_dense_qwen35_gguf,
-            )
-            from colibri_next.v2 import V2Model
+        if not V2Model.gpu_info()["available"]:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
-            directory = Path(tempfile.mkdtemp(prefix="colibri-bench-boundary-"))
-            path = directory / "dense.gguf"
-            build_dense_qwen35_gguf(
-                path,
-                DenseQwenSpec(
-                    hidden=32,
-                    layers=2,
-                    intermediate=64,
-                    vocabulary=16,
-                    heads=1,
-                    kv_heads=1,
-                    head_dim=32,
-                    value_heads=1,
-                    ssm_head_dim=32,
-                    key_heads=1,
-                    attention_every=2,
-                ),
-            )
-            model = V2Model(path)
-            with patch.dict("os.environ", {"COLIBRI_PREFILL_ROWS": "1"}):
-                serial = model.native_runtime(context_limit=256)
-                serial.prepare()
-            with patch.dict("os.environ", {"COLIBRI_PREFILL_ROWS": "64"}):
-                chunked = model.native_runtime(context_limit=256)
-                chunked.prepare()
-        except Exception as error:  # pragma: no cover - host CUDA dependent
-            raise unittest.SkipTest(f"native CUDA runtime is unavailable: {error}")
+        directory = Path(tempfile.mkdtemp(prefix="colibri-bench-boundary-"))
+        path = directory / "dense.gguf"
+        build_dense_qwen35_gguf(
+            path,
+            DenseQwenSpec(
+                hidden=32,
+                layers=2,
+                intermediate=64,
+                vocabulary=16,
+                heads=1,
+                kv_heads=1,
+                head_dim=32,
+                value_heads=1,
+                ssm_head_dim=32,
+                key_heads=1,
+                attention_every=2,
+            ),
+        )
+        model = V2Model(path)
+        with patch.dict("os.environ", {"COLIBRI_PREFILL_ROWS": "1"}):
+            serial = model.native_runtime(context_limit=256)
+            serial.prepare()
+        with patch.dict("os.environ", {"COLIBRI_PREFILL_ROWS": "64"}):
+            chunked = model.native_runtime(context_limit=256)
+            chunked.prepare()
         try:
             for length in (1, 2, 63, 64, 65, 66, 67, 128, 129):
                 prompt = _expand_tokens([1, 2, 3, 4], length)

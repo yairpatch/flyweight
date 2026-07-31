@@ -22,7 +22,7 @@ hardware-profile.json
 *.gguf
 
 # native build outputs (rebuilt via `python -m colibri_next.native_build`)
-src/colibri_next/_native/*.so
-src/colibri_next/_native/colibri_v2_provider_contract
+src/colibri_next/_native/*
+!src/colibri_next/_native/.gitkeep
 # opencode agent workspace
 .opencode/

@@ -289,6 +289,13 @@ COLIBRI_API int colibri_gpu_route_topk(
     std::uint64_t logits, std::uint64_t selected, std::uint64_t weights,
     std::int32_t experts, std::int32_t top_k, std::uint64_t stream
 );
+COLIBRI_API int colibri_gpu_sampling_topk(
+    std::uint64_t logits, std::uint64_t selected,
+    std::uint64_t selected_logits, std::uint64_t sort_indices_a,
+    std::uint64_t sort_values_a, std::uint64_t sort_indices_b,
+    std::uint64_t sort_values_b, std::int32_t vocabulary,
+    std::int32_t top_k, std::uint64_t stream
+);
 COLIBRI_API int colibri_gpu_q5_grouped_swiglu(
     std::uint64_t gate_pointers, std::uint64_t up_pointers,
     std::uint64_t input, std::uint64_t activated,

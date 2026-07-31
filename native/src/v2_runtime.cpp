@@ -78,19 +78,28 @@ struct Reader {
 
 // Execution consumes this descriptor rather than GGUF internals. GGUF is the
 // first WeightProvider; future providers can populate the same
-// tensor contract without changing CUDA/session code.
+// tensor contract without changing CUDA/runtime code.
 struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf"; colibri::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors;
 #if !defined(_WIN32)
     int fd=-1;
 #else
     HANDLE file=nullptr, mapping=nullptr;
 #endif
+    ~ColibriV2Model() {
+#if !defined(_WIN32)
+        if(data&&data!=MAP_FAILED)munmap(const_cast<uint8_t*>(data),size);
+        if(fd>=0)::close(fd);
+#else
+        if(data)UnmapViewOfFile(reinterpret_cast<LPCVOID>(data));
+        if(mapping)CloseHandle(mapping);
+        if(file&&file!=INVALID_HANDLE_VALUE)CloseHandle(file);
+#endif
+    }
     const char* format() const override { return format_name.c_str(); }
     uint64_t tensor_count() const override { return tensors.size(); }
     const colibri::v2::TensorDescriptor* tensor(uint64_t index) const override { return index < tensors.size() ? &tensors[index] : nullptr; }
     int read_tensor(uint64_t index, void* destination, uint64_t bytes) const override { if(index >= tensors.size() || !destination || bytes < tensors[index].size) return -1; std::memcpy(destination, data + tensors[index].offset, tensors[index].size); return 0; }
 };
-struct ColibriV2Session { ColibriV2Model* model; uint64_t limit, prompt=0, decoded=0, calls=0; bool cancelled=false; std::vector<uint32_t> history; ColibriV2KvCache* kv_cache=nullptr; };
 struct ColibriV2KvCache { std::uint64_t keys, values; std::int32_t capacity, kv_heads, head_dim, position=0; };
 
 struct QwenLayerPlan {
@@ -403,6 +412,10 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_cache_seed_avoided_misses = 0;
     std::uint64_t prefill_cache_seed_auto_skips = 0;
     std::uint64_t prefill_cache_seed_budget_stops = 0;
+    std::uint64_t sampling_gpu_topk_calls = 0;
+    std::uint64_t sampling_gpu_topk_bytes = 0;
+    std::uint64_t sampling_full_download_bytes = 0;
+    std::uint64_t sampling_nanoseconds = 0;
     std::uint64_t paging_registration_nanoseconds = 0;
     std::uint64_t host_available_bytes = 0;
     std::uint64_t cpu_prefetch_experts = 0;
@@ -2653,7 +2666,9 @@ int plan_memory(ColibriV2MemoryPlan& out, uint64_t budget, uint64_t static_weigh
 }
 
 extern "C" {
-uint32_t colibri_v2_version() { return 4; }
+uint32_t colibri_v2_version() { return 5; }
+uint64_t colibri_v2_runtime_options_size() { return sizeof(ColibriV2QwenRuntimeOptions); }
+uint64_t colibri_v2_runtime_info_size() { return sizeof(ColibriV2QwenRuntimeInfo); }
 const char* colibri_v2_last_error() { return error.c_str(); }
 int colibri_v2_gpu_probe(int32_t device, ColibriV2GpuInfo* out) { return guarded([&]{ if(!out||device<0) throw std::runtime_error("invalid GPU probe arguments"); return gpu_probe(*out,device); }); }
 int colibri_v2_memory_plan(uint64_t budget,uint64_t static_weights,uint64_t kv_state,uint64_t workspace,uint64_t active,uint64_t staging,ColibriV2MemoryPlan*out){return guarded([&]{if(!out)throw std::runtime_error("memory plan output is required");return plan_memory(*out,budget,static_weights,kv_state,workspace,active,staging);});}
@@ -2671,7 +2686,7 @@ void colibri_v2_kv_cache_destroy(ColibriV2KvCache*cache){try{delete cache;}catch
 int colibri_v2_kv_cache_reset(ColibriV2KvCache*cache){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}cache->position=0;return 0;});}
 int colibri_v2_kv_cache_position(const ColibriV2KvCache*cache,int32_t*out){return guarded([&]{if(!cache||!out){fail("invalid KV cache position");return -1;}*out=cache->position;return 0;});}
 int colibri_v2_gpu_decoder_attention_cached(ColibriV2KvCache*cache,uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t qkv_packed,uint64_t qkv_scales,uint64_t qkv,uint64_t attention_output,uint64_t out_packed,uint64_t out_scales,uint64_t output,int32_t hidden_size,int32_t heads,float epsilon,int32_t one_centered){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}int status=colibri_v2_gpu_decoder_attention_step(input,norm_weights,normalized,qkv_packed,qkv_scales,qkv,cache->keys,cache->values,attention_output,out_packed,out_scales,output,hidden_size,heads,cache->kv_heads,cache->head_dim,cache->position,cache->capacity,epsilon,one_centered);if(status)return status;++cache->position;return 0;});}
-int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guarded([&]{ if(!path||!out) throw std::runtime_error("path and output are required"); auto* m=new ColibriV2Model; m->path=path;
+int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guarded([&]{ if(!path||!out) throw std::runtime_error("path and output are required"); auto m=std::make_unique<ColibriV2Model>(); m->path=path;
 #if !defined(_WIN32)
     m->fd=open(path,O_RDONLY); if(m->fd<0) throw std::runtime_error("cannot open GGUF"); struct stat st{}; if(fstat(m->fd,&st)!=0) throw std::runtime_error("cannot stat GGUF"); m->size=static_cast<size_t>(st.st_size);
     const char* lock_env=std::getenv("COLIBRI_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
@@ -2731,17 +2746,8 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
             std::fprintf(stderr,"colibri_v2: pinned all %zu bytes\n",locked);
     }
 #endif
-    parse(*m); *out=m; return 0; }); }
-void colibri_v2_model_close(ColibriV2Model* m) { if(!m)return; try{
-#if !defined(_WIN32)
-    if(m->data) { munmap(const_cast<uint8_t*>(m->data),m->size); m->data=nullptr; m->size=0; }
-    if(m->fd>=0) { close(m->fd); m->fd=-1; }
-#else
-    if(m->data) { UnmapViewOfFile(reinterpret_cast<LPCVOID>(m->data)); m->data=nullptr; m->size=0; }
-    if(m->mapping) { CloseHandle(m->mapping); m->mapping=nullptr; }
-    if(m->file && m->file!=INVALID_HANDLE_VALUE) { CloseHandle(m->file); m->file=nullptr; }
-#endif
-    delete m; }catch(...){} }
+    parse(*m); *out=m.release(); return 0; }); }
+void colibri_v2_model_close(ColibriV2Model* m) { try{delete m;}catch(...){} }
 int colibri_v2_model_info(const ColibriV2Model* m, ColibriV2ModelInfo* out) { return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model info handle"); std::memset(out,0,sizeof(*out));out->gguf_version=m->version;out->tensor_count=m->tensor_count();out->metadata_count=m->metadata;out->file_size=m->size;out->alignment=m->alignment;copy_text(out->architecture,sizeof(out->architecture),m->architecture);copy_text(out->name,sizeof(out->name),m->name);copy_text(out->format,sizeof(out->format),m->format());return 0;}); }
 int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;return 0;});}
 int colibri_v2_model_attention_window(const ColibriV2Model* m,uint32_t layer,uint32_t*out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model attention-window handle");*out=attention_window(*m,layer);return 0;});}
@@ -3027,6 +3033,10 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->prefill_cache_seed_auto_skips=runtime->prefill_cache_seed_auto_skips;
     out->prefill_cache_seed_budget_stops=
         runtime->prefill_cache_seed_budget_stops;
+    out->sampling_gpu_topk_calls=runtime->sampling_gpu_topk_calls;
+    out->sampling_gpu_topk_bytes=runtime->sampling_gpu_topk_bytes;
+    out->sampling_full_download_bytes=runtime->sampling_full_download_bytes;
+    out->sampling_nanoseconds=runtime->sampling_nanoseconds;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
@@ -3037,9 +3047,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     if(colibri_gpu_init(runtime->options.device)!=0)throw std::runtime_error("failed to initialize native CUDA runtime");
     std::vector<std::string> option_storage;
 #if !defined(_WIN32)
-    for(const char*path:{"/opt/cuda/include","/usr/local/cuda/include","/usr/include"})if(access((std::string(path)+"/cuda_fp16.h").c_str(),R_OK)==0)option_storage.push_back(std::string("-I")+path);
+    for(const char*path:{"/opt/cuda/include","/usr/local/cuda/include","/usr/include"})if(access((std::string(path)+"/cuda_fp16.h").c_str(),R_OK)==0){option_storage.push_back(std::string("-I")+path);if(access((std::string(path)+"/cccl/cub/config.cuh").c_str(),R_OK)==0)option_storage.push_back(std::string("-I")+path+"/cccl");}
 #endif
-    if(const char*cuda_home=std::getenv("CUDA_HOME"))option_storage.push_back(std::string("-I")+cuda_home+"/include");
+    if(const char*cuda_home=std::getenv("CUDA_HOME")){option_storage.push_back(std::string("-I")+cuda_home+"/include");option_storage.push_back(std::string("-I")+cuda_home+"/include/cccl");}
     std::vector<const char*>compile_options;for(const auto&option:option_storage)compile_options.push_back(option.c_str());
     std::array<char,16384>compile_log{};
     const std::string cuda_source=std::string(colibri::v2::qwen_cuda_source)+colibri::v2::qwen_native_cuda_source;
@@ -5472,14 +5482,24 @@ static std::uint32_t qwen_sample_last_logits(
         ColibriV2QwenRuntime& runtime,QwenSamplingState& sampling,
         std::uint32_t greedy_token) {
     if(!sampling.enabled())return greedy_token;
+    struct SamplingTimer {
+        std::uint64_t& nanoseconds;
+        std::chrono::steady_clock::time_point started;
+        ~SamplingTimer(){nanoseconds+=std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();}
+    } sampling_timer{runtime.sampling_nanoseconds,
+                     std::chrono::steady_clock::now()};
     if(runtime.gemma4)throw std::runtime_error(
         "native Gemma 4 sampling is not implemented yet");
     if(!runtime.last_sampling_normalized||!runtime.last_sampling_logits)
         throw std::runtime_error("native Qwen sampling state is unavailable");
     const auto vocabulary=runtime.model->config.vocabulary_size;
     const auto bytes=static_cast<std::uint64_t>(vocabulary)*sizeof(float);
-    if(bytes>runtime.host_staging_bytes)
-        throw std::runtime_error("native Qwen sampling workspace is too small");
+    const std::size_t count=sampling.top_k?
+        std::min<std::size_t>(sampling.top_k,vocabulary):vocabulary;
+    // Sampling from a single candidate is identical to greedy decode. Avoid
+    // both the second LM-head projection and all candidate transfers.
+    if(count==1){runtime.last_output_token=greedy_token;return greedy_token;}
     const auto lm_head=runtime.device_tensors[runtime.lm_head];
     if(runtime.lm_head_type==12?
             colibri_gpu_q4k_matvec_transposed(
@@ -5501,31 +5521,84 @@ static std::uint32_t qwen_sample_last_logits(
                 static_cast<std::int32_t>(runtime.model->config.hidden_size),
                 static_cast<std::int32_t>(vocabulary),runtime.stream))
         throw std::runtime_error("native Qwen sampling LM-head projection failed");
-    auto*logits=static_cast<float*>(runtime.host_staging);
-    if(colibri_gpu_download(logits,runtime.last_sampling_logits,bytes,runtime.stream)!=0||
-       colibri_gpu_stream_sync(runtime.stream)!=0)
-        throw std::runtime_error("native Qwen sampling logits transfer failed");
-    std::size_t count=sampling.top_k?
-        std::min<std::size_t>(sampling.top_k,vocabulary):vocabulary;
-    std::vector<std::uint32_t> candidates(vocabulary);
-    for(std::uint32_t token=0;token<vocabulary;++token)candidates[token]=token;
-    auto greater=[&](std::uint32_t left,std::uint32_t right){
-        const float a=logits[left],b=logits[right];
-        if(std::isnan(a))return false;
-        if(std::isnan(b))return true;
-        return a!=b?a>b:left<right;
-    };
-    if(count<candidates.size()){
-        std::partial_sort(candidates.begin(),candidates.begin()+count,
-                          candidates.end(),greater);
-        candidates.resize(count);
-    }else std::sort(candidates.begin(),candidates.end(),greater);
-    const double maximum=static_cast<double>(logits[candidates.front()])/
+    std::vector<std::uint32_t> candidates;
+    std::vector<float> candidate_logits;
+    const char*gpu_topk_setting=std::getenv("COLIBRI_SAMPLING_GPU_TOPK");
+    const bool gpu_topk_enabled=
+        !gpu_topk_setting||gpu_topk_setting[0]!='0';
+    if(gpu_topk_enabled&&sampling.top_k&&
+       count<=colibri::v2::workspace::kSamplingTopKCapacity&&
+       vocabulary<=colibri::v2::workspace::kSamplingSortItemsPerBlock*
+                   colibri::v2::workspace::kSamplingSortBlockCapacity){
+        const auto selected_device=runtime.decode_workspace_layout.
+            sampling_selected.address(runtime.workspace);
+        const auto values_device=runtime.decode_workspace_layout.
+            sampling_logits.address(runtime.workspace);
+        const auto sort_indices_a=runtime.decode_workspace_layout.
+            sampling_sort_indices_a.address(runtime.workspace);
+        const auto sort_values_a=runtime.decode_workspace_layout.
+            sampling_sort_values_a.address(runtime.workspace);
+        const auto sort_indices_b=runtime.decode_workspace_layout.
+            sampling_sort_indices_b.address(runtime.workspace);
+        const auto sort_values_b=runtime.decode_workspace_layout.
+            sampling_sort_values_b.address(runtime.workspace);
+        if(colibri_gpu_sampling_topk(
+                runtime.last_sampling_logits,selected_device,values_device,
+                sort_indices_a,sort_values_a,sort_indices_b,sort_values_b,
+                static_cast<std::int32_t>(vocabulary),
+                static_cast<std::int32_t>(count),runtime.stream)!=0)
+            throw std::runtime_error("native Qwen sampling top-k reduction failed");
+        const auto candidate_bytes=count*sizeof(std::uint32_t);
+        const auto value_offset=device_align(candidate_bytes);
+        const auto value_bytes=count*sizeof(float);
+        if(value_offset+value_bytes>runtime.host_staging_bytes)
+            throw std::runtime_error("native Qwen sampling candidate workspace is too small");
+        auto*selected_host=static_cast<std::uint32_t*>(runtime.host_staging);
+        auto*values_host=reinterpret_cast<float*>(
+            static_cast<std::uint8_t*>(runtime.host_staging)+value_offset);
+        if(colibri_gpu_download(
+                selected_host,selected_device,candidate_bytes,runtime.stream)!=0||
+           colibri_gpu_download(
+                values_host,values_device,value_bytes,runtime.stream)!=0||
+           colibri_gpu_stream_sync(runtime.stream)!=0)
+            throw std::runtime_error("native Qwen sampling candidate transfer failed");
+        candidates.assign(selected_host,selected_host+count);
+        candidate_logits.assign(values_host,values_host+count);
+        if(candidates.empty()||candidates.front()>=vocabulary)
+            return greedy_token;
+        ++runtime.sampling_gpu_topk_calls;
+        runtime.sampling_gpu_topk_bytes+=candidate_bytes+value_bytes;
+    }else{
+        if(bytes>runtime.host_staging_bytes)
+            throw std::runtime_error("native Qwen sampling workspace is too small");
+        auto*logits=static_cast<float*>(runtime.host_staging);
+        if(colibri_gpu_download(
+                logits,runtime.last_sampling_logits,bytes,runtime.stream)!=0||
+           colibri_gpu_stream_sync(runtime.stream)!=0)
+            throw std::runtime_error("native Qwen sampling logits transfer failed");
+        runtime.sampling_full_download_bytes+=bytes;
+        candidates.resize(vocabulary);
+        for(std::uint32_t token=0;token<vocabulary;++token)candidates[token]=token;
+        auto greater=[&](std::uint32_t left,std::uint32_t right){
+            const float a=logits[left],b=logits[right];
+            if(std::isnan(a))return false;
+            if(std::isnan(b))return true;
+            return a!=b?a>b:left<right;
+        };
+        if(count<candidates.size()){
+            std::partial_sort(candidates.begin(),candidates.begin()+count,
+                              candidates.end(),greater);
+            candidates.resize(count);
+        }else std::sort(candidates.begin(),candidates.end(),greater);
+        candidate_logits.reserve(candidates.size());
+        for(const auto token:candidates)candidate_logits.push_back(logits[token]);
+    }
+    const double maximum=static_cast<double>(candidate_logits.front())/
         sampling.temperature;
     std::vector<double> probabilities(candidates.size());
     double total=0.0;
     for(std::size_t index=0;index<candidates.size();++index){
-        const double scaled=static_cast<double>(logits[candidates[index]])/
+        const double scaled=static_cast<double>(candidate_logits[index])/
             sampling.temperature;
         const double probability=std::isfinite(scaled)?
             std::exp(scaled-maximum):0.0;
@@ -7449,14 +7522,4 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
     return 0;
 });}
 
-int colibri_v2_session_create(ColibriV2Model*m,uint64_t limit,ColibriV2Session**out){return guarded([&]{if(!m||!out||!limit)throw std::runtime_error("invalid session arguments");*out=new ColibriV2Session{m,limit};return 0;});}
-void colibri_v2_session_destroy(ColibriV2Session*s){try{if(s)delete s;}catch(...){}}
-int colibri_v2_session_prompt(ColibriV2Session*s,const uint32_t*t,uint64_t n){return guarded([&]{if(!s||(!t&&n)||s->history.size()+n>s->limit)throw std::runtime_error("context limit exceeded");s->history.insert(s->history.end(),t,t+n);s->prompt+=n;return 0;});}
-int colibri_v2_session_decode(ColibriV2Session*s,uint32_t*out,float*logits,uint64_t n){return guarded([&]{if(!s||!out||s->cancelled||s->history.size()>=s->limit)throw std::runtime_error(s&&s->cancelled?"session cancelled":"context limit exceeded"); uint64_t h=1469598103934665603ULL;for(auto x:s->history)h=(h^x)*1099511628211ULL;*out=static_cast<uint32_t>((h^(h>>32))&0x7fffffff);if(logits)for(uint64_t i=0;i<n;i++)logits[i]=-INFINITY; s->history.push_back(*out);s->decoded++;s->calls++;return 0;});}
-int colibri_v2_session_generate(ColibriV2Session*s,uint64_t max,ColibriV2TokenCallback callback,void*user){return guarded([&]{if(!s||!callback)throw std::runtime_error("session and callback are required");for(uint64_t i=0;i<max&&!s->cancelled;i++){uint32_t token=0;int status=colibri_v2_session_decode(s,&token,nullptr,0);if(status) return status;if(callback(token,user)!=0){s->cancelled=true;break;}}return 0;});}
-int colibri_v2_session_cancel(ColibriV2Session*s){return guarded([&]{if(!s){fail("invalid session");return -1;}s->cancelled=true;return 0;});}
-int colibri_v2_session_sync(ColibriV2Session*s){return guarded([&]{if(!s){fail("invalid session");return -1;}return 0;});}
-int colibri_v2_session_stats(const ColibriV2Session*s,ColibriV2Stats*out){return guarded([&]{if(!s||!out)throw std::runtime_error("invalid stats handle");*out={s->prompt,s->decoded,s->calls,s->model->size};return 0;});}
-int colibri_v2_session_attach_kv_cache(ColibriV2Session*s,ColibriV2KvCache*cache){return guarded([&]{if(!s||!cache)throw std::runtime_error("invalid session or KV cache");if(cache->position!=static_cast<int32_t>(s->history.size()))throw std::runtime_error("KV cache position does not match session context");s->kv_cache=cache;return 0;});}
-int colibri_v2_session_detach_kv_cache(ColibriV2Session*s){return guarded([&]{if(!s){fail("invalid session");return -1;}s->kv_cache=nullptr;return 0;});}
 }

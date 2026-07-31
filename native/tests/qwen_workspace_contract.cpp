@@ -33,6 +33,10 @@ std::uint64_t legacy_decode_bytes(
         ws::align(top_k * sizeof(std::int32_t)) +
         ws::align(top_k * sizeof(float)) +
         ws::align(vocabulary * sizeof(float)) +
+        ws::align(ws::kSamplingTopKCapacity * sizeof(std::int32_t)) +
+        ws::align(ws::kSamplingTopKCapacity * sizeof(float)) +
+        ws::align(ws::kSamplingSortCapacity * sizeof(std::int32_t)) * 2 +
+        ws::align(ws::kSamplingSortCapacity * sizeof(float)) * 2 +
         ws::align(sizeof(std::uint64_t)) +
         ws::align(heads * context * sizeof(float));
 }
@@ -101,6 +105,9 @@ int main() {
             layout.second, layout.third, layout.fourth, layout.dense_q8,
             layout.dense_q8_scales, layout.activated, layout.router_logits,
             layout.selected_device, layout.route_weights, layout.logits,
+            layout.sampling_selected, layout.sampling_logits,
+            layout.sampling_sort_indices_a, layout.sampling_sort_values_a,
+            layout.sampling_sort_indices_b, layout.sampling_sort_values_b,
             layout.argmax_device, layout.attention_scores};
         if (!valid_regions(regions, layout.bytes) ||
             layout.bytes != legacy_decode_bytes(

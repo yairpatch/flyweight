@@ -1,4 +1,5 @@
 import ctypes
+import os
 import struct
 import tempfile
 import unittest
@@ -183,6 +184,21 @@ class V2RuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("tokens>=4096", runtime)
 
+    def test_sampled_topk_stays_on_gpu_until_candidates_are_reduced(self):
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/colibri_v2_qwen_kernels.hpp"
+        ).read_text()
+        driver = (root / "native/src/gpu_driver.cpp").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        self.assertIn("void sampling_block_topk_logits(", kernels)
+        self.assertIn("void sampling_block_topk_pairs(", kernels)
+        self.assertIn("cub::BlockRadixSort", kernels)
+        self.assertIn("colibri_gpu_sampling_topk", driver)
+        self.assertIn("sampling_gpu_topk_bytes", runtime)
+        self.assertIn("sampling_nanoseconds", runtime)
+        self.assertIn("COLIBRI_SAMPLING_GPU_TOPK", runtime)
+
     def test_turbo_cache_types_reach_the_native_options(self):
         class FakeLibrary:
             def __init__(self):
@@ -337,7 +353,7 @@ class V2RuntimeTests(unittest.TestCase):
         handle.close()
         return Path(handle.name), payload
 
-    def test_reads_metadata_offsets_and_session_stats(self):
+    def test_reads_metadata_and_tensor_offsets(self):
         path, payload = self.make_model()
         try:
             with V2Model(path) as model:
@@ -359,22 +375,22 @@ class V2RuntimeTests(unittest.TestCase):
                     model.view_tensor_slice("token_embd.weight", 1, 2),
                     payload[1:3],
                 )
-                with model.session(8) as session:
-                    session.prompt([1, 2])
-                    self.assertIsInstance(session.decode(), int)
-                    self.assertEqual(session.stats["prompt_tokens"], 2)
         finally:
             path.unlink()
 
-    def test_context_limit_and_cancellation_are_reported(self):
-        path, _ = self.make_model()
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires procfs")
+    def test_invalid_model_open_does_not_leak_file_descriptors(self):
+        handle = tempfile.NamedTemporaryFile(suffix=".gguf", delete=False)
+        handle.write(b"not a GGUF file")
+        handle.close()
+        path = Path(handle.name)
         try:
-            with V2Model(path) as model, model.session(1) as session:
+            before = len(os.listdir("/proc/self/fd"))
+            for _ in range(32):
                 with self.assertRaises(V2Error):
-                    session.prompt([1, 2])
-                session.cancel()
-                with self.assertRaises(V2Error):
-                    session.decode()
+                    V2Model(path)
+            after = len(os.listdir("/proc/self/fd"))
+            self.assertLessEqual(after, before + 1)
         finally:
             path.unlink()
 

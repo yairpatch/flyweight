@@ -4,6 +4,7 @@ import contextlib
 import hmac
 import json
 import re
+import socket
 import sys
 import threading
 import time
@@ -21,10 +22,33 @@ from .sampling import SamplingConfig
 
 
 class Generator(Protocol):
-    def generate_messages(self, messages: object, **options: object) -> GenerationResult: ...
-    def stream_messages(self, messages: object, **options: object) -> Iterator[GenerationStep]: ...
+    @property
+    def tokenizer(self) -> Tokenizer: ...
+
+    def prepare_messages(
+        self, messages: Sequence[Mapping[str, str]], **options: object
+    ) -> list[int]: ...
+    def generate_messages(
+        self, messages: Sequence[Mapping[str, str]], **options: object
+    ) -> GenerationResult: ...
+    def stream_messages(
+        self, messages: Sequence[Mapping[str, str]], **options: object
+    ) -> Iterator[GenerationStep]: ...
     def generate_text(self, prompt: str, **options: object) -> GenerationResult: ...
     def stream_text(self, prompt: str, **options: object) -> Iterator[GenerationStep]: ...
+
+
+class Tokenizer(Protocol):
+    def encode(self, text: str) -> list[int]: ...
+    def encode_messages(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        enable_thinking: bool = False,
+    ) -> list[int]: ...
+    def decode(
+        self, tokens: list[int], *, skip_special_tokens: bool = True
+    ) -> str: ...
 
 
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -76,6 +100,7 @@ class APIError(Exception):
 @dataclass(frozen=True, slots=True)
 class _GenerationRequest:
     messages: list[dict[str, str]]
+    prompt_ids: tuple[int, ...]
     max_new_tokens: int
     sampling: SamplingConfig
     enable_thinking: bool
@@ -103,11 +128,17 @@ class InferenceService:
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
+        max_concurrent_requests: int = 64,
+        request_timeout_seconds: float = 30.0,
     ):
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
         if context_window <= 0:
             raise ValueError("context_window must be positive")
+        if max_concurrent_requests <= 0:
+            raise ValueError("max_concurrent_requests must be positive")
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
         self.model_name = model_name
         self.generator = generator
         self.max_new_tokens = max_new_tokens
@@ -115,28 +146,51 @@ class InferenceService:
         self.api_key = api_key
         self.cors_origin = cors_origin
         self.strict_model = strict_model
+        self.max_concurrent_requests = max_concurrent_requests
+        self.request_timeout_seconds = request_timeout_seconds
         self.loaded_at = int(time.time())
         self._generation_lock = threading.Lock()
         # Generators that multiplex concurrent requests natively (the v2
         # cooperative engine) set this False so requests interleave instead of
         # queueing behind one long generation.
         self._serialize_generation = True
+        self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        self._request_count_lock = threading.Lock()
+        self._active_requests = 0
         self._response_lock = threading.Lock()
         self._response_records: OrderedDict[
             str, tuple[dict[str, Any], list[dict[str, str]]]
         ] = OrderedDict()
 
+    @contextlib.contextmanager
     def _generation_guard(self):
-        if self._serialize_generation:
-            return self._generation_lock
-        return contextlib.nullcontext()
+        if not self._request_slots.acquire(blocking=False):
+            raise APIError(
+                429,
+                "the inference queue is full; retry later",
+                "rate_limit_error",
+            )
+        with self._request_count_lock:
+            self._active_requests += 1
+        try:
+            if self._serialize_generation:
+                with self._generation_lock:
+                    yield
+            else:
+                yield
+        finally:
+            with self._request_count_lock:
+                self._active_requests -= 1
+            self._request_slots.release()
 
     def health(self) -> dict[str, Any]:
         return {
             "status": "ok",
             "model": self.model_name,
             "loaded_at": self.loaded_at,
-            "busy": self._generation_lock.locked(),
+            "busy": self._active_requests > 0,
+            "active_requests": self._active_requests,
+            "request_capacity": self.max_concurrent_requests,
             "context_window": self.context_window,
             "prefix_cache": (
                 self.generator.prefix_cache_stats()
@@ -197,6 +251,7 @@ class InferenceService:
         if not request.tools_enabled:
             return self.generator.generate_messages(
                 request.messages,
+                prepared_prompt_ids=request.prompt_ids,
                 max_new_tokens=request.max_new_tokens,
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
@@ -204,8 +259,11 @@ class InferenceService:
             )
 
         final_step: GenerationStep | None = None
+        text_parts: list[str] = []
+        end_marker_tail = ""
         steps = self.generator.stream_messages(
             request.messages,
+            prepared_prompt_ids=request.prompt_ids,
             max_new_tokens=request.max_new_tokens,
             sampling=request.sampling,
             enable_thinking=request.enable_thinking,
@@ -214,7 +272,20 @@ class InferenceService:
         try:
             for step in steps:
                 final_step = step
-                if step.finished or _has_complete_tool_call(step.text, tools=tools):
+                if step.text_delta:
+                    text_parts.append(step.text_delta)
+                    marker_window = end_marker_tail + step.text_delta
+                    end_marker_tail = marker_window[-len(TOOL_CALL_END_MARKER) :]
+                complete_call = (
+                    TOOL_CALL_END_MARKER in marker_window
+                    if step.text_delta
+                    else False
+                )
+                if complete_call:
+                    complete_call = _has_complete_tool_call(
+                        "".join(text_parts), tools=tools
+                    )
+                if step.finished or complete_call:
                     break
         finally:
             close = getattr(steps, "close", None)
@@ -222,15 +293,24 @@ class InferenceService:
                 close()
         if final_step is None:
             raise RuntimeError("generation stream ended without a final result")
-        return _generation_result(final_step)
+        if final_step.finished:
+            return _generation_result(final_step)
+        return GenerationResult(
+            prompt_ids=tuple(final_step.prompt_ids),
+            generated_ids=tuple(final_step.generated_ids),
+            text="".join(text_parts),
+            stopped_on_eos=final_step.stopped_on_eos,
+            state_tokens=final_step.state_tokens,
+        )
 
     def stream_chat_completion(
         self,
         payload: Mapping[str, Any],
         *,
         progress: Callable[[int, int], None] | None = None,
+        _prepared_request: _GenerationRequest | None = None,
     ) -> Iterator[dict[str, Any] | str]:
-        request = self._prepare_chat(payload)
+        request = _prepared_request or self._prepare_chat(payload)
         stream_options = payload.get("stream_options") or {}
         if not isinstance(stream_options, dict):
             raise APIError(
@@ -259,9 +339,10 @@ class InferenceService:
                 # valid call parses; at that point generation is cancelled and
                 # the structured call is emitted immediately.
                 final_step: GenerationStep | None = None
-                accumulated = ""
-                streamed = 0  # end of clean (non-tool) text already sent as content
+                text_parts: list[str] = []
+                pending = ""  # bounded tail that may be a partial tool marker
                 tool_start: int | None = None  # index of a <tool_call> marker once seen
+                tool_end_tail = ""
                 tool_calls: list[dict[str, Any]] = []
                 decode_started: float | None = None
                 marker = TOOL_CALL_MARKER
@@ -278,6 +359,7 @@ class InferenceService:
                 with self._generation_guard():
                     steps = self.generator.stream_messages(
                         request.messages,
+                        prepared_prompt_ids=request.prompt_ids,
                         max_new_tokens=request.max_new_tokens,
                         sampling=request.sampling,
                         enable_thinking=request.enable_thinking,
@@ -290,38 +372,46 @@ class InferenceService:
                                 continue
                             if step.token_id is None:
                                 continue
-                            accumulated += step.text_delta or ""
+                            delta_text = step.text_delta or ""
+                            text_parts.append(delta_text)
                             now = time.perf_counter()
                             if decode_started is None:
                                 decode_started = now
+                            marker_window = ""
                             if tool_start is None:
                                 # Stream clean text, but stop at (and never leak)
                                 # the native marker so clients receive a structured
                                 # tool call rather than raw XML.
-                                found = accumulated.find(marker, streamed)
+                                pending += delta_text
+                                found = pending.find(marker)
                                 if found != -1:
-                                    delta = accumulated[streamed:found]
-                                    streamed = found
-                                    tool_start = found
+                                    delta = pending[:found]
+                                    pending = pending[found:]
+                                    tool_start = 0
+                                    marker_window = pending
+                                    tool_end_tail = marker_window[
+                                        -len(TOOL_CALL_END_MARKER) :
+                                    ]
                                 else:
                                     # Hold back a possible partial marker at the tail.
-                                    safe = len(accumulated) - holdback
-                                    delta = (
-                                        accumulated[streamed:safe]
-                                        if safe > streamed
-                                        else ""
-                                    )
-                                    streamed += len(delta)
+                                    safe = max(0, len(pending) - holdback)
+                                    delta = pending[:safe]
+                                    pending = pending[safe:]
                                 if delta:
                                     yield _content_chunk(
                                         delta,
                                         len(step.generated_ids),
                                         now - decode_started,
                                     )
-                            if (
-                                tool_start is not None
-                                and TOOL_CALL_END_MARKER in accumulated[tool_start:]
+                            else:
+                                marker_window = tool_end_tail + delta_text
+                                tool_end_tail = marker_window[
+                                    -len(TOOL_CALL_END_MARKER) :
+                                ]
+                            if tool_start is not None and (
+                                TOOL_CALL_END_MARKER in marker_window
                             ):
+                                accumulated = "".join(text_parts)
                                 _, tool_calls = _parse_tool_calls(
                                     accumulated, tools=request.tools
                                 )
@@ -333,6 +423,7 @@ class InferenceService:
                             close()
                 if final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
+                accumulated = "".join(text_parts)
                 if not tool_calls:
                     _, tool_calls = _parse_tool_calls(accumulated, tools=request.tools)
                 if tool_calls:
@@ -354,11 +445,11 @@ class InferenceService:
                             ),
                         }
                     yield chunk
-                elif tool_start is None and streamed < len(accumulated):
+                elif tool_start is None and pending:
                     # No tool-call marker: flush the tail we held back in case it
                     # was a partial marker, so the turn is never silently empty.
                     yield self._chat_chunk(
-                        completion_id, created, {"content": accumulated[streamed:]}
+                        completion_id, created, {"content": pending}
                     )
                 # else: a <tool_call> marker was seen but produced no parseable
                 # call (truncated by max_tokens or malformed). Suppress the raw
@@ -372,22 +463,23 @@ class InferenceService:
                 prompt_count = len(final_step.prompt_ids)
                 completion_count = len(final_step.generated_ids)
             else:
-                final_step: GenerationStep | None = None
-                decode_started: float | None = None
+                plain_final_step: GenerationStep | None = None
+                plain_decode_started: float | None = None
                 with self._generation_guard():
                     for step in self.generator.stream_messages(
                         request.messages,
+                        prepared_prompt_ids=request.prompt_ids,
                         max_new_tokens=request.max_new_tokens,
                         sampling=request.sampling,
                         enable_thinking=request.enable_thinking,
                         progress=progress,
                     ):
                         if step.finished:
-                            final_step = step
+                            plain_final_step = step
                         elif step.token_id is not None:
                             now = time.perf_counter()
-                            if decode_started is None:
-                                decode_started = now
+                            if plain_decode_started is None:
+                                plain_decode_started = now
                             chunk = self._chat_chunk(
                                 completion_id,
                                 created,
@@ -397,14 +489,16 @@ class InferenceService:
                             # a small provider extension for live UI metrics.
                             chunk["colibri"] = {
                                 "generated_tokens": len(step.generated_ids),
-                                "decode_elapsed_seconds": now - decode_started,
+                                "decode_elapsed_seconds": now - plain_decode_started,
                             }
                             yield chunk
-                if final_step is None:
+                if plain_final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
-                finish_reason = "stop" if final_step.stopped_on_eos else "length"
-                prompt_count = len(final_step.prompt_ids)
-                completion_count = len(final_step.generated_ids)
+                finish_reason = (
+                    "stop" if plain_final_step.stopped_on_eos else "length"
+                )
+                prompt_count = len(plain_final_step.prompt_ids)
+                completion_count = len(plain_final_step.generated_ids)
             yield self._chat_chunk(
                 completion_id,
                 created,
@@ -670,6 +764,7 @@ class InferenceService:
             with self._generation_guard():
                 for step in self.generator.stream_messages(
                     request.messages,
+                    prepared_prompt_ids=request.prompt_ids,
                     max_new_tokens=request.max_new_tokens,
                     sampling=request.sampling,
                     enable_thinking=request.enable_thinking,
@@ -691,8 +786,8 @@ class InferenceService:
             if final_step is None:
                 raise RuntimeError("generation stream ended without a final result")
             result = GenerationResult(
-                prompt_ids=final_step.prompt_ids,
-                generated_ids=final_step.generated_ids,
+                prompt_ids=tuple(final_step.prompt_ids),
+                generated_ids=tuple(final_step.generated_ids),
                 text=final_step.text,
                 stopped_on_eos=final_step.stopped_on_eos,
                 state_tokens=final_step.state_tokens,
@@ -804,8 +899,13 @@ class InferenceService:
     ) -> Iterator[dict[str, Any]]:
         chat_payload = _anthropic_to_chat_payload(payload)
         chat_payload["stream_options"] = {"include_usage": True}
-        input_tokens = self._estimate_prompt_tokens(chat_payload)
-        chat_events = self.stream_chat_completion(chat_payload, progress=progress)
+        prepared_request = self._prepare_chat(chat_payload)
+        input_tokens = len(prepared_request.prompt_ids)
+        chat_events = self.stream_chat_completion(
+            chat_payload,
+            progress=progress,
+            _prepared_request=prepared_request,
+        )
 
         def events() -> Iterator[dict[str, Any]]:
             message_id = f"msg_{uuid.uuid4().hex}"
@@ -1057,22 +1157,26 @@ class InferenceService:
             raise APIError(400, str(error)) from error
         enable_thinking = _boolean_option(payload, "enable_thinking", False)
         try:
-            prompt_tokens = len(
-                self.generator.tokenizer.encode_messages(
+            prepare_messages = getattr(self.generator, "prepare_messages", None)
+            prompt_ids = tuple(
+                prepare_messages(messages, enable_thinking=enable_thinking)
+                if callable(prepare_messages)
+                else self.generator.tokenizer.encode_messages(
                     messages, enable_thinking=enable_thinking
                 )
             )
-        except Exception:
-            # Tokenization may fail on exotic/partial prompts or a backend
-            # tokenizer that rejects certain control sequences. Never let that
-            # block the request; fall back to a zero prompt count so clamping
-            # simply uses the whole context window.
-            prompt_tokens = 0
+        except Exception as error:
+            raise APIError(
+                400,
+                f"unable to tokenize the formatted prompt: {error}",
+                parameter="messages",
+            ) from error
         max_new_tokens = self._fit_max_new_tokens(
-            requested_max, prompt_tokens, parameter=max_key
+            requested_max, len(prompt_ids), parameter=max_key
         )
         return _GenerationRequest(
             messages,
+            prompt_ids,
             max_new_tokens,
             sampling,
             enable_thinking,
@@ -1101,27 +1205,6 @@ class InferenceService:
                 parameter=parameter,
             )
         return max(1, min(requested, self.max_new_tokens, room))
-
-    def _estimate_prompt_tokens(self, chat_payload: Mapping[str, Any]) -> int:
-        """Best-effort prompt token count for streaming usage reporting.
-
-        Mirrors the generation path (tool-prompt injection + chat formatting)
-        so the ``input_tokens`` reported in an Anthropic ``message_start`` block
-        matches what generation actually consumes. Returns 0 on any error since
-        usage reporting must never break the stream.
-        """
-        try:
-            messages, _ = _chat_messages(chat_payload)
-            return len(
-                self.generator.tokenizer.encode_messages(
-                    messages,
-                    enable_thinking=_boolean_option(
-                        chat_payload, "enable_thinking", False
-                    ),
-                )
-            )
-        except Exception:
-            return 0
 
     def _validate_model(self, requested_model: Any) -> None:
         if (
@@ -1329,6 +1412,44 @@ class InferenceService:
 class ColibriHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler: type[BaseHTTPRequestHandler],
+        bind_and_activate: bool = True,
+        *,
+        max_connections: int = 128,
+    ):
+        if max_connections <= 0:
+            raise ValueError("max_connections must be positive")
+        self._connection_slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(server_address, request_handler, bind_and_activate)
+
+    def process_request(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: object,
+    ) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            (request[1] if isinstance(request, tuple) else request).close()
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: object,
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
 
 
 def create_handler(
@@ -1337,6 +1458,10 @@ def create_handler(
     class ColibriRequestHandler(BaseHTTPRequestHandler):
         server_version = "colibri-next/0.2"
         protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(service.request_timeout_seconds)
 
         def do_OPTIONS(self) -> None:
             self.send_response(204)
@@ -1798,10 +1923,13 @@ def serve(
     *,
     host: str = "127.0.0.1",
     port: int = 8000,
+    max_connections: int = 128,
 ) -> None:
     if not 0 <= port <= 65535:
         raise ValueError("port must be between 0 and 65535")
-    server = ColibriHTTPServer((host, port), create_handler(service))
+    server = ColibriHTTPServer(
+        (host, port), create_handler(service), max_connections=max_connections
+    )
     try:
         server.serve_forever()
     finally:
@@ -2225,8 +2353,8 @@ def _has_complete_tool_call(text: str, *, tools: Sequence[dict[str, Any]]) -> bo
 
 def _generation_result(step: GenerationStep) -> GenerationResult:
     return GenerationResult(
-        prompt_ids=step.prompt_ids,
-        generated_ids=step.generated_ids,
+        prompt_ids=tuple(step.prompt_ids),
+        generated_ids=tuple(step.generated_ids),
         text=step.text,
         stopped_on_eos=step.stopped_on_eos,
         state_tokens=step.state_tokens,

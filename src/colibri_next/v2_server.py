@@ -6,7 +6,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 from queue import SimpleQueue
-from typing import Iterator, Mapping, Sequence
+from typing import Iterator, Mapping, Sequence, overload
 
 from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
@@ -19,6 +19,33 @@ from .v2 import (
     V2Model,
     V2QwenRuntime,
 )
+
+
+class _TokenSnapshot(Sequence[int]):
+    """Constant-time, immutable-length view of an append-only token buffer."""
+
+    __slots__ = ("_tokens", "_length")
+
+    def __init__(self, tokens: list[int], length: int):
+        self._tokens = tokens
+        self._length = length
+
+    def __len__(self) -> int:
+        return self._length
+
+    @overload
+    def __getitem__(self, index: int) -> int: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[int]: ...
+
+    def __getitem__(self, index: int | slice) -> int | Sequence[int]:
+        if isinstance(index, slice):
+            return self._tokens[: self._length][index]
+        normalized = index + self._length if index < 0 else index
+        if normalized < 0 or normalized >= self._length:
+            raise IndexError(index)
+        return self._tokens[normalized]
 
 
 class _NativeEngine:
@@ -112,17 +139,17 @@ class _NativeEngine:
                 continue
             for task_id, token, kind in events:
                 with self._lock:
-                    queue = self._queues.get(task_id)
-                if queue is None:
+                    task_queue = self._queues.get(task_id)
+                if task_queue is None:
                     continue
                 if kind == TASK_EVENT_TOKEN:
-                    queue.put(("token", token))
+                    task_queue.put(("token", token))
                 elif kind == TASK_EVENT_DONE:
-                    queue.put(("done", None))
+                    task_queue.put(("done", None))
                     with self._lock:
                         self._queues.pop(task_id, None)
                 elif kind == TASK_EVENT_ERROR:
-                    queue.put(("error", "native v2 engine task failed"))
+                    task_queue.put(("error", "native v2 engine task failed"))
                     with self._lock:
                         self._queues.pop(task_id, None)
 
@@ -162,6 +189,7 @@ class NativeV2Tokenizer:
             except (V2Error, KeyError):
                 pass
         self.eos_token_ids = tuple(dict.fromkeys(eos))
+        self._token_byte_cache: dict[int, bytes] = {}
 
     def encode(self, text: str) -> list[int]:
         return self.model.tokenize(text)
@@ -176,7 +204,11 @@ class NativeV2Tokenizer:
 
     def token_bytes(self, token_id: int) -> bytes:
         """Raw bytes of one token, for incremental (streaming) UTF-8 decoding."""
-        return self.model.decode_token_bytes([token_id])
+        cached = self._token_byte_cache.get(token_id)
+        if cached is None:
+            cached = self.model.decode_token_bytes([token_id])
+            self._token_byte_cache[token_id] = cached
+        return cached
 
     def format_messages(
         self,
@@ -313,12 +345,22 @@ class NativeV2Generator:
         if final is None:
             raise RuntimeError("native v2 generation ended without a final result")
         return GenerationResult(
-            final.prompt_ids,
-            final.generated_ids,
+            tuple(final.prompt_ids),
+            tuple(final.generated_ids),
             final.text,
             final.stopped_on_eos,
             final.state_tokens,
         )
+
+    def prepare_messages(
+        self, messages: Sequence[Mapping[str, str]], **options: object
+    ) -> list[int]:
+        thinking = bool(options.get("enable_thinking", False))
+        normalized = tuple(
+            (message["role"], message["content"].strip()) for message in messages
+        )
+        with self._chat_lock:
+            return self._continued_chat_prompt(normalized, thinking)
 
     def stream_messages(
         self, messages: Sequence[Mapping[str, str]], **options: object
@@ -327,8 +369,12 @@ class NativeV2Generator:
         normalized = tuple(
             (message["role"], message["content"].strip()) for message in messages
         )
-        with self._chat_lock:
-            prompt_ids = self._continued_chat_prompt(normalized, thinking)
+        prepared = options.get("prepared_prompt_ids")
+        prompt_ids = (
+            [int(token) for token in prepared]
+            if isinstance(prepared, Sequence)
+            else self.prepare_messages(messages, enable_thinking=thinking)
+        )
         final: GenerationStep | None = None
         for step in self._stream(prompt_ids, **options):
             if step.finished:
@@ -340,12 +386,12 @@ class NativeV2Generator:
             with self._chat_lock:
                 self._chat_messages = normalized
                 self._chat_prompt_ids = tuple(prompt_ids)
-                self._chat_generated_ids = final.generated_ids
+                self._chat_generated_ids = tuple(final.generated_ids)
                 self._chat_text = final.text
                 self._chat_thinking = thinking
                 self._chat_continuations[normalized] = (
                     tuple(prompt_ids),
-                    final.generated_ids,
+                    tuple(final.generated_ids),
                     final.text,
                     thinking,
                 )
@@ -463,8 +509,8 @@ class NativeV2Generator:
         if final is None:
             raise RuntimeError("native v2 generation ended without a final result")
         return GenerationResult(
-            final.prompt_ids,
-            final.generated_ids,
+            tuple(final.prompt_ids),
+            tuple(final.generated_ids),
             final.text,
             final.stopped_on_eos,
             final.state_tokens,
@@ -485,7 +531,8 @@ class NativeV2Generator:
         if not prompt_ids:
             raise ValueError("formatted prompt produced no token IDs")
         generated: list[int] = []
-        previous_text = ""
+        text_parts: list[str] = []
+        prompt_snapshot = tuple(prompt_ids)
         stopped = False
         # Streamed tokens are decoded through an INCREMENTAL UTF-8 decoder: a
         # BPE token often carries only part of a multi-byte character, and
@@ -526,13 +573,13 @@ class NativeV2Generator:
                     # A single undecodable token must never abort the whole
                     # stream; keep the previously decoded text and continue.
                     delta = ""
-                previous_text += delta
+                text_parts.append(delta)
                 yield GenerationStep(
                     token,
                     delta,
-                    tuple(prompt_ids),
-                    tuple(generated),
-                    previous_text,
+                    prompt_snapshot,
+                    _TokenSnapshot(generated, len(generated)),
+                    "",
                     stopped,
                     False,
                     len(prompt_ids) + len(generated),
@@ -542,13 +589,13 @@ class NativeV2Generator:
             # Flush any dangling partial UTF-8 sequence (a truncated character
             # at the very end of generation becomes a single visible U+FFFD).
             tail = utf8.decode(b"", True)
-            previous_text += tail
+            text_parts.append(tail)
             yield GenerationStep(
                 None,
                 tail,
-                tuple(prompt_ids),
+                prompt_snapshot,
                 tuple(generated),
-                previous_text,
+                "".join(text_parts),
                 stopped,
                 True,
                 len(prompt_ids) + len(generated),
@@ -591,6 +638,8 @@ class NativeV2InferenceService(InferenceService):
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
+        max_concurrent_requests: int = 64,
+        request_timeout_seconds: float = 30.0,
     ):
         self.v2_model = V2Model(model_path)
         self.v2_runtime: V2QwenRuntime | None = None
@@ -634,6 +683,8 @@ class NativeV2InferenceService(InferenceService):
             api_key=api_key,
             cors_origin=cors_origin,
             strict_model=strict_model,
+            max_concurrent_requests=max_concurrent_requests,
+            request_timeout_seconds=request_timeout_seconds,
         )
         runtime_info = self.v2_runtime.info
         self.requested_expert_mode = str(runtime_info["requested_expert_mode"])

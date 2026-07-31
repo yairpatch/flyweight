@@ -41,7 +41,15 @@ class StubTokenizer:
 class StubGenerator:
     def __init__(self) -> None:
         self.calls = []
+        self.prepare_calls = []
         self.tokenizer = StubTokenizer()
+
+    def prepare_messages(self, messages, **options):
+        self.prepare_calls.append((messages, options))
+        return self.tokenizer.encode_messages(
+            messages,
+            enable_thinking=bool(options.get("enable_thinking", False)),
+        )
 
     def generate_messages(self, messages, **options) -> GenerationResult:
         self.calls.append((messages, options))
@@ -476,6 +484,51 @@ class InferenceServiceTests(unittest.TestCase):
     def test_health_reports_native_backend(self) -> None:
         service = InferenceService("qwen-local", self.generator)
         self.assertEqual(service.health()["execution"]["backend"], "native-v2")
+
+    def test_chat_prompt_is_prepared_once_and_reused_for_generation(self) -> None:
+        self.service.chat_completion(
+            {"messages": [{"role": "user", "content": "Hi"}]}
+        )
+        self.assertEqual(len(self.generator.prepare_calls), 1)
+        _, options = self.generator.calls[-1]
+        self.assertEqual(options["prepared_prompt_ids"], (72, 105))
+
+    def test_anthropic_stream_prepares_prompt_only_once(self) -> None:
+        list(
+            self.service.stream_anthropic_message(
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 4,
+                }
+            )
+        )
+        self.assertEqual(len(self.generator.prepare_calls), 1)
+
+    def test_generation_capacity_rejects_excess_work_without_queueing(self) -> None:
+        service = InferenceService(
+            "qwen-local", self.generator, max_concurrent_requests=1
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_slot() -> None:
+            with service._generation_guard():
+                entered.set()
+                release.wait(2)
+
+        worker = threading.Thread(target=hold_slot)
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            self.assertEqual(service.health()["active_requests"], 1)
+            with self.assertRaises(APIError) as caught:
+                with service._generation_guard():
+                    pass
+            self.assertEqual(caught.exception.status, 429)
+        finally:
+            release.set()
+            worker.join()
+        self.assertEqual(service.health()["active_requests"], 0)
 
     def test_context_window_limits_combined_prompt_and_output(self) -> None:
         service = InferenceService(
@@ -1539,7 +1592,10 @@ class ServerCLITests(unittest.TestCase):
         load_model.assert_called_once()
         self.assertEqual(load_model.call_args.kwargs["max_new_tokens"], 24)
         serve_http.assert_called_once_with(
-            load_model.return_value, host="127.0.0.1", port=9012
+            load_model.return_value,
+            host="127.0.0.1",
+            port=9012,
+            max_connections=128,
         )
         load_model.return_value.close.assert_called_once()
 
