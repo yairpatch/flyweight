@@ -3,6 +3,7 @@ import itertools
 import json
 import re
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -261,6 +262,82 @@ class ToolCallParsingTests(unittest.TestCase):
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
         )
+
+    EDIT_TOOL = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "replace_all": {"type": "boolean"},
+                    },
+                },
+            },
+        }
+    ]
+
+    @staticmethod
+    def _hermes(name: str, **parameters: str) -> str:
+        body = "".join(
+            f"<parameter={key}>\n{value}\n</parameter>\n"
+            for key, value in parameters.items()
+        )
+        return f"<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
+
+    def test_hermes_parameter_keeps_leading_indentation(self) -> None:
+        # Edit matches old_string byte-for-byte. Stripping the value's
+        # surrounding whitespace ate the first line's indentation, so every
+        # edit to indented code failed and the model resorted to shell edits.
+        old = "    def foo(self):\n        return 1"
+        _, calls = _parse_tool_calls(
+            self._hermes("Edit", file_path="/tmp/a.py", old_string=old),
+            tools=self.EDIT_TOOL,
+        )
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments["old_string"], old)
+
+    def test_hermes_string_parameter_is_not_reinterpreted_as_json(self) -> None:
+        # Editing a JSON file sends content that happens to parse. Inferring a
+        # type from it replaced the declared string with a dict, and
+        # re-serializing changed the very whitespace the edit had to match.
+        old = '{"a": 1,\n "b": 2}'
+        _, calls = _parse_tool_calls(
+            self._hermes("Edit", file_path="/tmp/a.json", old_string=old),
+            tools=self.EDIT_TOOL,
+        )
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments["old_string"], old)
+
+    def test_hermes_declared_scalars_are_still_typed(self) -> None:
+        _, calls = _parse_tool_calls(
+            self._hermes("Edit", file_path="/tmp/a.py", replace_all="true"),
+            tools=self.EDIT_TOOL,
+        )
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertIs(arguments["replace_all"], True)
+
+    def test_hermes_declared_object_parameter_is_decoded(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Configure",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"options": {"type": "object"}},
+                    },
+                },
+            }
+        ]
+        _, calls = _parse_tool_calls(
+            self._hermes("Configure", options='{"depth": 2}'), tools=tools
+        )
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments["options"], {"depth": 2})
 
     def test_parses_json_format(self) -> None:
         # Qwen3/DeepSeek/GLM style: JSON object inside the <tool_call> block.
@@ -1598,6 +1675,89 @@ class ServerCLITests(unittest.TestCase):
             max_connections=128,
         )
         load_model.return_value.close.assert_called_once()
+
+
+class StreamKeepaliveTests(unittest.TestCase):
+    """A stalled generator must keep producing bytes on the wire.
+
+    Prompt evaluation holds the generator for minutes on a long prompt. With
+    no traffic in between, pooled clients (Claude Code, Cline) abandon the
+    request long before the first token arrives.
+    """
+
+    def setUp(self) -> None:
+        self.service = InferenceService(
+            "qwen-local", StubGenerator(), sse_keepalive_seconds=0.05
+        )
+        self.server = ColibriHTTPServer(
+            ("127.0.0.1", 0), create_handler(self.service)
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_port, timeout=10
+        )
+
+    def tearDown(self) -> None:
+        self.connection.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _stalling(self, events):
+        def stream(payload, *, progress=None):
+            time.sleep(0.3)  # stands in for a long prompt evaluation
+            yield from events
+
+        return stream
+
+    def _post(self, path: str) -> str:
+        self.connection.request(
+            "POST",
+            path,
+            body=json.dumps(
+                {"messages": [{"role": "user", "content": "Hi"}], "stream": True}
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        return response.read().decode("utf-8")
+
+    def test_anthropic_stream_pings_while_the_prompt_is_evaluated(self) -> None:
+        self.service.stream_anthropic_message = self._stalling(
+            [
+                {"type": "message_start", "message": {"id": "msg_1"}},
+                {"type": "message_stop"},
+            ]
+        )
+        body = self._post("/v1/messages")
+        head = body.split("message_start", 1)[0]
+        # 0.3 s of stall at a 0.05 s interval: several pings, and they have to
+        # land before the first real event rather than after it.
+        self.assertGreaterEqual(head.count('"type": "ping"'), 2, body)
+        self.assertIn("event: ping", head)
+        self.assertIn("message_stop", body)
+
+    def test_openai_stream_keepalive_uses_sse_comments(self) -> None:
+        self.service.stream_chat_completion = self._stalling(
+            [{"object": "chat.completion.chunk"}, "[DONE]"]
+        )
+        body = self._post("/v1/chat/completions")
+        head = body.split("chat.completion.chunk", 1)[0]
+        # A comment is inert framing for OpenAI-shaped clients, which have no
+        # ping event to parse.
+        self.assertGreaterEqual(head.count(": keepalive"), 2, body)
+        self.assertIn("data: [DONE]", body)
+
+    def test_stream_errors_still_propagate_through_the_keepalive_pump(self) -> None:
+        def failing(payload, *, progress=None):
+            yield {"object": "chat.completion.chunk"}
+            raise APIError(500, "boom", "server_error")
+
+        self.service.stream_chat_completion = failing
+        body = self._post("/v1/chat/completions")
+        self.assertIn("boom", body)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hmac
 import json
+import queue
 import re
 import socket
 import sys
@@ -84,9 +85,16 @@ TOOL_CALL_MARKER = "<tool_call>"
 TOOL_CALL_END_MARKER = "</tool_call>"
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 TOOL_FUNCTION_PATTERN = re.compile(r"<function=([^>\n]+)>", re.DOTALL)
+# The value is captured verbatim: \s* here would eat the first line's
+# indentation, which is content for tools that match on exact text (Edit).
 TOOL_PARAMETER_PATTERN = re.compile(
-    r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.DOTALL
+    r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL
 )
+# One newline on each side of a Hermes value is framing, per the layout
+# _tool_prompt() shows the model. Trailing horizontal space is only consumed
+# after that newline, where it is the closing tag's indentation.
+TOOL_PARAMETER_LEAD = re.compile(r"\A\r?\n")
+TOOL_PARAMETER_TAIL = re.compile(r"\r?\n[ \t]*\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +138,7 @@ class InferenceService:
         strict_model: bool = False,
         max_concurrent_requests: int = 64,
         request_timeout_seconds: float = 30.0,
+        sse_keepalive_seconds: float = 10.0,
     ):
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
@@ -139,6 +148,8 @@ class InferenceService:
             raise ValueError("max_concurrent_requests must be positive")
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
+        if sse_keepalive_seconds <= 0:
+            raise ValueError("sse_keepalive_seconds must be positive")
         self.model_name = model_name
         self.generator = generator
         self.max_new_tokens = max_new_tokens
@@ -148,6 +159,7 @@ class InferenceService:
         self.strict_model = strict_model
         self.max_concurrent_requests = max_concurrent_requests
         self.request_timeout_seconds = request_timeout_seconds
+        self.sse_keepalive_seconds = sse_keepalive_seconds
         self.loaded_at = int(time.time())
         self._generation_lock = threading.Lock()
         # Generators that multiplex concurrent requests natively (the v2
@@ -1452,6 +1464,73 @@ class ColibriHTTPServer(ThreadingHTTPServer):
             self._connection_slots.release()
 
 
+_SSE_KEEPALIVE = object()
+
+
+def _sse_with_keepalive(
+    events: Iterator[dict[str, Any] | str], interval: float
+) -> Iterator[object]:
+    """Yield the upstream events, injecting _SSE_KEEPALIVE while they stall.
+
+    Evaluating a long prompt holds the generator for minutes before the first
+    token, and pooled HTTP clients (Claude Code, Cline, ...) abandon a stream
+    that produces no bytes for that long. Draining the upstream iterator on a
+    worker thread lets the caller keep writing liveness markers meanwhile.
+    """
+    pending: queue.Queue[object] = queue.Queue(maxsize=1024)
+    finished = object()
+    stop = threading.Event()
+    failure: list[BaseException] = []
+
+    def pump() -> None:
+        try:
+            for event in events:
+                while not stop.is_set():
+                    try:
+                        pending.put(event, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                if stop.is_set():
+                    break
+        except BaseException as error:  # re-raised on the consuming thread
+            failure.append(error)
+        finally:
+            # The pump is the only thread inside the generator frame, so it is
+            # also the only one that may close it.
+            close = getattr(events, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    close()
+            with contextlib.suppress(queue.Full):
+                pending.put_nowait(finished)
+
+    worker = threading.Thread(target=pump, daemon=True)
+    worker.start()
+    try:
+        while True:
+            try:
+                item = pending.get(timeout=interval)
+            except queue.Empty:
+                yield _SSE_KEEPALIVE
+                continue
+            if item is finished:
+                break
+            yield item
+        if failure:
+            raise failure[0]
+    finally:
+        stop.set()
+        # Drain briefly so a pump blocked on a full queue notices `stop`. A
+        # pump still inside a long native call cannot be interrupted; it is a
+        # daemon thread, so leave it rather than block the connection.
+        deadline = time.monotonic() + 1.0
+        while worker.is_alive() and time.monotonic() < deadline:
+            with contextlib.suppress(queue.Empty):
+                pending.get_nowait()
+            worker.join(timeout=0.05)
+
+
 def create_handler(
     service: InferenceService,
 ) -> type[BaseHTTPRequestHandler]:
@@ -1609,7 +1688,10 @@ def create_handler(
                 if path == "/v1/messages":
                     if _boolean_option(payload, "stream", False):
                         self._send_sse(
-                            service.stream_anthropic_message(payload, progress=progress)
+                            service.stream_anthropic_message(
+                                payload, progress=progress
+                            ),
+                            keepalive={"type": "ping"},
                         )
                     else:
                         self._send_json(
@@ -1716,7 +1798,12 @@ def create_handler(
             if length:
                 self.rfile.read(length)
 
-        def _send_sse(self, events: Iterator[dict[str, Any] | str]) -> None:
+        def _send_sse(
+            self,
+            events: Iterator[dict[str, Any] | str],
+            *,
+            keepalive: Mapping[str, Any] | None = None,
+        ) -> None:
             # HTTP/1.1 chunked transfer-encoding rather than close-delimited: each
             # SSE event is a self-framed chunk, so the stream stays intact and the
             # keep-alive connection is cleanly reusable. Close-delimiting (Connection:
@@ -1742,8 +1829,12 @@ def create_handler(
             # for the very same generation.
             decode_elapsed = 0.0
             last_stat = 0.0
+            stream = _sse_with_keepalive(events, service.sse_keepalive_seconds)
             try:
-                for event in events:
+                for event in stream:
+                    if event is _SSE_KEEPALIVE:
+                        self._write_sse_keepalive(keepalive)
+                        continue
                     data = (
                         event
                         if isinstance(event, str)
@@ -1832,15 +1923,28 @@ def create_handler(
                     stream_ok = False
                     self.close_connection = True
             finally:
-                close = getattr(events, "close", None)
-                if close is not None:
-                    close()
+                # Closing the wrapper stops its worker, which owns closing the
+                # upstream generator.
+                stream.close()
                 if stream_ok:
                     try:
                         self.wfile.write(b"0\r\n\r\n")  # terminating chunk
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         self.close_connection = True
+
+        def _write_sse_keepalive(self, event: Mapping[str, Any] | None) -> None:
+            if event is not None:
+                self._write_sse_event(json.dumps(event, ensure_ascii=False), event)
+                return
+            # An SSE comment: valid framing that every compliant client
+            # ignores, so it is safe on the OpenAI-shaped endpoints where no
+            # keepalive event type is defined.
+            payload = b": keepalive\n\n"
+            self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
+            self.wfile.write(payload)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
 
         def _write_sse_event(
             self, data: str, event: Mapping[str, Any] | None = None
@@ -2323,6 +2427,12 @@ def _parse_tool_calls(
         schema = _tool_argument_schema(tools, name)
         if schema is not None:
             arguments = _normalize_schema_value(arguments, schema)
+        elif isinstance(arguments, dict):
+            # Undeclared tool: nothing describes these values, so fall back to
+            # inferring each one.
+            arguments = {
+                key: _infer_tool_value(item) for key, item in arguments.items()
+            }
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex}",
@@ -2422,6 +2532,13 @@ def _normalize_schema_value(value: Any, schema: Mapping[str, Any]) -> Any:
             return "null"
         return str(value)
 
+    # Hermes parameters arrive as text, so a declared object/array has to be
+    # decoded here -- after the string branch above, which must keep its text.
+    if isinstance(value, str) and (
+        "object" in allowed_types or "array" in allowed_types
+    ):
+        value = _infer_tool_value(value)
+
     if "object" in allowed_types and isinstance(value, dict):
         properties = schema.get("properties")
         property_schemas = properties if isinstance(properties, dict) else {}
@@ -2434,7 +2551,7 @@ def _normalize_schema_value(value: Any, schema: Mapping[str, Any]) -> Any:
             normalized[key] = (
                 _normalize_schema_value(item, item_schema)
                 if isinstance(item_schema, dict)
-                else item
+                else _infer_tool_value(item)
             )
         return normalized
 
@@ -2457,6 +2574,28 @@ def _normalize_schema_value(value: Any, schema: Mapping[str, Any]) -> Any:
     return value
 
 
+def _trim_parameter_text(raw: str) -> str:
+    """Drop only the framing newlines around a Hermes parameter value.
+
+    _tool_prompt() shows the model ``<parameter=name>\\nvalue\\n</parameter>``,
+    so exactly one newline per side is layout. Stripping all whitespace instead
+    removed the first line's indentation, so every Edit against indented code
+    failed its exact-match check and the model fell back to shell edits.
+    """
+    raw = TOOL_PARAMETER_LEAD.sub("", raw, count=1)
+    return TOOL_PARAMETER_TAIL.sub("", raw, count=1)
+
+
+def _infer_tool_value(value: Any) -> Any:
+    """Type a parameter the tool schema does not describe."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value.strip())
+    except json.JSONDecodeError:
+        return value
+
+
 def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
     """Decode one <tool_call> body in either the Hermes or JSON tool format."""
     body = body.strip()
@@ -2464,11 +2603,13 @@ def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
     if function_match:
         arguments: dict[str, Any] = {}
         for parameter in TOOL_PARAMETER_PATTERN.finditer(body):
-            raw_value = parameter.group(2).strip()
-            try:
-                arguments[parameter.group(1)] = json.loads(raw_value)
-            except json.JSONDecodeError:
-                arguments[parameter.group(1)] = raw_value
+            # Kept as text. Typing it here would have to guess, and guessing
+            # JSON turns file content that happens to parse (a .json edit, a
+            # bare number) into a value the tool never asked for. The declared
+            # schema decides in _normalize_schema_value instead.
+            arguments[parameter.group(1).strip()] = _trim_parameter_text(
+                parameter.group(2)
+            )
         return function_match.group(1).strip(), arguments
     # JSON style: {"name": "fn", "arguments": {...}} (arguments may be a string).
     try:

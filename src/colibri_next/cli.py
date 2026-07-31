@@ -168,6 +168,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-concurrent-requests", type=int, default=64)
     serve.add_argument("--max-connections", type=int, default=128)
     serve.add_argument("--request-timeout-seconds", type=float, default=30.0)
+    serve.add_argument("--sse-keepalive-seconds", type=float, default=10.0)
     _add_runtime_options(serve, serving=True)
     return parser
 
@@ -184,6 +185,8 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-connections must be at least 1")
     if getattr(args, "request_timeout_seconds", 1.0) <= 0:
         raise SystemExit("--request-timeout-seconds must be positive")
+    if getattr(args, "sse_keepalive_seconds", 1.0) <= 0:
+        raise SystemExit("--sse-keepalive-seconds must be positive")
     if args.cpu_prefetch_mib and args.cpu_prefetch_auto:
         raise SystemExit("use either --cpu-prefetch-mib or --cpu-prefetch-auto")
     if not 0 <= args.next_layer_prefetch <= 64:
@@ -333,6 +336,7 @@ def _serve(args: argparse.Namespace) -> int:
         strict_model=args.strict_model,
         max_concurrent_requests=args.max_concurrent_requests,
         request_timeout_seconds=args.request_timeout_seconds,
+        sse_keepalive_seconds=args.sse_keepalive_seconds,
     )
     try:
         print(f"Serving {service.model_name} at http://{args.host}:{args.port}", file=sys.stderr)

@@ -640,6 +640,7 @@ class NativeV2InferenceService(InferenceService):
         strict_model: bool = False,
         max_concurrent_requests: int = 64,
         request_timeout_seconds: float = 30.0,
+        sse_keepalive_seconds: float = 10.0,
     ):
         self.v2_model = V2Model(model_path)
         self.v2_runtime: V2QwenRuntime | None = None
@@ -685,6 +686,7 @@ class NativeV2InferenceService(InferenceService):
             strict_model=strict_model,
             max_concurrent_requests=max_concurrent_requests,
             request_timeout_seconds=request_timeout_seconds,
+            sse_keepalive_seconds=sse_keepalive_seconds,
         )
         runtime_info = self.v2_runtime.info
         self.requested_expert_mode = str(runtime_info["requested_expert_mode"])
