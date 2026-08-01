@@ -1915,6 +1915,11 @@ float qwen_nvfp4_value(const std::uint8_t*packed,std::uint64_t absolute){
 }
 float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*input,int elements,std::uint64_t row){
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0){
+        const char*setting=std::getenv("COLIBRI_IQ_AVX512");
+        if(!setting||setting[0]!='0')
+            return qwen_quant_dot_avx512(packed,type,input,elements,row);
+    }
     if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
@@ -2185,6 +2190,8 @@ void qwen_quant_dot_two_rows(
         row_bytes = static_cast<std::uint64_t>(elements / kBlockElements) * kQ5KBlockSize;
     } else if (type == 14) {
         row_bytes = static_cast<std::uint64_t>(elements / kBlockElements) * kQ6KBlockSize;
+    } else if (type == 17) {
+        row_bytes = static_cast<std::uint64_t>(elements / 256) * kIq2xsBlockBytes;
     } else if (type == 8) {
         row_bytes = static_cast<std::uint64_t>(elements / 32) * kQ8BlockSize;
     } else if (type == 40) {
@@ -2195,8 +2202,11 @@ void qwen_quant_dot_two_rows(
     const auto* first_row = first_matrix + row * row_bytes;
     const auto* second_row = second_matrix + row * row_bytes;
     if ((colibri_cpu_features() & 2u) != 0) {
+        const char* iq_setting = std::getenv("COLIBRI_IQ_AVX512");
+        const bool iq_avx512 = !iq_setting || iq_setting[0] != '0';
         const bool supported =
             (type == 8 && elements % 32 == 0)
+            || (type == 17 && iq_avx512 && elements % 256 == 0)
             || ((type == 12 || type == 13 || type == 14) && elements % 256 == 0);
         if (supported) {
             qwen_quant_dot_two_rows_avx512(
@@ -2636,6 +2646,12 @@ void qwen_cpu_moe(
 #endif
     const auto* input_q8_data = input_q8.data();
     auto* activated_q8_data = activated_q8.data();
+    const char* fused_gate_up_setting = std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
+    const char* iq_avx512_setting = std::getenv("COLIBRI_IQ_AVX512");
+    const bool auto_fused_iq2xs = gate_type == 17
+        && (colibri_cpu_features() & 2u) != 0
+        && (!iq_avx512_setting || iq_avx512_setting[0] != '0')
+        && (!fused_gate_up_setting || fused_gate_up_setting[0] != '0');
     const auto gate_up_task = [&](int task) {
         const int rank = task / intermediate;
         const int row = task % intermediate;
@@ -2648,7 +2664,8 @@ void qwen_cpu_moe(
             up_value = qwen_quant_dot_q8_k_avx2(
                 up[rank], up_type, input_q8_data, hidden, row
             );
-        } else if (runtime.fused_moe_gate_up && gate_type == up_type) {
+        } else if ((runtime.fused_moe_gate_up || auto_fused_iq2xs)
+                   && gate_type == up_type) {
             qwen_quant_dot_two_rows(
                 gate[rank], up[rank], gate_type, input, hidden,
                 row, gate_value, up_value

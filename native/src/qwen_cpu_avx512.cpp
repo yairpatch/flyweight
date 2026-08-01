@@ -83,6 +83,85 @@ float nvfp4_dot(const std::uint8_t* row_data, const float* input, int elements) 
     return output;
 }
 
+float iq2xs_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m512 sum = _mm512_setzero_ps();
+    const __m512 zero = _mm512_setzero_ps();
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq2xsBlockBytes;
+        const float d = half_value(base);
+        const float* values = input + block * 256;
+        for (int group = 0; group < 16; ++group) {
+            std::uint16_t first = 0, second = 0;
+            std::memcpy(&first, base + 2 + group * 4, 2);
+            std::memcpy(&second, base + 4 + group * 4, 2);
+            const __m128i packed = _mm_set_epi64x(
+                static_cast<long long>(kIq2xsGrid[second & 511]),
+                static_cast<long long>(kIq2xsGrid[first & 511]));
+            const __mmask16 signs = static_cast<__mmask16>(
+                kIq2xxsSigns[first >> 9]
+                | (static_cast<unsigned>(kIq2xxsSigns[second >> 9]) << 8));
+            const __m512 magnitudes = bytes_to_float(packed);
+            const __m512 signed_magnitudes = _mm512_mask_sub_ps(
+                magnitudes, signs, zero, magnitudes);
+            const int scale =
+                (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
+            const __m512 weights = _mm512_mul_ps(
+                signed_magnitudes,
+                _mm512_set1_ps(d * (0.5f + scale) * 0.25f));
+            sum = _mm512_fmadd_ps(
+                weights, _mm512_loadu_ps(values + group * 16), sum);
+        }
+    }
+    return _mm512_reduce_add_ps(sum);
+}
+
+void iq2xs_dot_two_rows(
+    const std::uint8_t* first_row, const std::uint8_t* second_row,
+    const float* input, int elements, float& first, float& second
+) {
+    __m512 first_sum = _mm512_setzero_ps();
+    __m512 second_sum = _mm512_setzero_ps();
+    const __m512 zero = _mm512_setzero_ps();
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* first_base = first_row + block * kIq2xsBlockBytes;
+        const auto* second_base = second_row + block * kIq2xsBlockBytes;
+        const float first_d = half_value(first_base);
+        const float second_d = half_value(second_base);
+        const float* values = input + block * 256;
+        for (int group = 0; group < 16; ++group) {
+            const __m512 activation = _mm512_loadu_ps(values + group * 16);
+            std::uint16_t first_codes[2]{}, second_codes[2]{};
+            std::memcpy(first_codes, first_base + 2 + group * 4, 4);
+            std::memcpy(second_codes, second_base + 2 + group * 4, 4);
+            const auto weights = [&](const std::uint8_t* base,
+                                     const std::uint16_t codes[2], float d) {
+                const __m128i packed = _mm_set_epi64x(
+                    static_cast<long long>(kIq2xsGrid[codes[1] & 511]),
+                    static_cast<long long>(kIq2xsGrid[codes[0] & 511]));
+                const __mmask16 signs = static_cast<__mmask16>(
+                    kIq2xxsSigns[codes[0] >> 9]
+                    | (static_cast<unsigned>(kIq2xxsSigns[codes[1] >> 9]) << 8));
+                const __m512 magnitudes = bytes_to_float(packed);
+                const __m512 signed_magnitudes = _mm512_mask_sub_ps(
+                    magnitudes, signs, zero, magnitudes);
+                const int scale =
+                    (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
+                return _mm512_mul_ps(
+                    signed_magnitudes,
+                    _mm512_set1_ps(d * (0.5f + scale) * 0.25f));
+            };
+            first_sum = _mm512_fmadd_ps(
+                weights(first_base, first_codes, first_d),
+                activation, first_sum);
+            second_sum = _mm512_fmadd_ps(
+                weights(second_base, second_codes, second_d),
+                activation, second_sum);
+        }
+    }
+    first = _mm512_reduce_add_ps(first_sum);
+    second = _mm512_reduce_add_ps(second_sum);
+}
+
 void nvfp4_dot_two_rows(
     const std::uint8_t* first_row, const std::uint8_t* second_row,
     const float* input, int elements, float& first, float& second
@@ -960,7 +1039,10 @@ void qwen_quant_dot_two_rows_avx512(
     float* first_output,
     float* second_output
 ) {
-    if (type == 12) {
+    if (type == 17) {
+        iq2xs_dot_two_rows(
+            first_row, second_row, input, elements, *first_output, *second_output);
+    } else if (type == 12) {
         q4_dot_two_rows(first_row, second_row, input, elements, *first_output, *second_output);
     } else if (type == 13) {
         q5_dot_two_rows(first_row, second_row, input, elements, *first_output, *second_output);
@@ -981,6 +1063,12 @@ float qwen_quant_dot_avx512(
     int elements,
     std::uint64_t row
 ) {
+    if (type == 17) {
+        return iq2xs_dot(
+            packed + row * static_cast<std::uint64_t>(elements / 256)
+                * kIq2xsBlockBytes,
+            input, elements);
+    }
     if (type == 10) {
         return q2_dot(packed + row * static_cast<std::uint64_t>(elements / 256) * kQ2KBlockBytes,
                       input, elements);

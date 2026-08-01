@@ -214,6 +214,10 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
   quantized 8-token CPU kernel by default instead of expanding expert rows to
   f32. Set `COLIBRI_PREFILL_DIRECT_QUANT=0` only for comparison; `=1` continues
   to opt other supported architectures into the same path.
+- On AVX-512 hosts, IQ2_XS decode widens a complete 16-value scale group at a
+  time and fuses the gate/up projections so they share each activation load.
+  Set `COLIBRI_IQ_AVX512=0` to compare with the AVX2 kernel, or
+  `COLIBRI_FUSED_MOE_GATE_UP=0` to disable only the automatic IQ2_XS fusion.
 - IQ expert decode is sensitive to memory bandwidth, clock sharing and thread
   placement. The default uses physical cores; tune `--cpu-threads` for the
   machine rather than assuming SMT helps (14 workers beat 8, 16 and 32 on the

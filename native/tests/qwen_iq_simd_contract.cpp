@@ -27,6 +27,15 @@ bool avx2_available() {
 #endif
 }
 
+bool avx512_available() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx512f")
+        && __builtin_cpu_supports("avx512bw");
+#else
+    return false;
+#endif
+}
+
 namespace {
 
 int failures = 0;
@@ -81,6 +90,25 @@ void check(const char* label, std::uint32_t type, std::uint32_t block_bytes,
         char name[64];
         std::snprintf(name, sizeof(name), "%s row %d", label, row);
         expect_close(name, actual, expected, scale);
+        if (type == 17 && avx512_available()) {
+            const float wide = qwen_quant_dot_avx512(
+                packed.data(), type, input.data(), kElements, row);
+            std::snprintf(name, sizeof(name), "%s AVX-512 row %d", label, row);
+            expect_close(name, wide, expected, scale);
+            const int other_row = (row + 1) % kRows;
+            const float other_expected = scalar(
+                packed.data(), input.data(), kElements, other_row);
+            const std::size_t row_bytes = blocks * block_bytes;
+            float pair_first = 0.0f, pair_second = 0.0f;
+            qwen_quant_dot_two_rows_avx512(
+                packed.data() + row * row_bytes,
+                packed.data() + other_row * row_bytes,
+                type, input.data(), kElements, &pair_first, &pair_second);
+            std::snprintf(name, sizeof(name), "%s AVX-512 fused first %d", label, row);
+            expect_close(name, pair_first, expected, scale);
+            std::snprintf(name, sizeof(name), "%s AVX-512 fused second %d", label, row);
+            expect_close(name, pair_second, other_expected, scale);
+        }
     }
 }
 
