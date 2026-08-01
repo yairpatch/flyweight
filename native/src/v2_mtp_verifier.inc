@@ -178,30 +178,72 @@ void qwen_forward_rows(
             add_rows(residual,hidden);moe_base=10;
             phase(layer_number,"outproj");
         }else{
-            const int heads=static_cast<int>(runtime.model->config.attention_heads);
+            // Laguna projects the query plainly and carries the attention gate
+            // in its own n_head-wide tensor, where Qwen interleaves a per-channel
+            // gate into the query projection. Head count and RoPE are per layer.
+            const bool laguna=runtime.laguna;
+            const int heads=laguna
+                ?static_cast<int>(layer.attention_heads)
+                :static_cast<int>(runtime.model->config.attention_heads);
             const int kv_heads=static_cast<int>(runtime.model->config.attention_kv_heads);
             const int head_dim=static_cast<int>(runtime.model->tensors[layer.static_tensors[2]].shape[1]/kv_heads);
-            const int query_elements=heads*head_dim,q_size=query_elements*2,kv_size=kv_heads*head_dim;
+            const int query_elements=heads*head_dim;
+            const int q_size=laguna?query_elements:query_elements*2;
+            const int kv_size=kv_heads*head_dim;
             dense(1,normalized,first,hidden_size,q_size);
             dense(2,normalized,second,hidden_size,kv_size);
             dense(3,normalized,third,hidden_size,kv_size);
-            const int rotary=static_cast<int>(runtime.model->config.rotary_dimension?runtime.model->config.rotary_dimension:head_dim);
-            const float theta=runtime.model->config.rope_freq_base?runtime.model->config.rope_freq_base:1000000.0f;
+            const int rotary=laguna
+                ?static_cast<int>(layer.rotary_dim)
+                :static_cast<int>(runtime.model->config.rotary_dimension?runtime.model->config.rotary_dimension:head_dim);
+            const float theta=laguna
+                ?layer.rope_theta
+                :(runtime.model->config.rope_freq_base?runtime.model->config.rope_freq_base:1000000.0f);
+            // Laguna's full-attention layers extend with YaRN; its sliding-window
+            // layers and every Qwen layer leave ext_factor at zero and so run the
+            // identical plain rotation.
+            const float freq_scale=laguna?layer.rope_freq_scale:1.0f;
+            const float ext_factor=laguna?layer.rope_ext_factor:0.0f;
+            const float mscale=laguna?layer.rope_attn_factor:1.0f;
+            float corr_low=0.0f,corr_high=0.0f;
+            if(ext_factor!=0.0f)
+                qwen_yarn_correction_dims(
+                    rotary,layer.rope_orig_context,theta,
+                    layer.rope_beta_fast,layer.rope_beta_slow,corr_low,corr_high);
             auto qnorm=tensor(5),knorm=tensor(6);
-            const auto queries=fourth,gates=fourth+static_cast<std::uint64_t>(rows)*query_elements*sizeof(float);
+            const auto queries=fourth;
+            // One scalar per head for Laguna, one per query channel for Qwen.
+            const auto gates=fourth+static_cast<std::uint64_t>(rows)*query_elements*sizeof(float);
+            if(laguna)dense(7,normalized,gates,hidden_size,heads);
             auto cache_keys=runtime.state+layer.state_first,cache_values=runtime.state+layer.state_second;
             int capacity=static_cast<int>(layer.cache_capacity);
             for(int token=0;token<rows;++token){
                 auto projected=first+static_cast<std::uint64_t>(token)*q_size*sizeof(float);
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
-                auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                auto gate=gates+static_cast<std::uint64_t>(token)*
+                    (laguna?heads:query_elements)*sizeof(float);
                 int position=static_cast<int>(runtime.position)+token;
-                void*q_args[]={&projected,&qnorm,&query,&gate,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-                launch("qwen_attention_query",heads,1,256,q_args);
                 auto projected_key=second+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 auto key=first+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
-                void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-                launch("qwen_attention_key",kv_heads,1,256,k_args);
+                if(laguna){
+                    void*q_args[]={&projected,&qnorm,&query,const_cast<int*>(&heads),
+                                   const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                                   &position,const_cast<float*>(&theta),const_cast<float*>(&epsilon),
+                                   const_cast<float*>(&freq_scale),const_cast<float*>(&ext_factor),
+                                   const_cast<float*>(&mscale),&corr_low,&corr_high};
+                    launch("laguna_head_norm_rope",heads,1,256,q_args);
+                    void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),
+                                   const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                                   &position,const_cast<float*>(&theta),const_cast<float*>(&epsilon),
+                                   const_cast<float*>(&freq_scale),const_cast<float*>(&ext_factor),
+                                   const_cast<float*>(&mscale),&corr_low,&corr_high};
+                    launch("laguna_head_norm_rope",kv_heads,1,256,k_args);
+                }else{
+                    void*q_args[]={&projected,&qnorm,&query,&gate,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
+                    launch("qwen_attention_query",heads,1,256,q_args);
+                    void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
+                    launch("qwen_attention_key",kv_heads,1,256,k_args);
+                }
                 auto value=third+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 int slot=static_cast<int>(static_cast<std::uint64_t>(position)%layer.cache_capacity);
                 void*k_store_args[]={&key,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
@@ -242,8 +284,11 @@ void qwen_forward_rows(
                 packed_query_bytes+packed_output_bytes<=
                 static_cast<std::uint64_t>(heads)*
                     runtime.options.context_limit*sizeof(float);
+            // The tensor-core prefill routines fold Qwen's per-channel sigmoid
+            // gate in themselves, so Laguna, whose gate is a per-head softplus,
+            // cannot use them and takes the warp path with its own gate kernel.
             const bool cublas_prefill_done=
-                cublas_prefill_requested&&!layer.attention_window&&
+                cublas_prefill_requested&&!laguna&&!layer.attention_window&&
                 runtime.options.cache_type_k==1&&
                 runtime.options.cache_type_v==1&&cublas_tile_rows>0&&
                 cublas_workspace_ok&&
@@ -264,9 +309,15 @@ void qwen_forward_rows(
                 void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale};
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
-                void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
-                launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
+                if(laguna){
+                    void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&rows,const_cast<int*>(&heads),const_cast<int*>(&head_dim)};
+                    launch("laguna_attention_gate_rows",(elements+255)/256,1,256,gate_args);
+                }else{
+                    void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
+                    launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
+                }
             }else if(std::uint64_t stage_keys=0,stage_values=0;
+                     !laguna&&
                      qwen_turbo_prefill_stage(
                          runtime,layer,queries,cache_keys,cache_values,
                          heads,kv_heads,head_dim,rows,
@@ -298,7 +349,8 @@ void qwen_forward_rows(
                 launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
             }else for(int token=0;token<rows;++token){
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
-                auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                auto gate=gates+static_cast<std::uint64_t>(token)*
+                    (laguna?heads:query_elements)*sizeof(float);
                 int position=static_cast<int>(runtime.position)+token;
                 const auto view=attention_cache_view(layer,static_cast<std::uint64_t>(position));
                 int tokens=view.tokens,first_slot=view.first;
@@ -308,10 +360,16 @@ void qwen_forward_rows(
                 void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
                 launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
                 auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);int elements=query_elements;
-                void*token_gate_args[]={&attended,&gate,&gated,&elements};launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                if(laguna){
+                    void*token_gate_args[]={&attended,&gate,&gated,
+                                            const_cast<int*>(&heads),const_cast<int*>(&head_dim)};
+                    launch("laguna_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                }else{
+                    void*token_gate_args[]={&attended,&gate,&gated,&elements};launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                }
             }
             dense(4,third,residual,query_elements,hidden_size);
-            add_rows(residual,hidden);moe_base=7;
+            add_rows(residual,hidden);moe_base=laguna?8:7;
         }
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill core profiling event failed");
@@ -320,7 +378,11 @@ void qwen_forward_rows(
         if(layer.dense_ffn){
             // Dense block over the whole row batch: one SwiGLU per token, no
             // router or experts. `first` holds gate and up back to back.
-            const int dense_intermediate=static_cast<int>(runtime.moe_intermediate);
+            // Laguna's leading dense blocks are far wider than its expert
+            // blocks, so this width comes from the block's own gate projection.
+            const int dense_intermediate=runtime.laguna
+                ?static_cast<int>(runtime.model->tensors[layer.static_tensors.at(moe_base+1)].shape[1])
+                :static_cast<int>(runtime.moe_intermediate);
             if(layer.ffn_on_host){
                 // Spilled block: its weights are not on the device at all, so
                 // run the SwiGLU on the host one row at a time through the
@@ -356,8 +418,21 @@ void qwen_forward_rows(
         }
         dense(moe_base+1,normalized,router_logits,hidden_size,experts);
         phase(layer_number,"router");
-        void*route_args[]={const_cast<std::uint64_t*>(&router_logits),const_cast<std::uint64_t*>(&selected_device),const_cast<std::uint64_t*>(&route_weights),&rows,const_cast<int*>(&experts),const_cast<int*>(&top_k)};
-        launch("route_topk_rows",rows,1,256,route_args,experts*sizeof(float));
+        if(runtime.laguna){
+            auto bias=runtime.device_tensors[layer.router_bias];
+            int normalize=runtime.model->config.expert_weights_norm?1:0;
+            float weight_scale=runtime.model->config.expert_weights_scale;
+            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&bias,
+                               const_cast<std::uint64_t*>(&selected_device),
+                               const_cast<std::uint64_t*>(&route_weights),&rows,
+                               const_cast<int*>(&experts),const_cast<int*>(&top_k),
+                               &normalize,&weight_scale};
+            launch("route_topk_sigmoid_bias_rows",rows,1,256,route_args,
+                   static_cast<std::uint32_t>(2*experts*sizeof(float)));
+        }else{
+            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),const_cast<std::uint64_t*>(&selected_device),const_cast<std::uint64_t*>(&route_weights),&rows,const_cast<int*>(&experts),const_cast<int*>(&top_k)};
+            launch("route_topk_rows",rows,1,256,route_args,experts*sizeof(float));
+        }
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_router_end_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill router profiling event failed");
         const auto selected_bytes=
@@ -426,8 +501,10 @@ void qwen_forward_rows(
             launch("silu_mul",(static_cast<std::uint32_t>(count)+255)/256,1,256,silu_args);
             dense(moe_base+4,second,third,intermediate,hidden_size);
         }
-        auto shared_scale=tensor(moe_base+5);
-        {
+        // Qwen gates the shared expert on a learned projection; Laguna's is
+        // always on, so its block ends at the down projection.
+        if(!runtime.laguna){
+            auto shared_scale=tensor(moe_base+5);
             const auto sg_type=runtime.model->tensors[layer.static_tensors.at(moe_base+5)].type;
             void*scale_args[]={const_cast<std::uint64_t*>(&normalized),&shared_scale,const_cast<std::uint64_t*>(&third),&rows,const_cast<int*>(&hidden_size)};
             launch(sg_type==30?"qwen_shared_scale_rows_bf16":"qwen_shared_scale_rows",rows,1,256,scale_args);

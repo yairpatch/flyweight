@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from colibri_next.v2 import V2Model
@@ -159,6 +161,29 @@ class LagunaNativeTests(unittest.TestCase):
         finally:
             runtime.close()
             model.close()
+
+    def test_batched_prefill_matches_token_by_token(self):
+        """The rows forward must agree with the one-token path.
+
+        This is the load-bearing check on the batched prefill: it exercises the
+        per-layer head count, both RoPE configurations, the softplus gate and
+        sigmoid routing through a second, independently written code path, and
+        any disagreement in those shows up as a different continuation.
+        """
+        prompt = [7, 11, 3, 29, 5, 17, 23, 2, 13, 19]
+        results = {}
+        for rows in ("1", "8"):
+            with unittest.mock.patch.dict(os.environ, {"COLIBRI_PREFILL_ROWS": rows}):
+                model, _ = _model()
+                runtime = _native(model)
+                try:
+                    produced: list[int] = []
+                    runtime.generate(prompt, 6, produced.append)
+                    results[rows] = produced
+                finally:
+                    runtime.close()
+                    model.close()
+        self.assertEqual(results["1"], results["8"])
 
     def test_decode_is_deterministic_across_runtimes(self):
         model, _ = _model()

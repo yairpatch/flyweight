@@ -3315,7 +3315,11 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // A 1024-row allocation consumes ~633 MiB for Qwen3.6-27B and can evict
     // several whole FFN blocks to the CPU. 64 rows preserves useful batching
     // without making decode pay that residency penalty.
-    runtime->prefill_rows=(gemma4||laguna)?1:(dense_ffn?64:1024);
+    // Gemma 4 has no rows forward. Laguna does, but its leading dense block is
+    // 12x the expert width, so the row scratch is far larger per token than a
+    // pure-MoE Qwen checkpoint's; 256 keeps the batch worth batching without
+    // sizing every scratch region for a 1024-row dense SwiGLU.
+    runtime->prefill_rows=gemma4?1:(laguna?256:(dense_ffn?64:1024));
     if(const char*env=std::getenv("COLIBRI_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));

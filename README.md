@@ -195,9 +195,11 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
 - CUDA is the only model-execution accelerator.
 - Gemma 4 sampling, MTP, per-layer embeddings, and shared-KV tail layers are not
   implemented.
-- Laguna runs one prompt token at a time (no batched prefill), has no MTP, and
-  supports only the per-head attention gate, so the per-element gate the larger
-  Laguna checkpoints use is rejected at load.
+- Laguna has no MTP, and supports only the per-head attention gate, so the
+  per-element gate the larger Laguna checkpoints use is rejected at load.
+- Laguna prefill uses the warp-online attention kernel. The tensor-core prefill
+  routines fold Qwen's per-channel sigmoid gate in themselves, so Laguna's
+  per-head softplus gate cannot use them and it forgoes that long-context path.
 - Laguna's pre-tokenizer classifies non-ASCII letters by Unicode block rather
   than by a full category table, so non-Latin prose can split differently from
   the reference tokenizer.

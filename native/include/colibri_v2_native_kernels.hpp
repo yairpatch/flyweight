@@ -910,6 +910,72 @@ void route_topk_sigmoid_bias(
     }
 }
 
+// Row-batched Laguna attention gate: one softplus scalar per (row, head),
+// broadcast over that head's channels across the whole prefill chunk.
+extern "C" __global__
+void laguna_attention_gate_rows(
+    const float* attended, const float* gates, float* output,
+    const int rows, const int heads, const int head_dim
+) {
+    const long long elements = (long long)rows * heads * head_dim;
+    for (long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += (long long)blockDim.x * gridDim.x) {
+        const float gate = gates[index / head_dim];
+        const float scale = gate > 20.0f ? gate : log1pf(expf(gate));
+        output[index] = attended[index] * scale;
+    }
+}
+
+// Row-batched counterpart of route_topk_sigmoid_bias: one block routes one
+// token, so a whole prefill chunk routes in a single launch.
+extern "C" __global__
+void route_topk_sigmoid_bias_rows(
+    const float* logits,
+    const float* bias,
+    int* selected,
+    float* routing_weights,
+    const int rows,
+    const int experts,
+    const int top_k,
+    const int normalize,
+    const float weight_scale
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float shared[];
+    float* scores = shared;
+    float* ranking = shared + experts;
+    const float* row_logits = logits + (long long)row * experts;
+    for (int index = threadIdx.x; index < experts; index += blockDim.x) {
+        const float probability = 1.0f / (1.0f + expf(-row_logits[index]));
+        scores[index] = probability;
+        ranking[index] = probability + (bias ? bias[index] : 0.0f);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int* row_selected = selected + (long long)row * top_k;
+        float* row_weights = routing_weights + (long long)row * top_k;
+        float total = 0.0f;
+        for (int rank = 0; rank < top_k; ++rank) {
+            int best_index = 0;
+            float best_value = -3.402823466e+38F;
+            for (int expert = 0; expert < experts; ++expert) {
+                if (ranking[expert] > best_value) {
+                    best_value = ranking[expert];
+                    best_index = expert;
+                }
+            }
+            row_selected[rank] = best_index;
+            row_weights[rank] = scores[best_index];
+            total += scores[best_index];
+            ranking[best_index] = -3.402823466e+38F;
+        }
+        const float inverse =
+            normalize && total > 0.0f ? weight_scale / total : weight_scale;
+        for (int rank = 0; rank < top_k; ++rank) row_weights[rank] *= inverse;
+    }
+}
+
 extern "C" __global__
 void qwen_shared_scale(
     const float* input, const float* gate,
