@@ -183,16 +183,20 @@ class NativeV2Tokenizer:
         self.model = model
         self.architecture = str(model.info["architecture"])
         eos: list[int] = []
-        for text in (
-            "<|im_end|>",
-            "<|endoftext|>",
-            "<turn|>",
-            "<eos>",
-            # Laguna spells its terminators with angle-bracket quotation marks
-            # rather than the usual ASCII pipes.
-            "〈|EOS|〉",
-            "〈|CODE_END|〉",
-        ):
+        # The GGUF's own terminator ids first. eot ends a chat turn where eos
+        # ends generation, and a model that closes its turn with a dedicated
+        # end-of-turn token (Laguna's </assistant>) never emits eos mid-chat,
+        # so leaving eot out lets generation run straight into the next turn.
+        try:
+            config = dict(getattr(model, "config", None) or {})
+        except (V2Error, KeyError, TypeError):
+            config = {}
+        for field in ("eos_token_id", "eot_token_id"):
+            value = config.get(field)
+            if value is not None and value != 0xFFFFFFFF:
+                eos.append(int(value))
+        # Names still cover checkpoints whose metadata omits the ids.
+        for text in ("<|im_end|>", "<|endoftext|>", "<turn|>", "<eos>"):
             try:
                 eos.append(model.token_id(text))
             except (V2Error, KeyError):

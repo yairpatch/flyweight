@@ -47,6 +47,11 @@ typedef struct ColibriV2ModelConfig {
     uint32_t rotary_dimension, full_attention_interval, sliding_window;
     uint32_t sliding_window_pattern_length;
     float rms_norm_epsilon, rope_freq_base;
+    /* Terminator ids straight from the GGUF tokenizer metadata. UINT32_MAX when
+       the key is absent. `eot` ends one chat turn where `eos` ends generation;
+       models that close a turn with a dedicated end-of-turn token never emit
+       `eos` in conversation, so a stop set built from `eos` alone runs on. */
+    uint32_t eos_token_id, eot_token_id, bos_token_id;
 } ColibriV2ModelConfig;
 
 typedef struct ColibriV2GpuInfo {

@@ -115,6 +115,9 @@ class _ModelConfig(ctypes.Structure):
         ("sliding_window_pattern_length", ctypes.c_uint32),
         ("rms_norm_epsilon", ctypes.c_float),
         ("rope_freq_base", ctypes.c_float),
+        ("eos_token_id", ctypes.c_uint32),
+        ("eot_token_id", ctypes.c_uint32),
+        ("bos_token_id", ctypes.c_uint32),
     ]
 
 

@@ -204,7 +204,9 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
   than by a full category table, so non-Latin prose can split differently from
   the reference tokenizer.
 - Routed experts quantized with IQ codebook formats execute on the CPU expert
-  path only; the grouped GPU expert kernels cover k-quants and NVFP4.
+  path only; the grouped GPU expert kernels cover k-quants and NVFP4. Such a
+  model falls back to `--expert-mode cpu` at preparation with a notice, so
+  `auto` and `resident` are accepted but do not place experts on the GPU.
 - Qwen sampled decoding currently transfers the vocabulary logits to the host.
 - Dynamic MoE routing still has host synchronization points.
 - Full-layer CUDA graph replay and persistent fused layer kernels are incomplete.

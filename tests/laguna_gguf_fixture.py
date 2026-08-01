@@ -206,6 +206,11 @@ def build_laguna_gguf(
         _kv("tokenizer.ggml.tokens", GGUF_ARRAY, _string_array(vocabulary)),
         _kv("tokenizer.ggml.token_type", GGUF_ARRAY, _uint_array(token_types)),
         _kv("tokenizer.ggml.merges", GGUF_ARRAY, _string_array([])),
+        # eos ends generation; eot ends one chat turn. Laguna closes an
+        # assistant turn with </assistant> and never emits eos in conversation.
+        _kv("tokenizer.ggml.eos_token_id", GGUF_UINT32, struct.pack("<I", 0)),
+        _kv("tokenizer.ggml.eot_token_id", GGUF_UINT32, struct.pack("<I", 2)),
+        _kv("tokenizer.ggml.bos_token_id", GGUF_UINT32, struct.pack("<I", 0)),
         _kv("general.alignment", GGUF_UINT32, struct.pack("<I", ALIGNMENT)),
     ]
 

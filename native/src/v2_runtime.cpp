@@ -1301,6 +1301,9 @@ int parse(ColibriV2Model& m) {
         else if (key=="general.name" && type==8) m.name=r.str();
         else if (key=="tokenizer.ggml.tokens" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_tokens=r.get<uint64_t>();m.config.vocabulary_size=static_cast<uint32_t>(count_tokens);m.vocabulary.reserve(static_cast<size_t>(count_tokens));for(uint64_t token_index=0;token_index<count_tokens;token_index++){if(element_type==8)m.vocabulary.push_back(r.str());else r.value(element_type);}}
         else if (key=="tokenizer.ggml.pre" && type==8) m.tokenizer_pre=r.str();
+        else if (key=="tokenizer.ggml.eos_token_id" && (type==4||type==10)) m.config.eos_token_id=static_cast<uint32_t>(read_uint(type));
+        else if (key=="tokenizer.ggml.eot_token_id" && (type==4||type==10)) m.config.eot_token_id=static_cast<uint32_t>(read_uint(type));
+        else if (key=="tokenizer.ggml.bos_token_id" && (type==4||type==10)) m.config.bos_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.token_type" && type==9) m.token_types=read_uint_array(type);
         else if (key=="tokenizer.ggml.merges" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_merges=r.get<uint64_t>();m.merges.reserve(static_cast<size_t>(count_merges));for(uint64_t merge_index=0;merge_index<count_merges;merge_index++){if(element_type==8)m.merges.push_back(r.str());else r.value(element_type);}}
         else if (key.size()>=21 && key.compare(key.size()-21,21,".rope.dimension_count")==0 && (type==4 || type==10)) m.config.rotary_dimension=static_cast<uint32_t>(read_uint(type));
@@ -2028,6 +2031,24 @@ void qwen_quant_dot_rows(
 void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const float*first,const float*second,int elements,std::uint64_t row,float&first_output,float&second_output){
     if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_quant_dot_pair_avx512(packed,type,first,second,elements,row,&first_output,&second_output);return;}
     first_output=qwen_quant_dot(packed,type,first,elements,row);second_output=qwen_quant_dot(packed,type,second,elements,row);
+}
+
+// Weight types the grouped GPU expert kernels can execute. The IQ codebook
+// formats have no grouped kernel: they have to stay on the CPU expert path,
+// which decodes every type qwen_quant_dot supports.
+bool qwen_gpu_expert_type_supported(std::uint32_t type) {
+    return type==8||type==12||type==13||type==14||type==40;
+}
+
+// True when every routed expert tensor in the model can run on the GPU.
+bool qwen_gpu_experts_executable(const ColibriV2QwenRuntime& runtime) {
+    for(const auto& layer:runtime.layers){
+        if(layer.dense_ffn||!layer.expert_tensors[0])continue;
+        for(const auto index:layer.expert_tensors)
+            if(!qwen_gpu_expert_type_supported(runtime.model->tensors[index].type))
+                return false;
+    }
+    return true;
 }
 
 // Weight types the CPU expert path can execute, which is exactly what
@@ -2962,7 +2983,7 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
     parse(*m); *out=m.release(); return 0; }); }
 void colibri_v2_model_close(ColibriV2Model* m) { try{delete m;}catch(...){} }
 int colibri_v2_model_info(const ColibriV2Model* m, ColibriV2ModelInfo* out) { return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model info handle"); std::memset(out,0,sizeof(*out));out->gguf_version=m->version;out->tensor_count=m->tensor_count();out->metadata_count=m->metadata;out->file_size=m->size;out->alignment=m->alignment;copy_text(out->architecture,sizeof(out->architecture),m->architecture);copy_text(out->name,sizeof(out->name),m->name);copy_text(out->format,sizeof(out->format),m->format());return 0;}); }
-int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;return 0;});}
+int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;out->eos_token_id=m->config.eos_token_id;out->eot_token_id=m->config.eot_token_id;out->bos_token_id=m->config.bos_token_id;return 0;});}
 int colibri_v2_model_attention_window(const ColibriV2Model* m,uint32_t layer,uint32_t*out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model attention-window handle");*out=attention_window(*m,layer);return 0;});}
 int colibri_v2_tensor_info(const ColibriV2Model* m,uint64_t i,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("tensor index out of range");return fill(m->tensors[i],*out);});}
 int colibri_v2_tensor_find(const ColibriV2Model* m,const char* name,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!name||!out)throw std::runtime_error("invalid tensor lookup");for(auto const&t:m->tensors)if(t.name==name)return fill(t,*out);throw std::runtime_error("tensor not found");});}
@@ -4043,6 +4064,22 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // and staging are allocated (notably for large Q6 models on 12 GiB
         // cards). In that case, keep the CUDA-resident shared model and execute
         // routed experts on CPU instead of failing on the first decode.
+        // Routed experts in an IQ codebook format have no grouped GPU kernel.
+        // Without this the dispatch below falls through to the k-quant kernel
+        // and decodes codebook bytes as super-block scales, which produces
+        // fluent-looking output for as long as the expert cache stays cold and
+        // then degenerates once experts become resident.
+        if(!prepare_policy.is_cpu()&&runtime->model->config.expert_count&&
+           !qwen_gpu_experts_executable(*runtime)){
+            runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
+            runtime->options.moe_device=colibri::v2::expert_execution_mode_value(
+                runtime->expert_mode);
+            prepare_policy=qwen_expert_policy(
+                *runtime,colibri::v2::ExpertExecutionPhase::prepare);
+            std::fprintf(stderr,
+                "[colibri-v2] routed experts use an IQ format with no grouped GPU "
+                "kernel; falling back to CPU MoE\n");
+        }
         if(prepare_policy.is_hybrid()&&runtime->model->config.expert_count&&
            runtime->expert_slots.empty()){
             runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
@@ -5739,6 +5776,15 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 const auto gate_scale_table=weight_table+gpu_count*sizeof(float),up_scale_table=gate_scale_table+gpu_count*sizeof(float),down_scale_table=up_scale_table+gpu_count*sizeof(float);
                 const auto gate_type=runtime->model->tensors[layer.expert_tensors[0]].type;
                 const auto down_type=runtime->model->tensors[layer.expert_tensors[2]].type;
+        // The grouped dispatch below ends in a k-quant fallback, so an
+        // unhandled type would be decoded as Q5_K rather than rejected. Prepare
+        // already routes such models to the CPU; this makes the silent path
+        // unreachable if that ever stops holding.
+        if(!qwen_gpu_expert_type_supported(gate_type)||
+           !qwen_gpu_expert_type_supported(down_type))
+            throw std::runtime_error(
+                "native GPU expert quantization is unsupported: "+
+                std::to_string(gate_type)+"/"+std::to_string(down_type));
                 const char*persistent_env=
                     std::getenv("COLIBRI_NVFP4_PERSISTENT");
                 const bool persistent_enabled=persistent_env&&
@@ -5886,6 +5932,15 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(colibri_gpu_upload(table_device,staging+table_host,table_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen expert pointer upload failed");
         const auto gate_type=runtime->model->tensors[layer.expert_tensors[0]].type;
         const auto down_type=runtime->model->tensors[layer.expert_tensors[2]].type;
+        // The grouped dispatch below ends in a k-quant fallback, so an
+        // unhandled type would be decoded as Q5_K rather than rejected. Prepare
+        // already routes such models to the CPU; this makes the silent path
+        // unreachable if that ever stops holding.
+        if(!qwen_gpu_expert_type_supported(gate_type)||
+           !qwen_gpu_expert_type_supported(down_type))
+            throw std::runtime_error(
+                "native GPU expert quantization is unsupported: "+
+                std::to_string(gate_type)+"/"+std::to_string(down_type));
         const char*tc_env=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");
         const bool tc_enabled=tc_env&&tc_env[0]=='1';
         bool tc_done=false;
@@ -7712,6 +7767,15 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     const auto gate_scale_table = weight_table + gpu_count * sizeof(float), up_scale_table = gate_scale_table + gpu_count * sizeof(float), down_scale_table = up_scale_table + gpu_count * sizeof(float);
                     const auto gate_type = runtime->model->tensors[layer.expert_tensors[0]].type;
                     const auto down_type = runtime->model->tensors[layer.expert_tensors[2]].type;
+        // The grouped dispatch below ends in a k-quant fallback, so an
+        // unhandled type would be decoded as Q5_K rather than rejected. Prepare
+        // already routes such models to the CPU; this makes the silent path
+        // unreachable if that ever stops holding.
+        if(!qwen_gpu_expert_type_supported(gate_type)||
+           !qwen_gpu_expert_type_supported(down_type))
+            throw std::runtime_error(
+                "native GPU expert quantization is unsupported: "+
+                std::to_string(gate_type)+"/"+std::to_string(down_type));
                     const char* persistent_env =
                         std::getenv("COLIBRI_NVFP4_PERSISTENT");
                     const bool persistent_enabled =

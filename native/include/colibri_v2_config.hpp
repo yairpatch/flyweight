@@ -35,5 +35,9 @@ struct ModelConfig {
     float rope_scaling_factor=0.0f, yarn_attn_factor=1.0f;
     float yarn_beta_fast=32.0f, yarn_beta_slow=1.0f;
     bool rope_scaling_yarn=false;
+    // GGUF tokenizer terminator ids; max means the key was absent.
+    std::uint32_t eos_token_id=0xffffffffu;
+    std::uint32_t eot_token_id=0xffffffffu;
+    std::uint32_t bos_token_id=0xffffffffu;
 };
 }

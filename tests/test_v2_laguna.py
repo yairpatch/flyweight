@@ -109,6 +109,32 @@ class LagunaTokenizerTests(unittest.TestCase):
             model.close()
 
 
+class LagunaTerminatorTests(unittest.TestCase):
+    def test_config_exposes_the_gguf_terminator_ids(self):
+        model, _ = _model()
+        try:
+            config = model.config
+            self.assertEqual(config["eos_token_id"], 0)
+            self.assertEqual(config["eot_token_id"], 2)
+        finally:
+            model.close()
+
+    def test_stop_set_includes_end_of_turn_not_just_end_of_text(self):
+        """A turn-ending token has to stop generation.
+
+        Laguna closes an assistant turn with </assistant> (its eot) and does not
+        emit eos in conversation, so a stop set built from eos alone runs
+        straight into a hallucinated next turn.
+        """
+        model, _ = _model()
+        try:
+            tokenizer = NativeV2Tokenizer(model)
+            self.assertIn(2, tokenizer.eos_token_ids)
+            self.assertIn(0, tokenizer.eos_token_ids)
+        finally:
+            model.close()
+
+
 class LagunaChatTemplateTests(unittest.TestCase):
     class _Stub:
         info = {"architecture": "laguna"}
