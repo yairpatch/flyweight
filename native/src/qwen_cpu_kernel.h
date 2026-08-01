@@ -26,6 +26,18 @@ float qwen_quant_dot_avx2(
     std::uint64_t row
 );
 
+// One IQ weight row against 4 or 8 activation vectors, amortizing the codebook
+// decode across them. False when the type or token count has no such kernel.
+bool qwen_quant_dot_iq_multi_avx2(
+    const std::uint8_t* packed,
+    std::uint32_t type,
+    const float* const inputs[],
+    int token_count,
+    int elements,
+    std::uint64_t row,
+    float* outputs
+);
+
 void qwen_quant_dot_rows_avx2(
     const std::uint8_t* packed,
     std::uint32_t type,

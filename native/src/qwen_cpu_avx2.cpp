@@ -16,6 +16,36 @@ float half_value(const std::uint8_t* pointer) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
 }
 
+// Sign application for the IQ codebook formats. Their grids store magnitudes
+// and a separate 8-bit pattern says which of the eight are negated, which the
+// scalar path does with a branch per weight. Negating a float is an XOR of the
+// sign bit, so one 8-lane mask per pattern replaces all eight branches. The
+// table is 8 KiB and indexed by that byte, so it stays hot in L1.
+struct IqSignMasks {
+    std::uint32_t lanes[256][8];
+};
+
+constexpr IqSignMasks build_iq_sign_masks() {
+    IqSignMasks masks{};
+    for (int pattern = 0; pattern < 256; ++pattern)
+        for (int lane = 0; lane < 8; ++lane)
+            masks.lanes[pattern][lane] =
+                (pattern >> lane) & 1 ? 0x80000000u : 0u;
+    return masks;
+}
+
+constexpr IqSignMasks kIqSignMasks = build_iq_sign_masks();
+
+// Eight consecutive codebook magnitudes, widened to float and signed.
+inline __m256 iq_signed_octet(std::uint64_t grid, std::uint8_t signs) {
+    const __m128i packed = _mm_cvtsi64_si128(static_cast<long long>(grid));
+    const __m256 magnitudes =
+        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(packed));
+    const __m256 mask = _mm256_loadu_ps(
+        reinterpret_cast<const float*>(kIqSignMasks.lanes[signs]));
+    return _mm256_xor_ps(magnitudes, mask);
+}
+
 float horizontal_sum(__m256 value) {
     const __m128 low = _mm256_castps256_ps128(value);
     const __m128 high = _mm256_extractf128_ps(value, 1);
@@ -642,9 +672,266 @@ void q8_dequant(const std::uint8_t* row_data, float* output, int elements) {
     for(int block=0;block<elements/32;++block){const auto*base=row_data+block*34;const __m256 scale=_mm256_set1_ps(half_value(base));for(int lanes=0;lanes<32;lanes+=8){const __m128i bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(base+2+lanes));_mm256_storeu_ps(output+block*32+lanes,_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)),scale));}}
 }
 
+// IQ2_XS: 74 bytes per 256 values -> d(2) then sixteen groups of two 16-bit
+// entries, then eight scale bytes holding a nibble per group. Each entry is a
+// 9-bit grid index plus a 7-bit sign index covering eight outputs.
+float iq2xs_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq2xsBlockBytes;
+        const float* vector = input + block * 256;
+        // The block scale factors out of the whole accumulation, so the group
+        // scale is all that has to ride on the individual weights.
+        __m256 accumulator = _mm256_setzero_ps();
+        for (int group = 0; group < 16; ++group) {
+            const int scale = (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
+            const __m256 weight = _mm256_set1_ps((0.5f + scale) * 0.25f);
+            for (int half = 0; half < 2; ++half) {
+                std::uint16_t entry = 0;
+                std::memcpy(&entry, base + 2 + (group * 2 + half) * 2, 2);
+                const __m256 magnitudes = iq_signed_octet(
+                    kIq2xsGrid[entry & 511], kIq2xxsSigns[entry >> 9]);
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(magnitudes, weight),
+                    _mm256_loadu_ps(vector + group * 16 + half * 8),
+                    accumulator);
+            }
+        }
+        result += half_value(base) * horizontal_sum(accumulator);
+    }
+    return result;
+}
+
+// IQ3_XXS: d(2), 64 index bytes, then eight 32-bit auxiliaries. Each auxiliary
+// carries a 4-bit group scale in its top nibble and four 7-bit sign indices.
+// Two 32-bit grid entries supply the eight magnitudes one sign index covers.
+float iq3xxs_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq3xxsBlockBytes;
+        const float* vector = input + block * 256;
+        __m256 accumulator = _mm256_setzero_ps();
+        for (int group = 0; group < 8; ++group) {
+            std::uint32_t aux = 0;
+            std::memcpy(&aux, base + 2 + 64 + group * 4, 4);
+            const __m256 weight = _mm256_set1_ps((0.5f + (aux >> 28)) * 0.5f);
+            for (int quad = 0; quad < 4; ++quad) {
+                const auto* indices = base + 2 + group * 8 + quad * 2;
+                // The quad's eight magnitudes are two 4-byte grid entries laid
+                // end to end, which is exactly one signed octet.
+                const std::uint64_t grid =
+                    static_cast<std::uint64_t>(kIq3xxsGrid[indices[0]]) |
+                    (static_cast<std::uint64_t>(kIq3xxsGrid[indices[1]]) << 32);
+                const __m256 magnitudes = iq_signed_octet(
+                    grid, kIq2xxsSigns[(aux >> (7 * quad)) & 127]);
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(magnitudes, weight),
+                    _mm256_loadu_ps(vector + group * 32 + quad * 8),
+                    accumulator);
+            }
+        }
+        result += half_value(base) * horizontal_sum(accumulator);
+    }
+    return result;
+}
+
+// IQ4_XS: d(2) scales_h(2) scales_l[4] qs[128]. Not a pattern codebook -- every
+// 4-bit code indexes the sixteen IQ4_NL levels, so a byte shuffle is the whole
+// decode, and each 32-value sub-block carries a 6-bit signed scale split across
+// scales_l and scales_h.
+float iq4xs_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    const __m128i low_nibble = _mm_set1_epi8(15);
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq4xsBlockBytes;
+        std::uint16_t scales_high = 0;
+        std::memcpy(&scales_high, base + 2, 2);
+        const float d = half_value(base);
+        const float* vector = input + block * 256;
+        for (int sub = 0; sub < 8; ++sub) {
+            const int low = (base[4 + (sub >> 1)] >> (4 * (sub & 1))) & 15;
+            const int scale = (low | (((scales_high >> (2 * sub)) & 3) << 4)) - 32;
+            const __m128i quants = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(base + 8 + sub * 16));
+            // Low nibbles feed the sub-block's first sixteen values, high
+            // nibbles the second sixteen.
+            const __m128i first =
+                _mm_shuffle_epi8(levels, _mm_and_si128(quants, low_nibble));
+            const __m128i second = _mm_shuffle_epi8(
+                levels, _mm_and_si128(_mm_srli_epi16(quants, 4), low_nibble));
+            const float* values = vector + sub * 32;
+            __m256 accumulator = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(first)),
+                _mm256_loadu_ps(values));
+            accumulator = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(first, 8))),
+                _mm256_loadu_ps(values + 8), accumulator);
+            accumulator = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(second)),
+                _mm256_loadu_ps(values + 16), accumulator);
+            accumulator = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(second, 8))),
+                _mm256_loadu_ps(values + 24), accumulator);
+            result += d * scale * horizontal_sum(accumulator);
+        }
+    }
+    return result;
+}
+
+// One weight row against several activation vectors. Decoding an IQ block is
+// far more expensive than the multiply it feeds, so amortizing that decode
+// across the tokens routed to the same expert is worth more here than in the
+// k-quant formats. The block scale is folded into the group weight so a single
+// accumulator per token carries the whole row.
+template <int kTokens>
+void iq2xs_dot_multi(const std::uint8_t* row_data, const float* const inputs[kTokens],
+                     int elements, float outputs[kTokens]) {
+    __m256 sums[kTokens];
+    for (auto& sum : sums) sum = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq2xsBlockBytes;
+        const float d = half_value(base);
+        for (int group = 0; group < 16; ++group) {
+            const int scale = (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
+            const __m256 weight = _mm256_set1_ps(d * (0.5f + scale) * 0.25f);
+            for (int half = 0; half < 2; ++half) {
+                std::uint16_t entry = 0;
+                std::memcpy(&entry, base + 2 + (group * 2 + half) * 2, 2);
+                const __m256 magnitudes = _mm256_mul_ps(
+                    iq_signed_octet(kIq2xsGrid[entry & 511], kIq2xxsSigns[entry >> 9]),
+                    weight);
+                const int index = block * 256 + group * 16 + half * 8;
+                for (int token = 0; token < kTokens; ++token)
+                    sums[token] = _mm256_fmadd_ps(
+                        magnitudes, _mm256_loadu_ps(inputs[token] + index), sums[token]);
+            }
+        }
+    }
+    for (int token = 0; token < kTokens; ++token)
+        outputs[token] = horizontal_sum(sums[token]);
+}
+
+template <int kTokens>
+void iq3xxs_dot_multi(const std::uint8_t* row_data, const float* const inputs[kTokens],
+                      int elements, float outputs[kTokens]) {
+    __m256 sums[kTokens];
+    for (auto& sum : sums) sum = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq3xxsBlockBytes;
+        const float d = half_value(base);
+        for (int group = 0; group < 8; ++group) {
+            std::uint32_t aux = 0;
+            std::memcpy(&aux, base + 2 + 64 + group * 4, 4);
+            const __m256 weight = _mm256_set1_ps(d * (0.5f + (aux >> 28)) * 0.5f);
+            for (int quad = 0; quad < 4; ++quad) {
+                const auto* indices = base + 2 + group * 8 + quad * 2;
+                const std::uint64_t grid =
+                    static_cast<std::uint64_t>(kIq3xxsGrid[indices[0]]) |
+                    (static_cast<std::uint64_t>(kIq3xxsGrid[indices[1]]) << 32);
+                const __m256 magnitudes = _mm256_mul_ps(
+                    iq_signed_octet(grid, kIq2xxsSigns[(aux >> (7 * quad)) & 127]),
+                    weight);
+                const int index = block * 256 + group * 32 + quad * 8;
+                for (int token = 0; token < kTokens; ++token)
+                    sums[token] = _mm256_fmadd_ps(
+                        magnitudes, _mm256_loadu_ps(inputs[token] + index), sums[token]);
+            }
+        }
+    }
+    for (int token = 0; token < kTokens; ++token)
+        outputs[token] = horizontal_sum(sums[token]);
+}
+
+template <int kTokens>
+void iq4xs_dot_multi(const std::uint8_t* row_data, const float* const inputs[kTokens],
+                     int elements, float outputs[kTokens]) {
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    const __m128i low_nibble = _mm_set1_epi8(15);
+    __m256 sums[kTokens];
+    for (auto& sum : sums) sum = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq4xsBlockBytes;
+        std::uint16_t scales_high = 0;
+        std::memcpy(&scales_high, base + 2, 2);
+        const float d = half_value(base);
+        for (int sub = 0; sub < 8; ++sub) {
+            const int low = (base[4 + (sub >> 1)] >> (4 * (sub & 1))) & 15;
+            const int scale = (low | (((scales_high >> (2 * sub)) & 3) << 4)) - 32;
+            const __m256 weight = _mm256_set1_ps(d * scale);
+            const __m128i quants = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(base + 8 + sub * 16));
+            const __m128i first =
+                _mm_shuffle_epi8(levels, _mm_and_si128(quants, low_nibble));
+            const __m128i second = _mm_shuffle_epi8(
+                levels, _mm_and_si128(_mm_srli_epi16(quants, 4), low_nibble));
+            const __m256 decoded[4] = {
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(first)), weight),
+                _mm256_mul_ps(_mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(first, 8))), weight),
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(second)), weight),
+                _mm256_mul_ps(_mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(second, 8))), weight),
+            };
+            const int index = block * 256 + sub * 32;
+            for (int octet = 0; octet < 4; ++octet)
+                for (int token = 0; token < kTokens; ++token)
+                    sums[token] = _mm256_fmadd_ps(
+                        decoded[octet],
+                        _mm256_loadu_ps(inputs[token] + index + octet * 8),
+                        sums[token]);
+        }
+    }
+    for (int token = 0; token < kTokens; ++token)
+        outputs[token] = horizontal_sum(sums[token]);
+}
+
+// Returns false when `type` has no IQ multi-token kernel.
+template <int kTokens>
+bool iq_dot_multi(const std::uint8_t* packed, std::uint32_t type,
+                  const float* const inputs[kTokens], int elements,
+                  std::uint64_t row, float outputs[kTokens]) {
+    const auto blocks = static_cast<std::uint64_t>(elements / 256);
+    switch (type) {
+        case 17:
+            iq2xs_dot_multi<kTokens>(
+                packed + row * blocks * kIq2xsBlockBytes, inputs, elements, outputs);
+            return true;
+        case 18:
+            iq3xxs_dot_multi<kTokens>(
+                packed + row * blocks * kIq3xxsBlockBytes, inputs, elements, outputs);
+            return true;
+        case 23:
+            iq4xs_dot_multi<kTokens>(
+                packed + row * blocks * kIq4xsBlockBytes, inputs, elements, outputs);
+            return true;
+        default:
+            return false;
+    }
+}
+
 } // namespace
 
+bool qwen_quant_dot_iq_multi_avx2(
+    const std::uint8_t* packed, std::uint32_t type, const float* const inputs[],
+    int token_count, int elements, std::uint64_t row, float* outputs
+) {
+    if (elements % 256) return false;
+    if (token_count == 4)
+        return iq_dot_multi<4>(packed, type, inputs, elements, row, outputs);
+    if (token_count == 8)
+        return iq_dot_multi<8>(packed, type, inputs, elements, row, outputs);
+    return false;
+}
+
 float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const float* input,int elements,std::uint64_t row){
+    if(type==17)return iq2xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,input,elements);
+    if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);
+    if(type==23)return iq4xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,input,elements);
     if(type==10)return q2_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ2KBlockBytes,input,elements);
     if(type==11)return q3_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ3KBlockBytes,input,elements);
     if(type==12)return q4_dot(packed+row*static_cast<std::uint64_t>(elements/256)*144,input,elements);

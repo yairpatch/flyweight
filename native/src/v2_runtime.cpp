@@ -1898,6 +1898,10 @@ float qwen_nvfp4_value(const std::uint8_t*packed,std::uint64_t absolute){
 float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*input,int elements,std::uint64_t row){
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
     if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+    // The IQ codebook formats decode a branch per weight in scalar form, which
+    // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
+    if((type==17||type==18||type==23)&&(colibri_cpu_features()&1u)!=0&&elements%256==0)
+        return qwen_quant_dot_avx2(packed,type,input,elements,row);
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     float result=0.0f;
     if(type==2){
@@ -2246,6 +2250,8 @@ void qwen_quant_dot_quad(
     if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%256==0){
         qwen_quant_dot_quad_avx2(packed,type,inputs,elements,row,outputs);return;
     }
+    if((colibri_cpu_features()&1u)!=0&&
+       qwen_quant_dot_iq_multi_avx2(packed,type,inputs,4,elements,row,outputs))return;
     qwen_quant_dot_pair(packed,type,inputs[0],inputs[1],elements,row,outputs[0],outputs[1]);
     qwen_quant_dot_pair(packed,type,inputs[2],inputs[3],elements,row,outputs[2],outputs[3]);
 }
@@ -2255,6 +2261,10 @@ void qwen_quant_dot_oct(
     int elements,std::uint64_t row,float outputs[8]
 ){
     if(!qwen_simd_multi_type(type)){
+        // The IQ formats have an eight-token AVX2 kernel; taking it here rather
+        // than as two quads halves the codebook decodes.
+        if((colibri_cpu_features()&1u)!=0&&
+           qwen_quant_dot_iq_multi_avx2(packed,type,inputs,8,elements,row,outputs))return;
         // NVFP4 uses two register-blocked AVX2 quads; the formats without an
         // AVX-512 oct kernel fall back through quad to the ordinary pair path,
         // because the oct entry point would otherwise decode them as Q8_0.

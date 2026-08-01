@@ -89,6 +89,21 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    colibri_qwen_iq_simd_contract
+    tests/qwen_iq_simd_contract.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx512.cpp
+)
+target_compile_features(colibri_qwen_iq_simd_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_iq_simd_contract PRIVATE src include)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_qwen_iq_simd_contract
+        COMMAND colibri_qwen_iq_simd_contract
+    )
+endif()
+
+add_executable(
     colibri_turboquant_contract
     tests/turboquant_contract.cpp
 )

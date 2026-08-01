@@ -207,6 +207,9 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
   path only; the grouped GPU expert kernels cover k-quants and NVFP4. Such a
   model falls back to `--expert-mode cpu` at preparation with a notice, so
   `auto` and `resident` are accepted but do not place experts on the GPU.
+- IQ expert decode is ALU-bound rather than bandwidth-bound, so it scales past
+  the physical core count. The default thread heuristic uses physical cores;
+  `--cpu-threads` at the SMT count is worth roughly 1.4x on such models.
 - Qwen sampled decoding currently transfers the vocabulary logits to the host.
 - Dynamic MoE routing still has host synchronization points.
 - Full-layer CUDA graph replay and persistent fused layer kernels are incomplete.
