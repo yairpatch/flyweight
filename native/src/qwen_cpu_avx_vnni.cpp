@@ -4,6 +4,8 @@
 #include <cstring>
 #include <immintrin.h>
 
+#include "qwen_kquant.h"
+
 namespace {
 
 float half_value(const std::uint8_t* pointer) {
@@ -36,6 +38,27 @@ int dot_i8_16(const std::int8_t* left, const std::int8_t* right) {
         _mm256_cvtepi8_epi16(b)));
 }
 
+struct IqSignBytes {
+    std::int8_t lanes[256][8];
+};
+
+constexpr IqSignBytes build_iq_sign_bytes() {
+    IqSignBytes signs{};
+    for (int pattern = 0; pattern < 256; ++pattern)
+        for (int lane = 0; lane < 8; ++lane)
+            signs.lanes[pattern][lane] =
+                (pattern >> lane) & 1 ? -1 : 1;
+    return signs;
+}
+
+constexpr IqSignBytes kIqSignBytes = build_iq_sign_bytes();
+
+std::int64_t iq_sign_bytes(std::uint8_t pattern) {
+    std::int64_t result;
+    std::memcpy(&result, kIqSignBytes.lanes[pattern], sizeof(result));
+    return result;
+}
+
 } // namespace
 
 float qwen_quant_dot_q8_k_avx_vnni(
@@ -43,7 +66,71 @@ float qwen_quant_dot_q8_k_avx_vnni(
     const QwenQ8KBlock* input, int elements, std::uint64_t row
 ) {
     float result=0.0f;
-    if(type==13){
+    if(type==17){
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes;
+        for(int block=0;block<elements/256;++block){
+            const auto*base=row_data+block*kIq2xsBlockBytes;const auto&q8=input[block];
+            __m256i sum=_mm256_setzero_si256();
+            for(int group=0;group<16;group+=2){
+                std::uint16_t codes[4];
+                std::memcpy(codes,base+2+group*4,sizeof(codes));
+                const __m256i magnitudes=_mm256_set_epi64x(
+                    static_cast<long long>(kIq2xsGrid[codes[3]&511]),
+                    static_cast<long long>(kIq2xsGrid[codes[2]&511]),
+                    static_cast<long long>(kIq2xsGrid[codes[1]&511]),
+                    static_cast<long long>(kIq2xsGrid[codes[0]&511]));
+                const __m256i signs=_mm256_set_epi64x(
+                    iq_sign_bytes(kIq2xxsSigns[codes[3]>>9]),
+                    iq_sign_bytes(kIq2xxsSigns[codes[2]>>9]),
+                    iq_sign_bytes(kIq2xxsSigns[codes[1]>>9]),
+                    iq_sign_bytes(kIq2xxsSigns[codes[0]>>9]));
+                const __m256i activation=_mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(q8.values+group*16));
+                const __m256i dots=_mm256_dpbusd_epi32(
+                    _mm256_setzero_si256(),magnitudes,
+                    _mm256_sign_epi8(activation,signs));
+                const int first=2*((base[66+(group>>1)]>>(4*(group&1)))&15)+1;
+                const int second=2*((base[66+((group+1)>>1)]>>(4*((group+1)&1)))&15)+1;
+                const __m256i scales=_mm256_set_m128i(
+                    _mm_set1_epi32(second),_mm_set1_epi32(first));
+                sum=_mm256_add_epi32(sum,_mm256_mullo_epi32(dots,scales));
+            }
+            result+=half_value(base)*q8.scale*0.125f*horizontal_sum(sum);
+        }
+    }else if(type==18){
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes;
+        for(int block=0;block<elements/256;++block){
+            const auto*base=row_data+block*kIq3xxsBlockBytes;const auto&q8=input[block];
+            __m256i sum=_mm256_setzero_si256();
+            for(int group=0;group<8;++group){
+                std::uint32_t aux;
+                std::memcpy(&aux,base+66+group*4,sizeof(aux));
+                const auto*code=base+2+group*8;
+                const __m256i magnitudes=_mm256_set_epi32(
+                    static_cast<int>(kIq3xxsGrid[code[7]]),
+                    static_cast<int>(kIq3xxsGrid[code[6]]),
+                    static_cast<int>(kIq3xxsGrid[code[5]]),
+                    static_cast<int>(kIq3xxsGrid[code[4]]),
+                    static_cast<int>(kIq3xxsGrid[code[3]]),
+                    static_cast<int>(kIq3xxsGrid[code[2]]),
+                    static_cast<int>(kIq3xxsGrid[code[1]]),
+                    static_cast<int>(kIq3xxsGrid[code[0]]));
+                const __m256i signs=_mm256_set_epi64x(
+                    iq_sign_bytes(kIq2xxsSigns[(aux>>21)&127]),
+                    iq_sign_bytes(kIq2xxsSigns[(aux>>14)&127]),
+                    iq_sign_bytes(kIq2xxsSigns[(aux>>7)&127]),
+                    iq_sign_bytes(kIq2xxsSigns[aux&127]));
+                const __m256i activation=_mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(q8.values+group*32));
+                const __m256i dots=_mm256_dpbusd_epi32(
+                    _mm256_setzero_si256(),magnitudes,
+                    _mm256_sign_epi8(activation,signs));
+                sum=_mm256_add_epi32(sum,_mm256_mullo_epi32(
+                    dots,_mm256_set1_epi32(2*(aux>>28)+1)));
+            }
+            result+=half_value(base)*q8.scale*0.25f*horizontal_sum(sum);
+        }
+    }else if(type==13){
         const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*176;
         for(int block=0;block<elements/256;++block){
             const auto*base=row_data+block*176;const auto&q8=input[block];

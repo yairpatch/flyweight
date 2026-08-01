@@ -2621,15 +2621,19 @@ void qwen_cpu_moe(
     const auto down_type = runtime.model->tensors[layer.expert_tensors[2]].type;
     const char* q8_setting = std::getenv("COLIBRI_Q8_ACTIVATIONS");
     const auto cpu_features = colibri_cpu_features();
-    // Q8-K activations only pay off, and are only decoded, for these k-quants.
+    // Q8-K activations only pay off, and are only decoded, for these quants.
     // Q4_K, NVFP4 and bf16 are faster on the vectorized f32 path (their small
-    // codes do not amortize the activation quantization), and the IQ codebook
-    // formats have no Q8-K decoder at all.
+    // codes do not amortize the activation quantization). IQ2_XS and IQ3_XXS
+    // use the same integer codebook matvec strategy as llama.cpp.
     const auto q8_activations_ok = [](std::uint32_t type) {
-        return type == 8 || type == 13 || type == 14;
+        return type == 8 || type == 13 || type == 14 || type == 17 || type == 18;
     };
+    const bool laguna_iq_q8 = (cpu_features & 4u) != 0
+        && gate_type == 17 && up_type == 17 && down_type == 18
+        && (!q8_setting || q8_setting[0] != '0');
     const bool use_q8 = (cpu_features & 1u) != 0 && hidden % 256 == 0
-        && intermediate % 256 == 0 && q8_setting && q8_setting[0] == '1'
+        && intermediate % 256 == 0
+        && ((q8_setting && q8_setting[0] == '1') || laguna_iq_q8)
         && q8_activations_ok(gate_type) && q8_activations_ok(up_type)
         && q8_activations_ok(down_type);
     static constexpr char q4_tile_name[] = {
@@ -2654,6 +2658,14 @@ void qwen_cpu_moe(
 #endif
     const auto* input_q8_data = input_q8.data();
     auto* activated_q8_data = activated_q8.data();
+    const auto q8_dot = [cpu_features](
+        const std::uint8_t* packed, std::uint32_t type,
+        const QwenQ8KBlock* input, int elements, std::uint64_t row
+    ) {
+        return (cpu_features & 4u) != 0
+            ? qwen_quant_dot_q8_k_avx_vnni(packed,type,input,elements,row)
+            : qwen_quant_dot_q8_k_avx2(packed,type,input,elements,row);
+    };
     const char* fused_gate_up_setting = std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
     const char* iq_avx512_setting = std::getenv("COLIBRI_IQ_AVX512");
     const bool auto_fused_iq2xs = gate_type == 17
@@ -2666,10 +2678,10 @@ void qwen_cpu_moe(
         float gate_value = 0.0f;
         float up_value = 0.0f;
         if (use_q8) {
-            gate_value = qwen_quant_dot_q8_k_avx2(
+            gate_value = q8_dot(
                 gate[rank], gate_type, input_q8_data, hidden, row
             );
-            up_value = qwen_quant_dot_q8_k_avx2(
+            up_value = q8_dot(
                 up[rank], up_type, input_q8_data, hidden, row
             );
         } else if ((runtime.fused_moe_gate_up || auto_fused_iq2xs)
@@ -2691,7 +2703,7 @@ void qwen_cpu_moe(
         float value = 0.0f;
         for (int rank = 0; rank < routed_count; ++rank) {
             const float expert_value = use_q8
-                ? qwen_quant_dot_q8_k_avx2(
+                ? q8_dot(
                     down[rank], down_type,
                     activated_q8_data + static_cast<std::size_t>(rank) * (intermediate / 256),
                     intermediate, row
@@ -2739,22 +2751,29 @@ void qwen_cpu_moe(
     };
     if (use_q8) {
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(team)
+#pragma omp parallel num_threads(team)
 #endif
-        for (int task = 0; task < routed_count * intermediate; ++task) {
-            gate_up_task(task);
-        }
-        for (int rank = 0; rank < routed_count; ++rank) {
-            qwen_quantize_q8_k_avx2(
-                activated + static_cast<std::size_t>(rank) * intermediate,
-                intermediate,
-                activated_q8_data + static_cast<std::size_t>(rank) * (intermediate / 256)
-            );
-        }
+        {
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(team)
+#pragma omp for schedule(static)
 #endif
-        for (int row = 0; row < hidden; ++row) down_row(row);
+            for (int task = 0; task < routed_count * intermediate; ++task)
+                gate_up_task(task);
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+            for (int rank = 0; rank < routed_count; ++rank) {
+                qwen_quantize_q8_k_avx2(
+                    activated + static_cast<std::size_t>(rank) * intermediate,
+                    intermediate,
+                    activated_q8_data + static_cast<std::size_t>(rank) * (intermediate / 256)
+                );
+            }
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+            for (int row = 0; row < hidden; ++row) down_row(row);
+        }
     } else {
         // One team covers both dependent phases. The implicit barrier after the
         // first loop replaces a second parallel-region launch on every layer.

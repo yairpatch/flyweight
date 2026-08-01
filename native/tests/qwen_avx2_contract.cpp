@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <immintrin.h>
 #include <vector>
@@ -126,6 +127,8 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
         if(type==12){set_half(base,0x3c00);set_half(base+2,0x3800);}
         else if(type==13){set_half(base,0x3c00);set_half(base+2,0x3800);}
         else if(type==14)set_half(base+208,0x3c00);
+        else if(type==17)set_half(base,0x3c00);
+        else if(type==18)set_half(base,0x3c00);
         else if(type==40)for(int block=0;block<4;++block)
             for(int scale=0;scale<4;++scale)
                 base[block*36+scale]=static_cast<std::uint8_t>(0x30+scale);
@@ -200,7 +203,7 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
             if(!close(reference,two_rows_first)||
                !close(other_reference,two_rows_second))return false;
         }
-        if(type==8||type==13||type==14){
+        if(type==8||type==13||type==14||type==18){
             float q8_reference=0.0f;
             for(int i=0;i<elements;++i)q8_reference+=dequant[i]*q8_input[i];
             const float q8_actual=qwen_quant_dot_q8_k_avx2(
@@ -212,6 +215,33 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
                 if(!close(q8_reference,vnni)||!close(q8_actual,vnni))return false;
             }
         }
+    }
+    return true;
+}
+
+bool iq_q8_contract(std::uint32_t type,int row_bytes){
+    constexpr int elements=256;
+    std::vector<std::uint8_t> packed(row_bytes);
+    for(int i=0;i<row_bytes;++i)
+        packed[i]=static_cast<std::uint8_t>((i*73+19)&255);
+    set_half(packed.data(),0x3c00);
+    std::vector<float> input(elements),dequant(elements);
+    for(int i=0;i<elements;++i)
+        input[i]=std::sin(i*0.071f)*0.75f;
+    QwenQ8KBlock q8{};
+    qwen_quantize_q8_k_avx2(input.data(),elements,&q8);
+    qwen_dequant_row_avx2(
+        packed.data(),type,elements,0,dequant.data());
+    float expected=0.0f;
+    for(int i=0;i<elements;++i)
+        expected+=dequant[i]*(q8.scale*q8.values[i]);
+    const float actual=qwen_quant_dot_q8_k_avx2(
+        packed.data(),type,&q8,elements,0);
+    if(!close(expected,actual))return false;
+    if(has_avx_vnni()){
+        const float vnni=qwen_quant_dot_q8_k_avx_vnni(
+            packed.data(),type,&q8,elements,0);
+        if(!close(expected,vnni)||!close(actual,vnni))return false;
     }
     return true;
 }
@@ -245,11 +275,19 @@ int main(){
 #else
     const bool avx512=has_avx512();
 #endif
-    if(!q8_quant_contract()||
-       !quant_contract(12,144,avx512)||
-       !quant_contract(13,176,avx512)||!quant_contract(14,210,avx512)||
-       !quant_contract(40,4*36,avx512)||
-       !quant_contract(8,8*34,avx512)||!f32_contract())return 1;
+    const auto require=[](bool passed,const char*name){
+        if(!passed)std::fprintf(stderr,"failed: %s\n",name);
+        return passed;
+    };
+    if(!require(q8_quant_contract(),"q8 quant")||
+       !require(quant_contract(12,144,avx512),"Q4_K")||
+       !require(quant_contract(13,176,avx512),"Q5_K")||
+       !require(quant_contract(14,210,avx512),"Q6_K")||
+       !require(iq_q8_contract(17,74),"IQ2_XS x Q8_K")||
+       !require(iq_q8_contract(18,98),"IQ3_XXS x Q8_K")||
+       !require(quant_contract(40,4*36,avx512),"NVFP4")||
+       !require(quant_contract(8,8*34,avx512),"Q8_0")||
+       !require(f32_contract(),"F32"))return 1;
 #endif
     return 0;
 }

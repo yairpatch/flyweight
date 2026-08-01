@@ -36,6 +36,24 @@ constexpr IqSignMasks build_iq_sign_masks() {
 
 constexpr IqSignMasks kIqSignMasks = build_iq_sign_masks();
 
+// Byte signs for the integer IQ x Q8_K kernels.  Applying the signs to the
+// activation lets vpmaddubsw consume the codebook magnitudes as unsigned bytes
+// without first expanding either operand to float.
+struct IqSignBytes {
+    std::int8_t lanes[256][8];
+};
+
+constexpr IqSignBytes build_iq_sign_bytes() {
+    IqSignBytes signs{};
+    for (int pattern = 0; pattern < 256; ++pattern)
+        for (int lane = 0; lane < 8; ++lane)
+            signs.lanes[pattern][lane] =
+                (pattern >> lane) & 1 ? -1 : 1;
+    return signs;
+}
+
+constexpr IqSignBytes kIqSignBytes = build_iq_sign_bytes();
+
 // Eight consecutive codebook magnitudes, widened to float and signed.
 inline __m256 iq_signed_octet(std::uint64_t grid, std::uint8_t signs) {
     const __m128i packed = _mm_cvtsi64_si128(static_cast<long long>(grid));
@@ -53,6 +71,20 @@ float horizontal_sum(__m256 value) {
     sum = _mm_hadd_ps(sum, sum);
     sum = _mm_hadd_ps(sum, sum);
     return _mm_cvtss_f32(sum);
+}
+
+int horizontal_sum_i32(__m256i value) {
+    __m128i sum = _mm_add_epi32(
+        _mm256_castsi256_si128(value), _mm256_extracti128_si256(value, 1));
+    sum = _mm_hadd_epi32(sum, sum);
+    sum = _mm_hadd_epi32(sum, sum);
+    return _mm_cvtsi128_si32(sum);
+}
+
+std::int64_t iq_sign_bytes(std::uint8_t pattern) {
+    std::int64_t result;
+    std::memcpy(&result, kIqSignBytes.lanes[pattern], sizeof(result));
+    return result;
 }
 
 int dot_i8_8(__m128i left, __m128i right) {
@@ -1003,7 +1035,72 @@ float qwen_quant_dot_q8_k_avx2(
     const QwenQ8KBlock* input, int elements, std::uint64_t row
 ) {
     float result=0.0f;
-    if(type==13){
+    if(type==17){
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes;
+        for(int block=0;block<elements/256;++block){
+            const auto*base=row_data+block*kIq2xsBlockBytes;const auto&q8=input[block];
+            __m256i sum=_mm256_setzero_si256();
+            for(int group=0;group<16;group+=2){
+                std::uint16_t codes[4];
+                std::memcpy(codes,base+2+group*4,sizeof(codes));
+                const __m256i magnitudes=_mm256_set_epi64x(
+                    static_cast<long long>(kIq2xsGrid[codes[3]&511]),
+                    static_cast<long long>(kIq2xsGrid[codes[2]&511]),
+                    static_cast<long long>(kIq2xsGrid[codes[1]&511]),
+                    static_cast<long long>(kIq2xsGrid[codes[0]&511]));
+                const __m256i signs=_mm256_set_epi64x(
+                    iq_sign_bytes(kIq2xxsSigns[codes[3]>>9]),
+                    iq_sign_bytes(kIq2xxsSigns[codes[2]>>9]),
+                    iq_sign_bytes(kIq2xxsSigns[codes[1]>>9]),
+                    iq_sign_bytes(kIq2xxsSigns[codes[0]>>9]));
+                const __m256i activation=_mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(q8.values+group*16));
+                const __m256i pairs=_mm256_maddubs_epi16(
+                    magnitudes,_mm256_sign_epi8(activation,signs));
+                const int first=2*((base[66+(group>>1)]>>(4*(group&1)))&15)+1;
+                const int second=2*((base[66+((group+1)>>1)]>>(4*((group+1)&1)))&15)+1;
+                const __m256i scales=_mm256_set_m128i(
+                    _mm_set1_epi16(static_cast<short>(second)),
+                    _mm_set1_epi16(static_cast<short>(first)));
+                sum=_mm256_add_epi32(sum,_mm256_madd_epi16(pairs,scales));
+            }
+            result+=half_value(base)*q8.scale*0.125f*horizontal_sum_i32(sum);
+        }
+    }else if(type==18){
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes;
+        for(int block=0;block<elements/256;++block){
+            const auto*base=row_data+block*kIq3xxsBlockBytes;const auto&q8=input[block];
+            const auto*indices=base+2;const auto*auxiliary=base+66;
+            __m256i sum=_mm256_setzero_si256();
+            for(int group=0;group<8;++group){
+                std::uint32_t aux;
+                std::memcpy(&aux,auxiliary+group*4,sizeof(aux));
+                const auto*code=indices+group*8;
+                const __m256i magnitudes=_mm256_set_epi32(
+                    static_cast<int>(kIq3xxsGrid[code[7]]),
+                    static_cast<int>(kIq3xxsGrid[code[6]]),
+                    static_cast<int>(kIq3xxsGrid[code[5]]),
+                    static_cast<int>(kIq3xxsGrid[code[4]]),
+                    static_cast<int>(kIq3xxsGrid[code[3]]),
+                    static_cast<int>(kIq3xxsGrid[code[2]]),
+                    static_cast<int>(kIq3xxsGrid[code[1]]),
+                    static_cast<int>(kIq3xxsGrid[code[0]]));
+                const __m256i signs=_mm256_set_epi64x(
+                    iq_sign_bytes(kIq2xxsSigns[(aux>>21)&127]),
+                    iq_sign_bytes(kIq2xxsSigns[(aux>>14)&127]),
+                    iq_sign_bytes(kIq2xxsSigns[(aux>>7)&127]),
+                    iq_sign_bytes(kIq2xxsSigns[aux&127]));
+                const __m256i activation=_mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(q8.values+group*32));
+                const __m256i pairs=_mm256_maddubs_epi16(
+                    magnitudes,_mm256_sign_epi8(activation,signs));
+                const __m256i scales=_mm256_set1_epi16(
+                    static_cast<short>(2*(aux>>28)+1));
+                sum=_mm256_add_epi32(sum,_mm256_madd_epi16(pairs,scales));
+            }
+            result+=half_value(base)*q8.scale*0.25f*horizontal_sum_i32(sum);
+        }
+    }else if(type==13){
         const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*176;
         for(int block=0;block<elements/256;++block){
             const auto*base=row_data+block*176;const auto&q8=input[block];
@@ -1052,6 +1149,8 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==12)q4_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*144,output,elements);
     else if(type==13)q5_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*176,output,elements);
     else if(type==14)q6_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*210,output,elements);
+    else if(type==17){const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes;for(int i=0;i<elements;++i)output[i]=qwen_iq2xs_value(row_data,i);}
+    else if(type==18){const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes;for(int i=0;i<elements;++i)output[i]=qwen_iq3xxs_value(row_data,i);}
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);
     else q8_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*34,output,elements);
 }
