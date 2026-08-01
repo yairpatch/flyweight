@@ -77,6 +77,7 @@ void check(const char* label, std::uint32_t type, std::uint32_t block_bytes,
                 &block_scale, sizeof(block_scale));
     std::vector<float> input(kElements);
     for (auto& value : input) value = activation(generator);
+    std::vector<float> second_input(input.rbegin(), input.rend());
     // Bound on the accumulated magnitude: every IQ magnitude is under 256 and
     // the group scale under 8, which is what the tolerance is measured against.
     float scale = 0.0f;
@@ -108,6 +109,15 @@ void check(const char* label, std::uint32_t type, std::uint32_t block_bytes,
             expect_close(name, pair_first, expected, scale);
             std::snprintf(name, sizeof(name), "%s AVX-512 fused second %d", label, row);
             expect_close(name, pair_second, other_expected, scale);
+            const float second_expected = scalar(
+                packed.data(), second_input.data(), kElements, row);
+            qwen_quant_dot_pair_avx512(
+                packed.data(), type, input.data(), second_input.data(),
+                kElements, row, &pair_first, &pair_second);
+            std::snprintf(name, sizeof(name), "%s AVX-512 input pair first %d", label, row);
+            expect_close(name, pair_first, expected, scale);
+            std::snprintf(name, sizeof(name), "%s AVX-512 input pair second %d", label, row);
+            expect_close(name, pair_second, second_expected, scale);
         }
     }
 }

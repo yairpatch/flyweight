@@ -2056,6 +2056,14 @@ void qwen_quant_dot_rows(
 }
 
 void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const float*first,const float*second,int elements,std::uint64_t row,float&first_output,float&second_output){
+    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0){
+        const char*setting=std::getenv("COLIBRI_IQ_AVX512");
+        if(!setting||setting[0]!='0'){
+            qwen_quant_dot_pair_avx512(
+                packed,type,first,second,elements,row,&first_output,&second_output);
+            return;
+        }
+    }
     if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_quant_dot_pair_avx512(packed,type,first,second,elements,row,&first_output,&second_output);return;}
     first_output=qwen_quant_dot(packed,type,first,elements,row);second_output=qwen_quant_dot(packed,type,second,elements,row);
 }
@@ -2824,6 +2832,12 @@ void qwen_cpu_moe_rows(
     const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
     const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
     const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
+    const char* fused_gate_up_setting=std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
+    const char* iq_avx512_setting=std::getenv("COLIBRI_IQ_AVX512");
+    const bool auto_fused_iq2xs=gate_type==17
+        &&(colibri_cpu_features()&2u)!=0
+        &&(!iq_avx512_setting||iq_avx512_setting[0]!='0')
+        &&(!fused_gate_up_setting||fused_gate_up_setting[0]!='0');
     for(const auto type:{gate_type,up_type,down_type})
         if(!qwen_cpu_expert_type_supported(type))
             throw std::runtime_error(
@@ -2863,8 +2877,13 @@ void qwen_cpu_moe_rows(
     for(int expert=0;expert<experts;++expert)if(counts[expert])group_experts.push_back(expert);
     const int group_count=static_cast<int>(group_experts.size());
     constexpr int kRowBlock=4;
+    // Direct IQ rows are already grouped by expert and have thousands of tasks
+    // available. Larger hand-out chunks avoid making OpenMP's dynamic scheduler
+    // a measurable part of short prompts; keep the finer balance for the f32
+    // fallback, whose per-task cost varies much more with route count.
+    const int schedule_chunk=direct_quant?32:4;
     const int gate_blocks=(intermediate+kRowBlock-1)/kRowBlock;
-#pragma omp parallel for schedule(dynamic,4) num_threads(qwen_cpu_thread_count(runtime))
+#pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*gate_blocks;++task){
         const int group=task/gate_blocks;const int row0=(task%gate_blocks)*kRowBlock;
         const int mr=std::min(kRowBlock,intermediate-row0);
@@ -2879,7 +2898,7 @@ void qwen_cpu_moe_rows(
         if(count<=2){
             for(int i=0;i<mr;++i){
                 float gate_values[2]{},up_values[2]{};
-                if(runtime.fused_moe_gate_up&&gate_type==up_type){
+                if((runtime.fused_moe_gate_up||auto_fused_iq2xs)&&gate_type==up_type){
                     if(count==1){
                         qwen_quant_dot_two_rows(
                             gate_data, up_data, gate_type, vectors[begin],
@@ -2950,7 +2969,7 @@ void qwen_cpu_moe_rows(
     for(int slot=0;slot<offsets[experts];++slot)
         activated_vectors[slot]=activated+static_cast<std::size_t>(occurrences[slot])*intermediate;
     const int down_blocks=(hidden+kRowBlock-1)/kRowBlock;
-#pragma omp parallel for schedule(dynamic,4) num_threads(qwen_cpu_thread_count(runtime))
+#pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*down_blocks;++task){
         const int group=task/down_blocks;const int row0=(task%down_blocks)*kRowBlock;
         const int mr=std::min(kRowBlock,hidden-row0);
