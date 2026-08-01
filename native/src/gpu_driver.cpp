@@ -925,6 +925,8 @@ extern "C" int colibri_gpu_compile(
              "nvfp4_matmul_rows",
              "q8_matmul_tiled", "delta_conv_chunk",
              "qwen_delta_recurrent_chunk",
+             "qwen_delta_wy_scores", "qwen_delta_wy_solve",
+             "qwen_delta_state_pass", "qwen_delta_norm_gate",
              "kv_store_f32", "kv_store_f16", "kv_store_bf16", "kv_store_q8",
              "kv_attention_scores_f16", "kv_attention_scores_bf16", "kv_attention_scores_q8",
              "kv_attention_values_f16", "kv_attention_values_bf16", "kv_attention_values_q8",

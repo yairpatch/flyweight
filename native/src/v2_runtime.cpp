@@ -338,6 +338,9 @@ struct ColibriV2QwenRuntime {
     std::uint64_t workspace_bytes = 0;
     colibri::v2::workspace::QwenDecodeWorkspaceLayout decode_workspace_layout;
     colibri::v2::workspace::QwenRowsWorkspaceLayout rows_workspace_layout;
+    // Non-zero when the model's DeltaNet layers match the chunked prefill
+    // kernels' fixed head_dim, which is what sized the delta_* workspace regions.
+    std::uint32_t delta_value_heads = 0;
     colibri::v2::workspace::QwenDecodeHostLayout decode_host_layout;
     colibri::v2::workspace::QwenRowsHostLayout rows_host_layout;
     // Pinned scratch for the host-side dense SwiGLU: normalized input, the
@@ -3817,11 +3820,23 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         const std::uint64_t rows=runtime->forward_rows_capacity;
         const std::uint64_t hidden=runtime->model->config.hidden_size;
         const std::uint64_t top_k=runtime->model->config.expert_used_count;
+        // The chunked DeltaNet prefill kernels need per-chunk intermediates, but
+        // only for models that have DeltaNet layers at the head_dim they support.
+        // Anything else leaves these regions empty and keeps the sequential path.
+        std::uint64_t delta_value_heads=0;
+        for(const auto&layer:runtime->layers){
+            if(layer.attention)continue;
+            const auto heads=runtime->model->tensors[layer.static_tensors[8]].shape[0];
+            const auto dim=runtime->model->tensors[layer.static_tensors[9]].shape[0];
+            if(dim==colibri::v2::workspace::kDeltaDim)delta_value_heads=heads;
+            break;
+        }
+        runtime->delta_value_heads=static_cast<std::uint32_t>(delta_value_heads);
         runtime->rows_workspace_layout=colibri::v2::workspace::qwen_rows(
             rows,hidden,runtime->scratch_elements,top_k,
             runtime->moe_intermediate,runtime->model->config.expert_count,
             runtime->model->config.attention_heads,
-            runtime->options.context_limit);
+            runtime->options.context_limit,delta_value_heads);
         runtime->rows_host_layout=
             colibri::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);

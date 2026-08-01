@@ -170,8 +170,123 @@ void qwen_forward_rows(
             else launch("delta_conv_sequence",channels,1,1,conv_args);
             phase(layer_number,"conv");
             auto recurrent_state=runtime.state+layer.state_second;auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
+            // COLIBRI_DELTA_DUMP=<dir> writes one DeltaNet layer's recurrence
+            // inputs so alternative kernels can be replayed on real activations
+            // instead of synthetic ones. Diagnostic only: it dumps the first
+            // such layer once and never alters what runs.
+            if(const char*dump_dir=std::getenv("COLIBRI_DELTA_DUMP")){
+                // COLIBRI_DELTA_DUMP_SKIP skips the first N opportunities. The
+                // default first one is layer 0 of the first chunk, whose incoming
+                // recurrent state is still all zeros; skipping past it is what
+                // captures a live state carried in from earlier tokens.
+                static long skip=[]{
+                    const char*value=std::getenv("COLIBRI_DELTA_DUMP_SKIP");
+                    return value?std::strtol(value,nullptr,10):0L;
+                }();
+                static bool dumped=false;
+                if(!dumped&&skip-->0){
+                    // fall through without dumping
+                }else if(!dumped){
+                    dumped=true;
+                    colibri_gpu_stream_sync(runtime.stream);
+                    auto save=[&](const char*what,std::uint64_t address,std::size_t count){
+                        std::vector<float> host(count);
+                        if(colibri_gpu_download(host.data(),address,count*sizeof(float),runtime.stream)!=0
+                           ||colibri_gpu_stream_sync(runtime.stream)!=0)
+                            throw std::runtime_error("native Qwen DeltaNet dump readback failed");
+                        char path[1024];
+                        std::snprintf(path,sizeof(path),"%s/delta_%s.f32",dump_dir,what);
+                        std::FILE*file=std::fopen(path,"wb");
+                        if(!file)throw std::runtime_error("native Qwen DeltaNet dump cannot open "+std::string(path));
+                        std::fwrite(host.data(),sizeof(float),count,file);
+                        std::fclose(file);
+                    };
+                    const std::size_t token_count=static_cast<std::size_t>(rows);
+                    save("convolved",fourth,token_count*static_cast<std::size_t>(channels));
+                    save("gates",second,token_count*static_cast<std::size_t>(gate_elements));
+                    save("decay_logits",third,token_count*static_cast<std::size_t>(value_heads));
+                    save("beta_logits",beta_logits,token_count*static_cast<std::size_t>(value_heads));
+                    save("state",recurrent_state,
+                         static_cast<std::size_t>(value_heads)*head_dim*head_dim);
+                    save("a_log",decay,static_cast<std::size_t>(value_heads));
+                    save("dt_bias",dt,static_cast<std::size_t>(value_heads));
+                    save("norm",norm,static_cast<std::size_t>(head_dim));
+                    char meta[1024];
+                    std::snprintf(meta,sizeof(meta),"%s/delta_meta.txt",dump_dir);
+                    if(std::FILE*file=std::fopen(meta,"w")){
+                        std::fprintf(file,
+                            "layer %u\nrows %d\nchannels %d\ngate_elements %d\n"
+                            "key_heads %d\nvalue_heads %d\nhead_dim %d\nepsilon %.9g\n",
+                            layer_number,rows,channels,gate_elements,
+                            key_heads,value_heads,head_dim,epsilon);
+                        std::fclose(file);
+                    }
+                    std::fprintf(stderr,"[delta-dump] layer %u rows %d -> %s\n",
+                        layer_number,rows,dump_dir);
+                }
+            }
             void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta_logits,const_cast<std::uint64_t*>(&third),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
-            if(head_dim==128)launch("qwen_delta_recurrent_chunk",value_heads,1,128,recurrent_args);
+            // Chunked WY form: the same recurrence with the serial depth cut from
+            // `rows` steps to rows/64 and the grid widened past `value_heads`.
+            // Requires the workspace regions sized at prepare time, so the guard
+            // is the same head_dim test that sized them.
+            const bool chunked_delta=
+                colibri::v2::workspace::use_chunked_delta(
+                    static_cast<std::uint64_t>(rows),
+                    static_cast<std::uint64_t>(head_dim),
+                    static_cast<std::uint64_t>(value_heads),
+                    runtime.delta_value_heads)&&
+                !std::getenv("COLIBRI_DELTA_SEQUENTIAL");
+            if(chunked_delta){
+                const auto attn=workspace_layout.delta_attn.address(runtime.workspace);
+                const auto pmat=workspace_layout.delta_pmat.address(runtime.workspace);
+                const auto gcum=workspace_layout.delta_gcum.address(runtime.workspace);
+                const auto beta_out=workspace_layout.delta_beta.address(runtime.workspace);
+                const auto qinv=workspace_layout.delta_qinv.address(runtime.workspace);
+                const auto kinv=workspace_layout.delta_kinv.address(runtime.workspace);
+                const auto w_rows=workspace_layout.delta_w.address(runtime.workspace);
+                const auto u_rows=workspace_layout.delta_u.address(runtime.workspace);
+                // `first` held the qkv projection, which the causal conv has
+                // already consumed into `fourth`; the epilogue then normalizes it
+                // in place, which is where the sequential kernel leaves its output.
+                const auto core=first;
+                const std::uint32_t chunk_count=
+                    (static_cast<std::uint32_t>(rows)
+                     +static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaChunk)-1)
+                    /static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaChunk);
+                void*score_args[]={const_cast<std::uint64_t*>(&fourth),&beta_logits,
+                    const_cast<std::uint64_t*>(&third),&decay,&dt,
+                    const_cast<std::uint64_t*>(&attn),const_cast<std::uint64_t*>(&pmat),
+                    const_cast<std::uint64_t*>(&gcum),const_cast<std::uint64_t*>(&beta_out),
+                    const_cast<std::uint64_t*>(&qinv),const_cast<std::uint64_t*>(&kinv),
+                    &rows,&key_heads,&value_heads};
+                launch("qwen_delta_wy_scores",chunk_count,
+                    static_cast<std::uint32_t>(value_heads),256,score_args);
+                void*solve_args[]={const_cast<std::uint64_t*>(&fourth),
+                    const_cast<std::uint64_t*>(&attn),const_cast<std::uint64_t*>(&gcum),
+                    const_cast<std::uint64_t*>(&beta_out),const_cast<std::uint64_t*>(&kinv),
+                    const_cast<std::uint64_t*>(&w_rows),const_cast<std::uint64_t*>(&u_rows),
+                    &rows,&key_heads,&value_heads};
+                launch("qwen_delta_wy_solve",chunk_count,
+                    static_cast<std::uint32_t>(value_heads),256,solve_args);
+                void*pass_args[]={const_cast<std::uint64_t*>(&fourth),
+                    const_cast<std::uint64_t*>(&pmat),const_cast<std::uint64_t*>(&gcum),
+                    const_cast<std::uint64_t*>(&qinv),const_cast<std::uint64_t*>(&kinv),
+                    const_cast<std::uint64_t*>(&w_rows),const_cast<std::uint64_t*>(&u_rows),
+                    &recurrent_state,const_cast<std::uint64_t*>(&core),
+                    &rows,&key_heads,&value_heads};
+                launch("qwen_delta_state_pass",static_cast<std::uint32_t>(value_heads),
+                    static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaDim)/32,
+                    256,pass_args);
+                void*gate_args[]={const_cast<std::uint64_t*>(&core),
+                    const_cast<std::uint64_t*>(&second),&norm,
+                    const_cast<std::uint64_t*>(&first),&value_heads,
+                    const_cast<float*>(&epsilon)};
+                launch("qwen_delta_norm_gate",static_cast<std::uint32_t>(rows),
+                    static_cast<std::uint32_t>(value_heads),
+                    static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaDim),
+                    gate_args);
+            }else if(head_dim==128)launch("qwen_delta_recurrent_chunk",value_heads,1,128,recurrent_args);
             else launch("qwen_delta_recurrent_rows",value_heads,1,256,recurrent_args);
             phase(layer_number,"recurrent");
             dense(3,first,residual,value_dim,hidden_size);

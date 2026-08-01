@@ -127,13 +127,36 @@ struct QwenRowsWorkspaceLayout {
     Region token_device;
     Region winners;
     Region attention_scores;
+    // Chunked DeltaNet intermediates. Zero-sized unless the model has DeltaNet
+    // layers with the head_dim the chunked kernels require.
+    Region delta_attn;
+    Region delta_pmat;
+    Region delta_gcum;
+    Region delta_beta;
+    Region delta_qinv;
+    Region delta_kinv;
+    Region delta_w;
+    Region delta_u;
     std::uint64_t bytes = 0;
 };
+
+constexpr std::uint64_t kDeltaChunk = 64;
+constexpr std::uint64_t kDeltaDim = 128;
+constexpr std::uint64_t kDeltaChunkedMinimumRows = 1024;
+
+constexpr bool use_chunked_delta(
+    std::uint64_t rows, std::uint64_t head_dim,
+    std::uint64_t value_heads, std::uint64_t prepared_value_heads
+) {
+    return rows >= kDeltaChunkedMinimumRows && head_dim == kDeltaDim &&
+        value_heads != 0 && value_heads == prepared_value_heads;
+}
 
 constexpr QwenRowsWorkspaceLayout qwen_rows(
     std::uint64_t rows, std::uint64_t hidden, std::uint64_t scratch,
     std::uint64_t top_k, std::uint64_t intermediate, std::uint64_t experts,
-    std::uint64_t attention_heads, std::uint64_t context
+    std::uint64_t attention_heads, std::uint64_t context,
+    std::uint64_t delta_value_heads
 ) {
     Builder builder;
     QwenRowsWorkspaceLayout layout;
@@ -163,6 +186,25 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     layout.winners = builder.add(rows * sizeof(std::uint64_t));
     layout.attention_scores =
         builder.add(attention_heads * context * sizeof(float));
+    {
+        // Sized so a partial trailing chunk still gets a full 64x64 pair of score
+        // matrices. The `core` output is not here: it aliases `first`, which is
+        // free once the causal conv has consumed it, and the epilogue rewrites it
+        // in place.
+        const std::uint64_t chunks =
+            (rows + kDeltaChunk - 1) / kDeltaChunk * (delta_value_heads ? 1 : 0);
+        const std::uint64_t pairs = chunks * delta_value_heads * kDeltaChunk * kDeltaChunk;
+        const std::uint64_t scalars = rows * delta_value_heads * (delta_value_heads ? 1 : 0);
+        const std::uint64_t vectors = scalars * kDeltaDim;
+        layout.delta_attn = builder.add(pairs * sizeof(float));
+        layout.delta_pmat = builder.add(pairs * sizeof(float));
+        layout.delta_gcum = builder.add(scalars * sizeof(float));
+        layout.delta_beta = builder.add(scalars * sizeof(float));
+        layout.delta_qinv = builder.add(scalars * sizeof(float));
+        layout.delta_kinv = builder.add(scalars * sizeof(float));
+        layout.delta_w = builder.add(vectors * sizeof(float));
+        layout.delta_u = builder.add(vectors * sizeof(float));
+    }
     layout.bytes = builder.bytes();
     return layout;
 }

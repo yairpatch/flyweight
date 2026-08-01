@@ -44,9 +44,19 @@ std::uint64_t legacy_decode_bytes(
 std::uint64_t legacy_rows_bytes(
     std::uint64_t rows, std::uint64_t hidden, std::uint64_t scratch,
     std::uint64_t top_k, std::uint64_t intermediate, std::uint64_t experts,
-    std::uint64_t heads, std::uint64_t context
+    std::uint64_t heads, std::uint64_t context, std::uint64_t delta_value_heads
 ) {
-    return ws::align(rows * hidden * sizeof(float)) * 3 +
+    const std::uint64_t chunks = delta_value_heads
+        ? (rows + ws::kDeltaChunk - 1) / ws::kDeltaChunk : 0;
+    const std::uint64_t pairs =
+        chunks * delta_value_heads * ws::kDeltaChunk * ws::kDeltaChunk;
+    const std::uint64_t scalars = rows * delta_value_heads;
+    const std::uint64_t delta =
+        ws::align(pairs * sizeof(float)) * 2 +
+        ws::align(scalars * sizeof(float)) * 4 +
+        ws::align(scalars * ws::kDeltaDim * sizeof(float)) * 2;
+    return delta +
+        ws::align(rows * hidden * sizeof(float)) * 3 +
         ws::align(rows * scratch * sizeof(float)) * 4 +
         ws::align(rows * experts * sizeof(float)) +
         ws::align(rows * top_k * sizeof(std::int32_t)) +
@@ -96,6 +106,12 @@ int main() {
     constexpr std::uint64_t heads = 32;
     constexpr std::uint64_t context = 32768;
 
+    if (ws::use_chunked_delta(1023, 128, 32, 32) ||
+        !ws::use_chunked_delta(1024, 128, 32, 32) ||
+        ws::use_chunked_delta(1024, 64, 32, 32) ||
+        ws::use_chunked_delta(1024, 128, 32, 48) ||
+        ws::use_chunked_delta(1024, 128, 0, 0)) return 6;
+
     for (const auto active_top_k : {std::uint64_t{1}, std::uint64_t{4}, top_k}) {
         const auto layout = ws::qwen_decode(
             hidden, scratch, active_top_k, intermediate, experts, vocabulary,
@@ -123,9 +139,10 @@ int main() {
     for (const auto rows : {
              std::uint64_t{1}, std::uint64_t{9}, std::uint64_t{64},
              std::uint64_t{1024}, std::uint64_t{4096}}) {
+      for (const auto delta_value_heads : {std::uint64_t{0}, std::uint64_t{32}}) {
         const auto layout = ws::qwen_rows(
             rows, hidden, scratch, top_k, intermediate, experts, heads,
-            context);
+            context, delta_value_heads);
         const std::array regions{
             layout.hidden, layout.residual, layout.normalized, layout.first,
             layout.second, layout.third, layout.fourth, layout.router_logits,
@@ -133,11 +150,20 @@ int main() {
             layout.gpu_gate_table, layout.gpu_up_table, layout.gpu_down_table,
             layout.gpu_weight_table, layout.gpu_gate_scale_table,
             layout.gpu_up_scale_table, layout.gpu_count_table,
-            layout.token_device, layout.winners, layout.attention_scores};
+            layout.token_device, layout.winners, layout.attention_scores,
+            layout.delta_attn, layout.delta_pmat, layout.delta_gcum,
+            layout.delta_beta, layout.delta_qinv, layout.delta_kinv,
+            layout.delta_w, layout.delta_u};
         if (!valid_regions(regions, layout.bytes) ||
             layout.bytes != legacy_rows_bytes(
                 rows, hidden, scratch, top_k, intermediate, experts, heads,
-                context)) return 3;
+                context, delta_value_heads)) return 3;
+        // A model without DeltaNet layers must not pay for the chunked buffers.
+        if (delta_value_heads == 0 && (layout.delta_attn.size != 0 ||
+            layout.delta_w.size != 0 || layout.delta_gcum.size != 0)) return 3;
+        if (delta_value_heads != 0 && layout.delta_w.size !=
+            rows * delta_value_heads * ws::kDeltaDim * sizeof(float)) return 3;
+      }
 
         const auto host =
             ws::qwen_rows_host(rows, hidden, top_k, intermediate);
