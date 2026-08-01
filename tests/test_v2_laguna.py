@@ -226,5 +226,43 @@ class LagunaNativeTests(unittest.TestCase):
             model.close()
 
 
+@unittest.skipUnless(
+    os.environ.get("COLIBRI_TEST_LAGUNA_MODEL")
+    and Path(os.environ["COLIBRI_TEST_LAGUNA_MODEL"]).is_file(),
+    "set COLIBRI_TEST_LAGUNA_MODEL to a Laguna GGUF checkpoint",
+)
+class LagunaRealModelTests(unittest.TestCase):
+    def test_whole_layer_placement_matches_cpu_experts(self):
+        path = os.environ["COLIBRI_TEST_LAGUNA_MODEL"]
+        with V2Model(path) as model:
+            tokens = model.tokenize(
+                "<s><user>What is the capital of France?</user><assistant>"
+            )
+            expected: list[int] = []
+            with model.native_qwen_runtime(
+                context_limit=512,
+                moe_device="cpu",
+                prefill_cache_seed="off",
+            ) as runtime:
+                runtime.prepare()
+                runtime.generate(tokens, 4, expected.append)
+
+            actual: list[int] = []
+            with (
+                unittest.mock.patch.dict(
+                    os.environ, {"COLIBRI_LAGUNA_WHOLE_LAYERS": "auto"}
+                ),
+                model.native_qwen_runtime(
+                    context_limit=512,
+                    moe_device="auto",
+                    prefill_cache_seed="auto",
+                ) as runtime,
+            ):
+                runtime.prepare()
+                runtime.generate(tokens, 4, actual.append)
+
+            self.assertEqual(actual, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

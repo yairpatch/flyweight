@@ -361,6 +361,10 @@ struct ColibriV2QwenRuntime {
     std::uint64_t expert_native_cache_bytes = 0;
     std::uint64_t expert_slot_bytes = 0;
     std::vector<QwenExpertSlot> expert_slots;
+    // Laguna caches complete routed-expert layers instead of spreading a
+    // partial working set across every layer. Entries are the first cache slot
+    // for that layer, or -1 for layers whose routed experts remain on the CPU.
+    std::vector<std::int32_t> whole_expert_layer_slots;
     std::vector<QwenExpertHistory> expert_history;
     std::string expert_history_path;
     std::uint64_t expert_history_fingerprint = 0;
@@ -1047,6 +1051,19 @@ std::size_t select_expert_cache_slot(
             runtime.model->config.expert_count + expert
     ];
     if (record_access) record_expert_access(runtime, layer, expert);
+    if(!runtime.whole_expert_layer_slots.empty()){
+        if(layer>=runtime.whole_expert_layer_slots.size()||
+           runtime.whole_expert_layer_slots[layer]<0){
+            ++runtime.expert_cache_rejections;
+            return kNoExpertSlot;
+        }
+        const auto slot=static_cast<std::size_t>(
+            runtime.whole_expert_layer_slots[layer])+expert;
+        if(slot>=runtime.expert_slots.size())
+            throw std::runtime_error(
+                "native Laguna whole-layer expert slot is out of range");
+        return slot;
+    }
     const auto cache_layers = qwen_cache_layer_count(runtime);
     const auto slot_begin = runtime.expert_slots.size() * layer / cache_layers;
     const auto slot_end = runtime.expert_slots.size() * (layer + 1) / cache_layers;
@@ -1216,6 +1233,7 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.expert_cache_bytes = runtime.expert_native_cache_bytes =
         runtime.expert_slot_bytes = 0;
     runtime.expert_slots.clear();
+    runtime.whole_expert_layer_slots.clear();
     runtime.expert_history.clear();
     runtime.expert_residency.clear();
     runtime.decode_ready = false;
@@ -4039,6 +4057,42 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 qwen_cache_layer_count(*runtime))*
                 runtime->model->config.expert_count*runtime->expert_slot_bytes;
             if(cache>max_cache)cache=max_cache;
+            const char*whole_layer_setting=
+                std::getenv("COLIBRI_LAGUNA_WHOLE_LAYERS");
+            const bool whole_layer_enabled=runtime->laguna&&
+                qwen_model_has_iq_experts(*runtime)&&
+                (!whole_layer_setting||whole_layer_setting[0]!='0');
+            if(whole_layer_enabled&&!runtime->options.strict_resident){
+                const auto experts=runtime->model->config.expert_count;
+                std::vector<std::uint32_t> candidates;
+                for(std::uint32_t layer=0;layer<runtime->layers.size();++layer)
+                    if(!runtime->layers[layer].dense_ffn)
+                        candidates.push_back(layer);
+                std::size_t layer_count=experts
+                    ?std::min<std::size_t>(
+                        candidates.size(),cache/runtime->expert_slot_bytes/experts)
+                    :0;
+                char*end=nullptr;
+                const auto requested=whole_layer_setting
+                    ?std::strtoul(whole_layer_setting,&end,10):0;
+                if(whole_layer_setting&&end!=whole_layer_setting&&requested)
+                    layer_count=std::min<std::size_t>(layer_count,requested);
+                runtime->whole_expert_layer_slots.assign(
+                    runtime->layers.size(),-1);
+                std::size_t slot=0;
+                for(std::size_t index=0;index<layer_count;++index){
+                    const auto layer=candidates[candidates.size()-layer_count+index];
+                    runtime->whole_expert_layer_slots[layer]=
+                        static_cast<std::int32_t>(slot);
+                    slot+=experts;
+                }
+                cache=slot*runtime->expert_slot_bytes;
+                if(!layer_count)
+                    runtime->whole_expert_layer_slots.clear();
+                std::fprintf(stderr,
+                    "[colibri-v2] Laguna whole-layer placement selected %zu "
+                    "layers (%zu expert bundles)\n",layer_count,slot);
+            }
             runtime->expert_cache_bytes=(cache/runtime->expert_slot_bytes<runtime->model->config.expert_used_count)?0:cache;
         }
         const auto resident_expert_bytes=static_cast<std::uint64_t>(
@@ -4162,10 +4216,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // then degenerates once experts become resident.
         // IQ experts do have grouped GPU kernels now, but splitting a layer
         // between the router on the GPU and the experts on the host costs a
-        // round trip per layer, and measurement on a 12 GiB card shows that
-        // synchronization grows by more than the offload saves. They stay on
-        // the CPU unless the deployment explicitly pins a seeded expert set,
-        // which is the only configuration where the offload has ever paid.
+        // round trip per layer. Laguna therefore concentrates its cache into
+        // complete pinned layers; other IQ models still require an explicitly
+        // seeded set before the GPU path is allowed.
         const bool seeded_placement=runtime->options.prefill_cache_seed!=0||
                                     runtime->options.prefill_cache_seed_auto!=0;
         // Gated on the decode policy, not the prepare one: `auto` prepares as
@@ -4175,7 +4228,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             *runtime,colibri::v2::ExpertExecutionPhase::decode).is_cpu();
         if(gpu_at_decode&&runtime->model->config.expert_count&&
            (!qwen_gpu_experts_executable(*runtime)||
-            (qwen_model_has_iq_experts(*runtime)&&!seeded_placement))){
+            (qwen_model_has_iq_experts(*runtime)&&!seeded_placement&&
+             runtime->whole_expert_layer_slots.empty()))){
             runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
             runtime->options.moe_device=colibri::v2::expert_execution_mode_value(
                 runtime->expert_mode);
@@ -4183,7 +4237,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 *runtime,colibri::v2::ExpertExecutionPhase::prepare);
             std::fprintf(stderr,
                 "[colibri-v2] routed experts stay on the CPU MoE; set "
-                "--prefill-cache-seed to place IQ experts on the GPU\n");
+                "--prefill-cache-seed or COLIBRI_LAGUNA_WHOLE_LAYERS to "
+                "place IQ experts on the GPU\n");
         }
         if(prepare_policy.is_hybrid()&&runtime->model->config.expert_count&&
            runtime->expert_slots.empty()){
@@ -4263,6 +4318,49 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 runtime->expert_slots.size(),
                 static_cast<unsigned long long>(
                     resident_expert_bytes/(1024ull*1024)));
+        }else if(!runtime->whole_expert_layer_slots.empty()){
+            const auto experts=runtime->model->config.expert_count;
+            std::size_t prepared=0;
+            for(std::uint32_t layer=0;layer<runtime->layers.size();++layer){
+                const auto first_slot=runtime->whole_expert_layer_slots[layer];
+                if(first_slot<0)continue;
+                const auto&plan=runtime->layers[layer];
+                for(std::uint32_t expert=0;expert<experts;++expert){
+                    const auto slot_index=static_cast<std::size_t>(first_slot)+expert;
+                    auto&slot=runtime->expert_slots.at(slot_index);
+                    const auto slot_base=runtime->expert_cache+
+                        slot_index*runtime->expert_slot_bytes;
+                    std::uint64_t role_offset=0;
+                    for(int role=0;role<3;++role){
+                        const auto&t=runtime->model->tensors[
+                            plan.expert_tensors[role]];
+                        const auto bytes=t.size/experts;
+                        const auto source_offset=
+                            static_cast<std::uint64_t>(expert)*bytes;
+                        if(colibri_gpu_upload(
+                                slot_base+role_offset,
+                                runtime->model->data+t.offset+source_offset,
+                                bytes,runtime->stream)!=0)
+                            throw std::runtime_error(
+                                "failed to prepare Laguna whole-layer expert");
+                        role_offset+=bytes;
+                    }
+                    if(role_offset>runtime->expert_slot_bytes)
+                        throw std::runtime_error(
+                            "Laguna whole-layer expert exceeds its cache slot");
+                    slot.key=(static_cast<std::uint64_t>(layer)<<32)|expert;
+                    slot.valid=true;
+                    slot.pinned=true;
+                    slot.last_used=++runtime->expert_clock;
+                    runtime->expert_residency[slot.key]=slot_index;
+                    ++prepared;
+                }
+            }
+            std::fprintf(stderr,
+                "[colibri-v2] prepared %zu pinned Laguna whole-layer experts "
+                "(%llu MiB)\n",prepared,
+                static_cast<unsigned long long>(
+                    runtime->expert_cache_bytes/(1024ull*1024)));
         }
         if(colibri_gpu_memset(runtime->workspace,0,runtime->workspace_bytes,runtime->stream)!=0||
            colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0||

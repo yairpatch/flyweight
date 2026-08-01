@@ -204,12 +204,12 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
   than by a full category table, so non-Latin prose can split differently from
   the reference tokenizer.
 - IQ2_XS, IQ3_XXS and IQ4_XS routed experts have grouped GPU kernels; the other
-  IQ formats do not and always run on the CPU expert path. Even where the
-  kernels exist, IQ experts stay on the CPU unless `--prefill-cache-seed` pins a
-  seeded set: splitting a layer between a GPU router and host experts costs a
-  round trip per layer, and on a 12 GiB card that synchronization grows by more
-  than the offload saves. Whole-layer residency, not per-expert paging, is what
-  would make the offload pay.
+  IQ formats always run on the CPU expert path. Laguna concentrates available
+  expert-cache VRAM into a contiguous suffix of complete layers and pins every
+  expert in those layers. This avoids the regressive partial-layer split while
+  using the CPU path for earlier layers. Set `COLIBRI_LAGUNA_WHOLE_LAYERS=0` to
+  restore per-expert placement for comparison, or to a positive integer to cap
+  the number of complete GPU layers.
 - IQ expert decode is ALU-bound rather than bandwidth-bound, so it scales past
   the physical core count. The default thread heuristic uses physical cores;
   `--cpu-threads` at the SMT count is worth roughly 1.4x on such models.
