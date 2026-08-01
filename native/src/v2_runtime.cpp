@@ -6925,11 +6925,13 @@ static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prom
 }
 
 // Post-prefill expert placement. Manual mode selects N experts per layer.
-// Automatic immutable-hybrid mode chooses a small prepared working set from
-// prompt-local frequency plus decayed persistent history, then bounds the
-// phase by both bytes and wall time. A low-value prompt leaves the previous
-// pinned set untouched, which is important for short side requests.
-static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
+// Automatic immutable-hybrid mode chooses a request-horizon-sized prepared
+// working set from prompt-local frequency plus decayed persistent history,
+// bounded by cache capacity and wall time. A low-value prompt leaves the
+// previous pinned set untouched, which is important for short side requests.
+static void qwen_seed_prefill_experts(
+        ColibriV2QwenRuntime& runtime,
+        std::uint64_t requested_generation_tokens) {
     const char* setting=std::getenv("COLIBRI_PREFILL_CACHE_SEED");
     long requested=static_cast<long>(runtime.options.prefill_cache_seed);
     bool automatic=runtime.options.prefill_cache_seed_auto!=0;
@@ -6981,7 +6983,8 @@ static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
     }
     const std::size_t per_layer=automatic
         ? colibri::v2::expert_seed::auto_experts_per_layer(
-            runtime.expert_slots.size(),cache_layers)
+            runtime.expert_slots.size(),cache_layers,
+            requested_generation_tokens)
         : static_cast<std::size_t>(std::clamp<long>(requested,1,256));
     if(!per_layer){
         if(automatic)++runtime.prefill_cache_seed_auto_skips;
@@ -7078,10 +7081,6 @@ static void qwen_seed_prefill_experts(ColibriV2QwenRuntime& runtime) {
         std::uint64_t bundle_bytes=0;
         for(int role=0;role<3;++role)
             bundle_bytes+=runtime.model->tensors[plan.expert_tensors[role]].size/experts;
-        if(automatic&&
-           uploaded_bytes+bundle_bytes>colibri::v2::expert_seed::kAutoMaxUploadBytes){
-            ++runtime.prefill_cache_seed_budget_stops;break;
-        }
         const auto slot_index=select_expert_cache_slot(
             runtime,layer,expert,false,false);
         if(slot_index==kNoExpertSlot)continue;
@@ -7262,10 +7261,11 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
 // Save this prompt's end-of-prefill state so the next turn only prefills its
 // suffix, and re-enable expert-cache admission for decode.
 static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
-        const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token) {
+        const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token,
+        uint64_t requested_generation_tokens) {
     runtime->cache_admission_enabled=true;
     qwen_prefetch_cpu_experts(*runtime);
-    qwen_seed_prefill_experts(*runtime);
+    qwen_seed_prefill_experts(*runtime,requested_generation_tokens);
     if(!runtime->prefill_snapshot_bytes||runtime->options.mtp_drafts)return;
     // Prefer the reserved slot when mid checkpoints exist, else the slot already
     // tracking this conversation, else a free slot, else the LRU.
@@ -7453,7 +7453,7 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
         status=qwen_prefill_unit(runtime,prompt,prompt_count,plan,index,next_token,prefill_done);
         if(status)return status;
     }
-    qwen_prompt_finish(runtime,prompt,prompt_count,next_token);
+    qwen_prompt_finish(runtime,prompt,prompt_count,next_token,max_tokens);
     QwenResidencyEpochGuard residency_epoch{*runtime};
     if(runtime->options.mtp_drafts){
         uint64_t emitted=0;
@@ -8233,7 +8233,8 @@ static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask&
     task.index = task.plan.prompt_start;
     task.next_token = task.plan.next_token;
     if (task.index >= prompt_count) {  // full reuse: nothing to prefill
-        qwen_prompt_finish(&runtime, prompt, prompt_count, task.next_token);
+        qwen_prompt_finish(
+            &runtime,prompt,prompt_count,task.next_token,task.max_tokens);
         task.phase = 2;
     } else {
         task.phase = 1;
@@ -8277,7 +8278,9 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                     error.empty()?"native Qwen prefill failed":
                     "native Qwen prefill failed: "+error);
                 if(done){
-                    qwen_prompt_finish(runtime,task.prompt.data(),task.prompt.size(),task.next_token);
+                    qwen_prompt_finish(
+                        runtime,task.prompt.data(),task.prompt.size(),
+                        task.next_token,task.max_tokens);
                     task.phase=2;
                 }
                 continue;

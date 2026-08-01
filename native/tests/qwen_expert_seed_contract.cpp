@@ -7,10 +7,16 @@
 int main() {
     using namespace colibri::v2::expert_seed;
 
-    assert(auto_experts_per_layer(383, 80) == 4);
-    assert(auto_experts_per_layer(3, 80) == 0);
-    assert(auto_experts_per_layer(8, 2) == 4);
-    assert(auto_experts_per_layer(8, 0) == 0);
+    assert(auto_experts_per_layer(383, 80, 1) == 4);
+    assert(auto_experts_per_layer(383, 80, 32) == 4);
+    assert(auto_experts_per_layer(2560, 80, 33) == 4);
+    assert(auto_experts_per_layer(4096, 80, 255) == 4);
+    assert(auto_experts_per_layer(4096, 80, 256) == 48);
+    assert(auto_experts_per_layer(4096, 80, 4096) == 48);
+    assert(auto_experts_per_layer(800, 80, 4096) == 10);
+    assert(auto_experts_per_layer(3, 80, 4096) == 0);
+    assert(auto_experts_per_layer(8, 2, 4096) == 4);
+    assert(auto_experts_per_layer(8, 0, 4096) == 0);
 
     assert(score(3, 2) == 26);
     assert(score(0, 9) == 9);
