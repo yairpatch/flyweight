@@ -1,7 +1,7 @@
 # Colibrì Next
 
-Colibrì Next is a native C++/CUDA GGUF inference runtime for Qwen 3.5/3.6 and
-supported Gemma 4 text models. Python provides the CLI, tokenizer-facing server
+Colibrì Next is a native C++/CUDA GGUF inference runtime for Qwen 3.5/3.6,
+Laguna 2.1, and supported Gemma 4 text models. Python provides the CLI, tokenizer-facing server
 adapter, and OpenAI/Anthropic-compatible HTTP API; model execution stays in the
 native runtime.
 
@@ -195,6 +195,14 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
 - CUDA is the only model-execution accelerator.
 - Gemma 4 sampling, MTP, per-layer embeddings, and shared-KV tail layers are not
   implemented.
+- Laguna runs one prompt token at a time (no batched prefill), has no MTP, and
+  supports only the per-head attention gate, so the per-element gate the larger
+  Laguna checkpoints use is rejected at load.
+- Laguna's pre-tokenizer classifies non-ASCII letters by Unicode block rather
+  than by a full category table, so non-Latin prose can split differently from
+  the reference tokenizer.
+- Routed experts quantized with IQ codebook formats execute on the CPU expert
+  path only; the grouped GPU expert kernels cover k-quants and NVFP4.
 - Qwen sampled decoding currently transfers the vocabulary logits to the host.
 - Dynamic MoE routing still has host synchronization points.
 - Full-layer CUDA graph replay and persistent fused layer kernels are incomplete.

@@ -856,6 +856,8 @@ extern "C" int colibri_gpu_compile(
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",
+             "laguna_head_norm_rope", "laguna_attention_gate",
+             "route_topk_sigmoid_bias",
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
              "qwen_attention_prefill_pack_f16",
              "kv_attention_prefill_softmax_f16",

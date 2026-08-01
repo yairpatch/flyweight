@@ -772,6 +772,144 @@ void qwen_attention_gate(
             / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gates[index]))));
 }
 
+// YaRN interpolation ramp. Pairs below `low` extrapolate (plain RoPE, so the
+// high-frequency channels keep their trained resolution), pairs above `high`
+// interpolate by the full context-scaling factor, and the band between the two
+// blends. `low`/`high` are the correction dimensions the host derives from
+// beta_fast/beta_slow.
+__device__ __forceinline__ float laguna_yarn_ramp(
+    const float low, const float high, const int pair
+) {
+    const float y = ((float)pair - low) / fmaxf(0.001f, high - low);
+    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+}
+
+// One rotation angle, YaRN-corrected when ext_factor is non-zero. With
+// ext_factor 0 and freq_scale 1 this reduces exactly to the plain RoPE angle
+// the Qwen kernels use, so sliding-window layers stay bit-comparable.
+__device__ __forceinline__ void laguna_rope_angle(
+    const int pair, const int rotary_dim, const int position,
+    const float theta, const float freq_scale, const float ext_factor,
+    const float mscale, const float corr_low, const float corr_high,
+    float* cos_out, float* sin_out
+) {
+    const float extrapolated = (float)position
+        / powf(theta, 2.0f * (float)pair / (float)rotary_dim);
+    float angle = freq_scale * extrapolated;
+    if (ext_factor != 0.0f) {
+        const float mix = laguna_yarn_ramp(corr_low, corr_high, pair) * ext_factor;
+        angle = angle * (1.0f - mix) + extrapolated * mix;
+    }
+    *cos_out = cosf(angle) * mscale;
+    *sin_out = sinf(angle) * mscale;
+}
+
+// Laguna Q/K projection tail: per-head RMS norm against learned weights, then
+// RoPE over the leading `rotary_dim` channels. Channels past rotary_dim pass
+// through unrotated, which is how the full-attention layers use 64 of their 128
+// head channels. Q and K differ only in head count, so both use this kernel.
+extern "C" __global__
+void laguna_head_norm_rope(
+    const float* projected, const float* norm_weights, float* output,
+    const int heads, const int head_dim, const int rotary_dim,
+    const int position, const float theta, const float epsilon,
+    const float freq_scale, const float ext_factor, const float mscale,
+    const float corr_low, const float corr_high
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const float* source = projected + head * head_dim;
+    float square = 0.0f;
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x)
+        square += source[index] * source[index];
+    square = block_reduce_sum(square);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) inverse_rms = rsqrtf(square / (float)head_dim + epsilon);
+    __syncthreads();
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x) {
+        float value = source[index] * inverse_rms * norm_weights[index];
+        if (index < rotary_dim) {
+            const int half = rotary_dim / 2;
+            const int pair = index < half ? index : index - half;
+            const int partner = index < half ? index + half : index - half;
+            const float other =
+                source[partner] * inverse_rms * norm_weights[partner];
+            float cos_angle, sin_angle;
+            laguna_rope_angle(pair, rotary_dim, position, theta, freq_scale,
+                              ext_factor, mscale, corr_low, corr_high,
+                              &cos_angle, &sin_angle);
+            value = index < half
+                ? value * cos_angle - other * sin_angle
+                : value * cos_angle + other * sin_angle;
+        }
+        output[head * head_dim + index] = value;
+    }
+}
+
+// Laguna's attention output gate is one softplus-activated scalar per head,
+// broadcast over that head's channels, applied before the output projection.
+extern "C" __global__
+void laguna_attention_gate(
+    const float* attended, const float* gates, float* output,
+    const int heads, const int head_dim
+) {
+    const int elements = heads * head_dim;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += blockDim.x * gridDim.x) {
+        const float gate = gates[index / head_dim];
+        // softplus; the linear branch keeps expf from overflowing for large
+        // gates, where log1p(exp(x)) is x to well within float precision.
+        const float scale = gate > 20.0f ? gate : log1pf(expf(gate));
+        output[index] = attended[index] * scale;
+    }
+}
+
+// Sigmoid-gated top-k routing with a score-correction bias (DeepSeek-V3 style,
+// which Laguna shares). Selection ranks on score + bias, but the returned
+// weights are the unbiased sigmoid scores: the bias steers load balancing only
+// and must not reach the expert combination.
+extern "C" __global__
+void route_topk_sigmoid_bias(
+    const float* logits,
+    const float* bias,
+    int* selected,
+    float* routing_weights,
+    const int experts,
+    const int top_k,
+    const int normalize,
+    const float weight_scale
+) {
+    extern __shared__ float shared[];
+    float* scores = shared;              // unbiased sigmoid probabilities
+    float* ranking = shared + experts;   // selection scores, consumed in place
+    for (int index = threadIdx.x; index < experts; index += blockDim.x) {
+        const float probability = 1.0f / (1.0f + expf(-logits[index]));
+        scores[index] = probability;
+        ranking[index] = probability + (bias ? bias[index] : 0.0f);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int rank = 0; rank < top_k; ++rank) {
+            int best_index = 0;
+            float best_value = -3.402823466e+38F;
+            for (int expert = 0; expert < experts; ++expert) {
+                if (ranking[expert] > best_value) {
+                    best_value = ranking[expert];
+                    best_index = expert;
+                }
+            }
+            selected[rank] = best_index;
+            routing_weights[rank] = scores[best_index];
+            total += scores[best_index];
+            ranking[best_index] = -3.402823466e+38F;
+        }
+        const float inverse =
+            normalize && total > 0.0f ? weight_scale / total : weight_scale;
+        for (int rank = 0; rank < top_k; ++rank) routing_weights[rank] *= inverse;
+    }
+}
+
 extern "C" __global__
 void qwen_shared_scale(
     const float* input, const float* gate,

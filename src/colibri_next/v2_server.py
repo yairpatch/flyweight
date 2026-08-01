@@ -183,13 +183,33 @@ class NativeV2Tokenizer:
         self.model = model
         self.architecture = str(model.info["architecture"])
         eos: list[int] = []
-        for text in ("<|im_end|>", "<|endoftext|>", "<turn|>", "<eos>"):
+        for text in (
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<turn|>",
+            "<eos>",
+            # Laguna spells its terminators with angle-bracket quotation marks
+            # rather than the usual ASCII pipes.
+            "〈|EOS|〉",
+            "〈|CODE_END|〉",
+        ):
             try:
                 eos.append(model.token_id(text))
             except (V2Error, KeyError):
                 pass
         self.eos_token_ids = tuple(dict.fromkeys(eos))
         self._token_byte_cache: dict[int, bytes] = {}
+
+    @property
+    def turn_separator(self) -> str:
+        """Markup that closes an unterminated assistant turn before the next one.
+
+        Used when resuming a cached conversation whose last generation stopped
+        short of an EOS token, so the reused prefix stays well formed.
+        """
+        if self.architecture == "laguna":
+            return "</assistant>\n"
+        return "<|im_end|>\n"
 
     def encode(self, text: str) -> list[int]:
         return self.model.tokenize(text)
@@ -220,6 +240,8 @@ class NativeV2Tokenizer:
             raise ValueError("messages must not be empty")
         if self.architecture == "gemma4":
             return self._format_gemma4(messages, enable_thinking=enable_thinking)
+        if self.architecture == "laguna":
+            return self._format_laguna(messages, enable_thinking=enable_thinking)
         sections: list[str] = []
         for message in messages:
             role = message["role"]
@@ -270,6 +292,48 @@ class NativeV2Tokenizer:
         sections.append("<|turn>model\n")
         if not enable_thinking:
             sections.append("<|channel>thought\n<channel|>")
+        return "".join(sections)
+
+    _LAGUNA_SYSTEM = (
+        "You are a helpful, conversationally-fluent assistant made by Poolside. "
+        "You are here to be helpful to users through natural language conversations."
+    )
+
+    @classmethod
+    def _format_laguna(
+        cls, messages: Sequence[Mapping[str, str]], *, enable_thinking: bool
+    ) -> str:
+        """Render the text-only subset of Laguna's GGUF chat template.
+
+        The template opens with the EOS token, emits a ``<system>`` block when
+        there is a system message or thinking is on, and wraps each turn in role
+        tags. An assistant turn always carries a ``<think>`` block, empty when
+        thinking is off, because the model is trained to expect it.
+        """
+        sections = ["〈|EOS|〉"]
+        system = cls._LAGUNA_SYSTEM
+        start = 0
+        if messages[0]["role"] in ("system", "developer"):
+            system = messages[0]["content"].strip()
+            start = 1
+        if system or enable_thinking:
+            sections.append(f"<system>{system}</system>\n")
+        for message in messages[start:]:
+            role = message["role"]
+            if role not in ("user", "assistant"):
+                raise ValueError(
+                    "Laguna text chat currently supports system, developer, "
+                    "user, and assistant messages"
+                )
+            content = message["content"].strip()
+            if not content:
+                raise ValueError("chat message content must not be empty")
+            if role == "user":
+                sections.append(f"<user>{content}</user>\n")
+            else:
+                sections.append(f"<assistant><think></think>{content}</assistant>\n")
+        sections.append("<assistant>")
+        sections.append("<think>" if enable_thinking else "<think></think>")
         return "".join(sections)
 
     def encode_messages(
@@ -439,7 +503,7 @@ class NativeV2Generator:
                 ended = bool(
                     generated and generated[-1] in self.tokenizer.eos_token_ids
                 )
-                separator = "\n" if ended else "<|im_end|>\n"
+                separator = "\n" if ended else self.tokenizer.turn_separator
                 suffix_messages = [
                     {"role": role, "content": content} for role, content in remaining
                 ]

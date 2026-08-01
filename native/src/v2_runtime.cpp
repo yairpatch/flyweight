@@ -80,6 +80,10 @@ struct Reader {
 // first WeightProvider; future providers can populate the same
 // tensor contract without changing CUDA/runtime code.
 struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf"; colibri::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors;
+    // GGUF tokenizer.ggml.pre selects the pre-tokenizer. Control tokens (GGUF
+    // token type 3) never come out of BPE and have to be split off ahead of it.
+    std::string tokenizer_pre; std::vector<std::uint32_t> token_types;
+    std::vector<std::pair<std::string,std::uint32_t>> control_tokens;
 #if !defined(_WIN32)
     int fd=-1;
 #else
@@ -117,10 +121,18 @@ struct QwenLayerPlan {
     std::uint32_t attention_heads = 0, kv_heads = 0, head_dim = 0;
     std::uint32_t rotary_dim = 0, expert_tensor_count = 3;
     float rope_theta = 0.0f;
+    // YaRN extension for this layer. A zero ext_factor means plain RoPE, which
+    // is what every architecture except Laguna's full-attention layers uses.
+    float rope_freq_scale = 1.0f, rope_ext_factor = 0.0f, rope_attn_factor = 1.0f;
+    float rope_beta_fast = 32.0f, rope_beta_slow = 1.0f;
+    std::uint32_t rope_orig_context = 0;
     std::vector<std::uint64_t> static_tensors;
     std::array<std::uint64_t, 3> expert_tensors{};
     std::uint64_t shared_graph = 0;
     bool shared_graph_attempted = false;
+    // Laguna's router score-correction bias. Kept out of static_tensors so the
+    // feed-forward slots line up with the Qwen layout the FFN code addresses.
+    std::uint64_t router_bias = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_gate_scale = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_up_scale = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_down_scale = std::numeric_limits<std::uint64_t>::max();
@@ -275,6 +287,7 @@ struct QwenEngineTask {
 struct ColibriV2QwenRuntime {
     ColibriV2Model* model = nullptr;
     bool gemma4 = false;
+    bool laguna = false;
     ColibriV2QwenRuntimeOptions options{};
     colibri::v2::ExpertExecutionMode expert_mode =
         colibri::v2::ExpertExecutionMode::streamed_gpu;
@@ -1269,10 +1282,14 @@ int parse(ColibriV2Model& m) {
         else if(suffix(".attention.head_count_kv"))target=&m.config.attention_kv_heads;
         else if(suffix(".attention.head_count"))target=&m.config.attention_heads;
         else if(suffix(".context_length"))target=&m.config.context_length;
+        else if(suffix(".expert_shared_feed_forward_length"))target=&m.config.expert_shared_intermediate_size;
         else if(suffix(".expert_feed_forward_length"))target=&m.config.expert_intermediate_size;
         else if(suffix(".feed_forward_length"))target=&m.config.dense_intermediate_size;
         else if(suffix(".expert_count"))target=&m.config.expert_count;
         else if(suffix(".expert_used_count"))target=&m.config.expert_used_count;
+        else if(suffix(".leading_dense_block_count"))target=&m.config.leading_dense_block_count;
+        else if(suffix(".expert_gating_func"))target=&m.config.expert_gating_func;
+        else if(suffix(".rope.scaling.original_context_length"))target=&m.config.rope_original_context_length;
         else if(key=="tokenizer.ggml.vocab_size")target=&m.config.vocabulary_size;
         if(!target)return false;
         *target=static_cast<uint32_t>(read_uint(type));
@@ -1283,10 +1300,13 @@ int parse(ColibriV2Model& m) {
         else if (key=="general.architecture" && type==8) {m.architecture=r.str();m.config.architecture=m.architecture;}
         else if (key=="general.name" && type==8) m.name=r.str();
         else if (key=="tokenizer.ggml.tokens" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_tokens=r.get<uint64_t>();m.config.vocabulary_size=static_cast<uint32_t>(count_tokens);m.vocabulary.reserve(static_cast<size_t>(count_tokens));for(uint64_t token_index=0;token_index<count_tokens;token_index++){if(element_type==8)m.vocabulary.push_back(r.str());else r.value(element_type);}}
+        else if (key=="tokenizer.ggml.pre" && type==8) m.tokenizer_pre=r.str();
+        else if (key=="tokenizer.ggml.token_type" && type==9) m.token_types=read_uint_array(type);
         else if (key=="tokenizer.ggml.merges" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_merges=r.get<uint64_t>();m.merges.reserve(static_cast<size_t>(count_merges));for(uint64_t merge_index=0;merge_index<count_merges;merge_index++){if(element_type==8)m.merges.push_back(r.str());else r.value(element_type);}}
         else if (key.size()>=21 && key.compare(key.size()-21,21,".rope.dimension_count")==0 && (type==4 || type==10)) m.config.rotary_dimension=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=24 && key.compare(key.size()-24,24,".full_attention_interval")==0 && (type==4 || type==10)) m.config.full_attention_interval=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=24 && key.compare(key.size()-24,24,".attention.head_count_kv")==0 && type==9) m.config.attention_kv_heads_by_layer=read_uint_array(type);
+        else if (key.size()>=21 && key.compare(key.size()-21,21,".attention.head_count")==0 && type==9) m.config.attention_heads_by_layer=read_uint_array(type);
         else if (key.size()>=25 && key.compare(key.size()-25,25,".attention.sliding_window")==0 && (type==4 || type==10)) m.config.sliding_window=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.sliding_window_pattern")==0 && type==9) {
             const auto element_type=r.get<uint32_t>();
@@ -1304,6 +1324,13 @@ int parse(ColibriV2Model& m) {
         else if (key.size()>=19 && key.compare(key.size()-19,19,".rope.freq_base_swa")==0 && (type==6 || type==12)) m.config.rope_freq_base_swa=read_float(type);
         else if (key.size()>=24 && key.compare(key.size()-24,24,".final_logit_softcapping")==0 && (type==6 || type==12)) m.config.final_logit_softcap=read_float(type);
         else if (key.size()>=15 && key.compare(key.size()-15,15,".rope.freq_base")==0 && (type==6 || type==12)) m.config.rope_freq_base=read_float(type);
+        else if (key.size()>=20 && key.compare(key.size()-20,20,".rope.scaling.factor")==0 && (type==6 || type==12)) m.config.rope_scaling_factor=read_float(type);
+        else if (key.size()>=30 && key.compare(key.size()-30,30,".rope.scaling.yarn_attn_factor")==0 && (type==6 || type==12)) m.config.yarn_attn_factor=read_float(type);
+        else if (key.size()>=28 && key.compare(key.size()-28,28,".rope.scaling.yarn_beta_fast")==0 && (type==6 || type==12)) m.config.yarn_beta_fast=read_float(type);
+        else if (key.size()>=28 && key.compare(key.size()-28,28,".rope.scaling.yarn_beta_slow")==0 && (type==6 || type==12)) m.config.yarn_beta_slow=read_float(type);
+        else if (key.size()>=18 && key.compare(key.size()-18,18,".rope.scaling.type")==0 && type==8) m.config.rope_scaling_yarn=r.str()=="yarn";
+        else if (key.size()>=21 && key.compare(key.size()-21,21,".expert_weights_scale")==0 && (type==6 || type==12)) m.config.expert_weights_scale=read_float(type);
+        else if (key.size()>=20 && key.compare(key.size()-20,20,".expert_weights_norm")==0 && type==7) m.config.expert_weights_norm=r.get<std::uint8_t>()!=0;
         else if (set_config(key,type)) {}
         else r.value(type);
     }
@@ -1327,6 +1354,29 @@ int parse(ColibriV2Model& m) {
             throw std::runtime_error("invalid Qwen MTP tensor layer index");
         }
     }
+    // An array-valued head count leaves the scalar unset. Workspaces and score
+    // buffers are sized off the scalar, so it has to cover the widest layer.
+    if(!m.config.attention_heads&&!m.config.attention_heads_by_layer.empty())
+        m.config.attention_heads=*std::max_element(
+            m.config.attention_heads_by_layer.begin(),
+            m.config.attention_heads_by_layer.end());
+    // Laguna does not ship a sliding-window pattern: the layout is implied by
+    // the architecture as a period-4 cycle that starts with a full-attention
+    // layer (12 full, 36 sliding for the 48-block S checkpoint).  The per-layer
+    // head-count array is the independent witness of that layout, so cross-check
+    // against it rather than trusting the period blindly.
+    if(m.architecture=="laguna"&&m.config.sliding_window&&
+       m.config.sliding_window_pattern.empty()&&m.config.layer_count){
+        m.config.sliding_window_pattern.assign(m.config.layer_count,0);
+        for(std::uint32_t layer=0;layer<m.config.layer_count;++layer)
+            m.config.sliding_window_pattern[layer]=layer%4?1:0;
+        const auto& heads=m.config.attention_heads_by_layer;
+        if(heads.size()>=m.config.layer_count)
+            for(std::uint32_t layer=0;layer<m.config.layer_count;++layer)
+                if((heads[layer]==heads[0])!=(m.config.sliding_window_pattern[layer]==0))
+                    throw std::runtime_error(
+                        "Laguna sliding-window layout disagrees with the per-layer head count");
+    }
     if(!m.config.sliding_window_pattern.empty()&&m.config.sliding_window_pattern.size()<m.config.layer_count)
         throw std::runtime_error("GGUF sliding-window pattern is shorter than the model layer count");
     if(!m.config.attention_kv_heads_by_layer.empty()&&m.config.attention_kv_heads_by_layer.size()<m.config.layer_count)
@@ -1338,6 +1388,17 @@ int parse(ColibriV2Model& m) {
     // ~150k-entry maps per tokenize call dominated short calls.
     for(int rank=0;rank<static_cast<int>(m.merges.size());rank++)m.merge_ranks[m.merges[rank]]=rank;
     for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++)m.vocabulary_ids.emplace(m.vocabulary[id],id);
+    // Longest first, so a control token that prefixes another still matches the
+    // longer one when scanning input left to right.
+    for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++){
+        if(id>=m.token_types.size()||m.token_types[id]!=3)continue;
+        if(m.vocabulary[id].empty())continue;
+        m.control_tokens.emplace_back(m.vocabulary[id],id);
+    }
+    std::sort(m.control_tokens.begin(),m.control_tokens.end(),
+        [](const auto& left,const auto& right){
+            return left.first.size()>right.first.size();
+        });
     return 0;
 }
 
@@ -1539,6 +1600,138 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
     // buffer, so one scratch slot has to hold both halves.
     if(front.dense_ffn)
         runtime.scratch_elements=std::max(runtime.scratch_elements,2u*runtime.moe_intermediate);
+}
+
+// YaRN correction band. `beta_fast` and `beta_slow` are expressed as numbers of
+// full rotations across the trained context; converting each to the rotary pair
+// index that completes that many rotations gives the band over which the kernel
+// blends extrapolation into interpolation.
+void qwen_yarn_correction_dims(
+    int rotary_dim, std::uint32_t original_context, float theta,
+    float beta_fast, float beta_slow, float& low, float& high
+) {
+    if(rotary_dim<=0||!original_context||theta<=1.0f){low=0.0f;high=0.0f;return;}
+    const auto dimension=[&](float rotations){
+        if(rotations<=0.0f)return 0.0f;
+        return static_cast<float>(rotary_dim)*
+            std::log(static_cast<float>(original_context)/
+                     (rotations*2.0f*3.14159265358979323846f))/
+            (2.0f*std::log(theta));
+    };
+    low=std::max(0.0f,std::floor(dimension(beta_fast)));
+    high=std::min(static_cast<float>(rotary_dim-1),std::ceil(dimension(beta_slow)));
+    if(high<low)high=low;
+}
+
+// Slot of the block's feed-forward norm within static_tensors, which every
+// later feed-forward tensor is addressed relative to. Laguna's attention blocks
+// carry an extra gate projection ahead of it; Qwen's DeltaNet blocks carry the
+// wider recurrent set.
+std::size_t qwen_ffn_base(const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
+    if(runtime.laguna)return 8;
+    return layer.attention?7:10;
+}
+
+// Laguna (poolside): every block is full attention or sliding-window attention
+// with a softplus per-head output gate, a single pre-FFN norm (no post-attention
+// or post-FFN norm), a leading run of dense blocks, and sigmoid-routed MoE with
+// a score-correction bias and one always-on ungated shared expert.
+void build_laguna_plan(ColibriV2QwenRuntime& runtime) {
+    auto& model=*runtime.model;
+    runtime.laguna=true;
+    runtime.token_embeddings=tensor_index(model,"token_embd.weight");
+    runtime.final_norm=tensor_index(model,"output_norm.weight");
+    // Laguna ships an untied head, but fall back to the table if a future
+    // checkpoint ties them.
+    runtime.lm_head=has_tensor(model,"output.weight")
+        ?tensor_index(model,"output.weight"):runtime.token_embeddings;
+    runtime.lm_head_type=model.tensors[runtime.lm_head].type;
+    runtime.static_tensor_bytes+=model.tensors[runtime.token_embeddings].size;
+    runtime.static_tensor_bytes+=model.tensors[runtime.final_norm].size;
+    if(runtime.lm_head!=runtime.token_embeddings)
+        runtime.static_tensor_bytes+=model.tensors[runtime.lm_head].size;
+    const auto head_dim=model.config.key_length?model.config.key_length:128u;
+    runtime.layers.reserve(model.config.layer_count);
+    for(std::uint32_t layer_index=0;layer_index<model.config.layer_count;++layer_index){
+        const std::string prefix="blk."+std::to_string(layer_index)+".";
+        QwenLayerPlan layer;layer.attention=true;
+        layer.attention_window=attention_window(model,layer_index);
+        layer.attention_heads=model.config.attention_heads_by_layer.empty()
+            ?model.config.attention_heads
+            :model.config.attention_heads_by_layer[layer_index];
+        layer.kv_heads=model.config.attention_kv_heads;
+        layer.head_dim=head_dim;
+        // Full-attention layers run YaRN over a partial rotary span with the
+        // long-context theta; sliding-window layers run plain RoPE over the
+        // whole head with the short theta.
+        layer.rotary_dim=layer.attention_window
+            ?(model.config.rotary_dimension_swa?model.config.rotary_dimension_swa:head_dim)
+            :(model.config.rotary_dimension?model.config.rotary_dimension:head_dim);
+        layer.rope_theta=layer.attention_window
+            ?(model.config.rope_freq_base_swa?model.config.rope_freq_base_swa:10000.0f)
+            :(model.config.rope_freq_base?model.config.rope_freq_base:500000.0f);
+        if(!layer.attention_window&&model.config.rope_scaling_yarn&&
+           model.config.rope_scaling_factor>1.0f){
+            layer.rope_freq_scale=1.0f/model.config.rope_scaling_factor;
+            layer.rope_ext_factor=1.0f;
+            layer.rope_attn_factor=model.config.yarn_attn_factor;
+            layer.rope_beta_fast=model.config.yarn_beta_fast;
+            layer.rope_beta_slow=model.config.yarn_beta_slow;
+            layer.rope_orig_context=model.config.rope_original_context_length
+                ?model.config.rope_original_context_length:model.config.context_length;
+        }
+        for(const char* suffix:{
+            "attn_norm.weight","attn_q.weight","attn_k.weight","attn_v.weight",
+            "attn_output.weight","attn_q_norm.weight","attn_k_norm.weight",
+            "attn_gate.weight","ffn_norm.weight"
+        })add_static_tensor(runtime,layer,prefix+suffix);
+        // The gate is per-head (one scalar broadcast over head_dim). The
+        // per-element variant the larger Laguna checkpoints use would need a
+        // different apply kernel, so reject it rather than silently mis-scale.
+        const auto gate_width=model.tensors[layer.static_tensors[7]].shape[1];
+        if(gate_width!=layer.attention_heads)
+            throw std::runtime_error(
+                "native Laguna supports only the per-head attention gate");
+        layer.dense_ffn=has_tensor(model,prefix+"ffn_gate.weight");
+        if(layer.dense_ffn){
+            for(const char* suffix:{"ffn_gate.weight","ffn_up.weight","ffn_down.weight"})
+                add_static_tensor(runtime,layer,prefix+suffix);
+        }else{
+            // Same slot order the Qwen MoE block uses (router, then the shared
+            // expert's gate/up/down) so the shared feed-forward code addresses
+            // both architectures off moe_base. Laguna's shared expert has no
+            // gate tensor, and its router bias hangs off the plan instead.
+            for(const char* suffix:{
+                "ffn_gate_inp.weight","ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight","ffn_down_shexp.weight"
+            })add_static_tensor(runtime,layer,prefix+suffix);
+            // Appended last so it lands past the shared expert's slots and the
+            // Qwen feed-forward addressing is undisturbed; it still has to be a
+            // static tensor to reach the device.
+            add_static_tensor(runtime,layer,prefix+"exp_probs_b.bias");
+            layer.router_bias=layer.static_tensors.back();
+            const std::array<std::string,3> experts={
+                prefix+"ffn_gate_exps.weight",
+                prefix+"ffn_up_exps.weight",
+                prefix+"ffn_down_exps.weight",
+            };
+            for(std::size_t role=0;role<experts.size();++role){
+                layer.expert_tensors[role]=tensor_index(model,experts[role]);
+                runtime.expert_tensor_bytes+=model.tensors[layer.expert_tensors[role]].size;
+            }
+        }
+        for(auto index:layer.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
+        runtime.layers.push_back(std::move(layer));
+    }
+    runtime.moe_intermediate=model.config.expert_intermediate_size;
+    // The shared expert and the routed experts may be sized differently; both
+    // SwiGLU stages write gate and up contiguously, so reserve the wider pair.
+    const auto shared_intermediate=model.config.expert_shared_intermediate_size
+        ?model.config.expert_shared_intermediate_size:runtime.moe_intermediate;
+    runtime.scratch_elements=std::max(
+        runtime.scratch_elements,
+        2u*std::max({runtime.moe_intermediate,shared_intermediate,
+                     model.config.dense_intermediate_size}));
 }
 
 void build_gemma4_plan(ColibriV2QwenRuntime& runtime) {
@@ -1804,7 +1997,8 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
             float value=0.0f;qwen_f32_dot_multi_avx2(row_data,&input,1,elements,&value);return value;
         }
         for(int index=0;index<elements;++index)result+=row_data[index]*input[index];
-    }else throw std::runtime_error("unsupported native CPU expert quantization");
+    }else throw std::runtime_error(
+        "unsupported native CPU expert quantization: "+std::to_string(type));
     return result;
 }
 
@@ -1834,6 +2028,20 @@ void qwen_quant_dot_rows(
 void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const float*first,const float*second,int elements,std::uint64_t row,float&first_output,float&second_output){
     if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_quant_dot_pair_avx512(packed,type,first,second,elements,row,&first_output,&second_output);return;}
     first_output=qwen_quant_dot(packed,type,first,elements,row);second_output=qwen_quant_dot(packed,type,second,elements,row);
+}
+
+// Weight types the CPU expert path can execute, which is exactly what
+// qwen_quant_dot decodes. The IQ codebook formats matter for the published
+// low-bit MoE checkpoints: their routed experts are IQ2/IQ3/IQ4 even when the
+// dense projections are k-quants.
+bool qwen_cpu_expert_type_supported(std::uint32_t type) {
+    switch(type){
+        case 0: case 2: case 8: case 10: case 11: case 12: case 13: case 14:
+        case 16: case 17: case 18: case 21: case 22: case 23: case 30: case 40:
+            return true;
+        default:
+            return false;
+    }
 }
 
 void qwen_quant_dot_two_rows(
@@ -2230,8 +2438,9 @@ void qwen_cpu_moe(
     }
     for (int role = 0; role < 3; ++role) {
         const auto type = runtime.model->tensors[layer.expert_tensors[role]].type;
-        if (type != 13 && type != 14 && type != 8 && type != 12 && type != 40 && type != 30) {
-            throw std::runtime_error("unsupported native CPU expert quantization");
+        if (!qwen_cpu_expert_type_supported(type)) {
+            throw std::runtime_error(
+                "unsupported native CPU expert quantization: " + std::to_string(type));
         }
     }
     std::array<const std::uint8_t*, 256> gate{}, up{}, down{};
@@ -2264,14 +2473,17 @@ void qwen_cpu_moe(
     const auto down_type = runtime.model->tensors[layer.expert_tensors[2]].type;
     const char* q8_setting = std::getenv("COLIBRI_Q8_ACTIVATIONS");
     const auto cpu_features = colibri_cpu_features();
+    // Q8-K activations only pay off, and are only decoded, for these k-quants.
+    // Q4_K, NVFP4 and bf16 are faster on the vectorized f32 path (their small
+    // codes do not amortize the activation quantization), and the IQ codebook
+    // formats have no Q8-K decoder at all.
+    const auto q8_activations_ok = [](std::uint32_t type) {
+        return type == 8 || type == 13 || type == 14;
+    };
     const bool use_q8 = (cpu_features & 1u) != 0 && hidden % 256 == 0
         && intermediate % 256 == 0 && q8_setting && q8_setting[0] == '1'
-        // The Q8-K activation path is slower than packed-f32 AVX2 for NVFP4:
-        // its tiny E2M1 codes do not amortize the activation quantization and
-        // integer-dot setup. Keep NVFP4 on the vectorized f32 path.
-        && gate_type != 12 && up_type != 12 && down_type != 12
-        && gate_type != 40 && up_type != 40 && down_type != 40
-        && gate_type != 30 && up_type != 30 && down_type != 30;
+        && q8_activations_ok(gate_type) && q8_activations_ok(up_type)
+        && q8_activations_ok(down_type);
     static constexpr char q4_tile_name[] = {
         'C','O','L','I','B','R','I','_','Q','4','_','R','O','W','_','T','I','L','E','S','\0'
     };
@@ -2449,8 +2661,9 @@ void qwen_cpu_moe_rows(
     const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
     const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
     for(const auto type:{gate_type,up_type,down_type})
-        if(type!=13&&type!=14&&type!=8&&type!=12&&type!=40&&type!=30)
-            throw std::runtime_error("unsupported native CPU expert quantization");
+        if(!qwen_cpu_expert_type_supported(type))
+            throw std::runtime_error(
+                "unsupported native CPU expert quantization: "+std::to_string(type));
     auto expert_data=[&](int role,int expert){
         const auto&t=runtime.model->tensors[layer.expert_tensors[role]];
         return runtime.model->data+t.offset+static_cast<std::uint64_t>(expert)*(t.size/experts);
@@ -2765,8 +2978,221 @@ int colibri_v2_qwen_token_text(const ColibriV2Model*m,uint32_t token,char*out,ui
 int colibri_v2_token_id(const ColibriV2Model*m,const char*text,uint32_t*token){return guarded([&]{if(!m||!text||!token)throw std::runtime_error("invalid token lookup arguments");const auto it=m->vocabulary_ids.find(text);if(it==m->vocabulary_ids.end())throw std::runtime_error("token text is not in the GGUF vocabulary");*token=it->second;return 0;});}
 std::string gguf_byte_encode(const char*text){static const int direct[] = {33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,161,162,163,164,165,166,167,168,169,170,171,172,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255};std::array<int,256>map{};for(int i=0;i<256;i++)map[i]=-1;for(int i=0;i<static_cast<int>(sizeof(direct)/sizeof(direct[0]));i++)map[direct[i]]=direct[i];int extra=0;for(int i=0;i<256;i++)if(map[i]<0)map[i]=256+extra++;std::string out;for(const unsigned char*p=reinterpret_cast<const unsigned char*>(text);*p;p++){int cp=map[*p];if(cp<128)out.push_back(static_cast<char>(cp));else if(cp<2048){out.push_back(static_cast<char>(0xC0|(cp>>6)));out.push_back(static_cast<char>(0x80|(cp&63)));}else{out.push_back(static_cast<char>(0xE0|(cp>>12)));out.push_back(static_cast<char>(0x80|((cp>>6)&63)));out.push_back(static_cast<char>(0x80|(cp&63)));}}return out;}
 std::vector<std::string> gguf_utf8_symbols(const std::string&text){std::vector<std::string> symbols;for(size_t i=0;i<text.size();){unsigned char c=text[i];size_t width=(c<0x80)?1:(c<0xE0?2:(c<0xF0?3:4));if(i+width>text.size())width=1;symbols.emplace_back(text.data()+i,width);i+=width;}return symbols;}
+// One UTF-8 codepoint at `offset`, with its encoded width.
+std::uint32_t gguf_utf8_codepoint(const std::string& text, size_t offset, size_t& width) {
+    const auto lead=static_cast<unsigned char>(text[offset]);
+    width=lead<0x80?1:(lead<0xE0?2:(lead<0xF0?3:4));
+    if(offset+width>text.size()){width=1;return lead;}
+    if(width==1)return lead;
+    std::uint32_t value=lead&(0xFFu>>(width+1));
+    for(size_t i=1;i<width;++i)
+        value=(value<<6)|(static_cast<unsigned char>(text[offset+i])&0x3Fu);
+    return value;
+}
+
+// Letter/number classification for the pre-tokenizer's \p{L} and \p{N}.
+// Exact over ASCII, which is what a code model overwhelmingly sees; above ASCII
+// it treats general punctuation, symbol and private-use blocks as non-letters
+// and everything else as a letter, rather than carrying a full Unicode category
+// table. Non-Latin prose can therefore split differently from the reference.
+bool gguf_codepoint_is_number(std::uint32_t codepoint) {
+    return codepoint>='0'&&codepoint<='9';
+}
+bool gguf_codepoint_is_letter(std::uint32_t codepoint) {
+    if(codepoint<0x80)
+        return (codepoint>='A'&&codepoint<='Z')||(codepoint>='a'&&codepoint<='z');
+    if(codepoint>=0x2000&&codepoint<=0x206F)return false;  // general punctuation
+    if(codepoint>=0x2070&&codepoint<=0x2BFF)return false;  // sub/superscripts, symbols, arrows
+    if(codepoint>=0x3000&&codepoint<=0x303F)return false;  // CJK punctuation
+    if(codepoint>=0xE000&&codepoint<=0xF8FF)return false;  // private use
+    if(codepoint>=0xFE00&&codepoint<=0xFE0F)return false;  // variation selectors
+    if(codepoint>=0xFF00&&codepoint<=0xFF0F)return false;  // fullwidth punctuation
+    if(codepoint>=0x1F000)return false;                    // emoji and pictographs
+    return true;
+}
+bool gguf_codepoint_is_space(std::uint32_t codepoint) {
+    return codepoint==' '||codepoint=='\t'||codepoint=='\n'||codepoint=='\r'||
+           codepoint=='\f'||codepoint=='\v'||codepoint==0x85||codepoint==0xA0||
+           (codepoint>=0x2000&&codepoint<=0x200A)||codepoint==0x2028||
+           codepoint==0x2029||codepoint==0x202F||codepoint==0x205F||codepoint==0x3000;
+}
+
+// Laguna's BPE pre-tokenizer, as a direct transcription of the two regexes the
+// reference implementation applies in sequence. Splitting here keeps merges from
+// running across word, digit and whitespace boundaries the model never saw:
+// notably each digit stands alone, so numbers do not collapse into one token.
+std::vector<std::string> laguna_pretokenize(const std::string& text) {
+    std::vector<std::string> pieces;
+    // First regex: "[^\n]+|[\n]+" -- newline runs separate from everything else.
+    for(size_t start=0;start<text.size();){
+        const bool newline=text[start]=='\n';
+        size_t end=start;
+        while(end<text.size()&&(text[end]=='\n')==newline)++end;
+        const std::string segment=text.substr(start,end-start);
+        start=end;
+        if(newline){pieces.push_back(segment);continue;}
+        // Second regex, greedy alternation at each position.
+        for(size_t at=0;at<segment.size();){
+            size_t width=0;
+            const auto first=gguf_utf8_codepoint(segment,at,width);
+            const size_t begin=at;
+            // "'s" and friends, either case.
+            if(first=='\''&&at+1<segment.size()){
+                const char follow=static_cast<char>(std::tolower(
+                    static_cast<unsigned char>(segment[at+1])));
+                const char third=at+2<segment.size()
+                    ?static_cast<char>(std::tolower(static_cast<unsigned char>(segment[at+2]))):0;
+                size_t length=0;
+                if(follow=='s'||follow=='t'||follow=='m'||follow=='d')length=2;
+                else if((follow=='r'&&third=='e')||(follow=='v'&&third=='e')||
+                        (follow=='l'&&third=='l'))length=3;
+                if(length){pieces.push_back(segment.substr(at,length));at+=length;continue;}
+            }
+            // "[^\r\n\p{L}\p{N}]?\p{L}+": an optional single leading non-letter.
+            {
+                size_t probe=at,probe_width=width;
+                auto codepoint=first;
+                if(!gguf_codepoint_is_letter(codepoint)&&!gguf_codepoint_is_number(codepoint)&&
+                   codepoint!='\r'&&codepoint!='\n'){
+                    const size_t after=probe+probe_width;
+                    if(after<segment.size()){
+                        size_t next_width=0;
+                        const auto next=gguf_utf8_codepoint(segment,after,next_width);
+                        if(gguf_codepoint_is_letter(next)){probe=after;probe_width=next_width;codepoint=next;}
+                    }
+                }
+                if(gguf_codepoint_is_letter(codepoint)){
+                    size_t end_at=probe;
+                    while(end_at<segment.size()){
+                        size_t letter_width=0;
+                        if(!gguf_codepoint_is_letter(
+                                gguf_utf8_codepoint(segment,end_at,letter_width)))break;
+                        end_at+=letter_width;
+                    }
+                    pieces.push_back(segment.substr(begin,end_at-begin));at=end_at;continue;
+                }
+            }
+            // "\p{N}": exactly one digit.
+            if(gguf_codepoint_is_number(first)){
+                pieces.push_back(segment.substr(at,width));at+=width;continue;
+            }
+            // " ?[^\s\p{L}\p{N}]+[\r\n]*"
+            {
+                size_t probe=at;
+                if(first==' '){
+                    const size_t after=at+width;
+                    if(after<segment.size()){
+                        size_t next_width=0;
+                        const auto next=gguf_utf8_codepoint(segment,after,next_width);
+                        if(!gguf_codepoint_is_space(next)&&!gguf_codepoint_is_letter(next)&&
+                           !gguf_codepoint_is_number(next))probe=after;
+                    }
+                }
+                if(probe<segment.size()){
+                    size_t end_at=probe,run_width=0;
+                    while(end_at<segment.size()){
+                        const auto codepoint=gguf_utf8_codepoint(segment,end_at,run_width);
+                        if(gguf_codepoint_is_space(codepoint)||gguf_codepoint_is_letter(codepoint)||
+                           gguf_codepoint_is_number(codepoint))break;
+                        end_at+=run_width;
+                    }
+                    if(end_at>probe){
+                        while(end_at<segment.size()&&
+                              (segment[end_at]=='\r'||segment[end_at]=='\n'))++end_at;
+                        pieces.push_back(segment.substr(begin,end_at-begin));at=end_at;continue;
+                    }
+                }
+            }
+            // "\s+(?!\S)" and "\s+": a whitespace run, with the last space split
+            // off when more non-space follows, which is what the lookahead does.
+            {
+                size_t end_at=at,space_width=0;
+                while(end_at<segment.size()&&
+                      gguf_codepoint_is_space(gguf_utf8_codepoint(segment,end_at,space_width)))
+                    end_at+=space_width;
+                if(end_at>at){
+                    size_t stop=end_at;
+                    if(end_at<segment.size()&&end_at-at>1)--stop;
+                    pieces.push_back(segment.substr(at,stop-at));at=stop;continue;
+                }
+            }
+            pieces.push_back(segment.substr(at,width));at+=width;
+        }
+    }
+    return pieces;
+}
+
+// BPE over one pre-tokenized piece, appending its ids to `result`.
+void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
+                    std::vector<uint32_t>& result) {
+    const std::string encoded=gguf_byte_encode(piece.c_str());
+    auto symbols=gguf_utf8_symbols(encoded);
+    if(symbols.empty())return;
+    const auto&ranks=m.merge_ranks;
+    struct Candidate{int rank;int left;int right;};
+    struct Later{bool operator()(const Candidate&a,const Candidate&b)const{return a.rank!=b.rank?a.rank>b.rank:a.left>b.left;}};
+    std::vector<int> next(symbols.size()),previous(symbols.size());
+    std::vector<bool> alive(symbols.size(),true);
+    for(size_t i=0;i<symbols.size();i++){next[i]=static_cast<int>(i)+1;previous[i]=static_cast<int>(i)-1;}
+    next[symbols.size()-1]=-1;
+    std::priority_queue<Candidate,std::vector<Candidate>,Later> queue;
+    auto propose=[&](int left){
+        if(left<0)return;
+        const int right=next[left];
+        if(right<0)return;
+        const auto it=ranks.find(symbols[left]+" "+symbols[right]);
+        if(it!=ranks.end())queue.push({it->second,left,right});
+    };
+    for(size_t i=0;i+1<symbols.size();i++)propose(static_cast<int>(i));
+    while(!queue.empty()){
+        const auto candidate=queue.top();queue.pop();
+        const int left=candidate.left,right=candidate.right;
+        if(!alive[left]||!alive[right]||next[left]!=right)continue;
+        const auto it=ranks.find(symbols[left]+" "+symbols[right]);
+        if(it==ranks.end()||it->second!=candidate.rank)continue;
+        symbols[left]+=symbols[right];
+        alive[right]=false;
+        next[left]=next[right];
+        if(next[left]>=0)previous[next[left]]=left;
+        propose(previous[left]);
+        propose(left);
+    }
+    for(int index=0;index>=0;index=next[index]){
+        const auto it=m.vocabulary_ids.find(symbols[index]);
+        result.push_back(it==m.vocabulary_ids.end()?0:it->second);
+    }
+}
+
 int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,uint64_t capacity,uint64_t*count){return guarded([&]{
     if(!m||!text||!count)throw std::runtime_error("invalid tokenize arguments");
+    if(m->tokenizer_pre=="laguna"){
+        // Control tokens are split out by exact match first: they are ordinary
+        // text to BPE, and Laguna spells them with characters whose merges would
+        // never reassemble the single reserved id.
+        std::vector<uint32_t> result;
+        const std::string input(text);
+        size_t at=0,plain=0;
+        auto flush=[&](size_t end){
+            if(end<=plain)return;
+            for(const auto& piece:laguna_pretokenize(input.substr(plain,end-plain)))
+                gguf_bpe_piece(*m,piece,result);
+        };
+        while(at<input.size()){
+            const auto* match=static_cast<const std::pair<std::string,std::uint32_t>*>(nullptr);
+            for(const auto& control:m->control_tokens)
+                if(input.compare(at,control.first.size(),control.first)==0){match=&control;break;}
+            if(!match){++at;continue;}
+            flush(at);
+            result.push_back(match->second);
+            at+=match->first.size();
+            plain=at;
+        }
+        flush(input.size());
+        *count=result.size();
+        if(capacity<result.size()||!tokens)throw std::runtime_error("token output buffer is too small");
+        std::copy(result.begin(),result.end(),tokens);
+        return 0;
+    }
     const std::string encoded=gguf_byte_encode(text);
     auto symbols=gguf_utf8_symbols(encoded);
     // Greedy BPE with the same semantics as a full rescan per merge (lowest
@@ -2820,7 +3246,8 @@ int colibri_v2_tensor_view(const ColibriV2Model*m,uint64_t i,uint64_t offset,uin
 int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOptions*options,ColibriV2QwenRuntime**out){return guarded([&]{
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
     const bool gemma4=m->config.architecture=="gemma4";
-    if(m->config.architecture.find("qwen")!=0&&!gemma4)throw std::runtime_error("native runtime supports Qwen and Gemma 4 models");
+    const bool laguna=m->config.architecture=="laguna";
+    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna)throw std::runtime_error("native runtime supports Qwen, Gemma 4 and Laguna models");
     // Dense checkpoints report no experts at all, so only require a routing
     // width from the ones that actually route.
     const bool dense_ffn=has_tensor(*m,"blk.0.ffn_gate.weight");
@@ -2840,6 +3267,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
             *runtime,colibri::v2::ExpertExecutionPhase::prepare
         ).is_streamed_gpu())
         throw std::runtime_error("native Gemma 4 supports --moe-device cpu or hybrid");
+    if(laguna&&runtime->options.mtp_drafts)throw std::runtime_error("native Laguna MTP is not implemented");
     if(gemma4&&m->config.per_layer_embedding_size)throw std::runtime_error("native Gemma 4 per-layer embeddings are not implemented");
     if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
@@ -2865,7 +3293,9 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>5)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), or 5 (turbo4)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>5)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), or 5 (turbo4)");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
-    if(gemma4)build_gemma4_plan(*runtime);else build_qwen_plan(*runtime);
+    if(gemma4)build_gemma4_plan(*runtime);
+    else if(laguna)build_laguna_plan(*runtime);
+    else build_qwen_plan(*runtime);
     if(runtime->options.next_layer_prefetch&&runtime->layers.size()>1){
         const auto experts=static_cast<std::size_t>(m->config.expert_count);
         runtime->expert_transitions.resize(
@@ -2885,7 +3315,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // A 1024-row allocation consumes ~633 MiB for Qwen3.6-27B and can evict
     // several whole FFN blocks to the CPU. 64 rows preserves useful batching
     // without making decode pay that residency penalty.
-    runtime->prefill_rows=gemma4?1:(dense_ffn?64:1024);
+    runtime->prefill_rows=(gemma4||laguna)?1:(dense_ffn?64:1024);
     if(const char*env=std::getenv("COLIBRI_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
@@ -3316,7 +3746,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         if(runtime->rope_factors!=std::numeric_limits<std::uint64_t>::max())
             persistent[runtime->rope_factors]=true;
         for(const auto&layer:runtime->layers){
-            const std::size_t ffn_base=layer.attention?7:10;
+            const std::size_t ffn_base=qwen_ffn_base(*runtime,layer);
             for(std::size_t slot=0;slot<layer.static_tensors.size();++slot){
                 // A spilled block reads its gate/up/down from the mapping, so
                 // those three must not consume arena space.
@@ -3394,7 +3824,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // layer-overlapped multi-decode driver assumes separate gate/up/down
         // expert tensors and must not consume Gemma's fused Q4_0 bundles.
         if(decode_slots>1&&runtime->model->config.expert_count&&
-           prepare_policy.routed_cpu_execution_allowed()&&!runtime->gemma4){
+           prepare_policy.routed_cpu_execution_allowed()&&
+           !runtime->gemma4&&!runtime->laguna){
             const std::uint64_t by_workspace=runtime->workspace_bytes/runtime->decode_slice_bytes;
             runtime->multi_decode_capacity=static_cast<std::uint32_t>(
                 std::min(std::min(decode_slots,by_workspace),std::uint64_t{4}));
@@ -4888,6 +5319,71 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             }
             add(residual,hidden);
             moe_base=10;
+        }else if(runtime->laguna){
+            // Laguna attention: plain Q/K/V projections (no fused gate), per-head
+            // QK RMS norm, per-layer-type RoPE, then a softplus per-head output
+            // gate computed from the same pre-attention hidden state.
+            const int heads=static_cast<int>(layer.attention_heads);
+            const int kv_heads=static_cast<int>(layer.kv_heads);
+            const int head_dim=static_cast<int>(layer.head_dim);
+            const int q_size=heads*head_dim,kv_size=kv_heads*head_dim;
+            if(static_cast<std::uint64_t>(q_size)+heads>runtime->scratch_elements)
+                throw std::runtime_error("native Laguna attention scratch is too small");
+            dense(1,normalized,first,hidden_size,q_size);
+            dense(2,normalized,second,hidden_size,kv_size);
+            dense(3,normalized,third,hidden_size,kv_size);
+            const std::uint64_t queries=fourth;
+            const std::uint64_t gates=fourth+static_cast<std::uint64_t>(q_size)*sizeof(float);
+            dense(7,normalized,gates,hidden_size,heads);
+            const int rotary=static_cast<int>(layer.rotary_dim);
+            const int position=static_cast<int>(runtime->position);
+            const float theta=layer.rope_theta;
+            const float freq_scale=layer.rope_freq_scale;
+            const float ext_factor=layer.rope_ext_factor;
+            const float mscale=layer.rope_attn_factor;
+            float corr_low=0.0f,corr_high=0.0f;
+            if(ext_factor!=0.0f)
+                qwen_yarn_correction_dims(
+                    rotary,layer.rope_orig_context,theta,
+                    layer.rope_beta_fast,layer.rope_beta_slow,corr_low,corr_high);
+            auto qnorm=tensor(5),knorm=tensor(6);
+            void*q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,
+                           const_cast<std::uint64_t*>(&queries),const_cast<int*>(&heads),
+                           const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                           const_cast<int*>(&position),const_cast<float*>(&theta),
+                           const_cast<float*>(&epsilon),const_cast<float*>(&freq_scale),
+                           const_cast<float*>(&ext_factor),const_cast<float*>(&mscale),
+                           &corr_low,&corr_high};
+            launch_named("laguna_head_norm_rope",heads,1,256,q_args);
+            const std::uint64_t keys=first;
+            void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,
+                           const_cast<std::uint64_t*>(&keys),const_cast<int*>(&kv_heads),
+                           const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                           const_cast<int*>(&position),const_cast<float*>(&theta),
+                           const_cast<float*>(&epsilon),const_cast<float*>(&freq_scale),
+                           const_cast<float*>(&ext_factor),const_cast<float*>(&mscale),
+                           &corr_low,&corr_high};
+            launch_named("laguna_head_norm_rope",kv_heads,1,256,k_args);
+            std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
+            const auto view=attention_cache_view(layer,runtime->position);
+            int slot=view.slot,capacity=view.capacity;
+            void*k_store_args[]={const_cast<std::uint64_t*>(&keys),&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_k,true),kv_heads,1,256,k_store_args);
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
+            std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;
+            float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            void*score_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+            launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
+            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+            launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            std::uint64_t gated=third;
+            void*gate_args[]={&attended,const_cast<std::uint64_t*>(&gates),&gated,
+                              const_cast<int*>(&heads),const_cast<int*>(&head_dim)};
+            launch_named("laguna_attention_gate",(q_size+255)/256,1,256,gate_args);
+            dense(4,gated,residual,q_size,hidden_size);
+            add(residual,hidden);
+            moe_base=8;
         }else{
             const int heads=static_cast<int>(runtime->model->config.attention_heads);
             const int kv_heads=static_cast<int>(runtime->model->config.attention_kv_heads);
@@ -4969,8 +5465,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         }
         if(layer.dense_ffn){
             // Dense block: one SwiGLU over the layer's own gate/up/down, with no
-            // router, shared expert or expert paging to run.
-            const int dense_intermediate=static_cast<int>(runtime->moe_intermediate);
+            // router, shared expert or expert paging to run. Laguna mixes dense
+            // leading blocks with MoE blocks in one model, and the two widths
+            // differ, so take this block's width from its own gate projection.
+            const int dense_intermediate=runtime->laguna
+                ?static_cast<int>(runtime->model->tensors[layer.static_tensors.at(moe_base+1)].shape[1])
+                :static_cast<int>(runtime->moe_intermediate);
             if(layer.ffn_on_host){
                 auto*scratch=static_cast<float*>(runtime->dense_host);
                 float*host_input=scratch;
@@ -4993,7 +5493,20 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             if(profile){profile_record(profile->pre_end);profile_record(profile->shared_start);profile_record(profile->shared_end);profile_record(profile->expert_start);}
         }else{
         dense(moe_base+1,normalized,router_logits,hidden_size,experts);
-        if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime->stream)!=0)throw std::runtime_error("native Qwen routing failed");
+        if(runtime->laguna){
+            // Sigmoid routing with the score-correction bias, sum-normalized
+            // over the selection and scaled by the trained routing factor.
+            auto bias=runtime->device_tensors[layer.router_bias];
+            int normalize=runtime->model->config.expert_weights_norm?1:0;
+            float weight_scale=runtime->model->config.expert_weights_scale;
+            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&bias,
+                               const_cast<std::uint64_t*>(&selected_device),
+                               const_cast<std::uint64_t*>(&route_weights),
+                               const_cast<int*>(&experts),const_cast<int*>(&top_k),
+                               &normalize,&weight_scale};
+            launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
+                         static_cast<std::uint32_t>(2*experts*sizeof(float)));
+        }else if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime->stream)!=0)throw std::runtime_error("native Qwen routing failed");
         const auto cpu_weights_offset=device_align(top_k*sizeof(std::int32_t));
         const auto cpu_input_offset=cpu_weights_offset+device_align(top_k*sizeof(float));
         const auto cpu_activated_offset=cpu_input_offset+device_align(hidden_size*sizeof(float));
@@ -5009,7 +5522,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         const int intermediate=static_cast<int>(runtime->moe_intermediate);
         auto enqueue_shared=[&]{
             auto shared_gate_matrix=tensor(moe_base+2),shared_up_matrix=tensor(moe_base+3);
-            const auto shexp_type=runtime->model->tensors[layer.static_tensors.at(moe_base+2)].type;
+            // The device type, not the stored one: bf16 shared experts are
+            // requantized to Q8_0 on upload and must still take the fused path.
+            const auto shexp_type=qwen_device_type(*runtime,layer.static_tensors.at(moe_base+2));
             if(shexp_type==40){
                 // NVFP4 shared expert. One block per output row (the kernel block-reduces),
                 // and weight_scale_2 passed in f32 -- it is far too small for E4M3.
@@ -5019,15 +5534,30 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 auto shared_down_matrix=tensor(moe_base+4);auto shared_down_scale=layer.shared_down_scale;
                 void*down_args[]={&shared_down_matrix,const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&third),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),&shared_down_scale};
                 launch_named("nvfp4_matvec_transposed",hidden_size,1,256,down_args);
-            }else{
+            }else if(shexp_type==8){
                 void*silu_args[]={&shared_gate_matrix,&shared_up_matrix,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&second),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate)};
                 launch_named("q8_swiglu_transposed_warp",(intermediate+7)/8,1,256,silu_args);
                 dense(moe_base+4,second,third,intermediate,hidden_size);
+            }else{
+                // No fused SwiGLU kernel for this weight type (Laguna ships a
+                // k-quant shared expert): project gate and up into one
+                // contiguous pair and let silu_mul combine them.
+                const auto up_half=first+static_cast<std::uint64_t>(intermediate)*sizeof(float);
+                dense(moe_base+2,normalized,first,hidden_size,intermediate);
+                dense(moe_base+3,normalized,up_half,hidden_size,intermediate);
+                int count=intermediate;
+                void*silu_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&second),&count};
+                launch_named("silu_mul",(static_cast<std::uint32_t>(count)+255)/256,1,256,silu_args);
+                dense(moe_base+4,second,third,intermediate,hidden_size);
             }
-            auto shared_gate=tensor(moe_base+5);
-            const auto sg_type=runtime->model->tensors[layer.static_tensors.at(moe_base+5)].type;
-            void*shared_args[]={const_cast<std::uint64_t*>(&normalized),&shared_gate,const_cast<std::uint64_t*>(&third),const_cast<int*>(&hidden_size)};
-            launch_named(sg_type==30?"qwen_shared_scale_bf16":"qwen_shared_scale",1,1,256,shared_args);
+            // Qwen gates the shared expert on a learned projection; Laguna's is
+            // always on, so its block ends at the down projection.
+            if(!runtime->laguna){
+                auto shared_gate=tensor(moe_base+5);
+                const auto sg_type=runtime->model->tensors[layer.static_tensors.at(moe_base+5)].type;
+                void*shared_args[]={const_cast<std::uint64_t*>(&normalized),&shared_gate,const_cast<std::uint64_t*>(&third),const_cast<int*>(&hidden_size)};
+                launch_named(sg_type==30?"qwen_shared_scale_bf16":"qwen_shared_scale",1,1,256,shared_args);
+            }
         };
         bool shared_launched=false;
         if(runtime->cuda_graphs&&layer.shared_graph){
