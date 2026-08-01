@@ -859,6 +859,13 @@ extern "C" int colibri_gpu_compile(
              "laguna_head_norm_rope", "laguna_attention_gate",
              "laguna_attention_gate_rows",
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",
+             // Grouped routed-expert kernels for the IQ codebook formats.
+             "iq2xs_grouped_swiglu", "iq2xs_grouped_swiglu_rows",
+             "iq2xs_grouped_accumulate", "iq2xs_grouped_accumulate_rows",
+             "iq3xxs_grouped_swiglu", "iq3xxs_grouped_swiglu_rows",
+             "iq3xxs_grouped_accumulate", "iq3xxs_grouped_accumulate_rows",
+             "iq4xs_grouped_swiglu", "iq4xs_grouped_swiglu_rows",
+             "iq4xs_grouped_accumulate", "iq4xs_grouped_accumulate_rows",
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
              "qwen_attention_prefill_pack_f16",
              "kv_attention_prefill_softmax_f16",

@@ -203,10 +203,13 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
 - Laguna's pre-tokenizer classifies non-ASCII letters by Unicode block rather
   than by a full category table, so non-Latin prose can split differently from
   the reference tokenizer.
-- Routed experts quantized with IQ codebook formats execute on the CPU expert
-  path only; the grouped GPU expert kernels cover k-quants and NVFP4. Such a
-  model falls back to `--expert-mode cpu` at preparation with a notice, so
-  `auto` and `resident` are accepted but do not place experts on the GPU.
+- IQ2_XS, IQ3_XXS and IQ4_XS routed experts have grouped GPU kernels; the other
+  IQ formats do not and always run on the CPU expert path. Even where the
+  kernels exist, IQ experts stay on the CPU unless `--prefill-cache-seed` pins a
+  seeded set: splitting a layer between a GPU router and host experts costs a
+  round trip per layer, and on a 12 GiB card that synchronization grows by more
+  than the offload saves. Whole-layer residency, not per-expert paging, is what
+  would make the offload pay.
 - IQ expert decode is ALU-bound rather than bandwidth-bound, so it scales past
   the physical core count. The default thread heuristic uses physical cores;
   `--cpu-threads` at the SMT count is worth roughly 1.4x on such models.

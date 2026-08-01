@@ -1669,6 +1669,7 @@ void q5k_grouped_accumulate_rows(
     if (threadIdx.x == 0) output[token * output_size + row] += partial;
 }
 
+
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
 // Warp-per-row LM-head argmax for the weight types that lacked one. The
@@ -2615,6 +2616,211 @@ void iq4xs_matvec_transposed(
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[row] = partial;
 }
+
+// Grouped routed-expert kernels for the IQ codebook formats, which had none:
+// the host dispatch ended in a k-quant fallback, so an IQ expert reaching the
+// GPU was decoded as Q5_K. Low-bit MoE checkpoints quantize routed experts this
+// way even when their dense projections are k-quants, so without these the
+// whole expert phase is pinned to the CPU.
+//
+// These decode an octet at a time rather than a value at a time. Every IQ
+// format packs 256 values as 32 groups of eight that share one grid entry, one
+// sign byte and one scale, so the per-value decoders redo the block header,
+// the codebook lookup and the scale extraction eight times over. Amortizing
+// that across the octet is the difference between these kernels being worth
+// running on the GPU at all and merely matching the vectorized CPU path.
+__device__ __forceinline__ void iq2xs_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 74;
+    const float d = __half2float(*((const __half*)base));
+    const int group = octet >> 1;
+    const int scale = (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
+    const float db = d * (0.5f + (float)scale) * 0.25f;
+    unsigned short entry;
+    memcpy(&entry, base + 2 + octet * 2, 2);
+    const unsigned long long grid = kIq2xsGrid[entry & 511];
+    const unsigned char signs = kIq2xxsSigns[entry >> 9];
+    for (int k = 0; k < 8; ++k) {
+        const float value = (float)((grid >> (8 * k)) & 0xffULL);
+        out[k] = ((signs >> k) & 1) ? -db * value : db * value;
+    }
+}
+
+__device__ __forceinline__ void iq3xxs_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 98;
+    const float d = __half2float(*((const __half*)base));
+    const int group = octet >> 2;
+    const int quad = octet & 3;
+    unsigned int aux;
+    memcpy(&aux, base + 2 + 64 + group * 4, 4);
+    const float scale = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+    const unsigned char* indices = base + 2 + group * 8 + quad * 2;
+    const unsigned char signs = kIq2xxsSigns[(aux >> (7 * quad)) & 127];
+    // The quad's eight magnitudes are two 4-byte grid entries end to end.
+    const unsigned long long grid =
+        (unsigned long long)kIq3xxsGrid[indices[0]] |
+        ((unsigned long long)kIq3xxsGrid[indices[1]] << 32);
+    for (int k = 0; k < 8; ++k) {
+        const float value = (float)((grid >> (8 * k)) & 0xffULL);
+        out[k] = ((signs >> k) & 1) ? -scale * value : scale * value;
+    }
+}
+
+__device__ __forceinline__ void iq4xs_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 136;
+    unsigned short scales_high;
+    memcpy(&scales_high, base + 2, 2);
+    const float d = __half2float(*((const __half*)base));
+    const int sub = octet >> 2;
+    const int part = octet & 3;
+    const int low = (base[4 + (sub >> 1)] >> (4 * (sub & 1))) & 15;
+    const int scale = (low | (((scales_high >> (2 * sub)) & 3) << 4)) - 32;
+    const float ds = d * (float)scale;
+    // Low nibbles supply the sub-block's first sixteen values, high nibbles the
+    // second sixteen, so the octet's nibble half follows from its index.
+    const unsigned char* quants = base + 8 + sub * 16 + (part & 1) * 8;
+    const int high = part >> 1;
+    for (int k = 0; k < 8; ++k) {
+        const unsigned char byte = quants[k];
+        out[k] = ds * (float)kIq4nlValues[high ? (byte >> 4) : (byte & 15)];
+    }
+}
+
+#define COLIBRI_IQ_GROUPED(prefix, octet_at)                                    \
+extern "C" __global__                                                           \
+void prefix##_grouped_swiglu(                                                   \
+    const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,     \
+    const float* vector, float* activated,                                      \
+    const int input_size, const int output_size, const int experts             \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    const int expert = blockIdx.y;                                              \
+    if (row >= output_size || expert >= experts) return;                        \
+    const unsigned char* gate_packed = (const unsigned char*)gate_ptrs[expert]; \
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[expert];     \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float gate = 0.0f, up = 0.0f, g[8], u[8];                                   \
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int block = (int)(absolute >> 8);                                 \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        octet_at(gate_packed, block, within, g);                                \
+        octet_at(up_packed, block, within, u);                                  \
+        const float* values = vector + octet * 8;                               \
+        for (int k = 0; k < 8; ++k) {                                           \
+            gate += g[k] * values[k];                                           \
+            up += u[k] * values[k];                                             \
+        }                                                                       \
+    }                                                                           \
+    gate = block_reduce_sum(gate);                                              \
+    up = block_reduce_sum(up);                                                  \
+    if (threadIdx.x == 0)                                                       \
+        activated[expert * output_size + row] =                                 \
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;    \
+}                                                                               \
+extern "C" __global__                                                           \
+void prefix##_grouped_swiglu_rows(                                              \
+    const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,     \
+    const int* counts, const float* vectors, float* activated,                  \
+    const int input_size, const int output_size, const int top_k,               \
+    const int rows                                                              \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    const int route = blockIdx.y;                                               \
+    const int token = route / top_k;                                            \
+    const int rank = route - token * top_k;                                     \
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;   \
+    const unsigned char* gate_packed = (const unsigned char*)gate_ptrs[route];  \
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[route];      \
+    const float* vector = vectors + token * input_size;                         \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float gate = 0.0f, up = 0.0f, g[8], u[8];                                   \
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int block = (int)(absolute >> 8);                                 \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        octet_at(gate_packed, block, within, g);                                \
+        octet_at(up_packed, block, within, u);                                  \
+        const float* values = vector + octet * 8;                               \
+        for (int k = 0; k < 8; ++k) {                                           \
+            gate += g[k] * values[k];                                           \
+            up += u[k] * values[k];                                             \
+        }                                                                       \
+    }                                                                           \
+    gate = block_reduce_sum(gate);                                              \
+    up = block_reduce_sum(up);                                                  \
+    if (threadIdx.x == 0)                                                       \
+        activated[route * output_size + row] =                                  \
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;    \
+}                                                                               \
+extern "C" __global__                                                           \
+void prefix##_grouped_accumulate(                                               \
+    const unsigned long long* down_ptrs, const float* activated,                \
+    float* output, const float* weights,                                        \
+    const int input_size, const int output_size, const int experts             \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    if (row >= output_size) return;                                             \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float partial = 0.0f, w[8];                                                 \
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int block = (int)(absolute >> 8);                                 \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        for (int expert = 0; expert < experts; ++expert) {                      \
+            octet_at((const unsigned char*)down_ptrs[expert], block, within, w);\
+            const float weight = weights[expert];                               \
+            const float* values = activated + expert * input_size + octet * 8;  \
+            for (int k = 0; k < 8; ++k) partial += weight * w[k] * values[k];   \
+        }                                                                       \
+    }                                                                           \
+    partial = block_reduce_sum(partial);                                        \
+    if (threadIdx.x == 0) output[row] += partial;                               \
+}                                                                               \
+extern "C" __global__                                                           \
+void prefix##_grouped_accumulate_rows(                                          \
+    const unsigned long long* down_ptrs, const float* activated,                \
+    float* output, const float* weights, const int* counts,                     \
+    const int input_size, const int output_size, const int top_k,               \
+    const int rows                                                              \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    const int token = blockIdx.y;                                               \
+    if (row >= output_size || token >= rows) return;                            \
+    const int base = token * top_k;                                             \
+    const int count = counts[token];                                            \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float partial = 0.0f, w[8];                                                 \
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int block = (int)(absolute >> 8);                                 \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        for (int rank = 0; rank < count; ++rank) {                              \
+            const int route = base + rank;                                      \
+            octet_at((const unsigned char*)down_ptrs[route], block, within, w); \
+            const float weight = weights[route];                                \
+            const float* values = activated + route * input_size + octet * 8;   \
+            for (int k = 0; k < 8; ++k) partial += weight * w[k] * values[k];   \
+        }                                                                       \
+    }                                                                           \
+    partial = block_reduce_sum(partial);                                        \
+    if (threadIdx.x == 0) output[token * output_size + row] += partial;         \
+}
+
+COLIBRI_IQ_GROUPED(iq2xs, iq2xs_octet)
+COLIBRI_IQ_GROUPED(iq3xxs, iq3xxs_octet)
+COLIBRI_IQ_GROUPED(iq4xs, iq4xs_octet)
+
+#undef COLIBRI_IQ_GROUPED
 
 __device__ __forceinline__ float q2k_value(
     const unsigned char* packed, int absolute

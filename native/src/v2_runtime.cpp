@@ -2040,8 +2040,89 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
 // Weight types the grouped GPU expert kernels can execute. The IQ codebook
 // formats have no grouped kernel: they have to stay on the CPU expert path,
 // which decodes every type qwen_quant_dot supports.
+// Kernel-name prefix for the IQ codebook formats, which share one generated
+// family of grouped expert kernels. Null for everything else.
+const char* qwen_iq_kernel_prefix(std::uint32_t type) {
+    // Only the formats with a device octet decoder. IQ2_XXS, IQ2_S and IQ3_S
+    // pack their signs and grid indices differently and have no grouped kernel,
+    // so models using them still route experts to the CPU.
+    switch(type){
+        case 17: return "iq2xs";
+        case 18: return "iq3xxs";
+        case 23: return "iq4xs";
+        default: return nullptr;
+    }
+}
+
+// Grouped kernel name for an IQ type, empty when the type is not one.
+std::string qwen_iq_grouped_kernel(std::uint32_t type, const char* suffix) {
+    const char* prefix=qwen_iq_kernel_prefix(type);
+    return prefix?std::string(prefix)+suffix:std::string();
+}
+
 bool qwen_gpu_expert_type_supported(std::uint32_t type) {
-    return type==8||type==12||type==13||type==14||type==40;
+    return type==8||type==12||type==13||type==14||type==40||
+           qwen_iq_kernel_prefix(type)!=nullptr;
+}
+
+// Grouped SwiGLU kernel for the routed experts' gate/up type. The trailing
+// k-quant case is the historical default and stays reachable only for types
+// this build actually decodes, because prepare rejects anything else.
+std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool rows) {
+    const char* suffix=rows?"_grouped_swiglu_rows":"_grouped_swiglu";
+    auto iq=qwen_iq_grouped_kernel(type,suffix);
+    if(!iq.empty())return iq;
+    if(type==40)return rows?"nvfp4_grouped_swiglu_rows"
+        :(nvfp4_tiled?"nvfp4_grouped_swiglu_tiled":"nvfp4_grouped_swiglu");
+    if(type==14)return rows?"q6k_grouped_swiglu_rows":"q6k_grouped_swiglu";
+    if(type==12)return rows?"q4k_grouped_swiglu_rows":"q4k_grouped_swiglu";
+    return rows?"q5k_grouped_swiglu_rows":"q5k_grouped_swiglu";
+}
+
+// Row-batched grouped accumulate, which the prefill path launches by name for
+// every weight type rather than through a driver entry point.
+std::string qwen_grouped_accumulate_rows_name(std::uint32_t type) {
+    auto iq=qwen_iq_grouped_kernel(type,"_grouped_accumulate_rows");
+    if(!iq.empty())return iq;
+    if(type==8)return "q8_grouped_accumulate_rows";
+    if(type==40)return "nvfp4_grouped_accumulate_rows";
+    if(type==12)return "q4k_grouped_accumulate_rows";
+    if(type==13)return "q5k_grouped_accumulate_rows";
+    return "q6k_grouped_accumulate_rows";
+}
+
+// The k-quant and NVFP4 accumulates go through their own driver entry points;
+// the IQ family has no such wrapper and launches by name with the identical
+// grid, one block per output row.
+int qwen_launch_grouped_accumulate(
+    std::uint64_t stream, std::uint32_t down_type, std::uint64_t down_table,
+    std::uint64_t activated, std::uint64_t output, std::uint64_t weights,
+    int intermediate, int hidden_size, int count
+) {
+    const auto iq=qwen_iq_grouped_kernel(down_type,"_grouped_accumulate");
+    if(!iq.empty()){
+        void* args[]={&down_table,&activated,&output,&weights,
+                      &intermediate,&hidden_size,&count};
+        return colibri_gpu_launch_named(
+            iq.c_str(),static_cast<std::uint32_t>(hidden_size),1,256,0,stream,args);
+    }
+    switch(down_type){
+        case 8:return colibri_gpu_q8_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 40:return colibri_gpu_nvfp4_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 12:return colibri_gpu_q4k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 13:return colibri_gpu_q5k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        default:return colibri_gpu_q6_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+    }
+}
+
+// True when any routed expert tensor uses an IQ codebook format.
+bool qwen_model_has_iq_experts(const ColibriV2QwenRuntime& runtime) {
+    for(const auto& layer:runtime.layers){
+        if(layer.dense_ffn||!layer.expert_tensors[0])continue;
+        for(const auto index:layer.expert_tensors)
+            if(qwen_iq_kernel_prefix(runtime.model->tensors[index].type))return true;
+    }
+    return false;
 }
 
 // True when every routed expert tensor in the model can run on the GPU.
@@ -4079,16 +4160,30 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // and decodes codebook bytes as super-block scales, which produces
         // fluent-looking output for as long as the expert cache stays cold and
         // then degenerates once experts become resident.
-        if(!prepare_policy.is_cpu()&&runtime->model->config.expert_count&&
-           !qwen_gpu_experts_executable(*runtime)){
+        // IQ experts do have grouped GPU kernels now, but splitting a layer
+        // between the router on the GPU and the experts on the host costs a
+        // round trip per layer, and measurement on a 12 GiB card shows that
+        // synchronization grows by more than the offload saves. They stay on
+        // the CPU unless the deployment explicitly pins a seeded expert set,
+        // which is the only configuration where the offload has ever paid.
+        const bool seeded_placement=runtime->options.prefill_cache_seed!=0||
+                                    runtime->options.prefill_cache_seed_auto!=0;
+        // Gated on the decode policy, not the prepare one: `auto` prepares as
+        // CPU and only promotes a hot set at decode, so a prepare-phase test
+        // would let IQ experts reach the GPU anyway.
+        const bool gpu_at_decode=!qwen_expert_policy(
+            *runtime,colibri::v2::ExpertExecutionPhase::decode).is_cpu();
+        if(gpu_at_decode&&runtime->model->config.expert_count&&
+           (!qwen_gpu_experts_executable(*runtime)||
+            (qwen_model_has_iq_experts(*runtime)&&!seeded_placement))){
             runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
             runtime->options.moe_device=colibri::v2::expert_execution_mode_value(
                 runtime->expert_mode);
             prepare_policy=qwen_expert_policy(
                 *runtime,colibri::v2::ExpertExecutionPhase::prepare);
             std::fprintf(stderr,
-                "[colibri-v2] routed experts use an IQ format with no grouped GPU "
-                "kernel; falling back to CPU MoE\n");
+                "[colibri-v2] routed experts stay on the CPU MoE; set "
+                "--prefill-cache-seed to place IQ experts on the GPU\n");
         }
         if(prepare_policy.is_hybrid()&&runtime->model->config.expert_count&&
            runtime->expert_slots.empty()){
@@ -5836,8 +5931,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     const char* tiled_env=std::getenv("COLIBRI_NVFP4_TILED");
                     const bool nvfp4_tiled=tiled_env&&tiled_env[0]=='1';
                     void*gate_up_args[]={const_cast<std::uint64_t*>(&gate_table),const_cast<std::uint64_t*>(&up_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),&gpu_count,const_cast<std::uint64_t*>(&gate_scale_table),const_cast<std::uint64_t*>(&up_scale_table)};
-                    launch_named(gate_type==40?(nvfp4_tiled?"nvfp4_grouped_swiglu_tiled":"nvfp4_grouped_swiglu"):gate_type==14?"q6k_grouped_swiglu":gate_type==12?"q4k_grouped_swiglu":"q5k_grouped_swiglu",gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,gpu_count,256,gate_up_args);
-                    const int status=down_type==8?colibri_gpu_q8_grouped_accumulate(down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count,runtime->stream):down_type==40?colibri_gpu_nvfp4_grouped_accumulate(down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count,runtime->stream):down_type==12?colibri_gpu_q4k_grouped_accumulate(down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count,runtime->stream):down_type==13?colibri_gpu_q5k_grouped_accumulate(down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count,runtime->stream):colibri_gpu_q6_grouped_accumulate(down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count,runtime->stream);
+                    launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(),gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,gpu_count,256,gate_up_args);
+                    const int status=qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count);
                     if(status!=0)throw std::runtime_error("native hybrid MoE down projection failed");
                 }
             }
@@ -5971,8 +6066,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             const char* tiled_env=std::getenv("COLIBRI_NVFP4_TILED");
             const bool nvfp4_tiled=tiled_env&&tiled_env[0]=='1';
             void*gate_up_args[]={const_cast<std::uint64_t*>(&gate_table),const_cast<std::uint64_t*>(&up_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),const_cast<std::uint64_t*>(&gate_scale_table),const_cast<std::uint64_t*>(&up_scale_table)};
-            launch_named(gate_type==40?(nvfp4_tiled?"nvfp4_grouped_swiglu_tiled":"nvfp4_grouped_swiglu"):gate_type==14?"q6k_grouped_swiglu":gate_type==12?"q4k_grouped_swiglu":"q5k_grouped_swiglu",gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,top_k,256,gate_up_args);
-            const int down_status=down_type==8?colibri_gpu_q8_grouped_accumulate(down_table,activated,third,route_weights,intermediate,hidden_size,top_k,runtime->stream):down_type==40?colibri_gpu_nvfp4_grouped_accumulate(down_table,activated,third,route_weights,intermediate,hidden_size,top_k,runtime->stream):down_type==12?colibri_gpu_q4k_grouped_accumulate(down_table,activated,third,route_weights,intermediate,hidden_size,top_k,runtime->stream):down_type==13?colibri_gpu_q5k_grouped_accumulate(down_table,activated,third,route_weights,intermediate,hidden_size,top_k,runtime->stream):colibri_gpu_q6_grouped_accumulate(down_table,activated,third,route_weights,intermediate,hidden_size,top_k,runtime->stream);
+            launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(),gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,top_k,256,gate_up_args);
+            const int down_status=qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,activated,third,route_weights,intermediate,hidden_size,top_k);
             if(down_status!=0)throw std::runtime_error("native Qwen expert down projection failed");
         }
         }
@@ -7843,8 +7938,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                         const char* tiled_env = std::getenv("COLIBRI_NVFP4_TILED");
                         const bool nvfp4_tiled = tiled_env && tiled_env[0] == '1';
                         void* gate_up_args[] = {const_cast<std::uint64_t*>(&gate_table), const_cast<std::uint64_t*>(&up_table), &s.normalized, &s.activated, const_cast<int*>(&hidden_size), const_cast<int*>(&intermediate), &gpu_count, const_cast<std::uint64_t*>(&gate_scale_table), const_cast<std::uint64_t*>(&up_scale_table)};
-                        launch_named(gate_type == 40 ? (nvfp4_tiled ? "nvfp4_grouped_swiglu_tiled" : "nvfp4_grouped_swiglu") : gate_type == 14 ? "q6k_grouped_swiglu" : gate_type == 12 ? "q4k_grouped_swiglu" : "q5k_grouped_swiglu", gate_type == 40 && nvfp4_tiled ? (intermediate + 7) / 8 : intermediate, gpu_count, 256, gate_up_args);
-                        const int status = down_type == 8 ? colibri_gpu_q8_grouped_accumulate(down_table, s.activated, s.third, weight_table, intermediate, hidden_size, gpu_count, runtime->stream) : down_type == 40 ? colibri_gpu_nvfp4_grouped_accumulate(down_table, s.activated, s.third, weight_table, intermediate, hidden_size, gpu_count, runtime->stream) : down_type == 12 ? colibri_gpu_q4k_grouped_accumulate(down_table, s.activated, s.third, weight_table, intermediate, hidden_size, gpu_count, runtime->stream) : down_type == 13 ? colibri_gpu_q5k_grouped_accumulate(down_table, s.activated, s.third, weight_table, intermediate, hidden_size, gpu_count, runtime->stream) : colibri_gpu_q6_grouped_accumulate(down_table, s.activated, s.third, weight_table, intermediate, hidden_size, gpu_count, runtime->stream);
+                        launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(), gate_type == 40 && nvfp4_tiled ? (intermediate + 7) / 8 : intermediate, gpu_count, 256, gate_up_args);
+                        const int status = qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,s.activated,s.third,weight_table,intermediate,hidden_size,gpu_count);
                         if (status != 0) throw std::runtime_error("native hybrid MoE down projection failed");
                     }
                 }
