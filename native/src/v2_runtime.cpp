@@ -2772,6 +2772,25 @@ void qwen_cpu_moe(
     }
 }
 
+bool qwen_prefill_direct_quant_enabled(
+    const ColibriV2QwenRuntime& runtime
+) {
+    if ((colibri_cpu_features() & 3u) == 0) return false;
+    if (const char* setting = std::getenv("COLIBRI_PREFILL_DIRECT_QUANT"))
+        return setting[0] == '1';
+    if (!runtime.laguna) return false;
+    bool found = false;
+    for (const auto& layer : runtime.layers) {
+        if (layer.dense_ffn || !layer.expert_tensors[0]) continue;
+        for (const auto tensor : layer.expert_tensors) {
+            const auto type = runtime.model->tensors[tensor].type;
+            if (type != 17 && type != 18 && type != 23) return false;
+            found = true;
+        }
+    }
+    return found;
+}
+
 void qwen_cpu_moe_rows(
     const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     const std::int32_t* selected, const float* weights, int rows,
@@ -2781,9 +2800,7 @@ void qwen_cpu_moe_rows(
     const int experts=runtime.model->config.expert_count;
     const int hidden=runtime.model->config.hidden_size;
     const int intermediate=runtime.moe_intermediate;
-    const char*direct_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
-    const bool direct_quant=(colibri_cpu_features()&3u)!=0&&
-        direct_setting&&direct_setting[0]=='1';
+    const bool direct_quant=qwen_prefill_direct_quant_enabled(runtime);
     const bool direct_oct=direct_quant&&(colibri_cpu_features()&2u)!=0;
     if(rows<=0||rows>4096||routed_count<=0||routed_count>256)
         throw std::runtime_error("native CPU batched MoE shape is unsupported");
@@ -3563,9 +3580,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->prefill_nanoseconds=runtime->prefill_nanoseconds;
     out->prefill_route_wait_nanoseconds=runtime->prefill_route_wait_nanoseconds;
     out->prefill_expert_nanoseconds=runtime->prefill_expert_nanoseconds;
-    const char*direct_quant_setting=std::getenv("COLIBRI_PREFILL_DIRECT_QUANT");
-    out->prefill_direct_quant=(colibri_cpu_features()&3u)!=0&&
-        direct_quant_setting&&direct_quant_setting[0]=='1';
+    out->prefill_direct_quant=qwen_prefill_direct_quant_enabled(*runtime);
     out->prefill_direct_quant_width=out->prefill_direct_quant?
         ((colibri_cpu_features()&2u)!=0?8:4):0;
     out->prefill_profile=runtime->prefill_profile?1:0;

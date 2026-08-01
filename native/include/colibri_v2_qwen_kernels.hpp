@@ -1499,6 +1499,51 @@ R"COLIBRI_CUDA(    const int quant = ((offset < 32) ? (low & 15) : (low >> 4)) +
     return d * (float)scale * (float)quant - dmin * (float)minimum;
 }
 
+// One Q5_K row per warp. The generic value-at-a-time kernel reloads the block
+// scales and recomputes the block/within divisions for all eight values owned
+// by a lane. Decode those values together, as the Q6_K path does below.
+__device__ __forceinline__ float q5k_row_dot_warp(
+    const unsigned char* packed, const float* vector,
+    int row, int input_size, int lane
+) {
+    const int blocks = input_size >> 8;
+    const unsigned char* row_data =
+        packed + (long long)row * blocks * 176;
+    float partial = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const unsigned char* base = row_data + block * 176;
+        const float d = __half2float(*((const __half*)base));
+        const float dmin = __half2float(*((const __half*)(base + 2)));
+        const unsigned char* scales = base + 4;
+        int lane_scale = 0, lane_minimum = 0;
+        if (lane < 8)
+            q5k_scale_min(scales, lane, &lane_scale, &lane_minimum);
+        const unsigned char high = base[16 + lane];
+        const int input_base = block << 8;
+        #pragma unroll
+        for (int group = 0; group < 4; ++group) {
+            const unsigned char low = base[48 + group * 32 + lane];
+            #pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                const int index = group * 2 + sub;
+                const int scale = __shfl_sync(
+                    0xffffffffu, lane_scale, index);
+                const int minimum = __shfl_sync(
+                    0xffffffffu, lane_minimum, index);
+                const int quant =
+                    (sub == 0 ? (low & 15) : (low >> 4))
+                    | (((high >> index) & 1) << 4);
+                partial = fmaf(
+                    d * (float)(scale * quant)
+                        - dmin * (float)minimum,
+                    vector[input_base + group * 64 + sub * 32 + lane],
+                    partial);
+            }
+        }
+    }
+    return partial;
+}
+
 extern "C" __global__
 void q5k_matvec_transposed(
     const unsigned char* packed, const float* vector, float* output,
@@ -5517,7 +5562,6 @@ extern "C" __global__ void name( \
 COLIBRI_LOWBIT_MATVEC_WARP(q2k_matvec_transposed_warp, q2k_value)
 COLIBRI_LOWBIT_MATVEC_WARP(q3k_matvec_transposed_warp, q3k_value)
 COLIBRI_LOWBIT_MATVEC_WARP(q4k_matvec_transposed_warp, q4k_value)
-COLIBRI_LOWBIT_MATVEC_WARP(q5k_matvec_transposed_warp, q5k_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq2xxs_matvec_transposed_warp, iq2xxs_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq3xxs_matvec_transposed_warp, iq3xxs_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq2s_matvec_transposed_warp, iq2s_value)
@@ -5525,6 +5569,21 @@ COLIBRI_LOWBIT_MATVEC_WARP(iq3s_matvec_transposed_warp, iq3s_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq2xs_matvec_transposed_warp, iq2xs_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq4xs_matvec_transposed_warp, iq4xs_value)
 #undef COLIBRI_LOWBIT_MATVEC_WARP
+
+extern "C" __global__ void q5k_matvec_transposed_warp(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    float partial =
+        q5k_row_dot_warp(packed, vector, row, input_size, lane);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);
+    if (lane == 0) output[row] = partial;
+}
 
 // Reuse each decoded weight across four prompt rows. This small register tile
 // cuts quant decoding and global weight traffic by up to 4x without requiring

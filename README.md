@@ -210,9 +210,14 @@ test failure; only an unset opt-in and an unavailable CUDA device are skipped.
   using the CPU path for earlier layers. Set `COLIBRI_LAGUNA_WHOLE_LAYERS=0` to
   restore per-expert placement for comparison, or to a positive integer to cap
   the number of complete GPU layers.
-- IQ expert decode is ALU-bound rather than bandwidth-bound, so it scales past
-  the physical core count. The default thread heuristic uses physical cores;
-  `--cpu-threads` at the SMT count is worth roughly 1.4x on such models.
+- Laguna prefill over IQ2_XS, IQ3_XXS or IQ4_XS experts uses the direct
+  quantized 8-token CPU kernel by default instead of expanding expert rows to
+  f32. Set `COLIBRI_PREFILL_DIRECT_QUANT=0` only for comparison; `=1` continues
+  to opt other supported architectures into the same path.
+- IQ expert decode is sensitive to memory bandwidth, clock sharing and thread
+  placement. The default uses physical cores; tune `--cpu-threads` for the
+  machine rather than assuming SMT helps (14 workers beat 8, 16 and 32 on the
+  reference 16-core Laguna host).
 - Qwen sampled decoding currently transfers the vocabulary logits to the host.
 - Dynamic MoE routing still has host synchronization points.
 - Full-layer CUDA graph replay and persistent fused layer kernels are incomplete.
