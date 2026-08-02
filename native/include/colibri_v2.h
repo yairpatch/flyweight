@@ -235,6 +235,10 @@ COLIBRI_V2_API int colibri_v2_model_attach_mtp(ColibriV2Model* model, const char
 COLIBRI_V2_API void colibri_v2_model_close(ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_model_info(const ColibriV2Model* model, ColibriV2ModelInfo* out);
 COLIBRI_V2_API int colibri_v2_model_config(const ColibriV2Model* model, ColibriV2ModelConfig* out);
+/* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
+   UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
+   query the required size; an absent key reports length zero. */
+COLIBRI_V2_API int colibri_v2_model_chat_template(const ColibriV2Model* model, char* output, uint64_t capacity, uint64_t* length);
 /* Returns the layer's trained attention window. 0 means global attention. */
 COLIBRI_V2_API int colibri_v2_model_attention_window(const ColibriV2Model* model, uint32_t layer, uint32_t* out);
 COLIBRI_V2_API int colibri_v2_tensor_info(const ColibriV2Model* model, uint64_t index, ColibriV2TensorInfo* out);

@@ -139,6 +139,7 @@ class InferenceService:
         max_concurrent_requests: int = 64,
         request_timeout_seconds: float = 30.0,
         sse_keepalive_seconds: float = 10.0,
+        generation_defaults: Mapping[str, int | float] | None = None,
     ):
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
@@ -160,6 +161,30 @@ class InferenceService:
         self.max_concurrent_requests = max_concurrent_requests
         self.request_timeout_seconds = request_timeout_seconds
         self.sse_keepalive_seconds = sse_keepalive_seconds
+        defaults: dict[str, int | float] = {
+            "temperature": 0.0,
+            "top_k": 20,
+            "top_p": 0.95,
+            "max_new_tokens": max_new_tokens,
+        }
+        defaults.update(generation_defaults or {})
+        try:
+            SamplingConfig(
+                temperature=float(defaults["temperature"]),
+                top_k=int(defaults["top_k"]),
+                top_p=float(defaults["top_p"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid generation defaults: {error}") from error
+        configured_max = int(defaults["max_new_tokens"])
+        if configured_max <= 0:
+            raise ValueError("generation default max_new_tokens must be positive")
+        self.generation_defaults = {
+            "temperature": float(defaults["temperature"]),
+            "top_k": int(defaults["top_k"]),
+            "top_p": float(defaults["top_p"]),
+            "max_new_tokens": min(configured_max, max_new_tokens),
+        }
         self.loaded_at = int(time.time())
         self._generation_lock = threading.Lock()
         # Generators that multiplex concurrent requests natively (the v2
@@ -636,6 +661,7 @@ class InferenceService:
             "max_output_tokens": self.max_new_tokens,
             "context_window": self.context_window,
             "chat_template": "qwen-chatml",
+            "generation_defaults": dict(self.generation_defaults),
             "capabilities": [
                 "completion",
                 "chat",
@@ -1110,7 +1136,9 @@ class InferenceService:
                 400, "logprobs are not implemented yet", parameter="logprobs"
             )
         requested_max = _integer_option(
-            payload, "max_tokens", default=self.max_new_tokens
+            payload,
+            "max_tokens",
+            default=int(self.generation_defaults["max_new_tokens"]),
         )
         max_new_tokens = self._fit_max_new_tokens(
             requested_max,
@@ -1119,9 +1147,15 @@ class InferenceService:
         )
         try:
             sampling = SamplingConfig(
-                temperature=_float_option(payload, "temperature", 0.0),
-                top_k=_integer_option(payload, "top_k", default=20),
-                top_p=_float_option(payload, "top_p", 0.95),
+                temperature=_float_option(
+                    payload, "temperature", float(self.generation_defaults["temperature"])
+                ),
+                top_k=_integer_option(
+                    payload, "top_k", default=int(self.generation_defaults["top_k"])
+                ),
+                top_p=_float_option(
+                    payload, "top_p", float(self.generation_defaults["top_p"])
+                ),
                 seed=_optional_integer(payload, "seed"),
             )
         except ValueError as error:
@@ -1156,13 +1190,19 @@ class InferenceService:
             payload,
             max_key,
             fallback_key=fallback_max_key,
-            default=self.max_new_tokens,
+            default=int(self.generation_defaults["max_new_tokens"]),
         )
         try:
             sampling = SamplingConfig(
-                temperature=_float_option(payload, "temperature", 0.0),
-                top_k=_integer_option(payload, "top_k", default=20),
-                top_p=_float_option(payload, "top_p", 0.95),
+                temperature=_float_option(
+                    payload, "temperature", float(self.generation_defaults["temperature"])
+                ),
+                top_k=_integer_option(
+                    payload, "top_k", default=int(self.generation_defaults["top_k"])
+                ),
+                top_p=_float_option(
+                    payload, "top_p", float(self.generation_defaults["top_p"])
+                ),
                 seed=_optional_integer(payload, "seed"),
             )
         except ValueError as error:
@@ -1358,13 +1398,17 @@ class InferenceService:
             "parallel_tool_calls": False,
             "previous_response_id": payload.get("previous_response_id"),
             "store": _boolean_option(payload, "store", True),
-            "temperature": _float_option(payload, "temperature", 0.0),
+            "temperature": _float_option(
+                payload, "temperature", float(self.generation_defaults["temperature"])
+            ),
             "text": {"format": {"type": "text"}},
             "tool_choice": payload.get(
                 "tool_choice", "auto" if payload.get("tools") else "none"
             ),
             "tools": payload.get("tools") or [],
-            "top_p": _float_option(payload, "top_p", 0.95),
+            "top_p": _float_option(
+                payload, "top_p", float(self.generation_defaults["top_p"])
+            ),
             "truncation": "disabled",
             "usage": None,
         }
@@ -1403,13 +1447,17 @@ class InferenceService:
             "parallel_tool_calls": False,
             "previous_response_id": payload.get("previous_response_id"),
             "store": _boolean_option(payload, "store", True),
-            "temperature": _float_option(payload, "temperature", 0.0),
+            "temperature": _float_option(
+                payload, "temperature", float(self.generation_defaults["temperature"])
+            ),
             "text": {"format": {"type": "text"}},
             "tool_choice": payload.get(
                 "tool_choice", "auto" if payload.get("tools") else "none"
             ),
             "tools": payload.get("tools") or [],
-            "top_p": _float_option(payload, "top_p", 0.95),
+            "top_p": _float_option(
+                payload, "top_p", float(self.generation_defaults["top_p"])
+            ),
             "truncation": "disabled",
             "usage": {
                 "input_tokens": len(result.prompt_ids),

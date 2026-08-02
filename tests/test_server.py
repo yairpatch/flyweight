@@ -16,6 +16,7 @@ except ImportError:
     OpenAI = None
 from colibri_next.cli import main
 from colibri_next.generation import GenerationResult, GenerationStep
+from colibri_next.sampling import SamplingConfig
 from colibri_next.server import (
     APIError,
     ColibriHTTPServer,
@@ -503,6 +504,37 @@ class InferenceServiceTests(unittest.TestCase):
 
         self.service.completion({"prompt": "Hi"})
         self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 32)
+
+    def test_model_generation_defaults_apply_only_when_request_omits_values(self) -> None:
+        service = InferenceService(
+            "qwen-local",
+            self.generator,
+            max_new_tokens=32,
+            generation_defaults={
+                "temperature": 0.6,
+                "top_k": 7,
+                "top_p": 0.8,
+                "max_new_tokens": 12,
+            },
+        )
+
+        service.chat_completion({"messages": [{"role": "user", "content": "Hi"}]})
+        options = self.generator.calls[-1][1]
+        self.assertEqual(options["max_new_tokens"], 12)
+        self.assertEqual(options["sampling"], SamplingConfig(0.6, 7, 0.8))
+
+        service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 3,
+                "temperature": 0,
+                "top_k": 2,
+                "top_p": 1,
+            }
+        )
+        options = self.generator.calls[-1][1]
+        self.assertEqual(options["max_new_tokens"], 3)
+        self.assertEqual(options["sampling"], SamplingConfig(0, 2, 1))
 
     def test_responses_api_reports_token_limit_as_incomplete(self) -> None:
         service = InferenceService(

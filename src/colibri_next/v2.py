@@ -360,6 +360,13 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(_ModelConfig),
                 ]
                 lib.colibri_v2_model_config.restype = ctypes.c_int
+                lib.colibri_v2_model_chat_template.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_model_chat_template.restype = ctypes.c_int
                 lib.colibri_v2_model_attach_mtp.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_char_p,
@@ -808,6 +815,25 @@ class V2Model:
         config["attention_windows"] = tuple(windows)
         config["sliding_window_pattern"] = tuple(bool(window) for window in windows)
         return config
+
+    @property
+    def chat_template(self) -> str | None:
+        """Return the model-authored Jinja chat template embedded in GGUF."""
+        length = ctypes.c_uint64()
+        self._check(
+            self._lib.colibri_v2_model_chat_template(
+                self._handle, None, 0, ctypes.byref(length)
+            )
+        )
+        if length.value == 0:
+            return None
+        output = ctypes.create_string_buffer(length.value + 1)
+        self._check(
+            self._lib.colibri_v2_model_chat_template(
+                self._handle, output, len(output), ctypes.byref(length)
+            )
+        )
+        return output.raw[: length.value].decode("utf-8", errors="strict")
 
     def tensor(self, name: str) -> dict[str, object]:
         if self._tensor_catalog is not None:

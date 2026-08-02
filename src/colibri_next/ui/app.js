@@ -63,6 +63,7 @@ const state = {
   conversations: loadConversations(),
   activeId: null,
   settings: loadSettings(),
+  settingsCustomized: hasPersistedSettings(),
   apiKey: readSession(API_KEY),
   theme: "system",
   sidebarHidden: false,
@@ -108,6 +109,14 @@ function loadSettings() {
   }
 }
 
+function hasPersistedSettings() {
+  try {
+    return localStorage.getItem(SETTINGS_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
 function normalizeSettings(value) {
   return {
     systemPrompt: typeof value.systemPrompt === "string" ? value.systemPrompt : "",
@@ -119,7 +128,7 @@ function normalizeSettings(value) {
     ),
     temperature: clampNumber(value.temperature, 0, 2, DEFAULT_SETTINGS.temperature),
     topP: clampNumber(value.topP, 0.01, 1, DEFAULT_SETTINGS.topP),
-    topK: clampInteger(value.topK, 1, 200, DEFAULT_SETTINGS.topK),
+    topK: clampInteger(value.topK, 0, 200, DEFAULT_SETTINGS.topK),
     thinking: Boolean(value.thinking),
   };
 }
@@ -199,7 +208,19 @@ function persistConversations() {
 }
 
 function persistSettings() {
+  state.settingsCustomized = true;
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+}
+
+function settingsFromModelDefaults() {
+  const defaults = state.properties?.generation_defaults || {};
+  return normalizeSettings({
+    ...DEFAULT_SETTINGS,
+    maxTokens: defaults.max_new_tokens ?? DEFAULT_SETTINGS.maxTokens,
+    temperature: defaults.temperature ?? DEFAULT_SETTINGS.temperature,
+    topP: defaults.top_p ?? DEFAULT_SETTINGS.topP,
+    topK: defaults.top_k ?? DEFAULT_SETTINGS.topK,
+  });
 }
 
 // The entry point for every "new chat" affordance: the logo, the sidebar
@@ -1902,6 +1923,10 @@ async function pollRuntime() {
       // Context window and output ceiling are fixed for the loaded model, so
       // this endpoint is read once rather than on every poll.
       state.properties = properties;
+      if (!state.settingsCustomized) {
+        state.settings = settingsFromModelDefaults();
+        renderSettingsSummary();
+      }
       state.maxOutputTokens = clampInteger(
         Math.min(
           properties.context_window || Number.MAX_SAFE_INTEGER,
@@ -2034,7 +2059,7 @@ function saveSettings() {
 }
 
 function resetSettings() {
-  state.settings = { ...DEFAULT_SETTINGS };
+  state.settings = settingsFromModelDefaults();
   elements.systemPrompt.value = state.settings.systemPrompt;
   elements.maxTokens.value = state.settings.maxTokens;
   elements.temperature.value = state.settings.temperature;

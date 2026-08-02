@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import codecs
+import datetime
 import json
 import threading
 from collections import OrderedDict
 from pathlib import Path
 from queue import SimpleQueue
 from typing import Iterator, Mapping, Sequence, overload
+
+from jinja2 import StrictUndefined, Template, nodes
+from jinja2.ext import Extension
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
@@ -20,6 +25,63 @@ from .v2 import (
     V2Model,
     V2QwenRuntime,
 )
+
+
+class _GenerationExtension(Extension):
+    """Render Hugging Face's generation block without token-span tracking."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.CallBlock(self.call_method("_render"), [], [], body).set_lineno(
+            lineno
+        )
+
+    def _render(self, caller):
+        return caller()
+
+
+def _generation_config_for_model(
+    model_path: Path | str,
+) -> tuple[dict[str, int | float], str]:
+    """Load Hugging Face generation defaults adjacent to a GGUF, if present.
+
+    The two stem-specific names avoid ambiguity in directories containing more
+    than one model. The conventional directory-level name supports GGUF files
+    kept inside an exported Hugging Face model directory.
+    """
+    path = Path(model_path)
+    candidates = (
+        path.with_name(path.name + ".generation_config.json"),
+        path.with_suffix(".generation_config.json"),
+        path.parent / "generation_config.json",
+    )
+    config_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if config_path is None:
+        return {}, "engine"
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"unable to read generation config {config_path}: {error}") from error
+    if not isinstance(raw, dict):
+        raise ValueError(f"generation config {config_path} must contain a JSON object")
+
+    defaults: dict[str, int | float] = {}
+    for key in ("temperature", "top_p"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            defaults[key] = float(value)
+    top_k = raw.get("top_k")
+    if isinstance(top_k, int) and not isinstance(top_k, bool):
+        defaults["top_k"] = top_k
+    max_new_tokens = raw.get("max_new_tokens")
+    if isinstance(max_new_tokens, int) and not isinstance(max_new_tokens, bool):
+        defaults["max_new_tokens"] = max_new_tokens
+    if raw.get("do_sample") is False:
+        defaults["temperature"] = 0.0
+    return defaults, str(config_path)
 
 
 class _TokenSnapshot(Sequence[int]):
@@ -185,6 +247,9 @@ class NativeV2Tokenizer:
     def __init__(self, model: V2Model):
         self.model = model
         self.architecture = str(model.info["architecture"])
+        self.chat_template = getattr(model, "chat_template", None)
+        self.chat_template_source = "gguf" if self.chat_template else "fallback"
+        self._compiled_chat_template: Template | None = None
         eos: list[int] = []
         # The GGUF's own terminator ids first. eot ends a chat turn where eos
         # ends generation, and a model that closes its turn with a dedicated
@@ -206,6 +271,42 @@ class NativeV2Tokenizer:
                 pass
         self.eos_token_ids = tuple(dict.fromkeys(eos))
         self._token_byte_cache: dict[int, bytes] = {}
+        self._template_tokens = {
+            "bos_token": self._configured_token(config, "bos_token_id"),
+            "eos_token": self._configured_token(config, "eos_token_id"),
+        }
+        if self.chat_template:
+            environment = ImmutableSandboxedEnvironment(
+                trim_blocks=True,
+                lstrip_blocks=True,
+                undefined=StrictUndefined,
+                extensions=[_GenerationExtension],
+            )
+            environment.globals["raise_exception"] = self._raise_template_exception
+            environment.globals["strftime_now"] = (
+                lambda pattern: datetime.datetime.now().strftime(pattern)
+            )
+            environment.filters["tojson"] = self._to_json
+            self._compiled_chat_template = environment.from_string(self.chat_template)
+
+    def _configured_token(self, config: Mapping[str, object], field: str) -> str:
+        token_id = config.get(field)
+        if token_id is None or token_id == 0xFFFFFFFF:
+            return ""
+        try:
+            return self.model.token_text(int(token_id))
+        except (V2Error, KeyError, ValueError):
+            return ""
+
+    @staticmethod
+    def _raise_template_exception(message: object) -> None:
+        raise ValueError(str(message))
+
+    @staticmethod
+    def _to_json(value: object, indent: int | None = None) -> str:
+        if indent is None:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(value, ensure_ascii=False, indent=indent)
 
     @property
     def turn_separator(self) -> str:
@@ -245,6 +346,25 @@ class NativeV2Tokenizer:
     ) -> str:
         if not messages:
             raise ValueError("messages must not be empty")
+        compiled_template = getattr(self, "_compiled_chat_template", None)
+        if compiled_template is not None:
+            normalized: list[dict[str, str]] = []
+            for message in messages:
+                role = message["role"]
+                content = message["content"]
+                if role not in ("system", "developer", "user", "assistant", "tool"):
+                    raise ValueError(f"unsupported chat role: {role}")
+                if not content.strip():
+                    raise ValueError("chat message content must not be empty")
+                normalized.append({"role": role, "content": content})
+            return compiled_template.render(
+                messages=normalized,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                tools=None,
+                documents=None,
+                **self._template_tokens,
+            )
         if self.architecture == "gemma4":
             return self._format_gemma4(messages, enable_thinking=enable_thinking)
         if self.architecture == "laguna":
@@ -724,6 +844,9 @@ class NativeV2InferenceService(InferenceService):
         request_timeout_seconds: float = 30.0,
         sse_keepalive_seconds: float = 10.0,
     ):
+        generation_defaults, generation_defaults_source = _generation_config_for_model(
+            model_path
+        )
         self.v2_model = V2Model(model_path, mtp_model=mtp_model_path)
         self.v2_runtime: V2QwenRuntime | None = None
         try:
@@ -770,7 +893,9 @@ class NativeV2InferenceService(InferenceService):
             max_concurrent_requests=max_concurrent_requests,
             request_timeout_seconds=request_timeout_seconds,
             sse_keepalive_seconds=sse_keepalive_seconds,
+            generation_defaults=generation_defaults,
         )
+        self.generation_defaults_source = generation_defaults_source
         runtime_info = self.v2_runtime.info
         self.requested_expert_mode = str(runtime_info["requested_expert_mode"])
         self.expert_mode = str(runtime_info["expert_mode"])
@@ -810,4 +935,16 @@ class NativeV2InferenceService(InferenceService):
             "mtp_drafts": self.mtp_drafts,
             "gpu_cache_mib": self.gpu_cache_mib,
         }
+        return value
+
+    def properties(self) -> dict[str, object]:
+        value = super().properties()
+        tokenizer = self.generator.tokenizer
+        source = getattr(tokenizer, "chat_template_source", "fallback")
+        architecture = getattr(tokenizer, "architecture", "unknown")
+        value["chat_template"] = (
+            "tokenizer.chat_template" if source == "gguf" else f"{architecture}-fallback"
+        )
+        value["chat_template_source"] = source
+        value["generation_defaults_source"] = self.generation_defaults_source
         return value

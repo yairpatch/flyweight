@@ -378,6 +378,7 @@ class V2RuntimeTests(unittest.TestCase):
         sliding_pattern: tuple[bool, ...] | None = None,
         architecture: str = "qwen3moe",
         kv_heads: tuple[int, ...] | None = None,
+        chat_template: str | None = None,
     ) -> tuple[Path, bytes]:
         prefix = architecture
         metadata_items = [
@@ -396,6 +397,12 @@ class V2RuntimeTests(unittest.TestCase):
                 gguf_string(f"{prefix}.attention.head_count_kv")
                 + struct.pack("<IIQ", 9, 5, len(kv_heads))
                 + struct.pack(f"<{len(kv_heads)}i", *kv_heads)
+            )
+        if chat_template is not None:
+            metadata_items.append(
+                gguf_string("tokenizer.chat_template")
+                + struct.pack("<I", 8)
+                + gguf_string(chat_template)
             )
         if sliding_pattern is not None:
             metadata_items.extend((
@@ -416,7 +423,8 @@ class V2RuntimeTests(unittest.TestCase):
         return Path(handle.name), payload
 
     def test_reads_metadata_and_tensor_offsets(self):
-        path, payload = self.make_model()
+        template = "{% for message in messages %}{{ message.content }}{% endfor %}"
+        path, payload = self.make_model(chat_template=template)
         try:
             with V2Model(path) as model:
                 self.assertEqual(model.info["architecture"], "qwen3moe")
@@ -425,6 +433,7 @@ class V2RuntimeTests(unittest.TestCase):
                 self.assertEqual(model.config["full_attention_interval"], 4)
                 self.assertAlmostEqual(model.config["rms_norm_epsilon"], 1e-6)
                 self.assertEqual(model.config["rope_freq_base"], 10_000_000.0)
+                self.assertEqual(model.chat_template, template)
                 model.validate_qwen()
                 self.assertEqual(model.qwen_tensor("token_embeddings")["name"], "token_embd.weight")
                 tensor = model.tensor("token_embd.weight")
@@ -437,6 +446,14 @@ class V2RuntimeTests(unittest.TestCase):
                     model.view_tensor_slice("token_embd.weight", 1, 2),
                     payload[1:3],
                 )
+        finally:
+            path.unlink()
+
+    def test_missing_chat_template_is_none(self):
+        path, _ = self.make_model()
+        try:
+            with V2Model(path) as model:
+                self.assertIsNone(model.chat_template)
         finally:
             path.unlink()
 

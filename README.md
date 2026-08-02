@@ -112,6 +112,14 @@ Set `COLIBRI_API_KEY` or pass `--api-key` to require bearer authentication.
 Use `--strict-model` when request model IDs must exactly match the configured
 server model name.
 
+Chat requests use the GGUF's `tokenizer.chat_template` when it is present;
+the built-in architecture formatter is only a fallback for older files. If a
+`generation_config.json` is stored beside the GGUF, its `temperature`, `top_k`,
+`top_p`, `max_new_tokens`, and `do_sample` defaults are also loaded. Explicit
+API request values always override model defaults. `GET /props` reports the
+resolved defaults and their sources, and the bundled UI adopts them until the
+user saves custom settings.
+
 ## Inspect and generate
 
 ~~~bash

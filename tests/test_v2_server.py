@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 from colibri_next.cli import _parser
 from colibri_next.sampling import SamplingConfig
@@ -10,6 +13,7 @@ from colibri_next.v2_server import (
     NativeV2Generator,
     NativeV2InferenceService,
     NativeV2Tokenizer,
+    _generation_config_for_model,
 )
 from colibri_next.v2 import TASK_EVENT_PREFILL
 
@@ -163,6 +167,48 @@ class NativeV2ServerTests(unittest.TestCase):
         )
         return generator, runtime
 
+    def test_generation_config_adjacent_to_model_supplies_sampling_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            model.touch()
+            config = root / "generation_config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "do_sample": True,
+                        "temperature": 0.6,
+                        "top_k": 20,
+                        "top_p": 0.9,
+                        "max_new_tokens": 512,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            defaults, source = _generation_config_for_model(model)
+
+        self.assertEqual(
+            defaults,
+            {"temperature": 0.6, "top_k": 20, "top_p": 0.9, "max_new_tokens": 512},
+        )
+        self.assertEqual(source, str(config))
+
+    def test_generation_config_disables_sampling_when_do_sample_is_false(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            model.touch()
+            config = root / "model.generation_config.json"
+            config.write_text(
+                json.dumps({"do_sample": False, "temperature": 0.7}),
+                encoding="utf-8",
+            )
+
+            defaults, _ = _generation_config_for_model(model)
+
+        self.assertEqual(defaults["temperature"], 0.0)
+
     def test_health_exposes_resolved_expert_policy(self) -> None:
         class Runtime:
             info = {
@@ -264,6 +310,25 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertTrue(
             direct.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         )
+
+    def test_gguf_chat_template_takes_precedence_over_architecture_fallback(self) -> None:
+        class TemplateModel(StubV2Model):
+            config = {}
+            chat_template = (
+                "{% for message in messages %}[{{ message.role }}]"
+                "{{ message.content }}{% endfor %}"
+                "{% if add_generation_prompt %}{% generation %}[assistant]"
+                "{% if enable_thinking %}<think>{% endif %}"
+                "{% endgeneration %}{% endif %}"
+            )
+
+        tokenizer = NativeV2Tokenizer(TemplateModel())  # type: ignore[arg-type]
+        prompt = tokenizer.format_messages(
+            [{"role": "user", "content": "Hello"}], enable_thinking=True
+        )
+
+        self.assertEqual(prompt, "[user]Hello[assistant]<think>")
+        self.assertEqual(tokenizer.chat_template_source, "gguf")
 
     def test_multibyte_character_split_across_tokens_decodes_intact(self) -> None:
         # Byte-level BPE splits "⚽" (e2 9a bd) across tokens 40+41. Per-token

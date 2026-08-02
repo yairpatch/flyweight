@@ -9,6 +9,7 @@ description = "Native GGUF inference runtime for Qwen and Gemma models"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+dependencies = ["Jinja2>=3.1"]
 
 [project.optional-dependencies]
 client = ["openai>=2.0"]
