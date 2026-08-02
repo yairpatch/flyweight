@@ -1,6 +1,8 @@
 #include "colibri_v2.h"
 #include "colibri_gpu_driver.h"
 #include <colibri_backend.hpp>
+
+#include <atomic>
 #include "colibri_v2_provider.hpp"
 #include "colibri_v2_config.hpp"
 #include "colibri_v2_attention_policy.hpp"
@@ -2627,6 +2629,37 @@ float qwen_expert_role_scale(
     return value;
 }
 
+// Per-phase MoE timing. The expert path does not go through launch_named, so
+// COLIBRI_CPU_PROFILE cannot see inside it; this is the only view of where the
+// ~43% of decode that lands here actually goes. Off unless COLIBRI_MOE_PROFILE=1.
+std::atomic<std::uint64_t> g_moe_gate_up_ns{0}, g_moe_quant_ns{0}, g_moe_down_ns{0};
+std::atomic<std::uint64_t> g_moe_calls{0};
+
+bool moe_profiling() {
+    static const bool on = [] {
+        const char* s = std::getenv("COLIBRI_MOE_PROFILE");
+        return s && s[0] == '1';
+    }();
+    return on;
+}
+
+extern "C" COLIBRI_BACKEND_API void colibri_moe_profile_dump() {
+    if (!moe_profiling()) return;
+    const double gate_up = g_moe_gate_up_ns.load() / 1e6;
+    const double quant = g_moe_quant_ns.load() / 1e6;
+    const double down = g_moe_down_ns.load() / 1e6;
+    const double total = gate_up + quant + down;
+    if (total <= 0.0) return;
+    std::fprintf(stderr,
+        "\n[colibri-moe] %llu calls, %.1f ms total\n"
+        "  gate+up+swiglu %8.1f ms  %5.1f%%\n"
+        "  activation q8  %8.1f ms  %5.1f%%\n"
+        "  down           %8.1f ms  %5.1f%%\n",
+        static_cast<unsigned long long>(g_moe_calls.load()), total,
+        gate_up, 100*gate_up/total, quant, 100*quant/total,
+        down, 100*down/total);
+}
+
 void qwen_cpu_moe(
     const ColibriV2QwenRuntime& runtime,
     const QwenLayerPlan& layer,
@@ -2823,11 +2856,26 @@ void qwen_cpu_moe(
 #pragma omp parallel num_threads(team)
 #endif
         {
+            // `omp for` carries an implicit barrier, so a timestamp taken by one
+            // thread between them is a true phase boundary rather than a sample
+            // of whichever thread got there first.
+            const bool profile = moe_profiling();
+            auto mark = std::chrono::steady_clock::time_point{};
+            if (profile) mark = std::chrono::steady_clock::now();
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
             for (int task = 0; task < routed_count * intermediate; ++task)
                 gate_up_task(task);
+#if defined(_OPENMP)
+#pragma omp master
+#endif
+            if (profile) {
+                const auto now = std::chrono::steady_clock::now();
+                g_moe_gate_up_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now-mark).count());
+                mark = now;
+            }
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
@@ -2839,9 +2887,27 @@ void qwen_cpu_moe(
                 );
             }
 #if defined(_OPENMP)
+#pragma omp master
+#endif
+            if (profile) {
+                const auto now = std::chrono::steady_clock::now();
+                g_moe_quant_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now-mark).count());
+                mark = now;
+            }
+#if defined(_OPENMP)
 #pragma omp for schedule(static)
 #endif
             for (int row = 0; row < hidden; ++row) down_row(row);
+#if defined(_OPENMP)
+#pragma omp master
+#endif
+            if (profile) {
+                g_moe_down_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now()-mark).count());
+                ++g_moe_calls;
+            }
         }
     } else {
         // One team covers both dependent phases. The implicit barrier after the
