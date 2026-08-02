@@ -56,6 +56,9 @@ void fail(const char* message) { error = message; }
 template <class F> int guarded(F&& f) { try { return f(); } catch (const std::exception& e) { error = e.what(); return -1; } catch (...) { error = "unknown native exception"; return -1; } }
 
 struct Tensor : colibri::v2::TensorDescriptor {
+    // Null means the primary model mapping. MTP overlays point into the
+    // sidecar mapping retained by ColibriV2Model::mtp_sidecar.
+    const uint8_t* source = nullptr;
 };
 
 struct Reader {
@@ -79,7 +82,7 @@ struct Reader {
 // Execution consumes this descriptor rather than GGUF internals. GGUF is the
 // first WeightProvider; future providers can populate the same
 // tensor contract without changing CUDA/runtime code.
-struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf"; colibri::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors;
+struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf"; colibri::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors; std::unique_ptr<ColibriV2Model> mtp_sidecar;
     // GGUF tokenizer.ggml.pre selects the pre-tokenizer. Control tokens (GGUF
     // token type 3) never come out of BPE and have to be split off ahead of it.
     std::string tokenizer_pre; std::vector<std::uint32_t> token_types;
@@ -102,8 +105,12 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
     const char* format() const override { return format_name.c_str(); }
     uint64_t tensor_count() const override { return tensors.size(); }
     const colibri::v2::TensorDescriptor* tensor(uint64_t index) const override { return index < tensors.size() ? &tensors[index] : nullptr; }
-    int read_tensor(uint64_t index, void* destination, uint64_t bytes) const override { if(index >= tensors.size() || !destination || bytes < tensors[index].size) return -1; std::memcpy(destination, data + tensors[index].offset, tensors[index].size); return 0; }
+    int read_tensor(uint64_t index, void* destination, uint64_t bytes) const override { if(index >= tensors.size() || !destination || bytes < tensors[index].size) return -1; const auto& tensor=tensors[index];const auto*base=tensor.source?tensor.source:data;std::memcpy(destination, base + tensor.offset, tensor.size); return 0; }
 };
+
+const uint8_t* tensor_data(const ColibriV2Model& model, const Tensor& tensor) {
+    return (tensor.source ? tensor.source : model.data) + tensor.offset;
+}
 struct ColibriV2KvCache { std::uint64_t keys, values; std::int32_t capacity, kv_heads, head_dim, position=0; };
 
 struct QwenLayerPlan {
@@ -414,6 +421,7 @@ struct ColibriV2QwenRuntime {
     bool mtp_adaptive_reported = false;
     std::uint64_t mtp_target_hidden_offset = 0;
     std::uint64_t mtp_draft_hidden_offset = 0;
+    std::uint64_t mtp_verified_hidden_offset = 0;
     std::uint64_t mtp_snapshot_offset = 0;
     std::uint64_t mtp_snapshot_bytes = 0;
     std::uint64_t mtp_cache_tokens = 0;
@@ -574,7 +582,10 @@ struct QwenResidencyEpochGuard {
 };
 
 std::size_t qwen_cache_layer_count(const ColibriV2QwenRuntime& runtime) {
-    return runtime.layers.size() + (runtime.options.mtp_drafts ? 1U : 0U);
+    // The MTP block's routed experts execute directly on the CPU and do
+    // not consult expert_residency. Only target layers consume GPU cache slots
+    // or persistent routing history.
+    return runtime.layers.size();
 }
 
 constexpr std::size_t kNoExpertSlot = std::numeric_limits<std::size_t>::max();
@@ -938,7 +949,8 @@ static void qwen_observe_and_prefetch_next_layer(
             const auto bytes = tensor.size / experts;
             const auto offset =
                 tensor.offset + static_cast<std::uint64_t>(expert) * bytes;
-            const auto* base = runtime.model->data + offset;
+            const auto* base = tensor_data(*runtime.model,tensor) +
+                static_cast<std::uint64_t>(expert) * bytes;
             const std::size_t page_size = 4096;
             for (std::size_t pos = 0; pos < bytes; pos += page_size)
                 (void)base[pos];
@@ -963,7 +975,7 @@ static void qwen_observe_and_prefetch_next_layer(
                 const auto offset = static_cast<std::uint64_t>(expert) * bytes;
                 if (colibri_gpu_upload(
                         slot_base + role_offset,
-                        runtime.model->data + tensor.offset + offset,
+                        tensor_data(*runtime.model,tensor) + offset,
                         bytes, runtime.prefetch_stream
                     ) != 0)
                     throw std::runtime_error(
@@ -1538,7 +1550,7 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
                 if (!has_tensor(model, name)) return 1.0f;
                 const auto& st = model.tensors[tensor_index(model, name)];
                 float value = 1.0f;
-                std::memcpy(&value, model.data + st.offset, sizeof(float));
+                std::memcpy(&value, tensor_data(model,st), sizeof(float));
                 return value;
             };
             layer.shared_gate_scale = scalar_scale(prefix + "ffn_gate_shexp.scale");
@@ -1592,7 +1604,7 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
                 if (!has_tensor(model, name)) return 1.0f;
                 const auto& st = model.tensors[tensor_index(model, name)];
                 float value = 1.0f;
-                std::memcpy(&value, model.data + st.offset, sizeof(float));
+                std::memcpy(&value, tensor_data(model,st), sizeof(float));
                 return value;
             };
             draft.shared_gate_scale = draft_scalar_scale(prefix + "ffn_gate_shexp.scale");
@@ -2256,12 +2268,12 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
     if(gate_up_tensor.type!=2||down_tensor.type!=2||scale_tensor.type!=0)
         throw std::runtime_error("native Gemma 4 expects Q4_0 experts and f32 expert scales");
     const auto gate_up_bytes=gate_up_tensor.size/experts,down_bytes=down_tensor.size/experts;
-    const auto*expert_scales=reinterpret_cast<const float*>(runtime.model->data+scale_tensor.offset);
+    const auto*expert_scales=reinterpret_cast<const float*>(tensor_data(*runtime.model,scale_tensor));
     #pragma omp parallel for schedule(dynamic,4) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<routed_count*intermediate;++task){
         const int rank=task/intermediate,row=task%intermediate,expert=selected[rank];
         if(expert<0||expert>=experts)continue;
-        const auto*gate_up=runtime.model->data+gate_up_tensor.offset+static_cast<std::uint64_t>(expert)*gate_up_bytes;
+        const auto*gate_up=tensor_data(*runtime.model,gate_up_tensor)+static_cast<std::uint64_t>(expert)*gate_up_bytes;
         const float gate=qwen_quant_dot(gate_up,2,input,hidden,row);
         const float up=qwen_quant_dot(gate_up,2,input,hidden,row+intermediate);
         const float cubic=gate*gate*gate;
@@ -2271,7 +2283,7 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
     #pragma omp parallel for schedule(dynamic,4) num_threads(qwen_cpu_thread_count(runtime))
     for(int row=0;row<hidden;++row){
         float sum=0.0f;
-        for(int rank=0;rank<routed_count;++rank){const int expert=selected[rank];if(expert<0||expert>=experts)continue;const auto*down=runtime.model->data+down_tensor.offset+static_cast<std::uint64_t>(expert)*down_bytes;sum+=weights[rank]*expert_scales[expert]*qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);}
+        for(int rank=0;rank<routed_count;++rank){const int expert=selected[rank];if(expert<0||expert>=experts)continue;const auto*down=tensor_data(*runtime.model,down_tensor)+static_cast<std::uint64_t>(expert)*down_bytes;sum+=weights[rank]*expert_scales[expert]*qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);}
         output[row]=sum;
     }
 }
@@ -2289,9 +2301,9 @@ void qwen_cpu_dense_ffn(
     const auto&gate_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+1]];
     const auto&up_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+2]];
     const auto&down_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+3]];
-    const auto*gate_data=runtime.model->data+gate_tensor.offset;
-    const auto*up_data=runtime.model->data+up_tensor.offset;
-    const auto*down_data=runtime.model->data+down_tensor.offset;
+    const auto*gate_data=tensor_data(*runtime.model,gate_tensor);
+    const auto*up_data=tensor_data(*runtime.model,up_tensor);
+    const auto*down_data=tensor_data(*runtime.model,down_tensor);
     // The pinned buffers the caller hands over are DMA staging, and every
     // output row re-reads the whole activation vector -- roughly 700 MiB of
     // re-reads per block. Doing that against page-locked memory costs ~5x, so
@@ -2512,7 +2524,7 @@ std::uint64_t qwen_stage_embedding_rows(
     const auto& table = runtime.model->tensors[runtime.token_embeddings];
     const auto row_bytes = runtime.embedding_row_bytes;
     const auto vocabulary = table.size / row_bytes;
-    const auto* source = runtime.model->data + table.offset;
+    const auto* source = tensor_data(*runtime.model,table);
     // Single-token decode is the hot case. When the mapping is registered the
     // row can be DMA'd straight out of it, which drops both the host memcpy and
     // the pinned-buffer reuse hazard from the per-token path. A rows chunk
@@ -2565,7 +2577,7 @@ float qwen_expert_role_scale(
     float value = 1.0f;
     std::memcpy(
         &value,
-        runtime.model->data + st.offset
+        tensor_data(*runtime.model,st)
             + static_cast<std::uint64_t>(expert) * scale_bytes,
         sizeof(float)
     );
@@ -2609,7 +2621,7 @@ void qwen_cpu_moe(
         for (int role = 0; role < 3; ++role) {
             const auto& t = runtime.model->tensors[layer.expert_tensors[role]];
             const auto bytes = t.size / experts;
-            const auto* pointer = runtime.model->data + t.offset
+            const auto* pointer = tensor_data(*runtime.model,t)
                 + static_cast<std::uint64_t>(selected[rank]) * bytes;
             if (role == 0) gate[rank] = pointer;
             else if (role == 1) up[rank] = pointer;
@@ -2867,7 +2879,7 @@ void qwen_cpu_moe_rows(
                 "unsupported native CPU expert quantization: "+std::to_string(type));
     auto expert_data=[&](int role,int expert){
         const auto&t=runtime.model->tensors[layer.expert_tensors[role]];
-        return runtime.model->data+t.offset+static_cast<std::uint64_t>(expert)*(t.size/experts);
+        return tensor_data(*runtime.model,t)+static_cast<std::uint64_t>(expert)*(t.size/experts);
     };
     // Group routes by expert (CSR over token_rank slots) so each expert's
     // weight rows are decoded once per batch and dotted with every token
@@ -3170,6 +3182,59 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
     }
 #endif
     parse(*m); *out=m.release(); return 0; }); }
+int colibri_v2_model_attach_mtp(ColibriV2Model* m,const char*path){return guarded([&]{
+    if(!m||!path||!path[0])throw std::runtime_error("model and MTP sidecar path are required");
+    if(m->mtp_sidecar)throw std::runtime_error("an MTP sidecar is already attached");
+    ColibriV2Model*opened=nullptr;
+    if(colibri_v2_model_open(path,&opened)!=0)
+        throw std::runtime_error(error.empty()?"failed to open MTP sidecar":error);
+    std::unique_ptr<ColibriV2Model>sidecar(opened);
+    if(sidecar->mtp_layer==std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("MTP sidecar has no draft block");
+    if(m->mtp_layer!=std::numeric_limits<std::uint32_t>::max()&&
+       sidecar->mtp_layer!=m->mtp_layer)
+        throw std::runtime_error("MTP sidecar draft layer does not match the base GGUF");
+    if(sidecar->config.hidden_size!=m->config.hidden_size||
+       sidecar->config.attention_heads!=m->config.attention_heads||
+       sidecar->config.attention_kv_heads!=m->config.attention_kv_heads||
+       sidecar->config.expert_count!=m->config.expert_count||
+       sidecar->config.expert_used_count!=m->config.expert_used_count)
+        throw std::runtime_error("MTP sidecar model geometry does not match the base GGUF");
+    if(m->mtp_layer==std::numeric_limits<std::uint32_t>::max())
+        m->mtp_layer=sidecar->mtp_layer;
+    const std::string prefix="blk."+std::to_string(m->mtp_layer)+".";
+    std::size_t replaced=0;
+    for(auto&target:m->tensors){
+        if(target.name.rfind(prefix,0)!=0)continue;
+        const auto found=std::find_if(sidecar->tensors.begin(),sidecar->tensors.end(),
+            [&](const Tensor&candidate){return candidate.name==target.name;});
+        if(found==sidecar->tensors.end())
+            throw std::runtime_error("MTP sidecar is missing tensor: "+target.name);
+        auto elements=[](const Tensor&tensor){std::uint64_t result=1;for(const auto dimension:tensor.shape)result*=dimension;return result;};
+        if(found->shape!=target.shape&&elements(*found)!=elements(target))
+            throw std::runtime_error("MTP sidecar tensor shape mismatch: "+target.name);
+        target.type=found->type;
+        target.offset=found->offset;
+        target.size=found->size;
+        target.source=sidecar->data;
+        ++replaced;
+    }
+    // Trunk-only GGUFs omit the optional draft block entirely. Append its
+    // descriptors while keeping their bytes in the sidecar mapping.
+    for(const auto&candidate:sidecar->tensors){
+        if(candidate.name.rfind(prefix,0)!=0)continue;
+        const auto present=std::any_of(m->tensors.begin(),m->tensors.end(),
+            [&](const Tensor&target){return target.name==candidate.name;});
+        if(present)continue;
+        auto added=candidate;
+        added.source=sidecar->data;
+        m->tensors.push_back(std::move(added));
+        ++replaced;
+    }
+    if(!replaced)throw std::runtime_error("MTP sidecar did not replace any tensors");
+    m->mtp_sidecar=std::move(sidecar);
+    return 0;
+});}
 void colibri_v2_model_close(ColibriV2Model* m) { try{delete m;}catch(...){} }
 int colibri_v2_model_info(const ColibriV2Model* m, ColibriV2ModelInfo* out) { return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model info handle"); std::memset(out,0,sizeof(*out));out->gguf_version=m->version;out->tensor_count=m->tensor_count();out->metadata_count=m->metadata;out->file_size=m->size;out->alignment=m->alignment;copy_text(out->architecture,sizeof(out->architecture),m->architecture);copy_text(out->name,sizeof(out->name),m->name);copy_text(out->format,sizeof(out->format),m->format());return 0;}); }
 int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;out->eos_token_id=m->config.eos_token_id;out->eot_token_id=m->config.eot_token_id;out->bos_token_id=m->config.bos_token_id;return 0;});}
@@ -3182,8 +3247,8 @@ int colibri_v2_qwen_layer_tensor(const ColibriV2Model*m,uint32_t layer,const cha
 float half_to_float(uint16_t bits){uint32_t sign=(bits&0x8000u)<<16, exponent=(bits>>10)&0x1fu, fraction=bits&0x3ffu;uint32_t result;if(exponent==0){if(!fraction)result=sign;else{exponent=1;while((fraction&0x400u)==0){fraction<<=1;--exponent;}result=sign|((exponent+112)<<23)|((fraction&0x3ffu)<<13);}}else if(exponent==31)result=sign|0x7f800000u|(fraction<<13);else result=sign|((exponent+112)<<23)|(fraction<<13);float value;std::memcpy(&value,&result,sizeof(value));return value;}
 float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
 const Tensor& qwen_role_tensor(const ColibriV2Model&m,const char*role){std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m.tensors)if(t.name==candidate)return t;throw std::runtime_error("Qwen tensor role is missing");}
-int colibri_v2_qwen_embedding(const ColibriV2Model*m,uint32_t token,float*out,uint64_t elements){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid embedding arguments");const Tensor&t=qwen_role_tensor(*m,"token_embeddings");if(t.shape.size()!=2)throw std::runtime_error("embedding shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(token>=vocab||elements<width)throw std::runtime_error("embedding token or buffer is invalid");for(uint64_t i=0;i<width;i++)out[i]=tensor_value(m->data+t.offset,t.type,static_cast<uint64_t>(token)*width+i);return 0;});}
-int colibri_v2_qwen_lm_head(const ColibriV2Model*m,const float*hidden,float*logits,uint64_t vocabulary,uint64_t elements){return guarded([&]{if(!m||!hidden||!logits)throw std::runtime_error("invalid LM-head arguments");const Tensor&t=qwen_role_tensor(*m,"lm_head");if(t.shape.size()!=2)throw std::runtime_error("LM-head shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(vocabulary<vocab||elements<width)throw std::runtime_error("LM-head shape or buffer is invalid");for(uint64_t row=0;row<vocab;row++){float sum=0;for(uint64_t column=0;column<width;column++)sum+=tensor_value(m->data+t.offset,t.type,row*width+column)*hidden[column];logits[row]=sum;}return 0;});}
+int colibri_v2_qwen_embedding(const ColibriV2Model*m,uint32_t token,float*out,uint64_t elements){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid embedding arguments");const Tensor&t=qwen_role_tensor(*m,"token_embeddings");if(t.shape.size()!=2)throw std::runtime_error("embedding shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(token>=vocab||elements<width)throw std::runtime_error("embedding token or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t i=0;i<width;i++)out[i]=tensor_value(data,t.type,static_cast<uint64_t>(token)*width+i);return 0;});}
+int colibri_v2_qwen_lm_head(const ColibriV2Model*m,const float*hidden,float*logits,uint64_t vocabulary,uint64_t elements){return guarded([&]{if(!m||!hidden||!logits)throw std::runtime_error("invalid LM-head arguments");const Tensor&t=qwen_role_tensor(*m,"lm_head");if(t.shape.size()!=2)throw std::runtime_error("LM-head shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(vocabulary<vocab||elements<width)throw std::runtime_error("LM-head shape or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t row=0;row<vocab;row++){float sum=0;for(uint64_t column=0;column<width;column++)sum+=tensor_value(data,t.type,row*width+column)*hidden[column];logits[row]=sum;}return 0;});}
 int colibri_v2_qwen_token_text(const ColibriV2Model*m,uint32_t token,char*out,uint64_t capacity){return guarded([&]{if(!m||!out||capacity==0)throw std::runtime_error("invalid token text arguments");if(token>=m->vocabulary.size())throw std::runtime_error("token is outside the GGUF vocabulary");const std::string&value=m->vocabulary[token];if(capacity<=value.size())throw std::runtime_error("token text buffer is too small");std::memcpy(out,value.data(),value.size());out[value.size()]=0;return 0;});}
 int colibri_v2_token_id(const ColibriV2Model*m,const char*text,uint32_t*token){return guarded([&]{if(!m||!text||!token)throw std::runtime_error("invalid token lookup arguments");const auto it=m->vocabulary_ids.find(text);if(it==m->vocabulary_ids.end())throw std::runtime_error("token text is not in the GGUF vocabulary");*token=it->second;return 0;});}
 std::string gguf_byte_encode(const char*text){static const int direct[] = {33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,161,162,163,164,165,166,167,168,169,170,171,172,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255};std::array<int,256>map{};for(int i=0;i<256;i++)map[i]=-1;for(int i=0;i<static_cast<int>(sizeof(direct)/sizeof(direct[0]));i++)map[direct[i]]=direct[i];int extra=0;for(int i=0;i<256;i++)if(map[i]<0)map[i]=256+extra++;std::string out;for(const unsigned char*p=reinterpret_cast<const unsigned char*>(text);*p;p++){int cp=map[*p];if(cp<128)out.push_back(static_cast<char>(cp));else if(cp<2048){out.push_back(static_cast<char>(0xC0|(cp>>6)));out.push_back(static_cast<char>(0x80|(cp&63)));}else{out.push_back(static_cast<char>(0xE0|(cp>>12)));out.push_back(static_cast<char>(0x80|((cp>>6)&63)));out.push_back(static_cast<char>(0x80|(cp&63)));}}return out;}
@@ -3451,8 +3516,8 @@ int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,u
     return 0;
 });}
 int colibri_v2_tensor_read(const ColibriV2Model* m,uint64_t i,void* dst,uint64_t bytes){return guarded([&]{if(!m||m->read_tensor(i,dst,bytes)!=0)throw std::runtime_error("invalid tensor read");return 0;});}
-int colibri_v2_tensor_read_slice(const ColibriV2Model*m,uint64_t i,uint64_t offset,void*dst,uint64_t bytes){return guarded([&]{if(!m||!dst||i>=m->tensors.size())throw std::runtime_error("invalid tensor slice read");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor slice is out of bounds");std::memcpy(dst,m->data+t.offset+offset,static_cast<size_t>(bytes));return 0;});}
-int colibri_v2_tensor_view(const ColibriV2Model*m,uint64_t i,uint64_t offset,uint64_t bytes,const void**out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("invalid tensor view");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor view is out of bounds");*out=m->data+t.offset+offset;return 0;});}
+int colibri_v2_tensor_read_slice(const ColibriV2Model*m,uint64_t i,uint64_t offset,void*dst,uint64_t bytes){return guarded([&]{if(!m||!dst||i>=m->tensors.size())throw std::runtime_error("invalid tensor slice read");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor slice is out of bounds");std::memcpy(dst,tensor_data(*m,t)+offset,static_cast<size_t>(bytes));return 0;});}
+int colibri_v2_tensor_view(const ColibriV2Model*m,uint64_t i,uint64_t offset,uint64_t bytes,const void**out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("invalid tensor view");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor view is out of bounds");*out=tensor_data(*m,t)+offset;return 0;});}
 int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOptions*options,ColibriV2QwenRuntime**out){return guarded([&]{
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
     const bool gemma4=m->config.architecture=="gemma4";
@@ -3494,6 +3559,8 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
         throw std::runtime_error("native Qwen prefill cache seed auto policy is invalid");
     if(runtime->options.strict_resident>1)
         throw std::runtime_error("native Qwen strict resident policy is invalid");
+    if(runtime->options.dense_requant>2)
+        throw std::runtime_error("native Qwen dense requant policy is invalid");
     if(runtime->options.strict_resident&&
        runtime->expert_mode!=colibri::v2::ExpertExecutionMode::streamed_gpu)
         throw std::runtime_error(
@@ -3798,6 +3865,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
             runtime->mtp_target_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
             runtime->mtp_draft_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
+            runtime->mtp_verified_hidden_offset=reserve(
+                8ULL*runtime->model->config.hidden_size*sizeof(float));
             runtime->mtp_snapshot_offset=state_cursor;
             const auto snapshot_start=state_cursor;
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
@@ -3963,6 +4032,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     static_cast<unsigned long long>(runtime->host_ffn_bytes/(1024ull*1024)));
         }
         std::vector<bool> persistent(runtime->model->tensors.size(),false);
+        std::vector<bool> preserve_bf16(runtime->model->tensors.size(),false);
         if(!runtime->embeddings_host_resident)
             persistent[runtime->token_embeddings]=true;
         persistent[runtime->final_norm]=true;
@@ -3979,8 +4049,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
         }
         if(runtime->options.mtp_drafts){
-            for(auto tensor:runtime->mtp_layer_plan.static_tensors)persistent[tensor]=true;
-            for(auto tensor:runtime->mtp_special_tensors)persistent[tensor]=true;
+            for(auto tensor:runtime->mtp_layer_plan.static_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
+            for(auto tensor:runtime->mtp_special_tensors){persistent[tensor]=true;preserve_bf16[tensor]=true;}
         }
         // NVFP4 checkpoints quantize only the routed experts and ship every
         // dense weight as bf16, which costs ~1.9x Q8_0's bytes for the same
@@ -3994,15 +4064,57 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         //
         // The routed experts are deliberately excluded: they are paged through
         // the expert cache from the mapping, not the static arena, and they are
-        // the tensors NVFP4 exists to compress. COLIBRI_REQUANT_BF16=0 disables.
+        // the tensors NVFP4 exists to compress. The public dense_requant policy
+        // controls this; COLIBRI_REQUANT_BF16 remains a legacy override only
+        // while the policy is auto.
         runtime->device_tensor_types.resize(runtime->model->tensors.size());
         for(std::uint64_t index=0;index<runtime->model->tensors.size();++index)
             runtime->device_tensor_types[index]=runtime->model->tensors[index].type;
         {
-            const char* requant_env=std::getenv("COLIBRI_REQUANT_BF16");
-            if(!(requant_env&&requant_env[0]=='0')){
+            std::uint32_t requant_mode=runtime->options.dense_requant;
+            if(requant_mode==0){
+                const char* legacy=std::getenv("COLIBRI_REQUANT_BF16");
+                if(legacy&&legacy[0]=='0')requant_mode=2;
+                else if(legacy&&legacy[0]=='1')requant_mode=1;
+            }
+            std::uint64_t candidate_count=0;
+            std::uint64_t persistent_bytes=0;
+            for(std::uint64_t index=0;index<persistent.size();++index){
+                if(!persistent[index])continue;
+                const auto&tensor=runtime->model->tensors[index];
+                persistent_bytes+=device_align(tensor.size);
+                if(preserve_bf16[index]||tensor.type!=30)continue;
+                std::uint64_t elements=1;
+                for(auto dimension:tensor.shape)elements*=dimension;
+                if(elements&&elements%32==0)++candidate_count;
+            }
+            std::uint64_t auto_budget=runtime->options.gpu_cache_bytes;
+            if(requant_mode==0&&auto_budget==0){
+                ColibriV2GpuInfo gi{};
+                if(gpu_probe(gi,runtime->options.device)==0&&gi.free_memory>0){
+                    const std::uint64_t margin=std::max<std::uint64_t>(
+                        2048ull*1024*1024,gi.total_memory/8);
+                    if(gi.free_memory>margin)auto_budget=gi.free_memory-margin;
+                }
+            }
+            const std::uint64_t requant_slots=runtime->options.mtp_drafts?1:
+                std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+            const std::uint64_t estimated_base=persistent_bytes+
+                runtime->workspace_bytes+requant_slots*runtime->state_bytes;
+            const auto requant_policy=qwen_expert_policy(
+                *runtime,colibri::v2::ExpertExecutionPhase::prepare);
+            const std::uint64_t useful_expert_cache=
+                requant_policy.routed_gpu_execution_allowed()
+                    ?runtime->expert_tensor_bytes:0;
+            const std::uint64_t estimated_need=estimated_base+useful_expert_cache;
+            const bool auto_pressure=candidate_count&&
+                (auto_budget==0||estimated_need>auto_budget);
+            const bool requantize=requant_mode==1||
+                (requant_mode==0&&auto_pressure);
+            if(requantize){
                 for(std::uint64_t index=0;index<persistent.size();++index){
                     if(!persistent[index])continue;
+                    if(preserve_bf16[index])continue;
                     const auto& tensor=runtime->model->tensors[index];
                     if(tensor.type!=30)continue;
                     std::uint64_t elements=1;
@@ -4015,6 +4127,13 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     runtime->requantized_saved_bytes+=
                         tensor.size-(elements/32)*kQ8BlockSize;
                 }
+            }else if(requant_mode==0&&candidate_count){
+                std::fprintf(stderr,
+                    "[colibri-v2] dense requant auto: kept %llu bf16 tensors "
+                    "(estimated %llu MiB need within %llu MiB GPU budget)\n",
+                    static_cast<unsigned long long>(candidate_count),
+                    static_cast<unsigned long long>(estimated_need/(1024ull*1024)),
+                    static_cast<unsigned long long>(auto_budget/(1024ull*1024)));
             }
         }
         // lm_head_type is captured from the checkpoint at plan time, so it has
@@ -4023,8 +4142,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         if(runtime->requantized_tensors){
             runtime->static_tensor_bytes-=runtime->requantized_saved_bytes;
             std::fprintf(stderr,
-                "[colibri-v2] requantized %llu bf16 dense tensors to Q8_0 "
+                "[colibri-v2] dense requant %s: %llu bf16 tensors to Q8_0 "
                 "(%llu MiB freed)\n",
+                runtime->options.dense_requant==1?"q8":"auto",
                 static_cast<unsigned long long>(runtime->requantized_tensors),
                 static_cast<unsigned long long>(
                     runtime->requantized_saved_bytes/(1024ull*1024)));
@@ -4359,12 +4479,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 widened.resize(elements);
                 packed.resize(device_bytes);
                 const auto* source=reinterpret_cast<const std::uint16_t*>(
-                    runtime->model->data+t.offset);
+                    tensor_data(*runtime->model,t));
                 for(std::uint64_t i=0;i<elements;++i)
                     widened[i]=qwen_bf16_value(source[i]);
                 qwen_pack_q8_0(widened.data(),elements,packed.data());
                 if(colibri_gpu_upload_sync(runtime->device_tensors[index],packed.data(),device_bytes)!=0)throw std::runtime_error("failed to upload requantized native Qwen static tensor");
-            }else if(colibri_gpu_upload_sync(runtime->device_tensors[index],runtime->model->data+t.offset,t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
+            }else if(colibri_gpu_upload_sync(runtime->device_tensors[index],tensor_data(*runtime->model,t),t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
             cursor+=device_align(device_bytes);
         }
         if(runtime->options.strict_resident&&resident_expert_bytes){
@@ -4388,7 +4508,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                             static_cast<std::uint64_t>(expert)*bytes;
                         if(colibri_gpu_upload(
                                 slot_base+role_offset,
-                                runtime->model->data+t.offset+source_offset,
+                                tensor_data(*runtime->model,t)+source_offset,
                                 bytes,runtime->stream)!=0)
                             throw std::runtime_error(
                                 "failed to prepare resident expert tensor");
@@ -4429,7 +4549,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                             static_cast<std::uint64_t>(expert)*bytes;
                         if(colibri_gpu_upload(
                                 slot_base+role_offset,
-                                runtime->model->data+t.offset+source_offset,
+                                tensor_data(*runtime->model,t)+source_offset,
                                 bytes,runtime->stream)!=0)
                             throw std::runtime_error(
                                 "failed to prepare Laguna whole-layer expert");
@@ -4673,10 +4793,95 @@ inline bool qwen_turbo_cublas_attention(
     return true;
 }
 
-void qwen_mtp_append_prompt_pair(
-    ColibriV2QwenRuntime& runtime, std::uint32_t token
+void qwen_mtp_dense_projection(
+    ColibriV2QwenRuntime& runtime, std::size_t tensor_index_value,
+    std::uint64_t input, std::uint64_t output,
+    int input_size, int output_size
 ) {
-    if (!runtime.options.mtp_drafts || !runtime.mtp_has_target_hidden) return;
+    std::uint64_t matrix = runtime.device_tensors[tensor_index_value];
+    const auto type = qwen_device_type(runtime, tensor_index_value);
+    auto launch = [&](const char* name, std::uint32_t grid_x, void** args) {
+        if (colibri_gpu_launch_named(
+                name, grid_x, 1, 256, 0, runtime.stream, args) != 0) {
+            throw std::runtime_error(
+                std::string("native MTP dense projection failed: ") + name);
+        }
+    };
+    switch (type) {
+        case 0: {
+            void* args[] = {
+                &matrix, &input, &output, &input_size, &output_size};
+            launch("qwen_f32_matvec_warp", (output_size + 7) / 8, args);
+            return;
+        }
+        case 30: {
+            // bf16_matvec takes (rows, columns), the reverse of the
+            // quantized matvec helpers.
+            void* args[] = {
+                &matrix, &input, &output, &output_size, &input_size};
+            launch("bf16_matvec_warp", (output_size + 7) / 8, args);
+            return;
+        }
+        case 8:
+            if (colibri_gpu_q8_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 16:
+            if (colibri_gpu_iq2xxs_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 18:
+            if (colibri_gpu_iq3xxs_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 22:
+            if (colibri_gpu_iq2s_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 21:
+            if (colibri_gpu_iq3s_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 17:
+            if (colibri_gpu_iq2xs_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 23:
+            if (colibri_gpu_iq4xs_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 10:
+            if (colibri_gpu_q2k_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 11:
+            if (colibri_gpu_q3k_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 13:
+            if (colibri_gpu_q5k_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 12:
+            if (colibri_gpu_q4k_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        case 14:
+            if (colibri_gpu_q6k_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
+        default:
+            throw std::runtime_error(
+                "native MTP dense projection type is unsupported: " +
+                std::to_string(type));
+    }
+    throw std::runtime_error("native MTP dense projection failed");
+}
+
+void qwen_mtp_append_pair(
+    ColibriV2QwenRuntime& runtime, std::uint32_t token,
+    std::uint64_t input_hidden
+) {
     const int hidden = static_cast<int>(runtime.model->config.hidden_size);
     const int kv_heads = static_cast<int>(runtime.model->config.attention_kv_heads);
     const auto& layer = runtime.mtp_layer_plan;
@@ -4710,12 +4915,6 @@ void qwen_mtp_append_prompt_pair(
             throw std::runtime_error(std::string("native MTP CUDA kernel failed: ") + name);
         }
     };
-    auto q8 = [&](std::uint64_t matrix, std::uint64_t input,
-                  std::uint64_t output, int input_size, int output_size) {
-        if (colibri_gpu_q8_matvec_transposed(
-                matrix, input, output, input_size, output_size, runtime.stream
-            ) != 0) throw std::runtime_error("native MTP Q8 projection failed");
-    };
     const std::uint32_t embedding_token = token;
     const auto embedding_matrix =
         qwen_stage_embedding_rows(runtime, &embedding_token, 1);
@@ -4735,19 +4934,23 @@ void qwen_mtp_append_prompt_pair(
         launch("rms_norm", 1, 1, args);
     };
     rms(embedding, runtime.device_tensors[runtime.mtp_special_tensors[1]], normalized_embedding);
-    const auto target_hidden = runtime.state + runtime.mtp_target_hidden_offset;
-    rms(target_hidden, runtime.device_tensors[runtime.mtp_special_tensors[2]], normalized_hidden);
+    rms(input_hidden, runtime.device_tensors[runtime.mtp_special_tensors[2]], normalized_hidden);
     void* concat_args[] = {
         const_cast<std::uint64_t*>(&normalized_embedding),
         const_cast<std::uint64_t*>(&normalized_hidden),
         const_cast<std::uint64_t*>(&concatenated), const_cast<int*>(&hidden),
     };
     launch("qwen_concat_pair", (hidden + 255) / 256, 1, concat_args);
-    q8(runtime.device_tensors[runtime.mtp_special_tensors[0]], concatenated,
-       fused, hidden * 2, hidden);
+    qwen_mtp_dense_projection(
+        runtime, runtime.mtp_special_tensors[0], concatenated,
+        fused, hidden * 2, hidden);
     rms(fused, runtime.device_tensors[layer.static_tensors[0]], normalized);
-    q8(runtime.device_tensors[layer.static_tensors[2]], normalized, keys, hidden, kv_size);
-    q8(runtime.device_tensors[layer.static_tensors[3]], normalized, values, hidden, kv_size);
+    qwen_mtp_dense_projection(
+        runtime, layer.static_tensors[2], normalized,
+        keys, hidden, kv_size);
+    qwen_mtp_dense_projection(
+        runtime, layer.static_tensors[3], normalized,
+        values, hidden, kv_size);
     const int rotary = static_cast<int>(runtime.model->config.rotary_dimension
         ? runtime.model->config.rotary_dimension : head_dim);
     const int position = static_cast<int>(runtime.mtp_cache_tokens);
@@ -4781,6 +4984,15 @@ void qwen_mtp_append_prompt_pair(
     };
     launch(kv_store_kernel(runtime.options.cache_type_v,false), kv_heads, 1, value_store_args);
     ++runtime.mtp_cache_tokens;
+}
+
+void qwen_mtp_append_prompt_pair(
+    ColibriV2QwenRuntime& runtime, std::uint32_t token
+) {
+    if (!runtime.options.mtp_drafts || !runtime.mtp_has_target_hidden) return;
+    qwen_mtp_append_pair(
+        runtime, token,
+        runtime.state + runtime.mtp_target_hidden_offset);
 }
 
 std::uint32_t qwen_mtp_draft(
@@ -4818,30 +5030,9 @@ std::uint32_t qwen_mtp_draft(
     const auto argmax_device=take(sizeof(std::uint64_t));
     const auto attention_scores=take(static_cast<std::uint64_t>(heads)*runtime.options.context_limit*sizeof(float));
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,void**args){if(colibri_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)throw std::runtime_error(std::string("native MTP CUDA kernel failed: ")+name);};
-    // Dense projections follow the checkpoint's tensor type, as in qwen_decode_step;
-    // the NVFP4 builds ship attention/router/eh_proj weights as bf16, older ones as Q8_0.
     auto dense_index=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
-        std::uint64_t matrix=runtime.device_tensors[index];
-        const auto type=qwen_device_type(runtime,index);
-        switch(type){
-            case 0:{void*args[]={&matrix,&input,&output,&input_size,&output_size};launch("qwen_f32_matvec_warp",(output_size+7)/8,1,args);return;}
-            // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
-            case 30:{void*args[]={&matrix,&input,&output,&output_size,&input_size};launch("bf16_matvec_warp",(output_size+7)/8,1,args);return;}
-            case 8:if(colibri_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 16:if(colibri_gpu_iq2xxs_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 18:if(colibri_gpu_iq3xxs_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 22:if(colibri_gpu_iq2s_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 21:if(colibri_gpu_iq3s_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 17:if(colibri_gpu_iq2xs_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 23:if(colibri_gpu_iq4xs_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 10:if(colibri_gpu_q2k_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 11:if(colibri_gpu_q3k_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 13:if(colibri_gpu_q5k_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 12:if(colibri_gpu_q4k_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            case 14:if(colibri_gpu_q6k_matvec_transposed(matrix,input,output,input_size,output_size,runtime.stream)==0)return;break;
-            default:throw std::runtime_error("native MTP dense projection type is unsupported: "+std::to_string(type));
-        }
-        throw std::runtime_error("native MTP dense projection failed");
+        qwen_mtp_dense_projection(
+            runtime,index,input,output,input_size,output_size);
     };
     auto rms=[&](std::uint64_t input,std::uint64_t weight,std::uint64_t output){int one_centered=0;void*args[]={&input,&weight,&output,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};launch("rms_norm",1,1,args);};
     auto add=[&](std::uint64_t target,std::uint64_t source){float scale=1.0f;int count=hidden_size;void*args[]={&target,&source,&scale,&count};launch("scaled_add",(hidden_size+255)/256,1,args);};
@@ -5351,7 +5542,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
             const auto gate_up_bytes=gate_up_tensor.size/experts;
             const auto down_bytes=down_tensor.size/experts;
             const auto scale_bytes=scale_tensor.size/experts;
-            const auto* expert_scales=reinterpret_cast<const float*>(runtime.model->data+scale_tensor.offset);
+            const auto* expert_scales=reinterpret_cast<const float*>(tensor_data(*runtime.model,scale_tensor));
             std::uint64_t paging_cursor=device_align(output_offset+hidden_size*sizeof(float));
             for(int rank=0;rank<top_k;++rank){
                 const int expert=selected_host[rank];
@@ -5385,9 +5576,9 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                 const auto bundle_bytes=gate_up_bytes+down_bytes+scale_bytes;
                 if(paging_cursor+bundle_bytes>runtime.host_staging_bytes)
                     throw std::runtime_error("native Gemma 4 hybrid paging workspace overflow");
-                std::memcpy(staging+paging_cursor,runtime.model->data+gate_up_tensor.offset+static_cast<std::uint64_t>(expert)*gate_up_bytes,gate_up_bytes);
-                std::memcpy(staging+paging_cursor+gate_up_bytes,runtime.model->data+down_tensor.offset+static_cast<std::uint64_t>(expert)*down_bytes,down_bytes);
-                std::memcpy(staging+paging_cursor+gate_up_bytes+down_bytes,runtime.model->data+scale_tensor.offset+static_cast<std::uint64_t>(expert)*scale_bytes,scale_bytes);
+                std::memcpy(staging+paging_cursor,tensor_data(*runtime.model,gate_up_tensor)+static_cast<std::uint64_t>(expert)*gate_up_bytes,gate_up_bytes);
+                std::memcpy(staging+paging_cursor+gate_up_bytes,tensor_data(*runtime.model,down_tensor)+static_cast<std::uint64_t>(expert)*down_bytes,down_bytes);
+                std::memcpy(staging+paging_cursor+gate_up_bytes+down_bytes,tensor_data(*runtime.model,scale_tensor)+static_cast<std::uint64_t>(expert)*scale_bytes,scale_bytes);
                 const auto base=runtime.expert_cache+slot_index*runtime.expert_slot_bytes;
                 if(colibri_gpu_upload(base,staging+paging_cursor,bundle_bytes,runtime.stream)!=0)
                     throw std::runtime_error("native Gemma 4 hybrid expert upload failed");
@@ -6018,7 +6209,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     const auto&st=runtime->model->tensors[layer.expert_down_scale];
                     const auto experts_count=runtime->model->config.expert_count;
                     const auto scale_bytes=st.size/experts_count;
-                    float ds=1.0f;std::memcpy(&ds,runtime->model->data+st.offset+static_cast<std::uint64_t>(expert)*scale_bytes,sizeof(float));
+                    float ds=1.0f;std::memcpy(&ds,tensor_data(*runtime->model,st)+static_cast<std::uint64_t>(expert)*scale_bytes,sizeof(float));
                     cpu_compact_weights[cpu_count]*=ds;
                 }
                 ++cpu_count;
@@ -6030,7 +6221,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     // DMA each role straight from the registered mmap into the cache slot;
                     // no CPU staging memcpy (the 4.4 ms/token page-in cost we are attacking).
                     std::uint64_t role_offset=0;
-                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(slot_base+role_offset,runtime->model->data+t.offset+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE DMA cache upload failed");role_offset+=bytes;}
+                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(slot_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE DMA cache upload failed");role_offset+=bytes;}
                     if(runtime->expert_native_cache){
                         const auto gate_bytes=runtime->model->tensors[
                             layer.expert_tensors[0]].size/experts;
@@ -6048,7 +6239,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     }
                 }else{
                     const auto bundle_start=staging_cursor;
-                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(staging_cursor+bytes>runtime->expert_staging_bytes)throw std::runtime_error("native hybrid MoE staging overflow");std::memcpy(staging+staging_cursor,runtime->model->data+t.offset+offset,bytes);staging_cursor+=bytes;}
+                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(staging_cursor+bytes>runtime->expert_staging_bytes)throw std::runtime_error("native hybrid MoE staging overflow");std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);staging_cursor+=bytes;}
                     pending[pending_count++]={slot_base,bundle_start,
                         staging_cursor-bundle_start,slot_index};
                 }
@@ -6195,10 +6386,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                             // memcpy from the critical path -- the CPU has already synced on
                             // route_event by here, so every byte it copies is GPU idle time.
                             std::uint64_t role_offset=0;
-                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(device_base+role_offset,runtime->model->data+t.offset+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert DMA upload failed");role_offset+=bytes;}
+                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(device_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert DMA upload failed");role_offset+=bytes;}
                         }else{
                             std::uint64_t bundle_bytes=0;
-                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor+bundle_bytes,runtime->model->data+t.offset+offset,bytes);bundle_bytes+=bytes;}
+                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor+bundle_bytes,tensor_data(*runtime->model,t)+offset,bytes);bundle_bytes+=bytes;}
                             if(staging_cursor+bundle_bytes>runtime->expert_staging_bytes||colibri_gpu_upload(device_base,staging+staging_cursor,bundle_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert upload failed");
                             staging_cursor+=bundle_bytes;
                         }
@@ -6206,13 +6397,13 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                         for(int role=0;role<3;++role){const auto bytes=runtime->model->tensors[layer.expert_tensors[role]].size/experts;const auto pointer=device_base+role_offset;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;role_offset+=bytes;}
                     }else{
                         has_uncached_expert=true;
-                        for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor,runtime->model->data+t.offset+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
+                        for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
                     }
                 }
             }else{
                 ++runtime->expert_cache_misses;
                 has_uncached_expert=true;
-                for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor,runtime->model->data+t.offset+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
+                for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
             }
         }
         const auto table_bytes=static_cast<std::uint64_t>(top_k)*(sizeof(std::uint64_t)*3+sizeof(float)*3);const auto table_host=device_align(staging_cursor);const auto table_device=runtime->expert_staging+runtime->expert_staging_bytes-device_align(table_bytes);const auto gate_table=table_device;const auto up_table=gate_table+top_k*sizeof(std::uint64_t);const auto down_table=up_table+top_k*sizeof(std::uint64_t);std::memcpy(staging+table_host,gate_pointers.data(),top_k*sizeof(std::uint64_t));std::memcpy(staging+table_host+top_k*sizeof(std::uint64_t),up_pointers.data(),top_k*sizeof(std::uint64_t));std::memcpy(staging+table_host+2*top_k*sizeof(std::uint64_t),down_pointers.data(),top_k*sizeof(std::uint64_t));
@@ -6966,7 +7157,7 @@ static void qwen_seed_prefill_experts(
     }
     const auto expert_policy=qwen_expert_policy(
         runtime,colibri::v2::ExpertExecutionPhase::prepare);
-    if(runtime.gemma4||runtime.options.mtp_drafts||
+    if(runtime.gemma4||
        !expert_policy.is_hybrid()||runtime.expert_slots.empty())return;
     // Auto placement is the prepared-map policy for immutable residency.
     // Mutable mode remains unchanged until the public mode consolidation.
@@ -7112,7 +7303,7 @@ static void qwen_seed_prefill_experts(
                 const auto& tensor=runtime.model->tensors[plan.expert_tensors[role]];
                 const auto bytes=tensor.size/experts;
                 const auto offset=static_cast<std::uint64_t>(expert)*bytes;
-                std::memcpy(staging+cursor,runtime.model->data+tensor.offset+offset,bytes);
+                std::memcpy(staging+cursor,tensor_data(*runtime.model,tensor)+offset,bytes);
                 cursor+=bytes;
             }
             auto& slot=runtime.expert_slots[slot_index];
@@ -7144,7 +7335,7 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
     const bool automatic=runtime.options.cpu_prefetch_auto!=0;
     const auto expert_policy=qwen_expert_policy(
         runtime,colibri::v2::ExpertExecutionPhase::decode);
-    if(runtime.gemma4||runtime.options.mtp_drafts||
+    if(runtime.gemma4||
        !expert_policy.routed_cpu_execution_allowed()||
        (!runtime.options.cpu_prefetch_mib&&!automatic))return;
     constexpr std::uint64_t mib=1024ULL*1024ULL;
@@ -7211,7 +7402,8 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
     inspected.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
     cold.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
     for(const auto& range:ranges){
-        const auto begin=reinterpret_cast<std::uintptr_t>(runtime.model->data+range.offset);
+        const auto begin=reinterpret_cast<std::uintptr_t>(
+            runtime.model->data+range.offset);
         const auto end=begin+range.bytes;
         const auto aligned_begin=begin-(begin%page);
         const auto aligned_end=((end+page-1)/page)*page;
@@ -7308,6 +7500,58 @@ static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
     slot->clock=++runtime->prefill_snapshot_clock;
 }
 
+// Drafting recursively feeds the MTP block's own hidden state into the next
+// speculative step. Those entries are useful only inside the current round:
+// once the target has verified a prefix, its KV entries must be rebuilt from
+// the target model's true hidden states. Keeping the recursive draft entries
+// makes the cache drift farther from training semantics after every round and
+// rapidly destroys acceptance.
+static void qwen_mtp_commit_true_cache(
+    ColibriV2QwenRuntime& runtime, std::uint64_t base_cache_tokens,
+    const std::uint32_t* inputs, std::uint32_t count,
+    std::uint64_t verified_hidden
+) {
+    if (!count) return;
+    const int hidden = static_cast<int>(runtime.model->config.hidden_size);
+    const int hidden_elements = static_cast<int>(count) * hidden;
+    const auto stable_hidden =
+        runtime.state + runtime.mtp_verified_hidden_offset;
+    void* batch_copy_args[] = {
+        &verified_hidden, const_cast<std::uint64_t*>(&stable_hidden),
+        const_cast<int*>(&hidden_elements),
+    };
+    if (colibri_gpu_launch_named(
+            "qwen_copy_vector", (hidden_elements + 255) / 256, 1, 256, 0,
+            runtime.stream, batch_copy_args) != 0) {
+        throw std::runtime_error("native MTP verified-hidden snapshot failed");
+    }
+
+    runtime.mtp_cache_tokens = base_cache_tokens;
+    const auto initial_hidden =
+        runtime.state + runtime.mtp_target_hidden_offset;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const auto preceding_hidden = index == 0
+            ? initial_hidden
+            : stable_hidden + static_cast<std::uint64_t>(index - 1)
+                * hidden * sizeof(float);
+        qwen_mtp_append_pair(
+            runtime, inputs[index], preceding_hidden);
+    }
+
+    auto final_source = stable_hidden + static_cast<std::uint64_t>(count - 1)
+        * hidden * sizeof(float);
+    auto final_target = initial_hidden;
+    void* final_copy_args[] = {
+        &final_source, &final_target, const_cast<int*>(&hidden),
+    };
+    if (colibri_gpu_launch_named(
+            "qwen_copy_vector", (hidden + 255) / 256, 1, 256, 0,
+            runtime.stream, final_copy_args) != 0 ||
+        colibri_gpu_stream_sync(runtime.stream) != 0) {
+        throw std::runtime_error("native MTP true-cache commit failed");
+    }
+}
+
 // One MTP draft-and-verify round for the active sequence: draft `wanted` tokens
 // from the draft block, verify them in a single batched target pass, and commit
 // the prefix the target agrees with. Writes the committed tokens to `out` (which
@@ -7357,16 +7601,11 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
             if(colibri_gpu_download(batch_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP trace download failed");
         }
         qwen_snapshot_delta_state(runtime,true);
-        runtime.mtp_cache_tokens=base_cache_tokens+valid;
         std::uint64_t replay_hidden=0;
         const auto replay_started=std::chrono::steady_clock::now();
         qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(valid),verified.data(),&replay_hidden);
-        const int hidden_size=static_cast<int>(runtime.model->config.hidden_size);
-        auto replay_source=replay_hidden+static_cast<std::uint64_t>(valid-1)*hidden_size*sizeof(float);
-        auto replay_target=runtime.state+runtime.mtp_target_hidden_offset;
-        void*replay_copy_args[]={&replay_source,&replay_target,const_cast<int*>(&hidden_size)};
-        if(colibri_gpu_launch_named("qwen_copy_vector",(hidden_size+255)/256,1,256,0,runtime.stream,replay_copy_args)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)
-            throw std::runtime_error("native MTP rollback hidden commit failed");
+        qwen_mtp_commit_true_cache(
+            runtime,base_cache_tokens,inputs.data(),valid,replay_hidden);
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);
         runtime.position+=valid;
         runtime.last_output_token=verified[valid-1];
@@ -7374,7 +7613,7 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
         runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-replay_started).count();
         if(trace){
             std::vector<float>replay_trace(trace_hidden);
-            const auto trace_source=replay_target;
+            const auto trace_source=runtime.state+runtime.mtp_target_hidden_offset;
             if(colibri_gpu_download(replay_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP replay trace download failed");
             float maximum=0.0f;
             for(int index=0;index<trace_hidden;++index)maximum=std::max(maximum,std::fabs(batch_trace[index]-replay_trace[index]));
@@ -7384,12 +7623,8 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
         ++runtime.mtp_rejected_tokens;
         runtime.mtp_rollback_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-rollback_started).count();
     }else{
-        const int hidden_size=static_cast<int>(runtime.model->config.hidden_size);
-        auto source=batch_hidden+static_cast<std::uint64_t>(wanted-1)*hidden_size*sizeof(float);
-        auto target=runtime.state+runtime.mtp_target_hidden_offset;
-        void*copy_args[]={&source,&target,const_cast<int*>(&hidden_size)};
-        if(colibri_gpu_launch_named("qwen_copy_vector",(hidden_size+255)/256,1,256,0,runtime.stream,copy_args)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)
-            throw std::runtime_error("native MTP verifier hidden commit failed");
+        qwen_mtp_commit_true_cache(
+            runtime,base_cache_tokens,inputs.data(),wanted,batch_hidden);
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+wanted);
         runtime.position+=wanted;
         runtime.last_output_token=verified[wanted-1];
@@ -8010,7 +8245,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                         const auto&st=runtime->model->tensors[layer.expert_down_scale];
                         const auto experts_count=runtime->model->config.expert_count;
                         const auto scale_bytes=st.size/experts_count;
-                        float ds=1.0f;std::memcpy(&ds,runtime->model->data+st.offset+static_cast<std::uint64_t>(expert)*scale_bytes,sizeof(float));
+                        float ds=1.0f;std::memcpy(&ds,tensor_data(*runtime->model,st)+static_cast<std::uint64_t>(expert)*scale_bytes,sizeof(float));
                         cpu_compact_weights[cpu_count]*=ds;
                     }
                     ++cpu_count;
@@ -8020,7 +8255,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     const auto slot_base = runtime->expert_cache + slot_index * runtime->expert_slot_bytes;
                     if (runtime->dma_paging) {
                         std::uint64_t role_offset = 0;
-                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (colibri_gpu_upload(slot_base + role_offset, runtime->model->data + t.offset + offset, bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE DMA cache upload failed"); role_offset += bytes; }
+                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (colibri_gpu_upload(slot_base + role_offset, tensor_data(*runtime->model,t) + offset, bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE DMA cache upload failed"); role_offset += bytes; }
                         if(runtime->expert_native_cache){
                             const auto gate_bytes=runtime->model->tensors[
                                 layer.expert_tensors[0]].size/experts;
@@ -8038,7 +8273,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                         }
                     } else {
                         const auto bundle_start = staging_cursor;
-                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (staging_cursor + bytes > runtime->expert_staging_bytes) throw std::runtime_error("native hybrid MoE staging overflow"); std::memcpy(pag + staging_cursor, runtime->model->data + t.offset + offset, bytes); staging_cursor += bytes; }
+                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (staging_cursor + bytes > runtime->expert_staging_bytes) throw std::runtime_error("native hybrid MoE staging overflow"); std::memcpy(pag + staging_cursor, tensor_data(*runtime->model,t) + offset, bytes); staging_cursor += bytes; }
                         pending[pending_count++] = {
                             slot_base, bundle_start,
                             staging_cursor - bundle_start, slot_index};

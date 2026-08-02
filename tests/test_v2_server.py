@@ -435,6 +435,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.cpu_threads, 0)
         self.assertEqual(args.hybrid_prefill, "split")
         self.assertIsNone(args.expert_residency)
+        self.assertEqual(args.dense_requant, "auto")
 
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
         defaults = _parser().parse_args(["benchmark-v2", "model.gguf"])
@@ -454,6 +455,7 @@ class NativeV2ServerTests(unittest.TestCase):
             "--next-layer-prefetch", "6",
             "--hybrid-prefill", "cpu",
             "--expert-residency", "immutable",
+            "--dense-requant", "off",
             '--cpu-threads', '12',
             "--cold-cache",
         ])
@@ -470,6 +472,7 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.cpu_threads, 12)
         self.assertEqual(args.hybrid_prefill, "cpu")
         self.assertEqual(args.expert_residency, "immutable")
+        self.assertEqual(args.dense_requant, "off")
         self.assertTrue(args.cold_cache)
         self.assertFalse(args.cpu_prefetch_auto)
 

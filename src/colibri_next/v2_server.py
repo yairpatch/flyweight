@@ -692,6 +692,7 @@ class NativeV2InferenceService(InferenceService):
         self,
         model_path: Path | str,
         *,
+        mtp_model_path: Path | str | None = None,
         model_name: str | None = None,
         device: int = 0,
         context_window: int = 32768,
@@ -715,6 +716,7 @@ class NativeV2InferenceService(InferenceService):
         cpu_threads: int = 0,
         hybrid_prefill: str = "split",
         expert_residency: str | None = None,
+        dense_requant: str = "auto",
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -722,7 +724,7 @@ class NativeV2InferenceService(InferenceService):
         request_timeout_seconds: float = 30.0,
         sse_keepalive_seconds: float = 10.0,
     ):
-        self.v2_model = V2Model(model_path)
+        self.v2_model = V2Model(model_path, mtp_model=mtp_model_path)
         self.v2_runtime: V2QwenRuntime | None = None
         try:
             self.v2_runtime = self.v2_model.native_runtime(
@@ -747,6 +749,7 @@ class NativeV2InferenceService(InferenceService):
                 cpu_threads=cpu_threads,
                 hybrid_prefill=hybrid_prefill,
                 expert_residency=expert_residency,
+                dense_requant=dense_requant,
             )
             self.v2_runtime.prepare()
         except Exception:

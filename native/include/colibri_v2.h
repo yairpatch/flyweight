@@ -98,6 +98,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t immutable_residency; /* hybrid decode: 0 = mutable; 1 = freeze per request/engine epoch */
     uint32_t prefill_cache_seed_auto; /* immutable hybrid: bounded automatic post-prefill placement */
     uint32_t strict_resident; /* streamed GPU: require and prepare the complete routed-expert set */
+    uint32_t dense_requant; /* 0=auto from GPU pressure, 1=force BF16->Q8_0, 2=off */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {
@@ -228,6 +229,9 @@ typedef struct ColibriV2QwenTaskEvent {
 typedef int (*ColibriV2TokenCallback)(uint32_t token, void* user_data);
 
 COLIBRI_V2_API int colibri_v2_model_open(const char* path, ColibriV2Model** out);
+/* Replace only the embedded Qwen MTP block with tensors from a compatible
+   MTP-only GGUF. The sidecar mapping is owned by `model` after attachment. */
+COLIBRI_V2_API int colibri_v2_model_attach_mtp(ColibriV2Model* model, const char* path);
 COLIBRI_V2_API void colibri_v2_model_close(ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_model_info(const ColibriV2Model* model, ColibriV2ModelInfo* out);
 COLIBRI_V2_API int colibri_v2_model_config(const ColibriV2Model* model, ColibriV2ModelConfig* out);

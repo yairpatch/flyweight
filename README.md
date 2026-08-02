@@ -157,6 +157,7 @@ Important CLI options include:
 - `--gpu-cache-mib 0`: size allocations from currently free VRAM
 - `--cache-type-k` / `--cache-type-v`: KV precision
 - `--mtp-drafts N`: enable supported Qwen MTP verification
+- `--dense-requant auto|q8|off`: control temporary BF16 dense-weight Q8 upload
 - `--parallel N`: independent sequence slots
 - `--prompt-cache-mib N`: host cache for spilled sequence state
 - `--max-concurrent-requests N`: reject excess generation work with HTTP 429
@@ -170,6 +171,12 @@ Important CLI options include:
 Runtime diagnostics are exposed through `/health`. Detailed profiling and
 experimental kernel switches use `COLIBRI_*` environment variables; unset
 profiling variables for production serving.
+
+`--dense-requant auto` keeps the GGUF unchanged and chooses the temporary GPU
+representation from the requested or available VRAM budget. It converts BF16
+dense tensors to Q8_0 when the BF16 working set plus useful routed-expert cache
+would exceed that budget. Use `q8` to force the memory-saving representation or
+`off` to preserve the checkpoint's dense precision exactly.
 
 Qwen sampling with `top_k <= 32` reduces candidates on the GPU by default.
 `sampling_gpu_topk_*`, `sampling_full_download_bytes`, and

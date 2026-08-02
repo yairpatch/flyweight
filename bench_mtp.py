@@ -10,12 +10,14 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 
 from colibri_next.v2 import V2Model
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
+MTP_MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-MTP-BF16.gguf"
 GPU_CACHE_BYTES = 8192 * 1024**2
 CONTEXT = 8192
 MAX_TOKENS = 512
@@ -51,6 +53,12 @@ def run_once(runtime, prompt: list[int]) -> tuple[list[int], float, dict]:
 
 
 def bench(model: V2Model, prompt: list[int], drafts: int) -> dict:
+    # This diagnostic compares the actual speculative path. The production
+    # default is adaptive and may deliberately disable MTP after calibration.
+    if drafts:
+        os.environ["COLIBRI_MTP_ADAPTIVE"] = "0"
+    else:
+        os.environ.pop("COLIBRI_MTP_ADAPTIVE", None)
     with model.native_qwen_runtime(
         context_limit=CONTEXT,
         gpu_cache_bytes=GPU_CACHE_BYTES,
@@ -74,7 +82,7 @@ def bench(model: V2Model, prompt: list[int], drafts: int) -> dict:
 
 
 def main() -> None:
-    model = V2Model(MODEL)
+    model = V2Model(MODEL, mtp_model=MTP_MODEL)
     try:
         prompt = model.tokenize(PROMPT_TEXT)
         print(f"prompt tokens={len(prompt)}  gen={MAX_TOKENS}  "

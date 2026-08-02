@@ -173,6 +173,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("immutable_residency", ctypes.c_uint32),
         ("prefill_cache_seed_auto", ctypes.c_uint32),
         ("strict_resident", ctypes.c_uint32),
+        ("dense_requant", ctypes.c_uint32),
     ]
 
 
@@ -359,6 +360,11 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(_ModelConfig),
                 ]
                 lib.colibri_v2_model_config.restype = ctypes.c_int
+                lib.colibri_v2_model_attach_mtp.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                ]
+                lib.colibri_v2_model_attach_mtp.restype = ctypes.c_int
                 lib.colibri_v2_model_attention_window.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_uint32,
@@ -675,16 +681,27 @@ def _library() -> ctypes.CDLL:
 
 
 class V2Model:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, mtp_model: str | Path | None = None):
         self.path = Path(path)
+        self.mtp_model_path = Path(mtp_model) if mtp_model is not None else None
         self._lib = _library()
         self._handle = ctypes.c_void_p()
         self._tensor_catalog: dict[str, dict[str, object]] | None = None
-        self._check(
-            self._lib.colibri_v2_model_open(
-                str(self.path).encode(), ctypes.byref(self._handle)
+        try:
+            self._check(
+                self._lib.colibri_v2_model_open(
+                    str(self.path).encode(), ctypes.byref(self._handle)
+                )
             )
-        )
+            if self.mtp_model_path is not None:
+                self._check(
+                    self._lib.colibri_v2_model_attach_mtp(
+                        self._handle, str(self.mtp_model_path).encode()
+                    )
+                )
+        except Exception:
+            self.close()
+            raise
         self._architecture = str(self.info["architecture"])
 
     def _check(self, status: int) -> None:
@@ -1060,6 +1077,7 @@ class V2Model:
         cpu_threads: int = 0,
         hybrid_prefill: str = "split",
         expert_residency: str | None = None,
+        dense_requant: str = "auto",
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -1086,6 +1104,7 @@ class V2Model:
             cpu_threads=cpu_threads,
             hybrid_prefill=hybrid_prefill,
             expert_residency=expert_residency,
+            dense_requant=dense_requant,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -1404,6 +1423,7 @@ class V2QwenRuntime:
         cpu_threads: int = 0,
         hybrid_prefill: str = "split",
         expert_residency: str | None = None,
+        dense_requant: str = "auto",
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -1456,6 +1476,8 @@ class V2QwenRuntime:
             raise ValueError("hybrid_prefill must be 'split' or 'cpu'")
         if expert_residency not in {"mutable", "immutable"}:
             raise ValueError("expert_residency must be 'mutable' or 'immutable'")
+        if dense_requant not in {"auto", "q8", "off"}:
+            raise ValueError("dense_requant must be 'auto', 'q8', or 'off'")
         if next_layer_prefetch and mtp_drafts:
             raise ValueError("next_layer_prefetch does not support MTP yet")
         effective_hybrid_prefill = (
@@ -1511,6 +1533,7 @@ class V2QwenRuntime:
             int(effective_expert_residency == "immutable"),
             int(prefill_cache_seed_auto),
             int(strict_resident),
+            {"auto": 0, "q8": 1, "off": 2}[dense_requant],
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

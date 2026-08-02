@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from colibri_next.cli import (
+    _benchmark_native_generate,
     _benchmark_native_prefill,
     _drop_file_cache,
     _parser,
@@ -38,6 +39,30 @@ class NativeV2BenchmarkTests(unittest.TestCase):
         self.assertEqual(token, 42)
         self.assertEqual(elapsed, 0.25)
         self.assertEqual(runtime.calls, [([1, 2, 3], 1)])
+
+    def test_mtp_benchmark_times_generate_instead_of_decode(self) -> None:
+        class Runtime:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, prompt, max_tokens, callback):
+                self.calls.append((prompt, max_tokens))
+                callback(41)
+                callback(42)
+
+        runtime = Runtime()
+        with patch(
+            "colibri_next.cli.time.perf_counter",
+            side_effect=(10.0, 10.1, 10.3, 10.4),
+        ):
+            generated, arrivals, elapsed = _benchmark_native_generate(
+                runtime, [1, 2, 3], 2,
+            )
+        self.assertEqual(runtime.calls, [([1, 2, 3], 2)])
+        self.assertEqual(generated, [41, 42])
+        self.assertAlmostEqual(arrivals[0], 0.1)
+        self.assertAlmostEqual(arrivals[1], 0.3)
+        self.assertAlmostEqual(elapsed, 0.4)
 
     def test_steady_state_includes_cpu_expert_compute(self) -> None:
         fields = (
@@ -82,6 +107,34 @@ class NativeV2BenchmarkTests(unittest.TestCase):
                 self.assertEqual(args.mtp_drafts, 1)
                 self.assertEqual(args.cache_type_k, "q8_0")
                 self.assertEqual(args.cache_type_v, "f16")
+
+    def test_mtp_sidecar_is_available_to_runtime_commands(self) -> None:
+        for command in ("generate", "benchmark-v2", "probe-native-v2", "serve-v2"):
+            with self.subTest(command=command):
+                argv = [command, "model.gguf", "--mtp-model", "mtp.gguf"]
+                if command == "generate":
+                    argv.extend(("--prompt", "hello"))
+                args = _parser().parse_args(argv)
+                self.assertEqual(args.mtp_model, Path("mtp.gguf"))
+
+    def test_embedded_mtp_does_not_require_a_sidecar(self) -> None:
+        for command in ("generate", "benchmark-v2", "probe-native-v2", "serve-v2"):
+            with self.subTest(command=command):
+                argv = [command, "model.gguf", "--mtp-drafts", "4"]
+                if command == "generate":
+                    argv.extend(("--prompt", "hello"))
+                args = _parser().parse_args(argv)
+                self.assertEqual(args.mtp_drafts, 4)
+                self.assertIsNone(args.mtp_model)
+
+    def test_dense_requant_policy_is_available_to_runtime_commands(self) -> None:
+        for command in ("generate", "benchmark-v2", "probe-native-v2", "serve-v2"):
+            with self.subTest(command=command):
+                argv = [command, "model.gguf", "--dense-requant", "off"]
+                if command == "generate":
+                    argv.extend(("--prompt", "hello"))
+                args = _parser().parse_args(argv)
+                self.assertEqual(args.dense_requant, "off")
 
 
 if __name__ == "__main__":

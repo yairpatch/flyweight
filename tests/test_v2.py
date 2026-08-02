@@ -276,6 +276,37 @@ class V2RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "cache_type"):
                     V2QwenRuntime(FakeModel(), cache_type_k=invalid)
 
+    def test_dense_requant_policy_reaches_native_options(self):
+        class FakeLibrary:
+            def __init__(self):
+                self.options = b""
+
+            def colibri_v2_qwen_runtime_create(
+                self, _model, options, _runtime
+            ):
+                self.options = ctypes.string_at(
+                    options, ctypes.sizeof(_QwenRuntimeOptions)
+                )
+                return 0
+
+        class FakeModel:
+            def __init__(self):
+                self._lib = FakeLibrary()
+                self._handle = ctypes.c_void_p(1)
+
+            def _check(self, status):
+                self.assert_status = status
+
+        for name, code in (("auto", 0), ("q8", 1), ("off", 2)):
+            with self.subTest(dense_requant=name):
+                model = FakeModel()
+                V2QwenRuntime(model, dense_requant=name)
+                native = _QwenRuntimeOptions.from_buffer_copy(model._lib.options)
+                self.assertEqual(native.dense_requant, code)
+
+        with self.assertRaisesRegex(ValueError, "dense_requant"):
+            V2QwenRuntime(FakeModel(), dense_requant="q4")
+
     def test_native_turbo_kv_path_is_wired_end_to_end(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (

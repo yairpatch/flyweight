@@ -90,7 +90,16 @@ def _add_runtime_options(parser: argparse.ArgumentParser, *, serving: bool) -> N
     )
     parser.add_argument("--hybrid-prefill", choices=("split", "cpu"), default="split")
     parser.add_argument("--expert-residency", choices=("mutable", "immutable"))
+    parser.add_argument(
+        "--dense-requant", choices=("auto", "q8", "off"), default="auto",
+        help="BF16 dense-weight GPU policy (default: auto from GPU pressure)",
+    )
     parser.add_argument("--mtp-drafts", type=int, default=0)
+    parser.add_argument(
+        "--mtp-model", type=Path,
+        help=("optional MTP-only GGUF overlay; when omitted, use the draft "
+              "head embedded in the target model"),
+    )
     parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--cache-type-k", choices=KV_TYPES, default="f16")
     parser.add_argument("--cache-type-v", choices=KV_TYPES, default="f16")
@@ -201,6 +210,7 @@ def _runtime_options(args: argparse.Namespace) -> dict[str, object]:
         "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
         "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
         "hybrid_prefill", "expert_residency", "expert_top_k", "expert_top_p",
+        "dense_requant",
     )
     options = {name: getattr(args, name) for name in names if hasattr(args, name)}
     options["gpu_cache_bytes"] = args.gpu_cache_mib * 1024**2
@@ -219,6 +229,28 @@ def _prompt_tokens(model: V2Model, args: argparse.Namespace) -> list[int]:
     return model.tokenize(text)
 
 
+def _benchmark_native_generate(
+    runtime: object, prompt: list[int], tokens: int,
+) -> tuple[list[int], list[float], float]:
+    """Time one complete generate call, retaining callback arrival times.
+
+    MTP may commit several tokens in one verifier round, so timing repeated
+    ``decode()`` calls bypasses the feature entirely. Callback intervals keep
+    round boundaries visible without pretending each committed token was a
+    separate native invocation.
+    """
+    generated: list[int] = []
+    arrivals: list[float] = []
+    started = time.perf_counter()
+
+    def receive(token: int) -> None:
+        generated.append(token)
+        arrivals.append(time.perf_counter() - started)
+
+    runtime.generate(prompt, tokens, receive)
+    return generated, arrivals, time.perf_counter() - started
+
+
 def _benchmark(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
     if args.iterations < 3 or args.warmup < 1 or args.context <= 0:
@@ -227,7 +259,7 @@ def _benchmark(args: argparse.Namespace) -> int:
         raise SystemExit("invalid expert routing limit")
     if args.cold_cache:
         _drop_file_cache(args.model)
-    with V2Model(args.model) as model:
+    with V2Model(args.model, mtp_model=args.mtp_model) as model:
         prompt = _prompt_tokens(model, args)
         if not prompt:
             raise SystemExit("benchmark prompt must contain at least one token")
@@ -239,34 +271,35 @@ def _benchmark(args: argparse.Namespace) -> int:
             started = time.perf_counter()
             runtime.prepare()
             prepare_seconds = time.perf_counter() - started
-            current, prompt_seconds = _benchmark_native_prefill(runtime, prompt)
-            generated: list[int] = []
-            warmup_seconds: list[float] = []
-            measured_seconds: list[float] = []
-            steady_start = None
-            for index in range(args.warmup + args.iterations):
-                if index == args.warmup:
-                    steady_start = runtime.info
-                started = time.perf_counter()
-                current = runtime.decode(current)
-                elapsed = time.perf_counter() - started
-                generated.append(current)
-                (warmup_seconds if index < args.warmup else measured_seconds).append(elapsed)
+            request_start = runtime.info
+            all_generated, arrivals, total_seconds = _benchmark_native_generate(
+                runtime, prompt, 1 + args.warmup + args.iterations,
+            )
             info = runtime.info
-        measured_total = sum(measured_seconds)
+        # Token zero is the pending result of prompt evaluation. Both paths
+        # then warm and measure the same following output positions.
+        generated = all_generated[1:]
+        measured_start = arrivals[args.warmup]
+        measured_total = arrivals[-1] - measured_start
+        callback_intervals = [
+            arrivals[index] - arrivals[index - 1]
+            for index in range(args.warmup + 1, len(arrivals))
+        ]
+        mtp_suffix = "-mtp" if args.mtp_drafts else ""
         print(json.dumps({
-            "execution": f"native-v2-{info['expert_mode']}",
+            "execution": f"native-v2-{info['expert_mode']}{mtp_suffix}",
             "prepare_seconds": prepare_seconds,
             "prompt_tokens": len(prompt),
-            "prompt_seconds": prompt_seconds,
-            "prompt_tokens_per_second": len(prompt) / prompt_seconds,
-            "first_warm_decode_seconds": warmup_seconds[0],
-            "decode_seconds": measured_seconds,
-            "decode_median_seconds": statistics.median(measured_seconds),
-            "decode_tokens_per_second": args.iterations / measured_total,
+            "prompt_and_first_token_seconds": arrivals[0],
+            "request_seconds": total_seconds,
+            "decode_seconds": callback_intervals,
+            "decode_median_seconds": statistics.median(callback_intervals),
+            "decode_tokens_per_second": (
+                args.iterations / measured_total if measured_total > 0 else 0.0
+            ),
             "generated_tokens": generated,
             "generated_text": model.decode_tokens(generated),
-            "steady_state": _steady_state_counters(steady_start, info),
+            "request_counters": _steady_state_counters(request_start, info),
             "runtime": info,
         }, indent=2))
     return 0
@@ -277,6 +310,7 @@ def _generate(args: argparse.Namespace) -> int:
     from .v2_server import NativeV2InferenceService
     service = NativeV2InferenceService(
         args.model,
+        mtp_model_path=args.mtp_model,
         context_window=args.context_window,
         max_new_tokens=args.max_new_tokens,
         gpu_cache_mib=args.gpu_cache_mib,
@@ -309,6 +343,7 @@ def _serve(args: argparse.Namespace) -> int:
     from .v2_server import NativeV2InferenceService
     service = NativeV2InferenceService(
         args.model,
+        mtp_model_path=args.mtp_model,
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,
@@ -331,6 +366,7 @@ def _serve(args: argparse.Namespace) -> int:
         cpu_threads=args.cpu_threads,
         hybrid_prefill=args.hybrid_prefill,
         expert_residency=args.expert_residency,
+        dense_requant=args.dense_requant,
         api_key=args.api_key,
         cors_origin=args.cors_origin,
         strict_model=args.strict_model,
@@ -368,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.command in {"probe-native-v2", "probe-qwen-native-v2", "probe-native"}:
         _validate_runtime_args(args)
-        with V2Model(args.model) as model:
+        with V2Model(args.model, mtp_model=args.mtp_model) as model:
             prompt = _prompt_tokens(model, args)
             options = _runtime_options(args)
             options["context_limit"] = args.context
