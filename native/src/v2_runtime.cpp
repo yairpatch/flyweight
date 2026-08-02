@@ -3594,6 +3594,22 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
         throw std::runtime_error("Qwen runtime MoE device is invalid");
     runtime->expert_mode=
         colibri::v2::expert_execution_mode(runtime->options.moe_device);
+    // Every expert placement other than `cpu` exists to divide work between a
+    // host and a device. With no device there is nothing to divide, and the
+    // resident/hybrid/auto paths degrade into copying expert weights from the
+    // GGUF mapping into another host buffer before computing on them -- 13x
+    // slower than running them in place. `auto` in particular is the serving
+    // default, so leaving this to the caller means the default configuration is
+    // the pathological one.
+    if(colibri_backend_is_cpu()&&
+       runtime->expert_mode!=colibri::v2::ExpertExecutionMode::cpu){
+        std::fprintf(stderr,
+            "[colibri-v2] expert placement forced to CPU: the CPU backend has "
+            "no device to page experts to\n");
+        runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
+        runtime->options.moe_device=
+            colibri::v2::expert_execution_mode_value(runtime->expert_mode);
+    }
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
     if(gemma4&&runtime->options.mtp_drafts)throw std::runtime_error("native Gemma 4 MTP is not implemented");
     if(gemma4&&qwen_expert_policy(

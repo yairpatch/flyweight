@@ -420,8 +420,16 @@ int colibri_cpu_host_free(void* pointer) {
     return 0;
 }
 
-// Pinning exists to make DMA possible; without a device there is no transfer.
-int colibri_cpu_host_register(const void*, std::uint64_t) { return 0; }
+// Page pinning exists so a GPU can DMA out of host memory. There is no device
+// here, so registration must FAIL rather than trivially succeed.
+//
+// This is not pedantry. The runtime treats a successful registration as "direct
+// expert paging is available" and switches routed experts to the hybrid device
+// path, which on this backend copies expert weights out of the GGUF mapping
+// into another host buffer and computes nothing faster for it. Measured on a
+// 35B MoE: 0.43 tok/s with registration reported as succeeding, 5.67 tok/s with
+// the CPU MoE path -- a 13x loss from one over-helpful return value.
+int colibri_cpu_host_register(const void*, std::uint64_t) { return -1; }
 int colibri_cpu_host_unregister(const void*) { return 0; }
 
 int colibri_cpu_upload(std::uint64_t destination, const void* source,
