@@ -312,6 +312,10 @@ NATIVE_ABI_VERSION = 5
 _cached_library: ctypes.CDLL | None = None
 
 
+# Mirrors ColibriBackend in native/include/colibri_backend.hpp.
+_BACKENDS = {"auto": -1, "cuda": 0, "cpu": 1}
+
+
 def _library() -> ctypes.CDLL:
     global _cached_library
     if _cached_library is not None:
@@ -534,6 +538,9 @@ def _library() -> ctypes.CDLL:
                 ]
                 lib.colibri_v2_gpu_probe.restype = ctypes.c_int
                 lib.colibri_v2_gpu_available.restype = ctypes.c_int
+                lib.colibri_backend_select.argtypes = [ctypes.c_int]
+                lib.colibri_backend_select.restype = ctypes.c_int
+                lib.colibri_backend_active.restype = ctypes.c_int
                 lib.colibri_v2_gpu_init.argtypes = [ctypes.c_int32]
                 lib.colibri_v2_gpu_init.restype = ctypes.c_int
                 lib.colibri_v2_gpu_compile.argtypes = [
@@ -1140,6 +1147,41 @@ class V2Model:
         ``native_qwen_runtime`` remains as a compatibility alias.
         """
         return self.native_qwen_runtime(**options)
+
+    @staticmethod
+    def select_backend(backend: str = "auto") -> str:
+        """Choose where the runtime executes. Returns the backend selected.
+
+        Must be called before a runtime is prepared: allocations belong to
+        whichever backend was active when they were made.
+
+        "auto" prefers CUDA and falls back to the CPU backend when no driver
+        is present, which is the behaviour a caller almost always wants -- the
+        alternative is a hard failure on a machine that could have run the
+        model slowly.
+        """
+        lib = _library()
+        if backend not in _BACKENDS:
+            raise ValueError(
+                f"unknown backend {backend!r}; expected one of "
+                + ", ".join(sorted(_BACKENDS))
+            )
+        if backend == "auto":
+            # Ask the CUDA backend whether a driver is present before settling.
+            lib.colibri_backend_select(_BACKENDS["cuda"])
+            backend = "cuda" if lib.colibri_v2_gpu_available() == 1 else "cpu"
+        if lib.colibri_backend_select(_BACKENDS[backend]) != 0:
+            raise V2Error(f"native backend {backend!r} is unavailable")
+        return backend
+
+    @staticmethod
+    def active_backend() -> str:
+        lib = _library()
+        value = int(lib.colibri_backend_active())
+        for name, code in _BACKENDS.items():
+            if name != "auto" and code == value:
+                return name
+        return "unknown"
 
     @staticmethod
     def gpu_info(device: int = 0) -> dict[str, int]:

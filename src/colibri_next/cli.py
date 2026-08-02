@@ -169,6 +169,15 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--model-name")
     serve.add_argument("--device", type=int, default=0)
+    # Separate from --device, which selects *which* GPU. This selects whether a
+    # GPU is used at all.
+    serve.add_argument(
+        "--backend",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help="execution backend; auto uses CUDA when a driver is present and "
+             "falls back to the CPU backend otherwise",
+    )
     serve.add_argument("--strict-model", action="store_true")
     serve.add_argument("--api-key", default=os.environ.get("COLIBRI_API_KEY"))
     serve.add_argument("--cors-origin", default="*")
@@ -340,6 +349,16 @@ def _generate(args: argparse.Namespace) -> int:
 
 def _serve(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
+    from .v2 import V2Model
+    # Before the service builds a runtime: allocations belong to whichever
+    # backend was active when they were made.
+    selected = V2Model.select_backend(getattr(args, "backend", "auto"))
+    if selected == "cpu":
+        print(
+            "[colibri] running on the CPU backend; decode will be far slower "
+            "than a GPU",
+            file=sys.stderr,
+        )
     from .v2_server import NativeV2InferenceService
     service = NativeV2InferenceService(
         args.model,
