@@ -1,5 +1,6 @@
 #include "colibri_v2.h"
 #include "colibri_gpu_driver.h"
+#include <colibri_backend.hpp>
 #include "colibri_v2_provider.hpp"
 #include "colibri_v2_config.hpp"
 #include "colibri_v2_attention_policy.hpp"
@@ -341,6 +342,12 @@ struct ColibriV2QwenRuntime {
     std::uint64_t requantized_saved_bytes = 0;
     std::uint64_t static_arena = 0;
     std::uint64_t static_arena_bytes = 0;
+    // Static tensors served directly from the GGUF mapping instead of a device
+    // copy (CPU backend only). Reported on stderr at prepare, alongside the
+    // requantization summary, rather than through the info struct -- the ABI is
+    // shared with the GPU build where these are always zero.
+    std::uint64_t aliased_tensors = 0;
+    std::uint64_t aliased_tensor_bytes = 0;
     std::uint64_t workspace = 0;
     std::uint64_t workspace_bytes = 0;
     colibri::v2::workspace::QwenDecodeWorkspaceLayout decode_workspace_layout;
@@ -2487,6 +2494,41 @@ std::uint64_t qwen_device_tensor_size(
     return tensor.size;
 }
 
+// Host pointer a static tensor can be used from directly, or 0 if it has to be
+// copied into the device arena.
+//
+// On the CPU backend "device memory" is ordinary host memory, and the weights
+// are already resident in the GGUF mapping -- so uploading them allocates and
+// fills a second full copy of the model. For a large checkpoint that is the
+// difference between running and exhausting RAM, and it buys nothing: the
+// mapping is MAP_PRIVATE and no kernel writes to weights.
+//
+// Aliasing is refused whenever the device representation is not byte-identical
+// to the file (the bf16 -> q8_0 requantization path genuinely transforms the
+// data) or the mapped address is not aligned enough for the 128-bit vector
+// loads the kernels use.
+const std::uint8_t* qwen_alias_static_tensor(
+    const ColibriV2QwenRuntime& runtime, std::uint64_t index
+) {
+    if (!colibri_backend_is_cpu()) return nullptr;
+    // Escape hatch: forces the copying path so a suspected aliasing problem can
+    // be confirmed or ruled out without a rebuild.
+    static const bool disabled = [] {
+        const char* setting = std::getenv("COLIBRI_CPU_NO_ALIAS");
+        return setting != nullptr && setting[0] == '1';
+    }();
+    if (disabled) return nullptr;
+    const auto& tensor = runtime.model->tensors[index];
+    if (qwen_device_type(runtime, index) != tensor.type) return nullptr;
+    if (qwen_device_tensor_size(runtime, index) != tensor.size) return nullptr;
+    const std::uint8_t* data = tensor_data(*runtime.model, tensor);
+    if (data == nullptr) return nullptr;
+    constexpr std::uintptr_t kVectorAlignment = 16;
+    if (reinterpret_cast<std::uintptr_t>(data) % kVectorAlignment != 0)
+        return nullptr;
+    return data;
+}
+
 const char* qwen_embedding_kernel(std::uint32_t type, bool rows) {
     switch (type) {
         case 0: return rows ? "qwen_f32_embedding_rows" : "qwen_f32_embedding";
@@ -3135,6 +3177,20 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
     // options. Model open necessarily happens before `--expert-paging` is
     // applied, so mapping permissions cannot depend on that option.
     m->data=static_cast<const uint8_t*>(mmap(nullptr,m->size,PROT_READ|PROT_WRITE,map_flags,m->fd,0)); if(m->data==MAP_FAILED) throw std::runtime_error("cannot map GGUF");
+#if defined(MADV_HUGEPAGE)
+    // Ask for 2 MiB pages. On the CPU backend the weights are read straight out
+    // of this mapping (see qwen_alias_static_tensor), so a decode walks the
+    // whole non-expert weight set every token -- 2.5 GiB for a 35B MoE, which
+    // is ~650k pages at 4 KiB.
+    //
+    // Measured no effect on the machine this was written on: smaps_rollup
+    // reported FilePmdMapped = 0 afterwards, i.e. the kernel declined to back a
+    // file mapping with large folios despite THP being set to `always`. It is
+    // kept because it is advisory, free, and correct where file THP is
+    // supported -- but do not assume it is doing anything without checking
+    // FilePmdMapped, and do not attribute a speedup to it on that assumption.
+    (void)madvise(const_cast<uint8_t*>(m->data),m->size,MADV_HUGEPAGE);
+#endif
     if(lock_model&&mlock(m->data,m->size)!=0) std::fprintf(stderr,"colibri_v2: mlock(%zu bytes) failed: %s; continuing without pinning (raise RLIMIT_MEMLOCK to pin)\n",m->size,std::strerror(errno));
 #else
     m->file=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
@@ -4151,7 +4207,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 static_cast<unsigned long long>(
                     runtime->requantized_saved_bytes/(1024ull*1024)));
         }
-        for(std::uint64_t index=0;index<persistent.size();++index)if(persistent[index])runtime->static_arena_bytes+=device_align(qwen_device_tensor_size(*runtime,index));
+        // Aliased tensors are read straight out of the GGUF mapping and need no
+        // arena space; see qwen_alias_static_tensor.
+        for(std::uint64_t index=0;index<persistent.size();++index)if(persistent[index]&&!qwen_alias_static_tensor(*runtime,index))runtime->static_arena_bytes+=device_align(qwen_device_tensor_size(*runtime,index));
         // Dense checkpoints have no routed experts, so there is nothing to size
         // a paging slot from -- and expert_count is zero, which would trap.
         std::uint64_t one_expert=0;
@@ -4475,6 +4533,15 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(!persistent[index])continue;
             const auto&t=runtime->model->tensors[index];
             const auto device_bytes=qwen_device_tensor_size(*runtime,index);
+            if(const auto* aliased=qwen_alias_static_tensor(*runtime,index)){
+                // Point at the mapping instead of copying into the arena, and
+                // leave the cursor alone -- no arena space was reserved.
+                runtime->device_tensors[index]=
+                    reinterpret_cast<std::uint64_t>(aliased);
+                runtime->aliased_tensors++;
+                runtime->aliased_tensor_bytes+=device_bytes;
+                continue;
+            }
             runtime->device_tensors[index]=runtime->static_arena+cursor;
             if(qwen_device_type(*runtime,index)==8&&t.type==30){
                 const std::uint64_t elements=device_bytes/kQ8BlockSize*32;
@@ -4489,6 +4556,13 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }else if(colibri_gpu_upload_sync(runtime->device_tensors[index],tensor_data(*runtime->model,t),t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
             cursor+=device_align(device_bytes);
         }
+        if(runtime->aliased_tensors)
+            std::fprintf(stderr,
+                "[colibri-v2] %llu static tensors (%llu MiB) served from the GGUF "
+                "mapping; device arena is %llu MiB\n",
+                static_cast<unsigned long long>(runtime->aliased_tensors),
+                static_cast<unsigned long long>(runtime->aliased_tensor_bytes/(1024ull*1024)),
+                static_cast<unsigned long long>(runtime->static_arena_bytes/(1024ull*1024)));
         if(runtime->options.strict_resident&&resident_expert_bytes){
             const auto experts=runtime->model->config.expert_count;
             const auto cache_layers=qwen_cache_layer_count(*runtime);

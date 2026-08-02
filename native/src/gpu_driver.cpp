@@ -7,6 +7,9 @@
 // automatic.
 #include "colibri_gpu_driver.h"
 
+#include <colibri_backend.hpp>
+#include <colibri_cpu_backend.hpp>
+
 #include <cmath>
 #include <chrono>
 #include <cstdint>
@@ -523,6 +526,17 @@ int launch(
     unsigned int shared_bytes = 0,
     CUstream stream = nullptr
 ) {
+    // Every wrapper in this file bottoms out here, so recognizing a CPU
+    // sentinel is all it takes for the host backend to inherit the whole set --
+    // including the hand-tuned grid geometry each wrapper computes.
+    if (colibri::is_cpu_function(function)) {
+        const char* name = colibri_cpu_kernel_name(
+            colibri::cpu_function_index(function));
+        if (name == nullptr) return -1;
+        return colibri_cpu_launch_named(
+            name, grid_x, grid_y, block_x, shared_bytes,
+            reinterpret_cast<std::uint64_t>(stream), args);
+    }
     return g_api.cuLaunchKernel(
         function,
         grid_x, grid_y, 1,
@@ -701,10 +715,14 @@ int enqueue_layer(
 }  // namespace
 
 extern "C" int colibri_gpu_available() {
+    if (colibri_backend_is_cpu()) return colibri_cpu_backend_available();
     return load_apis() ? 1 : 0;
 }
 
 extern "C" int colibri_gpu_init(std::int32_t device) {
+    // No driver to load and no context to retain; the host backend is ready as
+    // soon as it is selected.
+    if (colibri_backend_is_cpu()) return 0;
     if (!load_apis()) {
         return -1;
     }
@@ -739,6 +757,41 @@ extern "C" int colibri_gpu_init(std::int32_t device) {
     return 0;
 }
 
+struct Entry {
+    const char* name;
+    CUfunction* slot;
+};
+// Kernels the driver holds direct handles to, shared by both backends so the
+// CUDA and CPU paths can never disagree about which names are required.
+const Entry kNamedKernels[] = {
+    {"rms_norm", &g_kernels.rms_norm},
+    {"q4_matvec", &g_kernels.q4_matvec},
+    {"bf16_matvec", &g_kernels.bf16_matvec},
+    {"delta_conv_sequence", &g_kernels.delta_conv},
+    {"delta_conv_step", &g_kernels.delta_conv_step},
+    {"delta_recurrent_sequence", &g_kernels.delta_recurrent},
+    {"scaled_add", &g_kernels.scaled_add},
+    {"q4_batched_matvec", &g_kernels.q4_batched},
+    {"q4_silu_batched", &g_kernels.q4_silu},
+    {"q4_batched_weighted_matvec", &g_kernels.q4_weighted},
+    {"kv_attention", &g_kernels.attention},
+    {"kv_append", &g_kernels.kv_append},
+    {"q8_matvec_transposed_warp", &g_kernels.q8_matvec_transposed},
+    {"route_topk", &g_kernels.route_topk},
+    {"sampling_block_topk_logits", &g_kernels.sampling_block_topk_logits},
+    {"sampling_block_topk_pairs", &g_kernels.sampling_block_topk_pairs},
+    {"q5k_grouped_swiglu", &g_kernels.q5_grouped_swiglu},
+    {"q4k_grouped_swiglu", &g_kernels.q4k_grouped_swiglu},
+    {"q4k_grouped_accumulate", &g_kernels.q4k_grouped_accumulate},
+    {"q5k_grouped_accumulate", &g_kernels.q5k_grouped_accumulate},
+    {"q6k_grouped_accumulate", &g_kernels.q6_grouped_accumulate},
+    {"q8_grouped_accumulate", &g_kernels.q8_grouped_accumulate},
+    {"nvfp4_grouped_swiglu", &g_kernels.nvfp4_grouped_swiglu},
+    {"nvfp4_grouped_accumulate", &g_kernels.nvfp4_grouped_accumulate},
+    {"nvfp4_grouped_swiglu_tiled", &g_kernels.nvfp4_grouped_swiglu_tiled},
+    {"nvfp4_grouped_accumulate_tiled", &g_kernels.nvfp4_grouped_accumulate_tiled},
+};
+
 extern "C" int colibri_gpu_compile(
     const char* source,
     const char* const* options,
@@ -747,6 +800,34 @@ extern "C" int colibri_gpu_compile(
     char* log_buffer,
     std::int32_t log_capacity
 ) {
+    // CPU mode has no source to compile: the host kernels were compiled into
+    // this library. Publishing sentinel handles under the same names is what
+    // makes every wrapper below work unchanged.
+    if (colibri_backend_is_cpu()) {
+        g_functions.clear();
+        const int total = colibri_cpu_backend_kernel_count();
+        for (int index = 0; index < total; ++index) {
+            const char* name = colibri_cpu_kernel_name(
+                static_cast<std::uint64_t>(index));
+            if (name == nullptr) continue;
+            g_functions[name] = reinterpret_cast<CUfunction>(
+                colibri::make_cpu_function(static_cast<std::uint64_t>(index)));
+        }
+        for (const Entry& entry : kNamedKernels) {
+            const auto found = g_functions.find(entry.name);
+            if (found == g_functions.end()) {
+                // A name the driver dereferences directly but the corpus does
+                // not define would fault at launch; fail here instead.
+                if (log_buffer != nullptr && log_capacity > 0) {
+                    std::snprintf(log_buffer, log_capacity,
+                                  "CPU backend is missing kernel: %s", entry.name);
+                }
+                return -5;
+            }
+            *entry.slot = found->second;
+        }
+        return 0;
+    }
     if (!g_api.loaded || g_context == nullptr) {
         return -1;
     }
@@ -824,39 +905,7 @@ extern "C" int colibri_gpu_compile(
         != 0) {
         return -4;
     }
-    struct Entry {
-        const char* name;
-        CUfunction* slot;
-    };
-    const Entry entries[] = {
-        {"rms_norm", &g_kernels.rms_norm},
-        {"q4_matvec", &g_kernels.q4_matvec},
-        {"bf16_matvec", &g_kernels.bf16_matvec},
-        {"delta_conv_sequence", &g_kernels.delta_conv},
-        {"delta_conv_step", &g_kernels.delta_conv_step},
-        {"delta_recurrent_sequence", &g_kernels.delta_recurrent},
-        {"scaled_add", &g_kernels.scaled_add},
-        {"q4_batched_matvec", &g_kernels.q4_batched},
-        {"q4_silu_batched", &g_kernels.q4_silu},
-        {"q4_batched_weighted_matvec", &g_kernels.q4_weighted},
-        {"kv_attention", &g_kernels.attention},
-        {"kv_append", &g_kernels.kv_append},
-        {"q8_matvec_transposed_warp", &g_kernels.q8_matvec_transposed},
-        {"route_topk", &g_kernels.route_topk},
-        {"sampling_block_topk_logits", &g_kernels.sampling_block_topk_logits},
-        {"sampling_block_topk_pairs", &g_kernels.sampling_block_topk_pairs},
-        {"q5k_grouped_swiglu", &g_kernels.q5_grouped_swiglu},
-        {"q4k_grouped_swiglu", &g_kernels.q4k_grouped_swiglu},
-        {"q4k_grouped_accumulate", &g_kernels.q4k_grouped_accumulate},
-        {"q5k_grouped_accumulate", &g_kernels.q5k_grouped_accumulate},
-        {"q6k_grouped_accumulate", &g_kernels.q6_grouped_accumulate},
-        {"q8_grouped_accumulate", &g_kernels.q8_grouped_accumulate},
-        {"nvfp4_grouped_swiglu", &g_kernels.nvfp4_grouped_swiglu},
-        {"nvfp4_grouped_accumulate", &g_kernels.nvfp4_grouped_accumulate},
-        {"nvfp4_grouped_swiglu_tiled", &g_kernels.nvfp4_grouped_swiglu_tiled},
-        {"nvfp4_grouped_accumulate_tiled", &g_kernels.nvfp4_grouped_accumulate_tiled},
-    };
-    for (const Entry& entry : entries) {
+    for (const Entry& entry : kNamedKernels) {
         if (g_api.cuModuleGetFunction(entry.slot, g_module, entry.name) != 0) {
             return -5;
         }
@@ -1156,6 +1205,8 @@ extern "C" int colibri_gpu_q4_moe(
 }
 
 extern "C" int colibri_gpu_sync() {
+    if (colibri_backend_is_cpu()) return colibri_cpu_sync();
+
     if (!g_api.loaded) {
         return -1;
     }
@@ -1163,6 +1214,8 @@ extern "C" int colibri_gpu_sync() {
 }
 
 extern "C" int colibri_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_alloc(bytes, pointer);
+
     if (g_context == nullptr || pointer == nullptr || bytes == 0
         || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
     CUdeviceptr allocation = 0;
@@ -1172,18 +1225,24 @@ extern "C" int colibri_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
 }
 
 extern "C" int colibri_gpu_free(std::uint64_t pointer) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_free(pointer);
+
     if (pointer == 0) return 0;
     if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
     return g_api.cuMemFree(static_cast<CUdeviceptr>(pointer)) == 0 ? 0 : -2;
 }
 
 extern "C" int colibri_gpu_host_alloc(std::uint64_t bytes, void** pointer) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_host_alloc(bytes, pointer);
+
     if (pointer == nullptr || bytes == 0) return -1;
     return g_api.cuMemHostAlloc(pointer, static_cast<size_t>(bytes), 0) == 0
         ? 0 : -2;
 }
 
 extern "C" int colibri_gpu_host_free(void* pointer) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_host_free(pointer);
+
     if (pointer == nullptr) return 0;
     return g_api.cuMemFreeHost(pointer) == 0 ? 0 : -1;
 }
@@ -1192,6 +1251,8 @@ extern "C" int colibri_gpu_host_free(void* pointer) {
 // DMAs straight from it with no CPU staging copy. Read-only file mappings need
 // the READ_ONLY flag; fall back to portable/plain for older drivers.
 extern "C" int colibri_gpu_host_register(const void* pointer, std::uint64_t bytes) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_host_register(pointer, bytes);
+
     if (pointer == nullptr || bytes == 0) return -1;
     if (g_api.cuMemHostRegister == nullptr) return -3;
     void* host = const_cast<void*>(pointer);
@@ -1204,6 +1265,8 @@ extern "C" int colibri_gpu_host_register(const void* pointer, std::uint64_t byte
 }
 
 extern "C" int colibri_gpu_host_unregister(const void* pointer) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_host_unregister(pointer);
+
     if (pointer == nullptr) return 0;
     if (g_api.cuMemHostUnregister == nullptr) return -3;
     return g_api.cuMemHostUnregister(const_cast<void*>(pointer)) == 0 ? 0 : -1;
@@ -1213,6 +1276,8 @@ extern "C" int colibri_gpu_upload(
     std::uint64_t destination, const void* source, std::uint64_t bytes,
     std::uint64_t stream
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_upload(destination, source, bytes, stream);
+
     if (destination == 0 || source == nullptr || bytes == 0) return -1;
     return g_api.cuMemcpyHtoDAsync(
         static_cast<CUdeviceptr>(destination), source, static_cast<size_t>(bytes),
@@ -1223,6 +1288,8 @@ extern "C" int colibri_gpu_upload(
 extern "C" int colibri_gpu_upload_sync(
     std::uint64_t destination, const void* source, std::uint64_t bytes
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_upload_sync(destination, source, bytes);
+
     if (destination == 0 || source == nullptr || bytes == 0) return -1;
     return g_api.cuMemcpyHtoD(
         static_cast<CUdeviceptr>(destination), source, static_cast<size_t>(bytes)
@@ -1233,6 +1300,8 @@ extern "C" int colibri_gpu_download(
     void* destination, std::uint64_t source, std::uint64_t bytes,
     std::uint64_t stream
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_download(destination, source, bytes, stream);
+
     if (destination == nullptr || source == 0 || bytes == 0) return -1;
     return g_api.cuMemcpyDtoHAsync(
         destination, static_cast<CUdeviceptr>(source), static_cast<size_t>(bytes),
@@ -1244,6 +1313,8 @@ extern "C" int colibri_gpu_memset(
     std::uint64_t destination, std::uint8_t value, std::uint64_t bytes,
     std::uint64_t stream
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_memset(destination, value, bytes, stream);
+
     if (destination == 0 || bytes == 0) return -1;
     return g_api.cuMemsetD8Async(
         static_cast<CUdeviceptr>(destination), value, static_cast<size_t>(bytes),
@@ -1252,6 +1323,8 @@ extern "C" int colibri_gpu_memset(
 }
 
 extern "C" int colibri_gpu_stream_create(std::uint64_t* stream) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_stream_create(stream);
+
     if (stream == nullptr) return -1;
     CUstream created = nullptr;
     if (g_api.cuStreamCreate(&created, 1) != 0) return -2;
@@ -1260,17 +1333,23 @@ extern "C" int colibri_gpu_stream_create(std::uint64_t* stream) {
 }
 
 extern "C" int colibri_gpu_stream_destroy(std::uint64_t stream) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_stream_destroy(stream);
+
     if (stream == 0) return 0;
     return g_api.cuStreamDestroy(reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -1;
 }
 
 extern "C" int colibri_gpu_stream_sync(std::uint64_t stream) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_stream_sync(stream);
+
     return g_api.cuStreamSynchronize(reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -1;
 }
 
 extern "C" int colibri_gpu_graph_begin(std::uint64_t stream) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_graph_begin(stream);
+
     if (stream == 0 || g_api.cuStreamBeginCapture == nullptr) return -1;
     return g_api.cuStreamBeginCapture(
         reinterpret_cast<CUstream>(stream), 2 /* relaxed */
@@ -1280,6 +1359,8 @@ extern "C" int colibri_gpu_graph_begin(std::uint64_t stream) {
 extern "C" int colibri_gpu_graph_end(
     std::uint64_t stream, std::uint64_t* handle
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_graph_end(stream, handle);
+
     if (stream == 0 || handle == nullptr || g_api.cuStreamEndCapture == nullptr)
         return -1;
     *handle = 0;
@@ -1298,6 +1379,8 @@ extern "C" int colibri_gpu_graph_end(
 extern "C" int colibri_gpu_graph_launch(
     std::uint64_t graph, std::uint64_t stream
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_graph_launch(graph, stream);
+
     if (graph == 0 || stream == 0 || g_api.cuGraphLaunch == nullptr) return -1;
     return g_api.cuGraphLaunch(
         reinterpret_cast<void*>(graph), reinterpret_cast<CUstream>(stream)
@@ -1305,12 +1388,16 @@ extern "C" int colibri_gpu_graph_launch(
 }
 
 extern "C" int colibri_gpu_graph_destroy(std::uint64_t graph) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_graph_destroy(graph);
+
     if (graph == 0) return 0;
     if (g_api.cuGraphExecDestroy == nullptr) return -1;
     return g_api.cuGraphExecDestroy(reinterpret_cast<void*>(graph)) == 0 ? 0 : -2;
 }
 
 extern "C" int colibri_gpu_event_create(std::uint64_t* event) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_event_create(event);
+
     if (event == nullptr) return -1;
     CUevent created = nullptr;
     if (g_api.cuEventCreate(&created, 2 /* disable timing */) != 0) return -2;
@@ -1319,6 +1406,8 @@ extern "C" int colibri_gpu_event_create(std::uint64_t* event) {
 }
 
 extern "C" int colibri_gpu_timed_event_create(std::uint64_t* event) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_timed_event_create(event);
+
     if (event == nullptr) return -1;
     CUevent created = nullptr;
     if (g_api.cuEventCreate(&created, 0) != 0) return -2;
@@ -1329,6 +1418,8 @@ extern "C" int colibri_gpu_timed_event_create(std::uint64_t* event) {
 extern "C" int colibri_gpu_event_record(
     std::uint64_t event, std::uint64_t stream
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_event_record(event, stream);
+
     if (event == 0) return -1;
     return g_api.cuEventRecord(
         reinterpret_cast<CUevent>(event), reinterpret_cast<CUstream>(stream)
@@ -1336,6 +1427,8 @@ extern "C" int colibri_gpu_event_record(
 }
 
 extern "C" int colibri_gpu_event_sync(std::uint64_t event) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_event_sync(event);
+
     if (event == 0) return -1;
     return g_api.cuEventSynchronize(reinterpret_cast<CUevent>(event)) == 0
         ? 0 : -2;
@@ -1344,6 +1437,8 @@ extern "C" int colibri_gpu_event_sync(std::uint64_t event) {
 extern "C" int colibri_gpu_stream_wait_event(
     std::uint64_t stream, std::uint64_t event
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_stream_wait_event(stream, event);
+
     if (event == 0) return -1;
     return g_api.cuStreamWaitEvent(
         reinterpret_cast<CUstream>(stream), reinterpret_cast<CUevent>(event), 0
@@ -1351,6 +1446,8 @@ extern "C" int colibri_gpu_stream_wait_event(
 }
 
 extern "C" int colibri_gpu_event_destroy(std::uint64_t event) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_event_destroy(event);
+
     if (event == 0) return 0;
     return g_api.cuEventDestroy(reinterpret_cast<CUevent>(event)) == 0
         ? 0 : -1;
@@ -1359,6 +1456,8 @@ extern "C" int colibri_gpu_event_destroy(std::uint64_t event) {
 extern "C" int colibri_gpu_event_elapsed(
     std::uint64_t start, std::uint64_t end, float* milliseconds
 ) {
+    if (colibri_backend_is_cpu()) return colibri_cpu_event_elapsed(start, end, milliseconds);
+
     if (start == 0 || end == 0 || milliseconds == nullptr) return -1;
     return g_api.cuEventElapsedTime(
         milliseconds, reinterpret_cast<CUevent>(start),

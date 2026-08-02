@@ -18,6 +18,7 @@ GGUF_FLOAT32 = 6
 GGUF_STRING = 8
 GGUF_UINT64 = 10
 GGML_F32 = 0
+GGML_Q8_0 = 8
 
 ALIGNMENT = 32
 
@@ -25,6 +26,30 @@ ALIGNMENT = 32
 def _string(value: str) -> bytes:
     raw = value.encode("utf-8")
     return struct.pack("<Q", len(raw)) + raw
+
+
+def _quantize_q8_0(data: np.ndarray) -> bytes:
+    """Pack a row-major matrix as GGML Q8_0.
+
+    Block layout is 32 values per block: an fp16 scale followed by 32 int8
+    weights, 34 bytes total. Blocks run along the contiguous dimension, which
+    for these tensors is the input width.
+    """
+    rows, columns = data.shape
+    assert columns % 32 == 0, "Q8_0 needs a multiple of 32 along the row"
+    blocks = data.reshape(rows, columns // 32, 32).astype(np.float32)
+    absmax = np.abs(blocks).max(axis=2)
+    scale = (absmax / 127.0).astype(np.float32)
+    inverse = np.where(scale > 0.0, 1.0 / np.where(scale > 0.0, scale, 1.0), 0.0)
+    quantized = np.rint(blocks * inverse[:, :, None]).clip(-127, 127).astype(np.int8)
+
+    out = bytearray()
+    scale_f16 = scale.astype(np.float16)
+    for row in range(rows):
+        for block in range(columns // 32):
+            out += scale_f16[row, block].tobytes()
+            out += quantized[row, block].tobytes()
+    return bytes(out)
 
 
 def _kv(key: str, kind: int, payload: bytes) -> bytes:
@@ -91,6 +116,7 @@ def build_dense_qwen35_gguf(
     seed: int = 7,
     *,
     mute_mixer: bool = False,
+    quantize: str | None = None,
 ) -> DenseQwenSpec:
     """Write the fixture.
 
@@ -183,12 +209,25 @@ def build_dense_qwen35_gguf(
     payloads = bytearray()
     for name, shape, data in tensors:
         offset = len(payloads)
+        # Quantize only the wide 2D projections. Norms and other vectors stay
+        # f32 exactly as a real checkpoint leaves them.
+        use_q8 = (
+            quantize == "q8_0"
+            and len(shape) == 2
+            and shape[0] % 32 == 0
+            and name.endswith(".weight")
+            and "norm" not in name
+        )
         infos += _string(name)
         infos += struct.pack("<I", len(shape))
         infos += b"".join(struct.pack("<Q", dim) for dim in shape)
-        infos += struct.pack("<IQ", GGML_F32, offset)
-        raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()
-        assert len(raw) == int(np.prod(shape)) * 4, name
+        infos += struct.pack("<IQ", GGML_Q8_0 if use_q8 else GGML_F32, offset)
+        if use_q8:
+            raw = _quantize_q8_0(np.ascontiguousarray(data, dtype=np.float32))
+            assert len(raw) == int(np.prod(shape)) // 32 * 34, name
+        else:
+            raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()
+            assert len(raw) == int(np.prod(shape)) * 4, name
         payloads += raw
         padding = (-len(payloads)) % ALIGNMENT
         payloads += b"\0" * padding
