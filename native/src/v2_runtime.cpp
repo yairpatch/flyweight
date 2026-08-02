@@ -2690,9 +2690,19 @@ void qwen_cpu_moe(
     const bool laguna_iq_q8 = (cpu_features & 4u) != 0
         && gate_type == 17 && up_type == 17 && down_type == 18
         && (!q8_setting || q8_setting[0] != '0');
+    // On the CPU backend, default the Q8-K activation path on for any expert
+    // quantization q8_activations_ok() accepts. It was previously reachable for
+    // Q8_0 only through COLIBRI_Q8_ACTIVATIONS=1, even though the type is on
+    // that list -- measured worth ~14% on a 35B Q8_0 MoE (medians 7.53/7.16
+    // without against 8.33/8.42 with, two replications, non-overlapping in the
+    // second). Scoped to the CPU backend because that is the configuration the
+    // measurement covers; a GPU machine running hybrid or cpu expert placement
+    // keeps the old behaviour until someone measures it there.
+    const bool q8_default_on = colibri_backend_is_cpu()
+        && !(q8_setting && q8_setting[0] == '0');
     const bool use_q8 = (cpu_features & 1u) != 0 && hidden % 256 == 0
         && intermediate % 256 == 0
-        && ((q8_setting && q8_setting[0] == '1') || laguna_iq_q8)
+        && ((q8_setting && q8_setting[0] == '1') || laguna_iq_q8 || q8_default_on)
         && q8_activations_ok(gate_type) && q8_activations_ok(up_type)
         && q8_activations_ok(down_type);
     static constexpr char q4_tile_name[] = {
