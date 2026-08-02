@@ -63,7 +63,9 @@ struct CublasLtHeuristicResult {
 struct CudaApi {
     CUresult (*cuInit)(unsigned int) = nullptr;
     CUresult (*cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice) = nullptr;
+    CUresult (*cuDevicePrimaryCtxSetFlags)(CUdevice, unsigned int) = nullptr;
     CUresult (*cuCtxSetCurrent)(CUcontext) = nullptr;
+    CUresult (*cuCtxSetFlags)(unsigned int) = nullptr;
     CUresult (*cuDeviceGetAttribute)(int*, int, CUdevice) = nullptr;
     CUresult (*cuModuleLoadDataEx)(
         CUmodule*, const void*, unsigned int, int*, void**
@@ -314,7 +316,11 @@ bool load_apis() {
     ok &= load_symbol(
         cuda, "cuDevicePrimaryCtxRetain", g_api.cuDevicePrimaryCtxRetain
     );
+    load_symbol(
+        cuda, "cuDevicePrimaryCtxSetFlags", g_api.cuDevicePrimaryCtxSetFlags
+    );
     ok &= load_symbol(cuda, "cuCtxSetCurrent", g_api.cuCtxSetCurrent);
+    load_symbol(cuda, "cuCtxSetFlags", g_api.cuCtxSetFlags);
     ok &= load_symbol(
         cuda, "cuDeviceGetAttribute", g_api.cuDeviceGetAttribute
     );
@@ -705,12 +711,31 @@ extern "C" int colibri_gpu_init(std::int32_t device) {
     if (g_api.cuInit(0) != 0) {
         return -2;
     }
+    // CUDA's default AUTO scheduling actively spins a host core while a stream
+    // is synchronized. Decode has a host/device boundary at every routed MoE
+    // layer, so that spin can heat a shared-power laptop enough to force the
+    // GPU into a much lower firmware power state. Blocking synchronization
+    // preserves the same ordering while putting the waiting thread to sleep.
+    // Keep an opt-out for latency-sensitive systems with independent cooling.
+    constexpr unsigned int kCtxSchedBlockingSync = 0x04;
+    const char* spin_wait = std::getenv("COLIBRI_CUDA_SPIN_WAIT");
+    const bool blocking_sync = !spin_wait || spin_wait[0] != '1';
+    if (blocking_sync && g_api.cuDevicePrimaryCtxSetFlags != nullptr) {
+        // This can report PRIMARY_CONTEXT_ACTIVE when another CUDA consumer
+        // initialized first. cuCtxSetFlags below handles that case on drivers
+        // which expose the current-context API.
+        (void)g_api.cuDevicePrimaryCtxSetFlags(
+            device, kCtxSchedBlockingSync
+        );
+    }
     if (g_api.cuDevicePrimaryCtxRetain(&g_context, device) != 0) {
         return -3;
     }
     if (g_api.cuCtxSetCurrent(g_context) != 0) {
         return -4;
     }
+    if (blocking_sync && g_api.cuCtxSetFlags != nullptr)
+        (void)g_api.cuCtxSetFlags(kCtxSchedBlockingSync);
     return 0;
 }
 
@@ -884,6 +909,7 @@ extern "C" int colibri_gpu_compile(
               "q4k_matvec_transposed", "q4k_lm_head_argmax_warp",
               "q6k_lm_head_argmax_warp", "q6k_matvec_transposed",
              "q6k_grouped_swiglu_rows", "q6k_grouped_accumulate_rows",
+             "q8_grouped_swiglu", "q8_grouped_swiglu_rows",
              "q8_grouped_accumulate_rows", "nvfp4_grouped_swiglu_rows",
              "nvfp4_grouped_accumulate_rows", "nvfp4_matvec_transposed",
              "nvfp4_swiglu_transposed", "kv_attention_prefill",

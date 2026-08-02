@@ -1742,26 +1742,60 @@ def create_handler(
                 )
 
         def _prompt_progress(self, path: str) -> Callable[[int, int], None]:
-            last_reported = -1
+            label = f"[prefill {uuid.uuid4().hex[:8]}] {path}"
+            last_seen = -1
+            last_logged = -1
             started = time.perf_counter()
+            last_logged_at = started
+            first_report = True
+            reused = 0
 
             def report(processed: int, total: int) -> None:
-                nonlocal last_reported
-                if processed == last_reported:
+                nonlocal first_report, last_logged, last_logged_at, last_seen
+                nonlocal reused, started
+                if processed == last_seen:
                     return
-                last_reported = processed
+                last_seen = processed
+                now = time.perf_counter()
+                if first_report:
+                    first_report = False
+                    reused = min(max(0, processed), total)
+                    started = now
+                    last_logged = processed
+                    last_logged_at = now
+                    remaining = max(0, total - reused)
+                    cached = f", {reused} cached/reused" if reused else ""
+                    sys.stderr.write(
+                        f"{label}: starting {total} prompt tokens"
+                        f"{cached}, {remaining} to evaluate\n"
+                    )
+                    sys.stderr.flush()
+                    if processed < total:
+                        return
+                minimum_step = max(1, total // 20)
+                if (
+                    processed < total
+                    and processed - last_logged < minimum_step
+                    and now - last_logged_at < 1.0
+                ):
+                    return
                 pct = (100 * processed / total) if total else 100
-                elapsed = time.perf_counter() - started
-                rate = (processed / elapsed) if elapsed > 0 else 0.0
+                elapsed = now - started
+                evaluated = max(0, processed - reused)
+                rate = (evaluated / elapsed) if elapsed > 0 else 0.0
                 sys.stderr.write(
-                    f"\r[load] prompt {processed}/{total} tokens "
+                    f"{label}: {processed}/{total} tokens "
                     f"({pct:5.1f}%) {rate:6.1f} tok/s"
+                    "\n"
                 )
                 sys.stderr.flush()
+                last_logged = processed
+                last_logged_at = now
                 if processed >= total:
                     sys.stderr.write(
-                        f"\n[load] prompt ready in {elapsed:5.2f}s "
-                        f"({total} tokens, {rate:6.1f} tok/s)\n"
+                        f"{label}: ready in {elapsed:5.2f}s "
+                        f"({evaluated} evaluated, {reused} reused, "
+                        f"{rate:6.1f} tok/s)\n"
                     )
                     sys.stderr.flush()
 

@@ -3512,6 +3512,103 @@ void q6k_grouped_accumulate_rows(
 }
 
 extern "C" __global__
+void q8_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int experts
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate_packed =
+        (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[expert];
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        const float gate_scale = __half2float(
+            *((const __half*)(gate_packed + block * 34))
+        );
+        const float up_scale = __half2float(
+            *((const __half*)(up_packed + block * 34))
+        );
+        const signed char gate_value = *((const signed char*)(
+            gate_packed + block * 34 + 2 + within
+        ));
+        const signed char up_value = *((const signed char*)(
+            up_packed + block * 34 + 2 + within
+        ));
+        const float input_value = vector[input];
+        gate += ((float)gate_value * gate_scale) * input_value;
+        up += ((float)up_value * up_scale) * input_value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[expert * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
+void q8_grouped_swiglu_rows(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const int* counts,
+    const float* vectors,
+    float* activated,
+    const int input_size,
+    const int output_size,
+    const int top_k,
+    const int rows
+) {
+    const int row = blockIdx.x;
+    const int route = blockIdx.y;
+    const int token = route / top_k;
+    const int rank = route - token * top_k;
+    if (row >= output_size || token >= rows || rank >= counts[token]) return;
+    const unsigned char* gate_packed =
+        (const unsigned char*)gate_ptrs[route];
+    const unsigned char* up_packed =
+        (const unsigned char*)up_ptrs[route];
+    const float* vector = vectors + token * input_size;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        const float gate_scale = __half2float(
+            *((const __half*)(gate_packed + block * 34))
+        );
+        const float up_scale = __half2float(
+            *((const __half*)(up_packed + block * 34))
+        );
+        const signed char gate_value = *((const signed char*)(
+            gate_packed + block * 34 + 2 + within
+        ));
+        const signed char up_value = *((const signed char*)(
+            up_packed + block * 34 + 2 + within
+        ));
+        const float input_value = vector[input];
+        gate += ((float)gate_value * gate_scale) * input_value;
+        up += ((float)up_value * up_scale) * input_value;
+    }
+    gate = block_reduce_sum(gate);
+    up = block_reduce_sum(up);
+    if (threadIdx.x == 0)
+        activated[route * output_size + row] =
+            (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;
+}
+
+extern "C" __global__
 void q8_grouped_accumulate(
     const unsigned long long* down_ptrs,
     const float* activated,

@@ -11,6 +11,7 @@ from colibri_next.v2_server import (
     NativeV2InferenceService,
     NativeV2Tokenizer,
 )
+from colibri_next.v2 import TASK_EVENT_PREFILL
 
 
 class StubV2Model:
@@ -139,6 +140,19 @@ class BlockingV2Runtime(StubV2Runtime):
         self.cancelled.set()
 
 
+class ProgressV2Runtime(StubV2Runtime):
+    def engine_step(self, capacity: int = 256):
+        events = []
+        for task_id, (prompt, _max_tokens, _stops) in list(self._tasks.items()):
+            events.extend(
+                (task_id, processed, TASK_EVENT_PREFILL)
+                for processed in (0, 1, len(prompt))
+            )
+            events.extend(((task_id, 20, 0), (task_id, 0, 1)))
+            del self._tasks[task_id]
+        return events
+
+
 class NativeV2ServerTests(unittest.TestCase):
     def make_generator(self, outputs: list[int]):
         model = StubV2Model()
@@ -194,6 +208,23 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(result.text, "Hello world")
         self.assertEqual(runtime.inputs, [1, 2, 20])
         self.assertEqual(runtime.resets, 1)
+
+    def test_native_generator_reports_live_prefill_progress(self) -> None:
+        model = StubV2Model()
+        runtime = ProgressV2Runtime([20])
+        generator = NativeV2Generator(  # type: ignore[arg-type]
+            model, runtime, NativeV2Tokenizer(model)  # type: ignore[arg-type]
+        )
+        progress: list[tuple[int, int]] = []
+
+        result = generator.generate_text(
+            "Hi", max_new_tokens=1, progress=lambda done, total: progress.append(
+                (done, total)
+            )
+        )
+
+        self.assertEqual(result.generated_ids, (20,))
+        self.assertEqual(progress, [(0, 2), (1, 2), (2, 2)])
 
     def test_stream_steps_use_stable_constant_time_token_snapshots(self) -> None:
         generator, _ = self.make_generator([10, 20, 30])

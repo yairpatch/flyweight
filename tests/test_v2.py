@@ -160,6 +160,37 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("COLIBRI_NVFP4_TENSOR_CORES", verifier)
         self.assertIn('launch("nvfp4_matmul_rows"', verifier)
 
+    def test_q8_routed_experts_have_explicit_gpu_swiglu_dispatch(self):
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/colibri_v2_qwen_kernels.hpp"
+        ).read_text()
+        driver = (root / "native/src/gpu_driver.cpp").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+
+        self.assertIn("void q8_grouped_swiglu(", kernels)
+        self.assertIn("void q8_grouped_swiglu_rows(", kernels)
+        self.assertIn('"q8_grouped_swiglu"', driver)
+        self.assertIn('"q8_grouped_swiglu_rows"', driver)
+        self.assertIn(
+            'if(type==8)return rows?"q8_grouped_swiglu_rows":"q8_grouped_swiglu";',
+            runtime,
+        )
+
+    def test_cuda_waits_default_to_blocking_context_scheduling(self):
+        root = Path(__file__).resolve().parents[1]
+        driver = (root / "native/src/gpu_driver.cpp").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+
+        self.assertIn("cuDevicePrimaryCtxSetFlags", driver)
+        self.assertIn("cuCtxSetFlags", driver)
+        self.assertIn("kCtxSchedBlockingSync = 0x04", driver)
+        self.assertIn("COLIBRI_CUDA_SPIN_WAIT", driver)
+        # gpu_info() retains the primary context before runtime initialization,
+        # so the probe must set the same scheduling policy first.
+        self.assertIn("cuDevicePrimaryCtxSetFlags", runtime)
+        self.assertIn("set_flags(device,0x04)", runtime)
+
     def test_native_tiled_attention_covers_f16_bf16_and_q8(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (

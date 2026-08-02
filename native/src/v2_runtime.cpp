@@ -2108,6 +2108,7 @@ std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool 
     if(!iq.empty())return iq;
     if(type==40)return rows?"nvfp4_grouped_swiglu_rows"
         :(nvfp4_tiled?"nvfp4_grouped_swiglu_tiled":"nvfp4_grouped_swiglu");
+    if(type==8)return rows?"q8_grouped_swiglu_rows":"q8_grouped_swiglu";
     if(type==14)return rows?"q6k_grouped_swiglu_rows":"q6k_grouped_swiglu";
     if(type==12)return rows?"q4k_grouped_swiglu_rows":"q4k_grouped_swiglu";
     return rows?"q5k_grouped_swiglu_rows":"q5k_grouped_swiglu";
@@ -3065,15 +3066,19 @@ int gpu_probe(ColibriV2GpuInfo& out, int device) {
 #if defined(_WIN32)
     HMODULE lib = LoadLibraryW(L"nvcuda.dll");
     if (!lib) return 0;
-    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
-    auto init=reinterpret_cast<Init>(GetProcAddress(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(GetProcAddress(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(GetProcAddress(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(GetProcAddress(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(GetProcAddress(lib,"cuMemGetInfo_v2"));
-    if (!init || !retain || !set || !attr || init(0)!=0) { FreeLibrary(lib); return 0; } void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { FreeLibrary(lib); return 0; }
+    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using SetFlags = int (*)(int, unsigned int); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
+    auto init=reinterpret_cast<Init>(GetProcAddress(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(GetProcAddress(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(GetProcAddress(lib,"cuCtxSetCurrent")); auto set_flags=reinterpret_cast<SetFlags>(GetProcAddress(lib,"cuDevicePrimaryCtxSetFlags")); auto attr=reinterpret_cast<Attr>(GetProcAddress(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(GetProcAddress(lib,"cuMemGetInfo_v2"));
+    if (!init || !retain || !set || !attr || init(0)!=0) { FreeLibrary(lib); return 0; }
+    if(set_flags&&(!std::getenv("COLIBRI_CUDA_SPIN_WAIT")||std::getenv("COLIBRI_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
+    void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { FreeLibrary(lib); return 0; }
     int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { FreeLibrary(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } FreeLibrary(lib); return 0;
 #else
     void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL); if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_LOCAL); if (!lib) return 0;
-    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
-    auto init=reinterpret_cast<Init>(dlsym(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(dlsym(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(dlsym(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(dlsym(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(dlsym(lib,"cuMemGetInfo_v2"));
-    if (!init || !retain || !set || !attr || init(0)!=0) { dlclose(lib); return 0; } void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { dlclose(lib); return 0; }
+    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using SetFlags = int (*)(int, unsigned int); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
+    auto init=reinterpret_cast<Init>(dlsym(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(dlsym(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(dlsym(lib,"cuCtxSetCurrent")); auto set_flags=reinterpret_cast<SetFlags>(dlsym(lib,"cuDevicePrimaryCtxSetFlags")); auto attr=reinterpret_cast<Attr>(dlsym(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(dlsym(lib,"cuMemGetInfo_v2"));
+    if (!init || !retain || !set || !attr || init(0)!=0) { dlclose(lib); return 0; }
+    if(set_flags&&(!std::getenv("COLIBRI_CUDA_SPIN_WAIT")||std::getenv("COLIBRI_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
+    void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { dlclose(lib); return 0; }
     int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { dlclose(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } dlclose(lib); return 0;
 #endif
 }
@@ -8283,7 +8288,14 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
         auto&task=runtime->engine_tasks[(runtime->engine_cursor+visit)%total];
         try{
             if(task.cancelled&&task.phase!=2){finished.push_back(task.id);emit(task.id,0,1);continue;}
-            if(task.phase==0&&!qwen_engine_try_start(*runtime,task))continue;
+            if(task.phase==0){
+                if(!qwen_engine_try_start(*runtime,task))continue;
+                // Report the exact prefix/snapshot reuse point before doing
+                // more work. Yield this visit so the server can print a useful
+                // "starting at" line before the first potentially long chunk.
+                emit(task.id,static_cast<std::uint32_t>(task.index),3);
+                continue;
+            }
             if(task.phase==1){
                 qwen_switch_sequence(*runtime,task.slot);
                 runtime->cache_admission_enabled=false;
@@ -8298,6 +8310,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                         task.next_token,task.max_tokens);
                     task.phase=2;
                 }
+                emit(task.id,static_cast<std::uint32_t>(task.index),3);
                 continue;
             }
             // phase 2: emit the buffered token, then either finish or defer

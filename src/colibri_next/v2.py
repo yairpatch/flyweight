@@ -305,6 +305,7 @@ class _QwenTaskEvent(ctypes.Structure):
 TASK_EVENT_TOKEN = 0
 TASK_EVENT_DONE = 1
 TASK_EVENT_ERROR = 2
+TASK_EVENT_PREFILL = 3
 NATIVE_ABI_VERSION = 5
 
 _cached_library: ctypes.CDLL | None = None

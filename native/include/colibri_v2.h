@@ -222,7 +222,7 @@ typedef struct ColibriV2QwenRuntimeInfo {
 typedef struct ColibriV2QwenTaskEvent {
     uint64_t task_id;
     uint32_t token;
-    uint32_t kind; /* 0 = token emitted, 1 = task finished, 2 = task error */
+    uint32_t kind; /* 0 = token, 1 = finished, 2 = error, 3 = prefill progress */
 } ColibriV2QwenTaskEvent;
 
 typedef int (*ColibriV2TokenCallback)(uint32_t token, void* user_data);

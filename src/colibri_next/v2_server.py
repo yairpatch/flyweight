@@ -14,6 +14,7 @@ from .server import InferenceService, _parse_tool_calls
 from .v2 import (
     TASK_EVENT_DONE,
     TASK_EVENT_ERROR,
+    TASK_EVENT_PREFILL,
     TASK_EVENT_TOKEN,
     V2Error,
     V2Model,
@@ -144,6 +145,8 @@ class _NativeEngine:
                     continue
                 if kind == TASK_EVENT_TOKEN:
                     task_queue.put(("token", token))
+                elif kind == TASK_EVENT_PREFILL:
+                    task_queue.put(("prefill", token))
                 elif kind == TASK_EVENT_DONE:
                     task_queue.put(("done", None))
                     with self._lock:
@@ -619,17 +622,26 @@ class NativeV2Generator:
             sampling_config,
         )
         try:
-            progress_reported = False
+            prefill_complete = False
             while True:
                 kind, value = queue.get()
                 if kind == "done":
                     break
                 if kind == "error":
                     raise RuntimeError(str(value))
+                if kind == "prefill":
+                    processed = min(int(value), len(prompt_ids))
+                    if progress_callback is not None:
+                        progress_callback(processed, len(prompt_ids))
+                    prefill_complete = processed >= len(prompt_ids)
+                    continue
                 token = int(value)
-                if progress_callback is not None and not progress_reported:
+                # Compatibility fallback for a runtime which predates native
+                # prefill events: complete the old one-shot callback here.
+                if progress_callback is not None and not prefill_complete:
+                    progress_callback(0, len(prompt_ids))
                     progress_callback(len(prompt_ids), len(prompt_ids))
-                    progress_reported = True
+                    prefill_complete = True
                 generated.append(token)
                 stopped = token in self.tokenizer.eos_token_ids
                 try:
