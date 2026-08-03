@@ -6,7 +6,7 @@ import json
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from queue import SimpleQueue
+from queue import Empty, Full, Queue
 from typing import Iterator, Mapping, Sequence, overload
 
 from jinja2 import StrictUndefined, Template, nodes
@@ -117,10 +117,14 @@ class _NativeEngine:
     (a short request no longer waits behind a long prefill) while all CUDA work
     stays on a single thread."""
 
+    _MAX_ACTIVE_TASKS = 64
+    _MAX_BUFFERED_EVENTS = 256
+    _SHUTDOWN_TIMEOUT_SECONDS = 30.0
+
     def __init__(self, runtime: V2QwenRuntime):
         self.runtime = runtime
         self._lock = threading.Lock()
-        self._queues: dict[int, SimpleQueue] = {}
+        self._queues: dict[int, Queue[tuple[str, object]]] = {}
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._closing = False
@@ -131,12 +135,16 @@ class _NativeEngine:
         max_new_tokens: int,
         stop_tokens: tuple[int, ...],
         sampling: SamplingConfig | None = None,
-    ) -> tuple[int, SimpleQueue]:
-        queue: SimpleQueue = SimpleQueue()
+    ) -> tuple[int, Queue[tuple[str, object]]]:
+        task_queue: Queue[tuple[str, object]] = Queue(
+            maxsize=self._MAX_BUFFERED_EVENTS
+        )
         sampling_config = sampling or SamplingConfig()
         with self._lock:
             if self._closing:
                 raise RuntimeError("native v2 engine is shutting down")
+            if len(self._queues) >= self._MAX_ACTIVE_TASKS:
+                raise RuntimeError("native v2 engine queue is full; retry later")
             task_id = self.runtime.task_submit(
                 prompt_ids,
                 max_new_tokens,
@@ -146,14 +154,26 @@ class _NativeEngine:
                 top_p=sampling_config.top_p,
                 seed=sampling_config.seed,
             )
-            self._queues[task_id] = queue
+            self._queues[task_id] = task_queue
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
                     target=self._run, name="colibri-v2-engine", daemon=True
                 )
                 self._thread.start()
         self._wake.set()
-        return task_id, queue
+        return task_id, task_queue
+
+    @staticmethod
+    def _replace_with_error(
+        task_queue: Queue[tuple[str, object]], message: str
+    ) -> None:
+        """Bound memory while guaranteeing a terminal event remains readable."""
+        while True:
+            try:
+                task_queue.get_nowait()
+            except Empty:
+                break
+        task_queue.put_nowait(("error", message))
 
     def cancel(self, task_id: int) -> None:
         try:
@@ -185,15 +205,19 @@ class _NativeEngine:
                 # Windows error text so it is diagnosable.
                 with self._lock:
                     queues, self._queues = self._queues, {}
-                for queue in queues.values():
-                    queue.put(("error", f"native engine failure: {error}"))
+                for task_queue in queues.values():
+                    self._replace_with_error(
+                        task_queue, f"native engine failure: {error}"
+                    )
                 continue
             except Exception as error:
                 # Engine-level failure: fail every waiting request, not just one.
                 with self._lock:
                     queues, self._queues = self._queues, {}
-                for queue in queues.values():
-                    queue.put(("error", f"native engine failure: {error}"))
+                for task_queue in queues.values():
+                    self._replace_with_error(
+                        task_queue, f"native engine failure: {error}"
+                    )
                 continue
             if not events:
                 # Tasks exist but none progressed (e.g. waiting for a busy
@@ -205,18 +229,29 @@ class _NativeEngine:
                     task_queue = self._queues.get(task_id)
                 if task_queue is None:
                     continue
-                if kind == TASK_EVENT_TOKEN:
-                    task_queue.put(("token", token))
-                elif kind == TASK_EVENT_PREFILL:
-                    task_queue.put(("prefill", token))
-                elif kind == TASK_EVENT_DONE:
-                    task_queue.put(("done", None))
+                try:
+                    if kind == TASK_EVENT_TOKEN:
+                        task_queue.put_nowait(("token", token))
+                    elif kind == TASK_EVENT_PREFILL:
+                        task_queue.put_nowait(("prefill", token))
+                    elif kind == TASK_EVENT_DONE:
+                        task_queue.put_nowait(("done", None))
+                        with self._lock:
+                            self._queues.pop(task_id, None)
+                    elif kind == TASK_EVENT_ERROR:
+                        task_queue.put_nowait(
+                            ("error", "native v2 engine task failed")
+                        )
+                        with self._lock:
+                            self._queues.pop(task_id, None)
+                except Full:
+                    self.cancel(task_id)
                     with self._lock:
                         self._queues.pop(task_id, None)
-                elif kind == TASK_EVENT_ERROR:
-                    task_queue.put(("error", "native v2 engine task failed"))
-                    with self._lock:
-                        self._queues.pop(task_id, None)
+                    self._replace_with_error(
+                        task_queue,
+                        "native v2 client output queue overflow; request cancelled",
+                    )
 
     def forget(self, task_id: int) -> None:
         with self._lock:
@@ -226,19 +261,27 @@ class _NativeEngine:
         """Cancel active requests and stop touching the runtime before teardown."""
         with self._lock:
             if self._closing:
-                return
-            self._closing = True
-            queues, self._queues = self._queues, {}
+                queues = {}
+            else:
+                self._closing = True
+                queues, self._queues = self._queues, {}
             thread = self._thread
-        for task_id, queue in queues.items():
+        for task_id, task_queue in queues.items():
             try:
                 self.runtime.task_cancel(task_id)
             except V2Error:
                 pass
-            queue.put(("error", "native v2 engine is shutting down"))
+            self._replace_with_error(
+                task_queue, "native v2 engine is shutting down"
+            )
         self._wake.set()
         if thread is not None and thread is not threading.current_thread():
-            thread.join()
+            thread.join(timeout=self._SHUTDOWN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                raise RuntimeError(
+                    "native v2 engine did not stop within 30 seconds; "
+                    "runtime teardown was aborted to avoid a use-after-free"
+                )
 
 
 class NativeV2Tokenizer:

@@ -1190,7 +1190,10 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     }
     runtime.sequences.clear();
     runtime.active_sequence = 0;
-    for (auto& e : runtime.host_prompts) std::free(e.state);
+    for (auto& e : runtime.host_prompts) {
+        std::free(e.state);
+        for (auto& snapshot : e.snapshots) std::free(snapshot.state);
+    }
     runtime.host_prompts.clear();
     runtime.host_cache_used_bytes = 0;
     for (auto& layer : runtime.layers) {
@@ -6981,12 +6984,15 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
     for (const auto& r : ranges) packed_bytes += r.second;
     std::uint64_t valid_snaps = 0;
     for (const auto& s : seq.prefill_snapshots) if (s.valid) ++valid_snaps;
+    if (valid_snaps && runtime.prefill_snapshot_bytes >
+            (std::numeric_limits<std::uint64_t>::max() - packed_bytes) / valid_snaps)
+        return;
     const std::uint64_t need = packed_bytes + valid_snaps * runtime.prefill_snapshot_bytes;
     if (need > runtime.host_cache_limit_bytes) return;
-    while (runtime.host_cache_used_bytes + need > runtime.host_cache_limit_bytes
+    while (runtime.host_cache_used_bytes > runtime.host_cache_limit_bytes - need
            && !runtime.host_prompts.empty())
         qwen_evict_host_lru(runtime);
-    if (runtime.host_cache_used_bytes + need > runtime.host_cache_limit_bytes) return;
+    if (runtime.host_cache_used_bytes > runtime.host_cache_limit_bytes - need) return;
     void* buf = std::malloc(packed_bytes);
     if (!buf) return;
     std::uint64_t cursor = 0;
@@ -7861,7 +7867,9 @@ static void qwen_mtp_record_round(
 
 int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,ColibriV2TokenCallback callback,void*user){return guarded([&]{
     if(!runtime||!prompt||!prompt_count||!max_tokens||!callback)throw std::runtime_error("invalid native Qwen generation arguments");
-    if(prompt_count+max_tokens>runtime->options.context_limit)throw std::runtime_error("native Qwen generation exceeds the context limit");
+    if(prompt_count>runtime->options.context_limit||
+       max_tokens>runtime->options.context_limit-prompt_count)
+        throw std::runtime_error("native Qwen generation exceeds the context limit");
     if(!runtime->engine_tasks.empty()||!runtime->engine_pending.empty())throw std::runtime_error("the cooperative engine is active; blocking generate is unavailable");
     qwen_unfreeze_expert_residency(*runtime);
     QwenExpertHistorySaveGuard history_save{*runtime};
@@ -7928,7 +7936,9 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
         uint32_t top_k,float top_p,uint64_t seed,bool has_seed,
         uint64_t*task_id) {
     if(!runtime||!prompt||!prompt_count||!max_tokens||!task_id)throw std::runtime_error("invalid native Qwen task arguments");
-    if(prompt_count+max_tokens>runtime->options.context_limit)throw std::runtime_error("native Qwen generation exceeds the context limit");
+    if(prompt_count>runtime->options.context_limit||
+       max_tokens>runtime->options.context_limit-prompt_count)
+        throw std::runtime_error("native Qwen generation exceeds the context limit");
     if(!std::isfinite(temperature)||temperature<0.0f)
         throw std::runtime_error("native Qwen temperature must be finite and non-negative");
     if(!std::isfinite(top_p)||top_p<=0.0f||top_p>1.0f)
@@ -7943,6 +7953,10 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
     task.sampling.top_k=top_k;
     task.sampling.top_p=top_p;
     std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+    constexpr std::size_t kMaxQueuedTasks = 256;
+    if(runtime->engine_pending.size()>=kMaxQueuedTasks||
+       runtime->engine_tasks.size()>=kMaxQueuedTasks-runtime->engine_pending.size())
+        throw std::runtime_error("native Qwen engine queue is full");
     task.id=runtime->engine_next_task_id++;
     task.sampling.rng=has_seed?seed:
         static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())^

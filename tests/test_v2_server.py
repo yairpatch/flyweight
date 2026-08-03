@@ -415,6 +415,34 @@ class NativeV2ServerTests(unittest.TestCase):
             generator.engine.submit([1, 2], 8, ())
         generator.close()  # idempotent
 
+    def test_native_engine_rejects_work_past_active_task_limit(self) -> None:
+        runtime = BlockingV2Runtime()
+        generator = NativeV2Generator(  # type: ignore[arg-type]
+            StubV2Model(), runtime, NativeV2Tokenizer(StubV2Model())  # type: ignore[arg-type]
+        )
+        generator.engine._MAX_ACTIVE_TASKS = 1
+        generator.engine.submit([1], 2, ())
+        self.assertTrue(runtime.entered.wait(1))
+
+        with self.assertRaisesRegex(RuntimeError, "queue is full"):
+            generator.engine.submit([2], 2, ())
+
+        generator.close()
+
+    def test_native_engine_cancels_stalled_output_consumer(self) -> None:
+        runtime = StubV2Runtime([10, 11, 12, 13])
+        generator = NativeV2Generator(  # type: ignore[arg-type]
+            StubV2Model(), runtime, NativeV2Tokenizer(StubV2Model())  # type: ignore[arg-type]
+        )
+        generator.engine._MAX_BUFFERED_EVENTS = 2
+        _, task_queue = generator.engine.submit([1], 4, ())
+
+        kind, message = task_queue.get(timeout=1)
+        self.assertEqual(kind, "error")
+        self.assertIn("output queue overflow", str(message))
+        self.assertEqual(runtime.cancels, 1)
+        generator.close()
+
     def test_native_chat_continuation_preserves_generated_token_ids(self) -> None:
         generator, _ = self.make_generator([10, 20, 30])
         first_messages = (("user", "Hi"),)

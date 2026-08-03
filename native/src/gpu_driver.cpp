@@ -1336,7 +1336,27 @@ extern "C" int colibri_gpu_stream_destroy(std::uint64_t stream) {
     if (colibri_backend_is_cpu()) return colibri_cpu_stream_destroy(stream);
 
     if (stream == 0) return 0;
-    return g_api.cuStreamDestroy(reinterpret_cast<CUstream>(stream)) == 0
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    {
+        // NVFP4 scratch is process-global and remembers the stream that last
+        // used it. Release it before that stream becomes invalid; otherwise
+        // model reloads retain VRAM and later try to synchronize a stale handle.
+        std::lock_guard<std::mutex> lock(g_cublas_mutex);
+        if (g_nvfp4_scratch.stream == cuda_stream) {
+            g_api.cuStreamSynchronize(cuda_stream);
+            const auto release = [](CUdeviceptr pointer) {
+                if (pointer) g_api.cuMemFree(pointer);
+            };
+            release(g_nvfp4_scratch.weight_values);
+            release(g_nvfp4_scratch.weight_scales);
+            release(g_nvfp4_scratch.input_values);
+            release(g_nvfp4_scratch.input_scales);
+            release(g_nvfp4_scratch.projected);
+            release(g_nvfp4_scratch.expert_pointers);
+            g_nvfp4_scratch = Nvfp4Scratch{};
+        }
+    }
+    return g_api.cuStreamDestroy(cuda_stream) == 0
         ? 0 : -1;
 }
 
