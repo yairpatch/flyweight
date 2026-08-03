@@ -344,7 +344,20 @@ private:
         // generation 1 every worker's first job, whenever it actually wakes up.
         std::uint64_t seen = 0;
         for (;;) {
-            constexpr int kSpins = 2000;
+            // Spin budget before falling back to the condition variable.
+            //
+            // Tuned by measurement, and the curve is steep on one side only:
+            // 2000 gives 14.60 tok/s on a 35B Q8_0 MoE, 200 gives 14.20, and 0
+            // gives 2.65 -- a 5.5x collapse, because a wakeup then costs more
+            // than the kernel it is waking for. Raising it further does not
+            // help, and the workers do share cores with the OpenMP MoE team, so
+            // spinning longer is not free either.
+            static const int kSpins = [] {
+                const char* setting = std::getenv("COLIBRI_CPU_SPINS");
+                const int requested = setting ? std::atoi(setting) : 0;
+                return requested > 0 || (setting && requested == 0) ? requested
+                                                                    : 2000;
+            }();
             int spins = 0;
             std::uint64_t current = generation_.load(std::memory_order_acquire);
             while (current == seen) {
