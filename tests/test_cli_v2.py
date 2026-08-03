@@ -136,6 +136,28 @@ class NativeV2BenchmarkTests(unittest.TestCase):
                 args = _parser().parse_args(argv)
                 self.assertEqual(args.dense_requant, "off")
 
+    def test_public_command_names_and_short_limit_options(self) -> None:
+        serve = _parser().parse_args(
+            ["serve", "model.gguf", "--context", "65536", "--max-tokens", "8192",
+             "--concurrency", "4"]
+        )
+        self.assertEqual(serve.context_window, 65536)
+        self.assertEqual(serve.max_new_tokens, 8192)
+        self.assertEqual(serve.max_concurrent_requests, 4)
+
+        inspect = _parser().parse_args(["inspect", "model.gguf"])
+        benchmark = _parser().parse_args(["benchmark", "model.gguf"])
+        self.assertEqual(inspect.command, "inspect")
+        self.assertEqual(benchmark.command, "benchmark")
+
+    def test_legacy_serve_names_remain_compatible(self) -> None:
+        args = _parser().parse_args(
+            ["serve-v2", "model.gguf", "--context-window", "4096",
+             "--max-new-tokens", "512"]
+        )
+        self.assertEqual(args.context_window, 4096)
+        self.assertEqual(args.max_new_tokens, 512)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,38 +82,43 @@ def _prefill_cache_seed(value: str) -> int | str:
     return count
 
 
-def _add_runtime_options(parser: argparse.ArgumentParser, *, serving: bool) -> None:
-    parser.add_argument("--gpu-cache-mib", type=int, default=0)
+def _add_runtime_options(
+    parser: argparse.ArgumentParser, *, serving: bool, show_help: bool = True
+) -> None:
+    hidden = None if show_help else argparse.SUPPRESS
+    parser.add_argument("--gpu-cache-mib", type=int, default=0, help=hidden)
     parser.add_argument(
         "--expert-mode", "--moe-device", dest="expert_mode",
-        choices=EXPERT_MODE_CHOICES, default="auto",
+        choices=EXPERT_MODE_CHOICES, default="auto", help=hidden,
     )
-    parser.add_argument("--hybrid-prefill", choices=("split", "cpu"), default="split")
-    parser.add_argument("--expert-residency", choices=("mutable", "immutable"))
+    parser.add_argument("--hybrid-prefill", choices=("split", "cpu"), default="split", help=hidden)
+    parser.add_argument("--expert-residency", choices=("mutable", "immutable"), help=hidden)
     parser.add_argument(
         "--dense-requant", choices=("auto", "q8", "off"), default="auto",
-        help="BF16 dense-weight GPU policy (default: auto from GPU pressure)",
+        help=("BF16 dense-weight GPU policy (default: auto from GPU pressure)"
+              if show_help else argparse.SUPPRESS),
     )
-    parser.add_argument("--mtp-drafts", type=int, default=0)
+    parser.add_argument("--mtp-drafts", type=int, default=0, help=hidden)
     parser.add_argument(
         "--mtp-model", type=Path,
-        help=("optional MTP-only GGUF overlay; when omitted, use the draft "
-              "head embedded in the target model"),
+        help=(("optional MTP-only GGUF overlay; when omitted, use the draft "
+               "head embedded in the target model")
+              if show_help else argparse.SUPPRESS),
     )
-    parser.add_argument("--cpu-threads", type=int, default=0)
-    parser.add_argument("--cache-type-k", choices=KV_TYPES, default="f16")
-    parser.add_argument("--cache-type-v", choices=KV_TYPES, default="f16")
-    parser.add_argument("--parallel", type=int, default=1, dest="parallel_sequences")
-    parser.add_argument("--prompt-cache-mib", type=int, default=0)
-    parser.add_argument("--swa-full", action="store_true")
-    parser.add_argument("--prefill-cache-seed", type=_prefill_cache_seed, default=None)
-    parser.add_argument("--expert-paging", choices=("auto", "staged", "direct"), default="auto")
-    parser.add_argument("--cpu-prefetch-mib", type=int, default=0)
-    parser.add_argument("--cpu-prefetch-auto", action="store_true")
-    parser.add_argument("--next-layer-prefetch", type=int, default=0)
+    parser.add_argument("--cpu-threads", type=int, default=0, help=hidden)
+    parser.add_argument("--cache-type-k", choices=KV_TYPES, default="f16", help=hidden)
+    parser.add_argument("--cache-type-v", choices=KV_TYPES, default="f16", help=hidden)
+    parser.add_argument("--parallel", type=int, default=1, dest="parallel_sequences", help=hidden)
+    parser.add_argument("--prompt-cache-mib", type=int, default=0, help=hidden)
+    parser.add_argument("--swa-full", action="store_true", help=hidden)
+    parser.add_argument("--prefill-cache-seed", type=_prefill_cache_seed, default=None, help=hidden)
+    parser.add_argument("--expert-paging", choices=("auto", "staged", "direct"), default="auto", help=hidden)
+    parser.add_argument("--cpu-prefetch-mib", type=int, default=0, help=hidden)
+    parser.add_argument("--cpu-prefetch-auto", action="store_true", help=hidden)
+    parser.add_argument("--next-layer-prefetch", type=int, default=0, help=hidden)
     if serving:
-        parser.add_argument("--prefill-checkpoint-interval", type=int, default=256)
-        parser.add_argument("--prefill-checkpoint-slots", type=int, default=4)
+        parser.add_argument("--prefill-checkpoint-interval", type=int, default=256, help=hidden)
+        parser.add_argument("--prefill-checkpoint-slots", type=int, default=4, help=hidden)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -121,25 +126,40 @@ def _parser() -> argparse.ArgumentParser:
         prog="colibri-next",
         description="Native GGUF inference for Qwen and Gemma models",
     )
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command", required=True,
+        metavar="{serve,generate,inspect,benchmark}",
+    )
 
-    inspect = commands.add_parser("inspect-gguf-v2", aliases=("inspect-gguf",))
+    inspect = commands.add_parser(
+        "inspect", aliases=("inspect-gguf", "inspect-gguf-v2"),
+        help="show model metadata",
+    )
     inspect.add_argument("model", type=Path)
 
-    generate = commands.add_parser("generate", aliases=("generate-text-v2",))
+    generate = commands.add_parser(
+        "generate", aliases=("generate-text-v2",),
+        help="generate one response locally",
+    )
     generate.add_argument("model", type=Path)
     generate.add_argument("--prompt", required=True)
     generate.add_argument("--system")
-    generate.add_argument("--max-new-tokens", type=int, default=64)
-    generate.add_argument("--context-window", type=int, default=32768)
+    generate.add_argument(
+        "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
+        default=64, help="maximum generated tokens (default: 64)",
+    )
+    generate.add_argument(
+        "--context", "--context-window", dest="context_window", type=int,
+        default=32768, help="maximum prompt + output tokens (default: 32768)",
+    )
     generate.add_argument("--temperature", type=float, default=0.0)
     generate.add_argument("--top-k", type=int, default=20)
     generate.add_argument("--top-p", type=float, default=0.95)
     generate.add_argument("--seed", type=int)
     generate.add_argument("--enable-thinking", action="store_true")
-    _add_runtime_options(generate, serving=True)
+    _add_runtime_options(generate, serving=True, show_help=False)
 
-    benchmark = commands.add_parser("benchmark-v2", aliases=("benchmark",))
+    benchmark = commands.add_parser("benchmark", aliases=("benchmark-v2",), help="measure local inference speed")
     benchmark.add_argument("model", type=Path)
     benchmark.add_argument("--tokens", default="0")
     benchmark.add_argument("--prompt")
@@ -153,7 +173,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_runtime_options(benchmark, serving=False)
 
     probe = commands.add_parser(
-        "probe-native-v2", aliases=("probe-qwen-native-v2", "probe-native"),
+        "probe", aliases=("probe-native", "probe-native-v2", "probe-qwen-native-v2"),
     )
     probe.add_argument("model", type=Path)
     probe.add_argument("--token-id", type=int, default=0)
@@ -163,7 +183,10 @@ def _parser() -> argparse.ArgumentParser:
     probe.add_argument("--context", type=int, default=2048)
     _add_runtime_options(probe, serving=False)
 
-    serve = commands.add_parser("serve-v2", aliases=("serve",))
+    serve = commands.add_parser(
+        "serve", aliases=("serve-v2",),
+        help="start the OpenAI/Anthropic-compatible server",
+    )
     serve.add_argument("model", type=Path)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -181,13 +204,23 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--strict-model", action="store_true")
     serve.add_argument("--api-key", default=os.environ.get("COLIBRI_API_KEY"))
     serve.add_argument("--cors-origin", default="*")
-    serve.add_argument("--context-window", type=int, default=32768)
-    serve.add_argument("--max-new-tokens", type=int, default=4096)
-    serve.add_argument("--max-concurrent-requests", type=int, default=64)
-    serve.add_argument("--max-connections", type=int, default=128)
-    serve.add_argument("--request-timeout-seconds", type=float, default=30.0)
-    serve.add_argument("--sse-keepalive-seconds", type=float, default=10.0)
-    _add_runtime_options(serve, serving=True)
+    serve.add_argument(
+        "--context", "--context-window", dest="context_window", type=int,
+        default=32768, help="maximum prompt + output tokens (default: 32768)",
+    )
+    serve.add_argument(
+        "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
+        default=4096, help="maximum generated tokens per request (default: 4096)",
+    )
+    serve.add_argument(
+        "--concurrency", "--max-concurrent-requests",
+        dest="max_concurrent_requests", type=int, default=64,
+        help="maximum simultaneous inference requests (default: 64)",
+    )
+    serve.add_argument("--max-connections", type=int, default=128, help=argparse.SUPPRESS)
+    serve.add_argument("--request-timeout-seconds", type=float, default=30.0, help=argparse.SUPPRESS)
+    serve.add_argument("--sse-keepalive-seconds", type=float, default=10.0, help=argparse.SUPPRESS)
+    _add_runtime_options(serve, serving=True, show_help=False)
     return parser
 
 
@@ -410,7 +443,7 @@ def _serve(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command in {"inspect-gguf-v2", "inspect-gguf"}:
+    if args.command in {"inspect", "inspect-gguf-v2", "inspect-gguf"}:
         with V2Model(args.model) as model:
             print(json.dumps({"model": model.info, "config": model.config,
                               "tensors": list(model.tensors())}, indent=2))
@@ -421,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         return _generate(args)
     if args.command in {"serve-v2", "serve"}:
         return _serve(args)
-    if args.command in {"probe-native-v2", "probe-qwen-native-v2", "probe-native"}:
+    if args.command in {"probe", "probe-native-v2", "probe-qwen-native-v2", "probe-native"}:
         _validate_runtime_args(args)
         with V2Model(args.model, mtp_model=args.mtp_model) as model:
             prompt = _prompt_tokens(model, args)

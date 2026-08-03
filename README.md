@@ -53,15 +53,21 @@ the project does not require a separately installed CUDA toolkit for serving.
 ## Serve a model
 
 ~~~bash
-PYTHONPATH=src python -m colibri_next.cli serve-v2 model.gguf \
-  --context-window 32768 \
-  --expert-mode auto \
-  --cache-type-k f16 --cache-type-v f16 \
+colibri-next serve model.gguf
+~~~
+
+Open `http://127.0.0.1:8000/` for the local chat UI. The defaults select the
+backend and memory policy automatically. The common public options are kept
+small:
+
+~~~bash
+colibri-next serve model.gguf \
+  --context 65536 --max-tokens 16384 \
   --host 127.0.0.1 --port 8000
 ~~~
 
-`serve` is an alias for `serve-v2`. Open `http://127.0.0.1:8000/` for the local
-chat UI.
+Older `serve-v2`, `--context-window`, and `--max-new-tokens` spellings remain
+accepted for script compatibility.
 
 The native expert modes are:
 
@@ -123,11 +129,11 @@ user saves custom settings.
 ## Inspect and generate
 
 ~~~bash
-PYTHONPATH=src python -m colibri_next.cli inspect-gguf-v2 model.gguf
+colibri-next inspect model.gguf
 
-PYTHONPATH=src python -m colibri_next.cli generate model.gguf \
+colibri-next generate model.gguf \
   --prompt "Explain mixture-of-experts routing." \
-  --max-new-tokens 128 --temperature 0
+  --max-tokens 128 --temperature 0
 ~~~
 
 ## Benchmarking
@@ -135,7 +141,7 @@ PYTHONPATH=src python -m colibri_next.cli generate model.gguf \
 The direct benchmark separates preparation, prompt prefill, and steady decode:
 
 ~~~bash
-PYTHONPATH=src python -m colibri_next.cli benchmark-v2 model.gguf \
+colibri-next benchmark model.gguf \
   --prompt "Explain sliding-window attention." --chat \
   --context 32768 --iterations 30 --warmup 10 \
   --expert-mode auto --cache-type-k f16 --cache-type-v f16
