@@ -381,6 +381,40 @@ class ToolCallParsingTests(unittest.TestCase):
             {"status": "completed", "taskId": "1"},
         )
 
+    def test_incomplete_required_tool_call_is_not_exposed(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "filePath": {"type": "string"},
+                        },
+                        "required": ["content", "filePath"],
+                    },
+                },
+            }
+        ]
+        _, calls = _parse_tool_calls(
+            "<tool_call><function=write>\n"
+            "<parameter=content>\nhello\n</parameter>\n"
+            "</function></tool_call>",
+            tools=tools,
+        )
+        self.assertEqual(calls, [])
+
+    def test_duplicate_tool_calls_are_collapsed(self) -> None:
+        block = (
+            "<tool_call><function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n"
+            "</function></tool_call>"
+        )
+        _, calls = _parse_tool_calls(block + block)
+        self.assertEqual(len(calls), 1)
+
     def test_schema_normalization_recurses_through_arrays_and_objects(self) -> None:
         tools = [
             {
@@ -767,6 +801,14 @@ class InferenceServiceTests(unittest.TestCase):
         chat_events = [
             {"choices": [{"index": 0, "delta": {"content": "Let me check."}}]},
             {
+                "choices": [{"index": 0, "delta": {}}],
+                "colibri": {
+                    "generated_tokens": 32,
+                    "decode_elapsed_seconds": 0.75,
+                    "phase": "tool_call",
+                },
+            },
+            {
                 "choices": [
                     {
                         "index": 0,
@@ -852,6 +894,13 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(
             "".join(d["delta"]["text"] for d in text_deltas), "Let me check."
         )
+        progress_pings = [
+            event
+            for event in events
+            if event.get("type") == "ping"
+            and event.get("colibri", {}).get("phase") == "tool_call"
+        ]
+        self.assertEqual(progress_pings[0]["colibri"]["generated_tokens"], 32)
 
         stops = [e for e in events if e["type"] == "content_block_stop"]
         self.assertEqual([e["index"] for e in stops], [0, 1])
@@ -1073,6 +1122,14 @@ class InferenceServiceTests(unittest.TestCase):
 
         self.assertTrue(generator.closed)
         self.assertEqual(generator.consumed, len(generator.TOOL_TEXT))
+        progress = [
+            event["colibri"]
+            for event in events
+            if isinstance(event, dict)
+            and event.get("colibri", {}).get("phase") == "tool_call"
+        ]
+        self.assertTrue(progress)
+        self.assertGreaterEqual(progress[-1]["generated_tokens"], len("<tool_call>"))
         finish = next(
             event["choices"][0]["finish_reason"]
             for event in events

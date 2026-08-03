@@ -382,6 +382,8 @@ class InferenceService:
                 tool_end_tail = ""
                 tool_calls: list[dict[str, Any]] = []
                 decode_started: float | None = None
+                last_tool_progress_at = 0.0
+                last_tool_progress_tokens = 0
                 marker = TOOL_CALL_MARKER
                 holdback = len(marker) - 1
 
@@ -390,6 +392,15 @@ class InferenceService:
                     chunk["colibri"] = {
                         "generated_tokens": tokens,
                         "decode_elapsed_seconds": elapsed,
+                    }
+                    return chunk
+
+                def _tool_progress_chunk(tokens: int, elapsed: float):
+                    chunk = self._chat_chunk(completion_id, created, {})
+                    chunk["colibri"] = {
+                        "generated_tokens": tokens,
+                        "decode_elapsed_seconds": elapsed,
+                        "phase": "tool_call",
                     }
                     return chunk
 
@@ -454,6 +465,18 @@ class InferenceService:
                                 )
                                 if tool_calls:
                                     break
+                            if tool_start is not None and not tool_calls:
+                                token_count = len(step.generated_ids)
+                                if (
+                                    last_tool_progress_tokens == 0
+                                    or token_count - last_tool_progress_tokens >= 32
+                                    or now - last_tool_progress_at >= 1.0
+                                ):
+                                    yield _tool_progress_chunk(
+                                        token_count, now - decode_started
+                                    )
+                                    last_tool_progress_tokens = token_count
+                                    last_tool_progress_at = now
                     finally:
                         close = getattr(steps, "close", None)
                         if close is not None:
@@ -480,6 +503,7 @@ class InferenceService:
                             "decode_elapsed_seconds": (
                                 time.perf_counter() - decode_started
                             ),
+                            "phase": "tool_call",
                         }
                     yield chunk
                 elif tool_start is None and pending:
@@ -995,6 +1019,14 @@ class InferenceService:
                 colibri = event.get("colibri")
                 if isinstance(colibri, dict):
                     last_colibri = colibri
+                    if colibri.get("phase") == "tool_call" and not _is_decode_event(
+                        event
+                    ):
+                        # Keep Claude Code's stream alive and expose local
+                        # progress while raw tool syntax remains intentionally
+                        # hidden until the complete call can be parsed.
+                        yield {"type": "ping", "colibri": colibri}
+                        continue
                 if event.get("usage"):
                     usage = event["usage"]
                     output_tokens = usage.get("completion_tokens", output_tokens)
@@ -1515,6 +1547,13 @@ class ColibriHTTPServer(ThreadingHTTPServer):
 _SSE_KEEPALIVE = object()
 
 
+def _deferred_stream(
+    factory: Callable[[], Iterator[dict[str, Any] | str]],
+) -> Iterator[dict[str, Any] | str]:
+    """Defer request preparation until after SSE headers are sent."""
+    yield from factory()
+
+
 def _sse_with_keepalive(
     events: Iterator[dict[str, Any] | str], interval: float
 ) -> Iterator[object]:
@@ -1702,7 +1741,11 @@ def create_handler(
                 if path == "/v1/chat/completions":
                     if _boolean_option(payload, "stream", False):
                         self._send_sse(
-                            service.stream_chat_completion(payload, progress=progress)
+                            _deferred_stream(
+                                lambda: service.stream_chat_completion(
+                                    payload, progress=progress
+                                )
+                            )
                         )
                     else:
                         self._send_json(
@@ -1713,7 +1756,11 @@ def create_handler(
                 if path == "/v1/completions":
                     if _boolean_option(payload, "stream", False):
                         self._send_sse(
-                            service.stream_completion(payload, progress=progress)
+                            _deferred_stream(
+                                lambda: service.stream_completion(
+                                    payload, progress=progress
+                                )
+                            )
                         )
                     else:
                         self._send_json(
@@ -1736,8 +1783,10 @@ def create_handler(
                 if path == "/v1/messages":
                     if _boolean_option(payload, "stream", False):
                         self._send_sse(
-                            service.stream_anthropic_message(
-                                payload, progress=progress
+                            _deferred_stream(
+                                lambda: service.stream_anthropic_message(
+                                    payload, progress=progress
+                                )
                             ),
                             keepalive={"type": "ping"},
                         )
@@ -1910,6 +1959,7 @@ def create_handler(
             # formatGenerationMetrics() in ui/app.js, which the browser shows
             # for the very same generation.
             decode_elapsed = 0.0
+            decode_phase: str | None = None
             last_stat = 0.0
             stream = _sse_with_keepalive(events, service.sse_keepalive_seconds)
             try:
@@ -1931,9 +1981,12 @@ def create_handler(
                         if isinstance(colibri, dict):
                             tokens = colibri.get("generated_tokens")
                             elapsed = colibri.get("decode_elapsed_seconds")
+                            phase = colibri.get("phase")
                             if isinstance(tokens, int) and isinstance(elapsed, float):
                                 decode_tokens = tokens
                                 decode_elapsed = elapsed
+                                if isinstance(phase, str):
+                                    decode_phase = phase
                                 now = time.perf_counter()
                                 if now - last_stat >= 1.0:
                                     last_stat = now
@@ -1946,6 +1999,11 @@ def create_handler(
                                     sys.stderr.write(
                                         f"\r[gen ] {tokens} tokens "
                                         f"{rate:6.1f} tok/s {elapsed:5.1f}s"
+                                        + (
+                                            " [building tool call]"
+                                            if decode_phase == "tool_call"
+                                            else ""
+                                        )
                                     )
                                     sys.stderr.flush()
                     self._write_sse_event(
@@ -1963,7 +2021,13 @@ def create_handler(
                     )
                     sys.stderr.write(
                         f"\n[gen ] done {decode_tokens} tokens "
-                        f"in {decode_elapsed:5.2f}s ({rate:6.1f} tok/s)\n"
+                        f"in {decode_elapsed:5.2f}s ({rate:6.1f} tok/s)"
+                        + (
+                            " [tool call ready]"
+                            if decode_phase == "tool_call"
+                            else ""
+                        )
+                        + "\n"
                     )
                     sys.stderr.flush()
                 self.log_message("request completed: streaming events=%d", event_count)
@@ -2502,6 +2566,7 @@ def _parse_tool_calls(
     tools: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
 ) -> tuple[str | None, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
     for match in TOOL_CALL_BLOCK_PATTERN.finditer(text):
         name, arguments = _decode_tool_call_body(match.group(1))
         if name is None:
@@ -2509,20 +2574,31 @@ def _parse_tool_calls(
         schema = _tool_argument_schema(tools, name)
         if schema is not None:
             arguments = _normalize_schema_value(arguments, schema)
+            required = schema.get("required")
+            if isinstance(required, list) and any(
+                isinstance(key, str) and key not in arguments for key in required
+            ):
+                # Do not hand an incomplete call to the client/tool runner.
+                # Models sometimes close a tool block before emitting all
+                # parameters; exposing it produces confusing downstream schema
+                # errors (for example write missing content and filePath).
+                continue
         elif isinstance(arguments, dict):
             # Undeclared tool: nothing describes these values, so fall back to
             # inferring each one.
             arguments = {
                 key: _infer_tool_value(item) for key, item in arguments.items()
             }
+        encoded_arguments = json.dumps(arguments, ensure_ascii=False)
+        signature = (name, encoded_arguments)
+        if signature in seen:
+            continue
+        seen.add(signature)
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex}",
                 "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(arguments, ensure_ascii=False),
-                },
+                "function": {"name": name, "arguments": encoded_arguments},
             }
         )
     # Content is whatever precedes the first tool-call marker. Bound it on the
