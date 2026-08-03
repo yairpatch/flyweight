@@ -97,7 +97,16 @@ std::unordered_map<std::string, colibri::cpu::NativeKernel>& native_registry() {
     return registry;
 }
 
-std::atomic<bool> g_force_emulation{false};
+// COLIBRI_CPU_FORCE_EMULATION=1 routes every kernel back to the emulated
+// corpus. Slow, but it is the reference implementation, so it is the first
+// thing to try when the CPU backend produces wrong output: if a defect
+// survives it, the defect is not in a hand-written kernel.
+std::atomic<bool> g_force_emulation{
+    [] {
+        const char* setting = std::getenv("COLIBRI_CPU_FORCE_EMULATION");
+        return setting != nullptr && setting[0] == '1';
+    }()
+};
 
 // --- launch profiling -----------------------------------------------------
 //
@@ -142,6 +151,28 @@ std::mutex g_kernel_mutex;
 std::unordered_map<std::string, Resolved> g_kernel_cache;
 std::atomic<bool> g_kernel_cache_dirty{false};
 
+// COLIBRI_CPU_EMULATE=name1,name2 forces just those kernels back to the
+// emulated corpus. Bisecting a wrong-output bug with COLIBRI_CPU_FORCE_EMULATION
+// works but costs ~100x, which is impractical for a defect that only appears
+// after a hundred tokens; this narrows the search without that penalty.
+bool emulation_forced_for(const char* name) {
+    static const std::string list = [] {
+        const char* setting = std::getenv("COLIBRI_CPU_EMULATE");
+        return std::string(setting ? setting : "");
+    }();
+    if (list.empty()) return false;
+    const std::string needle(name);
+    std::size_t at = 0;
+    while ((at = list.find(needle, at)) != std::string::npos) {
+        const bool start = at == 0 || list[at - 1] == ',';
+        const std::size_t end = at + needle.size();
+        const bool finish = end == list.size() || list[end] == ',';
+        if (start && finish) return true;
+        at = end;
+    }
+    return false;
+}
+
 Resolved resolve(const char* name) {
     {
         std::lock_guard<std::mutex> lock(g_kernel_mutex);
@@ -152,7 +183,8 @@ Resolved resolve(const char* name) {
     colibri::cpu::find_kernel_entry(name, &resolved.kernel, &resolved.cooperative);
     const auto& registry = native_registry();
     const auto native = registry.find(name);
-    if (native != registry.end()) resolved.native = native->second;
+    if (native != registry.end() && !emulation_forced_for(name))
+        resolved.native = native->second;
     std::lock_guard<std::mutex> lock(g_kernel_mutex);
     g_kernel_cache.emplace(name, resolved);
     return resolved;
@@ -604,6 +636,8 @@ int colibri_cpu_launch_named(const char* name, std::uint32_t grid_x,
     const auto run_block = [&](colibri::cpu::BlockScheduler& scheduler,
                                std::uint64_t block) {
         set_geometry(block);
+        // New block, so any __shared__ it touches must look freshly allocated.
+        ++colibri::cpu::t_block_generation;
         if (resolved.cooperative) {
             scheduler.run(block_x, shared_bytes, &run_thread, &payload);
             return;

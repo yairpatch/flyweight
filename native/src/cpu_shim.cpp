@@ -3,7 +3,10 @@
 
 #include <colibri_cpu_shim.hpp>
 
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace colibri::cpu {
 
@@ -12,6 +15,26 @@ thread_local Dim3 t_block_index{};
 thread_local Dim3 t_block_dim{};
 thread_local Dim3 t_grid_dim{};
 thread_local BlockScheduler* t_scheduler = nullptr;
+thread_local std::uint64_t t_block_generation = 0;
+
+bool shared_zeroing_enabled() {
+    static const bool on = [] {
+        const char* setting = std::getenv("COLIBRI_CPU_SHARED_ZERO");
+        return setting == nullptr || setting[0] != '0';  // default on
+    }();
+    return on;
+}
+
+void shared_zero_once(void* storage, std::size_t bytes) {
+    if (!shared_zeroing_enabled()) return;
+    // Keyed by address: each __shared__ declaration has a distinct
+    // thread_local instance, so the address identifies the declaration site.
+    static thread_local std::unordered_map<const void*, std::uint64_t> seen;
+    auto& generation = seen[storage];
+    if (generation == t_block_generation) return;
+    generation = t_block_generation;
+    std::memset(storage, 0, bytes);
+}
 
 namespace {
 

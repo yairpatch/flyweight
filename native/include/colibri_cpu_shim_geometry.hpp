@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -162,6 +163,22 @@ private:
 };
 
 extern thread_local BlockScheduler* t_scheduler;
+
+// Monotonic block counter, bumped once per block launch.
+//
+// __shared__ maps to `static thread_local`, which is correct for sharing within
+// a block but wrong across them: blocks run sequentially on a worker and would
+// otherwise inherit the previous block's shared memory. CUDA gives each block
+// uninitialized shared memory, and parts of the corpus rely on that being
+// benign -- block_reduce_sum declares warp_sums[8] but only writes the warps
+// that exist, then reads all eight, so a 128-thread launch reads four slots it
+// never wrote. On a GPU those are whatever the SM had; here they were the last
+// block's real values, which is far more damaging.
+extern thread_local std::uint64_t t_block_generation;
+
+// Zeroes `storage` the first time it is reached in a given block. Emitted after
+// every __shared__ declaration by generate_cpu_kernels.py.
+void shared_zero_once(void* storage, std::size_t bytes);
 
 // ---------------------------------------------------------------------------
 // Half and bfloat16

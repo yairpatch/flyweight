@@ -5,6 +5,8 @@
 
 #include <colibri_cpu_shim_geometry.hpp>
 
+#include <atomic>
+
 // ---------------------------------------------------------------------------
 // CUDA language surface
 // ---------------------------------------------------------------------------
@@ -184,32 +186,36 @@ inline unsigned int __vcmpne4(unsigned int a, unsigned int b) {
     return out;
 }
 
+// Genuinely atomic, because the corpus uses these across blocks.
+//
+// These were once plain read-modify-write, on the reasoning that fibers in a
+// block never run concurrently and separate blocks write separate slots. The
+// second half is false: the lm_head argmax kernels fold every block's winner
+// into a single `winners[0]`, and the backend runs blocks on all workers at
+// once, so that was a race over the token being emitted.
+template <class T>
+inline T colibri_atomic_max(T* address, T value) {
+    auto* target = reinterpret_cast<std::atomic<T>*>(address);
+    T previous = target->load(std::memory_order_relaxed);
+    while (previous < value &&
+           !target->compare_exchange_weak(previous, value,
+                                          std::memory_order_relaxed)) {
+    }
+    return previous;
+}
+
 inline int atomicMax(int* address, int value) {
-    // Fibers within a block never run concurrently, and distinct blocks on
-    // distinct OS threads only reach this through separate output slots in the
-    // corpus, so plain read-modify-write matches device semantics here.
-    const int previous = *address;
-    if (value > previous) *address = value;
-    return previous;
+    return colibri_atomic_max(address, value);
 }
-
 inline unsigned int atomicMax(unsigned int* address, unsigned int value) {
-    const unsigned int previous = *address;
-    if (value > previous) *address = value;
-    return previous;
+    return colibri_atomic_max(address, value);
 }
-
 inline unsigned long long atomicMax(unsigned long long* address,
                                     unsigned long long value) {
-    const unsigned long long previous = *address;
-    if (value > previous) *address = value;
-    return previous;
+    return colibri_atomic_max(address, value);
 }
-
 inline long long atomicMax(long long* address, long long value) {
-    const long long previous = *address;
-    if (value > previous) *address = value;
-    return previous;
+    return colibri_atomic_max(address, value);
 }
 
 // ---------------------------------------------------------------------------

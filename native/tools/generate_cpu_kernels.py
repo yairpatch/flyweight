@@ -49,6 +49,13 @@ EXTERN_SHARED = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*\]\s*;"
 )
 
+# `__shared__ float warp_sums[8];` and `__shared__ typename S::T storage;`.
+# extern __shared__ is rewritten earlier and no longer matches.
+SHARED_DECL = re.compile(
+    r"__shared__\s+(?:typename\s+)?[A-Za-z_][A-Za-z0-9_:<>, ]*?\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^;\]]*\])*\s*;"
+)
+
 KERNEL_HEAD = re.compile(
     r'extern\s+"C"\s+' + MARKER + r"\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?"
     r"void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
@@ -69,6 +76,16 @@ def transform(cuda: str) -> str:
     cuda = EXTERN_SHARED.sub(
         r"\1* \2 = reinterpret_cast<\1*>("
         r"::colibri::cpu::t_scheduler->dynamic_shared());",
+        cuda,
+    )
+    # Every __shared__ declaration gets a zeroing call after it. __shared__ maps
+    # to `static thread_local`, which persists across blocks running on the same
+    # worker; CUDA hands each block uninitialized shared memory instead. Parts of
+    # the corpus read shared slots they did not write in this launch (see
+    # block_reduce_sum), which is benign-ish on a GPU and catastrophic against a
+    # previous block's real values.
+    cuda = SHARED_DECL.sub(
+        r"\g<0> ::colibri::cpu::shared_zero_once(&\g<name>, sizeof(\g<name>));",
         cuda,
     )
     # #pragma unroll is a device-compiler hint with no host spelling; GCC and
