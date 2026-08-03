@@ -205,13 +205,26 @@ int worker_count() {
         const int requested = std::atoi(setting);
         if (requested > 0) return requested;
     }
+    // Physical cores, not logical. Decode is bandwidth-bound on weights, and
+    // SMT siblings share load ports and cache, so the second thread on a core
+    // adds contention rather than throughput. Measured on a 16-core/32-thread
+    // Ryzen 9 9955HX with a 35B Q8_0 MoE: 8.30 tok/s at 16 threads against
+    // 5.73 at 32, so the logical-core default was costing 31%.
+    //
+    // qwen_cpu_thread_count() applies the same rule to the CPU MoE path; an
+    // explicit OMP_NUM_THREADS still wins in both places.
 #if defined(_OPENMP)
-    // Shared with the CPU MoE path, which is OpenMP-based, so both honour the
-    // same thread budget rather than oversubscribing the machine between them.
-    return omp_get_max_threads();
+    int team = omp_get_max_threads();
+    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        const int physical = omp_get_num_procs() / 2;
+        if (physical >= 1 && team > physical) team = physical;
+    }
+    return team;
 #else
     const unsigned int detected = std::thread::hardware_concurrency();
-    return detected ? static_cast<int>(detected) : 1;
+    if (detected == 0) return 1;
+    const int physical = static_cast<int>(detected) / 2;
+    return physical >= 1 ? physical : 1;
 #endif
 }
 
