@@ -348,7 +348,7 @@ class NativeV2Tokenizer:
             raise ValueError("messages must not be empty")
         compiled_template = getattr(self, "_compiled_chat_template", None)
         if compiled_template is not None:
-            normalized: list[dict[str, str]] = []
+            normalized: list[dict[str, object]] = []
             for message in messages:
                 role = message["role"]
                 content = message["content"]
@@ -356,7 +356,15 @@ class NativeV2Tokenizer:
                     raise ValueError(f"unsupported chat role: {role}")
                 if not content.strip():
                     raise ValueError("chat message content must not be empty")
-                normalized.append({"role": role, "content": content})
+                # Some tokenizer.chat_template variants access tool_calls
+                # unconditionally instead of guarding it with ``is defined``.
+                # Tool-call history has already been rendered into content by
+                # the OpenAI compatibility layer, so expose an empty collection
+                # here to preserve that rendered representation while matching
+                # the message shape expected by those templates.
+                normalized.append(
+                    {"role": role, "content": content, "tool_calls": []}
+                )
             return compiled_template.render(
                 messages=normalized,
                 add_generation_prompt=True,

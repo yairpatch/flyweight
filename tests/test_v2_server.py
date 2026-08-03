@@ -330,6 +330,24 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(prompt, "[user]Hello[assistant]<think>")
         self.assertEqual(tokenizer.chat_template_source, "gguf")
 
+    def test_gguf_chat_template_can_access_missing_tool_calls(self) -> None:
+        class TemplateModel(StubV2Model):
+            config = {}
+            chat_template = (
+                "{% for message in messages %}[{{ message.role }}]"
+                "{{ message.content }}"
+                "{% if message.tool_calls %}[tools]{% endif %}{% endfor %}"
+                "{% if add_generation_prompt %}[assistant]{% endif %}"
+            )
+
+        tokenizer = NativeV2Tokenizer(TemplateModel())  # type: ignore[arg-type]
+
+        prompt = tokenizer.format_messages(
+            [{"role": "user", "content": "Hello"}]
+        )
+
+        self.assertEqual(prompt, "[user]Hello[assistant]")
+
     def test_multibyte_character_split_across_tokens_decodes_intact(self) -> None:
         # Byte-level BPE splits "⚽" (e2 9a bd) across tokens 40+41. Per-token
         # string decoding turned each half into U+FFFD, and that corruption was
