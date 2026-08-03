@@ -1795,6 +1795,13 @@ extern "C" int colibri_gpu_nvfp4_grouped_accumulate(
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t experts, std::uint64_t stream
 ) {
+    // Not reachable through launch(), so the CPU backend cannot substitute a
+    // host kernel for it: this bottoms out in cuBLAS directly. Report failure
+    // so the runtime falls back to the kernel path it already has. Returning
+    // success here silently skipped attention entirely for sequences of 128+
+    // tokens, which is where cuBLAS attention becomes eligible.
+    if (colibri_backend_is_cpu()) return -1;
+
     const char* tiled_env = std::getenv("COLIBRI_NVFP4_TILED");
     const bool tiled = tiled_env && tiled_env[0] == '1';
     const auto kernel = tiled ? g_kernels.nvfp4_grouped_accumulate_tiled
@@ -1958,6 +1965,13 @@ extern "C" int colibri_gpu_nvfp4_matmul_cublas(
     std::uint64_t stream, std::int32_t input_size,
     std::int32_t output_size, std::int32_t rows, float scale
 ) {
+    // Not reachable through launch(), so the CPU backend cannot substitute a
+    // host kernel for it: this bottoms out in cuBLAS directly. Report failure
+    // so the runtime falls back to the kernel path it already has. Returning
+    // success here silently skipped attention entirely for sequences of 128+
+    // tokens, which is where cuBLAS attention becomes eligible.
+    if (colibri_backend_is_cpu()) return -1;
+
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!weights || !input || !output || input_size <= 0 || output_size <= 0
         || rows <= 0 || (input_size & 63) || (output_size & 15)
@@ -2129,6 +2143,13 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
     std::int32_t hidden_size, std::int32_t intermediate_size,
     std::int32_t experts
 ) {
+    // Not reachable through launch(), so the CPU backend cannot substitute a
+    // host kernel for it: this bottoms out in cuBLAS directly. Report failure
+    // so the runtime falls back to the kernel path it already has. Returning
+    // success here silently skipped attention entirely for sequences of 128+
+    // tokens, which is where cuBLAS attention becomes eligible.
+    if (colibri_backend_is_cpu()) return -1;
+
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!gate_pointers || !up_pointers || !down_pointers || !input
         || !activated || !output || !route_weights || hidden_size <= 0
@@ -2382,6 +2403,13 @@ extern "C" int colibri_gpu_nvfp4_prepare_expert(
     std::uint64_t native, std::uint64_t stream,
     std::int32_t hidden_size, std::int32_t intermediate_size
 ) {
+    // Not reachable through launch(), so the CPU backend cannot substitute a
+    // host kernel for it: this bottoms out in cuBLAS directly. Report failure
+    // so the runtime falls back to the kernel path it already has. Returning
+    // success here silently skipped attention entirely for sequences of 128+
+    // tokens, which is where cuBLAS attention becomes eligible.
+    if (colibri_backend_is_cpu()) return -1;
+
     if (!gate || !up || !down || !native || hidden_size <= 0
         || intermediate_size <= 0 || (hidden_size & 63)
         || (intermediate_size & 127)) return -1;
@@ -2431,6 +2459,13 @@ extern "C" int colibri_gpu_nvfp4_moe_persistent(
     std::int32_t hidden_size, std::int32_t intermediate_size,
     std::int32_t experts
 ) {
+    // Not reachable through launch(), so the CPU backend cannot substitute a
+    // host kernel for it: this bottoms out in cuBLAS directly. Report failure
+    // so the runtime falls back to the kernel path it already has. Returning
+    // success here silently skipped attention entirely for sequences of 128+
+    // tokens, which is where cuBLAS attention becomes eligible.
+    if (colibri_backend_is_cpu()) return -1;
+
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!native_experts || !route_weights || !input || !activated || !output
         || hidden_size <= 0 || intermediate_size <= 0 || experts <= 0
@@ -2676,6 +2711,13 @@ extern "C" int colibri_gpu_attention_f16_cublas(
     std::int32_t head_dim, std::int32_t tokens, std::int32_t capacity,
     std::int32_t first, float scale
 ) {
+    // Not reachable through launch(), so the CPU backend cannot substitute a
+    // host kernel for it: this bottoms out in cuBLAS directly. Report failure
+    // so the runtime falls back to the kernel path it already has. Returning
+    // success here silently skipped attention entirely for sequences of 128+
+    // tokens, which is where cuBLAS attention becomes eligible.
+    if (colibri_backend_is_cpu()) return -1;
+
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!query || !query_f16 || !keys || !values || !scores_f16 || !output
         || heads <= 0 || kv_heads <= 0 || heads % kv_heads != 0
@@ -2751,6 +2793,13 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     std::int32_t base_position, std::int32_t tile_rows_limit, float scale,
     std::int32_t apply_gate
 ) {
+    // Not reachable through launch(), so the CPU backend cannot substitute a
+    // host kernel for it: this bottoms out in cuBLAS directly. Report failure
+    // so the runtime falls back to the kernel path it already has. Returning
+    // success here silently skipped attention entirely for sequences of 128+
+    // tokens, which is where cuBLAS attention becomes eligible.
+    if (colibri_backend_is_cpu()) return -1;
+
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!queries || !gates || !keys || !values || !packed_queries
         || !scores_f32 || !probabilities_f16 || !packed_output || !output

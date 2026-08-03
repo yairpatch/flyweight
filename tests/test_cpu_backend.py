@@ -7,6 +7,7 @@ a device code path that has no device under it, and costing 13x for it.
 """
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -87,6 +88,70 @@ class CpuExpertPlacementTests(unittest.TestCase):
         V2Model.select_backend("cpu")
         with self.assertRaises(V2Error):
             self._prepared_runtime_mode("resident")
+
+
+class CpuCublasFallbackTests(unittest.TestCase):
+    """Enabling the cuBLAS attention path must not change CPU output.
+
+    Regression, and an expensive one. The backend substitutes host kernels at
+    launch(), so anything calling cuBLAS directly is invisible to it. Those
+    entry points returned success without computing, and the runtime believed
+    the work was done. Attention becomes cuBLAS-eligible at 128 tokens, so every
+    sequence of 128 or more silently skipped attention -- coherent output up to
+    that point, garbage after.
+
+    Phrased as "the cuBLAS toggle is a no-op on the CPU backend" because that is
+    the property the fix establishes.
+
+    Verified to fail when the guard is removed -- though by crashing rather than
+    by a clean assertion, since the unguarded path dereferences cuBLAS handles
+    that were never loaded. A core dump still fails the run, and only happens if
+    someone deletes the guard, but do not expect a readable message.
+
+    Two weaker versions were tried and discarded: checking the tokens for
+    degeneracy (on a small fixture the corrupted output is merely different, not
+    obviously broken, so it passed with the fix removed) and calling the entry
+    points directly with zeroed arguments (their null checks reject those before
+    the backend check is reached).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = TemporaryDirectory()
+        cls.model_path = Path(cls._directory.name) / "long.gguf"
+        build_dense_qwen35_gguf(cls.model_path, quantize="q8_0")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    def tearDown(self) -> None:
+        os.environ.pop("COLIBRI_CUBLAS_ATTENTION", None)
+        V2Model.select_backend("auto")
+
+    def _generate(self, prompt_length: int) -> list[int]:
+        model = V2Model(self.model_path)
+        runtime = model.native_qwen_runtime(context_limit=512, expert_mode="cpu")
+        runtime.prepare()
+        prompt = [(index * 7 + 3) % 64 for index in range(prompt_length)]
+        produced: list[int] = []
+        runtime.generate(prompt, 8, produced.append)
+        return produced
+
+    def test_cublas_attention_toggle_does_not_change_cpu_output(self):
+        V2Model.select_backend("cpu")
+        # 140 crosses the 128-token eligibility threshold; 100 does not, and is
+        # included so a failure points at the threshold rather than at the model.
+        for prompt_length in (100, 140):
+            with self.subTest(prompt_length=prompt_length):
+                os.environ["COLIBRI_CUBLAS_ATTENTION"] = "0"
+                disabled = self._generate(prompt_length)
+                os.environ.pop("COLIBRI_CUBLAS_ATTENTION", None)
+                enabled = self._generate(prompt_length)
+                self.assertEqual(
+                    disabled, enabled,
+                    "the cuBLAS attention path changed CPU output, so it is "
+                    "being taken on a backend that cannot execute it")
 
 
 if __name__ == "__main__":
