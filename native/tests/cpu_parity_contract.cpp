@@ -704,6 +704,87 @@ void add_cases() {
     });
 
     cases().push_back(Case{
+        "kv_attention_values_f16_ring",
+        [](std::vector<std::vector<float>>& outputs) {
+            // first + tokens > capacity is the wrapped case; the corpus indexes
+            // slots as (first + t) % capacity, so a run that straddles the end
+            // of the ring has to be covered or the wrap is untested.
+            const int shapes[][5] = {
+                // heads, kv_heads, head_dim, tokens, first  (capacity = 256)
+                {16, 2, 128, 37, 0},
+                {16, 2, 128, 200, 0},
+                {8, 8, 64, 90, 200},    // wraps
+                {4, 2, 32, 256, 128},   // full ring, wraps
+                {2, 1, 128, 1, 255},    // single token at the last slot
+            };
+            const int capacity = 256;
+            for (const auto& shape : shapes) {
+                int heads = shape[0], kv_heads = shape[1], head_dim = shape[2];
+                int tokens = shape[3], first = shape[4];
+                int cap = capacity;
+                auto scores = random_vector(
+                    static_cast<std::size_t>(heads) * tokens, -6.0f, 6.0f);
+                auto raw = random_vector(
+                    static_cast<std::size_t>(kv_heads) * capacity * head_dim,
+                    -2.0f, 2.0f);
+                // Round through fp16 so both paths read identical bits.
+                std::vector<std::uint16_t> values(raw.size());
+                for (std::size_t index = 0; index < raw.size(); ++index)
+                    values[index] = colibri::cpu::float_to_half_bits(raw[index]);
+                std::vector<float> output(
+                    static_cast<std::size_t>(heads) * head_dim, 0.0f);
+
+                float* scores_p = scores.data();
+                const std::uint16_t* values_p = values.data();
+                float* output_p = output.data();
+                void* arguments[] = {&scores_p, &values_p, &output_p, &heads,
+                                     &kv_heads, &head_dim, &tokens, &cap, &first};
+                colibri_cpu_launch_named("kv_attention_values_f16_ring", heads,
+                                         1, 256, 0, 0, arguments);
+                outputs.push_back(std::move(output));
+                // The scores buffer is softmaxed in place and read back by the
+                // caller, so it is part of the contract.
+                outputs.push_back(std::move(scores));
+            }
+        },
+        1e-5f,
+    });
+
+    cases().push_back(Case{
+        "kv_attention_values_ring",
+        [](std::vector<std::vector<float>>& outputs) {
+            // f32 cache variant of the same kernel; same wrap coverage.
+            const int shapes[][5] = {
+                {16, 2, 128, 37, 0}, {8, 8, 64, 90, 200}, {4, 2, 32, 256, 128},
+            };
+            const int capacity = 256;
+            for (const auto& shape : shapes) {
+                int heads = shape[0], kv_heads = shape[1], head_dim = shape[2];
+                int tokens = shape[3], first = shape[4];
+                int cap = capacity;
+                auto scores = random_vector(
+                    static_cast<std::size_t>(heads) * tokens, -6.0f, 6.0f);
+                auto values = random_vector(
+                    static_cast<std::size_t>(kv_heads) * capacity * head_dim,
+                    -2.0f, 2.0f);
+                std::vector<float> output(
+                    static_cast<std::size_t>(heads) * head_dim, 0.0f);
+
+                float* scores_p = scores.data();
+                const float* values_p = values.data();
+                float* output_p = output.data();
+                void* arguments[] = {&scores_p, &values_p, &output_p, &heads,
+                                     &kv_heads, &head_dim, &tokens, &cap, &first};
+                colibri_cpu_launch_named("kv_attention_values_ring", heads, 1,
+                                         256, 0, 0, arguments);
+                outputs.push_back(std::move(output));
+                outputs.push_back(std::move(scores));
+            }
+        },
+        1e-5f,
+    });
+
+    cases().push_back(Case{
         "qwen_attention_key",
         [](std::vector<std::vector<float>>& outputs) {
             const int shapes[][3] = {{2, 128, 128}, {8, 64, 32}, {1, 96, 64}};

@@ -1002,6 +1002,92 @@ void q8_swiglu_transposed_warp(const Launch&, void** arguments) {
     });
 }
 
+// --- kv_attention_values_*_ring -------------------------------------------
+//
+// Corpus signature (one per cache element type):
+//   void kv_attention_values_f16_ring(float* scores, const __half* values,
+//                                     float* output, int heads, int kv_heads,
+//                                     int head_dim, int tokens, int capacity,
+//                                     int first)
+//
+// Softmax over one head's attention scores, then the score-weighted sum of the
+// value vectors. `first` and `capacity` describe the circular KV window, so
+// logical token t lives at slot (first + t) % capacity.
+//
+// Measured at 36% of decode while emulated, at 3.2 ms per call on a 37-token
+// context where the arithmetic is a few microseconds' worth. All of that was
+// the cooperative-kernel path: two block reductions and four barriers mean
+// fiber switching dominates completely.
+//
+// The scores buffer is normalized in place, as in the corpus, because the
+// caller reads it back.
+template <class Element, class Load>
+inline void kv_values_ring_host(float* scores, const Element* values,
+                                float* output, int heads, int kv_heads,
+                                int head_dim, int tokens, int capacity,
+                                int first, Load load) {
+    const int group = heads / kv_heads;
+    parallel_chunks(static_cast<std::uint64_t>(heads), [&](std::uint64_t head) {
+        const int kv_head = static_cast<int>(head) / group;
+        float* head_scores = scores + static_cast<std::int64_t>(head) * tokens;
+
+        float maximum = -3.402823466e+38F;
+        for (int token = 0; token < tokens; ++token)
+            maximum = std::fmax(maximum, head_scores[token]);
+
+        float denominator = 0.0f;
+        for (int token = 0; token < tokens; ++token) {
+            const float weight = std::exp(head_scores[token] - maximum);
+            head_scores[token] = weight;
+            denominator += weight;
+        }
+        const float inverse_denominator = 1.0f / denominator;
+        for (int token = 0; token < tokens; ++token)
+            head_scores[token] *= inverse_denominator;
+
+        // Token-outer, dim-inner: each value row is contiguous in `d`, so this
+        // walks the cache sequentially instead of striding per output element.
+        float* out = output + static_cast<std::int64_t>(head) * head_dim;
+        for (int d = 0; d < head_dim; ++d) out[d] = 0.0f;
+        for (int token = 0; token < tokens; ++token) {
+            const int slot = (first + token) % capacity;
+            const Element* row = values +
+                (static_cast<std::int64_t>(kv_head) * capacity + slot) * head_dim;
+            const float weight = head_scores[token];
+            for (int d = 0; d < head_dim; ++d) out[d] += weight * load(row[d]);
+        }
+    });
+}
+
+void kv_attention_values_f16_ring(const Launch&, void** arguments) {
+    float* scores = *reinterpret_cast<float**>(arguments[0]);
+    const auto* values = *reinterpret_cast<const std::uint16_t**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int heads = *reinterpret_cast<const int*>(arguments[3]);
+    const int kv_heads = *reinterpret_cast<const int*>(arguments[4]);
+    const int head_dim = *reinterpret_cast<const int*>(arguments[5]);
+    const int tokens = *reinterpret_cast<const int*>(arguments[6]);
+    const int capacity = *reinterpret_cast<const int*>(arguments[7]);
+    const int first = *reinterpret_cast<const int*>(arguments[8]);
+    kv_values_ring_host(scores, values, output, heads, kv_heads, head_dim,
+                        tokens, capacity, first,
+                        [](std::uint16_t bits) { return half_bits_to_float(bits); });
+}
+
+void kv_attention_values_ring(const Launch&, void** arguments) {
+    float* scores = *reinterpret_cast<float**>(arguments[0]);
+    const float* values = *reinterpret_cast<const float**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int heads = *reinterpret_cast<const int*>(arguments[3]);
+    const int kv_heads = *reinterpret_cast<const int*>(arguments[4]);
+    const int head_dim = *reinterpret_cast<const int*>(arguments[5]);
+    const int tokens = *reinterpret_cast<const int*>(arguments[6]);
+    const int capacity = *reinterpret_cast<const int*>(arguments[7]);
+    const int first = *reinterpret_cast<const int*>(arguments[8]);
+    kv_values_ring_host(scores, values, output, heads, kv_heads, head_dim,
+                        tokens, capacity, first, [](float v) { return v; });
+}
+
 // --- q8_lm_head_argmax_warp -----------------------------------------------
 //
 // Corpus signature:
@@ -1067,6 +1153,8 @@ COLIBRI_CPU_NATIVE_KERNEL("qwen_attention_key", qwen_attention_key);
 COLIBRI_CPU_NATIVE_KERNEL("qwen_delta_recurrent_split", qwen_delta_recurrent_split);
 COLIBRI_CPU_NATIVE_KERNEL("qwen_delta_recurrent_chunk", qwen_delta_recurrent_chunk);
 COLIBRI_CPU_NATIVE_KERNEL("q8_swiglu_transposed_warp", q8_swiglu_transposed_warp);
+COLIBRI_CPU_NATIVE_KERNEL("kv_attention_values_f16_ring", kv_attention_values_f16_ring);
+COLIBRI_CPU_NATIVE_KERNEL("kv_attention_values_ring", kv_attention_values_ring);
 COLIBRI_CPU_NATIVE_KERNEL("q8_lm_head_argmax_warp", q8_lm_head_argmax_warp);
 COLIBRI_CPU_NATIVE_KERNEL("q8_matvec_transposed_warp", q8_matvec_transposed_warp);
 COLIBRI_CPU_NATIVE_KERNEL("q8_matmul_tiled", q8_matmul_tiled);
