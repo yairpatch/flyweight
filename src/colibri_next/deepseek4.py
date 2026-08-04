@@ -53,6 +53,28 @@ def grouped_matvec(
     return output
 
 
+def compress(values: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """Pool a block of positions into one latent, softmaxing per channel.
+
+    `values` and `scores` are both [positions, width]. Each channel weights the
+    block's positions by its own scores, so channels may draw from different
+    tokens.
+    """
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    scores = np.ascontiguousarray(scores, dtype=np.float32)
+    if values.shape != scores.shape:
+        raise ValueError("values and scores must have the same shape")
+    positions, width = values.shape
+    output = np.zeros(width, dtype=np.float32)
+    library = _library()
+    status = library.colibri_v2_deepseek4_compress(
+        _pointer(values), _pointer(scores), positions, width, _pointer(output)
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"compress failed").decode(errors="replace"))
+    return output
+
+
 def expert_matvec(
     model, name: str, expert: int, input_vector: np.ndarray, outputs: int
 ) -> np.ndarray:

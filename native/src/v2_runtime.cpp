@@ -3627,6 +3627,18 @@ int colibri_v2_expert_matvec(
         output[row]=qwen_quant_dot(packed,found->type,input,inputs,base+row);
     return 0;});}
 
+// Pool one block of positions into a single compressed latent.
+int colibri_v2_deepseek4_compress(
+    const float* values, const float* scores, int32_t positions, int32_t width,
+    float* output
+){return guarded([&]{
+    if(!values||!scores||!output||positions<=0||width<=0)
+        throw std::runtime_error("compress arguments are invalid");
+    colibri::v2::deepseek4::compress_block(
+        values,scores,static_cast<std::size_t>(positions),
+        static_cast<std::size_t>(width),output);
+    return 0;});}
+
 // Expert routing for one token: pick the experts and weight them.
 int colibri_v2_deepseek4_router(
     const float* logits, const float* bias, int32_t experts, int32_t used,

@@ -144,6 +144,39 @@ inline void hyper_connection_combine(
     }
 }
 
+// Compress a block of positions into a single latent.
+//
+// Both compressed attention kinds pool a run of tokens -- four for CSA, 128 for
+// HCA -- into one latent that later positions attend to instead of the tokens
+// themselves. The pooling is a softmax-weighted average taken *per channel*,
+// not per position: each of the `width` channels softmaxes its own scores over
+// the block and mixes the values accordingly, so different channels can draw
+// from different tokens in the same block.
+//
+// `values` and `scores` are [positions][width], row-major. The scores already
+// include the absolute position embedding for the slot within the block.
+inline void compress_block(
+    const float* values,
+    const float* scores,
+    std::size_t positions,
+    std::size_t width,
+    float* output
+) {
+    for (std::size_t channel = 0; channel < width; ++channel) {
+        float peak = -std::numeric_limits<float>::infinity();
+        for (std::size_t position = 0; position < positions; ++position)
+            peak = std::max(peak, scores[position * width + channel]);
+        float total = 0.0f;
+        float mixed = 0.0f;
+        for (std::size_t position = 0; position < positions; ++position) {
+            const float weight = std::exp(scores[position * width + channel] - peak);
+            total += weight;
+            mixed += weight * values[position * width + channel];
+        }
+        output[channel] = total > 0.0f ? mixed / total : 0.0f;
+    }
+}
+
 // Expert routing for one token.
 //
 // The probabilities are sqrt(softplus(logits)) -- not the sigmoid that

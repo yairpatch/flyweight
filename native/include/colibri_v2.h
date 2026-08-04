@@ -252,6 +252,10 @@ COLIBRI_V2_API int colibri_v2_matvec(const ColibriV2Model* model, const char* na
    of the tensor's output rows. */
 COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const char* name,
     const float* input, int32_t inputs, float* output, int32_t rank, int32_t groups);
+/* Pool `positions` rows of `width` into one compressed latent, softmaxing the
+   scores per channel. */
+COLIBRI_V2_API int colibri_v2_deepseek4_compress(const float* values, const float* scores,
+    int32_t positions, int32_t width, float* output);
 /* Matvec against one expert of a stacked [inputs, outputs, experts] tensor. */
 COLIBRI_V2_API int colibri_v2_expert_matvec(const ColibriV2Model* model, const char* name,
     int32_t expert, const float* input, int32_t inputs, float* output, int32_t outputs);
