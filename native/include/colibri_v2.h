@@ -252,6 +252,9 @@ COLIBRI_V2_API int colibri_v2_matvec(const ColibriV2Model* model, const char* na
    of the tensor's output rows. */
 COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const char* name,
     const float* input, int32_t inputs, float* output, int32_t rank, int32_t groups);
+/* Matvec against one expert of a stacked [inputs, outputs, experts] tensor. */
+COLIBRI_V2_API int colibri_v2_expert_matvec(const ColibriV2Model* model, const char* name,
+    int32_t expert, const float* input, int32_t inputs, float* output, int32_t outputs);
 /* Expert routing for one token. `bias` may be NULL. `select` false means the
    caller already filled `chosen` from a hash table and only wants weights. */
 COLIBRI_V2_API int colibri_v2_deepseek4_router(const float* logits, const float* bias,

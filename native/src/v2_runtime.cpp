@@ -3603,6 +3603,30 @@ int colibri_v2_grouped_matvec(
         });
     return 0;});}
 
+// Matvec against one expert of a stacked expert tensor. The experts are laid
+// out back to back, so expert e's rows start at e*outputs.
+int colibri_v2_expert_matvec(
+    const ColibriV2Model* m, const char* name, int32_t expert,
+    const float* input, int32_t inputs, float* output, int32_t outputs
+){return guarded([&]{
+    if(!m||!name||!input||!output||expert<0||inputs<=0||outputs<=0)
+        throw std::runtime_error("expert matvec arguments are invalid");
+    const auto found=std::find_if(m->tensors.begin(),m->tensors.end(),
+        [&](const Tensor& tensor){return tensor.name==name;});
+    if(found==m->tensors.end())throw std::runtime_error(std::string("tensor not found: ")+name);
+    if(found->shape.size()!=3||static_cast<std::int64_t>(found->shape[0])!=inputs||
+       static_cast<std::int64_t>(found->shape[1])!=outputs)
+        throw std::runtime_error("expert matvec shape does not match the tensor");
+    if(expert>=static_cast<std::int64_t>(found->shape[2]))
+        throw std::runtime_error("expert index is out of range");
+    if(!qwen_cpu_expert_type_supported(found->type))
+        throw std::runtime_error("expert matvec cannot decode this weight type");
+    const auto* packed=tensor_data(*m,*found);
+    const auto base=static_cast<std::uint64_t>(expert)*outputs;
+    for(std::int32_t row=0;row<outputs;++row)
+        output[row]=qwen_quant_dot(packed,found->type,input,inputs,base+row);
+    return 0;});}
+
 // Expert routing for one token: pick the experts and weight them.
 int colibri_v2_deepseek4_router(
     const float* logits, const float* bias, int32_t experts, int32_t used,

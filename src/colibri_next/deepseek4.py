@@ -53,6 +53,22 @@ def grouped_matvec(
     return output
 
 
+def expert_matvec(
+    model, name: str, expert: int, input_vector: np.ndarray, outputs: int
+) -> np.ndarray:
+    """Multiply one expert's slice of a stacked expert tensor by a vector."""
+    input_vector = np.ascontiguousarray(input_vector, dtype=np.float32)
+    output = np.zeros(outputs, dtype=np.float32)
+    library = _library()
+    status = library.colibri_v2_expert_matvec(
+        model._handle, name.encode(), expert, _pointer(input_vector),
+        input_vector.size, _pointer(output), outputs,
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"expert matvec failed").decode(errors="replace"))
+    return output
+
+
 def route(
     logits: np.ndarray,
     bias: np.ndarray | None = None,
