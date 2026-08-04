@@ -3661,6 +3661,19 @@ int colibri_v2_expert_matvec(
         output[row]=qwen_quant_dot(packed,found->type,input,inputs,base+row);
     return 0;});}
 
+// Collapse the streams for the output head, which needs only pre-weights.
+int colibri_v2_deepseek4_head(
+    const float* streams, const float* fn, const float* scale, const float* base,
+    int32_t n_embd, int32_t hc, float rms_epsilon, float hc_epsilon,
+    float* pre, float* output
+){return guarded([&]{
+    if(!streams||!fn||!scale||!base||!pre||!output||n_embd<=0||hc<=0)
+        throw std::runtime_error("head arguments are invalid");
+    colibri::v2::deepseek4::hyper_connection_head(
+        streams,fn,scale,base,static_cast<std::size_t>(n_embd),
+        static_cast<std::size_t>(hc),rms_epsilon,hc_epsilon,pre,output);
+    return 0;});}
+
 // Pool one block of positions into a single compressed latent.
 int colibri_v2_deepseek4_compress(
     const float* values, const float* scores, int32_t positions, int32_t width,

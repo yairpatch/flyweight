@@ -252,6 +252,11 @@ COLIBRI_V2_API int colibri_v2_matvec(const ColibriV2Model* model, const char* na
    of the tensor's output rows. */
 COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const char* name,
     const float* input, int32_t inputs, float* output, int32_t rank, int32_t groups);
+/* Collapse the streams for the output head: a [hc, hc*n_embd] mixer and a
+   single scale, producing pre-weights and the collapsed vector. */
+COLIBRI_V2_API int colibri_v2_deepseek4_head(const float* streams, const float* fn,
+    const float* scale, const float* base, int32_t n_embd, int32_t hc,
+    float rms_epsilon, float hc_epsilon, float* pre, float* output);
 /* Pool `positions` rows of `width` into one compressed latent, softmaxing the
    scores per channel. */
 COLIBRI_V2_API int colibri_v2_deepseek4_compress(const float* values, const float* scores,

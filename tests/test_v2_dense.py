@@ -14,8 +14,21 @@ from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 SPILL_BUDGET_BYTES = 32 * 1024 * 1024
 
 
+_WORKSPACES: list[tempfile.TemporaryDirectory] = []
+
+
+def tearDownModule():
+    # /tmp is often a RAM-backed tmpfs and these fixtures are megabytes each,
+    # so a directory per test adds up fast across repeated runs.
+    for holder in _WORKSPACES:
+        holder.cleanup()
+    _WORKSPACES.clear()
+
+
 def _model(**kwargs) -> tuple[V2Model, DenseQwenSpec, Path]:
-    directory = Path(tempfile.mkdtemp(prefix="colibri-dense-"))
+    holder = tempfile.TemporaryDirectory(prefix="colibri-dense-")
+    _WORKSPACES.append(holder)
+    directory = Path(holder.name)
     path = directory / "dense.gguf"
     spec = build_dense_qwen35_gguf(path, **kwargs)
     return V2Model(path), spec, path

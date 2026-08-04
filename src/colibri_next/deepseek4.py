@@ -53,6 +53,35 @@ def grouped_matvec(
     return output
 
 
+def head_collapse(
+    streams: np.ndarray,
+    fn: np.ndarray,
+    scale: np.ndarray,
+    base: np.ndarray,
+    *,
+    rms_epsilon: float = 1e-6,
+    hc_epsilon: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collapse the streams for the output head; returns (pre, collapsed)."""
+    streams = np.ascontiguousarray(streams, dtype=np.float32)
+    hc, n_embd = streams.shape
+    fn = np.ascontiguousarray(fn, dtype=np.float32)
+    if fn.shape != (hc, hc * n_embd):
+        raise ValueError(f"head mixer must be {(hc, hc * n_embd)}, got {fn.shape}")
+    pre = np.zeros(hc, dtype=np.float32)
+    output = np.zeros(n_embd, dtype=np.float32)
+    library = _library()
+    status = library.colibri_v2_deepseek4_head(
+        _pointer(streams), _pointer(fn),
+        _pointer(np.ascontiguousarray(scale, dtype=np.float32)),
+        _pointer(np.ascontiguousarray(base, dtype=np.float32)),
+        n_embd, hc, rms_epsilon, hc_epsilon, _pointer(pre), _pointer(output),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"head failed").decode(errors="replace"))
+    return pre, output
+
+
 def compress(values: np.ndarray, scores: np.ndarray) -> np.ndarray:
     """Pool a block of positions into one latent, softmaxing per channel.
 

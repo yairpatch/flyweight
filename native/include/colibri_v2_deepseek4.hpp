@@ -109,6 +109,42 @@ inline void hyper_connection_weights(
     sinkhorn(comb, hc, sinkhorn_iterations, hc_epsilon);
 }
 
+// Collapse the streams for the output head.
+//
+// The head only ever reads the streams, so its mixer produces just the `hc`
+// pre-weights rather than the pre/post/comb triple a block needs -- hence a
+// [hc, hc*n_embd] mixer with a single scale, against the block's
+// [(2+hc)*hc, hc*n_embd] with three.
+inline void hyper_connection_head(
+    const float* streams,
+    const float* fn,
+    const float* scale,
+    const float* base,
+    std::size_t n_embd,
+    std::size_t hc,
+    float rms_epsilon,
+    float hc_epsilon,
+    float* pre,
+    float* output
+) {
+    const std::size_t width = hc * n_embd;
+    std::vector<float> normalized(width);
+    rms_norm(streams, width, rms_epsilon, normalized.data());
+    for (std::size_t row = 0; row < hc; ++row) {
+        const float* weights = fn + row * width;
+        double total = 0.0;
+        for (std::size_t i = 0; i < width; ++i)
+            total += static_cast<double>(weights[i]) * normalized[i];
+        pre[row] = sigmoid(static_cast<float>(total) * scale[0] + base[row]) + hc_epsilon;
+    }
+    for (std::size_t i = 0; i < n_embd; ++i) output[i] = 0.0f;
+    for (std::size_t stream = 0; stream < hc; ++stream) {
+        const float weight = pre[stream];
+        const float* source = streams + stream * n_embd;
+        for (std::size_t i = 0; i < n_embd; ++i) output[i] += source[i] * weight;
+    }
+}
+
 // Collapse the streams into the single vector a block consumes.
 inline void hyper_connection_collapse(
     const float* streams, const float* pre, std::size_t n_embd, std::size_t hc, float* output
