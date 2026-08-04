@@ -639,6 +639,23 @@ constexpr std::uint32_t kIq3xxsBlockSize = kIq3xxsBlockBytes; // IQ3_XXS: 98 byt
 constexpr std::uint32_t kQ5KBlockSize = 176;  // Q5_K: 176 bytes per 256 elements
 constexpr std::uint32_t kQ6KBlockSize = 210;  // Q6_K: 210 bytes per 256 elements
 constexpr std::uint32_t kQ4KBlockSize = 144;  // Q4_K: 144 bytes per 256 elements
+constexpr std::uint32_t kMxfp4BlockSize = 17;      // MXFP4: e[1] E8M0 scale + qs[16] nibbles
+constexpr std::uint32_t kMxfp4BlockElements = 32;
+// The FP4 codebook, doubled -- which is why the scale is halved to match.
+constexpr float kMxfp4Lut[16] = {
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f,
+};
+// E8M0 exponent to float, halved: 2^(x-128). Values below 2 land in the
+// denormal range and are built from bit patterns rather than shifted.
+inline float mxfp4_scale(std::uint8_t exponent) {
+    const std::uint32_t bits = exponent < 2
+        ? (0x00200000u << exponent)
+        : (static_cast<std::uint32_t>(exponent - 1) << 23);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
 constexpr std::uint32_t kNvfp4BlockSize = 36;      // NVFP4: d[4] E4M3 scales + qs[32] nibbles
 constexpr std::uint32_t kNvfp4BlockElements = 64;  // 4 sub-blocks of 16 elements
 constexpr std::uint32_t kNvfp4SubBlock = 16;       // elements governed by one scale
@@ -2117,6 +2134,22 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         result+=qwen_iq2xs_dot_row(packed,input,elements,row);
     }else if(type==23){
         result+=qwen_iq4xs_dot_row(packed,input,elements,row);
+    }else if(type==39){
+        // MXFP4: one E8M0 exponent per 32 values, then 16 packed nibbles where
+        // byte j holds element j in the low half and element j+16 in the high.
+        const int blocks=elements/kMxfp4BlockElements;
+        const std::uint64_t row_offset=static_cast<std::uint64_t>(row)*blocks*kMxfp4BlockSize;
+        for(int block=0;block<blocks;++block){
+            const auto*base=packed+row_offset+block*kMxfp4BlockSize;
+            const float scale=mxfp4_scale(base[0]);
+            const auto*vector=input+block*kMxfp4BlockElements;
+            float partial=0.0f;
+            for(int lane=0;lane<16;++lane){
+                const auto byte=base[1+lane];
+                partial+=kMxfp4Lut[byte&15]*vector[lane]+kMxfp4Lut[byte>>4]*vector[lane+16];
+            }
+            result+=scale*partial;
+        }
     }else if(type==40){
         const int blocks=elements/kNvfp4BlockElements;
         const std::uint64_t row_offset=static_cast<std::uint64_t>(row)*blocks*kNvfp4BlockSize;
@@ -2297,7 +2330,8 @@ bool qwen_gpu_experts_executable(const ColibriV2QwenRuntime& runtime) {
 bool qwen_cpu_expert_type_supported(std::uint32_t type) {
     switch(type){
         case 0: case 2: case 8: case 10: case 11: case 12: case 13: case 14:
-        case 16: case 17: case 18: case 21: case 22: case 23: case 30: case 40:
+        case 16: case 17: case 18: case 21: case 22: case 23: case 30:
+        case 39: case 40:
             return true;
         default:
             return false;

@@ -182,14 +182,15 @@ def _reference_split(text: str) -> tuple[str, ...]:
 class JoyaiPretokenizerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        directory = Path(tempfile.mkdtemp(prefix="colibri-joyai-"))
-        path = directory / "deepseek4.gguf"
+        cls.workspace = tempfile.TemporaryDirectory(prefix="colibri-joyai-")
+        path = Path(cls.workspace.name) / "deepseek4.gguf"
         build_deepseek4_gguf(path)
         cls.model = V2Model(path)
 
     @classmethod
     def tearDownClass(cls):
         cls.model.close()
+        cls.workspace.cleanup()
 
     def test_pretokenizer_matches_the_reference_patterns(self):
         for text in CORPUS:

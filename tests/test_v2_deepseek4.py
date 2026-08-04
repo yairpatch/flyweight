@@ -19,8 +19,31 @@ from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 from tests.split_gguf_fixture import split_gguf
 
 
+def _workspace(case: unittest.TestCase | None = None) -> Path:
+    """A temp directory that goes away with the test that made it.
+
+    These fixtures are tens of megabytes and /tmp is usually a RAM-backed
+    tmpfs, so leaking one per test run adds up quickly.
+    """
+    holder = tempfile.TemporaryDirectory(prefix="colibri-deepseek4-")
+    if case is not None:
+        case.addCleanup(holder.cleanup)
+    else:
+        _MODULE_WORKSPACES.append(holder)
+    return Path(holder.name)
+
+
+_MODULE_WORKSPACES: list[tempfile.TemporaryDirectory] = []
+
+
+def tearDownModule():
+    for holder in _MODULE_WORKSPACES:
+        holder.cleanup()
+    _MODULE_WORKSPACES.clear()
+
+
 def _model(**kwargs) -> tuple[V2Model, DeepSeek4Spec]:
-    directory = Path(tempfile.mkdtemp(prefix="colibri-deepseek4-"))
+    directory = _workspace()
     path = directory / "deepseek4.gguf"
     spec = build_deepseek4_gguf(path, **kwargs)
     return V2Model(path), spec
@@ -95,7 +118,7 @@ class DeepSeek4ConfigTests(unittest.TestCase):
             model.close()
 
     def test_a_short_compress_ratio_array_is_rejected(self):
-        directory = Path(tempfile.mkdtemp(prefix="colibri-deepseek4-"))
+        directory = _workspace(self)
         path = directory / "short.gguf"
         # One entry fewer than the block count.
         build_deepseek4_gguf(path, DeepSeek4Spec(layers=6, extra_compress_ratios=-1))
@@ -115,7 +138,7 @@ class DeepSeek4ConfigTests(unittest.TestCase):
             model.close()
 
     def test_a_split_deepseek4_checkpoint_loads_like_the_real_layout(self):
-        directory = Path(tempfile.mkdtemp(prefix="colibri-deepseek4-"))
+        directory = _workspace(self)
         single = directory / "deepseek4.gguf"
         spec = build_deepseek4_gguf(single)
         first = split_gguf(single, directory, shards=4, metadata_only_first=True)
@@ -232,24 +255,22 @@ class DeepSeek4CheckpointTests(unittest.TestCase):
         self.assertGreaterEqual(len(ratios), 43)
         self.assertEqual(set(ratios) - {0, 4, 128}, set())
 
-    def test_the_only_undecodable_types_are_the_two_known_gaps(self):
+    def test_the_only_undecodable_type_is_the_hash_table(self):
         # Unsloth's dynamic quants mix types per tensor, so this is where a
         # format the runtime has no kernel for surfaces. UD-IQ3_XXS needs two
         # things the runtime does not have yet, and nothing else:
         #
-        #   26 = I32, the `ffn_gate_tid2eid` routing tables in the three hash
-        #        layers. An integer lookup table rather than a quantized
-        #        weight, so it needs routing support, not a decode kernel.
-        #   39 = MXFP4 (17 bytes per 32 values, 4.25 bits). Adjacent to the
-        #        NVFP4 (type 40) already implemented, which is 4.5 bits over
-        #        blocks of 16, so the two are not interchangeable.
+        # Only type 26 is left: the int32 `ffn_gate_tid2eid` routing tables
+        # in the three hash layers. Those are index data rather than weights,
+        # so having no dequantization kernel is correct. MXFP4 (39) used to be
+        # here too and is now implemented.
         #
-        # Pinning the exact set means a third gap appearing is a test failure
-        # rather than a surprise during Stage B.
+        # Pinning the exact set means a new gap is a test failure rather than a
+        # surprise during bring-up.
         offenders = self.model.unsupported_quant_types()
         self.assertEqual(
             {kind: len(names) for kind, names in sorted(offenders.items())},
-            {26: 3, 39: 2},
+            {26: 3},
             msg="undecodable GGML types: "
             + ", ".join(
                 f"type {kind} in {len(names)} tensors e.g. {names[0]}"

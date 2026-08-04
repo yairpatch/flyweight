@@ -236,7 +236,9 @@ class NativePromptBoundaryTests(unittest.TestCase):
             raise unittest.SkipTest("native CUDA runtime is unavailable")
         from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
-        directory = Path(tempfile.mkdtemp(prefix="colibri-bench-boundary-"))
+        holder = tempfile.TemporaryDirectory(prefix="colibri-bench-boundary-")
+        self.addCleanup(holder.cleanup)
+        directory = Path(holder.name)
         path = directory / "dense.gguf"
         build_dense_qwen35_gguf(
             path,

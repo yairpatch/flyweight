@@ -18,9 +18,20 @@ from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 from tests.split_gguf_fixture import split_gguf
 
 
+_WORKSPACES: list[tempfile.TemporaryDirectory] = []
+
+
+def tearDownModule():
+    for holder in _WORKSPACES:
+        holder.cleanup()
+    _WORKSPACES.clear()
+
+
 def _fixture(**kwargs) -> tuple[Path, Path, DenseQwenSpec]:
     """Write the dense fixture once and return it beside a split of itself."""
-    directory = Path(tempfile.mkdtemp(prefix="colibri-split-"))
+    holder = tempfile.TemporaryDirectory(prefix="colibri-split-")
+    _WORKSPACES.append(holder)
+    directory = Path(holder.name)
     single = directory / "dense.gguf"
     spec = build_dense_qwen35_gguf(single, DenseQwenSpec(layers=4))
     first = split_gguf(single, directory, **kwargs)

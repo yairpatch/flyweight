@@ -14,8 +14,25 @@ from colibri_next.v2_server import NativeV2Tokenizer
 from tests.laguna_gguf_fixture import LagunaSpec, build_laguna_gguf
 
 
+_WORKSPACES: list[tempfile.TemporaryDirectory] = []
+
+
+def tearDownModule():
+    # These fixtures are megabytes each and /tmp is usually a RAM-backed
+    # tmpfs, so a directory per test adds up fast across repeated runs.
+    for holder in _WORKSPACES:
+        holder.cleanup()
+    _WORKSPACES.clear()
+
+
+def _workspace(prefix: str) -> Path:
+    holder = tempfile.TemporaryDirectory(prefix=prefix)
+    _WORKSPACES.append(holder)
+    return Path(holder.name)
+
+
 def _model(**kwargs) -> tuple[V2Model, LagunaSpec]:
-    directory = Path(tempfile.mkdtemp(prefix="colibri-laguna-"))
+    directory = _workspace("colibri-laguna-")
     path = directory / "laguna.gguf"
     spec = build_laguna_gguf(path, **kwargs)
     return V2Model(path), spec
@@ -64,7 +81,7 @@ class LagunaConfigTests(unittest.TestCase):
         # The per-layer head count is the only independent witness of the
         # implied sliding-window layout, so a contradiction must not be
         # silently accepted.
-        directory = Path(tempfile.mkdtemp(prefix="colibri-laguna-bad-"))
+        directory = _workspace("colibri-laguna-bad-")
         path = directory / "laguna.gguf"
         spec = LagunaSpec()
         build_laguna_gguf(path, spec)
