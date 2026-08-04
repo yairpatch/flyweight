@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
+GGUF_INT32 = 5
 GGUF_UINT32 = 4
 GGUF_FLOAT32 = 6
 GGUF_BOOL = 7
@@ -48,24 +49,60 @@ def _float_array(values) -> bytes:
     return struct.pack("<IQ", GGUF_FLOAT32, len(values)) + body
 
 
+def _int32_array(values) -> bytes:
+    body = b"".join(struct.pack("<i", int(value)) for value in values)
+    return struct.pack("<IQ", GGUF_INT32, len(values)) + body
+
+
+def _string_array(values) -> bytes:
+    return struct.pack("<IQ", GGUF_STRING, len(values)) + b"".join(
+        _string(value) for value in values
+    )
+
+
+def _byte_vocabulary(size: int) -> list[str]:
+    """GPT-2's byte-to-unicode alphabet, truncated to `size` tokens.
+
+    Bytes that are already printable ASCII map to themselves; the rest are
+    lifted into a private range so every byte has a single-character spelling.
+    """
+    printable = set(
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(0xA1, 0xAD))
+        + list(range(0xAE, 0x100))
+    )
+    alphabet, spare = [], 0
+    for byte in range(256):
+        if byte in printable:
+            alphabet.append(chr(byte))
+        else:
+            alphabet.append(chr(0x100 + spare))
+            spare += 1
+    return alphabet[:size]
+
+
 class DeepSeek4Spec:
     """Geometry of the miniature model, shaped like the real checkpoint."""
 
     def __init__(
         self,
         *,
+        # Proportions are the published model's, divided down. The reference
+        # graph relies on some of them -- notably (heads/groups)*head_dim ==
+        # hidden, and heads*head_dim == 8*hidden -- so they are preserved
+        # rather than picked for convenience.
         hidden: int = 256,
         layers: int = 6,
-        vocabulary: int = 64,
-        heads: int = 8,
+        vocabulary: int = 256,
+        heads: int = 16,
         kv_heads: int = 1,
-        kv_lora_rank: int = 64,
+        kv_lora_rank: int = 128,
         q_lora_rank: int = 128,
         rope_dimension: int = 16,
         experts: int = 16,
         experts_used: int = 6,
         expert_intermediate: int = 64,
-        indexer_heads: int = 8,
+        indexer_heads: int = 16,
         indexer_key_length: int = 32,
         indexer_top_k: int = 512,
         output_lora_rank: int = 128,
@@ -161,10 +198,14 @@ def build_deepseek4_gguf(
         projection(prefix + "attn_q_b.weight", spec.q_lora_rank, spec.heads * spec.kv_lora_rank)
         projection(prefix + "attn_kv.weight", spec.hidden, spec.kv_lora_rank)
         vector(prefix + "attn_kv_a_norm.weight", spec.kv_lora_rank, value=1.0)
+        # The file carries wo_a as [n_head*head_dim/groups, lora_rank*groups],
+        # which the loader reshapes to three dimensions. In the published model
+        # the first dimension happens to equal n_embd; that is a coincidence of
+        # its geometry, not the rule.
         projection(
             prefix + "attn_output_a.weight",
-            spec.hidden,
-            spec.output_groups * spec.output_lora_rank,
+            spec.heads * spec.kv_lora_rank // spec.output_groups,
+            spec.output_lora_rank * spec.output_groups,
         )
         projection(
             prefix + "attn_output_b.weight",
@@ -210,6 +251,7 @@ def build_deepseek4_gguf(
             projection(prefix + "indexer_compressor_gate.weight", spec.hidden, index_width)
             vector(prefix + "indexer_compressor_norm.weight", spec.indexer_key_length, value=1.0)
         # Sparse MoE with a shared expert, stacked expert-major.
+        vector(prefix + "ffn_norm.weight", spec.hidden, value=1.0)
         projection(prefix + "ffn_gate_inp.weight", spec.hidden, spec.experts)
         if layer < spec.hash_layers:
             # Hash layers route by token id through an int32 table instead of
@@ -334,6 +376,21 @@ def build_deepseek4_gguf(
         _kv("tokenizer.ggml.model", GGUF_STRING, _string("gpt2")),
         _kv("tokenizer.ggml.pre", GGUF_STRING, _string("joyai-llm")),
         _kv("tokenizer.ggml.vocab_size", GGUF_UINT32, struct.pack("<I", spec.vocabulary)),
+        # A byte-level vocabulary, so the fixture is a complete model the
+        # reference implementation can load and run rather than a metadata
+        # skeleton. Every token is one byte in GPT-2's byte-to-unicode
+        # encoding, which makes tokenization trivially reversible.
+        _kv("tokenizer.ggml.tokens", GGUF_ARRAY, _string_array(_byte_vocabulary(spec.vocabulary))),
+        _kv(
+            "tokenizer.ggml.token_type",
+            GGUF_ARRAY,
+            _int32_array([1] * spec.vocabulary),
+        ),
+        _kv("tokenizer.ggml.merges", GGUF_ARRAY, _string_array([])),
+        _kv("tokenizer.ggml.bos_token_id", GGUF_UINT32, struct.pack("<I", 0)),
+        _kv("tokenizer.ggml.eos_token_id", GGUF_UINT32, struct.pack("<I", 1)),
+        _kv("tokenizer.ggml.add_bos_token", GGUF_BOOL, struct.pack("<B", 0)),
+        _kv("tokenizer.ggml.add_eos_token", GGUF_BOOL, struct.pack("<B", 0)),
     ]
 
     infos = bytearray()

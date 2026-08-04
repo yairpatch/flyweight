@@ -196,6 +196,29 @@ Hyper-connection maths, transcribed from `src/models/deepseek4.cpp`:
 then 19 further (row, column) pairs — 20 iterations total, dividing by sums that
 each have `eps` added.
 
+### The parity loop
+
+`llama-eval-callback` on the real checkpoint dumps every intermediate tensor with
+its name, op, shapes and a `sum` checksum, and a one-token prompt completes in
+about three minutes:
+
+    cd /home/yair/Desktop/llama.cpp-ref
+    ./build/bin/llama-eval-callback -m <shard 1> -p "The" -n 1 -c 256 --temp 0 > dump.txt
+
+That checksum per tensor is what each component gets diffed against, which avoids
+needing full activation dumps. The layer-0 entries already confirm the
+hyper-connection derivation above: `hc_mixes-0` is `MUL_MAT(hc_attn_fn{16384,24},
+{16384}) = {24}`, `hc_attn_pre-0` is `DSV4_HC_PRE(hc_init{4096,4}, {4}) = {4096}`,
+and `attn_wo_a-0` is `MUL_MAT(attn_output_a{4096,1024,8}, {4096,1,8}) = {1024,1,8}`.
+
+Running the miniature fixture through the reference instead would give a faster
+loop, and the fixture is now close enough that the reference loads it (its tensor
+set and shapes are accepted). It still aborts in `build_attention_impl` on a
+reshape, so some geometric relationship beyond the two already preserved
+(`(heads/groups)*head_dim == hidden` and `heads*head_dim == 8*hidden`) is
+required. Worth finishing, but the real-checkpoint loop is unblocked and is what
+the components are being diffed against for now.
+
 Order of work, each diffed against the reference before moving on:
 
 1. Hyper-connections: 4-stream expand, col-norm-first Sinkhorn (20 iterations, ε 1e-6),
