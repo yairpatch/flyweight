@@ -3535,6 +3535,47 @@ out->expert_shared_count=m->config.expert_shared_count;out->hash_layer_count=m->
 out->compress_ratios_length=static_cast<std::uint32_t>(m->config.compress_ratios.size());
 out->sinkhorn_epsilon=m->config.sinkhorn_epsilon;out->compress_rope_freq_base=m->config.compress_rope_freq_base;return 0;});}
 
+// Multiply a model tensor by a vector, decoding whatever weight type the
+// checkpoint stores it as. GGUF reports a matrix as [inputs, outputs], so
+// `output_size` rows are each a dot product over `input_size` elements.
+int colibri_v2_matvec(
+    const ColibriV2Model* m, const char* name, const float* input,
+    int32_t input_size, float* output, int32_t output_size
+){return guarded([&]{
+    if(!m||!name||!input||!output)throw std::runtime_error("matvec arguments are required");
+    const auto found=std::find_if(m->tensors.begin(),m->tensors.end(),
+        [&](const Tensor& tensor){return tensor.name==name;});
+    if(found==m->tensors.end())throw std::runtime_error(std::string("tensor not found: ")+name);
+    if(found->shape.size()!=2)throw std::runtime_error("matvec needs a 2D tensor");
+    if(static_cast<std::int64_t>(found->shape[0])!=input_size||
+       static_cast<std::int64_t>(found->shape[1])!=output_size)
+        throw std::runtime_error("matvec shape does not match the tensor");
+    if(!qwen_cpu_expert_type_supported(found->type))
+        throw std::runtime_error("matvec cannot decode this weight type");
+    const auto* packed=tensor_data(*m,*found);
+    for(std::int32_t row=0;row<output_size;++row)
+        output[row]=qwen_quant_dot(packed,found->type,input,input_size,
+            static_cast<std::uint64_t>(row));
+    return 0;});}
+
+// RMS normalization over `count` consecutive rows of `size`, optionally scaled
+// by a per-element gain. DeepSeek-V4 uses both forms: the query and KV latents
+// are normalized with a learned gain, while the per-head query norm has none.
+int colibri_v2_deepseek4_rms_norm(
+    const float* input, const float* weight, int32_t size, int32_t count,
+    float epsilon, float* output
+){return guarded([&]{
+    if(!input||!output||size<=0||count<=0)
+        throw std::runtime_error("rms-norm arguments are invalid");
+    for(std::int32_t row=0;row<count;++row){
+        const auto offset=static_cast<std::size_t>(row)*static_cast<std::size_t>(size);
+        colibri::v2::deepseek4::rms_norm(
+            input+offset,static_cast<std::size_t>(size),epsilon,output+offset);
+        if(weight)
+            for(std::int32_t i=0;i<size;++i)output[offset+i]*=weight[i];
+    }
+    return 0;});}
+
 // One DeepSeek-V4 hyper-connection step: derive the mixing weights from the
 // stream state, collapse the streams into the vector a block reads, and -- when
 // `block` is supplied -- write that block's output back into every stream.

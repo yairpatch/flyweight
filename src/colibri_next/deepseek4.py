@@ -15,6 +15,50 @@ import numpy as np
 from colibri_next.v2 import V2Error, _library
 
 
+def matvec(model, name: str, input_vector: np.ndarray, output_size: int) -> np.ndarray:
+    """Multiply a checkpoint tensor by a vector, whatever type it is stored as."""
+    input_vector = np.ascontiguousarray(input_vector, dtype=np.float32)
+    output = np.zeros(output_size, dtype=np.float32)
+    library = _library()
+    status = library.colibri_v2_matvec(
+        model._handle,
+        name.encode(),
+        _pointer(input_vector),
+        input_vector.size,
+        _pointer(output),
+        output_size,
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"matvec failed").decode(errors="replace"))
+    return output
+
+
+def rms_norm(
+    values: np.ndarray, weight: np.ndarray | None = None, *, epsilon: float = 1e-6
+) -> np.ndarray:
+    """RMS-normalize each row, optionally applying a learned gain.
+
+    A 2-D input is normalized row by row, which is how the per-head query norm
+    works: each head's slice is normalized on its own.
+    """
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    rows = 1 if values.ndim == 1 else values.shape[0]
+    size = values.shape[-1]
+    output = np.zeros_like(values)
+    library = _library()
+    status = library.colibri_v2_deepseek4_rms_norm(
+        _pointer(values),
+        _pointer(None if weight is None else np.ascontiguousarray(weight, dtype=np.float32)),
+        size,
+        rows,
+        epsilon,
+        _pointer(output),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"rms norm failed").decode(errors="replace"))
+    return output
+
+
 @dataclass(frozen=True)
 class HyperConnection:
     """One block's hyper-connection weights and the vectors derived from them."""

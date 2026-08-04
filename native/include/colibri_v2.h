@@ -244,6 +244,13 @@ COLIBRI_V2_API int colibri_v2_model_attach_mtp(ColibriV2Model* model, const char
 COLIBRI_V2_API void colibri_v2_model_close(ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_model_info(const ColibriV2Model* model, ColibriV2ModelInfo* out);
 COLIBRI_V2_API int colibri_v2_model_config(const ColibriV2Model* model, ColibriV2ModelConfig* out);
+/* Multiply a model tensor by a vector, decoding its stored weight type.
+   GGUF reports a matrix as [inputs, outputs]. */
+COLIBRI_V2_API int colibri_v2_matvec(const ColibriV2Model* model, const char* name,
+    const float* input, int32_t input_size, float* output, int32_t output_size);
+/* RMS normalization over `count` rows of `size`, with an optional gain. */
+COLIBRI_V2_API int colibri_v2_deepseek4_rms_norm(const float* input, const float* weight,
+    int32_t size, int32_t count, float epsilon, float* output);
 /* One DeepSeek-V4 hyper-connection step. `mixes`, `collapsed` and `combined`
    are optional; `combined` needs `block`. Sizes: streams/combined hc*n_embd,
    fn (2+hc)*hc rows of hc*n_embd, scale 3, base 2*hc+hc*hc, pre/post hc,
