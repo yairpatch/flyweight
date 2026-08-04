@@ -33,6 +33,61 @@ def matvec(model, name: str, input_vector: np.ndarray, output_size: int) -> np.n
     return output
 
 
+def grouped_matvec(
+    model, name: str, input_vector: np.ndarray, inputs: int, rank: int, groups: int
+) -> np.ndarray:
+    """The grouped half of the output projection.
+
+    The input is cut into `groups` chunks of `inputs`, and chunk g goes through
+    the g-th slice of the tensor's output rows rather than the whole matrix.
+    """
+    input_vector = np.ascontiguousarray(input_vector, dtype=np.float32)
+    output = np.zeros(rank * groups, dtype=np.float32)
+    library = _library()
+    status = library.colibri_v2_grouped_matvec(
+        model._handle, name.encode(), _pointer(input_vector), inputs,
+        _pointer(output), rank, groups,
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"grouped matvec failed").decode(errors="replace"))
+    return output
+
+
+def attention(
+    queries: np.ndarray,
+    latents: np.ndarray,
+    sinks: np.ndarray | None = None,
+    *,
+    scale: float | None = None,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Attention over the shared KV latent, one sink logit per head.
+
+    `queries` is [heads, head_dim] and `latents` is [positions, head_dim] --
+    keys and values are the same tensor. `scale` defaults to 1/sqrt(head_dim).
+    """
+    queries = np.ascontiguousarray(queries, dtype=np.float32)
+    latents = np.ascontiguousarray(latents, dtype=np.float32)
+    heads, head_dim = queries.shape
+    positions = latents.shape[0]
+    if latents.shape[1] != head_dim:
+        raise ValueError("queries and latents must share a width")
+    output = np.zeros((heads, head_dim), dtype=np.float32)
+    mask_array = None if mask is None else np.ascontiguousarray(mask, dtype=np.uint8)
+    library = _library()
+    status = library.colibri_v2_deepseek4_attention(
+        _pointer(queries), _pointer(latents),
+        _pointer(None if sinks is None else np.ascontiguousarray(sinks, dtype=np.float32)),
+        None if mask_array is None else mask_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        heads, head_dim, positions,
+        float(head_dim) ** -0.5 if scale is None else scale,
+        _pointer(output),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"attention failed").decode(errors="replace"))
+    return output
+
+
 def rms_norm(
     values: np.ndarray, weight: np.ndarray | None = None, *, epsilon: float = 1e-6
 ) -> np.ndarray:

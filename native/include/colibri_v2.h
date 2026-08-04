@@ -248,6 +248,15 @@ COLIBRI_V2_API int colibri_v2_model_config(const ColibriV2Model* model, ColibriV
    GGUF reports a matrix as [inputs, outputs]. */
 COLIBRI_V2_API int colibri_v2_matvec(const ColibriV2Model* model, const char* name,
     const float* input, int32_t input_size, float* output, int32_t output_size);
+/* Grouped matvec: input cut into `groups` chunks, each against its own slice
+   of the tensor's output rows. */
+COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const char* name,
+    const float* input, int32_t inputs, float* output, int32_t rank, int32_t groups);
+/* Attention over the shared KV latent, with one sink logit per head. `sinks`
+   and `mask` may be NULL. */
+COLIBRI_V2_API int colibri_v2_deepseek4_attention(const float* queries, const float* latents,
+    const float* sinks, const uint8_t* mask, int32_t heads, int32_t head_dim,
+    int32_t positions, float scale, float* output);
 /* RMS normalization over `count` rows of `size`, with an optional gain. */
 COLIBRI_V2_API int colibri_v2_deepseek4_rms_norm(const float* input, const float* weight,
     int32_t size, int32_t count, float epsilon, float* output);

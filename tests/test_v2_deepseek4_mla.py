@@ -27,7 +27,9 @@ import unittest
 
 import numpy as np
 
-from colibri_next.deepseek4 import hyper_connection, matvec, rms_norm
+from colibri_next.deepseek4 import (
+    attention, grouped_matvec, hyper_connection, matvec, rms_norm,
+)
 from colibri_next.v2 import V2Model
 
 CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
@@ -93,15 +95,25 @@ class LatentAttentionParityTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.model.close()
 
-    def _close(self, actual: float, expected: float, label: str, scale: float = 0.0) -> None:
+    def _close(
+        self, actual: float, expected: float, label: str,
+        scale: float = 0.0, steps: int = 1,
+    ) -> None:
         """Agree within the reference's activation-quantization noise.
 
         `scale` sets what the noise is measured against. It defaults to the
         expected value, but a sum over values that largely cancel is much
-        smaller than the terms feeding it, and the error does not shrink with
-        it -- so those pass the magnitude of the quantity they were split from.
+        smaller than the terms feeding it while the error is not, so those pass
+        the magnitude they were split from.
+
+        `steps` is how many quantized matmuls feed the value. The reference
+        requantizes activations at every one, so its error compounds along the
+        chain: the final projection here sits about 2% out after five. That
+        compounding is the reason sum-matching stops being informative as the
+        graph deepens, and why token-level agreement is the acceptance test
+        rather than this.
         """
-        allowed = QUANTIZED * max(abs(expected), abs(scale), 1.0)
+        allowed = QUANTIZED * steps * max(abs(expected), abs(scale), 1.0)
         self.assertLessEqual(
             abs(actual - expected), allowed,
             msg=f"{label}: {actual} vs reference {expected} "
@@ -123,25 +135,25 @@ class LatentAttentionParityTests(unittest.TestCase):
 
     def test_query_low_rank_path(self):
         low_rank, normed, wide = self._query()
-        for actual, key in (
-            (low_rank.sum(), "qr-0"),
-            (normed.sum(), "qr_norm-0"),
-            (wide.sum(), "q_b"),
+        for actual, key, steps in (
+            (low_rank.sum(), "qr-0", 1),
+            (normed.sum(), "qr_norm-0", 1),
+            (wide.sum(), "q_b", 2),
         ):
-            self._close(float(actual), REFERENCE[key], key)
+            self._close(float(actual), REFERENCE[key], key, steps=steps)
 
     def test_per_head_query_norm_has_no_gain(self):
         _, _, wide = self._query()
         # Each head's 512 values are normalized on their own, with no weight.
         normed = rms_norm(wide, None, epsilon=EPSILON)
-        self._close(float(normed.sum()), REFERENCE["q_norm-0"], "q_norm-0")
+        self._close(float(normed.sum()), REFERENCE["q_norm-0"], "q_norm-0", steps=2)
         nope = normed[:, : self.head_dim - self.rope_dim]
         rope = normed[:, self.head_dim - self.rope_dim :]
         # The two halves nearly cancel, so both are measured against the
         # magnitude of the RoPE half they were split from.
         scale = abs(REFERENCE["q_pe"])
-        self._close(float(nope.sum()), REFERENCE["q_nope"], "q_nope", scale)
-        self._close(float(rope.sum()), REFERENCE["q_pe"], "q_pe", scale)
+        self._close(float(nope.sum()), REFERENCE["q_nope"], "q_nope", scale, steps=2)
+        self._close(float(rope.sum()), REFERENCE["q_pe"], "q_pe", scale, steps=2)
         # Whatever the tolerance, the split itself must be exact.
         self.assertEqual(nope.shape[1] + rope.shape[1], self.head_dim)
         self.assertAlmostEqual(
@@ -187,3 +199,72 @@ class RmsNormTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+class AttentionAndOutputParityTests(LatentAttentionParityTests):
+    """The attention core and the grouped output projection.
+
+    Position 0 with a single token, so RoPE and its inverse are identity here
+    and this says nothing about them -- they are exercised once more than one
+    position exists. What it does pin down is the sink arithmetic, the fact that
+    keys and values are the same latent, and the grouping of the output
+    projection.
+    """
+
+    ATTENTION = {
+        "node_41": 93.621567,     # attention output, before de-rope
+        "attn_wo_a-0": 37.781158,
+        "attn_out-0": -22.063421,
+    }
+
+    def _attention(self):
+        _, _, wide = self._query()
+        query = rms_norm(wide, None, epsilon=EPSILON)
+        latent = rms_norm(
+            matvec(self.model, "blk.0.attn_kv.weight", self.attn_norm, self.head_dim),
+            _f32(self.model, "blk.0.attn_kv_a_norm.weight"),
+            epsilon=EPSILON,
+        )
+        # The cache holds f16, which the reference's own sum reflects.
+        cached = latent.astype(np.float16).astype(np.float32)[None, :]
+        sinks = _f32(self.model, "blk.0.attn_sinks.weight")
+        return attention(query, cached, sinks, scale=float(self.head_dim) ** -0.5)
+
+    def test_attention_over_the_shared_latent(self):
+        out = self._attention()
+        self.assertEqual(out.shape, (self.heads, self.head_dim))
+        self._close(float(out.sum()), self.ATTENTION["node_41"], "node_41", steps=3)
+
+    def test_sinks_damp_the_output_rather_than_redistributing_it(self):
+        # With one position, each head's weight is sigmoid(score - sink), so the
+        # output is the latent scaled by a number strictly below one.
+        out = self._attention()
+        latent = rms_norm(
+            matvec(self.model, "blk.0.attn_kv.weight", self.attn_norm, self.head_dim),
+            _f32(self.model, "blk.0.attn_kv_a_norm.weight"),
+            epsilon=EPSILON,
+        ).astype(np.float16).astype(np.float32)
+        total = float(latent.sum())
+        for head in range(self.heads):
+            share = float(out[head].sum()) / total
+            self.assertGreater(share, 0.0)
+            self.assertLess(share, 1.0, msg=f"head {head} ignored its sink")
+
+    def test_the_grouped_output_projection(self):
+        out = self._attention()
+        # At position 0 the inverse RoPE is identity, so de-rope is a no-op.
+        derope = out.reshape(-1)
+        groups = int(self.model.config["output_group_count"])
+        rank = int(self.model.config["output_lora_rank"])
+        inputs = derope.size // groups
+        low_rank = grouped_matvec(
+            self.model, "blk.0.attn_output_a.weight", derope, inputs, rank, groups
+        )
+        self._close(float(low_rank.sum()), self.ATTENTION["attn_wo_a-0"], "attn_wo_a-0", steps=4)
+        projected = matvec(
+            self.model, "blk.0.attn_output_b.weight", low_rank, self.n_embd
+        )
+        self._close(
+            float(projected.sum()), self.ATTENTION["attn_out-0"], "attn_out-0", steps=5
+        )

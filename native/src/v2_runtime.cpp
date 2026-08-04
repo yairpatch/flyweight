@@ -3576,6 +3576,47 @@ int colibri_v2_deepseek4_rms_norm(
     }
     return 0;});}
 
+// Grouped matvec: the input is cut into `groups` chunks and chunk g is
+// multiplied by the g-th slice of the tensor's output rows. `colibri_v2_matvec`
+// is the groups==1 case; DeepSeek-V4's output projection uses eight.
+int colibri_v2_grouped_matvec(
+    const ColibriV2Model* m, const char* name, const float* input,
+    int32_t inputs, float* output, int32_t rank, int32_t groups
+){return guarded([&]{
+    if(!m||!name||!input||!output||inputs<=0||rank<=0||groups<=0)
+        throw std::runtime_error("grouped matvec arguments are invalid");
+    const auto found=std::find_if(m->tensors.begin(),m->tensors.end(),
+        [&](const Tensor& tensor){return tensor.name==name;});
+    if(found==m->tensors.end())throw std::runtime_error(std::string("tensor not found: ")+name);
+    if(found->shape.size()!=2||static_cast<std::int64_t>(found->shape[0])!=inputs||
+       static_cast<std::int64_t>(found->shape[1])!=static_cast<std::int64_t>(rank)*groups)
+        throw std::runtime_error("grouped matvec shape does not match the tensor");
+    if(!qwen_cpu_expert_type_supported(found->type))
+        throw std::runtime_error("grouped matvec cannot decode this weight type");
+    const auto* packed=tensor_data(*m,*found);
+    colibri::v2::deepseek4::grouped_projection(
+        input,static_cast<std::size_t>(inputs),static_cast<std::size_t>(rank),
+        static_cast<std::size_t>(groups),output,
+        [&](const float* source,std::size_t row){
+            return qwen_quant_dot(packed,found->type,source,inputs,
+                static_cast<std::uint64_t>(row));
+        });
+    return 0;});}
+
+// Attention over the shared KV latent with per-head sink logits.
+int colibri_v2_deepseek4_attention(
+    const float* queries, const float* latents, const float* sinks,
+    const uint8_t* mask, int32_t heads, int32_t head_dim, int32_t positions,
+    float scale, float* output
+){return guarded([&]{
+    if(!queries||!latents||!output||heads<=0||head_dim<=0||positions<=0)
+        throw std::runtime_error("attention arguments are invalid");
+    colibri::v2::deepseek4::attention_with_sinks(
+        queries,latents,sinks,mask,static_cast<std::size_t>(heads),
+        static_cast<std::size_t>(head_dim),static_cast<std::size_t>(positions),
+        scale,output);
+    return 0;});}
+
 // One DeepSeek-V4 hyper-connection step: derive the mixing weights from the
 // stream state, collapse the streams into the vector a block reads, and -- when
 // `block` is supplied -- write that block's output back into every stream.

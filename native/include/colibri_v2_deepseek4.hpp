@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 // DeepSeek-V4 (`deepseek4`) building blocks, CPU reference implementations.
@@ -140,6 +141,79 @@ inline void hyper_connection_combine(
             const float* source = streams + src * n_embd;
             for (std::size_t i = 0; i < n_embd; ++i) target[i] += source[i] * mix;
         }
+    }
+}
+
+// Attention over the shared KV latent, with one learned sink logit per head.
+//
+// This is MLA in absorbed form: keys and values are the same tensor, one
+// `head_dim`-wide latent per position that every head reads. The sink joins the
+// softmax as an extra logit carrying no value, so a head can attend to nothing
+// by putting its mass there -- it damps the output rather than redistributing
+// it. `mask` may be null; where present, a false entry hides that position.
+inline void attention_with_sinks(
+    const float* queries,
+    const float* latents,
+    const float* sinks,
+    const std::uint8_t* mask,
+    std::size_t heads,
+    std::size_t head_dim,
+    std::size_t positions,
+    float scale,
+    float* output
+) {
+    std::vector<float> weights(positions);
+    for (std::size_t head = 0; head < heads; ++head) {
+        const float* query = queries + head * head_dim;
+        float peak = sinks ? sinks[head] : -std::numeric_limits<float>::infinity();
+        for (std::size_t position = 0; position < positions; ++position) {
+            if (mask && !mask[position]) {
+                weights[position] = -std::numeric_limits<float>::infinity();
+                continue;
+            }
+            const float* latent = latents + position * head_dim;
+            double total = 0.0;
+            for (std::size_t i = 0; i < head_dim; ++i)
+                total += static_cast<double>(query[i]) * latent[i];
+            weights[position] = static_cast<float>(total) * scale;
+            peak = std::max(peak, weights[position]);
+        }
+        float denominator = sinks ? std::exp(sinks[head] - peak) : 0.0f;
+        for (std::size_t position = 0; position < positions; ++position) {
+            weights[position] = weights[position] == -std::numeric_limits<float>::infinity()
+                ? 0.0f
+                : std::exp(weights[position] - peak);
+            denominator += weights[position];
+        }
+        float* target = output + head * head_dim;
+        for (std::size_t i = 0; i < head_dim; ++i) target[i] = 0.0f;
+        for (std::size_t position = 0; position < positions; ++position) {
+            const float weight = weights[position] / denominator;
+            if (weight == 0.0f) continue;
+            const float* latent = latents + position * head_dim;
+            for (std::size_t i = 0; i < head_dim; ++i) target[i] += latent[i] * weight;
+        }
+    }
+}
+
+// The grouped half of the output projection. The head outputs are cut into
+// `groups` contiguous chunks, and chunk g is multiplied by the g-th slice of the
+// weight rather than by the whole matrix, so the projection costs a fraction of
+// a dense one. `weights` is the file's [inputs, groups*rank] laid out
+// output-major; `input` is groups*inputs wide and `output` groups*rank.
+template <class Dot>
+inline void grouped_projection(
+    const float* input,
+    std::size_t inputs,
+    std::size_t rank,
+    std::size_t groups,
+    float* output,
+    Dot row_dot
+) {
+    for (std::size_t group = 0; group < groups; ++group) {
+        const float* source = input + group * inputs;
+        for (std::size_t index = 0; index < rank; ++index)
+            output[group * rank + index] = row_dot(source, group * rank + index);
     }
 }
 

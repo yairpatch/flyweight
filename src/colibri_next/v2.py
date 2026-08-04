@@ -426,6 +426,17 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_int32, _float_p, ctypes.c_int32,
                 ]
                 lib.colibri_v2_matvec.restype = ctypes.c_int
+                lib.colibri_v2_grouped_matvec.argtypes = [
+                    ctypes.c_void_p, ctypes.c_char_p, _float_p,
+                    ctypes.c_int32, _float_p, ctypes.c_int32, ctypes.c_int32,
+                ]
+                lib.colibri_v2_grouped_matvec.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_attention.argtypes = [
+                    _float_p, _float_p, _float_p, ctypes.POINTER(ctypes.c_uint8),
+                    ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                    ctypes.c_float, _float_p,
+                ]
+                lib.colibri_v2_deepseek4_attention.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_rms_norm.argtypes = [
                     _float_p, _float_p, ctypes.c_int32, ctypes.c_int32,
                     ctypes.c_float, _float_p,
