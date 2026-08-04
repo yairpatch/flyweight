@@ -252,6 +252,14 @@ COLIBRI_V2_API int colibri_v2_matvec(const ColibriV2Model* model, const char* na
    of the tensor's output rows. */
 COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const char* name,
     const float* input, int32_t inputs, float* output, int32_t rank, int32_t groups);
+/* Expert routing for one token. `bias` may be NULL. `select` false means the
+   caller already filled `chosen` from a hash table and only wants weights. */
+COLIBRI_V2_API int colibri_v2_deepseek4_router(const float* logits, const float* bias,
+    int32_t experts, int32_t used, float weight_scale, float sum_floor,
+    int32_t select, int32_t* chosen, float* weights);
+/* SwiGLU with both halves clamped to +/- limit. */
+COLIBRI_V2_API int colibri_v2_deepseek4_swiglu(const float* gate, const float* up,
+    int32_t size, float limit, float* output);
 /* Rotary embedding over the trailing `rope_dim` of each of `count` rows of
    `stride`. Adjacent-pair layout. `inverse` undoes the rotation. */
 COLIBRI_V2_API int colibri_v2_deepseek4_rope(float* values, int32_t stride, int32_t rope_dim,

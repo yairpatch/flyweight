@@ -53,6 +53,53 @@ def grouped_matvec(
     return output
 
 
+def route(
+    logits: np.ndarray,
+    bias: np.ndarray | None = None,
+    *,
+    used: int,
+    weight_scale: float = 1.0,
+    sum_floor: float = 1e-20,
+    experts: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Choose experts for one token and weight them.
+
+    Passing `experts` supplies the ids instead of selecting them, which is what
+    the hash layers do -- they read the ids from a table by token id.
+    """
+    logits = np.ascontiguousarray(logits, dtype=np.float32)
+    select = experts is None
+    chosen = (
+        np.zeros(used, dtype=np.int32) if select
+        else np.ascontiguousarray(experts, dtype=np.int32).copy()
+    )
+    weights = np.zeros(used, dtype=np.float32)
+    library = _library()
+    status = library.colibri_v2_deepseek4_router(
+        _pointer(logits),
+        _pointer(None if bias is None else np.ascontiguousarray(bias, dtype=np.float32)),
+        logits.size, used, weight_scale, sum_floor, 1 if select else 0,
+        chosen.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), _pointer(weights),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"router failed").decode(errors="replace"))
+    return chosen, weights
+
+
+def swiglu(gate: np.ndarray, up: np.ndarray, limit: float) -> np.ndarray:
+    """SwiGLU with both halves clamped to +/- limit before combining."""
+    gate = np.ascontiguousarray(gate, dtype=np.float32)
+    up = np.ascontiguousarray(up, dtype=np.float32)
+    output = np.zeros_like(gate)
+    library = _library()
+    status = library.colibri_v2_deepseek4_swiglu(
+        _pointer(gate), _pointer(up), gate.size, limit, _pointer(output)
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"swiglu failed").decode(errors="replace"))
+    return output
+
+
 def rope(
     values: np.ndarray,
     position: int,

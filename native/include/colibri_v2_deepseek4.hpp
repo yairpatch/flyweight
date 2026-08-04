@@ -144,6 +144,74 @@ inline void hyper_connection_combine(
     }
 }
 
+// Expert routing for one token.
+//
+// The probabilities are sqrt(softplus(logits)) -- not the sigmoid that
+// `expert_gating_func` and the DeepSeek-V3 lineage would suggest. Selection
+// uses a bias-corrected score, but the weights are gathered from the
+// *unbiased* probabilities, so the bias steers which experts are chosen without
+// distorting how much each contributes. The chosen weights are then normalized
+// to sum to one and scaled.
+//
+// `select` false is the hash-layer case: those blocks read their expert ids
+// from an int32 table indexed by token id, so `chosen` arrives filled in and
+// only the weights are computed.
+inline void moe_router(
+    const float* logits,
+    const float* bias,
+    std::size_t experts,
+    std::size_t used,
+    float weight_scale,
+    float sum_floor,
+    bool select,
+    std::int32_t* chosen,
+    float* weights
+) {
+    std::vector<float> probabilities(experts);
+    for (std::size_t expert = 0; expert < experts; ++expert) {
+        const float logit = logits[expert];
+        // softplus, guarded the way a stable implementation must be: for large
+        // logits it is the identity, and expf would overflow.
+        const float softplus = logit > 20.0f ? logit : std::log1p(std::exp(logit));
+        probabilities[expert] = std::sqrt(softplus);
+    }
+    if (select) {
+        std::vector<std::int32_t> order(experts);
+        for (std::size_t expert = 0; expert < experts; ++expert)
+            order[expert] = static_cast<std::int32_t>(expert);
+        const auto score = [&](std::int32_t expert) {
+            return probabilities[expert] + (bias ? bias[expert] : 0.0f);
+        };
+        std::partial_sort(
+            order.begin(), order.begin() + static_cast<std::ptrdiff_t>(used), order.end(),
+            [&](std::int32_t left, std::int32_t right) {
+                const float a = score(left), b = score(right);
+                return a != b ? a > b : left < right;
+            });
+        std::copy_n(order.begin(), used, chosen);
+    }
+    float total = 0.0f;
+    for (std::size_t slot = 0; slot < used; ++slot) {
+        weights[slot] = probabilities[chosen[slot]];
+        total += weights[slot];
+    }
+    const float divisor = std::max(total, sum_floor);
+    for (std::size_t slot = 0; slot < used; ++slot)
+        weights[slot] = weights[slot] / divisor * weight_scale;
+}
+
+// SwiGLU with both halves clamped before combining, which is what the per-layer
+// swiglu_clamp values bound.
+inline void clamped_swiglu(
+    const float* gate, const float* up, std::size_t size, float limit, float* output
+) {
+    for (std::size_t i = 0; i < size; ++i) {
+        const float g = std::min(std::max(gate[i], -limit), limit);
+        const float u = std::min(std::max(up[i], -limit), limit);
+        output[i] = (g / (1.0f + std::exp(-g))) * u;
+    }
+}
+
 // Rotary embedding over the trailing `rope_dim` of a row, pairing adjacent
 // elements (ggml's NORM layout, which is what this architecture selects).
 //

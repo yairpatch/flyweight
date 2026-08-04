@@ -3603,6 +3603,31 @@ int colibri_v2_grouped_matvec(
         });
     return 0;});}
 
+// Expert routing for one token: pick the experts and weight them.
+int colibri_v2_deepseek4_router(
+    const float* logits, const float* bias, int32_t experts, int32_t used,
+    float weight_scale, float sum_floor, int32_t select, int32_t* chosen, float* weights
+){return guarded([&]{
+    if(!logits||!chosen||!weights||experts<=0||used<=0||used>experts)
+        throw std::runtime_error("router arguments are invalid");
+    if(!select)
+        for(std::int32_t slot=0;slot<used;++slot)
+            if(chosen[slot]<0||chosen[slot]>=experts)
+                throw std::runtime_error("routed expert id is out of range");
+    colibri::v2::deepseek4::moe_router(
+        logits,bias,static_cast<std::size_t>(experts),static_cast<std::size_t>(used),
+        weight_scale,sum_floor,select!=0,chosen,weights);
+    return 0;});}
+
+// SwiGLU with both halves clamped, as the per-layer swiglu limits require.
+int colibri_v2_deepseek4_swiglu(
+    const float* gate, const float* up, int32_t size, float limit, float* output
+){return guarded([&]{
+    if(!gate||!up||!output||size<=0)throw std::runtime_error("swiglu arguments are invalid");
+    colibri::v2::deepseek4::clamped_swiglu(
+        gate,up,static_cast<std::size_t>(size),limit,output);
+    return 0;});}
+
 // Rotary embedding over `count` rows, each `stride` wide, rotating the trailing
 // `rope_dim` elements at `position`.
 int colibri_v2_deepseek4_rope(
