@@ -3755,10 +3755,45 @@ std::vector<std::string> gguf_regex_split(
     return out;
 }
 
+// The reference does not evaluate \p{...} against real Unicode categories for
+// ASCII. It "collapses" the text first: codepoints below 128 are left as
+// themselves and every category in the pattern is rewritten as an explicit
+// ASCII character class, while each non-ASCII codepoint becomes a single marker
+// byte standing for its category. Those ASCII classes are not the true
+// categories. '~' is the one ASCII character listed in neither the punctuation
+// class nor the symbol class, so it matches no category at all and splits
+// differently from every other ASCII symbol -- " +++" stays one piece while
+// " ~~~" becomes " " and "~~~". Reproduced here deliberately: agreeing with the
+// reference tokenizer matters more than agreeing with Unicode.
+bool joyai_is_letter(std::uint32_t c) {
+    if(c<128)return (c>='A'&&c<='Z')||(c>='a'&&c<='z');
+    return colibri::unicode::is_letter(c);
+}
+bool joyai_is_number(std::uint32_t c) {
+    if(c<128)return c>='0'&&c<='9';
+    return colibri::unicode::is_number(c);
+}
+bool joyai_is_accent_mark(std::uint32_t c) {
+    // The collapse lists no sub-128 codepoints for \p{M}.
+    return c<128?false:colibri::unicode::is_accent_mark(c);
+}
+bool joyai_is_punctuation(std::uint32_t c) {
+    if(c<128)
+        return (c>=0x21&&c<=0x23)||(c>=0x25&&c<=0x2A)||(c>=0x2C&&c<=0x2F)||
+               (c>=0x3A&&c<=0x3B)||(c>=0x3F&&c<=0x40)||(c>=0x5B&&c<=0x5D)||
+               c==0x5F||c==0x7B||c==0x7D;
+    return colibri::unicode::is_punctuation(c);
+}
+bool joyai_is_symbol(std::uint32_t c) {
+    if(c<128)
+        return c==0x24||c==0x2B||(c>=0x3C&&c<=0x3E)||c==0x5E||c==0x60||c==0x7C;
+    return colibri::unicode::is_symbol(c);
+}
+
 // "\p{N}{1,3}": digits break into groups of at most three.
 std::size_t joyai_match_number(const std::vector<std::uint32_t>& code,std::size_t at) {
     std::size_t length=0;
-    while(length<3&&at+length<code.size()&&colibri::unicode::is_number(code[at+length]))++length;
+    while(length<3&&at+length<code.size()&&joyai_is_number(code[at+length]))++length;
     return length;
 }
 
@@ -3789,8 +3824,8 @@ std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t 
     namespace unicode=colibri::unicode;
     const auto size=code.size();
     const auto first=code[at];
-    auto letter_or_mark=[](std::uint32_t c){return unicode::is_letter(c)||unicode::is_accent_mark(c);};
-    auto punct_or_symbol=[](std::uint32_t c){return unicode::is_punctuation(c)||unicode::is_symbol(c);};
+    auto letter_or_mark=[](std::uint32_t c){return joyai_is_letter(c)||joyai_is_accent_mark(c);};
+    auto punct_or_symbol=[](std::uint32_t c){return joyai_is_punctuation(c)||joyai_is_symbol(c);};
     // Every ASCII punctuation and symbol character, spelled out in the pattern
     // as a literal class rather than as \p{P}\p{S}.
     auto ascii_mark=[](std::uint32_t c){

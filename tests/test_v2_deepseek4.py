@@ -147,10 +147,13 @@ class DeepSeek4TensorPlanTests(unittest.TestCase):
             prefix = f"blk.{layer}."
             for role in (
                 "attn_q_a.weight",
+                "attn_q_a_norm.weight",
                 "attn_q_b.weight",
-                "attn_kv_a_mqa.weight",
-                "attn_kv_b.weight",
-                "attn_output.weight",
+                "attn_kv.weight",
+                "attn_kv_a_norm.weight",
+                "attn_output_a.weight",
+                "attn_output_b.weight",
+                "attn_sinks.weight",
                 "hc_attn_base.weight",
                 "hc_attn_fn.weight",
                 "hc_attn_scale.weight",
@@ -174,8 +177,20 @@ class DeepSeek4TensorPlanTests(unittest.TestCase):
         for role in ("output_hc_base.weight", "output_hc_fn.weight", "output_hc_scale.weight"):
             self.assertIn(role, self.names)
 
-    def test_every_weight_type_is_decodable(self):
-        self.assertEqual(self.model.unsupported_quant_types(), {})
+    def test_only_the_hash_tables_are_undecodable(self):
+        # Same shape of gap as the real checkpoint: the int32 routing tables
+        # are index data rather than weights, so they have no decode kernel.
+        self.assertEqual(
+            {kind: len(names) for kind, names in self.model.unsupported_quant_types().items()},
+            {26: self.spec.hash_layers},
+        )
+
+    def test_hash_layers_route_by_table_and_the_rest_by_router_bias(self):
+        for layer in range(self.spec.layers):
+            prefix = f"blk.{layer}."
+            hashed = layer < self.spec.hash_layers
+            self.assertEqual(prefix + "ffn_gate_tid2eid.weight" in self.names, hashed, msg=prefix)
+            self.assertEqual(prefix + "exp_probs_b.bias" in self.names, not hashed, msg=prefix)
 
 
 @unittest.skipUnless(

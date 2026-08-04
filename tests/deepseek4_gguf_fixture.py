@@ -24,6 +24,7 @@ GGUF_BOOL = 7
 GGUF_STRING = 8
 GGUF_ARRAY = 9
 GGML_F32 = 0
+GGML_I32 = 26
 
 ALIGNMENT = 32
 
@@ -71,6 +72,7 @@ class DeepSeek4Spec:
         output_groups: int = 8,
         hyper_connections: int = 4,
         sinkhorn_iterations: int = 20,
+        hash_layers: int = 3,
         # Three trailing entries beyond `layers`, as the real header carries
         # (46 for 43 blocks); the reference reads the first `layers` and
         # ignores the rest.
@@ -94,6 +96,7 @@ class DeepSeek4Spec:
         self.output_groups = output_groups
         self.hyper_connections = hyper_connections
         self.sinkhorn_iterations = sinkhorn_iterations
+        self.hash_layers = hash_layers
         self.extra_compress_ratios = extra_compress_ratios
 
     @property
@@ -135,10 +138,11 @@ def build_deepseek4_gguf(
     projection("token_embd.weight", spec.hidden, spec.vocabulary)
     vector("output_norm.weight", spec.hidden, value=1.0)
     projection("output.weight", spec.hidden, spec.vocabulary)
-    # The output head carries its own hyper-connection mixer.
+    # The head collapses the streams with a pre-weight only, so its mixer is
+    # [hc*hidden, hc] with a single scale.
     vector("output_hc_base.weight", spec.hyper_connections)
-    projection("output_hc_fn.weight", spec.hidden, spec.hyper_connections)
-    vector("output_hc_scale.weight", spec.hyper_connections)
+    projection("output_hc_fn.weight", spec.hyper_connections * spec.hidden, spec.hyper_connections)
+    vector("output_hc_scale.weight", 1)
 
     head_dim = spec.hidden // spec.heads
     for layer in range(spec.layers):
@@ -148,53 +152,78 @@ def build_deepseek4_gguf(
         # the loader, not the fixture, is what should reject it.
         ratio = ratios[layer] if layer < len(ratios) else 0
         vector(prefix + "attn_norm.weight", spec.hidden, value=1.0)
-        # Multi-head latent attention: a low-rank query path and a compressed
-        # KV latent, with the decoupled RoPE half carried alongside.
+        # Multi-head latent attention, with the names and shape relationships
+        # the published checkpoint uses: a low-rank query path, a single KV
+        # latent projection shared by every head, a grouped low-rank output
+        # projection, and one attention sink per head.
         projection(prefix + "attn_q_a.weight", spec.hidden, spec.q_lora_rank)
         vector(prefix + "attn_q_a_norm.weight", spec.q_lora_rank, value=1.0)
-        projection(prefix + "attn_q_b.weight", spec.q_lora_rank, spec.heads * head_dim)
-        projection(
-            prefix + "attn_kv_a_mqa.weight", spec.hidden, spec.kv_lora_rank + spec.rope_dimension
-        )
+        projection(prefix + "attn_q_b.weight", spec.q_lora_rank, spec.heads * spec.kv_lora_rank)
+        projection(prefix + "attn_kv.weight", spec.hidden, spec.kv_lora_rank)
         vector(prefix + "attn_kv_a_norm.weight", spec.kv_lora_rank, value=1.0)
-        projection(prefix + "attn_kv_b.weight", spec.kv_lora_rank, spec.heads * head_dim)
-        projection(prefix + "attn_output.weight", spec.heads * head_dim, spec.hidden)
+        projection(
+            prefix + "attn_output_a.weight",
+            spec.hidden,
+            spec.output_groups * spec.output_lora_rank,
+        )
+        projection(
+            prefix + "attn_output_b.weight",
+            spec.output_groups * spec.output_lora_rank,
+            spec.hidden,
+        )
+        vector(prefix + "attn_sinks.weight", spec.heads)
         # Hyper-connection mixers, one pair per block.
+        hc = spec.hyper_connections
         for role in ("hc_attn", "hc_ffn"):
-            vector(prefix + f"{role}_base.weight", spec.hyper_connections)
-            projection(prefix + f"{role}_fn.weight", spec.hidden, spec.hyper_connections)
-            vector(prefix + f"{role}_scale.weight", spec.hyper_connections)
+            vector(prefix + f"{role}_base.weight", 2 * hc + hc * hc)
+            projection(prefix + f"{role}_fn.weight", hc * spec.hidden, (2 + hc) * hc)
+            vector(prefix + f"{role}_scale.weight", 3)
         if ratio:
-            # Compressed attention layers carry a token compressor.
-            projection(prefix + "attn_compressor_ape.weight", spec.hidden, spec.kv_lora_rank)
-            projection(prefix + "attn_compressor_kv.weight", spec.hidden, spec.kv_lora_rank)
-            projection(prefix + "attn_compressor_gate.weight", spec.hidden, spec.kv_lora_rank)
+            # Compressed attention layers carry a token compressor. A 4:1 layer
+            # keeps two rows per compressed token, a 128:1 layer one, which is
+            # what sets the compressor width.
+            coff = 2 if ratio == 4 else 1
+            width = coff * spec.kv_lora_rank
+            tensors.append((
+                prefix + "attn_compressor_ape.weight",
+                (width, ratio),
+                (rng.standard_normal((ratio, width)) * 0.25).astype(np.float32),
+            ))
+            projection(prefix + "attn_compressor_kv.weight", spec.hidden, width)
+            projection(prefix + "attn_compressor_gate.weight", spec.hidden, width)
             vector(prefix + "attn_compressor_norm.weight", spec.kv_lora_rank, value=1.0)
         if ratio == 4:
             # Only 4:1 layers run the lightning indexer.
             projection(prefix + "indexer.proj.weight", spec.hidden, spec.indexer_heads)
             projection(
-                prefix + "indexer.attn_k.weight", spec.hidden, spec.indexer_key_length
-            )
-            projection(
                 prefix + "indexer.attn_q_b.weight",
                 spec.q_lora_rank,
                 spec.indexer_heads * spec.indexer_key_length,
             )
-            vector(prefix + "indexer.k_norm.weight", spec.indexer_key_length, value=1.0)
-            projection(
-                prefix + "indexer_compressor_ape.weight", spec.hidden, spec.indexer_key_length
-            )
-            projection(
-                prefix + "indexer_compressor_kv.weight", spec.hidden, spec.indexer_key_length
-            )
-            projection(
-                prefix + "indexer_compressor_gate.weight", spec.hidden, spec.indexer_key_length
-            )
+            index_width = 2 * spec.indexer_key_length
+            tensors.append((
+                prefix + "indexer_compressor_ape.weight",
+                (index_width, ratio),
+                (rng.standard_normal((ratio, index_width)) * 0.25).astype(np.float32),
+            ))
+            projection(prefix + "indexer_compressor_kv.weight", spec.hidden, index_width)
+            projection(prefix + "indexer_compressor_gate.weight", spec.hidden, index_width)
             vector(prefix + "indexer_compressor_norm.weight", spec.indexer_key_length, value=1.0)
         # Sparse MoE with a shared expert, stacked expert-major.
         projection(prefix + "ffn_gate_inp.weight", spec.hidden, spec.experts)
-        vector(prefix + "ffn_exp_probs_b.bias", spec.experts)
+        if layer < spec.hash_layers:
+            # Hash layers route by token id through an int32 table instead of
+            # the learned router bias the other blocks carry.
+            table = rng.integers(
+                0, spec.experts, size=(spec.vocabulary, spec.experts_used), dtype=np.int32
+            )
+            tensors.append((
+                prefix + "ffn_gate_tid2eid.weight",
+                (spec.experts_used, spec.vocabulary),
+                table,
+            ))
+        else:
+            vector(prefix + "exp_probs_b.bias", spec.experts)
         for role, inputs, outputs in (
             ("ffn_gate_exps", spec.hidden, spec.expert_intermediate),
             ("ffn_up_exps", spec.hidden, spec.expert_intermediate),
@@ -301,7 +330,7 @@ def build_deepseek4_gguf(
             struct.pack("<I", spec.sinkhorn_iterations),
         ),
         _kv("deepseek4.hyper_connection.epsilon", GGUF_FLOAT32, struct.pack("<f", 1e-6)),
-        _kv("deepseek4.hash_layer_count", GGUF_UINT32, struct.pack("<I", 3)),
+        _kv("deepseek4.hash_layer_count", GGUF_UINT32, struct.pack("<I", spec.hash_layers)),
         _kv("tokenizer.ggml.model", GGUF_STRING, _string("gpt2")),
         _kv("tokenizer.ggml.pre", GGUF_STRING, _string("joyai-llm")),
         _kv("tokenizer.ggml.vocab_size", GGUF_UINT32, struct.pack("<I", spec.vocabulary)),
@@ -313,8 +342,12 @@ def build_deepseek4_gguf(
         infos += _string(name)
         infos += struct.pack("<I", len(shape))
         infos += b"".join(struct.pack("<Q", dimension) for dimension in shape)
-        infos += struct.pack("<IQ", GGML_F32, len(payloads))
-        payloads += np.ascontiguousarray(data, dtype=np.float32).tobytes()
+        # The hash-layer routing tables are int32 tables, not weights.
+        integral = data.dtype == np.int32
+        infos += struct.pack("<IQ", GGML_I32 if integral else GGML_F32, len(payloads))
+        payloads += np.ascontiguousarray(
+            data, dtype=np.int32 if integral else np.float32
+        ).tobytes()
         payloads += b"\0" * ((-len(payloads)) % ALIGNMENT)
 
     header = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata))

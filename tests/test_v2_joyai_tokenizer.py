@@ -45,6 +45,12 @@ CORPUS = [
     "version 3.14.159 and 2026-08-04",
     "snake_case camelCase kebab-case",
     "punctuation!!! ??? ...ellipsis",
+    # '~' is the one ASCII character the reference puts in neither the
+    # punctuation nor the symbol class, so it splits unlike every other symbol.
+    "+++ ~~~ ===",
+    " ~",
+    "a~b ~~~ ~",
+    "~/path ~user cmd~",
     "@mention #hashtag $USD 50%",
     "'quoted' \"double\" `backtick`",
     "path/to/file.txt and C:\\Windows\\System32",
@@ -73,19 +79,92 @@ CORPUS = [
 ]
 
 
+# The reference does not match \p{...} against real Unicode for ASCII. It
+# collapses the text -- ASCII kept as itself, each non-ASCII codepoint replaced
+# by one marker character for its category -- and rewrites each category in the
+# pattern as an explicit ASCII class plus that marker. These are llama.cpp's
+# lists verbatim; note '~' is in neither, which is a real behavioural
+# difference, not a transcription slip.
+ASCII_CLASS = {
+    r"\p{N}": "0-9",
+    r"\p{L}": "A-Za-z",
+    r"\p{P}": r"!-#%-*,-/:-;?-@\[-\]_{}",
+    r"\p{M}": "",
+    r"\p{S}": r"$+<->^`|",
+}
+MARKER = {r"\p{N}": "Ñ", r"\p{L}": "Ò", r"\p{P}": "Ó",
+          r"\p{M}": "Ô", r"\p{S}": "Õ"}
+
+
+def _collapse(text: str) -> str:
+    out = []
+    for char in text:
+        cpt = ord(char)
+        if cpt < 128:
+            out.append(char)
+        elif regex.match(r"\s", char):
+            out.append("\v")  # the reference's whitespace stand-in
+        else:
+            category = regex.match(r"\p{N}", char) and r"\p{N}" \
+                or regex.match(r"\p{L}", char) and r"\p{L}" \
+                or regex.match(r"\p{P}", char) and r"\p{P}" \
+                or regex.match(r"\p{M}", char) and r"\p{M}" \
+                or regex.match(r"\p{S}", char) and r"\p{S}"
+            out.append(MARKER[category] if category else "Ð")
+    return "".join(out)
+
+
+def _collapse_pattern(pattern: str) -> str:
+    """Rewrite each category as its marker plus ASCII class.
+
+    A category standing on its own becomes a bracket class; one already inside
+    a class is spliced in bare, since classes cannot nest.
+    """
+    out: list[str] = []
+    inside = False
+    at = 0
+    while at < len(pattern):
+        char = pattern[at]
+        if char == "[" and (at == 0 or pattern[at - 1] != "\\"):
+            out.append("[")
+            inside = True
+            at += 1
+            continue
+        if inside and char == "]" and pattern[at - 1] != "\\":
+            out.append("]")
+            inside = False
+            at += 1
+            continue
+        name = next((n for n in ASCII_CLASS if pattern.startswith(n, at)), None)
+        if name is not None:
+            body = MARKER[name] + ASCII_CLASS[name]
+            out.append(body if inside else f"[{body}]")
+            at += len(name)
+            continue
+        out.append(char)
+        at += 1
+    return "".join(out)
+
+
 def _reference_split(text: str) -> tuple[str, ...]:
-    """Apply the patterns the way the reference does: each one refines the last.
+    """Split the way the reference does: each pattern refines the last.
 
     Every match becomes a piece and so does every gap between matches, with the
-    scan confined to one piece at a time.
+    scan confined to one piece at a time. Patterns that mention a Unicode
+    category run against the collapsed text; the rest run against the real
+    codepoints, which is exactly how llama.cpp dispatches them.
     """
     pieces = [text] if text else []
     for pattern in JOYAI_PATTERNS:
-        compiled = regex.compile(pattern)
+        collapsed = any(name in pattern for name in ASCII_CLASS)
+        compiled = regex.compile(_collapse_pattern(pattern) if collapsed else pattern)
         refined: list[str] = []
         for piece in pieces:
+            # Collapsing is codepoint-for-codepoint, so match offsets carry
+            # straight back to the original piece.
+            subject = _collapse(piece) if collapsed else piece
             at = 0
-            for match in compiled.finditer(piece):
+            for match in compiled.finditer(subject):
                 start, end = match.span()
                 if end == start:
                     continue
@@ -133,6 +212,13 @@ class JoyaiPretokenizerTests(unittest.TestCase):
             self.model.pretokenize("abc日本語def"),
             _reference_split("abc日本語def"),
         )
+
+    def test_tilde_belongs_to_no_category(self):
+        # Every other ASCII symbol keeps its leading space in one piece; '~'
+        # does not, because the reference's ASCII class lists omit it. Pinned
+        # against the real tokenizer, which produces [223, 95548] for " ~~~".
+        self.assertEqual(self.model.pretokenize(" +++"), (" +++",))
+        self.assertEqual(self.model.pretokenize(" ~~~"), (" ", "~~~"))
 
     def test_a_space_stays_with_the_word_that_follows(self):
         # "\s+(?!\S)" hands the last space of a run to the next word, which is
