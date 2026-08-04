@@ -413,6 +413,14 @@ def _library() -> ctypes.CDLL:
                 lib.colibri_v2_pretokenize.restype = ctypes.c_int
                 lib.colibri_v2_quant_supported.argtypes = [ctypes.c_uint32]
                 lib.colibri_v2_quant_supported.restype = ctypes.c_int
+                _float_p = ctypes.POINTER(ctypes.c_float)
+                lib.colibri_v2_deepseek4_hyper_connection.argtypes = [
+                    _float_p, _float_p, _float_p, _float_p,
+                    ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                    ctypes.c_float, ctypes.c_float, _float_p,
+                    _float_p, _float_p, _float_p, _float_p, _float_p, _float_p,
+                ]
+                lib.colibri_v2_deepseek4_hyper_connection.restype = ctypes.c_int
                 lib.colibri_v2_qwen_validate.argtypes = [ctypes.c_void_p]
                 lib.colibri_v2_qwen_validate.restype = ctypes.c_int
                 lib.colibri_v2_qwen_tensor_role.argtypes = [

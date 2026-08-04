@@ -15,6 +15,7 @@
 #include "qwen_kquant.h"
 #include "turboquant.h"
 #include "unicode_categories.h"
+#include "colibri_v2_deepseek4.hpp"
 
 #include <algorithm>
 #include <array>
@@ -3533,6 +3534,36 @@ out->hyper_connection_count=m->config.hyper_connection_count;out->sinkhorn_itera
 out->expert_shared_count=m->config.expert_shared_count;out->hash_layer_count=m->config.hash_layer_count;
 out->compress_ratios_length=static_cast<std::uint32_t>(m->config.compress_ratios.size());
 out->sinkhorn_epsilon=m->config.sinkhorn_epsilon;out->compress_rope_freq_base=m->config.compress_rope_freq_base;return 0;});}
+
+// One DeepSeek-V4 hyper-connection step: derive the mixing weights from the
+// stream state, collapse the streams into the vector a block reads, and -- when
+// `block` is supplied -- write that block's output back into every stream.
+// Exposed so the pieces can be diffed against the reference implementation one
+// at a time, before there is a whole forward pass to compare.
+int colibri_v2_deepseek4_hyper_connection(
+    const float* streams, const float* fn, const float* scale, const float* base,
+    int32_t n_embd, int32_t hc, int32_t sinkhorn_iterations,
+    float rms_epsilon, float hc_epsilon,
+    const float* block,
+    float* mixes, float* pre, float* post, float* comb,
+    float* collapsed, float* combined
+){return guarded([&]{
+    if(!streams||!fn||!scale||!base||!pre||!post||!comb)
+        throw std::runtime_error("hyper-connection inputs are required");
+    if(n_embd<=0||hc<=0||sinkhorn_iterations<=0)
+        throw std::runtime_error("hyper-connection geometry is invalid");
+    namespace ds4=colibri::v2::deepseek4;
+    ds4::hyper_connection_weights(
+        streams,fn,scale,base,static_cast<std::size_t>(n_embd),static_cast<std::size_t>(hc),
+        static_cast<std::uint32_t>(sinkhorn_iterations),rms_epsilon,hc_epsilon,
+        pre,post,comb,mixes);
+    if(collapsed)
+        ds4::hyper_connection_collapse(streams,pre,static_cast<std::size_t>(n_embd),
+            static_cast<std::size_t>(hc),collapsed);
+    if(block&&combined)
+        ds4::hyper_connection_combine(block,streams,post,comb,
+            static_cast<std::size_t>(n_embd),static_cast<std::size_t>(hc),combined);
+    return 0;});}
 
 // Whether the runtime can decode a GGML weight type at all. This is the CPU
 // path's set, which is the widest one: a type missing here cannot be executed

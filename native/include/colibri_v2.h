@@ -244,6 +244,16 @@ COLIBRI_V2_API int colibri_v2_model_attach_mtp(ColibriV2Model* model, const char
 COLIBRI_V2_API void colibri_v2_model_close(ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_model_info(const ColibriV2Model* model, ColibriV2ModelInfo* out);
 COLIBRI_V2_API int colibri_v2_model_config(const ColibriV2Model* model, ColibriV2ModelConfig* out);
+/* One DeepSeek-V4 hyper-connection step. `mixes`, `collapsed` and `combined`
+   are optional; `combined` needs `block`. Sizes: streams/combined hc*n_embd,
+   fn (2+hc)*hc rows of hc*n_embd, scale 3, base 2*hc+hc*hc, pre/post hc,
+   comb hc*hc, collapsed/block n_embd. */
+COLIBRI_V2_API int colibri_v2_deepseek4_hyper_connection(
+    const float* streams, const float* fn, const float* scale, const float* base,
+    int32_t n_embd, int32_t hc, int32_t sinkhorn_iterations,
+    float rms_epsilon, float hc_epsilon, const float* block,
+    float* mixes, float* pre, float* post, float* comb,
+    float* collapsed, float* combined);
 /* Whether the runtime can decode a GGML weight type on any backend. */
 COLIBRI_V2_API int colibri_v2_quant_supported(uint32_t type);
 /* Per-layer attention kinds for `deepseek4`. Returns the entry count when `out`
