@@ -52,6 +52,15 @@ typedef struct ColibriV2ModelConfig {
        models that close a turn with a dedicated end-of-turn token never emit
        `eos` in conversation, so a stop set built from `eos` alone runs on. */
     uint32_t eos_token_id, eot_token_id, bos_token_id;
+    /* DeepSeek-V4 (`deepseek4`) geometry. Zero on every other architecture.
+       `compress_ratios_length` is the length of the per-layer attention-kind
+       array, which does not fit a flat struct; read it with
+       colibri_v2_model_compress_ratios. */
+    uint32_t q_lora_rank, kv_lora_rank, output_lora_rank, output_group_count;
+    uint32_t indexer_head_count, indexer_key_length, indexer_top_k;
+    uint32_t hyper_connection_count, sinkhorn_iterations;
+    uint32_t expert_shared_count, hash_layer_count, compress_ratios_length;
+    float sinkhorn_epsilon, compress_rope_freq_base;
 } ColibriV2ModelConfig;
 
 typedef struct ColibriV2GpuInfo {
@@ -235,6 +244,11 @@ COLIBRI_V2_API int colibri_v2_model_attach_mtp(ColibriV2Model* model, const char
 COLIBRI_V2_API void colibri_v2_model_close(ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_model_info(const ColibriV2Model* model, ColibriV2ModelInfo* out);
 COLIBRI_V2_API int colibri_v2_model_config(const ColibriV2Model* model, ColibriV2ModelConfig* out);
+/* Whether the runtime can decode a GGML weight type on any backend. */
+COLIBRI_V2_API int colibri_v2_quant_supported(uint32_t type);
+/* Per-layer attention kinds for `deepseek4`. Returns the entry count when `out`
+   is NULL or `capacity` is zero, else the number of entries written. */
+COLIBRI_V2_API int colibri_v2_model_compress_ratios(const ColibriV2Model* model, uint32_t* out, int32_t capacity);
 /* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
    UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
    query the required size; an absent key reports length zero. */
@@ -251,6 +265,10 @@ COLIBRI_V2_API int colibri_v2_qwen_lm_head(const ColibriV2Model* model, const fl
 COLIBRI_V2_API int colibri_v2_qwen_token_text(const ColibriV2Model* model, uint32_t token, char* output, uint64_t capacity);
 COLIBRI_V2_API int colibri_v2_token_id(const ColibriV2Model* model, const char* text, uint32_t* token);
 COLIBRI_V2_API int colibri_v2_tokenize(const ColibriV2Model* model, const char* text, uint32_t* tokens, uint64_t capacity, uint64_t* count);
+/* Pre-tokenizer piece boundaries as byte offsets, with a trailing end offset,
+   so `count` is one more than the number of pieces. A NULL `offsets` asks for
+   the count alone. */
+COLIBRI_V2_API int colibri_v2_pretokenize(const ColibriV2Model* model, const char* text, uint64_t* offsets, uint64_t capacity, uint64_t* count);
 COLIBRI_V2_API int colibri_v2_tensor_read(const ColibriV2Model* model, uint64_t index, void* dst, uint64_t bytes);
 COLIBRI_V2_API int colibri_v2_tensor_read_slice(const ColibriV2Model* model, uint64_t index, uint64_t offset, void* dst, uint64_t bytes);
 COLIBRI_V2_API int colibri_v2_tensor_view(const ColibriV2Model* model, uint64_t index, uint64_t offset, uint64_t bytes, const void** out);

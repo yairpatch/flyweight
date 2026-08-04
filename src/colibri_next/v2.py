@@ -118,6 +118,21 @@ class _ModelConfig(ctypes.Structure):
         ("eos_token_id", ctypes.c_uint32),
         ("eot_token_id", ctypes.c_uint32),
         ("bos_token_id", ctypes.c_uint32),
+        # DeepSeek-V4 geometry; zero on every other architecture.
+        ("q_lora_rank", ctypes.c_uint32),
+        ("kv_lora_rank", ctypes.c_uint32),
+        ("output_lora_rank", ctypes.c_uint32),
+        ("output_group_count", ctypes.c_uint32),
+        ("indexer_head_count", ctypes.c_uint32),
+        ("indexer_key_length", ctypes.c_uint32),
+        ("indexer_top_k", ctypes.c_uint32),
+        ("hyper_connection_count", ctypes.c_uint32),
+        ("sinkhorn_iterations", ctypes.c_uint32),
+        ("expert_shared_count", ctypes.c_uint32),
+        ("hash_layer_count", ctypes.c_uint32),
+        ("compress_ratios_length", ctypes.c_uint32),
+        ("sinkhorn_epsilon", ctypes.c_float),
+        ("compress_rope_freq_base", ctypes.c_float),
     ]
 
 
@@ -382,6 +397,22 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_uint32),
                 ]
                 lib.colibri_v2_model_attention_window.restype = ctypes.c_int
+                lib.colibri_v2_model_compress_ratios.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_model_compress_ratios.restype = ctypes.c_int
+                lib.colibri_v2_pretokenize.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_uint64),
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_pretokenize.restype = ctypes.c_int
+                lib.colibri_v2_quant_supported.argtypes = [ctypes.c_uint32]
+                lib.colibri_v2_quant_supported.restype = ctypes.c_int
                 lib.colibri_v2_qwen_validate.argtypes = [ctypes.c_void_p]
                 lib.colibri_v2_qwen_validate.restype = ctypes.c_int
                 lib.colibri_v2_qwen_tensor_role.argtypes = [
@@ -799,7 +830,12 @@ class V2Model:
         self._check(
             self._lib.colibri_v2_model_config(self._handle, ctypes.byref(value))
         )
-        float_fields = {"rms_norm_epsilon", "rope_freq_base"}
+        float_fields = {
+            "rms_norm_epsilon",
+            "rope_freq_base",
+            "sinkhorn_epsilon",
+            "compress_rope_freq_base",
+        }
         config = {
             field: (
                 getattr(value, field).decode(errors="replace")
@@ -821,7 +857,61 @@ class V2Model:
             windows.append(int(window.value))
         config["attention_windows"] = tuple(windows)
         config["sliding_window_pattern"] = tuple(bool(window) for window in windows)
+        config["compress_ratios"] = self.compress_ratios
         return config
+
+    def unsupported_quant_types(self) -> dict[int, list[str]]:
+        """Tensors whose GGML type no backend can decode, keyed by type.
+
+        Unsloth's dynamic quants mix a different type per tensor, so a
+        checkpoint can be mostly decodable and still carry a handful of tensors
+        in a format the runtime has no kernel for. Empty means the whole file
+        is executable as far as its weight formats go.
+        """
+        offenders: dict[int, list[str]] = {}
+        for tensor in self.tensors():
+            kind = int(tensor["ggml_type"])
+            if not self._lib.colibri_v2_quant_supported(kind):
+                offenders.setdefault(kind, []).append(str(tensor["name"]))
+        return offenders
+
+    def pretokenize(self, text: str) -> tuple[str, ...]:
+        """Split `text` the way this model's pre-tokenizer does, before BPE."""
+        raw = text.encode("utf-8")
+        count = ctypes.c_uint64()
+        self._check(
+            self._lib.colibri_v2_pretokenize(
+                self._handle, raw, None, 0, ctypes.byref(count)
+            )
+        )
+        offsets = (ctypes.c_uint64 * count.value)()
+        self._check(
+            self._lib.colibri_v2_pretokenize(
+                self._handle, raw, offsets, count.value, ctypes.byref(count)
+            )
+        )
+        return tuple(
+            raw[offsets[index] : offsets[index + 1]].decode("utf-8", errors="replace")
+            for index in range(count.value - 1)
+        )
+
+    @property
+    def compress_ratios(self) -> tuple[int, ...]:
+        """DeepSeek-V4 per-layer attention kinds; empty on other architectures.
+
+        0 selects sliding-window attention, 4 compressed sparse attention over
+        4:1 compressed tokens, and 128 heavily compressed attention.
+        """
+        count = self._lib.colibri_v2_model_compress_ratios(self._handle, None, 0)
+        if count < 0:
+            self._check(count)
+        if count == 0:
+            return ()
+        buffer = (ctypes.c_uint32 * count)()
+        written = self._lib.colibri_v2_model_compress_ratios(self._handle, buffer, count)
+        if written < 0:
+            self._check(written)
+        return tuple(int(value) for value in buffer[:written])
 
     @property
     def chat_template(self) -> str | None:

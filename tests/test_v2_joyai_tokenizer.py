@@ -1,0 +1,144 @@
+"""The `joyai-llm` pre-tokenizer that DeepSeek-V4-Flash ships with.
+
+The native splitter is a hand transcription of three regexes, so it is checked
+against those regexes run through an actual Unicode-aware engine. `regex` (not
+`re`) is required because the patterns use \\p{...} classes and a negative
+lookahead.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from colibri_next.v2 import V2Model
+
+from tests.deepseek4_gguf_fixture import build_deepseek4_gguf
+
+try:
+    import regex
+except ImportError:  # pragma: no cover - exercised only where regex is absent
+    regex = None
+
+
+# Verbatim from the reference tokenizer's LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM.
+JOYAI_PATTERNS = [
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+",
+]
+
+CORPUS = [
+    "Hello world",
+    "  leading and trailing  ",
+    "one two  three   four",
+    "line one\nline two\n\n\nline three",
+    "trailing whitespace at end   ",
+    "tabs\tand\r\ncarriage returns",
+    "1 12 123 1234 12345 1234567890",
+    "version 3.14.159 and 2026-08-04",
+    "snake_case camelCase kebab-case",
+    "punctuation!!! ??? ...ellipsis",
+    "@mention #hashtag $USD 50%",
+    "'quoted' \"double\" `backtick`",
+    "path/to/file.txt and C:\\Windows\\System32",
+    "e=mc^2 + 5*3 >= 7",
+    "emoji 🙂🎉 mixed with text",
+    "café naïve résumé Zoë",
+    "Ω≈ç√∫˜µ≤≥÷",
+    "日本語のテキストです",
+    "カタカナとひらがなの混在テスト",
+    "中文文本测试内容",
+    "한국어 텍스트",
+    "Русский текст здесь",
+    "العربية نص",
+    "mixed 日本語 and English 123 text",
+    "中文123English日本語",
+    "<｜begin▁of▁sentence｜>",
+    "<think>reasoning</think>",
+    "",
+    " ",
+    "\n",
+    "\n\n\n",
+    "a",
+    "。、！？「」",
+    "def f(x): return x ** 2  # comment",
+    '{"key": "value", "n": [1, 2, 3]}',
+]
+
+
+def _reference_split(text: str) -> tuple[str, ...]:
+    """Apply the patterns the way the reference does: each one refines the last.
+
+    Every match becomes a piece and so does every gap between matches, with the
+    scan confined to one piece at a time.
+    """
+    pieces = [text] if text else []
+    for pattern in JOYAI_PATTERNS:
+        compiled = regex.compile(pattern)
+        refined: list[str] = []
+        for piece in pieces:
+            at = 0
+            for match in compiled.finditer(piece):
+                start, end = match.span()
+                if end == start:
+                    continue
+                if start > at:
+                    refined.append(piece[at:start])
+                refined.append(piece[start:end])
+                at = end
+            if at < len(piece):
+                refined.append(piece[at:])
+        pieces = refined
+    return tuple(pieces)
+
+
+@unittest.skipIf(regex is None, "the regex module is required for the oracle")
+class JoyaiPretokenizerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        directory = Path(tempfile.mkdtemp(prefix="colibri-joyai-"))
+        path = directory / "deepseek4.gguf"
+        build_deepseek4_gguf(path)
+        cls.model = V2Model(path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def test_pretokenizer_matches_the_reference_patterns(self):
+        for text in CORPUS:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self.model.pretokenize(text),
+                    _reference_split(text),
+                )
+
+    def test_pieces_always_reconstruct_the_input(self):
+        for text in CORPUS:
+            with self.subTest(text=text):
+                self.assertEqual("".join(self.model.pretokenize(text)), text)
+
+    def test_digits_group_in_threes(self):
+        self.assertEqual(self.model.pretokenize("1234567"), ("123", "456", "7"))
+
+    def test_cjk_runs_split_from_latin(self):
+        self.assertEqual(
+            self.model.pretokenize("abc日本語def"),
+            _reference_split("abc日本語def"),
+        )
+
+    def test_a_space_stays_with_the_word_that_follows(self):
+        # "\s+(?!\S)" hands the last space of a run to the next word, which is
+        # what keeps " word" a single piece.
+        self.assertEqual(self.model.pretokenize("a  b"), _reference_split("a  b"))
+
+
+if __name__ == "__main__":
+    unittest.main()

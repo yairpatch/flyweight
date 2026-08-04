@@ -35,6 +35,25 @@ struct ModelConfig {
     float rope_scaling_factor=0.0f, yarn_attn_factor=1.0f;
     float yarn_beta_fast=32.0f, yarn_beta_slow=1.0f;
     bool rope_scaling_yarn=false;
+    // DeepSeek-V4 (`deepseek4`). Multi-head latent attention carries a low-rank
+    // query path and a compressed KV latent instead of per-head K/V.
+    std::uint32_t q_lora_rank=0, kv_lora_rank=0;
+    // The output projection is low-rank and grouped rather than a single matrix.
+    std::uint32_t output_lora_rank=0, output_group_count=0;
+    // Lightning indexer: the top-k selector that drives compressed sparse
+    // attention, with its own head count, key width and selection budget.
+    std::uint32_t indexer_head_count=0, indexer_key_length=0, indexer_top_k=0;
+    // Per-layer attention kind. 0 = sliding window, 4 = compressed sparse
+    // attention over 4:1 compressed tokens, 128 = heavily compressed attention.
+    std::vector<std::uint32_t> compress_ratios;
+    float compress_rope_freq_base=0.0f;
+    // Hyper-connections replace the plain residual with `hyper_connection_count`
+    // parallel streams mixed by a Sinkhorn-normalized router.
+    std::uint32_t hyper_connection_count=0, sinkhorn_iterations=0;
+    float sinkhorn_epsilon=0.0f;
+    std::uint32_t expert_shared_count=0, hash_layer_count=0;
+    // Per-layer SwiGLU clamp bounds, routed experts and shared expert.
+    std::vector<float> swiglu_clamp_exp, swiglu_clamp_shexp;
     // GGUF tokenizer terminator ids; max means the key was absent.
     std::uint32_t eos_token_id=0xffffffffu;
     std::uint32_t eot_token_id=0xffffffffu;

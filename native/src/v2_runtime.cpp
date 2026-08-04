@@ -14,6 +14,7 @@
 #include "qwen_cpu_kernel.h"
 #include "qwen_kquant.h"
 #include "turboquant.h"
+#include "unicode_categories.h"
 
 #include <algorithm>
 #include <array>
@@ -90,6 +91,14 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
     // token type 3) never come out of BPE and have to be split off ahead of it.
     std::string tokenizer_pre; std::vector<std::uint32_t> token_types;
     std::vector<std::pair<std::string,std::uint32_t>> control_tokens;
+    // Split GGUF: `split.no` is this file's 0-based index of `split.count`, and
+    // `split.tensors.count` is the descriptor total across every shard. A zero
+    // count means an ordinary single-file checkpoint.
+    std::uint32_t split_no=0, split_count=0; std::uint64_t split_tensors=0;
+    // Shards other than the one that was opened. Their descriptors are merged
+    // into `tensors` with Tensor::source pointing at the shard mapping, so a
+    // split checkpoint is indistinguishable downstream from a single file.
+    std::vector<std::unique_ptr<ColibriV2Model>> shards;
 #if !defined(_WIN32)
     int fd=-1;
 #else
@@ -109,6 +118,14 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
     uint64_t tensor_count() const override { return tensors.size(); }
     const colibri::v2::TensorDescriptor* tensor(uint64_t index) const override { return index < tensors.size() ? &tensors[index] : nullptr; }
     int read_tensor(uint64_t index, void* destination, uint64_t bytes) const override { if(index >= tensors.size() || !destination || bytes < tensors[index].size) return -1; const auto& tensor=tensors[index];const auto*base=tensor.source?tensor.source:data;std::memcpy(destination, base + tensor.offset, tensor.size); return 0; }
+    // Every mapping that can hold tensor bytes, primary file first. Nothing may
+    // assume `data`/`size` spans the model: a split checkpoint keeps all of its
+    // metadata in one shard and all of its tensors in the others.
+    template <class F> void for_each_mapping(F&& visit) const {
+        if(data) visit(data,static_cast<std::uint64_t>(size));
+        for(const auto& shard:shards) if(shard&&shard->data) visit(shard->data,static_cast<std::uint64_t>(shard->size));
+    }
+    std::uint64_t mapped_bytes() const { std::uint64_t total=size; for(const auto& shard:shards) if(shard) total+=shard->size; return total; }
 };
 
 const uint8_t* tensor_data(const ColibriV2Model& model, const Tensor& tensor) {
@@ -658,7 +675,11 @@ static std::uint64_t expert_history_hash_bytes(
 
 static std::uint64_t qwen_model_fingerprint(const ColibriV2Model& model) {
     std::uint64_t hash = 1469598103934665603ULL;
-    hash = expert_history_hash_bytes(hash, &model.size, sizeof(model.size));
+    // Total mapped bytes, not the opened file's: a split checkpoint's first
+    // shard is a few megabytes of metadata and would not distinguish models.
+    // This equals `size` for a single file, so existing fingerprints hold.
+    const std::uint64_t bytes = model.mapped_bytes();
+    hash = expert_history_hash_bytes(hash, &bytes, sizeof(bytes));
     hash = expert_history_hash_bytes(
         hash, model.architecture.data(), model.architecture.size()
     );
@@ -1149,7 +1170,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     qwen_save_expert_history(runtime);
     if (runtime.stream) colibri_gpu_stream_sync(runtime.stream);
     if (runtime.model_registered && runtime.model) {
-        colibri_gpu_host_unregister(runtime.model->data);
+        runtime.model->for_each_mapping([](const std::uint8_t* base, std::uint64_t) {
+            colibri_gpu_host_unregister(base);
+        });
         runtime.model_registered = false;
         runtime.dma_paging = false;
     }
@@ -1292,11 +1315,51 @@ std::uint64_t available_host_memory() {
 }
 void copy_text(char* dst, size_t cap, const std::string& value) { if (!cap) return; std::strncpy(dst, value.c_str(), cap-1); dst[cap-1]=0; }
 
+// Qwen3-Next GGUF files include the optional MTP draft block in ``block_count``.
+// A block carrying ``nextn`` tensors is not part of the causal decoder stack and
+// must not be executed before the final norm. Split checkpoints only see their
+// full tensor list once the shards are merged, so this runs again after the
+// merge rather than only at the end of the shard's own parse.
+void detect_mtp_layer(ColibriV2Model& m) {
+    for (const auto& tensor : m.tensors) {
+        const auto marker = tensor.name.find(".nextn.");
+        if (marker == std::string::npos || tensor.name.rfind("blk.", 0) != 0) continue;
+        try {
+            const auto draft_layer = static_cast<uint32_t>(std::stoul(tensor.name.substr(4, marker - 4)));
+            if (m.mtp_layer != std::numeric_limits<uint32_t>::max() &&
+                m.mtp_layer != draft_layer) {
+                throw std::runtime_error("multiple Qwen MTP draft layers are unsupported");
+            }
+            m.mtp_layer = draft_layer;
+            if (draft_layer < m.config.layer_count) m.config.layer_count = draft_layer;
+        } catch (const std::exception&) {
+            throw std::runtime_error("invalid Qwen MTP tensor layer index");
+        }
+    }
+}
+
 int parse(ColibriV2Model& m) {
     if (m.size < 24 || std::memcmp(m.data,"GGUF",4)!=0) throw std::runtime_error("not a GGUF file");
     Reader r{m.data+4,m.data+m.size}; m.version=r.get<uint32_t>(); if (m.version<2 || m.version>3) throw std::runtime_error("unsupported GGUF version");
     uint64_t count=r.get<uint64_t>(); m.metadata=r.get<uint64_t>();
     auto read_uint = [&](uint32_t type)->uint64_t { if(type==4)return r.get<uint32_t>(); if(type==10)return r.get<uint64_t>(); throw std::runtime_error("GGUF architecture value is not an integer"); };
+    auto is_integer = [](uint32_t type){ return type==0||type==1||type==2||type==3||type==4||type==5||type==10||type==11; };
+    auto read_any_uint = [&](uint32_t type)->uint64_t {
+        std::int64_t value=0;
+        switch(type){
+        case 0: value=r.get<std::uint8_t>(); break;
+        case 1: value=r.get<std::int8_t>(); break;
+        case 2: value=r.get<std::uint16_t>(); break;
+        case 3: value=r.get<std::int16_t>(); break;
+        case 4: value=r.get<std::uint32_t>(); break;
+        case 5: value=r.get<std::int32_t>(); break;
+        case 10: return r.get<std::uint64_t>();
+        case 11: value=r.get<std::int64_t>(); break;
+        default: throw std::runtime_error("GGUF value is not an integer");
+        }
+        if(value<0)throw std::runtime_error("GGUF integer value is negative");
+        return static_cast<std::uint64_t>(value);
+    };
     auto read_float = [&](uint32_t type)->float { if(type==6)return r.get<float>(); if(type==12)return static_cast<float>(r.get<double>()); throw std::runtime_error("GGUF architecture value is not a float"); };
     auto read_uint_array = [&](uint32_t type)->std::vector<std::uint32_t> {
         if(type!=9)throw std::runtime_error("GGUF architecture value is not an array");
@@ -1316,11 +1379,34 @@ int parse(ColibriV2Model& m) {
         }
         return values;
     };
+    auto read_float_array = [&](uint32_t type)->std::vector<float> {
+        if(type!=9)throw std::runtime_error("GGUF architecture value is not an array");
+        const auto element_type=r.get<uint32_t>();const auto count=r.get<uint64_t>();
+        if(element_type!=6&&element_type!=12)
+            throw std::runtime_error("GGUF architecture array is not float");
+        std::vector<float> values;values.reserve(static_cast<std::size_t>(count));
+        for(std::uint64_t i=0;i<count;++i)
+            values.push_back(element_type==6?r.get<float>():static_cast<float>(r.get<double>()));
+        return values;
+    };
     auto set_config = [&](const std::string& key, uint32_t type)->bool {
         if(type!=4 && type!=10)return false;
         auto suffix=[&](const char* text){size_t n=std::strlen(text);return key.size()>=n && key.compare(key.size()-n,n,text)==0;};
         uint32_t* target=nullptr;
-        if(suffix(".embedding_length"))target=&m.config.hidden_size;
+        // DeepSeek-V4 scalars first: several of them end in strings that would
+        // otherwise be caught by the shorter generic suffixes below.
+        if(suffix(".attention.q_lora_rank"))target=&m.config.q_lora_rank;
+        else if(suffix(".attention.kv_lora_rank"))target=&m.config.kv_lora_rank;
+        else if(suffix(".attention.output_lora_rank"))target=&m.config.output_lora_rank;
+        else if(suffix(".attention.output_group_count"))target=&m.config.output_group_count;
+        else if(suffix(".attention.indexer.head_count"))target=&m.config.indexer_head_count;
+        else if(suffix(".attention.indexer.key_length"))target=&m.config.indexer_key_length;
+        else if(suffix(".attention.indexer.top_k"))target=&m.config.indexer_top_k;
+        else if(suffix(".hyper_connection.sinkhorn_iterations"))target=&m.config.sinkhorn_iterations;
+        else if(suffix(".hyper_connection.count"))target=&m.config.hyper_connection_count;
+        else if(suffix(".expert_shared_count"))target=&m.config.expert_shared_count;
+        else if(suffix(".hash_layer_count"))target=&m.config.hash_layer_count;
+        else if(suffix(".embedding_length"))target=&m.config.hidden_size;
         else if(suffix(".embedding_length_per_layer_input"))target=&m.config.per_layer_embedding_size;
         else if(suffix(".block_count"))target=&m.config.layer_count;
         else if(suffix(".attention.shared_kv_layers"))target=&m.config.shared_kv_layers;
@@ -1344,6 +1430,11 @@ int parse(ColibriV2Model& m) {
         if (key=="general.alignment" && type==4) m.alignment=r.get<uint32_t>();
         else if (key=="general.architecture" && type==8) {m.architecture=r.str();m.config.architecture=m.architecture;}
         else if (key=="general.name" && type==8) m.name=r.str();
+        // gguf-split writes the shard index and count as uint16 and the tensor
+        // total as int32, so these do not go through read_uint.
+        else if (key=="split.no" && is_integer(type)) m.split_no=static_cast<uint32_t>(read_any_uint(type));
+        else if (key=="split.count" && is_integer(type)) m.split_count=static_cast<uint32_t>(read_any_uint(type));
+        else if (key=="split.tensors.count" && is_integer(type)) m.split_tensors=read_any_uint(type);
         else if (key=="tokenizer.chat_template" && type==8) m.chat_template=r.str();
         else if (key=="tokenizer.ggml.tokens" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_tokens=r.get<uint64_t>();m.config.vocabulary_size=static_cast<uint32_t>(count_tokens);m.vocabulary.reserve(static_cast<size_t>(count_tokens));for(uint64_t token_index=0;token_index<count_tokens;token_index++){if(element_type==8)m.vocabulary.push_back(r.str());else r.value(element_type);}}
         else if (key=="tokenizer.ggml.pre" && type==8) m.tokenizer_pre=r.str();
@@ -1380,29 +1471,17 @@ int parse(ColibriV2Model& m) {
         else if (key.size()>=18 && key.compare(key.size()-18,18,".rope.scaling.type")==0 && type==8) m.config.rope_scaling_yarn=r.str()=="yarn";
         else if (key.size()>=21 && key.compare(key.size()-21,21,".expert_weights_scale")==0 && (type==6 || type==12)) m.config.expert_weights_scale=read_float(type);
         else if (key.size()>=20 && key.compare(key.size()-20,20,".expert_weights_norm")==0 && type==7) m.config.expert_weights_norm=r.get<std::uint8_t>()!=0;
+        else if (key.size()>=26 && key.compare(key.size()-26,26,".attention.compress_ratios")==0 && type==9) m.config.compress_ratios=read_uint_array(type);
+        else if (key.size()>=34 && key.compare(key.size()-34,34,".attention.compress_rope_freq_base")==0 && (type==6 || type==12)) m.config.compress_rope_freq_base=read_float(type);
+        else if (key.size()>=25 && key.compare(key.size()-25,25,".hyper_connection.epsilon")==0 && (type==6 || type==12)) m.config.sinkhorn_epsilon=read_float(type);
+        else if (key.size()>=19 && key.compare(key.size()-19,19,".swiglu_clamp_shexp")==0 && type==9) m.config.swiglu_clamp_shexp=read_float_array(type);
+        else if (key.size()>=17 && key.compare(key.size()-17,17,".swiglu_clamp_exp")==0 && type==9) m.config.swiglu_clamp_exp=read_float_array(type);
         else if (set_config(key,type)) {}
         else r.value(type);
     }
     m.tensors.reserve(static_cast<size_t>(count));
     for(uint64_t i=0;i<count;i++) { Tensor t; t.name=r.str(); auto dims=r.get<uint32_t>(); if(dims>4) throw std::runtime_error("GGUF rank exceeds v2 ABI"); for(uint32_t d=0;d<dims;d++) t.shape.push_back(r.get<uint64_t>()); t.type=r.get<uint32_t>(); t.offset=r.get<uint64_t>(); m.tensors.push_back(std::move(t)); }
-    // Qwen3-Next GGUF files include the optional MTP draft block in
-    // ``block_count``.  A block carrying ``nextn`` tensors is not part of the
-    // causal decoder stack and must not be executed before the final norm.
-    for (const auto& tensor : m.tensors) {
-        const auto marker = tensor.name.find(".nextn.");
-        if (marker == std::string::npos || tensor.name.rfind("blk.", 0) != 0) continue;
-        try {
-            const auto draft_layer = static_cast<uint32_t>(std::stoul(tensor.name.substr(4, marker - 4)));
-            if (m.mtp_layer != std::numeric_limits<uint32_t>::max() &&
-                m.mtp_layer != draft_layer) {
-                throw std::runtime_error("multiple Qwen MTP draft layers are unsupported");
-            }
-            m.mtp_layer = draft_layer;
-            if (draft_layer < m.config.layer_count) m.config.layer_count = draft_layer;
-        } catch (const std::exception&) {
-            throw std::runtime_error("invalid Qwen MTP tensor layer index");
-        }
-    }
+    detect_mtp_layer(m);
     // An array-valued head count leaves the scalar unset. Workspaces and score
     // buffers are sized off the scalar, so it has to cover the widest layer.
     if(!m.config.attention_heads&&!m.config.attention_heads_by_layer.empty())
@@ -1425,6 +1504,20 @@ int parse(ColibriV2Model& m) {
                 if((heads[layer]==heads[0])!=(m.config.sliding_window_pattern[layer]==0))
                     throw std::runtime_error(
                         "Laguna sliding-window layout disagrees with the per-layer head count");
+    }
+    // DeepSeek-V4 ships no explicit kv_lora_rank: `attention.key_length` is the
+    // width of the compressed KV latent, and the decoupled RoPE half is carried
+    // separately in `rope.dimension_count`. The shared expert likewise arrives
+    // as a count of routed-expert widths rather than a width.
+    if(m.architecture=="deepseek4"){
+        if(!m.config.kv_lora_rank)m.config.kv_lora_rank=m.config.key_length;
+        if(!m.config.expert_shared_intermediate_size&&m.config.expert_shared_count)
+            m.config.expert_shared_intermediate_size=
+                m.config.expert_intermediate_size*m.config.expert_shared_count;
+        if(!m.config.compress_ratios.empty()&&
+           m.config.compress_ratios.size()<m.config.layer_count)
+            throw std::runtime_error(
+                "deepseek4 compress-ratio array is shorter than the model layer count");
     }
     if(!m.config.sliding_window_pattern.empty()&&m.config.sliding_window_pattern.size()<m.config.layer_count)
         throw std::runtime_error("GGUF sliding-window pattern is shorter than the model layer count");
@@ -3243,7 +3336,9 @@ void colibri_v2_kv_cache_destroy(ColibriV2KvCache*cache){try{delete cache;}catch
 int colibri_v2_kv_cache_reset(ColibriV2KvCache*cache){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}cache->position=0;return 0;});}
 int colibri_v2_kv_cache_position(const ColibriV2KvCache*cache,int32_t*out){return guarded([&]{if(!cache||!out){fail("invalid KV cache position");return -1;}*out=cache->position;return 0;});}
 int colibri_v2_gpu_decoder_attention_cached(ColibriV2KvCache*cache,uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t qkv_packed,uint64_t qkv_scales,uint64_t qkv,uint64_t attention_output,uint64_t out_packed,uint64_t out_scales,uint64_t output,int32_t hidden_size,int32_t heads,float epsilon,int32_t one_centered){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}int status=colibri_v2_gpu_decoder_attention_step(input,norm_weights,normalized,qkv_packed,qkv_scales,qkv,cache->keys,cache->values,attention_output,out_packed,out_scales,output,hidden_size,heads,cache->kv_heads,cache->head_dim,cache->position,cache->capacity,epsilon,one_centered);if(status)return status;++cache->position;return 0;});}
-int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guarded([&]{ if(!path||!out) throw std::runtime_error("path and output are required"); auto m=std::make_unique<ColibriV2Model>(); m->path=path;
+// Map one GGUF file and parse its header. Shards of a split checkpoint come
+// through here too, which is why it does not attach shards itself.
+void map_and_parse(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&model; m->path=path;
 #if !defined(_WIN32)
     m->fd=open(path,O_RDONLY); if(m->fd<0) throw std::runtime_error("cannot open GGUF"); struct stat st{}; if(fstat(m->fd,&st)!=0) throw std::runtime_error("cannot stat GGUF"); m->size=static_cast<size_t>(st.st_size);
     const char* lock_env=std::getenv("COLIBRI_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
@@ -3317,7 +3412,64 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
             std::fprintf(stderr,"colibri_v2: pinned all %zu bytes\n",locked);
     }
 #endif
-    parse(*m); *out=m.release(); return 0; }); }
+    parse(*m); }
+
+// gguf-split names shards "<prefix>-00001-of-00004.gguf" with a 1-based file
+// index, while GGUF's own split.no is 0-based.
+std::string split_shard_path(const std::string& path, std::uint32_t index, std::uint32_t count) {
+    constexpr std::size_t kSuffix = 20; // "-00001-of-00004.gguf"
+    const auto shaped=[&]{
+        if(path.size()<=kSuffix)return false;
+        const char* tail=path.c_str()+path.size()-kSuffix;
+        if(tail[0]!='-'||std::memcmp(tail+6,"-of-",4)!=0||std::memcmp(tail+15,".gguf",5)!=0)return false;
+        for(int digit=0;digit<5;++digit)
+            if(!std::isdigit(static_cast<unsigned char>(tail[1+digit]))||
+               !std::isdigit(static_cast<unsigned char>(tail[10+digit])))return false;
+        return true;
+    }();
+    if(!shaped)throw std::runtime_error(
+        "split GGUF path does not carry a \"-00001-of-0000N.gguf\" suffix: "+path);
+    char suffix[32];
+    std::snprintf(suffix,sizeof(suffix),"-%05u-of-%05u.gguf",index+1,count);
+    return path.substr(0,path.size()-kSuffix)+suffix;
+}
+
+// Merge the remaining shards of a split checkpoint into `m`. Their descriptors
+// keep pointing at their own mapping through Tensor::source, so downstream code
+// never learns the model arrived in pieces.
+void attach_split_shards(ColibriV2Model& m) {
+    if(m.split_count<=1)return;
+    if(m.split_no>=m.split_count)
+        throw std::runtime_error("split GGUF shard index is outside its own split count");
+    m.shards.reserve(m.split_count-1);
+    for(std::uint32_t index=0;index<m.split_count;++index){
+        if(index==m.split_no)continue;
+        const auto path=split_shard_path(m.path,index,m.split_count);
+        auto shard=std::make_unique<ColibriV2Model>();
+        map_and_parse(path.c_str(),*shard);
+        if(shard->split_count!=m.split_count||shard->split_no!=index)
+            throw std::runtime_error("split GGUF shard disagrees about its place in the split: "+path);
+        for(const auto& tensor:shard->tensors){
+            auto merged=tensor;
+            merged.source=shard->data;
+            m.tensors.push_back(std::move(merged));
+        }
+        m.shards.push_back(std::move(shard));
+    }
+    if(m.split_tensors&&m.tensors.size()!=m.split_tensors)
+        throw std::runtime_error("split GGUF holds "+std::to_string(m.tensors.size())+
+            " tensors but declares "+std::to_string(m.split_tensors));
+    // The draft block can live in any shard, so this only becomes decidable
+    // once every descriptor is present.
+    detect_mtp_layer(m);
+}
+
+int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guarded([&]{
+    if(!path||!out) throw std::runtime_error("path and output are required");
+    auto m=std::make_unique<ColibriV2Model>();
+    map_and_parse(path,*m);
+    attach_split_shards(*m);
+    *out=m.release(); return 0; }); }
 int colibri_v2_model_attach_mtp(ColibriV2Model* m,const char*path){return guarded([&]{
     if(!m||!path||!path[0])throw std::runtime_error("model and MTP sidecar path are required");
     if(m->mtp_sidecar)throw std::runtime_error("an MTP sidecar is already attached");
@@ -3374,7 +3526,27 @@ int colibri_v2_model_attach_mtp(ColibriV2Model* m,const char*path){return guarde
 void colibri_v2_model_close(ColibriV2Model* m) { try{delete m;}catch(...){} }
 int colibri_v2_model_info(const ColibriV2Model* m, ColibriV2ModelInfo* out) { return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model info handle"); std::memset(out,0,sizeof(*out));out->gguf_version=m->version;out->tensor_count=m->tensor_count();out->metadata_count=m->metadata;out->file_size=m->size;out->alignment=m->alignment;copy_text(out->architecture,sizeof(out->architecture),m->architecture);copy_text(out->name,sizeof(out->name),m->name);copy_text(out->format,sizeof(out->format),m->format());return 0;}); }
 int colibri_v2_model_chat_template(const ColibriV2Model* m,char*out,uint64_t capacity,uint64_t*length){return guarded([&]{if(!m||!length)throw std::runtime_error("invalid model chat-template arguments");*length=static_cast<uint64_t>(m->chat_template.size());if(!out||capacity==0)return 0;if(capacity<=m->chat_template.size())throw std::runtime_error("chat-template output buffer is too small");std::memcpy(out,m->chat_template.data(),m->chat_template.size());out[m->chat_template.size()]=0;return 0;});}
-int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;out->eos_token_id=m->config.eos_token_id;out->eot_token_id=m->config.eot_token_id;out->bos_token_id=m->config.bos_token_id;return 0;});}
+int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;out->eos_token_id=m->config.eos_token_id;out->eot_token_id=m->config.eot_token_id;out->bos_token_id=m->config.bos_token_id;
+out->q_lora_rank=m->config.q_lora_rank;out->kv_lora_rank=m->config.kv_lora_rank;out->output_lora_rank=m->config.output_lora_rank;out->output_group_count=m->config.output_group_count;
+out->indexer_head_count=m->config.indexer_head_count;out->indexer_key_length=m->config.indexer_key_length;out->indexer_top_k=m->config.indexer_top_k;
+out->hyper_connection_count=m->config.hyper_connection_count;out->sinkhorn_iterations=m->config.sinkhorn_iterations;
+out->expert_shared_count=m->config.expert_shared_count;out->hash_layer_count=m->config.hash_layer_count;
+out->compress_ratios_length=static_cast<std::uint32_t>(m->config.compress_ratios.size());
+out->sinkhorn_epsilon=m->config.sinkhorn_epsilon;out->compress_rope_freq_base=m->config.compress_rope_freq_base;return 0;});}
+
+// Whether the runtime can decode a GGML weight type at all. This is the CPU
+// path's set, which is the widest one: a type missing here cannot be executed
+// by any backend, so a checkpoint carrying it is unusable rather than slow.
+int colibri_v2_quant_supported(uint32_t type){return qwen_cpu_expert_type_supported(type)?1:0;}
+
+// Copy the per-layer attention-kind array. Returns the number of entries written.
+int colibri_v2_model_compress_ratios(const ColibriV2Model* m,uint32_t* out,int32_t capacity){return guarded([&]{
+    if(!m)throw std::runtime_error("invalid model handle");
+    const auto& ratios=m->config.compress_ratios;
+    if(!out||capacity<=0)return static_cast<int>(ratios.size());
+    const auto written=std::min(static_cast<std::size_t>(capacity),ratios.size());
+    std::copy_n(ratios.begin(),written,out);
+    return static_cast<int>(written);});}
 int colibri_v2_model_attention_window(const ColibriV2Model* m,uint32_t layer,uint32_t*out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model attention-window handle");*out=attention_window(*m,layer);return 0;});}
 int colibri_v2_tensor_info(const ColibriV2Model* m,uint64_t i,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("tensor index out of range");return fill(m->tensors[i],*out);});}
 int colibri_v2_tensor_find(const ColibriV2Model* m,const char* name,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!name||!out)throw std::runtime_error("invalid tensor lookup");for(auto const&t:m->tensors)if(t.name==name)return fill(t,*out);throw std::runtime_error("tensor not found");});}
@@ -3534,6 +3706,155 @@ std::vector<std::string> laguna_pretokenize(const std::string& text) {
     return pieces;
 }
 
+// UTF-8 decoded into codepoints alongside the byte offset each one starts at,
+// with a trailing entry for the end so a piece can be sliced by codepoint index.
+struct Utf8Text {
+    std::vector<std::uint32_t> code;
+    std::vector<std::size_t> offset;
+};
+
+Utf8Text gguf_utf8_decode(const std::string& text) {
+    Utf8Text out;
+    for(std::size_t at=0;at<text.size();){
+        std::size_t width=0;
+        const auto codepoint=gguf_utf8_codepoint(text,at,width);
+        if(!width)width=1;
+        out.code.push_back(codepoint);
+        out.offset.push_back(at);
+        at+=width;
+    }
+    out.offset.push_back(text.size());
+    return out;
+}
+
+// The reference pre-tokenizer applies its regexes in sequence, each one
+// splitting the pieces the previous one produced. Within a piece every match
+// becomes a piece of its own, and so does every gap between matches.
+// Takes a function pointer rather than a template parameter: this lives inside
+// the extern "C" block, which templates may not.
+using GgufMatcher = std::size_t (*)(const std::vector<std::uint32_t>&, std::size_t);
+
+std::vector<std::string> gguf_regex_split(
+    const std::vector<std::string>& pieces, GgufMatcher match_at
+) {
+    std::vector<std::string> out;
+    for(const auto& piece:pieces){
+        const auto text=gguf_utf8_decode(piece);
+        std::size_t gap=0;
+        for(std::size_t at=0;at<text.code.size();){
+            const auto length=match_at(text.code,at);
+            if(!length){++at;continue;}
+            if(at>gap)
+                out.push_back(piece.substr(text.offset[gap],text.offset[at]-text.offset[gap]));
+            out.push_back(piece.substr(text.offset[at],text.offset[at+length]-text.offset[at]));
+            at+=length;
+            gap=at;
+        }
+        if(gap<text.code.size())out.push_back(piece.substr(text.offset[gap]));
+    }
+    return out;
+}
+
+// "\p{N}{1,3}": digits break into groups of at most three.
+std::size_t joyai_match_number(const std::vector<std::uint32_t>& code,std::size_t at) {
+    std::size_t length=0;
+    while(length<3&&at+length<code.size()&&colibri::unicode::is_number(code[at+length]))++length;
+    return length;
+}
+
+// "[一-龥぀-ゟ゠-ヿ]+": CJK ideographs, hiragana and katakana stand apart from
+// the Latin-oriented word rule below.
+bool joyai_is_cjk(std::uint32_t codepoint) {
+    return (codepoint>=0x4E00&&codepoint<=0x9FA5)||
+           (codepoint>=0x3040&&codepoint<=0x309F)||
+           (codepoint>=0x30A0&&codepoint<=0x30FF);
+}
+
+std::size_t joyai_match_cjk(const std::vector<std::uint32_t>& code,std::size_t at) {
+    std::size_t length=0;
+    while(at+length<code.size()&&joyai_is_cjk(code[at+length]))++length;
+    return length;
+}
+
+// The third regex, an ordered alternation. Each branch is tried in the order it
+// appears in the pattern and the first that matches wins:
+//
+//   [ASCII punctuation][A-Za-z]+
+// | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+// | ?[\p{P}\p{S}]+[\r\n]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t at) {
+    namespace unicode=colibri::unicode;
+    const auto size=code.size();
+    const auto first=code[at];
+    auto letter_or_mark=[](std::uint32_t c){return unicode::is_letter(c)||unicode::is_accent_mark(c);};
+    auto punct_or_symbol=[](std::uint32_t c){return unicode::is_punctuation(c)||unicode::is_symbol(c);};
+    // Every ASCII punctuation and symbol character, spelled out in the pattern
+    // as a literal class rather than as \p{P}\p{S}.
+    auto ascii_mark=[](std::uint32_t c){
+        return (c>=0x21&&c<=0x2F)||(c>=0x3A&&c<=0x40)||(c>=0x5B&&c<=0x60)||(c>=0x7B&&c<=0x7E);
+    };
+    auto ascii_letter=[](std::uint32_t c){return (c>='A'&&c<='Z')||(c>='a'&&c<='z');};
+
+    if(ascii_mark(first)){
+        std::size_t length=1;
+        while(at+length<size&&ascii_letter(code[at+length]))++length;
+        if(length>1)return length;
+    }
+    // The optional leading character is greedy, so the branch that consumes it
+    // is tried before the branch that does not.
+    for(int leading=1;leading>=0;--leading){
+        if(leading&&(first=='\r'||first=='\n'||unicode::is_letter(first)||punct_or_symbol(first)))
+            continue;
+        const std::size_t start=at+static_cast<std::size_t>(leading);
+        std::size_t length=0;
+        while(start+length<size&&letter_or_mark(code[start+length]))++length;
+        if(length)return static_cast<std::size_t>(leading)+length;
+    }
+    for(int leading=1;leading>=0;--leading){
+        if(leading&&first!=' ')continue;
+        const std::size_t start=at+static_cast<std::size_t>(leading);
+        std::size_t length=0;
+        while(start+length<size&&punct_or_symbol(code[start+length]))++length;
+        if(!length)continue;
+        std::size_t tail=0;
+        while(start+length+tail<size&&
+              (code[start+length+tail]=='\r'||code[start+length+tail]=='\n'))++tail;
+        return static_cast<std::size_t>(leading)+length+tail;
+    }
+    std::size_t run=0;
+    while(at+run<size&&unicode::is_whitespace(code[at+run]))++run;
+    if(run){
+        // "\s*[\r\n]+" backtracks so the match ends on the last line break in
+        // the whitespace run.
+        std::size_t through_break=0;
+        for(std::size_t index=0;index<run;++index)
+            if(code[at+index]=='\r'||code[at+index]=='\n')through_break=index+1;
+        if(through_break)return through_break;
+        // "\s+(?!\S)" forbids a non-space immediately after the match, so a run
+        // that is followed by text hands its last character back to that text.
+        const std::size_t trimmed=(at+run<size)?run-1:run;
+        if(trimmed)return trimmed;
+        return run;  // "\s+"
+    }
+    return 0;
+}
+
+// DeepSeek-V4's `joyai-llm` pre-tokenizer, transcribed from the three regexes
+// the reference applies in sequence. Unicode categories come from a generated
+// table (unicode_categories.h) rather than the codepoint-range approximation
+// the other pre-tokenizers use: this model is CJK-heavy and the pattern draws
+// explicit \p{L}/\p{M}/\p{P}/\p{S} distinctions that the approximation blurs.
+std::vector<std::string> deepseek4_pretokenize(const std::string& text) {
+    std::vector<std::string> pieces{text};
+    pieces=gguf_regex_split(pieces,joyai_match_number);
+    pieces=gguf_regex_split(pieces,joyai_match_cjk);
+    pieces=gguf_regex_split(pieces,joyai_match_word);
+    return pieces;
+}
+
 // BPE over one pre-tokenized piece, appending its ids to `result`.
 void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
                     std::vector<uint32_t>& result) {
@@ -3575,9 +3896,27 @@ void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
     }
 }
 
+// Pre-tokenizer boundaries, so the split can be checked against the reference
+// patterns without a vocabulary in the way. Writes the byte offset each piece
+// starts at plus a trailing end offset, so `count` is one more than the number
+// of pieces. A null `offsets` asks for the count alone.
+int colibri_v2_pretokenize(const ColibriV2Model*m,const char*text,uint64_t*offsets,uint64_t capacity,uint64_t*count){return guarded([&]{
+    if(!m||!text||!count)throw std::runtime_error("invalid pretokenize arguments");
+    const std::string input(text);
+    const auto pieces=m->tokenizer_pre=="joyai-llm"
+        ?deepseek4_pretokenize(input)
+        :laguna_pretokenize(input);
+    *count=pieces.size()+1;
+    if(!offsets)return 0;
+    if(capacity<*count)throw std::runtime_error("pretokenize output buffer is too small");
+    std::uint64_t at=0,index=0;
+    for(const auto& piece:pieces){offsets[index++]=at;at+=piece.size();}
+    offsets[index]=at;
+    return 0;});}
+
 int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,uint64_t capacity,uint64_t*count){return guarded([&]{
     if(!m||!text||!count)throw std::runtime_error("invalid tokenize arguments");
-    if(m->tokenizer_pre=="laguna"){
+    if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -3586,8 +3925,11 @@ int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,u
         size_t at=0,plain=0;
         auto flush=[&](size_t end){
             if(end<=plain)return;
-            for(const auto& piece:laguna_pretokenize(input.substr(plain,end-plain)))
-                gguf_bpe_piece(*m,piece,result);
+            const auto segment=input.substr(plain,end-plain);
+            const auto pieces=m->tokenizer_pre=="joyai-llm"
+                ?deepseek4_pretokenize(segment)
+                :laguna_pretokenize(segment);
+            for(const auto& piece:pieces)gguf_bpe_piece(*m,piece,result);
         };
         while(at<input.size()){
             const auto* match=static_cast<const std::pair<std::string,std::uint32_t>*>(nullptr);
@@ -3659,6 +4001,11 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
     const bool gemma4=m->config.architecture=="gemma4";
     const bool laguna=m->config.architecture=="laguna";
+    // DeepSeek-V4 loads and describes itself but has no execution path yet, so
+    // it gets its own message rather than looking like an unknown format.
+    if(m->config.architecture=="deepseek4")throw std::runtime_error(
+        "deepseek4 checkpoints load and report their configuration, but the native runtime "
+        "cannot execute them yet (no hyper-connection, compressed-attention or indexer path)");
     if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna)throw std::runtime_error("native runtime supports Qwen, Gemma 4 and Laguna models");
     // Dense checkpoints report no experts at all, so only require a routing
     // width from the ones that actually route.
@@ -4754,10 +5101,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->host_available_bytes=available_host_memory();
         const bool forced_direct=runtime->options.expert_paging==2||
             std::getenv("COLIBRI_V2_DMA_PAGING");
+        const auto model_bytes=runtime->model->mapped_bytes();
         const auto registration_headroom=std::max<std::uint64_t>(
-            4ull*1024*1024*1024,runtime->model->size/4);
+            4ull*1024*1024*1024,model_bytes/4);
         const bool auto_direct=runtime->options.expert_paging==0&&
-            runtime->host_available_bytes>=runtime->model->size+registration_headroom;
+            runtime->host_available_bytes>=model_bytes+registration_headroom;
         // Both GPU-side MoE paths page experts in from the mmap, so both benefit
         // from registering it; only the pure-CPU path never touches the device
         // cache. This used to read `moe_device==2`, which left the streamed-GPU
@@ -4770,8 +5118,17 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         if(pages_experts&&paging_policy.routed_gpu_execution_allowed()&&
            (forced_direct||auto_direct)){
             const auto registration_started=std::chrono::steady_clock::now();
-            const int registration=colibri_gpu_host_register(
-                runtime->model->data,runtime->model->size);
+            // Every shard of a split checkpoint has to be registered; a partial
+            // registration is rolled back so the staged path stays coherent.
+            int registration=0;
+            std::vector<const std::uint8_t*> registered;
+            runtime->model->for_each_mapping([&](const std::uint8_t* base,std::uint64_t bytes){
+                if(registration)return;
+                registration=colibri_gpu_host_register(base,bytes);
+                if(!registration)registered.push_back(base);
+            });
+            if(registration)
+                for(const auto* base:registered)colibri_gpu_host_unregister(base);
             runtime->paging_registration_nanoseconds=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-registration_started).count();
@@ -4779,7 +5136,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 runtime->model_registered=true;runtime->dma_paging=true;
                 std::fprintf(stderr,
                     "[colibri-v2] direct expert paging on (registered %.1f GiB mmap in %.2fs)\n",
-                    runtime->model->size/1073741824.0,
+                    model_bytes/1073741824.0,
                     runtime->paging_registration_nanoseconds/1e9);
             }else if(forced_direct){
                 throw std::runtime_error(
@@ -7536,7 +7893,9 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
             return a.frequency!=b.frequency?a.frequency>b.frequency:a.last_used>b.last_used;
         });
     }
-    struct Range { std::uint64_t offset,bytes; };
+    // A split checkpoint spreads experts over several mappings, so a range is
+    // only meaningful against the mapping its tensor came from.
+    struct Range { const std::uint8_t* base; std::uint64_t offset,bytes; };
     std::vector<Range> ranges;
     std::uint64_t selected_bytes=0,selected_experts=0;
     for(std::size_t rank=0;;++rank){
@@ -7553,14 +7912,16 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
             for(int role=0;role<3;++role){
                 const auto& tensor=runtime.model->tensors[plan.expert_tensors[role]];
                 const auto bytes=tensor.size/experts;
-                ranges.push_back({tensor.offset+static_cast<std::uint64_t>(expert)*bytes,bytes});
+                ranges.push_back({tensor.source?tensor.source:runtime.model->data,
+                    tensor.offset+static_cast<std::uint64_t>(expert)*bytes,bytes});
             }
             selected_bytes+=bundle;++selected_experts;
         }
         if(!any||selected_bytes==budget)break;
     }
     if(ranges.empty())return;
-    std::sort(ranges.begin(),ranges.end(),[](const Range&a,const Range&b){return a.offset<b.offset;});
+    std::sort(ranges.begin(),ranges.end(),[](const Range&a,const Range&b){
+        return a.base!=b.base?a.base<b.base:a.offset<b.offset;});
     const auto started=std::chrono::steady_clock::now();
 #if defined(_WIN32)
     SYSTEM_INFO si{}; GetSystemInfo(&si);
@@ -7576,8 +7937,7 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
     inspected.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
     cold.reserve(static_cast<std::size_t>((selected_bytes+page-1)/page));
     for(const auto& range:ranges){
-        const auto begin=reinterpret_cast<std::uintptr_t>(
-            runtime.model->data+range.offset);
+        const auto begin=reinterpret_cast<std::uintptr_t>(range.base+range.offset);
         const auto end=begin+range.bytes;
         const auto aligned_begin=begin-(begin%page);
         const auto aligned_end=((end+page-1)/page)*page;
