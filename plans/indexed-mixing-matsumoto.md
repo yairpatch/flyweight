@@ -155,6 +155,47 @@ Reference-driven, correctness only. Build the llama.cpp `deepseek4` fork locally
 dump per-layer activations on a fixed short prompt; every sub-step below is landed against
 that dump rather than by inspection.
 
+### Grounded facts (from upstream llama.cpp and the checkpoint's own shapes)
+
+`deepseek4` is in upstream `ggml-org/llama.cpp` master; the reference is built at
+`/home/yair/Desktop/llama.cpp-ref` (CPU-only) with `llama-eval-callback` for
+per-tensor dumps. Tokenization is already verified byte-identical against it.
+
+Layer layout, read off the checkpoint: ratios are `0, 0` then `4, 128` alternating
+through layer 42 (so 42 is a 4). Blocks 0–2 are the hash layers. The three trailing
+ratio entries are `0, 0, 0` for the draft blocks.
+
+Per-block tensors and what their shapes imply (4096 hidden, 64 heads):
+
+- MLA: `attn_q_a` 4096→1024, `attn_q_b` 1024→32768 (64 heads x 512), `attn_kv`
+  4096→512 shared by every head, `attn_kv_a_norm` 512, `attn_sinks` 64 (one
+  learned sink logit per head), output as `attn_output_a` 4096→8192 and
+  `attn_output_b` 8192→4096, where 8192 = `output_group_count` 8 x
+  `output_lora_rank` 1024.
+- Hyper-connections: `hc_{attn,ffn}_fn` is `[hc*n_embd, (2+hc)*hc]` = 16384x24,
+  `hc_*_base` 24, `hc_*_scale` 3. The head's `output_hc_fn` is 16384x4 with a
+  1-wide scale, because it only needs the pre-weights.
+- Compressors: width is `coff * 512` with `coff = 2` when the ratio is 4 and 1
+  otherwise, and `attn_compressor_ape` is `[width, ratio]` — one position
+  embedding per slot within a compressed block. Indexer compressors are the same
+  shape at width `2 * 128`.
+- Routing: blocks 0–2 carry an int32 `ffn_gate_tid2eid` `[6, 129280]`; blocks 3+
+  carry `exp_probs_b.bias` 256 instead.
+
+Hyper-connection maths, transcribed from `src/models/deepseek4.cpp`:
+
+    flat      = reshape(x, [hc*n_embd, nt])          # x is [n_embd, hc, nt]
+    mixes     = hc_fn @ rms_norm(flat)               # [24, nt]
+    pre       = sigmoid(mixes[0:4]  * scale[0] + base[0:4])  + eps
+    post      = sigmoid(mixes[4:8]  * scale[1] + base[4:8])  * 2
+    comb      = sinkhorn(reshape(mixes[8:24] * scale[2] + base[8:24], [hc, hc, nt]))
+    block_in  = sum_h x[:, h, :] * pre[h]
+    x_out[dst]= block_out * post[dst] + sum_src x[:, src, :] * comb[dst, src]
+
+`sinkhorn` is softmax over dst, then `+eps`, then one column normalization,
+then 19 further (row, column) pairs — 20 iterations total, dividing by sums that
+each have `eps` added.
+
 Order of work, each diffed against the reference before moving on:
 
 1. Hyper-connections: 4-stream expand, col-norm-first Sinkhorn (20 iterations, ε 1e-6),
