@@ -245,6 +245,31 @@ Also worth noting for the attention core: keys and values are the same tensor,
 so there is one K cache and no V cache, and each head's sink logit joins the
 softmax without contributing a value.
 
+### What the compressed kinds still need
+
+The kernels are in place; what is missing is state, not arithmetic.
+
+**HCA (ratio 128) needs no new attention kernel.** It concatenates the raw
+sliding-window K cache with the compressed-block cache along the position axis,
+concatenates their masks the same way, and runs one attention over the union.
+That is the existing `attention()` given a longer latent array and mask, so the
+work is entirely in maintaining the two caches.
+
+**CSA (ratio 4) adds the lightning indexer** on top of the same shape: a
+separate small projection (`indexer.proj`, `indexer.attn_q_b`) with its own
+compressors and K cache produces a score per compressed token, top-k selects
+which ones the main attention may see, and the mask is built from that
+selection. `indexer_top_k` is 512, so it only bites past 512 compressed tokens.
+
+**A Hadamard rotation wraps the compressed path.** Where `attn_inp_k_rot` is
+present the reference rotates q and kv through it before attention and rotates
+the output back. Being orthogonal it leaves the scores unchanged in exact
+arithmetic; the point is the cache, since the stored latents are the rotated
+ones and the rotation spreads quantization error evenly across channels. That
+makes it a no-op to skip while the cache is f32 and a correctness requirement
+once it is not -- worth knowing before choosing a cache type, and the same
+motivation as the existing turboquant work.
+
 Order of work, each diffed against the reference before moving on:
 
 1. Hyper-connections: 4-stream expand, col-norm-first Sinkhorn (20 iterations, ε 1e-6),
