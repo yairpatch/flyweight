@@ -53,6 +53,33 @@ def grouped_matvec(
     return output
 
 
+def rope(
+    values: np.ndarray,
+    position: int,
+    rope_dim: int,
+    *,
+    freq_base: float,
+    freq_scale: float = 1.0,
+    inverse: bool = False,
+) -> np.ndarray:
+    """Rotate the trailing `rope_dim` of each row at `position`.
+
+    Which frequency base and scaling apply depends on the layer kind, so both
+    are the caller's to supply.
+    """
+    values = np.ascontiguousarray(values, dtype=np.float32).copy()
+    rows = 1 if values.ndim == 1 else int(np.prod(values.shape[:-1]))
+    stride = values.shape[-1]
+    library = _library()
+    status = library.colibri_v2_deepseek4_rope(
+        _pointer(values), stride, rope_dim, rows, position,
+        freq_base, freq_scale, 1 if inverse else 0,
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"rope failed").decode(errors="replace"))
+    return values
+
+
 def attention(
     queries: np.ndarray,
     latents: np.ndarray,

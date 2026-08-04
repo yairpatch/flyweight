@@ -219,6 +219,32 @@ reshape, so some geometric relationship beyond the two already preserved
 required. Worth finishing, but the real-checkpoint loop is unblocked and is what
 the components are being diffed against for now.
 
+### Corrections to earlier assumptions, from the reference and the dumps
+
+Three things this plan originally got wrong, each found by checking rather than
+by reading:
+
+- **RoPE configuration is per layer, not global.** `use_compress_rope` is
+  `compress_ratios[il] != 0`, so layers 0 and 1 rotate at the model's own
+  `rope.freq_base` (10000) with no scaling and no YaRN at all, while the
+  compressed blocks use `attention.compress_rope_freq_base` (160000) *with*
+  YaRN. The plan's "YaRN scaling at factor 16" is right only for the latter.
+  The attn factor the reference passes there,
+  `1/(1 + 0.1*ln(1/freq_scale))`, exactly cancels the one ggml applies
+  internally, so the net magnitude scaling is 1.
+- **The router is `sqrt(softplus(logits))`, not sigmoid.** `expert_gating_func`
+  4 and the DeepSeek-V3 precedent both suggested sigmoid; the graph shows
+  `ffn_moe_probs = SQRT(SOFTPLUS(ffn_moe_logits))`. The existing
+  sigmoid-with-bias router kernel is therefore not reusable as-is.
+- **Hash layers do not compute a routing decision at all.** Blocks 0-2 do
+  `ffn_moe_topk = GET_ROWS(ffn_gate_tid2eid, inp_tokens)`: the expert ids come
+  straight out of the int32 table indexed by token id, so there is no router
+  arithmetic to match, only a lookup.
+
+Also worth noting for the attention core: keys and values are the same tensor,
+so there is one K cache and no V cache, and each head's sink logit joins the
+softmax without contributing a value.
+
 Order of work, each diffed against the reference before moving on:
 
 1. Hyper-connections: 4-stream expand, col-norm-first Sinkhorn (20 iterations, ε 1e-6),

@@ -252,6 +252,10 @@ COLIBRI_V2_API int colibri_v2_matvec(const ColibriV2Model* model, const char* na
    of the tensor's output rows. */
 COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const char* name,
     const float* input, int32_t inputs, float* output, int32_t rank, int32_t groups);
+/* Rotary embedding over the trailing `rope_dim` of each of `count` rows of
+   `stride`. Adjacent-pair layout. `inverse` undoes the rotation. */
+COLIBRI_V2_API int colibri_v2_deepseek4_rope(float* values, int32_t stride, int32_t rope_dim,
+    int32_t count, int32_t position, float freq_base, float freq_scale, int32_t inverse);
 /* Attention over the shared KV latent, with one sink logit per head. `sinks`
    and `mask` may be NULL. */
 COLIBRI_V2_API int colibri_v2_deepseek4_attention(const float* queries, const float* latents,

@@ -144,6 +144,35 @@ inline void hyper_connection_combine(
     }
 }
 
+// Rotary embedding over the trailing `rope_dim` of a row, pairing adjacent
+// elements (ggml's NORM layout, which is what this architecture selects).
+//
+// Which parameters apply is per layer, not global: a block whose compress ratio
+// is zero rotates at the model's own frequency base with no scaling, while the
+// compressed blocks use a separate, much larger base together with YaRN. Passing
+// `freq_scale` of 1 and no YaRN gives the first; the caller decides.
+//
+// `inverse` undoes the rotation, which the output path needs before projecting.
+inline void rope(
+    float* values,
+    std::size_t rope_dim,
+    std::int32_t position,
+    float freq_base,
+    float freq_scale,
+    bool inverse
+) {
+    for (std::size_t i = 0; i + 1 < rope_dim; i += 2) {
+        const float exponent = -static_cast<float>(i) / static_cast<float>(rope_dim);
+        const float theta = static_cast<float>(position) * std::pow(freq_base, exponent) * freq_scale;
+        const float cosine = std::cos(theta);
+        const float sine = inverse ? -std::sin(theta) : std::sin(theta);
+        const float first = values[i];
+        const float second = values[i + 1];
+        values[i] = first * cosine - second * sine;
+        values[i + 1] = first * sine + second * cosine;
+    }
+}
+
 // Attention over the shared KV latent, with one learned sink logit per head.
 //
 // This is MLA in absorbed form: keys and values are the same tensor, one

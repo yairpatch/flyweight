@@ -3603,6 +3603,20 @@ int colibri_v2_grouped_matvec(
         });
     return 0;});}
 
+// Rotary embedding over `count` rows, each `stride` wide, rotating the trailing
+// `rope_dim` elements at `position`.
+int colibri_v2_deepseek4_rope(
+    float* values, int32_t stride, int32_t rope_dim, int32_t count,
+    int32_t position, float freq_base, float freq_scale, int32_t inverse
+){return guarded([&]{
+    if(!values||stride<=0||rope_dim<=0||rope_dim>stride||count<=0)
+        throw std::runtime_error("rope arguments are invalid");
+    for(std::int32_t row=0;row<count;++row)
+        colibri::v2::deepseek4::rope(
+            values+static_cast<std::size_t>(row)*stride+(stride-rope_dim),
+            static_cast<std::size_t>(rope_dim),position,freq_base,freq_scale,inverse!=0);
+    return 0;});}
+
 // Attention over the shared KV latent with per-head sink logits.
 int colibri_v2_deepseek4_attention(
     const float* queries, const float* latents, const float* sinks,
