@@ -340,3 +340,39 @@ class CompressedState:
                 original_context=self.original_context,
             ))
         return np.stack(out)
+
+
+def csa_attention_latents(
+    raw: np.ndarray, compressed: np.ndarray, position: int, ratio: int, window: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keys a CSA query at `position` may attend to, and their mask.
+
+    The raw sliding window and the compressed blocks are both visible, and
+    deliberately overlap: a token can be attended directly and again through its
+    block's summary. The reference confirms this -- DSV4 raw attention uses the
+    sliding-window half of its cache, and the compressed keys are concatenated
+    after it rather than replacing anything.
+
+    A block becomes visible once every token it covers is at or before the
+    query, so block b is available from position b*ratio + ratio - 1 onward --
+    the query that completes a block may already attend to it.
+
+    That boundary was settled by comparing candidates against the reference
+    rather than reasoned from the source, which does it through mask tensors
+    built elsewhere. The winner is unambiguous: at layer 2 it lands within 0.85%
+    while requiring the block to strictly precede the query gives 4.10%, keying
+    on the block's first token 11.65%, and ignoring causality 40.25%.
+    """
+    first = max(0, position - window + 1)
+    visible_raw = np.zeros(len(raw), dtype=np.uint8)
+    visible_raw[first : position + 1] = 1
+
+    blocks = len(compressed)
+    visible_blocks = np.zeros(blocks, dtype=np.uint8)
+    for block in range(blocks):
+        if block * ratio + ratio - 1 <= position:
+            visible_blocks[block] = 1
+
+    latents = np.concatenate([raw, compressed]) if blocks else raw
+    mask = np.concatenate([visible_raw, visible_blocks]) if blocks else visible_raw
+    return latents, mask

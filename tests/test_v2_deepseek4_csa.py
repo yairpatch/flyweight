@@ -129,3 +129,44 @@ class CsaCompressorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+class CsaVisibilityTests(unittest.TestCase):
+    """Which keys a CSA query may attend to.
+
+    The raw window and the compressed blocks overlap on purpose: a token can be
+    attended directly and again through its block's summary. A block becomes
+    visible once every token it covers is at or before the query.
+    """
+
+    def setUp(self):
+        from colibri_next.deepseek4_layer import csa_attention_latents
+        self.latents = csa_attention_latents
+
+    def test_a_block_is_visible_from_the_query_that_completes_it(self):
+        raw = np.zeros((10, 4), dtype=np.float32)
+        compressed = np.zeros((2, 4), dtype=np.float32)
+        for position, expected in enumerate([0, 0, 0, 1, 1, 1, 1, 2, 2, 2]):
+            with self.subTest(position=position):
+                _, mask = self.latents(raw, compressed, position, 4, 128)
+                self.assertEqual(int(mask[len(raw):].sum()), expected)
+
+    def test_raw_keys_stay_causal(self):
+        raw = np.zeros((10, 4), dtype=np.float32)
+        compressed = np.zeros((2, 4), dtype=np.float32)
+        for position in range(10):
+            _, mask = self.latents(raw, compressed, position, 4, 128)
+            self.assertEqual(int(mask[: len(raw)].sum()), position + 1)
+
+    def test_the_window_bounds_the_raw_keys(self):
+        raw = np.zeros((10, 4), dtype=np.float32)
+        _, mask = self.latents(raw, np.zeros((0, 4), np.float32), 9, 4, 3)
+        # Window three means positions 7, 8, 9.
+        self.assertEqual(int(mask.sum()), 3)
+
+    def test_with_no_complete_blocks_only_raw_keys_are_offered(self):
+        raw = np.zeros((3, 4), dtype=np.float32)
+        latents, mask = self.latents(raw, np.zeros((0, 4), np.float32), 2, 4, 128)
+        self.assertEqual(len(latents), 3)
+        self.assertEqual(len(mask), 3)
