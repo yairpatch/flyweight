@@ -25,7 +25,7 @@ import unittest
 
 import numpy as np
 
-from colibri_next.deepseek4_layer import SlidingWindowBlock
+from colibri_next.deepseek4_layer import DeepSeek4Block
 from colibri_next.v2 import V2Model
 
 CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
@@ -52,12 +52,12 @@ WEIGHT_SUM = 15.0
 
 
 @unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
-class SlidingWindowBlockTests(unittest.TestCase):
+class DeepSeek4BlockTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = V2Model(CHECKPOINT)
         cls.tokens = list(cls.model.tokenize(PROMPT))
-        cls.block = SlidingWindowBlock(cls.model, 0)
+        cls.block = DeepSeek4Block(cls.model, 0)
         streams = np.stack([
             np.repeat(
                 np.asarray(

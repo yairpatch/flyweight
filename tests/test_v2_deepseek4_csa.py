@@ -27,7 +27,7 @@ import unittest
 import numpy as np
 
 from colibri_next.deepseek4 import rms_norm
-from colibri_next.deepseek4_layer import CompressedState, SlidingWindowBlock, _f32
+from colibri_next.deepseek4_layer import CompressedState, DeepSeek4Block, _f32
 from colibri_next.v2 import V2Model
 
 CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
@@ -47,7 +47,7 @@ class CsaCompressorTests(unittest.TestCase):
     def setUpClass(cls):
         cls.model = V2Model(CHECKPOINT)
         cls.tokens = list(cls.model.tokenize(PROMPT))
-        first = SlidingWindowBlock(cls.model, 0)
+        first = DeepSeek4Block(cls.model, 0)
         streams = np.stack([
             np.repeat(
                 np.asarray(cls.model.qwen_embedding(t, first.n_embd), dtype=np.float32)[None, :],
@@ -56,9 +56,9 @@ class CsaCompressorTests(unittest.TestCase):
             for t in cls.tokens
         ])
         streams, _ = first.forward(streams, cls.tokens)
-        streams, _ = SlidingWindowBlock(cls.model, 1).forward(streams, cls.tokens)
+        streams, _ = DeepSeek4Block(cls.model, 1).forward(streams, cls.tokens)
 
-        block = SlidingWindowBlock(cls.model, 2)
+        block = DeepSeek4Block(cls.model, 2)
         mixes = [block._mix(streams[p], block.hc_attn) for p in range(len(cls.tokens))]
         cls.hidden = np.stack([
             rms_norm(m.collapsed, block.attn_norm, epsilon=block.epsilon) for m in mixes

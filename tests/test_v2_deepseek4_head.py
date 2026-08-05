@@ -24,7 +24,7 @@ import unittest
 import numpy as np
 
 from colibri_next.deepseek4 import head_collapse, matvec, rms_norm
-from colibri_next.deepseek4_layer import SlidingWindowBlock, _f32
+from colibri_next.deepseek4_layer import DeepSeek4Block, _f32
 from colibri_next.v2 import V2Model
 
 CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
@@ -38,7 +38,7 @@ class OutputHeadTests(unittest.TestCase):
     def setUpClass(cls):
         cls.model = V2Model(CHECKPOINT)
         cls.tokens = list(cls.model.tokenize(PROMPT))
-        block = SlidingWindowBlock(cls.model, 0)
+        block = DeepSeek4Block(cls.model, 0)
         cls.n_embd = block.n_embd
         cls.hc = block.hc
         cls.vocabulary = int(cls.model.config["vocabulary_size"])

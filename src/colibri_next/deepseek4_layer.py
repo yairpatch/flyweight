@@ -19,6 +19,7 @@ import numpy as np
 
 from colibri_next.deepseek4 import (
     attention,
+    head_collapse,
     compress,
     expert_matvec,
     grouped_matvec,
@@ -70,8 +71,15 @@ class BlockTrace:
     output: np.ndarray
 
 
-class SlidingWindowBlock:
-    """One ratio-0 block, holding the weights it needs."""
+class DeepSeek4Block:
+    """One block of any kind, holding the weights it needs.
+
+    The kind is set by the layer's compress ratio: 0 is a plain sliding window,
+    4 is compressed sparse attention, 128 is heavily compressed. All three share
+    the same latent attention and feed-forward; they differ in which keys the
+    query may see and, for a non-zero ratio, in which rotation the query and key
+    take -- the compressed frequency base with YaRN rather than the model's own.
+    """
 
     def __init__(self, model, layer: int):
         self.model = model
@@ -95,6 +103,24 @@ class SlidingWindowBlock:
         self.window = int(config["sliding_window"]) or None
         self.hashed = layer < int(config["hash_layer_count"])
         self.clamp = 10.0
+        ratios = model.compress_ratios
+        self.ratio = int(ratios[layer]) if layer < len(ratios) else 0
+        # A non-zero ratio moves the query and key rotation onto the compressed
+        # frequency base with YaRN. This follows the reference rather than
+        # measurement: at short prompt lengths the two are hard to tell apart.
+        if self.ratio:
+            factor = float(config["rope_scaling_factor"]) if "rope_scaling_factor" in config else 16.0
+            scale = 1.0 / factor
+            self.rope_kwargs = dict(
+                freq_base=float(config["compress_rope_freq_base"]),
+                freq_scale=scale,
+                ext_factor=1.0,
+                attn_factor=1.0 / (1.0 + 0.1 * float(np.log(1.0 / scale))),
+                original_context=65536,
+            )
+        else:
+            self.rope_kwargs = dict(freq_base=self.freq_base)
+        self.compressor = CompressedState(model, layer, self.ratio) if self.ratio == 4 else None
 
         prefix = f"blk.{layer}."
         mix = (2 + self.hc) * self.hc
@@ -171,7 +197,7 @@ class SlidingWindowBlock:
                 self.heads * self.head_dim,
             ).reshape(self.heads, self.head_dim)
             query = rms_norm(query, None, epsilon=self.epsilon)
-            queries.append(rope(query, position, self.rope_dim, freq_base=self.freq_base))
+            queries.append(rope(query, position, self.rope_dim, **self.rope_kwargs))
 
             latent = rms_norm(
                 matvec(self.model, prefix + "attn_kv.weight", normed, self.head_dim),
@@ -179,24 +205,39 @@ class SlidingWindowBlock:
             )
             # The cache holds f16, and the reference's own numbers reflect that.
             latents.append(
-                rope(latent, position, self.rope_dim, freq_base=self.freq_base)
+                rope(latent, position, self.rope_dim, **self.rope_kwargs)
                 .astype(np.float16).astype(np.float32)
             )
         latents = np.stack(latents)
 
+        # A compressed layer summarizes completed blocks; below its ratio there
+        # are none, which is why a short prompt runs a 128:1 layer as a plain
+        # sliding window.
+        compressed = (
+            self.compressor.compress_blocks(
+                np.stack([
+                    rms_norm(m.collapsed, self.attn_norm, epsilon=self.epsilon)
+                    for m in attn_mix
+                ])
+            ).astype(np.float16).astype(np.float32)
+            if self.compressor is not None
+            else np.zeros((0, self.head_dim), dtype=np.float32)
+        )
+
         raw, deroped, outputs = [], [], []
         for position in range(positions):
-            visible = np.zeros(positions, dtype=np.uint8)
-            first = 0 if self.window is None else max(0, position - self.window + 1)
-            visible[first : position + 1] = 1
+            keys, visible = csa_attention_latents(
+                latents, compressed, position, max(self.ratio, 1),
+                self.window or positions,
+            )
             out = attention(
-                queries[position], latents, self.sinks,
+                queries[position], keys, self.sinks,
                 scale=float(self.head_dim) ** -0.5, mask=visible,
             )
             raw.append(out)
             # Undo the rotation before projecting.
             back = rope(
-                out, position, self.rope_dim, freq_base=self.freq_base, inverse=True
+                out, position, self.rope_dim, inverse=True, **self.rope_kwargs
             )
             deroped.append(back)
             grouped = grouped_matvec(
@@ -376,3 +417,50 @@ def csa_attention_latents(
     latents = np.concatenate([raw, compressed]) if blocks else raw
     mask = np.concatenate([visible_raw, visible_blocks]) if blocks else visible_raw
     return latents, mask
+
+
+class DeepSeek4Model:
+    """Every block, then the output head. Clarity over speed.
+
+    One token at a time, nothing cached between calls, no batching -- this is
+    the known-good answer the runtime path gets built against, not the runtime
+    path itself.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        config = model.config
+        self.n_embd = int(config["hidden_size"])
+        self.hc = int(config["hyper_connection_count"])
+        self.layers = int(config["layer_count"])
+        self.vocabulary = int(config["vocabulary_size"])
+        self.epsilon = float(config["rms_norm_epsilon"])
+        self.blocks = [DeepSeek4Block(model, layer) for layer in range(self.layers)]
+        self.head_fn = _f32(model, "output_hc_fn.weight").reshape(
+            self.hc, self.hc * self.n_embd
+        )
+        self.head_scale = _f32(model, "output_hc_scale.weight")
+        self.head_base = _f32(model, "output_hc_base.weight")
+        self.output_norm = _f32(model, "output_norm.weight")
+
+    def forward(self, tokens: list[int], *, last_only: bool = True) -> np.ndarray:
+        """Return logits, for the final position by default."""
+        streams = np.stack([
+            np.repeat(
+                np.asarray(self.model.qwen_embedding(token, self.n_embd), dtype=np.float32)[None, :],
+                self.hc, axis=0,
+            )
+            for token in tokens
+        ])
+        for block in self.blocks:
+            streams, _ = block.forward(streams, tokens)
+        positions = [len(tokens) - 1] if last_only else range(len(tokens))
+        out = []
+        for position in positions:
+            _, collapsed = head_collapse(
+                streams[position], self.head_fn, self.head_scale, self.head_base,
+                rms_epsilon=self.epsilon, hc_epsilon=self.epsilon,
+            )
+            normed = rms_norm(collapsed, self.output_norm, epsilon=self.epsilon)
+            out.append(matvec(self.model, "output.weight", normed, self.vocabulary))
+        return out[0] if last_only else np.stack(out)
