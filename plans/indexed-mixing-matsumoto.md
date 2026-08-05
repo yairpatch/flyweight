@@ -37,9 +37,14 @@ col-norm-first Sinkhorn router. That port is ~1500 lines of model code plus five
 ops with hand-written kernels; there are three K caches in flight per layer.
 
 Hardware reality on this box (60 GB RAM, 12 GB VRAM, 184 GB free disk): 104 GB cannot be
-resident. It must run mmap'd off NVMe with experts paged per token (~3 GB of expert reads
-per decode step), so ~1–2 tok/s is the ceiling even when everything is correct. Decision
-taken: correctness first, paging throughput is a separate problem later.
+resident. It must run mmap'd off NVMe with experts paged per token. Decision taken:
+correctness first, paging throughput is a separate problem later.
+
+The throughput estimate in this plan was ~1-2 tok/s. Measured, it is not: the reference
+implementation on this machine does 0.37 tok/s on prompt eval and 0.42 tok/s generating,
+with a 76-second model load, so the original figure was optimistic by three to five times.
+Anything built against the 1-2 tok/s number -- timeouts, batch sizing, what counts as an
+acceptable first response -- should be revisited against 0.4.
 
 Work lands in gated stages; each stage is independently useful and mergeable.
 
