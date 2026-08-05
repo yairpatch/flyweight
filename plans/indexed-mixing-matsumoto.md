@@ -40,11 +40,23 @@ Hardware reality on this box (60 GB RAM, 12 GB VRAM, 184 GB free disk): 104 GB c
 resident. It must run mmap'd off NVMe with experts paged per token. Decision taken:
 correctness first, paging throughput is a separate problem later.
 
-The throughput estimate in this plan was ~1-2 tok/s. Measured, it is not: the reference
-implementation on this machine does 0.37 tok/s on prompt eval and 0.42 tok/s generating,
-with a 76-second model load, so the original figure was optimistic by three to five times.
-Anything built against the 1-2 tok/s number -- timeouts, batch sizing, what counts as an
-acceptable first response -- should be revisited against 0.4.
+Throughput here is not a single number, and measuring it once gives the wrong one. On the
+reference implementation:
+
+- A cold one-shot run -- load, short prompt, six tokens -- gives 0.37 tok/s prompt eval and
+  0.42 tok/s generating, after a 76-second load.
+- The same machine serving successive requests reaches 1.81, then 2.75, then 3.22 tok/s
+  generating, with prompt eval climbing 0.53 -> 1.20 -> 1.69 over the same three requests.
+
+The difference is page-cache warmth and graph reuse, not variance: reused graphs went 128 ->
+245 -> 425 across those requests while the expert weights settled into cache. The steady
+state is roughly 3 tok/s, which is usable; the cold figure is not representative of
+anything except the first request after a boot.
+
+The lesson generalizes past this model, and this project has already written it down once
+for GPU clock ramp: take throughput at steady state over sustained work, never from a cold
+one-shot run. An earlier revision of this plan recorded 0.4 tok/s as the real number on the
+strength of exactly such a run, which was wrong by nearly an order of magnitude.
 
 Work lands in gated stages; each stage is independently useful and mergeable.
 
