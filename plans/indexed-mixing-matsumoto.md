@@ -245,6 +245,30 @@ Also worth noting for the attention core: keys and values are the same tensor,
 so there is one K cache and no V cache, and each head's sink logit joins the
 softmax without contributing a value.
 
+### Short prompts do not exercise most of the compressed machinery
+
+A block only compresses once `ratio` tokens have accumulated, so on a prompt
+shorter than the ratio nothing is compressed and the compressed cache stays
+empty. For HCA that ratio is 128, and the sliding window is also 128, so on any
+prompt below 128 tokens an HCA layer attends to exactly the raw window. Confirmed
+against the dump: layer 3 still projects and stores its per-token compressor
+state into the 128-slot buffer, but its attention is `FLASH_ATTN_EXT` over
+`cache_k` alone, with no compressed keys concatenated. Twenty-one of the 43
+layers are HCA, so on a short prompt they need the state bookkeeping and no
+compressed-attention path at all.
+
+CSA is the one that bites early: at ratio 4 a ten-token prompt already completes
+two blocks. Its indexer, though, selects the top 512 compressed tokens and there
+are two, so selection is a no-op at that length -- the compressed latents still
+have to be computed correctly, but the top-k path is not being tested by a short
+prompt even when it runs.
+
+The consequence for bring-up: a first full-model run on a short prompt needs the
+CSA compressor and nothing else of the compressed machinery, and passing it says
+nothing about HCA compression, the indexer's selection, or eviction. Those need
+a prompt of at least a few hundred tokens, which is worth arranging deliberately
+rather than assuming the short-prompt result generalizes.
+
 ### What the compressed kinds still need
 
 The kernels are in place; what is missing is state, not arithmetic.
