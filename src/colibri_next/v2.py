@@ -440,6 +440,8 @@ def _library() -> ctypes.CDLL:
                 lib.colibri_v2_deepseek4_rope.argtypes = [
                     _float_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
                     ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    ctypes.c_int32,
                 ]
                 lib.colibri_v2_deepseek4_rope.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_head.argtypes = [

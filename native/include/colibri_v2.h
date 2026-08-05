@@ -275,7 +275,9 @@ COLIBRI_V2_API int colibri_v2_deepseek4_swiglu(const float* gate, const float* u
 /* Rotary embedding over the trailing `rope_dim` of each of `count` rows of
    `stride`. Adjacent-pair layout. `inverse` undoes the rotation. */
 COLIBRI_V2_API int colibri_v2_deepseek4_rope(float* values, int32_t stride, int32_t rope_dim,
-    int32_t count, int32_t position, float freq_base, float freq_scale, int32_t inverse);
+    int32_t count, int32_t position, float freq_base, float freq_scale, int32_t inverse,
+    float ext_factor, float attn_factor, float beta_fast, float beta_slow,
+    int32_t original_context);
 /* Attention over the shared KV latent, with one sink logit per head. `sinks`
    and `mask` may be NULL. */
 COLIBRI_V2_API int colibri_v2_deepseek4_attention(const float* queries, const float* latents,

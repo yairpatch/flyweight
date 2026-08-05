@@ -19,6 +19,7 @@ import numpy as np
 
 from colibri_next.deepseek4 import (
     attention,
+    compress,
     expert_matvec,
     grouped_matvec,
     hyper_connection,
@@ -257,3 +258,85 @@ def hyper_connection_combine_wrapper(mix, block_output, streams):
             value = value + streams[src] * mix.comb[src, dst]
         result[dst] = value
     return result
+
+
+class CompressedState:
+    """The per-layer compressor for a CSA (ratio 4) block.
+
+    Each token projects to a state row twice the latent width: a "prev" half and
+    a "cur" half. A block pools eight entries -- the previous `ratio` tokens'
+    prev halves followed by its own `ratio` tokens' cur halves -- which is the
+    overlap the architecture describes as keeping a window of the last eight
+    tokens at each four-token boundary. Before the sequence starts there is no
+    previous block, so those rows read a padding entry whose value is zero and
+    whose score is -inf, contributing nothing to the softmax.
+
+    The compressed latent is then normalized, and its rope half rotated at the
+    *block* index using the compressed frequency base with YaRN -- a different
+    rotation from the one the raw tokens get.
+    """
+
+    def __init__(self, model, layer: int, ratio: int):
+        config = model.config
+        self.model = model
+        self.layer = layer
+        self.ratio = ratio
+        self.head_dim = int(config["kv_lora_rank"])
+        self.rope_dim = int(config["rotary_dimension"])
+        self.width = 2 * self.head_dim
+        self.epsilon = float(config["rms_norm_epsilon"])
+        self.freq_base = float(config["compress_rope_freq_base"])
+        factor = float(config.get("rope_scaling_factor", 0.0)) or 1.0
+        self.freq_scale = 1.0 / factor
+        # The reference passes an attenuation that exactly cancels the one ggml
+        # applies for YaRN, leaving the magnitude unscaled.
+        self.attn_factor = 1.0 / (1.0 + 0.1 * float(np.log(1.0 / self.freq_scale)))
+        self.original_context = int(config["rope_original_context_length"]) \
+            if "rope_original_context_length" in config else 65536
+        prefix = f"blk.{layer}."
+        self.norm = _f32(model, prefix + "attn_compressor_norm.weight")
+        self.ape = _f32(model, prefix + "attn_compressor_ape.weight").reshape(
+            ratio, self.width
+        )
+
+    def states(self, hidden: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Project every token to its compressor state, with the slot embedding."""
+        prefix = f"blk.{self.layer}."
+        values, scores = [], []
+        for position, vector in enumerate(hidden):
+            values.append(matvec(self.model, prefix + "attn_compressor_kv.weight", vector, self.width))
+            score = matvec(self.model, prefix + "attn_compressor_gate.weight", vector, self.width)
+            scores.append(score + self.ape[position % self.ratio])
+        return np.stack(values), np.stack(scores)
+
+    def compress_blocks(self, hidden: np.ndarray) -> np.ndarray:
+        """Compress every complete block; returns [blocks, head_dim]."""
+        blocks = len(hidden) // self.ratio
+        if blocks == 0:
+            # Nothing to pool, and projecting the partial block would be wasted
+            # work: it only matters once its remaining tokens arrive.
+            return np.zeros((0, self.head_dim), dtype=np.float32)
+        values, scores = self.states(hidden)
+        out = []
+        for block in range(blocks):
+            pooled_values = np.zeros((2 * self.ratio, self.head_dim), dtype=np.float32)
+            pooled_scores = np.full((2 * self.ratio, self.head_dim), -np.inf, dtype=np.float32)
+            for slot in range(self.ratio):
+                previous = (block - 1) * self.ratio + slot
+                if previous >= 0:
+                    # The prev half is the first `head_dim` of the state row.
+                    pooled_values[slot] = values[previous][: self.head_dim]
+                    pooled_scores[slot] = scores[previous][: self.head_dim]
+                current = block * self.ratio + slot
+                # The cur half is the second.
+                pooled_values[self.ratio + slot] = values[current][self.head_dim :]
+                pooled_scores[self.ratio + slot] = scores[current][self.head_dim :]
+            pooled = compress(pooled_values, pooled_scores)
+            pooled = rms_norm(pooled, self.norm, epsilon=self.epsilon)
+            out.append(rope(
+                pooled, block, self.rope_dim,
+                freq_base=self.freq_base, freq_scale=self.freq_scale,
+                ext_factor=1.0, attn_factor=self.attn_factor,
+                original_context=self.original_context,
+            ))
+        return np.stack(out)

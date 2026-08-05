@@ -3715,14 +3715,19 @@ int colibri_v2_deepseek4_swiglu(
 // `rope_dim` elements at `position`.
 int colibri_v2_deepseek4_rope(
     float* values, int32_t stride, int32_t rope_dim, int32_t count,
-    int32_t position, float freq_base, float freq_scale, int32_t inverse
+    int32_t position, float freq_base, float freq_scale, int32_t inverse,
+    float ext_factor, float attn_factor, float beta_fast, float beta_slow,
+    int32_t original_context
 ){return guarded([&]{
     if(!values||stride<=0||rope_dim<=0||rope_dim>stride||count<=0)
         throw std::runtime_error("rope arguments are invalid");
+    colibri::v2::deepseek4::YarnParameters yarn{
+        ext_factor,attn_factor,beta_fast,beta_slow,
+        static_cast<std::uint32_t>(original_context<0?0:original_context)};
     for(std::int32_t row=0;row<count;++row)
         colibri::v2::deepseek4::rope(
             values+static_cast<std::size_t>(row)*stride+(stride-rope_dim),
-            static_cast<std::size_t>(rope_dim),position,freq_base,freq_scale,inverse!=0);
+            static_cast<std::size_t>(rope_dim),position,freq_base,freq_scale,inverse!=0,yarn);
     return 0;});}
 
 // Attention over the shared KV latent with per-head sink logits.

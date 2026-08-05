@@ -175,6 +175,11 @@ def rope(
     freq_base: float,
     freq_scale: float = 1.0,
     inverse: bool = False,
+    ext_factor: float = 0.0,
+    attn_factor: float = 1.0,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+    original_context: int = 0,
 ) -> np.ndarray:
     """Rotate the trailing `rope_dim` of each row at `position`.
 
@@ -188,6 +193,7 @@ def rope(
     status = library.colibri_v2_deepseek4_rope(
         _pointer(values), stride, rope_dim, rows, position,
         freq_base, freq_scale, 1 if inverse else 0,
+        ext_factor, attn_factor, beta_fast, beta_slow, original_context,
     )
     if status:
         raise V2Error((library.colibri_v2_last_error() or b"rope failed").decode(errors="replace"))

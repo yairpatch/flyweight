@@ -290,19 +290,65 @@ inline void clamped_swiglu(
 // `freq_scale` of 1 and no YaRN gives the first; the caller decides.
 //
 // `inverse` undoes the rotation, which the output path needs before projecting.
+struct YarnParameters {
+    // Zero ext_factor disables extension entirely, which is what the
+    // uncompressed layers use.
+    float ext_factor = 0.0f;
+    float attn_factor = 1.0f;
+    float beta_fast = 32.0f;
+    float beta_slow = 1.0f;
+    std::uint32_t original_context = 0;
+};
+
+// The dimension at which a wavelength reaches `rotations` full turns within the
+// original context, which is what bounds YaRN's interpolation ramp.
+inline float yarn_correction_dim(
+    float rotations, std::size_t rope_dim, std::uint32_t original_context, float freq_base
+) {
+    return static_cast<float>(rope_dim) *
+        std::log(static_cast<float>(original_context) /
+                 (rotations * 2.0f * 3.14159265358979323846f)) /
+        (2.0f * std::log(freq_base));
+}
+
 inline void rope(
     float* values,
     std::size_t rope_dim,
     std::int32_t position,
     float freq_base,
     float freq_scale,
-    bool inverse
+    bool inverse,
+    const YarnParameters& yarn = {}
 ) {
+    // YaRN blends between interpolating a frequency (scaling the position down)
+    // and leaving it alone, per dimension: fast-rotating dimensions keep their
+    // frequency while slow ones are interpolated, with a ramp between.
+    float low = 0.0f, high = 0.0f;
+    const bool extended = yarn.ext_factor != 0.0f && yarn.original_context > 0;
+    if (extended) {
+        low = std::floor(yarn_correction_dim(
+            yarn.beta_fast, rope_dim, yarn.original_context, freq_base));
+        high = std::ceil(yarn_correction_dim(
+            yarn.beta_slow, rope_dim, yarn.original_context, freq_base));
+        low = std::max(0.0f, low);
+        high = std::min(static_cast<float>(rope_dim) - 1.0f, high);
+    }
+    const float magnitude = extended
+        ? yarn.attn_factor * (1.0f + 0.1f * std::log(1.0f / freq_scale))
+        : yarn.attn_factor;
+
     for (std::size_t i = 0; i + 1 < rope_dim; i += 2) {
         const float exponent = -static_cast<float>(i) / static_cast<float>(rope_dim);
-        const float theta = static_cast<float>(position) * std::pow(freq_base, exponent) * freq_scale;
-        const float cosine = std::cos(theta);
-        const float sine = inverse ? -std::sin(theta) : std::sin(theta);
+        const float extrapolated = static_cast<float>(position) * std::pow(freq_base, exponent);
+        float theta = extrapolated * freq_scale;
+        if (extended) {
+            const float ramp = std::min(1.0f, std::max(0.0f,
+                (static_cast<float>(i) / 2.0f - low) / std::max(0.001f, high - low)));
+            const float mix = (1.0f - ramp) * yarn.ext_factor;
+            theta = theta * (1.0f - mix) + extrapolated * mix;
+        }
+        const float cosine = std::cos(theta) * magnitude;
+        const float sine = (inverse ? -std::sin(theta) : std::sin(theta)) * magnitude;
         const float first = values[i];
         const float second = values[i + 1];
         values[i] = first * cosine - second * sine;
