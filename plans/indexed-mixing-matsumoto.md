@@ -245,6 +245,40 @@ Also worth noting for the attention core: keys and values are the same tensor,
 so there is one K cache and no V cache, and each head's sink logit joins the
 softmax without contributing a value.
 
+### Expert selection diverges from the reference, and probably always will
+
+Running the full stack and comparing block outputs, layers 0-32 agree to within
+7% and the tail then falls apart, reaching 50%. The mechanism is now located but
+not fully settled.
+
+At layer 34 the feed-forward takes an input summing to 151.6 and returns
+-17129 -- a hundredfold gain. Late layers are dominated by a few very large
+channels, so a small relative error upstream swamps the sum downstream.
+
+More importantly, the routed expert *selections* differ from the reference at
+every layer sampled (3, 20, 33, 34, 40), including layer 3 where the block
+output was still within 2.9%. Selection is a top-6 of 256 on scores that are
+often close together, so a one-percent perturbation is enough to swap the sixth
+and seventh choice. The size of the differences -- sums off by 30 to 220, where
+a single swapped id can move the sum by up to 255 -- is consistent with one or
+two swaps out of sixty selections, which is what numerical noise would produce
+rather than a systematic fault.
+
+That has not been proven: distinguishing noise-driven flipping from a router
+defect would need the reference's own hidden state fed through our router, and
+the dump gives sums rather than activations. What is established is that
+selections differ, that the difference is small in count, and that late layers
+amplify whatever it causes.
+
+The consequence for the acceptance criterion is the part worth acting on. This
+runtime dots f32 against dequantized weights where ggml requantizes activations,
+so the two implementations disagree slightly at every matmul by construction.
+Where that disagreement crosses an expert-selection boundary the outputs diverge
+sharply and legitimately. Token-for-token agreement with llama.cpp may therefore
+not be achievable at all, and treating it as the pass mark risks chasing a
+difference that is not a defect. A better bar is coherent output plus agreement
+on most tokens, with the expert-selection rate measured rather than assumed.
+
 ### Short prompts do not exercise most of the compressed machinery
 
 A block only compresses once `ratio` tokens have accumulated, so on a prompt
