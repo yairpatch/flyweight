@@ -304,7 +304,35 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("sampling_gpu_topk_bytes", ctypes.c_uint64),
         ("sampling_full_download_bytes", ctypes.c_uint64),
         ("sampling_nanoseconds", ctypes.c_uint64),
+        ("route_recurrence_observations", ctypes.c_uint64),
+        ("route_recurrence_prev_hits", ctypes.c_uint64),
+        ("route_recurrence_window_hits", ctypes.c_uint64),
+        ("route_recurrence_layer_samples", ctypes.c_uint64),
+        ("route_recurrence_window_experts", ctypes.c_uint64),
+        ("route_recurrence_resident", ctypes.c_uint64),
+        ("route_recurrence_miss_in_window", ctypes.c_uint64),
+        ("route_recurrence_miss_cold", ctypes.c_uint64),
+        ("resolved_cache_type_k", ctypes.c_int32),
+        ("resolved_cache_type_v", ctypes.c_int32),
     ]
+
+
+# KV cache precision codes shared with the native runtime. "auto" is resolved
+# natively at prepare time, where the context limit and every attention layer's
+# head_dim are known -- turbo needs a power-of-two head_dim and raises
+# otherwise, so it cannot be picked blind. See v2_runtime.cpp.
+#
+# "auto" is deliberately NOT the default. It selects turbo4 above 32K, which
+# changes generated tokens, and the regime it switches on in -- long context --
+# is exactly where KV quantization damage concentrates (retrieval and
+# instruction adherence degrade well before fluency does). No long-context
+# quality benchmark has been run, so this stays opt-in, matching llama.cpp
+# (-ctk/-ctv) and vLLM, which both ship an unquantized KV default.
+CACHE_TYPE_CODES = {
+    "f32": 0, "f16": 1, "bf16": 2, "q8_0": 3, "turbo3": 4, "turbo4": 5,
+    "auto": 6,
+}
+CACHE_TYPE_NAMES = {code: name for name, code in CACHE_TYPE_CODES.items()}
 
 
 _TokenCallback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p)
@@ -1715,15 +1743,14 @@ class V2QwenRuntime:
         # turbo3/turbo4 are TurboQuant (arXiv:2504.19874): a fixed rotation plus
         # a Lloyd-Max codebook, at 3.5 and 4.5 bits per value. They need a
         # head_dim that is a power of two between 32 and 512.
-        cache_types = {
-            "f32": 0, "f16": 1, "bf16": 2, "q8_0": 3, "turbo3": 4, "turbo4": 5,
-        }
+        cache_types = CACHE_TYPE_CODES
         if cache_type_k not in cache_types or cache_type_v not in cache_types:
             raise ValueError(
                 "cache_type_k/v must be one of " + ", ".join(sorted(cache_types))
             )
         self.model, self._lib = model, model._lib
         self.parallel_sequences = parallel_sequences
+        self.prompt_cache_mib = prompt_cache_mib
         self.requested_expert_mode = requested_expert_mode
         self.expert_mode = resolved_expert_mode
         self._handle = ctypes.c_void_p()
@@ -1802,6 +1829,12 @@ class V2QwenRuntime:
                     else ""
                 ),
                 "expert_fallback_reason": fallback_reason,
+                "cache_type_k": CACHE_TYPE_NAMES.get(
+                    int(result["resolved_cache_type_k"]), "?"
+                ),
+                "cache_type_v": CACHE_TYPE_NAMES.get(
+                    int(result["resolved_cache_type_v"]), "?"
+                ),
             }
         )
         return result

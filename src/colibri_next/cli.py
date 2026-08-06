@@ -16,7 +16,7 @@ EXPERT_MODE_CHOICES = (
     "cpu", "auto", "resident", "hybrid", "gpu",
     "legacy-paging", "legacy-hybrid",
 )
-KV_TYPES = ("f32", "f16", "bf16", "q8_0", "turbo3", "turbo4")
+KV_TYPES = ("auto", "f32", "f16", "bf16", "q8_0", "turbo3", "turbo4")
 
 
 def _steady_state_counters(start, end):
@@ -28,10 +28,23 @@ def _steady_state_counters(start, end):
         "expert_compute_nanoseconds", "expert_cache_hits",
         "expert_cache_misses", "expert_cache_evictions",
     )
+    # Opt-in probe (COLIBRI_ROUTE_RECURRENCE); absent from older runtimes and
+    # all-zero when it is off, so it is reported only once it has samples.
+    recurrence_fields = (
+        "route_recurrence_observations", "route_recurrence_prev_hits",
+        "route_recurrence_window_hits", "route_recurrence_layer_samples",
+        "route_recurrence_window_experts", "route_recurrence_resident",
+        "route_recurrence_miss_in_window", "route_recurrence_miss_cold",
+    )
     delta = {field: end[field] - start[field] for field in fields}
+    recurrence = {
+        field: end.get(field, 0) - start.get(field, 0)
+        for field in recurrence_fields
+    }
     calls = delta["decode_calls"] or 1
     lookups = delta["expert_cache_hits"] + delta["expert_cache_misses"]
-    return {
+    routes = recurrence["route_recurrence_observations"]
+    summary = {
         "decode_calls": delta["decode_calls"],
         "route_wait_ns_per_token": delta["route_wait_nanoseconds"] / calls,
         "expert_page_ns_per_token": delta["expert_page_nanoseconds"] / calls,
@@ -43,6 +56,24 @@ def _steady_state_counters(start, end):
         "expert_cache_evictions": delta["expert_cache_evictions"],
         "expert_cache_hit_rate": delta["expert_cache_hits"] / (lookups or 1),
     }
+    if routes:
+        summary.update({
+            "route_recurrence_observations": routes,
+            "route_recurrence_prev_rate":
+                recurrence["route_recurrence_prev_hits"] / routes,
+            "route_recurrence_window_rate":
+                recurrence["route_recurrence_window_hits"] / routes,
+            "route_recurrence_window_experts_per_layer":
+                recurrence["route_recurrence_window_experts"] /
+                (recurrence["route_recurrence_layer_samples"] or 1),
+            "route_recurrence_resident_rate":
+                recurrence["route_recurrence_resident"] / routes,
+            "route_recurrence_miss_in_window_rate":
+                recurrence["route_recurrence_miss_in_window"] / routes,
+            "route_recurrence_miss_cold_rate":
+                recurrence["route_recurrence_miss_cold"] / routes,
+        })
+    return summary
 
 
 def _benchmark_native_prefill(runtime, prompt_tokens: list[int]) -> tuple[int, float]:

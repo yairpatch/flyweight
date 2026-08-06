@@ -90,8 +90,8 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint64_t context_limit;
     uint64_t gpu_cache_bytes;
     float expert_top_p; /* 0 or >=1 disables; else keep experts to cumulative router prob p */
-    int32_t cache_type_k; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4 */
-    int32_t cache_type_v; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4 */
+    int32_t cache_type_k; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4, 6=auto */
+    int32_t cache_type_v; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4, 6=auto */
     uint32_t prefill_checkpoint_interval; /* position of the first mid-prefill checkpoint; 0 disables (end snapshots only) */
     uint32_t prefill_checkpoint_slots; /* total prefix-reuse snapshot slots; 0 = default (4) */
     uint32_t parallel_sequences; /* independent KV/decode slots (llama.cpp --parallel); 0/1 = single-sequence */
@@ -222,6 +222,16 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t sampling_gpu_topk_bytes; /* candidate ID/logit bytes downloaded */
     uint64_t sampling_full_download_bytes; /* fallback full-vocabulary bytes downloaded */
     uint64_t sampling_nanoseconds; /* second projection, top-k, transfer, and draw */
+    uint64_t route_recurrence_observations; /* decode routes with a prior token on that layer */
+    uint64_t route_recurrence_prev_hits; /* ...also routed by the immediately previous token */
+    uint64_t route_recurrence_window_hits; /* ...routed by any of the last 4 tokens */
+    uint64_t route_recurrence_layer_samples; /* (token, layer) pairs contributing above */
+    uint64_t route_recurrence_window_experts; /* distinct experts in the window, summed over samples */
+    uint64_t route_recurrence_resident; /* routed experts already in the GPU cache */
+    uint64_t route_recurrence_miss_in_window; /* misses the recency window already knew about */
+    uint64_t route_recurrence_miss_cold; /* misses outside the recency window */
+    int32_t resolved_cache_type_k; /* cache_type_k after `auto` resolution */
+    int32_t resolved_cache_type_v; /* cache_type_v after `auto` resolution */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

@@ -217,11 +217,26 @@ struct QwenPrefillSnapshot {
     bool valid = false;
 };
 
+// How many previously decoded tokens the route-recurrence probe keeps per
+// layer. Depth 1 answers "does token t reuse token t-1's experts"; the deeper
+// slots answer "how much does a small union buy", which is the difference
+// between prefetching a point prediction and prefetching a working set.
+constexpr std::size_t kRouteRecurrenceDepth = 16;
+
 struct QwenExpertPrefetchState {
     std::vector<std::int32_t> previous_layer_route;
     std::vector<std::int32_t> pending_predictions;
     std::uint32_t previous_route_layer =
         std::numeric_limits<std::uint32_t>::max();
+    // Route-recurrence probe (measurement only; nothing reads these to make a
+    // decision). Per layer, a ring of the last kRouteRecurrenceDepth decoded
+    // tokens' route sets: history is layers*depth*stride entries, counts and
+    // the ring cursor/fill are layers*depth and layers respectively.
+    std::vector<std::int32_t> recurrence_history;
+    std::vector<std::uint8_t> recurrence_counts;
+    std::vector<std::uint8_t> recurrence_cursor;
+    std::vector<std::uint8_t> recurrence_filled;
+    std::size_t recurrence_stride = 0;
 };
 
 // One decode sequence: its own attention-KV + DeltaNet state arena plus the
@@ -412,6 +427,23 @@ struct ColibriV2QwenRuntime {
     std::uint64_t next_layer_prefetch_hits = 0;
     std::uint64_t next_layer_prefetch_bytes = 0;
     std::uint64_t next_layer_prefetch_trained_pairs = 0;
+    // Route-recurrence probe. `observations` is the denominator (routed experts
+    // seen at decode with at least one prior token on the same layer);
+    // `prev_hits` counts those the immediately preceding token also routed to,
+    // `window_hits` those any of the last kRouteRecurrenceDepth tokens did.
+    std::uint64_t route_recurrence_observations = 0;
+    std::uint64_t route_recurrence_prev_hits = 0;
+    std::uint64_t route_recurrence_window_hits = 0;
+    std::uint64_t route_recurrence_layer_samples = 0;
+    // Distinct experts held by the window, summed over layer samples. The
+    // window's hit rate is only meaningful against this: it is the residency
+    // the window would cost if it were used as a prefetch set.
+    std::uint64_t route_recurrence_window_experts = 0;
+    // Miss decomposition against the same window: how much of the residual
+    // miss rate a whole-token prefetch plan could have covered in advance.
+    std::uint64_t route_recurrence_resident = 0;
+    std::uint64_t route_recurrence_miss_in_window = 0;
+    std::uint64_t route_recurrence_miss_cold = 0;
     std::uint64_t nvfp4_tensor_core_moe_calls = 0;
     std::uint64_t nvfp4_tensor_core_moe_fallbacks = 0;
     std::int64_t nvfp4_tensor_core_moe_last_status = 0;
@@ -854,6 +886,126 @@ static void qwen_wait_for_prefetch_layer(
     runtime.prefetch_pending = false;
     runtime.prefetch_target_layer =
         std::numeric_limits<std::uint32_t>::max();
+}
+
+// Measures how much of a decode token's routing a *previous* token already
+// told us, per layer. This is the cheap predictor the current design never
+// consults: it is known before the token starts, for every layer at once,
+// where the transition table only ever sees one layer of runway. Pure
+// measurement -- no caching, prefetch, or execution decision reads these.
+static void qwen_observe_route_recurrence(
+    ColibriV2QwenRuntime& runtime, QwenExpertPrefetchState& state,
+    std::uint32_t layer, const std::int32_t* selected, int selected_count
+) {
+    // Off unless asked for: the distinct-count pass below is O(depth^2 * top_k)
+    // per layer, which is measurement overhead nobody serving should pay.
+    static const bool enabled = [] {
+        const char* setting = std::getenv("COLIBRI_ROUTE_RECURRENCE");
+        return setting && setting[0] != '0';
+    }();
+    if (!enabled) return;
+    const auto layers = runtime.layers.size();
+    if (!layers || layer >= layers || selected_count <= 0) return;
+    const auto stride = static_cast<std::size_t>(selected_count);
+    // Route width can shrink mid-run (top-k / top-p pruning). Sizing the ring
+    // to the model's trained top-k keeps one allocation valid for the session.
+    const auto capacity = std::max<std::size_t>(
+        stride, runtime.model->config.expert_used_count);
+    if (state.recurrence_stride != capacity) {
+        state.recurrence_stride = capacity;
+        state.recurrence_history.assign(
+            layers * kRouteRecurrenceDepth * capacity, -1);
+        state.recurrence_counts.assign(layers * kRouteRecurrenceDepth, 0);
+        state.recurrence_cursor.assign(layers, 0);
+        state.recurrence_filled.assign(layers, 0);
+    }
+    const auto base = static_cast<std::size_t>(layer) * kRouteRecurrenceDepth;
+    const auto filled = state.recurrence_filled[layer];
+    if (filled) {
+        ++runtime.route_recurrence_layer_samples;
+        // Slot `cursor - 1` (mod depth) is the most recently written token.
+        const auto newest =
+            (state.recurrence_cursor[layer] + kRouteRecurrenceDepth - 1) %
+            kRouteRecurrenceDepth;
+        for (int rank = 0; rank < selected_count; ++rank) {
+            const auto expert = selected[rank];
+            if (expert < 0) continue;
+            ++runtime.route_recurrence_observations;
+            bool in_window = false;
+            for (std::size_t depth = 0; depth < filled; ++depth) {
+                const auto slot = base + (newest + kRouteRecurrenceDepth - depth) %
+                    kRouteRecurrenceDepth;
+                const auto count = state.recurrence_counts[slot];
+                const auto* entries =
+                    state.recurrence_history.data() + slot * capacity;
+                const bool present =
+                    std::find(entries, entries + count, expert) !=
+                    entries + count;
+                if (!present) continue;
+                in_window = true;
+                if (depth == 0) ++runtime.route_recurrence_prev_hits;
+                break;
+            }
+            if (in_window) ++runtime.route_recurrence_window_hits;
+            // Sizes the latency-hiding win. Residency is read before this
+            // layer's own lookup and before the next-layer prefetch (which
+            // only touches layer+1's slot range), so it is exactly what the
+            // layer is about to see. A miss the window already knew about is
+            // one a whole-token prefetch plan could have covered in advance;
+            // a miss outside the window is genuinely cold.
+            const auto key = (static_cast<std::uint64_t>(layer) << 32) |
+                static_cast<std::uint32_t>(expert);
+            if (runtime.expert_residency.find(key) !=
+                runtime.expert_residency.end()) {
+                ++runtime.route_recurrence_resident;
+            } else if (in_window) {
+                ++runtime.route_recurrence_miss_in_window;
+            } else {
+                ++runtime.route_recurrence_miss_cold;
+            }
+        }
+        // Distinct size of the same window, counted once per layer sample.
+        std::uint32_t distinct = 0;
+        for (std::size_t depth = 0; depth < filled; ++depth) {
+            const auto slot = base + (newest + kRouteRecurrenceDepth - depth) %
+                kRouteRecurrenceDepth;
+            const auto* entries =
+                state.recurrence_history.data() + slot * capacity;
+            for (std::size_t index = 0; index < state.recurrence_counts[slot];
+                 ++index) {
+                const auto expert = entries[index];
+                bool seen = false;
+                for (std::size_t earlier = 0; earlier < depth && !seen;
+                     ++earlier) {
+                    const auto other =
+                        base + (newest + kRouteRecurrenceDepth - earlier) %
+                            kRouteRecurrenceDepth;
+                    const auto* prior =
+                        state.recurrence_history.data() + other * capacity;
+                    seen = std::find(
+                        prior, prior + state.recurrence_counts[other], expert
+                    ) != prior + state.recurrence_counts[other];
+                }
+                if (!seen) {
+                    // Also dedupe against earlier ranks of this same slot.
+                    seen = std::find(entries, entries + index, expert) !=
+                        entries + index;
+                }
+                if (!seen) ++distinct;
+            }
+        }
+        runtime.route_recurrence_window_experts += distinct;
+    }
+    const auto write = base + state.recurrence_cursor[layer];
+    std::copy(selected, selected + selected_count,
+              state.recurrence_history.begin() +
+                  static_cast<std::ptrdiff_t>(write * capacity));
+    state.recurrence_counts[write] = static_cast<std::uint8_t>(selected_count);
+    state.recurrence_cursor[layer] =
+        static_cast<std::uint8_t>((state.recurrence_cursor[layer] + 1) %
+                                  kRouteRecurrenceDepth);
+    if (filled < kRouteRecurrenceDepth)
+        state.recurrence_filled[layer] = static_cast<std::uint8_t>(filled + 1);
 }
 
 static void qwen_observe_and_prefetch_next_layer(
@@ -3101,6 +3253,52 @@ bool qwen_prefill_direct_quant_enabled(
     return found;
 }
 
+// Region timers for the batched CPU MoE. `qwen_cpu_moe` is the largest block of
+// prefill (58% of wall on the 35B-A3B) and ~3.5x off its roofline, but it does
+// not go through `launch_named`, so COLIBRI_CPU_PROFILE never sees it. Enable
+// with COLIBRI_MOE_PROFILE=1; the dump prints once at exit. Off by default --
+// the clock reads sit inside the OpenMP task loop.
+struct QwenCpuMoeProfile {
+    std::atomic<std::uint64_t> setup{0};
+    std::atomic<std::uint64_t> gate_dequant{0};
+    std::atomic<std::uint64_t> gate_gemm{0};
+    std::atomic<std::uint64_t> gate_activate{0};
+    std::atomic<std::uint64_t> down_dequant{0};
+    std::atomic<std::uint64_t> down_gemm{0};
+    std::atomic<std::uint64_t> down_store{0};
+    std::atomic<std::uint64_t> combine{0};
+    std::atomic<std::uint64_t> calls{0};
+    std::atomic<std::uint64_t> tasks_gate{0};
+    std::atomic<std::uint64_t> tasks_down{0};
+
+    ~QwenCpuMoeProfile() {
+        if (!calls.load()) return;
+        const double ms = 1.0e6;
+        std::fprintf(stderr,
+            "[moe] calls=%llu gate{dequant=%.1fms gemm=%.1fms act=%.1fms} "
+            "down{dequant=%.1fms gemm=%.1fms store=%.1fms} setup=%.1fms "
+            "combine=%.1fms tasks{gate=%llu down=%llu}\n",
+            (unsigned long long)calls.load(),
+            gate_dequant.load()/ms, gate_gemm.load()/ms, gate_activate.load()/ms,
+            down_dequant.load()/ms, down_gemm.load()/ms, down_store.load()/ms,
+            setup.load()/ms, combine.load()/ms,
+            (unsigned long long)tasks_gate.load(),
+            (unsigned long long)tasks_down.load());
+    }
+};
+QwenCpuMoeProfile g_cpu_moe_profile;
+bool qwen_cpu_moe_profile_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("COLIBRI_MOE_PROFILE");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+inline std::uint64_t qwen_moe_now() {
+    return static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+}
+
 void qwen_cpu_moe_rows(
     const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     const std::int32_t* selected, const float* weights, int rows,
@@ -3135,6 +3333,8 @@ void qwen_cpu_moe_rows(
     // weight rows are decoded once per batch and dotted with every token
     // routed to it. Routes with weight 0 were already claimed by the GPU
     // expert cache (or pruned) and are skipped everywhere below.
+    const bool moe_profile=qwen_cpu_moe_profile_enabled();
+    const std::uint64_t t_setup0=moe_profile?qwen_moe_now():0;
     const int total=rows*routed_count;
     std::vector<int> counts(experts,0);
     for(int route=0;route<total;++route){
@@ -3161,6 +3361,8 @@ void qwen_cpu_moe_rows(
     group_experts.reserve(256);
     for(int expert=0;expert<experts;++expert)if(counts[expert])group_experts.push_back(expert);
     const int group_count=static_cast<int>(group_experts.size());
+    if(moe_profile){g_cpu_moe_profile.setup+=qwen_moe_now()-t_setup0;
+        ++g_cpu_moe_profile.calls;}
     constexpr int kRowBlock=4;
     // Direct IQ rows are already grouped by expert and have thousands of tasks
     // available. Larger hand-out chunks avoid making OpenMP's dynamic scheduler
@@ -3237,18 +3439,28 @@ void qwen_cpu_moe_rows(
         thread_local std::vector<float> gate_block,up_block,gate_values,up_values;
         gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
         gate_values.resize(static_cast<std::size_t>(kRowBlock)*count);up_values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        const std::uint64_t t_dq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i){
             qwen_dequant_row(gate_data,gate_type,hidden,row0+i,gate_block.data()+static_cast<std::size_t>(i)*hidden);
             qwen_dequant_row(up_data,up_type,hidden,row0+i,up_block.data()+static_cast<std::size_t>(i)*hidden);
         }
+        const std::uint64_t t_gemm0=moe_profile?qwen_moe_now():0;
         qwen_f32_gemm_rows(gate_block.data(),mr,&vectors[begin],count,hidden,gate_values.data());
         qwen_f32_gemm_rows(up_block.data(),mr,&vectors[begin],count,hidden,up_values.data());
-        for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence){
+        const std::uint64_t t_act0=moe_profile?qwen_moe_now():0;
+        if(moe_profile){g_cpu_moe_profile.gate_dequant+=t_gemm0-t_dq0;
+            g_cpu_moe_profile.gate_gemm+=t_act0-t_gemm0;
+            ++g_cpu_moe_profile.tasks_gate;}
+        for(int occurrence=0;occurrence<count;++occurrence){
             const int token_rank=occurrences[begin+occurrence];
-            const float gate_value=gate_values[static_cast<std::size_t>(i)*count+occurrence]*gate_scale;
-            const float clipped=std::max(-80.0f,std::min(80.0f,gate_value));
-            activated[static_cast<std::size_t>(token_rank)*intermediate+(row0+i)]=gate_value/(1.0f+std::exp(-clipped))*up_values[static_cast<std::size_t>(i)*count+occurrence]*up_scale;
+            float*dst=activated+static_cast<std::size_t>(token_rank)*intermediate+row0;
+            for(int i=0;i<mr;++i){
+                const float gate_value=gate_values[static_cast<std::size_t>(i)*count+occurrence]*gate_scale;
+                const float clipped=std::max(-80.0f,std::min(80.0f,gate_value));
+                dst[i]=gate_value/(1.0f+std::exp(-clipped))*up_values[static_cast<std::size_t>(i)*count+occurrence]*up_scale;
+            }
         }
+        if(moe_profile)g_cpu_moe_profile.gate_activate+=qwen_moe_now()-t_act0;
     }
     std::vector<const float*> activated_vectors(offsets[experts]);
     for(int slot=0;slot<offsets[experts];++slot)
@@ -3294,13 +3506,30 @@ void qwen_cpu_moe_rows(
         }
         thread_local std::vector<float> down_block,values;
         down_block.resize(static_cast<std::size_t>(kRowBlock)*intermediate);values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        const std::uint64_t t_ddq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i)qwen_dequant_row(down_data,down_type,intermediate,row0+i,down_block.data()+static_cast<std::size_t>(i)*intermediate);
+        const std::uint64_t t_dgemm0=moe_profile?qwen_moe_now():0;
         qwen_f32_gemm_rows(down_block.data(),mr,&activated_vectors[begin],count,intermediate,values.data());
-        for(int i=0;i<mr;++i)for(int occurrence=0;occurrence<count;++occurrence){
+        const std::uint64_t t_dst0=moe_profile?qwen_moe_now():0;
+        if(moe_profile){g_cpu_moe_profile.down_dequant+=t_dgemm0-t_ddq0;
+            g_cpu_moe_profile.down_gemm+=t_dst0-t_dgemm0;
+            ++g_cpu_moe_profile.tasks_down;}
+        // Token-outermost so each token's mr results land contiguously. The
+        // transposed order wrote one 4-byte value per 8 KB-strided cache line
+        // of a 67 MB buffer -- a full line fetched, and read-for-owned, per
+        // store. `values` is only kRowBlock*count floats, so the strided read
+        // it leaves behind stays in L1. Arithmetic is unchanged: the original
+        // already grouped as (weights*down_scale)*values, left to right.
+        for(int occurrence=0;occurrence<count;++occurrence){
             const int token_rank=occurrences[begin+occurrence];
-            down_values[static_cast<std::size_t>(token_rank)*hidden+(row0+i)]=weights[token_rank]*down_scale*values[static_cast<std::size_t>(i)*count+occurrence];
+            const float scale=weights[token_rank]*down_scale;
+            float*dst=down_values+static_cast<std::size_t>(token_rank)*hidden+row0;
+            for(int i=0;i<mr;++i)
+                dst[i]=scale*values[static_cast<std::size_t>(i)*count+occurrence];
         }
+        if(moe_profile)g_cpu_moe_profile.down_store+=qwen_moe_now()-t_dst0;
     }
+    const std::uint64_t t_comb0=moe_profile?qwen_moe_now():0;
 #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<rows*hidden;++task){
         const int token=task/hidden,row=task%hidden;
@@ -3312,6 +3541,7 @@ void qwen_cpu_moe_rows(
         }
         output[task]=value;
     }
+    if(moe_profile)g_cpu_moe_profile.combine+=qwen_moe_now()-t_comb0;
     if (std::getenv("COLIBRI_MOE_DEBUG")) {
         static int rcalls = 0;
         int n = rcalls++;
@@ -4342,12 +4572,33 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
             "native Qwen strict resident policy requires streamed GPU execution");
      if(gemma4&&runtime->options.next_layer_prefetch)throw std::runtime_error("native Gemma 4 next-layer prefetch is not implemented");
      if(runtime->options.next_layer_prefetch&&runtime->options.mtp_drafts)throw std::runtime_error("native Qwen next-layer prefetch does not support MTP yet");
-    if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>5)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), or 5 (turbo4)");
-    if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>5)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), or 5 (turbo4)");
+    if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>6)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
+    if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>6)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
     if(gemma4)build_gemma4_plan(*runtime);
     else if(laguna)build_laguna_plan(*runtime);
     else build_qwen_plan(*runtime);
+    // Resolve cache type `auto`. Must run after the layer plan, which is what
+    // supplies head_dim; the rule and its measurements live in
+    // colibri::v2::attention so they can be pinned by a contract test.
+    if(runtime->options.cache_type_k==colibri::v2::attention::kCacheTypeAuto||
+       runtime->options.cache_type_v==colibri::v2::attention::kCacheTypeAuto){
+        bool head_dim_ok=true;
+        for(const auto&layer:runtime->layers){
+            if(!layer.attention)continue;
+            if(!colibri::v2::attention::turbo_head_dim_ok(layer.head_dim)){
+                head_dim_ok=false;break;
+            }
+        }
+        const auto resolved=colibri::v2::attention::auto_cache_type(
+            runtime->options.context_limit,
+            runtime->model->config.expert_count>0,
+            head_dim_ok);
+        if(runtime->options.cache_type_k==colibri::v2::attention::kCacheTypeAuto)
+            runtime->options.cache_type_k=resolved;
+        if(runtime->options.cache_type_v==colibri::v2::attention::kCacheTypeAuto)
+            runtime->options.cache_type_v=resolved;
+    }
     if(runtime->options.next_layer_prefetch&&runtime->layers.size()>1){
         const auto experts=static_cast<std::size_t>(m->config.expert_count);
         runtime->expert_transitions.resize(
@@ -4392,9 +4643,26 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // Independent decode slots (llama.cpp --parallel): 0/1 = single-sequence.
     runtime->parallel_sequences=std::clamp<std::uint32_t>(
         runtime->options.parallel_sequences?runtime->options.parallel_sequences:1,1,16);
-    // Host RAM budget for the spilled-slot prompt cache (0 disables).
-    runtime->host_cache_limit_bytes=
-        static_cast<std::uint64_t>(runtime->options.prompt_cache_mib)*1024ull*1024;
+    // Host RAM budget for the spilled-slot prompt cache. UINT32_MAX selects a
+    // conservative automatic budget: one eighth of currently available RAM,
+    // capped at llama-server's practical 8 GiB default. This leaves ample
+    // headroom for the model mapping, filesystem cache, and request buffers.
+    if(runtime->options.prompt_cache_mib==std::numeric_limits<std::uint32_t>::max()){
+        const auto available=available_host_memory();
+        runtime->host_cache_limit_bytes=std::min<std::uint64_t>(
+            8ull*1024*1024*1024,available/8
+        );
+        runtime->host_cache_limit_bytes=
+            (runtime->host_cache_limit_bytes/(1024*1024))*(1024*1024);
+    }else{
+        runtime->host_cache_limit_bytes=
+            static_cast<std::uint64_t>(runtime->options.prompt_cache_mib)*1024ull*1024;
+    }
+    if(runtime->host_cache_limit_bytes)
+        std::fprintf(stderr,"[colibri-v2] prompt cache budget %.1f GiB%s\n",
+            runtime->host_cache_limit_bytes/static_cast<double>(1024ull*1024*1024),
+            runtime->options.prompt_cache_mib==std::numeric_limits<std::uint32_t>::max()
+                ? " (auto)":"");
     runtime->cuda_ready=false;
     runtime->decode_ready=false;
     *out=runtime.release();
@@ -4418,6 +4686,8 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->mtp_drafts=runtime->options.mtp_drafts;
     out->mtp_layer=runtime->mtp_available?runtime->model->mtp_layer:std::numeric_limits<std::uint32_t>::max();
     out->context_limit=runtime->options.context_limit;
+    out->resolved_cache_type_k=runtime->options.cache_type_k;
+    out->resolved_cache_type_v=runtime->options.cache_type_v;
     out->static_tensor_bytes=runtime->static_tensor_bytes;
     out->expert_tensor_bytes=runtime->expert_tensor_bytes;
     const std::uint64_t sequence_slots=std::max<std::size_t>(1,runtime->sequences.size());
@@ -4498,6 +4768,14 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->next_layer_prefetch_hits=runtime->next_layer_prefetch_hits;
     out->next_layer_prefetch_bytes=runtime->next_layer_prefetch_bytes;
     out->next_layer_prefetch_trained_pairs=runtime->next_layer_prefetch_trained_pairs;
+    out->route_recurrence_observations=runtime->route_recurrence_observations;
+    out->route_recurrence_prev_hits=runtime->route_recurrence_prev_hits;
+    out->route_recurrence_window_hits=runtime->route_recurrence_window_hits;
+    out->route_recurrence_layer_samples=runtime->route_recurrence_layer_samples;
+    out->route_recurrence_window_experts=runtime->route_recurrence_window_experts;
+    out->route_recurrence_resident=runtime->route_recurrence_resident;
+    out->route_recurrence_miss_in_window=runtime->route_recurrence_miss_in_window;
+    out->route_recurrence_miss_cold=runtime->route_recurrence_miss_cold;
     out->nvfp4_tensor_core_moe_calls=runtime->nvfp4_tensor_core_moe_calls;
     out->nvfp4_tensor_core_moe_fallbacks=runtime->nvfp4_tensor_core_moe_fallbacks;
     out->nvfp4_tensor_core_moe_last_status=runtime->nvfp4_tensor_core_moe_last_status;
@@ -6948,6 +7226,11 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         // the main stream block on the layer-ahead prefetch it had just queued,
         // serializing the copy engine against the very kernels it runs ahead of.
         const auto pager_started=std::chrono::steady_clock::now();
+        qwen_observe_route_recurrence(
+            *runtime,
+            runtime->sequences[runtime->active_sequence].expert_prefetch,
+            layer_number,selected_host,route_count
+        );
         qwen_wait_for_prefetch_layer(*runtime,layer_number);
         qwen_observe_and_prefetch_next_layer(
             *runtime,
@@ -7514,6 +7797,15 @@ static std::uint64_t qwen_sequence_match(
     return i;
 }
 
+// A large absolute shared prefix is worth restoring even when it is less than
+// half of a very long previous conversation. The fractional rule alone caused
+// 15-30k reusable agent prefixes to be discarded after a long side branch.
+static bool qwen_cache_match_useful(
+        std::uint64_t match, std::size_t cached_tokens) {
+    return match != 0 &&
+        (match >= 2048 || match >= (cached_tokens + 1) / 2);
+}
+
 // Save the live (active) working set into its slot and load `target`'s. The KV
 // arena is per-slot, so only the pointer + host bookkeeping move -- no device
 // copy. Snapshots stay global; the reuse KV-safety guard keeps them correct
@@ -7606,21 +7898,30 @@ static void qwen_evict_host_lru(ColibriV2QwenRuntime& runtime) {
 static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t slot) {
     if (!runtime.host_cache_limit_bytes || !runtime.state_bytes) return;
     const QwenSequence& seq = runtime.sequences[slot];
-    if (seq.processed_tokens.size() < 2048) return;
+    const bool active = slot == runtime.active_sequence;
+    const auto& tokens = active ? runtime.processed_tokens : seq.processed_tokens;
+    const auto position = active ? runtime.position : seq.position;
+    const auto last_output = active ? runtime.last_output_token : seq.last_output_token;
+    const auto& snapshots = active ? runtime.prefill_snapshots : seq.prefill_snapshots;
+    // Ignore tiny utility prompts, but retain ordinary conversations before a
+    // title/quota/subagent request displaces the sole GPU slot.
+    if (tokens.size() < 256) return;
     for (auto& e : runtime.host_prompts)
-        if (e.tokens == seq.processed_tokens) { e.clock = ++runtime.host_cache_clock; return; }
+        if (e.tokens == tokens) { e.clock = ++runtime.host_cache_clock; return; }
     // Pack only the live ranges (used KV prefixes + DeltaNet state) instead of
     // the whole arena: at small positions the spill is a fraction of state_bytes.
-    const auto ranges = qwen_used_state_ranges(runtime, seq.position);
+    const auto ranges = qwen_used_state_ranges(runtime, position);
     std::uint64_t packed_bytes = 0;
     for (const auto& r : ranges) packed_bytes += r.second;
+    if (packed_bytes > runtime.host_cache_limit_bytes) return;
     std::uint64_t valid_snaps = 0;
-    for (const auto& s : seq.prefill_snapshots) if (s.valid) ++valid_snaps;
-    if (valid_snaps && runtime.prefill_snapshot_bytes >
-            (std::numeric_limits<std::uint64_t>::max() - packed_bytes) / valid_snaps)
-        return;
-    const std::uint64_t need = packed_bytes + valid_snaps * runtime.prefill_snapshot_bytes;
-    if (need > runtime.host_cache_limit_bytes) return;
+    for (const auto& s : snapshots) if (s.valid) ++valid_snaps;
+    const std::uint64_t snapshot_capacity = runtime.prefill_snapshot_bytes
+        ? (runtime.host_cache_limit_bytes-packed_bytes)/runtime.prefill_snapshot_bytes
+        : 0;
+    const std::uint64_t snapshots_to_copy=std::min(valid_snaps,snapshot_capacity);
+    const std::uint64_t need =
+        packed_bytes + snapshots_to_copy * runtime.prefill_snapshot_bytes;
     while (runtime.host_cache_used_bytes > runtime.host_cache_limit_bytes - need
            && !runtime.host_prompts.empty())
         qwen_evict_host_lru(runtime);
@@ -7636,19 +7937,21 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
     }
     if (copy_failed || colibri_gpu_stream_sync(runtime.stream) != 0) { std::free(buf); return; }
     QwenHostPrompt e;
-    e.tokens = seq.processed_tokens;
+    e.tokens = tokens;
     e.state = buf;
-    e.position = seq.position;
-    e.last_output_token = seq.last_output_token;
+    e.position = position;
+    e.last_output_token = last_output;
     e.bytes = packed_bytes;
-    for (const auto& s : seq.prefill_snapshots) {
-        if (!s.valid || s.tokens.empty()) continue;
+    std::uint64_t copied_snapshots=0;
+    for (const auto& s : snapshots) {
+        if (!s.valid || s.tokens.empty() || copied_snapshots>=snapshots_to_copy) continue;
         void* sbuf = std::malloc(runtime.prefill_snapshot_bytes);
         if (!sbuf) break;  // partial checkpoint set is fine; arena reuse still works
         if (colibri_gpu_download(sbuf, s.device, runtime.prefill_snapshot_bytes, runtime.stream) != 0
             || colibri_gpu_stream_sync(runtime.stream) != 0) { std::free(sbuf); break; }
         e.snapshots.push_back({s.tokens, sbuf, s.last_output});
         e.bytes += runtime.prefill_snapshot_bytes;
+        ++copied_snapshots;
     }
     e.clock = ++runtime.host_cache_clock;
     runtime.host_cache_used_bytes += e.bytes;
@@ -7662,6 +7965,11 @@ static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
         std::size_t entry_idx, std::size_t victim) {
     QwenHostPrompt& e = runtime.host_prompts[entry_idx];
     QwenSequence& seq = runtime.sequences[victim];
+    const bool active = victim == runtime.active_sequence;
+    auto& tokens = active ? runtime.processed_tokens : seq.processed_tokens;
+    auto& snapshots = active ? runtime.prefill_snapshots : seq.prefill_snapshots;
+    auto& snapshot_clock = active
+        ? runtime.prefill_snapshot_clock : seq.prefill_snapshot_clock;
     // The packed layout is a pure function of (runtime config, position), so the
     // ranges recomputed here match the spill order exactly.
     const auto ranges = qwen_used_state_ranges(runtime, e.position);
@@ -7673,42 +7981,48 @@ static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
         cursor += r.second;
     }
     if (colibri_gpu_stream_sync(runtime.stream) != 0) return false;
-    seq.processed_tokens = std::move(e.tokens);
-    seq.position = e.position;
-    seq.last_output_token = e.last_output_token;
+    tokens = std::move(e.tokens);
+    if (active) {
+        runtime.position = e.position;
+        runtime.last_output_token = e.last_output_token;
+    } else {
+        seq.position = e.position;
+        seq.last_output_token = e.last_output_token;
+    }
     std::size_t slot_i = 0;
     for (auto& hs : e.snapshots) {
-        if (slot_i >= seq.prefill_snapshots.size()) break;
-        auto& dst = seq.prefill_snapshots[slot_i++];
+        if (slot_i >= snapshots.size()) break;
+        auto& dst = snapshots[slot_i++];
         if (colibri_gpu_upload(dst.device, hs.state, runtime.prefill_snapshot_bytes, runtime.stream) != 0
             || colibri_gpu_stream_sync(runtime.stream) != 0)
             break;
         dst.tokens = std::move(hs.tokens);
         dst.last_output = hs.last_output;
         dst.valid = true;
-        dst.clock = ++seq.prefill_snapshot_clock;
+        dst.clock = ++snapshot_clock;
     }
-    for (std::size_t i = slot_i; i < seq.prefill_snapshots.size(); ++i)
-        seq.prefill_snapshots[i].valid = false;
+    for (std::size_t i = slot_i; i < snapshots.size(); ++i)
+        snapshots[i].valid = false;
     qwen_free_host_prompt(runtime, entry_idx);
     return true;
 }
 
 // Route a prompt to the slot/host entry it continues; recycle the LRU slot
-// otherwise. A slot/entry only "owns" the prompt if the match covers most of
-// its committed tokens, so a short side-request sharing the system prefix can't
-// evict a big conversation. The host cache (>=2 slots) lets an LRU-recycled
-// conversation survive in RAM and be restored later instead of reprefiling cold.
+// otherwise. A slot/entry owns the prompt when it covers most of its committed
+// tokens or provides a substantial absolute prefix. Before a divergent request
+// overwrites that slot, the host cache preserves it even in one-slot mode.
 static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
         const std::uint32_t* prompt, std::uint64_t prompt_count) {
-    const bool host_cache = runtime.host_cache_limit_bytes && runtime.sequences.size() >= 2;
+    const bool host_cache = runtime.host_cache_limit_bytes != 0;
     if (runtime.sequences.size() <= 1 && !host_cache) return;
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
     std::size_t best = kNone;
     std::uint64_t best_match = 0;
     auto consider = [&](std::size_t i, const std::vector<std::uint32_t>& tokens) {
         const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
-        if (m > best_match && m * 2 >= tokens.size()) { best_match = m; best = i; }
+        if (m > best_match && qwen_cache_match_useful(m,tokens.size())) {
+            best_match = m; best = i;
+        }
     };
     consider(runtime.active_sequence, runtime.processed_tokens);
     for (std::size_t i = 0; i < runtime.sequences.size(); ++i)
@@ -7719,7 +8033,9 @@ static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
         for (std::size_t i = 0; i < runtime.host_prompts.size(); ++i) {
             const auto& t = runtime.host_prompts[i].tokens;
             const std::uint64_t m = qwen_sequence_match(t, prompt, prompt_count);
-            if (m > best_host_match && m * 2 >= t.size()) { best_host_match = m; best_host = i; }
+            if (m > best_host_match && qwen_cache_match_useful(m,t.size())) {
+                best_host_match = m; best_host = i;
+            }
         }
     auto lru_slot = [&]() {
         std::size_t v = 0;
@@ -7733,11 +8049,26 @@ static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
             best_host==kNone?-1LL:(long long)best_host, (unsigned long long)best_host_match,
             runtime.host_prompts.size());
     if (best != kNone && best_match >= best_host_match) {
+        const auto& best_tokens = best == runtime.active_sequence
+            ? runtime.processed_tokens : runtime.sequences[best].processed_tokens;
+        if (host_cache && best_match < best_tokens.size())
+            qwen_spill_slot_to_host(runtime, best);
         if (best != runtime.active_sequence) qwen_switch_sequence(runtime, best);
     } else if (best_host != kNone) {
         const std::size_t victim = lru_slot();
         qwen_spill_slot_to_host(runtime, victim);
-        qwen_restore_host_to_slot(runtime, best_host, victim);
+        // Spilling may evict or reorder host entries to stay within budget;
+        // resolve the index again rather than restoring a stale vector index.
+        best_host=kNone;
+        best_host_match=0;
+        for(std::size_t i=0;i<runtime.host_prompts.size();++i){
+            const auto&t=runtime.host_prompts[i].tokens;
+            const auto m=qwen_sequence_match(t,prompt,prompt_count);
+            if(m>best_host_match&&qwen_cache_match_useful(m,t.size())){
+                best_host_match=m;best_host=i;
+            }
+        }
+        if(best_host!=kNone)qwen_restore_host_to_slot(runtime,best_host,victim);
         qwen_switch_sequence(runtime, victim);
     } else {
         const std::size_t victim = lru_slot();
@@ -9263,7 +9594,7 @@ static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask&
     for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
         const auto& tokens = tokens_of(i);
         const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
-        if (!(m && m * 2 >= tokens.size())) continue;
+        if (!qwen_cache_match_useful(m,tokens.size())) continue;
         if (owned(i)) busy_match = std::max(busy_match, m);
         else if (m > best_match) { best_match = m; best = i; }
     }
@@ -9279,7 +9610,9 @@ static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask&
         for (std::size_t i = 0; i < runtime.host_prompts.size(); ++i) {
             const auto& t = runtime.host_prompts[i].tokens;
             const std::uint64_t m = qwen_sequence_match(t, prompt, prompt_count);
-            if (m > best_host_match && m * 2 >= t.size()) { best_host_match = m; best_host = i; }
+            if (m > best_host_match && qwen_cache_match_useful(m,t.size())) {
+                best_host_match = m; best_host = i;
+            }
         }
     // The conversation is already live on a busy slot and nothing free/host
     // beats it: wait for that task to finish rather than forking the history.
@@ -9287,9 +9620,21 @@ static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask&
     std::size_t chosen;
     if (best != kNone && best_match >= best_host_match) {
         chosen = best;
+        const auto& tokens = tokens_of(chosen);
+        if (host_cache && best_match < tokens.size())
+            qwen_spill_slot_to_host(runtime, chosen);
     } else if (best_host != kNone) {
         qwen_spill_slot_to_host(runtime, free_lru);
-        qwen_restore_host_to_slot(runtime, best_host, free_lru);
+        best_host=kNone;
+        best_host_match=0;
+        for(std::size_t i=0;i<runtime.host_prompts.size();++i){
+            const auto&t=runtime.host_prompts[i].tokens;
+            const auto m=qwen_sequence_match(t,prompt,prompt_count);
+            if(m>best_host_match&&qwen_cache_match_useful(m,t.size())){
+                best_host_match=m;best_host=i;
+            }
+        }
+        if(best_host!=kNone)qwen_restore_host_to_slot(runtime,best_host,free_lru);
         chosen = free_lru;
     } else {
         if (host_cache) qwen_spill_slot_to_host(runtime, free_lru);

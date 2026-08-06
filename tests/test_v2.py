@@ -255,7 +255,7 @@ class V2RuntimeTests(unittest.TestCase):
         # reordering here silently sends the runtime to the wrong codec.
         for name, code in (
             ("f32", 0), ("f16", 1), ("bf16", 2),
-            ("q8_0", 3), ("turbo3", 4), ("turbo4", 5),
+            ("q8_0", 3), ("turbo3", 4), ("turbo4", 5), ("auto", 6),
         ):
             with self.subTest(cache_type=name):
                 model = FakeModel()
@@ -275,6 +275,16 @@ class V2RuntimeTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaisesRegex(ValueError, "cache_type"):
                     V2QwenRuntime(FakeModel(), cache_type_k=invalid)
+
+        # The default is f16, NOT "auto". "auto" selects turbo4 above 32K, which
+        # changes generated tokens in exactly the regime -- long context -- where
+        # KV quantization damage concentrates, and no long-context quality
+        # benchmark has been run. Flipping this default is a deliberate call that
+        # needs that evidence first; llama.cpp and vLLM both ship unquantized KV.
+        model = FakeModel()
+        V2QwenRuntime(model)
+        default = _QwenRuntimeOptions.from_buffer_copy(model._lib.options)
+        self.assertEqual((default.cache_type_k, default.cache_type_v), (1, 1))
 
     def test_dense_requant_policy_reaches_native_options(self):
         class FakeLibrary:
