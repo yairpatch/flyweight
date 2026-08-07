@@ -1,14 +1,14 @@
-"""A whole DeepSeek-V4 block, composed from the individual components.
+"""DeepSeek-V4 blocks and the whole stack, composed from the native kernels.
 
-This runs a sliding-window block -- compress ratio zero -- end to end over a
-batch of positions, which is what turns a pile of separately-checked kernels
-into something that can be compared against the reference as a unit. The
-compressed-attention kinds are not here yet.
+All three attention kinds are here: the plain sliding window, and both
+compressed kinds with their block compressors. What is not here is the
+lightning indexer's top-k selection, which only bites once there are more
+compressed tokens than `indexer_top_k` -- 512 of them, so beyond roughly 2048
+raw tokens on a 4:1 layer.
 
 It is deliberately written for clarity rather than speed: one token at a time,
-no batching, no caching between calls. Its job is to establish that the
-components compose correctly, so the runtime path can be built against a known
-good answer.
+no batching, no state carried between calls. Its job is to be the known-good
+answer the runtime path gets built against, not to be that path.
 """
 
 from __future__ import annotations
@@ -109,18 +109,19 @@ class DeepSeek4Block:
         # frequency base with YaRN. This follows the reference rather than
         # measurement: at short prompt lengths the two are hard to tell apart.
         if self.ratio:
-            factor = float(config["rope_scaling_factor"]) if "rope_scaling_factor" in config else 16.0
-            scale = 1.0 / factor
+            scale = 1.0 / float(config["rope_scaling_factor"])
             self.rope_kwargs = dict(
                 freq_base=float(config["compress_rope_freq_base"]),
                 freq_scale=scale,
                 ext_factor=1.0,
                 attn_factor=1.0 / (1.0 + 0.1 * float(np.log(1.0 / scale))),
-                original_context=65536,
+                beta_fast=float(config["yarn_beta_fast"]),
+                beta_slow=float(config["yarn_beta_slow"]),
+                original_context=int(config["rope_original_context_length"]),
             )
         else:
             self.rope_kwargs = dict(freq_base=self.freq_base)
-        self.compressor = CompressedState(model, layer, self.ratio) if self.ratio == 4 else None
+        self.compressor = CompressedState(model, layer, self.ratio) if self.ratio else None
 
         prefix = f"blk.{layer}."
         mix = (2 + self.hc) * self.hc
@@ -302,17 +303,22 @@ def hyper_connection_combine_wrapper(mix, block_output, streams):
 
 
 class CompressedState:
-    """The per-layer compressor for a CSA (ratio 4) block.
+    """The per-layer compressor, for either compressed attention kind.
 
-    Each token projects to a state row twice the latent width: a "prev" half and
-    a "cur" half. A block pools eight entries -- the previous `ratio` tokens'
-    prev halves followed by its own `ratio` tokens' cur halves -- which is the
-    overlap the architecture describes as keeping a window of the last eight
-    tokens at each four-token boundary. Before the sequence starts there is no
-    previous block, so those rows read a padding entry whose value is zero and
-    whose score is -inf, contributing nothing to the softmax.
+    The two kinds pool differently, and the difference is not just the ratio.
 
-    The compressed latent is then normalized, and its rope half rotated at the
+    A 4:1 layer overlaps its blocks. Each token projects to a state row twice
+    the latent width -- a "prev" half and a "cur" half -- and a block pools
+    eight entries: the previous four tokens' prev halves followed by its own
+    four tokens' cur halves. That is the window of the last eight tokens the
+    architecture keeps at each four-token boundary. The first block has no
+    predecessor, so those rows read a padding entry scored -inf, which the
+    softmax drops.
+
+    A 128:1 layer does not overlap. Its state row is one latent wide and a block
+    pools its own 128 tokens and nothing else.
+
+    Either way the pooled latent is normalized, and its rope half rotated at the
     *block* index using the compressed frequency base with YaRN -- a different
     rotation from the one the raw tokens get.
     """
@@ -324,16 +330,23 @@ class CompressedState:
         self.ratio = ratio
         self.head_dim = int(config["kv_lora_rank"])
         self.rope_dim = int(config["rotary_dimension"])
-        self.width = 2 * self.head_dim
+        # A 4:1 layer keeps two half-rows per token to overlap its blocks; a
+        # 128:1 layer keeps one. The checkpoint's compressor widths say so
+        # directly: 1024 at layer 2 against 512 at layer 3.
+        self.overlapped = ratio == 4
+        self.width = (2 if self.overlapped else 1) * self.head_dim
         self.epsilon = float(config["rms_norm_epsilon"])
         self.freq_base = float(config["compress_rope_freq_base"])
-        factor = float(config.get("rope_scaling_factor", 0.0)) or 1.0
-        self.freq_scale = 1.0 / factor
+        # No fallback here on purpose. These came from a default until the ABI
+        # exposed them, and a wrong-but-plausible 1.0 silently disabled YaRN --
+        # invisible on short prompts, because the block index barely moves.
+        self.freq_scale = 1.0 / float(config["rope_scaling_factor"])
         # The reference passes an attenuation that exactly cancels the one ggml
         # applies for YaRN, leaving the magnitude unscaled.
         self.attn_factor = 1.0 / (1.0 + 0.1 * float(np.log(1.0 / self.freq_scale)))
-        self.original_context = int(config["rope_original_context_length"]) \
-            if "rope_original_context_length" in config else 65536
+        self.original_context = int(config["rope_original_context_length"])
+        self.beta_fast = float(config["yarn_beta_fast"])
+        self.beta_slow = float(config["yarn_beta_slow"])
         prefix = f"blk.{layer}."
         self.norm = _f32(model, prefix + "attn_compressor_norm.weight")
         self.ape = _f32(model, prefix + "attn_compressor_ape.weight").reshape(
@@ -360,24 +373,31 @@ class CompressedState:
         values, scores = self.states(hidden)
         out = []
         for block in range(blocks):
-            pooled_values = np.zeros((2 * self.ratio, self.head_dim), dtype=np.float32)
-            pooled_scores = np.full((2 * self.ratio, self.head_dim), -np.inf, dtype=np.float32)
-            for slot in range(self.ratio):
-                previous = (block - 1) * self.ratio + slot
-                if previous >= 0:
-                    # The prev half is the first `head_dim` of the state row.
-                    pooled_values[slot] = values[previous][: self.head_dim]
-                    pooled_scores[slot] = scores[previous][: self.head_dim]
-                current = block * self.ratio + slot
-                # The cur half is the second.
-                pooled_values[self.ratio + slot] = values[current][self.head_dim :]
-                pooled_scores[self.ratio + slot] = scores[current][self.head_dim :]
+            if self.overlapped:
+                rows = 2 * self.ratio
+                pooled_values = np.zeros((rows, self.head_dim), dtype=np.float32)
+                pooled_scores = np.full((rows, self.head_dim), -np.inf, dtype=np.float32)
+                for slot in range(self.ratio):
+                    previous = (block - 1) * self.ratio + slot
+                    if previous >= 0:
+                        # The prev half is the first `head_dim` of the state row.
+                        pooled_values[slot] = values[previous][: self.head_dim]
+                        pooled_scores[slot] = scores[previous][: self.head_dim]
+                    current = block * self.ratio + slot
+                    # The cur half is the second.
+                    pooled_values[self.ratio + slot] = values[current][self.head_dim :]
+                    pooled_scores[self.ratio + slot] = scores[current][self.head_dim :]
+            else:
+                span = slice(block * self.ratio, (block + 1) * self.ratio)
+                pooled_values = values[span]
+                pooled_scores = scores[span]
             pooled = compress(pooled_values, pooled_scores)
             pooled = rms_norm(pooled, self.norm, epsilon=self.epsilon)
             out.append(rope(
                 pooled, block, self.rope_dim,
                 freq_base=self.freq_base, freq_scale=self.freq_scale,
                 ext_factor=1.0, attn_factor=self.attn_factor,
+                beta_fast=self.beta_fast, beta_slow=self.beta_slow,
                 original_context=self.original_context,
             ))
         return np.stack(out)

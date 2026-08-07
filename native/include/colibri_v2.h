@@ -61,6 +61,10 @@ typedef struct ColibriV2ModelConfig {
     uint32_t hyper_connection_count, sinkhorn_iterations;
     uint32_t expert_shared_count, hash_layer_count, compress_ratios_length;
     float sinkhorn_epsilon, compress_rope_freq_base;
+    /* YaRN rope extension, needed by the compressed layers. A zero factor means
+       the checkpoint asked for no scaling. */
+    float rope_scaling_factor, yarn_beta_fast, yarn_beta_slow;
+    uint32_t rope_original_context_length;
 } ColibriV2ModelConfig;
 
 typedef struct ColibriV2GpuInfo {

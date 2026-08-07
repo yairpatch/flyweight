@@ -3797,7 +3797,9 @@ out->indexer_head_count=m->config.indexer_head_count;out->indexer_key_length=m->
 out->hyper_connection_count=m->config.hyper_connection_count;out->sinkhorn_iterations=m->config.sinkhorn_iterations;
 out->expert_shared_count=m->config.expert_shared_count;out->hash_layer_count=m->config.hash_layer_count;
 out->compress_ratios_length=static_cast<std::uint32_t>(m->config.compress_ratios.size());
-out->sinkhorn_epsilon=m->config.sinkhorn_epsilon;out->compress_rope_freq_base=m->config.compress_rope_freq_base;return 0;});}
+out->sinkhorn_epsilon=m->config.sinkhorn_epsilon;out->compress_rope_freq_base=m->config.compress_rope_freq_base;
+out->rope_scaling_factor=m->config.rope_scaling_factor;out->yarn_beta_fast=m->config.yarn_beta_fast;out->yarn_beta_slow=m->config.yarn_beta_slow;
+out->rope_original_context_length=m->config.rope_original_context_length;return 0;});}
 
 // Multiply a model tensor by a vector, decoding whatever weight type the
 // checkpoint stores it as. GGUF reports a matrix as [inputs, outputs], so

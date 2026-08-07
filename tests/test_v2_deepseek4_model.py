@@ -57,10 +57,19 @@ class FullStackTests(unittest.TestCase):
         self.assertEqual(ratios[:4], [0, 0, 4, 128])
         self.assertEqual(set(ratios), {0, 4, 128})
 
-    def test_only_the_four_to_one_layers_carry_a_compressor(self):
+    def test_every_compressed_layer_carries_a_compressor(self):
         for block in self.net.blocks:
             with self.subTest(layer=block.layer):
-                self.assertEqual(block.compressor is not None, block.ratio == 4)
+                self.assertEqual(block.compressor is not None, block.ratio != 0)
+                if block.compressor is None:
+                    continue
+                # Only the 4:1 kind overlaps its blocks, which is what doubles
+                # its state width.
+                self.assertEqual(block.compressor.overlapped, block.ratio == 4)
+                self.assertEqual(
+                    block.compressor.width,
+                    (2 if block.ratio == 4 else 1) * block.head_dim,
+                )
 
     def test_compressed_layers_rotate_on_the_compressed_base(self):
         plain = next(b for b in self.net.blocks if b.ratio == 0)

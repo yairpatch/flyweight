@@ -133,6 +133,10 @@ class _ModelConfig(ctypes.Structure):
         ("compress_ratios_length", ctypes.c_uint32),
         ("sinkhorn_epsilon", ctypes.c_float),
         ("compress_rope_freq_base", ctypes.c_float),
+        ("rope_scaling_factor", ctypes.c_float),
+        ("yarn_beta_fast", ctypes.c_float),
+        ("yarn_beta_slow", ctypes.c_float),
+        ("rope_original_context_length", ctypes.c_uint32),
     ]
 
 
@@ -924,6 +928,9 @@ class V2Model:
             "rope_freq_base",
             "sinkhorn_epsilon",
             "compress_rope_freq_base",
+            "rope_scaling_factor",
+            "yarn_beta_fast",
+            "yarn_beta_slow",
         }
         config = {
             field: (
