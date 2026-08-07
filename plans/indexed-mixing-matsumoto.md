@@ -442,6 +442,42 @@ token for at least 64 tokens; per-layer activation max-abs diff stays within the
 the quantization allows; a perplexity spot check on a short held-out text tracks the
 reference.
 
+## Where this stands
+
+Working, and checked: split-GGUF loading, metadata, the `joyai-llm` tokenizer
+byte-identical to the reference, every weight format in the checkpoint including
+MXFP4, all three attention kinds with both compressors, hyper-connections, the
+router, the head, and a native forward loop over all 43 layers whose logits are
+*identical* to the composed model -- which is itself verified against llama.cpp.
+It answers "The capital city of France is" with " Paris." and "2 + 2 =" with
+" 4", runs from `colibri-next generate`, and streams GenerationStep events.
+
+Throughput is around 2 tok/s warm against roughly 3 for the reference, measured
+after the page cache settles rather than cold.
+
+What is left, in the order worth doing it:
+
+1. **Engine integration.** The service class carries chat templates, tool calls,
+   concurrency limits and slot scheduling around a KV layout of one pair per
+   layer. This architecture needs three caches per layer plus the compressor's
+   partial-block state. The streaming already emits the right event type, so the
+   remaining work is the slot and scheduler shape, not the transport.
+2. **Expert paging**, for the last ~1.5x. Every expert matmul reads from the
+   mmap with no reuse between tokens; the existing paging machinery is what
+   closes it.
+3. **The lightning indexer**, before any context past roughly 2048 tokens. It is
+   inert below that -- top-512 over fewer than 512 compressed blocks selects
+   everything -- so nothing tested so far exercises it, and a short-prompt pass
+   says nothing about it.
+4. **The DSML tool-call dialect**, for anything past plain chat.
+
+Two things are believed rather than established. The tail layers diverge from
+the reference (element-wise error reaching 47% past layer 36) and the routed
+expert selections differ at every layer sampled; both are consistent with the
+activation-precision difference crossing selection boundaries in layers whose
+feed-forward gain is around a hundredfold, and neither has been proven benign.
+The generated text is coherent and correct, which is evidence but not proof.
+
 ## Stage C2 design — what the native loop must hold
 
 The state a sequence needs is far smaller than it first appears, and working out
