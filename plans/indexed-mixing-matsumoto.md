@@ -315,6 +315,27 @@ and it would be a legitimate consequence of the activation-precision difference
 rather than a defect. Establishing that needs the reference's own hidden state,
 which the dump does not carry.
 
+### The stack agrees with the reference behaviourally, not token for token
+
+On the 376-token prompt -- three identical paragraphs -- the reference's greedy
+continuation is "2. The history", having noticed the repetition and started
+numbering it. Our top prediction is "3", with "ĠThe" second and "2" fourth. The
+reference's next token after its digit is "The", which is our second choice.
+
+So both produce the same behaviour and differ on which digit. The reason is
+visible in the logits: the top six candidates span 1.07, and five of them are
+digits. The model is close to indifferent there, so the one-to-two percent
+activation difference between the two implementations is more than enough to
+reorder them.
+
+This is the concrete case the acceptance criterion was rewritten for. Token-for-
+token agreement fails here, and would fail on any near-tie, without indicating a
+defect in either implementation. What it does establish is that a 376-token
+prompt survives 43 layers -- including both compressed attention kinds and the
+tail whose element-wise error reaches 47% -- and still produces a sensible,
+reference-like continuation. The tail divergence does not appear to destroy the
+output.
+
 ### Expert selection diverges from the reference, and probably always will
 
 Running the full stack and comparing block outputs, layers 0-32 agree to within
