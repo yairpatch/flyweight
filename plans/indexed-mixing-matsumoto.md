@@ -460,6 +460,8 @@ reference.
   ten-token prompt, `long.txt` for the 376-token one. Regenerate with
   `llama-eval-callback -m <shard 1> -f <prompt> -n 1 -c 1024 --temp 0`. Keep
   them out of `/tmp`, which is a RAM-backed tmpfs here.
+- Serving: `colibri-next serve <shard 1> --context 2048`. The runtime knobs are
+  refused on this architecture, so pass none of them.
 - **The working tree carries unrelated uncommitted work** on a prompt-cache
   feature, in README.md, cli.py, v2.py, v2_server.py and two test files. Stage
   hunks selectively rather than whole files, and verify a commit by stashing the
@@ -478,21 +480,23 @@ It answers "The capital city of France is" with " Paris." and "2 + 2 =" with
 Throughput is around 2 tok/s warm against roughly 3 for the reference, measured
 after the page cache settles rather than cold.
 
+It now also **serves**: `colibri-next serve` starts the OpenAI/Anthropic API on
+this checkpoint, answers `/v1/chat/completions` (streaming and not), and reports
+the deepseek4 backend through `/health`. See the section below.
+
 What is left, in the order worth doing it:
 
-1. **Engine integration.** The service class carries chat templates, tool calls,
-   concurrency limits and slot scheduling around a KV layout of one pair per
-   layer. This architecture needs three caches per layer plus the compressor's
-   partial-block state. The streaming already emits the right event type, so the
-   remaining work is the slot and scheduler shape, not the transport.
-2. **Expert paging**, for the last ~1.5x. Every expert matmul reads from the
+1. **Expert paging**, for the last ~1.5x. Every expert matmul reads from the
    mmap with no reuse between tokens; the existing paging machinery is what
    closes it.
-3. **The lightning indexer**, before any context past roughly 2048 tokens. It is
+2. **The lightning indexer**, before any context past roughly 2048 tokens. It is
    inert below that -- top-512 over fewer than 512 compressed blocks selects
    everything -- so nothing tested so far exercises it, and a short-prompt pass
    says nothing about it.
-4. **The DSML tool-call dialect**, for anything past plain chat.
+3. **The DSML tool-call dialect**, for anything past plain chat.
+4. **Batched prefill.** The scheduler feeds the prompt a token at a time, which
+   rereads every expert row per position. This is the same cost expert paging
+   exists to manage and is worth doing with it rather than before it.
 
 Two things are believed rather than established. The tail layers diverge from
 the reference (element-wise error reaching 47% past layer 36) and the routed
@@ -540,6 +544,65 @@ composed model runs one position at a time through a matvec per weight, which is
 right for an oracle and wrong for a runtime: it rereads every expert row per
 token instead of amortizing it across a batch, which is precisely the cost the
 paging machinery exists to manage.
+
+## Engine integration: done, and what it cost
+
+The service layer is now reachable. `colibri-next serve` and `generate` both
+dispatch on architecture, and the model answers over HTTP with the chat
+template, streaming, keepalives and `/v1/models` intact.
+
+The split that made it cheap: everything above the scheduler -- templates, tool
+calls, continuation reuse, incremental UTF-8 decoding, the SSE transport --
+depends on the engine only through `submit`/`cancel`/`forget` and four event
+kinds, so it moved into a `ChatGenerator` base and was reused rather than
+rewritten. Only the scheduler is new: a pool of `Deepseek4Runtime` slots stepped
+round-robin on one thread, prefilling in chunks of 32 so a short request waits
+for a chunk rather than a whole prompt. One thread because the slots share the
+weights and the expert reads are the cost; two concurrent forwards would double
+the page pressure for nothing.
+
+Four things this turned up that were not obvious from the design:
+
+- **A slot can only be reused by a prompt that strictly extends it.** The
+  runtime advances a sequence and cannot rewind, so an *identical* prompt is a
+  cache miss: its last token has to be forwarded again for logits, and that
+  position is already spent. Also, the last token a request generates is never
+  forwarded, so a slot holds the prompt plus all but the final reply token --
+  reuse counts are one short of what the arithmetic suggests.
+- **Splicing a cached prefix bypasses the template, so it has to agree with
+  it.** Rendering the remaining turns as a fresh conversation planted a second
+  BOS mid-sequence, and the "turn already ended" separator added a newline this
+  template never emits. Both are fixed, and a second turn now tokenizes
+  *identically* to a fresh render of the whole conversation -- checked against
+  the real checkpoint.
+- **The chat markup is not readable off the template by inspection.** The
+  assistant role token is a transition emitted on the *preceding* user turn, so
+  an assistant message following a system message carries no role token at all;
+  tool results render inside the user block they answer; consecutive user turns
+  join with a blank line; and reasoning is dropped from every turn the
+  conversation has moved past. The fallback formatter was wrong on 678 of 1248
+  role sequences before those four rules were transcribed, and is now exact over
+  every sequence up to length four, with and without thinking. The real
+  checkpoint ships a template, so the fallback is only reached on a GGUF that
+  does not -- but a silent disagreement there would show up as output quality,
+  not as an error.
+- **The first prefill event is read as the count served from cache.** Emitting
+  the first chunk instead made the server report 9 of 10 tokens reused on a cold
+  slot. The scheduler now announces the reused prefix before any work.
+
+Sampling is Python-side (temperature, top-k, nucleus, seeded) because the native
+sampler is wired into the Qwen engine's task state; at 1.5 tok/s an argmax over
+129k floats is not what costs.
+
+Measured through the server, greedy, 24 tokens per request on a 10-token prompt,
+four successive identical requests: **0.49, 1.16, 1.40, 1.51 tok/s**. That is the
+page-cache ramp this plan already warns about, seen again from the other side --
+the cold figure understates the warm one by 3x, and 1.5 tok/s was still climbing.
+
+Runtime knobs this path cannot honour -- GPU placement, expert paging, KV
+quantization, MTP drafts -- are refused with a message rather than accepted and
+ignored, so `serve --cache-type-k q8_0` says so instead of quietly doing
+something else.
 
 ## Stage C — GPU / hybrid execution
 
