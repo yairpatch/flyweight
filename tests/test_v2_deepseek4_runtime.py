@@ -34,13 +34,15 @@ def _expected_bytes(config, ratios, context: int) -> int:
     window = min(int(config["sliding_window"]), context)
     total = 0
     for ratio in ratios[: int(config["layer_count"])]:
-        total += window * head_dim * 4                     # raw latent ring
+        # Caches are half precision, as the reference stores them; the
+        # compressor's own rows stay f32, which is also what the reference does.
+        total += window * head_dim * 2                     # raw latent ring
         if not ratio:
             continue
         overlapped = ratio == 4
         width = (2 if overlapped else 1) * head_dim
         rows = (2 if overlapped else 1) * ratio
-        total += (context // ratio + 1) * head_dim * 4     # compressed cache
+        total += (context // ratio + 1) * head_dim * 2     # compressed cache
         total += rows * width * 4 * 2                      # values and scores
     return total
 
@@ -76,15 +78,9 @@ class Deepseek4RuntimeTests(unittest.TestCase):
         # Tens of megabytes against 104 GiB, which is what makes cache
         # quantization pointless here and context nearly free.
         #
-        # 65 MiB rather than the 38 the plan estimated: that estimate assumed
-        # f16 caches, matching the reference, and these buffers are f32. The
-        # composed model rounds its latents to f16 precisely to stay numerically
-        # with the reference, so the write path will have to round too -- at
-        # which point storing f16 costs nothing and halves this. Left as f32
-        # until the write path exists rather than guessed at now.
         with Deepseek4Runtime(self.model, 4096) as runtime:
             megabytes = runtime.info["state_bytes"] / 1024 / 1024
-            self.assertLess(megabytes, 128)
+            self.assertLess(megabytes, 64)
             self.assertGreater(megabytes, 1)
 
     def test_raw_state_does_not_grow_with_context(self):
@@ -197,3 +193,51 @@ class WeightPlanFixtureTests(unittest.TestCase):
                     self.assertEqual(info["resolved_tensors"], expected)
             finally:
                 model.close()
+
+
+class HalfPrecisionTests(unittest.TestCase):
+    """The cache storage format, checked against a known-good implementation.
+
+    The caches hold half precision because the reference does, and the composed
+    model already rounds its latents the same way -- so matching costs no
+    accuracy and halves the footprint. But a hand-rolled float-to-half is easy
+    to get subtly wrong at the edges, and a rounding difference in the cache
+    would show up as drift that looks like an architecture bug. So it is
+    compared against numpy's float16 rather than trusted.
+    """
+
+    def test_it_matches_numpy_on_ordinary_values(self):
+        import numpy as np
+        from colibri_next.deepseek4 import half_round_trip
+
+        rng = np.random.default_rng(23)
+        values = np.concatenate([
+            rng.standard_normal(4000).astype(np.float32) * 10.0,
+            rng.standard_normal(2000).astype(np.float32) * 0.001,
+        ])
+        for value in values:
+            expected = float(np.float32(np.float16(value)))
+            self.assertEqual(half_round_trip(float(value)), expected, msg=f"{value!r}")
+
+    def test_it_matches_numpy_on_edges(self):
+        import numpy as np
+        from colibri_next.deepseek4 import half_round_trip
+
+        edges = [
+            0.0, -0.0, 1.0, -1.0, 65504.0, -65504.0,   # largest finite half
+            65520.0, 1e30, -1e30,                       # overflow to infinity
+            6.103515625e-05, 5.960464477539063e-08,     # smallest normal, smallest subnormal
+            3e-08, 1e-10, -1e-10,                       # underflow territory
+            2049.0, 2048.5, 0.30000001192092896,        # rounding ties
+        ]
+        for value in edges:
+            expected = float(np.float32(np.float16(np.float32(value))))
+            self.assertEqual(half_round_trip(value), expected, msg=f"{value!r}")
+
+    def test_infinities_and_nan_survive(self):
+        import math
+        from colibri_next.deepseek4 import half_round_trip
+
+        self.assertEqual(half_round_trip(math.inf), math.inf)
+        self.assertEqual(half_round_trip(-math.inf), -math.inf)
+        self.assertTrue(math.isnan(half_round_trip(math.nan)))

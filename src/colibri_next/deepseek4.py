@@ -131,6 +131,11 @@ class Deepseek4Runtime:
         return {field: getattr(value, field) for field, _ in self._info_type._fields_}
 
 
+def half_round_trip(value: float) -> float:
+    """Round a float through half precision, the format the caches store."""
+    return float(_library().colibri_v2_deepseek4_half_round_trip(float(value)))
+
+
 def gather_block(
     values: np.ndarray, scores: np.ndarray, head_dim: int, ratio: int,
     block: int, overlapped: bool,

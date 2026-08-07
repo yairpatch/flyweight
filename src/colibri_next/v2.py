@@ -507,6 +507,8 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.POINTER(_Deepseek4Info),
                 ]
                 lib.colibri_v2_deepseek4_runtime_info.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_half_round_trip.argtypes = [ctypes.c_float]
+                lib.colibri_v2_deepseek4_half_round_trip.restype = ctypes.c_float
                 lib.colibri_v2_deepseek4_gather_block.argtypes = [
                     _float_p, _float_p, ctypes.c_int32, ctypes.c_int32,
                     ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,

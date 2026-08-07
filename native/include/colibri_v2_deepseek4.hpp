@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -23,6 +24,64 @@ inline void rms_norm(const float* input, std::size_t size, float epsilon, float*
 }
 
 inline float sigmoid(float value) { return 1.0f / (1.0f + std::exp(-value)); }
+
+// Float to half, round to nearest even, matching what ggml stores.
+//
+// The caches hold half precision because the reference does, and the composed
+// model already rounds its latents the same way to stay numerically alongside
+// it. Storing anything wider here would not buy accuracy -- the value written
+// has been through half precision either way -- it would only cost memory.
+inline std::uint16_t half_bits(float value) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t sign = (bits >> 16) & 0x8000u;
+    std::int32_t exponent = static_cast<std::int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+    std::uint32_t mantissa = bits & 0x7FFFFFu;
+    if (((bits >> 23) & 0xFFu) == 0xFFu)  // inf or NaN, kept as such
+        return static_cast<std::uint16_t>(sign | 0x7C00u | (mantissa ? 0x200u : 0u));
+    if (exponent >= 0x1F) return static_cast<std::uint16_t>(sign | 0x7C00u);
+    if (exponent <= 0) {
+        if (exponent < -10) return static_cast<std::uint16_t>(sign);  // underflows to zero
+        mantissa |= 0x800000u;
+        const std::uint32_t shift = static_cast<std::uint32_t>(14 - exponent);
+        const std::uint32_t half = 1u << (shift - 1);
+        const std::uint32_t sticky = (mantissa & ((half << 1) - 1)) != half ? 0u : 1u;
+        const std::uint32_t rounded =
+            (mantissa + half - (sticky ? ((mantissa >> shift) & 1u) ^ 1u : 0u)) >> shift;
+        return static_cast<std::uint16_t>(sign | rounded);
+    }
+    const std::uint32_t rounded = mantissa + 0x0FFFu + ((mantissa >> 13) & 1u);
+    if (rounded & 0x800000u) {
+        ++exponent;
+        if (exponent >= 0x1F) return static_cast<std::uint16_t>(sign | 0x7C00u);
+        return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exponent) << 10));
+    }
+    return static_cast<std::uint16_t>(
+        sign | (static_cast<std::uint32_t>(exponent) << 10) | ((rounded >> 13) & 0x3FFu));
+}
+
+inline float half_value(std::uint16_t bits) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
+    const std::uint32_t exponent = (bits >> 10) & 0x1Fu;
+    std::uint32_t mantissa = bits & 0x3FFu;
+    std::uint32_t out;
+    if (exponent == 0) {
+        if (!mantissa) out = sign;
+        else {
+            std::int32_t shift = 0;
+            while (!(mantissa & 0x400u)) { mantissa <<= 1; ++shift; }
+            mantissa &= 0x3FFu;
+            out = sign | (static_cast<std::uint32_t>(127 - 15 - shift + 1) << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1F) {
+        out = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        out = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+    }
+    float value;
+    std::memcpy(&value, &out, sizeof(value));
+    return value;
+}
 
 // Sinkhorn-normalize the [hc, hc] mixing matrix in place. `comb` is indexed
 // [src*hc + dst], matching the reference's [dst, src] layout in memory.

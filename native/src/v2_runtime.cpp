@@ -3952,15 +3952,17 @@ struct Deepseek4LayerState {
     Deepseek4LayerPlan plan;
     std::uint32_t ratio = 0, window = 0, head_dim = 0;
     std::uint32_t state_width = 0, state_rows = 0, block_capacity = 0;
-    std::vector<float> latents;       // window x head_dim, ring
-    std::vector<float> compressed;    // block_capacity x head_dim
+    // Half precision, as the reference stores them. The composed model rounds
+    // its latents the same way, so nothing is lost by matching.
+    std::vector<std::uint16_t> latents;    // window x head_dim, ring
+    std::vector<std::uint16_t> compressed; // block_capacity x head_dim
     std::vector<float> state_values;  // state_rows x state_width, ring
     std::vector<float> state_scores;
     std::uint32_t positions = 0, blocks = 0;
 
     std::uint64_t bytes() const {
-        return (latents.size() + compressed.size() + state_values.size() +
-                state_scores.size()) * sizeof(float);
+        return (latents.size() + compressed.size()) * sizeof(std::uint16_t) +
+               (state_values.size() + state_scores.size()) * sizeof(float);
     }
     // The ring holds the newest `state_rows` rows, so a row's slot is its
     // position modulo the ring size.
@@ -4012,7 +4014,7 @@ int colibri_v2_deepseek4_runtime_create(
         layer.ratio=config.compress_ratios[index];
         layer.window=std::min(window,context_limit);
         layer.head_dim=head_dim;
-        layer.latents.assign(static_cast<std::size_t>(layer.window)*head_dim,0.0f);
+        layer.latents.assign(static_cast<std::size_t>(layer.window)*head_dim,0u);
 
         const std::string prefix="blk."+std::to_string(index)+".";
         auto find=[&](const char* suffix,bool required)->std::uint64_t{
@@ -4075,7 +4077,7 @@ int colibri_v2_deepseek4_runtime_create(
         layer.state_width=(overlapped?2u:1u)*head_dim;
         layer.state_rows=(overlapped?2u:1u)*layer.ratio;
         layer.block_capacity=context_limit/layer.ratio+1;
-        layer.compressed.assign(static_cast<std::size_t>(layer.block_capacity)*head_dim,0.0f);
+        layer.compressed.assign(static_cast<std::size_t>(layer.block_capacity)*head_dim,0u);
         const std::size_t rows=static_cast<std::size_t>(layer.state_rows)*layer.state_width;
         layer.state_values.assign(rows,0.0f);
         layer.state_scores.assign(rows,-std::numeric_limits<float>::infinity());
@@ -4108,6 +4110,12 @@ int colibri_v2_deepseek4_runtime_info(
         else ++out->window_layers;
     }
     return 0;});}
+
+// Round-trip a float through half precision, so the storage format the caches
+// use can be checked from outside.
+float colibri_v2_deepseek4_half_round_trip(float value){
+    return colibri::v2::deepseek4::half_value(colibri::v2::deepseek4::half_bits(value));
+}
 
 // Gather the state rows one compressed block pools.
 int colibri_v2_deepseek4_gather_block(

@@ -290,6 +290,8 @@ COLIBRI_V2_API void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime*
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime);
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_info(const ColibriV2Deepseek4Runtime* runtime,
     ColibriV2Deepseek4Info* out);
+/* Round-trip a float through half precision, as the caches store it. */
+COLIBRI_V2_API float colibri_v2_deepseek4_half_round_trip(float value);
 /* Gather the state rows one compressed block pools, ready for compression.
    Outputs are [rows][head_dim] with rows 2*ratio when overlapped, else ratio. */
 COLIBRI_V2_API int colibri_v2_deepseek4_gather_block(const float* values, const float* scores,
