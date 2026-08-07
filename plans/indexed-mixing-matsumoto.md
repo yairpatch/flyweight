@@ -477,8 +477,9 @@ router, the head, and a native forward loop over all 43 layers whose logits are
 It answers "The capital city of France is" with " Paris." and "2 + 2 =" with
 " 4", runs from `colibri-next generate`, and streams GenerationStep events.
 
-Throughput is around 2 tok/s warm against roughly 3 for the reference, measured
-after the page cache settles rather than cold.
+Throughput is 4.5 tok/s warm in the raw loop and 3.1 through the server, against
+roughly 3 for the reference, measured after the page cache settles rather than
+cold. It drops to about 3 and 2.2 when the routed experts are paging.
 
 It now also **serves**: `colibri-next serve` starts the OpenAI/Anthropic API on
 this checkpoint, answers `/v1/chat/completions` (streaming and not), and reports
@@ -486,17 +487,16 @@ the deepseek4 backend through `/health`. See the section below.
 
 What is left, in the order worth doing it:
 
-1. **Expert paging**, for the last ~1.5x. Every expert matmul reads from the
-   mmap with no reuse between tokens; the existing paging machinery is what
-   closes it.
-2. **The lightning indexer**, before any context past roughly 2048 tokens. It is
+1. **The lightning indexer**, before any context past roughly 2048 tokens. It is
    inert below that -- top-512 over fewer than 512 compressed blocks selects
    everything -- so nothing tested so far exercises it, and a short-prompt pass
    says nothing about it.
+2. **Expert residency**, worth up to 2x but only in the miss regime -- see the
+   attribution below, which replaced the assumption that paging was the next
+   thing to do.
 3. **The DSML tool-call dialect**, for anything past plain chat.
 4. **Batched prefill.** The scheduler feeds the prompt a token at a time, which
-   rereads every expert row per position. This is the same cost expert paging
-   exists to manage and is worth doing with it rather than before it.
+   rereads every expert row per position.
 
 Two things are believed rather than established. The tail layers diverge from
 the reference (element-wise error reaching 47% past layer 36) and the routed
@@ -603,6 +603,63 @@ Runtime knobs this path cannot honour -- GPU placement, expert paging, KV
 quantization, MTP drafts -- are refused with a message rather than accepted and
 ignored, so `serve --cache-type-k q8_0` says so instead of quietly doing
 something else.
+
+## Where a token's time goes, and why paging was not the next thing
+
+The plan said expert paging was worth "the last ~1.5x", on the reasoning that
+every expert matmul reads the mmap with no reuse between tokens. Measuring
+first turned that around, and the runtime now carries the counters the claims
+rest on (`forward_nanoseconds`, `routed_expert_*`, `shared_expert_*`,
+`attention_*`, `head_*`, exposed through the runtime info).
+
+**96% of the expert bytes are already in page cache.** A token touches 2.16 GiB
+of expert weights and, warm, only 88 MiB of that comes off disk. Paging had 4%
+of the bytes to win, not the whole read.
+
+**The loop was running on roughly one core.** The parallel teams took the
+default width -- one thread per hardware thread -- and on this 16-core /
+32-thread part that is 2.6x slower than one per core: 9.3 GiB/s of expert
+weights against 24.6. Two threads on a core share an L1 and a decode unit, and
+the loop forks about eight hundred times a token, so the wider team pays barrier
+time as well. The sweep is flat-topped at exactly the core count:
+
+    threads    4      8     12     16     20     24
+    tok/s   1.82   2.70   3.08   3.17   3.02   3.02
+
+Three more serial spots fell out of the same counters: the grouped output
+projection (a double loop over the largest read in the attention half, 34 MiB a
+layer), the hyper-connection mixer (24 rows of 16 384 weights, twice a layer,
+left serial by a row-count threshold), and the attention core over its 64
+independent heads. Warm steady state went **1.90 -> 4.5 tok/s** in the raw loop
+and **1.51 -> 3.1** through the server, against roughly 3 for the reference.
+
+What the attribution looks like now, warm, per token:
+
+- attention 111 ms, of which only 4.5 ms is the core; the rest is projections
+- routed experts 90 ms resident, 190-300 ms while paging
+- shared expert 20 ms, output head 9 ms
+
+**Attention is now the largest cost, and it is at memory bandwidth.** Its
+projections move 4.9 GiB of weights a token -- more than double the experts',
+being dense Q8_0 where the experts are 3-bit and six of 256 -- and run at about
+46 GiB/s, which is what this machine has. Nothing further is available there
+without reading fewer bytes; a cheaper quantization for `attn_q_b`,
+`attn_output_a` and `attn_output_b` is the only lever, and it costs accuracy.
+
+**Expert residency is now the measurable variable**, worth up to 2x but only
+when the cache misses. Successive passes over the same sequence:
+
+    disk 1-3 MiB/token   -> experts  92-95 ms -> 4.5 tok/s
+    disk 129-153 MiB/token -> experts 190-207 ms -> 3.0 tok/s
+
+So the prize is real but conditional, and it is bounded by which experts happen
+to be resident rather than by the paging machinery's cleverness. Worth doing
+after the indexer, and worth measuring in both regimes when it is.
+
+A caution for anything measured here: throughput swings by 2x with page-cache
+state alone, and an unlucky pass reads like a regression in code that did not
+change. Every number above is a warm steady state, and a suspected regression
+should be checked against `/proc/self/io` before it is believed.
 
 ## Stage C — GPU / hybrid execution
 
