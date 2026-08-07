@@ -262,6 +262,32 @@ Also worth noting for the attention core: keys and values are the same tensor,
 so there is one K cache and no V cache, and each head's sink logit joins the
 softmax without contributing a value.
 
+### Open: layer 2 diverges at length, downstream of attention
+
+On a 376-token prompt, layers 0 and 1 (ratio 0) track the reference to 0.06% and
+0.10% with a 128-token sliding window, so that window is right for them. Layer 2
+(ratio 4) lands at 8.28% on its block output, which is worth chasing but is not
+the attention path: isolating CSA attention against the reference's own
+`attn_csa_lid-2` gives
+
+    window 128 + compressed keys      0.88%
+    window 128, no compressed keys    2.87%
+    full causal + compressed keys     0.39%
+    full causal, no compressed keys   0.18%
+
+So attention is within a percent however it is masked, and cannot explain 8.28%.
+The block divergence is downstream of it -- the feed-forward or the
+hyper-connection -- or it is cancellation in a sum over 6.2 million values that
+comes to 2763.
+
+The raw window is settled, and from the source rather than from those numbers:
+the DSV4 cache builds `hparams_raw` as a copy of the model's own hparams and
+hands it to `llama_kv_cache_iswa`, so the sliding window is the model's 128 on
+every layer including the compressed ones. The first row above is therefore the
+right configuration, and full causal fitting marginally better is noise --
+fitting to it would have been the same mistake that produced the wrong block
+visibility rule earlier.
+
 ### Expert selection diverges from the reference, and probably always will
 
 Running the full stack and comparing block outputs, layers 0-32 agree to within
