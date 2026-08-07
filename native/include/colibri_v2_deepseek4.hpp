@@ -590,6 +590,67 @@ inline void attention_with_sinks(
     }
 }
 
+// The lightning indexer's score for every compressed block.
+//
+// Per head, the query is dotted with the block's key -- one key shared by all
+// heads, as the cache stores a single 128-wide row per block -- rectified, and
+// weighted by that head's share from the indexer projection. The rectifier is
+// what makes this a selector rather than a second attention: a head contributes
+// only where it agrees with the block, never against it.
+//
+// The reference rotates both query and keys through a fixed Hadamard matrix
+// first. It is orthogonal, so every dot product here is unchanged by it; the
+// rotation exists to spread quantization error across the cached channels, and
+// this cache is not quantized.
+inline void indexer_scores(
+    const float* queries,
+    const float* keys,
+    const float* weights,
+    std::size_t heads,
+    std::size_t dim,
+    std::size_t entries,
+    float* out
+) {
+#pragma omp parallel for schedule(static) num_threads(thread_count())
+    for (std::int64_t index = 0; index < static_cast<std::int64_t>(entries); ++index) {
+        const float* key = keys + static_cast<std::size_t>(index) * dim;
+        double total = 0.0;
+        for (std::size_t head = 0; head < heads; ++head) {
+            const float* query = queries + head * dim;
+            double dot = 0.0;
+            for (std::size_t i = 0; i < dim; ++i)
+                dot += static_cast<double>(query[i]) * key[i];
+            if (dot > 0.0) total += dot * weights[head];
+        }
+        out[static_cast<std::size_t>(index)] = static_cast<float>(total);
+    }
+}
+
+// Keep the `k` highest-scoring entries, marking the rest unusable.
+//
+// Selection is over the *visible* entries only, which is why the caller passes
+// the count rather than the whole cache: an invisible block scoring highly must
+// not take a slot from a visible one. Ties go to the lower index, which the
+// reference's partial sort does not promise -- it cannot matter for two blocks
+// whose scores are bit-identical, and it makes this deterministic.
+inline void top_k_select(
+    const float* scores, std::size_t entries, std::size_t k, std::uint8_t* keep
+) {
+    if (k >= entries) {
+        std::fill(keep, keep + entries, static_cast<std::uint8_t>(1));
+        return;
+    }
+    std::fill(keep, keep + entries, static_cast<std::uint8_t>(0));
+    std::vector<std::uint32_t> order(entries);
+    for (std::size_t i = 0; i < entries; ++i) order[i] = static_cast<std::uint32_t>(i);
+    std::nth_element(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k),
+                     order.end(), [&](std::uint32_t left, std::uint32_t right) {
+        if (scores[left] != scores[right]) return scores[left] > scores[right];
+        return left < right;
+    });
+    for (std::size_t i = 0; i < k; ++i) keep[order[i]] = 1;
+}
+
 // The grouped half of the output projection. The head outputs are cut into
 // `groups` contiguous chunks, and chunk g is multiplied by the g-th slice of the
 // weight rather than by the whole matrix, so the projection costs a fraction of

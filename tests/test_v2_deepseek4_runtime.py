@@ -44,6 +44,13 @@ def _expected_bytes(config, ratios, context: int) -> int:
         rows = (2 if overlapped else 1) * ratio
         total += (context // ratio + 1) * head_dim * 2     # compressed cache
         total += rows * width * 4 * 2                      # values and scores
+        if not overlapped:
+            continue
+        # A 4:1 layer also carries the lightning indexer's cache: the same
+        # shape at 128 wide instead of 512, because it only ranks blocks.
+        indexer = int(config["indexer_key_length"])
+        total += (context // ratio + 1) * indexer * 2
+        total += rows * (2 * indexer) * 4 * 2
     return total
 
 

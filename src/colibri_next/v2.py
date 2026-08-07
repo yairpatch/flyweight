@@ -158,6 +158,8 @@ class _Deepseek4Info(ctypes.Structure):
         ("head_nanoseconds", ctypes.c_uint64),
         ("attention_core_nanoseconds", ctypes.c_uint64),
         ("routed_expert_bytes", ctypes.c_uint64),
+        ("indexer_selections", ctypes.c_uint64),
+        ("indexer_candidates", ctypes.c_uint64),
     ]
 
 
@@ -533,6 +535,21 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_int32),
                 ]
                 lib.colibri_v2_deepseek4_visible_keys.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_indexer_key.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                    _float_p, ctypes.c_int32,
+                ]
+                lib.colibri_v2_deepseek4_indexer_key.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_indexer_scores.argtypes = [
+                    _float_p, _float_p, _float_p, ctypes.c_int32, ctypes.c_int32,
+                    ctypes.c_int32, _float_p,
+                ]
+                lib.colibri_v2_deepseek4_indexer_scores.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_top_k.argtypes = [
+                    _float_p, ctypes.c_int32, ctypes.c_int32,
+                    ctypes.POINTER(ctypes.c_uint8),
+                ]
+                lib.colibri_v2_deepseek4_top_k.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_compress.argtypes = [
                     _float_p, _float_p, ctypes.c_int32, ctypes.c_int32, _float_p,
                 ]

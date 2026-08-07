@@ -104,6 +104,7 @@ class Deepseek4Runtime:
             )
         self._handle = handle
         self._vocabulary = int(model.config["vocabulary_size"])
+        self._indexer_dim = int(model.config["indexer_key_length"])
         config = model.config
         # UINT32_MAX marks a terminator the checkpoint does not define.
         self._terminators = {
@@ -200,6 +201,25 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"reset failed").decode(errors="replace")
             )
 
+    def indexer_key(self, layer: int, block: int) -> np.ndarray:
+        """One compressed lightning-indexer key, as the cache holds it.
+
+        The cache fills from the first token but is read only once a sequence
+        outgrows the indexer's top-k, so this is how the compressor feeding it
+        is checked without a two-thousand-token prompt.
+        """
+        from colibri_next.v2 import V2Model  # noqa: F401  (documents the source)
+        dim = int(self._indexer_dim)
+        out = np.zeros(dim, dtype=np.float32)
+        status = self._library.colibri_v2_deepseek4_indexer_key(
+            self._handle, int(layer), int(block), _pointer(out), dim
+        )
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"indexer key failed").decode(errors="replace")
+            )
+        return out
+
     @property
     def info(self) -> dict:
         value = self._info_type()
@@ -291,6 +311,49 @@ def expert_matvec(
     if status:
         raise V2Error((library.colibri_v2_last_error() or b"expert matvec failed").decode(errors="replace"))
     return output
+
+
+def indexer_scores(
+    queries: np.ndarray, keys: np.ndarray, weights: np.ndarray
+) -> np.ndarray:
+    """Score every compressed block for the lightning indexer.
+
+    Per head the query is dotted with the block's key, rectified, and weighted
+    by that head's share; the block's score is the sum. The rectifier is what
+    separates this from an attention score: a head that disagrees with a block
+    contributes nothing rather than pushing it down.
+    """
+    queries = np.ascontiguousarray(queries, dtype=np.float32)
+    keys = np.ascontiguousarray(keys, dtype=np.float32)
+    weights = np.ascontiguousarray(weights, dtype=np.float32)
+    if queries.ndim != 2 or keys.ndim != 2 or queries.shape[1] != keys.shape[1]:
+        raise ValueError("queries and keys must be [n, dim] with the same dim")
+    if weights.shape != (queries.shape[0],):
+        raise ValueError("there must be one weight per head")
+    out = np.zeros(keys.shape[0], dtype=np.float32)
+    library = _library()
+    status = library.colibri_v2_deepseek4_indexer_scores(
+        _pointer(queries), _pointer(keys), _pointer(weights),
+        queries.shape[0], queries.shape[1], keys.shape[0], _pointer(out),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"indexer scores failed").decode(errors="replace"))
+    return out
+
+
+def top_k_select(scores: np.ndarray, keep: int) -> np.ndarray:
+    """Mark the `keep` highest-scoring entries; everything survives if there
+    are no more than `keep` of them."""
+    scores = np.ascontiguousarray(scores, dtype=np.float32)
+    out = np.zeros(scores.size, dtype=np.uint8)
+    library = _library()
+    status = library.colibri_v2_deepseek4_top_k(
+        _pointer(scores), scores.size, int(keep),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"top-k failed").decode(errors="replace"))
+    return out
 
 
 def route(

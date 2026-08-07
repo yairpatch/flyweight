@@ -286,6 +286,9 @@ typedef struct ColibriV2Deepseek4Info {
     uint64_t routed_expert_nanoseconds, shared_expert_nanoseconds;
     uint64_t attention_nanoseconds, head_nanoseconds, attention_core_nanoseconds;
     uint64_t routed_expert_bytes;
+    /* Compressed blocks the indexer kept and considered; zero while a sequence
+       is short enough that it selects everything. */
+    uint64_t indexer_selections, indexer_candidates;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding
@@ -314,6 +317,19 @@ COLIBRI_V2_API int colibri_v2_deepseek4_visible_keys(int32_t position, int32_t r
     int32_t blocks, int32_t ratio, int32_t window, uint8_t* mask, int32_t* visible);
 /* Pool `positions` rows of `width` into one compressed latent, softmaxing the
    scores per channel. */
+/* The lightning indexer's score for each compressed block, and the selection
+   built from it. Exposed so the ranking can be checked without a prompt long
+   enough to make the runtime run it. */
+/* One stored lightning-indexer key, dequantized. The cache is built from the
+   first token but nothing reads it until a sequence is long enough for the
+   indexer to run, so this is how the compressor behind it gets checked. */
+COLIBRI_V2_API int colibri_v2_deepseek4_indexer_key(const ColibriV2Deepseek4Runtime* runtime,
+    uint32_t layer, uint32_t block, float* out, int32_t outputs);
+COLIBRI_V2_API int colibri_v2_deepseek4_indexer_scores(const float* queries,
+    const float* keys, const float* weights, int32_t heads, int32_t dim,
+    int32_t entries, float* out);
+COLIBRI_V2_API int colibri_v2_deepseek4_top_k(const float* scores, int32_t entries,
+    int32_t keep, uint8_t* out);
 COLIBRI_V2_API int colibri_v2_deepseek4_compress(const float* values, const float* scores,
     int32_t positions, int32_t width, float* output);
 /* Matvec against one expert of a stacked [inputs, outputs, experts] tensor. */

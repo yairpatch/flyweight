@@ -3959,10 +3959,18 @@ struct Deepseek4LayerState {
     std::vector<float> state_values;  // state_rows x state_width, ring
     std::vector<float> state_scores;
     std::uint32_t positions = 0, blocks = 0;
+    // The lightning indexer's own compressor and cache, on 4:1 layers only. The
+    // same shape as the pair above at a narrower width -- 128 against 512 --
+    // because it only has to rank blocks, not answer with them.
+    std::uint32_t indexer_dim = 0, indexer_width = 0;
+    std::vector<std::uint16_t> indexer_compressed;
+    std::vector<float> indexer_state_values, indexer_state_scores;
 
     std::uint64_t bytes() const {
-        return (latents.size() + compressed.size()) * sizeof(std::uint16_t) +
-               (state_values.size() + state_scores.size()) * sizeof(float);
+        return (latents.size() + compressed.size() + indexer_compressed.size())
+                   * sizeof(std::uint16_t) +
+               (state_values.size() + state_scores.size() +
+                indexer_state_values.size() + indexer_state_scores.size()) * sizeof(float);
     }
     // The ring holds the newest `state_rows` rows, so a row's slot is its
     // position modulo the ring size.
@@ -3976,7 +3984,8 @@ struct Deepseek4Scratch {
     std::vector<float> low_rank, query, latent, block_out, grouped;
     std::vector<float> keys, attn, derope;
     std::vector<float> state_row, gate, up, activated, expert_out, moe, logits;
-    std::vector<std::uint8_t> mask;
+    std::vector<float> indexer_query, indexer_weights, indexer_scores, indexer_keys;
+    std::vector<std::uint8_t> mask, indexer_keep;
     std::vector<std::int32_t> experts;
     std::vector<float> weights;
 };
@@ -3990,6 +3999,7 @@ struct ColibriV2Deepseek4Runtime {
     std::uint32_t n_embd = 0, hc = 0, heads = 0, head_dim = 0, rope_dim = 0;
     std::uint32_t q_lora = 0, groups = 0, lora_rank = 0, experts = 0, experts_used = 0;
     std::uint32_t expert_ffn = 0, vocabulary = 0, sinkhorn_iterations = 0, hash_layers = 0;
+    std::uint32_t indexer_heads = 0, indexer_dim = 0, indexer_top_k = 0;
     float epsilon = 0.0f, freq_base = 0.0f, weight_scale = 1.5f, clamp = 10.0f;
     float compress_base = 0.0f, freq_scale = 1.0f, attn_factor = 1.0f;
     float beta_fast = 32.0f, beta_slow = 1.0f;
@@ -4006,6 +4016,9 @@ struct ColibriV2Deepseek4Runtime {
     std::uint64_t attention_nanoseconds = 0, head_nanoseconds = 0;
     std::uint64_t attention_core_nanoseconds = 0;
     std::uint64_t routed_expert_bytes = 0;
+    // How much the indexer is actually discarding, which is zero until a
+    // sequence is long enough for it to run at all.
+    std::uint64_t indexer_selections = 0, indexer_candidates = 0;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -4114,6 +4127,19 @@ int colibri_v2_deepseek4_runtime_create(
         const std::size_t rows=static_cast<std::size_t>(layer.state_rows)*layer.state_width;
         layer.state_values.assign(rows,0.0f);
         layer.state_scores.assign(rows,-std::numeric_limits<float>::infinity());
+        if(layer.ratio==4&&config.indexer_key_length){
+            // The indexer compresses the same blocks at the same ratio, so it
+            // shares the ring geometry and differs only in width.
+            layer.indexer_dim=config.indexer_key_length;
+            layer.indexer_width=2u*layer.indexer_dim;
+            layer.indexer_compressed.assign(
+                static_cast<std::size_t>(layer.block_capacity)*layer.indexer_dim,0u);
+            const std::size_t indexer_rows=
+                static_cast<std::size_t>(layer.state_rows)*layer.indexer_width;
+            layer.indexer_state_values.assign(indexer_rows,0.0f);
+            layer.indexer_state_scores.assign(
+                indexer_rows,-std::numeric_limits<float>::infinity());
+        }
     }
     auto& g=*runtime;
     g.n_embd=config.hidden_size; g.hc=config.hyper_connection_count;
@@ -4124,6 +4150,8 @@ int colibri_v2_deepseek4_runtime_create(
     g.expert_ffn=config.expert_intermediate_size?config.expert_intermediate_size:config.intermediate_size;
     g.vocabulary=config.vocabulary_size; g.sinkhorn_iterations=config.sinkhorn_iterations;
     g.hash_layers=config.hash_layer_count; g.epsilon=config.rms_norm_epsilon;
+    g.indexer_heads=config.indexer_head_count; g.indexer_dim=config.indexer_key_length;
+    g.indexer_top_k=config.indexer_top_k;
     g.freq_base=config.rope_freq_base; g.compress_base=config.compress_rope_freq_base;
     g.weight_scale=config.expert_weights_scale?config.expert_weights_scale:1.0f;
     g.freq_scale=config.rope_scaling_factor>0.0f?1.0f/config.rope_scaling_factor:1.0f;
@@ -4160,6 +4188,18 @@ int colibri_v2_deepseek4_runtime_create(
         widest=std::max(widest,layer.window+layer.block_capacity);
     sc.keys.assign(static_cast<std::size_t>(widest)*g.head_dim,0.0f);
     sc.mask.assign(widest,0);
+    // The indexer's scratch: one query per head, one weight per head, and a
+    // score and a verdict per compressed block.
+    if(g.indexer_dim){
+        std::uint32_t blocks=0;
+        for(const auto& layer:g.layers)
+            if(layer.indexer_dim)blocks=std::max(blocks,layer.block_capacity);
+        sc.indexer_query.assign(static_cast<std::size_t>(g.indexer_heads)*g.indexer_dim,0.0f);
+        sc.indexer_weights.assign(g.indexer_heads,0.0f);
+        sc.indexer_scores.assign(blocks,0.0f);
+        sc.indexer_keep.assign(blocks,0);
+        sc.indexer_keys.assign(static_cast<std::size_t>(blocks)*g.indexer_dim,0.0f);
+    }
 
     *out=runtime.release();
     return 0;});}
@@ -4233,6 +4273,61 @@ const float* ds4_f32(const ColibriV2Model& model, std::uint64_t index) {
     return reinterpret_cast<const float*>(tensor_data(model, model.tensors[index]));
 }
 
+// Close one compressed block: pool the rows it covers, normalize, rotate at the
+// block's own position, and store it half precision.
+//
+// The main path and the indexer differ only in width and in which norm they
+// read, so they share this. A 4:1 block pools the previous block's rows
+// alongside its own, which is why the ring holds twice the ratio and why the
+// halves of a row are read separately: the low half belongs to the block a row
+// was written for, the high half to the one after it.
+void ds4_close_block(const ColibriV2Deepseek4Runtime& rt, Deepseek4LayerState& layer,
+                     std::uint32_t block, std::uint32_t dim, std::uint32_t width,
+                     const std::vector<float>& source_values,
+                     const std::vector<float>& source_scores,
+                     std::uint64_t norm, std::vector<std::uint16_t>& target) {
+    namespace ds4 = colibri::v2::deepseek4;
+    const auto& model = *rt.model;
+    const bool overlapped = layer.ratio == 4;
+    const auto rows = layer.state_rows;
+    std::vector<float> pooled_values(static_cast<std::size_t>(rows) * dim, 0.0f);
+    std::vector<float> pooled_scores(pooled_values.size(),
+                                     -std::numeric_limits<float>::infinity());
+    for (std::uint32_t slot_index = 0; slot_index < layer.ratio; ++slot_index) {
+        const auto current = block * layer.ratio + slot_index;
+        const auto* cv = source_values.data() + static_cast<std::size_t>(current % rows) * width;
+        const auto* cs = source_scores.data() + static_cast<std::size_t>(current % rows) * width;
+        if (!overlapped) {
+            std::copy_n(cv, dim, pooled_values.data() + static_cast<std::size_t>(slot_index) * dim);
+            std::copy_n(cs, dim, pooled_scores.data() + static_cast<std::size_t>(slot_index) * dim);
+            continue;
+        }
+        if (block > 0) {
+            const auto previous = (block - 1) * layer.ratio + slot_index;
+            const auto* pv = source_values.data() + static_cast<std::size_t>(previous % rows) * width;
+            const auto* ps = source_scores.data() + static_cast<std::size_t>(previous % rows) * width;
+            std::copy_n(pv, dim, pooled_values.data() + static_cast<std::size_t>(slot_index) * dim);
+            std::copy_n(ps, dim, pooled_scores.data() + static_cast<std::size_t>(slot_index) * dim);
+        }
+        std::copy_n(cv + dim, dim,
+                    pooled_values.data() + static_cast<std::size_t>(layer.ratio + slot_index) * dim);
+        std::copy_n(cs + dim, dim,
+                    pooled_scores.data() + static_cast<std::size_t>(layer.ratio + slot_index) * dim);
+    }
+    std::vector<float> pooled(dim, 0.0f);
+    ds4::compress_block(pooled_values.data(), pooled_scores.data(), rows, dim, pooled.data());
+    ds4::rms_norm(pooled.data(), dim, rt.epsilon, pooled.data());
+    {
+        const float* gain = ds4_f32(model, norm);
+        for (std::uint32_t i = 0; i < dim; ++i) pooled[i] *= gain[i];
+    }
+    ds4::rope(pooled.data() + (dim - rt.rope_dim), rt.rope_dim,
+              static_cast<std::int32_t>(block), rt.compress_base, rt.freq_scale, false,
+              {1.0f, rt.attn_factor, rt.beta_fast, rt.beta_slow, rt.original_context});
+    std::uint16_t* slot = target.data() + static_cast<std::size_t>(block) * dim;
+    for (std::uint32_t i = 0; i < dim; ++i) slot[i] = ds4::half_bits(pooled[i]);
+}
+
 // Run one block over one position, reading and updating its cache.
 void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                        std::uint32_t position, std::uint32_t token,
@@ -4296,6 +4391,31 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         for (std::uint32_t i = 0; i < head_dim; ++i) slot[i] = ds4::half_bits(sc.latent[i]);
     }
 
+    // The indexer's compressor, kept on every 4:1 layer whatever the length.
+    //
+    // The cache has to be built from the first token even though nothing reads
+    // it until there are more blocks than the indexer may select: a block's
+    // rows are projected from a hidden state that is gone by the next step, so
+    // there is no way to fill this in later.
+    if (layer.indexer_dim) {
+        const auto width = layer.indexer_width;
+        const auto slot = position % layer.state_rows;
+        float* values = layer.indexer_state_values.data() + static_cast<std::size_t>(slot) * width;
+        float* scores = layer.indexer_state_scores.data() + static_cast<std::size_t>(slot) * width;
+        ds4_matvec(model, plan.indexer_comp_kv, sc.hidden.data(), n_embd, values,
+                   static_cast<std::int32_t>(width));
+        ds4_matvec(model, plan.indexer_comp_gate, sc.hidden.data(), n_embd, scores,
+                   static_cast<std::int32_t>(width));
+        const float* ape = ds4_f32(model, plan.indexer_comp_ape) +
+            static_cast<std::size_t>(position % layer.ratio) * width;
+        for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
+        if ((position + 1) % layer.ratio == 0 && layer.blocks < layer.block_capacity) {
+            ds4_close_block(rt, layer, layer.blocks, layer.indexer_dim, width,
+                            layer.indexer_state_values, layer.indexer_state_scores,
+                            plan.indexer_comp_norm, layer.indexer_compressed);
+        }
+    }
+
     // Compressor state, closing a block when it fills.
     if (layer.ratio) {
         const auto width = layer.state_width;
@@ -4310,52 +4430,58 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
             static_cast<std::size_t>(position % layer.ratio) * width;
         for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
         if ((position + 1) % layer.ratio == 0 && layer.blocks < layer.block_capacity) {
-            const bool overlapped = layer.ratio == 4;
-            const auto rows = layer.state_rows;
-            std::vector<float> pooled_values(static_cast<std::size_t>(rows) * head_dim, 0.0f);
-            std::vector<float> pooled_scores(pooled_values.size(),
-                                             -std::numeric_limits<float>::infinity());
-            const auto block = layer.blocks;
-            for (std::uint32_t slot_index = 0; slot_index < layer.ratio; ++slot_index) {
-                const auto current = block * layer.ratio + slot_index;
-                const auto* cv = layer.state_values.data() +
-                    static_cast<std::size_t>(current % rows) * width;
-                const auto* cs = layer.state_scores.data() +
-                    static_cast<std::size_t>(current % rows) * width;
-                if (!overlapped) {
-                    std::copy_n(cv, head_dim, pooled_values.data() + static_cast<std::size_t>(slot_index) * head_dim);
-                    std::copy_n(cs, head_dim, pooled_scores.data() + static_cast<std::size_t>(slot_index) * head_dim);
-                    continue;
-                }
-                if (block > 0) {
-                    const auto previous = (block - 1) * layer.ratio + slot_index;
-                    const auto* pv = layer.state_values.data() +
-                        static_cast<std::size_t>(previous % rows) * width;
-                    const auto* ps = layer.state_scores.data() +
-                        static_cast<std::size_t>(previous % rows) * width;
-                    std::copy_n(pv, head_dim, pooled_values.data() + static_cast<std::size_t>(slot_index) * head_dim);
-                    std::copy_n(ps, head_dim, pooled_scores.data() + static_cast<std::size_t>(slot_index) * head_dim);
-                }
-                std::copy_n(cv + head_dim, head_dim,
-                            pooled_values.data() + static_cast<std::size_t>(layer.ratio + slot_index) * head_dim);
-                std::copy_n(cs + head_dim, head_dim,
-                            pooled_scores.data() + static_cast<std::size_t>(layer.ratio + slot_index) * head_dim);
-            }
-            std::vector<float> pooled(head_dim, 0.0f);
-            ds4::compress_block(pooled_values.data(), pooled_scores.data(), rows, head_dim, pooled.data());
-            ds4::rms_norm(pooled.data(), head_dim, rt.epsilon, pooled.data());
-            {
-                const float* gain = ds4_f32(model, plan.comp_norm);
-                for (std::uint32_t i = 0; i < head_dim; ++i) pooled[i] *= gain[i];
-            }
-            ds4::rope(pooled.data() + (head_dim - rt.rope_dim), rt.rope_dim,
-                      static_cast<std::int32_t>(block), rt.compress_base, rt.freq_scale, false,
-                      {1.0f, rt.attn_factor, rt.beta_fast, rt.beta_slow, rt.original_context});
-            std::uint16_t* target = layer.compressed.data() +
-                static_cast<std::size_t>(block) * head_dim;
-            for (std::uint32_t i = 0; i < head_dim; ++i) target[i] = ds4::half_bits(pooled[i]);
+            ds4_close_block(rt, layer, layer.blocks, head_dim, width,
+                            layer.state_values, layer.state_scores,
+                            plan.comp_norm, layer.compressed);
             ++layer.blocks;
         }
+    }
+
+    // The lightning indexer: which of the compressed blocks this position is
+    // allowed to see.
+    //
+    // Only run once there are more visible blocks than it may select. Below
+    // that the top-k is everything and the mask it would build is the mask
+    // already in force, so skipping is exact rather than an approximation --
+    // and it saves reading the query projection, which is the expensive half.
+    std::uint32_t visible_blocks = 0;
+    for (std::uint32_t block = 0; block < layer.blocks; ++block) {
+        if (block * layer.ratio + layer.ratio - 1 > position) break;
+        ++visible_blocks;
+    }
+    const bool selecting = layer.indexer_dim && rt.indexer_top_k &&
+                           visible_blocks > rt.indexer_top_k;
+    if (selecting) {
+        const auto indexer_dim = layer.indexer_dim;
+        ds4_matvec(model, plan.indexer_q_b, sc.low_rank.data(),
+                   static_cast<std::int32_t>(rt.q_lora), sc.indexer_query.data(),
+                   static_cast<std::int32_t>(rt.indexer_heads * indexer_dim));
+        for (std::uint32_t head = 0; head < rt.indexer_heads; ++head) {
+            float* row = sc.indexer_query.data() + static_cast<std::size_t>(head) * indexer_dim;
+            ds4::rope(row + (indexer_dim - rt.rope_dim), rt.rope_dim,
+                      static_cast<std::int32_t>(position), base, scale, false, yarn);
+        }
+        ds4_matvec(model, plan.indexer_proj, sc.hidden.data(), n_embd,
+                   sc.indexer_weights.data(), static_cast<std::int32_t>(rt.indexer_heads));
+        // The reference scales the weights rather than the scores; with the
+        // rectifier in between the two are not the same thing.
+        const float scale_weights =
+            1.0f / std::sqrt(static_cast<float>(indexer_dim * rt.indexer_heads));
+        for (std::uint32_t head = 0; head < rt.indexer_heads; ++head)
+            sc.indexer_weights[head] *= scale_weights;
+        for (std::uint32_t block = 0; block < visible_blocks; ++block) {
+            const std::uint16_t* stored = layer.indexer_compressed.data() +
+                static_cast<std::size_t>(block) * indexer_dim;
+            float* target = sc.indexer_keys.data() + static_cast<std::size_t>(block) * indexer_dim;
+            for (std::uint32_t i = 0; i < indexer_dim; ++i) target[i] = ds4::half_value(stored[i]);
+        }
+        ds4::indexer_scores(sc.indexer_query.data(), sc.indexer_keys.data(),
+                            sc.indexer_weights.data(), rt.indexer_heads, indexer_dim,
+                            visible_blocks, sc.indexer_scores.data());
+        ds4::top_k_select(sc.indexer_scores.data(), visible_blocks, rt.indexer_top_k,
+                          sc.indexer_keep.data());
+        rt.indexer_selections += rt.indexer_top_k;
+        rt.indexer_candidates += visible_blocks;
     }
 
     // Gather the keys this position may see, raw window then compressed blocks.
@@ -4369,8 +4495,8 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         for (std::uint32_t i = 0; i < head_dim; ++i) target[i] = ds4::half_value(slot[i]);
         ++keys;
     }
-    for (std::uint32_t block = 0; block < layer.blocks; ++block) {
-        if (block * layer.ratio + layer.ratio - 1 > position) break;
+    for (std::uint32_t block = 0; block < visible_blocks; ++block) {
+        if (selecting && !sc.indexer_keep[block]) continue;
         const std::uint16_t* slot = layer.compressed.data() +
             static_cast<std::size_t>(block) * head_dim;
         float* target = sc.keys.data() + static_cast<std::size_t>(keys) * head_dim;
@@ -4497,6 +4623,8 @@ int colibri_v2_deepseek4_runtime_info(
     out->attention_core_nanoseconds=runtime->attention_core_nanoseconds;
     out->head_nanoseconds=runtime->head_nanoseconds;
     out->routed_expert_bytes=runtime->routed_expert_bytes;
+    out->indexer_selections=runtime->indexer_selections;
+    out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
 
 // Run one token through every block and the head.
@@ -4551,6 +4679,43 @@ int colibri_v2_deepseek4_forward(
     }
     ++rt.forward_calls;
     rt.forward_nanoseconds+=ds4_now()-forward_started;
+    return 0;});}
+
+int colibri_v2_deepseek4_indexer_key(
+    const ColibriV2Deepseek4Runtime* runtime, uint32_t layer, uint32_t block,
+    float* out, int32_t outputs
+){return guarded([&]{
+    if(!runtime||!out)throw std::runtime_error("invalid indexer key request");
+    if(layer>=runtime->layers.size())throw std::runtime_error("layer is out of range");
+    const auto& state=runtime->layers[layer];
+    if(!state.indexer_dim)throw std::runtime_error("this layer carries no indexer");
+    if(block>=state.blocks)throw std::runtime_error("that block has not been compressed yet");
+    if(outputs!=static_cast<std::int32_t>(state.indexer_dim))
+        throw std::runtime_error("output size does not match the indexer key length");
+    const std::uint16_t* stored=state.indexer_compressed.data()+
+        static_cast<std::size_t>(block)*state.indexer_dim;
+    for(std::uint32_t i=0;i<state.indexer_dim;++i)
+        out[i]=colibri::v2::deepseek4::half_value(stored[i]);
+    return 0;});}
+
+int colibri_v2_deepseek4_indexer_scores(
+    const float* queries, const float* keys, const float* weights,
+    int32_t heads, int32_t dim, int32_t entries, float* out
+){return guarded([&]{
+    if(!queries||!keys||!weights||!out||heads<=0||dim<=0||entries<0)
+        throw std::runtime_error("indexer score arguments are invalid");
+    colibri::v2::deepseek4::indexer_scores(queries,keys,weights,
+        static_cast<std::size_t>(heads),static_cast<std::size_t>(dim),
+        static_cast<std::size_t>(entries),out);
+    return 0;});}
+
+int colibri_v2_deepseek4_top_k(
+    const float* scores, int32_t entries, int32_t keep, uint8_t* out
+){return guarded([&]{
+    if(!scores||!out||entries<0||keep<0)
+        throw std::runtime_error("top-k arguments are invalid");
+    colibri::v2::deepseek4::top_k_select(scores,static_cast<std::size_t>(entries),
+        static_cast<std::size_t>(keep),out);
     return 0;});}
 
 // Round-trip a float through half precision, so the storage format the caches
