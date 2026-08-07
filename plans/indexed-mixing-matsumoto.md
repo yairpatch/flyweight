@@ -442,6 +442,29 @@ token for at least 64 tokens; per-layer activation max-abs diff stays within the
 the quantization allows; a perplexity spot check on a short held-out text tracks the
 reference.
 
+## Working setup
+
+- Repo `/home/yair/Desktop/colibri-next`, branch `v2-native-runtime`.
+- Checkpoint: `export DEEPSEEK4_GGUF=/home/yair/Downloads/DeepSeek-V4-Flash-IQ3_XXS/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf`.
+  The deepseek4 tests skip without it, so the suite passing means little unless
+  it is set.
+- Build: `PYTHONPATH=src python -m colibri_next.native_build`.
+  Tests: `PYTHONPATH=src python -m unittest discover -s tests`.
+- Reference: `/home/yair/Desktop/llama.cpp-ref`, built. `llama-simple` needs
+  `-ngl 0` or it tries to put 98 GiB on the GPU; `llama-cli` needs
+  `--no-conversation --simple-io < /dev/null`, since this checkpoint ships a
+  chat template and otherwise drops into conversation mode. Redirect to a file
+  rather than piping through `tail`: a run costs minutes and truncating the
+  output throws away the part worth having.
+- Reference dumps in `/home/yair/Desktop/ds4-dumps/`: `prompt10.txt` for the
+  ten-token prompt, `long.txt` for the 376-token one. Regenerate with
+  `llama-eval-callback -m <shard 1> -f <prompt> -n 1 -c 1024 --temp 0`. Keep
+  them out of `/tmp`, which is a RAM-backed tmpfs here.
+- **The working tree carries unrelated uncommitted work** on a prompt-cache
+  feature, in README.md, cli.py, v2.py, v2_server.py and two test files. Stage
+  hunks selectively rather than whole files, and verify a commit by stashing the
+  rest and running the suite against exactly what is staged.
+
 ## Where this stands
 
 Working, and checked: split-GGUF loading, metadata, the `joyai-llm` tokenizer
