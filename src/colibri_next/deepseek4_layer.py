@@ -393,14 +393,37 @@ class CompressedState:
                 pooled_scores = scores[span]
             pooled = compress(pooled_values, pooled_scores)
             pooled = rms_norm(pooled, self.norm, epsilon=self.epsilon)
-            out.append(rope(
-                pooled, block, self.rope_dim,
-                freq_base=self.freq_base, freq_scale=self.freq_scale,
-                ext_factor=1.0, attn_factor=self.attn_factor,
-                beta_fast=self.beta_fast, beta_slow=self.beta_slow,
-                original_context=self.original_context,
-            ))
+            out.append(self._rotate(pooled, block))
         return np.stack(out)
+
+    def _rotate(self, pooled: np.ndarray, block: int) -> np.ndarray:
+        """Rotate a pooled latent at its block index."""
+        return rope(
+            pooled, block, self.rope_dim,
+            freq_base=self.freq_base, freq_scale=self.freq_scale,
+            ext_factor=1.0, attn_factor=self.attn_factor,
+            beta_fast=self.beta_fast, beta_slow=self.beta_slow,
+            original_context=self.original_context,
+        )
+
+    def pool_block(self, values, scores, block: int) -> np.ndarray:
+        """Pool the newest complete block from accumulated state rows."""
+        if self.overlapped:
+            rows = 2 * self.ratio
+            pv = np.zeros((rows, self.head_dim), dtype=np.float32)
+            ps = np.full((rows, self.head_dim), -np.inf, dtype=np.float32)
+            for slot in range(self.ratio):
+                previous = (block - 1) * self.ratio + slot
+                if previous >= 0:
+                    pv[slot] = values[previous][: self.head_dim]
+                    ps[slot] = scores[previous][: self.head_dim]
+                current = block * self.ratio + slot
+                pv[self.ratio + slot] = values[current][self.head_dim :]
+                ps[self.ratio + slot] = scores[current][self.head_dim :]
+        else:
+            span = slice(block * self.ratio, (block + 1) * self.ratio)
+            pv, ps = values[span], scores[span]
+        return self._rotate(rms_norm(compress(pv, ps), self.norm, epsilon=self.epsilon), block)
 
 
 def csa_attention_latents(
@@ -484,3 +507,64 @@ class DeepSeek4Model:
             normed = rms_norm(collapsed, self.output_norm, epsilon=self.epsilon)
             out.append(matvec(self.model, "output.weight", normed, self.vocabulary))
         return out[0] if last_only else np.stack(out)
+
+
+class LayerCache:
+    """Everything a block must remember between decode steps.
+
+    A runtime cannot reprocess the prompt on every token, so each block carries
+    its own state forward. Three things persist, and the third is the one that
+    makes this more than an append-only cache:
+
+    - the raw latents the sliding window attends to,
+    - the compressed blocks completed so far,
+    - the compressor's *partial* block: rows already projected for tokens whose
+      block has not filled yet. They cannot be pooled until the block completes,
+      and they cannot be recomputed later because the hidden state that produced
+      them is gone.
+    """
+
+    def __init__(self, block: "DeepSeek4Block"):
+        self.block = block
+        self.latents: list[np.ndarray] = []
+        self.compressed: list[np.ndarray] = []
+        self.state_values: list[np.ndarray] = []
+        self.state_scores: list[np.ndarray] = []
+
+    @property
+    def positions(self) -> int:
+        return len(self.latents)
+
+    def append_latent(self, latent: np.ndarray) -> None:
+        self.latents.append(latent)
+
+    def append_compressor_state(self, hidden: np.ndarray) -> None:
+        """Project one token's compressor state and close the block if it fills."""
+        state = self.block.compressor
+        if state is None:
+            return
+        position = len(self.state_values)
+        prefix = f"blk.{self.block.layer}."
+        self.state_values.append(
+            matvec(self.block.model, prefix + "attn_compressor_kv.weight", hidden, state.width)
+        )
+        score = matvec(
+            self.block.model, prefix + "attn_compressor_gate.weight", hidden, state.width
+        )
+        self.state_scores.append(score + state.ape[position % state.ratio])
+        if (position + 1) % state.ratio == 0:
+            self.compressed.append(state.pool_block(
+                np.stack(self.state_values), np.stack(self.state_scores),
+                len(self.compressed),
+            ))
+
+    def keys(self, position: int) -> tuple[np.ndarray, np.ndarray]:
+        raw = np.stack(self.latents)
+        compressed = (
+            np.stack(self.compressed) if self.compressed
+            else np.zeros((0, self.block.head_dim), dtype=np.float32)
+        )
+        return csa_attention_latents(
+            raw, compressed, position, max(self.block.ratio, 1),
+            self.block.window or (position + 1),
+        )
