@@ -717,11 +717,89 @@ should be checked against `/proc/self/io` before it is believed.
 
 ## Stage C — GPU / hybrid execution
 
-Move attention, hyper-connections and the shared/dense path onto the 12 GB GPU while
-experts stay CPU-side and paged from the mmap, using the existing hybrid placement policy.
-Hand-written kernels are needed for the Sinkhorn mixing, the compressor, the indexer top-k
-and the RoPE tail — this runtime has no graph engine to compose them, which is why this is a
-separate stage from B. Success is measured against the Stage B CPU output, not re-derived.
+Move attention, the hyper-connections, the shared expert and the head onto the
+12 GB GPU while the routed experts stay CPU-side off the mmap. Success is
+measured against the Stage B CPU output, not re-derived.
+
+### The split is the opposite of the codebase's existing hybrid policy
+
+That policy exists to put *experts* on the GPU. Here they are the one thing that
+cannot go:
+
+    routed experts    90.2 GiB   — 2.16 GiB read per token, of 90 that cannot be resident
+    everything else    6.9 GiB   — read in full every token, and it fits
+
+And the dense side is where the time is. A warm token after the Stage B work is
+about 233 ms:
+
+    attention (projections + core)   111 ms   GPU
+    routed experts                    95 ms   CPU
+    shared expert                     20 ms   GPU
+    output head                        9 ms   GPU
+
+So 60% of the token is movable, and it is currently pinned at 46 GiB/s — this
+machine's memory bandwidth, measured, not inferred. If that 140 ms lands at
+15-30 ms the token is 110-125 ms, i.e. **about 2x, to 8-9 tok/s**, after which
+the experts are ~85% of it and the remaining levers are NVMe and RAM size.
+That figure is an estimate from the attribution and should be replaced by a
+measurement, warm and after the clock ramp, as soon as there is one.
+
+### Most of the kernels already exist
+
+Every type the dense path uses already has a GPU matvec, because the Qwen work
+needed them:
+
+    Q8_0   4994 MiB   q8_matvec_transposed_warp
+    Q6_K   1793 MiB   q6k_matvec_transposed_warp
+    F32     157 MiB   qwen_f32_matvec_warp
+    BF16     86 MiB   bf16_matvec_warp
+
+plus `rms_norm`, the softmax and argmax kernels. Kernels are NVRTC-compiled at
+runtime from `colibri_v2_qwen_kernels.hpp` and `colibri_v2_native_kernels.hpp`,
+and libcuda is dlopen'd, so adding to them is additive and the library still
+builds and runs with no CUDA present.
+
+What has to be written is the deepseek4-specific arithmetic, which is small:
+
+1. **Sinkhorn mixing** — the 24-row mixer, then 20 alternating normalizations
+   over a 4x4. Tiny and serial-ish; one block.
+2. **The compressor** — pool `2*ratio` rows into one, normalize, rotate. Runs
+   once every four tokens on a CSA layer, once every 128 on an HCA one.
+3. **The indexer** — the rectified per-head score over the compressed cache and
+   the top-k. The score is a reduction per block; the top-k over up to
+   context/4 entries wants a partial sort rather than a full one.
+4. **Attention with sinks** over the concatenated raw-window and compressed
+   keys, with the sink logit joining the softmax without contributing a value.
+
+The RoPE tail the earlier draft listed is already covered by the existing rope
+kernels; the compressor's own rotation is the only unusual one, and it rotates
+at the *block* index rather than the token position.
+
+### Crossing points
+
+Two per layer: the collapsed hidden goes to the CPU for the routed experts, and
+their weighted sum comes back. That is ~86 crossings a token at ~16 KiB each —
+nothing for bandwidth, a few milliseconds of synchronization latency, which is
+worth measuring before optimizing. Keeping the router and the shared expert on
+the GPU does not change the count.
+
+### Verification
+
+Bit-comparison against the CPU path will not hold — different reduction orders,
+different intrinsics — so the bar is the one this port already uses: element-wise
+agreement within the activation-quantization band, layer by layer against the CPU
+runtime on a fixed prompt, then the same generation. The expert-selection
+boundary problem applies here too: where the router is near a tie the two paths
+may pick differently, and that is legitimate.
+
+### The driver has to work first
+
+CUDA cannot initialize on this box as of the last attempt: the loaded kernel
+module is 610.43.03 against userspace libraries at 610.57.04, a driver upgraded
+without a reboot. `nvcc` and NVRTC still compile, but nothing runs, and
+`V2Model.gpu_info()` reports `available: 0`. `nvidia_drm` is held by the display
+so the modules will not unload on a running session — it is a reboot. Confirm
+with `nvidia-smi` and `gpu_info()` before trusting any Stage C measurement.
 
 ## Stage D — MTP and serving polish
 
