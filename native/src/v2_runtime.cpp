@@ -4171,6 +4171,16 @@ void ds4_matvec(const ColibriV2Model& model, std::uint64_t index,
                 const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
     const auto& tensor = model.tensors[index];
     const auto* packed = tensor_data(model, tensor);
+    // Rows are independent, and a token walks about a thousand of these across
+    // 43 layers, so the row loop is where the cores go. Small projections are
+    // left serial: the fork costs more than the work.
+    if (outputs >= 512) {
+#pragma omp parallel for schedule(static)
+        for (std::int32_t row = 0; row < outputs; ++row)
+            out[row] = qwen_quant_dot(packed, tensor.type, input, inputs,
+                                      static_cast<std::uint64_t>(row));
+        return;
+    }
     for (std::int32_t row = 0; row < outputs; ++row)
         out[row] = qwen_quant_dot(packed, tensor.type, input, inputs,
                                   static_cast<std::uint64_t>(row));
@@ -4181,6 +4191,9 @@ void ds4_expert_matvec(const ColibriV2Model& model, std::uint64_t index, std::in
     const auto& tensor = model.tensors[index];
     const auto* packed = tensor_data(model, tensor);
     const auto base = static_cast<std::uint64_t>(expert) * outputs;
+    // The routed experts are most of the arithmetic in a token: seven of them,
+    // three matrices each, 43 layers.
+#pragma omp parallel for schedule(static)
     for (std::int32_t row = 0; row < outputs; ++row)
         out[row] = qwen_quant_dot(packed, tensor.type, input, inputs, base + row);
 }
