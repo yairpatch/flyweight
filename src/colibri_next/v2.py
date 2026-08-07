@@ -149,6 +149,7 @@ class _Deepseek4Info(ctypes.Structure):
         ("context_limit", ctypes.c_uint32),
         ("positions", ctypes.c_uint32),
         ("state_bytes", ctypes.c_uint64),
+        ("resolved_tensors", ctypes.c_uint32),
     ]
 
 

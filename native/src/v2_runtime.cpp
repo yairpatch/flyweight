@@ -3915,7 +3915,41 @@ int colibri_v2_deepseek4_head(
 // the previous block's rows alongside its own, so two blocks' worth, and a
 // 128:1 layer pools only its own. Just the compressed caches scale with
 // context, at context/ratio entries.
+// Every weight one block reads, resolved to a tensor index once.
+//
+// The lookups this replaces are linear scans by name over all 1328 descriptors.
+// A block reads about twenty weights, so a 43-layer token would spend roughly
+// 900 scans of a 1328-entry vector on nothing but finding them again.
+struct Deepseek4LayerPlan {
+    static constexpr std::uint64_t kAbsent = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t attn_norm = kAbsent, q_a = kAbsent, q_a_norm = kAbsent, q_b = kAbsent;
+    std::uint64_t kv = kAbsent, kv_a_norm = kAbsent, sinks = kAbsent;
+    std::uint64_t output_a = kAbsent, output_b = kAbsent;
+    std::uint64_t hc_attn_fn = kAbsent, hc_attn_scale = kAbsent, hc_attn_base = kAbsent;
+    std::uint64_t hc_ffn_fn = kAbsent, hc_ffn_scale = kAbsent, hc_ffn_base = kAbsent;
+    std::uint64_t ffn_norm = kAbsent, gate_inp = kAbsent;
+    std::uint64_t gate_exps = kAbsent, up_exps = kAbsent, down_exps = kAbsent;
+    std::uint64_t gate_shexp = kAbsent, up_shexp = kAbsent, down_shexp = kAbsent;
+    // Exactly one of these two: hash layers route by table, the rest by bias.
+    std::uint64_t tid2eid = kAbsent, exp_probs_b = kAbsent;
+    // Compressed layers only.
+    std::uint64_t comp_kv = kAbsent, comp_gate = kAbsent, comp_ape = kAbsent, comp_norm = kAbsent;
+    // 4:1 layers only.
+    std::uint64_t indexer_proj = kAbsent, indexer_q_b = kAbsent;
+    std::uint64_t indexer_comp_kv = kAbsent, indexer_comp_gate = kAbsent;
+    std::uint64_t indexer_comp_ape = kAbsent, indexer_comp_norm = kAbsent;
+
+    std::uint32_t resolved() const {
+        const std::uint64_t* first = &attn_norm;
+        const std::uint64_t* last = &indexer_comp_norm;
+        std::uint32_t count = 0;
+        for (const std::uint64_t* it = first; it <= last; ++it) count += (*it != kAbsent);
+        return count;
+    }
+};
+
 struct Deepseek4LayerState {
+    Deepseek4LayerPlan plan;
     std::uint32_t ratio = 0, window = 0, head_dim = 0;
     std::uint32_t state_width = 0, state_rows = 0, block_capacity = 0;
     std::vector<float> latents;       // window x head_dim, ring
@@ -3958,6 +3992,12 @@ int colibri_v2_deepseek4_runtime_create(
     const auto& config=model->config;
     if(config.compress_ratios.size()<config.layer_count)
         throw std::runtime_error("compress-ratio array is shorter than the layer count");
+    // One pass over the descriptors builds the name index every layer plan
+    // draws from, so resolution is linear in the model rather than quadratic.
+    std::unordered_map<std::string,std::uint64_t> by_name;
+    by_name.reserve(model->tensors.size()*2);
+    for(std::uint64_t index=0;index<model->tensors.size();++index)
+        by_name.emplace(model->tensors[index].name,index);
     auto runtime=std::make_unique<ColibriV2Deepseek4Runtime>();
     runtime->model=model;
     runtime->context_limit=context_limit;
@@ -3973,7 +4013,64 @@ int colibri_v2_deepseek4_runtime_create(
         layer.window=std::min(window,context_limit);
         layer.head_dim=head_dim;
         layer.latents.assign(static_cast<std::size_t>(layer.window)*head_dim,0.0f);
+
+        const std::string prefix="blk."+std::to_string(index)+".";
+        auto find=[&](const char* suffix,bool required)->std::uint64_t{
+            const auto found=by_name.find(prefix+suffix);
+            if(found!=by_name.end())return found->second;
+            if(required)
+                throw std::runtime_error("deepseek4 layer is missing "+prefix+suffix);
+            return Deepseek4LayerPlan::kAbsent;
+        };
+        auto& plan=layer.plan;
+        plan.attn_norm=find("attn_norm.weight",true);
+        plan.q_a=find("attn_q_a.weight",true);
+        plan.q_a_norm=find("attn_q_a_norm.weight",true);
+        plan.q_b=find("attn_q_b.weight",true);
+        plan.kv=find("attn_kv.weight",true);
+        plan.kv_a_norm=find("attn_kv_a_norm.weight",true);
+        plan.sinks=find("attn_sinks.weight",true);
+        plan.output_a=find("attn_output_a.weight",true);
+        plan.output_b=find("attn_output_b.weight",true);
+        plan.hc_attn_fn=find("hc_attn_fn.weight",true);
+        plan.hc_attn_scale=find("hc_attn_scale.weight",true);
+        plan.hc_attn_base=find("hc_attn_base.weight",true);
+        plan.hc_ffn_fn=find("hc_ffn_fn.weight",true);
+        plan.hc_ffn_scale=find("hc_ffn_scale.weight",true);
+        plan.hc_ffn_base=find("hc_ffn_base.weight",true);
+        plan.ffn_norm=find("ffn_norm.weight",true);
+        plan.gate_inp=find("ffn_gate_inp.weight",true);
+        plan.gate_exps=find("ffn_gate_exps.weight",true);
+        plan.up_exps=find("ffn_up_exps.weight",true);
+        plan.down_exps=find("ffn_down_exps.weight",true);
+        plan.gate_shexp=find("ffn_gate_shexp.weight",true);
+        plan.up_shexp=find("ffn_up_shexp.weight",true);
+        plan.down_shexp=find("ffn_down_shexp.weight",true);
+        // A hash layer routes from a table and carries no bias; every other
+        // layer is the reverse. Requiring exactly one catches a checkpoint whose
+        // hash_layer_count disagrees with its tensors.
+        const bool hashed=index<config.hash_layer_count;
+        plan.tid2eid=find("ffn_gate_tid2eid.weight",hashed);
+        plan.exp_probs_b=find("exp_probs_b.bias",!hashed);
+        if((plan.tid2eid!=Deepseek4LayerPlan::kAbsent)==
+           (plan.exp_probs_b!=Deepseek4LayerPlan::kAbsent))
+            throw std::runtime_error(
+                "deepseek4 layer "+std::to_string(index)+
+                " must carry either a routing table or a router bias, not both or neither");
+
         if(!layer.ratio)continue;
+        plan.comp_kv=find("attn_compressor_kv.weight",true);
+        plan.comp_gate=find("attn_compressor_gate.weight",true);
+        plan.comp_ape=find("attn_compressor_ape.weight",true);
+        plan.comp_norm=find("attn_compressor_norm.weight",true);
+        if(layer.ratio==4){
+            plan.indexer_proj=find("indexer.proj.weight",true);
+            plan.indexer_q_b=find("indexer.attn_q_b.weight",true);
+            plan.indexer_comp_kv=find("indexer_compressor_kv.weight",true);
+            plan.indexer_comp_gate=find("indexer_compressor_gate.weight",true);
+            plan.indexer_comp_ape=find("indexer_compressor_ape.weight",true);
+            plan.indexer_comp_norm=find("indexer_compressor_norm.weight",true);
+        }
         const bool overlapped=layer.ratio==4;
         layer.state_width=(overlapped?2u:1u)*head_dim;
         layer.state_rows=(overlapped?2u:1u)*layer.ratio;
@@ -4004,6 +4101,7 @@ int colibri_v2_deepseek4_runtime_info(
     out->context_limit=runtime->context_limit;
     out->state_bytes=runtime->state_bytes();
     out->positions=runtime->layers.empty()?0:runtime->layers.front().positions;
+    for(const auto& layer:runtime->layers)out->resolved_tensors+=layer.plan.resolved();
     for(const auto& layer:runtime->layers){
         if(layer.ratio==4)++out->csa_layers;
         else if(layer.ratio)++out->hca_layers;

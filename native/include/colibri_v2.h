@@ -278,6 +278,7 @@ typedef struct ColibriV2Deepseek4Info {
     uint32_t context_limit;
     uint32_t positions;
     uint64_t state_bytes;
+    uint32_t resolved_tensors;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding

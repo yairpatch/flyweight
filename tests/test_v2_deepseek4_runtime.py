@@ -128,3 +128,72 @@ class Deepseek4RuntimeRejectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+class WeightPlanTests(unittest.TestCase):
+    """Every weight a block reads, resolved once at creation.
+
+    What this replaces is a linear scan by name over all 1328 descriptors, done
+    per weight per token. A block reads about twenty, so a 43-layer token would
+    have spent roughly 900 scans of a 1328-entry vector doing nothing but
+    finding weights it already found.
+
+    Resolving up front also turns a missing or misnamed tensor into a failure at
+    creation rather than a wrong answer mid-generation.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = V2Model(CHECKPOINT)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def test_every_layer_resolves_its_weights(self):
+        with Deepseek4Runtime(self.model, 4096) as runtime:
+            info = runtime.info
+            # 24 on every block -- 23 plus exactly one of the routing table or
+            # the router bias -- then 4 more on a compressed layer and 6 more on
+            # a 4:1 layer for the indexer.
+            expected = (
+                24 * info["layers"]
+                + 4 * (info["csa_layers"] + info["hca_layers"])
+                + 6 * info["csa_layers"]
+            )
+            self.assertEqual(info["resolved_tensors"], expected)
+
+    def test_creation_is_not_quadratic_in_the_model(self):
+        # One pass builds a name index the plans draw from, so creating a
+        # runtime over 1328 descriptors should be quick rather than 900 scans
+        # per layer.
+        import time
+        start = time.perf_counter()
+        with Deepseek4Runtime(self.model, 4096):
+            pass
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+
+class WeightPlanFixtureTests(unittest.TestCase):
+    def test_the_miniature_fixture_resolves_too(self):
+        import tempfile
+        from pathlib import Path
+
+        from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
+
+        with tempfile.TemporaryDirectory(prefix="colibri-ds4plan-") as directory:
+            path = Path(directory) / "ds4.gguf"
+            build_deepseek4_gguf(path, DeepSeek4Spec(layers=6, hash_layers=3))
+            model = V2Model(path)
+            try:
+                with Deepseek4Runtime(model, 256) as runtime:
+                    info = runtime.info
+                    expected = (
+                        24 * info["layers"]
+                        + 4 * (info["csa_layers"] + info["hca_layers"])
+                        + 6 * info["csa_layers"]
+                    )
+                    self.assertEqual(info["resolved_tensors"], expected)
+            finally:
+                model.close()
