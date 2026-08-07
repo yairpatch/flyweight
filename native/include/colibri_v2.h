@@ -289,6 +289,7 @@ typedef struct ColibriV2Deepseek4Info {
     /* Compressed blocks the indexer kept and considered; zero while a sequence
        is short enough that it selects everything. */
     uint64_t indexer_selections, indexer_candidates;
+    uint64_t expert_prefetch_bytes;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding

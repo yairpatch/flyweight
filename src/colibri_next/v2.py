@@ -160,6 +160,7 @@ class _Deepseek4Info(ctypes.Structure):
         ("routed_expert_bytes", ctypes.c_uint64),
         ("indexer_selections", ctypes.c_uint64),
         ("indexer_candidates", ctypes.c_uint64),
+        ("expert_prefetch_bytes", ctypes.c_uint64),
     ]
 
 

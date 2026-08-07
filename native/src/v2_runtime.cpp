@@ -4019,6 +4019,10 @@ struct ColibriV2Deepseek4Runtime {
     // How much the indexer is actually discarding, which is zero until a
     // sequence is long enough for it to run at all.
     std::uint64_t indexer_selections = 0, indexer_candidates = 0;
+    // Weight prefetch, on unless COLIBRI_DS4_PREFETCH=off, which exists so the
+    // two regimes can be compared rather than assumed.
+    bool expert_prefetch = true;
+    std::uint64_t expert_prefetch_bytes = 0;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -4150,6 +4154,10 @@ int colibri_v2_deepseek4_runtime_create(
     g.expert_ffn=config.expert_intermediate_size?config.expert_intermediate_size:config.intermediate_size;
     g.vocabulary=config.vocabulary_size; g.sinkhorn_iterations=config.sinkhorn_iterations;
     g.hash_layers=config.hash_layer_count; g.epsilon=config.rms_norm_epsilon;
+    {
+        const char* setting=std::getenv("COLIBRI_DS4_PREFETCH");
+        g.expert_prefetch=!(setting&&std::string(setting)=="off");
+    }
     g.indexer_heads=config.indexer_head_count; g.indexer_dim=config.indexer_key_length;
     g.indexer_top_k=config.indexer_top_k;
     g.freq_base=config.rope_freq_base; g.compress_base=config.compress_rope_freq_base;
@@ -4225,6 +4233,25 @@ namespace {
 // team costs barrier time as well. deepseek4's pragmas simply never took a
 // `num_threads`.
 int ds4_thread_count() { return colibri::v2::deepseek4::thread_count(); }
+
+// Hint that a weight range is about to be read.
+//
+// On the mapping rather than the file, because a split checkpoint backs
+// different tensors with different descriptors and the address is the one thing
+// that identifies a range whichever shard it came from.
+void ds4_prefetch(const std::uint8_t* address, std::uint64_t bytes) {
+#if !defined(_WIN32)
+    if (!address || !bytes) return;
+    static const std::uintptr_t page =
+        static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto start = reinterpret_cast<std::uintptr_t>(address) & ~(page - 1);
+    const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
+    (void)madvise(reinterpret_cast<void*>(start), static_cast<std::size_t>(end - start),
+                  MADV_WILLNEED);
+#else
+    (void)address; (void)bytes;
+#endif
+}
 
 // A monotonic nanosecond stamp, for attributing a token's time.
 std::uint64_t ds4_now() {
@@ -4564,6 +4591,26 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                     sc.experts.data(), sc.weights.data());
 
     std::fill(sc.moe.begin(), sc.moe.end(), 0.0f);
+    // Ask for every routed expert's weights before touching any of them.
+    //
+    // The six are known the moment the router runs, but the loop below reads
+    // them one matrix at a time, so a miss stalls on each in turn. Hinting all
+    // eighteen ranges up front lets the kernel fetch the later ones while the
+    // first is being multiplied. It costs nothing when they are already
+    // resident, which measurement says they usually are -- this is for the
+    // regime where they are not.
+    if (rt.expert_prefetch) {
+        for (std::uint32_t slot = 0; slot < rt.experts_used; ++slot) {
+            for (const auto matrix : {plan.gate_exps, plan.up_exps, plan.down_exps}) {
+                const auto& tensor = model.tensors[matrix];
+                const auto span = tensor.size / rt.experts;
+                ds4_prefetch(tensor_data(model, tensor) +
+                                 static_cast<std::uint64_t>(sc.experts[slot]) * span,
+                             span);
+                rt.expert_prefetch_bytes += span;
+            }
+        }
+    }
     const auto experts_started = ds4_now();
     for (std::uint32_t slot = 0; slot < rt.experts_used; ++slot) {
         const auto expert = sc.experts[slot];
@@ -4623,6 +4670,7 @@ int colibri_v2_deepseek4_runtime_info(
     out->attention_core_nanoseconds=runtime->attention_core_nanoseconds;
     out->head_nanoseconds=runtime->head_nanoseconds;
     out->routed_expert_bytes=runtime->routed_expert_bytes;
+    out->expert_prefetch_bytes=runtime->expert_prefetch_bytes;
     out->indexer_selections=runtime->indexer_selections;
     out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
