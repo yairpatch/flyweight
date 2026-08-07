@@ -490,13 +490,10 @@ the deepseek4 backend through `/health`. See the section below.
 
 What is left, in the order worth doing it:
 
-1. **Expert residency**, worth up to 2x but only in the miss regime -- see the
-   attribution below, which replaced the assumption that paging was the next
-   thing to do.
-2. **The DSML tool-call dialect**, for anything past plain chat.
-3. **Batched prefill.** The scheduler feeds the prompt a token at a time, which
+1. **The DSML tool-call dialect**, for anything past plain chat.
+2. **Batched prefill.** The scheduler feeds the prompt a token at a time, which
    rereads every expert row per position.
-4. **A long-context accuracy check.** The indexer is in and verified against the
+3. **A long-context accuracy check.** The indexer is in and verified against the
    reference's own numbers, but nothing has yet compared a *generation* past
    2048 tokens against the reference token for token.
 
@@ -694,9 +691,24 @@ when the cache misses. Successive passes over the same sequence:
     disk 1-3 MiB/token   -> experts  92-95 ms -> 4.5 tok/s
     disk 129-153 MiB/token -> experts 190-207 ms -> 3.0 tok/s
 
-So the prize is real but conditional, and it is bounded by which experts happen
-to be resident rather than by the paging machinery's cleverness. Worth doing
-after the indexer, and worth measuring in both regimes when it is.
+Most of that has since been taken, and not by a paging cache. The six experts
+of a layer are known the moment the router runs, so all eighteen of their weight
+ranges are now hinted before any is multiplied, and the kernel fetches the later
+ones during the earlier ones' arithmetic. With the page cache dropped first:
+
+    prefetch off   0.87 tok/s   experts 872 ms/token   disk 1372 MiB/token
+    prefetch on    1.46 tok/s   experts 353 ms/token   disk  766 MiB/token
+
+The halved disk traffic was the surprise: an explicit range read fetches what
+was asked for where fault-driven readahead guesses and over-fetches. Fully
+resident the hints cost two to three percent, which is the trade;
+`COLIBRI_DS4_PREFETCH=off` re-measures it. Batching the ranges through
+`process_madvise` would remove even that.
+
+What is left of residency is the 6% of expert bytes that miss when warm, and
+that is a memory-size problem rather than a policy one: 92 GB of experts against
+55 GB of page cache, with routing skewed enough that the kernel's own LRU
+already lands 94-96% of reads.
 
 A caution for anything measured here: throughput swings by 2x with page-cache
 state alone, and an unlucky pass reads like a regression in code that did not
