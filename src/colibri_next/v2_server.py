@@ -314,6 +314,10 @@ class NativeV2Tokenizer:
                 pass
         self.eos_token_ids = tuple(dict.fromkeys(eos))
         self._token_byte_cache: dict[int, bytes] = {}
+        bos = config.get("bos_token_id")
+        self._bos_token_id = (
+            int(bos) if bos is not None and bos != 0xFFFFFFFF else None
+        )
         self._template_tokens = {
             "bos_token": self._configured_token(config, "bos_token_id"),
             "eos_token": self._configured_token(config, "eos_token_id"),
@@ -330,6 +334,11 @@ class NativeV2Tokenizer:
                 lambda pattern: datetime.datetime.now().strftime(pattern)
             )
             environment.filters["tojson"] = self._to_json
+            # DeepSeek-V4's template re-renders a tool call the API handed back
+            # as a JSON string, so it needs the inverse of ``tojson``. Without
+            # it the filter is undefined and a second tool-using turn fails to
+            # render at all.
+            environment.filters["from_json"] = json.loads
             self._compiled_chat_template = environment.from_string(self.chat_template)
 
     def _configured_token(self, config: Mapping[str, object], field: str) -> str:
@@ -360,7 +369,31 @@ class NativeV2Tokenizer:
         """
         if self.architecture == "laguna":
             return "</assistant>\n"
+        if self.architecture == "deepseek4":
+            # The template closes every turn -- assistant included -- with the
+            # end-of-sentence token; there is no separate end-of-turn markup.
+            return "<｜end▁of▁sentence｜>"
         return "<|im_end|>\n"
+
+    @property
+    def finished_turn_separator(self) -> str:
+        """What follows a turn the model closed with a terminator of its own.
+
+        Qwen-style templates put the next turn on its own line; DeepSeek-V4
+        runs the next role token straight on from end-of-sentence, and a
+        newline there is markup no training example contains.
+        """
+        return "" if self.architecture == "deepseek4" else "\n"
+
+    @property
+    def bos_token_id(self) -> int | None:
+        """The id the template emits at the very start of a conversation.
+
+        Needed when a cached prefix is extended: the suffix is rendered as a
+        fresh conversation, so its leading BOS has to be dropped rather than
+        planted in the middle of the sequence.
+        """
+        return self._bos_token_id
 
     def encode(self, text: str) -> list[int]:
         return self.model.tokenize(text)
@@ -420,6 +453,8 @@ class NativeV2Tokenizer:
             return self._format_gemma4(messages, enable_thinking=enable_thinking)
         if self.architecture == "laguna":
             return self._format_laguna(messages, enable_thinking=enable_thinking)
+        if self.architecture == "deepseek4":
+            return self._format_deepseek4(messages, enable_thinking=enable_thinking)
         sections: list[str] = []
         for message in messages:
             role = message["role"]
@@ -470,6 +505,85 @@ class NativeV2Tokenizer:
         sections.append("<|turn>model\n")
         if not enable_thinking:
             sections.append("<|channel>thought\n<channel|>")
+        return "".join(sections)
+
+    @staticmethod
+    def _format_deepseek4(
+        messages: Sequence[Mapping[str, str]], *, enable_thinking: bool
+    ) -> str:
+        """Render the text-only core of DeepSeek-V4's GGUF chat template.
+
+        System messages are concatenated at the head with no markup of their
+        own; user, developer and tool turns all render into a user block; and
+        the assistant role token is emitted as a *transition* on the preceding
+        user-side turn rather than by the assistant turn itself, so an assistant
+        message that follows anything else carries no role token at all.
+
+        Checked against the checkpoint's own template over every role sequence
+        up to length four, with and without thinking.
+        """
+        sections = ["<｜begin▁of▁sentence｜>"]
+        sections.append("\n\n".join(
+            message["content"].strip() for message in messages
+            if message["role"] == "system"
+        ))
+        opening = "<think>" if enable_thinking else "</think>"
+        user_side = ("user", "developer", "tool")
+        last_user = max(
+            (
+                index for index, message in enumerate(messages)
+                if message["role"] in user_side
+            ),
+            default=-1,
+        )
+        # Thinking mode drops the developer turns the conversation has moved
+        # past -- there is no tool schema in this fallback, which is the other
+        # thing that would keep them.
+        dropped = {
+            index for index, message in enumerate(messages)
+            if message["role"] == "developer" and enable_thinking and index < last_user
+        }
+        # A tool result belongs to the user turn it answers, and consecutive
+        # user turns join rather than repeating the role token.
+        in_user = False
+        for index, message in enumerate(messages):
+            role = message["role"]
+            if role == "system" or index in dropped:
+                continue
+            content = message["content"].strip()
+            if not content:
+                raise ValueError("chat message content must not be empty")
+            if role in ("user", "tool"):
+                sections.append("\n\n" if in_user else "<｜User｜>")
+                in_user = True
+                sections.append(
+                    f"<tool_result>{content}</tool_result>" if role == "tool"
+                    else content
+                )
+            elif role == "developer":
+                in_user = False
+                sections.append(f"<｜User｜>{content}")
+            elif role == "assistant":
+                in_user = False
+                predecessor = index - 1
+                while predecessor in dropped:
+                    predecessor -= 1
+                follows_user = (
+                    predecessor >= 0 and messages[predecessor]["role"] in user_side
+                )
+                # Reasoning survives only on a turn the conversation has not
+                # moved past; ours never carries any, so a kept one is an empty
+                # block and a dropped one leaves just the closing tag.
+                keeps_reasoning = enable_thinking and index > last_user
+                if follows_user:
+                    sections.append("<｜Assistant｜>")
+                    sections.append("<think></think>" if keeps_reasoning else "</think>")
+                elif keeps_reasoning:
+                    sections.append("</think>")
+                sections.append(f"{content}<｜end▁of▁sentence｜>")
+            else:
+                raise ValueError(f"unsupported chat role: {role}")
+        sections.append(f"<｜Assistant｜>{opening}")
         return "".join(sections)
 
     _LAGUNA_SYSTEM = (
@@ -525,16 +639,20 @@ class NativeV2Tokenizer:
         )
 
 
-class NativeV2Generator:
-    """Streaming generator backed by the cooperative native Qwen engine."""
+class ChatGenerator:
+    """Chat formatting, continuation reuse and streaming over a task engine.
 
-    def __init__(
-        self, model: V2Model, runtime: V2QwenRuntime, tokenizer: NativeV2Tokenizer
-    ):
+    Everything here depends on the engine only through ``submit``/``cancel``/
+    ``forget`` and the events they produce, so an architecture whose state does
+    not fit the Qwen engine's one-KV-pair-per-layer slots can bring its own
+    scheduler and keep the whole server surface -- templates, tool calls,
+    continuation reuse, incremental UTF-8 decoding -- unchanged.
+    """
+
+    def __init__(self, model: V2Model, engine, tokenizer: NativeV2Tokenizer):
         self.model = model
-        self.runtime = runtime
         self.tokenizer = tokenizer
-        self.engine = _NativeEngine(runtime)
+        self.engine = engine
         self._chat_lock = threading.Lock()
         self._chat_messages: tuple[tuple[str, str], ...] | None = None
         self._chat_prompt_ids: tuple[int, ...] = ()
@@ -553,26 +671,8 @@ class NativeV2Generator:
         self._chat_continuation_capacity = 32
 
     def prefix_cache_stats(self) -> dict[str, int]:
-        info = self.runtime.info
-        capacity = int(getattr(self.runtime, "parallel_sequences", 1))
-        return {
-            "entries": 1 if info["position"] else 0,
-            "capacity": capacity,
-            "hits": int(info["prefix_cache_hits"]),
-            "misses": int(info["prefix_cache_misses"]),
-            "evictions": 0,
-            "reused_tokens": int(info["prefix_cache_reused_tokens"]),
-            "last_prompt_tokens": int(
-                info.get("prefix_cache_last_prompt_tokens", 0)
-            ),
-            "last_reused_tokens": int(
-                info.get("prefix_cache_last_reused_tokens", 0)
-            ),
-            "last_lcp_live": int(info.get("prefix_cache_last_lcp_live", 0)),
-            "last_lcp_snapshot": int(
-                info.get("prefix_cache_last_lcp_snapshot", 0)
-            ),
-        }
+        """Reuse counters for ``/health``; shape is the engine's business."""
+        raise NotImplementedError
 
     def close(self) -> None:
         self.engine.close()
@@ -681,17 +781,33 @@ class NativeV2Generator:
                 ended = bool(
                     generated and generated[-1] in self.tokenizer.eos_token_ids
                 )
-                separator = "\n" if ended else self.tokenizer.turn_separator
+                separator = (
+                    getattr(self.tokenizer, "finished_turn_separator", "\n")
+                    if ended
+                    else self.tokenizer.turn_separator
+                )
                 suffix_messages = [
                     {"role": role, "content": content} for role, content in remaining
                 ]
+                suffix = self.tokenizer.encode_messages(
+                    suffix_messages, enable_thinking=thinking
+                )
+                # The suffix is rendered as though it were a whole
+                # conversation, so a template that opens with BOS emits one
+                # here too. Kept, it would sit in the middle of the sequence,
+                # which no training example contains.
+                bos = getattr(self.tokenizer, "bos_token_id", None)
+                if (
+                    bos is not None
+                    and suffix[:1] == [bos]
+                    and list(prompt_ids[:1]) == [bos]
+                ):
+                    suffix = suffix[1:]
                 return (
                     list(prompt_ids)
                     + generated
                     + self.tokenizer.encode(separator)
-                    + self.tokenizer.encode_messages(
-                        suffix_messages, enable_thinking=thinking
-                    )
+                    + suffix
                 )
         return self.tokenizer.encode_messages(
             [{"role": role, "content": content} for role, content in messages],
@@ -856,6 +972,38 @@ class NativeV2Generator:
             raise
         finally:
             self.engine.forget(task_id)
+
+
+class NativeV2Generator(ChatGenerator):
+    """Streaming generator backed by the cooperative native Qwen engine."""
+
+    def __init__(
+        self, model: V2Model, runtime: V2QwenRuntime, tokenizer: NativeV2Tokenizer
+    ):
+        super().__init__(model, _NativeEngine(runtime), tokenizer)
+        self.runtime = runtime
+
+    def prefix_cache_stats(self) -> dict[str, int]:
+        info = self.runtime.info
+        capacity = int(getattr(self.runtime, "parallel_sequences", 1))
+        return {
+            "entries": 1 if info["position"] else 0,
+            "capacity": capacity,
+            "hits": int(info["prefix_cache_hits"]),
+            "misses": int(info["prefix_cache_misses"]),
+            "evictions": 0,
+            "reused_tokens": int(info["prefix_cache_reused_tokens"]),
+            "last_prompt_tokens": int(
+                info.get("prefix_cache_last_prompt_tokens", 0)
+            ),
+            "last_reused_tokens": int(
+                info.get("prefix_cache_last_reused_tokens", 0)
+            ),
+            "last_lcp_live": int(info.get("prefix_cache_last_lcp_live", 0)),
+            "last_lcp_snapshot": int(
+                info.get("prefix_cache_last_lcp_snapshot", 0)
+            ),
+        }
 
 
 class NativeV2InferenceService(InferenceService):

@@ -378,49 +378,84 @@ def _benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
-def _deepseek4_generate(args: argparse.Namespace) -> int:
-    """Generate through the DeepSeek-V4 runtime.
+# Knobs that select GPU placement, expert paging, KV quantization or MTP
+# drafting. The DeepSeek-V4 path runs on the CPU with half-precision caches and
+# honours none of them, so setting one is reported rather than ignored.
+_DEEPSEEK4_UNSUPPORTED = (
+    "backend", "device", "gpu_cache_mib", "expert_mode", "hybrid_prefill",
+    "expert_residency", "dense_requant", "mtp_drafts", "mtp_model",
+    "cache_type_k", "cache_type_v", "prompt_cache_mib", "swa_full",
+    "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
+    "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
+    "prefill_checkpoint_interval", "prefill_checkpoint_slots",
+)
 
-    A separate path because the engine the other architectures share is built
-    around one KV pair per layer, and this one carries a sliding-window cache, a
-    compressed-block cache and the compressor's own state. Wiring it into that
-    engine is worth doing; pretending it already fits is not.
 
-    Greedy only for now, and one sequence: the sampler and the scheduler are the
-    next pieces rather than assumed.
+def _architecture(model_path: Path) -> str | None:
+    """The checkpoint's architecture, or None if it cannot be read.
+
+    Used only to choose a service; a model that will not open is left to fail
+    where it is loaded for real, which reports the reason.
     """
-    from .deepseek4 import Deepseek4Runtime
+    from .v2 import V2Error
+    try:
+        with V2Model(model_path) as model:
+            return str(model.config["architecture"])
+    except (V2Error, OSError, KeyError):
+        return None
 
-    with V2Model(args.model) as model:
-        prompt = args.prompt if not args.system else f"{args.system}\n\n{args.prompt}"
-        tokens = list(model.tokenize(prompt))
-        if not tokens:
-            raise SystemExit("the prompt tokenized to nothing")
-        context = args.context_window or (len(tokens) + args.max_new_tokens + 8)
-        produced: list[int] = []
-        with Deepseek4Runtime(model, context) as runtime:
-            for token in runtime.generate(tokens, max_tokens=args.max_new_tokens):
-                produced.append(token)
-        print(model.decode_tokens(produced))
-    return 0
+
+def _deepseek4_service(args: argparse.Namespace, command: str):
+    """Build the DeepSeek-V4 service, refusing options it cannot honour.
+
+    The comparison is against this parser's own defaults, so a flag left alone
+    passes and one the caller actually typed does not.
+    """
+    from .deepseek4_server import NativeDeepseek4InferenceService
+
+    baseline = _parser().parse_args(
+        [command, str(args.model)] + (["--prompt", ""] if command == "generate" else [])
+    )
+    requested = [
+        name for name in _DEEPSEEK4_UNSUPPORTED
+        if getattr(args, name, None) != getattr(baseline, name, None)
+    ]
+    if requested:
+        raise SystemExit(
+            "the DeepSeek-V4 runtime does not support "
+            + ", ".join("--" + name.replace("_", "-") for name in sorted(requested))
+            + " yet; it runs on the CPU with half-precision caches"
+        )
+    return NativeDeepseek4InferenceService(
+        args.model,
+        model_name=getattr(args, "model_name", None),
+        context_window=args.context_window,
+        max_new_tokens=args.max_new_tokens,
+        parallel_sequences=args.parallel_sequences,
+        api_key=getattr(args, "api_key", None),
+        cors_origin=getattr(args, "cors_origin", "*"),
+        strict_model=getattr(args, "strict_model", False),
+        max_concurrent_requests=getattr(args, "max_concurrent_requests", 64),
+        request_timeout_seconds=getattr(args, "request_timeout_seconds", 30.0),
+        sse_keepalive_seconds=getattr(args, "sse_keepalive_seconds", 10.0),
+    )
 
 
 def _generate(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
-    with V2Model(args.model) as model:
-        architecture = str(model.config["architecture"])
-    if architecture == "deepseek4":
-        return _deepseek4_generate(args)
-    from .v2_server import NativeV2InferenceService
-    service = NativeV2InferenceService(
-        args.model,
-        mtp_model_path=args.mtp_model,
-        context_window=args.context_window,
-        max_new_tokens=args.max_new_tokens,
-        gpu_cache_mib=args.gpu_cache_mib,
-        **{key: value for key, value in _runtime_options(args).items()
-           if key not in {"gpu_cache_bytes", "device", "expert_top_k", "expert_top_p"}},  # type: ignore[arg-type]
-    )
+    if _architecture(args.model) == "deepseek4":
+        service = _deepseek4_service(args, "generate")
+    else:
+        from .v2_server import NativeV2InferenceService
+        service = NativeV2InferenceService(
+            args.model,
+            mtp_model_path=args.mtp_model,
+            context_window=args.context_window,
+            max_new_tokens=args.max_new_tokens,
+            gpu_cache_mib=args.gpu_cache_mib,
+            **{key: value for key, value in _runtime_options(args).items()
+               if key not in {"gpu_cache_bytes", "device", "expert_top_k", "expert_top_p"}},  # type: ignore[arg-type]
+        )
     try:
         messages = []
         if args.system:
@@ -445,6 +480,8 @@ def _generate(args: argparse.Namespace) -> int:
 def _serve(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
     from .v2 import V2Model
+    if _architecture(args.model) == "deepseek4":
+        return _serve_http(args, _deepseek4_service(args, "serve"))
     # Before the service builds a runtime: allocations belong to whichever
     # backend was active when they were made.
     selected = V2Model.select_backend(getattr(args, "backend", "auto"))
@@ -488,6 +525,10 @@ def _serve(args: argparse.Namespace) -> int:
         request_timeout_seconds=args.request_timeout_seconds,
         sse_keepalive_seconds=args.sse_keepalive_seconds,
     )
+    return _serve_http(args, service)
+
+
+def _serve_http(args: argparse.Namespace, service) -> int:
     try:
         print(f"Serving {service.model_name} at http://{args.host}:{args.port}", file=sys.stderr)
         serve_http(
