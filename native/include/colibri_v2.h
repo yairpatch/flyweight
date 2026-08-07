@@ -288,6 +288,10 @@ COLIBRI_V2_API int colibri_v2_deepseek4_runtime_create(ColibriV2Model* model,
     uint32_t context_limit, ColibriV2Deepseek4Runtime** out);
 COLIBRI_V2_API void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime);
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime);
+/* Run one token through the stack, advancing the sequence. `logits` may be
+   NULL for prompt tokens whose distribution is not wanted. */
+COLIBRI_V2_API int colibri_v2_deepseek4_forward(ColibriV2Deepseek4Runtime* runtime,
+    uint32_t token, float* logits);
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_info(const ColibriV2Deepseek4Runtime* runtime,
     ColibriV2Deepseek4Info* out);
 /* Round-trip a float through half precision, as the caches store it. */

@@ -503,6 +503,10 @@ def _library() -> ctypes.CDLL:
                 lib.colibri_v2_deepseek4_runtime_free.restype = None
                 lib.colibri_v2_deepseek4_runtime_reset.argtypes = [ctypes.c_void_p]
                 lib.colibri_v2_deepseek4_runtime_reset.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_forward.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32, _float_p,
+                ]
+                lib.colibri_v2_deepseek4_forward.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_runtime_info.argtypes = [
                     ctypes.c_void_p, ctypes.POINTER(_Deepseek4Info),
                 ]

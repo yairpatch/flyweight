@@ -103,6 +103,7 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"runtime create failed").decode(errors="replace")
             )
         self._handle = handle
+        self._vocabulary = int(model.config["vocabulary_size"])
 
     def close(self) -> None:
         if getattr(self, "_handle", None):
@@ -112,6 +113,18 @@ class Deepseek4Runtime:
     def __enter__(self): return self
 
     def __exit__(self, *_): self.close()
+
+    def forward(self, token: int, *, logits: bool = True):
+        """Run one token through the stack, advancing the sequence."""
+        out = np.zeros(self._vocabulary, dtype=np.float32) if logits else None
+        status = self._library.colibri_v2_deepseek4_forward(
+            self._handle, int(token), _pointer(out)
+        )
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"forward failed").decode(errors="replace")
+            )
+        return out
 
     def reset(self) -> None:
         status = self._library.colibri_v2_deepseek4_runtime_reset(self._handle)

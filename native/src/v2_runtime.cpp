@@ -3969,10 +3969,33 @@ struct Deepseek4LayerState {
     std::uint32_t slot(std::uint32_t position) const { return position % state_rows; }
 };
 
+// Scratch a single position's forward needs, allocated once per runtime.
+struct Deepseek4Scratch {
+    std::vector<float> streams, next_streams, collapsed, hidden;
+    std::vector<float> pre, post, comb;
+    std::vector<float> low_rank, query, latent, block_out, grouped;
+    std::vector<float> keys, attn, derope;
+    std::vector<float> state_row, gate, up, activated, expert_out, moe, logits;
+    std::vector<std::uint8_t> mask;
+    std::vector<std::int32_t> experts;
+    std::vector<float> weights;
+};
+
 struct ColibriV2Deepseek4Runtime {
     ColibriV2Model* model = nullptr;
     std::uint32_t context_limit = 0;
     std::vector<Deepseek4LayerState> layers;
+    Deepseek4Scratch scratch;
+    // Geometry the loop reads on every layer.
+    std::uint32_t n_embd = 0, hc = 0, heads = 0, head_dim = 0, rope_dim = 0;
+    std::uint32_t q_lora = 0, groups = 0, lora_rank = 0, experts = 0, experts_used = 0;
+    std::uint32_t expert_ffn = 0, vocabulary = 0, sinkhorn_iterations = 0, hash_layers = 0;
+    float epsilon = 0.0f, freq_base = 0.0f, weight_scale = 1.5f, clamp = 10.0f;
+    float compress_base = 0.0f, freq_scale = 1.0f, attn_factor = 1.0f;
+    float beta_fast = 32.0f, beta_slow = 1.0f;
+    std::uint32_t original_context = 0;
+    std::uint64_t head_fn = 0, head_scale = 0, head_base = 0, output_norm = 0, output = 0;
+    std::uint64_t token_embd = 0;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -4082,6 +4105,52 @@ int colibri_v2_deepseek4_runtime_create(
         layer.state_values.assign(rows,0.0f);
         layer.state_scores.assign(rows,-std::numeric_limits<float>::infinity());
     }
+    auto& g=*runtime;
+    g.n_embd=config.hidden_size; g.hc=config.hyper_connection_count;
+    g.heads=config.attention_heads; g.head_dim=head_dim;
+    g.rope_dim=config.rotary_dimension; g.q_lora=config.q_lora_rank;
+    g.groups=config.output_group_count; g.lora_rank=config.output_lora_rank;
+    g.experts=config.expert_count; g.experts_used=config.expert_used_count;
+    g.expert_ffn=config.expert_intermediate_size?config.expert_intermediate_size:config.intermediate_size;
+    g.vocabulary=config.vocabulary_size; g.sinkhorn_iterations=config.sinkhorn_iterations;
+    g.hash_layers=config.hash_layer_count; g.epsilon=config.rms_norm_epsilon;
+    g.freq_base=config.rope_freq_base; g.compress_base=config.compress_rope_freq_base;
+    g.weight_scale=config.expert_weights_scale?config.expert_weights_scale:1.0f;
+    g.freq_scale=config.rope_scaling_factor>0.0f?1.0f/config.rope_scaling_factor:1.0f;
+    g.attn_factor=1.0f/(1.0f+0.1f*std::log(1.0f/g.freq_scale));
+    g.beta_fast=config.yarn_beta_fast; g.beta_slow=config.yarn_beta_slow;
+    g.original_context=config.rope_original_context_length;
+    auto require=[&](const char* name)->std::uint64_t{
+        const auto found=by_name.find(name);
+        if(found==by_name.end())throw std::runtime_error(std::string("model is missing ")+name);
+        return found->second;
+    };
+    g.head_fn=require("output_hc_fn.weight"); g.head_scale=require("output_hc_scale.weight");
+    g.head_base=require("output_hc_base.weight"); g.output_norm=require("output_norm.weight");
+    g.output=require("output.weight"); g.token_embd=require("token_embd.weight");
+
+    auto& sc=g.scratch;
+    const std::size_t wide=static_cast<std::size_t>(g.heads)*g.head_dim;
+    sc.streams.assign(static_cast<std::size_t>(g.hc)*g.n_embd,0.0f);
+    sc.next_streams.assign(sc.streams.size(),0.0f);
+    sc.collapsed.assign(g.n_embd,0.0f); sc.hidden.assign(g.n_embd,0.0f);
+    sc.pre.assign(g.hc,0.0f); sc.post.assign(g.hc,0.0f); sc.comb.assign(static_cast<std::size_t>(g.hc)*g.hc,0.0f);
+    sc.low_rank.assign(g.q_lora,0.0f); sc.query.assign(wide,0.0f);
+    sc.latent.assign(g.head_dim,0.0f); sc.block_out.assign(g.n_embd,0.0f);
+    sc.grouped.assign(static_cast<std::size_t>(g.groups)*g.lora_rank,0.0f);
+    sc.attn.assign(wide,0.0f); sc.derope.assign(wide,0.0f);
+    sc.state_row.assign(2ull*g.head_dim,0.0f);
+    sc.gate.assign(g.expert_ffn,0.0f); sc.up.assign(g.expert_ffn,0.0f);
+    sc.activated.assign(g.expert_ffn,0.0f); sc.expert_out.assign(g.n_embd,0.0f);
+    sc.moe.assign(g.n_embd,0.0f); sc.logits.assign(g.vocabulary,0.0f);
+    sc.experts.assign(g.experts_used,0); sc.weights.assign(g.experts_used,0.0f);
+    // Keys for one attention: the window plus every compressed block.
+    std::uint32_t widest=0;
+    for(const auto& layer:g.layers)
+        widest=std::max(widest,layer.window+layer.block_capacity);
+    sc.keys.assign(static_cast<std::size_t>(widest)*g.head_dim,0.0f);
+    sc.mask.assign(widest,0);
+
     *out=runtime.release();
     return 0;});}
 
@@ -4093,6 +4162,257 @@ int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime){retur
     if(!runtime)throw std::runtime_error("invalid runtime");
     runtime->reset();
     return 0;});}
+
+namespace {
+
+// Multiply a resolved tensor by a vector. The plan holds indices, so this does
+// no lookup -- the difference from colibri_v2_matvec, which searches by name.
+void ds4_matvec(const ColibriV2Model& model, std::uint64_t index,
+                const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
+    const auto& tensor = model.tensors[index];
+    const auto* packed = tensor_data(model, tensor);
+    for (std::int32_t row = 0; row < outputs; ++row)
+        out[row] = qwen_quant_dot(packed, tensor.type, input, inputs,
+                                  static_cast<std::uint64_t>(row));
+}
+
+void ds4_expert_matvec(const ColibriV2Model& model, std::uint64_t index, std::int32_t expert,
+                       const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
+    const auto& tensor = model.tensors[index];
+    const auto* packed = tensor_data(model, tensor);
+    const auto base = static_cast<std::uint64_t>(expert) * outputs;
+    for (std::int32_t row = 0; row < outputs; ++row)
+        out[row] = qwen_quant_dot(packed, tensor.type, input, inputs, base + row);
+}
+
+// A resolved f32 tensor's data, for the norms and mixers the loop reads whole.
+const float* ds4_f32(const ColibriV2Model& model, std::uint64_t index) {
+    return reinterpret_cast<const float*>(tensor_data(model, model.tensors[index]));
+}
+
+// Run one block over one position, reading and updating its cache.
+void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
+                       std::uint32_t position, std::uint32_t token,
+                       const float* streams, float* out_streams) {
+    namespace ds4 = colibri::v2::deepseek4;
+    auto& layer = rt.layers[index];
+    const auto& plan = layer.plan;
+    const auto& model = *rt.model;
+    auto& sc = rt.scratch;
+    const auto n_embd = rt.n_embd, hc = rt.hc, head_dim = rt.head_dim;
+    const auto wide = static_cast<std::int32_t>(rt.heads) * head_dim;
+
+    const bool compressed_rope = layer.ratio != 0;
+    ds4::YarnParameters yarn{};
+    float base = rt.freq_base, scale = 1.0f;
+    if (compressed_rope) {
+        base = rt.compress_base; scale = rt.freq_scale;
+        yarn = {1.0f, rt.attn_factor, rt.beta_fast, rt.beta_slow, rt.original_context};
+    }
+
+    // Attention side of the hyper-connection.
+    ds4::hyper_connection_weights(
+        streams, ds4_f32(model, plan.hc_attn_fn), ds4_f32(model, plan.hc_attn_scale),
+        ds4_f32(model, plan.hc_attn_base), n_embd, hc, rt.sinkhorn_iterations,
+        rt.epsilon, rt.epsilon, sc.pre.data(), sc.post.data(), sc.comb.data());
+    ds4::hyper_connection_collapse(streams, sc.pre.data(), n_embd, hc, sc.collapsed.data());
+    ds4::rms_norm(sc.collapsed.data(), n_embd, rt.epsilon, sc.hidden.data());
+    {
+        const float* gain = ds4_f32(model, plan.attn_norm);
+        for (std::uint32_t i = 0; i < n_embd; ++i) sc.hidden[i] *= gain[i];
+    }
+
+    // Query: low-rank path, per-head norm without gain, then rotate.
+    ds4_matvec(model, plan.q_a, sc.hidden.data(), n_embd, sc.low_rank.data(), rt.q_lora);
+    ds4::rms_norm(sc.low_rank.data(), rt.q_lora, rt.epsilon, sc.low_rank.data());
+    {
+        const float* gain = ds4_f32(model, plan.q_a_norm);
+        for (std::uint32_t i = 0; i < rt.q_lora; ++i) sc.low_rank[i] *= gain[i];
+    }
+    ds4_matvec(model, plan.q_b, sc.low_rank.data(), rt.q_lora, sc.query.data(), wide);
+    for (std::uint32_t head = 0; head < rt.heads; ++head) {
+        float* row = sc.query.data() + static_cast<std::size_t>(head) * head_dim;
+        ds4::rms_norm(row, head_dim, rt.epsilon, row);
+        ds4::rope(row + (head_dim - rt.rope_dim), rt.rope_dim, static_cast<std::int32_t>(position),
+                  base, scale, false, yarn);
+    }
+
+    // Key and value are the same latent, stored half precision.
+    ds4_matvec(model, plan.kv, sc.hidden.data(), n_embd, sc.latent.data(), head_dim);
+    ds4::rms_norm(sc.latent.data(), head_dim, rt.epsilon, sc.latent.data());
+    {
+        const float* gain = ds4_f32(model, plan.kv_a_norm);
+        for (std::uint32_t i = 0; i < head_dim; ++i) sc.latent[i] *= gain[i];
+    }
+    ds4::rope(sc.latent.data() + (head_dim - rt.rope_dim), rt.rope_dim,
+              static_cast<std::int32_t>(position), base, scale, false, yarn);
+    {
+        std::uint16_t* slot = layer.latents.data() +
+            static_cast<std::size_t>(position % layer.window) * head_dim;
+        for (std::uint32_t i = 0; i < head_dim; ++i) slot[i] = ds4::half_bits(sc.latent[i]);
+    }
+
+    // Compressor state, closing a block when it fills.
+    if (layer.ratio) {
+        const auto width = layer.state_width;
+        const auto slot = position % layer.state_rows;
+        float* values = layer.state_values.data() + static_cast<std::size_t>(slot) * width;
+        float* scores = layer.state_scores.data() + static_cast<std::size_t>(slot) * width;
+        ds4_matvec(model, plan.comp_kv, sc.hidden.data(), n_embd, values,
+                   static_cast<std::int32_t>(width));
+        ds4_matvec(model, plan.comp_gate, sc.hidden.data(), n_embd, scores,
+                   static_cast<std::int32_t>(width));
+        const float* ape = ds4_f32(model, plan.comp_ape) +
+            static_cast<std::size_t>(position % layer.ratio) * width;
+        for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
+        if ((position + 1) % layer.ratio == 0 && layer.blocks < layer.block_capacity) {
+            const bool overlapped = layer.ratio == 4;
+            const auto rows = layer.state_rows;
+            std::vector<float> pooled_values(static_cast<std::size_t>(rows) * head_dim, 0.0f);
+            std::vector<float> pooled_scores(pooled_values.size(),
+                                             -std::numeric_limits<float>::infinity());
+            const auto block = layer.blocks;
+            for (std::uint32_t slot_index = 0; slot_index < layer.ratio; ++slot_index) {
+                const auto current = block * layer.ratio + slot_index;
+                const auto* cv = layer.state_values.data() +
+                    static_cast<std::size_t>(current % rows) * width;
+                const auto* cs = layer.state_scores.data() +
+                    static_cast<std::size_t>(current % rows) * width;
+                if (!overlapped) {
+                    std::copy_n(cv, head_dim, pooled_values.data() + static_cast<std::size_t>(slot_index) * head_dim);
+                    std::copy_n(cs, head_dim, pooled_scores.data() + static_cast<std::size_t>(slot_index) * head_dim);
+                    continue;
+                }
+                if (block > 0) {
+                    const auto previous = (block - 1) * layer.ratio + slot_index;
+                    const auto* pv = layer.state_values.data() +
+                        static_cast<std::size_t>(previous % rows) * width;
+                    const auto* ps = layer.state_scores.data() +
+                        static_cast<std::size_t>(previous % rows) * width;
+                    std::copy_n(pv, head_dim, pooled_values.data() + static_cast<std::size_t>(slot_index) * head_dim);
+                    std::copy_n(ps, head_dim, pooled_scores.data() + static_cast<std::size_t>(slot_index) * head_dim);
+                }
+                std::copy_n(cv + head_dim, head_dim,
+                            pooled_values.data() + static_cast<std::size_t>(layer.ratio + slot_index) * head_dim);
+                std::copy_n(cs + head_dim, head_dim,
+                            pooled_scores.data() + static_cast<std::size_t>(layer.ratio + slot_index) * head_dim);
+            }
+            std::vector<float> pooled(head_dim, 0.0f);
+            ds4::compress_block(pooled_values.data(), pooled_scores.data(), rows, head_dim, pooled.data());
+            ds4::rms_norm(pooled.data(), head_dim, rt.epsilon, pooled.data());
+            {
+                const float* gain = ds4_f32(model, plan.comp_norm);
+                for (std::uint32_t i = 0; i < head_dim; ++i) pooled[i] *= gain[i];
+            }
+            ds4::rope(pooled.data() + (head_dim - rt.rope_dim), rt.rope_dim,
+                      static_cast<std::int32_t>(block), rt.compress_base, rt.freq_scale, false,
+                      {1.0f, rt.attn_factor, rt.beta_fast, rt.beta_slow, rt.original_context});
+            std::uint16_t* target = layer.compressed.data() +
+                static_cast<std::size_t>(block) * head_dim;
+            for (std::uint32_t i = 0; i < head_dim; ++i) target[i] = ds4::half_bits(pooled[i]);
+            ++layer.blocks;
+        }
+    }
+
+    // Gather the keys this position may see, raw window then compressed blocks.
+    std::uint32_t keys = 0;
+    const std::uint32_t first = position + 1 > layer.window ? position + 1 - layer.window : 0;
+    for (std::uint32_t p = first; p <= position; ++p) {
+        const std::uint16_t* slot = layer.latents.data() +
+            static_cast<std::size_t>(p % layer.window) * head_dim;
+        float* target = sc.keys.data() + static_cast<std::size_t>(keys) * head_dim;
+        for (std::uint32_t i = 0; i < head_dim; ++i) target[i] = ds4::half_value(slot[i]);
+        ++keys;
+    }
+    for (std::uint32_t block = 0; block < layer.blocks; ++block) {
+        if (block * layer.ratio + layer.ratio - 1 > position) break;
+        const std::uint16_t* slot = layer.compressed.data() +
+            static_cast<std::size_t>(block) * head_dim;
+        float* target = sc.keys.data() + static_cast<std::size_t>(keys) * head_dim;
+        for (std::uint32_t i = 0; i < head_dim; ++i) target[i] = ds4::half_value(slot[i]);
+        ++keys;
+    }
+
+    ds4::attention_with_sinks(sc.query.data(), sc.keys.data(), ds4_f32(model, plan.sinks),
+                              nullptr, rt.heads, head_dim, keys,
+                              1.0f / std::sqrt(static_cast<float>(head_dim)), sc.attn.data());
+
+    // Undo the rotation, then the grouped output projection.
+    std::copy(sc.attn.begin(), sc.attn.end(), sc.derope.begin());
+    for (std::uint32_t head = 0; head < rt.heads; ++head)
+        ds4::rope(sc.derope.data() + static_cast<std::size_t>(head) * head_dim + (head_dim - rt.rope_dim),
+                  rt.rope_dim, static_cast<std::int32_t>(position), base, scale, true, yarn);
+    {
+        const auto inputs = static_cast<std::int32_t>(wide / rt.groups);
+        const auto& tensor = model.tensors[plan.output_a];
+        const auto* packed = tensor_data(model, tensor);
+        for (std::uint32_t group = 0; group < rt.groups; ++group) {
+            const float* source = sc.derope.data() + static_cast<std::size_t>(group) * inputs;
+            for (std::uint32_t j = 0; j < rt.lora_rank; ++j)
+                sc.grouped[static_cast<std::size_t>(group) * rt.lora_rank + j] =
+                    qwen_quant_dot(packed, tensor.type, source, inputs,
+                                   static_cast<std::uint64_t>(group) * rt.lora_rank + j);
+        }
+    }
+    ds4_matvec(model, plan.output_b, sc.grouped.data(),
+               static_cast<std::int32_t>(rt.groups * rt.lora_rank), sc.block_out.data(), n_embd);
+
+    ds4::hyper_connection_combine(sc.block_out.data(), streams, sc.post.data(), sc.comb.data(),
+                                  n_embd, hc, out_streams);
+
+    // Feed-forward side.
+    ds4::hyper_connection_weights(
+        out_streams, ds4_f32(model, plan.hc_ffn_fn), ds4_f32(model, plan.hc_ffn_scale),
+        ds4_f32(model, plan.hc_ffn_base), n_embd, hc, rt.sinkhorn_iterations,
+        rt.epsilon, rt.epsilon, sc.pre.data(), sc.post.data(), sc.comb.data());
+    ds4::hyper_connection_collapse(out_streams, sc.pre.data(), n_embd, hc, sc.collapsed.data());
+    ds4::rms_norm(sc.collapsed.data(), n_embd, rt.epsilon, sc.hidden.data());
+    {
+        const float* gain = ds4_f32(model, plan.ffn_norm);
+        for (std::uint32_t i = 0; i < n_embd; ++i) sc.hidden[i] *= gain[i];
+    }
+
+    std::vector<float> router(rt.experts, 0.0f);
+    ds4_matvec(model, plan.gate_inp, sc.hidden.data(), n_embd, router.data(), rt.experts);
+    const bool hashed = index < rt.hash_layers;
+    if (hashed) {
+        const auto* table = reinterpret_cast<const std::int32_t*>(
+            tensor_data(model, model.tensors[plan.tid2eid]));
+        std::copy_n(table + static_cast<std::size_t>(token) * rt.experts_used,
+                    rt.experts_used, sc.experts.begin());
+    }
+    ds4::moe_router(router.data(), hashed ? nullptr : ds4_f32(model, plan.exp_probs_b),
+                    rt.experts, rt.experts_used, rt.weight_scale, 1e-20f, !hashed,
+                    sc.experts.data(), sc.weights.data());
+
+    std::fill(sc.moe.begin(), sc.moe.end(), 0.0f);
+    for (std::uint32_t slot = 0; slot < rt.experts_used; ++slot) {
+        const auto expert = sc.experts[slot];
+        ds4_expert_matvec(model, plan.gate_exps, expert, sc.hidden.data(), n_embd,
+                          sc.gate.data(), rt.expert_ffn);
+        ds4_expert_matvec(model, plan.up_exps, expert, sc.hidden.data(), n_embd,
+                          sc.up.data(), rt.expert_ffn);
+        ds4::clamped_swiglu(sc.gate.data(), sc.up.data(), rt.expert_ffn, rt.clamp,
+                            sc.activated.data());
+        ds4_expert_matvec(model, plan.down_exps, expert, sc.activated.data(), rt.expert_ffn,
+                          sc.expert_out.data(), n_embd);
+        const float weight = sc.weights[slot];
+        for (std::uint32_t i = 0; i < n_embd; ++i) sc.moe[i] += sc.expert_out[i] * weight;
+    }
+    ds4_matvec(model, plan.gate_shexp, sc.hidden.data(), n_embd, sc.gate.data(), rt.expert_ffn);
+    ds4_matvec(model, plan.up_shexp, sc.hidden.data(), n_embd, sc.up.data(), rt.expert_ffn);
+    ds4::clamped_swiglu(sc.gate.data(), sc.up.data(), rt.expert_ffn, rt.clamp, sc.activated.data());
+    ds4_matvec(model, plan.down_shexp, sc.activated.data(), rt.expert_ffn,
+               sc.expert_out.data(), n_embd);
+    for (std::uint32_t i = 0; i < n_embd; ++i) sc.moe[i] += sc.expert_out[i];
+
+    std::vector<float> after(static_cast<std::size_t>(hc) * n_embd, 0.0f);
+    ds4::hyper_connection_combine(sc.moe.data(), out_streams, sc.post.data(), sc.comb.data(),
+                                  n_embd, hc, after.data());
+    std::copy(after.begin(), after.end(), out_streams);
+}
+
+}  // namespace
 
 int colibri_v2_deepseek4_runtime_info(
     const ColibriV2Deepseek4Runtime* runtime, ColibriV2Deepseek4Info* out
@@ -4108,6 +4428,55 @@ int colibri_v2_deepseek4_runtime_info(
         if(layer.ratio==4)++out->csa_layers;
         else if(layer.ratio)++out->hca_layers;
         else ++out->window_layers;
+    }
+    return 0;});}
+
+// Run one token through every block and the head.
+//
+// Positions advance with the call, so feeding a prompt is repeated calls and
+// decoding is the same call again -- prefill and decode share one path, which
+// is what keeps them from disagreeing. `logits` may be null for prompt tokens
+// whose distribution nobody wants.
+int colibri_v2_deepseek4_forward(
+    ColibriV2Deepseek4Runtime* runtime, uint32_t token, float* logits
+){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid runtime");
+    namespace ds4=colibri::v2::deepseek4;
+    auto& rt=*runtime;
+    const auto& model=*rt.model;
+    auto& sc=rt.scratch;
+    if(token>=rt.vocabulary)throw std::runtime_error("token id is outside the vocabulary");
+    const auto position=rt.layers.empty()?0u:rt.layers.front().positions;
+    if(position>=rt.context_limit)throw std::runtime_error("sequence is past the context limit");
+
+    // Every stream starts as a copy of the embedding.
+    {
+        const auto& tensor=model.tensors[rt.token_embd];
+        std::vector<float> row(rt.n_embd,0.0f);
+        if(colibri_v2_qwen_embedding(&model,token,row.data(),
+               static_cast<std::int32_t>(rt.n_embd))!=0)
+            throw std::runtime_error("cannot read the token embedding");
+        for(std::uint32_t stream=0;stream<rt.hc;++stream)
+            std::copy(row.begin(),row.end(),
+                      sc.streams.begin()+static_cast<std::size_t>(stream)*rt.n_embd);
+    }
+
+    for(std::uint32_t index=0;index<rt.layers.size();++index){
+        ds4_layer_forward(rt,index,position,token,sc.streams.data(),sc.next_streams.data());
+        std::swap(sc.streams,sc.next_streams);
+        ++rt.layers[index].positions;
+    }
+
+    if(logits){
+        std::vector<float> pre(rt.hc,0.0f);
+        ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
+            ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),
+            rt.n_embd,rt.hc,rt.epsilon,rt.epsilon,pre.data(),sc.collapsed.data());
+        ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
+        const float* gain=ds4_f32(model,rt.output_norm);
+        for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=gain[i];
+        ds4_matvec(model,rt.output,sc.hidden.data(),rt.n_embd,logits,
+                   static_cast<std::int32_t>(rt.vocabulary));
     }
     return 0;});}
 

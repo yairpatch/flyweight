@@ -241,3 +241,73 @@ class HalfPrecisionTests(unittest.TestCase):
         self.assertEqual(half_round_trip(math.inf), math.inf)
         self.assertEqual(half_round_trip(-math.inf), -math.inf)
         self.assertTrue(math.isnan(half_round_trip(math.nan)))
+
+
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+class NativeForwardTests(unittest.TestCase):
+    """The native forward against the composed model.
+
+    The oracle is verified against llama.cpp, so agreeing with it is what makes
+    the runtime trustworthy. The bar here is exact rather than approximate: both
+    call the same kernels in the same order on the same weights, so any
+    difference at all means the loop wired something differently, not that
+    precision drifted.
+
+    Prefill and decode are the same call. A prompt is repeated forwards and
+    generation is more of them, which is what stops the two paths disagreeing --
+    the failure mode that shows up as output degrading after the prompt rather
+    than breaking.
+    """
+
+    PROMPT = "The quick brown fox jumps over the lazy dog today"
+
+    @classmethod
+    def setUpClass(cls):
+        import numpy as np
+        from colibri_next.deepseek4_layer import DeepSeek4Model
+
+        cls.model = V2Model(CHECKPOINT)
+        cls.tokens = list(cls.model.tokenize(cls.PROMPT))
+        with Deepseek4Runtime(cls.model, 256) as runtime:
+            for index, token in enumerate(cls.tokens):
+                last = index == len(cls.tokens) - 1
+                cls.native = runtime.forward(token, logits=last)
+            cls.positions = runtime.info["positions"]
+        cls.oracle = DeepSeek4Model(cls.model).forward(cls.tokens)
+        cls.np = np
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def test_the_logits_match_the_oracle_exactly(self):
+        self.np.testing.assert_array_equal(self.native, self.oracle)
+
+    def test_the_prediction_matches(self):
+        self.assertEqual(int(self.np.argmax(self.native)), int(self.np.argmax(self.oracle)))
+
+    def test_the_sequence_advanced_once_per_token(self):
+        self.assertEqual(self.positions, len(self.tokens))
+
+    def test_running_past_the_context_limit_is_refused(self):
+        with Deepseek4Runtime(self.model, 4) as runtime:
+            for token in self.tokens[:4]:
+                runtime.forward(token, logits=False)
+            with self.assertRaises(V2Error):
+                runtime.forward(self.tokens[4], logits=False)
+
+    def test_reset_starts_a_fresh_sequence(self):
+        with Deepseek4Runtime(self.model, 64) as runtime:
+            for token in self.tokens[:3]:
+                runtime.forward(token, logits=False)
+            runtime.reset()
+            self.assertEqual(runtime.info["positions"], 0)
+            first = runtime.forward(self.tokens[0])
+            runtime.reset()
+            again = runtime.forward(self.tokens[0])
+            self.np.testing.assert_array_equal(first, again)
+
+    def test_a_token_outside_the_vocabulary_is_refused(self):
+        with Deepseek4Runtime(self.model, 16) as runtime:
+            with self.assertRaises(V2Error):
+                runtime.forward(10_000_000, logits=False)
