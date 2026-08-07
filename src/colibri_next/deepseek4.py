@@ -152,6 +152,47 @@ class Deepseek4Runtime:
                 return
             yield token
 
+    def stream(self, model, tokens, *, max_tokens: int = 32, stop=None):
+        """Yield a GenerationStep per token, the shape the server consumes.
+
+        Text is decoded from the whole generated run each step rather than per
+        token, because a token is bytes and not necessarily a character: a
+        multi-byte codepoint split across two tokens decodes to replacement
+        characters if each is decoded alone. The delta is what the full decode
+        grew by.
+        """
+        from colibri_next.generation import GenerationStep
+
+        if stop is None:
+            stop = self._terminators
+        stop = set(stop)
+        prompt = list(tokens)
+        produced: list[int] = []
+        text = ""
+        stopped = False
+        for token in prompt[:-1]:
+            self.forward(token, logits=False)
+        current = prompt[-1]
+        for _ in range(max_tokens):
+            logits = self.forward(current)
+            current = int(np.argmax(logits))
+            if current in stop:
+                stopped = True
+                break
+            produced.append(current)
+            decoded = model.decode_tokens(produced)
+            delta, text = decoded[len(text):], decoded
+            yield GenerationStep(
+                token_id=current, text_delta=delta, prompt_ids=prompt,
+                generated_ids=produced, text=text, stopped_on_eos=False,
+                finished=False, state_tokens=len(prompt) + len(produced),
+            )
+        yield GenerationStep(
+            token_id=None, text_delta="", prompt_ids=tuple(prompt),
+            generated_ids=tuple(produced), text=text, stopped_on_eos=stopped,
+            finished=True, state_tokens=len(prompt) + len(produced),
+        )
+
     def reset(self) -> None:
         status = self._library.colibri_v2_deepseek4_runtime_reset(self._handle)
         if status:

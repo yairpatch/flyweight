@@ -360,3 +360,51 @@ class GenerationTests(unittest.TestCase):
         with Deepseek4Runtime(self.model, 128) as runtime:
             produced = list(runtime.generate(tokens[:1], max_tokens=5, stop={likely}))
         self.assertEqual(produced, [])
+
+
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+class StreamingTests(unittest.TestCase):
+    """Streaming in the shape the server consumes.
+
+    The delta is computed by decoding the whole run each step and taking what
+    grew, not by decoding each token alone. A token is bytes rather than a
+    character, so a multi-byte codepoint split across two tokens decodes to
+    replacement characters if each is decoded by itself -- which is how streamed
+    output ends up with stray U+FFFD in exactly the languages that need the
+    bytes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = V2Model(CHECKPOINT)
+        cls.tokens = list(cls.model.tokenize("The capital city of France is"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def test_the_deltas_reassemble_the_text(self):
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            steps = list(runtime.stream(self.model, self.tokens, max_tokens=6))
+        self.assertTrue(steps[-1].finished)
+        self.assertEqual("".join(step.text_delta for step in steps), steps[-1].text)
+
+    def test_only_the_last_step_is_final(self):
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            steps = list(runtime.stream(self.model, self.tokens, max_tokens=4))
+        self.assertTrue(all(not step.finished for step in steps[:-1]))
+        self.assertIsNone(steps[-1].token_id)
+        self.assertTrue(all(step.token_id is not None for step in steps[:-1]))
+
+    def test_it_streams_the_same_text_it_generates(self):
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            streamed = list(runtime.stream(self.model, self.tokens, max_tokens=6))[-1]
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            produced = list(runtime.generate(self.tokens, max_tokens=6))
+        self.assertEqual(list(streamed.generated_ids), produced)
+        self.assertEqual(streamed.text, self.model.decode_tokens(produced))
+
+    def test_the_state_count_tracks_the_sequence(self):
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            steps = list(runtime.stream(self.model, self.tokens, max_tokens=3))
+        self.assertEqual(steps[-1].state_tokens, len(self.tokens) + len(steps[-1].generated_ids))
