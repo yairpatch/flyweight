@@ -3906,6 +3906,21 @@ int colibri_v2_deepseek4_head(
         static_cast<std::size_t>(hc),rms_epsilon,hc_epsilon,pre,output);
     return 0;});}
 
+// Build the attention mask for one query position of a DeepSeek-V4 layer.
+int colibri_v2_deepseek4_visible_keys(
+    int32_t position, int32_t raw_positions, int32_t blocks, int32_t ratio,
+    int32_t window, uint8_t* mask, int32_t* visible
+){return guarded([&]{
+    if(!mask||position<0||raw_positions<0||blocks<0||ratio<0||window<0)
+        throw std::runtime_error("visible-key arguments are invalid");
+    if(blocks&&!ratio)throw std::runtime_error("compressed blocks need a non-zero ratio");
+    const auto count=colibri::v2::deepseek4::visible_keys(
+        static_cast<std::size_t>(position),static_cast<std::size_t>(raw_positions),
+        static_cast<std::size_t>(blocks),static_cast<std::size_t>(ratio),
+        static_cast<std::size_t>(window),mask);
+    if(visible)*visible=static_cast<std::int32_t>(count);
+    return 0;});}
+
 // Pool one block of positions into a single compressed latent.
 int colibri_v2_deepseek4_compress(
     const float* values, const float* scores, int32_t positions, int32_t width,

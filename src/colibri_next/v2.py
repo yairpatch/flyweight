@@ -482,6 +482,12 @@ def _library() -> ctypes.CDLL:
                     _float_p, _float_p,
                 ]
                 lib.colibri_v2_deepseek4_head.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_visible_keys.argtypes = [
+                    ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                    ctypes.c_int32, ctypes.POINTER(ctypes.c_uint8),
+                    ctypes.POINTER(ctypes.c_int32),
+                ]
+                lib.colibri_v2_deepseek4_visible_keys.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_compress.argtypes = [
                     _float_p, _float_p, ctypes.c_int32, ctypes.c_int32, _float_p,
                 ]

@@ -82,6 +82,22 @@ def head_collapse(
     return pre, output
 
 
+def visible_keys(
+    position: int, raw_positions: int, blocks: int, ratio: int, window: int
+) -> np.ndarray:
+    """The attention mask for one query: raw window entries then block entries."""
+    mask = np.zeros(raw_positions + blocks, dtype=np.uint8)
+    visible = ctypes.c_int32()
+    library = _library()
+    status = library.colibri_v2_deepseek4_visible_keys(
+        position, raw_positions, blocks, ratio, window,
+        mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), ctypes.byref(visible),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"visible keys failed").decode(errors="replace"))
+    return mask
+
+
 def compress(values: np.ndarray, scores: np.ndarray) -> np.ndarray:
     """Pool a block of positions into one latent, softmaxing per channel.
 

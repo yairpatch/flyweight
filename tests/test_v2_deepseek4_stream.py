@@ -123,3 +123,36 @@ class StreamingShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NativeVisibilityTests(unittest.TestCase):
+    """The native mask must agree with the Python one, which is reference-checked.
+
+    The runtime builds this mask per query position, so it is the first piece of
+    the forward loop to move into C++. Keeping both and comparing them means the
+    translation is checked against something already known to be right, rather
+    than against a fresh reading of the architecture.
+    """
+
+    def test_native_matches_python_across_shapes(self):
+        from colibri_next.deepseek4 import visible_keys
+        from colibri_next.deepseek4_layer import csa_attention_latents
+
+        for raw_positions, blocks, ratio, window in (
+            (10, 2, 4, 128), (10, 0, 0, 128), (376, 94, 4, 128),
+            (376, 2, 128, 128), (20, 5, 4, 3), (1, 0, 4, 128),
+        ):
+            raw = np.zeros((raw_positions, 2), dtype=np.float32)
+            compressed = np.zeros((blocks, 2), dtype=np.float32)
+            for position in range(min(raw_positions, 40)):
+                with self.subTest(raw=raw_positions, blocks=blocks, pos=position):
+                    _, expected = csa_attention_latents(
+                        raw, compressed, position, max(ratio, 1), window
+                    )
+                    actual = visible_keys(position, raw_positions, blocks, ratio, window)
+                    np.testing.assert_array_equal(actual, expected)
+
+    def test_a_zero_ratio_with_blocks_is_rejected(self):
+        from colibri_next.deepseek4 import visible_keys
+        with self.assertRaises(Exception):
+            visible_keys(0, 4, 2, 0, 128)

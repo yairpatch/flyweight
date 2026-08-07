@@ -180,6 +180,39 @@ inline void hyper_connection_combine(
     }
 }
 
+// Which keys a query at `position` may attend to.
+//
+// The raw sliding window and the compressed blocks are both visible and
+// deliberately overlap: a token can be attended directly and again through its
+// block's summary. A block becomes visible once every token it covers is at or
+// before the query, so block b is available from b*ratio + ratio - 1 onward.
+//
+// Fills `mask` with `raw_positions + blocks` entries, raw first, and returns
+// how many are visible. A zero ratio means the layer compresses nothing, in
+// which case `blocks` should be zero.
+inline std::size_t visible_keys(
+    std::size_t position,
+    std::size_t raw_positions,
+    std::size_t blocks,
+    std::size_t ratio,
+    std::size_t window,
+    std::uint8_t* mask
+) {
+    std::size_t visible = 0;
+    const std::size_t first = window && position + 1 > window ? position + 1 - window : 0;
+    for (std::size_t i = 0; i < raw_positions; ++i) {
+        const bool seen = i >= first && i <= position;
+        mask[i] = seen ? 1 : 0;
+        visible += seen;
+    }
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const bool seen = ratio && b * ratio + ratio - 1 <= position;
+        mask[raw_positions + b] = seen ? 1 : 0;
+        visible += seen;
+    }
+    return visible;
+}
+
 // Compress a block of positions into a single latent.
 //
 // Both compressed attention kinds pool a run of tokens -- four for CSA, 128 for
