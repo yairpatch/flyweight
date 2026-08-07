@@ -442,6 +442,46 @@ token for at least 64 tokens; per-layer activation max-abs diff stays within the
 the quantization allows; a perplexity spot check on a short held-out text tracks the
 reference.
 
+## Stage C2 design — what the native loop must hold
+
+The state a sequence needs is far smaller than it first appears, and working out
+why changes where the effort belongs.
+
+**The raw latent cache holds the window, not the context.** Attention over raw
+tokens is bounded by the 128-token sliding window on every layer, so only 128
+latents per layer need retaining -- a ring buffer, not a growing cache. At 512
+wide in f16 that is 128 KiB per layer.
+
+**The compressor state holds two blocks, not the sequence.** A 4:1 layer pools
+the previous block's rows and its own, so once a block closes only its rows and
+the partial block after it can still be read: 2*ratio rows, eight of them. A
+128:1 layer does not overlap, so it needs only its own partial block. The
+composed model keeps every position because that is simpler for an oracle, and
+copying that into the runtime would waste the sequence's worth of memory for
+nothing.
+
+**The compressed caches do scale with context**, at context/4 entries for a 4:1
+layer and context/128 for a 128:1 one, plus the indexer's own cache on 4:1
+layers.
+
+Totalled across 43 layers: 37.9 MiB at 4096 context, 226 MiB at 32768. Against
+104 GiB of weights that is nothing, and three conclusions follow.
+
+- Cache quantization is pointless here. The existing turbo3/turbo4 KV types earn
+  their keep on models whose KV rivals their weights; on this one they would
+  save single-digit megabytes and cost accuracy.
+- Context length is nearly free in memory terms. What limits it is the lightning
+  indexer, unimplemented and needed beyond ~2048 tokens, not the cache budget.
+- Effort belongs on expert paging. The weights are the entire memory problem,
+  and the existing paging machinery is what determines whether this runs at 3
+  tok/s or 0.3.
+
+The loop itself should prefill in batches rather than a token at a time. The
+composed model runs one position at a time through a matvec per weight, which is
+right for an oracle and wrong for a runtime: it rereads every expert row per
+token instead of amortizing it across a batch, which is precisely the cost the
+paging machinery exists to manage.
+
 ## Stage C — GPU / hybrid execution
 
 Move attention, hyper-connections and the shared/dense path onto the 12 GB GPU while
