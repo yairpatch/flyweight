@@ -457,7 +457,10 @@ reference.
   rather than piping through `tail`: a run costs minutes and truncating the
   output throws away the part worth having.
 - Reference dumps in `/home/yair/Desktop/ds4-dumps/`: `prompt10.txt` for the
-  ten-token prompt, `long.txt` for the 376-token one. Regenerate with
+  ten-token prompt, `long.txt` for the 376-token one, `indexer.txt` for the
+  405-token `indexer_prompt.txt` (whose text is kept beside it, unlike the
+  earlier two -- their prompts are lost, which makes those dumps hard to
+  extend). Regenerate with
   `llama-eval-callback -m <shard 1> -f <prompt> -n 1 -c 1024 --temp 0`. Keep
   them out of `/tmp`, which is a RAM-backed tmpfs here.
 - Serving: `colibri-next serve <shard 1> --context 2048`. The runtime knobs are
@@ -487,16 +490,15 @@ the deepseek4 backend through `/health`. See the section below.
 
 What is left, in the order worth doing it:
 
-1. **The lightning indexer**, before any context past roughly 2048 tokens. It is
-   inert below that -- top-512 over fewer than 512 compressed blocks selects
-   everything -- so nothing tested so far exercises it, and a short-prompt pass
-   says nothing about it.
-2. **Expert residency**, worth up to 2x but only in the miss regime -- see the
+1. **Expert residency**, worth up to 2x but only in the miss regime -- see the
    attribution below, which replaced the assumption that paging was the next
    thing to do.
-3. **The DSML tool-call dialect**, for anything past plain chat.
-4. **Batched prefill.** The scheduler feeds the prompt a token at a time, which
+2. **The DSML tool-call dialect**, for anything past plain chat.
+3. **Batched prefill.** The scheduler feeds the prompt a token at a time, which
    rereads every expert row per position.
+4. **A long-context accuracy check.** The indexer is in and verified against the
+   reference's own numbers, but nothing has yet compared a *generation* past
+   2048 tokens against the reference token for token.
 
 Two things are believed rather than established. The tail layers diverge from
 the reference (element-wise error reaching 47% past layer 36) and the routed
@@ -603,6 +605,46 @@ Runtime knobs this path cannot honour -- GPU placement, expert paging, KV
 quantization, MTP drafts -- are refused with a message rather than accepted and
 ignored, so `serve --cache-type-k q8_0` says so instead of quietly doing
 something else.
+
+## The lightning indexer is in
+
+A 4:1 layer closes a block every four tokens and may attend to only 512 of
+them, so past roughly 2048 tokens the selection is what decides which of the
+compressed past the model can see. It is now implemented, and three things
+about it are worth keeping.
+
+**The cache cannot be built lazily.** The indexer carries its own compressor
+and cache beside the attention's -- 128 wide against 512, since it ranks blocks
+rather than answering with them -- and it has to run from the first token even
+while nothing reads it, because a block pools rows projected from a hidden
+state that is gone by the next step. Only the *scoring* is skipped below the
+threshold, and that skip is exact: keeping everything is the mask already in
+force, which a fixture test pins by showing byte-identical logits.
+
+**The score is rectified, and that is the whole difference from attention.**
+`score[j] = sum_h relu(q[h] . k[j]) * w[h]`. A head that disagrees with a block
+contributes nothing rather than voting it down, and the weights scale after the
+rectifier, not before. The Hadamard rotation the reference wraps this in is
+orthogonal and so changes no dot product; it exists to spread quantization
+error across channels, and this cache is not quantized.
+
+**Verification, since a short prompt says nothing here.** The compressed
+indexer keys match llama.cpp's dump of the same 405-token prompt element for
+element (`ds4-dumps/indexer_prompt.txt`, read `lid_state_compress-2` at the
+CONCAT, which is the pre-rotation value). The selection path itself runs in the
+suite on the miniature fixture with a small `indexer_top_k`. And on a real
+2627-token prompt the indexer discarded 12% of candidates while the model
+continued with a paragraph from far earlier in the context.
+
+Two cautions from doing it. A 2600-token prompt costs about half an hour here,
+so the fixture is the only practical place to exercise selection; and a first
+long run produced garbage that turned out to be a shared library rebuilt under
+a still-running process, not a defect -- worth remembering before believing a
+long-run result.
+
+The per-sequence state grows: a 4:1 layer now also carries the indexer's cache,
+which the design arithmetic in `tests/test_v2_deepseek4_runtime.py` accounts
+for. It is still far below the weights.
 
 ## Where a token's time goes, and why paging was not the next thing
 
