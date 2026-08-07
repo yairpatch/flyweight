@@ -311,3 +311,52 @@ class NativeForwardTests(unittest.TestCase):
         with Deepseek4Runtime(self.model, 16) as runtime:
             with self.assertRaises(V2Error):
                 runtime.forward(10_000_000, logits=False)
+
+
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+class GenerationTests(unittest.TestCase):
+    """Greedy generation, judged on what it says rather than on numbers.
+
+    Every other check here compares against the oracle or the reference. This
+    one asks whether the model answers a question correctly, which is the thing
+    a numeric check cannot tell you: a stack can match an oracle exactly and
+    still be wired to the wrong architecture if the oracle is too.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = V2Model(CHECKPOINT)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def _continue(self, prompt: str, limit: int) -> str:
+        tokens = list(self.model.tokenize(prompt))
+        with Deepseek4Runtime(self.model, 256) as runtime:
+            produced = list(runtime.generate(tokens, max_tokens=limit))
+        return self.model.decode_tokens(produced)
+
+    def test_it_answers_a_factual_prompt(self):
+        self.assertIn("Paris", self._continue("The capital city of France is", 6))
+
+    def test_it_answers_arithmetic(self):
+        self.assertIn("4", self._continue("2 + 2 =", 4))
+
+    def test_generation_stops_at_the_limit(self):
+        tokens = list(self.model.tokenize("Once upon a time"))
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            produced = list(runtime.generate(tokens, max_tokens=3))
+        self.assertLessEqual(len(produced), 3)
+
+    def test_a_terminator_ends_generation(self):
+        # Stopping is driven by the checkpoint's own terminator ids; forcing one
+        # that the first token will hit must end it immediately.
+        tokens = list(self.model.tokenize("The capital city of France is"))
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            first = runtime.forward(tokens[-1] if len(tokens) == 1 else tokens[0])
+        import numpy as np
+        likely = int(np.argmax(first))
+        with Deepseek4Runtime(self.model, 128) as runtime:
+            produced = list(runtime.generate(tokens[:1], max_tokens=5, stop={likely}))
+        self.assertEqual(produced, [])

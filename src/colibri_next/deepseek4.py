@@ -104,6 +104,12 @@ class Deepseek4Runtime:
             )
         self._handle = handle
         self._vocabulary = int(model.config["vocabulary_size"])
+        config = model.config
+        # UINT32_MAX marks a terminator the checkpoint does not define.
+        self._terminators = {
+            int(config[key]) for key in ("eos_token_id", "eot_token_id")
+            if int(config[key]) != 0xFFFFFFFF
+        }
 
     def close(self) -> None:
         if getattr(self, "_handle", None):
@@ -125,6 +131,26 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"forward failed").decode(errors="replace")
             )
         return out
+
+    def generate(self, tokens, *, max_tokens: int = 32, stop=None):
+        """Greedily continue `tokens`, yielding each new token id.
+
+        The prompt is fed through the same call as generation, so there is no
+        separate prefill path to fall out of step with this one. Stops on any id
+        in `stop`, which defaults to the checkpoint's own terminators.
+        """
+        if stop is None:
+            stop = self._terminators
+        stop = set(stop)
+        for token in tokens[:-1]:
+            self.forward(token, logits=False)
+        token = tokens[-1]
+        for _ in range(max_tokens):
+            logits = self.forward(token)
+            token = int(np.argmax(logits))
+            if token in stop:
+                return
+            yield token
 
     def reset(self) -> None:
         status = self._library.colibri_v2_deepseek4_runtime_reset(self._handle)
