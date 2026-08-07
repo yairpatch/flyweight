@@ -294,6 +294,27 @@ Anything relying on a relative error over a near-zero sum should be re-checked
 against printed values before it is believed, and new checks should prefer
 element comparison where the dump provides it.
 
+Re-running the whole 43-layer sweep that way, on the 376-token prompt and
+comparing the first and last three values of each block's output rather than its
+sum:
+
+- Layers 8 through 33 agree to between 0.28% and 2.0%. Twenty-six consecutive
+  layers in the activation-quantization band is the strongest evidence so far
+  that the implementation is right.
+- Layers 0 through 7 read between 1.2% and 105%, but their values are around
+  0.01 to 0.03, so this is the near-zero trap again at element scale rather than
+  sum scale. Nothing can be concluded from them either way.
+- Layers 36 through 42 climb from 8.7% to 47% on values of magnitude 500 to
+  1300. That is large enough to be real, and it survives the change of method.
+
+So the tail divergence is genuine and the middle of the network is not. The
+onset sits around layer 36 rather than 33. Given the routed expert selections
+differ from the reference and the feed-forward gain in those layers is around a
+hundredfold, a single flipped expert late in the stack is the obvious candidate,
+and it would be a legitimate consequence of the activation-precision difference
+rather than a defect. Establishing that needs the reference's own hidden state,
+which the dump does not carry.
+
 ### Expert selection diverges from the reference, and probably always will
 
 Running the full stack and comparing block outputs, layers 0-32 agree to within
