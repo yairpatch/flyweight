@@ -2,9 +2,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 // DeepSeek-V4 (`deepseek4`) building blocks, CPU reference implementations.
 //
@@ -13,6 +18,31 @@
 // into every stream through a learned mixing matrix that is Sinkhorn-normalized
 // so the streams stay balanced.
 namespace colibri::v2::deepseek4 {
+
+// How wide to fork a loop over rows or heads.
+//
+// One thread per core, not per hardware thread. Measured on this checkpoint:
+// the default team on a 16-core/32-thread part runs the expert weights at
+// 9.3 GiB/s where a 16-wide team reaches 24.6, because two threads sharing a
+// core contend for one L1 and one set of decode units. An explicit
+// OMP_NUM_THREADS still wins, which is how a part without SMT gets its cores
+// back. The rule matches `qwen_cpu_thread_count`; this is the copy the kernels
+// can see.
+inline int thread_count() {
+#if defined(_OPENMP)
+    static const int team = [] {
+        int chosen = omp_get_max_threads();
+        if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+            const int physical = omp_get_num_procs() / 2;
+            if (physical >= 1 && chosen > physical) chosen = physical;
+        }
+        return chosen;
+    }();
+    return team;
+#else
+    return 1;
+#endif
+}
 
 // Plain RMS normalization with no gain, matching the reference's RMS_NORM over
 // the flattened streams.
@@ -151,11 +181,15 @@ inline void hyper_connection_weights(
     rms_norm(streams, width, rms_epsilon, normalized.data());
 
     std::vector<float> mixes(mix_dim);
-    for (std::size_t row = 0; row < mix_dim; ++row) {
-        const float* weights = fn + row * width;
+    // Twenty-four rows of sixteen thousand weights, twice a layer: a megabyte
+    // and a half of reading each time, which is worth the fork even though the
+    // row count is small.
+#pragma omp parallel for schedule(static) num_threads(thread_count())
+    for (std::int64_t row = 0; row < static_cast<std::int64_t>(mix_dim); ++row) {
+        const float* weights = fn + static_cast<std::size_t>(row) * width;
         double total = 0.0;
         for (std::size_t i = 0; i < width; ++i) total += static_cast<double>(weights[i]) * normalized[i];
-        mixes[row] = static_cast<float>(total);
+        mixes[static_cast<std::size_t>(row)] = static_cast<float>(total);
     }
     if (mixes_out) std::copy(mixes.begin(), mixes.end(), mixes_out);
 
@@ -516,8 +550,14 @@ inline void attention_with_sinks(
     float scale,
     float* output
 ) {
-    std::vector<float> weights(positions);
-    for (std::size_t head = 0; head < heads; ++head) {
+    // Heads are independent and each writes only its own slice, so the split is
+    // exact rather than merely close: the arithmetic within a head, including
+    // the order of the softmax reduction, is untouched. The scratch moves
+    // inside the loop because it is the one thing the heads shared.
+#pragma omp parallel for schedule(static) num_threads(thread_count())
+    for (std::int64_t index = 0; index < static_cast<std::int64_t>(heads); ++index) {
+        const std::size_t head = static_cast<std::size_t>(index);
+        std::vector<float> weights(positions);
         const float* query = queries + head * head_dim;
         float peak = sinks ? sinks[head] : -std::numeric_limits<float>::infinity();
         for (std::size_t position = 0; position < positions; ++position) {

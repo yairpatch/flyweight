@@ -3997,6 +3997,16 @@ struct ColibriV2Deepseek4Runtime {
     std::uint64_t head_fn = 0, head_scale = 0, head_base = 0, output_norm = 0, output = 0;
     std::uint64_t token_embd = 0;
 
+    // Where a token's time goes. Attribution rather than a single number: the
+    // routed experts are believed to be nearly all of it, and paging work is
+    // only worth doing if that is measured rather than assumed.
+    std::uint64_t forward_calls = 0;
+    std::uint64_t forward_nanoseconds = 0;
+    std::uint64_t routed_expert_nanoseconds = 0, shared_expert_nanoseconds = 0;
+    std::uint64_t attention_nanoseconds = 0, head_nanoseconds = 0;
+    std::uint64_t attention_core_nanoseconds = 0;
+    std::uint64_t routed_expert_bytes = 0;
+
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
         for (const auto& layer : layers) total += layer.bytes();
@@ -4165,6 +4175,24 @@ int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime){retur
 
 namespace {
 
+// How wide to fork a matvec: one thread per core, the policy the kernels share.
+//
+// Measured on this checkpoint: the default team is one thread per *hardware*
+// thread, and on a 16-core/32-thread part that is 2.6x slower than one thread
+// per core -- 9.3 GiB/s of expert weights against 24.6, and 1.9 tok/s against
+// 3.2. Two threads sharing a core contend for the same L1 and the same decode
+// units, and the loop forks about eight hundred times per token, so the wider
+// team costs barrier time as well. deepseek4's pragmas simply never took a
+// `num_threads`.
+int ds4_thread_count() { return colibri::v2::deepseek4::thread_count(); }
+
+// A monotonic nanosecond stamp, for attributing a token's time.
+std::uint64_t ds4_now() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 // Multiply a resolved tensor by a vector. The plan holds indices, so this does
 // no lookup -- the difference from colibri_v2_matvec, which searches by name.
 void ds4_matvec(const ColibriV2Model& model, std::uint64_t index,
@@ -4172,10 +4200,12 @@ void ds4_matvec(const ColibriV2Model& model, std::uint64_t index,
     const auto& tensor = model.tensors[index];
     const auto* packed = tensor_data(model, tensor);
     // Rows are independent, and a token walks about a thousand of these across
-    // 43 layers, so the row loop is where the cores go. Small projections are
-    // left serial: the fork costs more than the work.
-    if (outputs >= 512) {
-#pragma omp parallel for schedule(static)
+    // 43 layers, so the row loop is where the cores go. The test is on the work
+    // rather than the row count: the hyper-connection mixer is 24 rows of 16384
+    // weights, which a row-count threshold leaves serial despite being a
+    // megabyte and a half of reading.
+    if (static_cast<std::int64_t>(outputs) * inputs >= (1 << 16)) {
+#pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
         for (std::int32_t row = 0; row < outputs; ++row)
             out[row] = qwen_quant_dot(packed, tensor.type, input, inputs,
                                       static_cast<std::uint64_t>(row));
@@ -4193,7 +4223,7 @@ void ds4_expert_matvec(const ColibriV2Model& model, std::uint64_t index, std::in
     const auto base = static_cast<std::uint64_t>(expert) * outputs;
     // The routed experts are most of the arithmetic in a token: seven of them,
     // three matrices each, 43 layers.
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
     for (std::int32_t row = 0; row < outputs; ++row)
         out[row] = qwen_quant_dot(packed, tensor.type, input, inputs, base + row);
 }
@@ -4214,6 +4244,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     auto& sc = rt.scratch;
     const auto n_embd = rt.n_embd, hc = rt.hc, head_dim = rt.head_dim;
     const auto wide = static_cast<std::int32_t>(rt.heads) * head_dim;
+    const auto attention_started = ds4_now();
 
     const bool compressed_rope = layer.ratio != 0;
     ds4::YarnParameters yarn{};
@@ -4328,6 +4359,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     }
 
     // Gather the keys this position may see, raw window then compressed blocks.
+    const auto core_started = ds4_now();
     std::uint32_t keys = 0;
     const std::uint32_t first = position + 1 > layer.window ? position + 1 - layer.window : 0;
     for (std::uint32_t p = first; p <= position; ++p) {
@@ -4349,6 +4381,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     ds4::attention_with_sinks(sc.query.data(), sc.keys.data(), ds4_f32(model, plan.sinks),
                               nullptr, rt.heads, head_dim, keys,
                               1.0f / std::sqrt(static_cast<float>(head_dim)), sc.attn.data());
+    rt.attention_core_nanoseconds += ds4_now() - core_started;
 
     // Undo the rotation, then the grouped output projection.
     std::copy(sc.attn.begin(), sc.attn.end(), sc.derope.begin());
@@ -4359,12 +4392,17 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         const auto inputs = static_cast<std::int32_t>(wide / rt.groups);
         const auto& tensor = model.tensors[plan.output_a];
         const auto* packed = tensor_data(model, tensor);
-        for (std::uint32_t group = 0; group < rt.groups; ++group) {
-            const float* source = sc.derope.data() + static_cast<std::size_t>(group) * inputs;
-            for (std::uint32_t j = 0; j < rt.lora_rank; ++j)
-                sc.grouped[static_cast<std::size_t>(group) * rt.lora_rank + j] =
-                    qwen_quant_dot(packed, tensor.type, source, inputs,
-                                   static_cast<std::uint64_t>(group) * rt.lora_rank + j);
+        // Every group's rows are independent, so this is one flat loop over
+        // them rather than two nested ones -- eight groups would otherwise
+        // fork eight times, and at 34 MiB a layer this is the largest single
+        // read in the attention half.
+        const auto rows = static_cast<std::int32_t>(rt.groups * rt.lora_rank);
+#pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
+        for (std::int32_t row = 0; row < rows; ++row) {
+            const auto group = static_cast<std::size_t>(row) / rt.lora_rank;
+            sc.grouped[static_cast<std::size_t>(row)] = qwen_quant_dot(
+                packed, tensor.type, sc.derope.data() + group * inputs, inputs,
+                static_cast<std::uint64_t>(row));
         }
     }
     ds4_matvec(model, plan.output_b, sc.grouped.data(),
@@ -4372,6 +4410,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
 
     ds4::hyper_connection_combine(sc.block_out.data(), streams, sc.post.data(), sc.comb.data(),
                                   n_embd, hc, out_streams);
+    rt.attention_nanoseconds += ds4_now() - attention_started;
 
     // Feed-forward side.
     ds4::hyper_connection_weights(
@@ -4399,6 +4438,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                     sc.experts.data(), sc.weights.data());
 
     std::fill(sc.moe.begin(), sc.moe.end(), 0.0f);
+    const auto experts_started = ds4_now();
     for (std::uint32_t slot = 0; slot < rt.experts_used; ++slot) {
         const auto expert = sc.experts[slot];
         ds4_expert_matvec(model, plan.gate_exps, expert, sc.hidden.data(), n_embd,
@@ -4411,13 +4451,20 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                           sc.expert_out.data(), n_embd);
         const float weight = sc.weights[slot];
         for (std::uint32_t i = 0; i < n_embd; ++i) sc.moe[i] += sc.expert_out[i] * weight;
+        // One expert's share of the three matrices, which is what a page-in
+        // would have to fetch.
+        for (const auto matrix : {plan.gate_exps, plan.up_exps, plan.down_exps})
+            rt.routed_expert_bytes += model.tensors[matrix].size / rt.experts;
     }
+    rt.routed_expert_nanoseconds += ds4_now() - experts_started;
+    const auto shared_started = ds4_now();
     ds4_matvec(model, plan.gate_shexp, sc.hidden.data(), n_embd, sc.gate.data(), rt.expert_ffn);
     ds4_matvec(model, plan.up_shexp, sc.hidden.data(), n_embd, sc.up.data(), rt.expert_ffn);
     ds4::clamped_swiglu(sc.gate.data(), sc.up.data(), rt.expert_ffn, rt.clamp, sc.activated.data());
     ds4_matvec(model, plan.down_shexp, sc.activated.data(), rt.expert_ffn,
                sc.expert_out.data(), n_embd);
     for (std::uint32_t i = 0; i < n_embd; ++i) sc.moe[i] += sc.expert_out[i];
+    rt.shared_expert_nanoseconds += ds4_now() - shared_started;
 
     std::vector<float> after(static_cast<std::size_t>(hc) * n_embd, 0.0f);
     ds4::hyper_connection_combine(sc.moe.data(), out_streams, sc.post.data(), sc.comb.data(),
@@ -4442,6 +4489,14 @@ int colibri_v2_deepseek4_runtime_info(
         else if(layer.ratio)++out->hca_layers;
         else ++out->window_layers;
     }
+    out->forward_calls=runtime->forward_calls;
+    out->forward_nanoseconds=runtime->forward_nanoseconds;
+    out->routed_expert_nanoseconds=runtime->routed_expert_nanoseconds;
+    out->shared_expert_nanoseconds=runtime->shared_expert_nanoseconds;
+    out->attention_nanoseconds=runtime->attention_nanoseconds;
+    out->attention_core_nanoseconds=runtime->attention_core_nanoseconds;
+    out->head_nanoseconds=runtime->head_nanoseconds;
+    out->routed_expert_bytes=runtime->routed_expert_bytes;
     return 0;});}
 
 // Run one token through every block and the head.
@@ -4459,6 +4514,7 @@ int colibri_v2_deepseek4_forward(
     const auto& model=*rt.model;
     auto& sc=rt.scratch;
     if(token>=rt.vocabulary)throw std::runtime_error("token id is outside the vocabulary");
+    const auto forward_started=ds4_now();
     const auto position=rt.layers.empty()?0u:rt.layers.front().positions;
     if(position>=rt.context_limit)throw std::runtime_error("sequence is past the context limit");
 
@@ -4481,6 +4537,7 @@ int colibri_v2_deepseek4_forward(
     }
 
     if(logits){
+        const auto head_started=ds4_now();
         std::vector<float> pre(rt.hc,0.0f);
         ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
             ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),
@@ -4490,7 +4547,10 @@ int colibri_v2_deepseek4_forward(
         for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=gain[i];
         ds4_matvec(model,rt.output,sc.hidden.data(),rt.n_embd,logits,
                    static_cast<std::int32_t>(rt.vocabulary));
+        rt.head_nanoseconds+=ds4_now()-head_started;
     }
+    ++rt.forward_calls;
+    rt.forward_nanoseconds+=ds4_now()-forward_started;
     return 0;});}
 
 // Round-trip a float through half precision, so the storage format the caches

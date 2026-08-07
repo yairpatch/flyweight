@@ -279,6 +279,13 @@ typedef struct ColibriV2Deepseek4Info {
     uint32_t positions;
     uint64_t state_bytes;
     uint32_t resolved_tensors;
+    /* Where a token's time goes, so paging work can be aimed by measurement.
+       `routed_expert_bytes` counts the weight bytes the selected experts span,
+       which is what a page-in would have to fetch. */
+    uint64_t forward_calls, forward_nanoseconds;
+    uint64_t routed_expert_nanoseconds, shared_expert_nanoseconds;
+    uint64_t attention_nanoseconds, head_nanoseconds, attention_core_nanoseconds;
+    uint64_t routed_expert_bytes;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding

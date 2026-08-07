@@ -150,6 +150,14 @@ class _Deepseek4Info(ctypes.Structure):
         ("positions", ctypes.c_uint32),
         ("state_bytes", ctypes.c_uint64),
         ("resolved_tensors", ctypes.c_uint32),
+        ("forward_calls", ctypes.c_uint64),
+        ("forward_nanoseconds", ctypes.c_uint64),
+        ("routed_expert_nanoseconds", ctypes.c_uint64),
+        ("shared_expert_nanoseconds", ctypes.c_uint64),
+        ("attention_nanoseconds", ctypes.c_uint64),
+        ("head_nanoseconds", ctypes.c_uint64),
+        ("attention_core_nanoseconds", ctypes.c_uint64),
+        ("routed_expert_bytes", ctypes.c_uint64),
     ]
 
 
