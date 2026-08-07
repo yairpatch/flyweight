@@ -82,6 +82,55 @@ def head_collapse(
     return pre, output
 
 
+class Deepseek4Runtime:
+    """One sequence's native DeepSeek-V4 state.
+
+    Sized from the architecture where it can be: raw latents are bounded by the
+    sliding window, and the compressor keeps only the blocks a later block can
+    still read. Only the compressed caches grow with the context limit.
+    """
+
+    def __init__(self, model, context_limit: int):
+        from colibri_next.v2 import _Deepseek4Info
+        self._info_type = _Deepseek4Info
+        self._library = _library()
+        handle = ctypes.c_void_p()
+        status = self._library.colibri_v2_deepseek4_runtime_create(
+            model._handle, context_limit, ctypes.byref(handle)
+        )
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"runtime create failed").decode(errors="replace")
+            )
+        self._handle = handle
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            self._library.colibri_v2_deepseek4_runtime_free(self._handle)
+            self._handle = None
+
+    def __enter__(self): return self
+
+    def __exit__(self, *_): self.close()
+
+    def reset(self) -> None:
+        status = self._library.colibri_v2_deepseek4_runtime_reset(self._handle)
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"reset failed").decode(errors="replace")
+            )
+
+    @property
+    def info(self) -> dict:
+        value = self._info_type()
+        status = self._library.colibri_v2_deepseek4_runtime_info(self._handle, ctypes.byref(value))
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"info failed").decode(errors="replace")
+            )
+        return {field: getattr(value, field) for field, _ in self._info_type._fields_}
+
+
 def gather_block(
     values: np.ndarray, scores: np.ndarray, head_dim: int, ratio: int,
     block: int, overlapped: bool,

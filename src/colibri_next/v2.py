@@ -140,6 +140,18 @@ class _ModelConfig(ctypes.Structure):
     ]
 
 
+class _Deepseek4Info(ctypes.Structure):
+    _fields_ = [
+        ("layers", ctypes.c_uint32),
+        ("window_layers", ctypes.c_uint32),
+        ("csa_layers", ctypes.c_uint32),
+        ("hca_layers", ctypes.c_uint32),
+        ("context_limit", ctypes.c_uint32),
+        ("positions", ctypes.c_uint32),
+        ("state_bytes", ctypes.c_uint64),
+    ]
+
+
 class _GpuInfo(ctypes.Structure):
     _fields_ = [
         ("available", ctypes.c_int32),
@@ -482,6 +494,18 @@ def _library() -> ctypes.CDLL:
                     _float_p, _float_p,
                 ]
                 lib.colibri_v2_deepseek4_head.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_runtime_create.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p),
+                ]
+                lib.colibri_v2_deepseek4_runtime_create.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_runtime_free.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_deepseek4_runtime_free.restype = None
+                lib.colibri_v2_deepseek4_runtime_reset.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_deepseek4_runtime_reset.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_runtime_info.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(_Deepseek4Info),
+                ]
+                lib.colibri_v2_deepseek4_runtime_info.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_gather_block.argtypes = [
                     _float_p, _float_p, ctypes.c_int32, ctypes.c_int32,
                     ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,

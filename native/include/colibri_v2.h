@@ -19,6 +19,7 @@ extern "C" {
 typedef struct ColibriV2Model ColibriV2Model;
 typedef struct ColibriV2KvCache ColibriV2KvCache;
 typedef struct ColibriV2QwenRuntime ColibriV2QwenRuntime;
+typedef struct ColibriV2Deepseek4Runtime ColibriV2Deepseek4Runtime;
 
 typedef struct ColibriV2ModelInfo {
     uint32_t gguf_version;
@@ -271,6 +272,23 @@ COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const 
 COLIBRI_V2_API int colibri_v2_deepseek4_head(const float* streams, const float* fn,
     const float* scale, const float* base, int32_t n_embd, int32_t hc,
     float rms_epsilon, float hc_epsilon, float* pre, float* output);
+typedef struct ColibriV2Deepseek4Info {
+    uint32_t layers;
+    uint32_t window_layers, csa_layers, hca_layers;
+    uint32_t context_limit;
+    uint32_t positions;
+    uint64_t state_bytes;
+} ColibriV2Deepseek4Info;
+
+/* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding
+   window and the compressor keeps only the blocks a future block can read, so
+   the footprint is far below the context length would suggest. */
+COLIBRI_V2_API int colibri_v2_deepseek4_runtime_create(ColibriV2Model* model,
+    uint32_t context_limit, ColibriV2Deepseek4Runtime** out);
+COLIBRI_V2_API void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime);
+COLIBRI_V2_API int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime);
+COLIBRI_V2_API int colibri_v2_deepseek4_runtime_info(const ColibriV2Deepseek4Runtime* runtime,
+    ColibriV2Deepseek4Info* out);
 /* Gather the state rows one compressed block pools, ready for compression.
    Outputs are [rows][head_dim] with rows 2*ratio when overlapped, else ratio. */
 COLIBRI_V2_API int colibri_v2_deepseek4_gather_block(const float* values, const float* scores,

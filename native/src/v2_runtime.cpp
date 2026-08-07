@@ -3906,6 +3906,111 @@ int colibri_v2_deepseek4_head(
         static_cast<std::size_t>(hc),rms_epsilon,hc_epsilon,pre,output);
     return 0;});}
 
+// One sequence's DeepSeek-V4 state, sized from the architecture rather than
+// from the context length wherever the architecture allows it.
+//
+// Raw latents are bounded by the sliding window on every layer, so they live in
+// a ring of `window` entries rather than growing with the sequence. The
+// compressor keeps only what a future block can still read: a 4:1 layer pools
+// the previous block's rows alongside its own, so two blocks' worth, and a
+// 128:1 layer pools only its own. Just the compressed caches scale with
+// context, at context/ratio entries.
+struct Deepseek4LayerState {
+    std::uint32_t ratio = 0, window = 0, head_dim = 0;
+    std::uint32_t state_width = 0, state_rows = 0, block_capacity = 0;
+    std::vector<float> latents;       // window x head_dim, ring
+    std::vector<float> compressed;    // block_capacity x head_dim
+    std::vector<float> state_values;  // state_rows x state_width, ring
+    std::vector<float> state_scores;
+    std::uint32_t positions = 0, blocks = 0;
+
+    std::uint64_t bytes() const {
+        return (latents.size() + compressed.size() + state_values.size() +
+                state_scores.size()) * sizeof(float);
+    }
+    // The ring holds the newest `state_rows` rows, so a row's slot is its
+    // position modulo the ring size.
+    std::uint32_t slot(std::uint32_t position) const { return position % state_rows; }
+};
+
+struct ColibriV2Deepseek4Runtime {
+    ColibriV2Model* model = nullptr;
+    std::uint32_t context_limit = 0;
+    std::vector<Deepseek4LayerState> layers;
+
+    std::uint64_t state_bytes() const {
+        std::uint64_t total = 0;
+        for (const auto& layer : layers) total += layer.bytes();
+        return total;
+    }
+    void reset() {
+        for (auto& layer : layers) { layer.positions = 0; layer.blocks = 0; }
+    }
+};
+
+int colibri_v2_deepseek4_runtime_create(
+    ColibriV2Model* model, uint32_t context_limit, ColibriV2Deepseek4Runtime** out
+){return guarded([&]{
+    if(!model||!out||!context_limit)
+        throw std::runtime_error("model, context limit and output are required");
+    if(model->config.architecture!="deepseek4")
+        throw std::runtime_error("not a deepseek4 model");
+    const auto& config=model->config;
+    if(config.compress_ratios.size()<config.layer_count)
+        throw std::runtime_error("compress-ratio array is shorter than the layer count");
+    auto runtime=std::make_unique<ColibriV2Deepseek4Runtime>();
+    runtime->model=model;
+    runtime->context_limit=context_limit;
+    runtime->layers.resize(config.layer_count);
+    const auto head_dim=config.kv_lora_rank?config.kv_lora_rank:config.key_length;
+    // A zero sliding window would mean unbounded raw attention; the checkpoint
+    // sets 128, and falling back to the context keeps the arithmetic honest
+    // rather than silently allocating nothing.
+    const auto window=config.sliding_window?config.sliding_window:context_limit;
+    for(std::uint32_t index=0;index<config.layer_count;++index){
+        auto& layer=runtime->layers[index];
+        layer.ratio=config.compress_ratios[index];
+        layer.window=std::min(window,context_limit);
+        layer.head_dim=head_dim;
+        layer.latents.assign(static_cast<std::size_t>(layer.window)*head_dim,0.0f);
+        if(!layer.ratio)continue;
+        const bool overlapped=layer.ratio==4;
+        layer.state_width=(overlapped?2u:1u)*head_dim;
+        layer.state_rows=(overlapped?2u:1u)*layer.ratio;
+        layer.block_capacity=context_limit/layer.ratio+1;
+        layer.compressed.assign(static_cast<std::size_t>(layer.block_capacity)*head_dim,0.0f);
+        const std::size_t rows=static_cast<std::size_t>(layer.state_rows)*layer.state_width;
+        layer.state_values.assign(rows,0.0f);
+        layer.state_scores.assign(rows,-std::numeric_limits<float>::infinity());
+    }
+    *out=runtime.release();
+    return 0;});}
+
+void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime){
+    try{delete runtime;}catch(...){}
+}
+
+int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid runtime");
+    runtime->reset();
+    return 0;});}
+
+int colibri_v2_deepseek4_runtime_info(
+    const ColibriV2Deepseek4Runtime* runtime, ColibriV2Deepseek4Info* out
+){return guarded([&]{
+    if(!runtime||!out)throw std::runtime_error("invalid runtime info request");
+    std::memset(out,0,sizeof(*out));
+    out->layers=static_cast<std::uint32_t>(runtime->layers.size());
+    out->context_limit=runtime->context_limit;
+    out->state_bytes=runtime->state_bytes();
+    out->positions=runtime->layers.empty()?0:runtime->layers.front().positions;
+    for(const auto& layer:runtime->layers){
+        if(layer.ratio==4)++out->csa_layers;
+        else if(layer.ratio)++out->hca_layers;
+        else ++out->window_layers;
+    }
+    return 0;});}
+
 // Gather the state rows one compressed block pools.
 int colibri_v2_deepseek4_gather_block(
     const float* values, const float* scores, int32_t width, int32_t head_dim,
