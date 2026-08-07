@@ -262,31 +262,37 @@ Also worth noting for the attention core: keys and values are the same tensor,
 so there is one K cache and no V cache, and each head's sink logit joins the
 softmax without contributing a value.
 
-### Open: layer 2 diverges at length, downstream of attention
+### Comparing sums was measuring noise; compare values instead
 
-On a 376-token prompt, layers 0 and 1 (ratio 0) track the reference to 0.06% and
-0.10% with a 128-token sliding window, so that window is right for them. Layer 2
-(ratio 4) lands at 8.28% on its block output, which is worth chasing but is not
-the attention path: isolating CSA attention against the reference's own
-`attn_csa_lid-2` gives
+Layer 2 looked badly wrong on a 376-token prompt: 8.28% on its block output,
+and 154% on `attn_out` while the `derope` feeding it was 2.81%. Its experts and
+weights matched the reference exactly, which for a hash layer they must, so the
+arithmetic in between was the suspect.
 
-    window 128 + compressed keys      0.88%
-    window 128, no compressed keys    2.87%
-    full causal + compressed keys     0.39%
-    full causal, no compressed keys   0.18%
+There is no defect. The dump prints values as well as sums, and element for
+element `attn_out` agrees:
 
-So attention is within a percent however it is masked, and cannot explain 8.28%.
-The block divergence is downstream of it -- the feed-forward or the
-hyper-connection -- or it is cancellation in a sum over 6.2 million values that
-comes to 2763.
+    pos 0   ours  0.4221 -0.8885 -1.2575    ref  0.4269 -0.8955 -1.2629
+    pos 1   ours -0.1702 -0.3229 -0.8092    ref -0.1854 -0.3372 -0.8138
+    pos 2   ours -0.3866 -0.8384 -1.6104    ref -0.3943 -0.8321 -1.6048
 
-The raw window is settled, and from the source rather than from those numbers:
-the DSV4 cache builds `hparams_raw` as a copy of the model's own hparams and
-hands it to `llama_kv_cache_iswa`, so the sliding window is the model's 128 on
-every layer including the compressed ones. The first row above is therefore the
-right configuration, and full causal fitting marginally better is noise --
-fitting to it would have been the same mistake that produced the wrong block
-visibility rule earlier.
+That is half a percent to two percent per element, which is the
+activation-quantization band every other component sits in. The 154% came from
+summing 1.5 million values whose mean is near zero: `attn_out` totals 3663
+across them, so an ordinary per-element error moves the total by multiples of
+itself while changing nothing that matters.
+
+This invalidates the method, not just this measurement. Sum comparison has been
+the workhorse here because the dump makes it cheap, and on tensors with a large
+coherent total -- attention output, the compressed keys -- it is informative. On
+anything centred near zero it is not, and several figures recorded earlier are
+suspect for that reason: the tail divergence from layer 33, the routed-expert
+output, the feed-forward norm. Each was read as error growth and may be nothing
+of the kind.
+
+Anything relying on a relative error over a near-zero sum should be re-checked
+against printed values before it is believed, and new checks should prefer
+element comparison where the dump provides it.
 
 ### Expert selection diverges from the reference, and probably always will
 
