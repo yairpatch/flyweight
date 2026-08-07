@@ -3906,6 +3906,24 @@ int colibri_v2_deepseek4_head(
         static_cast<std::size_t>(hc),rms_epsilon,hc_epsilon,pre,output);
     return 0;});}
 
+// Gather the state rows one compressed block pools.
+int colibri_v2_deepseek4_gather_block(
+    const float* values, const float* scores, int32_t width, int32_t head_dim,
+    int32_t ratio, int32_t block, int32_t overlapped,
+    float* out_values, float* out_scores, int32_t* rows
+){return guarded([&]{
+    if(!values||!scores||!out_values||!out_scores||width<=0||head_dim<=0||ratio<=0||block<0)
+        throw std::runtime_error("gather-block arguments are invalid");
+    const std::int32_t expected=overlapped?2*head_dim:head_dim;
+    if(width!=expected)
+        throw std::runtime_error("state width does not match the block kind");
+    const auto count=colibri::v2::deepseek4::gather_block(
+        values,scores,static_cast<std::size_t>(width),static_cast<std::size_t>(head_dim),
+        static_cast<std::size_t>(ratio),static_cast<std::size_t>(block),overlapped!=0,
+        out_values,out_scores);
+    if(rows)*rows=static_cast<std::int32_t>(count);
+    return 0;});}
+
 // Build the attention mask for one query position of a DeepSeek-V4 layer.
 int colibri_v2_deepseek4_visible_keys(
     int32_t position, int32_t raw_positions, int32_t blocks, int32_t ratio,

@@ -180,6 +180,56 @@ inline void hyper_connection_combine(
     }
 }
 
+// Gather the rows one block pools, ready for `compress_block`.
+//
+// A 4:1 layer overlaps: it pools the previous block's `ratio` rows taking the
+// first half of each state row, then its own `ratio` rows taking the second
+// half. Before the sequence starts there is no previous block, so those rows
+// are left at zero value and -inf score, which the softmax drops. A 128:1 layer
+// does not overlap and pools its own rows whole.
+//
+// `values` and `scores` are [positions][width] where width is 2*head_dim when
+// overlapped and head_dim otherwise. Outputs are [rows][head_dim] with rows
+// 2*ratio when overlapped, ratio otherwise.
+inline std::size_t gather_block(
+    const float* values,
+    const float* scores,
+    std::size_t width,
+    std::size_t head_dim,
+    std::size_t ratio,
+    std::size_t block,
+    bool overlapped,
+    float* out_values,
+    float* out_scores
+) {
+    const std::size_t rows = overlapped ? 2 * ratio : ratio;
+    if (!overlapped) {
+        for (std::size_t slot = 0; slot < ratio; ++slot) {
+            const std::size_t source = (block * ratio + slot) * width;
+            std::copy_n(values + source, head_dim, out_values + slot * head_dim);
+            std::copy_n(scores + source, head_dim, out_scores + slot * head_dim);
+        }
+        return rows;
+    }
+    for (std::size_t i = 0; i < rows * head_dim; ++i) {
+        out_values[i] = 0.0f;
+        out_scores[i] = -std::numeric_limits<float>::infinity();
+    }
+    for (std::size_t slot = 0; slot < ratio; ++slot) {
+        if (block > 0) {
+            // The previous block contributes the first half of its rows.
+            const std::size_t source = ((block - 1) * ratio + slot) * width;
+            std::copy_n(values + source, head_dim, out_values + slot * head_dim);
+            std::copy_n(scores + source, head_dim, out_scores + slot * head_dim);
+        }
+        // This block contributes the second half of its own.
+        const std::size_t source = (block * ratio + slot) * width + head_dim;
+        std::copy_n(values + source, head_dim, out_values + (ratio + slot) * head_dim);
+        std::copy_n(scores + source, head_dim, out_scores + (ratio + slot) * head_dim);
+    }
+    return rows;
+}
+
 // Which keys a query at `position` may attend to.
 //
 // The raw sliding window and the compressed blocks are both visible and

@@ -82,6 +82,29 @@ def head_collapse(
     return pre, output
 
 
+def gather_block(
+    values: np.ndarray, scores: np.ndarray, head_dim: int, ratio: int,
+    block: int, overlapped: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Gather the state rows one compressed block pools."""
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    scores = np.ascontiguousarray(scores, dtype=np.float32)
+    width = values.shape[1]
+    rows = (2 if overlapped else 1) * ratio
+    out_values = np.zeros((rows, head_dim), dtype=np.float32)
+    out_scores = np.zeros((rows, head_dim), dtype=np.float32)
+    written = ctypes.c_int32()
+    library = _library()
+    status = library.colibri_v2_deepseek4_gather_block(
+        _pointer(values), _pointer(scores), width, head_dim, ratio, block,
+        1 if overlapped else 0, _pointer(out_values), _pointer(out_scores),
+        ctypes.byref(written),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"gather block failed").decode(errors="replace"))
+    return out_values, out_scores
+
+
 def visible_keys(
     position: int, raw_positions: int, blocks: int, ratio: int, window: int
 ) -> np.ndarray:

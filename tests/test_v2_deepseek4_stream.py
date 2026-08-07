@@ -156,3 +156,74 @@ class NativeVisibilityTests(unittest.TestCase):
         from colibri_next.deepseek4 import visible_keys
         with self.assertRaises(Exception):
             visible_keys(0, 4, 2, 0, 128)
+
+
+class NativeGatherTests(unittest.TestCase):
+    """The overlap gather, translated and cross-checked.
+
+    Which rows a block pools took measurement to establish -- pooling four
+    entries instead of eight, or reading the wrong half of the state row, still
+    produces plausible numbers. So the native version is checked against the
+    Python one rather than against a rereading of the architecture.
+    """
+
+    def _python_gather(self, values, scores, head_dim, ratio, block, overlapped):
+        if not overlapped:
+            span = slice(block * ratio, (block + 1) * ratio)
+            return values[span].copy(), scores[span].copy()
+        rows = 2 * ratio
+        pv = np.zeros((rows, head_dim), dtype=np.float32)
+        ps = np.full((rows, head_dim), -np.inf, dtype=np.float32)
+        for slot in range(ratio):
+            previous = (block - 1) * ratio + slot
+            if previous >= 0:
+                pv[slot] = values[previous][:head_dim]
+                ps[slot] = scores[previous][:head_dim]
+            current = block * ratio + slot
+            pv[ratio + slot] = values[current][head_dim:]
+            ps[ratio + slot] = scores[current][head_dim:]
+        return pv, ps
+
+    def test_overlapped_gather_matches_python(self):
+        from colibri_next.deepseek4 import gather_block
+        rng = np.random.default_rng(17)
+        head_dim, ratio = 6, 4
+        values = rng.standard_normal((16, 2 * head_dim)).astype(np.float32)
+        scores = rng.standard_normal((16, 2 * head_dim)).astype(np.float32)
+        for block in range(4):
+            with self.subTest(block=block):
+                gv, gs = gather_block(values, scores, head_dim, ratio, block, True)
+                pv, ps = self._python_gather(values, scores, head_dim, ratio, block, True)
+                np.testing.assert_array_equal(gv, pv)
+                np.testing.assert_array_equal(gs, ps)
+
+    def test_the_first_block_pads_its_predecessor(self):
+        from colibri_next.deepseek4 import gather_block
+        head_dim, ratio = 5, 4
+        values = np.ones((8, 2 * head_dim), dtype=np.float32)
+        scores = np.ones((8, 2 * head_dim), dtype=np.float32)
+        gv, gs = gather_block(values, scores, head_dim, ratio, 0, True)
+        # The predecessor half is zero-valued and -inf scored, so it drops out.
+        np.testing.assert_array_equal(gv[:ratio], np.zeros((ratio, head_dim), np.float32))
+        self.assertTrue(np.all(np.isneginf(gs[:ratio])))
+        np.testing.assert_array_equal(gv[ratio:], np.ones((ratio, head_dim), np.float32))
+
+    def test_unoverlapped_gather_matches_python(self):
+        from colibri_next.deepseek4 import gather_block
+        rng = np.random.default_rng(18)
+        head_dim, ratio = 7, 8
+        values = rng.standard_normal((24, head_dim)).astype(np.float32)
+        scores = rng.standard_normal((24, head_dim)).astype(np.float32)
+        for block in range(3):
+            with self.subTest(block=block):
+                gv, gs = gather_block(values, scores, head_dim, ratio, block, False)
+                pv, ps = self._python_gather(values, scores, head_dim, ratio, block, False)
+                np.testing.assert_array_equal(gv, pv)
+                np.testing.assert_array_equal(gs, ps)
+
+    def test_a_state_width_that_disagrees_with_the_kind_is_rejected(self):
+        from colibri_next.deepseek4 import gather_block
+        values = np.zeros((8, 6), dtype=np.float32)
+        with self.assertRaises(Exception):
+            # Six-wide rows cannot be an overlapped layer with head_dim six.
+            gather_block(values, values, 6, 4, 0, True)

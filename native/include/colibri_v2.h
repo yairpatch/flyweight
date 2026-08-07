@@ -271,6 +271,11 @@ COLIBRI_V2_API int colibri_v2_grouped_matvec(const ColibriV2Model* model, const 
 COLIBRI_V2_API int colibri_v2_deepseek4_head(const float* streams, const float* fn,
     const float* scale, const float* base, int32_t n_embd, int32_t hc,
     float rms_epsilon, float hc_epsilon, float* pre, float* output);
+/* Gather the state rows one compressed block pools, ready for compression.
+   Outputs are [rows][head_dim] with rows 2*ratio when overlapped, else ratio. */
+COLIBRI_V2_API int colibri_v2_deepseek4_gather_block(const float* values, const float* scores,
+    int32_t width, int32_t head_dim, int32_t ratio, int32_t block, int32_t overlapped,
+    float* out_values, float* out_scores, int32_t* rows);
 /* Attention mask for one query position: raw window entries then compressed
    block entries. Writes `raw_positions + blocks` bytes. */
 COLIBRI_V2_API int colibri_v2_deepseek4_visible_keys(int32_t position, int32_t raw_positions,
