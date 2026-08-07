@@ -378,8 +378,39 @@ def _benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def _deepseek4_generate(args: argparse.Namespace) -> int:
+    """Generate through the DeepSeek-V4 runtime.
+
+    A separate path because the engine the other architectures share is built
+    around one KV pair per layer, and this one carries a sliding-window cache, a
+    compressed-block cache and the compressor's own state. Wiring it into that
+    engine is worth doing; pretending it already fits is not.
+
+    Greedy only for now, and one sequence: the sampler and the scheduler are the
+    next pieces rather than assumed.
+    """
+    from .deepseek4 import Deepseek4Runtime
+
+    with V2Model(args.model) as model:
+        prompt = args.prompt if not args.system else f"{args.system}\n\n{args.prompt}"
+        tokens = list(model.tokenize(prompt))
+        if not tokens:
+            raise SystemExit("the prompt tokenized to nothing")
+        context = args.context_window or (len(tokens) + args.max_new_tokens + 8)
+        produced: list[int] = []
+        with Deepseek4Runtime(model, context) as runtime:
+            for token in runtime.generate(tokens, max_tokens=args.max_new_tokens):
+                produced.append(token)
+        print(model.decode_tokens(produced))
+    return 0
+
+
 def _generate(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
+    with V2Model(args.model) as model:
+        architecture = str(model.config["architecture"])
+    if architecture == "deepseek4":
+        return _deepseek4_generate(args)
     from .v2_server import NativeV2InferenceService
     service = NativeV2InferenceService(
         args.model,
