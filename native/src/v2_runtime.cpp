@@ -4901,9 +4901,13 @@ int colibri_v2_deepseek4_runtime_gpu(
     };
     for(const auto& layer:rt.layers){
         const auto& plan=layer.plan;
+        // The shared expert is deliberately absent. Its three matvecs a layer
+        // are about 20 microseconds of work each and pay a round trip of
+        // roughly thirty, so on the device it measured 21.3 ms a token against
+        // 17.3 on the CPU. It belongs here only once activations stop crossing
+        // per call.
         for(const auto index:{plan.q_a,plan.q_b,plan.kv,plan.output_b,plan.comp_kv,
-                              plan.comp_gate,plan.gate_inp,plan.gate_shexp,plan.up_shexp,
-                              plan.down_shexp,plan.indexer_proj,plan.indexer_q_b,
+                              plan.comp_gate,plan.gate_inp,plan.indexer_proj,plan.indexer_q_b,
                               plan.indexer_comp_kv,plan.indexer_comp_gate,plan.output_a})
             want(index);
     }
