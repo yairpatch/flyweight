@@ -4034,6 +4034,7 @@ struct ColibriV2Deepseek4Runtime {
     std::uint64_t gpu_input_capacity = 0, gpu_output_capacity = 0;
     std::uint64_t gpu_weight_bytes = 0, gpu_matvec_calls = 0, gpu_batches = 0;
     std::uint64_t gpu_batch = 0, gpu_batch_capacity = 0;
+    std::uint64_t hyper_nanoseconds = 0, matvec_nanoseconds = 0;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -4305,8 +4306,12 @@ int ds4_gpu_matvec(std::uint32_t type, std::uint64_t weights, std::uint64_t inpu
             return colibri_gpu_launch_named("ds4_q8_matvec", blocks, 1, 256, 0,
                                             stream, arguments);
         }
-        case 14:  // Q6_K
-            return colibri_gpu_q6k_matvec_transposed(weights, input, output, inputs, outputs, stream);
+        case 14: {  // Q6_K
+            void* arguments[] = {&weights, &input, &output, &inputs, &outputs};
+            const auto blocks = static_cast<std::uint32_t>((outputs + 7) / 8);
+            return colibri_gpu_launch_named("ds4_q6k_matvec", blocks, 1, 256, 0,
+                                            stream, arguments);
+        }
         case 30:  // BF16
             return colibri_gpu_bf16_matvec_transposed(weights, input, output, inputs, outputs, stream);
         default:
@@ -4385,6 +4390,7 @@ void ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
                        batch[item].outputs);
         return;
     }
+    const auto batch_started = ds4_now();
     int status = colibri_gpu_upload(rt.gpu_input, input, input_bytes, 0);
     std::uint64_t offset = 0;
     for (std::size_t item = 0; item < count && status == 0; ++item) {
@@ -4401,6 +4407,7 @@ void ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
     }
     if (status == 0) status = colibri_gpu_sync();
     if (status != 0) throw std::runtime_error("a batched device matvec failed");
+    rt.matvec_nanoseconds += ds4_now() - batch_started;
     rt.gpu_matvec_calls += count;
     ++rt.gpu_batches;
 }
@@ -4423,6 +4430,7 @@ void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
                 // three. Waiting on the upload as well doubled the stalls, and
                 // at four hundred and seventy calls a token that is the cost
                 // that decides whether crossing per call is affordable at all.
+                const auto call_started = ds4_now();
                 int status = colibri_gpu_upload(rt.gpu_input, input, input_bytes, 0);
                 if (status == 0)
                     status = ds4_gpu_matvec(tensor.type, found->second, rt.gpu_input,
@@ -4431,6 +4439,7 @@ void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
                 if (status == 0) status = colibri_gpu_sync();
                 if (status != 0) throw std::runtime_error("a device matvec failed");
                 ++rt.gpu_matvec_calls;
+                rt.matvec_nanoseconds += ds4_now() - call_started;
                 return;
             }
         }
@@ -4547,6 +4556,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     }
 
     // Attention side of the hyper-connection.
+    const auto hyper_started = ds4_now();
     ds4::hyper_connection_weights(
         streams, ds4_f32(model, plan.hc_attn_fn), ds4_f32(model, plan.hc_attn_scale),
         ds4_f32(model, plan.hc_attn_base), n_embd, hc, rt.sinkhorn_iterations,
@@ -4557,6 +4567,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         const float* gain = ds4_f32(model, plan.attn_norm);
         for (std::uint32_t i = 0; i < n_embd; ++i) sc.hidden[i] *= gain[i];
     }
+    rt.hyper_nanoseconds += ds4_now() - hyper_started;
 
     // Everything a layer projects from the normalized hidden state, issued
     // together: the crossing is per round trip, not per weight, so six small
@@ -4785,6 +4796,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     rt.attention_nanoseconds += ds4_now() - attention_started;
 
     // Feed-forward side.
+    const auto hyper_ffn_started = ds4_now();
     ds4::hyper_connection_weights(
         out_streams, ds4_f32(model, plan.hc_ffn_fn), ds4_f32(model, plan.hc_ffn_scale),
         ds4_f32(model, plan.hc_ffn_base), n_embd, hc, rt.sinkhorn_iterations,
@@ -4796,6 +4808,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         for (std::uint32_t i = 0; i < n_embd; ++i) sc.hidden[i] *= gain[i];
     }
 
+    rt.hyper_nanoseconds += ds4_now() - hyper_ffn_started;
     std::vector<float> router(rt.experts, 0.0f);
     ds4_matvec(rt, plan.gate_inp, sc.hidden.data(), n_embd, router.data(), rt.experts);
     const bool hashed = index < rt.hash_layers;
@@ -4893,6 +4906,8 @@ int colibri_v2_deepseek4_runtime_info(
     out->gpu_weight_bytes=runtime->gpu_weight_bytes;
     out->gpu_matvec_calls=runtime->gpu_matvec_calls;
     out->gpu_batches=runtime->gpu_batches;
+    out->hyper_nanoseconds=runtime->hyper_nanoseconds;
+    out->matvec_nanoseconds=runtime->matvec_nanoseconds;
     out->indexer_selections=runtime->indexer_selections;
     out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
@@ -4987,15 +5002,21 @@ int colibri_v2_deepseek4_runtime_gpu(
     };
     for(const auto& layer:rt.layers){
         const auto& plan=layer.plan;
-        // The shared expert is deliberately absent. Its three matvecs a layer
-        // are about 20 microseconds of work each and pay a round trip of
-        // roughly thirty, so on the device it measured 21.3 ms a token against
-        // 17.3 on the CPU. It belongs here only once activations stop crossing
-        // per call.
+        // Whether the shared expert belongs on the device is a measurement
+        // rather than a deduction, and the first attempt at it was taken on a
+        // 100 W supply shared with a 16-core CPU. COLIBRI_DS4_SHEXP=cpu keeps
+        // it off so the two can be compared with everything else held still.
+        static const bool shexp_on_device = [] {
+            const char* setting = std::getenv("COLIBRI_DS4_SHEXP");
+            return !(setting && std::string(setting) == "cpu");
+        }();
         for(const auto index:{plan.q_a,plan.q_b,plan.kv,plan.output_b,plan.comp_kv,
                               plan.comp_gate,plan.gate_inp,plan.indexer_proj,plan.indexer_q_b,
                               plan.indexer_comp_kv,plan.indexer_comp_gate,plan.output_a})
             want(index);
+        if(shexp_on_device)
+            for(const auto index:{plan.gate_shexp,plan.up_shexp,plan.down_shexp})
+                want(index);
     }
     want(rt.output);
     std::sort(wanted.begin(),wanted.end());

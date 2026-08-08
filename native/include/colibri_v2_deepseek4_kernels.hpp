@@ -115,4 +115,86 @@ void ds4_q8_grouped_matvec(
     if (lane == 0) output[row] = partial;
 }
 
+
+// Q6_K matvec: scales read rather than shuffled, two blocks in flight.
+//
+// The shared kernel broadcasts each group scale across the warp with
+// __shfl_sync -- eight of them per 256-value block, and a warp-wide shuffle is
+// a synchronizing instruction. It measured 60 GiB/s against the CPU path's 46,
+// which is why the shared expert did not want to be on the device at all.
+//
+// Every lane can simply load the scale it needs: sixteen bytes per block that
+// every lane in a half-warp reads the same way, which is a broadcast out of L1
+// rather than a warp instruction. Two blocks per iteration then gives the
+// memory system something to overlap.
+//
+// The block is GGML's: 128 bytes of low nibbles, 64 of high bit-pairs, 16
+// signed group scales, then the half multiplier -- 210 bytes for 256 values.
+__device__ __forceinline__ float ds4_q6k_block(
+    const unsigned char* base, const float* vector, const int lane
+) {
+    const signed char* scales = (const signed char*)(base + 192);
+    const int scale_group = lane >> 4;
+    const unsigned char low_0 = base[lane];
+    const unsigned char low_1 = base[32 + lane];
+    const unsigned char low_2 = base[64 + lane];
+    const unsigned char low_3 = base[96 + lane];
+    const unsigned char high_0 = base[128 + lane];
+    const unsigned char high_1 = base[160 + lane];
+    float partial = 0.0f;
+    #pragma unroll
+    for (int segment = 0; segment < 4; ++segment) {
+        const unsigned char low = (segment & 1) ? low_1 : low_0;
+        const int nibble = segment < 2 ? (low & 15) : (low >> 4);
+        const int quant = (nibble | (((high_0 >> (segment * 2)) & 3) << 4)) - 32;
+        partial = fmaf((float)((int)scales[scale_group + segment * 2] * quant),
+                       vector[segment * 32 + lane], partial);
+    }
+    #pragma unroll
+    for (int segment = 0; segment < 4; ++segment) {
+        const unsigned char low = (segment & 1) ? low_3 : low_2;
+        const int nibble = segment < 2 ? (low & 15) : (low >> 4);
+        const int quant = (nibble | (((high_1 >> (segment * 2)) & 3) << 4)) - 32;
+        partial = fmaf((float)((int)scales[8 + scale_group + segment * 2] * quant),
+                       vector[128 + segment * 32 + lane], partial);
+    }
+    return partial * __half2float(*((const __half*)(base + 208)));
+}
+
+extern "C" __global__
+void ds4_q6k_matvec(
+    const unsigned char* packed,
+    const float* vector,
+    float* output,
+    const int input_size,
+    const int output_size
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= output_size) return;
+    // A row that is not a whole number of blocks is not something this
+    // checkpoint has; refusing it is better than addressing past the row.
+    if (input_size & 255) {
+        if (lane == 0) output[row] = 0.0f;
+        return;
+    }
+    const int blocks = input_size >> 8;
+    const unsigned char* base = packed + (unsigned long long)row * blocks * 210ull;
+    float partial = 0.0f;
+    int block = 0;
+    for (; block + 2 <= blocks; block += 2) {
+        partial += ds4_q6k_block(base + (unsigned long long)(block + 0) * 210,
+                                 vector + (block + 0) * 256, lane);
+        partial += ds4_q6k_block(base + (unsigned long long)(block + 1) * 210,
+                                 vector + (block + 1) * 256, lane);
+    }
+    for (; block < blocks; ++block)
+        partial += ds4_q6k_block(base + (unsigned long long)block * 210,
+                                 vector + block * 256, lane);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
 )COLIBRI_CUDA";
