@@ -8103,47 +8103,78 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     // accumulates GPU time per kernel name. The events serialize the stream, so
     // the absolute total runs high; the point is the relative split, which is
     // what says whether a token is spent reading weights or somewhere else.
+    static const bool lm_diagnostics=std::getenv("COLIBRI_LM_DIAG")!=nullptr;
     static const bool kernel_profile=
         std::getenv("COLIBRI_KERNEL_PROFILE")&&
         std::getenv("COLIBRI_KERNEL_PROFILE")[0]=='1';
     struct KernelProfileEntry{double milliseconds=0.0;std::uint64_t calls=0;};
     static std::map<std::string,KernelProfileEntry> kernel_profile_totals;
-    static std::uint64_t kernel_profile_start=0,kernel_profile_end=0;
-    if(kernel_profile&&!kernel_profile_start){
-        colibri_gpu_timed_event_create(&kernel_profile_start);
-        colibri_gpu_timed_event_create(&kernel_profile_end);
+    // Events are recorded on the stream and only read back once the token is
+    // done. Syncing per launch would stall the CPU, and an idle GPU drops from
+    // ~2.2 GHz to a few hundred MHz -- which silently rescales every number the
+    // profile reports. Nothing here blocks until the decode has been issued.
+    static constexpr std::size_t kKernelProfileCapacity=4096;
+    static std::vector<std::uint64_t> kernel_profile_events;
+    static std::vector<std::string> kernel_profile_labels;
+    static std::size_t kernel_profile_used=0;
+    static std::uint64_t kernel_profile_overflow=0;
+    static std::uint64_t kernel_profile_decodes=0;
+    if(kernel_profile&&kernel_profile_events.empty()){
+        kernel_profile_events.resize(2*kKernelProfileCapacity);
+        kernel_profile_labels.resize(kKernelProfileCapacity);
+        for(auto&event:kernel_profile_events)
+            colibri_gpu_timed_event_create(&event);
     }
     auto launch_named=[&](const char*name,std::uint32_t grid_x,std::uint32_t grid_y,std::uint32_t block_x,void**arguments,std::uint32_t shared=0){
-        if(kernel_profile)colibri_gpu_event_record(kernel_profile_start,launch_stream);
+        const bool traced=kernel_profile&&kernel_profile_used<kKernelProfileCapacity;
+        const std::size_t slot=kernel_profile_used;
+        if(traced)colibri_gpu_event_record(kernel_profile_events[2*slot],launch_stream);
         if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ")+name);
-        if(kernel_profile){
-            colibri_gpu_event_record(kernel_profile_end,launch_stream);
-            colibri_gpu_event_sync(kernel_profile_end);
-            float milliseconds=0.0f;
-            colibri_gpu_event_elapsed(kernel_profile_start,kernel_profile_end,&milliseconds);
+        if(traced){
+            colibri_gpu_event_record(kernel_profile_events[2*slot+1],launch_stream);
             char key[192];
             std::snprintf(key,sizeof(key),"%s grid=%u",name,grid_x);
-            auto&entry=kernel_profile_totals[key];
+            kernel_profile_labels[slot]=key;
+            ++kernel_profile_used;
+        }else if(kernel_profile)++kernel_profile_overflow;
+    };
+    auto kernel_profile_collect=[&]{
+        if(!kernel_profile)return;
+        for(std::size_t slot=0;slot<kernel_profile_used;++slot){
+            float milliseconds=0.0f;
+            if(colibri_gpu_event_elapsed(kernel_profile_events[2*slot],
+                                         kernel_profile_events[2*slot+1],
+                                         &milliseconds)!=0)continue;
+            auto&entry=kernel_profile_totals[kernel_profile_labels[slot]];
             entry.milliseconds+=milliseconds;++entry.calls;
         }
+        kernel_profile_used=0;
     };
     auto kernel_profile_report=[&]{
         if(!kernel_profile)return;
         double total=0.0;
+
         for(const auto&entry:kernel_profile_totals)total+=entry.second.milliseconds;
         std::vector<std::pair<std::string,KernelProfileEntry>> sorted(
             kernel_profile_totals.begin(),kernel_profile_totals.end());
         std::sort(sorted.begin(),sorted.end(),[](const auto&a,const auto&b){
             return a.second.milliseconds>b.second.milliseconds;});
-        std::fprintf(stderr,"[kernel-profile] total=%.2f ms over %llu decodes\n",
-            total,static_cast<unsigned long long>(runtime->decode_calls+1));
+        std::uint64_t calls=0;
+        for(const auto&entry:kernel_profile_totals)calls+=entry.second.calls;
+        const double decodes=static_cast<double>(kernel_profile_decodes?kernel_profile_decodes:1);
+        std::fprintf(stderr,
+            "[kernel-profile] %.2f ms/token of kernel time over %.0f decodes, "
+            "%.0f launches/token across %zu distinct kernels (untraced=%llu)\n",
+            total/decodes,decodes,calls/decodes,kernel_profile_totals.size(),
+            static_cast<unsigned long long>(kernel_profile_overflow));
         for(const auto&entry:sorted)
-            std::fprintf(stderr,"[kernel-profile]   %-52s %8.2f ms  %6.1f%%  %6llu calls  %7.1f us/call\n",
-                entry.first.c_str(),entry.second.milliseconds,
+            std::fprintf(stderr,"[kernel-profile]   %-52s %7.3f ms/tok %6.1f%%  %5.1f calls/tok %7.1f us\n",
+                entry.first.c_str(),entry.second.milliseconds/decodes,
                 100.0*entry.second.milliseconds/total,
-                static_cast<unsigned long long>(entry.second.calls),
+                entry.second.calls/decodes,
                 1000.0*entry.second.milliseconds/entry.second.calls);
         kernel_profile_totals.clear();
+        kernel_profile_overflow=0;kernel_profile_decodes=0;
     };
     // The Q8 copy of `normalized` is reused across the projections that share
     // it, so rms -- its only writer -- has to drop that memo.
@@ -8996,6 +9027,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     const auto tail_wait_started=std::chrono::steady_clock::now();
     if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
     runtime->tail_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tail_wait_started).count();
+    kernel_profile_collect();
+    if(kernel_profile)++kernel_profile_decodes;
     if(runtime->cuda_profile){
         float delta_ms=0.0f,attention_ms=0.0f,shared_ms=0.0f,expert_ms=0.0f,tail_ms=0.0f,lm_ms=0.0f,recurrent_ms=0.0f,attention_core_ms=0.0f;
         std::uint32_t delta_layers=0,attention_layers=0;
