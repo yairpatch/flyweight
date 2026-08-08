@@ -787,17 +787,35 @@ doubled the stalls; ordering upload, launch and download on one stream and
 waiting once took 46 -> 37 ms. At 470 crossings a token, per-call
 synchronization is the thing to watch.
 
-**The shared expert got slower on the device**, 17.3 -> 21.3 ms: Q6_K through
-the shared kernel, paying a crossing for each of its three matvecs a layer. So
-placement should be per tensor and measured, not "everything dense". A Q6_K
-kernel with four blocks in flight -- the same change that took Q8_0 from 80 to
-300 GiB/s -- would probably settle it either way, and is the cheapest next
-thing.
+**The shared expert is faster on the CPU, and is left there.** On the device it
+measured 21.3 ms a token against 17.3, judged against each run's own baseline;
+off it again, 19.1 against 18.4. The Q6_K kernel is not the reason -- it already
+moves 210 bytes per warp iteration, where the Q8_0 one moved 32 -- the reason is
+that its three matvecs a layer are about twenty microseconds of work each behind
+a round trip of roughly thirty.
 
-After that: the four deepseek4 kernels below, which is what lets activations
-stay on the device across a whole layer and removes the crossings entirely
-except for the experts. Experts are now the largest cost at ~100 ms of a 170 ms
-token.
+So placement here is per tensor and has to be measured. "Dense, therefore
+device" is right for the projections, 34 MiB a layer against the same round
+trip, and wrong for anything small enough that the crossing dominates. The
+shared expert belongs on the device once activations stop crossing per call.
+
+### What is left, and what it is worth
+
+The four deepseek4 kernels below are what lets activations stay on the device
+across a whole layer, removing the crossings except for the experts. Sizing it
+from the current split of a ~170 ms token:
+
+    routed experts   ~100 ms   CPU, and staying there
+    attention          37 ms   of which roughly 11 is crossings
+    shared expert      19 ms   CPU until crossings go
+    the rest           ~12 ms
+
+So the kernels are worth something like 20-25 ms, taking the token to roughly
+145 ms and 6.9 tok/s. Real but not transformative: **the experts now dominate at
+about 60% of a token**, they cannot be resident in 12 GiB, and streaming them
+over PCIe at 25 GB/s would be slower than the CPU reading them from RAM at 46.
+That is the ceiling on this box, and it is worth knowing before spending an
+afternoon on the kernels.
 
 ### Most of the kernels already exist
 
