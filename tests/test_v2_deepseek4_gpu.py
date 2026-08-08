@@ -92,5 +92,62 @@ class DeviceMatvecTests(unittest.TestCase):
         self.assertGreater(rate, 150.0, f"{rate:.0f} GiB/s")
 
 
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+@unittest.skipUnless(gpu_present(), "no CUDA device available")
+class ResidentDenseWeightTests(unittest.TestCase):
+    """The dense half resident on the device, the experts left where they are.
+
+    Which half is the point. The routed experts are 90 GiB and can never be
+    resident; everything else is under 7 and is read in full on every token.
+    The activations that cross for each call are a few kilobytes against
+    megabytes of weights that do not move at all, so crossing per call is
+    affordable even before the fiddlier pieces have device kernels.
+
+    Measured on the real checkpoint, warm: attention 102 -> 37 ms a token and
+    3.90 -> 5.89 tok/s. What the test holds is the part that would be a defect
+    rather than a slow day -- that the answer does not change.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from colibri_next.deepseek4 import Deepseek4Runtime
+
+        cls.model = V2Model(CHECKPOINT)
+        cls.tokens = list(cls.model.tokenize("The capital city of France is"))
+        cls.Runtime = Deepseek4Runtime
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def logits(self, gpu: bool):
+        with self.Runtime(self.model, 256) as runtime:
+            if gpu:
+                runtime.use_gpu(0)
+            for token in self.tokens[:-1]:
+                runtime.forward(token, logits=False)
+            return runtime.forward(self.tokens[-1]), dict(runtime.info)
+
+    def test_the_device_agrees_with_the_cpu_on_the_next_token(self):
+        # Not bit-identical: Q6_K accumulates in a different order on each, and
+        # 43 layers amplify that. The bar is the one this port already uses --
+        # the same answer, not the same bits.
+        on_cpu, _ = self.logits(False)
+        on_gpu, info = self.logits(True)
+        self.assertEqual(int(on_gpu.argmax()), int(on_cpu.argmax()))
+        top_cpu = set(int(index) for index in on_cpu.argsort()[::-1][:5])
+        top_gpu = set(int(index) for index in on_gpu.argsort()[::-1][:5])
+        self.assertGreaterEqual(len(top_cpu & top_gpu), 4)
+        self.assertGreater(info["gpu_matvec_calls"], 0)
+
+    def test_only_the_dense_half_is_uploaded(self):
+        _, info = self.logits(True)
+        resident = info["gpu_weight_bytes"] / 1024**3
+        # Under 7 GiB fits the 12 GiB card with room for the caches; if the
+        # routed experts ever crept in this would be ninety.
+        self.assertGreater(resident, 4.0)
+        self.assertLess(resident, 8.0)
+
+
 if __name__ == "__main__":
     unittest.main()

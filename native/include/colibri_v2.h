@@ -290,6 +290,7 @@ typedef struct ColibriV2Deepseek4Info {
        is short enough that it selects everything. */
     uint64_t indexer_selections, indexer_candidates;
     uint64_t expert_prefetch_bytes;
+    uint64_t gpu_weight_bytes, gpu_matvec_calls;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding
@@ -321,6 +322,10 @@ COLIBRI_V2_API int colibri_v2_deepseek4_visible_keys(int32_t position, int32_t r
 /* The lightning indexer's score for each compressed block, and the selection
    built from it. Exposed so the ranking can be checked without a prompt long
    enough to make the runtime run it. */
+/* Upload the dense half of the model to the device and run its matvecs there.
+   The routed experts stay on the CPU: they are 90 GiB against 12 of VRAM. */
+COLIBRI_V2_API int colibri_v2_deepseek4_runtime_gpu(ColibriV2Deepseek4Runtime* runtime,
+    int32_t device);
 /* Put one checkpoint tensor through the GPU and through the CPU with the same
    input, so the device kernels can be checked against the runtime's own before
    anything is placed on the device. */

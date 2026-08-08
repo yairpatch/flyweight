@@ -4024,6 +4024,15 @@ struct ColibriV2Deepseek4Runtime {
     // two regimes can be compared rather than assumed.
     bool expert_prefetch = true;
     std::uint64_t expert_prefetch_bytes = 0;
+    // The dense half, resident on the device: tensor index -> device pointer.
+    // The routed experts are never in here -- 90 GiB against 12 of VRAM -- which
+    // is what makes the split this model wants the opposite of the usual one.
+    bool gpu = false;
+    std::int32_t gpu_device = 0;
+    std::unordered_map<std::uint64_t, std::uint64_t> resident;
+    std::uint64_t gpu_input = 0, gpu_output = 0;
+    std::uint64_t gpu_input_capacity = 0, gpu_output_capacity = 0;
+    std::uint64_t gpu_weight_bytes = 0, gpu_matvec_calls = 0;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -4214,7 +4223,14 @@ int colibri_v2_deepseek4_runtime_create(
     return 0;});}
 
 void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime){
-    try{delete runtime;}catch(...){}
+    try{
+        if(runtime&&runtime->gpu){
+            for(const auto& entry:runtime->resident)colibri_gpu_free(entry.second);
+            if(runtime->gpu_input)colibri_gpu_free(runtime->gpu_input);
+            if(runtime->gpu_output)colibri_gpu_free(runtime->gpu_output);
+        }
+        delete runtime;
+    }catch(...){}
 }
 
 int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime){return guarded([&]{
@@ -4324,9 +4340,36 @@ std::uint64_t ds4_now() {
 
 // Multiply a resolved tensor by a vector. The plan holds indices, so this does
 // no lookup -- the difference from colibri_v2_matvec, which searches by name.
-void ds4_matvec(const ColibriV2Model& model, std::uint64_t index,
+void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
                 const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
+    const auto& model = *rt.model;
     const auto& tensor = model.tensors[index];
+    // On the device when the weights are already there. The activations cross
+    // for every call, which is a few kilobytes against the megabytes of weights
+    // that do not -- that asymmetry is the whole reason residency pays.
+    if (rt.gpu) {
+        const auto found = rt.resident.find(index);
+        if (found != rt.resident.end()) {
+            const auto input_bytes = static_cast<std::uint64_t>(inputs) * sizeof(float);
+            const auto output_bytes = static_cast<std::uint64_t>(outputs) * sizeof(float);
+            if (input_bytes <= rt.gpu_input_capacity && output_bytes <= rt.gpu_output_capacity) {
+                // Asynchronous: the upload, the launch and the download are
+                // ordered on one stream, so a single wait at the end covers all
+                // three. Waiting on the upload as well doubled the stalls, and
+                // at four hundred and seventy calls a token that is the cost
+                // that decides whether crossing per call is affordable at all.
+                int status = colibri_gpu_upload(rt.gpu_input, input, input_bytes, 0);
+                if (status == 0)
+                    status = ds4_gpu_matvec(tensor.type, found->second, rt.gpu_input,
+                                            rt.gpu_output, inputs, outputs, 0);
+                if (status == 0) status = colibri_gpu_download(out, rt.gpu_output, output_bytes, 0);
+                if (status == 0) status = colibri_gpu_sync();
+                if (status != 0) throw std::runtime_error("a device matvec failed");
+                ++rt.gpu_matvec_calls;
+                return;
+            }
+        }
+    }
     const auto* packed = tensor_data(model, tensor);
     // Rows are independent, and a token walks about a thousand of these across
     // 43 layers, so the row loop is where the cores go. The test is on the work
@@ -4451,13 +4494,13 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     }
 
     // Query: low-rank path, per-head norm without gain, then rotate.
-    ds4_matvec(model, plan.q_a, sc.hidden.data(), n_embd, sc.low_rank.data(), rt.q_lora);
+    ds4_matvec(rt, plan.q_a, sc.hidden.data(), n_embd, sc.low_rank.data(), rt.q_lora);
     ds4::rms_norm(sc.low_rank.data(), rt.q_lora, rt.epsilon, sc.low_rank.data());
     {
         const float* gain = ds4_f32(model, plan.q_a_norm);
         for (std::uint32_t i = 0; i < rt.q_lora; ++i) sc.low_rank[i] *= gain[i];
     }
-    ds4_matvec(model, plan.q_b, sc.low_rank.data(), rt.q_lora, sc.query.data(), wide);
+    ds4_matvec(rt, plan.q_b, sc.low_rank.data(), rt.q_lora, sc.query.data(), wide);
     for (std::uint32_t head = 0; head < rt.heads; ++head) {
         float* row = sc.query.data() + static_cast<std::size_t>(head) * head_dim;
         ds4::rms_norm(row, head_dim, rt.epsilon, row);
@@ -4466,7 +4509,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     }
 
     // Key and value are the same latent, stored half precision.
-    ds4_matvec(model, plan.kv, sc.hidden.data(), n_embd, sc.latent.data(), head_dim);
+    ds4_matvec(rt, plan.kv, sc.hidden.data(), n_embd, sc.latent.data(), head_dim);
     ds4::rms_norm(sc.latent.data(), head_dim, rt.epsilon, sc.latent.data());
     {
         const float* gain = ds4_f32(model, plan.kv_a_norm);
@@ -4491,9 +4534,9 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         const auto slot = position % layer.state_rows;
         float* values = layer.indexer_state_values.data() + static_cast<std::size_t>(slot) * width;
         float* scores = layer.indexer_state_scores.data() + static_cast<std::size_t>(slot) * width;
-        ds4_matvec(model, plan.indexer_comp_kv, sc.hidden.data(), n_embd, values,
+        ds4_matvec(rt, plan.indexer_comp_kv, sc.hidden.data(), n_embd, values,
                    static_cast<std::int32_t>(width));
-        ds4_matvec(model, plan.indexer_comp_gate, sc.hidden.data(), n_embd, scores,
+        ds4_matvec(rt, plan.indexer_comp_gate, sc.hidden.data(), n_embd, scores,
                    static_cast<std::int32_t>(width));
         const float* ape = ds4_f32(model, plan.indexer_comp_ape) +
             static_cast<std::size_t>(position % layer.ratio) * width;
@@ -4511,9 +4554,9 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         const auto slot = position % layer.state_rows;
         float* values = layer.state_values.data() + static_cast<std::size_t>(slot) * width;
         float* scores = layer.state_scores.data() + static_cast<std::size_t>(slot) * width;
-        ds4_matvec(model, plan.comp_kv, sc.hidden.data(), n_embd, values,
+        ds4_matvec(rt, plan.comp_kv, sc.hidden.data(), n_embd, values,
                    static_cast<std::int32_t>(width));
-        ds4_matvec(model, plan.comp_gate, sc.hidden.data(), n_embd, scores,
+        ds4_matvec(rt, plan.comp_gate, sc.hidden.data(), n_embd, scores,
                    static_cast<std::int32_t>(width));
         const float* ape = ds4_f32(model, plan.comp_ape) +
             static_cast<std::size_t>(position % layer.ratio) * width;
@@ -4542,7 +4585,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                            visible_blocks > rt.indexer_top_k;
     if (selecting) {
         const auto indexer_dim = layer.indexer_dim;
-        ds4_matvec(model, plan.indexer_q_b, sc.low_rank.data(),
+        ds4_matvec(rt, plan.indexer_q_b, sc.low_rank.data(),
                    static_cast<std::int32_t>(rt.q_lora), sc.indexer_query.data(),
                    static_cast<std::int32_t>(rt.indexer_heads * indexer_dim));
         for (std::uint32_t head = 0; head < rt.indexer_heads; ++head) {
@@ -4550,7 +4593,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
             ds4::rope(row + (indexer_dim - rt.rope_dim), rt.rope_dim,
                       static_cast<std::int32_t>(position), base, scale, false, yarn);
         }
-        ds4_matvec(model, plan.indexer_proj, sc.hidden.data(), n_embd,
+        ds4_matvec(rt, plan.indexer_proj, sc.hidden.data(), n_embd,
                    sc.indexer_weights.data(), static_cast<std::int32_t>(rt.indexer_heads));
         // The reference scales the weights rather than the scores; with the
         // rectifier in between the two are not the same thing.
@@ -4606,6 +4649,33 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     {
         const auto inputs = static_cast<std::int32_t>(wide / rt.groups);
         const auto& tensor = model.tensors[plan.output_a];
+        const auto resident = rt.gpu ? rt.resident.find(plan.output_a) : rt.resident.end();
+        const auto grouped_input_bytes = static_cast<std::uint64_t>(wide) * sizeof(float);
+        const auto grouped_output_bytes =
+            static_cast<std::uint64_t>(rt.groups * rt.lora_rank) * sizeof(float);
+        if (rt.gpu && resident != rt.resident.end() &&
+            grouped_input_bytes <= rt.gpu_input_capacity &&
+            grouped_output_bytes <= rt.gpu_output_capacity) {
+            const auto rows = static_cast<std::int32_t>(rt.groups * rt.lora_rank);
+            const auto group_rows = static_cast<std::int32_t>(rt.lora_rank);
+            const auto input_bytes = grouped_input_bytes;
+            const auto output_bytes = grouped_output_bytes;
+            std::uint64_t weights = resident->second;
+            std::uint64_t in = rt.gpu_input, out_buffer = rt.gpu_output;
+            std::int32_t inputs_arg = inputs, rows_arg = rows, group_arg = group_rows;
+            void* arguments[] = {&weights, &in, &out_buffer, &inputs_arg, &rows_arg, &group_arg};
+            int status = colibri_gpu_upload(rt.gpu_input, sc.derope.data(), input_bytes, 0);
+            if (status == 0)
+                status = colibri_gpu_launch_named("ds4_q8_grouped_matvec",
+                    static_cast<std::uint32_t>((rows + 7) / 8), 1, 256, 0, 0, arguments);
+            if (status == 0)
+                status = colibri_gpu_download(sc.grouped.data(), rt.gpu_output, output_bytes, 0);
+            if (status == 0) status = colibri_gpu_sync();
+            if (status != 0) throw std::runtime_error("the grouped device matvec failed");
+            ++rt.gpu_matvec_calls;
+            goto grouped_done;
+        }
+        {
         const auto* packed = tensor_data(model, tensor);
         // Every group's rows are independent, so this is one flat loop over
         // them rather than two nested ones -- eight groups would otherwise
@@ -4619,8 +4689,10 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                 packed, tensor.type, sc.derope.data() + group * inputs, inputs,
                 static_cast<std::uint64_t>(row));
         }
+        }
+        grouped_done:;
     }
-    ds4_matvec(model, plan.output_b, sc.grouped.data(),
+    ds4_matvec(rt, plan.output_b, sc.grouped.data(),
                static_cast<std::int32_t>(rt.groups * rt.lora_rank), sc.block_out.data(), n_embd);
 
     ds4::hyper_connection_combine(sc.block_out.data(), streams, sc.post.data(), sc.comb.data(),
@@ -4640,7 +4712,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     }
 
     std::vector<float> router(rt.experts, 0.0f);
-    ds4_matvec(model, plan.gate_inp, sc.hidden.data(), n_embd, router.data(), rt.experts);
+    ds4_matvec(rt, plan.gate_inp, sc.hidden.data(), n_embd, router.data(), rt.experts);
     const bool hashed = index < rt.hash_layers;
     if (hashed) {
         const auto* table = reinterpret_cast<const std::int32_t*>(
@@ -4693,10 +4765,10 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     }
     rt.routed_expert_nanoseconds += ds4_now() - experts_started;
     const auto shared_started = ds4_now();
-    ds4_matvec(model, plan.gate_shexp, sc.hidden.data(), n_embd, sc.gate.data(), rt.expert_ffn);
-    ds4_matvec(model, plan.up_shexp, sc.hidden.data(), n_embd, sc.up.data(), rt.expert_ffn);
+    ds4_matvec(rt, plan.gate_shexp, sc.hidden.data(), n_embd, sc.gate.data(), rt.expert_ffn);
+    ds4_matvec(rt, plan.up_shexp, sc.hidden.data(), n_embd, sc.up.data(), rt.expert_ffn);
     ds4::clamped_swiglu(sc.gate.data(), sc.up.data(), rt.expert_ffn, rt.clamp, sc.activated.data());
-    ds4_matvec(model, plan.down_shexp, sc.activated.data(), rt.expert_ffn,
+    ds4_matvec(rt, plan.down_shexp, sc.activated.data(), rt.expert_ffn,
                sc.expert_out.data(), n_embd);
     for (std::uint32_t i = 0; i < n_embd; ++i) sc.moe[i] += sc.expert_out[i];
     rt.shared_expert_nanoseconds += ds4_now() - shared_started;
@@ -4733,6 +4805,8 @@ int colibri_v2_deepseek4_runtime_info(
     out->head_nanoseconds=runtime->head_nanoseconds;
     out->routed_expert_bytes=runtime->routed_expert_bytes;
     out->expert_prefetch_bytes=runtime->expert_prefetch_bytes;
+    out->gpu_weight_bytes=runtime->gpu_weight_bytes;
+    out->gpu_matvec_calls=runtime->gpu_matvec_calls;
     out->indexer_selections=runtime->indexer_selections;
     out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
@@ -4783,7 +4857,7 @@ int colibri_v2_deepseek4_forward(
         ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
         const float* gain=ds4_f32(model,rt.output_norm);
         for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=gain[i];
-        ds4_matvec(model,rt.output,sc.hidden.data(),rt.n_embd,logits,
+        ds4_matvec(rt,rt.output,sc.hidden.data(),rt.n_embd,logits,
                    static_cast<std::int32_t>(rt.vocabulary));
         rt.head_nanoseconds+=ds4_now()-head_started;
     }
@@ -4801,6 +4875,76 @@ int colibri_v2_deepseek4_forward(
 // written for Qwen, decode a deepseek4 tensor to the same numbers this
 // runtime's own kernels do. Both paths see the same input vector, so a
 // disagreement here is a decode difference and nothing else.
+// Put the dense half of the model on the device and keep it there.
+//
+// Which half is the whole point: the routed experts are 90 GiB and can never be
+// resident, while everything else is under 7 and is read in full on every
+// token. The activations that cross for each call are a few kilobytes against
+// megabytes of weights that do not move at all, and that asymmetry is what
+// makes this pay even before the fiddlier pieces have device kernels.
+//
+// The grouped output projection is left off for now: it does not go through
+// ds4_matvec, so uploading it would spend 1.4 GiB of VRAM on nothing.
+int colibri_v2_deepseek4_runtime_gpu(
+    ColibriV2Deepseek4Runtime* runtime, int32_t device
+){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid runtime");
+    auto& rt=*runtime;
+    if(rt.gpu)return 0;
+    if(colibri_gpu_init(device)!=0)throw std::runtime_error("failed to initialize CUDA");
+    ds4_gpu_compile(device);
+    rt.gpu_device=device;
+
+    std::vector<std::uint64_t> wanted;
+    auto want=[&](std::uint64_t index){
+        if(index!=Deepseek4LayerPlan::kAbsent)wanted.push_back(index);
+    };
+    for(const auto& layer:rt.layers){
+        const auto& plan=layer.plan;
+        for(const auto index:{plan.q_a,plan.q_b,plan.kv,plan.output_b,plan.comp_kv,
+                              plan.comp_gate,plan.gate_inp,plan.gate_shexp,plan.up_shexp,
+                              plan.down_shexp,plan.indexer_proj,plan.indexer_q_b,
+                              plan.indexer_comp_kv,plan.indexer_comp_gate,plan.output_a})
+            want(index);
+    }
+    want(rt.output);
+    std::sort(wanted.begin(),wanted.end());
+    wanted.erase(std::unique(wanted.begin(),wanted.end()),wanted.end());
+
+    std::uint32_t widest_input=0,widest_output=0;
+    for(const auto index:wanted){
+        const auto& tensor=rt.model->tensors[index];
+        // Only what there is a device matvec for; anything else stays on the
+        // CPU rather than being uploaded and never used.
+        if(tensor.type!=8&&tensor.type!=14&&tensor.type!=30)continue;
+        std::uint64_t pointer=0;
+        if(colibri_gpu_alloc(tensor.size,&pointer)!=0)
+            throw std::runtime_error("out of device memory for the dense weights");
+        if(colibri_gpu_upload_sync(pointer,tensor_data(*rt.model,tensor),tensor.size)!=0){
+            colibri_gpu_free(pointer);
+            throw std::runtime_error("failed to upload a dense weight");
+        }
+        rt.resident.emplace(index,pointer);
+        rt.gpu_weight_bytes+=tensor.size;
+        const auto rows=tensor.shape.size()>0?tensor.shape[0]:0;
+        std::uint64_t columns=1;
+        for(std::size_t axis=1;axis<tensor.shape.size();++axis)columns*=tensor.shape[axis];
+        widest_input=std::max<std::uint32_t>(widest_input,static_cast<std::uint32_t>(rows));
+        widest_output=std::max<std::uint32_t>(widest_output,static_cast<std::uint32_t>(columns));
+    }
+    // The grouped output projection hands over every head's output at once,
+    // which is wider than any single tensor's row count, so the activation
+    // buffer is sized for the largest thing that actually crosses rather than
+    // for the largest weight.
+    widest_input=std::max(widest_input,rt.heads*rt.head_dim);
+    rt.gpu_input_capacity=static_cast<std::uint64_t>(widest_input)*sizeof(float);
+    rt.gpu_output_capacity=static_cast<std::uint64_t>(widest_output)*sizeof(float);
+    if(colibri_gpu_alloc(rt.gpu_input_capacity,&rt.gpu_input)!=0||
+       colibri_gpu_alloc(rt.gpu_output_capacity,&rt.gpu_output)!=0)
+        throw std::runtime_error("out of device memory for the activation buffers");
+    rt.gpu=true;
+    return 0;});}
+
 int colibri_v2_deepseek4_gpu_matvec_check(
     ColibriV2Model* model, const char* name, const float* input, int32_t inputs,
     int32_t outputs, float* out_gpu, float* out_cpu, int32_t device,

@@ -161,6 +161,8 @@ class _Deepseek4Info(ctypes.Structure):
         ("indexer_selections", ctypes.c_uint64),
         ("indexer_candidates", ctypes.c_uint64),
         ("expert_prefetch_bytes", ctypes.c_uint64),
+        ("gpu_weight_bytes", ctypes.c_uint64),
+        ("gpu_matvec_calls", ctypes.c_uint64),
     ]
 
 
@@ -536,6 +538,10 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_int32),
                 ]
                 lib.colibri_v2_deepseek4_visible_keys.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_runtime_gpu.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int32,
+                ]
+                lib.colibri_v2_deepseek4_runtime_gpu.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_gpu_matvec_check.argtypes = [
                     ctypes.c_void_p, ctypes.c_char_p, _float_p, ctypes.c_int32,
                     ctypes.c_int32, _float_p, _float_p, ctypes.c_int32,

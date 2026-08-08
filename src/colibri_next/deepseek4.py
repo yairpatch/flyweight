@@ -201,6 +201,18 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"reset failed").decode(errors="replace")
             )
 
+    def use_gpu(self, device: int = 0) -> None:
+        """Move the dense half of the model onto the device.
+
+        The routed experts stay where they are; they are 90 GiB against 12 of
+        VRAM, and they are also the part a token reads least of.
+        """
+        status = self._library.colibri_v2_deepseek4_runtime_gpu(self._handle, int(device))
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"gpu enable failed").decode(errors="replace")
+            )
+
     def indexer_key(self, layer: int, block: int) -> np.ndarray:
         """One compressed lightning-indexer key, as the cache holds it.
 

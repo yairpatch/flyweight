@@ -1023,7 +1023,7 @@ extern "C" int colibri_gpu_compile(
              "gemma_q4_0_lm_argmax",
              // DeepSeek-V4. Resolved the same way and simply absent when the
              // source those kernels live in was not compiled in.
-             "ds4_q8_matvec"
+             "ds4_q8_matvec", "ds4_q8_grouped_matvec"
          }) {
         CUfunction function = nullptr;
         if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)
