@@ -819,11 +819,22 @@ one. Two things fell out of wiring it:
   upload across slots is the fix; until then it refuses rather than failing
   halfway through an allocation.
 
-Through the server: 3.45 tok/s on the CPU against 4.22 hybrid. The raw loop does
-6.4, so **roughly two tokens a second is being spent in the Python serving
-layer** -- an argmax over 129 280 floats and the event plumbing, per token --
-not in the model. That is now a bigger prize than the remaining kernels, and it
-is not on the GPU.
+Through the server: 3.45 tok/s on the CPU against 4.22 hybrid.
+
+**The serving layer is not where the rest of the gap is.** An earlier revision
+of this section said roughly two tokens a second went to Python -- the argmax
+over 129 280 floats and the event plumbing. Measured against the runtime's own
+counters across a request, time spent outside the model is **0.1%**: 0.01 s of
+4.7. Per forward the server matches the raw loop almost exactly -- attention
+34.0 ms, routed experts 101.3, shared expert 10.8, output head 1.1 -- and the
+head, which the raw-loop figure skipped by passing `logits=False`, costs one
+millisecond rather than the nine estimated from its weight size.
+
+What the difference actually is: a request prefills its prompt and reports only
+the tokens it generated, so 55 forwards are charged to 48 tokens; and expert
+paging varies request to request, which moved the same measurement between 195
+and 163 ms a forward on two consecutive tries. Both are accounting and page
+cache, not overhead. There is nothing to win in the serving layer.
 
 ### What is left, and what it is worth
 
