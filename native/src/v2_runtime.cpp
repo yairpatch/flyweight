@@ -37,6 +37,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <map>
 #include <vector>
 
 #if defined(_OPENMP)
@@ -2733,6 +2734,21 @@ int qwen_gpu_matvec_by_type(
         default: break;
     }
     return -1;
+}
+
+// Q8-activation group-decode LM head, or null where the type has no such
+// kernel and the per-element fused head has to stand in.
+const char* qwen_q8_lm_head_kernel(std::uint32_t type) {
+    switch (type) {
+        case 10: return "q2k_q8_lm_head_argmax_warp";
+        case 11: return "q3k_q8_lm_head_argmax_warp";
+        case 12: return "q4k_q8_lm_head_argmax_warp";
+        case 13: return "q5k_q8_lm_head_argmax_warp";
+        case 14: return "q6k_q8_lm_head_argmax_warp";
+        case 16: return "iq2xxs_q8_lm_head_argmax_warp";
+        case 18: return "iq3xxs_q8_lm_head_argmax_warp";
+        default: return nullptr;
+    }
 }
 
 const char* qwen_lm_head_argmax_kernel(std::uint32_t type) {
@@ -8083,24 +8099,81 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     auto*staging=static_cast<std::uint8_t*>(runtime->host_staging);
     auto*selected_host=reinterpret_cast<std::int32_t*>(staging);
     std::uint64_t launch_stream=runtime->stream;
-    auto launch_named=[&](const char*name,std::uint32_t grid_x,std::uint32_t grid_y,std::uint32_t block_x,void**arguments,std::uint32_t shared=0){if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ")+name);};
-    auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){int one_centered=0;void*args[]={&input,&weights,&output,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};launch_named("rms_norm",1,1,256,args);};
+    // COLIBRI_KERNEL_PROFILE=1 brackets every decode launch with CUDA events and
+    // accumulates GPU time per kernel name. The events serialize the stream, so
+    // the absolute total runs high; the point is the relative split, which is
+    // what says whether a token is spent reading weights or somewhere else.
+    static const bool kernel_profile=
+        std::getenv("COLIBRI_KERNEL_PROFILE")&&
+        std::getenv("COLIBRI_KERNEL_PROFILE")[0]=='1';
+    struct KernelProfileEntry{double milliseconds=0.0;std::uint64_t calls=0;};
+    static std::map<std::string,KernelProfileEntry> kernel_profile_totals;
+    static std::uint64_t kernel_profile_start=0,kernel_profile_end=0;
+    if(kernel_profile&&!kernel_profile_start){
+        colibri_gpu_timed_event_create(&kernel_profile_start);
+        colibri_gpu_timed_event_create(&kernel_profile_end);
+    }
+    auto launch_named=[&](const char*name,std::uint32_t grid_x,std::uint32_t grid_y,std::uint32_t block_x,void**arguments,std::uint32_t shared=0){
+        if(kernel_profile)colibri_gpu_event_record(kernel_profile_start,launch_stream);
+        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ")+name);
+        if(kernel_profile){
+            colibri_gpu_event_record(kernel_profile_end,launch_stream);
+            colibri_gpu_event_sync(kernel_profile_end);
+            float milliseconds=0.0f;
+            colibri_gpu_event_elapsed(kernel_profile_start,kernel_profile_end,&milliseconds);
+            char key[192];
+            std::snprintf(key,sizeof(key),"%s grid=%u",name,grid_x);
+            auto&entry=kernel_profile_totals[key];
+            entry.milliseconds+=milliseconds;++entry.calls;
+        }
+    };
+    auto kernel_profile_report=[&]{
+        if(!kernel_profile)return;
+        double total=0.0;
+        for(const auto&entry:kernel_profile_totals)total+=entry.second.milliseconds;
+        std::vector<std::pair<std::string,KernelProfileEntry>> sorted(
+            kernel_profile_totals.begin(),kernel_profile_totals.end());
+        std::sort(sorted.begin(),sorted.end(),[](const auto&a,const auto&b){
+            return a.second.milliseconds>b.second.milliseconds;});
+        std::fprintf(stderr,"[kernel-profile] total=%.2f ms over %llu decodes\n",
+            total,static_cast<unsigned long long>(runtime->decode_calls+1));
+        for(const auto&entry:sorted)
+            std::fprintf(stderr,"[kernel-profile]   %-52s %8.2f ms  %6.1f%%  %6llu calls  %7.1f us/call\n",
+                entry.first.c_str(),entry.second.milliseconds,
+                100.0*entry.second.milliseconds/total,
+                static_cast<unsigned long long>(entry.second.calls),
+                1000.0*entry.second.milliseconds/entry.second.calls);
+        kernel_profile_totals.clear();
+    };
+    // The Q8 copy of `normalized` is reused across the projections that share
+    // it, so rms -- its only writer -- has to drop that memo.
+    std::uint64_t q8_cached_input=0;
+    auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){int one_centered=0;q8_cached_input=0;void*args[]={&input,&weights,&output,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};launch_named("rms_norm",1,1,1024,args);};
     auto q8=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){if(colibri_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)!=0)throw std::runtime_error("native Qwen Q8 projection failed");};
     auto f32=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);};
     const char*iq2_q8_setting=std::getenv("COLIBRI_IQ2_Q8_DECODE");
     const bool iq2_q8_enabled=
         !iq2_q8_setting||iq2_q8_setting[0]!='0';
-    auto iq2_q8=[&](std::uint64_t matrix,std::uint64_t input,
-                    std::uint64_t output,int input_size,int output_size){
+    // Quantize the activation to 32-value Q8 blocks once, then run a group-wise
+    // DP4A matvec instead of reconstructing every weight in f32. Requires a
+    // superblock-aligned row so the Q8 blocks line up with the weight groups.
+    auto q8_decode=[&](const char*kernel,std::uint64_t matrix,std::uint64_t input,
+                       std::uint64_t output,int input_size,int output_size){
         if(!iq2_q8_enabled||(input_size&255))return false;
-        void*quant_args[]={&input,const_cast<std::uint64_t*>(&dense_q8),
-            const_cast<std::uint64_t*>(&dense_q8_scales),&input_size};
-        launch_named("quantize_q8_blocks",(input_size+31)/32,1,32,quant_args);
+        // q/k/v and gate/up all project the same normalized vector, so the
+        // quantization is hoisted out of the repeats. Only `normalized` is
+        // memoized: every other source buffer is rewritten in place by kernels
+        // this lambda cannot see.
+        if(input!=normalized||input!=q8_cached_input){
+            void*quant_args[]={&input,const_cast<std::uint64_t*>(&dense_q8),
+                const_cast<std::uint64_t*>(&dense_q8_scales),&input_size};
+            launch_named("quantize_q8_blocks",(input_size+31)/32,1,32,quant_args);
+            q8_cached_input=(input==normalized)?input:0;
+        }
         void*matvec_args[]={&matrix,const_cast<std::uint64_t*>(&dense_q8),
             const_cast<std::uint64_t*>(&dense_q8_scales),&output,
             &input_size,&output_size};
-        launch_named("iq2xxs_q8_matvec_transposed_warp",
-            output_size,1,128,matvec_args);
+        launch_named(kernel,output_size,1,128,matvec_args);
         return true;
     };
     // Dense projections keep whatever type the checkpoint stored. The NVFP4 Qwen3.6
@@ -8116,19 +8189,37 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             case 30:{void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
             case 8:if(colibri_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
             case 16:
-                if(iq2_q8(matrix,input,output,input_size,output_size))return;
+                if(q8_decode("iq2xxs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
                 if(colibri_gpu_iq2xxs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
                 break;
-            case 18:if(colibri_gpu_iq3xxs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
+            case 18:
+                if(q8_decode("iq3xxs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_iq3xxs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
             case 22:if(colibri_gpu_iq2s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
             case 21:if(colibri_gpu_iq3s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
             case 17:if(colibri_gpu_iq2xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
             case 23:if(colibri_gpu_iq4xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 10:if(colibri_gpu_q2k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 11:if(colibri_gpu_q3k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 13:if(colibri_gpu_q5k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 12:if(colibri_gpu_q4k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 14:if(colibri_gpu_q6k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
+            case 10:
+                if(q8_decode("q2k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_q2k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
+            case 11:
+                if(q8_decode("q3k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_q3k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
+            case 13:
+                if(q8_decode("q5k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_q5k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
+            case 12:
+                if(q8_decode("q4k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_q4k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
+            case 14:
+                if(q8_decode("q6k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_q6k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
             default:throw std::runtime_error("native Qwen dense projection type is unsupported: "+std::to_string(type));
         }
         throw std::runtime_error("native Qwen dense projection failed");
@@ -8876,8 +8967,28 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     int vocabulary=static_cast<int>(runtime->model->config.vocabulary_size);
     if(colibri_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime->stream)!=0)throw std::runtime_error("native Qwen argmax reset failed");
     auto lm_head=runtime->device_tensors[runtime->lm_head];
-    void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&argmax_device),const_cast<int*>(&hidden_size),&vocabulary};
-    launch_named(qwen_lm_head_argmax_kernel(runtime->lm_head_type),(vocabulary+7)/8,1,256,argmax_args);
+    // The LM head is the largest single tensor read per token. Where the type
+    // has a group-decode kernel, quantize the activation once and use it; the
+    // fused per-element head remains the fallback.
+    const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime->lm_head_type);
+    if(lm_q8_kernel&&iq2_q8_enabled&&(hidden_size&255)==0){
+        if(normalized!=q8_cached_input){
+            void*quant_args[]={const_cast<std::uint64_t*>(&normalized),
+                const_cast<std::uint64_t*>(&dense_q8),
+                const_cast<std::uint64_t*>(&dense_q8_scales),
+                const_cast<int*>(&hidden_size)};
+            launch_named("quantize_q8_blocks",(hidden_size+31)/32,1,32,quant_args);
+            q8_cached_input=normalized;
+        }
+        void*lm_args[]={&lm_head,const_cast<std::uint64_t*>(&dense_q8),
+            const_cast<std::uint64_t*>(&dense_q8_scales),
+            const_cast<std::uint64_t*>(&argmax_device),
+            const_cast<int*>(&hidden_size),&vocabulary};
+        launch_named(lm_q8_kernel,(vocabulary+7)/8,1,256,lm_args);
+    }else{
+        void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&argmax_device),const_cast<int*>(&hidden_size),&vocabulary};
+        launch_named(qwen_lm_head_argmax_kernel(runtime->lm_head_type),(vocabulary+7)/8,1,256,argmax_args);
+    }
     if(runtime->cuda_profile)profile_record(runtime->cuda_lm_end);
     auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);
     if(colibri_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime->stream)!=0)throw std::runtime_error("native Qwen output transfer failed");
@@ -8922,6 +9033,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     }
     ++runtime->decode_calls;
     runtime->decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-decode_started).count();
+    if(runtime->decode_calls%50==0)kernel_profile_report();
     return 0;
 });}
 
@@ -10339,27 +10451,30 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             block+host_layout.winner.offset);
     }
     auto launch_named = [&](const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t bx, void** args) { if (colibri_gpu_launch_named(name, gx, gy, bx, 0, runtime->stream, args) != 0) throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ") + name); };
-    auto rms = [&](std::uint64_t input, std::uint64_t weights, std::uint64_t output) { int one_centered = 0; void* args[] = {&input, &weights, &output, const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon), &one_centered}; launch_named("rms_norm", 1, 1, 256, args); };
+    std::uint64_t q8_cached_input = 0, q8_cached_normalized = 0;
+    auto rms = [&](std::uint64_t input, std::uint64_t weights, std::uint64_t output) { int one_centered = 0; q8_cached_input = 0; void* args[] = {&input, &weights, &output, const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon), &one_centered}; launch_named("rms_norm", 1, 1, 1024, args); };
     auto q8 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { if (colibri_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) != 0) throw std::runtime_error("native Qwen Q8 projection failed"); };
     auto f32 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { void* args[] = {&matrix, &input, &output, &in_size, &out_size}; launch_named("qwen_f32_matvec_warp", (out_size + 7) / 8, 1, 256, args); };
     const char* iq2_q8_setting = std::getenv("COLIBRI_IQ2_Q8_DECODE");
     const bool iq2_q8_enabled =
         !iq2_q8_setting || iq2_q8_setting[0] != '0';
     std::uint64_t active_dense_q8 = 0, active_dense_q8_scales = 0;
-    auto iq2_q8 = [&](std::uint64_t matrix, std::uint64_t input,
-                      std::uint64_t output, int in_size, int out_size) {
+    auto q8_decode = [&](const char* kernel, std::uint64_t matrix,
+                         std::uint64_t input, std::uint64_t output,
+                         int in_size, int out_size) {
         if (!iq2_q8_enabled || (in_size & 255) ||
             !active_dense_q8 || !active_dense_q8_scales) return false;
-        void* quant_args[] = {
-            &input, &active_dense_q8, &active_dense_q8_scales, &in_size};
-        launch_named(
-            "quantize_q8_blocks", (in_size + 31) / 32, 1, 32, quant_args);
+        if (input != q8_cached_normalized || input != q8_cached_input) {
+            void* quant_args[] = {
+                &input, &active_dense_q8, &active_dense_q8_scales, &in_size};
+            launch_named(
+                "quantize_q8_blocks", (in_size + 31) / 32, 1, 32, quant_args);
+            q8_cached_input = (input == q8_cached_normalized) ? input : 0;
+        }
         void* matvec_args[] = {
             &matrix, &active_dense_q8, &active_dense_q8_scales, &output,
             &in_size, &out_size};
-        launch_named(
-            "iq2xxs_q8_matvec_transposed_warp",
-            out_size, 1, 128, matvec_args);
+        launch_named(kernel, out_size, 1, 128, matvec_args);
         return true;
     };
     // Same type dispatch as the single-token decode: dense weights carry the
@@ -10372,19 +10487,37 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             case 30: { void* args[] = {&matrix, &input, &output, &out_size, &in_size}; launch_named("bf16_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
             case 8: if (colibri_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
             case 16:
-                if (iq2_q8(matrix, input, output, in_size, out_size)) return;
+                if (q8_decode("iq2xxs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
                 if (colibri_gpu_iq2xxs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
                 break;
-            case 18: if (colibri_gpu_iq3xxs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
+            case 18:
+                if (q8_decode("iq3xxs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_iq3xxs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
             case 22: if (colibri_gpu_iq2s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
             case 21: if (colibri_gpu_iq3s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
             case 17: if (colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
             case 23: if (colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 10: if (colibri_gpu_q2k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 11: if (colibri_gpu_q3k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 13: if (colibri_gpu_q5k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 12: if (colibri_gpu_q4k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 14: if (colibri_gpu_q6k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
+            case 10:
+                if (q8_decode("q2k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_q2k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
+            case 11:
+                if (q8_decode("q3k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_q3k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
+            case 13:
+                if (q8_decode("q5k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_q5k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
+            case 12:
+                if (q8_decode("q4k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_q4k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
+            case 14:
+                if (q8_decode("q6k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_q6k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
             default: throw std::runtime_error("native Qwen dense projection type is unsupported: " + std::to_string(type));
         }
         throw std::runtime_error("native Qwen dense projection failed");
@@ -10407,6 +10540,10 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         for (auto& s : seqs) {
             active_dense_q8 = s.dense_q8;
             active_dense_q8_scales = s.dense_q8_scales;
+            // Each sequence owns its own scratch, so switching sequences drops
+            // the memo along with the buffer it referred to.
+            q8_cached_normalized = s.normalized;
+            q8_cached_input = 0;
             rms(s.hidden, tensor(0), s.normalized);
             if (!layer.attention) {
                 int channels = static_cast<int>(runtime->model->tensors[layer.static_tensors[1]].shape[1]);

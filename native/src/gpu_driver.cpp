@@ -919,6 +919,19 @@ extern "C" int colibri_gpu_compile(
              "q6k_matvec_transposed_warp",
              "iq2xxs_matvec_transposed_warp",
              "iq2xxs_q8_matvec_transposed_warp",
+             "q4k_q8_matvec_transposed_warp",
+             "q2k_q8_matvec_transposed_warp",
+             "q3k_q8_matvec_transposed_warp",
+             "q5k_q8_matvec_transposed_warp",
+             "q6k_q8_matvec_transposed_warp",
+             "iq3xxs_q8_matvec_transposed_warp",
+             "q2k_q8_lm_head_argmax_warp",
+             "q3k_q8_lm_head_argmax_warp",
+             "q4k_q8_lm_head_argmax_warp",
+             "q5k_q8_lm_head_argmax_warp",
+             "q6k_q8_lm_head_argmax_warp",
+             "iq2xxs_q8_lm_head_argmax_warp",
+             "iq3xxs_q8_lm_head_argmax_warp",
              "quantize_q8_blocks", "iq3xxs_matvec_transposed_warp",
              "iq2s_matvec_transposed_warp", "iq3s_matvec_transposed_warp",
              "iq2xs_matvec_transposed_warp", "iq4xs_matvec_transposed_warp",
@@ -1581,7 +1594,7 @@ extern "C" int colibri_gpu_iq2xxs_matvec_transposed(
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
     return launch_kquant_matvec(
-        "iq2xxs_matvec_transposed", "iq2xxs_matvec_transposed",
+        "iq2xxs_matvec_transposed_warp", "iq2xxs_matvec_transposed",
         packed, input, output, input_size, output_size, stream);
 }
 

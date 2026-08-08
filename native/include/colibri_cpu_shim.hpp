@@ -166,6 +166,16 @@ inline int __dp4a(unsigned int a, unsigned int b, int c) {
     return sum;
 }
 
+inline unsigned int __vadd4(unsigned int a, unsigned int b) {
+    unsigned int out = 0;
+    for (int index = 0; index < 4; ++index) {
+        const unsigned int lhs = (a >> (index * 8)) & 0xffu;
+        const unsigned int rhs = (b >> (index * 8)) & 0xffu;
+        out |= ((lhs + rhs) & 0xffu) << (index * 8);
+    }
+    return out;
+}
+
 inline unsigned int __vsub4(unsigned int a, unsigned int b) {
     unsigned int out = 0;
     for (int index = 0; index < 4; ++index) {

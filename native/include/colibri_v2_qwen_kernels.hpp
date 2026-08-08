@@ -12,13 +12,17 @@ inline constexpr char qwen_cuda_source[] = R"COLIBRI_CUDA(
 __device__ __forceinline__ float block_reduce_sum(float value) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
+    // Sized for the launch rather than a fixed eight warps, so single-block
+    // reductions (rms_norm over the whole hidden vector) can use a full 1024
+    // threads instead of leaving 3/4 of the SM idle.
+    const int warps = (int)((blockDim.x + 31) >> 5);
     for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(0xffffffff, value, offset);
     }
-    __shared__ float warp_sums[8];
+    __shared__ float warp_sums[32];
     if (lane == 0) warp_sums[warp] = value;
     __syncthreads();
-    value = threadIdx.x < 8 ? warp_sums[lane] : 0.0f;
+    value = (int)threadIdx.x < warps ? warp_sums[lane] : 0.0f;
     if (warp == 0) {
         for (int offset = 16; offset > 0; offset >>= 1) {
             value += __shfl_down_sync(0xffffffff, value, offset);
@@ -1499,6 +1503,147 @@ R"COLIBRI_CUDA(    const int quant = ((offset < 32) ? (low & 15) : (low >> 4)) +
     return d * (float)scale * (float)quant - dmin * (float)minimum;
 }
 
+// One block per output row: each thread walks a stride of 32-value groups and
+// the block reduces. Right for the wide-but-short projections in a layer.
+#define COLIBRI_Q8_MATVEC(name, group_fn, stride)                              \
+extern "C" __global__ void name(                                               \
+    const unsigned char* packed, const signed char* vector,                    \
+    const __half* vector_scales, float* output,                                \
+    const int input_size, const int output_size                                \
+) {                                                                            \
+    const int row = blockIdx.x;                                                \
+    if (row >= output_size) return;                                            \
+    const int blocks_per_row = input_size >> 8;                                \
+    const int groups_per_row = blocks_per_row << 3;                            \
+    const unsigned char* row_data =                                            \
+        packed + (long long)row * blocks_per_row * stride;                     \
+    float partial = 0.0f;                                                      \
+    for (int g = threadIdx.x; g < groups_per_row; g += blockDim.x)             \
+        partial += group_fn(row_data, vector, vector_scales, g);               \
+    const int lane = threadIdx.x & 31;                                         \
+    const int warp = threadIdx.x >> 5;                                         \
+    for (int offset = 16; offset > 0; offset >>= 1)                            \
+        partial += __shfl_down_sync(0xffffffffu, partial, offset);             \
+    __shared__ float warp_sums[4];                                             \
+    if (lane == 0) warp_sums[warp] = partial;                                  \
+    __syncthreads();                                                           \
+    if (warp == 0) {                                                           \
+        partial = lane < 4 ? warp_sums[lane] : 0.0f;                           \
+        for (int offset = 16; offset > 0; offset >>= 1)                        \
+            partial += __shfl_down_sync(0xffffffffu, partial, offset);         \
+        if (lane == 0) output[row] = partial;                                  \
+    }                                                                          \
+}
+
+// One warp per output row, eight rows per block, argmax fused in. The LM head
+// is ~250k rows of only ~160 groups each, so a block per row would spend most
+// of its time in the cross-warp reduction; a warp per row keeps the reduction
+// in registers. Same packed (ordered-float << 32 | ~row) result as the
+// per-element LM-head kernels.
+#define COLIBRI_Q8_LM_HEAD(name, group_fn, stride)                             \
+extern "C" __global__ void name(                                               \
+    const unsigned char* packed, const signed char* vector,                    \
+    const __half* vector_scales, unsigned long long* winners,                  \
+    const int input_size, const int output_size                                \
+) {                                                                            \
+    __shared__ unsigned long long warp_best[8];                                \
+    const int lane = threadIdx.x & 31;                                         \
+    const int warp = threadIdx.x >> 5;                                         \
+    const int row = blockIdx.x * 8 + warp;                                     \
+    if (lane == 0) warp_best[warp] = 0ull;                                     \
+    __syncthreads();                                                           \
+    if (row < output_size) {                                                   \
+        const int blocks_per_row = input_size >> 8;                            \
+        const int groups_per_row = blocks_per_row << 3;                        \
+        const unsigned char* row_data =                                        \
+            packed + (long long)row * blocks_per_row * stride;                 \
+        float partial = 0.0f;                                                  \
+        for (int g = lane; g < groups_per_row; g += 32)                        \
+            partial += group_fn(row_data, vector, vector_scales, g);           \
+        for (int offset = 16; offset > 0; offset >>= 1)                        \
+            partial += __shfl_down_sync(0xffffffffu, partial, offset);         \
+        if (lane == 0) {                                                       \
+            const unsigned int bits = __float_as_uint(partial);                \
+            const unsigned int ordered =                                       \
+                bits ^ (((int)bits < 0) ? 0xffffffffu : 0x80000000u);          \
+            warp_best[warp] = ((unsigned long long)ordered << 32)              \
+                | (unsigned int)(0xffffffffu - (unsigned int)row);             \
+        }                                                                      \
+    }                                                                          \
+    __syncthreads();                                                           \
+    if (threadIdx.x == 0) {                                                    \
+        unsigned long long best = warp_best[0];                                \
+        for (int i = 1; i < 8; ++i) best = max(best, warp_best[i]);            \
+        atomicMax(winners, best);                                              \
+    }                                                                          \
+}
+
+
+// Q5_K against a Q8-blocked activation. A 32-value Q8 block lines up exactly
+// with one Q5_K sub-block, so a single (scale, min) pair covers it and the
+// affine reconstruction needs just the weight dot and the activation sum. The
+// 5th bit comes from the shared qh array and ORs straight into the nibble.
+__device__ __forceinline__ float q5k_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    float partial = 0.0f;
+
+        const int block = linear_group >> 3;
+        const int sub_block = linear_group & 7;
+        const int group = sub_block >> 1;
+        const int sub = sub_block & 1;
+        const unsigned char* base = row_data + block * 176;
+        const unsigned char* quants = base + 48 + group * 32;
+        const unsigned char* highs = base + 16;
+        const int shift = sub * 4;
+        const int bit_shift = 2 * group + sub;
+        const signed char* activations = vector + linear_group * 32;
+
+        // 176-byte super-blocks with qs at +48 and qh at +16: everything here
+        // is 16-byte aligned, so weights, high bits and activations all load as
+        // int4. See the Q4_K kernel for why the load count is what matters.
+        const int4* quant_vectors = (const int4*)quants;
+        const int4* high_vectors = (const int4*)highs;
+        const int4* activation_vectors = (const int4*)activations;
+        int dot = 0, total = 0;
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int4 packed_quads = quant_vectors[part];
+            const int4 high_quads = high_vectors[part];
+            const int4 activation_quads = activation_vectors[part];
+            const int words[4] = {packed_quads.x, packed_quads.y,
+                                  packed_quads.z, packed_quads.w};
+            const int highs4[4] = {high_quads.x, high_quads.y,
+                                   high_quads.z, high_quads.w};
+            const int acts[4] = {activation_quads.x, activation_quads.y,
+                                 activation_quads.z, activation_quads.w};
+            #pragma unroll
+            for (int quad = 0; quad < 4; ++quad) {
+                const unsigned int weights =
+                    (((unsigned int)words[quad] >> shift) & 0x0f0f0f0fu)
+                    | ((((unsigned int)highs4[quad] >> bit_shift)
+                        & 0x01010101u) << 4);
+                dot = __dp4a((int)weights, acts[quad], dot);
+                total = __dp4a(0x01010101, acts[quad], total);
+            }
+        }
+        const float d = __half2float(*((const __half*)base));
+        const float dmin = __half2float(*((const __half*)(base + 2)));
+        int scale, minimum;
+        q5k_scale_min(base + 4, sub_block, &scale, &minimum);
+        partial += __half2float(vector_scales[linear_group])
+            * (d * (float)scale * (float)dot
+               - dmin * (float)minimum * (float)total);
+    return partial;
+}
+
+COLIBRI_Q8_MATVEC(q5k_q8_matvec_transposed_warp, q5k_q8_group, 176)
+COLIBRI_Q8_LM_HEAD(q5k_q8_lm_head_argmax_warp, q5k_q8_group, 176)
+
+
 // One Q5_K row per warp. The generic value-at-a-time kernel reloads the block
 // scales and recomputes the block/within divisions for all eight values owned
 // by a lane. Decode those values together, as the Q6_K path does below.
@@ -1769,7 +1914,13 @@ __device__ __forceinline__ float f32_head_value(
 // IQ2_XXS codebook. Each grid entry is eight bytes packed into a uint64 so a
 // lookup is a single load; the sign table maps a 7-bit selector to eight
 // sign bits. Both come from the llama.cpp reference tables.
-__device__ __constant__ unsigned long long kIq2xxsGrid[256] = {
+// The IQ codebooks are indexed divergently -- every lane decodes a different
+// grid entry -- which is the pathological case for __constant__ memory: the
+// constant cache broadcasts one address per cycle and serialises up to 32 ways.
+// In global memory these tables are a few KB, stay pinned in L1/L2 and service
+// a fully divergent warp in one pass. Measured on the reference SM120 laptop
+// this is worth ~5x on the IQ2_XXS matvec and ~11x on IQ3_XXS.
+__device__ const unsigned long long kIq2xxsGrid[256] = {
     578721382704613384ULL, 578721382704613419ULL, 578721382704617753ULL, 578721382704622344ULL,
     578721382704622379ULL, 578721382705727513ULL, 578721382705731848ULL, 578721382706907144ULL,
     578721382706907179ULL, 578721382706916104ULL, 578721382706916139ULL, 578721382989826073ULL,
@@ -1835,7 +1986,7 @@ __device__ __constant__ unsigned long long kIq2xxsGrid[256] = {
     3110588798216964139ULL, 3110588798503290888ULL, 3110588798804171033ULL, 3110588871231417113ULL,
     3110588948540819464ULL, 3110607489915759368ULL, 3110627281410263048ULL, 3110627354138384648ULL,
 };
-__device__ __constant__ unsigned char kIq2xxsSigns[128] = {
+__device__ const unsigned char kIq2xxsSigns[128] = {
     0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
     144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
     160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
@@ -1902,32 +2053,33 @@ R"COLIBRI_CUDA(// Decode IQ2_XXS against a vector quantized in independent 32-va
 // blocks.  IQ2's codebook magnitudes fit in signed bytes, so the 32 products
 // in one weight group reduce to eight DP4A instructions instead of 32
 // floating-point weight reconstructions and multiplies.
-extern "C" __global__
-void iq2xxs_q8_matvec_transposed_warp(
-    const unsigned char* packed,
+__device__ __forceinline__ float iq2xxs_q8_group(
+    const unsigned char* row_data,
     const signed char* vector,
     const __half* vector_scales,
-    float* output,
-    const int input_size,
-    const int output_size
+    const int linear_group
 ) {
-    const int row = blockIdx.x;
-    if (row >= output_size) return;
-
-    const int blocks_per_row = input_size >> 8;
-    const int groups_per_row = blocks_per_row << 3;
-    const unsigned char* row_data =
-        packed + (long long)row * blocks_per_row * 66;
     float partial = 0.0f;
-    for (int linear_group = threadIdx.x;
-         linear_group < groups_per_row;
-         linear_group += blockDim.x) {
+
         const int block = linear_group >> 3;
         const int group = linear_group & 7;
         const unsigned char* base = row_data + block * 66;
         unsigned int low, high;
         memcpy(&low, base + 2 + group * 8, 4);
         memcpy(&high, base + 2 + group * 8 + 4, 4);
+
+        // A 66-byte super-block leaves qs 2-byte aligned, so the codebook
+        // indices stay on 32-bit loads, but the 32-byte aligned activation
+        // block loads as two int4 instead of eight scalars.
+        const int4* activation_vectors =
+            (const int4*)(vector + linear_group * 32);
+        const int4 activation_low = activation_vectors[0];
+        const int4 activation_high = activation_vectors[1];
+        const int acts[8] = {
+            activation_low.x, activation_low.y,
+            activation_low.z, activation_low.w,
+            activation_high.x, activation_high.y,
+            activation_high.z, activation_high.w};
 
         int dot = 0;
         #pragma unroll
@@ -1936,7 +2088,6 @@ void iq2xxs_q8_matvec_transposed_warp(
                 iq2xxs_unpack_signs((high >> (7 * quad)) & 127);
             const unsigned long long pattern =
                 kIq2xxsGrid[(low >> (8 * quad)) & 255];
-            const int element = quad * 8;
             const int masks_first = __vcmpne4(
                 signs & 0x08040201u, 0);
             const int masks_second = __vcmpne4(
@@ -1946,34 +2097,85 @@ void iq2xxs_q8_matvec_transposed_warp(
             const int weights_second = __vsub4(
                 (int)(unsigned int)(pattern >> 32) ^ masks_second,
                 masks_second);
-            const signed char* activations =
-                vector + linear_group * 32 + element;
-            dot = __dp4a(
-                weights_first, *((const int*)activations), dot);
-            dot = __dp4a(
-                weights_second, *((const int*)(activations + 4)), dot);
+            dot = __dp4a(weights_first, acts[quad * 2], dot);
+            dot = __dp4a(weights_second, acts[quad * 2 + 1], dot);
         }
         const int scale = (int)(high >> 27) | 1;
         partial += (float)(dot * scale) * 0.125f
             * __half2float(*((const __half*)base))
             * __half2float(vector_scales[linear_group]);
-    }
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        partial += __shfl_down_sync(0xffffffffu, partial, offset);
-    __shared__ float warp_sums[4];
-    if (lane == 0) warp_sums[warp] = partial;
-    __syncthreads();
-    if (warp == 0) {
-        partial = lane < 4 ? warp_sums[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1)
-            partial += __shfl_down_sync(0xffffffffu, partial, offset);
-        if (lane == 0) output[row] = partial;
-    }
+    return partial;
 }
 
-__device__ __constant__ unsigned int kIq3xxsGrid[256] = {
+COLIBRI_Q8_MATVEC(iq2xxs_q8_matvec_transposed_warp, iq2xxs_q8_group, 66)
+COLIBRI_Q8_LM_HEAD(iq2xxs_q8_lm_head_argmax_warp, iq2xxs_q8_group, 66)
+
+
+// Decode Q4_K against a vector quantized in independent 32-value Q8 blocks.
+// A Q4_K sub-block is exactly 32 values and its reconstruction is affine --
+// d*scale*quant - dmin*minimum -- so the whole sub-block dot collapses to
+// sum(quant*activation) and sum(activation), eight DP4A pairs, instead of 32
+// nibble extractions each repeating the superblock header and scale unpack.
+// The Q8 blocks are 32 values too, so block index and sub-block index coincide.
+__device__ __forceinline__ float q4k_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    float partial = 0.0f;
+
+        const int block = linear_group >> 3;
+        const int sub_block = linear_group & 7;
+        const unsigned char* base = row_data + block * 144;
+
+        int scale, minimum;
+        q5k_scale_min(base + 4, sub_block, &scale, &minimum);
+
+        // Sub-block j lives in the 32 bytes at qs + (j/2)*32, low nibble for
+        // even j and high nibble for odd j -- the same mapping q4k_value
+        // recomputes per element.
+        const unsigned char* quants = base + 16 + (sub_block >> 1) * 32;
+        const int shift = (sub_block & 1) * 4;
+        const signed char* activations = vector + linear_group * 32;
+
+        // 16-byte loads: a Q4_K super-block is 144 bytes and qs starts at +16,
+        // so both the weight quads and the (32-byte aligned) activation block
+        // land on int4 boundaries. This is what separates a bandwidth-bound
+        // matvec from a load-issue-bound one -- four loads per group, not
+        // sixteen.
+        const int4* quant_vectors = (const int4*)quants;
+        const int4* activation_vectors = (const int4*)activations;
+        int dot = 0, total = 0;
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int4 packed_quads = quant_vectors[part];
+            const int4 activation_quads = activation_vectors[part];
+            const int words[4] = {packed_quads.x, packed_quads.y,
+                                  packed_quads.z, packed_quads.w};
+            const int acts[4] = {activation_quads.x, activation_quads.y,
+                                 activation_quads.z, activation_quads.w};
+            #pragma unroll
+            for (int quad = 0; quad < 4; ++quad) {
+                const int weights =
+                    (int)(((unsigned int)words[quad] >> shift) & 0x0f0f0f0fu);
+                dot = __dp4a(weights, acts[quad], dot);
+                total = __dp4a(0x01010101, acts[quad], total);
+            }
+        }
+        const float d = __half2float(*((const __half*)base));
+        const float dmin = __half2float(*((const __half*)(base + 2)));
+        partial += __half2float(vector_scales[linear_group])
+            * (d * (float)scale * (float)dot
+               - dmin * (float)minimum * (float)total);
+    return partial;
+}
+
+COLIBRI_Q8_MATVEC(q4k_q8_matvec_transposed_warp, q4k_q8_group, 144)
+COLIBRI_Q8_LM_HEAD(q4k_q8_lm_head_argmax_warp, q4k_q8_group, 144)
+
+
+__device__ const unsigned int kIq3xxsGrid[256] = {
     67372036u, 67372052u, 67372068u, 67374092u, 67374108u, 67374142u, 67376132u, 67376148u,
     67378188u, 67380244u, 67386908u, 67386924u, 67896332u, 67896348u, 67898372u, 67898388u,
     67900428u, 67900460u, 67902468u, 67902484u, 67904524u, 67906596u, 67911172u, 68420612u,
@@ -2007,6 +2209,69 @@ __device__ __constant__ unsigned int kIq3xxsGrid[256] = {
     1040460820u, 1040978996u, 1040983044u, 1041501204u, 1041507372u, 1041509396u, 1042023428u, 1042025516u,
     1042029596u, 1042035716u, 1042551820u, 1042555916u, 1043072004u, 1043072020u, 1043076132u, 1043602436u,
 };
+
+// Decode IQ3_XXS against a Q8-blocked activation. Structurally the same as the
+// IQ2_XXS kernel: one 32-value group is eight qs bytes plus a 4-byte aux word
+// carrying the group scale and four 7-bit sign selectors. Each quad indexes two
+// codebook entries -- four values wide here rather than eight -- so the eight
+// products collapse to two DP4A instructions on sign-corrected bytes.
+__device__ __forceinline__ float iq3xxs_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    float partial = 0.0f;
+
+        const int block = linear_group >> 3;
+        const int group = linear_group & 7;
+        const unsigned char* base = row_data + block * 98;
+        const unsigned char* quants = base + 2 + group * 8;
+        unsigned int aux;
+        memcpy(&aux, base + 66 + group * 4, 4);
+
+        // A 98-byte super-block leaves qs 2-byte aligned, so the codebook
+        // indices stay on byte loads; the activation block is 32-byte aligned.
+        const int4* activation_vectors =
+            (const int4*)(vector + linear_group * 32);
+        const int4 activation_low = activation_vectors[0];
+        const int4 activation_high = activation_vectors[1];
+        const int acts[8] = {
+            activation_low.x, activation_low.y,
+            activation_low.z, activation_low.w,
+            activation_high.x, activation_high.y,
+            activation_high.z, activation_high.w};
+
+        int dot = 0;
+        #pragma unroll
+        for (int quad = 0; quad < 4; ++quad) {
+            const unsigned int signs =
+                (unsigned int)kIq2xxsSigns[(aux >> (7 * quad)) & 127]
+                * 0x01010101u;
+            const unsigned int pattern_first =
+                kIq3xxsGrid[quants[quad * 2]];
+            const unsigned int pattern_second =
+                kIq3xxsGrid[quants[quad * 2 + 1]];
+            const int masks_first = __vcmpne4(signs & 0x08040201u, 0);
+            const int masks_second = __vcmpne4(signs & 0x80402010u, 0);
+            const int weights_first =
+                __vsub4((int)pattern_first ^ masks_first, masks_first);
+            const int weights_second =
+                __vsub4((int)pattern_second ^ masks_second, masks_second);
+            dot = __dp4a(weights_first, acts[quad * 2], dot);
+            dot = __dp4a(weights_second, acts[quad * 2 + 1], dot);
+        }
+        const float scale = __half2float(*((const __half*)base))
+            * (0.5f + (float)(aux >> 28)) * 0.5f;
+        partial += (float)dot * scale
+            * __half2float(vector_scales[linear_group]);
+    return partial;
+}
+
+COLIBRI_Q8_MATVEC(iq3xxs_q8_matvec_transposed_warp, iq3xxs_q8_group, 98)
+COLIBRI_Q8_LM_HEAD(iq3xxs_q8_lm_head_argmax_warp, iq3xxs_q8_group, 98)
+
+
 
 __device__ __forceinline__ float iq3xxs_value(
     const unsigned char* packed, int absolute
@@ -2050,7 +2315,7 @@ void iq3xxs_matvec_transposed(
 }
 
 )COLIBRI_CUDA"
-R"COLIBRI_CUDA(__device__ __constant__ unsigned long long kIq2sGrid[1024] = {
+R"COLIBRI_CUDA(__device__ const unsigned long long kIq2sGrid[1024] = {
     578721382704613384ULL, 578721382704613419ULL, 578721382704617753ULL, 578721382704622344ULL,
     578721382704622379ULL, 578721382705727513ULL, 578721382705731848ULL, 578721382705731883ULL,
     578721382705736473ULL, 578721382706907144ULL, 578721382706907179ULL, 578721382706911513ULL,
@@ -2309,7 +2574,7 @@ R"COLIBRI_CUDA(    1803738964258658568ULL, 1803738964541573128ULL, 1803738964541
     3110627354725587243ULL, 3110627431447800584ULL, 3110627431447800619ULL, 3110627431450085384ULL,
     3110627431450085419ULL, 3110627431450094344ULL, 3110627432035003144ULL, 3110627432037296939ULL,
 };
-__device__ __constant__ unsigned int kIq3sGrid[512] = {
+__device__ const unsigned int kIq3sGrid[512] = {
     16843009u, 16843011u, 16843013u, 16843019u, 16843023u, 16843521u, 16843523u, 16843525u,
     16843529u, 16843533u, 16844033u, 16844035u, 16844043u, 16844551u, 16845057u, 16845061u,
     16845067u, 16845071u, 16845571u, 16845575u, 16846081u, 16846085u, 16846595u, 16846601u,
@@ -2457,7 +2722,7 @@ void iq3s_matvec_transposed(
 }
 
 )COLIBRI_CUDA"
-R"COLIBRI_CUDA(__device__ __constant__ unsigned long long kIq2xsGrid[512] = {
+R"COLIBRI_CUDA(__device__ const unsigned long long kIq2xsGrid[512] = {
     578721382704613384ULL, 578721382704613419ULL, 578721382704617753ULL, 578721382704622344ULL,
     578721382704622379ULL, 578721382705727513ULL, 578721382705731848ULL, 578721382705731883ULL,
     578721382705736473ULL, 578721382706907144ULL, 578721382706907179ULL, 578721382706911513ULL,
@@ -2587,7 +2852,7 @@ R"COLIBRI_CUDA(__device__ __constant__ unsigned long long kIq2xsGrid[512] = {
     3110627281713441544ULL, 3110627354138384648ULL, 3110627354725587208ULL, 3110627354725587243ULL,
     3110627431450094344ULL, 3110627431450094379ULL, 3110627432036108313ULL, 3110627432037296939ULL,
 };
-__device__ __constant__ signed char kIq4nlValues[16] = {
+__device__ const signed char kIq4nlValues[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 
@@ -2984,6 +3249,123 @@ __device__ __forceinline__ float q4k_value(
     return d * (float)scale * (float)quant - dmin * (float)minimum;
 }
 
+// Q2_K against a Q8-blocked activation. A 32-value Q8 block spans two of
+// Q2_K's 16-element scale groups, so each block carries two (scale, min)
+// pairs and the affine reconstruction splits into two halves of four DP4A
+// pairs. Both halves read the same 2-bit field of the same 32 qs bytes.
+__device__ __forceinline__ float q2k_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    float partial = 0.0f;
+
+        const int block = linear_group >> 3;
+        const int sub_block = linear_group & 7;
+        const int half = sub_block >> 2;
+        const int group = sub_block & 3;
+        const unsigned char* base = row_data + block * 84;
+        const unsigned char* quants = base + 16 + half * 32;
+        const int shift = 2 * group;
+        const signed char* activations = vector + linear_group * 32;
+
+        // An 84-byte super-block leaves qs only 4-byte aligned, so the weights
+        // stay on 32-bit loads; the activation block is 32-byte aligned and
+        // moves to int4, cutting the per-group load count from 16 to 10.
+        const int4* activation_vectors = (const int4*)activations;
+        int dot[2] = {0, 0}, total[2] = {0, 0};
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int4 activation_quads = activation_vectors[part];
+            const int acts[4] = {activation_quads.x, activation_quads.y,
+                                 activation_quads.z, activation_quads.w};
+            #pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                unsigned int word;
+                memcpy(&word, quants + (part * 4 + step) * 4, 4);
+                const int weights = (int)((word >> shift) & 0x03030303u);
+                dot[part] = __dp4a(weights, acts[step], dot[part]);
+                total[part] = __dp4a(0x01010101, acts[step], total[part]);
+            }
+        }
+        const float d = __half2float(*((const __half*)(base + 80)));
+        const float dmin = __half2float(*((const __half*)(base + 82)));
+        const unsigned char* scale_bytes = base + half * 8 + group * 2;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int index = 0; index < 2; ++index) {
+            const unsigned char scale_byte = scale_bytes[index];
+            sum += d * (float)(scale_byte & 15) * (float)dot[index]
+                 - dmin * (float)(scale_byte >> 4) * (float)total[index];
+        }
+        partial += __half2float(vector_scales[linear_group]) * sum;
+    return partial;
+}
+
+COLIBRI_Q8_MATVEC(q2k_q8_matvec_transposed_warp, q2k_q8_group, 84)
+COLIBRI_Q8_LM_HEAD(q2k_q8_lm_head_argmax_warp, q2k_q8_group, 84)
+
+
+// Q3_K against a Q8-blocked activation. The signed 3-bit weight is a 2-bit low
+// part minus 4 unless the hmask bit is set, so a whole quad reconstructs with
+// byte-wise SIMD -- low + 4*mask_bit - 4 -- and feeds DP4A directly. Q3_K has
+// no min term, so only the weight dot is needed. Like Q2_K a 32-value Q8 block
+// straddles two 16-element scale groups.
+__device__ __forceinline__ float q3k_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    float partial = 0.0f;
+
+        const int block = linear_group >> 3;
+        const int sub_block = linear_group & 7;
+        const int half = sub_block >> 2;
+        const int group = sub_block & 3;
+        const unsigned char* base = row_data + block * 110;
+        const unsigned char* quants = base + 32 + half * 32;
+        const int shift = 2 * group;
+        const int mask_shift = half * 4 + group;
+        const signed char* activations = vector + linear_group * 32;
+
+        // 110-byte super-blocks keep qs and hmask on 32-bit loads; only the
+        // 32-byte aligned activation block can widen to int4.
+        const int4* activation_vectors = (const int4*)activations;
+        int dot[2] = {0, 0};
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int4 activation_quads = activation_vectors[part];
+            const int acts[4] = {activation_quads.x, activation_quads.y,
+                                 activation_quads.z, activation_quads.w};
+            #pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const int quad = part * 4 + step;
+                unsigned int word, mask_word;
+                memcpy(&word, quants + quad * 4, 4);
+                memcpy(&mask_word, base + quad * 4, 4);
+                const unsigned int low = (word >> shift) & 0x03030303u;
+                const unsigned int high =
+                    ((mask_word >> mask_shift) & 0x01010101u) << 2;
+                const int weights =
+                    __vsub4((int)__vadd4((int)low, (int)high), 0x04040404);
+                dot[part] = __dp4a(weights, acts[step], dot[part]);
+            }
+        }
+        const float d = __half2float(*((const __half*)(base + 108)));
+        const int scale_base = half * 8 + group * 2;
+        const float sum =
+            (float)(q3k_scale(base + 96, scale_base) - 32) * (float)dot[0]
+          + (float)(q3k_scale(base + 96, scale_base + 1) - 32) * (float)dot[1];
+        partial += __half2float(vector_scales[linear_group]) * d * sum;
+    return partial;
+}
+
+COLIBRI_Q8_MATVEC(q3k_q8_matvec_transposed_warp, q3k_q8_group, 110)
+COLIBRI_Q8_LM_HEAD(q3k_q8_lm_head_argmax_warp, q3k_q8_group, 110)
+
+
 extern "C" __global__
 void q4k_grouped_swiglu(
     const unsigned long long* gate_ptrs,
@@ -3196,6 +3578,65 @@ __device__ __forceinline__ float q6k_value(
     return d * (float)scales[scale_index] * (float)quant;
 }
 
+// Q6_K against a Q8-blocked activation. A 32-value Q8 block is one (half, lane)
+// pair, so it reads 32 consecutive ql bytes and the 32 shared qh bytes with a
+// fixed nibble and bit position. The quant is a plain 6-bit value biased by 32,
+// so the whole quad reconstructs with an OR and one byte-wise subtract. Q6_K has
+// no min term; the two 16-element scale groups split the block in half.
+__device__ __forceinline__ float q6k_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    float partial = 0.0f;
+
+        const int block = linear_group >> 3;
+        const int sub_block = linear_group & 7;
+        const int half = sub_block >> 2;
+        const int lane_group = sub_block & 3;
+        const unsigned char* base = row_data + block * 210;
+        const unsigned char* lows =
+            base + half * 64 + ((lane_group & 1) ? 32 : 0);
+        const unsigned char* highs = base + 128 + half * 32;
+        const int shift = (lane_group >> 1) * 4;
+        const int bit_shift = lane_group * 2;
+        const signed char* activations = vector + linear_group * 32;
+
+        // 210-byte super-blocks are only 2-byte aligned, so ql/qh stay on
+        // 32-bit loads and just the activation block widens to int4.
+        const int4* activation_vectors = (const int4*)activations;
+        int dot[2] = {0, 0};
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int4 activation_quads = activation_vectors[part];
+            const int acts[4] = {activation_quads.x, activation_quads.y,
+                                 activation_quads.z, activation_quads.w};
+            #pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const int quad = part * 4 + step;
+                unsigned int word, high_word;
+                memcpy(&word, lows + quad * 4, 4);
+                memcpy(&high_word, highs + quad * 4, 4);
+                const unsigned int weights = ((word >> shift) & 0x0f0f0f0fu)
+                    | (((high_word >> bit_shift) & 0x03030303u) << 4);
+                const int biased = __vsub4((int)weights, 0x20202020);
+                dot[part] = __dp4a(biased, acts[step], dot[part]);
+            }
+        }
+        const float d = __half2float(*((const __half*)(base + 208)));
+        const signed char* scales = (const signed char*)(base + 192);
+        const int scale_base = half * 8 + lane_group * 2;
+        partial += __half2float(vector_scales[linear_group]) * d
+            * ((float)scales[scale_base] * (float)dot[0]
+               + (float)scales[scale_base + 1] * (float)dot[1]);
+    return partial;
+}
+
+COLIBRI_Q8_MATVEC(q6k_q8_matvec_transposed_warp, q6k_q8_group, 210)
+COLIBRI_Q8_LM_HEAD(q6k_q8_lm_head_argmax_warp, q6k_q8_group, 210)
+
+
 // Decode one complete 256-value Q6_K super-block per warp.  The scalar helper
 // above reloads ql/qh, d and the group scales for every reconstructed value.
 // Keeping a lane fixed at l=[0,31] lets it reuse two low bytes and one high
@@ -3289,6 +3730,7 @@ COLIBRI_LM_HEAD_ARGMAX(iq2xs_lm_head_argmax_warp, iq2xs_value)
 COLIBRI_LM_HEAD_ARGMAX(iq4xs_lm_head_argmax_warp, iq4xs_value)
 
 #undef COLIBRI_LM_HEAD_ARGMAX
+
 
 
 extern "C" __global__
