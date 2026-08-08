@@ -541,6 +541,8 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_int32),
                 ]
                 lib.colibri_v2_deepseek4_visible_keys.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_runtime_gpu_attach.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_deepseek4_runtime_gpu_attach.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_runtime_gpu.argtypes = [
                     ctypes.c_void_p, ctypes.c_int32,
                 ]

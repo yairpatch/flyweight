@@ -188,6 +188,11 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--top-p", type=float, default=0.95)
     generate.add_argument("--seed", type=int)
     generate.add_argument("--enable-thinking", action="store_true")
+    generate.add_argument("--device", type=int, default=0, help=argparse.SUPPRESS)
+    generate.add_argument(
+        "--backend", choices=("auto", "cuda", "cpu"), default="auto",
+        help="execution backend; auto uses CUDA when a device is present",
+    )
     _add_runtime_options(generate, serving=True, show_help=False)
 
     benchmark = commands.add_parser("benchmark", aliases=("benchmark-v2",), help="measure local inference speed")
@@ -382,7 +387,7 @@ def _benchmark(args: argparse.Namespace) -> int:
 # drafting. The DeepSeek-V4 path runs on the CPU with half-precision caches and
 # honours none of them, so setting one is reported rather than ignored.
 _DEEPSEEK4_UNSUPPORTED = (
-    "backend", "device", "gpu_cache_mib", "expert_mode", "hybrid_prefill",
+    "gpu_cache_mib", "expert_mode", "hybrid_prefill",
     "expert_residency", "dense_requant", "mtp_drafts", "mtp_model",
     "cache_type_k", "cache_type_v", "prompt_cache_mib", "swa_full",
     "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
@@ -426,8 +431,29 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
             + ", ".join("--" + name.replace("_", "-") for name in sorted(requested))
             + " yet; it runs on the CPU with half-precision caches"
         )
+    # The dense half goes to the GPU when there is one and nothing said
+    # otherwise; the routed experts stay on the CPU whatever happens, because
+    # they are 90 GiB against 12 of VRAM.
+    backend = getattr(args, "backend", "auto")
+    device = None
+    if backend != "cpu":
+        from .v2 import V2Model as _V2Model
+        try:
+            available = bool(_V2Model.gpu_info()["available"])
+        except Exception:
+            available = False
+        if available:
+            device = int(getattr(args, "device", 0) or 0)
+        elif backend == "cuda":
+            raise SystemExit("no CUDA device is available")
+    if device is not None and getattr(args, "parallel_sequences", 1) > 1:
+        raise SystemExit(
+            "the DeepSeek-V4 device path uploads its weights per sequence, so "
+            "it serves one at a time; use --parallel 1 or --backend cpu"
+        )
     return NativeDeepseek4InferenceService(
         args.model,
+        device=device,
         model_name=getattr(args, "model_name", None),
         context_window=args.context_window,
         max_new_tokens=args.max_new_tokens,

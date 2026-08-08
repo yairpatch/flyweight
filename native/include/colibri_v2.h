@@ -327,6 +327,10 @@ COLIBRI_V2_API int colibri_v2_deepseek4_visible_keys(int32_t position, int32_t r
    The routed experts stay on the CPU: they are 90 GiB against 12 of VRAM. */
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_gpu(ColibriV2Deepseek4Runtime* runtime,
     int32_t device);
+/* Make the calling thread's CUDA context current. Needed once per thread that
+   drives a runtime whose weights were uploaded from another. */
+COLIBRI_V2_API int colibri_v2_deepseek4_runtime_gpu_attach(
+    ColibriV2Deepseek4Runtime* runtime);
 /* Put one checkpoint tensor through the GPU and through the CPU with the same
    input, so the device kernels can be checked against the runtime's own before
    anything is placed on the device. */

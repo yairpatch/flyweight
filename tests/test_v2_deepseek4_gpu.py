@@ -149,5 +149,44 @@ class ResidentDenseWeightTests(unittest.TestCase):
         self.assertLess(resident, 8.0)
 
 
+@unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
+@unittest.skipUnless(gpu_present(), "no CUDA device available")
+class HybridServiceTests(unittest.TestCase):
+    """Serving hybrid, which is where the context-per-thread rule bites.
+
+    The driver retains the device's primary context and makes it current on the
+    calling thread. The weights are uploaded from whichever thread builds the
+    service, and the scheduler forwards from its own -- where nothing was
+    current, so every launch failed and every request returned a 500. It is
+    invisible from a single-threaded script, which is how it survived a whole
+    round of measurement, so the test drives the engine rather than the runtime.
+    """
+
+    def test_a_generation_survives_the_scheduler_thread(self):
+        from colibri_next.deepseek4_server import NativeDeepseek4InferenceService
+
+        service = NativeDeepseek4InferenceService(
+            CHECKPOINT, context_window=512, max_new_tokens=8, device=0
+        )
+        self.addCleanup(service.close)
+        execution = service.health()["execution"]
+        self.assertEqual(execution["backend"], "native-v2-deepseek4-hybrid")
+        self.assertGreater(execution["gpu_weight_bytes"], 4 * 1024**3)
+        reply = service.chat_completion({
+            "model": service.model_name,
+            "messages": [{"role": "user", "content": "Capital of France, one word."}],
+            "max_tokens": 4,
+        })["choices"][0]["message"]["content"]
+        self.assertIn("Paris", reply)
+
+    def test_more_than_one_slot_is_refused_rather_than_half_allocated(self):
+        from colibri_next.deepseek4_server import NativeDeepseek4InferenceService
+
+        with self.assertRaises(ValueError):
+            NativeDeepseek4InferenceService(
+                CHECKPOINT, context_window=512, device=0, parallel_sequences=2
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

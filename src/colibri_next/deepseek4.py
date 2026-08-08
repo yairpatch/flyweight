@@ -213,6 +213,19 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"gpu enable failed").decode(errors="replace")
             )
 
+    def attach_gpu(self) -> None:
+        """Make this thread's CUDA context current.
+
+        The context the driver retains is current per thread, so a thread that
+        drives a runtime uploaded from another has to say so once before its
+        first launch.
+        """
+        status = self._library.colibri_v2_deepseek4_runtime_gpu_attach(self._handle)
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"gpu attach failed").decode(errors="replace")
+            )
+
     def indexer_key(self, layer: int, block: int) -> np.ndarray:
         """One compressed lightning-indexer key, as the cache holds it.
 

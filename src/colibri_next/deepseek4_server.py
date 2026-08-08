@@ -150,11 +150,27 @@ class Deepseek4Engine:
     _PREFILL_CHUNK = 32
     _SHUTDOWN_TIMEOUT_SECONDS = 60.0
 
-    def __init__(self, model: V2Model, context_limit: int, slots: int = 1):
+    def __init__(
+        self, model: V2Model, context_limit: int, slots: int = 1,
+        device: int | None = None,
+    ):
         if slots <= 0:
             raise ValueError("slots must be positive")
+        if device is not None and slots > 1:
+            # The dense weights are uploaded per runtime today, so a second
+            # slot would want a second 6.3 GiB of a 12 GiB card. Sharing one
+            # upload across slots is the fix; refusing is what keeps this from
+            # failing halfway through an allocation instead.
+            raise ValueError(
+                "the device path uploads its weights per sequence, so it "
+                "supports one slot; use --parallel 1 or run on the CPU"
+            )
         self.context_limit = int(context_limit)
+        self.device = device
         self._slots = [Deepseek4Runtime(model, context_limit) for _ in range(slots)]
+        if device is not None:
+            for runtime in self._slots:
+                runtime.use_gpu(device)
         self._pool = [_Slot(runtime) for runtime in self._slots]
         self._lock = threading.Lock()
         self._tasks: OrderedDict[int, _Task] = OrderedDict()
@@ -361,6 +377,11 @@ class Deepseek4Engine:
         return True
 
     def _run(self) -> None:
+        # The weights were uploaded from whichever thread built the engine, and
+        # a CUDA context is current per thread.
+        if self.device is not None:
+            for slot in self._pool:
+                slot.runtime.attach_gpu()
         while True:
             with self._lock:
                 if self._closing:
@@ -409,8 +430,11 @@ class Deepseek4Generator(ChatGenerator):
         *,
         context_limit: int,
         slots: int = 1,
+        device: int | None = None,
     ):
-        super().__init__(model, Deepseek4Engine(model, context_limit, slots), tokenizer)
+        super().__init__(
+            model, Deepseek4Engine(model, context_limit, slots, device), tokenizer
+        )
 
     def prefix_cache_stats(self) -> dict[str, int]:
         engine = self.engine
@@ -458,12 +482,12 @@ def _reject_unsupported(options: Mapping[str, object]) -> None:
 class NativeDeepseek4InferenceService(InferenceService):
     """The OpenAI-compatible service, backed by the DeepSeek-V4 scheduler.
 
-    The runtime knobs the Qwen service accepts -- GPU cache, expert placement,
-    KV quantization, MTP drafts -- have no counterpart here yet: this path is
-    CPU-only, its caches are half precision by construction and its state is too
-    small for quantization to earn anything. They are rejected rather than
-    accepted and ignored, so a serving command does not quietly do something
-    other than what it was asked for.
+    With `device` set it runs hybrid: the dense half of the model -- 6.3 GiB,
+    read in full on every token -- is resident on the GPU, and the routed
+    experts stay on the CPU because they are 90 GiB. The other runtime knobs the
+    Qwen service accepts (GPU cache, expert placement, KV quantization, MTP
+    drafts) still have no counterpart here, and are rejected rather than
+    accepted and ignored.
     """
 
     def __init__(
@@ -474,6 +498,7 @@ class NativeDeepseek4InferenceService(InferenceService):
         context_window: int = 8192,
         max_new_tokens: int = 1024,
         parallel_sequences: int = 1,
+        device: int | None = None,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -499,6 +524,7 @@ class NativeDeepseek4InferenceService(InferenceService):
                 tokenizer,
                 context_limit=context_window,
                 slots=parallel_sequences,
+                device=device,
             )
         except Exception:
             self.v2_model.close()
@@ -518,6 +544,7 @@ class NativeDeepseek4InferenceService(InferenceService):
         )
         self.generation_defaults_source = generation_defaults_source
         self.parallel_sequences = parallel_sequences
+        self.device = device
         # The scheduler interleaves requests itself, so the HTTP layer must not
         # serialize them on top of it.
         self._serialize_generation = False
@@ -530,8 +557,12 @@ class NativeDeepseek4InferenceService(InferenceService):
         value = super().health()
         runtime = self.generator.engine._pool[0].runtime
         value["execution"] = {
-            "backend": "native-v2-deepseek4-cpu",
+            "backend": (
+                "native-v2-deepseek4-cpu" if self.device is None
+                else "native-v2-deepseek4-hybrid"
+            ),
             "slots": self.parallel_sequences,
+            "device": self.device,
             **runtime.info,
         }
         return value

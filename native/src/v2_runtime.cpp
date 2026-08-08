@@ -5059,6 +5059,21 @@ int colibri_v2_deepseek4_runtime_gpu(
     rt.gpu=true;
     return 0;});}
 
+// Make this thread's CUDA context current.
+//
+// The driver retains the device's primary context and makes it current on the
+// calling thread, and "current" is per thread. The weights are uploaded from
+// whichever thread built the runtime, but the scheduler forwards from its own,
+// where nothing was current and every launch failed. Cheap and idempotent, so
+// a worker can simply call it once when it starts.
+int colibri_v2_deepseek4_runtime_gpu_attach(ColibriV2Deepseek4Runtime* runtime
+){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid runtime");
+    if(!runtime->gpu)return 0;
+    if(colibri_gpu_init(runtime->gpu_device)!=0)
+        throw std::runtime_error("cannot attach this thread to the CUDA context");
+    return 0;});}
+
 int colibri_v2_deepseek4_gpu_matvec_check(
     ColibriV2Model* model, const char* name, const float* input, int32_t inputs,
     int32_t outputs, float* out_gpu, float* out_cpu, int32_t device,
