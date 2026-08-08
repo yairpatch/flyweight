@@ -18,6 +18,12 @@ from colibri_next.v2 import V2Error, V2Model
 from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 from tests.split_gguf_fixture import split_gguf
 
+_CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
+# A stale path is as good as no path: the variable often outlives the file it
+# named, and treating that as "configured" turns a missing checkpoint into a
+# wall of errors instead of a skip.
+CHECKPOINT = _CHECKPOINT_PATH if _CHECKPOINT_PATH and os.path.exists(_CHECKPOINT_PATH) else None
+
 
 def _workspace(case: unittest.TestCase | None = None) -> Path:
     """A temp directory that goes away with the test that made it.
@@ -217,14 +223,13 @@ class DeepSeek4TensorPlanTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("DEEPSEEK4_GGUF"),
-    "set DEEPSEEK4_GGUF to the first shard of a real checkpoint",
+    CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint"
 )
 class DeepSeek4CheckpointTests(unittest.TestCase):
     """Runs against the published UD-IQ3_XXS build when it is on disk."""
 
     def setUp(self):
-        self.model = V2Model(Path(os.environ["DEEPSEEK4_GGUF"]))
+        self.model = V2Model(Path(CHECKPOINT))
         self.addCleanup(self.model.close)
 
     def test_real_checkpoint_geometry(self):

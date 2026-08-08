@@ -38,6 +38,10 @@ from colibri_next.sampling import SamplingConfig
 from colibri_next.v2 import V2Model
 from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 
+_CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
+# A stale path is as good as no path.
+CHECKPOINT = _CHECKPOINT_PATH if _CHECKPOINT_PATH and os.path.exists(_CHECKPOINT_PATH) else None
+
 
 class _Fixture:
     """A tiny real deepseek4 model, shared by every test in the module."""
@@ -372,7 +376,7 @@ class ServiceTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("DEEPSEEK4_GGUF"),
+    CHECKPOINT,
     "set DEEPSEEK4_GGUF to the first shard of a real checkpoint",
 )
 class ContinuationOnTheRealCheckpointTests(unittest.TestCase):
@@ -386,7 +390,7 @@ class ContinuationOnTheRealCheckpointTests(unittest.TestCase):
 
     def test_a_spliced_second_turn_matches_a_fresh_render(self):
         service = NativeDeepseek4InferenceService(
-            os.environ["DEEPSEEK4_GGUF"], context_window=2048, max_new_tokens=16
+            CHECKPOINT, context_window=2048, max_new_tokens=16
         )
         self.addCleanup(service.close)
         messages = [{"role": "user", "content": "Name the capital of France in one word."}]

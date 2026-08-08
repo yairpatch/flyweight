@@ -27,7 +27,11 @@ from colibri_next.deepseek4 import head_collapse, matvec, rms_norm
 from colibri_next.deepseek4_layer import DeepSeek4Block, _f32
 from colibri_next.v2 import V2Model
 
-CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
+_CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
+# A stale path is as good as no path: the variable often outlives the file it
+# named, and treating that as "configured" turns a missing checkpoint into a
+# wall of errors instead of a skip.
+CHECKPOINT = _CHECKPOINT_PATH if _CHECKPOINT_PATH and os.path.exists(_CHECKPOINT_PATH) else None
 PROMPT = "The quick brown fox jumps over the lazy dog today"
 EPSILON = 9.999999974752427e-07
 

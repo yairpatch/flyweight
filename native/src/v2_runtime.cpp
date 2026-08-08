@@ -673,6 +673,9 @@ constexpr std::uint32_t kIq3xxsBlockSize = kIq3xxsBlockBytes; // IQ3_XXS: 98 byt
 constexpr std::uint32_t kQ5KBlockSize = 176;  // Q5_K: 176 bytes per 256 elements
 constexpr std::uint32_t kQ6KBlockSize = 210;  // Q6_K: 210 bytes per 256 elements
 constexpr std::uint32_t kQ4KBlockSize = 144;  // Q4_K: 144 bytes per 256 elements
+// IQ1_S: d(2) + qs[32] + qh[8*2] = 50 bytes per 256 values, 1.5625 bits each.
+constexpr std::uint32_t kIq1sBlockSize = 50;
+constexpr float kIq1sDelta = 0.125f;
 constexpr std::uint32_t kMxfp4BlockSize = 17;      // MXFP4: e[1] E8M0 scale + qs[16] nibbles
 constexpr std::uint32_t kMxfp4BlockElements = 32;
 // The FP4 codebook, doubled -- which is why the scale is halved to match.
@@ -2288,6 +2291,39 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         result+=qwen_iq2xs_dot_row(packed,input,elements,row);
     }else if(type==23){
         result+=qwen_iq4xs_dot_row(packed,input,elements,row);
+    }else if(type==19){
+        // IQ1_S. Each group of eight weights is one 11-bit index into a shared
+        // grid -- eight bits from qs, three more from qh -- which is what makes
+        // 1.5 bits a weight possible. qh also carries the group's scale in bits
+        // 12-14 and, in its top bit, the sign of a delta applied to every weight
+        // in the group.
+        const int blocks=elements/256;
+        const std::uint64_t row_offset=static_cast<std::uint64_t>(row)*blocks*kIq1sBlockSize;
+        for(int block=0;block<blocks;++block){
+            const auto*base=packed+row_offset+block*kIq1sBlockSize;
+            std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);
+            const float d=qwen_half_value(scale_bits);
+            const auto*qs=base+2;
+            const auto*qh_bytes=base+34;
+            for(int group=0;group<8;++group){
+                std::uint16_t qh=0;std::memcpy(&qh,qh_bytes+group*2,2);
+                const float scale=d*static_cast<float>(2*((qh>>12)&7)+1);
+                const float delta=(qh&0x8000)?-kIq1sDelta:kIq1sDelta;
+                const auto*vector=input+block*256+group*32;
+                float partial=0.0f;
+                for(int part=0;part<4;++part){
+                    const std::uint32_t index=
+                        static_cast<std::uint32_t>(qs[4*group+part])|
+                        ((static_cast<std::uint32_t>(qh>>(3*part))&7u)<<8);
+                    const std::uint64_t entry=kIq1sGrid[index];
+                    for(int lane=0;lane<8;++lane){
+                        const auto weight=static_cast<std::int8_t>((entry>>(8*lane))&0xFF);
+                        partial+=(static_cast<float>(weight)+delta)*vector[part*8+lane];
+                    }
+                }
+                result+=scale*partial;
+            }
+        }
     }else if(type==39){
         // MXFP4: one E8M0 exponent per 32 values, then 16 packed nibbles where
         // byte j holds element j in the low half and element j+16 in the high.
@@ -2484,7 +2520,7 @@ bool qwen_gpu_experts_executable(const ColibriV2QwenRuntime& runtime) {
 bool qwen_cpu_expert_type_supported(std::uint32_t type) {
     switch(type){
         case 0: case 2: case 8: case 10: case 11: case 12: case 13: case 14:
-        case 16: case 17: case 18: case 21: case 22: case 23: case 30:
+        case 16: case 17: case 18: case 19: case 21: case 22: case 23: case 30:
         case 39: case 40:
             return true;
         default:

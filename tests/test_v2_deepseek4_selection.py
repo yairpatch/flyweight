@@ -30,7 +30,15 @@ from colibri_next.deepseek4 import Deepseek4Runtime
 from colibri_next.v2 import V2Model
 from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 
-CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
+_CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
+# A stale path is as good as no path: the variable often outlives the file it
+# named, and treating that as "configured" turns a missing checkpoint into a
+# wall of errors instead of a skip.
+CHECKPOINT = _CHECKPOINT_PATH if _CHECKPOINT_PATH and os.path.exists(_CHECKPOINT_PATH) else None
+# The indexer keys here were recorded from the UD-IQ3_XXS build; a different
+# quantization produces different weights and so different keys.
+if CHECKPOINT and "IQ3_XXS" not in CHECKPOINT:
+    CHECKPOINT = None
 
 
 def fixture(directory: str, **spec) -> Path:

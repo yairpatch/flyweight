@@ -33,7 +33,11 @@ import numpy as np
 
 from colibri_next.v2 import V2Model
 
-CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
+_CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
+# A stale path is as good as no path: the variable often outlives the file it
+# named, and treating that as "configured" turns a missing checkpoint into a
+# wall of errors instead of a skip.
+CHECKPOINT = _CHECKPOINT_PATH if _CHECKPOINT_PATH and os.path.exists(_CHECKPOINT_PATH) else None
 
 
 def gpu_present() -> bool:
@@ -57,6 +61,18 @@ class DeviceMatvecTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.model.close()
 
+    def a_tensor_of_type(self, ggml_type: int) -> str:
+        """Any 2-D tensor stored as `ggml_type`, or skip.
+
+        Which tensor carries which type is a property of the quantization, not
+        of the architecture -- a name that is Q6_K in one build is Q5_K in
+        another -- so these tests look the type up instead of assuming it.
+        """
+        for name, tensor in self.tensors.items():
+            if int(tensor["ggml_type"]) == ggml_type and len(tensor["shape"]) == 2:
+                return name
+        raise unittest.SkipTest(f"this checkpoint stores nothing as type {ggml_type}")
+
     def check(self, name: str, iterations: int = 0):
         from colibri_next.deepseek4 import gpu_matvec_check
 
@@ -70,20 +86,23 @@ class DeviceMatvecTests(unittest.TestCase):
 
     def test_q8_is_bit_identical_to_the_cpu(self):
         # Not "close": the same decode, the same order of accumulation per row.
-        for name in ("blk.10.attn_q_b.weight", "blk.10.attn_output_b.weight",
-                     "blk.10.attn_kv.weight"):
+        names = [
+            name for name, tensor in self.tensors.items()
+            if int(tensor["ggml_type"]) == 8 and len(tensor["shape"]) == 2
+        ][:3]
+        self.assertTrue(names, "checkpoint stores nothing as Q8_0")
+        for name in names:
             with self.subTest(name=name):
                 on_gpu, on_cpu, _, _ = self.check(name)
-                self.assertEqual(self.tensors[name]["ggml_type"], 8)
                 np.testing.assert_array_equal(on_gpu, on_cpu)
 
     def test_q6k_agrees_within_float_rounding(self):
-        on_gpu, on_cpu, _, _ = self.check("blk.10.attn_q_a.weight")
-        self.assertEqual(self.tensors["blk.10.attn_q_a.weight"]["ggml_type"], 14)
+        name = self.a_tensor_of_type(14)
+        on_gpu, on_cpu, _, _ = self.check(name)
         np.testing.assert_allclose(on_gpu, on_cpu, rtol=1e-4, atol=1e-5)
 
     def test_the_q8_kernel_clears_the_cpu_by_a_wide_margin(self):
-        name = "blk.10.attn_q_b.weight"
+        name = self.a_tensor_of_type(8)
         self.check(name, iterations=2000)          # let the clocks come up
         _, _, seconds, size = self.check(name, iterations=6000)
         rate = 6000 * size / 1024**3 / seconds

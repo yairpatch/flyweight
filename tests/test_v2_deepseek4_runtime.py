@@ -25,7 +25,11 @@ import unittest
 from colibri_next.deepseek4 import Deepseek4Runtime
 from colibri_next.v2 import V2Error, V2Model
 
-CHECKPOINT = os.environ.get("DEEPSEEK4_GGUF")
+_CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
+# A stale path is as good as no path: the variable often outlives the file it
+# named, and treating that as "configured" turns a missing checkpoint into a
+# wall of errors instead of a skip.
+CHECKPOINT = _CHECKPOINT_PATH if _CHECKPOINT_PATH and os.path.exists(_CHECKPOINT_PATH) else None
 
 
 def _expected_bytes(config, ratios, context: int) -> int:
