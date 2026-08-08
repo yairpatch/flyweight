@@ -768,9 +768,36 @@ Qwen set), a type dispatch for Q8_0/Q6_K/BF16, and
 `colibri_v2_deepseek4_gpu_matvec_check`, which runs one tensor both ways and
 optionally loops it for timing.
 
-Next, in order: upload the dense weights and keep activations resident across a
-layer so the crossings are only for the experts; then the four deepseek4 kernels
-below.
+**The dense weights are now resident and the matvecs run there.** 6.9 GiB
+uploaded once (2 s), each call crossing a few kilobytes of activations to meet
+megabytes of weights that do not move. Warm, against the same run with the
+device off:
+
+    attention  102 -> 37 ms/token
+    throughput 3.90 -> 5.89 tok/s
+
+Same next token, four of the top five shared. Not bit-identical: Q6_K
+accumulates in a different order on each side and 43 layers amplify it.
+
+Two things measurement decided rather than design. The grouped output
+projection needed its own kernel -- largest single read in the attention half,
+34 MiB a layer, and a shape the shared kernels do not have -- which took
+attention 57 -> 46 ms. And waiting on the upload as well as the download
+doubled the stalls; ordering upload, launch and download on one stream and
+waiting once took 46 -> 37 ms. At 470 crossings a token, per-call
+synchronization is the thing to watch.
+
+**The shared expert got slower on the device**, 17.3 -> 21.3 ms: Q6_K through
+the shared kernel, paying a crossing for each of its three matvecs a layer. So
+placement should be per tensor and measured, not "everything dense". A Q6_K
+kernel with four blocks in flight -- the same change that took Q8_0 from 80 to
+300 GiB/s -- would probably settle it either way, and is the cheapest next
+thing.
+
+After that: the four deepseek4 kernels below, which is what lets activations
+stay on the device across a whole layer and removes the crossings entirely
+except for the experts. Experts are now the largest cost at ~100 ms of a 170 ms
+token.
 
 ### Most of the kernels already exist
 
