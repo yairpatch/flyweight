@@ -787,17 +787,18 @@ doubled the stalls; ordering upload, launch and download on one stream and
 waiting once took 46 -> 37 ms. At 470 crossings a token, per-call
 synchronization is the thing to watch.
 
-**The shared expert is faster on the CPU, and is left there.** On the device it
-measured 21.3 ms a token against 17.3, judged against each run's own baseline;
-off it again, 19.1 against 18.4. The Q6_K kernel is not the reason -- it already
-moves 210 bytes per warp iteration, where the Q8_0 one moved 32 -- the reason is
-that its three matvecs a layer are about twenty microseconds of work each behind
-a round trip of roughly thirty.
+**The shared expert is on the device**, at 18.0 ms a token against 20.1 on the
+CPU. It took two corrections to get there. The first attempt measured it slower
+on the device and excluded it; the Q6_K kernel was then found to be running at
+60 GiB/s, because the shared one broadcasts each group scale through
+`__shfl_sync` -- eight synchronizing instructions per 256-value block -- where
+every lane can simply load the sixteen scale bytes itself. That took it to 250,
+and 350 on adequate power. Even then it still measured slower on the device,
+which the bandwidth arithmetic said was impossible; the cause was the 100 W
+supply, above.
 
-So placement here is per tensor and has to be measured. "Dense, therefore
-device" is right for the projections, 34 MiB a layer against the same round
-trip, and wrong for anything small enough that the crossing dominates. The
-shared expert belongs on the device once activations stop crossing per call.
+Placement here is still per tensor and still has to be measured -- but the
+measurement has to be taken on a machine that is not rationing.
 
 ### What is left, and what it is worth
 
@@ -805,10 +806,10 @@ The four deepseek4 kernels below are what lets activations stay on the device
 across a whole layer, removing the crossings except for the experts. Sizing it
 from the current split of a ~170 ms token:
 
-    routed experts   ~100 ms   CPU, and staying there
-    attention          37 ms
-    shared expert      19 ms   CPU until crossings go
-    the rest           ~12 ms
+    routed experts    ~90 ms   CPU, and staying there
+    attention          33 ms
+    shared expert      18 ms   on the device
+    the rest          ~10 ms
 
 **A crossing costs about five microseconds, not forty.** An earlier revision of
 this section attributed roughly 11 ms of the attention half to them. Batching a
@@ -824,13 +825,16 @@ modest: **the experts dominate at about 60% of a token**, they cannot be
 resident in 12 GiB, and streaming them over PCIe at 25 GB/s would be slower than
 the CPU reading them from RAM at 46. That is the ceiling on this box.
 
-**This laptop throttles under sustained GPU load.** Four consecutive measuring
-passes ran 53.3, 57.0, 59.4, 63.0 ms with batching off and 51.8, 55.2, 57.9,
-61.2 with it on. The clock discipline this project already records for cold
-starts has a warm end too: a fourth pass is not comparable with a first, and an
-A/B has to alternate within one process rather than across runs. Two hours were
-nearly spent chasing a "regression" that was the machine getting slower between
-runs.
+**Check the charger before believing any GPU number here.** Everything above
+was first measured on a 100 W supply, which a 16-core CPU and this GPU share.
+The symptom was a slide across a measuring series -- 53.3, 57.0, 59.4, 63.0 ms
+over four passes -- which was written up as thermal throttling. It is power
+starvation. On 280 W the same series is flat or rising, the kernels are 40-50%
+faster (Q8_0 matvec 300 -> 450 GiB/s, Q6_K 250 -> 350), and one conclusion in
+this plan reversed outright: the shared expert measured slower on the device
+(21.3 ms/token against 17.3) and is faster there on adequate power (18.0
+against 20.1), because loading the GPU had been downclocking the host and the
+comparison was measuring power allocation rather than placement.
 
 ### Most of the kernels already exist
 
