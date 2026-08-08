@@ -737,6 +737,38 @@ float iq2xs_dot(const std::uint8_t* row_data, const float* input, int elements) 
 // IQ3_XXS: d(2), 64 index bytes, then eight 32-bit auxiliaries. Each auxiliary
 // carries a 4-bit group scale in its top nibble and four 7-bit sign indices.
 // Two 32-bit grid entries supply the eight magnitudes one sign index covers.
+// IQ2_XXS: d(2) qs[64]. Each 8-byte group packs four 8-bit codebook indices in
+// its low word and four 7-bit sign selectors plus the group scale in its high
+// word. A grid entry is already eight magnitudes, so one lookup and one sign
+// byte cover a whole octet -- the scalar form redoes both per weight, which is
+// what makes a spilled IQ2_XXS block ~30x slower on the host than a K-quant one.
+float iq2xxs_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq2xxsBlockBytes;
+        const float* vector = input + block * 256;
+        __m256 accumulator = _mm256_setzero_ps();
+        for (int group = 0; group < 8; ++group) {
+            std::uint32_t low = 0, high = 0;
+            std::memcpy(&low, base + 2 + group * 8, 4);
+            std::memcpy(&high, base + 2 + group * 8 + 4, 4);
+            const __m256 weight = _mm256_set1_ps((0.5f + (high >> 28)) * 0.25f);
+            for (int quad = 0; quad < 4; ++quad) {
+                std::uint64_t grid = 0;
+                std::memcpy(&grid, kIq2xxsGrid[(low >> (8 * quad)) & 255], 8);
+                const __m256 magnitudes = iq_signed_octet(
+                    grid, kIq2xxsSigns[(high >> (7 * quad)) & 127]);
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(magnitudes, weight),
+                    _mm256_loadu_ps(vector + group * 32 + quad * 8),
+                    accumulator);
+            }
+        }
+        result += half_value(base) * horizontal_sum(accumulator);
+    }
+    return result;
+}
+
 float iq3xxs_dot(const std::uint8_t* row_data, const float* input, int elements) {
     float result = 0.0f;
     for (int block = 0; block < elements / 256; ++block) {
@@ -961,6 +993,7 @@ bool qwen_quant_dot_iq_multi_avx2(
 }
 
 float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const float* input,int elements,std::uint64_t row){
+    if(type==16)return iq2xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,input,elements);
     if(type==17)return iq2xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,input,elements);
     if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);
     if(type==23)return iq4xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,input,elements);

@@ -2216,7 +2216,7 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
     if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
-    if((type==17||type==18||type==23)&&(colibri_cpu_features()&1u)!=0&&elements%256==0)
+    if((type==16||type==17||type==18||type==23)&&(colibri_cpu_features()&1u)!=0&&elements%256==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     float result=0.0f;

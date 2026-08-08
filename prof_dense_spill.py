@@ -18,6 +18,9 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=40)
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--gpu-cache-mib", type=int, default=0)
+    # Fewer prefill checkpoints shrink the snapshot pool, which is what makes a
+    # manual budget usable at all on a tight card -- see the sizing note below.
+    parser.add_argument("--checkpoint-slots", type=int, default=4)
     arguments = parser.parse_args()
 
     model = V2Model(arguments.model)
@@ -25,6 +28,7 @@ def main() -> int:
         model,
         context_limit=arguments.context,
         gpu_cache_bytes=arguments.gpu_cache_mib * 1024 * 1024,
+        prefill_checkpoint_slots=arguments.checkpoint_slots,
     )
     runtime.prepare()
 
