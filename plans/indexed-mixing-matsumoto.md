@@ -744,6 +744,34 @@ the experts are ~85% of it and the remaining levers are NVMe and RAM size.
 That figure is an estimate from the attribution and should be replaced by a
 measurement, warm and after the clock ramp, as soon as there is one.
 
+### Status: the foundation is in and measured
+
+Two facts, both against the real checkpoint, both now tests
+(`tests/test_v2_deepseek4_gpu.py`):
+
+- **The Qwen kernels decode deepseek4 tensors identically.** Q8_0 comes back
+  bit-identical to this runtime's own decode, Q6_K within float rounding order.
+- **The shared Q8_0 matvec was the limiter, not the hardware.** It measured
+  80 GiB/s against the CPU path's 46, which would have made the whole stage
+  worth about 1.3x. It walks one 32-value block per warp iteration, so 32 bytes
+  of weights are in flight behind each dependent load. Four independent blocks
+  per iteration measures **300 GiB/s**, same layout, same answers. That restores
+  the 2x: 111 ms a token of attention projections becomes about 17.
+
+The new kernel is deepseek4's own (`colibri_v2_deepseek4_kernels.hpp`, launched
+by name) rather than a change to the shared one, since the Qwen path's numbers
+are not measured here and should not move as a side effect. The same trick very
+likely helps it too -- worth an afternoon and a benchmark.
+
+Also landed: `ds4_gpu_compile` (the deepseek4 source is concatenated onto the
+Qwen set), a type dispatch for Q8_0/Q6_K/BF16, and
+`colibri_v2_deepseek4_gpu_matvec_check`, which runs one tensor both ways and
+optionally loops it for timing.
+
+Next, in order: upload the dense weights and keep activations resident across a
+layer so the crossings are only for the experts; then the four deepseek4 kernels
+below.
+
 ### Most of the kernels already exist
 
 Every type the dense path uses already has a GPU matvec, because the Qwen work
