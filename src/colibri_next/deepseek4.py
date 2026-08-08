@@ -313,6 +313,32 @@ def expert_matvec(
     return output
 
 
+def gpu_matvec_check(
+    model, name: str, input_vector, outputs: int, device: int = 0,
+    iterations: int = 0
+):
+    """Run one checkpoint tensor through the GPU and the CPU, and return both.
+
+    The dense half of this model is what is worth moving to the device, and all
+    of it goes through a quantized matvec. This establishes the assumption the
+    rest of that work rests on: that the kernels written for Qwen decode a
+    deepseek4 tensor to the same numbers this runtime's own kernels do.
+    """
+    input_vector = np.ascontiguousarray(input_vector, dtype=np.float32)
+    on_gpu = np.zeros(outputs, dtype=np.float32)
+    on_cpu = np.zeros(outputs, dtype=np.float32)
+    elapsed = ctypes.c_double(0.0)
+    library = _library()
+    status = library.colibri_v2_deepseek4_gpu_matvec_check(
+        model._handle, name.encode(), _pointer(input_vector), input_vector.size,
+        outputs, _pointer(on_gpu), _pointer(on_cpu), int(device), int(iterations),
+        ctypes.byref(elapsed),
+    )
+    if status:
+        raise V2Error((library.colibri_v2_last_error() or b"gpu matvec check failed").decode(errors="replace"))
+    return on_gpu, on_cpu, elapsed.value
+
+
 def indexer_scores(
     queries: np.ndarray, keys: np.ndarray, weights: np.ndarray
 ) -> np.ndarray:

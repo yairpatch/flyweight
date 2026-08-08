@@ -536,6 +536,12 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_int32),
                 ]
                 lib.colibri_v2_deepseek4_visible_keys.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_gpu_matvec_check.argtypes = [
+                    ctypes.c_void_p, ctypes.c_char_p, _float_p, ctypes.c_int32,
+                    ctypes.c_int32, _float_p, _float_p, ctypes.c_int32,
+                    ctypes.c_int32, ctypes.POINTER(ctypes.c_double),
+                ]
+                lib.colibri_v2_deepseek4_gpu_matvec_check.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_indexer_key.argtypes = [
                     ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
                     _float_p, ctypes.c_int32,

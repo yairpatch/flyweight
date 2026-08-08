@@ -321,6 +321,13 @@ COLIBRI_V2_API int colibri_v2_deepseek4_visible_keys(int32_t position, int32_t r
 /* The lightning indexer's score for each compressed block, and the selection
    built from it. Exposed so the ranking can be checked without a prompt long
    enough to make the runtime run it. */
+/* Put one checkpoint tensor through the GPU and through the CPU with the same
+   input, so the device kernels can be checked against the runtime's own before
+   anything is placed on the device. */
+COLIBRI_V2_API int colibri_v2_deepseek4_gpu_matvec_check(ColibriV2Model* model,
+    const char* name, const float* input, int32_t inputs, int32_t outputs,
+    float* out_gpu, float* out_cpu, int32_t device, int32_t iterations,
+    double* seconds);
 /* One stored lightning-indexer key, dequantized. The cache is built from the
    first token but nothing reads it until a sequence is long enough for the
    indexer to run, so this is how the compressor behind it gets checked. */

@@ -10,6 +10,7 @@
 #include "colibri_v2_expert_seed.hpp"
 #include "colibri_v2_qwen_kernels.hpp"
 #include "colibri_v2_native_kernels.hpp"
+#include "colibri_v2_deepseek4_kernels.hpp"
 #include "colibri_v2_workspace.hpp"
 #include "qwen_cpu_kernel.h"
 #include "qwen_kquant.h"
@@ -4234,6 +4235,67 @@ namespace {
 // `num_threads`.
 int ds4_thread_count() { return colibri::v2::deepseek4::thread_count(); }
 
+// Compile the CUDA kernels once per process.
+//
+// The set is the Qwen one: the dense half of deepseek4 is Q8_0, Q6_K, BF16 and
+// F32, and a matvec for each of those already exists because the Qwen work
+// needed them. What deepseek4 adds later -- the Sinkhorn mixer, the compressor,
+// the indexer -- goes into the same source, so this stays the one place that
+// builds them.
+void ds4_gpu_compile(std::int32_t device) {
+    static bool built = false;
+    static std::mutex guard;
+    std::lock_guard<std::mutex> held(guard);
+    if (built) return;
+    std::vector<std::string> option_storage;
+#if !defined(_WIN32)
+    for (const char* path : {"/opt/cuda/include", "/usr/local/cuda/include", "/usr/include"})
+        if (access((std::string(path) + "/cuda_fp16.h").c_str(), R_OK) == 0) {
+            option_storage.push_back(std::string("-I") + path);
+            if (access((std::string(path) + "/cccl/cub/config.cuh").c_str(), R_OK) == 0)
+                option_storage.push_back(std::string("-I") + path + "/cccl");
+        }
+#endif
+    if (const char* cuda_home = std::getenv("CUDA_HOME")) {
+        option_storage.push_back(std::string("-I") + cuda_home + "/include");
+        option_storage.push_back(std::string("-I") + cuda_home + "/include/cccl");
+    }
+    std::vector<const char*> options;
+    for (const auto& option : option_storage) options.push_back(option.c_str());
+    std::array<char, 16384> log{};
+    const std::string source =
+        std::string(colibri::v2::qwen_cuda_source) + colibri::v2::qwen_native_cuda_source +
+        deepseek4_cuda_source;
+    if (colibri_gpu_compile(source.c_str(), options.data(),
+                            static_cast<std::int32_t>(options.size()), device,
+                            log.data(), static_cast<std::int32_t>(log.size())) != 0)
+        throw std::runtime_error(std::string("failed to compile CUDA kernels: ") + log.data());
+    built = true;
+}
+
+// Dispatch a device matvec on the weight's own type. The dense half of this
+// checkpoint uses four of these; anything else is a placement mistake caught
+// here rather than a wrong answer later.
+int ds4_gpu_matvec(std::uint32_t type, std::uint64_t weights, std::uint64_t input,
+                   std::uint64_t output, std::int32_t inputs, std::int32_t outputs,
+                   std::uint64_t stream) {
+    switch (type) {
+        case 8: {  // Q8_0
+            // Four blocks in flight per warp against the shared kernel's one.
+            void* arguments[] = {&weights, &input, &output, &inputs, &outputs};
+            const auto blocks = static_cast<std::uint32_t>((outputs + 7) / 8);
+            return colibri_gpu_launch_named("ds4_q8_matvec", blocks, 1, 256, 0,
+                                            stream, arguments);
+        }
+        case 14:  // Q6_K
+            return colibri_gpu_q6k_matvec_transposed(weights, input, output, inputs, outputs, stream);
+        case 30:  // BF16
+            return colibri_gpu_bf16_matvec_transposed(weights, input, output, inputs, outputs, stream);
+        default:
+            throw std::runtime_error("no device matvec for this weight type");
+    }
+}
+
 // Hint that a weight range is about to be read.
 //
 // On the mapping rather than the file, because a split checkpoint backs
@@ -4727,6 +4789,67 @@ int colibri_v2_deepseek4_forward(
     }
     ++rt.forward_calls;
     rt.forward_nanoseconds+=ds4_now()-forward_started;
+    return 0;});}
+
+// Put one checkpoint tensor through the GPU and report how far the answer
+// drifts from the CPU's.
+//
+// The dense half of this model is 6.9 GiB against 90 GiB of routed experts, and
+// it is read in full every token at CPU memory bandwidth -- which is why it is
+// the half worth moving. Before any of that is built, this establishes the one
+// thing everything else assumes: that the existing quantized matvec kernels,
+// written for Qwen, decode a deepseek4 tensor to the same numbers this
+// runtime's own kernels do. Both paths see the same input vector, so a
+// disagreement here is a decode difference and nothing else.
+int colibri_v2_deepseek4_gpu_matvec_check(
+    ColibriV2Model* model, const char* name, const float* input, int32_t inputs,
+    int32_t outputs, float* out_gpu, float* out_cpu, int32_t device,
+    int32_t iterations, double* seconds
+){return guarded([&]{
+    if(!model||!name||!input||!out_gpu||!out_cpu||inputs<=0||outputs<=0)
+        throw std::runtime_error("gpu matvec check arguments are invalid");
+    const auto found=std::find_if(model->tensors.begin(),model->tensors.end(),
+        [&](const Tensor& tensor){return tensor.name==name;});
+    if(found==model->tensors.end())
+        throw std::runtime_error(std::string("tensor not found: ")+name);
+    if(colibri_gpu_init(device)!=0)
+        throw std::runtime_error("failed to initialize CUDA");
+    ds4_gpu_compile(device);
+
+    // The CPU answer first, from the same path the runtime uses.
+    for(std::int32_t row=0;row<outputs;++row)
+        out_cpu[row]=qwen_quant_dot(tensor_data(*model,*found),found->type,input,inputs,
+                                    static_cast<std::uint64_t>(row));
+
+    std::uint64_t weights=0,vector=0,result=0;
+    if(colibri_gpu_alloc(found->size,&weights)!=0)
+        throw std::runtime_error("cannot allocate device weights");
+    if(colibri_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0)
+        throw std::runtime_error("cannot allocate the device input");
+    if(colibri_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0)
+        throw std::runtime_error("cannot allocate the device output");
+    int status=colibri_gpu_upload_sync(weights,tensor_data(*model,*found),found->size);
+    if(status==0)status=colibri_gpu_upload_sync(vector,input,
+        static_cast<std::uint64_t>(inputs)*sizeof(float));
+    if(status==0)status=ds4_gpu_matvec(found->type,weights,vector,result,inputs,outputs,0);
+    if(status==0)status=colibri_gpu_sync();
+    // Repeat the resident matvec for timing. The weights are already on the
+    // device, so this measures the kernel against VRAM rather than the upload,
+    // which is the number that decides whether moving the dense half is worth
+    // it. This laptop's clocks ramp under load, so the caller must ask for
+    // enough iterations to get past that.
+    if(status==0&&iterations>0){
+        const auto started=ds4_now();
+        for(std::int32_t i=0;i<iterations&&status==0;++i)
+            status=ds4_gpu_matvec(found->type,weights,vector,result,inputs,outputs,0);
+        if(status==0)status=colibri_gpu_sync();
+        if(seconds)*seconds=static_cast<double>(ds4_now()-started)/1e9;
+    }
+    if(status==0)status=colibri_gpu_download(out_gpu,result,
+        static_cast<std::uint64_t>(outputs)*sizeof(float),0);
+    if(status==0)status=colibri_gpu_sync();
+    colibri_gpu_free(weights);colibri_gpu_free(vector);colibri_gpu_free(result);
+    if(status!=0)throw std::runtime_error("the device matvec failed");
     return 0;});}
 
 int colibri_v2_deepseek4_indexer_key(
