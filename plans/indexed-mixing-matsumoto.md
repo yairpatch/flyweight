@@ -806,16 +806,31 @@ across a whole layer, removing the crossings except for the experts. Sizing it
 from the current split of a ~170 ms token:
 
     routed experts   ~100 ms   CPU, and staying there
-    attention          37 ms   of which roughly 11 is crossings
+    attention          37 ms
     shared expert      19 ms   CPU until crossings go
     the rest           ~12 ms
 
-So the kernels are worth something like 20-25 ms, taking the token to roughly
-145 ms and 6.9 tok/s. Real but not transformative: **the experts now dominate at
-about 60% of a token**, they cannot be resident in 12 GiB, and streaming them
-over PCIe at 25 GB/s would be slower than the CPU reading them from RAM at 46.
-That is the ceiling on this box, and it is worth knowing before spending an
-afternoon on the kernels.
+**A crossing costs about five microseconds, not forty.** An earlier revision of
+this section attributed roughly 11 ms of the attention half to them. Batching a
+layer's six projections of the hidden state into one round trip cut a token from
+470 crossings to 167 and bought 1.5 ms -- which prices a crossing at five
+microseconds and shows the earlier figure was arithmetic, not measurement.
+
+So the four kernels are worth less than that estimate implied. What they remove
+is the CPU-side arithmetic between the projections, which the attribution puts
+at about 10 ms a token in total, plus whatever the remaining crossings cost --
+call it 10-15 ms, taking the token to roughly 155 ms and 6.5 tok/s. Real but
+modest: **the experts dominate at about 60% of a token**, they cannot be
+resident in 12 GiB, and streaming them over PCIe at 25 GB/s would be slower than
+the CPU reading them from RAM at 46. That is the ceiling on this box.
+
+**This laptop throttles under sustained GPU load.** Four consecutive measuring
+passes ran 53.3, 57.0, 59.4, 63.0 ms with batching off and 51.8, 55.2, 57.9,
+61.2 with it on. The clock discipline this project already records for cold
+starts has a warm end too: a fourth pass is not comparable with a first, and an
+A/B has to alternate within one process rather than across runs. Two hours were
+nearly spent chasing a "regression" that was the machine getting slower between
+runs.
 
 ### Most of the kernels already exist
 
