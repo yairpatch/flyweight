@@ -4032,7 +4032,8 @@ struct ColibriV2Deepseek4Runtime {
     std::unordered_map<std::uint64_t, std::uint64_t> resident;
     std::uint64_t gpu_input = 0, gpu_output = 0;
     std::uint64_t gpu_input_capacity = 0, gpu_output_capacity = 0;
-    std::uint64_t gpu_weight_bytes = 0, gpu_matvec_calls = 0;
+    std::uint64_t gpu_weight_bytes = 0, gpu_matvec_calls = 0, gpu_batches = 0;
+    std::uint64_t gpu_batch = 0, gpu_batch_capacity = 0;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -4228,6 +4229,7 @@ void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime){
             for(const auto& entry:runtime->resident)colibri_gpu_free(entry.second);
             if(runtime->gpu_input)colibri_gpu_free(runtime->gpu_input);
             if(runtime->gpu_output)colibri_gpu_free(runtime->gpu_output);
+            if(runtime->gpu_batch)colibri_gpu_free(runtime->gpu_batch);
         }
         delete runtime;
     }catch(...){}
@@ -4340,6 +4342,69 @@ std::uint64_t ds4_now() {
 
 // Multiply a resolved tensor by a vector. The plan holds indices, so this does
 // no lookup -- the difference from colibri_v2_matvec, which searches by name.
+// Several projections of the same vector, in one round trip.
+//
+// A layer reads its normalized hidden state through six or seven different
+// weights -- the query's low-rank half, the key/value latent, both compressors
+// and the indexer's -- and each of those was crossing separately: upload the
+// same four kilobytes, launch, download, wait. The weights they multiply do not
+// move at all, so the crossing was most of what a small projection cost.
+//
+// Uploading once, launching all of them, and waiting once at the end turns
+// six stalls into one. The launches are independent and ordered on a single
+// stream, so nothing here changes an answer.
+struct Ds4Projection {
+    std::uint64_t index;
+    float* out;
+    std::int32_t outputs;
+};
+
+void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
+                const float* input, std::int32_t inputs, float* out,
+                std::int32_t outputs);
+
+void ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
+                      std::size_t count, const float* input, std::int32_t inputs) {
+    // Off by an environment switch so the two shapes can be compared in one
+    // process: the machine's page cache and this laptop's clocks drift enough
+    // between runs to swamp the difference otherwise.
+    static const bool batching = [] {
+        const char* setting = std::getenv("COLIBRI_DS4_BATCH");
+        return !(setting && std::string(setting) == "off");
+    }();
+    bool device = rt.gpu && batching;
+    std::uint64_t total = 0;
+    for (std::size_t item = 0; device && item < count; ++item) {
+        if (rt.resident.find(batch[item].index) == rt.resident.end()) device = false;
+        total += static_cast<std::uint64_t>(batch[item].outputs) * sizeof(float);
+    }
+    const auto input_bytes = static_cast<std::uint64_t>(inputs) * sizeof(float);
+    if (!device || input_bytes > rt.gpu_input_capacity || total > rt.gpu_batch_capacity) {
+        for (std::size_t item = 0; item < count; ++item)
+            ds4_matvec(rt, batch[item].index, input, inputs, batch[item].out,
+                       batch[item].outputs);
+        return;
+    }
+    int status = colibri_gpu_upload(rt.gpu_input, input, input_bytes, 0);
+    std::uint64_t offset = 0;
+    for (std::size_t item = 0; item < count && status == 0; ++item) {
+        const auto& tensor = rt.model->tensors[batch[item].index];
+        status = ds4_gpu_matvec(tensor.type, rt.resident[batch[item].index], rt.gpu_input,
+                                rt.gpu_batch + offset, inputs, batch[item].outputs, 0);
+        offset += static_cast<std::uint64_t>(batch[item].outputs) * sizeof(float);
+    }
+    offset = 0;
+    for (std::size_t item = 0; item < count && status == 0; ++item) {
+        const auto bytes = static_cast<std::uint64_t>(batch[item].outputs) * sizeof(float);
+        status = colibri_gpu_download(batch[item].out, rt.gpu_batch + offset, bytes, 0);
+        offset += bytes;
+    }
+    if (status == 0) status = colibri_gpu_sync();
+    if (status != 0) throw std::runtime_error("a batched device matvec failed");
+    rt.gpu_matvec_calls += count;
+    ++rt.gpu_batches;
+}
+
 void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
                 const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
     const auto& model = *rt.model;
@@ -4493,8 +4558,37 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         for (std::uint32_t i = 0; i < n_embd; ++i) sc.hidden[i] *= gain[i];
     }
 
+    // Everything a layer projects from the normalized hidden state, issued
+    // together: the crossing is per round trip, not per weight, so six small
+    // projections that shared an input were paying six stalls for one upload's
+    // worth of data.
+    {
+        Ds4Projection batch[6];
+        std::size_t count = 0;
+        batch[count++] = {plan.q_a, sc.low_rank.data(), static_cast<std::int32_t>(rt.q_lora)};
+        batch[count++] = {plan.kv, sc.latent.data(), static_cast<std::int32_t>(head_dim)};
+        if (layer.ratio) {
+            const auto slot = position % layer.state_rows;
+            batch[count++] = {plan.comp_kv,
+                layer.state_values.data() + static_cast<std::size_t>(slot) * layer.state_width,
+                static_cast<std::int32_t>(layer.state_width)};
+            batch[count++] = {plan.comp_gate,
+                layer.state_scores.data() + static_cast<std::size_t>(slot) * layer.state_width,
+                static_cast<std::int32_t>(layer.state_width)};
+        }
+        if (layer.indexer_dim) {
+            const auto slot = position % layer.state_rows;
+            batch[count++] = {plan.indexer_comp_kv,
+                layer.indexer_state_values.data() + static_cast<std::size_t>(slot) * layer.indexer_width,
+                static_cast<std::int32_t>(layer.indexer_width)};
+            batch[count++] = {plan.indexer_comp_gate,
+                layer.indexer_state_scores.data() + static_cast<std::size_t>(slot) * layer.indexer_width,
+                static_cast<std::int32_t>(layer.indexer_width)};
+        }
+        ds4_matvec_batch(rt, batch, count, sc.hidden.data(), n_embd);
+    }
+
     // Query: low-rank path, per-head norm without gain, then rotate.
-    ds4_matvec(rt, plan.q_a, sc.hidden.data(), n_embd, sc.low_rank.data(), rt.q_lora);
     ds4::rms_norm(sc.low_rank.data(), rt.q_lora, rt.epsilon, sc.low_rank.data());
     {
         const float* gain = ds4_f32(model, plan.q_a_norm);
@@ -4508,8 +4602,8 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                   base, scale, false, yarn);
     }
 
-    // Key and value are the same latent, stored half precision.
-    ds4_matvec(rt, plan.kv, sc.hidden.data(), n_embd, sc.latent.data(), head_dim);
+    // Key and value are the same latent, stored half precision. Its projection
+    // went out with the batch above.
     ds4::rms_norm(sc.latent.data(), head_dim, rt.epsilon, sc.latent.data());
     {
         const float* gain = ds4_f32(model, plan.kv_a_norm);
@@ -4532,12 +4626,8 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     if (layer.indexer_dim) {
         const auto width = layer.indexer_width;
         const auto slot = position % layer.state_rows;
-        float* values = layer.indexer_state_values.data() + static_cast<std::size_t>(slot) * width;
         float* scores = layer.indexer_state_scores.data() + static_cast<std::size_t>(slot) * width;
-        ds4_matvec(rt, plan.indexer_comp_kv, sc.hidden.data(), n_embd, values,
-                   static_cast<std::int32_t>(width));
-        ds4_matvec(rt, plan.indexer_comp_gate, sc.hidden.data(), n_embd, scores,
-                   static_cast<std::int32_t>(width));
+        // The two projections were issued with the rest of the layer's above.
         const float* ape = ds4_f32(model, plan.indexer_comp_ape) +
             static_cast<std::size_t>(position % layer.ratio) * width;
         for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
@@ -4552,12 +4642,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     if (layer.ratio) {
         const auto width = layer.state_width;
         const auto slot = position % layer.state_rows;
-        float* values = layer.state_values.data() + static_cast<std::size_t>(slot) * width;
         float* scores = layer.state_scores.data() + static_cast<std::size_t>(slot) * width;
-        ds4_matvec(rt, plan.comp_kv, sc.hidden.data(), n_embd, values,
-                   static_cast<std::int32_t>(width));
-        ds4_matvec(rt, plan.comp_gate, sc.hidden.data(), n_embd, scores,
-                   static_cast<std::int32_t>(width));
         const float* ape = ds4_f32(model, plan.comp_ape) +
             static_cast<std::size_t>(position % layer.ratio) * width;
         for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
@@ -4807,6 +4892,7 @@ int colibri_v2_deepseek4_runtime_info(
     out->expert_prefetch_bytes=runtime->expert_prefetch_bytes;
     out->gpu_weight_bytes=runtime->gpu_weight_bytes;
     out->gpu_matvec_calls=runtime->gpu_matvec_calls;
+    out->gpu_batches=runtime->gpu_batches;
     out->indexer_selections=runtime->indexer_selections;
     out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
@@ -4943,8 +5029,11 @@ int colibri_v2_deepseek4_runtime_gpu(
     widest_input=std::max(widest_input,rt.heads*rt.head_dim);
     rt.gpu_input_capacity=static_cast<std::uint64_t>(widest_input)*sizeof(float);
     rt.gpu_output_capacity=static_cast<std::uint64_t>(widest_output)*sizeof(float);
+    // One batch holds every projection of the hidden state a layer makes.
+    rt.gpu_batch_capacity=8ull*rt.gpu_output_capacity;
     if(colibri_gpu_alloc(rt.gpu_input_capacity,&rt.gpu_input)!=0||
-       colibri_gpu_alloc(rt.gpu_output_capacity,&rt.gpu_output)!=0)
+       colibri_gpu_alloc(rt.gpu_output_capacity,&rt.gpu_output)!=0||
+       colibri_gpu_alloc(rt.gpu_batch_capacity,&rt.gpu_batch)!=0)
         throw std::runtime_error("out of device memory for the activation buffers");
     rt.gpu=true;
     return 0;});}

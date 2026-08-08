@@ -163,6 +163,7 @@ class _Deepseek4Info(ctypes.Structure):
         ("expert_prefetch_bytes", ctypes.c_uint64),
         ("gpu_weight_bytes", ctypes.c_uint64),
         ("gpu_matvec_calls", ctypes.c_uint64),
+        ("gpu_batches", ctypes.c_uint64),
     ]
 
 

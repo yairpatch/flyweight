@@ -290,7 +290,7 @@ typedef struct ColibriV2Deepseek4Info {
        is short enough that it selects everything. */
     uint64_t indexer_selections, indexer_candidates;
     uint64_t expert_prefetch_bytes;
-    uint64_t gpu_weight_bytes, gpu_matvec_calls;
+    uint64_t gpu_weight_bytes, gpu_matvec_calls, gpu_batches;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding
