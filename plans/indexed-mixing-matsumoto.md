@@ -484,9 +484,12 @@ Throughput is 4.5 tok/s warm in the raw loop and 3.1 through the server, against
 roughly 3 for the reference, measured after the page cache settles rather than
 cold. It drops to about 3 and 2.2 when the routed experts are paging.
 
-It now also **serves**: `colibri-next serve` starts the OpenAI/Anthropic API on
-this checkpoint, answers `/v1/chat/completions` (streaming and not), and reports
-the deepseek4 backend through `/health`. See the section below.
+It now also **serves, hybrid**: `colibri-next serve` starts the OpenAI/Anthropic
+API on this checkpoint, puts the dense half on the GPU and keeps the routed
+experts on the host, answers `/v1/chat/completions` (streaming and not), and
+reports `native-v2-deepseek4-hybrid` with its resident byte count through
+`/health`. `--backend cpu` opts out. Five successive requests at steady state:
+3.45 tok/s on the CPU, 4.22 hybrid.
 
 What is left, in the order worth doing it:
 
@@ -799,6 +802,28 @@ supply, above.
 
 Placement here is still per tensor and still has to be measured -- but the
 measurement has to be taken on a machine that is not rationing.
+
+### Serving hybrid, and where the rest of the gap is
+
+`serve` and `generate` take a backend and default to the device when there is
+one. Two things fell out of wiring it:
+
+- **A CUDA context is current per thread.** The weights upload from whichever
+  thread builds the service and the scheduler forwards from its own, where
+  nothing was current: every launch failed and every request returned a 500.
+  Invisible from a single-threaded script, which is how it survived a whole
+  round of measurement. The runtime has an explicit attach now and the test
+  drives the engine rather than the runtime.
+- **One slot only, and it says so.** The dense weights upload per runtime, so a
+  second sequence would want a second 6.3 GiB of a 12 GiB card. Sharing one
+  upload across slots is the fix; until then it refuses rather than failing
+  halfway through an allocation.
+
+Through the server: 3.45 tok/s on the CPU against 4.22 hybrid. The raw loop does
+6.4, so **roughly two tokens a second is being spent in the Python serving
+layer** -- an argmax over 129 280 floats and the event plumbing, per token --
+not in the model. That is now a bigger prize than the remaining kernels, and it
+is not on the GPU.
 
 ### What is left, and what it is worth
 
