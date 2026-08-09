@@ -103,6 +103,9 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"runtime create failed").decode(errors="replace")
             )
         self._handle = handle
+        # Native state addresses tensors through the model's mmap. Retain the
+        # owner so a standalone runtime cannot outlive and dereference it.
+        self._model = model
         self._vocabulary = int(model.config["vocabulary_size"])
         self._indexer_dim = int(model.config["indexer_key_length"])
         config = model.config
@@ -116,6 +119,13 @@ class Deepseek4Runtime:
         if getattr(self, "_handle", None):
             self._library.colibri_v2_deepseek4_runtime_free(self._handle)
             self._handle = None
+            self._model = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self): return self
 
@@ -133,6 +143,21 @@ class Deepseek4Runtime:
             )
         return out
 
+    def prefill(self, tokens) -> None:
+        """Advance a prompt chunk without materializing intermediate logits."""
+        values = np.ascontiguousarray(list(tokens), dtype=np.uint32)
+        if not values.size:
+            return
+        status = self._library.colibri_v2_deepseek4_prefill(
+            self._handle,
+            values.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            values.size,
+        )
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"prefill failed").decode(errors="replace")
+            )
+
     def generate(self, tokens, *, max_tokens: int = 32, stop=None):
         """Greedily continue `tokens`, yielding each new token id.
 
@@ -140,6 +165,11 @@ class Deepseek4Runtime:
         separate prefill path to fall out of step with this one. Stops on any id
         in `stop`, which defaults to the checkpoint's own terminators.
         """
+        tokens = list(tokens)
+        if not tokens:
+            raise ValueError("tokens must not be empty")
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
         if stop is None:
             stop = self._terminators
         stop = set(stop)
@@ -164,10 +194,14 @@ class Deepseek4Runtime:
         """
         from colibri_next.generation import GenerationStep
 
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
         if stop is None:
             stop = self._terminators
         stop = set(stop)
         prompt = list(tokens)
+        if not prompt:
+            raise ValueError("tokens must not be empty")
         produced: list[int] = []
         text = ""
         stopped = False
@@ -212,6 +246,17 @@ class Deepseek4Runtime:
             raise V2Error(
                 (self._library.colibri_v2_last_error() or b"gpu enable failed").decode(errors="replace")
             )
+
+    def share_gpu(self, owner: "Deepseek4Runtime") -> None:
+        """Use an owner's immutable weights and serialized device workspace."""
+        status = self._library.colibri_v2_deepseek4_runtime_gpu_share(
+            self._handle, owner._handle
+        )
+        if status:
+            raise V2Error(
+                (self._library.colibri_v2_last_error() or b"gpu share failed").decode(errors="replace")
+            )
+        self._gpu_owner = owner
 
     def attach_gpu(self) -> None:
         """Make this thread's CUDA context current.

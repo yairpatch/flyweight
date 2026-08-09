@@ -4020,10 +4020,10 @@ struct Deepseek4LayerState {
     std::vector<float> indexer_state_values, indexer_state_scores;
 
     std::uint64_t bytes() const {
-        return (latents.size() + compressed.size() + indexer_compressed.size())
+        return (latents.capacity() + compressed.capacity() + indexer_compressed.capacity())
                    * sizeof(std::uint16_t) +
-               (state_values.size() + state_scores.size() +
-                indexer_state_values.size() + indexer_state_scores.size()) * sizeof(float);
+               (state_values.capacity() + state_scores.capacity() +
+                indexer_state_values.capacity() + indexer_state_scores.capacity()) * sizeof(float);
     }
     // The ring holds the newest `state_rows` rows, so a row's slot is its
     // position modulo the ring size.
@@ -4037,6 +4037,7 @@ struct Deepseek4Scratch {
     std::vector<float> low_rank, query, latent, block_out, grouped;
     std::vector<float> keys, attn, derope;
     std::vector<float> state_row, gate, up, activated, expert_out, moe, logits;
+    std::vector<float> router, after, embedding, head_pre;
     std::vector<float> indexer_query, indexer_weights, indexer_scores, indexer_keys;
     std::vector<std::uint8_t> mask, indexer_keep;
     std::vector<std::int32_t> experts;
@@ -4080,6 +4081,7 @@ struct ColibriV2Deepseek4Runtime {
     // The routed experts are never in here -- 90 GiB against 12 of VRAM -- which
     // is what makes the split this model wants the opposite of the usual one.
     bool gpu = false;
+    bool gpu_owner = false;
     std::int32_t gpu_device = 0;
     std::unordered_map<std::uint64_t, std::uint64_t> resident;
     std::uint64_t gpu_input = 0, gpu_output = 0;
@@ -4087,6 +4089,7 @@ struct ColibriV2Deepseek4Runtime {
     std::uint64_t gpu_weight_bytes = 0, gpu_matvec_calls = 0, gpu_batches = 0;
     std::uint64_t gpu_batch = 0, gpu_batch_capacity = 0;
     std::uint64_t hyper_nanoseconds = 0, matvec_nanoseconds = 0;
+    std::uint64_t prefill_calls = 0, prefill_tokens = 0, prefill_nanoseconds = 0;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -4106,6 +4109,8 @@ int colibri_v2_deepseek4_runtime_create(
     if(model->config.architecture!="deepseek4")
         throw std::runtime_error("not a deepseek4 model");
     const auto& config=model->config;
+    if(config.context_length&&context_limit>config.context_length)
+        throw std::runtime_error("deepseek4 context limit exceeds the checkpoint context length");
     if(config.compress_ratios.size()<config.layer_count)
         throw std::runtime_error("compress-ratio array is shorter than the layer count");
     // One pass over the descriptors builds the name index every layer plan
@@ -4191,7 +4196,10 @@ int colibri_v2_deepseek4_runtime_create(
         layer.state_width=(overlapped?2u:1u)*head_dim;
         layer.state_rows=(overlapped?2u:1u)*layer.ratio;
         layer.block_capacity=context_limit/layer.ratio+1;
-        layer.compressed.assign(static_cast<std::size_t>(layer.block_capacity)*head_dim,0u);
+        // Compressed caches grow with the sequence. Eagerly materializing the
+        // advertised one-million-token context consumed several GiB before the
+        // first token even arrived.
+        layer.compressed.clear();
         const std::size_t rows=static_cast<std::size_t>(layer.state_rows)*layer.state_width;
         layer.state_values.assign(rows,0.0f);
         layer.state_scores.assign(rows,-std::numeric_limits<float>::infinity());
@@ -4200,8 +4208,7 @@ int colibri_v2_deepseek4_runtime_create(
             // shares the ring geometry and differs only in width.
             layer.indexer_dim=config.indexer_key_length;
             layer.indexer_width=2u*layer.indexer_dim;
-            layer.indexer_compressed.assign(
-                static_cast<std::size_t>(layer.block_capacity)*layer.indexer_dim,0u);
+            layer.indexer_compressed.clear();
             const std::size_t indexer_rows=
                 static_cast<std::size_t>(layer.state_rows)*layer.indexer_width;
             layer.indexer_state_values.assign(indexer_rows,0.0f);
@@ -4253,11 +4260,18 @@ int colibri_v2_deepseek4_runtime_create(
     sc.gate.assign(g.expert_ffn,0.0f); sc.up.assign(g.expert_ffn,0.0f);
     sc.activated.assign(g.expert_ffn,0.0f); sc.expert_out.assign(g.n_embd,0.0f);
     sc.moe.assign(g.n_embd,0.0f); sc.logits.assign(g.vocabulary,0.0f);
+    sc.router.assign(g.experts,0.0f);
+    sc.after.assign(static_cast<std::size_t>(g.hc)*g.n_embd,0.0f);
+    sc.embedding.assign(g.n_embd,0.0f); sc.head_pre.assign(g.hc,0.0f);
     sc.experts.assign(g.experts_used,0); sc.weights.assign(g.experts_used,0.0f);
     // Keys for one attention: the window plus every compressed block.
     std::uint32_t widest=0;
-    for(const auto& layer:g.layers)
-        widest=std::max(widest,layer.window+layer.block_capacity);
+    for(const auto& layer:g.layers){
+        const auto compressed = layer.indexer_dim && g.indexer_top_k
+            ? std::min(layer.block_capacity,g.indexer_top_k)
+            : layer.block_capacity;
+        widest=std::max(widest,layer.window+compressed);
+    }
     sc.keys.assign(static_cast<std::size_t>(widest)*g.head_dim,0.0f);
     sc.mask.assign(widest,0);
     // The indexer's scratch: one query per head, one weight per head, and a
@@ -4270,7 +4284,6 @@ int colibri_v2_deepseek4_runtime_create(
         sc.indexer_weights.assign(g.indexer_heads,0.0f);
         sc.indexer_scores.assign(blocks,0.0f);
         sc.indexer_keep.assign(blocks,0);
-        sc.indexer_keys.assign(static_cast<std::size_t>(blocks)*g.indexer_dim,0.0f);
     }
 
     *out=runtime.release();
@@ -4278,7 +4291,7 @@ int colibri_v2_deepseek4_runtime_create(
 
 void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime){
     try{
-        if(runtime&&runtime->gpu){
+        if(runtime&&runtime->gpu_owner){
             for(const auto& entry:runtime->resident)colibri_gpu_free(entry.second);
             if(runtime->gpu_input)colibri_gpu_free(runtime->gpu_input);
             if(runtime->gpu_output)colibri_gpu_free(runtime->gpu_output);
@@ -4695,6 +4708,8 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
             static_cast<std::size_t>(position % layer.ratio) * width;
         for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
         if ((position + 1) % layer.ratio == 0 && layer.blocks < layer.block_capacity) {
+            layer.indexer_compressed.resize(
+                (static_cast<std::size_t>(layer.blocks)+1)*layer.indexer_dim);
             ds4_close_block(rt, layer, layer.blocks, layer.indexer_dim, width,
                             layer.indexer_state_values, layer.indexer_state_scores,
                             plan.indexer_comp_norm, layer.indexer_compressed);
@@ -4710,6 +4725,8 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
             static_cast<std::size_t>(position % layer.ratio) * width;
         for (std::uint32_t i = 0; i < width; ++i) scores[i] += ape[i];
         if ((position + 1) % layer.ratio == 0 && layer.blocks < layer.block_capacity) {
+            layer.compressed.resize(
+                (static_cast<std::size_t>(layer.blocks)+1)*head_dim);
             ds4_close_block(rt, layer, layer.blocks, head_dim, width,
                             layer.state_values, layer.state_scores,
                             plan.comp_norm, layer.compressed);
@@ -4749,15 +4766,23 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
             1.0f / std::sqrt(static_cast<float>(indexer_dim * rt.indexer_heads));
         for (std::uint32_t head = 0; head < rt.indexer_heads; ++head)
             sc.indexer_weights[head] *= scale_weights;
-        for (std::uint32_t block = 0; block < visible_blocks; ++block) {
-            const std::uint16_t* stored = layer.indexer_compressed.data() +
+        // Score directly from the half cache. Expanding every candidate into a
+        // context-sized float scratch buffer added another ~128 MiB at 1M.
+#pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
+        for (std::int64_t block = 0; block < static_cast<std::int64_t>(visible_blocks); ++block) {
+            const std::uint16_t* key = layer.indexer_compressed.data() +
                 static_cast<std::size_t>(block) * indexer_dim;
-            float* target = sc.indexer_keys.data() + static_cast<std::size_t>(block) * indexer_dim;
-            for (std::uint32_t i = 0; i < indexer_dim; ++i) target[i] = ds4::half_value(stored[i]);
+            double total = 0.0;
+            for (std::uint32_t head = 0; head < rt.indexer_heads; ++head) {
+                const float* query = sc.indexer_query.data() +
+                    static_cast<std::size_t>(head) * indexer_dim;
+                double dot = 0.0;
+                for (std::uint32_t i = 0; i < indexer_dim; ++i)
+                    dot += static_cast<double>(query[i]) * ds4::half_value(key[i]);
+                if (dot > 0.0) total += dot * sc.indexer_weights[head];
+            }
+            sc.indexer_scores[static_cast<std::size_t>(block)] = static_cast<float>(total);
         }
-        ds4::indexer_scores(sc.indexer_query.data(), sc.indexer_keys.data(),
-                            sc.indexer_weights.data(), rt.indexer_heads, indexer_dim,
-                            visible_blocks, sc.indexer_scores.data());
         ds4::top_k_select(sc.indexer_scores.data(), visible_blocks, rt.indexer_top_k,
                           sc.indexer_keep.data());
         rt.indexer_selections += rt.indexer_top_k;
@@ -4861,8 +4886,8 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     }
 
     rt.hyper_nanoseconds += ds4_now() - hyper_ffn_started;
-    std::vector<float> router(rt.experts, 0.0f);
-    ds4_matvec(rt, plan.gate_inp, sc.hidden.data(), n_embd, router.data(), rt.experts);
+    std::fill(sc.router.begin(),sc.router.end(),0.0f);
+    ds4_matvec(rt, plan.gate_inp, sc.hidden.data(), n_embd, sc.router.data(), rt.experts);
     const bool hashed = index < rt.hash_layers;
     if (hashed) {
         const auto* table = reinterpret_cast<const std::int32_t*>(
@@ -4870,7 +4895,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         std::copy_n(table + static_cast<std::size_t>(token) * rt.experts_used,
                     rt.experts_used, sc.experts.begin());
     }
-    ds4::moe_router(router.data(), hashed ? nullptr : ds4_f32(model, plan.exp_probs_b),
+    ds4::moe_router(sc.router.data(), hashed ? nullptr : ds4_f32(model, plan.exp_probs_b),
                     rt.experts, rt.experts_used, rt.weight_scale, 1e-20f, !hashed,
                     sc.experts.data(), sc.weights.data());
 
@@ -4923,10 +4948,9 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     for (std::uint32_t i = 0; i < n_embd; ++i) sc.moe[i] += sc.expert_out[i];
     rt.shared_expert_nanoseconds += ds4_now() - shared_started;
 
-    std::vector<float> after(static_cast<std::size_t>(hc) * n_embd, 0.0f);
     ds4::hyper_connection_combine(sc.moe.data(), out_streams, sc.post.data(), sc.comb.data(),
-                                  n_embd, hc, after.data());
-    std::copy(after.begin(), after.end(), out_streams);
+                                  n_embd, hc, sc.after.data());
+    std::copy(sc.after.begin(), sc.after.end(), out_streams);
 }
 
 }  // namespace
@@ -4960,6 +4984,9 @@ int colibri_v2_deepseek4_runtime_info(
     out->gpu_batches=runtime->gpu_batches;
     out->hyper_nanoseconds=runtime->hyper_nanoseconds;
     out->matvec_nanoseconds=runtime->matvec_nanoseconds;
+    out->prefill_calls=runtime->prefill_calls;
+    out->prefill_tokens=runtime->prefill_tokens;
+    out->prefill_nanoseconds=runtime->prefill_nanoseconds;
     out->indexer_selections=runtime->indexer_selections;
     out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
@@ -4986,12 +5013,11 @@ int colibri_v2_deepseek4_forward(
     // Every stream starts as a copy of the embedding.
     {
         const auto& tensor=model.tensors[rt.token_embd];
-        std::vector<float> row(rt.n_embd,0.0f);
-        if(colibri_v2_qwen_embedding(&model,token,row.data(),
+        if(colibri_v2_qwen_embedding(&model,token,sc.embedding.data(),
                static_cast<std::int32_t>(rt.n_embd))!=0)
             throw std::runtime_error("cannot read the token embedding");
         for(std::uint32_t stream=0;stream<rt.hc;++stream)
-            std::copy(row.begin(),row.end(),
+            std::copy(sc.embedding.begin(),sc.embedding.end(),
                       sc.streams.begin()+static_cast<std::size_t>(stream)*rt.n_embd);
     }
 
@@ -5003,10 +5029,9 @@ int colibri_v2_deepseek4_forward(
 
     if(logits){
         const auto head_started=ds4_now();
-        std::vector<float> pre(rt.hc,0.0f);
         ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
             ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),
-            rt.n_embd,rt.hc,rt.epsilon,rt.epsilon,pre.data(),sc.collapsed.data());
+            rt.n_embd,rt.hc,rt.epsilon,rt.epsilon,sc.head_pre.data(),sc.collapsed.data());
         ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
         const float* gain=ds4_f32(model,rt.output_norm);
         for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=gain[i];
@@ -5016,6 +5041,22 @@ int colibri_v2_deepseek4_forward(
     }
     ++rt.forward_calls;
     rt.forward_nanoseconds+=ds4_now()-forward_started;
+    return 0;});}
+
+int colibri_v2_deepseek4_prefill(
+    ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count
+){return guarded([&]{
+    if(!runtime||(!tokens&&count))throw std::runtime_error("invalid prefill arguments");
+    const auto started=ds4_now();
+    for(uint32_t index=0;index<count;++index){
+        if(colibri_v2_deepseek4_forward(runtime,tokens[index],nullptr)!=0){
+            const char* error=colibri_v2_last_error();
+            throw std::runtime_error(error?error:"deepseek4 prefill failed");
+        }
+    }
+    ++runtime->prefill_calls;
+    runtime->prefill_tokens+=count;
+    runtime->prefill_nanoseconds+=ds4_now()-started;
     return 0;});}
 
 // Put one checkpoint tensor through the GPU and report how far the answer
@@ -5075,20 +5116,35 @@ int colibri_v2_deepseek4_runtime_gpu(
     wanted.erase(std::unique(wanted.begin(),wanted.end()),wanted.end());
 
     std::uint32_t widest_input=0,widest_output=0;
+    std::unordered_map<std::uint64_t,std::uint64_t> resident;
+    std::uint64_t weight_bytes=0,input_buffer=0,output_buffer=0,batch_buffer=0;
+    // Device allocation has several failure points. Keep ownership local until
+    // the complete set is usable so a failed enable neither leaks VRAM nor
+    // leaves a half-populated runtime that cannot safely be retried.
+    auto release_pending=[&]{
+        for(const auto& entry:resident)colibri_gpu_free(entry.second);
+        if(input_buffer)colibri_gpu_free(input_buffer);
+        if(output_buffer)colibri_gpu_free(output_buffer);
+        if(batch_buffer)colibri_gpu_free(batch_buffer);
+        resident.clear(); input_buffer=output_buffer=batch_buffer=0;
+    };
     for(const auto index:wanted){
         const auto& tensor=rt.model->tensors[index];
         // Only what there is a device matvec for; anything else stays on the
         // CPU rather than being uploaded and never used.
         if(tensor.type!=8&&tensor.type!=14&&tensor.type!=30)continue;
         std::uint64_t pointer=0;
-        if(colibri_gpu_alloc(tensor.size,&pointer)!=0)
+        if(colibri_gpu_alloc(tensor.size,&pointer)!=0){
+            release_pending();
             throw std::runtime_error("out of device memory for the dense weights");
+        }
         if(colibri_gpu_upload_sync(pointer,tensor_data(*rt.model,tensor),tensor.size)!=0){
             colibri_gpu_free(pointer);
+            release_pending();
             throw std::runtime_error("failed to upload a dense weight");
         }
-        rt.resident.emplace(index,pointer);
-        rt.gpu_weight_bytes+=tensor.size;
+        resident.emplace(index,pointer);
+        weight_bytes+=tensor.size;
         const auto rows=tensor.shape.size()>0?tensor.shape[0]:0;
         std::uint64_t columns=1;
         for(std::size_t axis=1;axis<tensor.shape.size();++axis)columns*=tensor.shape[axis];
@@ -5100,15 +5156,43 @@ int colibri_v2_deepseek4_runtime_gpu(
     // buffer is sized for the largest thing that actually crosses rather than
     // for the largest weight.
     widest_input=std::max(widest_input,rt.heads*rt.head_dim);
-    rt.gpu_input_capacity=static_cast<std::uint64_t>(widest_input)*sizeof(float);
-    rt.gpu_output_capacity=static_cast<std::uint64_t>(widest_output)*sizeof(float);
+    const auto input_capacity=static_cast<std::uint64_t>(widest_input)*sizeof(float);
+    const auto output_capacity=static_cast<std::uint64_t>(widest_output)*sizeof(float);
     // One batch holds every projection of the hidden state a layer makes.
-    rt.gpu_batch_capacity=8ull*rt.gpu_output_capacity;
-    if(colibri_gpu_alloc(rt.gpu_input_capacity,&rt.gpu_input)!=0||
-       colibri_gpu_alloc(rt.gpu_output_capacity,&rt.gpu_output)!=0||
-       colibri_gpu_alloc(rt.gpu_batch_capacity,&rt.gpu_batch)!=0)
+    const auto batch_capacity=8ull*output_capacity;
+    if(colibri_gpu_alloc(input_capacity,&input_buffer)!=0||
+       colibri_gpu_alloc(output_capacity,&output_buffer)!=0||
+       colibri_gpu_alloc(batch_capacity,&batch_buffer)!=0){
+        release_pending();
         throw std::runtime_error("out of device memory for the activation buffers");
+    }
+    rt.resident=std::move(resident);
+    rt.gpu_weight_bytes=weight_bytes;
+    rt.gpu_input=input_buffer; rt.gpu_output=output_buffer; rt.gpu_batch=batch_buffer;
+    rt.gpu_input_capacity=input_capacity; rt.gpu_output_capacity=output_capacity;
+    rt.gpu_batch_capacity=batch_capacity;
+    input_buffer=output_buffer=batch_buffer=0;
     rt.gpu=true;
+    rt.gpu_owner=true;
+    return 0;});}
+
+int colibri_v2_deepseek4_runtime_gpu_share(
+    ColibriV2Deepseek4Runtime* runtime,const ColibriV2Deepseek4Runtime* owner
+){return guarded([&]{
+    if(!runtime||!owner||!owner->gpu)
+        throw std::runtime_error("a GPU-enabled owner runtime is required");
+    if(runtime->gpu)throw std::runtime_error("runtime already has a GPU workspace");
+    if(runtime->model!=owner->model||runtime->n_embd!=owner->n_embd||
+       runtime->heads!=owner->heads||runtime->vocabulary!=owner->vocabulary)
+        throw std::runtime_error("GPU workspace owner is incompatible");
+    runtime->gpu=true; runtime->gpu_owner=false; runtime->gpu_device=owner->gpu_device;
+    runtime->resident=owner->resident;
+    runtime->gpu_input=owner->gpu_input; runtime->gpu_output=owner->gpu_output;
+    runtime->gpu_batch=owner->gpu_batch;
+    runtime->gpu_input_capacity=owner->gpu_input_capacity;
+    runtime->gpu_output_capacity=owner->gpu_output_capacity;
+    runtime->gpu_batch_capacity=owner->gpu_batch_capacity;
+    runtime->gpu_weight_bytes=owner->gpu_weight_bytes;
     return 0;});}
 
 // Make this thread's CUDA context current.

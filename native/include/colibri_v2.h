@@ -292,6 +292,7 @@ typedef struct ColibriV2Deepseek4Info {
     uint64_t expert_prefetch_bytes;
     uint64_t gpu_weight_bytes, gpu_matvec_calls, gpu_batches;
     uint64_t hyper_nanoseconds, matvec_nanoseconds;
+    uint64_t prefill_calls, prefill_tokens, prefill_nanoseconds;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding
@@ -305,6 +306,11 @@ COLIBRI_V2_API int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime*
    NULL for prompt tokens whose distribution is not wanted. */
 COLIBRI_V2_API int colibri_v2_deepseek4_forward(ColibriV2Deepseek4Runtime* runtime,
     uint32_t token, float* logits);
+/* Feed a contiguous prompt chunk without producing intermediate logits. This
+   keeps the cross-language scheduler out of the per-token loop and is the ABI
+   used by progressively wider native prefill implementations. */
+COLIBRI_V2_API int colibri_v2_deepseek4_prefill(ColibriV2Deepseek4Runtime* runtime,
+    const uint32_t* tokens, uint32_t count);
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_info(const ColibriV2Deepseek4Runtime* runtime,
     ColibriV2Deepseek4Info* out);
 /* Round-trip a float through half precision, as the caches store it. */
@@ -327,6 +333,10 @@ COLIBRI_V2_API int colibri_v2_deepseek4_visible_keys(int32_t position, int32_t r
    The routed experts stay on the CPU: they are 90 GiB against 12 of VRAM. */
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_gpu(ColibriV2Deepseek4Runtime* runtime,
     int32_t device);
+/* Borrow immutable device weights and the serialized scheduler workspace from
+   another runtime. The owner must outlive the borrower. */
+COLIBRI_V2_API int colibri_v2_deepseek4_runtime_gpu_share(
+    ColibriV2Deepseek4Runtime* runtime, const ColibriV2Deepseek4Runtime* owner);
 /* Make the calling thread's CUDA context current. Needed once per thread that
    drives a runtime whose weights were uploaded from another. */
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_gpu_attach(

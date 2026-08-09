@@ -24,6 +24,7 @@ from colibri_next.server import (
     create_handler,
     _is_decode_event,
     _parse_tool_calls,
+    _split_reasoning_content,
 )
 
 
@@ -253,6 +254,16 @@ class TruncatedToolStubGenerator(StubGenerator):
 
 
 class ToolCallParsingTests(unittest.TestCase):
+    def test_splits_deepseek_reasoning_from_visible_content(self) -> None:
+        visible, reasoning = _split_reasoning_content(
+            "<think>considering options</think>final answer"
+        )
+        self.assertEqual(visible, "final answer")
+        self.assertEqual(reasoning, "considering options")
+
+    def test_strips_non_thinking_protocol_close(self) -> None:
+        self.assertEqual(_split_reasoning_content("</think>answer"), ("answer", None))
+
     def test_parses_hermes_xml_format(self) -> None:
         content, calls = _parse_tool_calls(
             "sure\n<tool_call>\n<function=get_weather>\n"
@@ -351,6 +362,29 @@ class ToolCallParsingTests(unittest.TestCase):
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
         )
+
+    def test_parses_deepseek_dsml_with_multiple_invocations(self) -> None:
+        content, calls = _parse_tool_calls(
+            "thinking\n<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="weather">\n'
+            '<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>\n'
+            '</｜DSML｜invoke>\n'
+            '<｜DSML｜invoke name="notify">\n'
+            '<｜DSML｜parameter name="urgent" string="false">true</｜DSML｜parameter>\n'
+            '</｜DSML｜invoke>\n</｜DSML｜tool_calls>'
+        )
+        self.assertEqual(content, "thinking")
+        self.assertEqual([call["function"]["name"] for call in calls], ["weather", "notify"])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Paris", "days": 3})
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"]), {"urgent": True})
+
+    def test_truncated_deepseek_dsml_does_not_leak_markup(self) -> None:
+        content, calls = _parse_tool_calls(
+            'clean\n<｜DSML｜tool_calls><｜DSML｜invoke name="weather">'
+        )
+        self.assertEqual(content, "clean")
+        self.assertEqual(calls, [])
 
     def test_schema_restores_string_ids_from_unquoted_hermes_values(self) -> None:
         tools = [

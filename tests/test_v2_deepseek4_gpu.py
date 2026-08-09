@@ -198,13 +198,17 @@ class HybridServiceTests(unittest.TestCase):
         })["choices"][0]["message"]["content"]
         self.assertIn("Paris", reply)
 
-    def test_more_than_one_slot_is_refused_rather_than_half_allocated(self):
+    def test_multiple_slots_share_one_dense_weight_upload(self):
         from colibri_next.deepseek4_server import NativeDeepseek4InferenceService
 
-        with self.assertRaises(ValueError):
-            NativeDeepseek4InferenceService(
-                CHECKPOINT, context_window=512, device=0, parallel_sequences=2
-            )
+        service = NativeDeepseek4InferenceService(
+            CHECKPOINT, context_window=512, device=0, parallel_sequences=2
+        )
+        self.addCleanup(service.close)
+        runtimes = [slot.runtime for slot in service.generator.engine._pool]
+        self.assertEqual(runtimes[0].info["gpu_weight_bytes"],
+                         runtimes[1].info["gpu_weight_bytes"])
+        self.assertGreater(runtimes[0].info["gpu_weight_bytes"], 4 * 1024**3)
 
 
 if __name__ == "__main__":

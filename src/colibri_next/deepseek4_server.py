@@ -156,21 +156,13 @@ class Deepseek4Engine:
     ):
         if slots <= 0:
             raise ValueError("slots must be positive")
-        if device is not None and slots > 1:
-            # The dense weights are uploaded per runtime today, so a second
-            # slot would want a second 6.3 GiB of a 12 GiB card. Sharing one
-            # upload across slots is the fix; refusing is what keeps this from
-            # failing halfway through an allocation instead.
-            raise ValueError(
-                "the device path uploads its weights per sequence, so it "
-                "supports one slot; use --parallel 1 or run on the CPU"
-            )
         self.context_limit = int(context_limit)
         self.device = device
         self._slots = [Deepseek4Runtime(model, context_limit) for _ in range(slots)]
         if device is not None:
-            for runtime in self._slots:
-                runtime.use_gpu(device)
+            self._slots[0].use_gpu(device)
+            for runtime in self._slots[1:]:
+                runtime.share_gpu(self._slots[0])
         self._pool = [_Slot(runtime) for runtime in self._slots]
         self._lock = threading.Lock()
         self._tasks: OrderedDict[int, _Task] = OrderedDict()
@@ -197,6 +189,8 @@ class Deepseek4Engine:
         prompt = [int(token) for token in prompt_ids]
         if not prompt:
             raise ValueError("prompt must not be empty")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
         needed = len(prompt) + max_new_tokens
         if needed > self.context_limit:
             raise ValueError(
@@ -254,7 +248,10 @@ class Deepseek4Engine:
                     "was abandoned rather than free state a thread still reads"
                 )
         if not already:
-            for runtime in self._slots:
+            # Borrowers hold the owner's device pointers; destroy them first so
+            # that ownership order remains explicit even though teardown no
+            # longer forwards work.
+            for runtime in reversed(self._slots):
                 runtime.close()
 
     # -- scheduling -------------------------------------------------------
@@ -353,9 +350,9 @@ class Deepseek4Engine:
         # first thing generation needs.
         if task.fed < len(task.prompt) - 1:
             end = min(task.fed + self._PREFILL_CHUNK, len(task.prompt) - 1)
-            for index in range(task.fed, end):
-                slot.runtime.forward(task.prompt[index], logits=False)
-                slot.tokens.append(task.prompt[index])
+            chunk = task.prompt[task.fed:end]
+            slot.runtime.prefill(chunk)
+            slot.tokens.extend(chunk)
             task.fed = end
             self._emit(task, ("prefill", task.fed))
             return True
@@ -379,9 +376,24 @@ class Deepseek4Engine:
     def _run(self) -> None:
         # The weights were uploaded from whichever thread built the engine, and
         # a CUDA context is current per thread.
-        if self.device is not None:
-            for slot in self._pool:
-                slot.runtime.attach_gpu()
+        try:
+            if self.device is not None:
+                for slot in self._pool:
+                    slot.runtime.attach_gpu()
+        except Exception as error:
+            # Initialization happens on the worker because CUDA contexts are
+            # current per thread.  It must still follow the same terminal-event
+            # contract as a failed forward; otherwise every caller blocks on an
+            # event queue whose only producer has exited.
+            with self._lock:
+                tasks = list(self._tasks.values())
+                self._tasks.clear()
+            for task in tasks:
+                task.cancelled = True
+                self._replace_with_error(
+                    task.queue, f"deepseek4 engine initialization failed: {error}"
+                )
+            return
         while True:
             with self._lock:
                 if self._closing:
@@ -475,7 +487,7 @@ def _reject_unsupported(options: Mapping[str, object]) -> None:
         raise ValueError(
             "the DeepSeek-V4 runtime does not support "
             + ", ".join(sorted(requested))
-            + " yet; it runs on the CPU with half-precision caches"
+            + " yet; it uses its dedicated CPU/hybrid runtime with half-precision caches"
         )
 
 
@@ -484,7 +496,9 @@ class NativeDeepseek4InferenceService(InferenceService):
 
     With `device` set it runs hybrid: the dense half of the model -- 6.3 GiB,
     read in full on every token -- is resident on the GPU, and the routed
-    experts stay on the CPU because they are 90 GiB. The other runtime knobs the
+    experts stay on the CPU because they are 90 GiB. Immutable device weights
+    and the serialized activation workspace are shared by all sequence slots.
+    The other runtime knobs the
     Qwen service accepts (GPU cache, expert placement, KV quantization, MTP
     drafts) still have no counterpart here, and are rejected rather than
     accepted and ignored.

@@ -430,7 +430,9 @@ class NativeV2Tokenizer:
                 content = message["content"]
                 if role not in ("system", "developer", "user", "assistant", "tool"):
                     raise ValueError(f"unsupported chat role: {role}")
-                if not content.strip():
+                if not content.strip() and not (
+                    role == "assistant" and message.get("tool_calls")
+                ):
                     raise ValueError("chat message content must not be empty")
                 # Some tokenizer.chat_template variants access tool_calls
                 # unconditionally instead of guarding it with ``is defined``.
@@ -439,7 +441,13 @@ class NativeV2Tokenizer:
                 # here to preserve that rendered representation while matching
                 # the message shape expected by those templates.
                 normalized.append(
-                    {"role": role, "content": content, "tool_calls": []}
+                    {
+                        "role": role,
+                        "content": content,
+                        "tool_calls": message.get("tool_calls", []),
+                        "reasoning_content": message.get("reasoning_content", ""),
+                        "tools": message.get("tools", []),
+                    }
                 )
             return compiled_template.render(
                 messages=normalized,
@@ -461,7 +469,8 @@ class NativeV2Tokenizer:
             content = message["content"].strip()
             if role not in ("system", "developer", "user", "assistant", "tool"):
                 raise ValueError(f"unsupported chat role: {role}")
-            if not content:
+            tool_calls = message.get("tool_calls", [])
+            if not content and not (role == "assistant" and tool_calls):
                 raise ValueError("chat message content must not be empty")
             if role == "assistant" and not content.startswith("<think>"):
                 thinking_prefix = (
@@ -551,7 +560,8 @@ class NativeV2Tokenizer:
             if role == "system" or index in dropped:
                 continue
             content = message["content"].strip()
-            if not content:
+            tool_calls = message.get("tool_calls", [])
+            if not content and not (role == "assistant" and tool_calls):
                 raise ValueError("chat message content must not be empty")
             if role in ("user", "tool"):
                 sections.append("\n\n" if in_user else "<｜User｜>")
@@ -575,12 +585,36 @@ class NativeV2Tokenizer:
                 # moved past; ours never carries any, so a kept one is an empty
                 # block and a dropped one leaves just the closing tag.
                 keeps_reasoning = enable_thinking and index > last_user
+                reasoning = str(message.get("reasoning_content", "") or "")
                 if follows_user:
                     sections.append("<｜Assistant｜>")
-                    sections.append("<think></think>" if keeps_reasoning else "</think>")
+                    sections.append(
+                        f"<think>{reasoning}</think>" if keeps_reasoning else "</think>"
+                    )
                 elif keeps_reasoning:
-                    sections.append("</think>")
-                sections.append(f"{content}<｜end▁of▁sentence｜>")
+                    sections.append(f"{reasoning}</think>")
+                sections.append(content)
+                if tool_calls:
+                    sections.append("\n\n<｜DSML｜tool_calls>\n")
+                    for call in tool_calls:
+                        function = call["function"]
+                        arguments = function.get("arguments", {})
+                        if isinstance(arguments, str):
+                            arguments = json.loads(arguments)
+                        sections.append(f'<｜DSML｜invoke name="{function["name"]}">\n')
+                        for key, value in arguments.items():
+                            string = isinstance(value, str)
+                            rendered = value if string else json.dumps(
+                                value, ensure_ascii=False, separators=(",", ":")
+                            )
+                            sections.append(
+                                f'<｜DSML｜parameter name="{key}" '
+                                f'string="{str(string).lower()}">{rendered}'
+                                f'</｜DSML｜parameter>\n'
+                            )
+                        sections.append("</｜DSML｜invoke>\n")
+                    sections.append("</｜DSML｜tool_calls>")
+                sections.append("<｜end▁of▁sentence｜>")
             else:
                 raise ValueError(f"unsupported chat role: {role}")
         sections.append(f"<｜Assistant｜>{opening}")

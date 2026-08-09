@@ -383,9 +383,9 @@ def _benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
-# Knobs that select GPU placement, expert paging, KV quantization or MTP
-# drafting. The DeepSeek-V4 path runs on the CPU with half-precision caches and
-# honours none of them, so setting one is reported rather than ignored.
+# Knobs for Qwen-specific placement, paging, KV formats or drafting. DeepSeek-V4
+# has its own CPU/hybrid placement and half-precision compressed state, so these
+# are reported rather than accepted and ignored.
 _DEEPSEEK4_UNSUPPORTED = (
     "gpu_cache_mib", "expert_mode", "hybrid_prefill",
     "expert_residency", "dense_requant", "mtp_drafts", "mtp_model",
@@ -429,7 +429,7 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
         raise SystemExit(
             "the DeepSeek-V4 runtime does not support "
             + ", ".join("--" + name.replace("_", "-") for name in sorted(requested))
-            + " yet; it runs on the CPU with half-precision caches"
+            + " yet; it uses its dedicated CPU/hybrid runtime with half-precision caches"
         )
     # The dense half goes to the GPU when there is one and nothing said
     # otherwise; the routed experts stay on the CPU whatever happens, because
@@ -446,11 +446,6 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
             device = int(getattr(args, "device", 0) or 0)
         elif backend == "cuda":
             raise SystemExit("no CUDA device is available")
-    if device is not None and getattr(args, "parallel_sequences", 1) > 1:
-        raise SystemExit(
-            "the DeepSeek-V4 device path uploads its weights per sequence, so "
-            "it serves one at a time; use --parallel 1 or --backend cpu"
-        )
     return NativeDeepseek4InferenceService(
         args.model,
         device=device,

@@ -78,12 +78,12 @@ class Deepseek4RuntimeTests(unittest.TestCase):
             self.assertEqual(info["context_limit"], 4096)
             self.assertEqual(info["positions"], 0)
 
-    def test_the_state_matches_the_design_arithmetic(self):
+    def test_compressed_state_is_allocated_lazily(self):
         for context in (1024, 4096, 32768):
             with self.subTest(context=context):
                 with Deepseek4Runtime(self.model, context) as runtime:
                     expected = _expected_bytes(self.model.config, self.ratios, context)
-                    self.assertEqual(runtime.info["state_bytes"], expected)
+                    self.assertLess(runtime.info["state_bytes"], expected)
 
     def test_the_state_is_negligible_beside_the_weights(self):
         # Tens of megabytes against 104 GiB, which is what makes cache
@@ -95,14 +95,10 @@ class Deepseek4RuntimeTests(unittest.TestCase):
             self.assertGreater(megabytes, 1)
 
     def test_raw_state_does_not_grow_with_context(self):
-        # Only the compressed caches scale. Quadrupling the context must not
-        # quadruple the total, because the window and compressor rings are
-        # fixed.
+        # Before tokens close blocks only fixed window/compressor rings exist.
         with Deepseek4Runtime(self.model, 4096) as small:
             with Deepseek4Runtime(self.model, 16384) as large:
-                self.assertLess(
-                    large.info["state_bytes"], 4 * small.info["state_bytes"]
-                )
+                self.assertEqual(large.info["state_bytes"], small.info["state_bytes"])
 
     def test_reset_clears_the_positions(self):
         with Deepseek4Runtime(self.model, 1024) as runtime:

@@ -26,6 +26,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -145,6 +146,9 @@ class EngineTests(unittest.TestCase):
         # The first report is read as the count served from cache, so on a
         # cold slot it has to be zero rather than the first chunk.
         self.assertEqual(prefill[0], 0)
+        info = engine._pool[0].runtime.info
+        self.assertEqual(info["prefill_tokens"], 3)
+        self.assertGreaterEqual(info["prefill_calls"], 1)
 
     def test_the_first_prefill_report_is_the_reused_prefix(self):
         engine = self.engine()
@@ -226,6 +230,23 @@ class EngineTests(unittest.TestCase):
     def test_an_empty_prompt_is_refused(self):
         with self.assertRaises(ValueError):
             self.engine().submit([], 4, ())
+
+    def test_a_non_positive_generation_limit_is_refused(self):
+        for limit in (0, -1):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                self.engine().submit([5, 6], limit, ())
+
+    def test_a_worker_gpu_attach_failure_reaches_the_request(self):
+        engine = self.engine()
+        engine.device = 0
+        with patch(
+            "colibri_next.deepseek4.Deepseek4Runtime.attach_gpu",
+            side_effect=RuntimeError("attach failed"),
+        ):
+            _, queue = engine.submit([5, 6], 1, ())
+            event = queue.get(timeout=5)
+        self.assertEqual(event[0], "error")
+        self.assertIn("initialization failed", str(event[1]))
 
     def test_two_requests_interleave_on_two_slots(self):
         engine = self.engine(slots=2)

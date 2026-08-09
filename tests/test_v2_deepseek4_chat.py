@@ -114,6 +114,33 @@ class Deepseek4TemplateTests(unittest.TestCase):
             ], enable_thinking=True),
         )
 
+    def test_reasoning_content_is_preserved_on_the_live_assistant_turn(self):
+        self.assertIn(
+            "<think>why</think>answer",
+            render([
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer", "reasoning_content": "why"},
+            ], enable_thinking=True),
+        )
+
+    def test_structured_tool_history_renders_as_dsml(self):
+        rendered = render([
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"city":"Paris","days":3}',
+                    }
+                }],
+            },
+        ])
+        self.assertIn('<｜DSML｜invoke name="weather">', rendered)
+        self.assertIn('name="city" string="true">Paris', rendered)
+        self.assertIn('name="days" string="false">3', rendered)
+
     def test_thinking_drops_a_developer_turn_the_conversation_moved_past(self):
         rendered = render([
             {"role": "developer", "content": "gone"},

@@ -166,6 +166,9 @@ class _Deepseek4Info(ctypes.Structure):
         ("gpu_batches", ctypes.c_uint64),
         ("hyper_nanoseconds", ctypes.c_uint64),
         ("matvec_nanoseconds", ctypes.c_uint64),
+        ("prefill_calls", ctypes.c_uint64),
+        ("prefill_tokens", ctypes.c_uint64),
+        ("prefill_nanoseconds", ctypes.c_uint64),
     ]
 
 
@@ -523,6 +526,10 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.c_uint32, _float_p,
                 ]
                 lib.colibri_v2_deepseek4_forward.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_prefill.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+                ]
+                lib.colibri_v2_deepseek4_prefill.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_runtime_info.argtypes = [
                     ctypes.c_void_p, ctypes.POINTER(_Deepseek4Info),
                 ]
@@ -547,6 +554,10 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.c_int32,
                 ]
                 lib.colibri_v2_deepseek4_runtime_gpu.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_runtime_gpu_share.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                ]
+                lib.colibri_v2_deepseek4_runtime_gpu_share.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_gpu_matvec_check.argtypes = [
                     ctypes.c_void_p, ctypes.c_char_p, _float_p, ctypes.c_int32,
                     ctypes.c_int32, _float_p, _float_p, ctypes.c_int32,

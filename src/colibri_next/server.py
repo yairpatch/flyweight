@@ -95,6 +95,19 @@ TOOL_PARAMETER_PATTERN = re.compile(
 # after that newline, where it is the closing tag's indentation.
 TOOL_PARAMETER_LEAD = re.compile(r"\A\r?\n")
 TOOL_PARAMETER_TAIL = re.compile(r"\r?\n[ \t]*\Z")
+DSML_TOOL_CALL_MARKER = "<｜DSML｜tool_calls>"
+DSML_TOOL_CALL_END_MARKER = "</｜DSML｜tool_calls>"
+DSML_TOOL_CALL_BLOCK_PATTERN = re.compile(
+    r"<｜DSML｜tool_calls>\s*(.*?)\s*</｜DSML｜tool_calls>", re.DOTALL
+)
+DSML_INVOKE_PATTERN = re.compile(
+    r'<｜DSML｜invoke\s+name="([^"]+)">\s*(.*?)\s*</｜DSML｜invoke>', re.DOTALL
+)
+DSML_PARAMETER_PATTERN = re.compile(
+    r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)">'
+    r'(.*?)</｜DSML｜parameter>', re.DOTALL
+)
+THINKING_BLOCK_PATTERN = re.compile(r"\A\s*<think>(.*?)</think>\s*", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -668,7 +681,9 @@ class InferenceService:
         chat_payload = _anthropic_to_chat_payload(
             {**payload, "max_tokens": payload.get("max_tokens", 1)}
         )
-        messages, _ = _chat_messages(chat_payload)
+        messages, _ = _chat_messages(
+            chat_payload, architecture=getattr(self.generator.tokenizer, "architecture", None)
+        )
         tokens = self.generator.tokenizer.encode_messages(
             messages,
             enable_thinking=_boolean_option(
@@ -1195,7 +1210,9 @@ class InferenceService:
         return _TextRequest(prompt, max_new_tokens, sampling)
 
     def _prepare_chat(self, payload: Mapping[str, Any]) -> _GenerationRequest:
-        messages, tools_enabled = _chat_messages(payload)
+        messages, tools_enabled = _chat_messages(
+            payload, architecture=getattr(self.generator.tokenizer, "architecture", None)
+        )
         tools = tuple(_selected_tools(payload)) if tools_enabled else ()
         return self._prepare_generation(
             payload,
@@ -1309,7 +1326,8 @@ class InferenceService:
         *,
         tools: tuple[dict[str, Any], ...] = (),
     ) -> dict[str, Any]:
-        content, tool_calls = _parse_tool_calls(result.text, tools=tools)
+        visible, reasoning = _split_reasoning_content(result.text)
+        content, tool_calls = _parse_tool_calls(visible, tools=tools)
         finish_reason = (
             "tool_calls"
             if tool_calls
@@ -1323,6 +1341,8 @@ class InferenceService:
         }
         if tool_calls:
             message["tool_calls"] = tool_calls
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -2186,13 +2206,15 @@ def serve(
         server.server_close()
 
 
-def _chat_messages(payload: Mapping[str, Any]) -> tuple[list[dict[str, str]], bool]:
+def _chat_messages(
+    payload: Mapping[str, Any], *, architecture: str | None = None
+) -> tuple[list[dict[str, Any]], bool]:
     value = payload.get("messages")
     if not isinstance(value, list) or not value:
         raise APIError(400, "messages must be a non-empty array", parameter="messages")
     tools = _selected_tools(payload)
     system_parts: list[str] = []
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     for index, message in enumerate(value):
         if not isinstance(message, dict):
             raise APIError(
@@ -2213,7 +2235,9 @@ def _chat_messages(payload: Mapping[str, Any]) -> tuple[list[dict[str, str]], bo
             # empty) tool_response block so the turn structure is preserved.
             content = _optional_text_content(message.get("content"), index)
             messages.append(
-                {
+                {"role": "tool", "content": content}
+                if architecture == "deepseek4"
+                else {
                     "role": "user",
                     "content": f"<tool_response>\n{content}\n</tool_response>",
                 }
@@ -2221,13 +2245,32 @@ def _chat_messages(payload: Mapping[str, Any]) -> tuple[list[dict[str, str]], bo
             continue
         content = _optional_text_content(message.get("content"), index)
         if role == "assistant" and message.get("tool_calls"):
-            content = _render_tool_calls(content, message["tool_calls"], index)
-        if not content:
+            if architecture != "deepseek4":
+                content = _render_tool_calls(content, message["tool_calls"], index)
+        if not content and not (role == "assistant" and message.get("tool_calls")):
             raise APIError(
                 400, f"messages[{index}].content must be text", parameter="messages"
             )
-        messages.append({"role": role, "content": content})
-    if tools:
+        normalized: dict[str, Any] = {"role": role, "content": content}
+        if role == "assistant" and architecture == "deepseek4" and message.get("tool_calls"):
+            normalized["tool_calls"] = message["tool_calls"]
+        reasoning = message.get("reasoning_content")
+        if role == "assistant" and reasoning is not None:
+            if not isinstance(reasoning, str):
+                raise APIError(
+                    400,
+                    f"messages[{index}].reasoning_content must be text",
+                    parameter="messages",
+                )
+            normalized["reasoning_content"] = reasoning
+        messages.append(normalized)
+    if tools and architecture == "deepseek4":
+        # The checkpoint template owns the DSML instructions and schema
+        # rendering. Attach schemas to a message, which its template explicitly
+        # recognizes, instead of injecting the generic Hermes prompt.
+        if messages:
+            messages[0]["tools"] = list(tools)
+    elif tools:
         system_parts.insert(0, _tool_prompt(tools, payload.get("tool_choice")))
     if system_parts:
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
@@ -2567,8 +2610,24 @@ def _parse_tool_calls(
 ) -> tuple[str | None, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    for match in TOOL_CALL_BLOCK_PATTERN.finditer(text):
-        name, arguments = _decode_tool_call_body(match.group(1))
+    decoded: list[tuple[str | None, dict[str, Any]]] = [
+        _decode_tool_call_body(match.group(1))
+        for match in TOOL_CALL_BLOCK_PATTERN.finditer(text)
+    ]
+    for block in DSML_TOOL_CALL_BLOCK_PATTERN.finditer(text):
+        for invoke in DSML_INVOKE_PATTERN.finditer(block.group(1)):
+            arguments: dict[str, Any] = {}
+            for parameter in DSML_PARAMETER_PATTERN.finditer(invoke.group(2)):
+                key, string_flag, raw = parameter.groups()
+                if string_flag == "true":
+                    arguments[key] = raw
+                else:
+                    try:
+                        arguments[key] = json.loads(raw.strip())
+                    except json.JSONDecodeError:
+                        arguments[key] = raw
+            decoded.append((invoke.group(1), arguments))
+    for name, arguments in decoded:
         if name is None:
             continue
         schema = _tool_argument_schema(tools, name)
@@ -2606,14 +2665,32 @@ def _parse_tool_calls(
     # (no closing </tool_call>) or malformed tool call never leaks its raw
     # markup into assistant content -- the caller sees empty content plus a
     # "length"/"stop" finish reason instead of a wall of <tool_call> tags.
-    marker = text.find(TOOL_CALL_MARKER)
+    markers = [
+        position for position in (
+            text.find(TOOL_CALL_MARKER), text.find(DSML_TOOL_CALL_MARKER)
+        ) if position != -1
+    ]
+    marker = min(markers) if markers else -1
     content = (text[:marker] if marker != -1 else text).strip()
     return (content or None), calls
 
 
+def _split_reasoning_content(text: str) -> tuple[str, str | None]:
+    """Separate DeepSeek's leading thinking block from visible assistant text."""
+    match = THINKING_BLOCK_PATTERN.match(text)
+    if match:
+        return text[match.end():], match.group(1)
+    # Non-thinking DeepSeek prompts begin with a closing tag. It is protocol
+    # framing, not user-visible assistant content.
+    stripped = text.lstrip()
+    if stripped.startswith("</think>"):
+        return stripped[len("</think>"):].lstrip(), None
+    return text, None
+
+
 def _has_complete_tool_call(text: str, *, tools: Sequence[dict[str, Any]]) -> bool:
     """Return true only for closed native markup that parses as a tool call."""
-    if TOOL_CALL_END_MARKER not in text:
+    if TOOL_CALL_END_MARKER not in text and DSML_TOOL_CALL_END_MARKER not in text:
         return False
     _, calls = _parse_tool_calls(text, tools=list(tools))
     return bool(calls)
