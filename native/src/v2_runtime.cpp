@@ -5533,7 +5533,8 @@ int colibri_v2_deepseek4_lm_head(ColibriV2Deepseek4Runtime*r,const float*hidden,
     return 0;});}
 
 static int ds4_prefill_impl(
-    ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count,float* all_logits
+    ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count,float* all_logits,
+    float* all_captures
 ){return guarded([&]{
     if(!runtime||(!tokens&&count))throw std::runtime_error("invalid prefill arguments");
     if(!count)return 0;
@@ -5566,6 +5567,18 @@ static int ds4_prefill_impl(
             const auto position=rt.layers[layer].positions;
             for(std::uint32_t row=0;row<rows;++row){
                 auto& sc=scratch[row];
+                if(all_captures){
+                    const auto found=std::find(rt.capture_layers.begin(),rt.capture_layers.end(),layer);
+                    if(found!=rt.capture_layers.end()){
+                        const auto slot=static_cast<std::size_t>(found-rt.capture_layers.begin());
+                        auto*dst=all_captures+(static_cast<std::size_t>(chunk+row)*rt.capture_layers.size()+slot)*rt.n_embd;
+                        for(std::uint32_t column=0;column<rt.n_embd;++column){
+                            float sum=0.0f;for(std::uint32_t stream=0;stream<rt.hc;++stream)
+                                sum+=sc.streams[static_cast<std::size_t>(stream)*rt.n_embd+column];
+                            dst[column]=sum/static_cast<float>(rt.hc);
+                        }
+                    }
+                }
                 ds4_layer_attention_prepare(rt,layer,position+row,tokens[chunk+row],
                     sc.streams.data(),sc.next_streams.data(),sc);
             }
@@ -5584,6 +5597,20 @@ static int ds4_prefill_impl(
                 std::swap(sc.streams,sc.next_streams);
             }
             rt.layers[layer].positions+=rows;
+        }
+        if(all_captures){
+            const auto final=std::find(rt.capture_layers.begin(),rt.capture_layers.end(),
+                static_cast<std::uint32_t>(rt.layers.size()));
+            if(final!=rt.capture_layers.end())for(std::uint32_t row=0;row<rows;++row){
+                const auto slot=static_cast<std::size_t>(final-rt.capture_layers.begin());
+                auto*dst=all_captures+(static_cast<std::size_t>(chunk+row)*rt.capture_layers.size()+slot)*rt.n_embd;
+                const auto&sc=scratch[row];
+                for(std::uint32_t column=0;column<rt.n_embd;++column){
+                    float sum=0.0f;for(std::uint32_t stream=0;stream<rt.hc;++stream)
+                        sum+=sc.streams[static_cast<std::size_t>(stream)*rt.n_embd+column];
+                    dst[column]=sum/static_cast<float>(rt.hc);
+                }
+            }
         }
         if(all_logits){
             namespace ds4=colibri::v2::deepseek4;
@@ -5609,14 +5636,22 @@ static int ds4_prefill_impl(
     return 0;});}
 
 int colibri_v2_deepseek4_prefill(ColibriV2Deepseek4Runtime*r,const uint32_t*t,uint32_t n){
-    return ds4_prefill_impl(r,t,n,nullptr);
+    return ds4_prefill_impl(r,t,n,nullptr,nullptr);
 }
 int colibri_v2_deepseek4_forward_batch(ColibriV2Deepseek4Runtime*r,const uint32_t*t,
     uint32_t n,float*logits,uint64_t elements){
     if(!r||!logits||elements<static_cast<std::uint64_t>(n)*r->vocabulary){
         error="invalid DeepSeek forward-batch output";return -1;
     }
-    return ds4_prefill_impl(r,t,n,logits);
+    return ds4_prefill_impl(r,t,n,logits,nullptr);
+}
+int colibri_v2_deepseek4_forward_batch_capture(ColibriV2Deepseek4Runtime*r,const uint32_t*t,
+    uint32_t n,float*logits,uint64_t logits_elements,float*captures,uint64_t capture_elements){
+    if(!r||!logits||!captures||logits_elements<static_cast<std::uint64_t>(n)*r->vocabulary||
+       capture_elements<static_cast<std::uint64_t>(n)*r->capture_layers.size()*r->n_embd){
+        error="invalid DeepSeek batch-capture output";return -1;
+    }
+    return ds4_prefill_impl(r,t,n,logits,captures);
 }
 int colibri_v2_deepseek4_snapshot(const ColibriV2Deepseek4Runtime*r,ColibriV2Deepseek4Snapshot**out){return guarded([&]{
     if(!r||!out)throw std::runtime_error("invalid DeepSeek snapshot arguments");

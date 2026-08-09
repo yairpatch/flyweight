@@ -206,6 +206,21 @@ class Deepseek4Runtime:
             raise V2Error((self._library.colibri_v2_last_error() or b"batch forward failed").decode(errors="replace"))
         return output
 
+    def forward_batch_capture(self, tokens):
+        values = np.ascontiguousarray(tuple(tokens), dtype=np.uint32)
+        logits = np.empty((values.size, self._vocabulary), dtype=np.float32)
+        captures = np.empty((values.size, int(getattr(self, "_capture_count", 0)),
+                             int(self._model.config["hidden_size"])), dtype=np.float32)
+        if not values.size:
+            return logits, captures
+        status = self._library.colibri_v2_deepseek4_forward_batch_capture(
+            self._handle, values.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)), values.size,
+            _pointer(logits), logits.size, _pointer(captures), captures.size,
+        )
+        if status:
+            raise V2Error((self._library.colibri_v2_last_error() or b"batch capture failed").decode(errors="replace"))
+        return logits, captures
+
     def snapshot(self):
         handle = ctypes.c_void_p()
         status = self._library.colibri_v2_deepseek4_snapshot(self._handle, ctypes.byref(handle))

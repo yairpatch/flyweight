@@ -326,6 +326,9 @@ COLIBRI_V2_API int colibri_v2_deepseek4_prefill(ColibriV2Deepseek4Runtime* runti
     const uint32_t* tokens, uint32_t count);
 COLIBRI_V2_API int colibri_v2_deepseek4_forward_batch(ColibriV2Deepseek4Runtime* runtime,
     const uint32_t* tokens, uint32_t count, float* logits, uint64_t elements);
+COLIBRI_V2_API int colibri_v2_deepseek4_forward_batch_capture(ColibriV2Deepseek4Runtime* runtime,
+    const uint32_t* tokens, uint32_t count, float* logits, uint64_t logits_elements,
+    float* captures, uint64_t capture_elements);
 COLIBRI_V2_API int colibri_v2_deepseek4_snapshot(const ColibriV2Deepseek4Runtime* runtime,
     ColibriV2Deepseek4Snapshot** out);
 COLIBRI_V2_API int colibri_v2_deepseek4_restore(ColibriV2Deepseek4Runtime* runtime,

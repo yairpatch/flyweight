@@ -172,6 +172,38 @@ class DsparkSession:
         base_logits = self.target.lm_head(normalized)
         return self.draft.heads(base_logits, hidden, anchor_token)
 
+    def verify(self, initial_logits, draft_tokens):
+        candidates = np.ascontiguousarray(draft_tokens, dtype=np.uint32).reshape(-1)
+        if not candidates.size:
+            return (), None, np.asarray(initial_logits, dtype=np.float32)
+        with self.target.snapshot() as snapshot:
+            batch_logits, captures = self.target.forward_batch_capture(candidates)
+            accepted = 0
+            expected = int(np.argmax(initial_logits))
+            while accepted < candidates.size and int(candidates[accepted]) == expected:
+                accepted += 1
+                if accepted < candidates.size:
+                    expected = int(np.argmax(batch_logits[accepted - 1]))
+            if accepted < candidates.size:
+                snapshot.restore()
+                if accepted:
+                    self.target.forward_batch(candidates[:accepted])
+            else:
+                expected = None
+        for row in range(accepted):
+            self.draft.inject(self.sidecar_model.dspark_encode(captures[row]))
+        next_logits = np.asarray(initial_logits, dtype=np.float32) if not accepted else batch_logits[accepted - 1]
+        return tuple(int(token) for token in candidates[:accepted]), expected, next_logits
+
+    def speculative_round(self, anchor_token: int, initial_logits, *, p_min: float = 0.0):
+        _, confidence, tokens = self.draft_tokens(anchor_token)
+        count = len(tokens)
+        if p_min > 0.0:
+            below = np.flatnonzero(confidence < p_min)
+            if below.size:
+                count = int(below[0])
+        return self.verify(initial_logits, tokens[:count])
+
     def close(self) -> None:
         if getattr(self, "draft", None) is not None:
             self.draft.close()
