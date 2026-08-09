@@ -68,6 +68,8 @@ void qwen_forward_rows(
     const auto token_device=workspace_layout.token_device.address(runtime.workspace);
     const auto winners=workspace_layout.winners.address(runtime.workspace);
     const auto attention_scores=workspace_layout.attention_scores.address(runtime.workspace);
+    const auto mtp_prompt_hidden=
+        workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,std::uint32_t bx,void**args,std::uint32_t shared=0){
         if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
@@ -76,6 +78,15 @@ void qwen_forward_rows(
         int one_centered=0;void*args[]={&input,&weights,&output,&rows,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};
         launch("rms_norm_rows",rows,1,256,args);
     };
+    const bool preserve_mtp_prompt_hidden=
+        !output_tokens&&runtime.options.mtp_drafts&&mtp_prompt_hidden;
+    const bool had_mtp_target_hidden=runtime.mtp_has_target_hidden;
+    if(preserve_mtp_prompt_hidden&&had_mtp_target_hidden){
+        auto source=runtime.state+runtime.mtp_target_hidden_offset;
+        void*args[]={&source,const_cast<std::uint64_t*>(&mtp_prompt_hidden),
+                     const_cast<int*>(&hidden_size)};
+        launch("qwen_copy_vector",(hidden_size+255)/256,1,256,args);
+    }
     auto q8_rows=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
         launch("q8_matmul_tiled",(output_size+31)/32,(static_cast<std::uint32_t>(rows)+31)/32,256,args);
@@ -829,6 +840,20 @@ void qwen_forward_rows(
         if(colibri_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
         for(int row=0;row<rows;++row)output_tokens[row]=0xffffffffu-static_cast<std::uint32_t>(packed[row]);
     }
+    if(preserve_mtp_prompt_hidden){
+        auto destination=mtp_prompt_hidden+
+            static_cast<std::uint64_t>(hidden_size)*sizeof(float);
+        int elements=rows*hidden_size;
+        void*copy_rows_args[]={&hidden,&destination,&elements};
+        launch("qwen_copy_vector",(elements+255)/256,1,256,copy_rows_args);
+        auto last_hidden=hidden+
+            static_cast<std::uint64_t>(rows-1)*hidden_size*sizeof(float);
+        auto target_hidden=runtime.state+runtime.mtp_target_hidden_offset;
+        void*copy_last_args[]={&last_hidden,&target_hidden,
+                              const_cast<int*>(&hidden_size)};
+        launch("qwen_copy_vector",(hidden_size+255)/256,1,256,copy_last_args);
+        runtime.mtp_has_target_hidden=true;
+    }
     if(final_hidden)*final_hidden=hidden;
 }
 
@@ -846,7 +871,17 @@ void qwen_prefill_rows(
     ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows
 ) {
     const auto started=std::chrono::steady_clock::now();
+    const bool had_mtp_target_hidden=runtime.mtp_has_target_hidden;
     qwen_forward_rows(runtime,tokens,rows,nullptr,nullptr);
+    if(runtime.options.mtp_drafts){
+        const auto preserved=
+            runtime.rows_workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
+        const int hidden=static_cast<int>(runtime.model->config.hidden_size);
+        for(int row=had_mtp_target_hidden?0:1;row<rows;++row)
+            qwen_mtp_append_pair(
+                runtime,tokens[row],preserved+
+                    static_cast<std::uint64_t>(row)*hidden*sizeof(float));
+    }
     runtime.processed_tokens.insert(runtime.processed_tokens.end(),tokens,tokens+rows);
     runtime.position+=static_cast<std::uint64_t>(rows);
     runtime.decode_calls+=static_cast<std::uint64_t>(rows);

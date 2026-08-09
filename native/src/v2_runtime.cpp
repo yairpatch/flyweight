@@ -7355,7 +7355,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             rows,hidden,runtime->scratch_elements,top_k,
             runtime->moe_intermediate,runtime->model->config.expert_count,
             runtime->model->config.attention_heads,
-            runtime->options.context_limit,delta_value_heads);
+            runtime->options.context_limit,delta_value_heads,
+            runtime->options.mtp_drafts!=0);
         runtime->rows_host_layout=
             colibri::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);
@@ -10768,7 +10769,7 @@ static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prom
     // index+3<=prompt_count is prompt_count-1-index>=2 without the unsigned
     // underflow that fired when a cache/snapshot reuse left index==prompt_count
     // (it read 1024 tokens past the prompt -> "input token out of range").
-    if(runtime->prefill_rows>1&&!runtime->options.mtp_drafts&&prompt_count>1&&
+    if(runtime->prefill_rows>1&&prompt_count>1&&
        index+3<=prompt_count&&!runtime->cancelled){
         uint64_t rows=std::min<uint64_t>(runtime->prefill_rows,prompt_count-1-index);
         // Stop the chunk exactly at the next checkpoint target so checkpoints

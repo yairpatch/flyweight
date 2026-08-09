@@ -153,7 +153,7 @@ int main() {
             layout.token_device, layout.winners, layout.attention_scores,
             layout.delta_attn, layout.delta_pmat, layout.delta_gcum,
             layout.delta_beta, layout.delta_qinv, layout.delta_kinv,
-            layout.delta_w, layout.delta_u};
+            layout.delta_w, layout.delta_u, layout.mtp_prompt_hidden};
         if (!valid_regions(regions, layout.bytes) ||
             layout.bytes != legacy_rows_bytes(
                 rows, hidden, scratch, top_k, intermediate, experts, heads,
@@ -163,6 +163,15 @@ int main() {
             layout.delta_w.size != 0 || layout.delta_gcum.size != 0)) return 3;
         if (delta_value_heads != 0 && layout.delta_w.size !=
             rows * delta_value_heads * ws::kDeltaDim * sizeof(float)) return 3;
+
+        const auto mtp_layout = ws::qwen_rows(
+            rows, hidden, scratch, top_k, intermediate, experts, heads,
+            context, delta_value_heads, true);
+        if (mtp_layout.mtp_prompt_hidden.size !=
+                (rows + 1) * hidden * sizeof(float) ||
+            mtp_layout.mtp_prompt_hidden.offset != layout.bytes ||
+            mtp_layout.bytes != layout.bytes +
+                ws::align((rows + 1) * hidden * sizeof(float))) return 3;
       }
 
         const auto host =

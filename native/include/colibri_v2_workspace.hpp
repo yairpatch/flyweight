@@ -137,6 +137,9 @@ struct QwenRowsWorkspaceLayout {
     Region delta_kinv;
     Region delta_w;
     Region delta_u;
+    // Preserves the target hidden row preceding a chunk plus every output row
+    // while the MTP cache builder reuses the rest of the workspace.
+    Region mtp_prompt_hidden;
     std::uint64_t bytes = 0;
 };
 
@@ -156,7 +159,7 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     std::uint64_t rows, std::uint64_t hidden, std::uint64_t scratch,
     std::uint64_t top_k, std::uint64_t intermediate, std::uint64_t experts,
     std::uint64_t attention_heads, std::uint64_t context,
-    std::uint64_t delta_value_heads
+    std::uint64_t delta_value_heads, bool mtp = false
 ) {
     Builder builder;
     QwenRowsWorkspaceLayout layout;
@@ -205,6 +208,8 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
         layout.delta_w = builder.add(vectors * sizeof(float));
         layout.delta_u = builder.add(vectors * sizeof(float));
     }
+    layout.mtp_prompt_hidden =
+        builder.add((mtp ? rows + 1 : 0) * hidden * sizeof(float));
     layout.bytes = builder.bytes();
     return layout;
 }

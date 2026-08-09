@@ -195,6 +195,22 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("rows<=8&&type==8", verifier)
         self.assertIn("colibri_gpu_q8_matvec_transposed(", verifier)
 
+    def test_mtp_prompt_prefill_keeps_the_batched_target_path(self):
+        root = Path(__file__).resolve().parents[1]
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text()
+        workspace = (
+            root / "native/include/colibri_v2_workspace.hpp"
+        ).read_text()
+
+        self.assertIn("if(runtime->prefill_rows>1&&prompt_count>1", runtime)
+        self.assertNotIn(
+            "runtime->prefill_rows>1&&!runtime->options.mtp_drafts", runtime
+        )
+        self.assertIn("mtp_prompt_hidden", workspace)
+        self.assertIn("preserve_mtp_prompt_hidden", verifier)
+        self.assertIn("qwen_mtp_append_pair(", verifier)
+
     def test_cuda_waits_default_to_blocking_context_scheduling(self):
         root = Path(__file__).resolve().parents[1]
         driver = (root / "native/src/gpu_driver.cpp").read_text()
