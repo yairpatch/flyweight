@@ -56,6 +56,24 @@ class DensePlanTests(unittest.TestCase):
         finally:
             model.close()
 
+    def test_tied_embedding_table_is_used_as_the_lm_head(self):
+        model, _, _ = _model(tied_lm_head=True)
+        try:
+            self.assertEqual(model.qwen_tensor("lm_head")["name"], "token_embd.weight")
+            with model.native_runtime(context_limit=32, mtp_drafts=0) as runtime:
+                self.assertGreater(runtime.info["static_tensor_bytes"], 0)
+        finally:
+            model.close()
+
+    def test_mtp_without_dedicated_head_norm_uses_output_norm(self):
+        model, spec, _ = _model(mtp=True, mtp_head_norm=False)
+        try:
+            with model.native_runtime(context_limit=32, mtp_drafts=0) as runtime:
+                self.assertTrue(runtime.info["mtp_available"])
+                self.assertEqual(runtime.info["mtp_layer"], spec.layers)
+        finally:
+            model.close()
+
 
 class DenseNativeTests(unittest.TestCase):
     def test_host_spilled_feed_forward_matches_the_resident_one(self):

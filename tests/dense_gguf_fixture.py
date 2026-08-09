@@ -117,6 +117,9 @@ def build_dense_qwen35_gguf(
     *,
     mute_mixer: bool = False,
     quantize: str | None = None,
+    tied_lm_head: bool = False,
+    mtp: bool = False,
+    mtp_head_norm: bool = True,
 ) -> DenseQwenSpec:
     """Write the fixture.
 
@@ -147,7 +150,8 @@ def build_dense_qwen35_gguf(
 
     projection("token_embd.weight", spec.hidden, spec.vocabulary)
     vector("output_norm.weight", spec.hidden, value=1.0)
-    projection("output.weight", spec.hidden, spec.vocabulary)
+    if not tied_lm_head:
+        projection("output.weight", spec.hidden, spec.vocabulary)
 
     for layer in range(spec.layers):
         prefix = f"blk.{layer}."
@@ -183,6 +187,25 @@ def build_dense_qwen35_gguf(
         projection(prefix + "ffn_gate.weight", spec.hidden, spec.intermediate)
         projection(prefix + "ffn_up.weight", spec.hidden, spec.intermediate)
         projection(prefix + "ffn_down.weight", spec.intermediate, spec.hidden)
+
+    if mtp:
+        prefix = f"blk.{spec.layers}."
+        vector(prefix + "attn_norm.weight", spec.hidden, value=1.0)
+        projection(prefix + "attn_q.weight", spec.hidden, spec.heads * spec.head_dim * 2)
+        projection(prefix + "attn_k.weight", spec.hidden, spec.kv_heads * spec.head_dim)
+        projection(prefix + "attn_v.weight", spec.hidden, spec.kv_heads * spec.head_dim)
+        projection(prefix + "attn_output.weight", spec.heads * spec.head_dim, spec.hidden)
+        vector(prefix + "attn_q_norm.weight", spec.head_dim, value=1.0)
+        vector(prefix + "attn_k_norm.weight", spec.head_dim, value=1.0)
+        vector(prefix + "post_attention_norm.weight", spec.hidden, value=1.0)
+        projection(prefix + "ffn_gate.weight", spec.hidden, spec.intermediate)
+        projection(prefix + "ffn_up.weight", spec.hidden, spec.intermediate)
+        projection(prefix + "ffn_down.weight", spec.intermediate, spec.hidden)
+        projection(prefix + "nextn.eh_proj.weight", 2 * spec.hidden, spec.hidden)
+        vector(prefix + "nextn.enorm.weight", spec.hidden, value=1.0)
+        vector(prefix + "nextn.hnorm.weight", spec.hidden, value=1.0)
+        if mtp_head_norm:
+            vector(prefix + "nextn.shared_head_norm.weight", spec.hidden, value=1.0)
 
     metadata = [
         _kv("general.architecture", GGUF_STRING, _string("qwen35")),

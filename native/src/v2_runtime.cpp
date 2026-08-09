@@ -1769,11 +1769,19 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
     runtime.final_norm = first_tensor_index(
         model, {"output_norm.weight", "model.norm.weight", "norm.weight"}
     );
-    runtime.lm_head = first_tensor_index(model, {"output.weight", "lm_head.weight"});
+    // Qwen permits tying the output projection to the token embedding table.
+    // GGUF omits output.weight for that layout, just as the reference loader
+    // does, so retain the embedding tensor as the executable LM head.
+    runtime.lm_head = has_tensor(model, "output.weight")
+        ? tensor_index(model, "output.weight")
+        : (has_tensor(model, "lm_head.weight")
+            ? tensor_index(model, "lm_head.weight")
+            : runtime.token_embeddings);
     runtime.lm_head_type = model.tensors[runtime.lm_head].type;
     runtime.static_tensor_bytes += model.tensors[runtime.token_embeddings].size;
     runtime.static_tensor_bytes += model.tensors[runtime.final_norm].size;
-    runtime.static_tensor_bytes += model.tensors[runtime.lm_head].size;
+    if (runtime.lm_head != runtime.token_embeddings)
+        runtime.static_tensor_bytes += model.tensors[runtime.lm_head].size;
     runtime.layers.reserve(model.config.layer_count);
     for (std::uint32_t layer_index = 0; layer_index < model.config.layer_count; ++layer_index) {
         const std::string prefix = "blk." + std::to_string(layer_index) + ".";
@@ -1898,14 +1906,22 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
             draft.shared_down_scale = draft_scalar_scale(prefix + "ffn_down_shexp.scale");
         }
         }
-        const std::array<std::string, 4> special = {
+        const std::array<std::string, 3> special = {
             prefix + "nextn.eh_proj.weight", prefix + "nextn.enorm.weight",
-            prefix + "nextn.hnorm.weight", prefix + "nextn.shared_head_norm.weight",
+            prefix + "nextn.hnorm.weight",
         };
         for (std::size_t role = 0; role < special.size(); ++role) {
             runtime.mtp_special_tensors[role] = tensor_index(model, special[role]);
             runtime.mtp_tensor_bytes += model.tensors[runtime.mtp_special_tensors[role]].size;
         }
+        // Some valid Qwen NextN blocks share the trunk output norm instead of
+        // carrying a dedicated draft-head norm.
+        const auto head_norm = prefix + "nextn.shared_head_norm.weight";
+        runtime.mtp_special_tensors[3] = has_tensor(model, head_norm)
+            ? tensor_index(model, head_norm) : runtime.final_norm;
+        if (runtime.mtp_special_tensors[3] != runtime.final_norm)
+            runtime.mtp_tensor_bytes +=
+                model.tensors[runtime.mtp_special_tensors[3]].size;
         runtime.mtp_layer_plan = std::move(draft);
         runtime.mtp_available = true;
     }
@@ -6121,7 +6137,7 @@ int colibri_v2_model_attention_window(const ColibriV2Model* m,uint32_t layer,uin
 int colibri_v2_tensor_info(const ColibriV2Model* m,uint64_t i,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("tensor index out of range");return fill(m->tensors[i],*out);});}
 int colibri_v2_tensor_find(const ColibriV2Model* m,const char* name,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!name||!out)throw std::runtime_error("invalid tensor lookup");for(auto const&t:m->tensors)if(t.name==name)return fill(t,*out);throw std::runtime_error("tensor not found");});}
 int colibri_v2_qwen_validate(const ColibriV2Model*m){return guarded([&]{if(!m)throw std::runtime_error("invalid model handle");if(m->config.architecture.find("qwen")!=0)throw std::runtime_error("model architecture is not Qwen");if(!m->config.hidden_size||!m->config.layer_count||!m->config.attention_heads)throw std::runtime_error("Qwen config is incomplete");return 0;});}
-int colibri_v2_qwen_tensor_role(const ColibriV2Model*m,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen tensor role lookup");std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"final_norm")==0)candidates={"output_norm.weight","model.norm.weight","norm.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m->tensors)if(t.name==candidate)return fill(t,*out);throw std::runtime_error("Qwen tensor role is missing");});}
+int colibri_v2_qwen_tensor_role(const ColibriV2Model*m,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen tensor role lookup");std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"final_norm")==0)candidates={"output_norm.weight","model.norm.weight","norm.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight","token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m->tensors)if(t.name==candidate)return fill(t,*out);throw std::runtime_error("Qwen tensor role is missing");});}
 int colibri_v2_qwen_layer_tensor(const ColibriV2Model*m,uint32_t layer,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen layer tensor lookup");std::string prefix="blk."+std::to_string(layer)+".";std::vector<std::string> suffixes;if(std::strcmp(role,"input_norm")==0)suffixes={"attn_norm.weight"};else if(std::strcmp(role,"qkv")==0)suffixes={"attn_qkv.weight"};else if(std::strcmp(role,"attention_q")==0)suffixes={"attn_q.weight"};else if(std::strcmp(role,"attention_k")==0)suffixes={"attn_k.weight"};else if(std::strcmp(role,"attention_v")==0)suffixes={"attn_v.weight"};else if(std::strcmp(role,"attention_output")==0)suffixes={"attn_output.weight","attn_out.weight"};else if(std::strcmp(role,"attention_gate")==0)suffixes={"attn_gate.weight"};else if(std::strcmp(role,"ssm_output")==0)suffixes={"ssm_out.weight"};else if(std::strcmp(role,"ssm_alpha")==0)suffixes={"ssm_alpha.weight"};else if(std::strcmp(role,"ssm_beta")==0)suffixes={"ssm_beta.weight"};else if(std::strcmp(role,"ssm_conv")==0)suffixes={"ssm_conv1d.weight"};else if(std::strcmp(role,"ssm_dt_bias")==0)suffixes={"ssm_dt.bias"};else if(std::strcmp(role,"ssm_a")==0)suffixes={"ssm_a"};else if(std::strcmp(role,"ssm_norm")==0)suffixes={"ssm_norm.weight"};else if(std::strcmp(role,"post_attention_norm")==0)suffixes={"post_attention_norm.weight"};else if(std::strcmp(role,"router")==0)suffixes={"ffn_gate_inp.weight"};else if(std::strcmp(role,"shared_gate")==0)suffixes={"ffn_gate_shexp.weight"};else throw std::runtime_error("unknown Qwen layer tensor role");for(auto const&suffix:suffixes)for(auto const&t:m->tensors)if(t.name==prefix+suffix)return fill(t,*out);throw std::runtime_error("Qwen layer tensor role is missing");});}
 float half_to_float(uint16_t bits){uint32_t sign=(bits&0x8000u)<<16, exponent=(bits>>10)&0x1fu, fraction=bits&0x3ffu;uint32_t result;if(exponent==0){if(!fraction)result=sign;else{exponent=1;while((fraction&0x400u)==0){fraction<<=1;--exponent;}result=sign|((exponent+112)<<23)|((fraction&0x3ffu)<<13);}}else if(exponent==31)result=sign|0x7f800000u|(fraction<<13);else result=sign|((exponent+112)<<23)|(fraction<<13);float value;std::memcpy(&value,&result,sizeof(value));return value;}
 float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
@@ -7400,7 +7416,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
             if(runtime->mtp_available){
                 for(auto tensor:runtime->mtp_layer_plan.static_tensors)resident+=device_align(runtime->model->tensors[tensor].size);
-                for(auto tensor:runtime->mtp_special_tensors)resident+=device_align(runtime->model->tensors[tensor].size);
+                for(auto tensor:runtime->mtp_special_tensors)
+                    if(tensor!=runtime->final_norm)
+                        resident+=device_align(runtime->model->tensors[tensor].size);
             }
             std::uint64_t budget=runtime->options.gpu_cache_bytes;
             if(!budget){
