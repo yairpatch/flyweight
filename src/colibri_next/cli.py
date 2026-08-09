@@ -388,7 +388,7 @@ def _benchmark(args: argparse.Namespace) -> int:
 # are reported rather than accepted and ignored.
 _DEEPSEEK4_UNSUPPORTED = (
     "gpu_cache_mib", "expert_mode", "hybrid_prefill",
-    "expert_residency", "dense_requant", "mtp_drafts",
+    "expert_residency", "dense_requant",
     "cache_type_k", "cache_type_v", "prompt_cache_mib", "swa_full",
     "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
     "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
@@ -449,6 +449,7 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
     return NativeDeepseek4InferenceService(
         args.model,
         dspark_model_path=getattr(args, "mtp_model", None),
+        dspark_drafts=getattr(args, "mtp_drafts", 0),
         device=device,
         model_name=getattr(args, "model_name", None),
         context_window=args.context_window,

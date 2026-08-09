@@ -155,11 +155,15 @@ class Deepseek4Engine:
     def __init__(
         self, model: V2Model, context_limit: int, slots: int = 1,
         device: int | None = None, dspark_model: V2Model | None = None,
+        dspark_drafts: int = 0,
     ):
         if slots <= 0:
             raise ValueError("slots must be positive")
         self.context_limit = int(context_limit)
         self.device = device
+        if dspark_drafts < 0:
+            raise ValueError("DSpark draft count must be non-negative")
+        self.dspark_drafts = int(dspark_drafts)
         self._slots = [
             DsparkSession(model, dspark_model, context_limit) if dspark_model is not None
             else Deepseek4Runtime(model, context_limit)
@@ -384,8 +388,9 @@ class Deepseek4Engine:
             self._emit(task, ("prefill", task.fed))
         if dspark is not None and task.sampling.temperature <= 0:
             remaining = task.max_new_tokens - task.generated
+            candidates = min(remaining, self.dspark_drafts) if self.dspark_drafts else remaining
             accepted, correction, next_logits = dspark.speculative_round(
-                slot.tokens[-1], logits, p_min=0.1, max_candidates=remaining
+                slot.tokens[-1], logits, p_min=0.1, max_candidates=candidates
             )
             emitted = list(accepted)
             slot.tokens.extend(emitted)
@@ -491,9 +496,12 @@ class Deepseek4Generator(ChatGenerator):
         slots: int = 1,
         device: int | None = None,
         dspark_model: V2Model | None = None,
+        dspark_drafts: int = 0,
     ):
         super().__init__(
-            model, Deepseek4Engine(model, context_limit, slots, device, dspark_model), tokenizer
+            model, Deepseek4Engine(
+                model, context_limit, slots, device, dspark_model, dspark_drafts
+            ), tokenizer
         )
 
     def prefix_cache_stats(self) -> dict[str, int]:
@@ -562,6 +570,7 @@ class NativeDeepseek4InferenceService(InferenceService):
         parallel_sequences: int = 1,
         device: int | None = None,
         dspark_model_path: Path | str | None = None,
+        dspark_drafts: int = 0,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -590,6 +599,7 @@ class NativeDeepseek4InferenceService(InferenceService):
                 slots=parallel_sequences,
                 device=device,
                 dspark_model=self.dspark_model,
+                dspark_drafts=dspark_drafts,
             )
         except Exception:
             if self.dspark_model is not None:
@@ -612,6 +622,7 @@ class NativeDeepseek4InferenceService(InferenceService):
         self.generation_defaults_source = generation_defaults_source
         self.parallel_sequences = parallel_sequences
         self.device = device
+        self.dspark_drafts = dspark_drafts
         # The scheduler interleaves requests itself, so the HTTP layer must not
         # serialize them on top of it.
         self._serialize_generation = False
