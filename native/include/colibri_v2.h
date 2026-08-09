@@ -20,6 +20,7 @@ typedef struct ColibriV2Model ColibriV2Model;
 typedef struct ColibriV2KvCache ColibriV2KvCache;
 typedef struct ColibriV2QwenRuntime ColibriV2QwenRuntime;
 typedef struct ColibriV2Deepseek4Runtime ColibriV2Deepseek4Runtime;
+typedef struct ColibriV2DsparkRuntime ColibriV2DsparkRuntime;
 
 typedef struct ColibriV2ModelInfo {
     uint32_t gguf_version;
@@ -414,6 +415,13 @@ COLIBRI_V2_API int colibri_v2_model_target_layers(const ColibriV2Model* model, u
    sidecar encoder RMS norm. */
 COLIBRI_V2_API int colibri_v2_dspark_encode(const ColibriV2Model* model,
     const float* features, uint64_t elements, float* output, uint64_t output_elements);
+COLIBRI_V2_API int colibri_v2_dspark_runtime_create(ColibriV2Model* model,
+    uint32_t context_limit, ColibriV2DsparkRuntime** out);
+COLIBRI_V2_API void colibri_v2_dspark_runtime_free(ColibriV2DsparkRuntime* runtime);
+COLIBRI_V2_API int colibri_v2_dspark_inject(ColibriV2DsparkRuntime* runtime,
+    const float* fused, uint64_t elements);
+COLIBRI_V2_API int colibri_v2_dspark_cached(const ColibriV2DsparkRuntime* runtime,
+    uint32_t layer, uint32_t position, float* output, uint64_t elements);
 /* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
    UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
    query the required size; an absent key reports length zero. */

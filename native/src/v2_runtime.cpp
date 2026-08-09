@@ -1689,7 +1689,7 @@ int parse(ColibriV2Model& m) {
     // width of the compressed KV latent, and the decoupled RoPE half is carried
     // separately in `rope.dimension_count`. The shared expert likewise arrives
     // as a count of routed-expert widths rather than a width.
-    if(m.architecture=="deepseek4"){
+    if(m.architecture=="deepseek4"||m.architecture=="dflash"){
         if(!m.config.kv_lora_rank)m.config.kv_lora_rank=m.config.key_length;
         if(!m.config.expert_shared_intermediate_size&&m.config.expert_shared_count)
             m.config.expert_shared_intermediate_size=
@@ -6050,6 +6050,57 @@ int colibri_v2_dspark_encode(const ColibriV2Model*m,const float*features,uint64_
     const float scale=1.0f/std::sqrt(static_cast<float>(square/width)+m->config.rms_norm_epsilon);
     const auto*data=tensor_data(*m,*norm);
     for(std::uint32_t i=0;i<width;++i)output[i]*=scale*tensor_value(data,norm->type,i);
+    return 0;});}
+
+struct ColibriV2DsparkRuntime {
+    ColibriV2Model* model=nullptr;
+    std::uint32_t context_limit=0,position=0,width=0,rope_dim=0,window=0;
+    float epsilon=0.0f,freq_base=10000.0f;
+    std::vector<std::uint16_t> cache;
+    std::vector<float> projected;
+};
+
+int colibri_v2_dspark_runtime_create(ColibriV2Model*m,uint32_t context_limit,ColibriV2DsparkRuntime**out){return guarded([&]{
+    if(!m||!out||!context_limit)throw std::runtime_error("DSpark model, context and output are required");
+    if(m->config.architecture!="dflash")throw std::runtime_error("not a DFlash/DSpark sidecar");
+    if(context_limit>m->config.context_length)throw std::runtime_error("DSpark context exceeds checkpoint limit");
+    auto runtime=std::make_unique<ColibriV2DsparkRuntime>();
+    runtime->model=m;runtime->context_limit=context_limit;runtime->width=m->config.kv_lora_rank;
+    runtime->rope_dim=m->config.rotary_dimension;runtime->window=std::min(context_limit,m->config.sliding_window);
+    runtime->epsilon=m->config.rms_norm_epsilon;runtime->freq_base=m->config.rope_freq_base;
+    if(!runtime->width||runtime->rope_dim>runtime->width||!runtime->window)
+        throw std::runtime_error("DSpark KV geometry is incomplete");
+    runtime->cache.assign(static_cast<std::size_t>(m->config.layer_count)*runtime->window*runtime->width,0);
+    runtime->projected.resize(runtime->width);*out=runtime.release();return 0;});}
+void colibri_v2_dspark_runtime_free(ColibriV2DsparkRuntime*r){try{delete r;}catch(...){}}
+
+int colibri_v2_dspark_inject(ColibriV2DsparkRuntime*r,const float*fused,uint64_t elements){return guarded([&]{
+    if(!r||!fused||elements!=r->model->config.hidden_size)throw std::runtime_error("invalid DSpark injection");
+    if(r->position>=r->context_limit)throw std::runtime_error("DSpark cache is past its context limit");
+    auto& m=*r->model;
+    for(std::uint32_t layer=0;layer<m.config.layer_count;++layer){
+        const auto prefix="blk."+std::to_string(layer)+".";
+        if(colibri_v2_matvec(&m,(prefix+"attn_kv.weight").c_str(),fused,static_cast<int32_t>(elements),r->projected.data(),r->width)!=0)
+            throw std::runtime_error(error.empty()?"DSpark KV projection failed":error);
+        const auto norm_name=prefix+"attn_kv_a_norm.weight";
+        const auto norm=std::find_if(m.tensors.begin(),m.tensors.end(),[&](const Tensor&t){return t.name==norm_name;});
+        if(norm==m.tensors.end())throw std::runtime_error("DSpark KV norm is missing");
+        double square=0.0;for(const auto value:r->projected)square+=static_cast<double>(value)*value;
+        const float scale=1.0f/std::sqrt(static_cast<float>(square/r->width)+r->epsilon);
+        const auto*gain=tensor_data(m,*norm);
+        for(std::uint32_t i=0;i<r->width;++i)r->projected[i]*=scale*tensor_value(gain,norm->type,i);
+        colibri::v2::deepseek4::rope(r->projected.data()+r->width-r->rope_dim,r->rope_dim,
+            static_cast<std::int32_t>(r->position),r->freq_base,1.0f,false);
+        auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+r->position%r->window)*r->width;
+        for(std::uint32_t i=0;i<r->width;++i)slot[i]=colibri::v2::deepseek4::half_bits(r->projected[i]);
+    }
+    ++r->position;return 0;});}
+
+int colibri_v2_dspark_cached(const ColibriV2DsparkRuntime*r,uint32_t layer,uint32_t position,float*output,uint64_t elements){return guarded([&]{
+    if(!r||!output||layer>=r->model->config.layer_count||position>=r->position||
+       r->position-position>r->window||elements<r->width)throw std::runtime_error("invalid DSpark cache read");
+    const auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+position%r->window)*r->width;
+    for(std::uint32_t i=0;i<r->width;++i)output[i]=colibri::v2::deepseek4::half_value(slot[i]);
     return 0;});}
 const Tensor& qwen_role_tensor(const ColibriV2Model&m,const char*role){std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m.tensors)if(t.name==candidate)return t;throw std::runtime_error("Qwen tensor role is missing");}
 int colibri_v2_qwen_embedding(const ColibriV2Model*m,uint32_t token,float*out,uint64_t elements){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid embedding arguments");const Tensor&t=qwen_role_tensor(*m,"token_embeddings");if(t.shape.size()!=2)throw std::runtime_error("embedding shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(token>=vocab||elements<width)throw std::runtime_error("embedding token or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t i=0;i<width;i++)out[i]=tensor_value(data,t.type,static_cast<uint64_t>(token)*width+i);return 0;});}
