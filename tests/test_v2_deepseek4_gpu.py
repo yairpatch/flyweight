@@ -101,6 +101,17 @@ class DeviceMatvecTests(unittest.TestCase):
         on_gpu, on_cpu, _, _ = self.check(name)
         np.testing.assert_allclose(on_gpu, on_cpu, rtol=1e-4, atol=1e-5)
 
+    def test_iq1s_expert_slice_agrees_with_the_cpu(self):
+        tensor = next(
+            (item for item in self.tensors.values()
+             if int(item["ggml_type"]) == 19 and len(item["shape"]) == 3),
+            None,
+        )
+        if tensor is None:
+            self.skipTest("this checkpoint stores no IQ1_S expert tensor")
+        on_gpu, on_cpu, _, _ = self.check(tensor["name"])
+        np.testing.assert_allclose(on_gpu, on_cpu, rtol=2e-4, atol=2e-4)
+
     def test_the_q8_kernel_clears_the_cpu_by_a_wide_margin(self):
         name = self.a_tensor_of_type(8)
         self.check(name, iterations=2000)          # let the clocks come up

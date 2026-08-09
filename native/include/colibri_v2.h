@@ -293,6 +293,8 @@ typedef struct ColibriV2Deepseek4Info {
     uint64_t gpu_weight_bytes, gpu_matvec_calls, gpu_batches;
     uint64_t hyper_nanoseconds, matvec_nanoseconds;
     uint64_t prefill_calls, prefill_tokens, prefill_nanoseconds;
+    uint64_t expert_cache_bytes, expert_cache_slots;
+    uint64_t expert_cache_hits, expert_cache_misses, expert_cache_evictions;
 } ColibriV2Deepseek4Info;
 
 /* One sequence's DeepSeek-V4 state. Raw latents are bounded by the sliding
@@ -330,7 +332,7 @@ COLIBRI_V2_API int colibri_v2_deepseek4_visible_keys(int32_t position, int32_t r
    built from it. Exposed so the ranking can be checked without a prompt long
    enough to make the runtime run it. */
 /* Upload the dense half of the model to the device and run its matvecs there.
-   The routed experts stay on the CPU: they are 90 GiB against 12 of VRAM. */
+   COLIBRI_DS4_EXPERT_CACHE_MIB optionally enables a per-layer routed cache. */
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_gpu(ColibriV2Deepseek4Runtime* runtime,
     int32_t device);
 /* Borrow immutable device weights and the serialized scheduler workspace from

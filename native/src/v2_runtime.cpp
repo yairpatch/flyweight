@@ -54,6 +54,7 @@
 #  include <fcntl.h>
 #  include <sys/mman.h>
 #  include <sys/stat.h>
+#  include <sched.h>
 #  include <unistd.h>
 #  include <dlfcn.h>
 #endif
@@ -4043,6 +4044,12 @@ struct Deepseek4Scratch {
     std::vector<std::uint8_t> mask, indexer_keep;
     std::vector<std::int32_t> experts;
     std::vector<float> weights;
+    std::vector<std::uint8_t> gpu_experts;
+};
+
+struct Deepseek4ExpertSlot {
+    std::uint64_t key = 0, last_used = 0;
+    bool valid = false;
 };
 
 struct ColibriV2Deepseek4Runtime {
@@ -4089,6 +4096,14 @@ struct ColibriV2Deepseek4Runtime {
     std::uint64_t gpu_input_capacity = 0, gpu_output_capacity = 0;
     std::uint64_t gpu_weight_bytes = 0, gpu_matvec_calls = 0, gpu_batches = 0;
     std::uint64_t gpu_batch = 0, gpu_batch_capacity = 0;
+    std::uint64_t expert_cache = 0, expert_cache_bytes = 0, expert_slot_bytes = 0;
+    std::uint32_t expert_slots_per_layer = 0;
+    std::uint64_t expert_cache_clock = 0, expert_cache_hits = 0;
+    std::uint64_t expert_cache_misses = 0, expert_cache_evictions = 0;
+    std::vector<Deepseek4ExpertSlot> expert_slots;
+    std::unordered_map<std::uint64_t, std::size_t> expert_residency;
+    std::unordered_map<std::uint64_t, std::uint32_t> expert_frequency;
+    ColibriV2Deepseek4Runtime* gpu_cache_owner = nullptr;
     std::uint64_t hyper_nanoseconds = 0, matvec_nanoseconds = 0;
     std::uint64_t prefill_calls = 0, prefill_tokens = 0, prefill_nanoseconds = 0;
 
@@ -4269,6 +4284,7 @@ int colibri_v2_deepseek4_runtime_create(
     sc.routed_activated.assign(sc.routed_gate.size(),0.0f);
     sc.routed_out.assign(static_cast<std::size_t>(g.experts_used)*g.n_embd,0.0f);
     sc.experts.assign(g.experts_used,0); sc.weights.assign(g.experts_used,0.0f);
+    sc.gpu_experts.assign(g.experts_used,0);
     // Keys for one attention: the window plus every compressed block.
     std::uint32_t widest=0;
     for(const auto& layer:g.layers){
@@ -4301,6 +4317,7 @@ void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime){
             if(runtime->gpu_input)colibri_gpu_free(runtime->gpu_input);
             if(runtime->gpu_output)colibri_gpu_free(runtime->gpu_output);
             if(runtime->gpu_batch)colibri_gpu_free(runtime->gpu_batch);
+            if(runtime->expert_cache)colibri_gpu_free(runtime->expert_cache);
         }
         delete runtime;
     }catch(...){}
@@ -4323,6 +4340,35 @@ namespace {
 // team costs barrier time as well. deepseek4's pragmas simply never took a
 // `num_threads`.
 int ds4_thread_count() { return colibri::v2::deepseek4::thread_count(); }
+
+void ds4_pin_current_thread() {
+#if defined(_OPENMP) && !defined(_WIN32)
+    static const bool enabled=[] {
+        const char* setting=std::getenv("COLIBRI_DS4_AFFINITY");
+        return setting&&std::string(setting)=="on";
+    }();
+    static const std::vector<int> cpus=[] {
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        std::vector<int> result;
+        if(sched_getaffinity(0,sizeof(allowed),&allowed)==0)
+            for(int cpu=0;cpu<CPU_SETSIZE;++cpu)
+                if(CPU_ISSET(cpu,&allowed))result.push_back(cpu);
+        return result;
+    }();
+    thread_local bool pinned=false;
+    if(!enabled||pinned||cpus.empty())return;
+    const int target=omp_get_thread_num();
+    // The OpenMP master is also the long-lived inference/scheduler thread.
+    // Pinning it leaked affinity into unrelated work after the parallel region;
+    // workers are persistent and safe to bind, while the master stays mobile.
+    if(target==0)return;
+    const int cpu=cpus[static_cast<std::size_t>(target)%cpus.size()];
+    cpu_set_t one;
+    CPU_ZERO(&one); CPU_SET(cpu,&one);
+    if(sched_setaffinity(0,sizeof(one),&one)==0)pinned=true;
+#endif
+}
 
 // Compile the CUDA kernels once per process.
 //
@@ -4352,9 +4398,17 @@ void ds4_gpu_compile(std::int32_t device) {
     std::vector<const char*> options;
     for (const auto& option : option_storage) options.push_back(option.c_str());
     std::array<char, 16384> log{};
+    std::string iq1_grid =
+        "extern \"C\" __device__ __constant__ unsigned long long "
+        "ds4_iq1s_grid[2048]={";
+    for (const auto entry : kIq1sGrid) {
+        iq1_grid += std::to_string(entry);
+        iq1_grid += "ULL,";
+    }
+    iq1_grid += "};\n";
     const std::string source =
         std::string(colibri::v2::qwen_cuda_source) + colibri::v2::qwen_native_cuda_source +
-        deepseek4_cuda_source;
+        iq1_grid + deepseek4_cuda_source;
     if (colibri_gpu_compile(source.c_str(), options.data(),
                             static_cast<std::int32_t>(options.size()), device,
                             log.data(), static_cast<std::int32_t>(log.size())) != 0)
@@ -4369,6 +4423,12 @@ int ds4_gpu_matvec(std::uint32_t type, std::uint64_t weights, std::uint64_t inpu
                    std::uint64_t output, std::int32_t inputs, std::int32_t outputs,
                    std::uint64_t stream) {
     switch (type) {
+        case 19: {  // IQ1_S
+            void* arguments[] = {&weights, &input, &output, &inputs, &outputs};
+            const auto blocks = static_cast<std::uint32_t>((outputs + 7) / 8);
+            return colibri_gpu_launch_named("ds4_iq1s_matvec", blocks, 1, 256, 0,
+                                            stream, arguments);
+        }
         case 8: {  // Q8_0
             // Four blocks in flight per warp against the shared kernel's one.
             void* arguments[] = {&weights, &input, &output, &inputs, &outputs};
@@ -4385,7 +4445,8 @@ int ds4_gpu_matvec(std::uint32_t type, std::uint64_t weights, std::uint64_t inpu
         case 30:  // BF16
             return colibri_gpu_bf16_matvec_transposed(weights, input, output, inputs, outputs, stream);
         default:
-            throw std::runtime_error("no device matvec for this weight type");
+            return qwen_gpu_matvec_by_type(
+                type, weights, input, output, inputs, outputs, stream);
     }
 }
 
@@ -4483,6 +4544,130 @@ bool ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
     rt.gpu_matvec_calls += count;
     ++rt.gpu_batches;
     return true;
+}
+
+void ds4_cached_experts(
+    ColibriV2Deepseek4Runtime& rt, std::uint32_t layer_index,
+    const Deepseek4LayerPlan& plan, Deepseek4Scratch& sc
+) {
+    std::fill(sc.gpu_experts.begin(),sc.gpu_experts.end(),0);
+    auto* cache=rt.gpu_cache_owner?rt.gpu_cache_owner:&rt;
+    if(!rt.gpu||!cache->expert_cache||!cache->expert_slots_per_layer)return;
+    const auto& model=*rt.model;
+    const auto& gate=model.tensors[plan.gate_exps];
+    const auto& up=model.tensors[plan.up_exps];
+    const auto& down=model.tensors[plan.down_exps];
+    // The profitable path groups every hit into two launches. IQ2_XXS has only
+    // a scalar matvec kernel, and the launch-heavy version benchmarked slower
+    // than the fused host loop, so those layers deliberately remain on CPU.
+    if(gate.type!=19||up.type!=19||down.type!=18)return;
+    const std::uint64_t gate_bytes=gate.size/rt.experts;
+    const std::uint64_t up_bytes=up.size/rt.experts;
+    const std::uint64_t down_bytes=down.size/rt.experts;
+    const auto begin=static_cast<std::size_t>(layer_index)*cache->expert_slots_per_layer;
+    const auto end=begin+cache->expert_slots_per_layer;
+    std::array<std::uint64_t,8> gate_ptrs{},up_ptrs{},down_ptrs{};
+    std::array<float,8> gpu_weights{};
+    std::uint32_t gpu_count=0;
+    for(std::uint32_t selected=0;selected<rt.experts_used;++selected){
+        const auto expert=static_cast<std::uint32_t>(sc.experts[selected]);
+        const auto key=(static_cast<std::uint64_t>(layer_index)<<32)|expert;
+        auto found=cache->expert_residency.find(key);
+        std::size_t slot_index=0;
+        if(found!=cache->expert_residency.end()){
+            slot_index=found->second;
+            ++cache->expert_cache_hits;
+            auto& frequency=cache->expert_frequency[key];
+            if(frequency!=std::numeric_limits<std::uint32_t>::max())++frequency;
+        }else{
+            ++cache->expert_cache_misses;
+            auto& frequency=cache->expert_frequency[key];
+            if(frequency!=std::numeric_limits<std::uint32_t>::max())++frequency;
+            // A one-off route is cheaper on the fused CPU path than a PCIe
+            // upload. Admit only after recurrence proves there is reuse.
+            if(frequency<2)continue;
+            auto free=std::find_if(cache->expert_slots.begin()+begin,
+                cache->expert_slots.begin()+end,
+                [](const Deepseek4ExpertSlot& slot){return !slot.valid;});
+            auto victim=free;
+            if(victim==cache->expert_slots.begin()+end){
+                victim=std::min_element(cache->expert_slots.begin()+begin,
+                    cache->expert_slots.begin()+end,
+                    [&](const Deepseek4ExpertSlot& a,const Deepseek4ExpertSlot& b){
+                        const auto af=cache->expert_frequency[a.key];
+                        const auto bf=cache->expert_frequency[b.key];
+                        return af!=bf?af<bf:a.last_used<b.last_used;
+                    });
+                if(frequency<=cache->expert_frequency[victim->key])continue;
+                cache->expert_residency.erase(victim->key);
+                ++cache->expert_cache_evictions;
+            }
+            slot_index=static_cast<std::size_t>(victim-cache->expert_slots.begin());
+            const auto base=cache->expert_cache+slot_index*cache->expert_slot_bytes;
+            std::uint64_t offset=0;
+            for(const auto role:{plan.gate_exps,plan.up_exps,plan.down_exps}){
+                const auto& tensor=model.tensors[role];
+                const auto bytes=tensor.size/rt.experts;
+                if(colibri_gpu_upload(base+offset,tensor_data(model,tensor)+
+                        static_cast<std::uint64_t>(expert)*bytes,bytes,0)!=0)
+                    throw std::runtime_error("DeepSeek expert-cache upload failed");
+                offset+=bytes;
+            }
+            victim->key=key; victim->valid=true;
+            cache->expert_residency[key]=slot_index;
+            // The admission upload is allowed to finish alongside this token's
+            // CPU expert calculation; it becomes a GPU hit next time.
+            victim->last_used=++cache->expert_cache_clock;
+            continue;
+        }
+        auto& slot=cache->expert_slots[slot_index];
+        slot.last_used=++cache->expert_cache_clock;
+        const auto base=cache->expert_cache+slot_index*cache->expert_slot_bytes;
+        gate_ptrs[gpu_count]=base;
+        up_ptrs[gpu_count]=base+gate_bytes;
+        down_ptrs[gpu_count]=base+gate_bytes+up_bytes;
+        gpu_weights[gpu_count]=sc.weights[selected];
+        sc.gpu_experts[selected]=1;
+        ++gpu_count;
+    }
+    if(!gpu_count)return;
+    struct PointerBundle {
+        std::uint64_t gate[8],up[8],down[8];
+        float weights[8];
+    } bundle{};
+    std::copy_n(gate_ptrs.begin(),gpu_count,bundle.gate);
+    std::copy_n(up_ptrs.begin(),gpu_count,bundle.up);
+    std::copy_n(down_ptrs.begin(),gpu_count,bundle.down);
+    std::copy_n(gpu_weights.begin(),gpu_count,bundle.weights);
+    std::uint64_t pointer_buffer=rt.gpu_batch;
+    std::uint64_t gate_device=pointer_buffer;
+    std::uint64_t up_device=gate_device+sizeof(bundle.gate);
+    std::uint64_t down_device=up_device+sizeof(bundle.up);
+    std::uint64_t weights_device=down_device+sizeof(bundle.down);
+    std::uint64_t aggregate=weights_device+sizeof(bundle.weights);
+    int input_size=static_cast<int>(rt.n_embd);
+    int intermediate=static_cast<int>(rt.expert_ffn);
+    int output_size=static_cast<int>(rt.n_embd);
+    int count=static_cast<int>(gpu_count);
+    int status=colibri_gpu_upload(rt.gpu_input,sc.hidden.data(),
+        static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
+    if(status==0)status=colibri_gpu_upload(pointer_buffer,&bundle,sizeof(bundle),0);
+    if(status==0)status=colibri_gpu_memset(
+        aggregate,0,static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
+    void* gate_args[]={&gate_device,&up_device,&rt.gpu_input,&rt.gpu_output,
+        &input_size,&intermediate,&count,&rt.clamp};
+    if(status==0)status=colibri_gpu_launch_named("ds4_iq1s_grouped_swiglu",
+        rt.expert_ffn,gpu_count,256,0,0,gate_args);
+    void* down_args[]={&down_device,&rt.gpu_output,&aggregate,&weights_device,
+        &intermediate,&output_size,&count};
+    if(status==0)status=colibri_gpu_launch_named("iq3xxs_grouped_accumulate",
+        rt.n_embd,1,256,0,0,down_args);
+    if(status==0)status=colibri_gpu_download(sc.expert_out.data(),aggregate,
+        static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
+    if(status==0)status=colibri_gpu_sync();
+    if(status!=0)throw std::runtime_error("DeepSeek grouped cached experts failed");
+    for(std::uint32_t i=0;i<rt.n_embd;++i)sc.moe[i]+=sc.expert_out[i];
+    rt.gpu_matvec_calls+=3*gpu_count;
 }
 
 void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
@@ -4954,6 +5139,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         }
     }
     const auto experts_started = ds4_now();
+    ds4_cached_experts(rt,index,plan,sc);
     static const bool expert_batch_enabled=[] {
         const char* setting=std::getenv("COLIBRI_DS4_EXPERT_BATCH");
         return !(setting&&std::string(setting)=="off");
@@ -4970,7 +5156,9 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         const auto* down_packed=tensor_data(model,down_tensor);
 #pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
         for(std::int64_t item=0;item<static_cast<std::int64_t>(rt.experts_used)*rt.expert_ffn;++item){
+            ds4_pin_current_thread();
             const auto slot=static_cast<std::uint32_t>(item/rt.expert_ffn);
+            if(sc.gpu_experts[slot])continue;
             const auto row=static_cast<std::uint32_t>(item%rt.expert_ffn);
             const auto absolute=static_cast<std::uint64_t>(sc.experts[slot])*rt.expert_ffn+row;
             sc.routed_gate[static_cast<std::size_t>(item)]=qwen_quant_dot(
@@ -4980,13 +5168,18 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
         }
 #pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
         for(std::int64_t item=0;item<static_cast<std::int64_t>(rt.experts_used)*rt.expert_ffn;++item){
+            ds4_pin_current_thread();
+            const auto slot=static_cast<std::uint32_t>(item/rt.expert_ffn);
+            if(sc.gpu_experts[slot])continue;
             const float gate=std::clamp(sc.routed_gate[static_cast<std::size_t>(item)],-rt.clamp,rt.clamp);
             const float up=std::clamp(sc.routed_up[static_cast<std::size_t>(item)],-rt.clamp,rt.clamp);
             sc.routed_activated[static_cast<std::size_t>(item)]=gate/(1.0f+std::exp(-gate))*up;
         }
 #pragma omp parallel for schedule(static) num_threads(ds4_thread_count())
         for(std::int64_t item=0;item<static_cast<std::int64_t>(rt.experts_used)*n_embd;++item){
+            ds4_pin_current_thread();
             const auto slot=static_cast<std::uint32_t>(item/n_embd);
+            if(sc.gpu_experts[slot])continue;
             const auto row=static_cast<std::uint32_t>(item%n_embd);
             const auto absolute=static_cast<std::uint64_t>(sc.experts[slot])*n_embd+row;
             sc.routed_out[static_cast<std::size_t>(item)]=qwen_quant_dot(
@@ -4995,12 +5188,16 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                 rt.expert_ffn,absolute);
         }
         for (std::uint32_t slot = 0; slot < rt.experts_used; ++slot) {
+            if(sc.gpu_experts[slot])continue;
             const float weight = sc.weights[slot];
             const float* expert_out=sc.routed_out.data()+static_cast<std::size_t>(slot)*n_embd;
             for (std::uint32_t i = 0; i < n_embd; ++i) sc.moe[i] += expert_out[i] * weight;
         }
     }else{
         for (std::uint32_t slot = 0; slot < rt.experts_used; ++slot) {
+            if(sc.gpu_experts[slot]){
+                continue;
+            }
             const auto expert = sc.experts[slot];
             ds4_expert_matvec(model, plan.gate_exps, expert, sc.hidden.data(), n_embd,
                               sc.gate.data(), rt.expert_ffn);
@@ -5069,6 +5266,12 @@ int colibri_v2_deepseek4_runtime_info(
     out->prefill_calls=runtime->prefill_calls;
     out->prefill_tokens=runtime->prefill_tokens;
     out->prefill_nanoseconds=runtime->prefill_nanoseconds;
+    const auto* cache=runtime->gpu_cache_owner?runtime->gpu_cache_owner:runtime;
+    out->expert_cache_bytes=cache->expert_cache_bytes;
+    out->expert_cache_slots=cache->expert_slots.size();
+    out->expert_cache_hits=cache->expert_cache_hits;
+    out->expert_cache_misses=cache->expert_cache_misses;
+    out->expert_cache_evictions=cache->expert_cache_evictions;
     out->indexer_selections=runtime->indexer_selections;
     out->indexer_candidates=runtime->indexer_candidates;
     return 0;});}
@@ -5200,6 +5403,8 @@ int colibri_v2_deepseek4_runtime_gpu(
     std::uint32_t widest_input=0,widest_output=0;
     std::unordered_map<std::uint64_t,std::uint64_t> resident;
     std::uint64_t weight_bytes=0,input_buffer=0,output_buffer=0,batch_buffer=0;
+    std::uint64_t expert_cache=0,expert_cache_bytes=0,expert_slot_bytes=0;
+    std::uint32_t expert_slots_per_layer=0;
     // Device allocation has several failure points. Keep ownership local until
     // the complete set is usable so a failed enable neither leaks VRAM nor
     // leaves a half-populated runtime that cannot safely be retried.
@@ -5208,7 +5413,9 @@ int colibri_v2_deepseek4_runtime_gpu(
         if(input_buffer)colibri_gpu_free(input_buffer);
         if(output_buffer)colibri_gpu_free(output_buffer);
         if(batch_buffer)colibri_gpu_free(batch_buffer);
+        if(expert_cache)colibri_gpu_free(expert_cache);
         resident.clear(); input_buffer=output_buffer=batch_buffer=0;
+        expert_cache=0;
     };
     for(const auto index:wanted){
         const auto& tensor=rt.model->tensors[index];
@@ -5248,12 +5455,54 @@ int colibri_v2_deepseek4_runtime_gpu(
         release_pending();
         throw std::runtime_error("out of device memory for the activation buffers");
     }
+    // Keep a layer-partitioned cache. A global LRU is pathological here: the
+    // next token visits all 43 layers in the same order and evicts every early
+    // layer before it can be reused. Equal per-layer partitions preserve route
+    // recurrence and guarantee that one layer cannot churn another's experts.
+    for(const auto& layer:rt.layers){
+        std::uint64_t bytes=0;
+        for(const auto index:{layer.plan.gate_exps,layer.plan.up_exps,layer.plan.down_exps})
+            bytes+=rt.model->tensors[index].size/rt.experts;
+        expert_slot_bytes=std::max(expert_slot_bytes,bytes);
+    }
+    expert_slot_bytes=device_align(expert_slot_bytes);
+    // Opt-in on this hardware: even grouped execution is slightly slower than
+    // the 16-core IQ path at its measured route recurrence. Larger-memory GPUs
+    // can enable it explicitly and inspect the exported hit-rate counters.
+    std::uint64_t requested_mib=0;
+    if(const char* setting=std::getenv("COLIBRI_DS4_EXPERT_CACHE_MIB")){
+        if(std::string(setting)=="off")requested_mib=0;
+        else requested_mib=std::strtoull(setting,nullptr,10);
+    }
+    ColibriV2GpuInfo gpu_info{};
+    gpu_probe(gpu_info,device);
+    constexpr std::uint64_t reserve=768ull*1024*1024;
+    const auto available=gpu_info.free_memory>reserve?gpu_info.free_memory-reserve:0;
+    const auto budget=std::min<std::uint64_t>(requested_mib*1024ull*1024ull,available);
+    if(expert_slot_bytes&&!rt.layers.empty()){
+        expert_slots_per_layer=static_cast<std::uint32_t>(
+            budget/expert_slot_bytes/rt.layers.size());
+        expert_cache_bytes=static_cast<std::uint64_t>(expert_slots_per_layer)*
+            rt.layers.size()*expert_slot_bytes;
+        if(expert_slots_per_layer<rt.experts_used)expert_cache_bytes=0;
+    }
+    if(expert_cache_bytes&&colibri_gpu_alloc(expert_cache_bytes,&expert_cache)!=0){
+        // Caching is an optimization. Dense placement remains useful when a
+        // fragmented or concurrently used device cannot satisfy this request.
+        expert_cache=expert_cache_bytes=0;
+        expert_slots_per_layer=0;
+    }
     rt.resident=std::move(resident);
     rt.gpu_weight_bytes=weight_bytes;
     rt.gpu_input=input_buffer; rt.gpu_output=output_buffer; rt.gpu_batch=batch_buffer;
     rt.gpu_input_capacity=input_capacity; rt.gpu_output_capacity=output_capacity;
     rt.gpu_batch_capacity=batch_capacity;
-    input_buffer=output_buffer=batch_buffer=0;
+    rt.expert_cache=expert_cache; rt.expert_cache_bytes=expert_cache_bytes;
+    rt.expert_slot_bytes=expert_slot_bytes;
+    rt.expert_slots_per_layer=expert_slots_per_layer;
+    rt.expert_slots.resize(static_cast<std::size_t>(expert_slots_per_layer)*rt.layers.size());
+    rt.gpu_cache_owner=&rt;
+    input_buffer=output_buffer=batch_buffer=expert_cache=0;
     rt.gpu=true;
     rt.gpu_owner=true;
     return 0;});}
@@ -5275,6 +5524,11 @@ int colibri_v2_deepseek4_runtime_gpu_share(
     runtime->gpu_output_capacity=owner->gpu_output_capacity;
     runtime->gpu_batch_capacity=owner->gpu_batch_capacity;
     runtime->gpu_weight_bytes=owner->gpu_weight_bytes;
+    runtime->expert_cache=owner->expert_cache;
+    runtime->expert_cache_bytes=owner->expert_cache_bytes;
+    runtime->expert_slot_bytes=owner->expert_slot_bytes;
+    runtime->expert_slots_per_layer=owner->expert_slots_per_layer;
+    runtime->gpu_cache_owner=const_cast<ColibriV2Deepseek4Runtime*>(owner);
     return 0;});}
 
 // Make this thread's CUDA context current.
@@ -5312,14 +5566,19 @@ int colibri_v2_deepseek4_gpu_matvec_check(
         out_cpu[row]=qwen_quant_dot(tensor_data(*model,*found),found->type,input,inputs,
                                     static_cast<std::uint64_t>(row));
 
+    // A three-dimensional routed tensor can be checked one expert at a time;
+    // allocating its complete 18 GiB backing just to exercise an 8 MiB kernel
+    // slice would make the checker unusable on the device this path targets.
+    const std::uint64_t weight_bytes = found->shape.size() == 3
+        ? found->size / found->shape[2] : found->size;
     std::uint64_t weights=0,vector=0,result=0;
-    if(colibri_gpu_alloc(found->size,&weights)!=0)
+    if(colibri_gpu_alloc(weight_bytes,&weights)!=0)
         throw std::runtime_error("cannot allocate device weights");
     if(colibri_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0)
         throw std::runtime_error("cannot allocate the device input");
     if(colibri_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0)
         throw std::runtime_error("cannot allocate the device output");
-    int status=colibri_gpu_upload_sync(weights,tensor_data(*model,*found),found->size);
+    int status=colibri_gpu_upload_sync(weights,tensor_data(*model,*found),weight_bytes);
     if(status==0)status=colibri_gpu_upload_sync(vector,input,
         static_cast<std::uint64_t>(inputs)*sizeof(float));
     if(status==0)status=ds4_gpu_matvec(found->type,weights,vector,result,inputs,outputs,0);
@@ -5340,7 +5599,8 @@ int colibri_v2_deepseek4_gpu_matvec_check(
         static_cast<std::uint64_t>(outputs)*sizeof(float),0);
     if(status==0)status=colibri_gpu_sync();
     colibri_gpu_free(weights);colibri_gpu_free(vector);colibri_gpu_free(result);
-    if(status!=0)throw std::runtime_error("the device matvec failed");
+    if(status!=0)throw std::runtime_error(
+        "the device matvec failed with status "+std::to_string(status));
     return 0;});}
 
 int colibri_v2_deepseek4_indexer_key(

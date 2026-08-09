@@ -169,6 +169,11 @@ class _Deepseek4Info(ctypes.Structure):
         ("prefill_calls", ctypes.c_uint64),
         ("prefill_tokens", ctypes.c_uint64),
         ("prefill_nanoseconds", ctypes.c_uint64),
+        ("expert_cache_bytes", ctypes.c_uint64),
+        ("expert_cache_slots", ctypes.c_uint64),
+        ("expert_cache_hits", ctypes.c_uint64),
+        ("expert_cache_misses", ctypes.c_uint64),
+        ("expert_cache_evictions", ctypes.c_uint64),
     ]
 
 

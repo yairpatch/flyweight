@@ -7,6 +7,111 @@
 // would move another model's numbers.
 inline constexpr char deepseek4_cuda_source[] = R"COLIBRI_CUDA(
 
+// The 2048-entry IQ1_S grid is emitted ahead of this source by the runtime.
+extern "C" __device__ __constant__ unsigned long long ds4_iq1s_grid[2048];
+
+extern "C" __global__
+void ds4_iq1s_matvec(
+    const unsigned char* packed,
+    const float* vector,
+    float* output,
+    const int input_size,
+    const int output_size
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= output_size) return;
+    const int blocks = input_size >> 8;
+    const unsigned char* row_data =
+        packed + (unsigned long long)row * blocks * 50;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const unsigned char* base = row_data + (unsigned long long)block * 50;
+        const unsigned char* qs = base + 2;
+        const unsigned short* qh = (const unsigned short*)(base + 34);
+        const float d = __half2float(*((const __half*)base));
+        #pragma unroll
+        for (int group = 0; group < 8; ++group) {
+            const unsigned short header = qh[group];
+            const int part = lane >> 3;
+            const int within = lane & 7;
+            const unsigned int index = (unsigned int)qs[4 * group + part] |
+                (((unsigned int)header >> (3 * part) & 7u) << 8);
+            const unsigned long long entry = ds4_iq1s_grid[index];
+            const signed char quant = (signed char)(entry >> (8 * within));
+            const float delta = (header & 0x8000) ? -0.125f : 0.125f;
+            const float scale = d * (float)(2 * ((header >> 12) & 7) + 1);
+            result = fmaf(scale * ((float)quant + delta),
+                          vector[block * 256 + group * 32 + lane], result);
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        result += __shfl_down_sync(0xffffffff, result, offset);
+    if (lane == 0) output[row] = result;
+}
+
+__device__ __forceinline__ float ds4_iq1s_value(
+    const unsigned char* packed, const long long absolute
+) {
+    const int block = (int)(absolute >> 8);
+    const int within = (int)(absolute & 255);
+    const int group = within >> 5;
+    const int part = (within >> 3) & 3;
+    const int lane = within & 7;
+    const unsigned char* base = packed + (long long)block * 50;
+    const unsigned short header = *((const unsigned short*)(base + 34 + group * 2));
+    const unsigned int index = (unsigned int)base[2 + 4 * group + part] |
+        (((unsigned int)header >> (3 * part) & 7u) << 8);
+    const signed char quant = (signed char)(ds4_iq1s_grid[index] >> (8 * lane));
+    const float delta = (header & 0x8000) ? -0.125f : 0.125f;
+    const float scale = __half2float(*((const __half*)base)) *
+        (float)(2 * ((header >> 12) & 7) + 1);
+    return scale * ((float)quant + delta);
+}
+
+extern "C" __global__
+void ds4_iq1s_grouped_swiglu(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector, float* activated,
+    const int input_size, const int output_size,
+    const int experts, const float limit
+) {
+    const int row = blockIdx.x;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate = (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up = (const unsigned char*)up_ptrs[expert];
+    const long long base = (long long)row * input_size;
+    float g = 0.0f, u = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float value = vector[input];
+        g += ds4_iq1s_value(gate, base + input) * value;
+        u += ds4_iq1s_value(up, base + input) * value;
+    }
+    g = block_reduce_sum(g);
+    u = block_reduce_sum(u);
+    if (threadIdx.x == 0) {
+        g = fminf(fmaxf(g, -limit), limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        activated[expert * output_size + row] =
+            (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+extern "C" __global__
+void ds4_clamped_swiglu(
+    const float* gate, const float* up, float* output,
+    const int size, const float limit
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size) return;
+    const float g = fminf(fmaxf(gate[index], -limit), limit);
+    const float u = fminf(fmaxf(up[index], -limit), limit);
+    output[index] = (g / (1.0f + expf(-g))) * u;
+}
+
 // Q8_0 matvec, four blocks of weights in flight per warp iteration.
 //
 // The shared kernel walks one 32-value block per warp iteration, which is 32

@@ -238,8 +238,10 @@ class Deepseek4Runtime:
     def use_gpu(self, device: int = 0) -> None:
         """Move the dense half of the model onto the device.
 
-        The routed experts stay where they are; they are 90 GiB against 12 of
-        VRAM, and they are also the part a token reads least of.
+        Routed experts remain on the CPU by default. Set
+        ``COLIBRI_DS4_EXPERT_CACHE_MIB`` before this call to opt into the
+        measured, per-layer GPU cache on a device where its hit rate and PCIe
+        bandwidth make it profitable.
         """
         status = self._library.colibri_v2_deepseek4_runtime_gpu(self._handle, int(device))
         if status:
