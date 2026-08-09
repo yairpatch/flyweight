@@ -36,6 +36,7 @@ from typing import Mapping
 import numpy as np
 
 from .deepseek4 import Deepseek4Runtime
+from .dspark import DsparkSession
 from .sampling import SamplingConfig
 from .server import InferenceService
 from .v2 import V2Error, V2Model
@@ -109,7 +110,7 @@ class _Slot:
 class _Task:
     __slots__ = (
         "task_id", "prompt", "max_new_tokens", "stop", "sampling", "queue",
-        "slot", "fed", "generated", "pending", "rng", "cancelled",
+        "slot", "fed", "generated", "pending", "rng", "cancelled", "logits",
     )
 
     def __init__(
@@ -133,6 +134,7 @@ class _Task:
         self.pending = 0        # the token whose forward produces the next logits
         self.rng = np.random.default_rng(sampling.seed)
         self.cancelled = False
+        self.logits = None
 
 
 class Deepseek4Engine:
@@ -152,17 +154,22 @@ class Deepseek4Engine:
 
     def __init__(
         self, model: V2Model, context_limit: int, slots: int = 1,
-        device: int | None = None,
+        device: int | None = None, dspark_model: V2Model | None = None,
     ):
         if slots <= 0:
             raise ValueError("slots must be positive")
         self.context_limit = int(context_limit)
         self.device = device
-        self._slots = [Deepseek4Runtime(model, context_limit) for _ in range(slots)]
+        self._slots = [
+            DsparkSession(model, dspark_model, context_limit) if dspark_model is not None
+            else Deepseek4Runtime(model, context_limit)
+            for _ in range(slots)
+        ]
         if device is not None:
-            self._slots[0].use_gpu(device)
+            owner = self._slots[0].target if dspark_model is not None else self._slots[0]
+            owner.use_gpu(device)
             for runtime in self._slots[1:]:
-                runtime.share_gpu(self._slots[0])
+                (runtime.target if dspark_model is not None else runtime).share_gpu(owner)
         self._pool = [_Slot(runtime) for runtime in self._slots]
         self._lock = threading.Lock()
         self._tasks: OrderedDict[int, _Task] = OrderedDict()
@@ -346,12 +353,17 @@ class Deepseek4Engine:
             self._emit(task, ("prefill", task.fed))
         slot = task.slot
         assert slot is not None
+        dspark = slot.runtime if isinstance(slot.runtime, DsparkSession) else None
         # Prefill: everything but the last prompt token, whose logits are the
         # first thing generation needs.
         if task.fed < len(task.prompt) - 1:
             end = min(task.fed + self._PREFILL_CHUNK, len(task.prompt) - 1)
             chunk = task.prompt[task.fed:end]
-            slot.runtime.prefill(chunk)
+            if dspark is None:
+                slot.runtime.prefill(chunk)
+            else:
+                for token in chunk:
+                    dspark.forward_target(token, logits=False)
             slot.tokens.extend(chunk)
             task.fed = end
             self._emit(task, ("prefill", task.fed))
@@ -359,12 +371,46 @@ class Deepseek4Engine:
         current = (
             task.prompt[-1] if task.fed == len(task.prompt) - 1 else task.pending
         )
-        logits = slot.runtime.forward(current)
-        slot.tokens.append(current)
+        if dspark is not None:
+            if task.logits is None:
+                task.logits = dspark.forward_target(current)
+                slot.tokens.append(current)
+            logits = task.logits
+        else:
+            logits = slot.runtime.forward(current)
+            slot.tokens.append(current)
         if task.fed == len(task.prompt) - 1:
             task.fed = len(task.prompt)
             self._emit(task, ("prefill", task.fed))
+        if dspark is not None and task.sampling.temperature <= 0:
+            remaining = task.max_new_tokens - task.generated
+            accepted, correction, next_logits = dspark.speculative_round(
+                slot.tokens[-1], logits, p_min=0.1, max_candidates=remaining
+            )
+            emitted = list(accepted)
+            slot.tokens.extend(emitted)
+            task.logits = next_logits
+            if correction is not None and len(emitted) < remaining:
+                emitted.append(correction)
+                task.pending = correction
+                task.logits = None
+            elif not emitted:
+                correction = int(np.argmax(logits))
+                emitted.append(correction)
+                task.pending = correction
+                task.logits = None
+            for index, token in enumerate(emitted):
+                task.generated += 1
+                if not self._emit(task, ("token", token)):
+                    return True
+                if token in task.stop or task.generated >= task.max_new_tokens:
+                    if index + 1 < len(emitted):
+                        slot.dirty = True
+                    self._finish(task, ("done", None))
+                    return True
+            return True
         token = sample_token(logits, task.sampling, task.rng)
+        task.logits = None
         task.pending = token
         task.generated += 1
         if not self._emit(task, ("token", token)):
@@ -379,7 +425,8 @@ class Deepseek4Engine:
         try:
             if self.device is not None:
                 for slot in self._pool:
-                    slot.runtime.attach_gpu()
+                    runtime = slot.runtime.target if isinstance(slot.runtime, DsparkSession) else slot.runtime
+                    runtime.attach_gpu()
         except Exception as error:
             # Initialization happens on the worker because CUDA contexts are
             # current per thread.  It must still follow the same terminal-event
@@ -443,9 +490,10 @@ class Deepseek4Generator(ChatGenerator):
         context_limit: int,
         slots: int = 1,
         device: int | None = None,
+        dspark_model: V2Model | None = None,
     ):
         super().__init__(
-            model, Deepseek4Engine(model, context_limit, slots, device), tokenizer
+            model, Deepseek4Engine(model, context_limit, slots, device, dspark_model), tokenizer
         )
 
     def prefix_cache_stats(self) -> dict[str, int]:
@@ -513,6 +561,7 @@ class NativeDeepseek4InferenceService(InferenceService):
         max_new_tokens: int = 1024,
         parallel_sequences: int = 1,
         device: int | None = None,
+        dspark_model_path: Path | str | None = None,
         api_key: str | None = None,
         cors_origin: str = "*",
         strict_model: bool = False,
@@ -526,6 +575,7 @@ class NativeDeepseek4InferenceService(InferenceService):
             model_path
         )
         self.v2_model = V2Model(model_path)
+        self.dspark_model = V2Model(dspark_model_path) if dspark_model_path else None
         try:
             architecture = str(self.v2_model.config["architecture"])
             if architecture != "deepseek4":
@@ -539,8 +589,11 @@ class NativeDeepseek4InferenceService(InferenceService):
                 context_limit=context_window,
                 slots=parallel_sequences,
                 device=device,
+                dspark_model=self.dspark_model,
             )
         except Exception:
+            if self.dspark_model is not None:
+                self.dspark_model.close()
             self.v2_model.close()
             raise
         super().__init__(
@@ -565,11 +618,14 @@ class NativeDeepseek4InferenceService(InferenceService):
 
     def close(self) -> None:
         self.generator.close()
+        if self.dspark_model is not None:
+            self.dspark_model.close()
         self.v2_model.close()
 
     def health(self) -> dict[str, object]:
         value = super().health()
         runtime = self.generator.engine._pool[0].runtime
+        target = runtime.target if isinstance(runtime, DsparkSession) else runtime
         value["execution"] = {
             "backend": (
                 "native-v2-deepseek4-cpu" if self.device is None
@@ -577,8 +633,10 @@ class NativeDeepseek4InferenceService(InferenceService):
             ),
             "slots": self.parallel_sequences,
             "device": self.device,
-            **runtime.info,
+            **target.info,
         }
+        if isinstance(runtime, DsparkSession):
+            value["execution"]["dspark"] = dict(runtime.stats)
         return value
 
     def properties(self) -> dict[str, object]:

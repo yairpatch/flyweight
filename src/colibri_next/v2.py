@@ -491,6 +491,8 @@ def _library() -> ctypes.CDLL:
                 ]
                 lib.colibri_v2_dspark_runtime_create.restype = ctypes.c_int
                 lib.colibri_v2_dspark_runtime_free.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_dspark_runtime_reset.argtypes = [ctypes.c_void_p]
+                lib.colibri_v2_dspark_runtime_reset.restype = ctypes.c_int
                 lib.colibri_v2_dspark_inject.argtypes = [
                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
                 ]

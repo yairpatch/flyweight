@@ -6166,6 +6166,12 @@ int colibri_v2_dspark_runtime_create(ColibriV2Model*m,uint32_t context_limit,Col
         throw std::runtime_error(error.empty()?"cannot create DSpark decoder plan":error);
     *out=runtime.release();return 0;});}
 void colibri_v2_dspark_runtime_free(ColibriV2DsparkRuntime*r){try{if(r)colibri_v2_deepseek4_runtime_free(r->decoder);delete r;}catch(...){}}
+int colibri_v2_dspark_runtime_reset(ColibriV2DsparkRuntime*r){return guarded([&]{
+    if(!r)throw std::runtime_error("invalid DSpark runtime");
+    r->position=0;std::fill(r->cache.begin(),r->cache.end(),0);
+    if(colibri_v2_deepseek4_runtime_reset(r->decoder)!=0)
+        throw std::runtime_error(error.empty()?"cannot reset DSpark decoder":error);
+    return 0;});}
 
 int colibri_v2_dspark_inject(ColibriV2DsparkRuntime*r,const float*fused,uint64_t elements){return guarded([&]{
     if(!r||!fused||elements!=r->model->config.hidden_size)throw std::runtime_error("invalid DSpark injection");

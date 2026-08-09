@@ -431,6 +431,7 @@ COLIBRI_V2_API int colibri_v2_dspark_encode(const ColibriV2Model* model,
 COLIBRI_V2_API int colibri_v2_dspark_runtime_create(ColibriV2Model* model,
     uint32_t context_limit, ColibriV2DsparkRuntime** out);
 COLIBRI_V2_API void colibri_v2_dspark_runtime_free(ColibriV2DsparkRuntime* runtime);
+COLIBRI_V2_API int colibri_v2_dspark_runtime_reset(ColibriV2DsparkRuntime* runtime);
 COLIBRI_V2_API int colibri_v2_dspark_inject(ColibriV2DsparkRuntime* runtime,
     const float* fused, uint64_t elements);
 COLIBRI_V2_API int colibri_v2_dspark_cached(const ColibriV2DsparkRuntime* runtime,

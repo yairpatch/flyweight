@@ -29,6 +29,9 @@ class DsparkRuntime:
             self._handle, values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), values.size
         ))
 
+    def reset(self) -> None:
+        self._check(self._library.colibri_v2_dspark_runtime_reset(self._handle))
+
     def cached(self, layer: int, position: int) -> np.ndarray:
         output = np.empty(self._width, dtype=np.float32)
         self._check(self._library.colibri_v2_dspark_cached(
@@ -159,6 +162,12 @@ class DsparkSession:
         fused = self.sidecar_model.dspark_encode(self.target.captured)
         self.draft.inject(fused)
         return result
+
+    def reset(self) -> None:
+        self.target.reset()
+        self.draft.reset()
+        for key in self.stats:
+            self.stats[key] = 0
 
     def draft_tokens(self, anchor_token: int):
         config = self.sidecar_model.config
