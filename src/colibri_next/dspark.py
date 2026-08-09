@@ -37,6 +37,28 @@ class DsparkRuntime:
         ))
         return output
 
+    def heads(self, base_logits, hidden, anchor_token: int):
+        base = np.ascontiguousarray(base_logits, dtype=np.float32)
+        states = np.ascontiguousarray(hidden, dtype=np.float32)
+        if base.ndim != 2 or states.ndim != 2 or base.shape[0] != states.shape[0]:
+            raise ValueError("base logits and hidden states must have matching rows")
+        if base.shape[1] != int(self._model.config["vocabulary_size"]):
+            raise ValueError("base logits have the wrong vocabulary width")
+        if states.shape[1] != int(self._model.config["hidden_size"]):
+            raise ValueError("hidden states have the wrong width")
+        rows = base.shape[0]
+        output = np.empty_like(base)
+        confidence = np.empty(rows, dtype=np.float32)
+        tokens = np.empty(rows, dtype=np.uint32)
+        fp = ctypes.POINTER(ctypes.c_float)
+        self._check(self._library.colibri_v2_dspark_heads(
+            self._model._handle,
+            base.ctypes.data_as(fp), states.ctypes.data_as(fp), rows, anchor_token,
+            output.ctypes.data_as(fp), confidence.ctypes.data_as(fp),
+            tokens.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+        ))
+        return output, confidence, tokens
+
     def close(self) -> None:
         if getattr(self, "_handle", None):
             self._library.colibri_v2_dspark_runtime_free(self._handle)

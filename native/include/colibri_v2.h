@@ -422,6 +422,11 @@ COLIBRI_V2_API int colibri_v2_dspark_inject(ColibriV2DsparkRuntime* runtime,
     const float* fused, uint64_t elements);
 COLIBRI_V2_API int colibri_v2_dspark_cached(const ColibriV2DsparkRuntime* runtime,
     uint32_t layer, uint32_t position, float* output, uint64_t elements);
+/* Apply the chained DSpark Markov bias and confidence projection to one draft
+   block. `base_logits` and `hidden` are row-major. */
+COLIBRI_V2_API int colibri_v2_dspark_heads(const ColibriV2Model* model,
+    const float* base_logits, const float* hidden, uint32_t rows,
+    uint32_t anchor_token, float* logits, float* confidence, uint32_t* tokens);
 /* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
    UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
    query the required size; an absent key reports length zero. */
