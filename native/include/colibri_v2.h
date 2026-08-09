@@ -316,6 +316,8 @@ COLIBRI_V2_API int colibri_v2_deepseek4_capture_layers(ColibriV2Deepseek4Runtime
     const uint32_t* layers, uint32_t count);
 COLIBRI_V2_API int colibri_v2_deepseek4_captured(const ColibriV2Deepseek4Runtime* runtime,
     float* output, uint64_t elements);
+COLIBRI_V2_API int colibri_v2_deepseek4_lm_head(ColibriV2Deepseek4Runtime* runtime,
+    const float* hidden, uint32_t rows, float* logits, uint64_t elements);
 /* Feed a contiguous prompt chunk without producing intermediate logits. This
    keeps the cross-language scheduler out of the per-token loop and is the ABI
    used by progressively wider native prefill implementations. */
@@ -432,6 +434,11 @@ COLIBRI_V2_API int colibri_v2_dspark_attention(const ColibriV2DsparkRuntime* run
     float* output, uint64_t elements);
 COLIBRI_V2_API int colibri_v2_dspark_attention_stage(ColibriV2DsparkRuntime* runtime,
     uint32_t layer, const float* streams, uint32_t rows, float* output, uint64_t elements);
+COLIBRI_V2_API int colibri_v2_dspark_ffn_stage(ColibriV2DsparkRuntime* runtime,
+    uint32_t layer, const float* streams, uint32_t rows, float* output, uint64_t elements);
+COLIBRI_V2_API int colibri_v2_dspark_decode_hidden(ColibriV2DsparkRuntime* runtime,
+    const float* embeddings, uint32_t rows, float* hidden, float* normalized,
+    uint64_t elements);
 /* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
    UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
    query the required size; an absent key reports length zero. */

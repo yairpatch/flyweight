@@ -519,6 +519,16 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_uint32, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
                 ]
                 lib.colibri_v2_dspark_attention_stage.restype = ctypes.c_int
+                lib.colibri_v2_dspark_ffn_stage.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_uint32, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                ]
+                lib.colibri_v2_dspark_ffn_stage.restype = ctypes.c_int
+                lib.colibri_v2_dspark_decode_hidden.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                ]
+                lib.colibri_v2_dspark_decode_hidden.restype = ctypes.c_int
                 lib.colibri_v2_pretokenize.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_char_p,
@@ -586,6 +596,11 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, _float_p, ctypes.c_uint64,
                 ]
                 lib.colibri_v2_deepseek4_captured.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_lm_head.argtypes = [
+                    ctypes.c_void_p, _float_p, ctypes.c_uint32,
+                    _float_p, ctypes.c_uint64,
+                ]
+                lib.colibri_v2_deepseek4_lm_head.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_prefill.argtypes = [
                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
                 ]

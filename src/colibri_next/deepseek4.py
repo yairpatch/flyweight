@@ -166,6 +166,18 @@ class Deepseek4Runtime:
             raise V2Error((self._library.colibri_v2_last_error() or b"capture read failed").decode(errors="replace"))
         return output
 
+    def lm_head(self, hidden):
+        values = np.ascontiguousarray(hidden, dtype=np.float32)
+        if values.ndim != 2 or values.shape[1] != int(self._model.config["hidden_size"]):
+            raise ValueError("hidden must have shape [rows, hidden_size]")
+        output = np.empty((values.shape[0], self._vocabulary), dtype=np.float32)
+        status = self._library.colibri_v2_deepseek4_lm_head(
+            self._handle, _pointer(values), values.shape[0], _pointer(output), output.size
+        )
+        if status:
+            raise V2Error((self._library.colibri_v2_last_error() or b"LM head failed").decode(errors="replace"))
+        return output
+
     def prefill(self, tokens) -> None:
         """Advance a prompt chunk without materializing intermediate logits."""
         values = np.ascontiguousarray(list(tokens), dtype=np.uint32)

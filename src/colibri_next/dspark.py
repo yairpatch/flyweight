@@ -88,6 +88,32 @@ class DsparkRuntime:
         ))
         return output
 
+    def ffn_stage(self, layer: int, streams):
+        values = np.ascontiguousarray(streams, dtype=np.float32)
+        expected = (int(self._model.config["hyper_connection_count"]),
+                    int(self._model.config["hidden_size"]))
+        if values.ndim != 3 or values.shape[1:] != expected:
+            raise ValueError("streams must have shape [rows, hc, hidden]")
+        output = np.empty_like(values); fp = ctypes.POINTER(ctypes.c_float)
+        self._check(self._library.colibri_v2_dspark_ffn_stage(
+            self._handle, layer, values.ctypes.data_as(fp), values.shape[0],
+            output.ctypes.data_as(fp), output.size,
+        ))
+        return output
+
+    def decode_hidden(self, embeddings):
+        values = np.ascontiguousarray(embeddings, dtype=np.float32)
+        width = int(self._model.config["hidden_size"])
+        if values.ndim != 2 or values.shape[1] != width:
+            raise ValueError("embeddings must have shape [rows, hidden]")
+        hidden = np.empty_like(values); normalized = np.empty_like(values)
+        fp = ctypes.POINTER(ctypes.c_float)
+        self._check(self._library.colibri_v2_dspark_decode_hidden(
+            self._handle, values.ctypes.data_as(fp), values.shape[0],
+            hidden.ctypes.data_as(fp), normalized.ctypes.data_as(fp), hidden.size,
+        ))
+        return hidden, normalized
+
     def close(self) -> None:
         if getattr(self, "_handle", None):
             self._library.colibri_v2_dspark_runtime_free(self._handle)
@@ -132,6 +158,19 @@ class DsparkSession:
         fused = self.sidecar_model.dspark_encode(self.target.captured)
         self.draft.inject(fused)
         return result
+
+    def draft_tokens(self, anchor_token: int):
+        config = self.sidecar_model.config
+        rows = int(config["draft_block_size"])
+        mask = int(config["mask_token_id"])
+        ids = [anchor_token] + [mask] * (rows - 1)
+        embeddings = np.asarray([
+            self.target._model.qwen_embedding(token, int(config["hidden_size"]))
+            for token in ids
+        ], dtype=np.float32)
+        hidden, normalized = self.draft.decode_hidden(embeddings)
+        base_logits = self.target.lm_head(normalized)
+        return self.draft.heads(base_logits, hidden, anchor_token)
 
     def close(self) -> None:
         if getattr(self, "draft", None) is not None:
