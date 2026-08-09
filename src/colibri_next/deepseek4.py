@@ -193,6 +193,26 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"prefill failed").decode(errors="replace")
             )
 
+    def forward_batch(self, tokens):
+        values = np.ascontiguousarray(tuple(tokens), dtype=np.uint32)
+        output = np.empty((values.size, self._vocabulary), dtype=np.float32)
+        if not values.size:
+            return output
+        status = self._library.colibri_v2_deepseek4_forward_batch(
+            self._handle, values.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            values.size, _pointer(output), output.size,
+        )
+        if status:
+            raise V2Error((self._library.colibri_v2_last_error() or b"batch forward failed").decode(errors="replace"))
+        return output
+
+    def snapshot(self):
+        handle = ctypes.c_void_p()
+        status = self._library.colibri_v2_deepseek4_snapshot(self._handle, ctypes.byref(handle))
+        if status:
+            raise V2Error((self._library.colibri_v2_last_error() or b"snapshot failed").decode(errors="replace"))
+        return _Deepseek4Snapshot(self, handle)
+
     def generate(self, tokens, *, max_tokens: int = 32, stop=None):
         """Greedily continue `tokens`, yielding each new token id.
 
@@ -336,6 +356,22 @@ class Deepseek4Runtime:
                 (self._library.colibri_v2_last_error() or b"info failed").decode(errors="replace")
             )
         return {field: getattr(value, field) for field, _ in self._info_type._fields_}
+
+
+class _Deepseek4Snapshot:
+    def __init__(self, runtime, handle): self.runtime, self.handle = runtime, handle
+    def restore(self):
+        status = self.runtime._library.colibri_v2_deepseek4_restore(self.runtime._handle, self.handle)
+        if status:
+            raise V2Error((self.runtime._library.colibri_v2_last_error() or b"restore failed").decode(errors="replace"))
+    def close(self):
+        if self.handle:
+            self.runtime._library.colibri_v2_deepseek4_snapshot_free(self.handle); self.handle = None
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()
+    def __del__(self):
+        try: self.close()
+        except Exception: pass
 
 
 def half_round_trip(value: float) -> float:

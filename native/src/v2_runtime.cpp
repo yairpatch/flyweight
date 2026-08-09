@@ -4125,6 +4125,10 @@ struct ColibriV2Deepseek4Runtime {
         for (auto& layer : layers) { layer.positions = 0; layer.blocks = 0; }
     }
 };
+struct ColibriV2Deepseek4Snapshot {
+    std::vector<Deepseek4LayerState> layers;
+    std::vector<float> captured;
+};
 
 int colibri_v2_deepseek4_runtime_create(
     ColibriV2Model* model, uint32_t context_limit, ColibriV2Deepseek4Runtime** out
@@ -5528,8 +5532,8 @@ int colibri_v2_deepseek4_lm_head(ColibriV2Deepseek4Runtime*r,const float*hidden,
             logits+static_cast<std::size_t>(row)*r->vocabulary,r->vocabulary);
     return 0;});}
 
-int colibri_v2_deepseek4_prefill(
-    ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count
+static int ds4_prefill_impl(
+    ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count,float* all_logits
 ){return guarded([&]{
     if(!runtime||(!tokens&&count))throw std::runtime_error("invalid prefill arguments");
     if(!count)return 0;
@@ -5581,6 +5585,20 @@ int colibri_v2_deepseek4_prefill(
             }
             rt.layers[layer].positions+=rows;
         }
+        if(all_logits){
+            namespace ds4=colibri::v2::deepseek4;
+            for(std::uint32_t row=0;row<rows;++row){
+                auto&sc=scratch[row];
+                ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
+                    ds4_f32(model,rt.head_scale),ds4_f32(model,rt.head_base),rt.n_embd,rt.hc,
+                    rt.epsilon,rt.epsilon,sc.head_pre.data(),sc.collapsed.data());
+                ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
+                const auto*gain=ds4_f32(model,rt.output_norm);
+                for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=gain[i];
+                ds4_matvec(rt,rt.output,sc.hidden.data(),rt.n_embd,
+                    all_logits+static_cast<std::size_t>(chunk+row)*rt.vocabulary,rt.vocabulary);
+            }
+        }
         rt.forward_calls+=rows;
     }
     const auto elapsed=ds4_now()-started;
@@ -5589,6 +5607,25 @@ int colibri_v2_deepseek4_prefill(
     runtime->prefill_nanoseconds+=elapsed;
     runtime->forward_nanoseconds+=elapsed;
     return 0;});}
+
+int colibri_v2_deepseek4_prefill(ColibriV2Deepseek4Runtime*r,const uint32_t*t,uint32_t n){
+    return ds4_prefill_impl(r,t,n,nullptr);
+}
+int colibri_v2_deepseek4_forward_batch(ColibriV2Deepseek4Runtime*r,const uint32_t*t,
+    uint32_t n,float*logits,uint64_t elements){
+    if(!r||!logits||elements<static_cast<std::uint64_t>(n)*r->vocabulary){
+        error="invalid DeepSeek forward-batch output";return -1;
+    }
+    return ds4_prefill_impl(r,t,n,logits);
+}
+int colibri_v2_deepseek4_snapshot(const ColibriV2Deepseek4Runtime*r,ColibriV2Deepseek4Snapshot**out){return guarded([&]{
+    if(!r||!out)throw std::runtime_error("invalid DeepSeek snapshot arguments");
+    auto snapshot=std::make_unique<ColibriV2Deepseek4Snapshot>();snapshot->layers=r->layers;
+    snapshot->captured=r->captured;*out=snapshot.release();return 0;});}
+int colibri_v2_deepseek4_restore(ColibriV2Deepseek4Runtime*r,const ColibriV2Deepseek4Snapshot*s){return guarded([&]{
+    if(!r||!s||s->layers.size()!=r->layers.size())throw std::runtime_error("invalid DeepSeek snapshot");
+    r->layers=s->layers;r->captured=s->captured;return 0;});}
+void colibri_v2_deepseek4_snapshot_free(ColibriV2Deepseek4Snapshot*s){try{delete s;}catch(...){}}
 
 // Put one checkpoint tensor through the GPU and report how far the answer
 // drifts from the CPU's.

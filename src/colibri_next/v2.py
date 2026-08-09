@@ -605,6 +605,16 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
                 ]
                 lib.colibri_v2_deepseek4_prefill.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_forward_batch.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+                    _float_p, ctypes.c_uint64,
+                ]
+                lib.colibri_v2_deepseek4_forward_batch.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_snapshot.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+                lib.colibri_v2_deepseek4_snapshot.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_restore.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                lib.colibri_v2_deepseek4_restore.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_snapshot_free.argtypes = [ctypes.c_void_p]
                 lib.colibri_v2_deepseek4_runtime_info.argtypes = [
                     ctypes.c_void_p, ctypes.POINTER(_Deepseek4Info),
                 ]

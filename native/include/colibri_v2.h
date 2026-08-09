@@ -21,6 +21,7 @@ typedef struct ColibriV2KvCache ColibriV2KvCache;
 typedef struct ColibriV2QwenRuntime ColibriV2QwenRuntime;
 typedef struct ColibriV2Deepseek4Runtime ColibriV2Deepseek4Runtime;
 typedef struct ColibriV2DsparkRuntime ColibriV2DsparkRuntime;
+typedef struct ColibriV2Deepseek4Snapshot ColibriV2Deepseek4Snapshot;
 
 typedef struct ColibriV2ModelInfo {
     uint32_t gguf_version;
@@ -323,6 +324,13 @@ COLIBRI_V2_API int colibri_v2_deepseek4_lm_head(ColibriV2Deepseek4Runtime* runti
    used by progressively wider native prefill implementations. */
 COLIBRI_V2_API int colibri_v2_deepseek4_prefill(ColibriV2Deepseek4Runtime* runtime,
     const uint32_t* tokens, uint32_t count);
+COLIBRI_V2_API int colibri_v2_deepseek4_forward_batch(ColibriV2Deepseek4Runtime* runtime,
+    const uint32_t* tokens, uint32_t count, float* logits, uint64_t elements);
+COLIBRI_V2_API int colibri_v2_deepseek4_snapshot(const ColibriV2Deepseek4Runtime* runtime,
+    ColibriV2Deepseek4Snapshot** out);
+COLIBRI_V2_API int colibri_v2_deepseek4_restore(ColibriV2Deepseek4Runtime* runtime,
+    const ColibriV2Deepseek4Snapshot* snapshot);
+COLIBRI_V2_API void colibri_v2_deepseek4_snapshot_free(ColibriV2Deepseek4Snapshot* snapshot);
 COLIBRI_V2_API int colibri_v2_deepseek4_runtime_info(const ColibriV2Deepseek4Runtime* runtime,
     ColibriV2Deepseek4Info* out);
 /* Round-trip a float through half precision, as the caches store it. */
