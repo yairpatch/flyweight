@@ -75,6 +75,19 @@ class DsparkRuntime:
         ))
         return output
 
+    def attention_stage(self, layer: int, streams):
+        values = np.ascontiguousarray(streams, dtype=np.float32)
+        expected = (int(self._model.config["hyper_connection_count"]),
+                    int(self._model.config["hidden_size"]))
+        if values.ndim != 3 or values.shape[1:] != expected:
+            raise ValueError("streams must have shape [rows, hc, hidden]")
+        output = np.empty_like(values); fp = ctypes.POINTER(ctypes.c_float)
+        self._check(self._library.colibri_v2_dspark_attention_stage(
+            self._handle, layer, values.ctypes.data_as(fp), values.shape[0],
+            output.ctypes.data_as(fp), output.size,
+        ))
+        return output
+
     def close(self) -> None:
         if getattr(self, "_handle", None):
             self._library.colibri_v2_dspark_runtime_free(self._handle)

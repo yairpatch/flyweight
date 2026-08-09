@@ -4131,8 +4131,9 @@ int colibri_v2_deepseek4_runtime_create(
 ){return guarded([&]{
     if(!model||!out||!context_limit)
         throw std::runtime_error("model, context limit and output are required");
-    if(model->config.architecture!="deepseek4")
-        throw std::runtime_error("not a deepseek4 model");
+    const bool draft_model=model->config.architecture=="dflash";
+    if(model->config.architecture!="deepseek4"&&!draft_model)
+        throw std::runtime_error("not a deepseek4/dflash model");
     const auto& config=model->config;
     if(config.context_length&&context_limit>config.context_length)
         throw std::runtime_error("deepseek4 context limit exceeds the checkpoint context length");
@@ -4269,7 +4270,12 @@ int colibri_v2_deepseek4_runtime_create(
     };
     g.head_fn=require("output_hc_fn.weight"); g.head_scale=require("output_hc_scale.weight");
     g.head_base=require("output_hc_base.weight"); g.output_norm=require("output_norm.weight");
-    g.output=require("output.weight"); g.token_embd=require("token_embd.weight");
+    if(draft_model){
+        g.output=Deepseek4LayerPlan::kAbsent;
+        g.token_embd=Deepseek4LayerPlan::kAbsent;
+    }else{
+        g.output=require("output.weight"); g.token_embd=require("token_embd.weight");
+    }
 
     auto& sc=g.scratch;
     const std::size_t wide=static_cast<std::size_t>(g.heads)*g.head_dim;
@@ -6058,6 +6064,7 @@ struct ColibriV2DsparkRuntime {
     float epsilon=0.0f,freq_base=10000.0f;
     std::vector<std::uint16_t> cache;
     std::vector<float> projected;
+    ColibriV2Deepseek4Runtime* decoder=nullptr;
 };
 
 int colibri_v2_dspark_runtime_create(ColibriV2Model*m,uint32_t context_limit,ColibriV2DsparkRuntime**out){return guarded([&]{
@@ -6071,8 +6078,11 @@ int colibri_v2_dspark_runtime_create(ColibriV2Model*m,uint32_t context_limit,Col
     if(!runtime->width||runtime->rope_dim>runtime->width||!runtime->window)
         throw std::runtime_error("DSpark KV geometry is incomplete");
     runtime->cache.assign(static_cast<std::size_t>(m->config.layer_count)*runtime->window*runtime->width,0);
-    runtime->projected.resize(runtime->width);*out=runtime.release();return 0;});}
-void colibri_v2_dspark_runtime_free(ColibriV2DsparkRuntime*r){try{delete r;}catch(...){}}
+    runtime->projected.resize(runtime->width);
+    if(colibri_v2_deepseek4_runtime_create(m,context_limit,&runtime->decoder)!=0)
+        throw std::runtime_error(error.empty()?"cannot create DSpark decoder plan":error);
+    *out=runtime.release();return 0;});}
+void colibri_v2_dspark_runtime_free(ColibriV2DsparkRuntime*r){try{if(r)colibri_v2_deepseek4_runtime_free(r->decoder);delete r;}catch(...){}}
 
 int colibri_v2_dspark_inject(ColibriV2DsparkRuntime*r,const float*fused,uint64_t elements){return guarded([&]{
     if(!r||!fused||elements!=r->model->config.hidden_size)throw std::runtime_error("invalid DSpark injection");
@@ -6092,7 +6102,10 @@ int colibri_v2_dspark_inject(ColibriV2DsparkRuntime*r,const float*fused,uint64_t
         colibri::v2::deepseek4::rope(r->projected.data()+r->width-r->rope_dim,r->rope_dim,
             static_cast<std::int32_t>(r->position),r->freq_base,1.0f,false);
         auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+r->position%r->window)*r->width;
-        for(std::uint32_t i=0;i<r->width;++i)slot[i]=colibri::v2::deepseek4::half_bits(r->projected[i]);
+        auto*decoder_slot=r->decoder->layers[layer].latents.data()+
+            static_cast<std::size_t>(r->position%r->window)*r->width;
+        for(std::uint32_t i=0;i<r->width;++i)slot[i]=decoder_slot[i]=colibri::v2::deepseek4::half_bits(r->projected[i]);
+        r->decoder->layers[layer].positions=r->position+1;
     }
     ++r->position;return 0;});}
 
@@ -6177,6 +6190,68 @@ int colibri_v2_dspark_attention(const ColibriV2DsparkRuntime*r,uint32_t layer,
         colibri::v2::deepseek4::attention_with_sinks(
             queries+static_cast<std::size_t>(row)*heads*width,keys.data(),sinks.data(),nullptr,
             heads,width,count,scale,output+static_cast<std::size_t>(row)*heads*width);
+    }
+    return 0;});}
+
+int colibri_v2_dspark_attention_stage(ColibriV2DsparkRuntime*r,uint32_t layer,
+    const float*streams,uint32_t rows,float*output,uint64_t elements){return guarded([&]{
+    if(!r||!streams||!output||layer>=r->decoder->layers.size()||!rows||rows>r->model->config.draft_block_size)
+        throw std::runtime_error("invalid DSpark attention stage");
+    auto&rt=*r->decoder;const auto&plan=rt.layers[layer].plan;const auto&model=*rt.model;
+    namespace ds4=colibri::v2::deepseek4;
+    const auto stream_width=static_cast<std::size_t>(rt.hc)*rt.n_embd;
+    if(elements<static_cast<std::uint64_t>(rows)*stream_width)throw std::runtime_error("DSpark stage output is too small");
+    const auto wide=static_cast<std::size_t>(rt.heads)*rt.head_dim;
+    std::vector<Deepseek4Scratch>scratch(rows,rt.scratch);
+    std::vector<float>queries(static_cast<std::size_t>(rows)*wide);
+    std::vector<float>latents(static_cast<std::size_t>(rows)*rt.head_dim);
+    std::vector<float>attended(static_cast<std::size_t>(rows)*wide);
+    for(std::uint32_t row=0;row<rows;++row){
+        auto&sc=scratch[row];const auto*input=streams+static_cast<std::size_t>(row)*stream_width;
+        ds4::hyper_connection_weights(input,ds4_f32(model,plan.hc_attn_fn),ds4_f32(model,plan.hc_attn_scale),
+            ds4_f32(model,plan.hc_attn_base),rt.n_embd,rt.hc,rt.sinkhorn_iterations,rt.epsilon,rt.epsilon,
+            sc.pre.data(),sc.post.data(),sc.comb.data());
+        ds4::hyper_connection_collapse(input,sc.pre.data(),rt.n_embd,rt.hc,sc.collapsed.data());
+        ds4::rms_norm(sc.collapsed.data(),rt.n_embd,rt.epsilon,sc.hidden.data());
+        const auto*attn_gain=ds4_f32(model,plan.attn_norm);
+        for(std::uint32_t i=0;i<rt.n_embd;++i)sc.hidden[i]*=attn_gain[i];
+        ds4_matvec(rt,plan.q_a,sc.hidden.data(),rt.n_embd,sc.low_rank.data(),rt.q_lora);
+        ds4::rms_norm(sc.low_rank.data(),rt.q_lora,rt.epsilon,sc.low_rank.data());
+        const auto*q_gain=ds4_f32(model,plan.q_a_norm);
+        for(std::uint32_t i=0;i<rt.q_lora;++i)sc.low_rank[i]*=q_gain[i];
+        ds4_matvec(rt,plan.q_b,sc.low_rank.data(),rt.q_lora,sc.query.data(),static_cast<int32_t>(wide));
+        ds4_matvec(rt,plan.kv,sc.hidden.data(),rt.n_embd,sc.latent.data(),rt.head_dim);
+        const auto position=r->position+row;
+        for(std::uint32_t head=0;head<rt.heads;++head){
+            auto*q=sc.query.data()+static_cast<std::size_t>(head)*rt.head_dim;
+            ds4::rms_norm(q,rt.head_dim,rt.epsilon,q);
+            ds4::rope(q+rt.head_dim-rt.rope_dim,rt.rope_dim,position,rt.freq_base,1.0f,false);
+        }
+        ds4::rms_norm(sc.latent.data(),rt.head_dim,rt.epsilon,sc.latent.data());
+        const auto*kv_gain=ds4_f32(model,plan.kv_a_norm);
+        for(std::uint32_t i=0;i<rt.head_dim;++i)sc.latent[i]*=kv_gain[i];
+        ds4::rope(sc.latent.data()+rt.head_dim-rt.rope_dim,rt.rope_dim,position,rt.freq_base,1.0f,false);
+        std::copy_n(sc.query.data(),wide,queries.data()+static_cast<std::size_t>(row)*wide);
+        std::copy_n(sc.latent.data(),rt.head_dim,latents.data()+static_cast<std::size_t>(row)*rt.head_dim);
+    }
+    if(colibri_v2_dspark_attention(r,layer,queries.data(),latents.data(),rows,attended.data(),attended.size())!=0)
+        throw std::runtime_error(error.empty()?"DSpark block attention failed":error);
+    for(std::uint32_t row=0;row<rows;++row){
+        auto&sc=scratch[row];const auto position=r->position+row;
+        std::copy_n(attended.data()+static_cast<std::size_t>(row)*wide,wide,sc.derope.data());
+        for(std::uint32_t head=0;head<rt.heads;++head)
+            ds4::rope(sc.derope.data()+static_cast<std::size_t>(head)*rt.head_dim+rt.head_dim-rt.rope_dim,
+                rt.rope_dim,position,rt.freq_base,1.0f,true);
+        const auto&wa=model.tensors[plan.output_a];const auto*packed=tensor_data(model,wa);
+        const auto inputs=static_cast<std::int32_t>(wide/rt.groups);
+        for(std::uint32_t out_row=0;out_row<rt.groups*rt.lora_rank;++out_row){
+            const auto group=out_row/rt.lora_rank;
+            sc.grouped[out_row]=qwen_quant_dot(packed,wa.type,sc.derope.data()+static_cast<std::size_t>(group)*inputs,inputs,out_row);
+        }
+        ds4_matvec(rt,plan.output_b,sc.grouped.data(),rt.groups*rt.lora_rank,sc.block_out.data(),rt.n_embd);
+        const auto*input=streams+static_cast<std::size_t>(row)*stream_width;
+        auto*out=output+static_cast<std::size_t>(row)*stream_width;
+        ds4::hyper_connection_combine(sc.block_out.data(),input,sc.post.data(),sc.comb.data(),rt.n_embd,rt.hc,out);
     }
     return 0;});}
 const Tensor& qwen_role_tensor(const ColibriV2Model&m,const char*role){std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m.tensors)if(t.name==candidate)return t;throw std::runtime_error("Qwen tensor role is missing");}

@@ -430,6 +430,8 @@ COLIBRI_V2_API int colibri_v2_dspark_heads(const ColibriV2Model* model,
 COLIBRI_V2_API int colibri_v2_dspark_attention(const ColibriV2DsparkRuntime* runtime,
     uint32_t layer, const float* queries, const float* noise_kv, uint32_t rows,
     float* output, uint64_t elements);
+COLIBRI_V2_API int colibri_v2_dspark_attention_stage(ColibriV2DsparkRuntime* runtime,
+    uint32_t layer, const float* streams, uint32_t rows, float* output, uint64_t elements);
 /* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
    UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
    query the required size; an absent key reports length zero. */
