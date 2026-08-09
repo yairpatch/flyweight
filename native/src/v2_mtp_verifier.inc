@@ -44,6 +44,17 @@ void qwen_forward_rows(
     const auto selected_device=workspace_layout.selected_device.address(runtime.workspace);
     const auto route_weights=workspace_layout.route_weights.address(runtime.workspace);
     const auto gpu_activated=workspace_layout.gpu_activated.address(runtime.workspace);
+    // Small MTP batches are decode-shaped rather than prefill-shaped.  Their
+    // k-quant matrix kernels are dominated by reconstructing weights against
+    // f32 activations, while decode's DP4A path quantizes each activation once
+    // and reuses it across q/k/v and the FFN projections.  Borrow the routed
+    // activation region as transient Q8 scratch; expert execution consumes it
+    // only after all dense projections for the layer have finished.
+    const auto small_q8= gpu_activated;
+    const auto small_q8_scales=small_q8+
+        device_align(static_cast<std::uint64_t>(rows)*runtime.scratch_elements);
+    std::uint64_t q8_cached_input=0;
+    int q8_cached_width=0;
     const auto gpu_table_entries=static_cast<std::uint64_t>(rows)*top_k;
     const auto gpu_gate_table=workspace_layout.gpu_gate_table.address(runtime.workspace);
     const auto gpu_up_table=workspace_layout.gpu_up_table.address(runtime.workspace);
@@ -80,6 +91,56 @@ void qwen_forward_rows(
     auto dense_rows=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         std::uint64_t matrix=runtime.device_tensors[index];
         const auto type=qwen_device_type(runtime,index);
+        const char* q8_kernel=nullptr;
+        if(experts>0&&rows<=8&&(input_size&255)==0){
+            switch(type){
+                case 10:q8_kernel="q2k_q8_matvec_transposed_warp";break;
+                case 11:q8_kernel="q3k_q8_matvec_transposed_warp";break;
+                case 12:q8_kernel="q4k_q8_matvec_transposed_warp";break;
+                case 13:q8_kernel="q5k_q8_matvec_transposed_warp";break;
+                case 14:q8_kernel="q6k_q8_matvec_transposed_warp";break;
+                case 16:q8_kernel="iq2xxs_q8_matvec_transposed_warp";break;
+                case 18:q8_kernel="iq3xxs_q8_matvec_transposed_warp";break;
+                default:break;
+            }
+        }
+        if(q8_kernel){
+            if(q8_cached_input!=input||q8_cached_width!=input_size){
+                for(int row=0;row<rows;++row){
+                    auto row_input=input+static_cast<std::uint64_t>(row)*input_size*sizeof(float);
+                    auto row_q8=small_q8+static_cast<std::uint64_t>(row)*input_size;
+                    auto row_scales=small_q8_scales+
+                        static_cast<std::uint64_t>(row)*(input_size/32)*sizeof(float);
+                    void*quant_args[]={&row_input,&row_q8,&row_scales,&input_size};
+                    launch("quantize_q8_blocks",(input_size+31)/32,1,32,quant_args);
+                }
+                q8_cached_input=input;q8_cached_width=input_size;
+            }
+            for(int row=0;row<rows;++row){
+                auto row_q8=small_q8+static_cast<std::uint64_t>(row)*input_size;
+                auto row_scales=small_q8_scales+
+                    static_cast<std::uint64_t>(row)*(input_size/32)*sizeof(float);
+                auto row_output=output+static_cast<std::uint64_t>(row)*output_size*sizeof(float);
+                void*matvec_args[]={&matrix,&row_q8,&row_scales,&row_output,
+                    &input_size,&output_size};
+                launch(q8_kernel,output_size,1,128,matvec_args);
+            }
+            return;
+        }
+        if(rows<=8&&type==8){
+            for(int row=0;row<rows;++row){
+                const auto row_input=input+
+                    static_cast<std::uint64_t>(row)*input_size*sizeof(float);
+                const auto row_output=output+
+                    static_cast<std::uint64_t>(row)*output_size*sizeof(float);
+                if(colibri_gpu_q8_matvec_transposed(
+                       matrix,row_input,row_output,input_size,output_size,
+                       runtime.stream)!=0)
+                    throw std::runtime_error(
+                        "native Qwen rows Q8 projection failed");
+            }
+            return;
+        }
         void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
         switch(type){
             case 0:launch("qwen_f32_matmul_rows",output_size,rows,256,args);return;
@@ -141,6 +202,7 @@ void qwen_forward_rows(
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
         auto&layer=runtime.layers[layer_number];
+        q8_cached_input=0;q8_cached_width=0;
         const bool profile_prefill=
             runtime.prefill_profile&&expert_policy.records_prefill_frequency();
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)

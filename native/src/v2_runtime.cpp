@@ -11306,18 +11306,21 @@ static bool qwen_mtp_adaptive_enabled(){
     return !setting||setting[0]!='0';
 }
 
+static constexpr std::uint32_t kQwenMtpBaselineTokens=16;
+static constexpr std::uint64_t kQwenMtpKeepPercent=80;
+
 static bool qwen_mtp_should_draft(const ColibriV2QwenRuntime&runtime){
     if(!qwen_mtp_adaptive_enabled())return runtime.options.mtp_drafts!=0;
     return runtime.options.mtp_drafts>=2&&
         !runtime.mtp_adaptive_disabled&&
-        runtime.mtp_calibration_decode_tokens>=4;
+        runtime.mtp_calibration_decode_tokens>=kQwenMtpBaselineTokens;
 }
 
 static void qwen_mtp_record_decode(
     ColibriV2QwenRuntime&runtime,std::uint64_t nanoseconds
 ){
     if(!qwen_mtp_adaptive_enabled()||
-       runtime.mtp_calibration_decode_tokens>=4)return;
+       runtime.mtp_calibration_decode_tokens>=kQwenMtpBaselineTokens)return;
     runtime.mtp_calibration_decode_nanoseconds+=nanoseconds;
     ++runtime.mtp_calibration_decode_tokens;
 }
@@ -11339,9 +11342,11 @@ static void qwen_mtp_record_round(
     const auto mtp_per_token=
         runtime.mtp_calibration_round_nanoseconds/
         runtime.mtp_calibration_round_tokens;
-    // Keep speculation only when it clears a useful margin. Tiny apparent
-    // wins are run-to-run noise and do not repay rejection variance.
-    if(mtp_per_token*100>=baseline_per_token*95){
+    // The verifier is intentionally layer-major, so it is not bit-identical to
+    // token-major decode.  Keep it only for a decisive win: besides absorbing
+    // timing and rejection variance, the short trial then ends well before
+    // harmless rounding differences can accumulate into a greedy-token change.
+    if(mtp_per_token*100>=baseline_per_token*kQwenMtpKeepPercent){
         runtime.mtp_adaptive_disabled=true;
         if(!runtime.mtp_adaptive_reported){
             std::fprintf(stderr,

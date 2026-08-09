@@ -177,6 +177,24 @@ class V2RuntimeTests(unittest.TestCase):
             runtime,
         )
 
+    def test_mtp_adaptive_trial_uses_warm_baseline_and_decisive_margin(self):
+        root = Path(__file__).resolve().parents[1]
+        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+
+        self.assertIn("kQwenMtpBaselineTokens=16", runtime)
+        self.assertIn("kQwenMtpKeepPercent=80", runtime)
+        self.assertIn(
+            "mtp_per_token*100>=baseline_per_token*kQwenMtpKeepPercent",
+            runtime,
+        )
+
+    def test_mtp_small_q8_batches_use_decode_matvecs(self):
+        root = Path(__file__).resolve().parents[1]
+        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text()
+
+        self.assertIn("rows<=8&&type==8", verifier)
+        self.assertIn("colibri_gpu_q8_matvec_transposed(", verifier)
+
     def test_cuda_waits_default_to_blocking_context_scheduling(self):
         root = Path(__file__).resolve().parents[1]
         driver = (root / "native/src/gpu_driver.cpp").read_text()
