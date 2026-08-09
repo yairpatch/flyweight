@@ -152,6 +152,7 @@ class DsparkSession:
             self.target.close()
             raise
         self.sidecar_model = sidecar_model
+        self.stats = {"rounds": 0, "drafted": 0, "accepted": 0, "rejected": 0}
 
     def forward_target(self, token: int, *, logits: bool = True):
         result = self.target.forward(token, logits=logits)
@@ -195,14 +196,66 @@ class DsparkSession:
         next_logits = np.asarray(initial_logits, dtype=np.float32) if not accepted else batch_logits[accepted - 1]
         return tuple(int(token) for token in candidates[:accepted]), expected, next_logits
 
-    def speculative_round(self, anchor_token: int, initial_logits, *, p_min: float = 0.0):
+    def speculative_round(self, anchor_token: int, initial_logits, *, p_min: float = 0.0,
+                          max_candidates: int | None = None):
         _, confidence, tokens = self.draft_tokens(anchor_token)
         count = len(tokens)
         if p_min > 0.0:
             below = np.flatnonzero(confidence < p_min)
             if below.size:
                 count = int(below[0])
-        return self.verify(initial_logits, tokens[:count])
+        if max_candidates is not None:
+            count = min(count, max(0, int(max_candidates)))
+        self.stats["rounds"] += 1
+        self.stats["drafted"] += count
+        accepted, correction, next_logits = self.verify(initial_logits, tokens[:count])
+        self.stats["accepted"] += len(accepted)
+        self.stats["rejected"] += int(correction is not None)
+        return accepted, correction, next_logits
+
+    def generate(self, prompt_tokens, *, max_tokens: int = 32, stop=None,
+                 p_min: float = 0.0):
+        prompt = tuple(int(token) for token in prompt_tokens)
+        if not prompt:
+            raise ValueError("prompt tokens must not be empty")
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
+        if stop is None:
+            config = self.target._model.config
+            stop = {int(config[key]) for key in ("eos_token_id", "eot_token_id")
+                    if int(config[key]) != 0xFFFFFFFF}
+        stop = set(stop)
+        for token in prompt[:-1]:
+            self.forward_target(token, logits=False)
+        anchor = prompt[-1]
+        logits = self.forward_target(anchor, logits=True)
+        produced = 0
+        while produced < max_tokens:
+            accepted, correction, logits = self.speculative_round(
+                anchor, logits, p_min=p_min, max_candidates=max_tokens - produced
+            )
+            for token in accepted:
+                produced += 1
+                yield token
+                anchor = token
+                if token in stop or produced >= max_tokens:
+                    return
+            if correction is not None and produced < max_tokens:
+                produced += 1
+                yield correction
+                if correction in stop or produced >= max_tokens:
+                    return
+                anchor = correction
+                logits = self.forward_target(correction, logits=True)
+            elif not accepted:
+                # A confidence cutoff can deliberately produce no candidates.
+                correction = int(np.argmax(logits))
+                produced += 1
+                yield correction
+                if correction in stop or produced >= max_tokens:
+                    return
+                anchor = correction
+                logits = self.forward_target(correction, logits=True)
 
     def close(self) -> None:
         if getattr(self, "draft", None) is not None:
