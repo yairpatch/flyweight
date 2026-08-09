@@ -481,6 +481,11 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_int32,
                 ]
                 lib.colibri_v2_model_target_layers.restype = ctypes.c_int
+                lib.colibri_v2_dspark_encode.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                ]
+                lib.colibri_v2_dspark_encode.restype = ctypes.c_int
                 lib.colibri_v2_pretokenize.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_char_p,
@@ -540,6 +545,14 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.c_uint32, _float_p,
                 ]
                 lib.colibri_v2_deepseek4_forward.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_capture_layers.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+                ]
+                lib.colibri_v2_deepseek4_capture_layers.restype = ctypes.c_int
+                lib.colibri_v2_deepseek4_captured.argtypes = [
+                    ctypes.c_void_p, _float_p, ctypes.c_uint64,
+                ]
+                lib.colibri_v2_deepseek4_captured.restype = ctypes.c_int
                 lib.colibri_v2_deepseek4_prefill.argtypes = [
                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
                 ]
@@ -1082,6 +1095,18 @@ class V2Model:
         if written < 0:
             self._check(written)
         return tuple(int(buffer[index]) for index in range(written))
+
+    def dspark_encode(self, features):
+        import numpy as np
+
+        values = np.ascontiguousarray(features, dtype=np.float32).reshape(-1)
+        output = np.empty(int(self.config["hidden_size"]), dtype=np.float32)
+        self._check(self._lib.colibri_v2_dspark_encode(
+            self._handle,
+            values.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), values.size,
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), output.size,
+        ))
+        return output
 
     def unsupported_quant_types(self) -> dict[int, list[str]]:
         """Tensors whose GGML type no backend can decode, keyed by type.

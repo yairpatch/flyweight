@@ -143,6 +143,29 @@ class Deepseek4Runtime:
             )
         return out
 
+    def capture_layers(self, layers) -> None:
+        """Retain mean hyper-connection inputs for DSpark feature fusion."""
+        values = np.ascontiguousarray(tuple(layers), dtype=np.uint32)
+        status = self._library.colibri_v2_deepseek4_capture_layers(
+            self._handle,
+            values.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            values.size,
+        )
+        if status:
+            raise V2Error((self._library.colibri_v2_last_error() or b"capture setup failed").decode(errors="replace"))
+        self._capture_count = int(values.size)
+
+    @property
+    def captured(self):
+        count = int(getattr(self, "_capture_count", 0))
+        output = np.zeros((count, int(self._model.config["hidden_size"])), dtype=np.float32)
+        status = self._library.colibri_v2_deepseek4_captured(
+            self._handle, _pointer(output), output.size
+        )
+        if status < 0:
+            raise V2Error((self._library.colibri_v2_last_error() or b"capture read failed").decode(errors="replace"))
+        return output
+
     def prefill(self, tokens) -> None:
         """Advance a prompt chunk without materializing intermediate logits."""
         values = np.ascontiguousarray(list(tokens), dtype=np.uint32)

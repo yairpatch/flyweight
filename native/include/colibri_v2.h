@@ -309,6 +309,12 @@ COLIBRI_V2_API int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime*
    NULL for prompt tokens whose distribution is not wanted. */
 COLIBRI_V2_API int colibri_v2_deepseek4_forward(ColibriV2Deepseek4Runtime* runtime,
     uint32_t token, float* logits);
+/* Select target-layer inputs to retain during forward. Captures are the exact
+   mean of the hyper-connection streams used by DFlash/DSpark encoders. */
+COLIBRI_V2_API int colibri_v2_deepseek4_capture_layers(ColibriV2Deepseek4Runtime* runtime,
+    const uint32_t* layers, uint32_t count);
+COLIBRI_V2_API int colibri_v2_deepseek4_captured(const ColibriV2Deepseek4Runtime* runtime,
+    float* output, uint64_t elements);
 /* Feed a contiguous prompt chunk without producing intermediate logits. This
    keeps the cross-language scheduler out of the per-token loop and is the ABI
    used by progressively wider native prefill implementations. */
@@ -404,6 +410,10 @@ COLIBRI_V2_API int colibri_v2_quant_supported(uint32_t type);
    is NULL or `capacity` is zero, else the number of entries written. */
 COLIBRI_V2_API int colibri_v2_model_compress_ratios(const ColibriV2Model* model, uint32_t* out, int32_t capacity);
 COLIBRI_V2_API int colibri_v2_model_target_layers(const ColibriV2Model* model, uint32_t* out, int32_t capacity);
+/* DFlash feature fusion: fc(concat(target layer inputs)) followed by the
+   sidecar encoder RMS norm. */
+COLIBRI_V2_API int colibri_v2_dspark_encode(const ColibriV2Model* model,
+    const float* features, uint64_t elements, float* output, uint64_t output_elements);
 /* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
    UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
    query the required size; an absent key reports length zero. */

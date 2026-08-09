@@ -36,6 +36,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <map>
 #include <vector>
@@ -4112,6 +4113,8 @@ struct ColibriV2Deepseek4Runtime {
     ColibriV2Deepseek4Runtime* gpu_cache_owner = nullptr;
     std::uint64_t hyper_nanoseconds = 0, matvec_nanoseconds = 0;
     std::uint64_t prefill_calls = 0, prefill_tokens = 0, prefill_nanoseconds = 0;
+    std::vector<std::uint32_t> capture_layers;
+    std::vector<float> captured;
 
     std::uint64_t state_bytes() const {
         std::uint64_t total = 0;
@@ -5438,9 +5441,35 @@ int colibri_v2_deepseek4_forward(
     }
 
     for(std::uint32_t index=0;index<rt.layers.size();++index){
+        const auto capture=std::find(rt.capture_layers.begin(),rt.capture_layers.end(),index);
+        if(capture!=rt.capture_layers.end()){
+            const auto slot=static_cast<std::size_t>(capture-rt.capture_layers.begin());
+            auto* destination=rt.captured.data()+slot*rt.n_embd;
+            const float inverse=1.0f/static_cast<float>(rt.hc);
+            for(std::uint32_t column=0;column<rt.n_embd;++column){
+                float sum=0.0f;
+                for(std::uint32_t stream=0;stream<rt.hc;++stream)
+                    sum+=sc.streams[static_cast<std::size_t>(stream)*rt.n_embd+column];
+                destination[column]=sum*inverse;
+            }
+        }
         ds4_layer_forward(rt,index,position,token,sc.streams.data(),sc.next_streams.data());
         std::swap(sc.streams,sc.next_streams);
         ++rt.layers[index].positions;
+    }
+    const auto final_capture=std::find(
+        rt.capture_layers.begin(),rt.capture_layers.end(),
+        static_cast<std::uint32_t>(rt.layers.size()));
+    if(final_capture!=rt.capture_layers.end()){
+        const auto slot=static_cast<std::size_t>(final_capture-rt.capture_layers.begin());
+        auto* destination=rt.captured.data()+slot*rt.n_embd;
+        const float inverse=1.0f/static_cast<float>(rt.hc);
+        for(std::uint32_t column=0;column<rt.n_embd;++column){
+            float sum=0.0f;
+            for(std::uint32_t stream=0;stream<rt.hc;++stream)
+                sum+=sc.streams[static_cast<std::size_t>(stream)*rt.n_embd+column];
+            destination[column]=sum*inverse;
+        }
     }
 
     if(logits){
@@ -5458,6 +5487,29 @@ int colibri_v2_deepseek4_forward(
     ++rt.forward_calls;
     rt.forward_nanoseconds+=ds4_now()-forward_started;
     return 0;});}
+
+int colibri_v2_deepseek4_capture_layers(
+    ColibriV2Deepseek4Runtime* runtime,const uint32_t* layers,uint32_t count
+){return guarded([&]{
+    if(!runtime||(!layers&&count))throw std::runtime_error("invalid capture-layer arguments");
+    std::vector<std::uint32_t> selected;
+    if(count)selected.assign(layers,layers+count);
+    std::unordered_set<std::uint32_t> unique;
+    for(const auto layer:selected){
+        if(!unique.insert(layer).second)throw std::runtime_error("capture layers must be unique");
+        if(layer>runtime->layers.size())throw std::runtime_error("capture layer is outside the target model");
+    }
+    runtime->capture_layers=std::move(selected);
+    runtime->captured.assign(static_cast<std::size_t>(count)*runtime->n_embd,0.0f);
+    return 0;});}
+
+int colibri_v2_deepseek4_captured(
+    const ColibriV2Deepseek4Runtime* runtime,float* output,uint64_t elements
+){return guarded([&]{
+    if(!runtime||(!output&&elements))throw std::runtime_error("invalid captured-feature arguments");
+    if(elements<runtime->captured.size())throw std::runtime_error("captured-feature output is too small");
+    std::copy(runtime->captured.begin(),runtime->captured.end(),output);
+    return static_cast<int>(runtime->capture_layers.size());});}
 
 int colibri_v2_deepseek4_prefill(
     ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count
@@ -5984,6 +6036,21 @@ int colibri_v2_qwen_tensor_role(const ColibriV2Model*m,const char*role,ColibriV2
 int colibri_v2_qwen_layer_tensor(const ColibriV2Model*m,uint32_t layer,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen layer tensor lookup");std::string prefix="blk."+std::to_string(layer)+".";std::vector<std::string> suffixes;if(std::strcmp(role,"input_norm")==0)suffixes={"attn_norm.weight"};else if(std::strcmp(role,"qkv")==0)suffixes={"attn_qkv.weight"};else if(std::strcmp(role,"attention_q")==0)suffixes={"attn_q.weight"};else if(std::strcmp(role,"attention_k")==0)suffixes={"attn_k.weight"};else if(std::strcmp(role,"attention_v")==0)suffixes={"attn_v.weight"};else if(std::strcmp(role,"attention_output")==0)suffixes={"attn_output.weight","attn_out.weight"};else if(std::strcmp(role,"attention_gate")==0)suffixes={"attn_gate.weight"};else if(std::strcmp(role,"ssm_output")==0)suffixes={"ssm_out.weight"};else if(std::strcmp(role,"ssm_alpha")==0)suffixes={"ssm_alpha.weight"};else if(std::strcmp(role,"ssm_beta")==0)suffixes={"ssm_beta.weight"};else if(std::strcmp(role,"ssm_conv")==0)suffixes={"ssm_conv1d.weight"};else if(std::strcmp(role,"ssm_dt_bias")==0)suffixes={"ssm_dt.bias"};else if(std::strcmp(role,"ssm_a")==0)suffixes={"ssm_a"};else if(std::strcmp(role,"ssm_norm")==0)suffixes={"ssm_norm.weight"};else if(std::strcmp(role,"post_attention_norm")==0)suffixes={"post_attention_norm.weight"};else if(std::strcmp(role,"router")==0)suffixes={"ffn_gate_inp.weight"};else if(std::strcmp(role,"shared_gate")==0)suffixes={"ffn_gate_shexp.weight"};else throw std::runtime_error("unknown Qwen layer tensor role");for(auto const&suffix:suffixes)for(auto const&t:m->tensors)if(t.name==prefix+suffix)return fill(t,*out);throw std::runtime_error("Qwen layer tensor role is missing");});}
 float half_to_float(uint16_t bits){uint32_t sign=(bits&0x8000u)<<16, exponent=(bits>>10)&0x1fu, fraction=bits&0x3ffu;uint32_t result;if(exponent==0){if(!fraction)result=sign;else{exponent=1;while((fraction&0x400u)==0){fraction<<=1;--exponent;}result=sign|((exponent+112)<<23)|((fraction&0x3ffu)<<13);}}else if(exponent==31)result=sign|0x7f800000u|(fraction<<13);else result=sign|((exponent+112)<<23)|(fraction<<13);float value;std::memcpy(&value,&result,sizeof(value));return value;}
 float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
+int colibri_v2_dspark_encode(const ColibriV2Model*m,const float*features,uint64_t elements,float*output,uint64_t output_elements){return guarded([&]{
+    if(!m||!features||!output)throw std::runtime_error("DSpark encoder arguments are required");
+    if(m->config.architecture!="dflash")throw std::runtime_error("not a DFlash/DSpark sidecar");
+    const auto width=m->config.hidden_size;
+    const auto expected=static_cast<std::uint64_t>(m->config.target_layers.size())*width;
+    if(!width||elements!=expected||output_elements<width)throw std::runtime_error("DSpark encoder feature shape is invalid");
+    if(colibri_v2_matvec(m,"fc.weight",features,static_cast<int32_t>(elements),output,static_cast<int32_t>(width))!=0)
+        throw std::runtime_error(error.empty()?"DSpark fusion projection failed":error);
+    const auto norm=std::find_if(m->tensors.begin(),m->tensors.end(),[](const Tensor&t){return t.name=="enc.output_norm.weight";});
+    if(norm==m->tensors.end())throw std::runtime_error("DSpark encoder norm is missing");
+    double square=0.0;for(std::uint32_t i=0;i<width;++i)square+=static_cast<double>(output[i])*output[i];
+    const float scale=1.0f/std::sqrt(static_cast<float>(square/width)+m->config.rms_norm_epsilon);
+    const auto*data=tensor_data(*m,*norm);
+    for(std::uint32_t i=0;i<width;++i)output[i]*=scale*tensor_value(data,norm->type,i);
+    return 0;});}
 const Tensor& qwen_role_tensor(const ColibriV2Model&m,const char*role){std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m.tensors)if(t.name==candidate)return t;throw std::runtime_error("Qwen tensor role is missing");}
 int colibri_v2_qwen_embedding(const ColibriV2Model*m,uint32_t token,float*out,uint64_t elements){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid embedding arguments");const Tensor&t=qwen_role_tensor(*m,"token_embeddings");if(t.shape.size()!=2)throw std::runtime_error("embedding shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(token>=vocab||elements<width)throw std::runtime_error("embedding token or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t i=0;i<width;i++)out[i]=tensor_value(data,t.type,static_cast<uint64_t>(token)*width+i);return 0;});}
 int colibri_v2_qwen_lm_head(const ColibriV2Model*m,const float*hidden,float*logits,uint64_t vocabulary,uint64_t elements){return guarded([&]{if(!m||!hidden||!logits)throw std::runtime_error("invalid LM-head arguments");const Tensor&t=qwen_role_tensor(*m,"lm_head");if(t.shape.size()!=2)throw std::runtime_error("LM-head shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(vocabulary<vocab||elements<width)throw std::runtime_error("LM-head shape or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t row=0;row<vocab;row++){float sum=0;for(uint64_t column=0;column<width;column++)sum+=tensor_value(data,t.type,row*width+column)*hidden[column];logits[row]=sum;}return 0;});}

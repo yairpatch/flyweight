@@ -105,6 +105,19 @@ class Deepseek4RuntimeTests(unittest.TestCase):
             runtime.reset()
             self.assertEqual(runtime.info["positions"], 0)
 
+    def test_layer_zero_capture_is_the_mean_initial_stream(self):
+        import numpy as np
+
+        token = self.model.tokenize("capture")[0]
+        expected = np.asarray(
+            self.model.qwen_embedding(token, self.model.config["hidden_size"]),
+            dtype=np.float32,
+        )
+        with Deepseek4Runtime(self.model, 16) as runtime:
+            runtime.capture_layers((0,))
+            runtime.forward(token, logits=False)
+            np.testing.assert_array_equal(runtime.captured[0], expected)
+
     def test_closing_twice_is_harmless(self):
         runtime = Deepseek4Runtime(self.model, 1024)
         runtime.close()
