@@ -59,6 +59,22 @@ class DsparkRuntime:
         ))
         return output, confidence, tokens
 
+    def attention(self, layer: int, queries, noise_kv):
+        q = np.ascontiguousarray(queries, dtype=np.float32)
+        kv = np.ascontiguousarray(noise_kv, dtype=np.float32)
+        heads = int(self._model.config["attention_heads"])
+        if q.ndim != 3 or q.shape[1:] != (heads, self._width):
+            raise ValueError("queries must have shape [rows, heads, kv_width]")
+        if kv.shape != (q.shape[0], self._width):
+            raise ValueError("noise KV must have shape [rows, kv_width]")
+        output = np.empty_like(q)
+        fp = ctypes.POINTER(ctypes.c_float)
+        self._check(self._library.colibri_v2_dspark_attention(
+            self._handle, layer, q.ctypes.data_as(fp), kv.ctypes.data_as(fp),
+            q.shape[0], output.ctypes.data_as(fp), output.size,
+        ))
+        return output
+
     def close(self) -> None:
         if getattr(self, "_handle", None):
             self._library.colibri_v2_dspark_runtime_free(self._handle)

@@ -6143,6 +6143,42 @@ int colibri_v2_dspark_heads(const ColibriV2Model*m,const float*base_logits,const
         tokens[row]=best;previous=best;
     }
     return 0;});}
+
+int colibri_v2_dspark_attention(const ColibriV2DsparkRuntime*r,uint32_t layer,
+    const float*queries,const float*noise_kv,uint32_t rows,float*output,uint64_t elements){return guarded([&]{
+    if(!r||!queries||!noise_kv||!output||layer>=r->model->config.layer_count||
+       !rows||rows>r->model->config.draft_block_size)
+        throw std::runtime_error("invalid DSpark attention block");
+    const auto heads=r->model->config.attention_heads,width=r->width;
+    const auto needed=static_cast<std::uint64_t>(rows)*heads*width;
+    if(elements<needed)throw std::runtime_error("DSpark attention output is too small");
+    const auto sink_name="blk."+std::to_string(layer)+".attn_sinks.weight";
+    const auto sink=std::find_if(r->model->tensors.begin(),r->model->tensors.end(),[&](const Tensor&t){return t.name==sink_name;});
+    if(sink==r->model->tensors.end())throw std::runtime_error("DSpark attention sinks are missing");
+    const auto*sink_data=tensor_data(*r->model,*sink);
+    std::vector<float>sinks(heads),keys(static_cast<std::size_t>(r->window+rows)*width);
+    for(std::uint32_t h=0;h<heads;++h)sinks[h]=tensor_value(sink_data,sink->type,h);
+    const float scale=1.0f/std::sqrt(static_cast<float>(width));
+    for(std::uint32_t row=0;row<rows;++row){
+        const auto query_position=r->position+row;
+        const auto first=query_position+1>r->window?query_position+1-r->window:0u;
+        std::uint32_t count=0;
+        for(std::uint32_t position=first;position<r->position;++position){
+            const auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+position%r->window)*width;
+            auto*target=keys.data()+static_cast<std::size_t>(count++)*width;
+            for(std::uint32_t i=0;i<width;++i)target[i]=colibri::v2::deepseek4::half_value(slot[i]);
+        }
+        for(std::uint32_t noise=0;noise<rows;++noise){
+            const auto key_position=r->position+noise;
+            if(key_position<=query_position&&query_position-key_position>=r->window)continue;
+            std::copy_n(noise_kv+static_cast<std::size_t>(noise)*width,width,
+                keys.data()+static_cast<std::size_t>(count++)*width);
+        }
+        colibri::v2::deepseek4::attention_with_sinks(
+            queries+static_cast<std::size_t>(row)*heads*width,keys.data(),sinks.data(),nullptr,
+            heads,width,count,scale,output+static_cast<std::size_t>(row)*heads*width);
+    }
+    return 0;});}
 const Tensor& qwen_role_tensor(const ColibriV2Model&m,const char*role){std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m.tensors)if(t.name==candidate)return t;throw std::runtime_error("Qwen tensor role is missing");}
 int colibri_v2_qwen_embedding(const ColibriV2Model*m,uint32_t token,float*out,uint64_t elements){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid embedding arguments");const Tensor&t=qwen_role_tensor(*m,"token_embeddings");if(t.shape.size()!=2)throw std::runtime_error("embedding shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(token>=vocab||elements<width)throw std::runtime_error("embedding token or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t i=0;i<width;i++)out[i]=tensor_value(data,t.type,static_cast<uint64_t>(token)*width+i);return 0;});}
 int colibri_v2_qwen_lm_head(const ColibriV2Model*m,const float*hidden,float*logits,uint64_t vocabulary,uint64_t elements){return guarded([&]{if(!m||!hidden||!logits)throw std::runtime_error("invalid LM-head arguments");const Tensor&t=qwen_role_tensor(*m,"lm_head");if(t.shape.size()!=2)throw std::runtime_error("LM-head shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(vocabulary<vocab||elements<width)throw std::runtime_error("LM-head shape or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t row=0;row<vocab;row++){float sum=0;for(uint64_t column=0;column<width;column++)sum+=tensor_value(data,t.type,row*width+column)*hidden[column];logits[row]=sum;}return 0;});}

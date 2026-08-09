@@ -508,6 +508,12 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_uint32),
                 ]
                 lib.colibri_v2_dspark_heads.restype = ctypes.c_int
+                lib.colibri_v2_dspark_attention.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_uint32, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                ]
+                lib.colibri_v2_dspark_attention.restype = ctypes.c_int
                 lib.colibri_v2_pretokenize.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_char_p,
