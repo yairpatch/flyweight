@@ -1582,6 +1582,7 @@ int parse(ColibriV2Model& m) {
         else if(suffix(".hyper_connection.count"))target=&m.config.hyper_connection_count;
         else if(suffix(".expert_shared_count"))target=&m.config.expert_shared_count;
         else if(suffix(".hash_layer_count"))target=&m.config.hash_layer_count;
+        else if(suffix(".block_size"))target=&m.config.draft_block_size;
         else if(suffix(".embedding_length"))target=&m.config.hidden_size;
         else if(suffix(".embedding_length_per_layer_input"))target=&m.config.per_layer_embedding_size;
         else if(suffix(".block_count"))target=&m.config.layer_count;
@@ -1617,6 +1618,7 @@ int parse(ColibriV2Model& m) {
         else if (key=="tokenizer.ggml.eos_token_id" && (type==4||type==10)) m.config.eos_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.eot_token_id" && (type==4||type==10)) m.config.eot_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.bos_token_id" && (type==4||type==10)) m.config.bos_token_id=static_cast<uint32_t>(read_uint(type));
+        else if (key=="tokenizer.ggml.mask_token_id" && is_integer(type)) m.config.mask_token_id=static_cast<uint32_t>(read_any_uint(type));
         else if (key=="tokenizer.ggml.token_type" && type==9) m.token_types=read_uint_array(type);
         else if (key=="tokenizer.ggml.merges" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_merges=r.get<uint64_t>();m.merges.reserve(static_cast<size_t>(count_merges));for(uint64_t merge_index=0;merge_index<count_merges;merge_index++){if(element_type==8)m.merges.push_back(r.str());else r.value(element_type);}}
         else if (key.size()>=21 && key.compare(key.size()-21,21,".rope.dimension_count")==0 && (type==4 || type==10)) m.config.rotary_dimension=static_cast<uint32_t>(read_uint(type));
@@ -1648,6 +1650,7 @@ int parse(ColibriV2Model& m) {
         else if (key.size()>=21 && key.compare(key.size()-21,21,".expert_weights_scale")==0 && (type==6 || type==12)) m.config.expert_weights_scale=read_float(type);
         else if (key.size()>=20 && key.compare(key.size()-20,20,".expert_weights_norm")==0 && type==7) m.config.expert_weights_norm=r.get<std::uint8_t>()!=0;
         else if (key.size()>=26 && key.compare(key.size()-26,26,".attention.compress_ratios")==0 && type==9) m.config.compress_ratios=read_uint_array(type);
+        else if (key.size()>=14 && key.compare(key.size()-14,14,".target_layers")==0 && type==9) m.config.target_layers=read_uint_array(type);
         else if (key.size()>=34 && key.compare(key.size()-34,34,".attention.compress_rope_freq_base")==0 && (type==6 || type==12)) m.config.compress_rope_freq_base=read_float(type);
         else if (key.size()>=25 && key.compare(key.size()-25,25,".hyper_connection.epsilon")==0 && (type==6 || type==12)) m.config.sinkhorn_epsilon=read_float(type);
         else if (key.size()>=19 && key.compare(key.size()-19,19,".swiglu_clamp_shexp")==0 && type==9) m.config.swiglu_clamp_shexp=read_float_array(type);
@@ -3853,7 +3856,10 @@ out->expert_shared_count=m->config.expert_shared_count;out->hash_layer_count=m->
 out->compress_ratios_length=static_cast<std::uint32_t>(m->config.compress_ratios.size());
 out->sinkhorn_epsilon=m->config.sinkhorn_epsilon;out->compress_rope_freq_base=m->config.compress_rope_freq_base;
 out->rope_scaling_factor=m->config.rope_scaling_factor;out->yarn_beta_fast=m->config.yarn_beta_fast;out->yarn_beta_slow=m->config.yarn_beta_slow;
-out->rope_original_context_length=m->config.rope_original_context_length;return 0;});}
+out->rope_original_context_length=m->config.rope_original_context_length;
+out->draft_block_size=m->config.draft_block_size;
+out->target_layers_length=static_cast<std::uint32_t>(m->config.target_layers.size());
+out->mask_token_id=m->config.mask_token_id;return 0;});}
 
 // Multiply a model tensor by a vector, decoding whatever weight type the
 // checkpoint stores it as. GGUF reports a matrix as [inputs, outputs], so
@@ -5962,6 +5968,13 @@ int colibri_v2_model_compress_ratios(const ColibriV2Model* m,uint32_t* out,int32
     if(!out||capacity<=0)return static_cast<int>(ratios.size());
     const auto written=std::min(static_cast<std::size_t>(capacity),ratios.size());
     std::copy_n(ratios.begin(),written,out);
+    return static_cast<int>(written);});}
+int colibri_v2_model_target_layers(const ColibriV2Model* m,uint32_t* out,int32_t capacity){return guarded([&]{
+    if(!m)throw std::runtime_error("invalid model handle");
+    const auto& layers=m->config.target_layers;
+    if(!out||capacity<=0)return static_cast<int>(layers.size());
+    const auto written=std::min(static_cast<std::size_t>(capacity),layers.size());
+    std::copy_n(layers.begin(),written,out);
     return static_cast<int>(written);});}
 int colibri_v2_model_attention_window(const ColibriV2Model* m,uint32_t layer,uint32_t*out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model attention-window handle");*out=attention_window(*m,layer);return 0;});}
 int colibri_v2_tensor_info(const ColibriV2Model* m,uint64_t i,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("tensor index out of range");return fill(m->tensors[i],*out);});}

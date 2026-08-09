@@ -52,11 +52,14 @@ struct ModelConfig {
     std::uint32_t hyper_connection_count=0, sinkhorn_iterations=0;
     float sinkhorn_epsilon=0.0f;
     std::uint32_t expert_shared_count=0, hash_layer_count=0;
+    std::vector<std::uint32_t> target_layers;
+    std::uint32_t draft_block_size=0;
     // Per-layer SwiGLU clamp bounds, routed experts and shared expert.
     std::vector<float> swiglu_clamp_exp, swiglu_clamp_shexp;
     // GGUF tokenizer terminator ids; max means the key was absent.
     std::uint32_t eos_token_id=0xffffffffu;
     std::uint32_t eot_token_id=0xffffffffu;
     std::uint32_t bos_token_id=0xffffffffu;
+    std::uint32_t mask_token_id=0xffffffffu;
 };
 }

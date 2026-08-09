@@ -66,6 +66,7 @@ typedef struct ColibriV2ModelConfig {
        the checkpoint asked for no scaling. */
     float rope_scaling_factor, yarn_beta_fast, yarn_beta_slow;
     uint32_t rope_original_context_length;
+    uint32_t draft_block_size, target_layers_length, mask_token_id;
 } ColibriV2ModelConfig;
 
 typedef struct ColibriV2GpuInfo {
@@ -402,6 +403,7 @@ COLIBRI_V2_API int colibri_v2_quant_supported(uint32_t type);
 /* Per-layer attention kinds for `deepseek4`. Returns the entry count when `out`
    is NULL or `capacity` is zero, else the number of entries written. */
 COLIBRI_V2_API int colibri_v2_model_compress_ratios(const ColibriV2Model* model, uint32_t* out, int32_t capacity);
+COLIBRI_V2_API int colibri_v2_model_target_layers(const ColibriV2Model* model, uint32_t* out, int32_t capacity);
 /* Copies tokenizer.chat_template from GGUF metadata. `length` receives the
    UTF-8 byte count without the trailing NUL. A null/zero-capacity output can
    query the required size; an absent key reports length zero. */

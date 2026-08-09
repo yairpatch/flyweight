@@ -137,6 +137,9 @@ class _ModelConfig(ctypes.Structure):
         ("yarn_beta_fast", ctypes.c_float),
         ("yarn_beta_slow", ctypes.c_float),
         ("rope_original_context_length", ctypes.c_uint32),
+        ("draft_block_size", ctypes.c_uint32),
+        ("target_layers_length", ctypes.c_uint32),
+        ("mask_token_id", ctypes.c_uint32),
     ]
 
 
@@ -472,6 +475,12 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_int32,
                 ]
                 lib.colibri_v2_model_compress_ratios.restype = ctypes.c_int
+                lib.colibri_v2_model_target_layers.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_int32,
+                ]
+                lib.colibri_v2_model_target_layers.restype = ctypes.c_int
                 lib.colibri_v2_pretokenize.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_char_p,
@@ -1056,7 +1065,23 @@ class V2Model:
         config["attention_windows"] = tuple(windows)
         config["sliding_window_pattern"] = tuple(bool(window) for window in windows)
         config["compress_ratios"] = self.compress_ratios
+        config["target_layers"] = self.target_layers
         return config
+
+    @property
+    def target_layers(self) -> tuple[int, ...]:
+        count = self._lib.colibri_v2_model_target_layers(self._handle, None, 0)
+        if count < 0:
+            self._check(count)
+        if not count:
+            return ()
+        buffer = (ctypes.c_uint32 * count)()
+        written = self._lib.colibri_v2_model_target_layers(
+            self._handle, buffer, count
+        )
+        if written < 0:
+            self._check(written)
+        return tuple(int(buffer[index]) for index in range(written))
 
     def unsupported_quant_types(self) -> dict[int, list[str]]:
         """Tensors whose GGML type no backend can decode, keyed by type.
