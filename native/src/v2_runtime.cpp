@@ -4670,6 +4670,110 @@ void ds4_cached_experts(
     rt.gpu_matvec_calls+=3*gpu_count;
 }
 
+void ds4_quant_dot_many(
+    const std::uint8_t* packed, std::uint32_t type,
+    const std::vector<const float*>& vectors, int begin, int count,
+    int elements, std::uint64_t row, float* output
+) {
+    if(count==8){
+        const float* inputs[8]={vectors[begin],vectors[begin+1],vectors[begin+2],
+            vectors[begin+3],vectors[begin+4],vectors[begin+5],vectors[begin+6],
+            vectors[begin+7]};
+        qwen_quant_dot_oct(packed,type,inputs,elements,row,output);
+        return;
+    }
+    int offset=0;
+    for(;offset+4<=count;offset+=4){
+        const float* inputs[4]={vectors[begin+offset],vectors[begin+offset+1],
+            vectors[begin+offset+2],vectors[begin+offset+3]};
+        qwen_quant_dot_quad(packed,type,inputs,elements,row,output+offset);
+    }
+    if(offset+2<=count){
+        qwen_quant_dot_pair(packed,type,vectors[begin+offset],vectors[begin+offset+1],
+            elements,row,output[offset],output[offset+1]);
+        offset+=2;
+    }
+    if(offset<count)
+        output[offset]=qwen_quant_dot(packed,type,vectors[begin+offset],elements,row);
+}
+
+void ds4_cpu_moe_rows(
+    ColibriV2Deepseek4Runtime& rt, std::uint32_t layer_index,
+    std::vector<Deepseek4Scratch>& rows
+) {
+    const auto& model=*rt.model;
+    const auto& plan=rt.layers[layer_index].plan;
+    const int row_count=static_cast<int>(rows.size());
+    const int top_k=static_cast<int>(rt.experts_used);
+    const int total=row_count*top_k;
+    std::vector<int> counts(rt.experts,0),offsets(rt.experts+1,0);
+    for(int row=0;row<row_count;++row)
+        for(int slot=0;slot<top_k;++slot)++counts[rows[row].experts[slot]];
+    for(std::uint32_t expert=0;expert<rt.experts;++expert)
+        offsets[expert+1]=offsets[expert]+counts[expert];
+    std::vector<int> occurrences(total),cursor(offsets.begin(),offsets.end()-1);
+    std::vector<const float*> hidden(total),activated(total);
+    for(int row=0;row<row_count;++row)for(int slot=0;slot<top_k;++slot){
+        const int route=row*top_k+slot;
+        const int expert=rows[row].experts[slot];
+        const int position=cursor[expert]++;
+        occurrences[position]=route;
+        hidden[position]=rows[row].hidden.data();
+        activated[position]=rows[row].routed_activated.data()+
+            static_cast<std::size_t>(slot)*rt.expert_ffn;
+    }
+    std::vector<int> active;
+    for(std::uint32_t expert=0;expert<rt.experts;++expert)
+        if(counts[expert])active.push_back(static_cast<int>(expert));
+    const auto& gate=model.tensors[plan.gate_exps];
+    const auto& up=model.tensors[plan.up_exps];
+    const auto& down=model.tensors[plan.down_exps];
+    const auto gate_span=gate.size/rt.experts,up_span=up.size/rt.experts;
+    const auto down_span=down.size/rt.experts;
+#pragma omp parallel for schedule(dynamic,16) num_threads(ds4_thread_count())
+    for(std::int64_t task=0;task<static_cast<std::int64_t>(active.size())*rt.expert_ffn;++task){
+        const int group=static_cast<int>(task/rt.expert_ffn);
+        const int output=static_cast<int>(task%rt.expert_ffn);
+        const int expert=active[group],begin=offsets[expert],count=counts[expert];
+        float gate_values[8]{},up_values[8]{};
+        ds4_quant_dot_many(tensor_data(model,gate)+expert*gate_span,gate.type,
+            hidden,begin,count,rt.n_embd,output,gate_values);
+        ds4_quant_dot_many(tensor_data(model,up)+expert*up_span,up.type,
+            hidden,begin,count,rt.n_embd,output,up_values);
+        for(int item=0;item<count;++item){
+            const int route=occurrences[begin+item];
+            const int row=route/top_k,slot=route%top_k;
+            const float g=std::clamp(gate_values[item],-rt.clamp,rt.clamp);
+            const float u=std::clamp(up_values[item],-rt.clamp,rt.clamp);
+            rows[row].routed_activated[static_cast<std::size_t>(slot)*rt.expert_ffn+output]=
+                g/(1.0f+std::exp(-g))*u;
+        }
+    }
+#pragma omp parallel for schedule(dynamic,16) num_threads(ds4_thread_count())
+    for(std::int64_t task=0;task<static_cast<std::int64_t>(active.size())*rt.n_embd;++task){
+        const int group=static_cast<int>(task/rt.n_embd);
+        const int output=static_cast<int>(task%rt.n_embd);
+        const int expert=active[group],begin=offsets[expert],count=counts[expert];
+        float values[8]{};
+        ds4_quant_dot_many(tensor_data(model,down)+expert*down_span,down.type,
+            activated,begin,count,rt.expert_ffn,output,values);
+        for(int item=0;item<count;++item){
+            const int route=occurrences[begin+item];
+            const int row=route/top_k,slot=route%top_k;
+            rows[row].routed_out[static_cast<std::size_t>(slot)*rt.n_embd+output]=values[item];
+        }
+    }
+    for(int row=0;row<row_count;++row){
+        auto& sc=rows[row];
+        std::fill(sc.moe.begin(),sc.moe.end(),0.0f);
+        for(int slot=0;slot<top_k;++slot){
+            const float weight=sc.weights[slot];
+            const float* output=sc.routed_out.data()+static_cast<std::size_t>(slot)*rt.n_embd;
+            for(std::uint32_t item=0;item<rt.n_embd;++item)sc.moe[item]+=output[item]*weight;
+        }
+    }
+}
+
 void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
                 const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
     const auto& model = *rt.model;
@@ -4793,14 +4897,14 @@ void ds4_close_block(const ColibriV2Deepseek4Runtime& rt, Deepseek4LayerState& l
 }
 
 // Run one block over one position, reading and updating its cache.
-void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
-                       std::uint32_t position, std::uint32_t token,
-                       const float* streams, float* out_streams) {
+void ds4_layer_attention_prepare(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
+                                 std::uint32_t position, std::uint32_t token,
+                                 const float* streams, float* out_streams,
+                                 Deepseek4Scratch& sc) {
     namespace ds4 = colibri::v2::deepseek4;
     auto& layer = rt.layers[index];
     const auto& plan = layer.plan;
     const auto& model = *rt.model;
-    auto& sc = rt.scratch;
     const auto n_embd = rt.n_embd, hc = rt.hc, head_dim = rt.head_dim;
     const auto wide = static_cast<std::int32_t>(rt.heads) * head_dim;
     const auto attention_started = ds4_now();
@@ -5117,6 +5221,18 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
                     rt.experts, rt.experts_used, rt.weight_scale, 1e-20f, !hashed,
                     sc.experts.data(), sc.weights.data());
 
+}
+
+void ds4_layer_ffn_complete(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
+                            float* out_streams, Deepseek4Scratch& sc,
+                            bool routed_ready=false) {
+    namespace ds4 = colibri::v2::deepseek4;
+    const auto& layer = rt.layers[index];
+    const auto& plan = layer.plan;
+    const auto& model = *rt.model;
+    const auto n_embd = rt.n_embd, hc = rt.hc;
+
+    if(!routed_ready){
     std::fill(sc.moe.begin(), sc.moe.end(), 0.0f);
     // Ask for every routed expert's weights before touching any of them.
     //
@@ -5218,6 +5334,7 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
             rt.routed_expert_bytes += model.tensors[matrix].size / rt.experts;
     }
     rt.routed_expert_nanoseconds += ds4_now() - experts_started;
+    }
     const auto shared_started = ds4_now();
     ds4_matvec(rt, plan.gate_shexp, sc.hidden.data(), n_embd, sc.gate.data(), rt.expert_ffn);
     ds4_matvec(rt, plan.up_shexp, sc.hidden.data(), n_embd, sc.up.data(), rt.expert_ffn);
@@ -5230,6 +5347,14 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     ds4::hyper_connection_combine(sc.moe.data(), out_streams, sc.post.data(), sc.comb.data(),
                                   n_embd, hc, sc.after.data());
     std::copy(sc.after.begin(), sc.after.end(), out_streams);
+}
+
+void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
+                       std::uint32_t position, std::uint32_t token,
+                       const float* streams, float* out_streams) {
+    auto& sc=rt.scratch;
+    ds4_layer_attention_prepare(rt,index,position,token,streams,out_streams,sc);
+    ds4_layer_ffn_complete(rt,index,out_streams,sc);
 }
 
 }  // namespace
@@ -5332,16 +5457,62 @@ int colibri_v2_deepseek4_prefill(
     ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count
 ){return guarded([&]{
     if(!runtime||(!tokens&&count))throw std::runtime_error("invalid prefill arguments");
+    if(!count)return 0;
+    auto& rt=*runtime;
+    const auto& model=*rt.model;
+    std::uint32_t row_limit=4;
+    if(const char* setting=std::getenv("COLIBRI_DS4_PREFILL_ROWS"))
+        row_limit=std::max(1u,static_cast<std::uint32_t>(std::strtoul(setting,nullptr,10)));
+    row_limit=std::min({row_limit,count,8u});
+    const auto first_position=rt.layers.empty()?0u:rt.layers.front().positions;
+    if(static_cast<std::uint64_t>(first_position)+count>rt.context_limit)
+        throw std::runtime_error("prefill exceeds the DeepSeek context limit");
+    for(std::uint32_t index=0;index<count;++index)
+        if(tokens[index]>=rt.vocabulary)
+            throw std::runtime_error("prefill token id is outside the vocabulary");
     const auto started=ds4_now();
-    for(uint32_t index=0;index<count;++index){
-        if(colibri_v2_deepseek4_forward(runtime,tokens[index],nullptr)!=0){
-            const char* error=colibri_v2_last_error();
-            throw std::runtime_error(error?error:"deepseek4 prefill failed");
+    for(std::uint32_t chunk=0;chunk<count;chunk+=row_limit){
+        const auto rows=std::min(row_limit,count-chunk);
+        std::vector<Deepseek4Scratch> scratch(rows,rt.scratch);
+        for(std::uint32_t row=0;row<rows;++row){
+            auto& sc=scratch[row];
+            if(colibri_v2_qwen_embedding(&model,tokens[chunk+row],sc.embedding.data(),
+                   static_cast<std::int32_t>(rt.n_embd))!=0)
+                throw std::runtime_error("cannot read a prefill token embedding");
+            for(std::uint32_t stream=0;stream<rt.hc;++stream)
+                std::copy(sc.embedding.begin(),sc.embedding.end(),
+                    sc.streams.begin()+static_cast<std::size_t>(stream)*rt.n_embd);
         }
+        for(std::uint32_t layer=0;layer<rt.layers.size();++layer){
+            const auto position=rt.layers[layer].positions;
+            for(std::uint32_t row=0;row<rows;++row){
+                auto& sc=scratch[row];
+                ds4_layer_attention_prepare(rt,layer,position+row,tokens[chunk+row],
+                    sc.streams.data(),sc.next_streams.data(),sc);
+            }
+            const auto experts_started=ds4_now();
+            ds4_cpu_moe_rows(rt,layer,scratch);
+            rt.routed_expert_nanoseconds+=ds4_now()-experts_started;
+            for(std::uint32_t row=0;row<rows;++row)
+                for(std::uint32_t slot=0;slot<rt.experts_used;++slot)
+                    for(const auto matrix:{rt.layers[layer].plan.gate_exps,
+                                           rt.layers[layer].plan.up_exps,
+                                           rt.layers[layer].plan.down_exps})
+                        rt.routed_expert_bytes+=model.tensors[matrix].size/rt.experts;
+            for(std::uint32_t row=0;row<rows;++row){
+                auto& sc=scratch[row];
+                ds4_layer_ffn_complete(rt,layer,sc.next_streams.data(),sc,true);
+                std::swap(sc.streams,sc.next_streams);
+            }
+            rt.layers[layer].positions+=rows;
+        }
+        rt.forward_calls+=rows;
     }
+    const auto elapsed=ds4_now()-started;
     ++runtime->prefill_calls;
     runtime->prefill_tokens+=count;
-    runtime->prefill_nanoseconds+=ds4_now()-started;
+    runtime->prefill_nanoseconds+=elapsed;
+    runtime->forward_nanoseconds+=elapsed;
     return 0;});}
 
 // Put one checkpoint tensor through the GPU and report how far the answer

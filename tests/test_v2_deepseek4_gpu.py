@@ -178,6 +178,23 @@ class ResidentDenseWeightTests(unittest.TestCase):
         self.assertGreater(resident, 4.0)
         self.assertLess(resident, 8.0)
 
+    def test_layer_major_prefill_matches_sequential_forward(self):
+        sequential, batched = [], []
+        for use_prefill, target in ((False, sequential), (True, batched)):
+            with self.Runtime(self.model, 256) as runtime:
+                runtime.use_gpu(0)
+                if use_prefill:
+                    runtime.prefill(self.tokens[:-1])
+                else:
+                    for token in self.tokens[:-1]:
+                        runtime.forward(token, logits=False)
+                logits = runtime.forward(self.tokens[-1])
+                target.extend(int(index) for index in logits.argsort()[::-1][:10])
+                if use_prefill:
+                    self.assertEqual(runtime.info["prefill_tokens"], len(self.tokens) - 1)
+        self.assertEqual(batched[0], sequential[0])
+        self.assertGreaterEqual(len(set(batched) & set(sequential)), 9)
+
 
 @unittest.skipUnless(CHECKPOINT, "set DEEPSEEK4_GGUF to the first shard of a real checkpoint")
 @unittest.skipUnless(gpu_present(), "no CUDA device available")
