@@ -1298,6 +1298,74 @@ void q8_matvec_transposed_warp(
     if (lane == 0) output[row] = partial;
 }
 
+// Two decode-shaped rows share each Q8 weight load.  MTP verification almost
+// always uses two candidates; launching the single-row kernel twice otherwise
+// doubles the dominant dense-weight traffic without gaining GEMM occupancy.
+extern "C" __global__
+void q8_matvec_transposed_pair(
+    const unsigned char* packed,
+    const float* vectors,
+    float* outputs,
+    const int input_size,
+    const int output_size
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    float first = 0.0f;
+    float second = 0.0f;
+    for (int input = lane; input < input_size; input += 32) {
+        const int absolute = row * input_size + input;
+        const int block = absolute >> 5;
+        const int within = absolute & 31;
+        const float weight = (float)(*((const signed char*)(
+            packed + block * 34 + 2 + within))) * __half2float(
+                *((const __half*)(packed + block * 34)));
+        first += weight * vectors[input];
+        second += weight * vectors[input_size + input];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        first += __shfl_down_sync(0xffffffff, first, offset);
+        second += __shfl_down_sync(0xffffffff, second, offset);
+    }
+    if (lane == 0) {
+        outputs[row] = first;
+        outputs[output_size + row] = second;
+    }
+}
+
+extern "C" __global__
+void q8_matvec_transposed_triple(
+    const unsigned char* packed,
+    const float* vectors,
+    float* outputs,
+    const int input_size,
+    const int output_size
+) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const int row=blockIdx.x*8+warp;
+    if(row>=output_size)return;
+    float first=0.0f,second=0.0f,third=0.0f;
+    for(int input=lane;input<input_size;input+=32){
+        const int absolute=row*input_size+input;
+        const int block=absolute>>5,within=absolute&31;
+        const float weight=(float)(*((const signed char*)(
+            packed+block*34+2+within)))*__half2float(
+                *((const __half*)(packed+block*34)));
+        first+=weight*vectors[input];
+        second+=weight*vectors[input_size+input];
+        third+=weight*vectors[2*input_size+input];
+    }
+    for(int offset=16;offset;offset>>=1){
+        first+=__shfl_down_sync(0xffffffff,first,offset);
+        second+=__shfl_down_sync(0xffffffff,second,offset);
+        third+=__shfl_down_sync(0xffffffff,third,offset);
+    }
+    if(lane==0){outputs[row]=first;outputs[output_size+row]=second;
+        outputs[2*output_size+row]=third;}
+}
+
 extern "C" __global__
 void q8_swiglu_transposed_warp(
     const unsigned char* gate_packed,

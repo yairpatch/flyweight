@@ -139,6 +139,18 @@ void qwen_forward_rows(
             return;
         }
         if(rows<=8&&type==8){
+            if(rows==2){
+                void*pair_args[]={&matrix,&input,&output,&input_size,&output_size};
+                launch("q8_matvec_transposed_pair",(output_size+7)/8,1,256,
+                       pair_args);
+                return;
+            }
+            if(rows==3){
+                void*triple_args[]={&matrix,&input,&output,&input_size,&output_size};
+                launch("q8_matvec_transposed_triple",(output_size+7)/8,1,256,
+                       triple_args);
+                return;
+            }
             for(int row=0;row<rows;++row){
                 const auto row_input=input+
                     static_cast<std::uint64_t>(row)*input_size*sizeof(float);

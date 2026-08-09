@@ -191,9 +191,16 @@ class V2RuntimeTests(unittest.TestCase):
     def test_mtp_small_q8_batches_use_decode_matvecs(self):
         root = Path(__file__).resolve().parents[1]
         verifier = (root / "native/src/v2_mtp_verifier.inc").read_text()
+        kernels = (
+            root / "native/include/colibri_v2_qwen_kernels.hpp"
+        ).read_text()
 
         self.assertIn("rows<=8&&type==8", verifier)
+        self.assertIn('launch("q8_matvec_transposed_pair"', verifier)
+        self.assertIn('launch("q8_matvec_transposed_triple"', verifier)
         self.assertIn("colibri_gpu_q8_matvec_transposed(", verifier)
+        self.assertIn("q8_matvec_transposed_pair", kernels)
+        self.assertIn("q8_matvec_transposed_triple", kernels)
 
     def test_mtp_prompt_prefill_keeps_the_batched_target_path(self):
         root = Path(__file__).resolve().parents[1]

@@ -8462,6 +8462,119 @@ void qwen_mtp_append_pair(
     ++runtime.mtp_cache_tokens;
 }
 
+void qwen_mtp_append_pair_batch2(
+    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens,
+    std::uint64_t first_hidden, std::uint64_t second_hidden
+) {
+    constexpr int rows=2;
+    const int hidden=static_cast<int>(runtime.model->config.hidden_size);
+    const int kv_heads=static_cast<int>(runtime.model->config.attention_kv_heads);
+    const auto&layer=runtime.mtp_layer_plan;
+    const int head_dim=static_cast<int>(
+        runtime.model->tensors[layer.static_tensors[2]].shape[1]/kv_heads);
+    const int kv_size=kv_heads*head_dim;
+    const float epsilon=runtime.model->config.rms_norm_epsilon
+        ?runtime.model->config.rms_norm_epsilon:1.0e-6f;
+    std::uint64_t cursor=runtime.workspace;
+    const auto workspace_end=runtime.workspace+runtime.workspace_bytes;
+    auto take=[&](std::uint64_t bytes){const auto result=cursor;
+        cursor+=device_align(bytes);if(cursor>workspace_end)
+            throw std::runtime_error("native MTP batch-commit workspace is too small");
+        return result;};
+    const auto embeddings=take(2ULL*hidden*sizeof(float));
+    const auto norm_embeddings=take(2ULL*hidden*sizeof(float));
+    const auto hidden_rows=take(2ULL*hidden*sizeof(float));
+    const auto norm_hiddens=take(2ULL*hidden*sizeof(float));
+    const auto concatenated=take(4ULL*hidden*sizeof(float));
+    const auto fused=take(2ULL*hidden*sizeof(float));
+    const auto normalized=take(2ULL*hidden*sizeof(float));
+    const auto keys=take(2ULL*kv_size*sizeof(float));
+    const auto values=take(2ULL*kv_size*sizeof(float));
+    const auto token_rows=take(2ULL*sizeof(std::uint32_t));
+    auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,
+                    std::uint32_t bx,void**args,std::uint32_t shared=0){
+        if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
+            throw std::runtime_error(std::string("native MTP batch-commit kernel failed: ")+name);
+    };
+    auto copy_hidden=[&](std::uint64_t source,int row){
+        auto destination=hidden_rows+static_cast<std::uint64_t>(row)*hidden*sizeof(float);
+        void*args[]={&source,&destination,const_cast<int*>(&hidden)};
+        launch("qwen_copy_vector",(hidden+255)/256,1,256,args);
+    };
+    copy_hidden(first_hidden,0);copy_hidden(second_hidden,1);
+    const auto embedding_matrix=qwen_stage_embedding_rows(runtime,tokens,rows);
+    if(!runtime.embeddings_host_resident&&
+       colibri_gpu_upload(token_rows,tokens,2*sizeof(std::uint32_t),runtime.stream)!=0)
+        throw std::runtime_error("native MTP batch-commit token upload failed");
+    const auto embedding_index=runtime.embeddings_host_resident
+        ?runtime.embedding_row_index:token_rows;
+    void*embedding_args[]={const_cast<std::uint64_t*>(&embedding_matrix),
+        const_cast<std::uint64_t*>(&embedding_index),
+        const_cast<std::uint64_t*>(&embeddings),
+        const_cast<int*>(&rows),const_cast<int*>(&hidden)};
+    launch(qwen_embedding_kernel(qwen_device_type(runtime,runtime.token_embeddings),true),
+        (hidden+255)/256,rows,256,embedding_args);
+    auto rms_rows=[&](std::uint64_t input,std::uint64_t weight,std::uint64_t output){
+        int one_centered=0;void*args[]={&input,&weight,&output,
+            const_cast<int*>(&rows),const_cast<int*>(&hidden),
+            const_cast<float*>(&epsilon),&one_centered};
+        launch("rms_norm_rows",rows,1,256,args);
+    };
+    rms_rows(embeddings,runtime.device_tensors[runtime.mtp_special_tensors[1]],norm_embeddings);
+    rms_rows(hidden_rows,runtime.device_tensors[runtime.mtp_special_tensors[2]],norm_hiddens);
+    for(int row=0;row<rows;++row){
+        auto embedding=norm_embeddings+static_cast<std::uint64_t>(row)*hidden*sizeof(float);
+        auto input_hidden=norm_hiddens+static_cast<std::uint64_t>(row)*hidden*sizeof(float);
+        auto output=concatenated+static_cast<std::uint64_t>(row)*2*hidden*sizeof(float);
+        void*args[]={&embedding,&input_hidden,&output,const_cast<int*>(&hidden)};
+        launch("qwen_concat_pair",(hidden+255)/256,1,256,args);
+    }
+    auto dense_pair=[&](std::size_t index,std::uint64_t input,std::uint64_t output,
+                        int input_size,int output_size){
+        auto matrix=runtime.device_tensors[index];
+        if(qwen_device_type(runtime,index)==8){
+            void*args[]={&matrix,&input,&output,&input_size,&output_size};
+            launch("q8_matvec_transposed_pair",(output_size+7)/8,1,256,args);
+            return;
+        }
+        for(int row=0;row<rows;++row)
+            qwen_mtp_dense_projection(runtime,index,
+                input+static_cast<std::uint64_t>(row)*input_size*sizeof(float),
+                output+static_cast<std::uint64_t>(row)*output_size*sizeof(float),
+                input_size,output_size);
+    };
+    dense_pair(runtime.mtp_special_tensors[0],concatenated,fused,2*hidden,hidden);
+    rms_rows(fused,runtime.device_tensors[layer.static_tensors[0]],normalized);
+    dense_pair(layer.static_tensors[2],normalized,keys,hidden,kv_size);
+    dense_pair(layer.static_tensors[3],normalized,values,hidden,kv_size);
+    const int rotary=static_cast<int>(runtime.model->config.rotary_dimension
+        ?runtime.model->config.rotary_dimension:head_dim);
+    const float theta=runtime.model->config.rope_freq_base
+        ?runtime.model->config.rope_freq_base:1000000.0f;
+    const auto key_norm=runtime.device_tensors[layer.static_tensors[6]];
+    const auto cache_keys=runtime.state+layer.state_first;
+    const auto cache_values=runtime.state+layer.state_second;
+    int capacity=static_cast<int>(runtime.options.context_limit);
+    for(int row=0;row<rows;++row){
+        auto key=keys+static_cast<std::uint64_t>(row)*kv_size*sizeof(float);
+        auto value=values+static_cast<std::uint64_t>(row)*kv_size*sizeof(float);
+        auto rotated=fused+static_cast<std::uint64_t>(row)*hidden*sizeof(float);
+        int position=static_cast<int>(runtime.mtp_cache_tokens)+row;
+        void*key_args[]={&key,const_cast<std::uint64_t*>(&key_norm),&rotated,
+            const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+            const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),
+            const_cast<float*>(&epsilon)};
+        launch("qwen_attention_key",kv_heads,1,256,key_args);
+        void*key_store_args[]={&rotated,const_cast<std::uint64_t*>(&cache_keys),
+            const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
+        launch(kv_store_kernel(runtime.options.cache_type_k,true),kv_heads,1,256,key_store_args);
+        void*value_store_args[]={&value,const_cast<std::uint64_t*>(&cache_values),
+            const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
+        launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,value_store_args);
+    }
+    runtime.mtp_cache_tokens+=rows;
+}
+
 void qwen_mtp_append_prompt_pair(
     ColibriV2QwenRuntime& runtime, std::uint32_t token
 ) {
@@ -11190,14 +11303,19 @@ static void qwen_mtp_commit_true_cache(
         throw std::runtime_error("native MTP verified-hidden snapshot failed");
     }
 
-    runtime.mtp_cache_tokens = base_cache_tokens;
+    // Draft step zero consumed the target model's real hidden state, so its KV
+    // entry already has exactly the semantics of qwen_mtp_append_pair.  Only
+    // later recursive steps used draft hidden states and need rebuilding.
+    runtime.mtp_cache_tokens = base_cache_tokens + 1;
     const auto initial_hidden =
         runtime.state + runtime.mtp_target_hidden_offset;
-    for (std::uint32_t index = 0; index < count; ++index) {
-        const auto preceding_hidden = index == 0
-            ? initial_hidden
-            : stable_hidden + static_cast<std::uint64_t>(index - 1)
-                * hidden * sizeof(float);
+    if(count==3){
+        qwen_mtp_append_pair_batch2(
+            runtime,inputs+1,stable_hidden,
+            stable_hidden+static_cast<std::uint64_t>(hidden)*sizeof(float));
+    }else for (std::uint32_t index = 1; index < count; ++index) {
+        const auto preceding_hidden = stable_hidden +
+            static_cast<std::uint64_t>(index - 1)*hidden*sizeof(float);
         qwen_mtp_append_pair(
             runtime, inputs[index], preceding_hidden);
     }
