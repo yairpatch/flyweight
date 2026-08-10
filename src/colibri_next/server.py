@@ -139,6 +139,10 @@ class _GenerationRequest:
     enable_thinking: bool
     tools_enabled: bool = False
     tools: tuple[dict[str, Any], ...] = ()
+    # Route a reasoning model's chain-of-thought to `reasoning_content` rather
+    # than streaming it as ordinary content. Off by default so output stays
+    # live for clients that render only `content`.
+    separate_reasoning: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,7 +471,11 @@ class InferenceService:
                                     yield self._chat_chunk(
                                         completion_id,
                                         created,
-                                        {"reasoning_content": channel_reasoning},
+                                        {
+                                            _reasoning_delta_field(
+                                                request.separate_reasoning
+                                            ): channel_reasoning
+                                        },
                                     )
                             marker_window = ""
                             if tool_start is None:
@@ -597,7 +605,11 @@ class InferenceService:
                             now = time.perf_counter()
                             if plain_decode_started is None:
                                 plain_decode_started = now
-                            delta = _channel_delta(channels, step.text_delta)
+                            delta = _channel_delta(
+                                channels,
+                                step.text_delta,
+                                separate_reasoning=request.separate_reasoning,
+                            )
                             chunk = self._chat_chunk(
                                 completion_id,
                                 created,
@@ -615,9 +627,10 @@ class InferenceService:
                     tail_visible, tail_reasoning = channels.flush()
                     tail = {}
                     if tail_reasoning:
-                        tail["reasoning_content"] = tail_reasoning
+                        field = _reasoning_delta_field(request.separate_reasoning)
+                        tail[field] = tail_reasoning
                     if tail_visible:
-                        tail["content"] = tail_visible
+                        tail["content"] = tail.get("content", "") + tail_visible
                     if tail:
                         yield self._chat_chunk(completion_id, created, tail)
                 if plain_final_step is None:
@@ -1311,6 +1324,7 @@ class InferenceService:
         except ValueError as error:
             raise APIError(400, str(error)) from error
         enable_thinking = _boolean_option(payload, "enable_thinking", False)
+        separate_reasoning = _boolean_option(payload, "separate_reasoning", False)
         try:
             prepare_messages = getattr(self.generator, "prepare_messages", None)
             prompt_ids = tuple(
@@ -1337,6 +1351,7 @@ class InferenceService:
             enable_thinking,
             tools_enabled,
             tools,
+            separate_reasoning,
         )
 
     def _fit_max_new_tokens(
@@ -2755,8 +2770,27 @@ def _split_muse_channels(text: str) -> tuple[str, str | None] | None:
     return "".join(visible).strip(), "\n\n".join(reasoning).strip() or None
 
 
+def _reasoning_delta_field(separate_reasoning: bool) -> str:
+    """Where a streamed reasoning delta belongs.
+
+    Muse Glimmer has no setting that stops it reasoning, and the reasoning runs
+    first, so routing it to `reasoning_content` leaves any client that does not
+    render that field watching a dead stream until the answer begins -- often
+    for a long time. Streaming it as ordinary content keeps output live, which
+    is the behaviour worth defaulting to; a client that renders the channels
+    separately opts in with `separate_reasoning`.
+
+    Either way the protocol framing is stripped: `<|message|>` and friends are
+    never content by any reading.
+    """
+    return "reasoning_content" if separate_reasoning else "content"
+
+
 def _channel_delta(
-    channels: "MuseChannelStream | None", text_delta: str | None
+    channels: "MuseChannelStream | None",
+    text_delta: str | None,
+    *,
+    separate_reasoning: bool = False,
 ) -> dict[str, str]:
     """Shape one streaming delta, splitting Muse Glimmer's channels.
 
@@ -2770,9 +2804,10 @@ def _channel_delta(
     visible, reasoning = channels.feed(text_delta)
     delta: dict[str, str] = {}
     if reasoning:
-        delta["reasoning_content"] = reasoning
+        field = _reasoning_delta_field(separate_reasoning)
+        delta[field] = reasoning
     if visible:
-        delta["content"] = visible
+        delta["content"] = delta.get("content", "") + visible
     return delta
 
 

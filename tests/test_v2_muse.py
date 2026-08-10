@@ -302,7 +302,7 @@ class MuseStreamingEndpointTests(unittest.TestCase):
         "<|start|>assistant to=user<|message|>The capital of France is Paris.<|eot|>"
     )
 
-    def _events(self, architecture: str):
+    def _events(self, architecture: str, **payload):
         from colibri_next.server import InferenceService
 
         from tests.test_server import StubGenerator
@@ -340,7 +340,11 @@ class MuseStreamingEndpointTests(unittest.TestCase):
         service = InferenceService("muse-local", generator, max_new_tokens=512)
         return list(
             service.stream_chat_completion(
-                {"messages": [{"role": "user", "content": "Hi"}], "stream": True}
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                    **payload,
+                }
             )
         )
 
@@ -351,19 +355,42 @@ class MuseStreamingEndpointTests(unittest.TestCase):
             if isinstance(event, dict) and event.get("choices")
         )
 
-    def test_reasoning_never_reaches_the_content_stream(self):
+    def test_by_default_reasoning_streams_live_as_content(self):
+        # This model cannot be told to stop reasoning, and the reasoning comes
+        # first. Withholding it would leave the stream silent until the answer
+        # began, so by default it flows as ordinary content -- minus the
+        # protocol framing, which is never content.
         events = self._events("muse-glimmer")
         content = self._joined(events, "content")
-        self.assertEqual(content.strip(), "The capital of France is Paris.")
+        self.assertIn("We need Paris.", content)
+        self.assertIn("The capital of France is Paris.", content)
         self.assertNotIn("<|", content)
         self.assertNotIn("to=self", content)
-        self.assertNotIn("We need Paris", content)
+        self.assertEqual(self._joined(events, "reasoning_content"), "")
 
-    def test_reasoning_is_streamed_on_its_own_field(self):
-        events = self._events("muse-glimmer")
+    def test_the_first_delta_arrives_before_the_answer(self):
+        # The liveness property itself: something is emitted well before the
+        # reasoning ends, rather than one burst at the end.
+        events = [
+            event
+            for event in self._events("muse-glimmer")
+            if isinstance(event, dict)
+            and event.get("choices")
+            and event["choices"][0]["delta"].get("content")
+        ]
+        self.assertGreater(len(events), 1)
+        first = events[0]["choices"][0]["delta"]["content"]
+        self.assertTrue(first.strip())
+        self.assertNotIn("Paris is", first)
+
+    def test_separate_reasoning_moves_it_off_the_content_stream(self):
+        events = self._events("muse-glimmer", separate_reasoning=True)
+        content = self._joined(events, "content")
         reasoning = self._joined(events, "reasoning_content")
+        self.assertEqual(content.strip(), "The capital of France is Paris.")
         self.assertEqual(reasoning.strip(), "We need Paris.")
-        self.assertNotIn("<|", reasoning)
+        self.assertNotIn("We need Paris", content)
+        self.assertNotIn("<|", content + reasoning)
 
     def test_other_architectures_stream_unchanged(self):
         # The same raw text from a non-Muse model is forwarded verbatim.
