@@ -64,8 +64,13 @@ struct ExpertExecutionPolicy {
     }
 
     constexpr bool misses_may_be_admitted() const {
+        // Verification admits for the same reason decode does: under MTP it
+        // *replaces* decode, so excluding it left the device cache permanently
+        // empty and pushed every routed expert onto the CPU. Prefill still may
+        // not churn the cache -- it only trains the history for a bulk seed.
         return routed_gpu_execution_allowed() &&
-            phase == ExpertExecutionPhase::decode &&
+            (phase == ExpertExecutionPhase::decode ||
+             phase == ExpertExecutionPhase::verification) &&
             admission_enabled && !residency_frozen;
     }
 

@@ -29,7 +29,7 @@ int main() {
         Expected{Mode::streamed_gpu, Phase::decode, false,
                  false, true, false, false, false},
         Expected{Mode::streamed_gpu, Phase::verification, true,
-                 true, true, false, false, false},
+                 true, true, true, false, false},
         Expected{Mode::cpu, Phase::prepare, true,
                  true, false, false, false, true},
         Expected{Mode::cpu, Phase::prefill, false,
@@ -49,7 +49,7 @@ int main() {
         Expected{Mode::hybrid, Phase::decode, false,
                  true, true, false, false, true},
         Expected{Mode::hybrid, Phase::verification, true,
-                 true, true, false, false, true},
+                 true, true, true, false, true},
     };
 
     for (const auto& expected : cases) {
@@ -79,12 +79,26 @@ int main() {
         !unchanged_decode.misses_may_be_admitted())
         return 5;
 
+    // MTP verification replaces decode, so it must admit: pinning this false
+    // left the device expert cache permanently empty under MTP and ran every
+    // routed expert on the CPU (measured -32% at drafts=2). CPU fallback stays
+    // available for the routes admission declines.
     const v2::ExpertExecutionPolicy unchanged_verification{
         Mode::hybrid, Phase::verification, true, true};
     if (!unchanged_verification.routed_cpu_execution_allowed() ||
         !unchanged_verification.routed_gpu_execution_allowed() ||
-        unchanged_verification.misses_may_be_admitted())
+        !unchanged_verification.misses_may_be_admitted())
         return 6;
+
+    // ...but a frozen or admission-disabled runtime still overrides it.
+    const v2::ExpertExecutionPolicy frozen_verification{
+        Mode::hybrid, Phase::verification, true, false, true};
+    if (frozen_verification.misses_may_be_admitted() ||
+        frozen_verification.residency_may_change())
+        return 8;
+    const v2::ExpertExecutionPolicy closed_verification{
+        Mode::hybrid, Phase::verification, false, false};
+    if (closed_verification.misses_may_be_admitted()) return 9;
 
     const v2::ExpertExecutionPolicy frozen_decode{
         Mode::hybrid, Phase::decode, true, false, true};

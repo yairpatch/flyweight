@@ -16,6 +16,11 @@ import time
 
 from colibri_next.v2 import V2Model
 
+# Direct expert paging is auto-enabled only when ~31 GiB of host RAM is free,
+# so the SECOND runtime built in a process silently falls back to staged copies
+# and is not comparable to the first. Force it for every runtime here.
+os.environ["COLIBRI_V2_DMA_PAGING"] = "1"
+
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 MTP_MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-MTP-BF16.gguf"
 GPU_CACHE_BYTES = 8192 * 1024**2

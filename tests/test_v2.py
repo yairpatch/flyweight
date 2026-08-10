@@ -178,15 +178,49 @@ class V2RuntimeTests(unittest.TestCase):
         )
 
     def test_mtp_adaptive_trial_uses_warm_baseline_and_decisive_margin(self):
+        """The gate must compare like with like, and reach a verdict.
+
+        This test used to assert only the constants, so it passed while the
+        gate was measuring its sequential baseline on the first 16 tokens after
+        prefill -- the slowest tokens there are -- and MTP afterwards. That
+        inflated the baseline enough to keep MTP while it ran ~30% slower.
+        """
         root = Path(__file__).resolve().parents[1]
         runtime = (root / "native/src/v2_runtime.cpp").read_text()
 
-        self.assertIn("kQwenMtpBaselineTokens=16", runtime)
         self.assertIn("kQwenMtpKeepPercent=80", runtime)
         self.assertIn(
-            "mtp_per_token*100>=baseline_per_token*kQwenMtpKeepPercent",
+            "mtp_per_token*100<baseline_per_token*kQwenMtpKeepPercent",
             runtime,
         )
+
+        # The post-prefill ramp is discarded before either arm is timed.
+        self.assertIn("kQwenMtpWarmupTokens=8", runtime)
+        self.assertIn(
+            "runtime.mtp_calibration_warmup_tokens<kQwenMtpWarmupTokens",
+            runtime,
+        )
+
+        # Both arms are then sampled alternately, in the same thermal state.
+        self.assertIn(
+            "if(need_decode&&need_rounds)return runtime.mtp_calibration_draft_turn;",
+            runtime,
+        )
+
+        # The verdict must be reachable from whichever recorder fills the last
+        # slot; deciding only inside record_round wedged should_draft at false
+        # with the verdict never reached.
+        self.assertIn("qwen_mtp_finish_calibration", runtime)
+        record_decode = runtime.split("static void qwen_mtp_record_decode")[1]
+        record_decode = record_decode.split("\n}")[0]
+        self.assertIn("qwen_mtp_finish_calibration(runtime);", record_decode)
+        record_round = runtime.split("static void qwen_mtp_record_round")[1]
+        record_round = record_round.split("\n}")[0]
+        self.assertIn("qwen_mtp_finish_calibration(runtime);", record_round)
+
+        # Both verdicts are logged: a gate that wrongly keeps MTP used to be
+        # completely silent, which is the case that costs throughput.
+        self.assertIn('keep?"keeping MTP":"falling back', runtime)
 
     def test_mtp_small_q8_batches_use_decode_matvecs(self):
         root = Path(__file__).resolve().parents[1]

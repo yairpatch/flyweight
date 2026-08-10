@@ -480,6 +480,9 @@ struct ColibriV2QwenRuntime {
     std::uint64_t mtp_calibration_round_tokens = 0;
     std::uint32_t mtp_calibration_decode_tokens = 0;
     std::uint32_t mtp_calibration_rounds = 0;
+    std::uint32_t mtp_calibration_warmup_tokens = 0;
+    bool mtp_calibration_draft_turn = false;
+    bool mtp_calibration_done = false;
     bool mtp_adaptive_disabled = false;
     bool mtp_adaptive_reported = false;
     std::uint64_t mtp_target_hidden_offset = 0;
@@ -7225,6 +7228,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->fused_moe_gate_up=fused[0]!='0';
     if(const char*strict=std::getenv("COLIBRI_EXPERT_CACHE_STRICT_ADMISSION"))
         runtime->strict_cache_admission=strict[0]!='0';
+    // COLIBRI_MTP_PROFILE reuses the prefill profiling events to split MTP
+    // verification into GPU core / router / transfer, so it needs the same
+    // timed events -- which only exist when prefill profiling is on.
+    if(std::getenv("COLIBRI_MTP_PROFILE"))runtime->prefill_profile=1;
     const int route_event_status=runtime->prefill_profile
         ?colibri_gpu_timed_event_create(&runtime->route_event)
         :colibri_gpu_event_create(&runtime->route_event);
@@ -11425,36 +11432,63 @@ static bool qwen_mtp_adaptive_enabled(){
     return !setting||setting[0]!='0';
 }
 
-static constexpr std::uint32_t kQwenMtpBaselineTokens=16;
+static constexpr std::uint32_t kQwenMtpBaselineTokens=8;
+static constexpr std::uint32_t kQwenMtpTrialRounds=4;
+// Tokens discarded before calibration starts. The first tokens after prefill
+// are far slower than steady state -- cold expert residency, GPU clocks still
+// ramping -- and the old gate spent its entire sequential baseline there before
+// timing MTP afterwards. That inflated the baseline enough that MTP measured as
+// a win and was kept while actually running ~30% slower.
+static constexpr std::uint32_t kQwenMtpWarmupTokens=8;
 static constexpr std::uint64_t kQwenMtpKeepPercent=80;
 
 static bool qwen_mtp_should_draft(const ColibriV2QwenRuntime&runtime){
     if(!qwen_mtp_adaptive_enabled())return runtime.options.mtp_drafts!=0;
-    return runtime.options.mtp_drafts>=2&&
-        !runtime.mtp_adaptive_disabled&&
-        runtime.mtp_calibration_decode_tokens>=kQwenMtpBaselineTokens;
+    if(runtime.options.mtp_drafts<2||runtime.mtp_adaptive_disabled)return false;
+    if(runtime.mtp_calibration_done)return true;
+    if(runtime.mtp_calibration_warmup_tokens<kQwenMtpWarmupTokens)return false;
+    // Alternate the two arms so both are sampled in the same thermal and cache
+    // state. Whichever arm fills first stops, and the other runs to its target.
+    const bool need_decode=
+        runtime.mtp_calibration_decode_tokens<kQwenMtpBaselineTokens;
+    const bool need_rounds=
+        runtime.mtp_calibration_rounds<kQwenMtpTrialRounds;
+    if(need_decode&&need_rounds)return runtime.mtp_calibration_draft_turn;
+    // One arm is full, so run the other. Both full is unreachable: whichever
+    // record_* call filled the last slot ran qwen_mtp_finish_calibration, and
+    // mtp_calibration_done returned above.
+    return need_rounds;
 }
+
+static void qwen_mtp_finish_calibration(ColibriV2QwenRuntime&runtime);
 
 static void qwen_mtp_record_decode(
     ColibriV2QwenRuntime&runtime,std::uint64_t nanoseconds
 ){
-    if(!qwen_mtp_adaptive_enabled()||
-       runtime.mtp_calibration_decode_tokens>=kQwenMtpBaselineTokens)return;
-    runtime.mtp_calibration_decode_nanoseconds+=nanoseconds;
-    ++runtime.mtp_calibration_decode_tokens;
+    if(!qwen_mtp_adaptive_enabled()||runtime.mtp_adaptive_disabled||
+       runtime.mtp_calibration_done)return;
+    if(runtime.mtp_calibration_warmup_tokens<kQwenMtpWarmupTokens){
+        ++runtime.mtp_calibration_warmup_tokens;
+        return;
+    }
+    runtime.mtp_calibration_draft_turn=true;
+    if(runtime.mtp_calibration_decode_tokens<kQwenMtpBaselineTokens){
+        runtime.mtp_calibration_decode_nanoseconds+=nanoseconds;
+        ++runtime.mtp_calibration_decode_tokens;
+    }
+    qwen_mtp_finish_calibration(runtime);
 }
 
-static void qwen_mtp_record_round(
-    ColibriV2QwenRuntime&runtime,std::uint64_t nanoseconds,
-    std::uint32_t committed
-){
-    if(!qwen_mtp_adaptive_enabled()||runtime.mtp_adaptive_disabled)return;
-    runtime.mtp_calibration_round_nanoseconds+=nanoseconds;
-    runtime.mtp_calibration_round_tokens+=committed;
-    ++runtime.mtp_calibration_rounds;
-    if(runtime.mtp_calibration_rounds<4||
-       !runtime.mtp_calibration_round_tokens||
-       !runtime.mtp_calibration_decode_tokens)return;
+// Both arms full -> decide. This must be reachable from whichever record_*
+// call completes the pair: the sequential arm can be the last to fill, and
+// deciding only inside record_round left should_draft returning false forever
+// with the verdict never reached -- MTP off by accident rather than by verdict.
+static void qwen_mtp_finish_calibration(ColibriV2QwenRuntime&runtime){
+    if(runtime.mtp_calibration_done||
+       runtime.mtp_calibration_rounds<kQwenMtpTrialRounds||
+       runtime.mtp_calibration_decode_tokens<kQwenMtpBaselineTokens||
+       !runtime.mtp_calibration_round_tokens)return;
+    runtime.mtp_calibration_done=true;
     const auto baseline_per_token=
         runtime.mtp_calibration_decode_nanoseconds/
         runtime.mtp_calibration_decode_tokens;
@@ -11465,17 +11499,34 @@ static void qwen_mtp_record_round(
     // token-major decode.  Keep it only for a decisive win: besides absorbing
     // timing and rejection variance, the short trial then ends well before
     // harmless rounding differences can accumulate into a greedy-token change.
-    if(mtp_per_token*100>=baseline_per_token*kQwenMtpKeepPercent){
-        runtime.mtp_adaptive_disabled=true;
-        if(!runtime.mtp_adaptive_reported){
-            std::fprintf(stderr,
-                "[colibri-v2] MTP adaptive fallback: %llu us/token vs "
-                "%llu us/token ordinary decode\n",
-                static_cast<unsigned long long>(mtp_per_token/1000),
-                static_cast<unsigned long long>(baseline_per_token/1000));
-            runtime.mtp_adaptive_reported=true;
-        }
+    const bool keep=
+        mtp_per_token*100<baseline_per_token*kQwenMtpKeepPercent;
+    if(!keep)runtime.mtp_adaptive_disabled=true;
+    // Report both verdicts. Only the fallback used to be logged, so a gate that
+    // wrongly kept MTP -- the case that costs the user throughput -- was
+    // completely silent.
+    if(!runtime.mtp_adaptive_reported){
+        std::fprintf(stderr,
+            "[colibri-v2] MTP calibration: %llu us/token speculative vs "
+            "%llu us/token ordinary decode -- %s\n",
+            static_cast<unsigned long long>(mtp_per_token/1000),
+            static_cast<unsigned long long>(baseline_per_token/1000),
+            keep?"keeping MTP":"falling back to ordinary decode");
+        runtime.mtp_adaptive_reported=true;
     }
+}
+
+static void qwen_mtp_record_round(
+    ColibriV2QwenRuntime&runtime,std::uint64_t nanoseconds,
+    std::uint32_t committed
+){
+    if(!qwen_mtp_adaptive_enabled()||runtime.mtp_adaptive_disabled||
+       runtime.mtp_calibration_done)return;
+    runtime.mtp_calibration_draft_turn=false;
+    runtime.mtp_calibration_round_nanoseconds+=nanoseconds;
+    runtime.mtp_calibration_round_tokens+=committed;
+    ++runtime.mtp_calibration_rounds;
+    qwen_mtp_finish_calibration(runtime);
 }
 
 int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,ColibriV2TokenCallback callback,void*user){return guarded([&]{

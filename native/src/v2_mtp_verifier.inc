@@ -226,8 +226,17 @@ void qwen_forward_rows(
         if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
         auto&layer=runtime.layers[layer_number];
         q8_cached_input=0;q8_cached_width=0;
+        // The same GPU-event split (core / router / transfer) answers "is
+        // route_wait real GPU work or a bubble?" for MTP verification, which is
+        // the phase that currently stalls more than decode. Opt in with
+        // COLIBRI_MTP_PROFILE=1; it accumulates into the prefill_gpu_* counters,
+        // so a probe must snapshot them between the prefill and decode phases.
+        static const bool verify_profile=
+            std::getenv("COLIBRI_MTP_PROFILE")!=nullptr;
         const bool profile_prefill=
-            runtime.prefill_profile&&expert_policy.records_prefill_frequency();
+            (runtime.prefill_profile&&expert_policy.records_prefill_frequency())||
+            (verify_profile&&
+             expert_phase==colibri::v2::ExpertExecutionPhase::verification);
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill layer-start profiling event failed");
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
@@ -750,6 +759,10 @@ void qwen_forward_rows(
         const bool gpu_rows_allowed=
             expert_policy.routed_gpu_execution_allowed()&&
             !runtime.expert_slots.empty();
+        // select_expert_cache_slot evaluates the policy at phase `decode`
+        // internally, so the real phase has to be checked here: prefill rows
+        // must keep training the history without touching residency.
+        const bool rows_may_admit=expert_policy.misses_may_be_admitted();
         const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
         if(gpu_table_path){
             std::fill(gpu_weights.begin(),gpu_weights.end(),0.0f);
@@ -768,10 +781,44 @@ void qwen_forward_rows(
                     record_expert_access(runtime,layer_number,expert);
                 const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|static_cast<std::uint32_t>(expert);
                 const auto resident=runtime.expert_residency.find(cache_key);
-                if(resident==runtime.expert_residency.end()){++runtime.expert_cache_misses;continue;}
-                auto& slot=runtime.expert_slots[resident->second];
-                record_expert_cache_hit(runtime,slot);
-                const auto slot_index=resident->second;
+                std::size_t slot_index=kNoExpertSlot;
+                if(resident!=runtime.expert_residency.end()){
+                    slot_index=resident->second;
+                    record_expert_cache_hit(runtime,runtime.expert_slots[slot_index]);
+                }else{
+                    ++runtime.expert_cache_misses;
+                    // Under MTP this path *is* the decode path, so declining to
+                    // admit here leaves the cache empty forever and runs every
+                    // route on the CPU. Page in exactly as decode does. Only the
+                    // DMA route is taken: the staged route would need
+                    // rows*top_k expert bundles of host staging, and
+                    // expert_staging_bytes is sized for top_k*2.
+                    if(rows_may_admit&&runtime.dma_paging)
+                        slot_index=select_expert_cache_slot(
+                            runtime,layer_number,expert,true);
+                    if(slot_index==kNoExpertSlot)continue;
+                    auto&admitted=runtime.expert_slots[slot_index];
+                    admitted.key=cache_key;
+                    admitted.valid=true;
+                    admitted.native_valid=false;
+                    runtime.expert_residency[cache_key]=slot_index;
+                    const auto admitted_base=
+                        runtime.expert_cache+slot_index*runtime.expert_slot_bytes;
+                    std::uint64_t admitted_offset=0;
+                    for(int role=0;role<3;++role){
+                        const auto&source=runtime.model->tensors[layer.expert_tensors[role]];
+                        const auto bytes=source.size/experts;
+                        if(colibri_gpu_upload(
+                               admitted_base+admitted_offset,
+                               tensor_data(*runtime.model,source)+
+                                   static_cast<std::uint64_t>(expert)*bytes,
+                               bytes,runtime.stream)!=0)
+                            throw std::runtime_error(
+                                "native Qwen rows forward expert DMA upload failed");
+                        admitted_offset+=bytes;
+                    }
+                }
+                auto& slot=runtime.expert_slots[slot_index];
                 slot.last_used=++runtime.expert_clock;
                 const int compact=token*top_k+gpu_counts[token]++;
                 const auto device_base=runtime.expert_cache+slot_index*runtime.expert_slot_bytes;
