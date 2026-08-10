@@ -535,6 +535,26 @@ class InferenceService:
                             close()
                 if final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
+                if tool_channels is not None:
+                    # Release what the channel filter was withholding as a
+                    # possible marker. A turn cut short by max_tokens can end on
+                    # a character that begins one -- without this the answer
+                    # loses its last few characters, and only when tools are
+                    # enabled. Routed through `pending` so the tool-marker tail
+                    # flush below is the single place that emits it.
+                    tail_visible, tail_reasoning = tool_channels.flush()
+                    if tail_reasoning:
+                        yield self._chat_chunk(
+                            completion_id,
+                            created,
+                            {
+                                _reasoning_delta_field(
+                                    request.separate_reasoning
+                                ): tail_reasoning
+                            },
+                        )
+                    if tail_visible and tool_start is None:
+                        pending += tail_visible
                 accumulated = "".join(text_parts)
                 if not tool_calls:
                     _, tool_calls = _parse_tool_calls(accumulated, tools=request.tools)

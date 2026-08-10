@@ -302,7 +302,7 @@ class MuseStreamingEndpointTests(unittest.TestCase):
         "<|start|>assistant to=user<|message|>The capital of France is Paris.<|eot|>"
     )
 
-    def _events(self, architecture: str, **payload):
+    def _events(self, architecture: str, raw: str | None = None, **payload):
         from colibri_next.server import InferenceService
 
         from tests.test_server import StubGenerator
@@ -310,17 +310,19 @@ class MuseStreamingEndpointTests(unittest.TestCase):
         generator = StubGenerator()
         generator.tokenizer.architecture = architecture
 
+        text = self.RAW if raw is None else raw
+
         def stream_messages(messages, **options):
             generated: list[int] = []
             # One character per step, so every marker straddles a delta.
-            for index, character in enumerate(self.RAW):
+            for index, character in enumerate(text):
                 generated.append(index)
                 yield GenerationStep(
                     token_id=index,
                     text_delta=character,
                     prompt_ids=(1, 2, 3),
                     generated_ids=tuple(generated),
-                    text=self.RAW[: index + 1],
+                    text=text[: index + 1],
                     stopped_on_eos=False,
                     finished=False,
                     state_tokens=3 + len(generated),
@@ -330,8 +332,8 @@ class MuseStreamingEndpointTests(unittest.TestCase):
                 text_delta="",
                 prompt_ids=(1, 2, 3),
                 generated_ids=tuple(generated),
-                text=self.RAW,
-                stopped_on_eos=True,
+                text=text,
+                stopped_on_eos=raw is None,
                 finished=True,
                 state_tokens=3 + len(generated),
             )
@@ -391,6 +393,34 @@ class MuseStreamingEndpointTests(unittest.TestCase):
         self.assertEqual(reasoning.strip(), "We need Paris.")
         self.assertNotIn("We need Paris", content)
         self.assertNotIn("<|", content + reasoning)
+
+    def test_a_truncated_turn_keeps_its_last_characters(self):
+        """A stream cut short by max_tokens must still release the tail.
+
+        The filter withholds text that could still grow into a marker. If the
+        turn simply stops -- no <|eot|> -- that tail has to be flushed, or the
+        answer silently loses its last characters. The tool-enabled stream is a
+        separate code path and regressed here independently.
+        """
+        truncated = (
+            "to=self<|message|>t<|eom|>"
+            "<|start|>assistant to=user<|message|>Use the tag <"
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "w",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        for label, payload in (("plain", {}), ("tools", {"tools": tools})):
+            with self.subTest(stream=label):
+                events = self._events("muse-glimmer", raw=truncated, **payload)
+                self.assertEqual(
+                    self._joined(events, "content").strip(), "tUse the tag <"
+                )
 
     def test_other_architectures_stream_unchanged(self):
         # The same raw text from a non-Muse model is forwarded verbatim.
