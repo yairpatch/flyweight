@@ -2735,6 +2735,80 @@ __device__ __forceinline__ float iq2s_value(
     return ((signs[index] >> element) & 1) ? -db * value : db * value;
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(// IQ2_S against a vector quantized in independent 32-value Q8 blocks: the
+// DP4A twin of iq2xxs_q8_group above. The codebook magnitudes fit in signed
+// bytes, so the 32 products of one Q8 block collapse into eight __dp4a
+// instructions instead of 32 weight reconstructions.
+//
+// Two things differ from IQ2_XXS. The grid index takes two high bits from qh,
+// and the signs are stored literally rather than through the 7-bit sign
+// codebook -- broadcasting the sign byte across all four lanes reproduces
+// exactly the mask layout the shared __vcmpne4 trick expects.
+//
+// The subtlety is the scale. A Q8 block spans 32 values, which is two of
+// IQ2_S's 16-value scale groups, so the two halves have to accumulate
+// separately and take their own nibble of the scale byte. Folding them into
+// one dot product would apply one half's scale to all 32 weights.
+__device__ __forceinline__ float iq2s_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 82;
+    const unsigned char* quants = base + 2;
+    const unsigned char* signs = base + 34;
+    const unsigned char* high = base + 66;
+    const unsigned char* scales = base + 74;
+
+    // 82 bytes leaves the activation block 32-byte aligned, so it loads as two
+    // int4 rather than eight scalars.
+    const int4* activation_vectors = (const int4*)(vector + linear_group * 32);
+    const int4 activation_low = activation_vectors[0];
+    const int4 activation_high = activation_vectors[1];
+    const int acts[8] = {
+        activation_low.x, activation_low.y,
+        activation_low.z, activation_low.w,
+        activation_high.x, activation_high.y,
+        activation_high.z, activation_high.w};
+
+    // The four grid indices this block covers share one qh byte and one scale
+    // byte, both selected by the group alone.
+    const int first_index = group * 4;
+    const unsigned int qh_byte = high[group];
+    const unsigned int scale_byte = scales[group];
+
+    int dot_low = 0, dot_high = 0;
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const int index = first_index + step;
+        const int entry =
+            quants[index] | (int)(((qh_byte >> (2 * step)) & 3u) << 8);
+        const unsigned long long pattern = kIq2sGrid[entry];
+        const unsigned int sign_word = (unsigned int)signs[index] * 0x01010101u;
+        const int masks_first = __vcmpne4(sign_word & 0x08040201u, 0);
+        const int masks_second = __vcmpne4(sign_word & 0x80402010u, 0);
+        const int weights_first = __vsub4(
+            (int)(unsigned int)pattern ^ masks_first, masks_first);
+        const int weights_second = __vsub4(
+            (int)(unsigned int)(pattern >> 32) ^ masks_second, masks_second);
+        int dot = 0;
+        dot = __dp4a(weights_first, acts[step * 2], dot);
+        dot = __dp4a(weights_second, acts[step * 2 + 1], dot);
+        if (step < 2) dot_low += dot; else dot_high += dot;
+    }
+    const float scale_low = 0.5f + (float)(scale_byte & 15u);
+    const float scale_high = 0.5f + (float)((scale_byte >> 4) & 15u);
+    return ((float)dot_low * scale_low + (float)dot_high * scale_high) * 0.25f
+        * __half2float(*((const __half*)base))
+        * __half2float(vector_scales[linear_group]);
+}
+
+COLIBRI_Q8_MATVEC(iq2s_q8_matvec_transposed_warp, iq2s_q8_group, 82)
+
 __device__ __forceinline__ float iq3s_value(
     const unsigned char* packed, int absolute
 ) {

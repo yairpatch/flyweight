@@ -9657,7 +9657,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 if(q8_decode("iq3xxs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
                 if(colibri_gpu_iq3xxs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
                 break;
-            case 22:if(colibri_gpu_iq2s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
+            case 22:
+                if(q8_decode("iq2s_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_iq2s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
             case 21:if(colibri_gpu_iq3s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
             case 17:if(colibri_gpu_iq2xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
             case 23:if(colibri_gpu_iq4xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
