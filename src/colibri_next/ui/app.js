@@ -183,7 +183,13 @@ function historyPayload(limit) {
   const retained = [];
   let bytes = 2;
   for (const conversation of ordered) {
-    const serialized = JSON.stringify(conversation);
+    // A persisted message is never mid-generation. The flag drives the caret
+    // and suppresses the message actions, so a snapshot taken while an answer
+    // was still drawing would reload as an answer that never finishes.
+    const serialized = JSON.stringify(
+      conversation,
+      (key, value) => (key === "generating" ? undefined : value),
+    );
     if (retained.length && bytes + serialized.length + 1 > HISTORY_BYTE_BUDGET) {
       break;
     }
@@ -675,6 +681,7 @@ const smooth = {
   instant: false,
   onDone: null,
   last: 0,
+  speed: REVEAL_MIN_CPS,
   frame: null,
 };
 
@@ -687,6 +694,7 @@ function beginSmoothStream(message) {
   smooth.instant = false;
   smooth.onDone = null;
   smooth.last = performance.now();
+  smooth.speed = REVEAL_MIN_CPS;
   smooth.frame = requestAnimationFrame(smoothTick);
 }
 
@@ -697,18 +705,30 @@ function smoothTick(now) {
     return;
   }
   const target = (message.content || "").length;
-  const elapsed = Math.min(0.25, Math.max(0, (now - smooth.last) / 1000));
+  // Real time not spent on a frame is still time the reveal owes the reader, so
+  // the whole delta is carried. Clamping it (this once capped at 0.25 s) threw
+  // the excess away, which left a throttled tab losing ground on every long
+  // frame with no way to catch up. `revealed` is bounded by `target` below, so
+  // a large delta can only ever close the gap, never overrun it.
+  const elapsed = Math.max(0, (now - smooth.last) / 1000);
   smooth.last = now;
   if (smooth.instant) {
     smooth.revealed = target;
   } else if (smooth.revealed < target) {
-    const speed = clampNumber(
+    // Chasing the backlog is right while tokens are still arriving. Once the
+    // request is over the backlog only shrinks, and a speed proportional to it
+    // decays exponentially through the last characters -- a slow-motion tail
+    // exactly where the reader is looking. Finishing therefore holds the pace
+    // the stream had reached and runs out at it, only ever revising upwards so
+    // a large unrevealed remainder still drains promptly.
+    const chase = clampNumber(
       (target - smooth.revealed) / REVEAL_DRAIN_SECONDS,
       REVEAL_MIN_CPS,
       REVEAL_MAX_CPS,
       REVEAL_MIN_CPS,
     );
-    smooth.revealed = Math.min(target, smooth.revealed + speed * elapsed);
+    smooth.speed = smooth.finishing ? Math.max(smooth.speed, chase) : chase;
+    smooth.revealed = Math.min(target, smooth.revealed + smooth.speed * elapsed);
   }
 
   const head = Math.floor(smooth.revealed);
@@ -760,6 +780,25 @@ function endSmoothStream(done, { instant = false } = {}) {
   smooth.onDone = done;
 }
 
+// requestAnimationFrame is suspended while the page is hidden, but the SSE
+// reader is not, so the reveal head can be an entire answer behind by the time
+// the reader comes back. Replaying that as an animation shows text arriving
+// long after the runtime finished. Returning to the page therefore snaps the
+// head to everything received and settles a request that ended while away --
+// the frame this cancels would otherwise be the one that ran `onDone`.
+function catchUpSmoothStream() {
+  if (!smooth.message) {
+    return;
+  }
+  smooth.revealed = (smooth.message.content || "").length;
+  smooth.last = performance.now();
+  if (smooth.finishing) {
+    // `onDone` re-renders the transcript from the message itself, so the full
+    // text lands without painting it here first.
+    finishSmoothStream();
+  }
+}
+
 // Reveals whatever is left at once and settles the request. Used when the
 // transcript is about to be rebuilt under a stream that is still draining.
 function flushSmoothStream() {
@@ -788,6 +827,7 @@ function cancelSmoothStream() {
   smooth.painted = -1;
   smooth.finishing = false;
   smooth.instant = false;
+  smooth.speed = REVEAL_MIN_CPS;
 }
 
 function resetStreamState(messageId = null, content = null) {
@@ -1751,6 +1791,12 @@ async function sendMessage(promptOverride = null) {
     state.generating = false;
     state.controller = null;
     updateSendButton();
+    // The answer is complete the moment the request ends; the reveal may still
+    // be drawing it, and while the page is hidden it is not drawing at all.
+    // Saving here rather than only in the settle callback below means a tab
+    // closed mid-reveal cannot lose a response the server already delivered.
+    conversation.updatedAt = Date.now();
+    persistConversations();
     endSmoothStream(() => {
       const following = isFollowingStream();
       resetStreamState();
@@ -2564,6 +2610,7 @@ setInterval(() => {
 }, 5000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
+    catchUpSmoothStream();
     pollRuntime();
   }
 });
