@@ -482,5 +482,49 @@ class MuseNativeTests(unittest.TestCase):
         self.assertEqual(results["1"], results["8"])
 
 
+@unittest.skipUnless(
+    os.environ.get("COLIBRI_TEST_MUSE_MODEL")
+    and Path(os.environ["COLIBRI_TEST_MUSE_MODEL"]).is_file(),
+    "set COLIBRI_TEST_MUSE_MODEL to a Muse Glimmer GGUF checkpoint",
+)
+class MuseRealCheckpointTests(unittest.TestCase):
+    """Batched prefill against the one-token path, on real quantized weights.
+
+    The synthetic fixture is f32, so it never reaches the DP4A projections --
+    which is exactly where batched prefill broke by reusing a stale Q8
+    activation cache, producing fluent-looking garbage. Only a quantized
+    checkpoint exercises it.
+    """
+
+    def _continuation(self, rows: str) -> list[int]:
+        # Closed before the next configuration runs: two runtimes of a
+        # multi-gigabyte checkpoint do not fit on the card at once, and the
+        # second would spill every block and answer a different question.
+        with unittest.mock.patch.dict(os.environ, {"COLIBRI_PREFILL_ROWS": rows}):
+            model = V2Model(os.environ["COLIBRI_TEST_MUSE_MODEL"])
+            try:
+                runtime = model.native_runtime(context_limit=2048, mtp_drafts=0)
+                try:
+                    runtime.prepare()
+                    body = "Paris is the capital of France. " * 40
+                    prompt = model.tokenize(
+                        f"<|start|>user<|message|>{body}\nWhat is the capital of "
+                        "France? Reply with just the city name.<|eot|>"
+                        "<|start|>assistant to=user<|message|>"
+                    )
+                    produced: list[int] = []
+                    runtime.generate(prompt, 10, produced.append)
+                    return produced
+                finally:
+                    runtime.close()
+            finally:
+                model.close()
+
+    def test_batched_prefill_matches_token_by_token(self):
+        if not V2Model.gpu_info()["available"]:
+            self.skipTest("native CUDA runtime is unavailable")
+        self.assertEqual(self._continuation("1"), self._continuation("64"))
+
+
 if __name__ == "__main__":
     unittest.main()

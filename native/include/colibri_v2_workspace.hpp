@@ -117,6 +117,8 @@ struct QwenRowsWorkspaceLayout {
     Region selected_device;
     Region route_weights;
     Region gpu_activated;
+    Region rows_q8;
+    Region rows_q8_scales;
     Region gpu_gate_table;
     Region gpu_up_table;
     Region gpu_down_table;
@@ -175,6 +177,14 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     layout.route_weights = builder.add(rows * top_k * sizeof(float));
     layout.gpu_activated =
         builder.add(rows * top_k * intermediate * sizeof(float));
+    // Q8-quantized activations for the DP4A projections. The MoE path borrows
+    // `gpu_activated` for this, which is sized off top_k and therefore empty on
+    // a dense model -- so the DP4A kernels had no scratch to work in and dense
+    // rows fell back to reconstructing every weight in float. One byte per
+    // element plus an fp16 scale per 32-element block; the scales keep a float
+    // stride so the region stays aligned for either width.
+    layout.rows_q8 = builder.add(rows * scratch);
+    layout.rows_q8_scales = builder.add(rows * (scratch / 32 + 1) * sizeof(float));
     layout.gpu_gate_table =
         builder.add(rows * top_k * sizeof(std::uint64_t));
     layout.gpu_up_table =

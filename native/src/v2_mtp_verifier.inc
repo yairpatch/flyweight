@@ -50,9 +50,11 @@ void qwen_forward_rows(
     // and reuses it across q/k/v and the FFN projections.  Borrow the routed
     // activation region as transient Q8 scratch; expert execution consumes it
     // only after all dense projections for the layer have finished.
-    const auto small_q8= gpu_activated;
-    const auto small_q8_scales=small_q8+
-        device_align(static_cast<std::uint64_t>(rows)*runtime.scratch_elements);
+    // Dedicated regions rather than borrowing `gpu_activated`, which is sized
+    // off top_k and so is empty on a dense model.
+    const auto small_q8=workspace_layout.rows_q8.address(runtime.workspace);
+    const auto small_q8_scales=
+        workspace_layout.rows_q8_scales.address(runtime.workspace);
     std::uint64_t q8_cached_input=0;
     int q8_cached_width=0;
     const auto gpu_table_entries=static_cast<std::uint64_t>(rows)*top_k;
@@ -75,6 +77,13 @@ void qwen_forward_rows(
             throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
     };
     auto rms_rows=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
+        // Invalidate the Q8 activation cache, which is keyed on the source
+        // address. `normalized` is rewritten twice per layer -- once before
+        // attention and again before the feed-forward -- at the same address,
+        // so a per-layer invalidation alone leaves the second set of
+        // projections reading the first one's quantized activations. The
+        // single-token path invalidates on every norm for the same reason.
+        q8_cached_input=0;q8_cached_width=0;
         int one_centered=0;void*args[]={&input,&weights,&output,&rows,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};
         launch("rms_norm_rows",rows,1,256,args);
     };
@@ -103,7 +112,13 @@ void qwen_forward_rows(
         std::uint64_t matrix=runtime.device_tensors[index];
         const auto type=qwen_device_type(runtime,index);
         const char* q8_kernel=nullptr;
-        if(experts>0&&rows<=8&&(input_size&255)==0){
+        // On MoE this stays a small-batch optimization: the row loop below
+        // re-reads the whole weight matrix per row, which only pays off against
+        // the reconstruct-in-float matmul when there are few rows. A dense
+        // model has no *_matmul_rows kernel that uses DP4A at all, so the same
+        // per-row loop is the faster path at any batch size -- prefill was
+        // running slower than decode without it.
+        if((experts>0?rows<=8:true)&&(input_size&255)==0){
             switch(type){
                 case 10:q8_kernel="q2k_q8_matvec_transposed_warp";break;
                 case 11:q8_kernel="q3k_q8_matvec_transposed_warp";break;
@@ -112,6 +127,7 @@ void qwen_forward_rows(
                 case 14:q8_kernel="q6k_q8_matvec_transposed_warp";break;
                 case 16:q8_kernel="iq2xxs_q8_matvec_transposed_warp";break;
                 case 18:q8_kernel="iq3xxs_q8_matvec_transposed_warp";break;
+                case 22:q8_kernel="iq2s_q8_matvec_transposed_warp";break;
                 default:break;
             }
         }
@@ -201,6 +217,7 @@ void qwen_forward_rows(
     // join. rms_norm_rows reduces per row before writing, so in place is safe.
     const float post_norm_epsilon=1.0e-8f;
     auto post_rms_rows=[&](std::uint64_t values,std::uint64_t weights){
+        q8_cached_input=0;q8_cached_width=0;
         int one_centered=0;
         void*args[]={&values,&weights,&values,&rows,const_cast<int*>(&hidden_size),
                      const_cast<float*>(&post_norm_epsilon),&one_centered};
