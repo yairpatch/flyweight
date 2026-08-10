@@ -26,3 +26,6 @@ src/colibri_next/_native/*
 !src/colibri_next/_native/.gitkeep
 # opencode agent workspace
 .opencode/
+# Claude Code per-machine permission state
+.claude/settings.local.json
+.claude/settings.local.json.tmp.*
