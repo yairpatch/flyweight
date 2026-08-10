@@ -116,6 +116,10 @@ MUSE_MESSAGE_HEADER = re.compile(
     r"(?:<\|start\|>assistant)?[ \t]*(?:to=(?P<recipient>[^\s<|]+))?[ \t]*<\|message\|>"
 )
 MUSE_MESSAGE_END = re.compile(r"<\|eom\|>|<\|eot\|>")
+# Anything that can begin the markup following a message body. A body is only
+# streamed once its tail cannot still be growing into one of these.
+_MUSE_MARKERS = ("<|eom|>", "<|eot|>", "<|start|>")
+_MUSE_LONGEST_MARKER = max(len(marker) for marker in _MUSE_MARKERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +411,12 @@ class InferenceService:
                 last_tool_progress_tokens = 0
                 marker = TOOL_CALL_MARKER
                 holdback = len(marker) - 1
+                tool_channels = (
+                    MuseChannelStream()
+                    if getattr(self.generator.tokenizer, "architecture", None)
+                    == "muse-glimmer"
+                    else None
+                )
 
                 def _content_chunk(text: str, tokens: int, elapsed: float):
                     chunk = self._chat_chunk(completion_id, created, {"content": text})
@@ -446,6 +456,19 @@ class InferenceService:
                             now = time.perf_counter()
                             if decode_started is None:
                                 decode_started = now
+                            if tool_channels is not None:
+                                # Hide the reasoning channel before the tool
+                                # marker scan sees it: text_parts keeps the raw
+                                # turn, which is what the tool parser needs.
+                                delta_text, channel_reasoning = tool_channels.feed(
+                                    delta_text
+                                )
+                                if channel_reasoning:
+                                    yield self._chat_chunk(
+                                        completion_id,
+                                        created,
+                                        {"reasoning_content": channel_reasoning},
+                                    )
                             marker_window = ""
                             if tool_start is None:
                                 # Stream clean text, but stop at (and never leak)
@@ -547,6 +570,18 @@ class InferenceService:
             else:
                 plain_final_step: GenerationStep | None = None
                 plain_decode_started: float | None = None
+                # Muse Glimmer always reasons, so the raw stream carries its
+                # chain-of-thought and framing; route them to reasoning_content
+                # instead of letting them through as assistant text. Keyed on
+                # the architecture rather than on spotting markup mid-stream,
+                # which would forward the opening "to=self" as content before
+                # there was enough text to recognize it.
+                channels = (
+                    MuseChannelStream()
+                    if getattr(self.generator.tokenizer, "architecture", None)
+                    == "muse-glimmer"
+                    else None
+                )
                 with self._generation_guard():
                     for step in self.generator.stream_messages(
                         request.messages,
@@ -562,10 +597,11 @@ class InferenceService:
                             now = time.perf_counter()
                             if plain_decode_started is None:
                                 plain_decode_started = now
+                            delta = _channel_delta(channels, step.text_delta)
                             chunk = self._chat_chunk(
                                 completion_id,
                                 created,
-                                {"content": step.text_delta} if step.text_delta else {},
+                                delta,
                             )
                             # Keep the standard OpenAI chunk shape while exposing
                             # a small provider extension for live UI metrics.
@@ -574,6 +610,16 @@ class InferenceService:
                                 "decode_elapsed_seconds": now - plain_decode_started,
                             }
                             yield chunk
+                if channels is not None:
+                    # Whatever the marker holdback was still withholding.
+                    tail_visible, tail_reasoning = channels.flush()
+                    tail = {}
+                    if tail_reasoning:
+                        tail["reasoning_content"] = tail_reasoning
+                    if tail_visible:
+                        tail["content"] = tail_visible
+                    if tail:
+                        yield self._chat_chunk(completion_id, created, tail)
                 if plain_final_step is None:
                     raise RuntimeError("generation stream ended without a final result")
                 finish_reason = (
@@ -2707,6 +2753,101 @@ def _split_muse_channels(text: str) -> tuple[str, str | None] | None:
     if not reasoning and not visible:
         return None
     return "".join(visible).strip(), "\n\n".join(reasoning).strip() or None
+
+
+def _channel_delta(
+    channels: "MuseChannelStream | None", text_delta: str | None
+) -> dict[str, str]:
+    """Shape one streaming delta, splitting Muse Glimmer's channels.
+
+    Text that carries no Muse markup is forwarded untouched, so every other
+    architecture streams exactly as before.
+    """
+    if not text_delta:
+        return {}
+    if channels is None:
+        return {"content": text_delta}
+    visible, reasoning = channels.feed(text_delta)
+    delta: dict[str, str] = {}
+    if reasoning:
+        delta["reasoning_content"] = reasoning
+    if visible:
+        delta["content"] = visible
+    return delta
+
+
+def _without_partial_marker(text: str) -> str:
+    """Drop a trailing run that could still grow into a message marker."""
+    for size in range(min(len(text), _MUSE_LONGEST_MARKER - 1), 0, -1):
+        tail = text[-size:]
+        if any(marker.startswith(tail) for marker in _MUSE_MARKERS):
+            return text[:-size]
+    return text
+
+
+class MuseChannelStream:
+    """Incremental form of :func:`_split_muse_channels` for streaming.
+
+    Muse Glimmer has no setting that stops it reasoning, so a stream that
+    forwarded raw text would show every client the chain-of-thought and the
+    <|eom|>/<|start|> framing around it. This re-splits the accumulated text on
+    each delta and returns only what is newly settled, which keeps one
+    implementation of the channel rules rather than a second incremental one.
+
+    Text is emitted only once it cannot still turn out to be the start of a
+    marker, so a ``<|eom|>`` arriving one character at a time never leaks a
+    stray ``<|`` into the output. What has already been emitted is tracked by
+    length, which means emission has to be monotonic -- nothing may be sent
+    that a later delta would retract.
+    """
+
+    def __init__(self) -> None:
+        self._raw = ""
+        self._visible = 0
+        self._reasoning = 0
+        self._saw_header = False
+
+    def feed(self, delta: str) -> tuple[str, str]:
+        """Return (visible, reasoning) text newly settled by this delta."""
+        self._raw += delta
+        return self._advance(final=False)
+
+    def flush(self) -> tuple[str, str]:
+        """Release the tail that was being withheld as a possible marker.
+
+        A turn that never produced a header carries no channels to separate --
+        it is forwarded whole rather than swallowed.
+        """
+        visible, reasoning = self._advance(final=True)
+        if not self._saw_header and not self._visible and not self._reasoning:
+            return self._raw, ""
+        return visible, reasoning
+
+    def _advance(self, *, final: bool) -> tuple[str, str]:
+        text = self._raw
+        visible: list[str] = []
+        reasoning: list[str] = []
+        for header in MUSE_MESSAGE_HEADER.finditer(text):
+            self._saw_header = True
+            start = header.end()
+            terminator = MUSE_MESSAGE_END.search(text, start)
+            if terminator:
+                body = text[start : terminator.start()]
+            else:
+                # The open message: its tail may still be a partial marker.
+                body = text[start:]
+                if not final:
+                    body = _without_partial_marker(body)
+            (reasoning if header.group("recipient") == "self" else visible).append(body)
+        # Joined the way the batch splitter joins them, so a stream and a
+        # non-streamed response of the same turn read identically.
+        joined_visible = "".join(visible)
+        joined_reasoning = "\n\n".join(reasoning)
+        fresh_visible = joined_visible[self._visible :]
+        fresh_reasoning = joined_reasoning[self._reasoning :]
+        self._visible = len(joined_visible)
+        self._reasoning = len(joined_reasoning)
+        return fresh_visible, fresh_reasoning
 
 
 def _split_reasoning_content(text: str) -> tuple[str, str | None]:

@@ -460,6 +460,14 @@ class NativeV2Tokenizer:
                 messages=normalized,
                 add_generation_prompt=True,
                 enable_thinking=enable_thinking,
+                # Muse Glimmer's template ignores enable_thinking and reads a
+                # `reasoning_strength` of its own, defaulting to 'high' when it
+                # is undefined -- so leaving it unset asks for the *most*
+                # reasoning precisely when thinking was turned off. The model
+                # has no setting that stops it reasoning, so off maps to the
+                # weakest level it accepts. Templates that do not use the
+                # variable ignore it.
+                reasoning_strength="high" if enable_thinking else "low",
                 tools=None,
                 documents=None,
                 **self._template_tokens,

@@ -8,13 +8,19 @@ through a real Unicode-aware engine rather than against pinned expectations.
 
 from __future__ import annotations
 
+import itertools
 import os
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
 
-from colibri_next.server import _split_reasoning_content
+from colibri_next.generation import GenerationStep
+from colibri_next.server import (
+    MuseChannelStream,
+    _split_muse_channels,
+    _split_reasoning_content,
+)
 from colibri_next.v2 import V2Model
 
 from tests.muse_gguf_fixture import MuseSpec, build_muse_gguf
@@ -228,6 +234,141 @@ class MuseChannelSplitTests(unittest.TestCase):
             _split_reasoning_content("</think>\n\nvisible"), ("visible", None)
         )
         self.assertEqual(_split_reasoning_content("just text"), ("just text", None))
+
+
+class MuseChannelStreamTests(unittest.TestCase):
+    """The streaming filter must agree with the batch splitter, always.
+
+    Markers arrive split across token boundaries, so the risk is emitting a
+    fragment like ``<|`` as content -- emission is tracked by length and cannot
+    be retracted once sent.
+    """
+
+    TURNS = [
+        "to=self<|message|>We need Paris.<|eom|>"
+        "<|start|>assistant to=user<|message|>The capital of France is Paris.<|eot|>",
+        "to=self<|message|>a<|eom|><|start|>assistant to=self<|message|>b<|eom|>"
+        "<|start|>assistant<|message|>Final answer here.",
+        "to=user<|message|>Straight to the answer, no reasoning at all.<|eot|>",
+        "to=self<|message|>edge < case with <| bare marks |> inside<|eom|>"
+        "<|start|>assistant to=user<|message|>Done <|eot|>",
+    ]
+
+    def _drive(self, raw: str, sizes):
+        stream = MuseChannelStream()
+        visible = reasoning = ""
+        at = 0
+        for size in itertools.cycle(sizes):
+            if at >= len(raw):
+                break
+            piece, at = raw[at : at + size], at + size
+            fresh_visible, fresh_reasoning = stream.feed(piece)
+            visible += fresh_visible
+            reasoning += fresh_reasoning
+        fresh_visible, fresh_reasoning = stream.flush()
+        return visible + fresh_visible, reasoning + fresh_reasoning
+
+    def test_matches_the_batch_split_for_every_chunking(self):
+        for raw in self.TURNS:
+            expected = _split_muse_channels(raw)
+            for sizes in ([1], [2], [3], [7], [1, 5, 2], [len(raw)]):
+                with self.subTest(raw=raw[:30], sizes=sizes):
+                    visible, reasoning = self._drive(raw, sizes)
+                    self.assertEqual(visible.strip(), expected[0])
+                    self.assertEqual(reasoning.strip() or None, expected[1])
+
+    def test_a_marker_split_across_deltas_never_leaks(self):
+        # One character at a time is the worst case: every marker is torn apart.
+        visible, reasoning = self._drive(self.TURNS[0], [1])
+        self.assertNotIn("<|", visible)
+        self.assertNotIn("<|", reasoning)
+        self.assertEqual(visible.strip(), "The capital of France is Paris.")
+
+    def test_text_without_markup_is_forwarded_whole(self):
+        stream = MuseChannelStream()
+        stream.feed("plain text, no channels")
+        self.assertEqual(stream.flush(), ("plain text, no channels", ""))
+
+
+class MuseStreamingEndpointTests(unittest.TestCase):
+    """The streaming endpoint must not leak reasoning into `content`.
+
+    Driven through the real endpoint with a stub generator, because the filter
+    being correct in isolation says nothing about it being wired up.
+    """
+
+    RAW = (
+        "to=self<|message|>We need Paris.<|eom|>"
+        "<|start|>assistant to=user<|message|>The capital of France is Paris.<|eot|>"
+    )
+
+    def _events(self, architecture: str):
+        from colibri_next.server import InferenceService
+
+        from tests.test_server import StubGenerator
+
+        generator = StubGenerator()
+        generator.tokenizer.architecture = architecture
+
+        def stream_messages(messages, **options):
+            generated: list[int] = []
+            # One character per step, so every marker straddles a delta.
+            for index, character in enumerate(self.RAW):
+                generated.append(index)
+                yield GenerationStep(
+                    token_id=index,
+                    text_delta=character,
+                    prompt_ids=(1, 2, 3),
+                    generated_ids=tuple(generated),
+                    text=self.RAW[: index + 1],
+                    stopped_on_eos=False,
+                    finished=False,
+                    state_tokens=3 + len(generated),
+                )
+            yield GenerationStep(
+                token_id=None,
+                text_delta="",
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(generated),
+                text=self.RAW,
+                stopped_on_eos=True,
+                finished=True,
+                state_tokens=3 + len(generated),
+            )
+
+        generator.stream_messages = stream_messages
+        service = InferenceService("muse-local", generator, max_new_tokens=512)
+        return list(
+            service.stream_chat_completion(
+                {"messages": [{"role": "user", "content": "Hi"}], "stream": True}
+            )
+        )
+
+    def _joined(self, events, field):
+        return "".join(
+            event["choices"][0]["delta"].get(field, "")
+            for event in events
+            if isinstance(event, dict) and event.get("choices")
+        )
+
+    def test_reasoning_never_reaches_the_content_stream(self):
+        events = self._events("muse-glimmer")
+        content = self._joined(events, "content")
+        self.assertEqual(content.strip(), "The capital of France is Paris.")
+        self.assertNotIn("<|", content)
+        self.assertNotIn("to=self", content)
+        self.assertNotIn("We need Paris", content)
+
+    def test_reasoning_is_streamed_on_its_own_field(self):
+        events = self._events("muse-glimmer")
+        reasoning = self._joined(events, "reasoning_content")
+        self.assertEqual(reasoning.strip(), "We need Paris.")
+        self.assertNotIn("<|", reasoning)
+
+    def test_other_architectures_stream_unchanged(self):
+        # The same raw text from a non-Muse model is forwarded verbatim.
+        content = self._joined(self._events("qwen35"), "content")
+        self.assertEqual(content, self.RAW)
 
 
 class MuseNativeTests(unittest.TestCase):
