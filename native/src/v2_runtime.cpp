@@ -7605,25 +7605,38 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // here because the dense spill accounting below and the arena sizing
         // both depend on it.
         //
-        // Off by default: it trades VRAM for a per-token read of a random row
-        // of the mapping, and host registration does not populate those pages,
-        // so the read is a cold major fault on the critical path. Measured on
-        // the reference SM120 laptop with Qwen3.6-35B-Fast-NVFP4 it buys 575
-        // more expert slots and 30% fewer misses but adds ~1 ms/token to
-        // route_wait, for ~2% net loss. Worth revisiting for cards where the
-        // freed GiB changes the miss rate by much more than it does at an
-        // 8 GiB budget. COLIBRI_EMBED_HOST=1 enables it.
+        // What the freed VRAM buys decides the default, and it differs by model
+        // kind. It always costs the same thing: a per-token read of a random
+        // row of the mapping, and host registration does not populate those
+        // pages, so the read is a cold major fault on the critical path.
+        //
+        // On MoE the gain is indirect -- more expert slots, so a lower miss
+        // rate. Measured on the reference SM120 laptop with
+        // Qwen3.6-35B-Fast-NVFP4 that is 575 more slots and 30% fewer misses
+        // but ~1 ms/token more route_wait, a ~2% net loss. So it stays off.
+        //
+        // On a dense model the gain is direct: there are no experts to page,
+        // so every freed byte is feed-forward that stops being re-read from
+        // RAM on *every* token. Measured on Muse-Glimmer-30B IQ2_XXS (a 10 GiB
+        // checkpoint on a 12 GiB card) returning the 1.03 GiB embedding table
+        // takes the spill from nine blocks to one and decode from 11.9 to 17.8
+        // tok/s -- a 1.5x that one 5.4 KB row read per token cannot dent. So it
+        // defaults on there.
+        //
+        // COLIBRI_EMBED_HOST forces it either way.
         {
             const auto& table=runtime->model->tensors[runtime->token_embeddings];
             const auto vocabulary=runtime->model->config.vocabulary_size;
             const char* embed_env=std::getenv("COLIBRI_EMBED_HOST");
             runtime->embedding_row_bytes=
                 (vocabulary&&table.size%vocabulary==0)?table.size/vocabulary:0;
+            const bool dense_model=runtime->model->config.expert_count==0;
+            const bool wanted=embed_env?embed_env[0]=='1':dense_model;
             runtime->embeddings_host_resident=
                 runtime->embedding_row_bytes!=0&&
                 runtime->lm_head!=runtime->token_embeddings&&
                 !runtime->gemma4&&
-                embed_env&&embed_env[0]=='1';
+                wanted;
             if(runtime->embeddings_host_resident)
                 runtime->static_tensor_bytes-=table.size;
         }
