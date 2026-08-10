@@ -69,6 +69,11 @@ typedef struct ColibriV2ModelConfig {
     float rope_scaling_factor, yarn_beta_fast, yarn_beta_slow;
     uint32_t rope_original_context_length;
     uint32_t draft_block_size, target_layers_length, mask_token_id;
+    /* Head-output transforms. `logit_scale` multiplies the logits and
+       `final_logit_softcap` tanh-compresses them; zero means the checkpoint
+       asked for neither. Both are monotonic, so they change sampling but never
+       a greedy argmax. */
+    float logit_scale, final_logit_softcap;
 } ColibriV2ModelConfig;
 
 typedef struct ColibriV2GpuInfo {

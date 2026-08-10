@@ -373,6 +373,11 @@ class NativeV2Tokenizer:
             # The template closes every turn -- assistant included -- with the
             # end-of-sentence token; there is no separate end-of-turn markup.
             return "<｜end▁of▁sentence｜>"
+        if self.architecture == "muse-glimmer":
+            # An assistant turn is one or more messages; <|eom|> only ends a
+            # message and generation runs on past it, so the token that closes
+            # the turn is <|eot|>.
+            return "<|eot|>"
         return "<|im_end|>\n"
 
     @property
@@ -383,7 +388,9 @@ class NativeV2Tokenizer:
         runs the next role token straight on from end-of-sentence, and a
         newline there is markup no training example contains.
         """
-        return "" if self.architecture == "deepseek4" else "\n"
+        # Muse Glimmer runs <|start|> straight on from <|eot|> the same way
+        # DeepSeek-V4 does; a newline there is markup the template never emits.
+        return "" if self.architecture in ("deepseek4", "muse-glimmer") else "\n"
 
     @property
     def bos_token_id(self) -> int | None:

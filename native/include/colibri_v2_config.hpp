@@ -23,6 +23,12 @@ struct ModelConfig {
     std::uint32_t rotary_dimension_swa=0;
     float rope_freq_base_swa=0.0f, final_logit_softcap=0.0f;
     float rms_norm_epsilon=0.0f, rope_freq_base=0.0f;
+    // Muse Glimmer scales the logits by a trained constant before the softcap.
+    // Zero means the checkpoint carries no scale and the head output stands.
+    float logit_scale=0.0f;
+    // A sliding-window pattern written as a scalar period rather than a
+    // per-layer array: the layer is sliding unless it closes the cycle.
+    std::uint32_t sliding_window_period=0;
     // Leading blocks that carry a dense feed-forward instead of a router.
     std::uint32_t leading_dense_block_count=0;
     std::uint32_t expert_shared_intermediate_size=0;

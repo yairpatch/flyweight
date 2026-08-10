@@ -335,6 +335,7 @@ struct ColibriV2QwenRuntime {
     ColibriV2Model* model = nullptr;
     bool gemma4 = false;
     bool laguna = false;
+    bool muse = false;
     ColibriV2QwenRuntimeOptions options{};
     colibri::v2::ExpertExecutionMode expert_mode =
         colibri::v2::ExpertExecutionMode::streamed_gpu;
@@ -706,8 +707,12 @@ constexpr std::uint32_t kBlockElements = 256;  // Super-block element count for 
 // The AVX2/AVX-512 entry points decode anything they do not recognize with
 // their Q8_0 path, so this has to be an allowlist of the formats that actually
 // have a hand-written SIMD kernel. A blocklist silently mis-decodes every type
-// nobody remembered to add to it. NVFP4 is dispatched separately because it has
-// an AVX2 kernel but no AVX-512 one.
+// nobody remembered to add to it. NVFP4 is dispatched separately, to AVX2, and
+// deliberately so: qwen_cpu_avx512.cpp does carry a complete NVFP4 kernel set,
+// but it is ~15% SLOWER than the AVX2 one at every working set from 72 KiB to
+// 4.6 MiB (138.9 vs 159.2 ns/row, identical checksums), so routing type 40
+// there costs throughput. Measured 2026-08-10 on Zen 5 against
+// Qwen3.6-35B-Fast-NVFP4; do not "fix" this dispatch without re-measuring.
 constexpr bool qwen_simd_quant_type(std::uint32_t type) {
     return type == 8 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14;
 }
@@ -1637,6 +1642,11 @@ int parse(ColibriV2Model& m) {
             m.config.sliding_window_pattern.reserve(static_cast<std::size_t>(elements));
             for(std::uint64_t element=0;element<elements;++element)m.config.sliding_window_pattern.push_back(r.get<std::uint8_t>()?1:0);
         }
+        // Muse Glimmer writes the same key as a scalar period instead of a
+        // per-layer array. The layout is expanded once the block count is
+        // known, which is not guaranteed to have been read yet.
+        else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.sliding_window_pattern")==0 && (type==4 || type==10)) m.config.sliding_window_period=static_cast<uint32_t>(read_uint(type));
+        else if (key.size()>=12 && key.compare(key.size()-12,12,".logit_scale")==0 && (type==6 || type==12)) m.config.logit_scale=read_float(type);
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.layer_norm_rms_epsilon")==0 && (type==6 || type==12)) m.config.rms_norm_epsilon=read_float(type);
         else if (key.size()>=21 && key.compare(key.size()-21,21,".attention.key_length")==0 && (type==4 || type==10)) m.config.key_length=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=23 && key.compare(key.size()-23,23,".attention.value_length")==0 && (type==4 || type==10)) m.config.value_length=static_cast<uint32_t>(read_uint(type));
@@ -1687,6 +1697,16 @@ int parse(ColibriV2Model& m) {
                 if((heads[layer]==heads[0])!=(m.config.sliding_window_pattern[layer]==0))
                     throw std::runtime_error(
                         "Laguna sliding-window layout disagrees with the per-layer head count");
+    }
+    // A scalar sliding-window period expands to the per-layer layout the rest
+    // of the runtime reads. The cycle ends on the full-attention layer, so for
+    // period 4 layers 3, 7, 11 ... are full and the other three are sliding.
+    if(m.config.sliding_window_period&&m.config.sliding_window_pattern.empty()&&
+       m.config.layer_count){
+        const auto period=m.config.sliding_window_period;
+        m.config.sliding_window_pattern.assign(m.config.layer_count,0);
+        for(std::uint32_t layer=0;layer<m.config.layer_count;++layer)
+            m.config.sliding_window_pattern[layer]=layer%period+1<period?1:0;
     }
     // DeepSeek-V4 ships no explicit kv_lora_rank: `attention.key_length` is the
     // width of the compressed KV latent, and the decoupled RoPE half is carried
@@ -1970,6 +1990,9 @@ void qwen_yarn_correction_dims(
 // wider recurrent set.
 std::size_t qwen_ffn_base(const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
     if(runtime.laguna)return 8;
+    // Muse Glimmer carries a post-attention norm that the other layouts do not,
+    // so its pre-FFN norm sits one slot later and gate/up/down at 10/11/12.
+    if(runtime.muse)return 9;
     return layer.attention?7:10;
 }
 
@@ -2073,6 +2096,74 @@ void build_laguna_plan(ColibriV2QwenRuntime& runtime) {
         runtime.scratch_elements,
         2u*std::max({runtime.moe_intermediate,shared_intermediate,
                      model.config.dense_intermediate_size}));
+}
+
+// Muse Glimmer is dense throughout: no router, no experts, no expert paging.
+// Every layer carries the same fourteen tensors, so the slot layout is fixed
+// and `moe_base` lands on the pre-FFN norm exactly as the Qwen dense block
+// expects.
+//
+// Slots 8 and 13 are the two post-norms that make this architecture different
+// from Laguna: attention output and feed-forward output are each normalized
+// *before* rejoining the residual stream, rather than added raw.
+void build_muse_glimmer_plan(ColibriV2QwenRuntime& runtime) {
+    auto& model=*runtime.model;
+    runtime.muse=true;
+    runtime.token_embeddings=tensor_index(model,"token_embd.weight");
+    runtime.final_norm=tensor_index(model,"output_norm.weight");
+    // The 202k-entry head is untied and is the single largest tensor in the
+    // file, so fall back to the table only if a future checkpoint ties them.
+    runtime.lm_head=has_tensor(model,"output.weight")
+        ?tensor_index(model,"output.weight"):runtime.token_embeddings;
+    runtime.lm_head_type=model.tensors[runtime.lm_head].type;
+    runtime.static_tensor_bytes+=model.tensors[runtime.token_embeddings].size;
+    runtime.static_tensor_bytes+=model.tensors[runtime.final_norm].size;
+    if(runtime.lm_head!=runtime.token_embeddings)
+        runtime.static_tensor_bytes+=model.tensors[runtime.lm_head].size;
+    const auto head_dim=model.config.key_length?model.config.key_length:128u;
+    runtime.layers.reserve(model.config.layer_count);
+    for(std::uint32_t layer_index=0;layer_index<model.config.layer_count;++layer_index){
+        const std::string prefix="blk."+std::to_string(layer_index)+".";
+        QwenLayerPlan layer;layer.attention=true;
+        layer.attention_window=attention_window(model,layer_index);
+        layer.attention_heads=model.config.attention_heads;
+        layer.kv_heads=model.config.attention_kv_heads;
+        layer.head_dim=head_dim;
+        // RoPE runs on the sliding-window layers and the full-attention layers
+        // run NoPE. A zero rotary span is how that reaches the kernel, and it
+        // is the reverse of the usual arrangement -- the global layers here
+        // carry no positional signal of their own at all.
+        layer.rotary_dim=layer.attention_window
+            ?(model.config.rotary_dimension?model.config.rotary_dimension:head_dim)
+            :0;
+        layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:500000.0f;
+        for(const char* suffix:{
+            "attn_norm.weight","attn_q.weight","attn_k.weight","attn_v.weight",
+            "attn_output.weight","attn_q_norm.weight","attn_k_norm.weight",
+            "attn_gate.weight","post_attention_norm.weight","ffn_norm.weight",
+            "ffn_gate.weight","ffn_up.weight","ffn_down.weight",
+            "post_ffw_norm.weight"
+        })add_static_tensor(runtime,layer,prefix+suffix);
+        // The gate is one value per query channel, not per head: it multiplies
+        // the attention output elementwise before the output projection. A
+        // per-head checkpoint would silently broadcast wrong, so check.
+        const auto gate_width=model.tensors[layer.static_tensors[7]].shape[1];
+        if(gate_width!=static_cast<std::uint64_t>(layer.attention_heads)*head_dim)
+            throw std::runtime_error(
+                "native Muse Glimmer expects a per-channel attention gate");
+        layer.dense_ffn=true;
+        for(auto index:layer.static_tensors){
+            const auto&t=model.tensors[index];
+            if(t.shape.size()==2)runtime.scratch_elements=std::max(
+                runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));
+        }
+        runtime.layers.push_back(std::move(layer));
+    }
+    // The dense block writes gate and up contiguously before silu_mul reads the
+    // pair, so the scratch has to hold both halves at once.
+    runtime.moe_intermediate=model.config.dense_intermediate_size;
+    runtime.scratch_elements=std::max(
+        runtime.scratch_elements,2u*model.config.dense_intermediate_size);
 }
 
 void build_gemma4_plan(ColibriV2QwenRuntime& runtime) {
@@ -2652,7 +2743,7 @@ void qwen_cpu_dense_ffn(
 ) {
     const int hidden=runtime.model->config.hidden_size;
     const int intermediate=static_cast<int>(runtime.moe_intermediate);
-    const std::size_t ffn_base=layer.attention?7:10;
+    const std::size_t ffn_base=qwen_ffn_base(runtime,layer);
     const auto&gate_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+1]];
     const auto&up_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+2]];
     const auto&down_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+3]];
@@ -3879,7 +3970,9 @@ out->rope_scaling_factor=m->config.rope_scaling_factor;out->yarn_beta_fast=m->co
 out->rope_original_context_length=m->config.rope_original_context_length;
 out->draft_block_size=m->config.draft_block_size;
 out->target_layers_length=static_cast<std::uint32_t>(m->config.target_layers.size());
-out->mask_token_id=m->config.mask_token_id;return 0;});}
+out->mask_token_id=m->config.mask_token_id;
+out->logit_scale=m->config.logit_scale;
+out->final_logit_softcap=m->config.final_logit_softcap;return 0;});}
 
 // Multiply a model tensor by a vector, decoding whatever weight type the
 // checkpoint stores it as. GGUF reports a matrix as [inputs, outputs], so
@@ -6747,6 +6840,114 @@ std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t 
 // table (unicode_categories.h) rather than the codepoint-range approximation
 // the other pre-tokenizers use: this model is CJK-heavy and the pattern draws
 // explicit \p{L}/\p{M}/\p{P}/\p{S} distinctions that the approximation blurs.
+// The GPT-4o pre-tokenizer, which is what llama.cpp maps the `llama4` pre onto
+// and therefore what Muse Glimmer uses. Transcribed from the single regex the
+// reference applies, alternative by alternative and in order, because regex
+// alternation takes the first branch that matches at each position.
+//
+// Two details are easy to lose. The case split is ASCII only -- the reference
+// spells it `[^a-z]` and `[^A-Z]` behind a `\p{L}` lookahead -- so every
+// non-ASCII letter counts as both upper- and lower-ish and letter runs in
+// non-Latin scripts stay whole. And digits come in groups of at most three,
+// unlike the Laguna pre-tokenizer above where every digit stands alone.
+std::vector<std::string> gpt4o_pretokenize(const std::string& text) {
+    const auto decoded=gguf_utf8_decode(text);
+    const std::size_t count=decoded.code.size();
+    std::vector<std::string> pieces;
+    auto at_code=[&](std::size_t index){return decoded.code[index];};
+    auto slice=[&](std::size_t from,std::size_t to){
+        return text.substr(decoded.offset[from],decoded.offset[to]-decoded.offset[from]);
+    };
+    auto is_space=[&](std::uint32_t c){return gguf_codepoint_is_space(c);};
+    auto upperish=[&](std::uint32_t c){return joyai_is_letter(c)&&!(c>='a'&&c<='z');};
+    auto lowerish=[&](std::uint32_t c){return joyai_is_letter(c)&&!(c>='A'&&c<='Z');};
+    // 's 't 're 've 'm 'll 'd, either case.
+    auto contraction=[&](std::size_t index)->std::size_t{
+        if(index>=count||at_code(index)!='\'')return 0;
+        auto lower=[&](std::size_t k){
+            const auto c=at_code(k);
+            return c<128?static_cast<std::uint32_t>(
+                std::tolower(static_cast<int>(c))):c;
+        };
+        if(index+1>=count)return 0;
+        const auto first=lower(index+1);
+        if(first=='s'||first=='t'||first=='m'||first=='d')return 2;
+        if(index+2<count){
+            const auto second=lower(index+2);
+            if((first=='r'&&second=='e')||(first=='v'&&second=='e')||
+               (first=='l'&&second=='l'))return 3;
+        }
+        return 0;
+    };
+    for(std::size_t at=0;at<count;){
+        // Alternatives 1 and 2: an optional single leading character that is
+        // neither a line break, a letter nor a digit, then a letter run. The
+        // first alternative wants upper-ish* lower-ish+, the second upper-ish+
+        // lower-ish*; taken greedily in that order they accept any letter run,
+        // which is why one pass over the two loops covers both.
+        {
+            std::size_t probe=at;
+            if(!joyai_is_letter(at_code(probe))&&!joyai_is_number(at_code(probe))&&
+               at_code(probe)!='\r'&&at_code(probe)!='\n'&&
+               probe+1<count&&joyai_is_letter(at_code(probe+1)))
+                ++probe;
+            if(probe<count&&joyai_is_letter(at_code(probe))){
+                std::size_t end=probe;
+                while(end<count&&upperish(at_code(end)))++end;
+                while(end<count&&lowerish(at_code(end)))++end;
+                if(end>probe){
+                    end+=contraction(end);
+                    pieces.push_back(slice(at,end));at=end;continue;
+                }
+            }
+        }
+        // Alternative 3: one to three digits.
+        if(joyai_is_number(at_code(at))){
+            std::size_t end=at;
+            while(end<count&&end-at<3&&joyai_is_number(at_code(end)))++end;
+            pieces.push_back(slice(at,end));at=end;continue;
+        }
+        // Alternative 4: an optional single leading space, then a run of
+        // characters that are neither whitespace, letters nor digits.
+        {
+            auto plain=[&](std::size_t index){
+                const auto c=at_code(index);
+                return !is_space(c)&&!joyai_is_letter(c)&&!joyai_is_number(c);
+            };
+            std::size_t probe=at;
+            if(at_code(probe)==' '&&probe+1<count&&plain(probe+1))++probe;
+            if(probe<count&&plain(probe)){
+                std::size_t end=probe;
+                while(end<count&&plain(end))++end;
+                while(end<count&&(at_code(end)=='\r'||at_code(end)=='\n'||
+                                  at_code(end)=='/'))++end;
+                pieces.push_back(slice(at,end));at=end;continue;
+            }
+        }
+        // Alternatives 5 to 7 are all whitespace runs, and the order between
+        // them is what gives a following word its single leading space.
+        if(is_space(at_code(at))){
+            std::size_t run=at;
+            while(run<count&&is_space(at_code(run)))++run;
+            // 5: "\s*[\r\n]+", greedy, so the piece ends at the last line break
+            // in the run and any trailing spaces start a new piece.
+            std::size_t last_break=run;
+            while(last_break>at&&at_code(last_break-1)!='\r'&&
+                  at_code(last_break-1)!='\n')--last_break;
+            if(last_break>at){pieces.push_back(slice(at,last_break));at=last_break;continue;}
+            // 6: "\s+(?!\S)". Mid-text the run gives up its last character to
+            // the word that follows; at the end of the text it keeps all of it.
+            const std::size_t end=run<count?run-1:run;
+            if(end>at){pieces.push_back(slice(at,end));at=end;continue;}
+            // 7: "\s+" on whatever is left, which is a lone separator.
+            pieces.push_back(slice(at,run));at=run;continue;
+        }
+        // Unreachable for well-formed input, but the scan must still advance.
+        pieces.push_back(slice(at,at+1));at=at+1;
+    }
+    return pieces;
+}
+
 std::vector<std::string> deepseek4_pretokenize(const std::string& text) {
     std::vector<std::string> pieces{text};
     pieces=gguf_regex_split(pieces,joyai_match_number);
@@ -6796,6 +6997,16 @@ void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
     }
 }
 
+// The pre-tokenizer a checkpoint asks for by name. Anything unlisted keeps the
+// historical behaviour of no pre-tokenization at all, which is what the Qwen
+// checkpoints have always run.
+std::vector<std::string> gguf_pretokenize(const ColibriV2Model& m,
+                                          const std::string& text) {
+    if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
+    if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text);
+    return laguna_pretokenize(text);
+}
+
 // Pre-tokenizer boundaries, so the split can be checked against the reference
 // patterns without a vocabulary in the way. Writes the byte offset each piece
 // starts at plus a trailing end offset, so `count` is one more than the number
@@ -6803,9 +7014,7 @@ void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
 int colibri_v2_pretokenize(const ColibriV2Model*m,const char*text,uint64_t*offsets,uint64_t capacity,uint64_t*count){return guarded([&]{
     if(!m||!text||!count)throw std::runtime_error("invalid pretokenize arguments");
     const std::string input(text);
-    const auto pieces=m->tokenizer_pre=="joyai-llm"
-        ?deepseek4_pretokenize(input)
-        :laguna_pretokenize(input);
+    const auto pieces=gguf_pretokenize(*m,input);
     *count=pieces.size()+1;
     if(!offsets)return 0;
     if(capacity<*count)throw std::runtime_error("pretokenize output buffer is too small");
@@ -6816,7 +7025,11 @@ int colibri_v2_pretokenize(const ColibriV2Model*m,const char*text,uint64_t*offse
 
 int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,uint64_t capacity,uint64_t*count){return guarded([&]{
     if(!m||!text||!count)throw std::runtime_error("invalid tokenize arguments");
-    if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"){
+    // Muse Glimmer's chat format is built entirely out of control tokens
+    // (<|start|>, <|message|>, <|eom|>, <|eot|>), and BPE would happily shred
+    // them into ordinary text, so it takes the exact-match split too.
+    if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"||
+       m->tokenizer_pre=="llama4"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -6826,10 +7039,8 @@ int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,u
         auto flush=[&](size_t end){
             if(end<=plain)return;
             const auto segment=input.substr(plain,end-plain);
-            const auto pieces=m->tokenizer_pre=="joyai-llm"
-                ?deepseek4_pretokenize(segment)
-                :laguna_pretokenize(segment);
-            for(const auto& piece:pieces)gguf_bpe_piece(*m,piece,result);
+            for(const auto& piece:gguf_pretokenize(*m,segment))
+                gguf_bpe_piece(*m,piece,result);
         };
         while(at<input.size()){
             const auto* match=static_cast<const std::pair<std::string,std::uint32_t>*>(nullptr);
@@ -6901,12 +7112,13 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
     const bool gemma4=m->config.architecture=="gemma4";
     const bool laguna=m->config.architecture=="laguna";
+    const bool muse=m->config.architecture=="muse-glimmer";
     // DeepSeek-V4 loads and describes itself but has no execution path yet, so
     // it gets its own message rather than looking like an unknown format.
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
         "deepseek4 checkpoints load and report their configuration, but the native runtime "
         "cannot execute them yet (no hyper-connection, compressed-attention or indexer path)");
-    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna)throw std::runtime_error("native runtime supports Qwen, Gemma 4 and Laguna models");
+    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse)throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna and Muse Glimmer models");
     // Dense checkpoints report no experts at all, so only require a routing
     // width from the ones that actually route.
     const bool dense_ffn=has_tensor(*m,"blk.0.ffn_gate.weight");
@@ -6943,6 +7155,9 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
         ).is_streamed_gpu())
         throw std::runtime_error("native Gemma 4 supports --moe-device cpu or hybrid");
     if(laguna&&runtime->options.mtp_drafts)throw std::runtime_error("native Laguna MTP is not implemented");
+    // Muse Glimmer's speculative drafter is a separate DFlash checkpoint rather
+    // than in-model MTP heads, so there is nothing here to draft with.
+    if(muse&&runtime->options.mtp_drafts)throw std::runtime_error("native Muse Glimmer MTP is not implemented");
     if(gemma4&&m->config.per_layer_embedding_size)throw std::runtime_error("native Gemma 4 per-layer embeddings are not implemented");
     if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
     if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
@@ -6972,6 +7187,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
     if(gemma4)build_gemma4_plan(*runtime);
     else if(laguna)build_laguna_plan(*runtime);
+    else if(muse)build_muse_glimmer_plan(*runtime);
     else build_qwen_plan(*runtime);
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
@@ -7017,6 +7233,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // 12x the expert width, so the row scratch is far larger per token than a
     // pure-MoE Qwen checkpoint's; 256 keeps the batch worth batching without
     // sizing every scratch region for a 1024-row dense SwiGLU.
+    // Muse Glimmer is dense, so it batches like the other dense checkpoints.
     runtime->prefill_rows=gemma4?1:(laguna?256:(dense_ffn?64:1024));
     if(const char*env=std::getenv("COLIBRI_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
@@ -7462,7 +7679,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 for(auto layer=runtime->layers.rbegin();
                     layer!=runtime->layers.rend()&&resident>weight_budget;++layer){
                     if(!layer->dense_ffn||layer->ffn_on_host)continue;
-                    const std::size_t ffn_base=layer->attention?7:10;
+                    const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
                     bool all_simd=true;
                     for(std::size_t role=1;role<=3;++role)
                         all_simd=all_simd&&qwen_simd_quant_type(
@@ -9382,6 +9599,17 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     // it, so rms -- its only writer -- has to drop that memo.
     std::uint64_t q8_cached_input=0;
     auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){int one_centered=0;q8_cached_input=0;void*args[]={&input,&weights,&output,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};launch_named("rms_norm",1,1,1024,args);};
+    // Muse Glimmer's two post-norms run at a tighter epsilon than the model's
+    // own rms_norm_epsilon (1e-8 against 1e-5) and are safe in place: rms_norm
+    // block-reduces before any write, then each thread only rewrites the index
+    // it read.
+    const float post_norm_epsilon=1.0e-8f;
+    auto post_rms=[&](std::uint64_t values,std::uint64_t weights){
+        int one_centered=0;q8_cached_input=0;
+        void*args[]={&values,&weights,&values,const_cast<int*>(&hidden_size),
+                     const_cast<float*>(&post_norm_epsilon),&one_centered};
+        launch_named("rms_norm",1,1,1024,args);
+    };
     auto q8=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){if(colibri_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)!=0)throw std::runtime_error("native Qwen Q8 projection failed");};
     auto f32=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);};
     const char*iq2_q8_setting=std::getenv("COLIBRI_IQ2_Q8_DECODE");
@@ -9465,6 +9693,18 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         const int token=runtime->embeddings_host_resident?0:static_cast<int>(input_token);int width=hidden_size;
         void*args[]={const_cast<std::uint64_t*>(&embedding),const_cast<std::uint64_t*>(&hidden),const_cast<int*>(&token),&width};
         launch_named(qwen_embedding_kernel(qwen_device_type(*runtime,runtime->token_embeddings),false),(hidden_size+255)/256,1,256,args);
+        // Muse Glimmer RMS-normalizes the raw embedding before the first block,
+        // with no learned weight of its own. Skipping it leaves the residual
+        // stream off by the embedding norm and the model drifts within a few
+        // tokens. gemma_head_rms is the weightless form; one "head" is the
+        // whole row.
+        if(runtime->muse){
+            int heads=1,width=hidden_size;
+            void*norm_args[]={const_cast<std::uint64_t*>(&hidden),
+                              const_cast<std::uint64_t*>(&hidden),&heads,&width,
+                              const_cast<float*>(&epsilon)};
+            launch_named("gemma_head_rms",1,1,256,norm_args);
+        }
     }
     if(std::getenv("COLIBRI_LM_DIAG")){
         static int ec=0;
@@ -9546,6 +9786,66 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             }
             add(residual,hidden);
             moe_base=10;
+        }else if(runtime->muse){
+            // Muse Glimmer attention: plain Q/K/V projections, per-head QK RMS
+            // norm with interleaved RoPE on the sliding-window layers only, and
+            // a per-channel sigmoid output gate taken from the same
+            // pre-attention hidden state.
+            const int heads=static_cast<int>(layer.attention_heads);
+            const int kv_heads=static_cast<int>(layer.kv_heads);
+            const int head_dim=static_cast<int>(layer.head_dim);
+            const int q_size=heads*head_dim,kv_size=kv_heads*head_dim;
+            if(static_cast<std::uint64_t>(2*q_size)>runtime->scratch_elements)
+                throw std::runtime_error("native Muse Glimmer attention scratch is too small");
+            dense(1,normalized,first,hidden_size,q_size);
+            dense(2,normalized,second,hidden_size,kv_size);
+            dense(3,normalized,third,hidden_size,kv_size);
+            const std::uint64_t queries=fourth;
+            const std::uint64_t gates=fourth+static_cast<std::uint64_t>(q_size)*sizeof(float);
+            dense(7,normalized,gates,hidden_size,q_size);
+            // Zero on the full-attention layers, which run NoPE.
+            const int rotary=static_cast<int>(layer.rotary_dim);
+            const int position=static_cast<int>(runtime->position);
+            const float theta=layer.rope_theta;
+            auto qnorm=tensor(5),knorm=tensor(6);
+            void*q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,
+                           const_cast<std::uint64_t*>(&queries),const_cast<int*>(&heads),
+                           const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                           const_cast<int*>(&position),const_cast<float*>(&theta),
+                           const_cast<float*>(&epsilon)};
+            launch_named("muse_head_norm_rope",heads,1,256,q_args);
+            const std::uint64_t keys=first;
+            void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,
+                           const_cast<std::uint64_t*>(&keys),const_cast<int*>(&kv_heads),
+                           const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                           const_cast<int*>(&position),const_cast<float*>(&theta),
+                           const_cast<float*>(&epsilon)};
+            launch_named("muse_head_norm_rope",kv_heads,1,256,k_args);
+            std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
+            const auto view=attention_cache_view(layer,runtime->position);
+            int slot=view.slot,capacity=view.capacity;
+            void*k_store_args[]={const_cast<std::uint64_t*>(&keys),&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_k,true),kv_heads,1,256,k_store_args);
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
+            std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;
+            // The q_norm weights already carry qk_scale_factor, so the score
+            // scale is the plain 1/sqrt(head_dim).
+            float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            void*score_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+            launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
+            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+            launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            std::uint64_t gated=third;
+            int gate_elements=q_size;
+            void*gate_args[]={&attended,const_cast<std::uint64_t*>(&gates),&gated,
+                              &gate_elements};
+            launch_named("qwen_attention_gate",(q_size+255)/256,1,256,gate_args);
+            dense(4,gated,residual,q_size,hidden_size);
+            // Post-attention norm before the residual join, not after.
+            post_rms(residual,tensor(8));
+            add(residual,hidden);
+            moe_base=9;
         }else if(runtime->laguna){
             // Laguna attention: plain Q/K/V projections (no fused gate), per-head
             // QK RMS norm, per-layer-type RoPE, then a softplus per-head output
@@ -10166,6 +10466,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         }
         runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
         }
+        // The feed-forward output takes its own norm before rejoining the
+        // residual stream, mirroring the post-attention norm above.
+        if(runtime->muse)post_rms(third,tensor(13));
         add(residual,third);
         if(profile)profile_record(profile->expert_end);
         std::swap(hidden,residual);
@@ -10324,6 +10627,23 @@ static std::uint32_t qwen_sample_last_logits(
                 static_cast<std::int32_t>(runtime.model->config.hidden_size),
                 static_cast<std::int32_t>(vocabulary),runtime.stream))
         throw std::runtime_error("native Qwen sampling LM-head projection failed");
+    // Muse Glimmer scales the head output and then tanh-softcaps it. Both are
+    // monotonic, so the greedy argmax path above is unaffected and skips this
+    // entirely -- but temperature and top-p read the actual distribution, and
+    // the softcap compresses it, so it has to run before candidate selection.
+    if(runtime.muse&&(runtime.model->config.logit_scale!=0.0f||
+                      runtime.model->config.final_logit_softcap!=0.0f)){
+        const float scale=runtime.model->config.logit_scale!=0.0f
+            ?runtime.model->config.logit_scale:1.0f;
+        const float softcap=runtime.model->config.final_logit_softcap;
+        int vocabulary_count=static_cast<int>(vocabulary);
+        void*args[]={const_cast<std::uint64_t*>(&runtime.last_sampling_logits),
+                     &vocabulary_count,const_cast<float*>(&scale),
+                     const_cast<float*>(&softcap)};
+        if(colibri_gpu_launch_named("muse_logit_softcap",
+                (vocabulary_count+255)/256,1,256,0,runtime.stream,args)!=0)
+            throw std::runtime_error("native Muse Glimmer logit softcap failed");
+    }
     std::vector<std::uint32_t> candidates;
     std::vector<float> candidate_logits;
     const char*gpu_topk_setting=std::getenv("COLIBRI_SAMPLING_GPU_TOPK");

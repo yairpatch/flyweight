@@ -140,6 +140,9 @@ class _ModelConfig(ctypes.Structure):
         ("draft_block_size", ctypes.c_uint32),
         ("target_layers_length", ctypes.c_uint32),
         ("mask_token_id", ctypes.c_uint32),
+        # Head-output transforms; zero when the checkpoint asked for neither.
+        ("logit_scale", ctypes.c_float),
+        ("final_logit_softcap", ctypes.c_float),
     ]
 
 
@@ -1120,6 +1123,8 @@ class V2Model:
             "rope_scaling_factor",
             "yarn_beta_fast",
             "yarn_beta_slow",
+            "logit_scale",
+            "final_logit_softcap",
         }
         config = {
             field: (

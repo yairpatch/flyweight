@@ -864,6 +864,71 @@ void laguna_attention_gate(
     }
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(// Muse Glimmer Q/K projection tail: per-head RMS norm against learned weights,
+// then RoPE over the leading `rotary_dim` channels.
+//
+// Two things differ from the Laguna kernel above and neither is cosmetic.
+// First, the rotation pairs *consecutive* channels (2i, 2i+1) rather than
+// splitting the head in half -- llama.cpp calls this NORM rope, and the
+// conversion script unpermutes the HF weights specifically to feed it. Running
+// the half-split form here produces fluent-looking but wrong text.
+// Second, `rotary_dim` of 0 skips the rotation entirely, which is how the
+// full-attention layers run NoPE while the sliding-window layers rotate.
+//
+// The q_norm weights carry the model's `qk_scale_factor` broadcast across the
+// head (the k_norm weights are ones), so the scale rides in for free here and
+// the attention scale stays the plain 1/sqrt(head_dim).
+extern "C" __global__
+void muse_head_norm_rope(
+    const float* projected, const float* norm_weights, float* output,
+    const int heads, const int head_dim, const int rotary_dim,
+    const int position, const float theta, const float epsilon
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const float* source = projected + head * head_dim;
+    float square = 0.0f;
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x)
+        square += source[index] * source[index];
+    square = block_reduce_sum(square);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) inverse_rms = rsqrtf(square / (float)head_dim + epsilon);
+    __syncthreads();
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x) {
+        float value = source[index] * inverse_rms * norm_weights[index];
+        if (index < rotary_dim) {
+            const int pair = index >> 1;
+            const int partner = index ^ 1;
+            const float other =
+                source[partner] * inverse_rms * norm_weights[partner];
+            const float angle = (float)position
+                / powf(theta, 2.0f * (float)pair / (float)rotary_dim);
+            const float cos_angle = cosf(angle), sin_angle = sinf(angle);
+            value = (index & 1)
+                ? value * cos_angle + other * sin_angle
+                : value * cos_angle - other * sin_angle;
+        }
+        output[head * head_dim + index] = value;
+    }
+}
+
+// Muse Glimmer's output multiplier and tanh logit softcap, fused.
+//
+// Both are monotonic, so neither can move an argmax and the greedy decode path
+// skips this entirely. It runs for sampling, where the compression genuinely
+// changes the distribution that temperature and top-p see.
+extern "C" __global__
+void muse_logit_softcap(
+    float* logits, const int vocabulary, const float scale, const float softcap
+) {
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < vocabulary; index += blockDim.x * gridDim.x) {
+        const float scaled = logits[index] * scale;
+        logits[index] = softcap > 0.0f ? softcap * tanhf(scaled / softcap) : scaled;
+    }
+}
+
 // Sigmoid-gated top-k routing with a score-correction bias (DeepSeek-V3 style,
 // which Laguna shares). Selection ranks on score + bias, but the returned
 // weights are the unbiased sigmoid scores: the bias steers load balancing only

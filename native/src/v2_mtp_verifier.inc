@@ -196,6 +196,16 @@ void qwen_forward_rows(
         return;
     };
     auto add_rows=[&](std::uint64_t target,std::uint64_t source){float scale=1.0f;int count=rows*hidden_size;void*args[]={&target,&source,&scale,&count};launch("scaled_add",(count+255)/256,1,256,args);};
+    // Muse Glimmer's post-attention and post-FFN norms, which run at a tighter
+    // epsilon than the model's own and are applied in place before the residual
+    // join. rms_norm_rows reduces per row before writing, so in place is safe.
+    const float post_norm_epsilon=1.0e-8f;
+    auto post_rms_rows=[&](std::uint64_t values,std::uint64_t weights){
+        int one_centered=0;
+        void*args[]={&values,&weights,&values,&rows,const_cast<int*>(&hidden_size),
+                     const_cast<float*>(&post_norm_epsilon),&one_centered};
+        launch("rms_norm_rows",rows,1,256,args);
+    };
     if(colibri_gpu_upload(token_device,input_tokens,rows*sizeof(std::uint32_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows token upload failed");
     const auto embedding=qwen_stage_embedding_rows(runtime,input_tokens,rows);
     // Staged rows arrive in chunk order, so they are gathered by the identity
@@ -204,6 +214,16 @@ void qwen_forward_rows(
         ?runtime.embedding_row_index:token_device;
     void*embedding_args[]={const_cast<std::uint64_t*>(&embedding),const_cast<std::uint64_t*>(&embedding_index),&hidden,&rows,const_cast<int*>(&hidden_size)};
     launch(qwen_embedding_kernel(qwen_device_type(runtime,runtime.token_embeddings),true),(hidden_size+255)/256,rows,256,embedding_args);
+    // Muse Glimmer RMS-normalizes the raw embedding, with no learned weight,
+    // before the first block. The decode path does the same; a row batch that
+    // skipped it would disagree with token-by-token prefill immediately.
+    if(runtime.muse){
+        int norm_rows=rows,width=hidden_size;
+        void*norm_args[]={const_cast<std::uint64_t*>(&hidden),
+                          const_cast<std::uint64_t*>(&hidden),&norm_rows,&width,
+                          const_cast<float*>(&epsilon)};
+        launch("gemma_head_rms",rows,1,256,norm_args);
+    }
     auto*staging=static_cast<std::uint8_t*>(runtime.host_staging);
     const bool prune_experts=expert_policy.route_pruning_allowed()&&
         (runtime.options.expert_top_k>0||(runtime.options.expert_top_p>0.0f&&runtime.options.expert_top_p<1.0f));
@@ -391,21 +411,28 @@ void qwen_forward_rows(
             // in its own n_head-wide tensor, where Qwen interleaves a per-channel
             // gate into the query projection. Head count and RoPE are per layer.
             const bool laguna=runtime.laguna;
+            // Muse Glimmer projects the query plainly like Laguna, but its gate
+            // is per-channel like Qwen's, so it takes Laguna's projection shape
+            // and Qwen's gate kernels.
+            const bool muse=runtime.muse;
             const int heads=laguna
                 ?static_cast<int>(layer.attention_heads)
                 :static_cast<int>(runtime.model->config.attention_heads);
             const int kv_heads=static_cast<int>(runtime.model->config.attention_kv_heads);
             const int head_dim=static_cast<int>(runtime.model->tensors[layer.static_tensors[2]].shape[1]/kv_heads);
             const int query_elements=heads*head_dim;
-            const int q_size=laguna?query_elements:query_elements*2;
+            const int q_size=(laguna||muse)?query_elements:query_elements*2;
             const int kv_size=kv_heads*head_dim;
             dense(1,normalized,first,hidden_size,q_size);
             dense(2,normalized,second,hidden_size,kv_size);
             dense(3,normalized,third,hidden_size,kv_size);
-            const int rotary=laguna
+            // Both per-layer architectures carry their own rotary span and
+            // theta. For Muse Glimmer the span is zero on full-attention
+            // layers, which is how those run NoPE.
+            const int rotary=(laguna||muse)
                 ?static_cast<int>(layer.rotary_dim)
                 :static_cast<int>(runtime.model->config.rotary_dimension?runtime.model->config.rotary_dimension:head_dim);
-            const float theta=laguna
+            const float theta=(laguna||muse)
                 ?layer.rope_theta
                 :(runtime.model->config.rope_freq_base?runtime.model->config.rope_freq_base:1000000.0f);
             // Laguna's full-attention layers extend with YaRN; its sliding-window
@@ -423,7 +450,11 @@ void qwen_forward_rows(
             const auto queries=fourth;
             // One scalar per head for Laguna, one per query channel for Qwen.
             const auto gates=fourth+static_cast<std::uint64_t>(rows)*query_elements*sizeof(float);
+            // Laguna's gate is one scalar per head, Muse Glimmer's one per
+            // query channel; both come from a tensor of their own rather than
+            // riding in the query projection the way Qwen's does.
             if(laguna)dense(7,normalized,gates,hidden_size,heads);
+            else if(muse)dense(7,normalized,gates,hidden_size,query_elements);
             auto cache_keys=runtime.state+layer.state_first,cache_values=runtime.state+layer.state_second;
             int capacity=static_cast<int>(layer.cache_capacity);
             for(int token=0;token<rows;++token){
@@ -447,6 +478,19 @@ void qwen_forward_rows(
                                    const_cast<float*>(&freq_scale),const_cast<float*>(&ext_factor),
                                    const_cast<float*>(&mscale),&corr_low,&corr_high};
                     launch("laguna_head_norm_rope",kv_heads,1,256,k_args);
+                }else if(muse){
+                    // The interleaved-rope kernel is per token already, so the
+                    // row batch reuses it unchanged.
+                    void*q_args[]={&projected,&qnorm,&query,const_cast<int*>(&heads),
+                                   const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                                   &position,const_cast<float*>(&theta),
+                                   const_cast<float*>(&epsilon)};
+                    launch("muse_head_norm_rope",heads,1,256,q_args);
+                    void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),
+                                   const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                                   &position,const_cast<float*>(&theta),
+                                   const_cast<float*>(&epsilon)};
+                    launch("muse_head_norm_rope",kv_heads,1,256,k_args);
                 }else{
                     void*q_args[]={&projected,&qnorm,&query,&gate,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
                     launch("qwen_attention_query",heads,1,256,q_args);
@@ -578,7 +622,10 @@ void qwen_forward_rows(
                 }
             }
             dense(4,third,residual,query_elements,hidden_size);
-            add_rows(residual,hidden);moe_base=laguna?8:7;
+            // Muse Glimmer normalizes the attention output before the residual
+            // join rather than adding it raw.
+            if(muse)post_rms_rows(residual,tensor(8));
+            add_rows(residual,hidden);moe_base=qwen_ffn_base(runtime,layer);
         }
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill core profiling event failed");
@@ -612,6 +659,7 @@ void qwen_forward_rows(
                 }
                 runtime.dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-host_started).count();
+                if(runtime.muse)post_rms_rows(third,tensor(13));
                 add_rows(residual,third);std::swap(hidden,residual);
                 continue;
             }
@@ -622,6 +670,8 @@ void qwen_forward_rows(
             void*dense_silu_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&second),&dense_count};
             launch("silu_mul",(static_cast<std::uint32_t>(dense_count)+255)/256,1,256,dense_silu_args);
             dense(moe_base+3,second,third,dense_intermediate,hidden_size);
+            // Post-FFN norm, mirroring the post-attention norm above.
+            if(runtime.muse)post_rms_rows(third,tensor(13));
             add_rows(residual,third);std::swap(hidden,residual);
             continue;
         }

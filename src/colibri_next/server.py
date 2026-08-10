@@ -108,6 +108,14 @@ DSML_PARAMETER_PATTERN = re.compile(
     r'(.*?)</｜DSML｜parameter>', re.DOTALL
 )
 THINKING_BLOCK_PATTERN = re.compile(r"\A\s*<think>(.*?)</think>\s*", re.DOTALL)
+# Muse Glimmer renders an assistant turn as a run of recipient-tagged messages
+# rather than one block with a thinking prefix. The header is optionally
+# preceded by <|start|>assistant (the generation prompt already supplied the
+# first one) and the recipient itself is optional on the final message.
+MUSE_MESSAGE_HEADER = re.compile(
+    r"(?:<\|start\|>assistant)?[ \t]*(?:to=(?P<recipient>[^\s<|]+))?[ \t]*<\|message\|>"
+)
+MUSE_MESSAGE_END = re.compile(r"<\|eom\|>|<\|eot\|>")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2675,8 +2683,37 @@ def _parse_tool_calls(
     return (content or None), calls
 
 
+def _split_muse_channels(text: str) -> tuple[str, str | None] | None:
+    """Separate Muse Glimmer's recipient-tagged messages.
+
+    An assistant turn is one or more messages, each ``to=<recipient>`` and
+    terminated by ``<|eom|>`` (more follow) or ``<|eot|>`` (turn over).
+    Messages addressed to ``self`` are chain-of-thought; everything else --
+    ``to=user``, or a tool recipient carrying ATEM markup -- is the visible
+    turn. Returns None when the text carries no such markup, so the caller can
+    fall through to the ``<think>`` convention.
+    """
+    if "<|message|>" not in text:
+        return None
+    reasoning: list[str] = []
+    visible: list[str] = []
+    for header in MUSE_MESSAGE_HEADER.finditer(text):
+        start = header.end()
+        terminator = MUSE_MESSAGE_END.search(text, start)
+        body = text[start : terminator.start()] if terminator else text[start:]
+        # An absent recipient is the final answer; only "self" is hidden.
+        target = reasoning if header.group("recipient") == "self" else visible
+        target.append(body)
+    if not reasoning and not visible:
+        return None
+    return "".join(visible).strip(), "\n\n".join(reasoning).strip() or None
+
+
 def _split_reasoning_content(text: str) -> tuple[str, str | None]:
     """Separate DeepSeek's leading thinking block from visible assistant text."""
+    muse = _split_muse_channels(text)
+    if muse is not None:
+        return muse
     match = THINKING_BLOCK_PATTERN.match(text)
     if match:
         return text[match.end():], match.group(1)
