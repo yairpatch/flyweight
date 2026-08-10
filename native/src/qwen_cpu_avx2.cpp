@@ -734,6 +734,49 @@ float iq2xs_dot(const std::uint8_t* row_data, const float* input, int elements) 
     return result;
 }
 
+// IQ2_S: 82 bytes per 256 values -> d(2) qs[32] signs[32] qh[8] scales[8].
+// The same sixteen groups of two octets as IQ2_XS, and the same offset-and-
+// scale nibble per group, with two differences: the grid index takes two high
+// bits from qh, and the signs are stored literally rather than through the
+// 7-bit sign codebook -- so the sign byte feeds iq_signed_octet unchanged.
+//
+// Without this the format fell to the scalar loop, which redoes the grid
+// lookup and the sign test for every individual weight. That made a spilled
+// IQ2_S block cost roughly an order of magnitude more on the host than a
+// K-quant one, so a checkpoint whose feed-forward is IQ2_S was slower than a
+// far larger K-quant that spilled twenty times as much.
+float iq2s_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq2sBlockBytes;
+        const auto* quants = base + 2;
+        const auto* signs = base + 34;
+        const auto* high = base + 66;
+        const auto* scales = base + 74;
+        const float* vector = input + block * 256;
+        // The block scale factors out of the whole accumulation, so only the
+        // group scale rides on the individual weights.
+        __m256 accumulator = _mm256_setzero_ps();
+        for (int group = 0; group < 16; ++group) {
+            const int scale = (scales[group >> 1] >> (4 * (group & 1))) & 15;
+            const __m256 weight = _mm256_set1_ps((0.5f + scale) * 0.25f);
+            for (int half = 0; half < 2; ++half) {
+                const int index = group * 2 + half;
+                const int entry = quants[index] |
+                    (((high[index >> 2] >> (2 * (index & 3))) & 3) << 8);
+                const __m256 magnitudes =
+                    iq_signed_octet(kIq2sGrid[entry], signs[index]);
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(magnitudes, weight),
+                    _mm256_loadu_ps(vector + group * 16 + half * 8),
+                    accumulator);
+            }
+        }
+        result += half_value(base) * horizontal_sum(accumulator);
+    }
+    return result;
+}
+
 // IQ3_XXS: d(2), 64 index bytes, then eight 32-bit auxiliaries. Each auxiliary
 // carries a 4-bit group scale in its top nibble and four 7-bit sign indices.
 // Two 32-bit grid entries supply the eight magnitudes one sign index covers.
@@ -996,6 +1039,7 @@ float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const fl
     if(type==16)return iq2xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,input,elements);
     if(type==17)return iq2xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,input,elements);
     if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);
+    if(type==22)return iq2s_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2sBlockBytes,input,elements);
     if(type==23)return iq4xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,input,elements);
     if(type==10)return q2_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ2KBlockBytes,input,elements);
     if(type==11)return q3_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ3KBlockBytes,input,elements);

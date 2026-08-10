@@ -164,6 +164,7 @@ int main() {
     }
     check("iq2xs", 17, kIq2xsBlockBytes, qwen_iq2xs_dot_row);
     check("iq3xxs", 18, kIq3xxsBlockBytes, qwen_iq3xxs_dot_row);
+    check("iq2s", 22, kIq2sBlockBytes, qwen_iq2s_dot_row);
     check("iq4xs", 23, kIq4xsBlockBytes, qwen_iq4xs_dot_row);
     if (failures) {
         std::fprintf(stderr, "%d IQ SIMD mismatches\n", failures);
