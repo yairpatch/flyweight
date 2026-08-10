@@ -42,6 +42,17 @@ def _native(model: V2Model, **options):
     return runtime
 
 
+def _run_task(runtime, prompt: list[int]) -> None:
+    task_id = runtime.task_submit(prompt, 1)
+    for _ in range(16):
+        if any(
+            event_task == task_id and kind == 1
+            for event_task, _, kind in runtime.engine_step()
+        ):
+            return
+    raise AssertionError("native engine task did not finish")
+
+
 class DensePlanTests(unittest.TestCase):
     def test_config_reports_a_dense_model_with_no_experts(self):
         model, spec, _ = _model()
@@ -76,6 +87,31 @@ class DensePlanTests(unittest.TestCase):
 
 
 class DenseNativeTests(unittest.TestCase):
+    def test_single_slot_host_cache_restores_displaced_conversation(self):
+        V2Model.select_backend("cpu")
+        model, _, _ = _model()
+        runtime = model.native_runtime(
+            context_limit=512,
+            mtp_drafts=0,
+            parallel_sequences=1,
+            prompt_cache_mib=64,
+        )
+        runtime.prepare()
+        main = [5] * 300
+        side = [11] * 300
+        try:
+            _run_task(runtime, main)
+            _run_task(runtime, side)
+            self.assertGreaterEqual(runtime.info["prompt_cache_entries"], 1)
+
+            _run_task(runtime, [*main, 7])
+
+            self.assertEqual(runtime.info["prefix_cache_last_reused_tokens"], 300)
+        finally:
+            runtime.close()
+            model.close()
+            V2Model.select_backend("auto")
+
     def test_host_spilled_feed_forward_matches_the_resident_one(self):
         model, _, _ = _model()
         resident = _native(model)

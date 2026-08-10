@@ -66,6 +66,12 @@ colibri-next serve model.gguf \
   --host 127.0.0.1 --port 8000
 ~~~
 
+Prompt caching is automatic: displaced conversations are packed into a
+byte-budgeted host-RAM LRU and restored by longest matching prefix, including
+when only one GPU sequence slot is configured. Use `--cache off` to disable it
+or `--cache 4096` to set an explicit 4 GiB budget. Automatic mode uses one
+eighth of currently available RAM, capped at 8 GiB.
+
 Older `serve-v2`, `--context-window`, and `--max-new-tokens` spellings remain
 accepted for script compatibility.
 
@@ -173,7 +179,7 @@ Important CLI options include:
 - `--mtp-drafts N`: enable supported Qwen MTP verification
 - `--dense-requant auto|q8|off`: control temporary BF16 dense-weight Q8 upload
 - `--parallel N`: independent sequence slots
-- `--prompt-cache-mib N`: host cache for spilled sequence state
+- `--cache auto|off|MIB`: host cache for displaced conversation state
 - `--max-concurrent-requests N`: reject excess generation work with HTTP 429
 - `--max-connections N`: cap simultaneous HTTP connection threads
 - `--request-timeout-seconds N`: bound idle/read time on client sockets

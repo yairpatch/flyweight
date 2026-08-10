@@ -385,6 +385,8 @@ class NativeV2ServerTests(unittest.TestCase):
             {
                 "entries": 0,
                 "capacity": 1,
+                "ram_entries": 0,
+                "ram_bytes": 0,
                 "hits": 3,
                 "misses": 1,
                 "evictions": 0,
@@ -547,6 +549,19 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.hybrid_prefill, "split")
         self.assertIsNone(args.expert_residency)
         self.assertEqual(args.dense_requant, "auto")
+        self.assertEqual(args.prompt_cache_mib, (1 << 32) - 1)
+
+    def test_serve_cache_has_simple_public_modes(self) -> None:
+        automatic = _parser().parse_args(["serve", "model.gguf", "--cache", "auto"])
+        disabled = _parser().parse_args(["serve", "model.gguf", "--cache", "off"])
+        explicit = _parser().parse_args(["serve", "model.gguf", "--cache", "2048"])
+        legacy = _parser().parse_args(
+            ["serve", "model.gguf", "--prompt-cache-mib", "512"]
+        )
+        self.assertEqual(automatic.prompt_cache_mib, (1 << 32) - 1)
+        self.assertEqual(disabled.prompt_cache_mib, 0)
+        self.assertEqual(explicit.prompt_cache_mib, 2048)
+        self.assertEqual(legacy.prompt_cache_mib, 512)
 
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
         defaults = _parser().parse_args(["benchmark-v2", "model.gguf"])

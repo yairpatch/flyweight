@@ -17,6 +17,7 @@ EXPERT_MODE_CHOICES = (
     "legacy-paging", "legacy-hybrid",
 )
 KV_TYPES = ("auto", "f32", "f16", "bf16", "q8_0", "turbo3", "turbo4")
+AUTO_PROMPT_CACHE_MIB = (1 << 32) - 1
 
 
 def _steady_state_counters(start, end):
@@ -113,8 +114,28 @@ def _prefill_cache_seed(value: str) -> int | str:
     return count
 
 
+def _prompt_cache_budget(value: str) -> int:
+    normalized = value.lower()
+    if normalized == "auto":
+        return AUTO_PROMPT_CACHE_MIB
+    if normalized == "off":
+        return 0
+    try:
+        budget = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected auto, off, or a non-negative MiB budget"
+        ) from error
+    if not 0 <= budget < AUTO_PROMPT_CACHE_MIB:
+        raise argparse.ArgumentTypeError(
+            "expected auto, off, or a non-negative MiB budget"
+        )
+    return budget
+
+
 def _add_runtime_options(
-    parser: argparse.ArgumentParser, *, serving: bool, show_help: bool = True
+    parser: argparse.ArgumentParser, *, serving: bool, show_help: bool = True,
+    cache_default: int = 0, show_cache_help: bool = False,
 ) -> None:
     hidden = None if show_help else argparse.SUPPRESS
     parser.add_argument("--gpu-cache-mib", type=int, default=0, help=hidden)
@@ -140,7 +161,13 @@ def _add_runtime_options(
     parser.add_argument("--cache-type-k", choices=KV_TYPES, default="f16", help=hidden)
     parser.add_argument("--cache-type-v", choices=KV_TYPES, default="f16", help=hidden)
     parser.add_argument("--parallel", type=int, default=1, dest="parallel_sequences", help=hidden)
-    parser.add_argument("--prompt-cache-mib", type=int, default=0, help=hidden)
+    parser.add_argument(
+        "--cache", "--prompt-cache-mib", dest="prompt_cache_mib",
+        type=_prompt_cache_budget, default=cache_default,
+        metavar="{auto,off,MIB}",
+        help=("host prompt cache budget: auto, off, or MiB (default: auto)"
+              if show_help or show_cache_help else argparse.SUPPRESS),
+    )
     parser.add_argument("--swa-full", action="store_true", help=hidden)
     parser.add_argument("--prefill-cache-seed", type=_prefill_cache_seed, default=None, help=hidden)
     parser.add_argument("--expert-paging", choices=("auto", "staged", "direct"), default="auto", help=hidden)
@@ -256,7 +283,10 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-connections", type=int, default=128, help=argparse.SUPPRESS)
     serve.add_argument("--request-timeout-seconds", type=float, default=30.0, help=argparse.SUPPRESS)
     serve.add_argument("--sse-keepalive-seconds", type=float, default=10.0, help=argparse.SUPPRESS)
-    _add_runtime_options(serve, serving=True, show_help=False)
+    _add_runtime_options(
+        serve, serving=True, show_help=False,
+        cache_default=AUTO_PROMPT_CACHE_MIB, show_cache_help=True,
+    )
     return parser
 
 

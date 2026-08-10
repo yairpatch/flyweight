@@ -1020,9 +1020,13 @@ class NativeV2Generator(ChatGenerator):
     def prefix_cache_stats(self) -> dict[str, int]:
         info = self.runtime.info
         capacity = int(getattr(self.runtime, "parallel_sequences", 1))
+        live_entries = 1 if info["position"] else 0
+        ram_entries = int(info.get("prompt_cache_entries", 0))
         return {
-            "entries": 1 if info["position"] else 0,
+            "entries": live_entries + ram_entries,
             "capacity": capacity,
+            "ram_entries": ram_entries,
+            "ram_bytes": int(info.get("prompt_cache_used_bytes", 0)),
             "hits": int(info["prefix_cache_hits"]),
             "misses": int(info["prefix_cache_misses"]),
             "evictions": 0,
