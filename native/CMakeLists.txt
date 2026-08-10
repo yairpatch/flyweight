@@ -37,7 +37,7 @@ add_custom_command(
         ${COLIBRI_CPU_KERNEL_TABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/include/colibri_v2_qwen_kernels.hpp
         ${CMAKE_CURRENT_SOURCE_DIR}/include/colibri_v2_native_kernels.hpp
-        --preprocessor "${CMAKE_CXX_COMPILER} -E -P -x c++"
+        --preprocessor "${CMAKE_CXX_COMPILER}"
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_cpu_kernels.py
         ${CMAKE_CURRENT_SOURCE_DIR}/include/colibri_v2_qwen_kernels.hpp
@@ -191,6 +191,7 @@ add_executable(
     src/q4_avx512.cpp
 )
 target_compile_features(colibri_cpu_parity_contract PRIVATE cxx_std_20)
+target_compile_definitions(colibri_cpu_parity_contract PRIVATE COLIBRI_V2_STATIC)
 target_include_directories(
     colibri_cpu_parity_contract PRIVATE include src ${COLIBRI_CPU_KERNEL_DIR}
 )

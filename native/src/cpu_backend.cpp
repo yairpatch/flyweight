@@ -429,7 +429,7 @@ long long colibri_cpu_kernel_index(const char* name) {
 
 // --- backend selection ----------------------------------------------------
 
-int colibri_backend_select(int backend) {
+COLIBRI_BACKEND_API int colibri_backend_select(int backend) {
     if (backend == kColibriBackendCpu) {
         g_backend.store(kColibriBackendCpu, std::memory_order_relaxed);
         return 0;
@@ -441,11 +441,11 @@ int colibri_backend_select(int backend) {
     return -1;
 }
 
-int colibri_backend_active() {
+COLIBRI_BACKEND_API int colibri_backend_active() {
     return g_backend.load(std::memory_order_relaxed);
 }
 
-int colibri_backend_is_cpu() {
+COLIBRI_BACKEND_API int colibri_backend_is_cpu() {
     return g_backend.load(std::memory_order_relaxed) == kColibriBackendCpu;
 }
 

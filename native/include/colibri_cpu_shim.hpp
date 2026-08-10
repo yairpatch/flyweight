@@ -93,7 +93,14 @@ struct __nv_fp4x2_e2m1 {
 // ---------------------------------------------------------------------------
 
 // CUDA puts integer min/max in the global namespace; host C++ only has the
-// std:: templates, and the corpus calls the unqualified names.
+// std:: templates, and the corpus calls the unqualified names. NOMINMAX covers
+// our own windows.h include; this covers a translation unit that pulled one in
+// ahead of the shim, where the macros would eat these definitions.
+#if defined(_WIN32)
+#  undef min
+#  undef max
+#endif
+
 inline int min(int a, int b) { return a < b ? a : b; }
 inline unsigned int min(unsigned int a, unsigned int b) { return a < b ? a : b; }
 inline long long min(long long a, long long b) { return a < b ? a : b; }

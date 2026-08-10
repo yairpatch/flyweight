@@ -55,6 +55,11 @@
 
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
+// windows.h defines min and max as function-like macros, which mangles the
+// unqualified min/max overloads the corpus calls (see colibri_cpu_shim.hpp).
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
 #  include <windows.h>
 #else
 #  include <ucontext.h>

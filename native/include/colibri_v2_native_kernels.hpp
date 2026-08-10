@@ -358,15 +358,15 @@ void qwen_q8_lm_head_argmax_rows(
     }
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(
+
 // bf16 output tables, as shipped by the NVFP4 Qwen3.6 checkpoints. Same warp
 // layout as the Q8_0 variant above, only the weight decode differs.
 extern "C" __global__
 void qwen_bf16_lm_head_argmax_rows(
     const unsigned short* weights, const float* vectors,
     unsigned long long* winners, const int input_size,
-    const int output_size, const int rows
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    const int output_size, const int rows
 ) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -630,8 +630,7 @@ void qwen_delta_recurrent_rows(
     __shared__ float core_values[256];
     __shared__ float inverse_rms;
     for (int token = 0; token < rows; ++token) {
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(        const float* row = convolved + token * (total_key_dim * 2 + value_heads * head_dim);
+        const float* row = convolved + token * (total_key_dim * 2 + value_heads * head_dim);
         if (lane == 0) {
             float query_square = 0.0f, key_square = 0.0f;
             for (int index = 0; index < head_dim; ++index) {
@@ -722,7 +721,8 @@ void qwen_attention_query(
                 ? value * cosf(angle) - other * sinf(angle)
                 : value * cosf(angle) + other * sinf(angle);
         }
-        queries[head * head_dim + index] = value;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        queries[head * head_dim + index] = value;
         gates[head * head_dim + index] = source[head_dim + index];
     }
 }
@@ -1090,15 +1090,15 @@ void qwen_delta_recurrent_chunk(
             query_inverse_norm = rsqrtf(query_square + 1.0e-6f) * rsqrtf(128.0f);
             key_inverse_norm = rsqrtf(key_square + 1.0e-6f);
             beta = 1.0f / (1.0f + expf(-beta_logits[token * value_heads + head]));
-            const float softplus_input = decay_logits[token * value_heads + head] + dt_bias[head];
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(            const float softplus_input = decay_logits[token * value_heads + head] + dt_bias[head];
             const float softplus = softplus_input > 20.0f
                 ? softplus_input : log1pf(expf(softplus_input));
             decay_scale = expf(decay_coefficients[head] * softplus);
         }
         __syncthreads();
         shared_key[lane] = key_raw * key_inverse_norm;
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(        shared_query[lane] = query_raw * query_inverse_norm;
+        shared_query[lane] = query_raw * query_inverse_norm;
         __syncthreads();
         const float value = row[total_key_dim * 2 + head * 128 + lane];
         float memory = 0.0f;
@@ -1340,8 +1340,7 @@ void qwen_argmax(const float* values, unsigned int* output, const int elements) 
     }
     *output = (unsigned int)best;
 }
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(
+
 
 // Chunked WY-representation gated DeltaNet, used for prefill row batches.
 // native/tools/deltanet_chunked.cu holds the same source for use with the
@@ -1442,7 +1441,8 @@ void qwen_delta_wy_scores(
         }
         if (lane == 0) {
             qinv[t] = rsqrtf(query_square + 1.0e-6f) * rsqrtf((float)DELTA_DIM);
-            kinv[t] = rsqrtf(key_square + 1.0e-6f);
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(            kinv[t] = rsqrtf(key_square + 1.0e-6f);
             const long long scalar = (long long)(base + t) * value_heads + head;
             betas[t] = 1.0f / (1.0f + expf(-beta_logits[scalar]));
             const float softplus_input = decay_logits[scalar] + dt_bias[head];
@@ -1777,7 +1777,8 @@ void qwen_delta_state_pass(
                 #pragma unroll
                 for (int c = 0; c < 2; ++c) omega_column[c] = omega[j][col + c];
                 #pragma unroll
-                for (int r = 0; r < 4; ++r)
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(                for (int r = 0; r < 4; ++r)
                     k_row[r] = scratch[j * (DELTA_CHUNK + 1) + row4 + r];
                 #pragma unroll
                 for (int r = 0; r < 4; ++r)

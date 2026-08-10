@@ -341,8 +341,7 @@ __device__ __forceinline__ float block_reduce_max(float value) {
 
 extern "C" __global__
 void rms_norm(
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    const float* input,
+    const float* input,
     const float* weights,
     float* output,
     const int elements,
@@ -443,7 +442,8 @@ __device__ __forceinline__ float sampling_key_value(
 
 // Sort 1,024 vocabulary logits per block and retain only that block's top-k.
 extern "C" __global__
-void sampling_block_topk_logits(
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(void sampling_block_topk_logits(
     const float* logits,
     int* output_indices,
     float* output_values,
@@ -859,8 +859,7 @@ void q4_batched_matvec(
     const unsigned long long* scale_addresses,
     const float* vector,
     float* output,
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    const int rows,
+    const int rows,
     const int columns,
     const int expert_count
 ) {
@@ -882,7 +881,8 @@ R"COLIBRI_CUDA(    const int rows,
         partial += weight * vector[column];
     }
     partial = block_reduce_sum(partial);
-    if (threadIdx.x == 0) output[expert * rows + row] = partial;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    if (threadIdx.x == 0) output[expert * rows + row] = partial;
 }
 
 extern "C" __global__
@@ -1164,8 +1164,7 @@ extern "C" __global__ void gemma_q4_0_geglu(
 ) {
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
     if(row>=intermediate)return;
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    float g=0.0f,u=0.0f;
+    float g=0.0f,u=0.0f;
     for(int i=lane;i<input_size;i+=32){
         const float x=input[i];
         g+=ggml_q4_0_load(gate,(long long)row*input_size+i)*x;
@@ -1262,7 +1261,8 @@ extern "C" __global__ void gemma_q4_0_lm_argmax(
     const int hidden,const int vocabulary
 ) {
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5,token=blockIdx.x*8+warp;
-    if(token>=vocabulary)return;float sum=0.0f;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    if(token>=vocabulary)return;float sum=0.0f;
     for(int i=lane;i<hidden;i+=32)sum+=ggml_q4_0_load(packed,(long long)token*hidden+i)*input[i];
     for(int offset=16;offset;offset>>=1)sum+=__shfl_down_sync(0xffffffff,sum,offset);
     if(lane==0){const unsigned int ordered=__float_as_uint(sum)^(sum>=0.0f?0x80000000u:0xffffffffu);const unsigned long long candidate=((unsigned long long)ordered<<32)|(0xffffffffu-(unsigned int)token);atomicMax(winner,candidate);}
@@ -1564,8 +1564,7 @@ __device__ __forceinline__ float q5k_value(
     const unsigned char low = base[48 + qindex];
     const unsigned char high = base[16 + (offset & 31)];
     const int bit = (high >> (2 * group + sub)) & 1;
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    const int quant = ((offset < 32) ? (low & 15) : (low >> 4)) + 16 * bit;
+    const int quant = ((offset < 32) ? (low & 15) : (low >> 4)) + 16 * bit;
     int scale, minimum;
     q5k_scale_min(scales, group * 2 + sub, &scale, &minimum);
     return d * (float)scale * (float)quant - dmin * (float)minimum;
@@ -1623,7 +1622,8 @@ extern "C" __global__ void name(                                               \
     if (row < output_size) {                                                   \
         const int blocks_per_row = input_size >> 8;                            \
         const int groups_per_row = blocks_per_row << 3;                        \
-        const unsigned char* row_data =                                        \
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        const unsigned char* row_data =                                        \
             packed + (long long)row * blocks_per_row * stride;                 \
         float partial = 0.0f;                                                  \
         for (int g = lane; g < groups_per_row; g += 32)                        \
@@ -1928,8 +1928,7 @@ void q5k_grouped_accumulate_rows(
 }
 
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(
+
 // Warp-per-row LM-head argmax for the weight types that lacked one. The
 // dispatch used to fall through to the Q8_0 kernel for anything it did not
 // recognize, which decodes the head as garbage and pins the argmax to a
@@ -1979,7 +1978,8 @@ __device__ __forceinline__ float f32_head_value(
     return ((const float*)packed)[absolute];
 }
 
-// IQ2_XXS codebook. Each grid entry is eight bytes packed into a uint64 so a
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(// IQ2_XXS codebook. Each grid entry is eight bytes packed into a uint64 so a
 // lookup is a single load; the sign table maps a 7-bit selector to eight
 // sign bits. Both come from the llama.cpp reference tables.
 // The IQ codebooks are indexed divergently -- every lane decodes a different
@@ -2116,8 +2116,7 @@ void iq2xxs_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(// Decode IQ2_XXS against a vector quantized in independent 32-value Q8
+// Decode IQ2_XXS against a vector quantized in independent 32-value Q8
 // blocks.  IQ2's codebook magnitudes fit in signed bytes, so the 32 products
 // in one weight group reduce to eight DP4A instructions instead of 32
 // floating-point weight reconstructions and multiplies.
@@ -2248,7 +2247,8 @@ __device__ const unsigned int kIq3xxsGrid[256] = {
     67378188u, 67380244u, 67386908u, 67386924u, 67896332u, 67896348u, 67898372u, 67898388u,
     67900428u, 67900460u, 67902468u, 67902484u, 67904524u, 67906596u, 67911172u, 68420612u,
     68420628u, 68420644u, 68422668u, 68424708u, 68424724u, 68426764u, 68426780u, 68426814u,
-    68430860u, 68430910u, 68435500u, 68944908u, 68944958u, 68946948u, 68946964u, 68949036u,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    68430860u, 68430910u, 68435500u, 68944908u, 68944958u, 68946948u, 68946964u, 68949036u,
     68959748u, 69471260u, 69475390u, 69477412u, 69479486u, 69484060u, 69484076u, 69993484u,
     69993534u, 69999636u, 70003732u, 70523948u, 70530084u, 71175172u, 71175204u, 71175220u,
     71181340u, 71185420u, 201589772u, 201589788u, 201591812u, 201591828u, 201593868u, 201593884u,
@@ -2382,8 +2382,7 @@ void iq3xxs_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(__device__ const unsigned long long kIq2sGrid[1024] = {
+__device__ const unsigned long long kIq2sGrid[1024] = {
     578721382704613384ULL, 578721382704613419ULL, 578721382704617753ULL, 578721382704622344ULL,
     578721382704622379ULL, 578721382705727513ULL, 578721382705731848ULL, 578721382705731883ULL,
     578721382705736473ULL, 578721382706907144ULL, 578721382706907179ULL, 578721382706911513ULL,
@@ -2475,7 +2474,8 @@ R"COLIBRI_CUDA(__device__ const unsigned long long kIq2sGrid[1024] = {
     583544940501997832ULL, 583544940503173128ULL, 583544940802869273ULL, 583544940802873608ULL,
     583545013230110728ULL, 583545013230110763ULL, 583545013230115097ULL, 583545013230119688ULL,
     583545013231224857ULL, 583545013231229192ULL, 583545013232404488ULL, 583545013515323417ULL,
-    583545013515327752ULL, 583545013516437512ULL, 583545013517626137ULL, 583545013819607083ULL,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    583545013515327752ULL, 583545013516437512ULL, 583545013517626137ULL, 583545013819607083ULL,
     583545090539526408ULL, 583545090540636168ULL, 583545090824734728ULL, 583545090825853227ULL,
     588573006889486344ULL, 588573006889486379ULL, 588573006889490713ULL, 588573006889495304ULL,
     588573006890600473ULL, 588573006890604808ULL, 588573006890604843ULL, 588573006890609433ULL,
@@ -2538,8 +2538,7 @@ R"COLIBRI_CUDA(__device__ const unsigned long long kIq2sGrid[1024] = {
     1803719323656132872ULL, 1803719323657242632ULL, 1803719323958118408ULL, 1803719323960416537ULL,
     1803738964256360473ULL, 1803738964256364808ULL, 1803738964256369433ULL, 1803738964257474568ULL,
     1803738964257474603ULL, 1803738964257478937ULL, 1803738964257483528ULL, 1803738964258654233ULL,
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    1803738964258658568ULL, 1803738964541573128ULL, 1803738964541573163ULL, 1803738964541577497ULL,
+    1803738964258658568ULL, 1803738964541573128ULL, 1803738964541573163ULL, 1803738964541577497ULL,
     1803738964541582088ULL, 1803738964542687257ULL, 1803738964542691592ULL, 1803738964543866888ULL,
     1803738964843567368ULL, 1803738964844677128ULL, 1803739037270804488ULL, 1803739037270804523ULL,
     1803739037270808857ULL, 1803739037270813448ULL, 1803739037271918617ULL, 1803739037271922952ULL,
@@ -2637,7 +2636,8 @@ R"COLIBRI_CUDA(    1803738964258658568ULL, 1803738964541573128ULL, 1803738964541
     3110588948543113259ULL, 3110588948543122184ULL, 3110588948543122219ULL, 3110588949128022059ULL,
     3110588949128030984ULL, 3110588949128031019ULL, 3110588949130324744ULL, 3110607489914636313ULL,
     3110607489914640648ULL, 3110607489915750408ULL, 3110607490199848968ULL, 3110607490501847833ULL,
-    3110607490504136968ULL, 3110607562929080328ULL, 3110607562930203417ULL, 3110607640524818457ULL,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    3110607490504136968ULL, 3110607562929080328ULL, 3110607562930203417ULL, 3110607640524818457ULL,
     3110627281123945259ULL, 3110627281126238984ULL, 3110627281713432619ULL, 3110627354424711432ULL,
     3110627354725587243ULL, 3110627431447800584ULL, 3110627431447800619ULL, 3110627431450085384ULL,
     3110627431450085419ULL, 3110627431450094344ULL, 3110627432035003144ULL, 3110627432037296939ULL,
@@ -2693,8 +2693,7 @@ __device__ const unsigned int kIq3sGrid[512] = {
     151326465u, 151453961u, 151454467u, 151454471u, 151454977u, 151454981u, 151455491u, 151455499u,
     151585025u, 151585029u, 151586057u, 151586575u, 151587073u, 151588611u, 151716107u, 151716111u,
     151717123u, 151719173u, 151847687u, 151848713u, 151850241u, 151978753u, 151978763u, 151979777u,
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    151980295u, 151980803u, 184615173u, 184615681u, 184615689u, 184616197u, 184617217u, 184617225u,
+    151980295u, 151980803u, 184615173u, 184615681u, 184615689u, 184616197u, 184617217u, 184617225u,
     184617231u, 184617733u, 184618253u, 184618761u, 184746243u, 184746247u, 184746251u, 184746757u,
     184747267u, 184747781u, 184749829u, 184877313u, 184877827u, 184878343u, 184878849u, 184878861u,
     184879879u, 185008389u, 185008399u, 185008897u, 185009423u, 185010441u, 185010947u, 185011467u,
@@ -2789,8 +2788,7 @@ void iq3s_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(__device__ const unsigned long long kIq2xsGrid[512] = {
+__device__ const unsigned long long kIq2xsGrid[512] = {
     578721382704613384ULL, 578721382704613419ULL, 578721382704617753ULL, 578721382704622344ULL,
     578721382704622379ULL, 578721382705727513ULL, 578721382705731848ULL, 578721382705731883ULL,
     578721382705736473ULL, 578721382706907144ULL, 578721382706907179ULL, 578721382706911513ULL,
@@ -2853,7 +2851,8 @@ R"COLIBRI_CUDA(__device__ const unsigned long long kIq2xsGrid[512] = {
     588591772189928217ULL, 588591848911013913ULL, 588591848912137003ULL, 588591849500514603ULL,
     588611489796458504ULL, 588611489796467464ULL, 588611489796467499ULL, 588611489798752264ULL,
     588611490082789657ULL, 588611490383670024ULL, 588611490385954859ULL, 588611563098417928ULL,
-    588611563399219208ULL, 588611640120322824ULL, 588611640122607624ULL, 588611640707516459ULL,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    588611563399219208ULL, 588611640120322824ULL, 588611640122607624ULL, 588611640707516459ULL,
     588611640707525384ULL, 588611640707525419ULL, 1803700481349388313ULL, 1803700481349392648ULL,
     1803700481349392683ULL, 1803700481349397273ULL, 1803700481350502408ULL, 1803700481350502443ULL,
     1803700481350506777ULL, 1803700481350511368ULL, 1803700481351682073ULL, 1803700481351686408ULL,
@@ -2966,8 +2965,7 @@ __device__ __forceinline__ float iq4xs_value(
     return d * (float)scale * (float)kIq4nlValues[code];
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(extern "C" __global__
+extern "C" __global__
 void iq2xs_matvec_transposed(
     const unsigned char* packed, const float* vector, float* output,
     const int input_size, const int output_size
@@ -3103,7 +3101,8 @@ void prefix##_grouped_swiglu(                                                   
             (gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))))) * up;    \
 }                                                                               \
 extern "C" __global__                                                           \
-void prefix##_grouped_swiglu_rows(                                              \
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(void prefix##_grouped_swiglu_rows(                                              \
     const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,     \
     const int* counts, const float* vectors, float* activated,                  \
     const int input_size, const int output_size, const int top_k,               \
@@ -3399,7 +3398,8 @@ __device__ __forceinline__ float q3k_q8_group(
         const signed char* activations = vector + linear_group * 32;
 
         // 110-byte super-blocks keep qs and hmask on 32-bit loads; only the
-        // 32-byte aligned activation block can widen to int4.
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        // 32-byte aligned activation block can widen to int4.
         const int4* activation_vectors = (const int4*)activations;
         int dot[2] = {0, 0};
         #pragma unroll
@@ -3620,7 +3620,7 @@ void q4k_lm_head_argmax_warp(
     }
 }
 
-)COLIBRI_CUDA" R"COLIBRI_CUDA(
+
 
 
 __device__ __forceinline__ float q6k_value(
@@ -3804,7 +3804,8 @@ COLIBRI_LM_HEAD_ARGMAX(iq4xs_lm_head_argmax_warp, iq4xs_value)
 extern "C" __global__
 void q6k_matvec_transposed(
     const unsigned char* packed, const float* vector, float* output,
-    const int input_size, const int output_size
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    const int input_size, const int output_size
 ) {
     const int row = blockIdx.x;
     if (row >= output_size) return;
@@ -4195,8 +4196,7 @@ void q8_grouped_accumulate_rows(
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[token * output_size + row] += partial;
 }
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(
+
 // ---- NVFP4 (GGML type 40): E2M1 4-bit float (1 sign + 2 exp + 1 mantissa, bias=1) -
 // 36 bytes per 64 elements: d[4] E4M3 scales then qs[32] packed nibbles, with
 // scale i governing bytes 4+8i..11+8i (16 elements). Nibbles are split-half like
@@ -4235,7 +4235,8 @@ __device__ __forceinline__ float fp4_e2m1_to_float(int val) {
     const unsigned int bits = exponent
         ? (((exponent + 126u) << 23) | ((magnitude & 1u) << 22))
         : (magnitude ? 0x3F000000u : 0u);
-    return __uint_as_float(bits | ((unsigned int)(val & 8) << 28));
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    return __uint_as_float(bits | ((unsigned int)(val & 8) << 28));
 }
 
 __device__ __forceinline__ float nvfp4_value(
@@ -4623,7 +4624,8 @@ void nvfp4_quantize_broadcast16_cublaslt(
 ) {
     const int blocks_per_row = columns >> 4;
     const int scaled_block = blockIdx.x;
-    const int row = scaled_block / blocks_per_row;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(    const int row = scaled_block / blocks_per_row;
     const int inner = scaled_block - row * blocks_per_row;
     if (row >= 16) return;
     const int lane = threadIdx.x & 31;
@@ -4663,8 +4665,7 @@ void nvfp4_quantize_broadcast16_cublaslt(
     }
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(// Concatenate each routed down matrix along K. Multiplying that matrix by the
+// Concatenate each routed down matrix along K. Multiplying that matrix by the
 // concatenated, route-weighted expert activations produces the final weighted
 // expert sum directly, without an E-way post-GEMM reduction.
 extern "C" __global__
@@ -5031,15 +5032,15 @@ void nvfp4_grouped_accumulate_tiled(
                 * nvfp4_value(packed, row * input_size + input)
                 * activated[expert * input_size + input];
         }
-        partial += combined;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        partial += combined;
     }
     for (int offset = 16; offset > 0; offset >>= 1)
         partial += __shfl_down_sync(0xffffffff, partial, offset);
     if (lane == 0) output[row] += partial;
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(extern "C" __global__
+extern "C" __global__
 void nvfp4_grouped_accumulate(
     const unsigned long long* down_ptrs,
     const float* activated,
@@ -5115,8 +5116,7 @@ __device__ __forceinline__ void kv_st(__nv_bfloat16* p, long long i, float v) { 
 template<typename T>
 __device__ void kv_store_impl(
     const float* current, T* cache,
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    const int kv_heads, const int head_dim, const int position, const int capacity
+    const int kv_heads, const int head_dim, const int position, const int capacity
 ) {
     const int head = blockIdx.x;
     if (head >= kv_heads) return;
@@ -5277,8 +5277,7 @@ __device__ __forceinline__ void turbo_encode_block_d(const float* v, unsigned ch
         turbo_pack_d(dst + 2, i, BITS, (unsigned)best);
     }
 }
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(
+
 // head_dim is guarded to a power of two <= 512 wherever a turbo cache type is
 // selected, so the scratch below always holds a whole rotated row.
 #define TURBO_MAX_DIM 512
@@ -5365,7 +5364,8 @@ KV_SCORES_TURBO_RING(kv_attention_scores_turbo3_ring, 3)
 KV_SCORES_TURBO_RING(kv_attention_scores_turbo4_ring, 4)
 #undef KV_SCORES_TURBO_RING
 
-// One block per head, so the weighted sum is accumulated in the rotated domain
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(// One block per head, so the weighted sum is accumulated in the rotated domain
 // in shared memory and inverse-rotated once at the end: R^-1 = R^T = S*H, i.e.
 // Walsh-Hadamard first, then the sign flip.
 template<int BITS, bool RING>
@@ -5691,7 +5691,8 @@ extern "C" __global__ void kv_attention_values_bf16(
     float* scores, const __nv_bfloat16* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
     const int tokens, const int capacity
-) { kv_values_impl<__nv_bfloat16>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA() { kv_values_impl<__nv_bfloat16>(scores, values, output, heads, kv_heads, head_dim, tokens, capacity); }
 extern "C" __global__ void kv_attention_values_q8(
     float* scores, const unsigned char* values, float* output,
     const int heads, const int kv_heads, const int head_dim,
@@ -5740,8 +5741,7 @@ __device__ void kv_values_ring_impl(
     const float reduced_maximum=block_reduce_max(local_maximum);
     __shared__ float maximum;
     if(threadIdx.x==0)maximum=reduced_maximum;
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(    __syncthreads();
+    __syncthreads();
     float local_denominator=0.0f;
     for(int token=threadIdx.x;token<tokens;token+=blockDim.x){
         const float weight=expf(head_scores[token]-maximum);
@@ -6023,8 +6023,7 @@ extern "C" __global__ void qwen_attention_prefill_unpack(
         packed, gates, output, tile_start, tile_rows, heads, kv_heads, head_dim);
 }
 
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(template<typename KT, typename VT>
+template<typename KT, typename VT>
 __device__ void kv_attention_fused_tiles_impl(
     const float* query,
     const KT* keys,
@@ -6062,7 +6061,8 @@ __device__ void kv_attention_fused_tiles_impl(
         int slot = first + token;
         if (slot >= capacity) slot -= capacity;
         const long long row = (long long)kv_head * capacity + slot;
-        float dot = 0.0f;
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(        float dot = 0.0f;
         #pragma unroll
         for (int part = 0; part < 4; ++part) {
             const int dimension = lane + part * 32;
@@ -6355,8 +6355,7 @@ __device__ void kv_append_impl(
     if (head >= kv_heads) return;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         const long long slot = ((long long)head * capacity + position) * head_dim + d;
-)COLIBRI_CUDA"
-R"COLIBRI_CUDA(        kv_st(cache_keys, slot, current_keys[head * head_dim + d]);
+        kv_st(cache_keys, slot, current_keys[head * head_dim + d]);
         kv_st(cache_values, slot, current_values[head * head_dim + d]);
     }
 }

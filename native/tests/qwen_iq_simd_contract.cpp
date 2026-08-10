@@ -17,11 +17,32 @@
 #include <random>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+#endif
+
 // Detected locally rather than by linking the dispatch translation unit, which
-// would drag in the whole q4 kernel chain for one predicate.
+// would drag in the whole q4 kernel chain for one predicate. MSVC has no
+// __builtin_cpu_supports, so it reads the leaves directly -- including the
+// OSXSAVE and XCR0 checks that the builtin folds in, since an OS that does not
+// save the wide state will fault on the first kernel instruction.
 bool avx2_available() {
 #if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+    int registers[4]{};
+    __cpuid(registers, 0);
+    if (registers[0] < 7) return false;
+    __cpuid(registers, 1);
+    if ((registers[2] & (1 << 27)) == 0) return false;  // OSXSAVE
+    if ((registers[2] & (1 << 28)) == 0) return false;  // AVX
+    if ((_xgetbv(0) & 0x6) != 0x6) return false;        // XMM and YMM saved
+    __cpuidex(registers, 7, 0);
+    return (registers[1] & (1 << 5)) != 0;              // AVX2
+#else
     return __builtin_cpu_supports("avx2");
+#endif
 #else
     return false;
 #endif
@@ -29,8 +50,20 @@ bool avx2_available() {
 
 bool avx512_available() {
 #if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+    int registers[4]{};
+    __cpuid(registers, 0);
+    if (registers[0] < 7) return false;
+    __cpuid(registers, 1);
+    if ((registers[2] & (1 << 27)) == 0) return false;  // OSXSAVE
+    if ((_xgetbv(0) & 0xe6) != 0xe6) return false;      // ZMM state saved
+    __cpuidex(registers, 7, 0);
+    return (registers[1] & (1 << 16)) != 0             // AVX-512F
+        && (registers[1] & (1 << 30)) != 0;            // AVX-512BW
+#else
     return __builtin_cpu_supports("avx512f")
         && __builtin_cpu_supports("avx512bw");
+#endif
 #else
     return false;
 #endif

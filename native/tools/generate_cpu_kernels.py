@@ -63,11 +63,28 @@ KERNEL_HEAD = re.compile(
 )
 
 
+# MSVC truncates a single string literal past 16384 bytes (C2026), which is why
+# the corpus is split into adjacent literals rather than written as one. The
+# concatenation is unbounded, so only the individual pieces matter. Checked here
+# because the headers are edited on Linux, where nothing else would notice.
+MAX_SEGMENT_BYTES = 16384
+
+
 def extract(path: Path) -> str:
     text = path.read_text()
     segments = RAW_SEGMENT.findall(text)
     if not segments:
         raise SystemExit(f"no COLIBRI_CUDA raw segments found in {path}")
+    for index, segment in enumerate(segments):
+        if len(segment.encode()) < MAX_SEGMENT_BYTES:
+            continue
+        line = text[: text.index(segment)].count("\n") + 1
+        raise SystemExit(
+            f"{path}:{line}: COLIBRI_CUDA segment {index} is "
+            f"{len(segment.encode())} bytes, over the {MAX_SEGMENT_BYTES} MSVC "
+            'limit; close it with )COLIBRI_CUDA" and reopen with '
+            'R"COLIBRI_CUDA( at a line boundary'
+        )
     return "".join(segments)
 
 
@@ -94,13 +111,27 @@ def transform(cuda: str) -> str:
     return cuda
 
 
+def preprocessor_flags(compiler: str) -> list[str]:
+    """Flags that make `compiler` preprocess C++ to stdout, no line markers.
+
+    MSVC shares none of the GCC spellings: /EP is -E -P, /TP is -x c++, and the
+    logo would otherwise land in the token stream we parse.
+    """
+    name = Path(compiler).stem.lower()
+    if name in ("cl", "clang-cl"):
+        return ["/nologo", "/EP", "/TP"]
+    return ["-E", "-P", "-x", "c++"]
+
+
 def find_preprocessor(explicit: str | None) -> list[str]:
+    # A path, not a command line: MSVC lives under "Program Files (x86)", and
+    # splitting on whitespace would tear that path apart.
     if explicit:
-        return explicit.split()
-    for candidate in ("cc", "gcc", "clang", "c++", "g++"):
+        return [explicit, *preprocessor_flags(explicit)]
+    for candidate in ("cc", "gcc", "clang", "c++", "g++", "cl"):
         found = shutil.which(candidate)
         if found:
-            return [found, "-E", "-P", "-x", "c++"]
+            return [found, *preprocessor_flags(found)]
     raise SystemExit("no C preprocessor found; pass --preprocessor")
 
 
@@ -118,9 +149,14 @@ def preprocess(cuda: str, command: list[str]) -> str:
         )
         if result.returncode != 0:
             raise SystemExit(
-                "preprocessing the CUDA corpus failed:\n" + result.stderr[:4000]
+                "preprocessing the CUDA corpus failed:\n"
+                + " ".join(command)
+                + "\n"
+                + result.stderr[:4000]
             )
-        return result.stdout
+        # cl echoes the input file name onto the output stream ahead of the
+        # preprocessed text; it is not a token the table scanner should see.
+        return result.stdout.replace(source.name + "\n", "", 1)
 
 
 def scan_parameter_list(text: str, start: int) -> tuple[str, int]:

@@ -24,7 +24,12 @@
 
 // Matches colibri_gpu_driver.h; the library is built with -fvisibility=hidden,
 // so selection has to be exported explicitly for the CLI and the tests.
-#if defined(_WIN32)
+// COLIBRI_V2_STATIC is for the contract executables, which link these sources
+// directly: on Windows they neither import nor export, and dllimport on a
+// definition is a hard error rather than a warning.
+#if defined(COLIBRI_V2_STATIC)
+#  define COLIBRI_BACKEND_API
+#elif defined(_WIN32)
 #  if defined(COLIBRI_V2_BUILD)
 #    define COLIBRI_BACKEND_API __declspec(dllexport)
 #  else
