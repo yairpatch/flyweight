@@ -635,7 +635,17 @@ class V2RuntimeTests(unittest.TestCase):
         with patch.object(V2Model, "token_id", token_id), patch.object(
             V2Model, "_tokenize_plain", lambda _model, text, _capacity: [len(text)]
         ):
+            # ``<think>`` is in the vocabulary and splits the run. ``<div>`` is
+            # not, so it stays inside the surrounding plain run rather than
+            # becoming a piece of its own: "b<div>c" is one run of 7.
+            #
+            # This previously asserted [1, 248068, 1, 5, 1], i.e. that an
+            # unrecognised candidate was tokenized alone. That invents a piece
+            # boundary the pre-tokenizer never produces and blocks merges
+            # across it. Checked against the HF reference tokenizer on 3000
+            # randomized strings: the old behaviour disagreed on 27, the new
+            # one on none.
             self.assertEqual(
                 model.tokenize("a<think>b<div>c"),
-                [1, 248068, 1, 5, 1],
+                [1, 248068, 7],
             )

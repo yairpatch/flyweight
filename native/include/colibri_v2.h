@@ -74,7 +74,14 @@ typedef struct ColibriV2ModelConfig {
        asked for neither. Both are monotonic, so they change sampling but never
        a greedy argmax. */
     float logit_scale, final_logit_softcap;
+    /* `noaux_tc` group-limited routing: experts are split into
+       `expert_group_count` groups and only the best `expert_group_used` supply
+       candidates. Zero means routing is not group limited. Appended at the end
+       so the struct stays layout-compatible with existing callers. */
+    uint32_t expert_group_count, expert_group_used;
 } ColibriV2ModelConfig;
+
+typedef struct ColibriV2BailingRuntime ColibriV2BailingRuntime;
 
 typedef struct ColibriV2GpuInfo {
     int32_t available;
@@ -464,6 +471,21 @@ COLIBRI_V2_API int colibri_v2_model_chat_template(const ColibriV2Model* model, c
 COLIBRI_V2_API int colibri_v2_model_attention_window(const ColibriV2Model* model, uint32_t layer, uint32_t* out);
 COLIBRI_V2_API int colibri_v2_tensor_info(const ColibriV2Model* model, uint64_t index, ColibriV2TensorInfo* out);
 COLIBRI_V2_API int colibri_v2_tensor_find(const ColibriV2Model* model, const char* name, ColibriV2TensorInfo* out);
+/* BailingMoE3 (Ling 3.0) host execution.
+
+   A straightforward f32 forward pass on the CPU: correct, unoptimized, and the
+   thing the eventual kernels are checked against. Requires a model whose
+   tensors are f32 (open an HF checkpoint with COLIBRI_HF_QUANT=F32); the
+   quantized path runs through the main runtime once its kernels land.
+
+   `colibri_v2_bailing_eval` consumes `count` tokens starting at the runtime's
+   current position and writes `vocabulary_size` logits for the LAST one. Call
+   it repeatedly to decode; call reset to start a new sequence. */
+COLIBRI_V2_API int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity, ColibriV2BailingRuntime** out);
+COLIBRI_V2_API void colibri_v2_bailing_destroy(ColibriV2BailingRuntime* runtime);
+COLIBRI_V2_API int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime);
+COLIBRI_V2_API int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* tokens, uint32_t count, float* logits);
+
 COLIBRI_V2_API int colibri_v2_qwen_validate(const ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_qwen_tensor_role(const ColibriV2Model* model, const char* role, ColibriV2TensorInfo* out);
 COLIBRI_V2_API int colibri_v2_qwen_layer_tensor(const ColibriV2Model* model, uint32_t layer, const char* role, ColibriV2TensorInfo* out);

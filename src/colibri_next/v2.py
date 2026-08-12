@@ -11,7 +11,12 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
+
+try:  # optional: only used to keep the logits path off the Python interpreter
+    import numpy as _numpy
+except ImportError:  # pragma: no cover - numpy is normally present
+    _numpy = None
 
 
 class V2Error(RuntimeError):
@@ -143,6 +148,8 @@ class _ModelConfig(ctypes.Structure):
         # Head-output transforms; zero when the checkpoint asked for neither.
         ("logit_scale", ctypes.c_float),
         ("final_logit_softcap", ctypes.c_float),
+        ("expert_group_count", ctypes.c_uint32),
+        ("expert_group_used", ctypes.c_uint32),
     ]
 
 
@@ -1010,6 +1017,207 @@ def _library() -> ctypes.CDLL:
     )
 
 
+class BailingRuntime:
+    """Host execution for BailingMoE3 (Ling 3.0) checkpoints.
+
+    Straightforward f32 CPU inference: correct rather than fast, and the thing
+    the eventual quantized and GPU paths are checked against. Needs a model
+    opened with ``COLIBRI_HF_QUANT=F32``.
+
+    The runtime owns a position: ``eval`` continues from wherever the last call
+    left off, so a prompt is one call and each generated token is another.
+    ``reset`` starts a new sequence.
+    """
+
+    def __init__(self, model: "V2Model", capacity: int = 4096):
+        self._model = model
+        self._lib = model._lib
+        self._handle = ctypes.c_void_p()
+        self._vocabulary = int(model.config["vocabulary_size"])
+        self._lib.colibri_v2_bailing_create.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+        ]
+        self._lib.colibri_v2_bailing_eval.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_float)
+        ]
+        self._check(
+            self._lib.colibri_v2_bailing_create(
+                model._handle, ctypes.c_uint32(capacity), ctypes.byref(self._handle)
+            )
+        )
+        self._logits = (ctypes.c_float * self._vocabulary)()
+        # Built on first unseeded sample and reused; see sample().
+        self._generator: Any = None
+
+    def _check(self, status: int) -> None:
+        if status:
+            message = self._lib.colibri_v2_last_error() or b"native v2 error"
+            raise V2Error(message.decode(errors="replace"))
+
+    def _eval_into_buffer(self, tokens: Sequence[int]) -> None:
+        if not tokens:
+            raise ValueError("eval needs at least one token")
+        buffer = (ctypes.c_uint32 * len(tokens))(*tokens)
+        self._check(
+            self._lib.colibri_v2_bailing_eval(
+                self._handle, buffer, ctypes.c_uint32(len(tokens)), self._logits
+            )
+        )
+
+    def eval(self, tokens: Sequence[int]) -> Any:
+        """Advance by `tokens` and return the logits for the last one.
+
+        Returns a numpy array when numpy is available and a list otherwise.
+        The distinction matters: converting this vocabulary (157k floats) to a
+        Python list costs ~7 ms, which was larger than the entire GPU forward
+        pass it was reporting on.
+        """
+        self._eval_into_buffer(tokens)
+        if _numpy is not None:
+            # Copy: the buffer is reused by the next call, so handing back a
+            # view would alias.
+            return _numpy.frombuffer(self._logits, dtype=_numpy.float32).copy()
+        return list(self._logits)
+
+    def reset(self) -> None:
+        self._check(self._lib.colibri_v2_bailing_reset(self._handle))
+
+    def eval_into(self, tokens: Sequence[int]) -> None:
+        """Advance the caches, leaving the logits in the internal buffer.
+
+        The server path never wants the logits as Python objects -- it samples
+        from them and discards them -- and materializing 157k floats per token
+        costs more than the model does.
+        """
+        self._eval_into_buffer(tokens)
+
+    def sample(self, config: Any = None) -> int:
+        """Pick the next token from the logits currently in the buffer.
+
+        Greedy when no temperature is set. Sampling runs on the ctypes buffer
+        through numpy rather than a Python list, for the same reason as above.
+        """
+        temperature = float(getattr(config, "temperature", 0.0) or 0.0)
+        top_k = int(getattr(config, "top_k", 0) or 0)
+        top_p = float(getattr(config, "top_p", 0.0) or 0.0)
+        if _numpy is None or temperature <= 0.0:
+            if _numpy is not None:
+                view = _numpy.frombuffer(self._logits, dtype=_numpy.float32)
+                return int(view.argmax())
+            return max(range(self._vocabulary), key=self._logits.__getitem__)
+
+        # Everything below runs on the CANDIDATES, not on the vocabulary.
+        #
+        # This used to widen all 157k logits to float64, mask all but top_k of
+        # them to -inf, and then argsort, cumsum and `choice` over the whole
+        # array -- of which at most `top_k` entries could ever be drawn. It cost
+        # ~5 ms per token against a ~7 ms token, so asking for any temperature
+        # at all took decode from 146 to 88 tok/s while the GPU sat idle.
+        #
+        # Selecting first is exact, not an approximation: the discarded entries
+        # have probability zero, so they cannot enter the top_p prefix and
+        # cannot be drawn.
+        view = _numpy.frombuffer(self._logits, dtype=_numpy.float32)
+        if top_k > 0 and top_k < view.size:
+            candidates = _numpy.argpartition(view, -top_k)[-top_k:]
+        else:
+            # No top_k, so top_p has to consider the whole distribution. Take a
+            # generous prefix and widen it only if its mass has not reached
+            # top_p -- which keeps this exact while almost always touching a few
+            # hundred entries rather than the vocabulary. A top_p of 1.0 (or
+            # none) needs everything, and says so immediately.
+            candidates = _numpy.arange(view.size)
+            if 0.0 < top_p < 1.0:
+                full = _numpy.exp((view - view.max()) / temperature)
+                mass = full.sum()
+                width = 256
+                while width < view.size:
+                    prefix = _numpy.argpartition(view, -width)[-width:]
+                    if full[prefix].sum() >= top_p * mass:
+                        candidates = prefix
+                        break
+                    width *= 2
+
+        values = view[candidates].astype(_numpy.float32) / temperature
+        values -= values.max()
+        probabilities = _numpy.exp(values)
+        total = probabilities.sum()
+        if not _numpy.isfinite(total) or total <= 0.0:
+            return int(candidates[int(_numpy.argmax(values))])
+        probabilities /= total
+
+        order = _numpy.argsort(probabilities)[::-1]
+        candidates = candidates[order]
+        probabilities = probabilities[order]
+        if 0.0 < top_p < 1.0:
+            cumulative = _numpy.cumsum(probabilities)
+            # Keep the smallest prefix whose mass reaches top_p, always at
+            # least one token.
+            keep = int(_numpy.searchsorted(cumulative, top_p) + 1)
+            candidates = candidates[:keep]
+            probabilities = probabilities[:keep]
+            probabilities = probabilities / probabilities.sum()
+
+        seed = getattr(config, "seed", None)
+        if seed is not None:
+            generator = _numpy.random.default_rng(seed)
+        else:
+            # One generator for the runtime rather than one per token:
+            # constructing a Generator seeds it from the OS entropy pool, which
+            # is not something to do 150 times a second.
+            generator = self._generator
+            if generator is None:
+                generator = self._generator = _numpy.random.default_rng()
+        return int(candidates[generator.choice(probabilities.size, p=probabilities)])
+
+    def generate(
+        self,
+        tokens: Sequence[int],
+        max_tokens: int = 32,
+        stop: Sequence[int] | None = None,
+    ) -> list[int]:
+        """Greedy decode. Returns only the generated ids, not the prompt."""
+        terminators = set(stop or ())
+        produced: list[int] = []
+        # The prompt goes through in one call; every step after is one token,
+        # which is what makes the caches worth having.
+        #
+        # The argmax runs over the ctypes buffer directly rather than a copy:
+        # a Python-level max() over 157k logits costs ~2 ms and the copy ~7 ms,
+        # which together dwarfed the model.
+        step = tokens
+        for _ in range(max_tokens):
+            self._eval_into_buffer(step)
+            if _numpy is not None:
+                view = _numpy.frombuffer(self._logits, dtype=_numpy.float32)
+                best = int(view.argmax())
+            else:
+                best = max(range(self._vocabulary), key=self._logits.__getitem__)
+            produced.append(best)
+            if best in terminators:
+                break
+            step = [best]
+        return produced
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None) and self._handle:
+            self._lib.colibri_v2_bailing_destroy(self._handle)
+            self._handle = ctypes.c_void_p()
+
+    def __enter__(self) -> "BailingRuntime":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class V2Model:
     def __init__(self, path: str | Path, *, mtp_model: str | Path | None = None):
         self.path = Path(path)
@@ -1125,6 +1333,8 @@ class V2Model:
             "yarn_beta_slow",
             "logit_scale",
             "final_logit_softcap",
+            "expert_group_count",
+            "expert_group_used",
         }
         config = {
             field: (
@@ -1415,21 +1625,29 @@ class V2Model:
         # and ordinary angle-delimited control tokens (``<think>`` and
         # ``</think>``).  Only treat an angle-delimited candidate as special
         # when it exists verbatim in the GGUF vocabulary.
+        #
+        # A candidate that is *not* in the vocabulary has to be left inside the
+        # surrounding run rather than tokenized on its own.  ``<[^<>]+>`` is a
+        # broad pattern -- it happily spans ordinary prose containing a ``<``
+        # and a later ``>`` -- and splitting there invents a piece boundary the
+        # pre-tokenizer never would, which silently blocks merges across it.
         pieces: list[int] = []
-        position = 0
+        plain_start = 0
         for match in _SPECIAL_TOKEN_PATTERN.finditer(text):
-            if match.start() > position:
-                pieces.extend(
-                    self._tokenize_plain(text[position : match.start()], capacity)
-                )
-            candidate = match.group(0)
+            if match.start() < plain_start:
+                continue  # overlapped by a candidate already consumed
             try:
-                pieces.append(self.token_id(candidate))
+                token = self.token_id(match.group(0))
             except V2Error:
-                pieces.extend(self._tokenize_plain(candidate, capacity))
-            position = match.end()
-        if position < len(text):
-            pieces.extend(self._tokenize_plain(text[position:], capacity))
+                continue
+            if match.start() > plain_start:
+                pieces.extend(
+                    self._tokenize_plain(text[plain_start : match.start()], capacity)
+                )
+            pieces.append(token)
+            plain_start = match.end()
+        if plain_start < len(text):
+            pieces.extend(self._tokenize_plain(text[plain_start:], capacity))
         return pieces
 
     def _tokenize_plain(self, text: str, capacity: int) -> list[int]:

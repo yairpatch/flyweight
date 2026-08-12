@@ -241,6 +241,13 @@ COLIBRI_API int colibri_gpu_q4k_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 );
+// The sub-block-scale Q4_K matvec. Returns -1 when it is unavailable (kernel
+// absent, or a row that is not a whole number of 32-element sub-blocks), so
+// callers fall back to the transposed one above.
+COLIBRI_API int colibri_gpu_q4k_matvec_subblock(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
 COLIBRI_API int colibri_gpu_q6k_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream

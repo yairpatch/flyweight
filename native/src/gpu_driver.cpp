@@ -1041,7 +1041,14 @@ extern "C" int colibri_gpu_compile(
              // source those kernels live in was not compiled in.
              "ds4_q8_matvec", "ds4_q8_grouped_matvec", "ds4_q6k_matvec",
              "ds4_iq1s_matvec", "ds4_iq1s_grouped_swiglu",
-             "ds4_clamped_swiglu"
+             "ds4_clamped_swiglu",
+             // BailingMoE3. Same treatment: resolved if present, absent
+             // otherwise, so a build without them still loads.
+             "bailing_kda_recurrent_chunk", "bailing_mla_attention",
+             "bailing_copy", "bailing_partial_rope", "bailing_split_query",
+             "bailing_head_gate", "bailing_short_conv",
+             "bailing_gated_head_norm", "bailing_swiglu",
+             "bailing_q4k_matvec"
          }) {
         CUfunction function = nullptr;
         if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)
@@ -1516,6 +1523,34 @@ extern "C" int colibri_gpu_q8_matvec_transposed(
     const auto blocks = static_cast<unsigned int>((output_size + 7) / 8);
     return launch(g_kernels.q8_matvec_transposed, blocks, 1, 256, args, 0,
                   reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
+}
+
+// Q4_K, with the sub-block scale unpack amortized across a warp.
+//
+// The generic `q4k_matvec_transposed_warp` below calls `q4k_value` per element,
+// which re-derives the block offsets and reloads both f16 scales to produce
+// four bits -- instruction-bound, not bandwidth-bound, and measured at 58-131
+// GB/s on a card that does ~670. `bailing_q4k_matvec` was written to fix that
+// and has been compiled and resolved into the function table all along with
+// nothing to launch it; this is that launcher.
+//
+// Block per row, one warp per 32-element sub-block, block-reduced at the end,
+// so the launch geometry differs from the warp-per-row kernels. Returns -1 when
+// the kernel is absent, which is what lets the caller fall back.
+extern "C" int colibri_gpu_q4k_matvec_subblock(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    if (!packed || !input || !output || input_size <= 0 || output_size <= 0)
+        return -1;
+    // The kernel walks whole 32-element sub-blocks; a ragged row would read
+    // past the last one.
+    if (input_size % 32 != 0) return -1;
+    auto it = g_functions.find("bailing_q4k_matvec");
+    if (it == g_functions.end()) return -1;
+    void* args[] = {&packed, &input, &output, &input_size, &output_size};
+    return launch(it->second, static_cast<unsigned int>(output_size), 1, 256,
+                  args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
 extern "C" int colibri_gpu_q4k_matvec_transposed(

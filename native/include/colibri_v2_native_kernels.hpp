@@ -1200,6 +1200,393 @@ R"COLIBRI_CUDA(            const float softplus_input = decay_logits[token * val
         state[(head * 128 + key) * 128 + lane] = local_state[key];
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+extern "C" __global__
+void bailing_q4k_matvec(
+    const unsigned char* packed,
+    const float* vector,
+    float* output,
+    const int input_size,
+    const int output_size
+) {
+    // Q4_K matvec that unpacks a sub-block's scales ONCE instead of per
+    // element.
+    //
+    // q4k_matvec_transposed calls q4k_value per value, and that function
+    // re-derives the block offsets and reloads both f16 scales every time --
+    // roughly five loads and two half-to-float conversions to produce four
+    // bits. Measured, the existing kernel runs these shapes at 58-131 GB/s on
+    // a card that does ~670: instruction-bound, not bandwidth-bound.
+    //
+    // Here each warp owns one 32-element sub-block and lane i takes element i,
+    // so the scale unpack is amortized 32x and the quant byte load is the only
+    // per-element memory traffic. Same arrangement as qwen_q4k_dot_row on the
+    // CPU side, for the same reason.
+    //
+    // Requires input_size % 32 == 0, which the quantizer already guarantees.
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const long long row_base = (long long)row * input_size;
+    const int sub_blocks = input_size >> 5;
+    float partial = 0.0f;
+    for (int sb = warp; sb < sub_blocks; sb += warps) {
+        const long long absolute = row_base + (long long)sb * 32;
+        const unsigned char* base = packed + (absolute >> 8) * 144;
+        const int within = (int)(absolute & 255);
+        const __half* halves = (const __half*)base;
+        const float d = __half2float(halves[0]);
+        const float dmin = __half2float(halves[1]);
+        const unsigned char* scales = base + 4;
+        const int group = within >> 6;
+        const int half_index = (within >> 5) & 1;
+        const int index = group * 2 + half_index;
+        int scale, minimum;
+        if (index < 4) {
+            scale = scales[index] & 63;
+            minimum = scales[index + 4] & 63;
+        } else {
+            scale = (scales[index + 4] & 15) | ((scales[index - 4] >> 6) << 4);
+            minimum = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+        }
+        const unsigned char byte = base[16 + group * 32 + lane];
+        const int quant = half_index == 0 ? (byte & 15) : (byte >> 4);
+        partial += (d * scale * (float)quant - dmin * (float)minimum)
+                 * vector[sb * 32 + lane];
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Small BailingMoE3 helpers. Each is the device half of a host function in
+// colibri_v2_bailing.hpp and is checked against it the same way.
+
+extern "C" __global__
+void bailing_copy(float* destination, const float* source, const int count) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += blockDim.x * gridDim.x)
+        destination[i] = source[i];
+}
+
+extern "C" __global__
+void bailing_partial_rope(
+    float* rows, const int heads, const int head_dim, const int rope_dim,
+    const int position, const float theta
+) {
+    // Adjacent-pair (NORM) rotation over the trailing rope_dim channels. See
+    // partial_rope_norm for why this is adjacent pairs and not the half-split
+    // form the reference appears to use.
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    float* span = rows + (long long)head * head_dim + (head_dim - rope_dim);
+    for (int pair = threadIdx.x; pair * 2 < rope_dim; pair += blockDim.x) {
+        const float exponent = (float)(2 * pair) / (float)rope_dim;
+        // Accurate variants, not the __-prefixed fast-math intrinsics: the CPU
+        // shim that compiles this corpus as host C++ does not define those, and
+        // rope angle error compounds over long contexts.
+        const float frequency = powf(theta, -exponent);
+        const float angle = (float)position * frequency;
+        const float cosine = cosf(angle), sine = sinf(angle);
+        const float even = span[pair * 2], odd = span[pair * 2 + 1];
+        span[pair * 2] = even * cosine - odd * sine;
+        span[pair * 2 + 1] = odd * cosine + even * sine;
+    }
+}
+
+extern "C" __global__
+void bailing_split_query(
+    const float* query, float* nope, float* rope,
+    const int heads, const int qk_nope, const int qk_rope
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const int width = qk_nope + qk_rope;
+    for (int i = threadIdx.x; i < qk_nope; i += blockDim.x)
+        nope[(long long)head * qk_nope + i] = query[(long long)head * width + i];
+    for (int i = threadIdx.x; i < qk_rope; i += blockDim.x)
+        rope[(long long)head * qk_rope + i] = query[(long long)head * width + qk_nope + i];
+}
+
+extern "C" __global__
+void bailing_head_gate(
+    const float* logits, const int heads, const int value_dim, float* attention
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const float gate = 1.0f / (1.0f + __expf(-logits[head]));
+    for (int i = threadIdx.x; i < value_dim; i += blockDim.x)
+        attention[(long long)head * value_dim + i] *= gate;
+}
+
+extern "C" __global__
+void bailing_short_conv(
+    float* values, const float* weights, float* window,
+    const int channels, const int width
+) {
+    // Causal depthwise conv over one token plus SiLU, advancing the window.
+    const int history = width - 1;
+    for (int channel = blockIdx.x * blockDim.x + threadIdx.x; channel < channels;
+         channel += blockDim.x * gridDim.x) {
+        const float* taps = weights + (long long)channel * width;
+        float* past = window + (long long)channel * history;
+        const float input = values[channel];
+        float total = 0.0f;
+        for (int i = 0; i < history; ++i) total += past[i] * taps[i];
+        total += input * taps[history];
+        values[channel] = total / (1.0f + __expf(-total));
+        for (int i = 0; i + 1 < history; ++i) past[i] = past[i + 1];
+        if (history > 0) past[history - 1] = input;
+    }
+}
+
+extern "C" __global__
+void bailing_gated_head_norm(
+    float* rows, const float* gain, const float* gate,
+    const int heads, const int head_dim, const float epsilon
+) {
+    // RMS norm per head with a shared gain, times the sigmoid of the gate.
+    // FusedRMSNormGated(activation='sigmoid'), not a norm followed by a gate.
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    float* row = rows + (long long)head * head_dim;
+    const float* head_gate = gate + (long long)head * head_dim;
+    __shared__ float reduce[128];
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        partial += row[i] * row[i];
+    reduce[threadIdx.x] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse = rsqrtf(reduce[0] / (float)head_dim + epsilon);
+    __syncthreads();
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        row[i] = row[i] * inverse * gain[i] / (1.0f + __expf(-head_gate[i]));
+}
+
+extern "C" __global__
+void bailing_swiglu(
+    const float* gate, const float* up, const int size, const float limit,
+    float* output
+) {
+    const bool clamped = limit > 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < size;
+         i += blockDim.x * gridDim.x) {
+        float g = gate[i], u = up[i];
+        if (clamped) {
+            g = fminf(fmaxf(g, -limit), limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        output[i] = (g / (1.0f + __expf(-g))) * u;
+    }
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+extern "C" __global__
+void bailing_mla_attention(
+    const float* query_nope, const float* query_rope,
+    const float* kv_b, const float* latents, const float* rope_keys,
+    float* scores, float* output,
+    const int positions, const int heads, const int qk_nope,
+    const int qk_rope, const int v_head_dim, const int kv_lora
+) {
+    // Absorbed MLA attention for one token: one block per head.
+    //
+    // "Absorbed" means kv_b is folded into the query and the output rather than
+    // used to decompress the cache, so attention runs against the raw 512-wide
+    // latent. That is the whole reason the KV cache is 8.9x smaller here; see
+    // mla_attention_absorbed in colibri_v2_bailing.hpp for the identity.
+    //
+    // `scores` is caller-supplied scratch of at least `heads * positions`,
+    // because positions is unbounded and the softmax needs somewhere to live.
+    // Requires kv_lora <= 512. Launch: grid heads, block 128.
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (head >= heads || kv_lora > 512) return;
+
+    __shared__ float projected[512];
+    __shared__ float accumulated[512];
+    __shared__ float reduce[128];
+    __shared__ float shared_max, shared_sum;
+
+    const float* head_weights = kv_b + (long long)head * (qk_nope + v_head_dim) * kv_lora;
+    const float* qn = query_nope + (long long)head * qk_nope;
+    const float* qr = query_rope + (long long)head * qk_rope;
+    float* head_scores = scores + (long long)head * positions;
+    const float scale = rsqrtf((float)(qk_nope + qk_rope));
+
+    // 1. Pull the query through kv_b's key half once, instead of pushing every
+    //    cached latent through it. O(1) per token rather than O(context).
+    for (int i = lane; i < kv_lora; i += 128) {
+        float total = 0.0f;
+        for (int row = 0; row < qk_nope; ++row)
+            total += qn[row] * head_weights[(long long)row * kv_lora + i];
+        projected[i] = total;
+    }
+    __syncthreads();
+
+    // 2. Scores against the latent, plus the shared rope half.
+    for (int position = lane; position < positions; position += 128) {
+        const float* latent = latents + (long long)position * kv_lora;
+        float total = 0.0f;
+        for (int i = 0; i < kv_lora; ++i) total += projected[i] * latent[i];
+        const float* rope = rope_keys + (long long)position * qk_rope;
+        for (int i = 0; i < qk_rope; ++i) total += qr[i] * rope[i];
+        head_scores[position] = total * scale;
+    }
+    __syncthreads();
+
+    // 3. Softmax, max-shifted. Two block reductions over a strided range.
+    float local_max = -3.0e38f;
+    for (int position = lane; position < positions; position += 128)
+        local_max = fmaxf(local_max, head_scores[position]);
+    reduce[lane] = local_max;
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (lane < stride) reduce[lane] = fmaxf(reduce[lane], reduce[lane + stride]);
+        __syncthreads();
+    }
+    if (lane == 0) shared_max = reduce[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int position = lane; position < positions; position += 128) {
+        const float value = __expf(head_scores[position] - shared_max);
+        head_scores[position] = value;
+        local_sum += value;
+    }
+    reduce[lane] = local_sum;
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (lane < stride) reduce[lane] += reduce[lane + stride];
+        __syncthreads();
+    }
+    if (lane == 0) shared_sum = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    __syncthreads();
+    for (int position = lane; position < positions; position += 128)
+        head_scores[position] *= shared_sum;
+    __syncthreads();
+
+    // 4. Mix in latent space, then decompress once through kv_b's value half.
+    for (int i = lane; i < kv_lora; i += 128) {
+        float total = 0.0f;
+        for (int position = 0; position < positions; ++position)
+            total += head_scores[position] * latents[(long long)position * kv_lora + i];
+        accumulated[i] = total;
+    }
+    __syncthreads();
+
+    for (int row = lane; row < v_head_dim; row += 128) {
+        const float* source = head_weights + (long long)(qk_nope + row) * kv_lora;
+        float total = 0.0f;
+        for (int i = 0; i < kv_lora; ++i) total += source[i] * accumulated[i];
+        output[(long long)head * v_head_dim + row] = total;
+    }
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+extern "C" __global__
+void bailing_kda_recurrent_chunk(
+    const float* queries, const float* keys, const float* values,
+    const float* gate_raw, const float* beta_logits,
+    const float* a_log, const float* dt_bias,
+    float* state, float* output,
+    const int rows, const int heads, const int head_dim, const float epsilon
+) {
+    // Kimi Delta Attention over a chunk, one block per head, state held in
+    // registers across the token loop. Structurally this is
+    // qwen_delta_recurrent_chunk with one change, which is the whole difference
+    // between DeltaNet and KDA:
+    //
+    //     DeltaNet   local_state[key] *= decay_scale    (one scalar per head)
+    //     KDA        local_state[key] *= shared_decay[key]  (one per channel)
+    //
+    // The decay is therefore a vector, computed by thread `lane` for key=lane
+    // and shared, because a thread owns one VALUE column and touches every KEY
+    // row. The gate formula itself is identical to DeltaNet's
+    // expf(coefficient * softplus(x + bias)) with a negative coefficient; only
+    // its argument and bias are per channel here rather than per head.
+    //
+    // Requires head_dim == 128. Launch: grid heads, block 128.
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (head >= heads || head_dim != 128) return;
+    float local_state[128];
+    #pragma unroll
+    for (int key = 0; key < 128; ++key)
+        local_state[key] = state[(head * 128 + key) * 128 + lane];
+    __shared__ float shared_key[128], shared_query[128], shared_decay[128];
+    __shared__ float query_sums[4], key_sums[4];
+    __shared__ float beta, query_inverse_norm, key_inverse_norm;
+    const float coefficient = -expf(a_log[head]);
+    for (int token = 0; token < rows; ++token) {
+        const long long base = ((long long)token * heads + head) * 128;
+        const float query_raw = queries[base + lane];
+        const float key_raw = keys[base + lane];
+        float query_partial = query_raw * query_raw;
+        float key_partial = key_raw * key_raw;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            query_partial += __shfl_down_sync(0xffffffff, query_partial, offset);
+            key_partial += __shfl_down_sync(0xffffffff, key_partial, offset);
+        }
+        if ((lane & 31) == 0) {
+            query_sums[lane >> 5] = query_partial;
+            key_sums[lane >> 5] = key_partial;
+        }
+        __syncthreads();
+        if (lane == 0) {
+            const float query_square =
+                query_sums[0] + query_sums[1] + query_sums[2] + query_sums[3];
+            const float key_square =
+                key_sums[0] + key_sums[1] + key_sums[2] + key_sums[3];
+            // The query carries the 1/sqrt(head_dim) attention scale.
+            query_inverse_norm = rsqrtf(query_square + epsilon) * rsqrtf(128.0f);
+            key_inverse_norm = rsqrtf(key_square + epsilon);
+            beta = 1.0f / (1.0f + expf(-beta_logits[token * heads + head]));
+        }
+        __syncthreads();
+        shared_query[lane] = query_raw * query_inverse_norm;
+        shared_key[lane] = key_raw * key_inverse_norm;
+        {
+            const float raw = gate_raw[base + lane] + dt_bias[head * 128 + lane];
+            // Guarded softplus: above 20 the identity is exact in float and
+            // expf would overflow.
+            const float softplus = raw > 20.0f ? raw : log1pf(expf(raw));
+            shared_decay[lane] = expf(coefficient * softplus);
+        }
+        __syncthreads();
+        const float value = values[base + lane];
+        float memory = 0.0f;
+        #pragma unroll
+        for (int key = 0; key < 128; ++key) {
+            local_state[key] *= shared_decay[key];
+            memory += local_state[key] * shared_key[key];
+        }
+        const float delta = (value - memory) * beta;
+        float core = 0.0f;
+        #pragma unroll
+        for (int key = 0; key < 128; ++key) {
+            local_state[key] += shared_key[key] * delta;
+            core += local_state[key] * shared_query[key];
+        }
+        output[base + lane] = core;
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int key = 0; key < 128; ++key)
+        state[(head * 128 + key) * 128 + lane] = local_state[key];
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 extern "C" __global__
 void q8_matmul_tiled(
     const unsigned char* packed, const float* input, float* output,

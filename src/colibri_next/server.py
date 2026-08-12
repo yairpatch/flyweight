@@ -1966,9 +1966,6 @@ def create_handler(
                 if first_report:
                     first_report = False
                     reused = min(max(0, processed), total)
-                    started = now
-                    last_logged = processed
-                    last_logged_at = now
                     remaining = max(0, total - reused)
                     cached = f", {reused} cached/reused" if reused else ""
                     sys.stderr.write(
@@ -1976,6 +1973,27 @@ def create_handler(
                         f"{cached}, {remaining} to evaluate\n"
                     )
                     sys.stderr.flush()
+                    # The clock is NOT restarted here, and that is deliberate.
+                    #
+                    # It used to be, on the reasoning that the first callback
+                    # reports cache reuse, which costs nothing and should not
+                    # drag the rate down. But a runtime that emits no
+                    # incremental prefill events gets a compatibility fallback
+                    # in v2_server, which synthesizes both callbacks back to
+                    # back once the first token arrives. The clock then started
+                    # and stopped microseconds apart and the rate came out as
+                    # "1227 tokens at 48521041 tok/s" -- a number with no
+                    # relationship to anything.
+                    #
+                    # `started` is set when this reporter is built, just after
+                    # the request is read, so it brackets tokenization, prefill
+                    # and (on the fallback path) the first token. That
+                    # over-counts the setup slightly. Over-counting by a
+                    # constant beats under-counting by three orders of
+                    # magnitude, and unlike the reset it cannot produce a figure
+                    # that is obviously false yet easy to quote.
+                    last_logged = processed
+                    last_logged_at = now
                     if processed < total:
                         return
                 minimum_step = max(1, total // 20)

@@ -11,9 +11,13 @@
 #include "colibri_v2_qwen_kernels.hpp"
 #include "colibri_v2_native_kernels.hpp"
 #include "colibri_v2_deepseek4_kernels.hpp"
+#include "colibri_v2_bailing.hpp"
+#include "colibri_v2_hf_quantize.hpp"
+#include "colibri_v2_hf_cache.hpp"
 #include "colibri_v2_workspace.hpp"
 #include "qwen_cpu_kernel.h"
 #include "qwen_kquant.h"
+#include "qwen_kquant_pack_api.hpp"
 #include "turboquant.h"
 #include "unicode_categories.h"
 #include "colibri_v2_deepseek4.hpp"
@@ -28,6 +32,10 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <sstream>
+#if !defined(_WIN32)
+#include <dirent.h>
+#endif
 #include <initializer_list>
 #include <limits>
 #include <mutex>
@@ -104,6 +112,12 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
     // into `tensors` with Tensor::source pointing at the shard mapping, so a
     // split checkpoint is indistinguishable downstream from a single file.
     std::vector<std::unique_ptr<ColibriV2Model>> shards;
+    // HF checkpoints arrive unquantized and are quantized during open, so their
+    // tensor bytes are owned here rather than mapped from a file. Every
+    // descriptor then points into this buffer through Tensor::source, which is
+    // the same indirection split GGUF shards already use -- so nothing
+    // downstream can tell the difference.
+    std::vector<std::uint8_t> owned_arena;
 #if !defined(_WIN32)
     int fd=-1;
 #else
@@ -657,8 +671,8 @@ std::size_t qwen_cache_layer_count(const ColibriV2QwenRuntime& runtime) {
 
 constexpr std::size_t kNoExpertSlot = std::numeric_limits<std::size_t>::max();
 
-// GGUF quantization block sizes (bytes per block).
-constexpr std::uint32_t kQ8BlockSize = 34;   // Q8_0: 2-byte scale + 32 bytes per 32 elements
+// GGUF quantization block sizes (bytes per block). kQ8/kQ4K/kQ5K/kQ6K and
+// kBlockElements live in src/qwen_kquant.h beside the decoders that use them.
 constexpr std::uint32_t kQ4BlockSize = 18;   // Q4_0: 2-byte scale + 16 nibbles + 2 padding per 32 elements
 constexpr std::uint32_t kTurbo3BlockSize = 14; // TurboQuant 3-bit: f16 scale + 32 packed indices
 constexpr std::uint32_t kTurbo4BlockSize = 18; // TurboQuant 4-bit: f16 scale + 32 packed indices
@@ -676,9 +690,6 @@ constexpr std::uint32_t kQ2KBlockSize = kQ2KBlockBytes;   // Q2_K: 84 bytes per 
 constexpr std::uint32_t kQ3KBlockSize = kQ3KBlockBytes;   // Q3_K: 110 bytes per 256 elements
 constexpr std::uint32_t kIq2xxsBlockSize = kIq2xxsBlockBytes; // IQ2_XXS: 66 bytes per 256 elements
 constexpr std::uint32_t kIq3xxsBlockSize = kIq3xxsBlockBytes; // IQ3_XXS: 98 bytes per 256 elements
-constexpr std::uint32_t kQ5KBlockSize = 176;  // Q5_K: 176 bytes per 256 elements
-constexpr std::uint32_t kQ6KBlockSize = 210;  // Q6_K: 210 bytes per 256 elements
-constexpr std::uint32_t kQ4KBlockSize = 144;  // Q4_K: 144 bytes per 256 elements
 // IQ1_S: d(2) + qs[32] + qh[8*2] = 50 bytes per 256 values, 1.5625 bits each.
 constexpr std::uint32_t kIq1sBlockSize = 50;
 constexpr float kIq1sDelta = 0.125f;
@@ -702,7 +713,6 @@ inline float mxfp4_scale(std::uint8_t exponent) {
 constexpr std::uint32_t kNvfp4BlockSize = 36;      // NVFP4: d[4] E4M3 scales + qs[32] nibbles
 constexpr std::uint32_t kNvfp4BlockElements = 64;  // 4 sub-blocks of 16 elements
 constexpr std::uint32_t kNvfp4SubBlock = 16;       // elements governed by one scale
-constexpr std::uint32_t kBlockElements = 256;  // Super-block element count for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K
 
 // The AVX2/AVX-512 entry points decode anything they do not recognize with
 // their Q8_0 path, so this has to be an allowlist of the formats that actually
@@ -1523,6 +1533,28 @@ void detect_mtp_layer(ColibriV2Model& m) {
     }
 }
 
+// Tokenizer lookup tables, built once per model: rebuilding these ~150k-entry
+// maps per tokenize call dominated short calls. Shared by the GGUF metadata
+// path and the HF tokenizer.json path so the two cannot drift.
+void build_tokenizer_tables(ColibriV2Model& m) {
+    m.merge_ranks.clear();
+    m.vocabulary_ids.clear();
+    m.control_tokens.clear();
+    for(int rank=0;rank<static_cast<int>(m.merges.size());rank++)m.merge_ranks[m.merges[rank]]=rank;
+    for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++)m.vocabulary_ids.emplace(m.vocabulary[id],id);
+    // Longest first, so a control token that prefixes another still matches the
+    // longer one when scanning input left to right.
+    for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++){
+        if(id>=m.token_types.size()||m.token_types[id]!=3)continue;
+        if(m.vocabulary[id].empty())continue;
+        m.control_tokens.emplace_back(m.vocabulary[id],id);
+    }
+    std::sort(m.control_tokens.begin(),m.control_tokens.end(),
+        [](const auto& left,const auto& right){
+            return left.first.size()>right.first.size();
+        });
+}
+
 int parse(ColibriV2Model& m) {
     if (m.size < 24 || std::memcmp(m.data,"GGUF",4)!=0) throw std::runtime_error("not a GGUF file");
     Reader r{m.data+4,m.data+m.size}; m.version=r.get<uint32_t>(); if (m.version<2 || m.version>3) throw std::runtime_error("unsupported GGUF version");
@@ -1729,21 +1761,7 @@ int parse(ColibriV2Model& m) {
     if(!m.config.intermediate_size)m.config.intermediate_size=m.config.expert_intermediate_size?m.config.expert_intermediate_size:m.config.dense_intermediate_size;
     uint64_t data_offset=align_to(static_cast<uint64_t>(r.p-m.data),m.alignment ? m.alignment : 32); if(data_offset>m.size) throw std::runtime_error("GGUF tensor data is outside the file"); for(auto& t:m.tensors) { if(t.offset>m.size-data_offset) throw std::runtime_error("GGUF tensor offset out of bounds"); t.offset += data_offset; }
     for(size_t i=0;i<m.tensors.size();i++) { auto& t=m.tensors[i]; uint64_t next=m.size; for(auto const& other:m.tensors) if(other.offset>t.offset) next=std::min(next,other.offset); t.size=next-t.offset; }
-    // Tokenizer lookup tables, built once per model: rebuilding these
-    // ~150k-entry maps per tokenize call dominated short calls.
-    for(int rank=0;rank<static_cast<int>(m.merges.size());rank++)m.merge_ranks[m.merges[rank]]=rank;
-    for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++)m.vocabulary_ids.emplace(m.vocabulary[id],id);
-    // Longest first, so a control token that prefixes another still matches the
-    // longer one when scanning input left to right.
-    for(uint32_t id=0;id<static_cast<uint32_t>(m.vocabulary.size());id++){
-        if(id>=m.token_types.size()||m.token_types[id]!=3)continue;
-        if(m.vocabulary[id].empty())continue;
-        m.control_tokens.emplace_back(m.vocabulary[id],id);
-    }
-    std::sort(m.control_tokens.begin(),m.control_tokens.end(),
-        [](const auto& left,const auto& right){
-            return left.first.size()>right.first.size();
-        });
+    build_tokenizer_tables(m);
     return 0;
 }
 
@@ -2231,57 +2249,18 @@ float qwen_bf16_value(std::uint16_t bits) {
     float value;std::memcpy(&value,&widened,sizeof(value));return value;
 }
 
-// Narrowing counterpart for Q8_0 block scales. Round-half-to-even keeps the
-// scale error under the codes' own quantization error; a mantissa carry lands
-// in the exponent field on its own because the fields are packed adjacently.
-std::uint16_t qwen_half_bits(float value) {
-    std::uint32_t bits;std::memcpy(&bits,&value,sizeof(bits));
-    const std::uint32_t sign=(bits>>16)&0x8000u;
-    const std::int32_t exponent=
-        static_cast<std::int32_t>((bits>>23)&0xffu)-127+15;
-    const std::uint32_t fraction=bits&0x7fffffu;
-    if(exponent>=31)return static_cast<std::uint16_t>(sign|0x7c00u);
-    // Block scales are absmax/127 of real weights, never subnormal in f16;
-    // flushing is still the right answer for an all-zero block.
-    if(exponent<=0)return static_cast<std::uint16_t>(sign);
-    std::uint32_t packed=(static_cast<std::uint32_t>(exponent)<<10)|(fraction>>13);
-    const std::uint32_t remainder=fraction&0x1fffu;
-    if(remainder>0x1000u||(remainder==0x1000u&&(packed&1u)))++packed;
-    return static_cast<std::uint16_t>(sign|packed);
-}
+// qwen_half_bits now lives in src/qwen_kquant.h beside qwen_half_value, so the
+// K-quant packers can share one definition with the decoders.
 
 // Pack `count` f32 values (a multiple of 32) into Q8_0 blocks: one f16 scale
 // followed by 32 int8 codes. Matches qwen_q8_value and the q8 CUDA kernels.
-void qwen_pack_q8_0(const float* values, std::uint64_t count, std::uint8_t* out) {
-    for(std::uint64_t block=0;block*32<count;++block){
-        const float* source=values+block*32;
-        float absmax=0.0f;
-        for(int i=0;i<32;++i)absmax=std::max(absmax,std::fabs(source[i]));
-        const float scale=absmax/127.0f;
-        // Quantize against the scale that will actually be stored, so decode
-        // reproduces these codes exactly rather than the pre-rounding value.
-        const std::uint16_t scale_bits=qwen_half_bits(scale);
-        const float stored=qwen_half_value(scale_bits);
-        const float inverse=stored>0.0f?1.0f/stored:0.0f;
-        auto* destination=out+block*kQ8BlockSize;
-        std::memcpy(destination,&scale_bits,2);
-        for(int i=0;i<32;++i){
-            const int code=static_cast<int>(std::lround(source[i]*inverse));
-            destination[2+i]=static_cast<std::uint8_t>(
-                static_cast<std::int8_t>(std::min(127,std::max(-127,code))));
-        }
-    }
-}
+using qwen_kpack::pack_q8_0;
 
-float qwen_q5_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/kBlockElements;const int within=static_cast<int>(absolute&(kBlockElements-1));const auto*base=packed+block*kQ5KBlockSize;std::uint16_t d_bits=0,dmin_bits=0;std::memcpy(&d_bits,base,2);std::memcpy(&dmin_bits,base+2,2);const auto*scales=base+4;const int group=within/64,offset=within&63,sub=offset/32,qindex=group*32+(offset&31);const int bit=(base[16+(offset&31)]>>(2*group+sub))&1;const int quant=((offset<32)?(base[48+qindex]&15):(base[48+qindex]>>4))+16*bit;const int index=group*2+sub;int scale=0,minimum=0;if(index<4){scale=scales[index]&63;minimum=scales[index+4]&63;}else{scale=(scales[index+4]&15)|((scales[index-4]>>6)<<4);minimum=(scales[index+4]>>4)|((scales[index]>>6)<<4);}return qwen_half_value(d_bits)*scale*quant-qwen_half_value(dmin_bits)*minimum;}
-float qwen_q6_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/kBlockElements;const int within=static_cast<int>(absolute&(kBlockElements-1));const auto*base=packed+block*kQ6KBlockSize;const auto*ql=base;const auto*qh=base+128;const auto*scales=reinterpret_cast<const std::int8_t*>(base+192);std::uint16_t d_bits=0;std::memcpy(&d_bits,base+208,2);const int half=within/128,offset=within&127,lane=offset/32,l=offset&31,qindex=l+((lane==0||lane==2)?0:32);const auto qbyte=ql[half*64+qindex],high=qh[half*32+l];const int nibble=(lane==0||lane==1)?(qbyte&15):(qbyte>>4);const int quant=(nibble|(((high>>(lane*2))&3)<<4))-32;const int scale_index=half*8+(l/16)+lane*2;return qwen_half_value(d_bits)*scales[scale_index]*quant;}
-float qwen_q8_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/32,within=absolute&31;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,packed+block*kQ8BlockSize,2);std::int8_t value=0;std::memcpy(&value,packed+block*kQ8BlockSize+2+within,1);return qwen_half_value(scale_bits)*value;}
 // Q2_K and Q3_K element decoders are shared with the SIMD kernels and the
 // contract tests; see src/qwen_kquant.h for the block layouts.
 // Q4_K super-block (GGML type 12): 144 bytes per 256 values -> d(2) dmin(2)
 // scales[12] (same 6-bit packing as Q5_K) qs[128] (4-bit). Like Q5_K but with
 // no 5th-bit array; value = d*scale*q - dmin*min.
-float qwen_q4k_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/kBlockElements;const int within=static_cast<int>(absolute&(kBlockElements-1));const auto*base=packed+block*kQ4KBlockSize;std::uint16_t d_bits=0,dmin_bits=0;std::memcpy(&d_bits,base,2);std::memcpy(&dmin_bits,base+2,2);const auto*scales=base+4;const int group=within/64,offset=within&63,sub=offset/32,qindex=group*32+(offset&31);const int quant=(offset<32)?(base[16+qindex]&15):(base[16+qindex]>>4);const int index=group*2+sub;int scale=0,minimum=0;if(index<4){scale=scales[index]&63;minimum=scales[index+4]&63;}else{scale=(scales[index+4]&15)|((scales[index-4]>>6)<<4);minimum=(scales[index+4]>>4)|((scales[index]>>6)<<4);}return qwen_half_value(d_bits)*scale*quant-qwen_half_value(dmin_bits)*minimum;}
 // NVFP4 (GGML type 40): E2M1 4-bit float (1 sign + 2 exp + 1 mantissa, bias=1).
 // Verified against a real NVFP4 checkpoint (Qwen3.6-35B-Fast-NVFP4.gguf):
 // 36 bytes per 64 elements -- d[4] E4M3 scales then qs[32] packed nibbles, with
@@ -2873,7 +2852,16 @@ int qwen_gpu_matvec_by_type(
         case 8: return colibri_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 10: return colibri_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 11: return colibri_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 12: return colibri_gpu_q4k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        // Q4_K has two kernels: a sub-block one that unpacks each scale once
+        // and the generic per-element one. Prefer the fast path and fall back
+        // when it declines (kernel absent, or a row that is not a whole number
+        // of sub-blocks) rather than assuming it is always there.
+        case 12: {
+            const int fast = colibri_gpu_q4k_matvec_subblock(
+                matrix, input, output, input_size, output_size, stream);
+            if (fast == 0) return 0;
+            return colibri_gpu_q4k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        }
         case 13: return colibri_gpu_q5k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 14: return colibri_gpu_q6k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 16: return colibri_gpu_iq2xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
@@ -3769,9 +3757,9 @@ void colibri_v2_kv_cache_destroy(ColibriV2KvCache*cache){try{delete cache;}catch
 int colibri_v2_kv_cache_reset(ColibriV2KvCache*cache){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}cache->position=0;return 0;});}
 int colibri_v2_kv_cache_position(const ColibriV2KvCache*cache,int32_t*out){return guarded([&]{if(!cache||!out){fail("invalid KV cache position");return -1;}*out=cache->position;return 0;});}
 int colibri_v2_gpu_decoder_attention_cached(ColibriV2KvCache*cache,uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t qkv_packed,uint64_t qkv_scales,uint64_t qkv,uint64_t attention_output,uint64_t out_packed,uint64_t out_scales,uint64_t output,int32_t hidden_size,int32_t heads,float epsilon,int32_t one_centered){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}int status=colibri_v2_gpu_decoder_attention_step(input,norm_weights,normalized,qkv_packed,qkv_scales,qkv,cache->keys,cache->values,attention_output,out_packed,out_scales,output,hidden_size,heads,cache->kv_heads,cache->head_dim,cache->position,cache->capacity,epsilon,one_centered);if(status)return status;++cache->position;return 0;});}
-// Map one GGUF file and parse its header. Shards of a split checkpoint come
-// through here too, which is why it does not attach shards itself.
-void map_and_parse(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&model; m->path=path;
+// Map one file into `model`, without interpreting a byte of it. GGUF shards and
+// safetensors shards both come through here; only the caller knows which.
+void map_file(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&model; m->path=path;
 #if !defined(_WIN32)
     m->fd=open(path,O_RDONLY); if(m->fd<0) throw std::runtime_error("cannot open GGUF"); struct stat st{}; if(fstat(m->fd,&st)!=0) throw std::runtime_error("cannot stat GGUF"); m->size=static_cast<size_t>(st.st_size);
     const char* lock_env=std::getenv("COLIBRI_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
@@ -3845,7 +3833,14 @@ void map_and_parse(const char* path, ColibriV2Model& model) { ColibriV2Model* m=
             std::fprintf(stderr,"colibri_v2: pinned all %zu bytes\n",locked);
     }
 #endif
-    parse(*m); }
+}
+
+// Map one GGUF file and parse its header. Shards of a split checkpoint come
+// through here too, which is why it does not attach shards itself.
+void map_and_parse(const char* path, ColibriV2Model& model) {
+    map_file(path,model);
+    parse(model);
+}
 
 // gguf-split names shards "<prefix>-00001-of-00004.gguf" with a 1-based file
 // index, while GGUF's own split.no is 0-based.
@@ -3897,11 +3892,1273 @@ void attach_split_shards(ColibriV2Model& m) {
     detect_mtp_layer(m);
 }
 
+// Resolve every tensor the layer plan calls for, and fail on the first one
+// missing. Runs at open, which is the earliest point a misnamed tensor can be
+// caught: the loader's own gate only proves descriptors point at the right
+// bytes, never that they were given the right meaning.
+void bailing_validate_plan(const ColibriV2Model& m) {
+    namespace bailing = colibri::v2::bailing;
+    const auto& config = m.config;
+    if(!config.layer_count)throw std::runtime_error("bailingmoe3 config has no layers");
+    std::unordered_set<std::string> present;
+    present.reserve(m.tensors.size() * 2);
+    for(const auto& tensor:m.tensors)present.insert(tensor.name);
+
+    for(const char* name:{"token_embd.weight","output_norm.weight","output.weight"})
+        if(!present.count(name))
+            throw std::runtime_error(std::string("bailingmoe3 checkpoint is missing ")+name);
+
+    std::uint32_t full_layers=0,linear_layers=0;
+    for(std::uint32_t layer=0;layer<config.layer_count;++layer){
+        const bool full=bailing::layer_is_full_attention(
+            layer,config.layer_count,config.full_attention_interval);
+        // The cadence is derived twice from the same config -- once by the
+        // parser into sliding_window_pattern, once here -- so a disagreement
+        // means one of the two transcriptions is wrong. A nonzero pattern entry
+        // marks the linear (KDA) layers.
+        if(layer<config.sliding_window_pattern.size()){
+            const bool pattern_says_linear=config.sliding_window_pattern[layer]!=0;
+            if(full==pattern_says_linear)
+                throw std::runtime_error(
+                    "bailingmoe3 layer cadence disagrees with the parsed pattern at layer "+
+                    std::to_string(layer));
+        }
+        full?++full_layers:++linear_layers;
+        const bool routed=config.expert_count&&layer>=config.leading_dense_block_count;
+        const auto plan=bailing::layer_requirements(
+            full,routed,config.expert_shared_count!=0);
+        const std::string prefix="blk."+std::to_string(layer)+".";
+        for(const char* suffix:plan.names)
+            if(!present.count(prefix+suffix))
+                throw std::runtime_error(
+                    "bailingmoe3 layer "+std::to_string(layer)+" is missing "+
+                    prefix+suffix);
+    }
+    std::fprintf(stderr,
+        "[colibri-v2] bailingmoe3: %u layers (%u MLA, %u KDA), %u experts "
+        "top-%u in %u groups keeping %u, %u shared\n",
+        config.layer_count,full_layers,linear_layers,config.expert_count,
+        config.expert_used_count,config.expert_group_count,
+        config.expert_group_used,config.expert_shared_count);
+}
+
+// An HF checkpoint is a directory: config.json plus one or more safetensors
+// shards. A GGUF is a single file. That is the whole detection rule.
+bool is_hf_directory(const char* path) {
+    struct stat st{};
+    if(stat(path,&st)!=0||!S_ISDIR(st.st_mode))return false;
+    const std::string config=std::string(path)+"/config.json";
+    return stat(config.c_str(),&st)==0;
+}
+
+std::string read_text_file(const std::string& path) {
+    std::ifstream file(path,std::ios::binary);
+    if(!file)return {};
+    std::ostringstream buffer;
+    buffer<<file.rdbuf();
+    return buffer.str();
+}
+
+// Modification time in nanoseconds, for the cache fingerprint. The three
+// spellings of `st_mtim` are a portability wart, not a design decision.
+std::int64_t modified_ns(const struct stat& st) {
+#if defined(__APPLE__)
+    return static_cast<std::int64_t>(st.st_mtimespec.tv_sec)*1000000000+st.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return static_cast<std::int64_t>(st.st_mtime)*1000000000;
+#else
+    return static_cast<std::int64_t>(st.st_mtim.tv_sec)*1000000000+st.st_mtim.tv_nsec;
+#endif
+}
+
+// Where the quantized arena may live, most preferred first.
+//
+// Beside the checkpoint is the useful place: it survives cache eviction, it is
+// obvious to anyone wondering what the extra file is, and deleting the model
+// deletes it. But checkpoint directories are often read-only (a shared mount, a
+// hub cache), so the user cache directory stands behind it. The file name
+// carries the fingerprint, so a directory holding caches for several models --
+// or several quantizations of one -- never collides.
+std::vector<std::string> hf_cache_candidates(const std::string& directory,
+                                             std::uint64_t print) {
+    char name[64];
+    std::snprintf(name,sizeof(name),"colibri-%016llx.cache",
+                  static_cast<unsigned long long>(print));
+
+    const char* configured=std::getenv("COLIBRI_HF_CACHE");
+    if(configured){
+        const std::string value=configured;
+        // An explicit off switch matters for benchmarking the packers and for
+        // machines where the extra 4 GB on disk is not wanted.
+        if(value=="0"||value=="off"||value.empty())return {};
+        return {value+"/"+name};
+    }
+
+    std::vector<std::string> out{directory+"/"+name};
+    std::string base;
+    if(const char* xdg=std::getenv("XDG_CACHE_HOME");xdg&&xdg[0])base=xdg;
+    else if(const char* home=std::getenv("HOME");home&&home[0])base=std::string(home)+"/.cache";
+#if defined(_WIN32)
+    else if(const char* appdata=std::getenv("LOCALAPPDATA");appdata&&appdata[0])base=appdata;
+#endif
+    if(!base.empty()){
+        const std::string folder=base+"/colibri-next";
+#if defined(_WIN32)
+        CreateDirectoryA(folder.c_str(),nullptr);
+#else
+        ::mkdir(folder.c_str(),0755);
+#endif
+        out.push_back(folder+"/"+name);
+    }
+    return out;
+}
+
+// Load an HF checkpoint: map every shard, translate the descriptors, quantize
+// into an owned arena, then drop the mappings.
+//
+// Dropping them is the point of the ordering. The source is bf16 -- 15.8 GB for
+// Ling-3.0-tiny -- and the arena is a quarter of that; keeping both alive would
+// waste the difference for the whole process lifetime when nothing reads the
+// originals again.
+//
+// Quantizing is hundreds of core-seconds, and its inputs are files that do not
+// change, so the arena is written to a sidecar on the way out and mapped on the
+// way back in. A hit skips the shard mappings entirely -- the 15.8 GB of bf16
+// is never opened, let alone read.
+void load_hf(const char* path, ColibriV2Model& m) {
+    namespace hf = colibri::v2::hf;
+    m.path=path;
+    m.format_name="safetensors";
+
+    // Phase timings under COLIBRI_HF_PROFILE=1. "Open is slow" has at least
+    // four candidate causes here -- JSON parsing, packing, disk, page faults --
+    // and they take different fixes, so guessing between them is not useful.
+    const bool profile=[]{
+        const char* value=std::getenv("COLIBRI_HF_PROFILE");
+        return value&&value[0]=='1';
+    }();
+    auto mark=std::chrono::steady_clock::now();
+    const auto phase=[&profile,&mark](const char* name){
+        if(!profile)return;
+        const auto now=std::chrono::steady_clock::now();
+        std::fprintf(stderr,"[colibri-v2]   %-20s %7.2fs\n",name,
+            std::chrono::duration<double>(now-mark).count());
+        mark=now;
+    };
+
+    const std::string directory=path;
+    const auto config_text=read_text_file(directory+"/config.json");
+    if(config_text.empty())throw std::runtime_error("cannot read config.json");
+    m.config=hf::config_from_json(colibri::v2::json::parse(config_text));
+    m.architecture=m.config.architecture;
+    // The directory name is the closest thing an HF checkpoint has to a model
+    // name; config.json carries no equivalent of general.name.
+    const auto slash=directory.find_last_of('/');
+    m.name=slash==std::string::npos?directory:directory.substr(slash+1);
+    m.chat_template=read_text_file(directory+"/chat_template.jinja");
+    phase("config.json");
+
+    // tokenizer.json is ~12 MB of JSON on this checkpoint, most of it the
+    // 157k-entry vocabulary, and it is parsed once at open.
+    const auto tokenizer_text=read_text_file(directory+"/tokenizer.json");
+    if(tokenizer_text.empty())
+        throw std::runtime_error("cannot read tokenizer.json");
+    phase("tokenizer.json read");
+    auto tokenizer=hf::tokenizer_from_json(
+        colibri::v2::json::parse(tokenizer_text),m.config.vocabulary_size);
+    phase("tokenizer.json parse");
+    if(tokenizer.pre.empty())
+        throw std::runtime_error(
+            "tokenizer.json uses a pre-tokenizer pattern this runtime has not "
+            "transcribed; refusing to tokenize with the wrong splitter");
+    m.vocabulary=std::move(tokenizer.vocabulary);
+    m.merges=std::move(tokenizer.merges);
+    m.token_types=std::move(tokenizer.token_types);
+    m.tokenizer_pre=std::move(tokenizer.pre);
+    build_tokenizer_tables(m);
+    phase("tokenizer tables");
+
+    std::vector<std::string> files;
+    if(DIR* handle=opendir(path)){
+        while(dirent* entry=readdir(handle)){
+            const std::string name=entry->d_name;
+            static const std::string suffix=".safetensors";
+            if(name.size()>suffix.size()&&
+               name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0)
+                files.push_back(directory+"/"+name);
+        }
+        closedir(handle);
+    }
+    if(files.empty())throw std::runtime_error("no .safetensors files in "+directory);
+    // Shard order must not affect the result -- experts are placed by parsed
+    // index, not encounter order -- but sort anyway so logs are reproducible,
+    // and so the cache fingerprint does not depend on readdir order.
+    std::sort(files.begin(),files.end());
+
+    hf::Policy policy;
+    const char* requested=std::getenv("COLIBRI_HF_QUANT");
+    if(requested){
+        const std::string type=requested;
+        if(type=="Q4_K")policy.weights=hf::Target::Q4_K;
+        else if(type=="Q5_K")policy.weights=hf::Target::Q5_K;
+        else if(type=="Q6_K")policy.weights=hf::Target::Q6_K;
+        else if(type=="Q8_0")policy.weights=hf::Target::Q8_0;
+        else if(type=="F32"){
+            // F32 means an unquantized model, not "f32 bulk weights beside a
+            // Q6_K embedding". The embedding otherwise keeps its own higher
+            // target and quietly makes the checkpoint mixed-precision.
+            policy.weights=hf::Target::F32;
+            policy.embedding=hf::Target::F32;
+        }
+        else throw std::runtime_error("COLIBRI_HF_QUANT must be one of "
+            "Q4_K, Q5_K, Q6_K, Q8_0, F32");
+    }
+
+    // Fingerprint from metadata alone: every shard is stat'd, none is read.
+    // Hashing 15.8 GB of content to decide whether to avoid re-quantizing it
+    // would cost more than the packing it saves.
+    std::vector<hf::cache::SourceFile> sources;
+    sources.reserve(files.size());
+    for(const auto& file:files){
+        struct stat st{};
+        if(stat(file.c_str(),&st)!=0)throw std::runtime_error("cannot stat "+file);
+        const auto cut=file.find_last_of('/');
+        sources.push_back({cut==std::string::npos?file:file.substr(cut+1),
+                           static_cast<std::uint64_t>(st.st_size),modified_ns(st)});
+    }
+    const auto print=hf::cache::fingerprint(config_text,sources,policy);
+    const auto candidates=hf_cache_candidates(directory,print);
+
+    // Publish descriptors against whichever arena we end up with. `base` is
+    // borrowed -- it is either a mapping this model keeps alive in `shards` or
+    // the owned buffer -- which is the same indirection split GGUF already uses.
+    const auto install=[&m](const std::vector<hf::QuantizedTensor>& source,
+                            const std::uint8_t* base,std::uint64_t arena_offset){
+        m.tensors.clear();
+        m.tensors.reserve(source.size());
+        for(const auto& entry:source){
+            Tensor tensor;
+            tensor.name=entry.name;
+            tensor.shape=entry.shape;
+            tensor.type=entry.type;
+            tensor.offset=arena_offset+entry.offset;
+            tensor.size=entry.size;
+            tensor.source=base;
+            m.tensors.push_back(std::move(tensor));
+        }
+    };
+
+    const auto started=std::chrono::steady_clock::now();
+
+    // Cache hit: the shards are never opened. Anything a candidate gets wrong
+    // -- absent, unreadable, stale, truncated -- is a miss, so the loop just
+    // moves on rather than distinguishing failures it would treat alike.
+    for(const auto& candidate:candidates){
+        auto mapping=std::make_unique<ColibriV2Model>();
+        try{
+            map_file(candidate.c_str(),*mapping);
+        }catch(const std::exception&){
+            continue;
+        }
+        hf::cache::Contents contents;
+        if(!hf::cache::decode(mapping->data,mapping->size,print,contents))continue;
+        install(contents.tensors,mapping->data,contents.arena_offset);
+        m.shards.push_back(std::move(mapping));
+        phase("cache map");
+        if(m.architecture=="bailingmoe3")bailing_validate_plan(m);
+        std::fprintf(stderr,
+            "[colibri-v2] safetensors: %llu tensors, %llu MiB mapped from %s "
+            "in %.2fs\n",
+            static_cast<unsigned long long>(m.tensors.size()),
+            static_cast<unsigned long long>(contents.arena_bytes/(1024ull*1024)),
+            candidate.c_str(),
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-started).count());
+        return;
+    }
+
+    std::vector<hf::Shard> parsed;
+    parsed.reserve(files.size());
+    for(const auto& file:files){
+        auto shard=std::make_unique<ColibriV2Model>();
+        map_file(file.c_str(),*shard);
+        parsed.push_back({colibri::v2::safetensors::parse_header(shard->data,shard->size),
+                          shard->data});
+        m.shards.push_back(std::move(shard));
+    }
+    phase("shard mmap");
+
+    const auto tensors=hf::build_tensors(parsed,m.config);
+    phase("build_tensors");
+    auto quantized=hf::quantize(tensors,policy);
+    phase("quantize");
+    const double seconds=std::chrono::duration<double>(
+        std::chrono::steady_clock::now()-started).count();
+
+    // Write before the arena moves into the model, while the source bytes are
+    // still mapped -- a failure here costs nothing but the next open's time,
+    // so it is reported and stepped over rather than raised.
+    std::string cached;
+    for(const auto& candidate:candidates)
+        if(hf::cache::write(candidate,quantized,print)){cached=candidate;break;}
+    phase("cache write");
+    if(!candidates.empty()&&cached.empty())
+        std::fprintf(stderr,
+            "[colibri-v2] safetensors: could not write the quantized cache to "
+            "%s; the next open will quantize again\n",candidates.back().c_str());
+
+    m.owned_arena=std::move(quantized.arena);
+    install(quantized.tensors,m.owned_arena.data(),0);
+    // Every byte now lives in the arena, so the source mappings are dead
+    // weight. Releasing them here also releases their file descriptors.
+    m.shards.clear();
+
+    if(m.architecture=="bailingmoe3")bailing_validate_plan(m);
+
+    std::fprintf(stderr,
+        "[colibri-v2] safetensors: %llu tensors, %llu MiB bf16 -> %llu MiB "
+        "quantized in %.1fs%s%s\n",
+        static_cast<unsigned long long>(m.tensors.size()),
+        static_cast<unsigned long long>(quantized.source_bytes/(1024ull*1024)),
+        static_cast<unsigned long long>(m.owned_arena.size()/(1024ull*1024)),
+        seconds,
+        cached.empty()?"":"; cached to ",cached.c_str());
+}
+
+
+// ---------------------------------------------------------------------------
+// BailingMoE3 GPU decode
+// ---------------------------------------------------------------------------
+//
+// Decode only, for now: one token at a time, which is the latency path and the
+// one where the CPU is slowest. Prefill stays on the host because MoE routing
+// would need either a device-side top-k or a sync per token, and neither is
+// worth building before the decode path proves the wiring.
+//
+// Everything the layer needs already existed: `qwen_gpu_matvec_by_type`
+// dispatches the quantized matvecs, `colibri_gpu_rms_norm` the norms, and the
+// two new kernels cover KDA and MLA. What is added here is residency and
+// sequencing, not numerics.
+
+struct BailingGpuMatrix {
+    std::uint64_t data = 0;
+    std::uint32_t type = 0;
+};
+
+struct BailingGpuLayer {
+    BailingGpuMatrix q_a, q_b, kv_a_mqa, attn_gate, attn_output;
+    std::uint64_t q_a_norm = 0, kv_a_norm = 0, kv_b = 0;
+    BailingGpuMatrix ssm_q, ssm_k, ssm_v, ssm_f, ssm_b, ssm_g, ssm_out;
+    std::uint64_t ssm_q_conv = 0, ssm_k_conv = 0, ssm_v_conv = 0;
+    std::uint64_t ssm_a = 0, ssm_dt = 0, ssm_norm = 0;
+    BailingGpuMatrix router, gate_exps, up_exps, down_exps;
+    BailingGpuMatrix shared_gate, shared_up, shared_down;
+    std::uint64_t router_bias = 0;
+    std::uint64_t attn_norm = 0, ffn_norm = 0;
+    // Per-layer state that must persist across tokens.
+    std::uint64_t latents = 0, rope_keys = 0;   // MLA cache
+    std::uint64_t state = 0;                    // KDA recurrent state
+    std::uint64_t conv_windows = 0;             // three windows, packed
+};
+
+struct BailingGpu {
+    bool ready = false;
+    std::uint64_t stream = 0;
+    std::vector<BailingGpuLayer> layers;
+    BailingGpuMatrix embedding, head;
+    std::uint64_t output_norm = 0;
+    // Scratch, sized once for the widest use.
+    std::uint64_t hidden_a = 0, hidden_b = 0, normalized = 0, branch = 0;
+    std::uint64_t wide_a = 0, wide_b = 0, wide_c = 0, wide_d = 0;
+    std::uint64_t scores = 0, logits = 0, small = 0;
+    // Grouped MoE: device-side arrays of the chosen experts' weight pointers.
+    std::uint64_t expert_gate_ptrs = 0, expert_up_ptrs = 0, expert_down_ptrs = 0;
+    std::uint64_t expert_weights = 0, expert_activated = 0;
+    std::vector<std::uint64_t> owned;
+};
+
+// BailingMoE3 host execution.
+//
+// Resolves every layer's weights once, then runs tokens through
+// bailing::decoder_layer. Deliberately plain: this is the correctness path and
+// the oracle the eventual GPU kernels are measured against, so it favours being
+// obviously right over being fast.
+struct ColibriV2BailingRuntime {
+    const ColibriV2Model* model = nullptr;
+    colibri::v2::bailing::Geometry geometry;
+    std::vector<colibri::v2::bailing::LayerWeights> layers;
+    std::vector<colibri::v2::bailing::LayerCache> caches;
+    colibri::v2::bailing::Matrix embedding_matrix;
+    const float* output_norm = nullptr;
+    colibri::v2::bailing::Matrix head;
+    std::uint32_t capacity = 0;
+    std::uint32_t position = 0;
+    // kv_b decoded to f32 per MLA layer; see MlaWeights::kv_b for why.
+    std::vector<std::vector<float>> decoded_kv_b;
+    std::unique_ptr<BailingGpu> gpu;
+    // Which copy of the per-layer cache is current. The host and device each
+    // keep their own, and the two paths play to different strengths -- the host
+    // has a batched prefill, the device has the faster decode -- so eval uses
+    // whichever suits the call and moves the cache across when it has to. False
+    // means the host copy is authoritative, which is the state after a reset.
+    bool cache_on_device = false;
+};
+
+// A weight in whatever storage the checkpoint used.
+colibri::v2::bailing::Matrix bailing_matrix(const ColibriV2Model& m,
+                                            const std::string& name,
+                                            bool required = true) {
+    for (const auto& tensor : m.tensors) {
+        if (tensor.name != name) continue;
+        return {tensor_data(m, tensor), tensor.type};
+    }
+    if (required) throw std::runtime_error("bailingmoe3 is missing " + name);
+    return {};
+}
+
+// Small tensors the policy always keeps f32: norms, biases, A_log, dt_bias and
+// the convolution taps, all of which are read as vectors rather than matvecs.
+const float* bailing_f32(const ColibriV2Model& m, const std::string& name,
+                         bool required = true) {
+    for (const auto& tensor : m.tensors) {
+        if (tensor.name != name) continue;
+        if (tensor.type != 0)
+            throw std::runtime_error(
+                "bailingmoe3 expects " + name + " to be f32 but it is type " +
+                std::to_string(tensor.type));
+        return reinterpret_cast<const float*>(tensor_data(m, tensor));
+    }
+    if (required) throw std::runtime_error("bailingmoe3 is missing " + name);
+    return nullptr;
+}
+
+// Upload one tensor and remember it for release.
+std::uint64_t bailing_gpu_upload(BailingGpu& gpu, const ColibriV2Model& m,
+                                 const std::string& name, bool required = true) {
+    for (const auto& tensor : m.tensors) {
+        if (tensor.name != name) continue;
+        std::uint64_t pointer = 0;
+        if (colibri_gpu_alloc(tensor.size, &pointer) != 0)
+            throw std::runtime_error("out of device memory uploading " + name);
+        if (colibri_gpu_upload_sync(pointer, tensor_data(m, tensor), tensor.size) != 0)
+            throw std::runtime_error("failed to upload " + name);
+        gpu.owned.push_back(pointer);
+        return pointer;
+    }
+    if (required) throw std::runtime_error("bailingmoe3 is missing " + name);
+    return 0;
+}
+
+BailingGpuMatrix bailing_gpu_matrix(BailingGpu& gpu, const ColibriV2Model& m,
+                                    const std::string& name, bool required = true) {
+    for (const auto& tensor : m.tensors)
+        if (tensor.name == name)
+            return {bailing_gpu_upload(gpu, m, name, required), tensor.type};
+    if (required) throw std::runtime_error("bailingmoe3 is missing " + name);
+    return {};
+}
+
+std::uint64_t bailing_gpu_scratch(BailingGpu& gpu, std::size_t bytes) {
+    std::uint64_t pointer = 0;
+    if (colibri_gpu_alloc(bytes, &pointer) != 0)
+        throw std::runtime_error("out of device memory for bailing scratch");
+    colibri_gpu_memset(pointer, 0, bytes, 0);
+    gpu.owned.push_back(pointer);
+    return pointer;
+}
+
+// Bring the whole model onto the device. Q4_K is 4.4 GB, which fits the 12 GB
+// card with room for the caches and scratch.
+void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
+    namespace bailing = colibri::v2::bailing;
+    auto& gpu = *runtime.gpu;
+    const auto& m = *runtime.model;
+    const auto& c = m.config;
+    const auto& g = runtime.geometry;
+
+    if (colibri_gpu_init(0) != 0) throw std::runtime_error("failed to initialize CUDA");
+    std::vector<std::string> option_storage;
+#if !defined(_WIN32)
+    for (const char* path : {"/opt/cuda/include", "/usr/local/cuda/include", "/usr/include"})
+        if (access((std::string(path) + "/cuda_fp16.h").c_str(), R_OK) == 0) {
+            option_storage.push_back(std::string("-I") + path);
+            if (access((std::string(path) + "/cccl/cub/config.cuh").c_str(), R_OK) == 0)
+                option_storage.push_back(std::string("-I") + path + "/cccl");
+        }
+#endif
+    std::vector<const char*> options;
+    for (const auto& option : option_storage) options.push_back(option.c_str());
+    std::array<char, 16384> log{};
+    const std::string source = std::string(colibri::v2::qwen_cuda_source) +
+                               colibri::v2::qwen_native_cuda_source;
+    if (colibri_gpu_compile(source.c_str(), options.data(),
+                            static_cast<std::int32_t>(options.size()), 0,
+                            log.data(), log.size()) != 0)
+        throw std::runtime_error(std::string("failed to compile CUDA kernels: ") + log.data());
+    if (colibri_gpu_stream_create(&gpu.stream) != 0)
+        throw std::runtime_error("failed to create CUDA stream");
+
+    gpu.embedding = bailing_gpu_matrix(gpu, m, "token_embd.weight");
+    gpu.head = bailing_gpu_matrix(gpu, m, "output.weight");
+    gpu.output_norm = bailing_gpu_upload(gpu, m, "output_norm.weight");
+
+    const std::size_t channels = g.heads * g.head_dim;
+    const std::size_t qk = g.qk_nope + g.qk_rope;
+    gpu.layers.resize(c.layer_count);
+    for (std::uint32_t index = 0; index < c.layer_count; ++index) {
+        auto& L = gpu.layers[index];
+        const std::string prefix = "blk." + std::to_string(index) + ".";
+        const auto& weights = runtime.layers[index];
+        L.attn_norm = bailing_gpu_upload(gpu, m, prefix + "attn_norm.weight");
+        L.ffn_norm = bailing_gpu_upload(gpu, m, prefix + "ffn_norm.weight");
+        if (weights.full_attention) {
+            L.q_a = bailing_gpu_matrix(gpu, m, prefix + "attn_q_a.weight");
+            L.q_a_norm = bailing_gpu_upload(gpu, m, prefix + "attn_q_a_norm.weight");
+            L.q_b = bailing_gpu_matrix(gpu, m, prefix + "attn_q_b.weight");
+            L.kv_a_mqa = bailing_gpu_matrix(gpu, m, prefix + "attn_kv_a_mqa.weight");
+            L.kv_a_norm = bailing_gpu_upload(gpu, m, prefix + "attn_kv_a_norm.weight");
+            L.attn_gate = bailing_gpu_matrix(gpu, m, prefix + "attn_gate.weight");
+            L.attn_output = bailing_gpu_matrix(gpu, m, prefix + "attn_output.weight");
+            // kv_b goes up already decoded: the absorbed attention walks along
+            // its rows, and the host runtime decoded it for the same reason.
+            const auto& decoded = runtime.decoded_kv_b[index];
+            if (colibri_gpu_alloc(decoded.size() * 4, &L.kv_b) != 0)
+                throw std::runtime_error("out of device memory for kv_b");
+            colibri_gpu_upload_sync(L.kv_b, decoded.data(), decoded.size() * 4);
+            gpu.owned.push_back(L.kv_b);
+            L.latents = bailing_gpu_scratch(gpu, (std::size_t)runtime.capacity * g.kv_lora * 4);
+            L.rope_keys = bailing_gpu_scratch(gpu, (std::size_t)runtime.capacity * g.qk_rope * 4);
+        } else {
+            L.ssm_q = bailing_gpu_matrix(gpu, m, prefix + "ssm_q.weight");
+            L.ssm_k = bailing_gpu_matrix(gpu, m, prefix + "ssm_k.weight");
+            L.ssm_v = bailing_gpu_matrix(gpu, m, prefix + "ssm_v.weight");
+            L.ssm_f = bailing_gpu_matrix(gpu, m, prefix + "ssm_f.weight");
+            L.ssm_b = bailing_gpu_matrix(gpu, m, prefix + "ssm_b.weight");
+            L.ssm_g = bailing_gpu_matrix(gpu, m, prefix + "ssm_g.weight");
+            L.ssm_out = bailing_gpu_matrix(gpu, m, prefix + "ssm_out.weight");
+            L.ssm_q_conv = bailing_gpu_upload(gpu, m, prefix + "ssm_q_conv1d.weight");
+            L.ssm_k_conv = bailing_gpu_upload(gpu, m, prefix + "ssm_k_conv1d.weight");
+            L.ssm_v_conv = bailing_gpu_upload(gpu, m, prefix + "ssm_v_conv1d.weight");
+            L.ssm_a = bailing_gpu_upload(gpu, m, prefix + "ssm_a");
+            L.ssm_dt = bailing_gpu_upload(gpu, m, prefix + "ssm_dt.bias");
+            L.ssm_norm = bailing_gpu_upload(gpu, m, prefix + "ssm_norm.weight");
+            L.state = bailing_gpu_scratch(gpu, channels * g.head_dim * 4);
+            L.conv_windows = bailing_gpu_scratch(gpu, 3 * channels * (g.conv_width - 1) * 4);
+        }
+        if (weights.routed) {
+            L.router = bailing_gpu_matrix(gpu, m, prefix + "ffn_gate_inp.weight");
+            L.router_bias = bailing_gpu_upload(gpu, m, prefix + "exp_probs_b.bias", false);
+            L.gate_exps = bailing_gpu_matrix(gpu, m, prefix + "ffn_gate_exps.weight");
+            L.up_exps = bailing_gpu_matrix(gpu, m, prefix + "ffn_up_exps.weight");
+            L.down_exps = bailing_gpu_matrix(gpu, m, prefix + "ffn_down_exps.weight");
+            L.shared_gate = bailing_gpu_matrix(gpu, m, prefix + "ffn_gate_shexp.weight", false);
+            L.shared_up = bailing_gpu_matrix(gpu, m, prefix + "ffn_up_shexp.weight", false);
+            L.shared_down = bailing_gpu_matrix(gpu, m, prefix + "ffn_down_shexp.weight", false);
+        } else {
+            L.gate_exps = bailing_gpu_matrix(gpu, m, prefix + "ffn_gate.weight");
+            L.up_exps = bailing_gpu_matrix(gpu, m, prefix + "ffn_up.weight");
+            L.down_exps = bailing_gpu_matrix(gpu, m, prefix + "ffn_down.weight");
+        }
+    }
+
+    const std::size_t widest = std::max({channels, g.heads * qk, (std::size_t)g.dense_size,
+                                         g.kv_lora + g.qk_rope, (std::size_t)g.experts});
+    gpu.hidden_a = bailing_gpu_scratch(gpu, g.hidden * 4);
+    gpu.hidden_b = bailing_gpu_scratch(gpu, g.hidden * 4);
+    gpu.normalized = bailing_gpu_scratch(gpu, g.hidden * 4);
+    gpu.branch = bailing_gpu_scratch(gpu, g.hidden * 4);
+    gpu.wide_a = bailing_gpu_scratch(gpu, widest * 4);
+    gpu.wide_b = bailing_gpu_scratch(gpu, widest * 4);
+    gpu.wide_c = bailing_gpu_scratch(gpu, widest * 4);
+    gpu.wide_d = bailing_gpu_scratch(gpu, widest * 4);
+    gpu.scores = bailing_gpu_scratch(gpu, (std::size_t)g.heads * runtime.capacity * 4);
+    gpu.logits = bailing_gpu_scratch(gpu, (std::size_t)c.vocabulary_size * 4);
+    gpu.small = bailing_gpu_scratch(gpu, widest * 4);
+    // One allocation holding gate, up and down pointer arrays followed by the
+    // weights, so the per-layer update is a single transfer.
+    gpu.expert_gate_ptrs = bailing_gpu_scratch(gpu, g.experts_used * 28);
+    gpu.expert_up_ptrs = gpu.expert_gate_ptrs + g.experts_used * 8;
+    gpu.expert_down_ptrs = gpu.expert_gate_ptrs + g.experts_used * 16;
+    gpu.expert_weights = gpu.expert_gate_ptrs + g.experts_used * 24;
+    gpu.expert_activated = bailing_gpu_scratch(gpu, g.experts_used * g.expert_size * 4);
+    gpu.ready = true;
+    std::fprintf(stderr, "[colibri-v2] bailingmoe3: %zu tensors resident on device\n",
+                 gpu.owned.size());
+}
+
+// One token through the whole model, on the device.
+//
+// Routing is the one thing that comes back to the host: the router's 128 logits
+// are downloaded, `bailing::moe_router` picks the experts, and the chosen
+// expert matvecs are launched. That is one small sync per MoE layer, which is
+// affordable for decode and would not be for prefill -- hence decode only.
+// Bind this thread to the primary CUDA context.
+//
+// Driver contexts are per thread. The weights were uploaded on whichever thread
+// built the runtime, but a server runs generation on an engine worker, which
+// starts with no current context -- and there every launch, upload and download
+// fails. Binding costs nothing after the first call on a thread.
+//
+// EVERY entry point that touches the device has to do this, not just the one
+// that runs kernels. `bailing_cache_transfer` did not, and its uploads failed
+// on the server's worker with "bailing cache transfer failed" while every
+// single-threaded test passed.
+void bailing_gpu_bind_thread() {
+    static thread_local bool bound = false;
+    if (bound) return;
+    if (colibri_gpu_init(0) != 0)
+        throw std::runtime_error("failed to bind CUDA context to this thread");
+    bound = true;
+}
+
+// Move the per-layer cache between the host and the device.
+//
+// The two copies have identical layouts -- the same row strides, the same
+// [position][channel] order, the three conv windows in the same q/k/v order --
+// because the device path was written against the host one. So this is a
+// straight transfer, not a conversion, and the only thing to get right is how
+// much of it is live: only `position` rows of the MLA caches hold anything, and
+// copying `capacity` rows would move megabytes of zeros on every switch.
+//
+// Cost is small enough not to need managing: ~1 MB of MLA cache per 512
+// positions plus a fixed ~1 MB of recurrent state per KDA layer, once per
+// prefill/decode transition rather than per token.
+void bailing_cache_transfer(ColibriV2BailingRuntime& runtime, bool to_device) {
+    if (!runtime.gpu || !runtime.gpu->ready) return;
+    bailing_gpu_bind_thread();
+    const auto& g = runtime.geometry;
+    const std::size_t position = runtime.position;
+    const std::size_t channels = g.heads * g.head_dim;
+    const std::size_t history = g.conv_width - 1;
+
+    auto move = [&](const char* what, std::size_t layer, std::uint64_t device,
+                    float* host, std::size_t elements) {
+        if (!device || !elements) return;
+        const std::uint64_t bytes = static_cast<std::uint64_t>(elements) * 4;
+        const int status = to_device ? colibri_gpu_upload(device, host, bytes, 0)
+                                     : colibri_gpu_download(host, device, bytes, 0);
+        if (status != 0)
+            throw std::runtime_error(
+                std::string("bailing cache ") + (to_device ? "upload" : "download") +
+                " failed for " + what + " of layer " + std::to_string(layer) +
+                " (" + std::to_string(bytes) + " bytes, status " +
+                std::to_string(status) + ")");
+    };
+
+    for (std::size_t index = 0; index < runtime.layers.size(); ++index) {
+        auto& L = runtime.gpu->layers[index];
+        auto& cache = runtime.caches[index];
+        if (runtime.layers[index].full_attention) {
+            move("latents", index, L.latents, cache.latents.data(),
+                 position * g.kv_lora);
+            move("rope keys", index, L.rope_keys, cache.rope_keys.data(),
+                 position * g.qk_rope);
+        } else {
+            move("state", index, L.state, cache.state.data(), channels * g.head_dim);
+            const std::size_t window = channels * history;
+            move("query window", index, L.conv_windows,
+                 cache.query_window.data(), window);
+            move("key window", index, L.conv_windows + window * 4,
+                 cache.key_window.data(), window);
+            move("value window", index, L.conv_windows + window * 8,
+                 cache.value_window.data(), window);
+        }
+    }
+    if (colibri_gpu_sync() != 0)
+        throw std::runtime_error("bailing cache transfer failed to synchronize");
+    runtime.cache_on_device = to_device;
+}
+
+void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
+                      float* logits) {
+    namespace bailing = colibri::v2::bailing;
+    bailing_gpu_bind_thread();
+    auto& gpu = *runtime.gpu;
+    const auto& g = runtime.geometry;
+    const auto& c = runtime.model->config;
+    // Everything on the default stream. colibri_gpu_rms_norm and
+    // colibri_gpu_scaled_add take no stream argument and use the default one,
+    // so issuing the matvecs and custom kernels on gpu.stream left the two
+    // halves of every layer unordered with respect to each other -- which
+    // produced finite but uncorrelated logits, the classic symptom.
+    const std::uint64_t stream = 0;
+    const std::size_t channels = g.heads * g.head_dim;
+    const std::size_t qk = g.qk_nope + g.qk_rope;
+    const std::size_t position = runtime.position;
+
+    auto matvec = [&](const BailingGpuMatrix& w, std::uint64_t in, std::uint64_t out,
+                      std::size_t inputs, std::size_t outputs) {
+        if (qwen_gpu_matvec_by_type(w.type, w.data, in, out,
+                                    static_cast<int>(inputs),
+                                    static_cast<int>(outputs), stream) != 0)
+            throw std::runtime_error("bailing GPU matvec failed for type " +
+                                     std::to_string(w.type));
+    };
+    // Phase timing for the device path. Each stop syncs, which perturbs by
+    // ~16us a call -- measured, and negligible against a 20ms token.
+    const bool timing = bailing::profiling();
+    auto clock_now = []{ return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double mark = timing ? (colibri_gpu_sync(), clock_now()) : 0.0;
+    auto stop = [&](double& bucket) {
+        if (!timing) return;
+        colibri_gpu_sync();
+        const double now = clock_now();
+        bucket += now - mark;
+        mark = now;
+    };
+    auto launch = [&](const char* name, std::uint32_t grid, std::uint32_t block,
+                      void** arguments) {
+        if (colibri_gpu_launch_named(name, grid, 1, block, 0, stream, arguments) != 0)
+            throw std::runtime_error(std::string("bailing GPU launch failed: ") + name);
+    };
+
+    // Embedding row -> hidden_a.
+    {
+        int token_arg = static_cast<int>(token), hidden = static_cast<int>(g.hidden);
+        std::uint64_t packed = gpu.embedding.data, out = gpu.hidden_a;
+        void* arguments[] = {&packed, &out, &token_arg, &hidden};
+        launch(qwen_embedding_kernel(gpu.embedding.type, false), 32, 256, arguments);
+    }
+    stop(bailing::profile().norms);
+
+    std::uint64_t current = gpu.hidden_a, next = gpu.hidden_b;
+    for (std::size_t index = 0; index < runtime.layers.size(); ++index) {
+        const auto& weights = runtime.layers[index];
+        auto& L = gpu.layers[index];
+        colibri_gpu_rms_norm(current, L.attn_norm, gpu.normalized,
+                             static_cast<int>(g.hidden), g.epsilon, 0);
+        if (weights.full_attention) {
+            matvec(L.q_a, gpu.normalized, gpu.wide_a, g.hidden, g.q_lora);
+            colibri_gpu_rms_norm(gpu.wide_a, L.q_a_norm, gpu.wide_b,
+                                 static_cast<int>(g.q_lora), g.epsilon, 0);
+            matvec(L.q_b, gpu.wide_b, gpu.wide_c, g.q_lora, g.heads * qk);
+            matvec(L.kv_a_mqa, gpu.normalized, gpu.wide_d, g.hidden,
+                   g.kv_lora + g.qk_rope);
+            colibri_gpu_rms_norm(gpu.wide_d, L.kv_a_norm,
+                                 L.latents + position * g.kv_lora * 4,
+                                 static_cast<int>(g.kv_lora), g.epsilon, 0);
+            {
+                // rope the shared key half, in place at its cache slot.
+                std::uint64_t source = gpu.wide_d + g.kv_lora * 4;
+                std::uint64_t target = L.rope_keys + position * g.qk_rope * 4;
+                int count = static_cast<int>(g.qk_rope);
+                void* copy_args[] = {&target, &source, &count};
+                launch("bailing_copy", 1, 64, copy_args);
+                int head_dim = static_cast<int>(g.qk_rope);
+                int rope_dim = static_cast<int>(g.qk_rope);
+                int pos = static_cast<int>(position), heads_arg = 1;
+                float theta = g.rope_theta;
+                void* arguments[] = {&target, &heads_arg, &head_dim, &rope_dim,
+                                     &pos, &theta};
+                launch("bailing_partial_rope", 1, 64, arguments);
+            }
+            {
+                int heads_arg = static_cast<int>(g.heads);
+                int head_dim = static_cast<int>(qk), rope_dim = static_cast<int>(g.qk_rope);
+                int pos = static_cast<int>(position);
+                float theta = g.rope_theta;
+                void* arguments[] = {&gpu.wide_c, &heads_arg, &head_dim, &rope_dim,
+                                     &pos, &theta};
+                launch("bailing_partial_rope", static_cast<std::uint32_t>(g.heads),
+                       64, arguments);
+            }
+            {
+                // Split the query into its nope and rope halves for the kernel.
+                int heads_arg = static_cast<int>(g.heads);
+                int nope = static_cast<int>(g.qk_nope), rope = static_cast<int>(g.qk_rope);
+                void* arguments[] = {&gpu.wide_c, &gpu.wide_a, &gpu.wide_b,
+                                     &heads_arg, &nope, &rope};
+                launch("bailing_split_query", static_cast<std::uint32_t>(g.heads),
+                       128, arguments);
+            }
+            {
+                int positions = static_cast<int>(position + 1);
+                int heads_arg = static_cast<int>(g.heads);
+                int nope = static_cast<int>(g.qk_nope), rope = static_cast<int>(g.qk_rope);
+                int value_dim = static_cast<int>(g.v_head_dim);
+                int lora = static_cast<int>(g.kv_lora);
+                void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &L.kv_b, &L.latents,
+                                     &L.rope_keys, &gpu.scores, &gpu.wide_d,
+                                     &positions, &heads_arg, &nope, &rope,
+                                     &value_dim, &lora};
+                launch("bailing_mla_attention", static_cast<std::uint32_t>(g.heads),
+                       128, arguments);
+            }
+            matvec(L.attn_gate, gpu.normalized, gpu.small, g.hidden, g.heads);
+            {
+                int heads_arg = static_cast<int>(g.heads);
+                int value_dim = static_cast<int>(g.v_head_dim);
+                void* arguments[] = {&gpu.small, &heads_arg, &value_dim, &gpu.wide_d};
+                launch("bailing_head_gate", static_cast<std::uint32_t>(g.heads),
+                       128, arguments);
+            }
+            matvec(L.attn_output, gpu.wide_d, gpu.branch, g.heads * g.v_head_dim, g.hidden);
+            stop(bailing::profile().mla);
+        } else {
+            matvec(L.ssm_q, gpu.normalized, gpu.wide_a, g.hidden, channels);
+            matvec(L.ssm_k, gpu.normalized, gpu.wide_b, g.hidden, channels);
+            matvec(L.ssm_v, gpu.normalized, gpu.wide_c, g.hidden, channels);
+            {
+                int channels_arg = static_cast<int>(channels);
+                int width = static_cast<int>(g.conv_width);
+                std::uint64_t wq = L.conv_windows;
+                std::uint64_t wk = L.conv_windows + channels * (g.conv_width - 1) * 4;
+                std::uint64_t wv = wk + channels * (g.conv_width - 1) * 4;
+                void* a1[] = {&gpu.wide_a, &L.ssm_q_conv, &wq, &channels_arg, &width};
+                launch("bailing_short_conv", 32, 256, a1);
+                void* a2[] = {&gpu.wide_b, &L.ssm_k_conv, &wk, &channels_arg, &width};
+                launch("bailing_short_conv", 32, 256, a2);
+                void* a3[] = {&gpu.wide_c, &L.ssm_v_conv, &wv, &channels_arg, &width};
+                launch("bailing_short_conv", 32, 256, a3);
+            }
+            matvec(L.ssm_f, gpu.normalized, gpu.wide_d, g.hidden, channels);
+            matvec(L.ssm_b, gpu.normalized, gpu.small, g.hidden, g.heads);
+            {
+                int rows = 1, heads_arg = static_cast<int>(g.heads);
+                int head_dim = static_cast<int>(g.head_dim);
+                float epsilon = g.epsilon;
+                std::uint64_t out = gpu.wide_a;   // reuse: queries are consumed
+                void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &gpu.wide_c,
+                                     &gpu.wide_d, &gpu.small, &L.ssm_a, &L.ssm_dt,
+                                     &L.state, &out, &rows, &heads_arg, &head_dim,
+                                     &epsilon};
+                launch("bailing_kda_recurrent_chunk",
+                       static_cast<std::uint32_t>(g.heads), 128, arguments);
+            }
+            matvec(L.ssm_g, gpu.normalized, gpu.wide_b, g.hidden, channels);
+            {
+                int heads_arg = static_cast<int>(g.heads);
+                int head_dim = static_cast<int>(g.head_dim);
+                float epsilon = g.epsilon;
+                void* arguments[] = {&gpu.wide_a, &L.ssm_norm, &gpu.wide_b,
+                                     &heads_arg, &head_dim, &epsilon};
+                launch("bailing_gated_head_norm",
+                       static_cast<std::uint32_t>(g.heads), 128, arguments);
+            }
+            matvec(L.ssm_out, gpu.wide_a, gpu.branch, channels, g.hidden);
+            stop(bailing::profile().kda);
+        }
+        colibri_gpu_scaled_add(gpu.branch, current, 1.0f, static_cast<int>(g.hidden));
+        colibri_gpu_rms_norm(gpu.branch, L.ffn_norm, gpu.normalized,
+                             static_cast<int>(g.hidden), g.epsilon, 0);
+
+        if (weights.routed) {
+            matvec(L.router, gpu.normalized, gpu.small, g.hidden, g.experts);
+            std::vector<float> router_logits(g.experts);
+            colibri_gpu_sync();
+            colibri_gpu_download(router_logits.data(), gpu.small, g.experts * 4, 0);
+            std::vector<std::int32_t> chosen(g.experts_used);
+            std::vector<float> expert_weights(g.experts_used);
+            bailing::moe_router(router_logits.data(),
+                                runtime.layers[index].ffn.router_bias,
+                                g.experts, g.experts_used, g.groups, g.groups_used,
+                                g.weight_scale, g.normalize_weights,
+                                chosen.data(), expert_weights.data());
+            // One launch for all chosen experts, not one per expert. The
+            // per-expert loop issued 8 x (3 matvecs + swiglu) = 32 tiny kernels
+            // per MoE layer, 874 of the 1168 launches per token, each giving
+            // the GPU only 512 blocks of work. These grouped kernels grid over
+            // (rows, experts) instead, so the card sees 4096 blocks and the
+            // launch count drops to 2.
+            //
+            // Q4_K only for now; other types fall back to the per-expert path.
+            const auto narrow = g.expert_size *
+                bailing::row_bytes(L.gate_exps.type, g.hidden);
+            const auto wide = g.hidden *
+                bailing::row_bytes(L.down_exps.type, g.expert_size);
+            const bool grouped = L.gate_exps.type == 12 && L.down_exps.type == 12;
+            // q4k_grouped_accumulate does `output[row] += partial`, so the
+            // target has to start at zero. Both paths need this.
+            colibri_gpu_memset(gpu.wide_d, 0, g.hidden * 4, stream);
+            if (grouped) {
+                std::vector<std::uint64_t> gate_ptrs(g.experts_used),
+                    up_ptrs(g.experts_used), down_ptrs(g.experts_used);
+                for (std::size_t slot = 0; slot < g.experts_used; ++slot) {
+                    const auto expert = static_cast<std::size_t>(chosen[slot]);
+                    gate_ptrs[slot] = L.gate_exps.data + expert * narrow;
+                    up_ptrs[slot] = L.up_exps.data + expert * narrow;
+                    down_ptrs[slot] = L.down_exps.data + expert * wide;
+                }
+                // One upload, not four. Each colibri_gpu_upload_sync blocks,
+                // and four per MoE layer is 92 blocking transfers per token --
+                // measured at ~15us each, which was more than the expert
+                // matmuls they were feeding. The three pointer arrays and the
+                // weights share one device buffer and one copy.
+                const std::size_t pointer_bytes = g.experts_used * 8;
+                std::vector<std::uint8_t> packed(pointer_bytes * 3 +
+                                                 g.experts_used * 4);
+                std::memcpy(packed.data(), gate_ptrs.data(), pointer_bytes);
+                std::memcpy(packed.data() + pointer_bytes, up_ptrs.data(), pointer_bytes);
+                std::memcpy(packed.data() + pointer_bytes * 2, down_ptrs.data(),
+                            pointer_bytes);
+                std::memcpy(packed.data() + pointer_bytes * 3, expert_weights.data(),
+                            g.experts_used * 4);
+                colibri_gpu_upload_sync(gpu.expert_gate_ptrs, packed.data(),
+                                        packed.size());
+                int inputs = static_cast<int>(g.hidden);
+                int outputs = static_cast<int>(g.expert_size);
+                int used = static_cast<int>(g.experts_used);
+                void* swiglu_args[] = {&gpu.expert_gate_ptrs, &gpu.expert_up_ptrs,
+                                       &gpu.normalized, &gpu.expert_activated,
+                                       &inputs, &outputs, &used};
+                if (colibri_gpu_launch_named("q4k_grouped_swiglu",
+                        static_cast<std::uint32_t>(g.expert_size),
+                        static_cast<std::uint32_t>(g.experts_used), 128, 0,
+                        stream, swiglu_args) != 0)
+                    throw std::runtime_error("q4k_grouped_swiglu launch failed");
+                int down_inputs = static_cast<int>(g.expert_size);
+                int down_outputs = static_cast<int>(g.hidden);
+                void* accumulate_args[] = {&gpu.expert_down_ptrs, &gpu.expert_activated,
+                                           &gpu.wide_d, &gpu.expert_weights,
+                                           &down_inputs, &down_outputs, &used};
+                if (colibri_gpu_launch_named("q4k_grouped_accumulate",
+                        static_cast<std::uint32_t>(g.hidden), 1, 128, 0, stream,
+                        accumulate_args) != 0)
+                    throw std::runtime_error("q4k_grouped_accumulate launch failed");
+            } else {
+            for (std::size_t slot = 0; slot < g.experts_used; ++slot) {
+                const auto expert = static_cast<std::size_t>(chosen[slot]);
+                BailingGpuMatrix eg{L.gate_exps.data + expert * narrow, L.gate_exps.type};
+                BailingGpuMatrix eu{L.up_exps.data + expert * narrow, L.up_exps.type};
+                BailingGpuMatrix ed{L.down_exps.data + expert * wide, L.down_exps.type};
+                matvec(eg, gpu.normalized, gpu.wide_a, g.hidden, g.expert_size);
+                matvec(eu, gpu.normalized, gpu.wide_b, g.hidden, g.expert_size);
+                {
+                    int size = static_cast<int>(g.expert_size);
+                    float limit = g.swiglu_limit;
+                    void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &size, &limit,
+                                         &gpu.wide_c};
+                    launch("bailing_swiglu", 32, 256, arguments);
+                }
+                matvec(ed, gpu.wide_c, gpu.wide_b, g.expert_size, g.hidden);
+                colibri_gpu_scaled_add(gpu.wide_d, gpu.wide_b, expert_weights[slot],
+                                       static_cast<int>(g.hidden));
+            }
+            }
+            if (L.shared_gate.data) {
+                matvec(L.shared_gate, gpu.normalized, gpu.wide_a, g.hidden, g.shared_size);
+                matvec(L.shared_up, gpu.normalized, gpu.wide_b, g.hidden, g.shared_size);
+                int size = static_cast<int>(g.shared_size);
+                float limit = g.swiglu_limit;
+                void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &size, &limit, &gpu.wide_c};
+                launch("bailing_swiglu", 32, 256, arguments);
+                matvec(L.shared_down, gpu.wide_c, gpu.wide_b, g.shared_size, g.hidden);
+                colibri_gpu_scaled_add(gpu.wide_d, gpu.wide_b, 1.0f,
+                                       static_cast<int>(g.hidden));
+            }
+            int count = static_cast<int>(g.hidden);
+            void* copy_args[] = {&next, &gpu.wide_d, &count};
+            launch("bailing_copy", 32, 256, copy_args);
+        } else {
+            matvec(L.gate_exps, gpu.normalized, gpu.wide_a, g.hidden, g.dense_size);
+            matvec(L.up_exps, gpu.normalized, gpu.wide_b, g.hidden, g.dense_size);
+            int size = static_cast<int>(g.dense_size);
+            float limit = g.swiglu_limit;
+            void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &size, &limit, &gpu.wide_c};
+            launch("bailing_swiglu", 32, 256, arguments);
+            matvec(L.down_exps, gpu.wide_c, next, g.dense_size, g.hidden);
+        }
+        colibri_gpu_scaled_add(next, gpu.branch, 1.0f, static_cast<int>(g.hidden));
+        stop(bailing::profile().moe);
+        std::swap(current, next);
+    }
+
+    colibri_gpu_rms_norm(current, gpu.output_norm, gpu.normalized,
+                         static_cast<int>(g.hidden), g.epsilon, 0);
+    matvec(gpu.head, gpu.normalized, gpu.logits, g.hidden, c.vocabulary_size);
+    stop(bailing::profile().projections);   // reused bucket: the lm head
+    colibri_gpu_sync();
+    colibri_gpu_download(logits, gpu.logits, (std::size_t)c.vocabulary_size * 4, 0);
+    if (timing) bailing::profile().tokens += 1;
+    ++runtime.position;
+}
+
+int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
+                              ColibriV2BailingRuntime** out) {
+    return guarded([&]{
+    if(!model||!out||!capacity)throw std::runtime_error("invalid bailing runtime arguments");
+    if(model->architecture!="bailingmoe3")
+        throw std::runtime_error("model architecture is not bailingmoe3");
+    namespace bailing = colibri::v2::bailing;
+    const auto& c = model->config;
+    auto runtime = std::make_unique<ColibriV2BailingRuntime>();
+    runtime->model = model;
+    runtime->capacity = capacity;
+
+    auto& g = runtime->geometry;
+    g.hidden = c.hidden_size;
+    g.heads = c.attention_heads;
+    g.qk_rope = c.rotary_dimension;
+    g.qk_nope = c.key_length - c.rotary_dimension;
+    g.v_head_dim = c.value_length;
+    g.q_lora = c.q_lora_rank;
+    g.kv_lora = c.kv_lora_rank;
+    // The KDA head width is the declared head_dim, NOT hidden/heads. Those
+    // differ here -- 128 against 96 -- and using the quotient silently makes
+    // every KDA projection the wrong shape, which produces fluent nonsense
+    // rather than a crash.
+    g.head_dim = c.attention_head_dim
+        ? c.attention_head_dim
+        : c.hidden_size / (c.attention_heads ? c.attention_heads : 1);
+    g.conv_width = 4;
+    g.dense_size = c.dense_intermediate_size;
+    g.expert_size = c.expert_intermediate_size;
+    g.shared_size = c.expert_shared_intermediate_size;
+    g.experts = c.expert_count;
+    g.experts_used = c.expert_used_count;
+    g.groups = c.expert_group_count;
+    g.groups_used = c.expert_group_used;
+    g.rope_theta = c.rope_freq_base;
+    g.epsilon = c.rms_norm_epsilon;
+    g.weight_scale = c.expert_weights_scale;
+    g.normalize_weights = c.expert_weights_norm;
+    g.swiglu_limit = 0.0f;
+
+    runtime->embedding_matrix = bailing_matrix(*model, "token_embd.weight");
+    runtime->output_norm = bailing_f32(*model, "output_norm.weight");
+    runtime->head = bailing_matrix(*model, "output.weight");
+
+    runtime->layers.resize(c.layer_count);
+    runtime->caches.resize(c.layer_count);
+    runtime->decoded_kv_b.resize(c.layer_count);
+    for(std::uint32_t index=0;index<c.layer_count;++index){
+        auto& w = runtime->layers[index];
+        const std::string prefix = "blk." + std::to_string(index) + ".";
+        w.full_attention = bailing::layer_is_full_attention(
+            index, c.layer_count, c.full_attention_interval);
+        w.routed = c.expert_count && index >= c.leading_dense_block_count;
+        w.attention_norm = bailing_f32(*model, prefix + "attn_norm.weight");
+        w.ffn_norm = bailing_f32(*model, prefix + "ffn_norm.weight");
+        if(w.full_attention){
+            w.mla.q_a = bailing_matrix(*model, prefix + "attn_q_a.weight");
+            w.mla.q_a_norm = bailing_f32(*model, prefix + "attn_q_a_norm.weight");
+            w.mla.q_b = bailing_matrix(*model, prefix + "attn_q_b.weight");
+            w.mla.kv_a_mqa = bailing_matrix(*model, prefix + "attn_kv_a_mqa.weight");
+            w.mla.kv_a_norm = bailing_f32(*model, prefix + "attn_kv_a_norm.weight");
+            {
+                // Decoded once here rather than kept packed: the absorbed
+                // attention walks along kv_b's rows instead of dotting them.
+                const auto packed = bailing_matrix(*model, prefix + "attn_kv_b.weight");
+                const std::size_t rows = g.heads * (g.qk_nope + g.v_head_dim);
+                runtime->decoded_kv_b[index].resize(rows * g.kv_lora);
+                colibri::v2::bailing::matrix_decode(
+                    packed, g.kv_lora, rows, runtime->decoded_kv_b[index].data());
+                w.mla.kv_b = runtime->decoded_kv_b[index].data();
+            }
+            w.mla.gate = bailing_matrix(*model, prefix + "attn_gate.weight");
+            w.mla.output = bailing_matrix(*model, prefix + "attn_output.weight");
+        } else {
+            w.kda.query = bailing_matrix(*model, prefix + "ssm_q.weight");
+            w.kda.key = bailing_matrix(*model, prefix + "ssm_k.weight");
+            w.kda.value = bailing_matrix(*model, prefix + "ssm_v.weight");
+            w.kda.query_conv = bailing_f32(*model, prefix + "ssm_q_conv1d.weight");
+            w.kda.key_conv = bailing_f32(*model, prefix + "ssm_k_conv1d.weight");
+            w.kda.value_conv = bailing_f32(*model, prefix + "ssm_v_conv1d.weight");
+            w.kda.decay = bailing_matrix(*model, prefix + "ssm_f.weight");
+            w.kda.beta = bailing_matrix(*model, prefix + "ssm_b.weight");
+            w.kda.gate = bailing_matrix(*model, prefix + "ssm_g.weight");
+            w.kda.a_log = bailing_f32(*model, prefix + "ssm_a");
+            w.kda.dt_bias = bailing_f32(*model, prefix + "ssm_dt.bias");
+            w.kda.norm = bailing_f32(*model, prefix + "ssm_norm.weight");
+            w.kda.output = bailing_matrix(*model, prefix + "ssm_out.weight");
+        }
+        if(w.routed){
+            w.ffn.router = bailing_matrix(*model, prefix + "ffn_gate_inp.weight");
+            w.ffn.router_bias = bailing_f32(*model, prefix + "exp_probs_b.bias", false);
+            w.ffn.gate_experts = bailing_matrix(*model, prefix + "ffn_gate_exps.weight");
+            w.ffn.up_experts = bailing_matrix(*model, prefix + "ffn_up_exps.weight");
+            w.ffn.down_experts = bailing_matrix(*model, prefix + "ffn_down_exps.weight");
+            w.ffn.shared_gate = bailing_matrix(*model, prefix + "ffn_gate_shexp.weight", false);
+            w.ffn.shared_up = bailing_matrix(*model, prefix + "ffn_up_shexp.weight", false);
+            w.ffn.shared_down = bailing_matrix(*model, prefix + "ffn_down_shexp.weight", false);
+        } else {
+            w.ffn.gate = bailing_matrix(*model, prefix + "ffn_gate.weight");
+            w.ffn.up = bailing_matrix(*model, prefix + "ffn_up.weight");
+            w.ffn.down = bailing_matrix(*model, prefix + "ffn_down.weight");
+        }
+        bailing::reset_cache(runtime->caches[index], w, g, capacity);
+    }
+    // On by default wherever there is a device to use.
+    //
+    // It was opt-in while the device had to take prefill as well as decode,
+    // which cost about half the prefill rate -- so on a long prompt with a
+    // short answer the GPU lost overall, and defaulting to it would have been a
+    // regression. Now the host keeps its batched prefill and the device only
+    // takes decode (see colibri_v2_bailing_eval), so the device path is no
+    // longer worse at anything: measured 155 vs 158 tok/s prefill, and decode
+    // from 44 to 172 tok/s at Q6_K. There is nothing left for the caller to
+    // trade off, so there is nothing left to ask them.
+    //
+    // `COLIBRI_BAILING_GPU=0` still forces the host path, which is what makes
+    // the two comparable -- and the host path remains the correctness oracle.
+    const char* want_gpu = std::getenv("COLIBRI_BAILING_GPU");
+    const bool forced_off = want_gpu && want_gpu[0]=='0';
+    const bool forced_on = want_gpu && want_gpu[0]=='1';
+    if(!forced_off && (forced_on || colibri_v2_gpu_available()==1)){
+        // Preparation compiles the kernel corpus and uploads every weight, and
+        // it can fail for reasons that are not the caller's problem -- no
+        // driver, no nvrtc, not enough VRAM for this model. Falling back to the
+        // host is always correct and merely slower, so an unasked-for GPU is
+        // never allowed to turn into a failed runtime. Asking for it explicitly
+        // still reports the failure.
+        try {
+            runtime->gpu = std::make_unique<BailingGpu>();
+            bailing_gpu_prepare(*runtime);
+        } catch(const std::exception& failure) {
+            if(forced_on) throw;
+            runtime->gpu.reset();
+            std::fprintf(stderr,
+                "[colibri-v2] bailingmoe3: staying on the host path (%s)\n",
+                failure.what());
+        }
+    }
+    *out = runtime.release();
+    return 0; });
+}
+
+void colibri_v2_bailing_destroy(ColibriV2BailingRuntime* runtime){
+    try{
+        if(colibri::v2::bailing::profiling())
+            colibri::v2::bailing::profile().report(stderr);
+        if(runtime&&runtime->gpu){
+            for(const auto pointer:runtime->gpu->owned)colibri_gpu_free(pointer);
+            runtime->gpu->owned.clear();
+        }
+        delete runtime;
+    }catch(...){}
+}
+
+int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime){
+    return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid bailing runtime");
+    for(std::size_t index=0;index<runtime->layers.size();++index)
+        colibri::v2::bailing::reset_cache(runtime->caches[index],
+            runtime->layers[index], runtime->geometry, runtime->capacity);
+    // The DEVICE caches need clearing too. Missing this leaked a KDA layer's
+    // recurrent state from one request into the next -- and because that state
+    // is a running summary of everything seen, the contamination compounds
+    // rather than washing out. It showed up as identical greedy requests
+    // returning different answers, and eventually as degenerate repetition.
+    //
+    // Only the KDA state and convolution windows actually need it: the MLA
+    // latents and rope keys are written before they are read at each position,
+    // so stale contents past `position` are never consulted. They are cleared
+    // anyway because "reset" that leaves some state behind is the kind of
+    // distinction nobody remembers a year later.
+    if(runtime->gpu && runtime->gpu->ready){
+        const auto& g = runtime->geometry;
+        const std::size_t channels = g.heads * g.head_dim;
+        for(auto& layer : runtime->gpu->layers){
+            if(layer.state)
+                colibri_gpu_memset(layer.state, 0,
+                    channels * g.head_dim * 4, 0);
+            if(layer.conv_windows)
+                colibri_gpu_memset(layer.conv_windows, 0,
+                    3 * channels * (g.conv_width - 1) * 4, 0);
+            if(layer.latents)
+                colibri_gpu_memset(layer.latents, 0,
+                    static_cast<std::size_t>(runtime->capacity) * g.kv_lora * 4, 0);
+            if(layer.rope_keys)
+                colibri_gpu_memset(layer.rope_keys, 0,
+                    static_cast<std::size_t>(runtime->capacity) * g.qk_rope * 4, 0);
+        }
+        colibri_gpu_sync();
+    }
+    // Both copies are now zero, so neither is stale and the host one is as good
+    // a starting point as the other. Saying so avoids a pointless transfer on
+    // the first eval after a reset.
+    runtime->cache_on_device = false;
+    runtime->position = 0;
+    return 0; });
+}
+
+int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* tokens,
+                            uint32_t count, float* logits){
+    return guarded([&]{
+    if(!runtime||!tokens||!count||!logits)
+        throw std::runtime_error("invalid bailing eval arguments");
+    const auto& g = runtime->geometry;
+    const auto& c = runtime->model->config;
+    if(runtime->position + count > runtime->capacity)
+        throw std::runtime_error("bailing sequence exceeds the runtime capacity");
+
+    // Each path takes the work it is better at, and the cache follows.
+    //
+    // The host has a batched prefill -- it runs the whole prompt through each
+    // layer at once, so the weights are read once rather than once per token --
+    // and measured ~2x the device's token-at-a-time loop. The device has the
+    // faster decode. Using both means the per-layer caches have to move across
+    // at the transition, which `bailing_cache_transfer` does.
+    //
+    // The hazard this replaces: the host and device caches are SEPARATE, and an
+    // earlier version routed prefill to the host and decode to the device with
+    // no transfer, so decode read a device cache the prompt never touched. The
+    // model answered with no context at all -- first token plausible,
+    // everything after it invented. It hid through testing because feeding a
+    // prompt one token at a time (as every test here does) keeps both on the
+    // same path; only a server sending a whole prompt at once splits them.
+    // Hence `cache_on_device`: the transfer is not optional and not inferred
+    // from the call, it is tracked.
+    if(runtime->gpu && runtime->gpu->ready && count > 1){
+        if(runtime->cache_on_device) bailing_cache_transfer(*runtime,false);
+        // Falls through to the host batched path below, which leaves the cache
+        // on the host; the next single-token eval moves it back.
+    } else if(runtime->gpu && runtime->gpu->ready){
+        if(!runtime->cache_on_device) bailing_cache_transfer(*runtime,true);
+        for(std::uint32_t index=0;index<count;++index){
+            if(tokens[index] >= c.vocabulary_size)
+                throw std::runtime_error("token id is outside the vocabulary");
+            if(runtime->position >= runtime->capacity)
+                throw std::runtime_error("bailing sequence exceeds the runtime capacity");
+            bailing_gpu_step(*runtime, tokens[index], logits);
+        }
+        return 0;
+    }
+    // Prefill runs the whole batch through each layer at once so the weights
+    // are read once rather than once per token; decode (count == 1) takes the
+    // same path and degrades to the single-token one inside.
+    std::vector<float> current(static_cast<std::size_t>(count) * g.hidden);
+    std::vector<float> next(static_cast<std::size_t>(count) * g.hidden);
+    for(std::uint32_t index=0;index<count;++index){
+        const std::uint32_t token = tokens[index];
+        if(token >= c.vocabulary_size)
+            throw std::runtime_error("token id is outside the vocabulary");
+        const auto stride = colibri::v2::bailing::row_bytes(
+            runtime->embedding_matrix.type, g.hidden);
+        const auto* base = reinterpret_cast<const std::uint8_t*>(
+            runtime->embedding_matrix.data);
+        colibri::v2::bailing::row_decode(base + static_cast<std::size_t>(token)*stride,
+            runtime->embedding_matrix.type, g.hidden,
+            current.data() + static_cast<std::size_t>(index) * g.hidden);
+    }
+    for(std::size_t layer=0;layer<runtime->layers.size();++layer){
+        colibri::v2::bailing::decoder_layer_batch(
+            current.data(), count, runtime->layers[layer], g, runtime->position,
+            runtime->caches[layer], next.data());
+        current.swap(next);
+    }
+    runtime->position += count;
+    // Only the last token's logits are produced; the earlier ones exist purely
+    // to advance the caches.
+    std::vector<float> normalized(g.hidden);
+    const float* last = current.data() + static_cast<std::size_t>(count - 1) * g.hidden;
+    colibri::v2::bailing::rms_norm(last, runtime->output_norm, g.hidden,
+                                   g.epsilon, normalized.data());
+    colibri::v2::bailing::matvec(runtime->head, normalized.data(), g.hidden,
+                                 c.vocabulary_size, logits);
+    return 0; });
+}
+
 int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guarded([&]{
     if(!path||!out) throw std::runtime_error("path and output are required");
     auto m=std::make_unique<ColibriV2Model>();
-    map_and_parse(path,*m);
-    attach_split_shards(*m);
+    if(is_hf_directory(path)){
+        load_hf(path,*m);
+    }else{
+        map_and_parse(path,*m);
+        attach_split_shards(*m);
+    }
     *out=m.release(); return 0; }); }
 int colibri_v2_model_attach_mtp(ColibriV2Model* m,const char*path){return guarded([&]{
     if(!m||!path||!path[0])throw std::runtime_error("model and MTP sidecar path are required");
@@ -3963,7 +5220,7 @@ int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){
 out->q_lora_rank=m->config.q_lora_rank;out->kv_lora_rank=m->config.kv_lora_rank;out->output_lora_rank=m->config.output_lora_rank;out->output_group_count=m->config.output_group_count;
 out->indexer_head_count=m->config.indexer_head_count;out->indexer_key_length=m->config.indexer_key_length;out->indexer_top_k=m->config.indexer_top_k;
 out->hyper_connection_count=m->config.hyper_connection_count;out->sinkhorn_iterations=m->config.sinkhorn_iterations;
-out->expert_shared_count=m->config.expert_shared_count;out->hash_layer_count=m->config.hash_layer_count;
+out->expert_group_count=m->config.expert_group_count;out->expert_group_used=m->config.expert_group_used;out->expert_shared_count=m->config.expert_shared_count;out->hash_layer_count=m->config.hash_layer_count;
 out->compress_ratios_length=static_cast<std::uint32_t>(m->config.compress_ratios.size());
 out->sinkhorn_epsilon=m->config.sinkhorn_epsilon;out->compress_rope_freq_base=m->config.compress_rope_freq_base;
 out->rope_scaling_factor=m->config.rope_scaling_factor;out->yarn_beta_fast=m->config.yarn_beta_fast;out->yarn_beta_slow=m->config.yarn_beta_slow;
@@ -6850,7 +8107,126 @@ std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t 
 // non-ASCII letter counts as both upper- and lower-ish and letter runs in
 // non-Latin scripts stay whole. And digits come in groups of at most three,
 // unlike the Laguna pre-tokenizer above where every digit stands alone.
-std::vector<std::string> gpt4o_pretokenize(const std::string& text) {
+// The llama3 / BailingMoE3 pre-tokenizer, transcribed from the single regex
+// the reference applies, alternative by alternative and in order:
+//
+//   '(?i:[sdmt]|ll|ve|re)
+// | [^\r\n\p{L}\p{N}]?+\p{L}+
+// | \p{N}
+// |  ?[^\s\p{L}\p{N}]++[\r\n]*
+// | \s*[\r\n]
+// | \s+(?!\S)
+// | \s+
+//
+// It looks close enough to the GPT-4o pattern above to tempt sharing one
+// implementation. It is not. Two branches differ, and only one of them is
+// obvious:
+//
+//   * digits stand alone here (`\p{N}`), not in groups of up to three;
+//   * and the letter run is plain `\p{L}+` with NO case machinery, where
+//     GPT-4o splits an upper-to-lower transition. That second difference is
+//     the one that bites: sharing GPT-4o's rule splits "mV" into "m" + "V",
+//     which lands them in separate pre-tokens, which means BPE can never apply
+//     the (m, V) merge no matter how correct the merge table is. The symptom
+//     shows up as a ~2% token mismatch on mixed-case input and nowhere else.
+//
+// The quantifiers are possessive (`?+`, `++`), so the optional leading
+// character in the letter branch is never given back: if it is consumed and no
+// letter follows, the branch fails outright rather than retrying without it.
+std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
+    const auto decoded=gguf_utf8_decode(text);
+    const std::size_t count=decoded.code.size();
+    std::vector<std::string> pieces;
+    auto at_code=[&](std::size_t index){return decoded.code[index];};
+    auto slice=[&](std::size_t from,std::size_t to){
+        return text.substr(decoded.offset[from],decoded.offset[to]-decoded.offset[from]);
+    };
+    auto is_space=[&](std::uint32_t c){return gguf_codepoint_is_space(c);};
+    auto is_letter=[&](std::uint32_t c){return joyai_is_letter(c);};
+    auto is_number=[&](std::uint32_t c){return joyai_is_number(c);};
+
+    for(std::size_t at=0;at<count;){
+        // Alternative 1: an apostrophe plus a contraction tail, either case.
+        if(at_code(at)=='\''&&at+1<count){
+            auto lower=[&](std::size_t k){
+                const auto c=at_code(k);
+                return c<128?static_cast<std::uint32_t>(
+                    std::tolower(static_cast<int>(c))):c;
+            };
+            const auto first=lower(at+1);
+            std::size_t length=0;
+            if(first=='s'||first=='d'||first=='m'||first=='t')length=2;
+            else if(at+2<count){
+                const auto second=lower(at+2);
+                if((first=='l'&&second=='l')||(first=='v'&&second=='e')||
+                   (first=='r'&&second=='e'))length=3;
+            }
+            if(length){pieces.push_back(slice(at,at+length));at+=length;continue;}
+        }
+        // Alternative 2: an optional leading character that is neither a line
+        // break, a letter nor a digit, then a run of letters.
+        {
+            std::size_t probe=at;
+            const auto first=at_code(probe);
+            if(first!='\r'&&first!='\n'&&!is_letter(first)&&!is_number(first))++probe;
+            if(probe<count&&is_letter(at_code(probe))){
+                std::size_t end=probe;
+                while(end<count&&is_letter(at_code(end)))++end;
+                pieces.push_back(slice(at,end));at=end;continue;
+            }
+        }
+        // Alternative 3: exactly one digit.
+        if(is_number(at_code(at))){
+            pieces.push_back(slice(at,at+1));at+=1;continue;
+        }
+        // Alternative 4: an optional single leading space, then a run of
+        // characters that are neither whitespace, letters nor digits, then any
+        // trailing line breaks.
+        {
+            auto plain=[&](std::size_t index){
+                const auto c=at_code(index);
+                return !is_space(c)&&!is_letter(c)&&!is_number(c);
+            };
+            std::size_t probe=at;
+            if(at_code(probe)==' '&&probe+1<count&&plain(probe+1))++probe;
+            if(probe<count&&plain(probe)){
+                std::size_t end=probe;
+                while(end<count&&plain(end))++end;
+                while(end<count&&(at_code(end)=='\r'||at_code(end)=='\n'))++end;
+                pieces.push_back(slice(at,end));at=end;continue;
+            }
+        }
+        // Alternative 5: `\s*[\r\n]`. The `\s*` is greedy and backtracks, so
+        // this reaches the LAST line break in the whitespace run, not the
+        // first -- `\s*` happily consumes line breaks on the way there. Taking
+        // the first instead splits "\r\r" into two pieces, which stops BPE from
+        // ever applying the (\r, \r) merge.
+        {
+            std::size_t end=at,last_break=count;
+            while(end<count&&is_space(at_code(end))){
+                if(at_code(end)=='\r'||at_code(end)=='\n')last_break=end;
+                ++end;
+            }
+            if(last_break!=count){
+                pieces.push_back(slice(at,last_break+1));at=last_break+1;continue;
+            }
+        }
+        // Alternatives 6 and 7: a whitespace run. The lookahead in `\s+(?!\S)`
+        // makes the run stop one short when a non-space follows, leaving that
+        // last space to open the next piece.
+        if(is_space(at_code(at))){
+            std::size_t end=at;
+            while(end<count&&is_space(at_code(end)))++end;
+            if(end<count&&end>at+1)--end;
+            pieces.push_back(slice(at,end));at=end;continue;
+        }
+        pieces.push_back(slice(at,at+1));at+=1;
+    }
+    return pieces;
+}
+
+std::vector<std::string> gpt4o_pretokenize(const std::string& text,
+                                          std::size_t max_digit_run) {
     const auto decoded=gguf_utf8_decode(text);
     const std::size_t count=decoded.code.size();
     std::vector<std::string> pieces;
@@ -6901,10 +8277,14 @@ std::vector<std::string> gpt4o_pretokenize(const std::string& text) {
                 }
             }
         }
-        // Alternative 3: one to three digits.
+        // Alternative 3: a bounded digit run. GPT-4o spells this \p{N}{1,3};
+        // the llama3/BailingMoE3 variant of the same pattern spells it \p{N},
+        // i.e. every digit alone. That single character is the only difference
+        // between the two regexes, so the run length is a parameter rather
+        // than a second transcription.
         if(joyai_is_number(at_code(at))){
             std::size_t end=at;
-            while(end<count&&end-at<3&&joyai_is_number(at_code(end)))++end;
+            while(end<count&&end-at<max_digit_run&&joyai_is_number(at_code(end)))++end;
             pieces.push_back(slice(at,end));at=end;continue;
         }
         // Alternative 4: an optional single leading space, then a run of
@@ -7003,7 +8383,8 @@ void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
 std::vector<std::string> gguf_pretokenize(const ColibriV2Model& m,
                                           const std::string& text) {
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
-    if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text);
+    if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
+    if(m.tokenizer_pre=="llama-bpe")return llama_bpe_pretokenize(text);
     return laguna_pretokenize(text);
 }
 
@@ -7029,7 +8410,7 @@ int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,u
     // (<|start|>, <|message|>, <|eom|>, <|eot|>), and BPE would happily shred
     // them into ordinary text, so it takes the exact-match split too.
     if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"||
-       m->tokenizer_pre=="llama4"){
+       m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -8178,7 +9559,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     tensor_data(*runtime->model,t));
                 for(std::uint64_t i=0;i<elements;++i)
                     widened[i]=qwen_bf16_value(source[i]);
-                qwen_pack_q8_0(widened.data(),elements,packed.data());
+                pack_q8_0(widened.data(),elements,packed.data());
                 if(colibri_gpu_upload_sync(runtime->device_tensors[index],packed.data(),device_bytes)!=0)throw std::runtime_error("failed to upload requantized native Qwen static tensor");
             }else if(colibri_gpu_upload_sync(runtime->device_tensors[index],tensor_data(*runtime->model,t),t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
             cursor+=device_align(device_bytes);

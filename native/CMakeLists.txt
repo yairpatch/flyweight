@@ -59,6 +59,50 @@ if(BUILD_TESTING)
     add_test(NAME colibri_v2_provider_contract COMMAND colibri_v2_provider_contract)
 endif()
 
+add_executable(colibri_bailing_router_contract tests/bailing_router_contract.cpp)
+target_compile_features(colibri_bailing_router_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_bailing_router_contract PRIVATE include src)
+target_compile_definitions(colibri_bailing_router_contract PRIVATE COLIBRI_BAILING_NO_SIMD)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_bailing_router_contract
+        COMMAND colibri_bailing_router_contract
+    )
+endif()
+
+add_executable(colibri_bailing_kda_contract tests/bailing_kda_contract.cpp)
+target_compile_features(colibri_bailing_kda_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_bailing_kda_contract PRIVATE include src)
+target_compile_definitions(colibri_bailing_kda_contract PRIVATE COLIBRI_BAILING_NO_SIMD)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_bailing_kda_contract
+        COMMAND colibri_bailing_kda_contract
+    )
+endif()
+
+add_executable(colibri_bailing_attention_contract tests/bailing_attention_contract.cpp)
+target_compile_features(colibri_bailing_attention_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_bailing_attention_contract PRIVATE include src)
+target_compile_definitions(colibri_bailing_attention_contract PRIVATE COLIBRI_BAILING_NO_SIMD)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_bailing_attention_contract
+        COMMAND colibri_bailing_attention_contract
+    )
+endif()
+
+add_executable(colibri_bailing_layer_contract tests/bailing_layer_contract.cpp)
+target_compile_features(colibri_bailing_layer_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_bailing_layer_contract PRIVATE include src)
+target_compile_definitions(colibri_bailing_layer_contract PRIVATE COLIBRI_BAILING_NO_SIMD)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_bailing_layer_contract
+        COMMAND colibri_bailing_layer_contract
+    )
+endif()
+
 add_executable(colibri_qwen_workspace_contract tests/qwen_workspace_contract.cpp)
 target_compile_features(colibri_qwen_workspace_contract PRIVATE cxx_std_20)
 target_include_directories(colibri_qwen_workspace_contract PRIVATE include)
@@ -177,6 +221,61 @@ target_compile_features(colibri_qwen_cpu_bench PRIVATE cxx_std_20)
 target_include_directories(colibri_qwen_cpu_bench PRIVATE src)
 
 add_executable(
+    colibri_bailing_kernels_contract
+    tests/bailing_kernels_contract.cpp
+    src/cpu_backend.cpp
+    src/cpu_kernels.cpp
+    src/cpu_native_kernels.cpp
+    src/cpu_q8_dot_avx2.cpp
+    src/cpu_q8_dot_avx512.cpp
+    src/cpu_shim.cpp
+    src/q4_dispatch.cpp
+    src/q4_scalar.cpp
+    src/q4_avx2.cpp
+    src/q4_avx512.cpp
+)
+target_compile_features(colibri_bailing_kernels_contract PRIVATE cxx_std_20)
+target_include_directories(
+    colibri_bailing_kernels_contract PRIVATE include src ${COLIBRI_CPU_KERNEL_DIR}
+)
+add_dependencies(colibri_bailing_kernels_contract colibri_cpu_kernel_sources)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(colibri_bailing_kernels_contract PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_bailing_kernels_contract
+        COMMAND colibri_bailing_kernels_contract
+    )
+endif()
+
+add_executable(
+    colibri_hf_quantize_tiling_contract
+    tests/hf_quantize_tiling_contract.cpp
+    src/qwen_kquant_pack.cpp
+    src/qwen_kquant_pack_avx2.cpp
+)
+target_compile_features(
+    colibri_hf_quantize_tiling_contract PRIVATE cxx_std_20
+)
+target_include_directories(
+    colibri_hf_quantize_tiling_contract PRIVATE include src
+)
+# The golden hashes cover this file's own sample generator too, which has a
+# multiply-add in it.
+if(NOT MSVC)
+    target_compile_options(
+        colibri_hf_quantize_tiling_contract PRIVATE -ffp-contract=off
+    )
+endif()
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_hf_quantize_tiling_contract
+        COMMAND colibri_hf_quantize_tiling_contract
+    )
+endif()
+
+add_executable(
     colibri_cpu_parity_contract
     tests/cpu_parity_contract.cpp
     src/cpu_backend.cpp
@@ -231,10 +330,28 @@ add_library(
     src/qwen_cpu_avx2.cpp
     src/qwen_cpu_avx_vnni.cpp
     src/qwen_cpu_avx512.cpp
+    src/qwen_kquant_pack.cpp
+    src/qwen_kquant_pack_avx2.cpp
     ${COLIBRI_CPU_KERNEL_BODY}
     ${COLIBRI_CPU_KERNEL_TABLE}
 )
 add_dependencies(colibri_v2 colibri_cpu_kernel_sources)
+# The K-quant encoders must not have their multiply-adds fused. See the header
+# note in src/qwen_kquant_pack.h: contraction changes what a checkpoint
+# quantizes to, and changes it differently on machines with and without FMA.
+# Applied per source rather than per target, so the rest of the runtime keeps
+# its FMAs.
+if(NOT MSVC)
+    set_source_files_properties(
+        src/qwen_kquant_pack.cpp
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off"
+    )
+    # -mavx2 without -mfma: the search must not have an FMA to fuse into.
+    set_source_files_properties(
+        src/qwen_kquant_pack_avx2.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-ffp-contract=off"
+    )
+endif()
 set_source_files_properties(
     ${COLIBRI_CPU_KERNEL_BODY} ${COLIBRI_CPU_KERNEL_TABLE}
     PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE

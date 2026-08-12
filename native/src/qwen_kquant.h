@@ -28,6 +28,204 @@ inline float qwen_half_value(std::uint16_t bits) {
     return value;
 }
 
+// Narrowing counterpart, used for every block scale this file's formats carry.
+// Round-half-to-even keeps the scale error under the codes' own quantization
+// error; a mantissa carry lands in the exponent field on its own because the
+// fields are packed adjacently.
+inline std::uint16_t qwen_half_bits(float value) {
+    std::uint32_t bits;std::memcpy(&bits,&value,sizeof(bits));
+    const std::uint32_t sign=(bits>>16)&0x8000u;
+    const std::int32_t exponent=
+        static_cast<std::int32_t>((bits>>23)&0xffu)-127+15;
+    const std::uint32_t fraction=bits&0x7fffffu;
+    if(((bits>>23)&0xffu)==0xffu)
+        return static_cast<std::uint16_t>(sign|0x7c00u|(fraction?0x200u:0u));
+    if(exponent>=31)return static_cast<std::uint16_t>(sign|0x7c00u);
+    // Subnormals are reachable and must be encoded, not flushed. A Q8_0 block
+    // scale is absmax/127 of real weights and never lands here, which is why
+    // this used to flush -- but a K-quant super-block scale is a scale *of
+    // scales* (max_scale/63 for Q4_K/Q5_K, max_scale/-128 for Q6_K), which
+    // routinely falls under the f16 normal minimum of 6.104e-5. Flushing it
+    // zeroed the whole super-block.
+    if(exponent<=0){
+        // Below 2^-24 there is no subnormal left to round to.
+        if(exponent<-10)return static_cast<std::uint16_t>(sign);
+        const std::uint32_t mantissa=fraction|0x800000u;
+        const int shift=14-exponent;
+        std::uint32_t subnormal=mantissa>>shift;
+        const std::uint32_t dropped=mantissa&((1u<<shift)-1u);
+        const std::uint32_t halfway=1u<<(shift-1);
+        if(dropped>halfway||(dropped==halfway&&(subnormal&1u)))++subnormal;
+        // A carry out of the mantissa lands in the exponent field on its own,
+        // producing the smallest normal -- which is the correct next value.
+        return static_cast<std::uint16_t>(sign|subnormal);
+    }
+    std::uint32_t packed=(static_cast<std::uint32_t>(exponent)<<10)|(fraction>>13);
+    const std::uint32_t remainder=fraction&0x1fffu;
+    if(remainder>0x1000u||(remainder==0x1000u&&(packed&1u)))++packed;
+    return static_cast<std::uint16_t>(sign|packed);
+}
+
+
+// Block geometry for the formats decoded below. These sit here rather than in
+// the runtime because the decoders are here; a consumer that can see one must
+// be able to see the other.
+constexpr std::uint32_t kBlockElements = 256;  // super-block size for the K-quants
+constexpr std::uint32_t kQ8BlockSize = 34;     // Q8_0: f16 scale + 32 codes
+constexpr std::uint32_t kQ4KBlockSize = 144;
+constexpr std::uint32_t kQ5KBlockSize = 176;
+constexpr std::uint32_t kQ6KBlockSize = 210;
+
+// Q8_0, Q4_K, Q5_K and Q6_K element decoders. These lived in v2_runtime.cpp
+// while their Q2_K/Q3_K/IQ siblings lived here, which meant the four formats
+// the HF quantizer actually emits were the only ones an out-of-runtime consumer
+// could not decode. Same definitions, moved.
+inline float qwen_q8_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/32,within=absolute&31;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,packed+block*kQ8BlockSize,2);std::int8_t value=0;std::memcpy(&value,packed+block*kQ8BlockSize+2+within,1);return qwen_half_value(scale_bits)*value;}
+inline float qwen_q4k_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/kBlockElements;const int within=static_cast<int>(absolute&(kBlockElements-1));const auto*base=packed+block*kQ4KBlockSize;std::uint16_t d_bits=0,dmin_bits=0;std::memcpy(&d_bits,base,2);std::memcpy(&dmin_bits,base+2,2);const auto*scales=base+4;const int group=within/64,offset=within&63,sub=offset/32,qindex=group*32+(offset&31);const int quant=(offset<32)?(base[16+qindex]&15):(base[16+qindex]>>4);const int index=group*2+sub;int scale=0,minimum=0;if(index<4){scale=scales[index]&63;minimum=scales[index+4]&63;}else{scale=(scales[index+4]&15)|((scales[index-4]>>6)<<4);minimum=(scales[index+4]>>4)|((scales[index]>>6)<<4);}return qwen_half_value(d_bits)*scale*quant-qwen_half_value(dmin_bits)*minimum;}
+inline float qwen_q5_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/kBlockElements;const int within=static_cast<int>(absolute&(kBlockElements-1));const auto*base=packed+block*kQ5KBlockSize;std::uint16_t d_bits=0,dmin_bits=0;std::memcpy(&d_bits,base,2);std::memcpy(&dmin_bits,base+2,2);const auto*scales=base+4;const int group=within/64,offset=within&63,sub=offset/32,qindex=group*32+(offset&31);const int bit=(base[16+(offset&31)]>>(2*group+sub))&1;const int quant=((offset<32)?(base[48+qindex]&15):(base[48+qindex]>>4))+16*bit;const int index=group*2+sub;int scale=0,minimum=0;if(index<4){scale=scales[index]&63;minimum=scales[index+4]&63;}else{scale=(scales[index+4]&15)|((scales[index-4]>>6)<<4);minimum=(scales[index+4]>>4)|((scales[index]>>6)<<4);}return qwen_half_value(d_bits)*scale*quant-qwen_half_value(dmin_bits)*minimum;}
+inline float qwen_q6_value(const std::uint8_t*packed,std::uint64_t absolute){const auto block=absolute/kBlockElements;const int within=static_cast<int>(absolute&(kBlockElements-1));const auto*base=packed+block*kQ6KBlockSize;const auto*ql=base;const auto*qh=base+128;const auto*scales=reinterpret_cast<const std::int8_t*>(base+192);std::uint16_t d_bits=0;std::memcpy(&d_bits,base+208,2);const int half=within/128,offset=within&127,lane=offset/32,l=offset&31,qindex=l+((lane==0||lane==2)?0:32);const auto qbyte=ql[half*64+qindex],high=qh[half*32+l];const int nibble=(lane==0||lane==1)?(qbyte&15):(qbyte>>4);const int quant=(nibble|(((high>>(lane*2))&3)<<4))-32;const int scale_index=half*8+(l/16)+lane*2;return qwen_half_value(d_bits)*scales[scale_index]*quant;}
+
+// Row dot products for the four formats the HF quantizer emits.
+//
+// The `_value` decoders above are correct but decode a block's scales afresh
+// for every element, which is 32-256x redundant inside a matvec. These unpack
+// each block's scales once and stream the codes, which is what makes a
+// quantized forward pass competitive with an f32 one rather than slower.
+//
+// `elements` must be a whole number of blocks; the caller's shapes are already
+// constrained that way by the quantizer.
+inline float qwen_q8_dot_row(const std::uint8_t* packed, const float* input,
+                             std::uint64_t elements) {
+    double total = 0.0;
+    for (std::uint64_t block = 0; block * 32 < elements; ++block) {
+        const std::uint8_t* base = packed + block * kQ8BlockSize;
+        std::uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, base, 2);
+        const auto* codes = reinterpret_cast<const std::int8_t*>(base + 2);
+        const float* x = input + block * 32;
+        float partial = 0.0f;
+        for (int i = 0; i < 32; ++i) partial += static_cast<float>(codes[i]) * x[i];
+        total += static_cast<double>(qwen_half_value(scale_bits)) * partial;
+    }
+    return static_cast<float>(total);
+}
+
+// Shared 6-bit scale/min unpacking for Q4_K and Q5_K.
+inline void qwen_k4_scale_min(const std::uint8_t* scales, int index,
+                              int* scale, int* minimum) {
+    if (index < 4) {
+        *scale = scales[index] & 63;
+        *minimum = scales[index + 4] & 63;
+    } else {
+        *scale = (scales[index + 4] & 15) | ((scales[index - 4] >> 6) << 4);
+        *minimum = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+    }
+}
+
+inline float qwen_q4k_dot_row(const std::uint8_t* packed, const float* input,
+                              std::uint64_t elements) {
+    double total = 0.0;
+    for (std::uint64_t block = 0; block * kBlockElements < elements; ++block) {
+        const std::uint8_t* base = packed + block * kQ4KBlockSize;
+        std::uint16_t d_bits = 0, dmin_bits = 0;
+        std::memcpy(&d_bits, base, 2);
+        std::memcpy(&dmin_bits, base + 2, 2);
+        const float d = qwen_half_value(d_bits), dmin = qwen_half_value(dmin_bits);
+        const std::uint8_t* scales = base + 4;
+        const std::uint8_t* quants = base + 16;
+        const float* x = input + block * kBlockElements;
+        for (int group = 0; group < 4; ++group) {
+            for (int half = 0; half < 2; ++half) {
+                int scale = 0, minimum = 0;
+                qwen_k4_scale_min(scales, group * 2 + half, &scale, &minimum);
+                // value = d*scale*q - dmin*min, so the min term factors out of
+                // the sum as dmin*min*sum(x).
+                float dot = 0.0f, sum = 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    const std::uint8_t byte = quants[group * 32 + i];
+                    const int q = half == 0 ? (byte & 15) : (byte >> 4);
+                    const float value = x[group * 64 + half * 32 + i];
+                    dot += static_cast<float>(q) * value;
+                    sum += value;
+                }
+                total += static_cast<double>(d) * scale * dot -
+                         static_cast<double>(dmin) * minimum * sum;
+            }
+        }
+    }
+    return static_cast<float>(total);
+}
+
+inline float qwen_q5k_dot_row(const std::uint8_t* packed, const float* input,
+                              std::uint64_t elements) {
+    double total = 0.0;
+    for (std::uint64_t block = 0; block * kBlockElements < elements; ++block) {
+        const std::uint8_t* base = packed + block * kQ5KBlockSize;
+        std::uint16_t d_bits = 0, dmin_bits = 0;
+        std::memcpy(&d_bits, base, 2);
+        std::memcpy(&dmin_bits, base + 2, 2);
+        const float d = qwen_half_value(d_bits), dmin = qwen_half_value(dmin_bits);
+        const std::uint8_t* scales = base + 4;
+        const std::uint8_t* high = base + 16;
+        const std::uint8_t* quants = base + 48;
+        const float* x = input + block * kBlockElements;
+        for (int group = 0; group < 4; ++group) {
+            for (int half = 0; half < 2; ++half) {
+                int scale = 0, minimum = 0;
+                qwen_k4_scale_min(scales, group * 2 + half, &scale, &minimum);
+                float dot = 0.0f, sum = 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    const std::uint8_t byte = quants[group * 32 + i];
+                    const int low = half == 0 ? (byte & 15) : (byte >> 4);
+                    const int bit = (high[i] >> (2 * group + half)) & 1;
+                    const float value = x[group * 64 + half * 32 + i];
+                    dot += static_cast<float>(low + 16 * bit) * value;
+                    sum += value;
+                }
+                total += static_cast<double>(d) * scale * dot -
+                         static_cast<double>(dmin) * minimum * sum;
+            }
+        }
+    }
+    return static_cast<float>(total);
+}
+
+inline float qwen_q6k_dot_row(const std::uint8_t* packed, const float* input,
+                              std::uint64_t elements) {
+    double total = 0.0;
+    for (std::uint64_t block = 0; block * kBlockElements < elements; ++block) {
+        const std::uint8_t* base = packed + block * kQ6KBlockSize;
+        const std::uint8_t* ql = base;
+        const std::uint8_t* qh = base + 128;
+        const auto* scales = reinterpret_cast<const std::int8_t*>(base + 192);
+        std::uint16_t d_bits = 0;
+        std::memcpy(&d_bits, base + 208, 2);
+        const float d = qwen_half_value(d_bits);
+        const float* x = input + block * kBlockElements;
+        for (int half = 0; half < 2; ++half) {
+            for (int lane = 0; lane < 4; ++lane) {
+                // Each 16-element group has its own signed scale; a lane spans
+                // two of them.
+                for (int part = 0; part < 2; ++part) {
+                    const int scale = scales[half * 8 + part + lane * 2];
+                    float dot = 0.0f;
+                    for (int i = 0; i < 16; ++i) {
+                        const int l = part * 16 + i;
+                        const int index = l + ((lane == 0 || lane == 2) ? 0 : 32);
+                        const std::uint8_t byte = ql[half * 64 + index];
+                        const int nibble = (lane == 0 || lane == 1) ? (byte & 15) : (byte >> 4);
+                        const int q = (nibble | (((qh[half * 32 + l] >> (lane * 2)) & 3) << 4)) - 32;
+                        dot += static_cast<float>(q) * x[half * 128 + lane * 32 + l];
+                    }
+                    total += static_cast<double>(d) * scale * dot;
+                }
+            }
+        }
+    }
+    return static_cast<float>(total);
+}
+
+
 // Q2_K (GGML type 10): 84 bytes per 256 values -> scales[16] qs[64] d(2) dmin(2).
 // Each scales byte packs a 4-bit scale (low nibble) and a 4-bit min (high
 // nibble) governing one 16-element group; value = d*scale*q - dmin*min. The

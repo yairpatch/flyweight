@@ -3,6 +3,7 @@ from __future__ import annotations
 import codecs
 import datetime
 import json
+import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -22,6 +23,7 @@ from .v2 import (
     TASK_EVENT_PREFILL,
     TASK_EVENT_TOKEN,
     V2Error,
+    BailingRuntime,
     V2Model,
     V2QwenRuntime,
 )
@@ -1060,6 +1062,137 @@ class NativeV2Generator(ChatGenerator):
         }
 
 
+class BailingEngine:
+    """Engine adapter for the BailingMoE3 host/GPU runtime.
+
+    Presents the same submit/cancel/forget/close surface as `_NativeEngine` so
+    `ChatGenerator` needs no changes, but it is deliberately much simpler: the
+    bailing runtime owns ONE sequence of caches, so tasks run strictly one at a
+    time rather than being interleaved across slots. Concurrent requests queue.
+    """
+
+    _MAX_ACTIVE_TASKS = 32
+    _MAX_BUFFERED_EVENTS = 256
+
+    def __init__(self, runtime: "BailingRuntime"):
+        self.runtime = runtime
+        self._lock = threading.Lock()
+        self._queues: dict[int, Queue[tuple[str, object]]] = {}
+        self._pending: list[tuple[int, list[int], int, tuple[int, ...], object]] = []
+        self._cancelled: set[int] = set()
+        self._next_id = 1
+        self._closing = False
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def submit(
+        self,
+        prompt_ids: list[int],
+        max_new_tokens: int,
+        stop_tokens: tuple[int, ...],
+        sampling: SamplingConfig | None = None,
+    ) -> tuple[int, Queue[tuple[str, object]]]:
+        task_queue: Queue[tuple[str, object]] = Queue(maxsize=self._MAX_BUFFERED_EVENTS)
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("bailing engine is shutting down")
+            if len(self._queues) >= self._MAX_ACTIVE_TASKS:
+                raise RuntimeError("bailing engine queue is full; retry later")
+            task_id = self._next_id
+            self._next_id += 1
+            self._queues[task_id] = task_queue
+            self._pending.append(
+                (task_id, list(prompt_ids), max_new_tokens, stop_tokens,
+                 sampling or SamplingConfig())
+            )
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run, name="colibri-bailing-engine", daemon=True
+                )
+                self._thread.start()
+        self._wake.set()
+        return task_id, task_queue
+
+    def cancel(self, task_id: int) -> None:
+        with self._lock:
+            self._cancelled.add(task_id)
+
+    def forget(self, task_id: int) -> None:
+        with self._lock:
+            self._queues.pop(task_id, None)
+            self._cancelled.discard(task_id)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closing = True
+        self._wake.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=30.0)
+
+    def _emit(self, task_id: int, event: tuple[str, object]) -> bool:
+        """False when the consumer has gone away or the task was cancelled."""
+        with self._lock:
+            task_queue = self._queues.get(task_id)
+            cancelled = task_id in self._cancelled or self._closing
+        if task_queue is None or cancelled:
+            return False
+        try:
+            task_queue.put_nowait(event)
+        except Exception:
+            return False
+        return True
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                if self._closing and not self._pending:
+                    return
+                task = self._pending.pop(0) if self._pending else None
+            if task is None:
+                self._wake.wait(timeout=0.05)
+                self._wake.clear()
+                continue
+            task_id, prompt_ids, max_new_tokens, stop_tokens, sampling = task
+            try:
+                self._run_task(task_id, prompt_ids, max_new_tokens,
+                               stop_tokens, sampling)
+            except Exception as error:  # keep the worker alive across failures
+                self._emit(task_id, ("error", str(error)))
+
+    def _run_task(self, task_id, prompt_ids, max_new_tokens, stop_tokens, sampling):
+        # One sequence of caches, so every task starts from a clean state. This
+        # is also why there is no prefix cache here: nothing survives a task.
+        self.runtime.reset()
+        if not prompt_ids:
+            self._emit(task_id, ("done", None))
+            return
+        self.runtime.eval_into(prompt_ids)
+        stops = set(stop_tokens)
+        for _ in range(max_new_tokens):
+            token = self.runtime.sample(sampling)
+            if not self._emit(task_id, ("token", token)):
+                return
+            if token in stops:
+                break
+            self.runtime.eval_into([token])
+        self._emit(task_id, ("done", None))
+
+
+class BailingGenerator(ChatGenerator):
+    """Streaming generator backed by the BailingMoE3 runtime."""
+
+    def __init__(self, model: V2Model, runtime: "BailingRuntime",
+                 tokenizer: NativeV2Tokenizer):
+        super().__init__(model, BailingEngine(runtime), tokenizer)
+        self.runtime = runtime
+
+    def prefix_cache_stats(self) -> dict[str, int]:
+        # No prefix cache on this path yet; report zeros rather than the Qwen
+        # runtime's numbers, which would be a lie about a different runtime.
+        return {"capacity": 1, "used": 0, "hits": 0, "misses": 0}
+
+
 class NativeV2InferenceService(InferenceService):
     def __init__(
         self,
@@ -1101,6 +1234,29 @@ class NativeV2InferenceService(InferenceService):
             model_path
         )
         self.v2_model = V2Model(model_path, mtp_model=mtp_model_path)
+        # BailingMoE3 runs on its own runtime rather than the Qwen one: 24 of
+        # its 24 layers use attention the Qwen path does not implement. It is a
+        # narrower runtime -- one sequence, no prefix cache, no expert paging --
+        # so the options below that describe those features do not apply to it.
+        self.architecture = str(self.v2_model.info["architecture"])
+        self.bailing_runtime: BailingRuntime | None = None
+        if self.architecture == "bailingmoe3":
+            self._init_bailing(
+                model_name=model_name or Path(model_path).stem,
+                max_new_tokens=max_new_tokens,
+                context_window=context_window,
+                api_key=api_key,
+                cors_origin=cors_origin,
+                strict_model=strict_model,
+                max_concurrent_requests=max_concurrent_requests,
+                request_timeout_seconds=request_timeout_seconds,
+                sse_keepalive_seconds=sse_keepalive_seconds,
+                generation_defaults=generation_defaults,
+            )
+            self.generation_defaults_source = generation_defaults_source
+            self.gpu_cache_mib = gpu_cache_mib
+            self.mtp_drafts = 0
+            return
         self.v2_runtime: V2QwenRuntime | None = None
         try:
             self.v2_runtime = self.v2_model.native_runtime(
@@ -1165,16 +1321,58 @@ class NativeV2InferenceService(InferenceService):
         # serialize them.
         self._serialize_generation = False
 
+    def _init_bailing(self, *, model_name, max_new_tokens, context_window, api_key,
+                      cors_origin, strict_model, max_concurrent_requests,
+                      request_timeout_seconds, sse_keepalive_seconds,
+                      generation_defaults) -> None:
+        self.v2_runtime = None
+        tokenizer = NativeV2Tokenizer(self.v2_model)
+        self.bailing_runtime = BailingRuntime(self.v2_model, capacity=context_window)
+        super().__init__(
+            model_name,
+            BailingGenerator(self.v2_model, self.bailing_runtime, tokenizer),
+            max_new_tokens=max_new_tokens,
+            context_window=context_window,
+            api_key=api_key,
+            cors_origin=cors_origin,
+            strict_model=strict_model,
+            max_concurrent_requests=max_concurrent_requests,
+            request_timeout_seconds=request_timeout_seconds,
+            sse_keepalive_seconds=sse_keepalive_seconds,
+            generation_defaults=generation_defaults,
+        )
+        self.requested_expert_mode = "n/a"
+        self.expert_mode = "n/a"
+        self.expert_fallback_reason = ""
+        self.moe_device = "n/a"
+        # One sequence of caches, so requests must not overlap.
+        self._serialize_generation = True
+
     def close(self) -> None:
         generator_close = getattr(self.generator, "close", None)
         if callable(generator_close):
             generator_close()
+        if getattr(self, "bailing_runtime", None) is not None:
+            self.bailing_runtime.close()
+            self.bailing_runtime = None
         if self.v2_runtime is not None:
             self.v2_runtime.close()
             self.v2_runtime = None
         self.v2_model.close()
 
     def health(self) -> dict[str, object]:
+        # getattr rather than attribute access: tests construct this service
+        # without running __init__, so the field may not exist.
+        if getattr(self, "bailing_runtime", None) is not None:
+            value = super().health()
+            value["execution"] = {
+                "backend": "native-v2-bailingmoe3",
+                "architecture": self.architecture,
+                "device": "gpu" if os.environ.get("COLIBRI_BAILING_GPU") == "1"
+                          else "cpu",
+                "parallel_sequences": 1,
+            }
+            return value
         if self.v2_runtime is None:
             raise RuntimeError("native v2 service is closed")
         value = super().health()

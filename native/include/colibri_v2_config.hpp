@@ -19,6 +19,10 @@ struct ModelConfig {
     std::uint32_t dense_intermediate_size=0, expert_intermediate_size=0;
     std::uint32_t per_layer_embedding_size=0, shared_kv_layers=0;
     std::uint32_t key_length=0, value_length=0;
+    // The per-head width the architecture declares, which is NOT always
+    // hidden_size / heads: BailingMoE3 is 1536/16 = 96 by that formula but
+    // declares head_dim 128, and its KDA projections are heads*head_dim wide.
+    std::uint32_t attention_head_dim=0;
     std::uint32_t key_length_swa=0, value_length_swa=0;
     std::uint32_t rotary_dimension_swa=0;
     float rope_freq_base_swa=0.0f, final_logit_softcap=0.0f;
@@ -34,6 +38,10 @@ struct ModelConfig {
     std::uint32_t expert_shared_intermediate_size=0;
     // GGUF llama_expert_gating_func_type: 1 = softmax, 2 = sigmoid.
     std::uint32_t expert_gating_func=0;
+    // `noaux_tc` group-limited routing: experts are split into
+    // `expert_group_count` groups and only the best `expert_group_used` of them
+    // supply candidates. Zero means routing is not group limited.
+    std::uint32_t expert_group_count=0, expert_group_used=0;
     bool expert_weights_norm=false;
     float expert_weights_scale=1.0f;
     // YaRN rope extension. A zero factor means the layer runs plain RoPE.
