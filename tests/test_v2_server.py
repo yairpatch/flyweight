@@ -10,6 +10,7 @@ from colibri_next.cli import _parser
 from colibri_next.sampling import SamplingConfig
 from colibri_next.server import InferenceService
 from colibri_next.v2_server import (
+    BailingEngine,
     NativeV2Generator,
     NativeV2InferenceService,
     NativeV2Tokenizer,
@@ -83,6 +84,7 @@ class StubV2Runtime:
     def cancel(self) -> None:
         self.cancels += 1
 
+
     # Cooperative-engine API mirroring the native semantics (prefill the whole
     # prompt, then per step: emit token; stop on stop-token or max; else decode
     # the emitted token as the next input).
@@ -128,6 +130,23 @@ class StubV2Runtime:
         getattr(self, "_tasks", {}).pop(task_id, None)
 
 
+class StubBailingRuntime:
+    def __init__(self) -> None:
+        self.resets = 0
+        self.eval_calls: list[list[int]] = []
+        self.next_token = 20
+
+    def reset(self) -> None:
+        self.resets += 1
+
+    def eval_into(self, tokens) -> None:
+        self.eval_calls.append(list(tokens))
+
+    def sample(self, _sampling) -> int:
+        self.next_token += 1
+        return self.next_token
+
+
 class BlockingV2Runtime(StubV2Runtime):
     def __init__(self):
         super().__init__([10])
@@ -166,6 +185,32 @@ class NativeV2ServerTests(unittest.TestCase):
             model, runtime, tokenizer
         )
         return generator, runtime
+
+    def test_bailing_engine_reuses_exact_live_prefix_and_reports_progress(self) -> None:
+        runtime = StubBailingRuntime()
+        engine = BailingEngine(runtime)  # type: ignore[arg-type]
+
+        def run(prompt: list[int]) -> list[tuple[str, object]]:
+            task_id, events = engine.submit(prompt, 1, ())
+            received: list[tuple[str, object]] = []
+            while True:
+                event = events.get(timeout=2)
+                received.append(event)
+                if event[0] == "done":
+                    break
+            engine.forget(task_id)
+            return received
+
+        try:
+            first = run([1, 2])
+            second = run([1, 2, 21, 3])
+        finally:
+            engine.close()
+
+        self.assertEqual(runtime.resets, 1)
+        self.assertEqual(runtime.eval_calls, [[1, 2], [21], [3], [22]])
+        self.assertEqual([value for kind, value in first if kind == "prefill"], [0, 2])
+        self.assertEqual([value for kind, value in second if kind == "prefill"], [3, 4])
 
     def test_generation_config_adjacent_to_model_supplies_sampling_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -208,6 +253,18 @@ class NativeV2ServerTests(unittest.TestCase):
             defaults, _ = _generation_config_for_model(model)
 
         self.assertEqual(defaults["temperature"], 0.0)
+
+    def test_hf_directory_uses_its_own_generation_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "checkpoint"
+            model.mkdir()
+            config = model / "generation_config.json"
+            config.write_text(json.dumps({"temperature": 0.4, "top_p": 0.8}))
+
+            defaults, source = _generation_config_for_model(model)
+
+        self.assertEqual(defaults, {"temperature": 0.4, "top_p": 0.8})
+        self.assertEqual(source, str(config))
 
     def test_health_exposes_resolved_expert_policy(self) -> None:
         class Runtime:
@@ -566,6 +623,7 @@ class NativeV2ServerTests(unittest.TestCase):
     def test_benchmark_v2_exposes_native_runtime_tuning_options(self) -> None:
         defaults = _parser().parse_args(["benchmark-v2", "model.gguf"])
         self.assertEqual(defaults.gpu_cache_mib, 0)
+        self.assertEqual(defaults.iterations, 128)
 
         args = _parser().parse_args([
             "benchmark-v2", "model.gguf",

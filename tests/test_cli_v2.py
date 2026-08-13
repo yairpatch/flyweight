@@ -1,10 +1,14 @@
 import os
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from colibri_next.cli import (
     _benchmark_native_generate,
+    _benchmark_bailing_generate,
+    _architecture,
     _benchmark_native_prefill,
     _drop_file_cache,
     _parser,
@@ -14,6 +18,49 @@ from colibri_next.cli import (
 
 
 class NativeV2BenchmarkTests(unittest.TestCase):
+    def test_hf_architecture_detection_reads_config_without_opening_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(json.dumps({
+                "model_type": "bailing_hybrid",
+                "architectures": ["BailingMoeV3ForCausalLM"],
+            }))
+            with patch("colibri_next.cli.V2Model") as model:
+                self.assertEqual(_architecture(path), "bailingmoe3")
+            model.assert_not_called()
+
+    def test_bailing_benchmark_uses_the_server_eval_sample_loop(self) -> None:
+        class Runtime:
+            def __init__(self):
+                self.steps = []
+                self.samples = iter((41, 42))
+                self.reset_count = 0
+
+            def reset(self):
+                self.reset_count += 1
+
+            def eval_into(self, step):
+                self.steps.append(list(step))
+
+            def sample(self, config):
+                return next(self.samples)
+
+        runtime = Runtime()
+        config = object()
+        with patch(
+            "colibri_next.cli.time.perf_counter",
+            side_effect=(10.0, 10.1, 10.3, 10.4),
+        ):
+            generated, arrivals, elapsed = _benchmark_bailing_generate(
+                runtime, [1, 2, 3], 2, config,
+            )
+        self.assertEqual(runtime.reset_count, 1)
+        self.assertEqual(runtime.steps, [[1, 2, 3], [41]])
+        self.assertEqual(generated, [41, 42])
+        self.assertAlmostEqual(arrivals[0], 0.1)
+        self.assertAlmostEqual(arrivals[1], 0.3)
+        self.assertAlmostEqual(elapsed, 0.4)
+
     def test_prefill_cache_seed_accepts_auto_off_and_bounded_counts(self) -> None:
         self.assertEqual(_prefill_cache_seed("auto"), "auto")
         self.assertEqual(_prefill_cache_seed("OFF"), "off")

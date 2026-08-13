@@ -235,6 +235,23 @@ inline long long atomicMax(long long* address, long long value) {
     return colibri_atomic_max(address, value);
 }
 
+template <class T>
+inline T colibri_atomic_add(T* address, T value) {
+    auto* target = reinterpret_cast<std::atomic<T>*>(address);
+    T previous = target->load(std::memory_order_relaxed);
+    while (!target->compare_exchange_weak(previous, previous + value,
+                                          std::memory_order_relaxed)) {
+    }
+    return previous;
+}
+
+inline int atomicAdd(int* address, int value) {
+    return colibri_atomic_add(address, value);
+}
+inline float atomicAdd(float* address, float value) {
+    return colibri_atomic_add(address, value);
+}
+
 // ---------------------------------------------------------------------------
 // Warp shuffles
 // ---------------------------------------------------------------------------

@@ -62,6 +62,8 @@ std::uint64_t legacy_rows_bytes(
         ws::align(rows * top_k * sizeof(std::int32_t)) +
         ws::align(rows * top_k * sizeof(float)) +
         ws::align(rows * top_k * intermediate * sizeof(float)) +
+        ws::align(rows * scratch) +
+        ws::align(rows * (scratch / 32 + 1) * sizeof(float)) +
         ws::align(rows * top_k * sizeof(std::uint64_t)) * 3 +
         ws::align(rows * top_k * sizeof(float)) * 3 +
         ws::align(rows * sizeof(std::int32_t)) +
@@ -147,6 +149,7 @@ int main() {
             layout.hidden, layout.residual, layout.normalized, layout.first,
             layout.second, layout.third, layout.fourth, layout.router_logits,
             layout.selected_device, layout.route_weights, layout.gpu_activated,
+            layout.rows_q8, layout.rows_q8_scales,
             layout.gpu_gate_table, layout.gpu_up_table, layout.gpu_down_table,
             layout.gpu_weight_table, layout.gpu_gate_scale_table,
             layout.gpu_up_scale_table, layout.gpu_count_table,

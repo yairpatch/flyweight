@@ -55,7 +55,7 @@ def _generation_config_for_model(
     kept inside an exported Hugging Face model directory.
     """
     path = Path(model_path)
-    candidates = (
+    candidates = (() if not path.is_dir() else (path / "generation_config.json",)) + (
         path.with_name(path.name + ".generation_config.json"),
         path.with_suffix(".generation_config.json"),
         path.parent / "generation_config.json",
@@ -1084,6 +1084,11 @@ class BailingEngine:
         self._closing = False
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        # Exact token sequence represented by the runtime's single live cache.
+        # Bailing cannot rewind yet, but ordinary conversation continuation
+        # extends this sequence exactly and should not pay a full reprefill.
+        self._cached_tokens: list[int] = []
+        self._cache_initialized = False
 
     def submit(
         self,
@@ -1161,13 +1166,29 @@ class BailingEngine:
                 self._emit(task_id, ("error", str(error)))
 
     def _run_task(self, task_id, prompt_ids, max_new_tokens, stop_tokens, sampling):
-        # One sequence of caches, so every task starts from a clean state. This
-        # is also why there is no prefix cache here: nothing survives a task.
-        self.runtime.reset()
         if not prompt_ids:
             self._emit(task_id, ("done", None))
             return
-        self.runtime.eval_into(prompt_ids)
+        cached = len(self._cached_tokens)
+        reusable = (
+            self._cache_initialized
+            and cached <= len(prompt_ids)
+            and prompt_ids[:cached] == self._cached_tokens
+        )
+        if not reusable:
+            self.runtime.reset()
+            self._cached_tokens.clear()
+            self._cache_initialized = True
+            cached = 0
+        # Make reuse and long blocking prefills visible to the HTTP progress
+        # logger. The runtime has no chunk callbacks yet, so this reports the
+        # exact reused boundary and completion rather than invented progress.
+        self._emit(task_id, ("prefill", cached))
+        suffix = prompt_ids[cached:]
+        if suffix:
+            self.runtime.eval_into(suffix)
+            self._cached_tokens.extend(suffix)
+        self._emit(task_id, ("prefill", len(prompt_ids)))
         stops = set(stop_tokens)
         for _ in range(max_new_tokens):
             token = self.runtime.sample(sampling)
@@ -1176,6 +1197,7 @@ class BailingEngine:
             if token in stops:
                 break
             self.runtime.eval_into([token])
+            self._cached_tokens.append(token)
         self._emit(task_id, ("done", None))
 
 

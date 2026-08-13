@@ -1388,6 +1388,1261 @@ void bailing_swiglu(
     }
 }
 
+// Complete row-batched Bailing prefill helpers. All layouts are row-major and
+// remain device-resident across a prompt tile.
+extern "C" __global__
+void bailing_mla_prepare_rows(
+    const float* compressed, const float* query, const float* latent_gain,
+    float* latents, float* rope_keys, float* query_nope, float* query_rope,
+    const int rows, const int base_position, const int heads,
+    const int qk_nope, const int qk_rope, const int kv_lora,
+    const float epsilon, const float theta
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int lane = threadIdx.x;
+    const int compressed_width = kv_lora + qk_rope;
+    const float* source = compressed + (long long)row * compressed_width;
+    float* latent = latents + (long long)(base_position + row) * kv_lora;
+    __shared__ float reduce[256];
+    float partial = 0.0f;
+    for (int i = lane; i < kv_lora; i += 256) partial += source[i] * source[i];
+    reduce[lane] = partial;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (lane < stride) reduce[lane] += reduce[lane + stride];
+        __syncthreads();
+    }
+    const float inverse = rsqrtf(reduce[0] / (float)kv_lora + epsilon);
+    for (int i = lane; i < kv_lora; i += 256)
+        latent[i] = source[i] * inverse * latent_gain[i];
+
+    const int position = base_position + row;
+    float* cached_rope = rope_keys + (long long)position * qk_rope;
+    for (int pair = lane; pair * 2 < qk_rope; pair += 256) {
+        const float exponent = (float)(2 * pair) / (float)qk_rope;
+        const float angle = (float)position * powf(theta, -exponent);
+        const float cosine = cosf(angle), sine = sinf(angle);
+        const float even = source[kv_lora + pair * 2];
+        const float odd = source[kv_lora + pair * 2 + 1];
+        cached_rope[pair * 2] = even * cosine - odd * sine;
+        cached_rope[pair * 2 + 1] = odd * cosine + even * sine;
+    }
+    const int qk = qk_nope + qk_rope;
+    const float* query_row = query + (long long)row * heads * qk;
+    float* nope_row = query_nope + (long long)row * heads * qk_nope;
+    float* rope_row = query_rope + (long long)row * heads * qk_rope;
+    for (int index = lane; index < heads * qk_nope; index += 256) {
+        const int head = index / qk_nope, channel = index % qk_nope;
+        nope_row[index] = query_row[head * qk + channel];
+    }
+    for (int index = lane; index < heads * (qk_rope / 2); index += 256) {
+        const int head = index / (qk_rope / 2), pair = index % (qk_rope / 2);
+        const float exponent = (float)(2 * pair) / (float)qk_rope;
+        const float angle = (float)position * powf(theta, -exponent);
+        const float cosine = cosf(angle), sine = sinf(angle);
+        const float* span = query_row + head * qk + qk_nope;
+        const float even = span[pair * 2], odd = span[pair * 2 + 1];
+        float* target = rope_row + head * qk_rope;
+        target[pair * 2] = even * cosine - odd * sine;
+        target[pair * 2 + 1] = odd * cosine + even * sine;
+    }
+}
+
+extern "C" __global__
+void bailing_mla_project_rows(
+    const float* query_nope, const float* kv_b, float* projected,
+    const int rows, const int heads, const int qk_nope,
+    const int v_head_dim, const int kv_lora
+) {
+    const int query_index = blockIdx.x;
+    const int row = query_index / heads, head = query_index % heads;
+    if (row >= rows) return;
+    const float* weights = kv_b +
+        (long long)head * (qk_nope + v_head_dim) * kv_lora;
+    const float* query = query_nope +
+        ((long long)row * heads + head) * qk_nope;
+    float* target = projected + ((long long)row * heads + head) * kv_lora;
+    for (int column = threadIdx.x; column < kv_lora; column += blockDim.x) {
+        float total = 0.0f;
+        for (int i = 0; i < qk_nope; ++i)
+            total += query[i] * weights[(long long)i * kv_lora + column];
+        target[column] = total;
+    }
+}
+
+extern "C" __global__
+void bailing_mla_scores_rows(
+    const float* projected, const float* query_rope,
+    const float* latents, const float* rope_keys, float* scores,
+    const int rows, const int base_position, const int capacity,
+    const int heads, const int qk_nope, const int qk_rope, const int kv_lora
+) {
+    const int query_index = blockIdx.x;
+    const int row = query_index / heads, head = query_index % heads;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int position = blockIdx.y * 8 + warp;
+    const int visible = base_position + row + 1;
+    if (row >= rows || position >= visible) return;
+    const float* p = projected + ((long long)row * heads + head) * kv_lora;
+    const float* latent = latents + (long long)position * kv_lora;
+    const float* qr = query_rope + ((long long)row * heads + head) * qk_rope;
+    const float* kr = rope_keys + (long long)position * qk_rope;
+    float total = 0.0f;
+    for (int i = lane; i < kv_lora; i += 32) total += p[i] * latent[i];
+    for (int i = lane; i < qk_rope; i += 32) total += qr[i] * kr[i];
+    for (int offset = 16; offset; offset >>= 1)
+        total += __shfl_down_sync(0xffffffff, total, offset);
+    if (lane == 0)
+        scores[(long long)query_index * capacity + position] =
+            total * rsqrtf((float)(qk_nope + qk_rope));
+}
+
+extern "C" __global__
+void bailing_mla_softmax_rows(
+    float* scores, const int rows, const int base_position,
+    const int capacity, const int heads
+) {
+    const int query_index = blockIdx.x;
+    const int row = query_index / heads;
+    if (row >= rows) return;
+    const int visible = base_position + row + 1, lane = threadIdx.x;
+    float* values = scores + (long long)query_index * capacity;
+    __shared__ float reduce[128];
+    float local = -3.0e38f;
+    for (int i = lane; i < visible; i += 128) local = fmaxf(local, values[i]);
+    reduce[lane] = local;
+    __syncthreads();
+    for (int stride = 64; stride; stride >>= 1) {
+        if (lane < stride) reduce[lane] = fmaxf(reduce[lane], reduce[lane + stride]);
+        __syncthreads();
+    }
+    const float peak = reduce[0];
+    local = 0.0f;
+    for (int i = lane; i < visible; i += 128) {
+        const float value = __expf(values[i] - peak);
+        values[i] = value;
+        local += value;
+    }
+    reduce[lane] = local;
+    __syncthreads();
+    for (int stride = 64; stride; stride >>= 1) {
+        if (lane < stride) reduce[lane] += reduce[lane + stride];
+        __syncthreads();
+    }
+    const float inverse = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    for (int i = lane; i < visible; i += 128) values[i] *= inverse;
+}
+
+extern "C" __global__
+void bailing_mla_accumulate_rows(
+    const float* scores, const float* latents, float* accumulated,
+    const int rows, const int base_position, const int capacity,
+    const int heads, const int kv_lora
+) {
+    const int query_index = blockIdx.x;
+    const int row = query_index / heads;
+    const int column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= rows || column >= kv_lora) return;
+    const int visible = base_position + row + 1;
+    const float* weights = scores + (long long)query_index * capacity;
+    float total = 0.0f;
+    for (int position = 0; position < visible; ++position)
+        total += weights[position] * latents[(long long)position * kv_lora + column];
+    accumulated[(long long)query_index * kv_lora + column] = total;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+extern "C" __global__
+void bailing_mla_fused_rows(
+    const float* projected, const float* query_rope,
+    const float* latents, const float* rope_keys, float* accumulated,
+    const int rows, const int base_position, const int heads,
+    const int qk_nope, const int qk_rope, const int kv_lora
+) {
+    const int query_index = blockIdx.x;
+    const int row = query_index / heads, head = query_index % heads;
+    const int lane = threadIdx.x;
+    const int warp = lane >> 5, warp_lane = lane & 31;
+    if (row >= rows || kv_lora > blockDim.x || blockDim.x != 512) return;
+    const int visible = base_position + row + 1;
+    const float* query = projected +
+        ((long long)row * heads + head) * kv_lora;
+    const float* rope = query_rope +
+        ((long long)row * heads + head) * qk_rope;
+    float value = 0.0f;
+    __shared__ float running_max;
+    __shared__ float running_sum;
+    __shared__ float old_factor;
+    __shared__ float tile_weights[16];
+    if (lane == 0) {
+        running_max = -3.402823466e+38F;
+        running_sum = 0.0f;
+    }
+    __syncthreads();
+    const float scale = rsqrtf((float)(qk_nope + qk_rope));
+    for (int position_base = 0; position_base < visible; position_base += 16) {
+        const int position = position_base + warp;
+        float partial = 0.0f;
+        if (position < visible) {
+            const float* latent = latents + (long long)position * kv_lora;
+            for (int i = warp_lane; i < kv_lora; i += 32)
+                partial += query[i] * latent[i];
+            for (int i = warp_lane; i < qk_rope; i += 32)
+                partial += rope[i] *
+                    rope_keys[(long long)position * qk_rope + i];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, offset);
+        if (warp_lane == 0)
+            tile_weights[warp] = position < visible
+                ? partial * scale : -3.402823466e+38F;
+        __syncthreads();
+        if (lane == 0) {
+            float peak = running_max;
+            const int count = min(16, visible - position_base);
+            for (int i = 0; i < count; ++i)
+                peak = fmaxf(peak, tile_weights[i]);
+            old_factor = running_sum > 0.0f
+                ? __expf(running_max - peak) : 0.0f;
+            float tile_sum = 0.0f;
+            for (int i = 0; i < count; ++i) {
+                tile_weights[i] = __expf(tile_weights[i] - peak);
+                tile_sum += tile_weights[i];
+            }
+            running_sum = running_sum * old_factor + tile_sum;
+            running_max = peak;
+        }
+        __syncthreads();
+        if (lane < kv_lora) {
+            float update = 0.0f;
+            const int count = min(16, visible - position_base);
+            for (int i = 0; i < count; ++i)
+                update += tile_weights[i] * latents[
+                    (long long)(position_base + i) * kv_lora + lane];
+            value = value * old_factor + update;
+        }
+        __syncthreads();
+    }
+    if (lane < kv_lora)
+        accumulated[(long long)query_index * kv_lora + lane] =
+            running_sum > 0.0f ? value / running_sum : 0.0f;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+
+extern "C" __global__
+void bailing_mla_output_rows(
+    const float* accumulated, const float* kv_b, const float* gates,
+    float* output, const int rows, const int heads, const int qk_nope,
+    const int v_head_dim, const int kv_lora
+) {
+    const int query_index = blockIdx.x;
+    const int row = query_index / heads, head = query_index % heads;
+    if (row >= rows) return;
+    const float* values = accumulated + (long long)query_index * kv_lora;
+    const float* weights = kv_b +
+        ((long long)head * (qk_nope + v_head_dim) + qk_nope) * kv_lora;
+    const float gate = 1.0f / (1.0f + __expf(-gates[(long long)row * heads + head]));
+    for (int output_row = threadIdx.x; output_row < v_head_dim; output_row += blockDim.x) {
+        const float* source = weights + (long long)output_row * kv_lora;
+        float total = 0.0f;
+        for (int i = 0; i < kv_lora; ++i) total += source[i] * values[i];
+        output[((long long)row * heads + head) * v_head_dim + output_row] = total * gate;
+    }
+}
+
+extern "C" __global__
+void bailing_short_conv_rows(
+    float* values, const float* weights, float* window,
+    const int rows, const int channels, const int width
+) {
+    const int history = width - 1;
+    for (int channel = blockIdx.x * blockDim.x + threadIdx.x; channel < channels;
+         channel += blockDim.x * gridDim.x) {
+        const float* taps = weights + (long long)channel * width;
+        float* past = window + (long long)channel * history;
+        for (int row = 0; row < rows; ++row) {
+            const float input = values[(long long)row * channels + channel];
+            float total = 0.0f;
+            for (int i = 0; i < history; ++i) total += past[i] * taps[i];
+            total += input * taps[history];
+            values[(long long)row * channels + channel] =
+                total / (1.0f + __expf(-total));
+            for (int i = 0; i + 1 < history; ++i) past[i] = past[i + 1];
+            if (history > 0) past[history - 1] = input;
+        }
+    }
+}
+
+extern "C" __global__
+void bailing_gated_head_norm_rows(
+    float* values, const float* gain, const float* gate,
+    const int rows, const int heads, const int head_dim, const float epsilon
+) {
+    const int index = blockIdx.x;
+    const int row_index = index / heads, head = index % heads;
+    if (row_index >= rows) return;
+    float* row = values + ((long long)row_index * heads + head) * head_dim;
+    const float* row_gate = gate + ((long long)row_index * heads + head) * head_dim;
+    __shared__ float reduce[128];
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) partial += row[i] * row[i];
+    reduce[threadIdx.x] = partial;
+    __syncthreads();
+    for (int stride = 64; stride; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse = rsqrtf(reduce[0] / (float)head_dim + epsilon);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        row[i] = row[i] * inverse * gain[i] / (1.0f + __expf(-row_gate[i]));
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(extern "C" __global__
+void bailing_route_rows(
+    const float* logits, const float* bias, int* selected, float* weights,
+    int* expert_counts, int* expert_routes, const int max_routes,
+    const int rows, const int experts, const int top_k,
+    const int groups, const int groups_used,
+    const int normalize, const float weight_scale
+) {
+    const int row = blockIdx.x;
+    if (row >= rows || experts > 256 || groups > 64 || top_k > 32) return;
+    __shared__ float probability[256], ranking[256], group_score[64];
+    __shared__ unsigned char allowed[256], group_kept[64];
+    for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
+        const float p = 1.0f / (1.0f + expf(-logits[(long long)row * experts + expert]));
+        probability[expert] = p;
+        ranking[expert] = p + (bias ? bias[expert] : 0.0f);
+        allowed[expert] = 1;
+    }
+    for (int group = threadIdx.x; group < groups; group += blockDim.x) group_kept[group] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    const bool limited = groups > 1 && groups_used > 0 && groups_used < groups &&
+                         experts % groups == 0;
+    if (limited) {
+        const int span = experts / groups;
+        for (int group = 0; group < groups; ++group) {
+            float best = -3.402823466e+38F, second = -3.402823466e+38F;
+            for (int offset = 0; offset < span; ++offset) {
+                const float value = ranking[group * span + offset];
+                if (value > best) { second = best; best = value; }
+                else if (value > second) second = value;
+            }
+            group_score[group] = best + second;
+        }
+        for (int slot = 0; slot < groups_used; ++slot) {
+            int best_group = -1; float best = -3.402823466e+38F;
+            for (int group = 0; group < groups; ++group)
+                if (!group_kept[group] && (best_group < 0 || group_score[group] > best)) {
+                    best_group = group; best = group_score[group];
+                }
+            group_kept[best_group] = 1;
+        }
+        for (int expert = 0; expert < experts; ++expert)
+            allowed[expert] = group_kept[expert / span];
+    }
+    int* row_selected = selected + (long long)row * top_k;
+    float* row_weights = weights + (long long)row * top_k;
+    float total = 0.0f;
+    for (int rank = 0; rank < top_k; ++rank) {
+        int best_expert = -1; float best = -3.402823466e+38F;
+        for (int expert = 0; expert < experts; ++expert) {
+            bool used = false;
+            for (int prior = 0; prior < rank; ++prior) used |= row_selected[prior] == expert;
+            if (!used && allowed[expert] && (best_expert < 0 || ranking[expert] > best)) {
+                best_expert = expert; best = ranking[expert];
+            }
+        }
+        row_selected[rank] = best_expert;
+        row_weights[rank] = probability[best_expert];
+        total += row_weights[rank];
+    }
+    const float factor = normalize && total > 0.0f ? weight_scale / total : weight_scale;
+    for (int rank = 0; rank < top_k; ++rank) {
+        row_weights[rank] *= factor;
+        if (expert_counts && expert_routes) {
+            const int expert = row_selected[rank];
+            const int slot = atomicAdd(expert_counts + expert, 1);
+            if (slot < max_routes)
+                expert_routes[(long long)expert * max_routes + slot] =
+                    row * top_k + rank;
+        }
+    }
+}
+
+extern "C" __global__
+void bailing_q6_expert_swiglu_rows(
+    const unsigned char* gate_base, const unsigned char* up_base,
+    const int* selected, const float* input, float* activated,
+    const unsigned long long expert_stride, const int rows, const int top_k,
+    const int input_size, const int output_size
+) {
+    const int output_row = blockIdx.x, route = blockIdx.y;
+    if (output_row >= output_size || route >= rows * top_k) return;
+    const int token = route / top_k, expert = selected[route];
+    const unsigned char* gate = gate_base + (unsigned long long)expert * expert_stride;
+    const unsigned char* up = up_base + (unsigned long long)expert * expert_stride;
+    const float* vector = input + (long long)token * input_size;
+    float g = 0.0f, u = 0.0f;
+    for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+        const float value = vector[i];
+        const int absolute = output_row * input_size + i;
+        g += q6k_value(gate, absolute) * value;
+        u += q6k_value(up, absolute) * value;
+    }
+    // block_reduce_sum reuses one shared warp-sum arena.  Without a barrier,
+    // a fast warp can begin the second reduction and overwrite that arena
+    // while warp 0 is still finishing the first one.  The resulting rare
+    // corrupt gate value was deterministic for layer 19 / expert 0 here.
+    g = block_reduce_sum(g);
+    __syncthreads();
+    u = block_reduce_sum(u);
+    if (threadIdx.x == 0)
+        activated[(long long)route * output_size + output_row] =
+            (g / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, g))))) * u;
+}
+
+extern "C" __global__
+void bailing_q6_expert_accumulate_rows(
+    const unsigned char* down_base, const int* selected,
+    const float* activated, const float* weights, float* output,
+    const unsigned long long expert_stride, const int rows, const int top_k,
+    const int input_size, const int output_size
+) {
+    const int output_row = blockIdx.x, token = blockIdx.y;
+    if (output_row >= output_size || token >= rows) return;
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+        float combined = 0.0f;
+        for (int rank = 0; rank < top_k; ++rank) {
+            const int route = token * top_k + rank;
+            const unsigned char* down = down_base +
+                (unsigned long long)selected[route] * expert_stride;
+            combined += weights[route] * q6k_value(down, output_row * input_size + i)
+                * activated[(long long)route * input_size + i];
+        }
+        partial += combined;
+    }
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[(long long)token * output_size + output_row] = partial;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+extern "C" __global__
+void bailing_q6_expert_swiglu_grouped_rows(
+    const unsigned char* gate_base, const unsigned char* up_base,
+    const int* expert_counts, const int* expert_routes,
+    const float* input, float* activated,
+    const unsigned long long expert_stride, const int max_routes,
+    const int top_k, const int input_size, const int output_size
+) {
+    const int output_row = blockIdx.x, expert = blockIdx.y;
+    if (output_row >= output_size) return;
+    const int count = expert_counts[expert];
+    if (count <= 0) return;
+    const unsigned char* gate = gate_base +
+        (unsigned long long)expert * expert_stride;
+    const unsigned char* up = up_base +
+        (unsigned long long)expert * expert_stride;
+    __shared__ float reduced_gate[16][8];
+    __shared__ float reduced_up[16][8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int assignment_base = 0; assignment_base < count;
+         assignment_base += 16) {
+        float g[16] = {0.0f};
+        float u[16] = {0.0f};
+        for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+            const int absolute = output_row * input_size + i;
+            const float gate_weight = q6k_value(gate, absolute);
+            const float up_weight = q6k_value(up, absolute);
+            #pragma unroll
+            for (int tile = 0; tile < 16; ++tile) {
+                const int assignment = assignment_base + tile;
+                if (assignment < count) {
+                    const int route = expert_routes[
+                        (long long)expert * max_routes + assignment];
+                    const int token = route / top_k;
+                    const float value = input[(long long)token * input_size + i];
+                    g[tile] += gate_weight * value;
+                    u[tile] += up_weight * value;
+                }
+            }
+        }
+        #pragma unroll
+        for (int tile = 0; tile < 16; ++tile) {
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                g[tile] += __shfl_down_sync(0xffffffffu, g[tile], offset);
+                u[tile] += __shfl_down_sync(0xffffffffu, u[tile], offset);
+            }
+            if (lane == 0) {
+                reduced_gate[tile][warp] = g[tile];
+                reduced_up[tile][warp] = u[tile];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 16) {
+            const int tile = threadIdx.x;
+            const int assignment = assignment_base + tile;
+            if (assignment < count) {
+                float gate_sum = 0.0f, up_sum = 0.0f;
+                #pragma unroll
+                for (int source_warp = 0; source_warp < 8; ++source_warp) {
+                    gate_sum += reduced_gate[tile][source_warp];
+                    up_sum += reduced_up[tile][source_warp];
+                }
+                const int route = expert_routes[
+                    (long long)expert * max_routes + assignment];
+                activated[(long long)route * output_size + output_row] =
+                    (gate_sum / (1.0f + expf(-fminf(80.0f,
+                        fmaxf(-80.0f, gate_sum))))) * up_sum;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__
+void bailing_q6_expert_accumulate_grouped_rows(
+    const unsigned char* down_base,
+    const int* expert_counts, const int* expert_routes,
+    const float* activated, const float* weights, float* output,
+    const unsigned long long expert_stride, const int max_routes,
+    const int top_k, const int input_size, const int output_size
+) {
+    const int output_row = blockIdx.x, expert = blockIdx.y;
+    if (output_row >= output_size) return;
+    const int count = expert_counts[expert];
+    if (count <= 0) return;
+    const unsigned char* down = down_base +
+        (unsigned long long)expert * expert_stride;
+    __shared__ float reduced[16][8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int assignment_base = 0; assignment_base < count;
+         assignment_base += 16) {
+        float partial[16] = {0.0f};
+        for (int i = threadIdx.x; i < input_size; i += blockDim.x) {
+            const float weight = q6k_value(
+                down, output_row * input_size + i);
+            #pragma unroll
+            for (int tile = 0; tile < 16; ++tile) {
+                const int assignment = assignment_base + tile;
+                if (assignment < count) {
+                    const int route = expert_routes[
+                        (long long)expert * max_routes + assignment];
+                    partial[tile] += weight *
+                        activated[(long long)route * input_size + i];
+                }
+            }
+        }
+        #pragma unroll
+        for (int tile = 0; tile < 16; ++tile) {
+            for (int offset = 16; offset > 0; offset >>= 1)
+                partial[tile] += __shfl_down_sync(
+                    0xffffffffu, partial[tile], offset);
+            if (lane == 0) reduced[tile][warp] = partial[tile];
+        }
+        __syncthreads();
+        if (threadIdx.x < 16) {
+            const int tile = threadIdx.x;
+            const int assignment = assignment_base + tile;
+            if (assignment < count) {
+                float total = 0.0f;
+                #pragma unroll
+                for (int source_warp = 0; source_warp < 8; ++source_warp)
+                    total += reduced[tile][source_warp];
+                const int route = expert_routes[
+                    (long long)expert * max_routes + assignment];
+                const int token = route / top_k;
+                atomicAdd(output + (long long)token * output_size + output_row,
+                          weights[route] * total);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__
+void bailing_quantize_q8_rows(
+    const float* input, signed char* output, __half* scales,
+    const int rows, const int elements
+) {
+    const int row = blockIdx.y, group = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int index = group * 32 + lane;
+    if (row >= rows || index >= elements) return;
+    const long long absolute = (long long)row * elements + index;
+    const float value = input[absolute];
+    float maximum = fabsf(value);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, offset));
+    maximum = __shfl_sync(0xffffffffu, maximum, 0);
+    const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+    if (lane == 0) scales[(long long)row * (elements / 32) + group] =
+        __float2half(scale);
+    const int quantized = max(-127, min(127, __float2int_rn(value / scale)));
+    output[absolute] = (signed char)quantized;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+__device__ __forceinline__ int bailing_mmq_load_i32(const void* pointer) {
+    int value;
+    memcpy(&value, pointer, 4);
+    return value;
+}
+
+__device__ __forceinline__ float bailing_mmq_q6_q8_dot(
+    const int* weights, const int* activations, const signed char* scales,
+    const float weight_scale, const float* activation_scales
+) {
+    float total = 0.0f;
+    #pragma unroll
+    for (int group = 0; group < 2; ++group) {
+        int first = 0, second = 0;
+        #pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int index = group * 4 + part;
+            first = __dp4a(weights[2 * index], activations[2 * index], first);
+            first = __dp4a(weights[2 * index + 1], activations[2 * index + 1], first);
+            second = __dp4a(weights[2 * index + 4], activations[2 * index + 4], second);
+            second = __dp4a(weights[2 * index + 5], activations[2 * index + 5], second);
+        }
+        total += activation_scales[group] *
+            ((float)scales[2 * group] * first +
+             (float)scales[2 * group + 1] * second);
+    }
+    return weight_scale * total;
+}
+
+extern "C" __global__
+void bailing_q6_q8_mmq_rows(
+    const unsigned char* packed, const signed char* vectors,
+    const __half* vector_scales, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int output_base = blockIdx.x * 32;
+    const int token_base = blockIdx.y * 4;
+    if (output_base >= output_size || token_base >= rows) return;
+
+    __shared__ int weight_values[32 * 65];
+    __shared__ float weight_d[32];
+    __shared__ int weight_scales[32 * 4 + 4];
+    __shared__ int activation_values[4 * 32];
+    __shared__ float activation_d[4 * 4];
+
+    const int blocks_per_row = input_size / 256;
+    float total = 0.0f;
+    for (int block = 0; block < blocks_per_row; ++block) {
+        #pragma unroll
+        for (int row_group = 0; row_group < 32; row_group += 4) {
+            int row = row_group + warp;
+            const int available = output_size - output_base - 1;
+            row = min(row, available);
+            const unsigned char* source = packed +
+                ((long long)(output_base + row) * blocks_per_row + block) * 210;
+            const int low = bailing_mmq_load_i32(source + lane * 4);
+            const int low_first = low & 0x0f0f0f0f;
+            const int low_second = (low >> 4) & 0x0f0f0f0f;
+            const int high_index = 8 * (lane / 16) + lane % 8;
+            const int high = bailing_mmq_load_i32(source + 128 + high_index * 4);
+            const int shift = 2 * ((lane % 16) / 8);
+            const int high_first = ((high >> shift) << 4) & 0x30303030;
+            const int high_second = (high >> shift) & 0x30303030;
+            const int first_index = 2 * lane - (2 * lane) % 32 + lane % 16;
+            weight_values[row * 65 + first_index] =
+                __vsub4(low_first | high_first, 0x20202020);
+            weight_values[row * 65 + first_index + 16] =
+                __vsub4(low_second | high_second, 0x20202020);
+        }
+
+        const int scale_row = (warp * 32 + lane) & 31;
+        const int scale_source_row = min(
+            scale_row, output_size - output_base - 1);
+        const unsigned char* scale_source = packed +
+            ((long long)(output_base + scale_source_row) * blocks_per_row + block) * 210;
+        weight_d[scale_row] = __half2float(
+            *((const __half*)(scale_source + 208)));
+
+        const int packed_scale_row = (warp * 8 + lane / 4) & 31;
+        const int packed_scale_source_row = min(
+            packed_scale_row, output_size - output_base - 1);
+        const unsigned char* packed_scale_source = packed +
+            ((long long)(output_base + packed_scale_source_row) * blocks_per_row + block) * 210;
+        weight_scales[packed_scale_row * 4 + packed_scale_row / 8 + lane % 4] =
+            bailing_mmq_load_i32(packed_scale_source + 192 + (lane % 4) * 4);
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int activation_block = block * 8 + half * 4 + lane / 8;
+            const int token = min(token_base + warp, rows - 1);
+            const signed char* values = vectors +
+                (long long)token * input_size + activation_block * 32;
+            activation_values[warp * 32 + lane] =
+                bailing_mmq_load_i32(values + (lane % 8) * 4);
+
+            const int scale_token = (lane / 4) & 3;
+            const int scale_block = block * 8 + half * 4 + lane % 4;
+            const int source_token = min(token_base + scale_token, rows - 1);
+            activation_d[scale_token * 4 + lane % 4] = __half2float(
+                vector_scales[(long long)source_token * (input_size / 32) +
+                              scale_block]);
+            __syncthreads();
+
+            const int output_row = lane;
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                const signed char* scales = (const signed char*)(weight_scales +
+                    output_row * 4 + output_row / 8 + half * 2 + part);
+                const int weight_index =
+                    output_row * 65 + half * 32 + part * 16;
+                const int activation_index = warp * 32 + part * 16;
+                total += bailing_mmq_q6_q8_dot(
+                    weight_values + weight_index,
+                    activation_values + activation_index,
+                    scales, weight_d[output_row],
+                    activation_d + warp * 4 + part * 2);
+            }
+            __syncthreads();
+        }
+    }
+
+    const int output_row = output_base + lane;
+    const int token = token_base + warp;
+    if (output_row < output_size && token < rows)
+        output[(long long)token * output_size + output_row] = total;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+__device__ __forceinline__ float bailing_q6_q8_mmq_tile(
+    const unsigned char* packed, const signed char* vectors,
+    const __half* vector_scales, const int* vector_rows,
+    const int input_size, const int output_size, const int output_base,
+    int* weight_values, float* weight_d, int* weight_scales,
+    int* activation_values, float* activation_d
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int blocks_per_row = input_size / 256;
+    float total = 0.0f;
+    for (int block = 0; block < blocks_per_row; ++block) {
+        #pragma unroll
+        for (int row_group = 0; row_group < 32; row_group += 4) {
+            int row = min(row_group + warp, output_size - output_base - 1);
+            const unsigned char* source = packed +
+                ((long long)(output_base + row) * blocks_per_row + block) * 210;
+            const int low = bailing_mmq_load_i32(source + lane * 4);
+            const int low_first = low & 0x0f0f0f0f;
+            const int low_second = (low >> 4) & 0x0f0f0f0f;
+            const int high_index = 8 * (lane / 16) + lane % 8;
+            const int high = bailing_mmq_load_i32(source + 128 + high_index * 4);
+            const int shift = 2 * ((lane % 16) / 8);
+            const int high_first = ((high >> shift) << 4) & 0x30303030;
+            const int high_second = (high >> shift) & 0x30303030;
+            const int first_index = 2 * lane - (2 * lane) % 32 + lane % 16;
+            weight_values[row * 65 + first_index] =
+                __vsub4(low_first | high_first, 0x20202020);
+            weight_values[row * 65 + first_index + 16] =
+                __vsub4(low_second | high_second, 0x20202020);
+        }
+
+        const int scale_row = lane;
+        const int source_row = min(scale_row, output_size - output_base - 1);
+        const unsigned char* source = packed +
+            ((long long)(output_base + source_row) * blocks_per_row + block) * 210;
+        weight_d[scale_row] = __half2float(*((const __half*)(source + 208)));
+
+        const int packed_scale_row = (warp * 8 + lane / 4) & 31;
+        const int packed_source_row = min(
+            packed_scale_row, output_size - output_base - 1);
+        const unsigned char* packed_source = packed +
+            ((long long)(output_base + packed_source_row) * blocks_per_row + block) * 210;
+        weight_scales[packed_scale_row * 4 + packed_scale_row / 8 + lane % 4] =
+            bailing_mmq_load_i32(packed_source + 192 + (lane % 4) * 4);
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int activation_block = block * 8 + half * 4 + lane / 8;
+            const signed char* values = vectors +
+                (long long)vector_rows[warp] * input_size + activation_block * 32;
+            activation_values[warp * 32 + lane] =
+                bailing_mmq_load_i32(values + (lane % 8) * 4);
+            const int scale_row_index = (lane / 4) & 3;
+            const int scale_block = block * 8 + half * 4 + lane % 4;
+            activation_d[scale_row_index * 4 + lane % 4] = __half2float(
+                vector_scales[(long long)vector_rows[scale_row_index] *
+                              (input_size / 32) + scale_block]);
+            __syncthreads();
+            #pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                const signed char* scales = (const signed char*)(weight_scales +
+                    lane * 4 + lane / 8 + half * 2 + part);
+                total += bailing_mmq_q6_q8_dot(
+                    weight_values + lane * 65 + half * 32 + part * 16,
+                    activation_values + warp * 32 + part * 16,
+                    scales, weight_d[lane],
+                    activation_d + warp * 4 + part * 2);
+            }
+            __syncthreads();
+        }
+    }
+    return total;
+}
+
+extern "C" __global__
+void bailing_q6_q8_expert_swiglu_mmq_rows(
+    const unsigned char* gate_base, const unsigned char* up_base,
+    const int* expert_counts, const int* expert_routes,
+    const signed char* input, const __half* input_scales, float* activated,
+    const unsigned long long expert_stride, const int max_routes,
+    const int top_k, const int input_size, const int output_size
+) {
+    const int expert = blockIdx.y;
+    const int output_base = blockIdx.x * 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (output_base >= output_size || expert_counts[expert] <= 0) return;
+    __shared__ int routes[4], vector_rows[4], valid[4];
+    __shared__ int weight_values[32 * 65];
+    __shared__ float weight_d[32];
+    __shared__ int weight_scales[32 * 4 + 4];
+    __shared__ int activation_values[4 * 32];
+    __shared__ float activation_d[4 * 4];
+    const int count = expert_counts[expert];
+    const unsigned char* gate = gate_base +
+        (unsigned long long)expert * expert_stride;
+    const unsigned char* up = up_base +
+        (unsigned long long)expert * expert_stride;
+    for (int base = 0; base < count; base += 4) {
+        if (threadIdx.x < 4) {
+            const int assignment = base + threadIdx.x;
+            valid[threadIdx.x] = assignment < count;
+            routes[threadIdx.x] = expert_routes[
+                (long long)expert * max_routes + min(assignment, count - 1)];
+            vector_rows[threadIdx.x] = routes[threadIdx.x] / top_k;
+        }
+        __syncthreads();
+        const float gate_total = bailing_q6_q8_mmq_tile(
+            gate, input, input_scales, vector_rows, input_size, output_size,
+            output_base, weight_values, weight_d, weight_scales,
+            activation_values, activation_d);
+        const float up_total = bailing_q6_q8_mmq_tile(
+            up, input, input_scales, vector_rows, input_size, output_size,
+            output_base, weight_values, weight_d, weight_scales,
+            activation_values, activation_d);
+        const int output_row = output_base + lane;
+        if (valid[warp] && output_row < output_size)
+            activated[(long long)routes[warp] * output_size + output_row] =
+                (gate_total / (1.0f + expf(-fminf(80.0f,
+                    fmaxf(-80.0f, gate_total))))) * up_total;
+        __syncthreads();
+    }
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+extern "C" __global__
+void bailing_q6_f32_expert_accumulate_mmq_rows(
+    const unsigned char* down_base,
+    const int* expert_counts, const int* expert_routes,
+    const float* activated, const float* weights, float* output,
+    const unsigned long long expert_stride, const int max_routes,
+    const int top_k, const int input_size, const int output_size
+) {
+    const int expert = blockIdx.y;
+    const int output_base = blockIdx.x * 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (output_base >= output_size || expert_counts[expert] <= 0) return;
+    __shared__ int routes[4], valid[4];
+    __shared__ int weight_values[32 * 65];
+    __shared__ float weight_d[32];
+    __shared__ int weight_scales[32 * 4 + 4];
+    const int count = expert_counts[expert];
+    const int blocks_per_row = input_size / 256;
+    const unsigned char* down = down_base +
+        (unsigned long long)expert * expert_stride;
+    for (int route_base = 0; route_base < count; route_base += 4) {
+        if (threadIdx.x < 4) {
+            const int assignment = route_base + threadIdx.x;
+            valid[threadIdx.x] = assignment < count;
+            routes[threadIdx.x] = expert_routes[
+                (long long)expert * max_routes + min(assignment, count - 1)];
+        }
+        __syncthreads();
+        float total = 0.0f;
+        for (int block = 0; block < blocks_per_row; ++block) {
+            #pragma unroll
+            for (int row_group = 0; row_group < 32; row_group += 4) {
+                int row = min(row_group + warp, output_size - output_base - 1);
+                const unsigned char* source = down +
+                    ((long long)(output_base + row) * blocks_per_row + block) * 210;
+                const int low = bailing_mmq_load_i32(source + lane * 4);
+                const int low_first = low & 0x0f0f0f0f;
+                const int low_second = (low >> 4) & 0x0f0f0f0f;
+                const int high_index = 8 * (lane / 16) + lane % 8;
+                const int high = bailing_mmq_load_i32(
+                    source + 128 + high_index * 4);
+                const int shift = 2 * ((lane % 16) / 8);
+                const int high_first = ((high >> shift) << 4) & 0x30303030;
+                const int high_second = (high >> shift) & 0x30303030;
+                const int first_index =
+                    2 * lane - (2 * lane) % 32 + lane % 16;
+                weight_values[row * 65 + first_index] =
+                    __vsub4(low_first | high_first, 0x20202020);
+                weight_values[row * 65 + first_index + 16] =
+                    __vsub4(low_second | high_second, 0x20202020);
+            }
+            const int source_row = min(lane, output_size - output_base - 1);
+            const unsigned char* source = down +
+                ((long long)(output_base + source_row) * blocks_per_row + block) * 210;
+            weight_d[lane] = __half2float(*((const __half*)(source + 208)));
+            const int packed_scale_row = (warp * 8 + lane / 4) & 31;
+            const int packed_source_row = min(
+                packed_scale_row, output_size - output_base - 1);
+            const unsigned char* packed_source = down +
+                ((long long)(output_base + packed_source_row) * blocks_per_row + block) * 210;
+            weight_scales[packed_scale_row * 4 +
+                          packed_scale_row / 8 + lane % 4] =
+                bailing_mmq_load_i32(
+                    packed_source + 192 + (lane % 4) * 4);
+            __syncthreads();
+
+            const float* values = activated +
+                (long long)routes[warp] * input_size + block * 256;
+            const signed char* scales = (const signed char*)(weight_scales +
+                lane * 4 + lane / 8);
+            float block_total = 0.0f;
+            #pragma unroll
+            for (int packed_index = 0; packed_index < 64; ++packed_index) {
+                const int packed_weight =
+                    weight_values[lane * 65 + packed_index];
+                float partial = 0.0f;
+                #pragma unroll
+                for (int byte = 0; byte < 4; ++byte) {
+                    const signed char weight = (signed char)
+                        ((unsigned int)packed_weight >> (byte * 8));
+                    partial += (float)weight *
+                        values[packed_index * 4 + byte];
+                }
+                block_total += (float)scales[packed_index / 4] * partial;
+            }
+            total += weight_d[lane] * block_total;
+            __syncthreads();
+        }
+        const int output_row = output_base + lane;
+        if (valid[warp] && output_row < output_size) {
+            const int route = routes[warp];
+            const int token = route / top_k;
+            atomicAdd(output + (long long)token * output_size + output_row,
+                      weights[route] * total);
+        }
+        __syncthreads();
+    }
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+extern "C" __global__
+void bailing_q6_grouped_swiglu_warp(
+    const unsigned long long* gate_ptrs,
+    const unsigned long long* up_ptrs,
+    const float* vector, float* activated,
+    const int input_size, const int output_size, const int experts
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    const int expert = blockIdx.y;
+    if (row >= output_size || expert >= experts) return;
+    const unsigned char* gate =
+        (const unsigned char*)gate_ptrs[expert];
+    const unsigned char* up =
+        (const unsigned char*)up_ptrs[expert];
+    float gate_total = q6k_row_dot_warp(
+        gate, vector, row, input_size, lane);
+    float up_total = q6k_row_dot_warp(
+        up, vector, row, input_size, lane);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate_total += __shfl_down_sync(0xffffffffu, gate_total, offset);
+        up_total += __shfl_down_sync(0xffffffffu, up_total, offset);
+    }
+    if (lane == 0) {
+        const float clamped = fminf(80.0f, fmaxf(-80.0f, gate_total));
+        activated[(long long)expert * output_size + row] =
+            (gate_total / (1.0f + expf(-clamped))) * up_total;
+    }
+}
+
+extern "C" __global__
+void bailing_q6_grouped_accumulate_warp(
+    const unsigned long long* down_ptrs,
+    const float* activated, float* output, const float* weights,
+    const int input_size, const int output_size, const int experts
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    float total = 0.0f;
+    for (int expert = 0; expert < experts; ++expert) {
+        const unsigned char* down =
+            (const unsigned char*)down_ptrs[expert];
+        const float* vector = activated + (long long)expert * input_size;
+        float partial = q6k_row_dot_warp(
+            down, vector, row, input_size, lane);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, offset);
+        if (lane == 0) total += weights[expert] * partial;
+    }
+    if (lane == 0) output[row] += total;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+__device__ __forceinline__ void bailing_q6_dp4a_group(
+    const unsigned char* row_data, const int group,
+    int packed_weights[2][8], float* scale, int* scale_first, int* scale_second
+) {
+    const int block = group >> 3, sub_block = group & 7;
+    const int half = sub_block >> 2, lane_group = sub_block & 3;
+    const unsigned char* base = row_data + block * 210;
+    const unsigned char* lows =
+        base + half * 64 + ((lane_group & 1) ? 32 : 0);
+    const unsigned char* highs = base + 128 + half * 32;
+    const int shift = (lane_group >> 1) * 4;
+    const int bit_shift = lane_group * 2;
+    #pragma unroll
+    for (int part = 0; part < 2; ++part) {
+        #pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            const int quad = part * 4 + step;
+            unsigned int word, high_word;
+            memcpy(&word, lows + quad * 4, 4);
+            memcpy(&high_word, highs + quad * 4, 4);
+            const unsigned int weights = ((word >> shift) & 0x0f0f0f0fu)
+                | (((high_word >> bit_shift) & 0x03030303u) << 4);
+            packed_weights[part][step] =
+                __vsub4((int)weights, 0x20202020);
+        }
+    }
+    *scale = __half2float(*((const __half*)(base + 208)));
+    const signed char* scales = (const signed char*)(base + 192);
+    const int scale_base = half * 8 + lane_group * 2;
+    *scale_first = scales[scale_base];
+    *scale_second = scales[scale_base + 1];
+}
+
+extern "C" __global__
+void bailing_q6_q8_expert_swiglu_grouped_rows(
+    const unsigned char* gate_base, const unsigned char* up_base,
+    const int* expert_counts, const int* expert_routes,
+    const signed char* input, const __half* input_scales, float* activated,
+    const unsigned long long expert_stride, const int max_routes,
+    const int top_k, const int input_size, const int output_size
+) {
+    const int output_row = blockIdx.x, expert = blockIdx.y;
+    if (output_row >= output_size) return;
+    const int count = expert_counts[expert];
+    if (count <= 0) return;
+    const int groups = input_size / 32;
+    const unsigned char* gate = gate_base +
+        (unsigned long long)expert * expert_stride;
+    const unsigned char* up = up_base +
+        (unsigned long long)expert * expert_stride;
+    const unsigned char* gate_row = gate +
+        (long long)output_row * (input_size / 256) * 210;
+    const unsigned char* up_row = up +
+        (long long)output_row * (input_size / 256) * 210;
+    __shared__ float reduced_gate[16][8], reduced_up[16][8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int assignment_base = 0; assignment_base < count;
+         assignment_base += 16) {
+        float gate_partial[16] = {0.0f};
+        float up_partial[16] = {0.0f};
+        for (int group = threadIdx.x; group < groups; group += blockDim.x) {
+            int gate_weights[2][8], up_weights[2][8];
+            float gate_scale, up_scale;
+            int gate_first, gate_second, up_first, up_second;
+            bailing_q6_dp4a_group(gate_row, group, gate_weights,
+                &gate_scale, &gate_first, &gate_second);
+            bailing_q6_dp4a_group(up_row, group, up_weights,
+                &up_scale, &up_first, &up_second);
+            #pragma unroll
+            for (int tile = 0; tile < 16; ++tile) {
+                const int assignment = assignment_base + tile;
+                if (assignment < count) {
+                    const int route = expert_routes[
+                        (long long)expert * max_routes + assignment];
+                    const int token = route / top_k;
+                    const signed char* values = input +
+                        (long long)token * input_size + group * 32;
+                    int gate_dot[2] = {0, 0}, up_dot[2] = {0, 0};
+                    #pragma unroll
+                    for (int part = 0; part < 2; ++part) {
+                        #pragma unroll
+                        for (int step = 0; step < 4; ++step) {
+                            int activation;
+                            memcpy(&activation, values + (part * 4 + step) * 4, 4);
+                            gate_dot[part] = __dp4a(
+                                gate_weights[part][step], activation, gate_dot[part]);
+                            up_dot[part] = __dp4a(
+                                up_weights[part][step], activation, up_dot[part]);
+                        }
+                    }
+                    const float activation_scale = __half2float(
+                        input_scales[(long long)token * groups + group]);
+                    gate_partial[tile] += activation_scale * gate_scale *
+                        ((float)gate_first * gate_dot[0] +
+                         (float)gate_second * gate_dot[1]);
+                    up_partial[tile] += activation_scale * up_scale *
+                        ((float)up_first * up_dot[0] +
+                         (float)up_second * up_dot[1]);
+                }
+            }
+        }
+        #pragma unroll
+        for (int tile = 0; tile < 16; ++tile) {
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                gate_partial[tile] += __shfl_down_sync(
+                    0xffffffffu, gate_partial[tile], offset);
+                up_partial[tile] += __shfl_down_sync(
+                    0xffffffffu, up_partial[tile], offset);
+            }
+            if (lane == 0) {
+                reduced_gate[tile][warp] = gate_partial[tile];
+                reduced_up[tile][warp] = up_partial[tile];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 16) {
+            const int tile = threadIdx.x;
+            const int assignment = assignment_base + tile;
+            if (assignment < count) {
+                float gate_sum = 0.0f, up_sum = 0.0f;
+                for (int source_warp = 0; source_warp < 8; ++source_warp) {
+                    gate_sum += reduced_gate[tile][source_warp];
+                    up_sum += reduced_up[tile][source_warp];
+                }
+                const int route = expert_routes[
+                    (long long)expert * max_routes + assignment];
+                activated[(long long)route * output_size + output_row] =
+                    (gate_sum / (1.0f + expf(-fminf(80.0f,
+                        fmaxf(-80.0f, gate_sum))))) * up_sum;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__
+void bailing_q6_matmul_rows_16(
+    const unsigned char* packed, const float* vectors, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    const int output_row = blockIdx.x;
+    const int token_base = blockIdx.y * 16;
+    if (output_row >= output_size || token_base >= rows) return;
+    float partial[16] = {0.0f};
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x) {
+        const float weight = q6k_value(
+            packed, output_row * input_size + input);
+        #pragma unroll
+        for (int tile = 0; tile < 16; ++tile) {
+            const int token = token_base + tile;
+            if (token < rows)
+                partial[tile] += weight *
+                    vectors[(long long)token * input_size + input];
+        }
+    }
+    #pragma unroll
+    for (int tile = 0; tile < 16; ++tile) {
+        partial[tile] = block_reduce_sum(partial[tile]);
+        __syncthreads();
+        if (threadIdx.x == 0 && token_base + tile < rows)
+            output[(long long)(token_base + tile) * output_size + output_row] =
+                partial[tile];
+    }
+}
+
+extern "C" __global__
+void bailing_q6_q8_matmul_rows(
+    const unsigned char* packed, const signed char* vectors,
+    const __half* vector_scales, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    const int output_row = blockIdx.x;
+    const int token_base = blockIdx.y * 4;
+    if (output_row >= output_size || token_base >= rows) return;
+    const int blocks_per_row = input_size >> 8;
+    const int groups_per_row = blocks_per_row << 3;
+    const unsigned char* row_data =
+        packed + (long long)output_row * blocks_per_row * 210;
+    float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int group = threadIdx.x; group < groups_per_row; group += blockDim.x) {
+        const int block = group >> 3, sub_block = group & 7;
+        const int half = sub_block >> 2, lane_group = sub_block & 3;
+        const unsigned char* base = row_data + block * 210;
+        const unsigned char* lows =
+            base + half * 64 + ((lane_group & 1) ? 32 : 0);
+        const unsigned char* highs = base + 128 + half * 32;
+        const int shift = (lane_group >> 1) * 4;
+        const int bit_shift = lane_group * 2;
+        int dot[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+        for (int part = 0; part < 2; ++part) {
+            for (int step = 0; step < 4; ++step) {
+                const int quad = part * 4 + step;
+                unsigned int word, high_word;
+                memcpy(&word, lows + quad * 4, 4);
+                memcpy(&high_word, highs + quad * 4, 4);
+                const unsigned int weights = ((word >> shift) & 0x0f0f0f0fu)
+                    | (((high_word >> bit_shift) & 0x03030303u) << 4);
+                const int biased = __vsub4((int)weights, 0x20202020);
+                for (int tile = 0; tile < 4; ++tile) {
+                    const int token = token_base + tile;
+                    if (token < rows) {
+                        const signed char* activation = vectors +
+                            (long long)token * input_size + group * 32;
+                        int values;
+                        memcpy(&values, activation + quad * 4, 4);
+                        dot[tile][part] = __dp4a(
+                            biased, values, dot[tile][part]);
+                    }
+                }
+            }
+        }
+        const float d = __half2float(*((const __half*)(base + 208)));
+        const signed char* weight_scales = (const signed char*)(base + 192);
+        const int scale_base = half * 8 + lane_group * 2;
+        for (int tile = 0; tile < 4; ++tile) {
+            const int token = token_base + tile;
+            if (token < rows) {
+                const float activation_scale = __half2float(
+                    vector_scales[(long long)token * (input_size / 32) + group]);
+                partial[tile] += activation_scale * d *
+                    ((float)weight_scales[scale_base] * (float)dot[tile][0] +
+                     (float)weight_scales[scale_base + 1] * (float)dot[tile][1]);
+            }
+        }
+    }
+    for (int tile = 0; tile < 4; ++tile) {
+        partial[tile] = block_reduce_sum(partial[tile]);
+        __syncthreads();
+        if (threadIdx.x == 0 && token_base + tile < rows)
+            output[(long long)(token_base + tile) * output_size + output_row] =
+                partial[tile];
+    }
+}
+
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
 extern "C" __global__
@@ -1489,6 +2744,123 @@ void bailing_mla_attention(
         float total = 0.0f;
         for (int i = 0; i < kv_lora; ++i) total += source[i] * accumulated[i];
         output[(long long)head * v_head_dim + row] = total;
+    }
+}
+
+// Parallel absorbed-MLA decode.  The original kernel above is intentionally
+// retained as the compact correctness fallback.  Splitting the operation lets
+// the score phase scale across context tiles instead of assigning an entire
+// history scan to one block per head.
+extern "C" __global__
+void bailing_mla_project(
+    const float* query_nope, const float* kv_b, float* projected,
+    const int heads, const int qk_nope, const int v_head_dim,
+    const int kv_lora
+) {
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (head >= heads) return;
+    const float* weights = kv_b +
+        (long long)head * (qk_nope + v_head_dim) * kv_lora;
+    const float* query = query_nope + (long long)head * qk_nope;
+    for (int column = lane; column < kv_lora; column += blockDim.x) {
+        float total = 0.0f;
+        for (int row = 0; row < qk_nope; ++row)
+            total += query[row] * weights[(long long)row * kv_lora + column];
+        projected[(long long)head * kv_lora + column] = total;
+    }
+}
+
+extern "C" __global__
+void bailing_mla_scores(
+    const float* projected, const float* query_rope,
+    const float* latents, const float* rope_keys, float* scores,
+    const int positions, const int heads, const int qk_nope,
+    const int qk_rope, const int kv_lora
+) {
+    const int head = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int position = blockIdx.y * 8 + warp;
+    if (head >= heads || position >= positions) return;
+    const float* p = projected + (long long)head * kv_lora;
+    const float* latent = latents + (long long)position * kv_lora;
+    const float* query = query_rope + (long long)head * qk_rope;
+    const float* rope = rope_keys + (long long)position * qk_rope;
+    float total = 0.0f;
+    for (int i = lane; i < kv_lora; i += 32) total += p[i] * latent[i];
+    for (int i = lane; i < qk_rope; i += 32) total += query[i] * rope[i];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        total += __shfl_down_sync(0xffffffff, total, offset);
+    if (lane == 0)
+        scores[(long long)head * positions + position] =
+            total * rsqrtf((float)(qk_nope + qk_rope));
+}
+
+extern "C" __global__
+void bailing_mla_softmax(float* scores, const int positions, const int heads) {
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (head >= heads) return;
+    float* values = scores + (long long)head * positions;
+    __shared__ float reduce[128];
+    float local = -3.0e38f;
+    for (int i = lane; i < positions; i += 128) local = fmaxf(local, values[i]);
+    reduce[lane] = local;
+    __syncthreads();
+    for (int stride = 64; stride; stride >>= 1) {
+        if (lane < stride) reduce[lane] = fmaxf(reduce[lane], reduce[lane + stride]);
+        __syncthreads();
+    }
+    const float maximum = reduce[0];
+    local = 0.0f;
+    for (int i = lane; i < positions; i += 128) {
+        const float value = __expf(values[i] - maximum);
+        values[i] = value;
+        local += value;
+    }
+    reduce[lane] = local;
+    __syncthreads();
+    for (int stride = 64; stride; stride >>= 1) {
+        if (lane < stride) reduce[lane] += reduce[lane + stride];
+        __syncthreads();
+    }
+    const float inverse = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    for (int i = lane; i < positions; i += 128) values[i] *= inverse;
+}
+
+extern "C" __global__
+void bailing_mla_accumulate(
+    const float* scores, const float* latents, float* accumulated,
+    const int positions, const int heads, const int kv_lora
+) {
+    const int head = blockIdx.x;
+    const int column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (head >= heads || column >= kv_lora) return;
+    const float* weights = scores + (long long)head * positions;
+    float total = 0.0f;
+    for (int position = 0; position < positions; ++position)
+        total += weights[position] * latents[(long long)position * kv_lora + column];
+    accumulated[(long long)head * kv_lora + column] = total;
+}
+
+extern "C" __global__
+void bailing_mla_output(
+    const float* accumulated, const float* kv_b, float* output,
+    const int heads, const int qk_nope, const int v_head_dim,
+    const int kv_lora
+) {
+    const int head = blockIdx.x;
+    const int row = threadIdx.x;
+    if (head >= heads) return;
+    const float* values = accumulated + (long long)head * kv_lora;
+    const float* weights = kv_b +
+        ((long long)head * (qk_nope + v_head_dim) + qk_nope) * kv_lora;
+    for (int output_row = row; output_row < v_head_dim; output_row += blockDim.x) {
+        float total = 0.0f;
+        const float* source = weights + (long long)output_row * kv_lora;
+        for (int i = 0; i < kv_lora; ++i) total += source[i] * values[i];
+        output[(long long)head * v_head_dim + output_row] = total;
     }
 }
 

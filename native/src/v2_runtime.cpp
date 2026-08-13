@@ -4271,9 +4271,25 @@ struct BailingGpu {
     std::uint64_t hidden_a = 0, hidden_b = 0, normalized = 0, branch = 0;
     std::uint64_t wide_a = 0, wide_b = 0, wide_c = 0, wide_d = 0;
     std::uint64_t scores = 0, logits = 0, small = 0;
+    std::uint64_t mla_projected = 0, mla_accumulated = 0;
     // Grouped MoE: device-side arrays of the chosen experts' weight pointers.
     std::uint64_t expert_gate_ptrs = 0, expert_up_ptrs = 0, expert_down_ptrs = 0;
     std::uint64_t expert_weights = 0, expert_activated = 0;
+    // Complete row-batched prefill workspace. The default 128-row MLA score
+    // tile remains bounded enough for a 128K context on a 12 GiB card.
+    std::uint32_t prefill_rows = 128;
+    std::uint64_t prefill_tokens = 0;
+    std::uint64_t prefill_hidden_a = 0, prefill_hidden_b = 0;
+    std::uint64_t prefill_normalized = 0, prefill_branch = 0;
+    std::uint64_t prefill_wide_a = 0, prefill_wide_b = 0;
+    std::uint64_t prefill_wide_c = 0, prefill_wide_d = 0;
+    std::uint64_t prefill_wide_e = 0;
+    std::uint64_t prefill_scores = 0;
+    std::uint64_t prefill_projected = 0, prefill_accumulated = 0;
+    std::uint64_t prefill_router_logits = 0, prefill_selected = 0;
+    std::uint64_t prefill_weights = 0, prefill_activated = 0;
+    std::uint64_t prefill_expert_counts = 0, prefill_expert_routes = 0;
+    std::uint64_t prefill_q8 = 0, prefill_q8_scales = 0;
     std::vector<std::uint64_t> owned;
 };
 
@@ -4472,6 +4488,8 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     gpu.wide_c = bailing_gpu_scratch(gpu, widest * 4);
     gpu.wide_d = bailing_gpu_scratch(gpu, widest * 4);
     gpu.scores = bailing_gpu_scratch(gpu, (std::size_t)g.heads * runtime.capacity * 4);
+    gpu.mla_projected = bailing_gpu_scratch(gpu, (std::size_t)g.heads * g.kv_lora * 4);
+    gpu.mla_accumulated = bailing_gpu_scratch(gpu, (std::size_t)g.heads * g.kv_lora * 4);
     gpu.logits = bailing_gpu_scratch(gpu, (std::size_t)c.vocabulary_size * 4);
     gpu.small = bailing_gpu_scratch(gpu, widest * 4);
     // One allocation holding gate, up and down pointer arrays followed by the
@@ -4481,6 +4499,44 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     gpu.expert_down_ptrs = gpu.expert_gate_ptrs + g.experts_used * 16;
     gpu.expert_weights = gpu.expert_gate_ptrs + g.experts_used * 24;
     gpu.expert_activated = bailing_gpu_scratch(gpu, g.experts_used * g.expert_size * 4);
+    if (const char* setting = std::getenv("COLIBRI_BAILING_PREFILL_ROWS")) {
+        const long requested = std::strtol(setting, nullptr, 10);
+        if (requested >= 1 && requested <= 512)
+            gpu.prefill_rows = static_cast<std::uint32_t>(requested);
+    }
+    const std::size_t batch = gpu.prefill_rows;
+    gpu.prefill_tokens = bailing_gpu_scratch(gpu, batch * sizeof(std::uint32_t));
+    gpu.prefill_hidden_a = bailing_gpu_scratch(gpu, batch * g.hidden * 4);
+    gpu.prefill_hidden_b = bailing_gpu_scratch(gpu, batch * g.hidden * 4);
+    gpu.prefill_normalized = bailing_gpu_scratch(gpu, batch * g.hidden * 4);
+    gpu.prefill_branch = bailing_gpu_scratch(gpu, batch * g.hidden * 4);
+    gpu.prefill_wide_a = bailing_gpu_scratch(gpu, batch * widest * 4);
+    gpu.prefill_wide_b = bailing_gpu_scratch(gpu, batch * widest * 4);
+    gpu.prefill_wide_c = bailing_gpu_scratch(gpu, batch * widest * 4);
+    gpu.prefill_wide_d = bailing_gpu_scratch(gpu, batch * widest * 4);
+    gpu.prefill_wide_e = bailing_gpu_scratch(gpu, batch * widest * 4);
+    const char* fused_mla_setting = std::getenv("COLIBRI_BAILING_FUSED_MLA");
+    if (!fused_mla_setting || fused_mla_setting[0] != '1')
+        gpu.prefill_scores = bailing_gpu_scratch(
+            gpu, batch * g.heads * runtime.capacity * 4);
+    gpu.prefill_projected = bailing_gpu_scratch(
+        gpu, batch * g.heads * g.kv_lora * 4);
+    gpu.prefill_accumulated = bailing_gpu_scratch(
+        gpu, batch * g.heads * g.kv_lora * 4);
+    gpu.prefill_router_logits = bailing_gpu_scratch(gpu, batch * g.experts * 4);
+    gpu.prefill_selected = bailing_gpu_scratch(
+        gpu, batch * g.experts_used * sizeof(std::int32_t));
+    gpu.prefill_weights = bailing_gpu_scratch(gpu, batch * g.experts_used * 4);
+    gpu.prefill_expert_counts = bailing_gpu_scratch(
+        gpu, g.experts * sizeof(std::int32_t));
+    gpu.prefill_expert_routes = bailing_gpu_scratch(
+        gpu, g.experts * batch * g.experts_used * sizeof(std::int32_t));
+    gpu.prefill_activated = bailing_gpu_scratch(
+        gpu, batch * g.experts_used * g.expert_size * 4);
+    const std::size_t q8_elements = batch * widest;
+    gpu.prefill_q8 = bailing_gpu_scratch(gpu, q8_elements);
+    gpu.prefill_q8_scales = bailing_gpu_scratch(
+        gpu, ((q8_elements + 31) / 32) * sizeof(std::uint16_t));
     gpu.ready = true;
     std::fprintf(stderr, "[colibri-v2] bailingmoe3: %zu tensors resident on device\n",
                  gpu.owned.size());
@@ -4585,6 +4641,9 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
     const std::size_t channels = g.heads * g.head_dim;
     const std::size_t qk = g.qk_nope + g.qk_rope;
     const std::size_t position = runtime.position;
+    const char* grouped_q6_env =
+        std::getenv("COLIBRI_BAILING_GROUPED_Q6_DECODE");
+    const bool grouped_q6 = !grouped_q6_env || grouped_q6_env[0] != '0';
 
     auto matvec = [&](const BailingGpuMatrix& w, std::uint64_t in, std::uint64_t out,
                       std::size_t inputs, std::size_t outputs) {
@@ -4610,6 +4669,13 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
     auto launch = [&](const char* name, std::uint32_t grid, std::uint32_t block,
                       void** arguments) {
         if (colibri_gpu_launch_named(name, grid, 1, block, 0, stream, arguments) != 0)
+            throw std::runtime_error(std::string("bailing GPU launch failed: ") + name);
+    };
+    auto launch_2d = [&](const char* name, std::uint32_t grid_x,
+                         std::uint32_t grid_y, std::uint32_t block,
+                         void** arguments) {
+        if (colibri_gpu_launch_named(name, grid_x, grid_y, block, 0, stream,
+                                     arguments) != 0)
             throw std::runtime_error(std::string("bailing GPU launch failed: ") + name);
     };
 
@@ -4678,12 +4744,40 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
                 int nope = static_cast<int>(g.qk_nope), rope = static_cast<int>(g.qk_rope);
                 int value_dim = static_cast<int>(g.v_head_dim);
                 int lora = static_cast<int>(g.kv_lora);
-                void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &L.kv_b, &L.latents,
-                                     &L.rope_keys, &gpu.scores, &gpu.wide_d,
-                                     &positions, &heads_arg, &nope, &rope,
-                                     &value_dim, &lora};
-                launch("bailing_mla_attention", static_cast<std::uint32_t>(g.heads),
-                       128, arguments);
+                const char* tiled_env = std::getenv("COLIBRI_BAILING_MLA_TILED");
+                const bool tiled = !tiled_env || tiled_env[0] != '0';
+                if (tiled) {
+                    void* project_args[] = {&gpu.wide_a, &L.kv_b,
+                        &gpu.mla_projected, &heads_arg, &nope, &value_dim, &lora};
+                    launch("bailing_mla_project", static_cast<std::uint32_t>(g.heads),
+                           128, project_args);
+                    void* score_args[] = {&gpu.mla_projected, &gpu.wide_b,
+                        &L.latents, &L.rope_keys, &gpu.scores, &positions,
+                        &heads_arg, &nope, &rope, &lora};
+                    launch_2d("bailing_mla_scores",
+                              static_cast<std::uint32_t>(g.heads),
+                              static_cast<std::uint32_t>((positions + 7) / 8),
+                              256, score_args);
+                    void* softmax_args[] = {&gpu.scores, &positions, &heads_arg};
+                    launch("bailing_mla_softmax",
+                           static_cast<std::uint32_t>(g.heads), 128, softmax_args);
+                    void* accumulate_args[] = {&gpu.scores, &L.latents,
+                        &gpu.mla_accumulated, &positions, &heads_arg, &lora};
+                    launch_2d("bailing_mla_accumulate",
+                              static_cast<std::uint32_t>(g.heads),
+                              static_cast<std::uint32_t>((lora + 127) / 128),
+                              128, accumulate_args);
+                    void* output_args[] = {&gpu.mla_accumulated, &L.kv_b,
+                        &gpu.wide_d, &heads_arg, &nope, &value_dim, &lora};
+                    launch("bailing_mla_output",
+                           static_cast<std::uint32_t>(g.heads), 128, output_args);
+                } else {
+                    void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &L.kv_b,
+                        &L.latents, &L.rope_keys, &gpu.scores, &gpu.wide_d,
+                        &positions, &heads_arg, &nope, &rope, &value_dim, &lora};
+                    launch("bailing_mla_attention",
+                           static_cast<std::uint32_t>(g.heads), 128, arguments);
+                }
             }
             matvec(L.attn_gate, gpu.normalized, gpu.small, g.hidden, g.heads);
             {
@@ -4761,17 +4855,20 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
             // the GPU only 512 blocks of work. These grouped kernels grid over
             // (rows, experts) instead, so the card sees 4096 blocks and the
             // launch count drops to 2.
-            //
-            // Q4_K only for now; other types fall back to the per-expert path.
             const auto narrow = g.expert_size *
                 bailing::row_bytes(L.gate_exps.type, g.hidden);
             const auto wide = g.hidden *
                 bailing::row_bytes(L.down_exps.type, g.expert_size);
-            const bool grouped = L.gate_exps.type == 12 && L.down_exps.type == 12;
+            const auto expert_type = L.gate_exps.type;
+            const bool grouped = (expert_type == 12 ||
+                    (expert_type == 14 && grouped_q6)) &&
+                L.up_exps.type == expert_type &&
+                L.down_exps.type == expert_type;
             // q4k_grouped_accumulate does `output[row] += partial`, so the
             // target has to start at zero. Both paths need this.
             colibri_gpu_memset(gpu.wide_d, 0, g.hidden * 4, stream);
             if (grouped) {
+                const bool q6_grouped = expert_type == 14;
                 std::vector<std::uint64_t> gate_ptrs(g.experts_used),
                     up_ptrs(g.experts_used), down_ptrs(g.experts_used);
                 for (std::size_t slot = 0; slot < g.experts_used; ++slot) {
@@ -4802,20 +4899,32 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
                 void* swiglu_args[] = {&gpu.expert_gate_ptrs, &gpu.expert_up_ptrs,
                                        &gpu.normalized, &gpu.expert_activated,
                                        &inputs, &outputs, &used};
-                if (colibri_gpu_launch_named("q4k_grouped_swiglu",
-                        static_cast<std::uint32_t>(g.expert_size),
-                        static_cast<std::uint32_t>(g.experts_used), 128, 0,
+                const char* swiglu_kernel = q6_grouped
+                    ? "bailing_q6_grouped_swiglu_warp"
+                    : "q4k_grouped_swiglu";
+                if (colibri_gpu_launch_named(swiglu_kernel,
+                        static_cast<std::uint32_t>(q6_grouped
+                            ? (g.expert_size + 7) / 8 : g.expert_size),
+                        static_cast<std::uint32_t>(g.experts_used),
+                        q6_grouped ? 256 : 128, 0,
                         stream, swiglu_args) != 0)
-                    throw std::runtime_error("q4k_grouped_swiglu launch failed");
+                    throw std::runtime_error(std::string(swiglu_kernel) +
+                                             " launch failed");
                 int down_inputs = static_cast<int>(g.expert_size);
                 int down_outputs = static_cast<int>(g.hidden);
                 void* accumulate_args[] = {&gpu.expert_down_ptrs, &gpu.expert_activated,
                                            &gpu.wide_d, &gpu.expert_weights,
                                            &down_inputs, &down_outputs, &used};
-                if (colibri_gpu_launch_named("q4k_grouped_accumulate",
-                        static_cast<std::uint32_t>(g.hidden), 1, 128, 0, stream,
+                const char* accumulate_kernel = q6_grouped
+                    ? "bailing_q6_grouped_accumulate_warp"
+                    : "q4k_grouped_accumulate";
+                if (colibri_gpu_launch_named(accumulate_kernel,
+                        static_cast<std::uint32_t>(q6_grouped
+                            ? (g.hidden + 7) / 8 : g.hidden),
+                        1, q6_grouped ? 256 : 128, 0, stream,
                         accumulate_args) != 0)
-                    throw std::runtime_error("q4k_grouped_accumulate launch failed");
+                    throw std::runtime_error(std::string(accumulate_kernel) +
+                                             " launch failed");
             } else {
             for (std::size_t slot = 0; slot < g.experts_used; ++slot) {
                 const auto expert = static_cast<std::size_t>(chosen[slot]);
@@ -4872,6 +4981,492 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
     colibri_gpu_download(logits, gpu.logits, (std::size_t)c.vocabulary_size * 4, 0);
     if (timing) bailing::profile().tokens += 1;
     ++runtime.position;
+}
+
+bool bailing_gpu_prefill_tiled_supported(const ColibriV2BailingRuntime& runtime) {
+    if (!runtime.gpu || !runtime.gpu->ready) return false;
+    // The direct expert kernels currently decode Q6_K. Dense row kernels exist
+    // for the other formats, but mixing in a host MoE would defeat the purpose
+    // of a fully device-resident prompt tile.
+    for (std::size_t index = 0; index < runtime.layers.size(); ++index) {
+        const auto& weights = runtime.layers[index];
+        const auto& layer = runtime.gpu->layers[index];
+        if (weights.routed && (layer.gate_exps.type != 14 ||
+                               layer.up_exps.type != 14 ||
+                               layer.down_exps.type != 14)) return false;
+    }
+    return true;
+}
+
+void bailing_gpu_prefill_tiled(
+    ColibriV2BailingRuntime& runtime, const std::uint32_t* tokens,
+    std::uint32_t count, float* logits
+) {
+    namespace bailing = colibri::v2::bailing;
+    bailing_gpu_bind_thread();
+    auto& gpu = *runtime.gpu;
+    const auto& g = runtime.geometry;
+    const auto& c = runtime.model->config;
+    const std::uint64_t stream = 0;
+    const int hidden = static_cast<int>(g.hidden);
+    const int heads = static_cast<int>(g.heads);
+    const int channels = static_cast<int>(g.heads * g.head_dim);
+    const int head_dim = static_cast<int>(g.head_dim);
+    const int qk_nope = static_cast<int>(g.qk_nope);
+    const int qk_rope = static_cast<int>(g.qk_rope);
+    const int qk = qk_nope + qk_rope;
+    const int value_dim = static_cast<int>(g.v_head_dim);
+    const int lora = static_cast<int>(g.kv_lora);
+    const int top_k = static_cast<int>(g.experts_used);
+    const int experts = static_cast<int>(g.experts);
+    const int groups = static_cast<int>(g.groups);
+    const int groups_used = static_cast<int>(g.groups_used);
+    const int expert_size = static_cast<int>(g.expert_size);
+    const int dense_size = static_cast<int>(g.dense_size);
+    const float epsilon = g.epsilon;
+    const bool phase_profile = std::getenv("COLIBRI_BAILING_TILED_PROFILE") != nullptr;
+    double mla_seconds = 0.0, kda_seconds = 0.0;
+    double routed_seconds = 0.0, dense_seconds = 0.0;
+    double router_projection_seconds = 0.0, router_selection_seconds = 0.0;
+    double expert_gate_seconds = 0.0, expert_down_seconds = 0.0;
+    double shared_expert_seconds = 0.0;
+
+    auto launch = [&](const char* name, std::uint32_t gx, std::uint32_t gy,
+                      std::uint32_t block, void** args,
+                      std::uint32_t shared = 0) {
+        if (colibri_gpu_launch_named(name, gx, gy, block, shared, stream, args) != 0)
+            throw std::runtime_error(std::string("bailing tiled prefill kernel failed: ") + name);
+    };
+    auto rows_kernel = [](std::uint32_t type) -> const char* {
+        switch (type) {
+            case 8: return "q8_matmul_tiled";
+            case 10: return "q2k_matmul_rows";
+            case 11: return "q3k_matmul_rows";
+            case 12: return "q4k_matmul_rows";
+            case 13: return "q5k_matmul_rows";
+            case 14: return "q6k_matmul_rows";
+            case 16: return "iq2xxs_matmul_rows";
+            case 17: return "iq2xs_matmul_rows";
+            case 18: return "iq3xxs_matmul_rows";
+            case 21: return "iq3s_matmul_rows";
+            case 22: return "iq2s_matmul_rows";
+            case 23: return "iq4xs_matmul_rows";
+            default: return nullptr;
+        }
+    };
+    const char* q8_prefill_env = std::getenv("COLIBRI_BAILING_Q8_PREFILL");
+    const bool q8_prefill = !q8_prefill_env || q8_prefill_env[0] != '0';
+    const char* mmq_prefill_env = std::getenv("COLIBRI_BAILING_MMQ_PREFILL");
+    const bool mmq_prefill = !mmq_prefill_env || mmq_prefill_env[0] != '0';
+    const char* fused_mla_env = std::getenv("COLIBRI_BAILING_FUSED_MLA");
+    const bool fused_mla = fused_mla_env && fused_mla_env[0] == '1';
+    const char* grouped_moe_env = std::getenv("COLIBRI_BAILING_GROUPED_PREFILL");
+    const bool grouped_moe = !grouped_moe_env || grouped_moe_env[0] != '0';
+    const char* q8_expert_env = std::getenv("COLIBRI_BAILING_Q8_EXPERT_PREFILL");
+    const bool q8_expert_prefill = !q8_expert_env || q8_expert_env[0] != '0';
+    const char* mmq_expert_env = std::getenv("COLIBRI_BAILING_MMQ_EXPERT_PREFILL");
+    const bool mmq_expert_prefill =
+        !mmq_expert_env || mmq_expert_env[0] != '0';
+    std::uint64_t q8_cached_input = 0;
+    int q8_cached_inputs = 0, q8_cached_rows = 0;
+    auto matmul = [&](const BailingGpuMatrix& matrix, std::uint64_t input,
+                      std::uint64_t output, int inputs, int outputs, int rows) {
+        if (q8_prefill && matrix.type == 14 && !(inputs & 255)) {
+            if (q8_cached_input != input || q8_cached_inputs != inputs ||
+                q8_cached_rows != rows) {
+                void* quant_args[] = {&input, &gpu.prefill_q8,
+                    &gpu.prefill_q8_scales, &rows, &inputs};
+                launch("bailing_quantize_q8_rows", inputs / 32, rows, 32,
+                       quant_args);
+                q8_cached_input = input;
+                q8_cached_inputs = inputs;
+                q8_cached_rows = rows;
+            }
+            void* q8_args[] = {const_cast<std::uint64_t*>(&matrix.data),
+                &gpu.prefill_q8, &gpu.prefill_q8_scales, &output,
+                &inputs, &outputs, &rows};
+            if (mmq_prefill)
+                launch("bailing_q6_q8_mmq_rows", (outputs + 31) / 32,
+                       (rows + 3) / 4, 128, q8_args);
+            else
+                launch("bailing_q6_q8_matmul_rows", outputs, (rows + 3) / 4,
+                       128, q8_args);
+            if (output == q8_cached_input) q8_cached_input = 0;
+            return;
+        }
+        const char* name = rows_kernel(matrix.type);
+        if (!name) throw std::runtime_error(
+            "bailing tiled prefill has no row kernel for type " +
+            std::to_string(matrix.type));
+        void* args[] = {const_cast<std::uint64_t*>(&matrix.data), &input, &output,
+                        &inputs, &outputs, &rows};
+        if (matrix.type == 8)
+            launch(name, (outputs + 31) / 32, (rows + 31) / 32, 256, args);
+        else if (matrix.type == 14)
+            launch("bailing_q6_matmul_rows_16", outputs, (rows + 15) / 16,
+                   256, args);
+        else
+            launch(name, outputs, (rows + 3) / 4, 256, args);
+    };
+    auto rms = [&](std::uint64_t input, std::uint64_t weights,
+                   std::uint64_t output, int rows, int columns) {
+        int one_centered = 0;
+        void* args[] = {&input, &weights, &output, &rows, &columns,
+                        const_cast<float*>(&epsilon), &one_centered};
+        launch("rms_norm_rows", rows, 1, 256, args);
+    };
+    auto add = [&](std::uint64_t target, std::uint64_t source, int elements) {
+        if (colibri_gpu_scaled_add(target, source, 1.0f, elements) != 0)
+            throw std::runtime_error("bailing tiled prefill residual add failed");
+    };
+
+    for (std::uint32_t offset = 0; offset < count; offset += gpu.prefill_rows) {
+        const int rows = static_cast<int>(std::min<std::uint32_t>(
+            gpu.prefill_rows, count - offset));
+        const int base_position = static_cast<int>(runtime.position);
+        if (colibri_gpu_upload_sync(gpu.prefill_tokens, tokens + offset,
+                                    rows * sizeof(std::uint32_t)) != 0)
+            throw std::runtime_error("bailing tiled prefill token upload failed");
+        {
+            int grid = (hidden + 255) / 256;
+            void* args[] = {&gpu.embedding.data, &gpu.prefill_tokens,
+                            &gpu.prefill_hidden_a, const_cast<int*>(&rows),
+                            const_cast<int*>(&hidden)};
+            launch(qwen_embedding_kernel(gpu.embedding.type, true), grid, rows,
+                   256, args);
+        }
+        std::uint64_t current = gpu.prefill_hidden_a;
+        std::uint64_t next = gpu.prefill_hidden_b;
+        for (std::size_t layer_index = 0; layer_index < runtime.layers.size();
+             ++layer_index) {
+            const auto& weights = runtime.layers[layer_index];
+            auto& layer = gpu.layers[layer_index];
+            const auto attention_start = std::chrono::steady_clock::now();
+            rms(current, layer.attn_norm, gpu.prefill_normalized, rows, hidden);
+            q8_cached_input = 0;
+            if (weights.full_attention) {
+                matmul(layer.q_a, gpu.prefill_normalized, gpu.prefill_wide_a,
+                       hidden, static_cast<int>(g.q_lora), rows);
+                rms(gpu.prefill_wide_a, layer.q_a_norm, gpu.prefill_wide_b,
+                    rows, static_cast<int>(g.q_lora));
+                matmul(layer.q_b, gpu.prefill_wide_b, gpu.prefill_wide_c,
+                       static_cast<int>(g.q_lora), heads * qk, rows);
+                matmul(layer.kv_a_mqa, gpu.prefill_normalized, gpu.prefill_wide_d,
+                       hidden, lora + qk_rope, rows);
+                matmul(layer.attn_gate, gpu.prefill_normalized, gpu.prefill_wide_a,
+                       hidden, heads, rows);
+                void* prepare_args[] = {&gpu.prefill_wide_d, &gpu.prefill_wide_c,
+                    &layer.kv_a_norm, &layer.latents, &layer.rope_keys,
+                    &gpu.prefill_wide_b, &gpu.prefill_normalized,
+                    const_cast<int*>(&rows), const_cast<int*>(&base_position),
+                    const_cast<int*>(&heads), const_cast<int*>(&qk_nope),
+                    const_cast<int*>(&qk_rope), const_cast<int*>(&lora),
+                    const_cast<float*>(&epsilon), const_cast<float*>(&g.rope_theta)};
+                launch("bailing_mla_prepare_rows", rows, 1, 256, prepare_args);
+                void* project_args[] = {&gpu.prefill_wide_b, &layer.kv_b,
+                    &gpu.prefill_projected, const_cast<int*>(&rows),
+                    const_cast<int*>(&heads), const_cast<int*>(&qk_nope),
+                    const_cast<int*>(&value_dim), const_cast<int*>(&lora)};
+                launch("bailing_mla_project_rows", rows * heads, 1, 128,
+                       project_args);
+                if (fused_mla) {
+                    void* fused_args[] = {&gpu.prefill_projected,
+                        &gpu.prefill_normalized, &layer.latents, &layer.rope_keys,
+                        &gpu.prefill_accumulated, const_cast<int*>(&rows),
+                        const_cast<int*>(&base_position), const_cast<int*>(&heads),
+                        const_cast<int*>(&qk_nope), const_cast<int*>(&qk_rope),
+                        const_cast<int*>(&lora)};
+                    launch("bailing_mla_fused_rows", rows * heads, 1, 512,
+                           fused_args);
+                } else {
+                    void* score_args[] = {&gpu.prefill_projected,
+                        &gpu.prefill_normalized, &layer.latents, &layer.rope_keys,
+                        &gpu.prefill_scores, const_cast<int*>(&rows),
+                        const_cast<int*>(&base_position), &runtime.capacity,
+                        const_cast<int*>(&heads), const_cast<int*>(&qk_nope),
+                        const_cast<int*>(&qk_rope), const_cast<int*>(&lora)};
+                    launch("bailing_mla_scores_rows", rows * heads,
+                           (base_position + rows + 7) / 8, 256, score_args);
+                    void* softmax_args[] = {&gpu.prefill_scores,
+                        const_cast<int*>(&rows), const_cast<int*>(&base_position),
+                        &runtime.capacity, const_cast<int*>(&heads)};
+                    launch("bailing_mla_softmax_rows", rows * heads, 1, 128,
+                           softmax_args);
+                    void* accumulate_args[] = {&gpu.prefill_scores, &layer.latents,
+                        &gpu.prefill_accumulated, const_cast<int*>(&rows),
+                        const_cast<int*>(&base_position), &runtime.capacity,
+                        const_cast<int*>(&heads), const_cast<int*>(&lora)};
+                    launch("bailing_mla_accumulate_rows", rows * heads,
+                           (lora + 127) / 128, 128, accumulate_args);
+                }
+                void* output_args[] = {&gpu.prefill_accumulated, &layer.kv_b,
+                    &gpu.prefill_wide_a, &gpu.prefill_wide_c,
+                    const_cast<int*>(&rows), const_cast<int*>(&heads),
+                    const_cast<int*>(&qk_nope), const_cast<int*>(&value_dim),
+                    const_cast<int*>(&lora)};
+                launch("bailing_mla_output_rows", rows * heads, 1, 128,
+                       output_args);
+                matmul(layer.attn_output, gpu.prefill_wide_c, gpu.prefill_branch,
+                       heads * value_dim, hidden, rows);
+            } else {
+                matmul(layer.ssm_q, gpu.prefill_normalized, gpu.prefill_wide_a,
+                       hidden, channels, rows);
+                matmul(layer.ssm_k, gpu.prefill_normalized, gpu.prefill_wide_b,
+                       hidden, channels, rows);
+                matmul(layer.ssm_v, gpu.prefill_normalized, gpu.prefill_wide_c,
+                       hidden, channels, rows);
+                matmul(layer.ssm_f, gpu.prefill_normalized, gpu.prefill_wide_d,
+                       hidden, channels, rows);
+                matmul(layer.ssm_b, gpu.prefill_normalized, gpu.prefill_branch,
+                       hidden, heads, rows);
+                matmul(layer.ssm_g, gpu.prefill_normalized,
+                       gpu.prefill_wide_e, hidden, channels, rows);
+                int width = static_cast<int>(g.conv_width);
+                std::uint64_t windows[] = {
+                    layer.conv_windows,
+                    layer.conv_windows + static_cast<std::uint64_t>(channels) * (width - 1) * 4,
+                    layer.conv_windows + static_cast<std::uint64_t>(channels) * (width - 1) * 8};
+                std::uint64_t values[] = {gpu.prefill_wide_a, gpu.prefill_wide_b,
+                                          gpu.prefill_wide_c};
+                std::uint64_t conv_weights[] = {layer.ssm_q_conv, layer.ssm_k_conv,
+                                                layer.ssm_v_conv};
+                for (int part = 0; part < 3; ++part) {
+                    void* conv_args[] = {&values[part], &conv_weights[part],
+                        &windows[part], const_cast<int*>(&rows),
+                        const_cast<int*>(&channels), &width};
+                    launch("bailing_short_conv_rows", 32, 1, 256, conv_args);
+                }
+                void* recurrent_args[] = {&gpu.prefill_wide_a,
+                    &gpu.prefill_wide_b, &gpu.prefill_wide_c,
+                    &gpu.prefill_wide_d, &gpu.prefill_branch, &layer.ssm_a,
+                    &layer.ssm_dt, &layer.state, &gpu.prefill_wide_a,
+                    const_cast<int*>(&rows), const_cast<int*>(&heads),
+                    const_cast<int*>(&head_dim), const_cast<float*>(&epsilon)};
+                launch("bailing_kda_recurrent_chunk", heads, 1, 128,
+                       recurrent_args);
+                void* norm_args[] = {&gpu.prefill_wide_a, &layer.ssm_norm,
+                    &gpu.prefill_wide_e, const_cast<int*>(&rows),
+                    const_cast<int*>(&heads), const_cast<int*>(&head_dim),
+                    const_cast<float*>(&epsilon)};
+                launch("bailing_gated_head_norm_rows", rows * heads, 1, 128,
+                       norm_args);
+                matmul(layer.ssm_out, gpu.prefill_wide_a, gpu.prefill_branch,
+                       channels, hidden, rows);
+            }
+            add(gpu.prefill_branch, current, rows * hidden);
+            if (phase_profile) {
+                colibri_gpu_sync();
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - attention_start).count();
+                (weights.full_attention ? mla_seconds : kda_seconds) += seconds;
+            }
+            const auto ffn_start = std::chrono::steady_clock::now();
+            rms(gpu.prefill_branch, layer.ffn_norm, gpu.prefill_normalized,
+                rows, hidden);
+            q8_cached_input = 0;
+            if (weights.routed) {
+                auto moe_mark = std::chrono::steady_clock::now();
+                matmul(layer.router, gpu.prefill_normalized,
+                       gpu.prefill_router_logits, hidden, experts, rows);
+                if (phase_profile) {
+                    colibri_gpu_sync();
+                    const auto now = std::chrono::steady_clock::now();
+                    router_projection_seconds +=
+                        std::chrono::duration<double>(now - moe_mark).count();
+                    moe_mark = now;
+                }
+                int normalize = g.normalize_weights ? 1 : 0;
+                const int max_routes = rows * top_k;
+                if (colibri_gpu_memset(gpu.prefill_expert_counts, 0,
+                        static_cast<std::size_t>(experts) * sizeof(std::int32_t),
+                        stream) != 0)
+                    throw std::runtime_error(
+                        "bailing tiled prefill route-count reset failed");
+                void* route_args[] = {&gpu.prefill_router_logits,
+                    &layer.router_bias, &gpu.prefill_selected,
+                    &gpu.prefill_weights, &gpu.prefill_expert_counts,
+                    &gpu.prefill_expert_routes, const_cast<int*>(&max_routes),
+                    const_cast<int*>(&rows),
+                    const_cast<int*>(&experts), const_cast<int*>(&top_k),
+                    const_cast<int*>(&groups), const_cast<int*>(&groups_used),
+                    &normalize, const_cast<float*>(&g.weight_scale)};
+                launch("bailing_route_rows", rows, 1, 256, route_args);
+                if (phase_profile) {
+                    colibri_gpu_sync();
+                    const auto now = std::chrono::steady_clock::now();
+                    router_selection_seconds +=
+                        std::chrono::duration<double>(now - moe_mark).count();
+                    moe_mark = now;
+                }
+                const auto narrow = static_cast<std::uint64_t>(g.expert_size) *
+                    bailing::row_bytes(layer.gate_exps.type, g.hidden);
+                const auto wide = static_cast<std::uint64_t>(g.hidden) *
+                    bailing::row_bytes(layer.down_exps.type, g.expert_size);
+                if (grouped_moe) {
+                    const bool q8_expert = q8_expert_prefill &&
+                        layer.gate_exps.type == 14 &&
+                        layer.up_exps.type == 14 && !(hidden & 255);
+                    const bool mmq_expert = mmq_expert_prefill && q8_expert &&
+                        layer.down_exps.type == 14;
+                    if (q8_expert) {
+                        void* quant_args[] = {&gpu.prefill_normalized,
+                            &gpu.prefill_q8, &gpu.prefill_q8_scales,
+                            const_cast<int*>(&rows), const_cast<int*>(&hidden)};
+                        launch("bailing_quantize_q8_rows", hidden / 32, rows,
+                               32, quant_args);
+                        void* gate_args[] = {&layer.gate_exps.data,
+                            &layer.up_exps.data, &gpu.prefill_expert_counts,
+                            &gpu.prefill_expert_routes, &gpu.prefill_q8,
+                            &gpu.prefill_q8_scales, &gpu.prefill_activated,
+                            const_cast<std::uint64_t*>(&narrow),
+                            const_cast<int*>(&max_routes),
+                            const_cast<int*>(&top_k), const_cast<int*>(&hidden),
+                            const_cast<int*>(&expert_size)};
+                        if (mmq_expert)
+                            launch("bailing_q6_q8_expert_swiglu_mmq_rows",
+                                   (expert_size + 31) / 32, experts, 128,
+                                   gate_args);
+                        else
+                            launch("bailing_q6_q8_expert_swiglu_grouped_rows",
+                                   expert_size, experts, 256, gate_args);
+                    } else {
+                        void* gate_args[] = {&layer.gate_exps.data,
+                            &layer.up_exps.data, &gpu.prefill_expert_counts,
+                            &gpu.prefill_expert_routes, &gpu.prefill_normalized,
+                            &gpu.prefill_activated,
+                            const_cast<std::uint64_t*>(&narrow),
+                            const_cast<int*>(&max_routes),
+                            const_cast<int*>(&top_k), const_cast<int*>(&hidden),
+                            const_cast<int*>(&expert_size)};
+                        launch("bailing_q6_expert_swiglu_grouped_rows",
+                               expert_size, experts, 256, gate_args);
+                    }
+                    if (phase_profile) {
+                        colibri_gpu_sync();
+                        const auto now = std::chrono::steady_clock::now();
+                        expert_gate_seconds +=
+                            std::chrono::duration<double>(now - moe_mark).count();
+                        moe_mark = now;
+                    }
+                    if (colibri_gpu_memset(next, 0,
+                            static_cast<std::size_t>(rows) * hidden * 4,
+                            stream) != 0)
+                        throw std::runtime_error(
+                            "bailing tiled prefill expert-output reset failed");
+                    void* down_args[] = {&layer.down_exps.data,
+                        &gpu.prefill_expert_counts,
+                        &gpu.prefill_expert_routes,
+                        &gpu.prefill_activated, &gpu.prefill_weights, &next,
+                        const_cast<std::uint64_t*>(&wide),
+                        const_cast<int*>(&max_routes),
+                        const_cast<int*>(&top_k),
+                        const_cast<int*>(&expert_size),
+                        const_cast<int*>(&hidden)};
+                    if (mmq_expert)
+                        launch("bailing_q6_f32_expert_accumulate_mmq_rows",
+                               (hidden + 31) / 32, experts, 128, down_args);
+                    else
+                        launch("bailing_q6_expert_accumulate_grouped_rows",
+                               hidden, experts, 256, down_args);
+                    if (phase_profile) {
+                        colibri_gpu_sync();
+                        const auto now = std::chrono::steady_clock::now();
+                        expert_down_seconds +=
+                            std::chrono::duration<double>(now - moe_mark).count();
+                        moe_mark = now;
+                    }
+                } else {
+                    void* gate_args[] = {&layer.gate_exps.data,
+                        &layer.up_exps.data, &gpu.prefill_selected,
+                        &gpu.prefill_normalized, &gpu.prefill_activated,
+                        const_cast<std::uint64_t*>(&narrow),
+                        const_cast<int*>(&rows), const_cast<int*>(&top_k),
+                        const_cast<int*>(&hidden),
+                        const_cast<int*>(&expert_size)};
+                    launch("bailing_q6_expert_swiglu_rows", expert_size,
+                           rows * top_k, 256, gate_args);
+                    void* down_args[] = {&layer.down_exps.data,
+                        &gpu.prefill_selected, &gpu.prefill_activated,
+                        &gpu.prefill_weights, &next,
+                        const_cast<std::uint64_t*>(&wide),
+                        const_cast<int*>(&rows), const_cast<int*>(&top_k),
+                        const_cast<int*>(&expert_size),
+                        const_cast<int*>(&hidden)};
+                    launch("bailing_q6_expert_accumulate_rows", hidden, rows,
+                           256, down_args);
+                }
+                if (layer.shared_gate.data && layer.shared_up.data &&
+                    layer.shared_down.data) {
+                    matmul(layer.shared_gate, gpu.prefill_normalized,
+                           gpu.prefill_wide_a, hidden,
+                           static_cast<int>(g.shared_size), rows);
+                    matmul(layer.shared_up, gpu.prefill_normalized,
+                           gpu.prefill_wide_b, hidden,
+                           static_cast<int>(g.shared_size), rows);
+                    int elements = rows * static_cast<int>(g.shared_size);
+                    void* swiglu_args[] = {&gpu.prefill_wide_a,
+                        &gpu.prefill_wide_b, &elements,
+                        const_cast<float*>(&g.swiglu_limit), &gpu.prefill_wide_c};
+                    launch("bailing_swiglu", (elements + 255) / 256, 1, 256,
+                           swiglu_args);
+                    matmul(layer.shared_down, gpu.prefill_wide_c,
+                           gpu.prefill_wide_a, static_cast<int>(g.shared_size),
+                           hidden, rows);
+                    add(next, gpu.prefill_wide_a, rows * hidden);
+                    if (phase_profile) {
+                        colibri_gpu_sync();
+                        const auto now = std::chrono::steady_clock::now();
+                        shared_expert_seconds +=
+                            std::chrono::duration<double>(now - moe_mark).count();
+                    }
+                }
+            } else {
+                matmul(layer.gate_exps, gpu.prefill_normalized,
+                       gpu.prefill_wide_a, hidden, dense_size, rows);
+                matmul(layer.up_exps, gpu.prefill_normalized,
+                       gpu.prefill_wide_b, hidden, dense_size, rows);
+                int elements = rows * dense_size;
+                void* swiglu_args[] = {&gpu.prefill_wide_a,
+                    &gpu.prefill_wide_b, &elements,
+                    const_cast<float*>(&g.swiglu_limit), &gpu.prefill_wide_c};
+                launch("bailing_swiglu", (elements + 255) / 256, 1, 256,
+                       swiglu_args);
+                matmul(layer.down_exps, gpu.prefill_wide_c, next,
+                       dense_size, hidden, rows);
+            }
+            add(next, gpu.prefill_branch, rows * hidden);
+            if (phase_profile) {
+                colibri_gpu_sync();
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - ffn_start).count();
+                (weights.routed ? routed_seconds : dense_seconds) += seconds;
+            }
+            std::swap(current, next);
+        }
+        runtime.position += rows;
+        if (offset + rows == count) {
+            std::uint64_t last = current +
+                static_cast<std::uint64_t>(rows - 1) * g.hidden * 4;
+            if (colibri_gpu_rms_norm(last, gpu.output_norm, gpu.normalized,
+                                     hidden, epsilon, 0) != 0)
+                throw std::runtime_error("bailing tiled prefill output norm failed");
+            if (qwen_gpu_matvec_by_type(gpu.head.type, gpu.head.data,
+                    gpu.normalized, gpu.logits, hidden,
+                    static_cast<int>(c.vocabulary_size), stream) != 0)
+                throw std::runtime_error("bailing tiled prefill LM head failed");
+            colibri_gpu_sync();
+            if (colibri_gpu_download(logits, gpu.logits,
+                    static_cast<std::size_t>(c.vocabulary_size) * 4, stream) != 0)
+                throw std::runtime_error("bailing tiled prefill logits download failed");
+        }
+    }
+    if (phase_profile) std::fprintf(stderr,
+        "[bailing-tiled-profile] mla=%.3fs kda=%.3fs routed=%.3fs dense=%.3fs "
+        "router=%.3fs select=%.3fs gate=%.3fs down=%.3fs shared=%.3fs\n",
+        mla_seconds, kda_seconds, routed_seconds, dense_seconds,
+        router_projection_seconds, router_selection_seconds,
+        expert_gate_seconds, expert_down_seconds, shared_expert_seconds);
+    runtime.cache_on_device = true;
 }
 
 int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
@@ -5085,11 +5680,12 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
 
     // Each path takes the work it is better at, and the cache follows.
     //
-    // The host has a batched prefill -- it runs the whole prompt through each
-    // layer at once, so the weights are read once rather than once per token --
-    // and measured ~2x the device's token-at-a-time loop. The device has the
-    // faster decode. Using both means the per-layer caches have to move across
-    // at the transition, which `bailing_cache_transfer` does.
+    // The host has weight-stationary batched projections and wins on ordinary
+    // prompts. Its causal MLA is quadratic and becomes the bottleneck on long
+    // fresh prompts, however; after the tiled device MLA landed, the fully
+    // resident token loop wins beyond a conservative 4096-token crossover
+    // (measured at 8871: 96.5 vs 56.7 tok/s on Q6_K). Use that automatically.
+    // COLIBRI_BAILING_GPU_PREFILL=0/1 forces either side for reproducible A/B.
     //
     // The hazard this replaces: the host and device caches are SEPARATE, and an
     // earlier version routed prefill to the host and decode to the device with
@@ -5100,7 +5696,20 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
     // same path; only a server sending a whole prompt at once splits them.
     // Hence `cache_on_device`: the transfer is not optional and not inferred
     // from the call, it is tracked.
-    if(runtime->gpu && runtime->gpu->ready && count > 1){
+    const char* tiled_prefill_env = std::getenv("COLIBRI_BAILING_TILED_PREFILL");
+    const bool tiled_prefill = !tiled_prefill_env ||
+        tiled_prefill_env[0] != '0';
+    if (count > 1 && tiled_prefill &&
+        bailing_gpu_prefill_tiled_supported(*runtime)) {
+        if (!runtime->cache_on_device) bailing_cache_transfer(*runtime, true);
+        bailing_gpu_prefill_tiled(*runtime, tokens, count, logits);
+        return 0;
+    }
+    const char* gpu_prefill_env = std::getenv("COLIBRI_BAILING_GPU_PREFILL");
+    const bool gpu_prefill = gpu_prefill_env
+        ? gpu_prefill_env[0] == '1'
+        : count >= 4096;
+    if(runtime->gpu && runtime->gpu->ready && count > 1 && !gpu_prefill){
         if(runtime->cache_on_device) bailing_cache_transfer(*runtime,false);
         // Falls through to the host batched path below, which leaves the cache
         // on the host; the next single-token eval moves it back.

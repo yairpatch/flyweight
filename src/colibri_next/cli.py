@@ -7,6 +7,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from .server import serve as serve_http
 from .v2 import V2Model
@@ -228,10 +229,16 @@ def _parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--prompt")
     benchmark.add_argument("--chat", action="store_true")
     benchmark.add_argument("--warmup", type=int, default=3)
-    benchmark.add_argument("--iterations", type=int, default=10)
+    benchmark.add_argument(
+        "--iterations", type=int, default=128,
+        help="measured decode tokens after warmup (default: 128)",
+    )
     benchmark.add_argument("--context", type=int, default=2048)
     benchmark.add_argument("--expert-top-k", type=int, default=0)
     benchmark.add_argument("--expert-top-p", type=float, default=0.0)
+    benchmark.add_argument("--temperature", type=float, default=0.0)
+    benchmark.add_argument("--top-k", type=int, default=0)
+    benchmark.add_argument("--top-p", type=float, default=0.0)
     benchmark.add_argument("--cold-cache", action="store_true")
     _add_runtime_options(benchmark, serving=False)
 
@@ -359,12 +366,30 @@ def _benchmark_native_generate(
     return generated, arrivals, time.perf_counter() - started
 
 
+def _benchmark_bailing_generate(runtime, prompt, tokens, config):
+    """Time the same eval/sample loop used by the Bailing HTTP generator."""
+    generated: list[int] = []
+    arrivals: list[float] = []
+    started = time.perf_counter()
+    step = prompt
+    runtime.reset()
+    for _ in range(tokens):
+        runtime.eval_into(step)
+        token = runtime.sample(config)
+        generated.append(token)
+        arrivals.append(time.perf_counter() - started)
+        step = [token]
+    return generated, arrivals, time.perf_counter() - started
+
+
 def _benchmark(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
     if args.iterations < 3 or args.warmup < 1 or args.context <= 0:
         raise SystemExit("benchmark requires warmup >= 1, iterations >= 3, and context > 0")
     if args.expert_top_k < 0 or not 0 <= args.expert_top_p <= 1:
         raise SystemExit("invalid expert routing limit")
+    if args.temperature < 0 or args.top_k < 0 or not 0 <= args.top_p <= 1:
+        raise SystemExit("invalid sampling options")
     if args.cold_cache:
         _drop_file_cache(args.model)
     with V2Model(args.model, mtp_model=args.mtp_model) as model:
@@ -373,17 +398,37 @@ def _benchmark(args: argparse.Namespace) -> int:
             raise SystemExit("benchmark prompt must contain at least one token")
         if len(prompt) + args.warmup + args.iterations > args.context:
             raise SystemExit("benchmark exceeds --context")
-        options = _runtime_options(args)
-        options["context_limit"] = args.context
-        with model.native_runtime(**options) as runtime:
+        if str(model.config["architecture"]) == "bailingmoe3":
+            from .v2 import BailingRuntime
+
             started = time.perf_counter()
-            runtime.prepare()
+            runtime = BailingRuntime(model, capacity=args.context)
             prepare_seconds = time.perf_counter() - started
-            request_start = runtime.info
-            all_generated, arrivals, total_seconds = _benchmark_native_generate(
-                runtime, prompt, 1 + args.warmup + args.iterations,
-            )
-            info = runtime.info
+            try:
+                sampling = SimpleNamespace(
+                    temperature=args.temperature, top_k=args.top_k,
+                    top_p=args.top_p, seed=None,
+                )
+                all_generated, arrivals, total_seconds = _benchmark_bailing_generate(
+                    runtime, prompt, 1 + args.warmup + args.iterations, sampling,
+                )
+            finally:
+                runtime.close()
+            info = {"expert_mode": "bailing-gpu-or-host"}
+            request_counters = None
+        else:
+            options = _runtime_options(args)
+            options["context_limit"] = args.context
+            with model.native_runtime(**options) as runtime:
+                started = time.perf_counter()
+                runtime.prepare()
+                prepare_seconds = time.perf_counter() - started
+                request_start = runtime.info
+                all_generated, arrivals, total_seconds = _benchmark_native_generate(
+                    runtime, prompt, 1 + args.warmup + args.iterations,
+                )
+                info = runtime.info
+            request_counters = _steady_state_counters(request_start, info)
         # Token zero is the pending result of prompt evaluation. Both paths
         # then warm and measure the same following output positions.
         generated = all_generated[1:]
@@ -393,6 +438,18 @@ def _benchmark(args: argparse.Namespace) -> int:
             arrivals[index] - arrivals[index - 1]
             for index in range(args.warmup + 1, len(arrivals))
         ]
+        # Short decode windows can materially overstate sustained server speed.
+        # Expose the tail and latency distribution so decay is not hidden in a
+        # single optimistic aggregate.
+        sorted_intervals = sorted(callback_intervals)
+        def percentile(fraction: float) -> float:
+            return sorted_intervals[min(
+                len(sorted_intervals) - 1,
+                int((len(sorted_intervals) - 1) * fraction),
+            )]
+        window = min(32, max(1, len(callback_intervals) // 2))
+        first_window = callback_intervals[:window]
+        last_window = callback_intervals[-window:]
         mtp_suffix = "-mtp" if args.mtp_drafts else ""
         print(json.dumps({
             "execution": f"native-v2-{info['expert_mode']}{mtp_suffix}",
@@ -402,12 +459,20 @@ def _benchmark(args: argparse.Namespace) -> int:
             "request_seconds": total_seconds,
             "decode_seconds": callback_intervals,
             "decode_median_seconds": statistics.median(callback_intervals),
+            "decode_p90_seconds": percentile(0.90),
+            "decode_p99_seconds": percentile(0.99),
             "decode_tokens_per_second": (
                 args.iterations / measured_total if measured_total > 0 else 0.0
             ),
+            "decode_first_window_tokens_per_second": (
+                len(first_window) / sum(first_window) if sum(first_window) > 0 else 0.0
+            ),
+            "decode_last_window_tokens_per_second": (
+                len(last_window) / sum(last_window) if sum(last_window) > 0 else 0.0
+            ),
             "generated_tokens": generated,
             "generated_text": model.decode_tokens(generated),
-            "request_counters": _steady_state_counters(request_start, info),
+            "request_counters": request_counters,
             "runtime": info,
         }, indent=2))
     return 0
@@ -432,6 +497,22 @@ def _architecture(model_path: Path) -> str | None:
     Used only to choose a service; a model that will not open is left to fail
     where it is loaded for real, which reports the reason.
     """
+    # HF directories already expose their architecture in a tiny config file.
+    # Opening V2Model here mapped/parsed the multi-gigabyte quantized arena and
+    # the 12 MB tokenizer, only to close both and repeat the work in the service.
+    if model_path.is_dir():
+        try:
+            config = json.loads((model_path / "config.json").read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        model_type = config.get("model_type")
+        architectures = config.get("architectures") or ()
+        if model_type in {"bailing_hybrid", "bailingmoe3", "bailing-hybrid"} or (
+            "BailingMoeV3ForCausalLM" in architectures
+        ):
+            return "bailingmoe3"
+        return model_type if isinstance(model_type, str) else None
+
     from .v2 import V2Error
     try:
         with V2Model(model_path) as model:
