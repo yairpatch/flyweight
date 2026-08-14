@@ -1314,6 +1314,9 @@ std::size_t select_expert_cache_slot(
         return !slot.valid;
     });
     if (free_slot != end) {
+        // The slot is about to hold a different expert, so any seed pin it
+        // still carries describes the previous occupant.
+        free_slot->pinned = false;
         ++runtime.expert_cache_admissions;
         return static_cast<std::size_t>(free_slot - runtime.expert_slots.begin());
     }
@@ -1329,7 +1332,13 @@ std::size_t select_expert_cache_slot(
             ? left_history.frequency < right_history.frequency
             : left.last_used < right.last_used;
     });
-    if (victim->pinned || victim->prefetch_pins) {
+    // Only an in-flight prefetch is a hard block: its upload is still landing in
+    // the slot. A seed pin is a placement preference, and the comparator above
+    // already sorts pinned slots last, so a seeded expert is only ever the
+    // victim once every unpinned slot in the layer is hotter than it. Treating
+    // the seed pin as absolute left the cache unable to replace a single slot
+    // after seeding -- evictions stayed at 0 for whole generations.
+    if (victim->prefetch_pins) {
         ++runtime.expert_cache_rejections;
         return kNoExpertSlot;
     }
@@ -1352,6 +1361,11 @@ std::size_t select_expert_cache_slot(
     const auto slot = static_cast<std::size_t>(victim - runtime.expert_slots.begin());
     runtime.expert_residency.erase(victim->key);
     victim->native_valid = false;
+    // The pin belonged to the expert being evicted, not to its replacement.
+    // Leaving it set made every later occupant look seed-protected, which both
+    // inflated the seed hit counters and flattened the eviction preference that
+    // is supposed to keep the seeded set resident.
+    victim->pinned = false;
     ++runtime.expert_cache_evictions;
     ++runtime.expert_cache_admissions;
     return slot;
@@ -13266,9 +13280,10 @@ static void qwen_seed_prefill_experts(
         runtime,colibri::v2::ExpertExecutionPhase::prepare);
     if(runtime.gemma4||
        !expert_policy.is_hybrid()||runtime.expert_slots.empty())return;
-    // Auto placement is the prepared-map policy for immutable residency.
-    // Mutable mode remains unchanged until the public mode consolidation.
-    if(automatic&&!runtime.options.immutable_residency)return;
+    // Auto placement warms the cache whether or not residency is frozen after
+    // it: the seed decides the *starting* map, mutability decides whether decode
+    // may improve on it. Gating the seed on immutable residency meant the two
+    // could not be had together.
     if(!automatic&&requested<=0)return;
     if(runtime.expert_residency_frozen){
         if(automatic)++runtime.prefill_cache_seed_auto_skips;

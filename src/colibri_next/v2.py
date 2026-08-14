@@ -2152,7 +2152,11 @@ class V2QwenRuntime:
         if prefill_cache_seed is None:
             prefill_cache_seed = "off" if legacy_policy else "auto"
         if expert_residency is None:
-            expert_residency = "mutable" if legacy_policy else "immutable"
+            # Decode must be allowed to replace seeded experts. Freezing residency
+            # for the whole request left the device cache at whatever the prefill
+            # seed guessed -- ~99% of decode expert lookups missed and fell to the
+            # CPU. See the expert cache notes in the native runtime.
+            expert_residency = "mutable"
         prefill_cache_seed_count, prefill_cache_seed_auto = (
             _normalize_prefill_cache_seed(prefill_cache_seed)
         )
@@ -2177,9 +2181,7 @@ class V2QwenRuntime:
         effective_hybrid_prefill = (
             "cpu" if resolved_expert_mode == "auto" else hybrid_prefill
         )
-        effective_expert_residency = (
-            "immutable" if resolved_expert_mode == "auto" else expert_residency
-        )
+        effective_expert_residency = expert_residency
         if mtp_drafts < 0 or mtp_drafts > 8:
             raise ValueError("mtp_drafts must be between 0 and 8")
         if expert_top_k < 0:

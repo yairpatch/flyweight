@@ -94,7 +94,11 @@ class V2RuntimeTests(unittest.TestCase):
         resident_native = _QwenRuntimeOptions.from_buffer_copy(resident_options)
         self.assertEqual(auto_native.moe_device, 2)
         self.assertEqual(auto_native.hybrid_prefill_cpu, 1)
-        self.assertEqual(auto_native.immutable_residency, 1)
+        # Auto seeds the cache and then lets decode replace what it seeded.
+        # Freezing residency for the whole request pinned the device cache to the
+        # seed's guess and missed ~99% of decode expert lookups.
+        self.assertEqual(auto_native.immutable_residency, 0)
+        self.assertEqual(auto_native.prefill_cache_seed_auto, 1)
         self.assertEqual(auto_native.strict_resident, 0)
         self.assertEqual(hybrid_native.moe_device, 2)
         self.assertEqual(hybrid_native.prefill_cache_seed_auto, 0)
