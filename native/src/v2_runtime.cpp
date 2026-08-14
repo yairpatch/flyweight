@@ -10359,6 +10359,49 @@ inline const char* kv_fused_tiles_kernel(const ColibriV2QwenRuntime& r){
            t==2?"kv_attention_fused_bf16_tiles":
            t==1?"kv_attention_fused_f16_tiles":nullptr;
 }
+// The 256-dim twin of the above. Kept a separate instantiation rather than
+// widening the 128 one so models with 128-dim heads keep their shared-memory
+// footprint and register count exactly as they were.
+inline const char* kv_fused_tiles_kernel256(const ColibriV2QwenRuntime& r){
+    if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
+    const int t=r.options.cache_type_k;
+    return t==3?"kv_attention_fused_q8_tiles256":
+           t==2?"kv_attention_fused_bf16_tiles256":
+           t==1?"kv_attention_fused_f16_tiles256":nullptr;
+}
+// Width the fused path would run `head_dim` at, or 0 when it cannot.
+inline int kv_fused_width(int head_dim){
+    return head_dim==128?128:head_dim==256?256:0;
+}
+// Grouped-query kernel for `share` query heads per KV head, or nullptr when the
+// shape is not one of the instantiated ones. Opt-out via COLIBRI_GQA_ATTENTION=0.
+inline const char* kv_gqa_tiles_kernel(
+    const ColibriV2QwenRuntime& r,int head_dim,int heads,int kv_heads
+){
+    static const bool enabled=[]{
+        const char*env=std::getenv("COLIBRI_GQA_ATTENTION");
+        return !env||env[0]!='0';
+    }();
+    if(!enabled||kv_heads<=0||head_dim!=256)return nullptr;
+    if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
+    const int share=heads/kv_heads;
+    if(heads!=kv_heads*share||(share!=8&&share!=4))return nullptr;
+    const int t=r.options.cache_type_k;
+    if(share==8)
+        return t==3?"kv_attention_gqa_q8_256_s8":
+               t==2?"kv_attention_gqa_bf16_256_s8":
+               t==1?"kv_attention_gqa_f16_256_s8":nullptr;
+    return t==3?"kv_attention_gqa_q8_256_s4":
+           t==2?"kv_attention_gqa_bf16_256_s4":
+           t==1?"kv_attention_gqa_f16_256_s4":nullptr;
+}
+// The grouped kernel uses a smaller tile than the per-head one: its grid is
+// keyed on KV heads, so with only two of them a 1024-token tile left far too
+// few blocks to fill the SMs.
+inline int kv_gqa_tile_tokens(){return 512;}
+// Floats per (head, tile) partial record: the head dimension plus the running
+// maximum and denominator. Must match the kernel width that wrote it.
+inline int kv_fused_record_stride(int width){return width+2;}
 // Prefill counterpart of qwen_turbo_cublas_attention: stage the whole causal
 // window as f16 once for the chunk, then run the fused f16 prefill kernel over
 // it instead of walking the cache once per row.
@@ -11970,24 +12013,61 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     queries,first,cache_keys,cache_values,attention_scores,
                     attended,runtime->stream,heads,kv_heads,head_dim,tokens,
                     capacity,first_slot,scale)==0);
+            const char* gqa_tiles=(!cublas_done&&runtime->fused_attention)
+                ? kv_gqa_tiles_kernel(*runtime,head_dim,heads,kv_heads)
+                : nullptr;
+            const int gqa_tile_count=gqa_tiles
+                ? (tokens+kv_gqa_tile_tokens()-1)/kv_gqa_tile_tokens() : 0;
+            // Ranked below cuBLAS by measurement, not by principle: reading the
+            // cache once per block instead of once per query head does cut the
+            // traffic, but each warp then walks the whole tile alone, and the
+            // longer reduction chain costs more than the traffic saves. On f16
+            // at 49k that is 40.0 tok/s against cuBLAS' 44.4. Where cuBLAS
+            // cannot go -- any cache but f16, a wrapped ring -- it is the best
+            // of the remaining options: q8 at 49k measures 39.8 against 36.1
+            // for the per-head kernel and 8.3 for the serial fallback.
+            const bool gqa_done=gqa_tiles&&gqa_tile_count<=512&&
+                static_cast<std::uint64_t>(gqa_tile_count)*
+                    kv_fused_record_stride(256)<=runtime->options.context_limit;
             if(cublas_done){
-                // Tensor-core GQA attention already wrote `attended`.
-            }else if(runtime->fused_attention&&fused_tiles&&
-               head_dim==128&&
+                // Turbo or tensor-core attention already wrote `attended`.
+            }else if(gqa_done){
+                void*gqa_args[]={&queries,&cache_keys,&cache_values,
+                    const_cast<std::uint64_t*>(&attention_scores),
+                    const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                    const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+                launch_named(gqa_tiles,kv_heads,gqa_tile_count,
+                             32*(heads/kv_heads),gqa_args);
+                void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
+                    &attended,const_cast<int*>(&heads),
+                    const_cast<int*>(&head_dim),
+                    const_cast<int*>(&gqa_tile_count)};
+                launch_named("kv_attention_fused_merge256",heads,1,256,merge_args);
+            }else if(runtime->fused_attention&&kv_fused_width(head_dim)&&
+               (kv_fused_width(head_dim)==128
+                    ? fused_tiles
+                    : kv_fused_tiles_kernel256(*runtime))&&
                heads/kv_heads<=8&&
                (tokens+fused_tile_tokens-1)/fused_tile_tokens<=512&&
-               static_cast<std::uint64_t>((tokens+fused_tile_tokens-1)/fused_tile_tokens)*130<=
+               static_cast<std::uint64_t>((tokens+fused_tile_tokens-1)/fused_tile_tokens)*
+                   kv_fused_record_stride(kv_fused_width(head_dim))<=
                    runtime->options.context_limit){
+                const int width=kv_fused_width(head_dim);
+                const char* tiles=width==128
+                    ? fused_tiles : kv_fused_tiles_kernel256(*runtime);
                 const int tile_count=(tokens+fused_tile_tokens-1)/fused_tile_tokens;
                 void*fused_args[]={&queries,&cache_keys,&cache_values,
                     const_cast<std::uint64_t*>(&attention_scores),
                     const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
                     const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-                launch_named(fused_tiles,kv_fused_grid_heads(*runtime,heads,kv_heads),tile_count,256,fused_args);
+                launch_named(tiles,kv_fused_grid_heads(*runtime,heads,kv_heads),tile_count,256,fused_args);
                 void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
                     &attended,const_cast<int*>(&heads),
                     const_cast<int*>(&head_dim),const_cast<int*>(&tile_count)};
-                launch_named("kv_attention_fused_merge",heads,1,256,merge_args);
+                launch_named(width==128
+                        ? "kv_attention_fused_merge"
+                        : "kv_attention_fused_merge256",
+                    heads,1,256,merge_args);
             }else{
                 void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
                 launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);

@@ -6096,8 +6096,9 @@ extern "C" __global__ void qwen_attention_prefill_unpack(
     qwen_attention_prefill_unpack_impl<false>(
         packed, gates, output, tile_start, tile_rows, heads, kv_heads, head_dim);
 }
-
-template<typename KT, typename VT>
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+template<typename KT, typename VT, int maximum_head_dim = 128>
 __device__ void kv_attention_fused_tiles_impl(
     const float* query,
     const KT* keys,
@@ -6112,7 +6113,11 @@ __device__ void kv_attention_fused_tiles_impl(
     const float scale
 ) {
     constexpr int warp_count = 8;
-    constexpr int maximum_head_dim = 128;
+    // One register slot per 32-lane sweep of the head dimension. Templating
+    // this rather than fixing it at 128 is what lets a 256-dim head (Qwen3.6)
+    // use the split-K path at all; it used to fall through to cuBLAS, which
+    // reaches only ~35% of this card's read bandwidth on so skinny a GEMV.
+    constexpr int parts = maximum_head_dim / 32;
     constexpr int tokens_per_tile = 1024;
     const int head = blockIdx.x;
     const int tile = blockIdx.y;
@@ -6125,7 +6130,9 @@ __device__ void kv_attention_fused_tiles_impl(
     const int tile_end = min(tokens, tile_begin + tokens_per_tile);
     const int kv_head = head / (heads / kv_heads);
     const float* q = query + head * head_dim;
-    float accumulator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float accumulator[parts];
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) accumulator[part] = 0.0f;
     float maximum = -3.402823466e+38F;
     float denominator = 0.0f;
 
@@ -6138,7 +6145,7 @@ __device__ void kv_attention_fused_tiles_impl(
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(        float dot = 0.0f;
         #pragma unroll
-        for (int part = 0; part < 4; ++part) {
+        for (int part = 0; part < parts; ++part) {
             const int dimension = lane + part * 32;
             if (dimension < head_dim)
                 dot += q[dimension]
@@ -6155,7 +6162,7 @@ R"COLIBRI_CUDA(        float dot = 0.0f;
         denominator = denominator * old_scale + token_scale;
 
         #pragma unroll
-        for (int part = 0; part < 4; ++part) {
+        for (int part = 0; part < parts; ++part) {
             const int dimension = lane + part * 32;
             if (dimension < head_dim) {
                 accumulator[part] = accumulator[part] * old_scale
@@ -6177,7 +6184,7 @@ R"COLIBRI_CUDA(        float dot = 0.0f;
         warp_denominator[warp] = denominator;
     }
     #pragma unroll
-    for (int part = 0; part < 4; ++part) {
+    for (int part = 0; part < parts; ++part) {
         const int dimension = lane + part * 32;
         if (dimension < head_dim)
             partial_output[warp][dimension] = accumulator[part];
@@ -6307,17 +6314,20 @@ COLIBRI_LOWBIT_MATMUL_ROWS(iq2xs_matmul_rows, iq2xs_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq4xs_matmul_rows, iq4xs_value)
 #undef COLIBRI_LOWBIT_MATMUL_ROWS
 
-#define KV_ATTENTION_FUSED_TILES(name, KT, VT) \
+#define KV_ATTENTION_FUSED_TILES_W(name, KT, VT, WIDTH) \
 extern "C" __global__ void name( \
     const float* query, const KT* keys, const VT* values, float* partial, \
     const int heads, const int kv_heads, const int head_dim, const int tokens, \
     const int capacity, const int first, const float scale \
 ) { \
-    kv_attention_fused_tiles_impl<KT, VT>( \
+    kv_attention_fused_tiles_impl<KT, VT, WIDTH>( \
         query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
         capacity, first, scale \
     ); \
 }
+#define KV_ATTENTION_FUSED_TILES(name, KT, VT) \
+    KV_ATTENTION_FUSED_TILES_W(name, KT, VT, 128) \
+    KV_ATTENTION_FUSED_TILES_W(name##256, KT, VT, 256)
 KV_ATTENTION_FUSED_TILES(
     kv_attention_fused_f16_tiles, __half, __half
 )
@@ -6328,15 +6338,168 @@ KV_ATTENTION_FUSED_TILES(
     kv_attention_fused_q8_tiles, unsigned char, unsigned char
 )
 #undef KV_ATTENTION_FUSED_TILES
+#undef KV_ATTENTION_FUSED_TILES_W
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Grouped-query attention that reads each cached byte once per block instead of
+// once per query head.
+//
+// The per-head kernel above keys its grid on query heads, so with GQA 8:1 the
+// eight heads sharing a KV head each re-read and re-reduce the same bytes.
+// Measured on this card at 49k tokens: 235 us at a sharing factor of 2 (428
+// GB/s, memory-bound) against 675 us at 8 (149 GB/s) for *identical* KV -- the
+// loss is entirely the redundancy, not DRAM.
+//
+// So key the grid on KV heads, stage a chunk of K and V in shared once, and give
+// each warp one query head. Two consequences beyond the saved traffic: the eight
+// reduction chains become independent, and because a warp owns its query head
+// outright there is no cross-warp merge and no partial_output array -- which is
+// what makes 256-dim heads fit, since eight warps' worth of 256 floats each
+// would have been 64 KB of shared memory.
+template<typename KT, typename VT, int maximum_head_dim, int share>
+__device__ void kv_attention_gqa_tiles_impl(
+    const float* query,
+    const KT* keys,
+    const VT* values,
+    float* partial,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const int first,
+    const float scale
+) {
+    constexpr int parts = maximum_head_dim / 32;
+    constexpr int tokens_per_tile = 512;
+    // Tokens staged per round. 16 costs 32 KB of shared for K and V together,
+    // which still leaves room for more than one block per SM.
+    constexpr int chunk = 16;
 
-extern "C" __global__ void kv_attention_fused_merge(
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (kv_head >= kv_heads || head_dim > maximum_head_dim ||
+        (head_dim & 31) != 0 || heads != kv_heads * share)
+        return;
+
+    const int tile_begin = tile * tokens_per_tile;
+    const int tile_end = min(tokens, tile_begin + tokens_per_tile);
+    if (tile_begin >= tile_end) return;
+
+    const int head = kv_head * share + warp;
+    const float* q = query + (long long)head * head_dim;
+    float query_registers[parts];
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int dimension = lane + part * 32;
+        query_registers[part] = dimension < head_dim ? q[dimension] : 0.0f;
+    }
+
+    __shared__ float key_stage[chunk][maximum_head_dim];
+    __shared__ float value_stage[chunk][maximum_head_dim];
+
+    float accumulator[parts];
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) accumulator[part] = 0.0f;
+    float maximum = -3.402823466e+38F;
+    float denominator = 0.0f;
+
+    for (int base = tile_begin; base < tile_end; base += chunk) {
+        const int count = min(chunk, tile_end - base);
+        for (int index = threadIdx.x;
+             index < count * head_dim;
+             index += blockDim.x) {
+            const int token = index / head_dim;
+            const int dimension = index - token * head_dim;
+            int slot = first + base + token;
+            if (slot >= capacity) slot -= capacity;
+            const long long row = (long long)kv_head * capacity + slot;
+            key_stage[token][dimension] =
+                kv_fused_load(keys, row, dimension, head_dim);
+            value_stage[token][dimension] =
+                kv_fused_load(values, row, dimension, head_dim);
+        }
+        __syncthreads();
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+        for (int token = 0; token < count; ++token) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int part = 0; part < parts; ++part) {
+                const int dimension = lane + part * 32;
+                if (dimension < head_dim)
+                    dot += query_registers[part] * key_stage[token][dimension];
+            }
+            for (int offset = 16; offset > 0; offset >>= 1)
+                dot += __shfl_down_sync(0xffffffff, dot, offset);
+            const float score = __shfl_sync(0xffffffff, dot, 0) * scale;
+            const float next_maximum = fmaxf(maximum, score);
+            const float old_scale = maximum == -3.402823466e+38F
+                ? 0.0f : __expf(maximum - next_maximum);
+            const float token_scale = __expf(score - next_maximum);
+            denominator = denominator * old_scale + token_scale;
+            #pragma unroll
+            for (int part = 0; part < parts; ++part) {
+                const int dimension = lane + part * 32;
+                if (dimension < head_dim)
+                    accumulator[part] = accumulator[part] * old_scale
+                        + token_scale * value_stage[token][dimension];
+            }
+            maximum = next_maximum;
+        }
+        __syncthreads();
+    }
+
+    // Same record layout as the per-head kernel, so kv_attention_fused_merge*
+    // combines these tiles unchanged.
+    const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
+    float* record = partial
+        + ((long long)head * tile_count + tile) * (maximum_head_dim + 2);
+    if (lane == 0) {
+        record[0] = maximum;
+        record[1] = denominator;
+    }
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int dimension = lane + part * 32;
+        if (dimension < head_dim)
+            record[dimension + 2] = accumulator[part];
+    }
+}
+
+#define KV_ATTENTION_GQA_TILES(name, KT, VT, WIDTH, SHARE) \
+extern "C" __global__ void name( \
+    const float* query, const KT* keys, const VT* values, float* partial, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first, const float scale \
+) { \
+    kv_attention_gqa_tiles_impl<KT, VT, WIDTH, SHARE>( \
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
+        capacity, first, scale \
+    ); \
+}
+KV_ATTENTION_GQA_TILES(kv_attention_gqa_f16_256_s8, __half, __half, 256, 8)
+KV_ATTENTION_GQA_TILES(kv_attention_gqa_f16_256_s4, __half, __half, 256, 4)
+KV_ATTENTION_GQA_TILES(
+    kv_attention_gqa_bf16_256_s8, __nv_bfloat16, __nv_bfloat16, 256, 8)
+KV_ATTENTION_GQA_TILES(
+    kv_attention_gqa_bf16_256_s4, __nv_bfloat16, __nv_bfloat16, 256, 4)
+KV_ATTENTION_GQA_TILES(
+    kv_attention_gqa_q8_256_s8, unsigned char, unsigned char, 256, 8)
+KV_ATTENTION_GQA_TILES(
+    kv_attention_gqa_q8_256_s4, unsigned char, unsigned char, 256, 4)
+#undef KV_ATTENTION_GQA_TILES
+
+template<int maximum_head_dim>
+__device__ void kv_attention_fused_merge_impl(
     const float* partial,
     float* output,
     const int heads,
     const int head_dim,
     const int tile_count
 ) {
-    constexpr int maximum_head_dim = 128;
     constexpr int maximum_tiles = 512;
     const int head = blockIdx.x;
     if (head >= heads || head_dim > maximum_head_dim ||
@@ -6372,6 +6535,24 @@ extern "C" __global__ void kv_attention_fused_merge(
         output[head * head_dim + dimension] =
             result * inverse_denominator;
     }
+}
+
+extern "C" __global__ void kv_attention_fused_merge(
+    const float* partial, float* output,
+    const int heads, const int head_dim, const int tile_count
+) {
+    kv_attention_fused_merge_impl<128>(
+        partial, output, heads, head_dim, tile_count);
+}
+
+// The 256-dim twin. The partial record stride follows maximum_head_dim, so a
+// merge must be paired with the tiles kernel of the same width.
+extern "C" __global__ void kv_attention_fused_merge256(
+    const float* partial, float* output,
+    const int heads, const int head_dim, const int tile_count
+) {
+    kv_attention_fused_merge_impl<256>(
+        partial, output, heads, head_dim, tile_count);
 }
 
 // Portable compatibility entry point used by the small C ABI parity tests.

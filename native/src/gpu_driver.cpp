@@ -1032,6 +1032,15 @@ extern "C" int colibri_gpu_compile(
              "turbo_rotate_rows", "turbo_unrotate_rows",
              "kv_attention_fused_f16_tiles", "kv_attention_fused_bf16_tiles",
              "kv_attention_fused_q8_tiles", "kv_attention_fused_merge",
+             // 256-dim twins, for heads the 128-wide instantiation cannot cover
+             // (Qwen3.6 runs head_dim 256).
+             "kv_attention_fused_f16_tiles256", "kv_attention_fused_bf16_tiles256",
+             "kv_attention_fused_q8_tiles256", "kv_attention_fused_merge256",
+             // Grouped-query variants: one block per KV head, one warp per
+             // query head, KV staged through shared memory.
+             "kv_attention_gqa_f16_256_s8", "kv_attention_gqa_f16_256_s4",
+             "kv_attention_gqa_bf16_256_s8", "kv_attention_gqa_bf16_256_s4",
+             "kv_attention_gqa_q8_256_s8", "kv_attention_gqa_q8_256_s4",
              "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8",
              "gemma_q4_0_matvec", "gemma_q4_0_embedding", "gemma_q4_0_geglu",
              "gemma_q4_0_grouped_geglu", "gemma_q4_0_grouped_accumulate",
