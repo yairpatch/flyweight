@@ -90,6 +90,19 @@ TOOL_FUNCTION_PATTERN = re.compile(r"<function=([^>\n]+)>", re.DOTALL)
 TOOL_PARAMETER_PATTERN = re.compile(
     r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL
 )
+# Every opening tag, so a body can be checked for parameters the strict pattern
+# above could not close.
+TOOL_PARAMETER_OPEN_TAG_PATTERN = re.compile(r"<parameter=[^>\n]+>")
+# The same parameter with its closing tag optional, ending instead at whatever
+# tag comes next. Only ever used to recover keys the strict pattern missed, so a
+# well-formed value that happens to contain </function> as text still decodes
+# through the strict pattern and keeps its literal content.
+TOOL_PARAMETER_LOOSE_PATTERN = re.compile(
+    r"<parameter=([^>\n]+)>"
+    r"(.*?)"
+    r"(?:</parameter>|(?=<parameter=)|(?=</function>)|(?=</tool_call>)|\Z)",
+    re.DOTALL,
+)
 # One newline on each side of a Hermes value is framing, per the layout
 # _tool_prompt() shows the model. Trailing horizontal space is only consumed
 # after that newline, where it is the closing tag's indentation.
@@ -3096,6 +3109,18 @@ def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
             arguments[parameter.group(1).strip()] = _trim_parameter_text(
                 parameter.group(2)
             )
+        # A dropped </parameter> otherwise costs the entire call: the arguments
+        # come out empty, the required-parameter check in _parse_tool_calls
+        # rejects it, and the caller is handed prose with no tool call at all --
+        # an agent loop just stalls, with nothing saying why. The format is
+        # Qwen3.5's own (its template mandates the nested function/parameter
+        # tags), and a low-bit quantization of it drops the closing tag often
+        # enough to matter, so recover those parameters by ending them at the
+        # next tag. Strictly-parsed values win, leaving well-formed bodies
+        # decoding exactly as before.
+        if len(arguments) != len(TOOL_PARAMETER_OPEN_TAG_PATTERN.findall(body)):
+            for key, value in TOOL_PARAMETER_LOOSE_PATTERN.findall(body):
+                arguments.setdefault(key.strip(), _trim_parameter_text(value))
         return function_match.group(1).strip(), arguments
     # JSON style: {"name": "fn", "arguments": {...}} (arguments may be a string).
     try:

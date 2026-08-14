@@ -275,6 +275,67 @@ class ToolCallParsingTests(unittest.TestCase):
             json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
         )
 
+    def test_hermes_recovers_a_parameter_missing_its_closing_tag(self) -> None:
+        # Qwen3.5 at a low-bit quantization drops </parameter> often enough to
+        # stall an agent loop: the call used to decode to no arguments, fail the
+        # required-parameter check, and reach the client as prose with no tool
+        # call at all.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                },
+            }
+        ]
+        content, calls = _parse_tool_calls(
+            "exploring\n<tool_call>\n<function=read>\n"
+            "<parameter=file_path>\n/app/package.json\n</function>\n</tool_call>",
+            tools=tools,
+        )
+        self.assertEqual(content, "exploring")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"file_path": "/app/package.json"},
+        )
+
+    def test_unclosed_recovery_leaves_a_closed_value_verbatim(self) -> None:
+        # The loose pass must not truncate a well-formed value at text that
+        # merely looks like a closing tag.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                },
+            }
+        ]
+        _, calls = _parse_tool_calls(
+            "<tool_call>\n<function=Write>\n"
+            "<parameter=path>\n/a.txt\n</parameter>\n"
+            "<parameter=content>\nline1\n</function>\nline2\n</parameter>\n"
+            "</function>\n</tool_call>",
+            tools=tools,
+        )
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"path": "/a.txt", "content": "line1\n</function>\nline2"},
+        )
+
     EDIT_TOOL = [
         {
             "type": "function",

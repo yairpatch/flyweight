@@ -653,6 +653,88 @@ inline float qwen_iq2xs_dot_row(
     return result;
 }
 
+// IQ1_M (GGML type 29): 56 bytes per 256 values -> qs[32] qh[16] scales[8].
+// Same 2048-entry grid as IQ1_S, but the super-block scale is not stored as a
+// field of its own: its sixteen half-precision bits are scattered four at a
+// time across the top nibbles of the four scale halfwords, and each halfword
+// also carries two 3-bit sub-scales. Every group of eight weights takes an
+// 11-bit grid index (eight bits from qs, three from qh) and a per-group sign
+// for the same +-0.125 delta IQ1_S applies.
+constexpr std::uint32_t kIq1mBlockBytes = 56;
+constexpr float kIq1mDelta = 0.125f;
+
+// Super-block scale of an IQ1_M block, reassembled from the four scale
+// halfwords. Shared by the element decoder and the row dot product.
+inline float qwen_iq1m_scale(const std::uint8_t* base) {
+    std::uint16_t sc[4];
+    std::memcpy(sc, base + 48, 8);
+    const std::uint16_t bits = static_cast<std::uint16_t>(
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) |
+        (sc[3] & 0xf000));
+    return qwen_half_value(bits);
+}
+
+inline float qwen_iq1m_value(const std::uint8_t* packed, std::uint64_t absolute) {
+    const auto block = absolute / 256;
+    const int within = static_cast<int>(absolute & 255);
+    const auto* base = packed + block * kIq1mBlockBytes;
+    std::uint16_t sc[4];
+    std::memcpy(sc, base + 48, 8);
+    // Sub-block of 32, group of 8 within it, element within the group.
+    const int ib = within / 32, group = (within % 32) / 8, lane = within & 7;
+    const auto qh = base[32 + ib * 2 + group / 2];
+    const std::uint32_t index = static_cast<std::uint32_t>(base[ib * 4 + group]) |
+        ((static_cast<std::uint32_t>(qh) << ((group & 1) ? 4 : 8)) & 0x700u);
+    const float delta = (qh & ((group & 1) ? 0x80 : 0x08)) ? -kIq1mDelta : kIq1mDelta;
+    // The two halves of a sub-block carry separate 3-bit scales, packed three
+    // bits apart in the halfword that covers this pair of sub-blocks.
+    const int shift = 6 * (ib & 1) + (group < 2 ? 0 : 3);
+    const float scale = qwen_iq1m_scale(base) *
+        static_cast<float>(2 * ((sc[ib / 2] >> shift) & 7) + 1);
+    const auto weight =
+        static_cast<std::int8_t>((kIq1sGrid[index] >> (8 * lane)) & 0xffull);
+    return scale * (static_cast<float>(weight) + delta);
+}
+
+inline float qwen_iq1m_dot_row(
+    const std::uint8_t* packed, const float* input, int elements, std::uint64_t row
+) {
+    const int blocks = elements / 256;
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(blocks) * kIq1mBlockBytes;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const auto* base = row_data + block * kIq1mBlockBytes;
+        std::uint16_t sc[4];
+        std::memcpy(sc, base + 48, 8);
+        const float d = qwen_iq1m_scale(base);
+        const float* vector = input + block * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            for (int group = 0; group < 4; ++group) {
+                const auto qh = base[32 + ib * 2 + group / 2];
+                const std::uint32_t index =
+                    static_cast<std::uint32_t>(base[ib * 4 + group]) |
+                    ((static_cast<std::uint32_t>(qh) << ((group & 1) ? 4 : 8)) & 0x700u);
+                const float delta =
+                    (qh & ((group & 1) ? 0x80 : 0x08)) ? -kIq1mDelta : kIq1mDelta;
+                const int shift = 6 * (ib & 1) + (group < 2 ? 0 : 3);
+                const float scale =
+                    d * static_cast<float>(2 * ((sc[ib / 2] >> shift) & 7) + 1);
+                const std::uint64_t entry = kIq1sGrid[index];
+                const float* values = vector + ib * 32 + group * 8;
+                float partial = 0.0f;
+                for (int lane = 0; lane < 8; ++lane) {
+                    const auto weight =
+                        static_cast<std::int8_t>((entry >> (8 * lane)) & 0xffull);
+                    partial += (static_cast<float>(weight) + delta) * values[lane];
+                }
+                result += scale * partial;
+            }
+        }
+    }
+    return result;
+}
+
 // IQ4_XS (GGML type 23): 136 bytes per 256 values -> d(2) scales_h(2)
 // scales_l[4] qs[128]. Not a codebook of patterns like the other IQ formats:
 // each 4-bit code indexes the sixteen non-uniform IQ4_NL levels, and each

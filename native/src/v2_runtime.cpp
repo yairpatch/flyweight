@@ -2432,6 +2432,8 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
                 result+=scale*partial;
             }
         }
+    }else if(type==29){
+        result+=qwen_iq1m_dot_row(packed,input,elements,row);
     }else if(type==39){
         // MXFP4: one E8M0 exponent per 32 values, then 16 packed nibbles where
         // byte j holds element j in the low half and element j+16 in the high.
@@ -8116,7 +8118,7 @@ int colibri_v2_qwen_validate(const ColibriV2Model*m){return guarded([&]{if(!m)th
 int colibri_v2_qwen_tensor_role(const ColibriV2Model*m,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen tensor role lookup");std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"final_norm")==0)candidates={"output_norm.weight","model.norm.weight","norm.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight","token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m->tensors)if(t.name==candidate)return fill(t,*out);throw std::runtime_error("Qwen tensor role is missing");});}
 int colibri_v2_qwen_layer_tensor(const ColibriV2Model*m,uint32_t layer,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen layer tensor lookup");std::string prefix="blk."+std::to_string(layer)+".";std::vector<std::string> suffixes;if(std::strcmp(role,"input_norm")==0)suffixes={"attn_norm.weight"};else if(std::strcmp(role,"qkv")==0)suffixes={"attn_qkv.weight"};else if(std::strcmp(role,"attention_q")==0)suffixes={"attn_q.weight"};else if(std::strcmp(role,"attention_k")==0)suffixes={"attn_k.weight"};else if(std::strcmp(role,"attention_v")==0)suffixes={"attn_v.weight"};else if(std::strcmp(role,"attention_output")==0)suffixes={"attn_output.weight","attn_out.weight"};else if(std::strcmp(role,"attention_gate")==0)suffixes={"attn_gate.weight"};else if(std::strcmp(role,"ssm_output")==0)suffixes={"ssm_out.weight"};else if(std::strcmp(role,"ssm_alpha")==0)suffixes={"ssm_alpha.weight"};else if(std::strcmp(role,"ssm_beta")==0)suffixes={"ssm_beta.weight"};else if(std::strcmp(role,"ssm_conv")==0)suffixes={"ssm_conv1d.weight"};else if(std::strcmp(role,"ssm_dt_bias")==0)suffixes={"ssm_dt.bias"};else if(std::strcmp(role,"ssm_a")==0)suffixes={"ssm_a"};else if(std::strcmp(role,"ssm_norm")==0)suffixes={"ssm_norm.weight"};else if(std::strcmp(role,"post_attention_norm")==0)suffixes={"post_attention_norm.weight"};else if(std::strcmp(role,"router")==0)suffixes={"ffn_gate_inp.weight"};else if(std::strcmp(role,"shared_gate")==0)suffixes={"ffn_gate_shexp.weight"};else throw std::runtime_error("unknown Qwen layer tensor role");for(auto const&suffix:suffixes)for(auto const&t:m->tensors)if(t.name==prefix+suffix)return fill(t,*out);throw std::runtime_error("Qwen layer tensor role is missing");});}
 float half_to_float(uint16_t bits){uint32_t sign=(bits&0x8000u)<<16, exponent=(bits>>10)&0x1fu, fraction=bits&0x3ffu;uint32_t result;if(exponent==0){if(!fraction)result=sign;else{exponent=1;while((fraction&0x400u)==0){fraction<<=1;--exponent;}result=sign|((exponent+112)<<23)|((fraction&0x3ffu)<<13);}}else if(exponent==31)result=sign|0x7f800000u|(fraction<<13);else result=sign|((exponent+112)<<23)|(fraction<<13);float value;std::memcpy(&value,&result,sizeof(value));return value;}
-float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
+float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==29)return qwen_iq1m_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
 int colibri_v2_dspark_encode(const ColibriV2Model*m,const float*features,uint64_t elements,float*output,uint64_t output_elements){return guarded([&]{
     if(!m||!features||!output)throw std::runtime_error("DSpark encoder arguments are required");
     if(m->config.architecture!="dflash")throw std::runtime_error("not a DFlash/DSpark sidecar");
@@ -9759,6 +9761,37 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->device_tensor_types.resize(runtime->model->tensors.size());
         for(std::uint64_t index=0;index<runtime->model->tensors.size();++index)
             runtime->device_tensor_types[index]=runtime->model->tensors[index].type;
+        // IQ1_M has no device kernel, and earning one would be wasted work: the
+        // only tensors quantized this way are the two per-head DeltaNet gate
+        // projections (hidden x 48), well under a thousandth of a block's
+        // weights. Decode them once here and upload Q8_0 instead, which every
+        // consumer already dispatches on. This is unconditional, not a policy:
+        // without it the checkpoint cannot run at all. Unlike the bf16 path
+        // below it grows the arena rather than shrinking it -- by about 200 KiB
+        // per converted tensor, ~20 MiB over a 48-layer checkpoint.
+        {
+            std::uint64_t converted=0,growth=0;
+            for(std::uint64_t index=0;index<persistent.size();++index){
+                if(!persistent[index])continue;
+                const auto& tensor=runtime->model->tensors[index];
+                if(tensor.type!=29)continue;
+                std::uint64_t elements=1;
+                for(auto dimension:tensor.shape)elements*=dimension;
+                // A partial trailing block would need its own padding path.
+                if(elements==0||elements%256)continue;
+                runtime->device_tensor_types[index]=8;
+                ++converted;
+                growth+=(elements/32)*kQ8BlockSize-tensor.size;
+            }
+            if(converted){
+                runtime->static_tensor_bytes+=growth;
+                std::fprintf(stderr,
+                    "[colibri-v2] IQ1_M requant: %llu tensors to Q8_0 "
+                    "(%llu MiB added)\n",
+                    static_cast<unsigned long long>(converted),
+                    static_cast<unsigned long long>(growth/(1024ull*1024)));
+            }
+        }
         {
             std::uint32_t requant_mode=runtime->options.dense_requant;
             if(requant_mode==0){
@@ -10174,14 +10207,20 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 continue;
             }
             runtime->device_tensors[index]=runtime->static_arena+cursor;
-            if(qwen_device_type(*runtime,index)==8&&t.type==30){
+            if(qwen_device_type(*runtime,index)==8&&t.type!=8){
                 const std::uint64_t elements=device_bytes/kQ8BlockSize*32;
                 widened.resize(elements);
                 packed.resize(device_bytes);
-                const auto* source=reinterpret_cast<const std::uint16_t*>(
-                    tensor_data(*runtime->model,t));
-                for(std::uint64_t i=0;i<elements;++i)
-                    widened[i]=qwen_bf16_value(source[i]);
+                const auto* source=tensor_data(*runtime->model,t);
+                if(t.type==30){
+                    const auto* halves=
+                        reinterpret_cast<const std::uint16_t*>(source);
+                    for(std::uint64_t i=0;i<elements;++i)
+                        widened[i]=qwen_bf16_value(halves[i]);
+                }else{
+                    for(std::uint64_t i=0;i<elements;++i)
+                        widened[i]=tensor_value(source,t.type,i);
+                }
                 pack_q8_0(widened.data(),elements,packed.data());
                 if(colibri_gpu_upload_sync(runtime->device_tensors[index],packed.data(),device_bytes)!=0)throw std::runtime_error("failed to upload requantized native Qwen static tensor");
             }else if(colibri_gpu_upload_sync(runtime->device_tensors[index],tensor_data(*runtime->model,t),t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
