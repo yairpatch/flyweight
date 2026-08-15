@@ -84,6 +84,18 @@ thread_local std::string error;
 void fail(const char* message) { error = message; }
 template <class F> int guarded(F&& f) { try { return f(); } catch (const std::exception& e) { error = e.what(); return -1; } catch (...) { error = "unknown native exception"; return -1; } }
 
+// Guard for the per-layer timing accumulators (route_wait, expert_compute, etc.).
+// On Linux, clock_gettime via vDSO is ~20 ns; on Windows QueryPerformanceCounter
+// is ~150 ns.  Unconditionally calling steady_clock::now() 2-3 times per layer
+// per token added ~50 us/token of pure overhead.  Off unless COLIBRI_TIMING=1.
+bool timing_enabled() {
+    static const bool on = [] {
+        const char* s = std::getenv("COLIBRI_TIMING");
+        return s && s[0] == '1';
+    }();
+    return on;
+}
+
 struct Tensor : colibri::v2::TensorDescriptor {
     // Null means the primary model mapping. MTP overlays point into the
     // sidecar mapping retained by ColibriV2Model::mtp_sidecar.
@@ -3178,7 +3190,7 @@ void qwen_cpu_moe(
     const auto gate_type = runtime.model->tensors[layer.expert_tensors[0]].type;
     const auto up_type = runtime.model->tensors[layer.expert_tensors[1]].type;
     const auto down_type = runtime.model->tensors[layer.expert_tensors[2]].type;
-    const char* q8_setting = std::getenv("COLIBRI_Q8_ACTIVATIONS");
+    static const char* q8_setting = std::getenv("COLIBRI_Q8_ACTIVATIONS");
     const auto cpu_features = colibri_cpu_features();
     // Q8-K activations only pay off, and are only decoded, for these quants.
     // Q4_K, NVFP4 and bf16 are faster on the vectorized f32 path (their small
@@ -3208,7 +3220,7 @@ void qwen_cpu_moe(
     static constexpr char q4_tile_name[] = {
         'C','O','L','I','B','R','I','_','Q','4','_','R','O','W','_','T','I','L','E','S','\0'
     };
-    const char* q4_tile_setting = std::getenv(q4_tile_name);
+    static const char* q4_tile_setting = std::getenv(q4_tile_name);
     const bool q4_tiled = !use_q8 && (cpu_features & 3u) != 0
         && hidden % 256 == 0 && intermediate % 256 == 0
         && gate_type == 12 && up_type == 12 && down_type == 12
@@ -3235,8 +3247,8 @@ void qwen_cpu_moe(
             ? qwen_quant_dot_q8_k_avx_vnni(packed,type,input,elements,row)
             : qwen_quant_dot_q8_k_avx2(packed,type,input,elements,row);
     };
-    const char* fused_gate_up_setting = std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
-    const char* iq_avx512_setting = std::getenv("COLIBRI_IQ_AVX512");
+    static const char* fused_gate_up_setting = std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
+    static const char* iq_avx512_setting = std::getenv("COLIBRI_IQ_AVX512");
     const bool auto_fused_iq2xs = gate_type == 17
         && (colibri_cpu_features() & 2u) != 0
         && (!iq_avx512_setting || iq_avx512_setting[0] != '0')
@@ -3499,8 +3511,8 @@ void qwen_cpu_moe_rows(
     const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
     const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
     const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
-    const char* fused_gate_up_setting=std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
-    const char* iq_avx512_setting=std::getenv("COLIBRI_IQ_AVX512");
+    static const char* fused_gate_up_setting=std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
+    static const char* iq_avx512_setting=std::getenv("COLIBRI_IQ_AVX512");
     const bool auto_fused_iq2xs=gate_type==17
         &&(colibri_cpu_features()&2u)!=0
         &&(!iq_avx512_setting||iq_avx512_setting[0]!='0')
@@ -12207,9 +12219,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 float*host_output=host_input+hidden_size;
                 if(colibri_gpu_download(host_input,normalized,hidden_size*sizeof(float),runtime->stream)!=0||
                    colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native dense host FFN input transfer failed");
-                const auto host_started=std::chrono::steady_clock::now();
+                const auto host_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 qwen_cpu_dense_ffn(*runtime,layer,host_input,host_output);
-                runtime->dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-host_started).count();
+                if(timing_enabled())runtime->dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-host_started).count();
                 if(colibri_gpu_upload(third,host_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native dense host FFN output transfer failed");
             }else{
             const auto up_half=first+static_cast<std::uint64_t>(dense_intermediate)*sizeof(float);
@@ -12330,9 +12342,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         }
         if(!shared_launched)enqueue_shared();
         if(profile)profile_record(profile->shared_end);
-        const auto route_wait_started=std::chrono::steady_clock::now();
+        const auto route_wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         if(colibri_gpu_event_sync(runtime->route_event)!=0)throw std::runtime_error("native Qwen route event failed");
-        runtime->route_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
+        if(timing_enabled())runtime->route_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
         if(profile)profile_record(profile->expert_start);
         // Optional adaptive expert pruning (top-p / hard top-k). Runs only for
         // the CPU/hybrid paths, whose expert weights are the host `cpu_weights`
@@ -12349,7 +12361,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         // they have to land; waiting after the call below would instead have made
         // the main stream block on the layer-ahead prefetch it had just queued,
         // serializing the copy engine against the very kernels it runs ahead of.
-        const auto pager_started=std::chrono::steady_clock::now();
+        const auto pager_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         qwen_observe_route_recurrence(
             *runtime,
             runtime->sequences[runtime->active_sequence].expert_prefetch,
@@ -12367,9 +12379,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     static_cast<std::uint32_t>(selected_host[rank]));
         if(expert_policy.is_cpu()){
             if(cpu_output_offset+hidden_size*sizeof(float)>runtime->expert_staging_bytes)throw std::runtime_error("native CPU MoE workspace overflow");
-            const auto compute_started=std::chrono::steady_clock::now();
+            const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             qwen_cpu_moe(*runtime,layer,selected_host,cpu_weights,route_count,cpu_input,cpu_activated,cpu_output);
-            runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
+            if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
             if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");
             add(third,fourth);
         }else if(expert_policy.is_hybrid()){
@@ -12550,9 +12562,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 }
             }
             if(cpu_count){
-                const auto compute_started=std::chrono::steady_clock::now();
+                const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 qwen_cpu_moe(*runtime,layer,cpu_selected.data(),cpu_compact_weights.data(),cpu_count,cpu_input,cpu_activated,cpu_output);
-                runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
+                if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
                 if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native hybrid MoE output upload failed");
                 add(third,fourth);
             }
@@ -12667,7 +12679,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             if(colibri_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] L0 before_final_add residual[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
         }
-        runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
+        if(timing_enabled())runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
         }
         // The feed-forward output takes its own norm before rejoining the
         // residual stream, mirroring the post-attention norm above.
@@ -12732,9 +12744,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);
     if(colibri_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime->stream)!=0)throw std::runtime_error("native Qwen output transfer failed");
     if(runtime->cuda_profile)profile_record(runtime->cuda_tail_end);
-    const auto tail_wait_started=std::chrono::steady_clock::now();
+    const auto tail_wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
-    runtime->tail_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tail_wait_started).count();
+    if(timing_enabled())runtime->tail_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tail_wait_started).count();
     kernel_profile_collect();
     if(kernel_profile)++kernel_profile_decodes;
     if(runtime->cuda_profile){
@@ -14514,11 +14526,11 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         // One stream wait covers every sequence's upload batch; predictions
         // made below target layer+1 and continue overlapping this layer.
         qwen_wait_for_prefetch_layer(*runtime,layer_number);
-        const char*batch_cpu_moe=std::getenv("COLIBRI_BATCHED_CPU_MOE");
+        static const char*batch_cpu_moe=std::getenv("COLIBRI_BATCHED_CPU_MOE");
         const bool batch_cpu_supported=(colibri_cpu_features()&2u)!=0||(batch_cpu_moe&&batch_cpu_moe[0]=='1');
         if(expert_policy.is_cpu()&&n==2&&batch_cpu_supported&&
            !(batch_cpu_moe&&batch_cpu_moe[0]=='0')){
-            const auto expert_started=std::chrono::steady_clock::now();
+            const auto expert_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             thread_local std::vector<std::int32_t> batch_selected;
             thread_local std::vector<float> batch_weights,batch_inputs,batch_activated,batch_down,batch_outputs;
             batch_selected.assign(n*top_k,0);batch_weights.assign(n*top_k,0.0f);
@@ -14526,10 +14538,10 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             batch_down.resize(n*top_k*hidden_size);batch_outputs.resize(n*hidden_size);
             for(std::size_t index=0;index<n;++index){
                 auto&s=seqs[index];
-                const auto wait_started=std::chrono::steady_clock::now();
+                const auto wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 if(colibri_gpu_event_sync(runtime->slot_events[s.slot])!=0)
                     throw std::runtime_error("native Qwen route event failed");
-                runtime->route_wait_nanoseconds+=
+                if(timing_enabled())runtime->route_wait_nanoseconds+=
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now()-wait_started
                     ).count();
@@ -14562,33 +14574,33 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     batch_inputs.data()+index*hidden_size
                 );
             }
-            const auto compute_started=std::chrono::steady_clock::now();
+            const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             qwen_cpu_moe_rows(*runtime,layer,batch_selected.data(),batch_weights.data(),static_cast<int>(n),top_k,batch_inputs.data(),batch_activated.data(),batch_down.data(),batch_outputs.data());
-            runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
+            if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
             for(std::size_t index=0;index<n;++index){auto&s=seqs[index];if(colibri_gpu_upload(s.fourth,batch_outputs.data()+index*hidden_size,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");add(s.third,s.fourth);add(s.residual,s.third);std::swap(s.hidden,s.residual);}
-            runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-expert_started).count();
+            if(timing_enabled())runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-expert_started).count();
             continue;
         }
         // Pass B: serial CPU expert phases; while sequence i runs on the CPU,
         // the GPU is still executing the queued pass-A work of the later ones.
         for (auto& s : seqs) {
-            const auto route_wait_started = std::chrono::steady_clock::now();
+            const auto route_wait_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             if (colibri_gpu_event_sync(runtime->slot_events[s.slot]) != 0) throw std::runtime_error("native Qwen route event failed");
-            runtime->route_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - route_wait_started).count();
+            if(timing_enabled())runtime->route_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - route_wait_started).count();
             int route_count = top_k;
             if (runtime->options.expert_top_k > 0 || (runtime->options.expert_top_p > 0.0f && runtime->options.expert_top_p < 1.0f))
                 route_count = apply_expert_router_policy(s.selected_host, s.cpu_weights, top_k, static_cast<int>(runtime->options.expert_top_k), runtime->options.expert_top_p);
             runtime->route_expert_sum += static_cast<std::uint64_t>(route_count);
-            const auto pager_started = std::chrono::steady_clock::now();
+            const auto pager_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             qwen_observe_and_prefetch_next_layer(
                 *runtime,
                 runtime->sequences[s.slot].expert_prefetch,
                 layer_number,s.selected_host,route_count
             );
             if (expert_policy.is_cpu()) {
-                const auto compute_started = std::chrono::steady_clock::now();
+                const auto compute_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 qwen_cpu_moe(*runtime, layer, s.selected_host, s.cpu_weights, route_count, s.cpu_input, s.cpu_activated, s.cpu_output);
-                runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
+                if(timing_enabled())runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
                 if (colibri_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native CPU MoE output upload failed");
                 add(s.third, s.fourth);
             } else {
@@ -14787,14 +14799,14 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 }
                 if (colibri_gpu_event_record(runtime->staging_event, runtime->stream) != 0) throw std::runtime_error("native Qwen staging event failed");
                 if (cpu_count) {
-                    const auto compute_started = std::chrono::steady_clock::now();
+                    const auto compute_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                     qwen_cpu_moe(*runtime, layer, cpu_selected.data(), cpu_compact_weights.data(), cpu_count, s.cpu_input, s.cpu_activated, s.cpu_output);
-                    runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
+                    if(timing_enabled())runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
                     if (colibri_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native hybrid MoE output upload failed");
                     add(s.third, s.fourth);
                 }
             }
-            runtime->expert_page_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pager_started).count();
+            if(timing_enabled())runtime->expert_page_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pager_started).count();
             }
             add(s.residual, s.third);
             std::swap(s.hidden, s.residual);
@@ -14809,9 +14821,9 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         launch_named(qwen_lm_head_argmax_kernel(runtime->lm_head_type), (vocabulary + 7) / 8, 1, 256, argmax_args);
         if (colibri_gpu_download(s.winner_host, s.argmax_device, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen output transfer failed");
     }
-    const auto tail_wait_started = std::chrono::steady_clock::now();
+    const auto tail_wait_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if (colibri_gpu_stream_sync(runtime->stream) != 0) throw std::runtime_error("native Qwen output synchronization failed");
-    runtime->tail_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tail_wait_started).count();
+    if(timing_enabled())runtime->tail_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tail_wait_started).count();
     for (std::size_t i = 0; i < n; ++i) {
         outputs[i] = 0xffffffffu - static_cast<std::uint32_t>(*seqs[i].winner_host);
         auto& sequence = runtime->sequences[seqs[i].slot];
