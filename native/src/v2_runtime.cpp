@@ -3532,11 +3532,13 @@ void qwen_cpu_moe_rows(
     const bool moe_profile=qwen_cpu_moe_profile_enabled();
     const std::uint64_t t_setup0=moe_profile?qwen_moe_now():0;
     const int total=rows*routed_count;
-    // Reuse heap allocations across calls via thread_local vectors.
-    thread_local std::vector<int> counts;
-    thread_local std::vector<int> offsets;
-    thread_local std::vector<int> occurrences;
-    thread_local std::vector<const float*> vectors;
+    // Reuse heap allocations across calls via static vectors.  These are
+    // filled sequentially before the OpenMP parallel region and only read
+    // inside it, so there is no data race.
+    static std::vector<int> counts;
+    static std::vector<int> offsets;
+    static std::vector<int> occurrences;
+    static std::vector<const float*> vectors;
     counts.assign(experts,0);
     for(int route=0;route<total;++route){
         if(weights[route]==0.0f)continue;
@@ -3551,7 +3553,7 @@ void qwen_cpu_moe_rows(
     occurrences.resize(offsets[experts]);
     vectors.resize(offsets[experts]);
     {
-        thread_local std::vector<int> cursor;
+        static std::vector<int> cursor;
         cursor.assign(offsets.begin(),offsets.end()-1);
         for(int route=0;route<total;++route){
             if(weights[route]==0.0f)continue;
@@ -3560,7 +3562,7 @@ void qwen_cpu_moe_rows(
             vectors[slot]=input+static_cast<std::size_t>(route/routed_count)*hidden;
         }
     }
-    thread_local std::vector<int> group_experts;
+    static std::vector<int> group_experts;
     group_experts.clear();
     group_experts.reserve(256);
     for(int expert=0;expert<experts;++expert)if(counts[expert])group_experts.push_back(expert);
@@ -3666,7 +3668,7 @@ void qwen_cpu_moe_rows(
         }
         if(moe_profile)g_cpu_moe_profile.gate_activate+=qwen_moe_now()-t_act0;
     }
-    thread_local std::vector<const float*> activated_vectors;
+    static std::vector<const float*> activated_vectors;
     activated_vectors.resize(offsets[experts]);
     for(int slot=0;slot<offsets[experts];++slot)
         activated_vectors[slot]=activated+static_cast<std::size_t>(occurrences[slot])*intermediate;
