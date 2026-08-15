@@ -3532,7 +3532,12 @@ void qwen_cpu_moe_rows(
     const bool moe_profile=qwen_cpu_moe_profile_enabled();
     const std::uint64_t t_setup0=moe_profile?qwen_moe_now():0;
     const int total=rows*routed_count;
-    std::vector<int> counts(experts,0);
+    // Reuse heap allocations across calls via thread_local vectors.
+    thread_local std::vector<int> counts;
+    thread_local std::vector<int> offsets;
+    thread_local std::vector<int> occurrences;
+    thread_local std::vector<const float*> vectors;
+    counts.assign(experts,0);
     for(int route=0;route<total;++route){
         if(weights[route]==0.0f)continue;
         const int expert=selected[route];
@@ -3540,12 +3545,14 @@ void qwen_cpu_moe_rows(
             throw std::runtime_error("native CPU batched MoE selected an invalid expert");
         ++counts[expert];
     }
-    std::vector<int> offsets(experts+1,0);
+    offsets.resize(experts+1);
+    offsets[0]=0;
     for(int expert=0;expert<experts;++expert)offsets[expert+1]=offsets[expert]+counts[expert];
-    std::vector<int> occurrences(offsets[experts]);
-    std::vector<const float*> vectors(offsets[experts]);
+    occurrences.resize(offsets[experts]);
+    vectors.resize(offsets[experts]);
     {
-        std::vector<int> cursor(offsets.begin(),offsets.end()-1);
+        thread_local std::vector<int> cursor;
+        cursor.assign(offsets.begin(),offsets.end()-1);
         for(int route=0;route<total;++route){
             if(weights[route]==0.0f)continue;
             const int slot=cursor[selected[route]]++;
@@ -3553,7 +3560,8 @@ void qwen_cpu_moe_rows(
             vectors[slot]=input+static_cast<std::size_t>(route/routed_count)*hidden;
         }
     }
-    std::vector<int> group_experts;
+    thread_local std::vector<int> group_experts;
+    group_experts.clear();
     group_experts.reserve(256);
     for(int expert=0;expert<experts;++expert)if(counts[expert])group_experts.push_back(expert);
     const int group_count=static_cast<int>(group_experts.size());
@@ -3658,7 +3666,8 @@ void qwen_cpu_moe_rows(
         }
         if(moe_profile)g_cpu_moe_profile.gate_activate+=qwen_moe_now()-t_act0;
     }
-    std::vector<const float*> activated_vectors(offsets[experts]);
+    thread_local std::vector<const float*> activated_vectors;
+    activated_vectors.resize(offsets[experts]);
     for(int slot=0;slot<offsets[experts];++slot)
         activated_vectors[slot]=activated+static_cast<std::size_t>(occurrences[slot])*intermediate;
     const int down_blocks=(hidden+kRowBlock-1)/kRowBlock;

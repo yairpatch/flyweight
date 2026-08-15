@@ -403,6 +403,9 @@ if(MSVC)
     set_source_files_properties(src/cpu_q8_dot_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/cpu_q8_dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/qwen_kquant_pack_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    # Native kernels contain hot loops (dot_f32, rms_norm, route_topk) that
+    # benefit from AVX2 vectorisation.  Without this flag MSVC targets SSE2.
+    set_source_files_properties(src/cpu_native_kernels.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 endif()
 
 if(MSVC)

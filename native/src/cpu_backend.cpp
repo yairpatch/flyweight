@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <new>
 #include <string>
 #include <thread>
@@ -147,7 +148,7 @@ void record_launch(const char* name, std::uint64_t nanoseconds, bool native) {
 // name resolves to the same function pointer, so a reader either misses and
 // takes the slow path or sees a complete entry. Holding a mutex per launch
 // would serialize every kernel in the model behind one lock.
-std::mutex g_kernel_mutex;
+std::shared_mutex g_kernel_mutex;
 std::unordered_map<std::string, Resolved> g_kernel_cache;
 std::atomic<bool> g_kernel_cache_dirty{false};
 
@@ -175,7 +176,7 @@ bool emulation_forced_for(const char* name) {
 
 Resolved resolve(const char* name) {
     {
-        std::lock_guard<std::mutex> lock(g_kernel_mutex);
+        std::shared_lock<std::shared_mutex> lock(g_kernel_mutex);
         const auto found = g_kernel_cache.find(name);
         if (found != g_kernel_cache.end()) return found->second;
     }
@@ -185,7 +186,7 @@ Resolved resolve(const char* name) {
     const auto native = registry.find(name);
     if (native != registry.end() && !emulation_forced_for(name))
         resolved.native = native->second;
-    std::lock_guard<std::mutex> lock(g_kernel_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_kernel_mutex);
     g_kernel_cache.emplace(name, resolved);
     return resolved;
 }
@@ -722,7 +723,7 @@ void parallel_for(std::uint64_t count, void (*body)(void*, std::uint64_t),
 void set_force_emulation(bool force) {
     g_force_emulation.store(force, std::memory_order_relaxed);
     // Resolution is cached per name, so the flag has to invalidate it.
-    std::lock_guard<std::mutex> lock(g_kernel_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_kernel_mutex);
     g_kernel_cache.clear();
 }
 
