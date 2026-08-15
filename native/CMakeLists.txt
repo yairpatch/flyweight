@@ -16,6 +16,9 @@ if(MSVC)
     # try/catch and out of the DLL as SEH 0xE06D7363, losing the message. /EHs
     # keeps the same C++ semantics but assumes extern "C" can throw.
     string(REPLACE "/EHsc" "/EHs" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    # Prevent <windows.h> from defining min/max macros that clash with
+    # std::min/std::max.
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
 # The CPU backend compiles the CUDA corpus as host C++ rather than carrying a
@@ -235,6 +238,7 @@ add_executable(
     src/q4_avx512.cpp
 )
 target_compile_features(colibri_bailing_kernels_contract PRIVATE cxx_std_20)
+target_compile_definitions(colibri_bailing_kernels_contract PRIVATE COLIBRI_V2_STATIC)
 target_include_directories(
     colibri_bailing_kernels_contract PRIVATE include src ${COLIBRI_CPU_KERNEL_DIR}
 )
@@ -394,6 +398,7 @@ if(MSVC)
     set_source_files_properties(src/qwen_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/cpu_q8_dot_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/cpu_q8_dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(src/qwen_kquant_pack_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 endif()
 
 if(MSVC)

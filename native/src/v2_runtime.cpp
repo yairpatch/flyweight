@@ -1,3 +1,8 @@
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#endif
+
 #include "colibri_v2.h"
 #include "colibri_gpu_driver.h"
 #include <colibri_backend.hpp>
@@ -33,8 +38,15 @@
 #include <deque>
 #include <fstream>
 #include <sstream>
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#include <sys/stat.h>
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#else
 #include <dirent.h>
+#include <sys/stat.h>
 #endif
 #include <initializer_list>
 #include <limits>
@@ -4095,6 +4107,22 @@ void load_hf(const char* path, ColibriV2Model& m) {
     phase("tokenizer tables");
 
     std::vector<std::string> files;
+#if defined(_WIN32)
+    {
+        WIN32_FIND_DATAA find_data;
+        HANDLE hfind = FindFirstFileA((std::string(path)+"\\*").c_str(), &find_data);
+        if(hfind != INVALID_HANDLE_VALUE){
+            do {
+                const std::string name=find_data.cFileName;
+                static const std::string suffix=".safetensors";
+                if(name.size()>suffix.size()&&
+                   name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0)
+                    files.push_back(directory+"/"+name);
+            } while(FindNextFileA(hfind, &find_data));
+            FindClose(hfind);
+        }
+    }
+#else
     if(DIR* handle=opendir(path)){
         while(dirent* entry=readdir(handle)){
             const std::string name=entry->d_name;
@@ -4105,6 +4133,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
         }
         closedir(handle);
     }
+#endif
     if(files.empty())throw std::runtime_error("no .safetensors files in "+directory);
     // Shard order must not affect the result -- experts are placed by parsed
     // index, not encounter order -- but sort anyway so logs are reproducible,

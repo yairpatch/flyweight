@@ -11,7 +11,7 @@
 
 namespace qwen_kpack {
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(_M_X64)
 void fit_sub_block_scales_avx2_entry(const float* x, int nmax, float rmin,
                                      int nstep, float* scales, float* mins) {
     fit_sub_block_scales_avx2(x, nmax, rmin, nstep, scales, mins);
