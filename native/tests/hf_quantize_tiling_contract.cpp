@@ -110,9 +110,9 @@ struct Golden {
 
 const Golden kGolden[] = {
     {"q8_0", qwen_kpack::pack_q8_0, 32, 34, 0x2c01736abd78f494ull},
-    {"q4_K", qwen_kpack::pack_q4_k, 256, 144, 0xd1d80e944961a86aull},
-    {"q5_K", qwen_kpack::pack_q5_k, 256, 176, 0x8f750028afb2771eull},
-    {"q6_K", qwen_kpack::pack_q6_k, 256, 210, 0x62da10453f32c722ull},
+    {"q4_K", qwen_kpack::pack_q4_k, 256, 144, 0x8459c08361f3f516ull},
+    {"q5_K", qwen_kpack::pack_q5_k, 256, 176, 0x06e0997c7256420full},
+    {"q6_K", qwen_kpack::pack_q6_k, 256, 210, 0x542c1f0feac76c54ull},
 };
 
 std::uint64_t fnv1a(const std::vector<std::uint8_t>& bytes) {

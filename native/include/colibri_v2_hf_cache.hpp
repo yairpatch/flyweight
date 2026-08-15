@@ -46,7 +46,7 @@ inline constexpr std::uint32_t kFormatVersion = 1;
 //    Before that GCC fused their multiply-adds, so the bytes depended on the
 //    build rather than on the input -- a checkpoint quantized on a machine
 //    without FMA did not match one quantized with it.
-inline constexpr std::uint32_t kPackerVersion = 3;
+inline constexpr std::uint32_t kPackerVersion = 4;
 inline constexpr std::uint32_t kByteOrderProbe = 0x01020304u;
 // The arena starts on a page boundary so a mapped arena keeps the alignment the
 // in-memory one had, and so the mapping's first arena page is not shared with

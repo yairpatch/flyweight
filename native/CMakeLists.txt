@@ -364,7 +364,11 @@ target_include_directories(colibri_v2 PRIVATE ${COLIBRI_CPU_KERNEL_DIR})
 target_compile_features(colibri_v2 PRIVATE cxx_std_20)
 target_include_directories(colibri_v2 PRIVATE include src)
 target_compile_definitions(colibri_v2 PRIVATE COLIBRI_V2_BUILD)
-if(NOT WIN32)
+if(MSVC)
+    # Match the -O3 optimization level used on GCC/Clang.  Without this the
+    # default build type is Debug (/Od) and every kernel runs unoptimised.
+    target_compile_options(colibri_v2 PRIVATE /O2)
+else()
     target_compile_options(colibri_v2 PRIVATE -O3 -fvisibility=hidden)
 endif()
 set_target_properties(colibri_v2 PROPERTIES PREFIX "" OUTPUT_NAME "colibri_v2")

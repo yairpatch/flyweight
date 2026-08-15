@@ -88,6 +88,25 @@ void BlockScheduler::run(unsigned int threads, unsigned int shared_bytes,
     // worker threads the backend keeps alive across launches.
     void* const converted = ConvertThreadToFiber(nullptr);
     scheduler_handle_ = converted != nullptr ? converted : GetCurrentFiber();
+
+    // Reuse existing fibers when the thread count has not grown.  Creating and
+    // deleting fibers on every block launch was the single most expensive CPU
+    // backend operation; the handles are one-shot on Windows (a fiber that has
+    // been entered cannot be re-entered), but the trampoline never returns --
+    // it switches back to the scheduler via SwitchToFiber -- so the handle is
+    // still valid and can be re-entered on the *next* block launch.
+    static thread_local unsigned int prev_threads = 0;
+    if (threads > prev_threads) {
+        for (unsigned int t = prev_threads; t < threads; ++t) {
+            Fiber& fiber = fibers_[t];
+            fiber.alive = false;
+            fiber.releasable = false;
+            fiber.waiting = Waiting::none;
+            if (fiber.handle != nullptr) DeleteFiber(fiber.handle);
+            fiber.handle = nullptr;
+        }
+        prev_threads = threads;
+    }
 #endif
 
     for (unsigned int thread = 0; thread < threads; ++thread) {
@@ -100,10 +119,12 @@ void BlockScheduler::run(unsigned int threads, unsigned int shared_bytes,
         // started before the next assignment overwrites it.
         t_entry = FiberEntry{body, payload, this, thread};
 #if defined(_WIN32)
-        if (fiber.handle != nullptr) DeleteFiber(fiber.handle);
-        fiber.handle = CreateFiber(kFiberStackBytes,
-                                   [](void*) { fiber_trampoline(); }, nullptr);
-        if (fiber.handle == nullptr) throw std::runtime_error("cannot create block fiber");
+        if (fiber.handle == nullptr) {
+            fiber.handle = CreateFiber(kFiberStackBytes,
+                                       [](void*) { fiber_trampoline(); }, nullptr);
+            if (fiber.handle == nullptr)
+                throw std::runtime_error("cannot create block fiber");
+        }
 #else
         if (fiber.stack.size() != kFiberStackBytes) fiber.stack.resize(kFiberStackBytes);
         if (getcontext(&fiber.context) != 0)
@@ -148,14 +169,6 @@ void BlockScheduler::run(unsigned int threads, unsigned int shared_bytes,
         }
     }
 
-#if defined(_WIN32)
-    for (unsigned int thread = 0; thread < threads; ++thread) {
-        if (fibers_[thread].handle != nullptr) {
-            DeleteFiber(fibers_[thread].handle);
-            fibers_[thread].handle = nullptr;
-        }
-    }
-#endif
     t_scheduler = previous_scheduler;
 }
 

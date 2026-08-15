@@ -6384,11 +6384,23 @@ namespace {
 int ds4_thread_count() { return colibri::v2::deepseek4::thread_count(); }
 
 void ds4_pin_current_thread() {
-#if defined(_OPENMP) && !defined(_WIN32)
     static const bool enabled=[] {
         const char* setting=std::getenv("COLIBRI_DS4_AFFINITY");
         return setting&&std::string(setting)=="on";
     }();
+    if(!enabled)return;
+#if defined(_WIN32)
+    static const std::vector<DWORD_PTR> cpus=[] {
+        DWORD_PTR process_affinity, system_affinity;
+        GetProcessAffinityMask(GetCurrentProcess(),
+                               &process_affinity, &system_affinity);
+        std::vector<DWORD_PTR> result;
+        for(int cpu=0;cpu<64;++cpu)
+            if(process_affinity&(DWORD_PTR(1)<<cpu))
+                result.push_back(cpu);
+        return result;
+    }();
+#else
     static const std::vector<int> cpus=[] {
         cpu_set_t allowed;
         CPU_ZERO(&allowed);
@@ -6398,17 +6410,29 @@ void ds4_pin_current_thread() {
                 if(CPU_ISSET(cpu,&allowed))result.push_back(cpu);
         return result;
     }();
+#endif
     thread_local bool pinned=false;
-    if(!enabled||pinned||cpus.empty())return;
-    const int target=omp_get_thread_num();
+    if(pinned||cpus.empty())return;
+#if defined(_OPENMP) || defined(_WIN32)
+    const int target=
+#ifdef _OPENMP
+        omp_get_thread_num();
+#else
+        0;  // single-threaded fallback
+#endif
     // The OpenMP master is also the long-lived inference/scheduler thread.
     // Pinning it leaked affinity into unrelated work after the parallel region;
     // workers are persistent and safe to bind, while the master stays mobile.
     if(target==0)return;
-    const int cpu=cpus[static_cast<std::size_t>(target)%cpus.size()];
+    const auto cpu=cpus[static_cast<std::size_t>(target)%cpus.size()];
+#if defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(),static_cast<DWORD_PTR>(1)<<cpu);
+    pinned=true;
+#else
     cpu_set_t one;
     CPU_ZERO(&one); CPU_SET(cpu,&one);
     if(sched_setaffinity(0,sizeof(one),&one)==0)pinned=true;
+#endif
 #endif
 }
 
@@ -6498,16 +6522,27 @@ int ds4_gpu_matvec(std::uint32_t type, std::uint64_t weights, std::uint64_t inpu
 // different tensors with different descriptors and the address is the one thing
 // that identifies a range whichever shard it came from.
 void ds4_prefetch(const std::uint8_t* address, std::uint64_t bytes) {
-#if !defined(_WIN32)
     if (!address || !bytes) return;
+#if defined(_WIN32)
+    // PrefetchVirtualMemory (Win 8.1+) pages in the range without blocking.
+    static const DWORD_PTR page_mask = [] {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return static_cast<DWORD_PTR>(si.dwPageSize) - 1;
+    }();
+    const auto base = reinterpret_cast<DWORD_PTR>(address) & ~page_mask;
+    const auto end  = reinterpret_cast<DWORD_PTR>(address) + bytes;
+    WIN32_MEMORY_RANGE_ENTRY range;
+    range.VirtualAddress  = reinterpret_cast<void*>(base);
+    range.NumberOfBytes   = static_cast<SIZE_T>(end - base);
+    (void)PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+#else
     static const std::uintptr_t page =
         static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
     const auto start = reinterpret_cast<std::uintptr_t>(address) & ~(page - 1);
-    const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
-    (void)madvise(reinterpret_cast<void*>(start), static_cast<std::size_t>(end - start),
-                  MADV_WILLNEED);
-#else
-    (void)address; (void)bytes;
+    const auto end_  = reinterpret_cast<std::uintptr_t>(address) + bytes;
+    (void)madvise(reinterpret_cast<void*>(start),
+                  static_cast<std::size_t>(end_ - start), MADV_WILLNEED);
 #endif
 }
 
