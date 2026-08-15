@@ -11900,6 +11900,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(ec<2){++ec;float v[8]={};if(colibri_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
             std::fprintf(stderr,"[diag] after_embed hidden[0..7]=% .6e % .6e % .6e % .6e % .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);}
     }
+    // Cache per-layer env vars once; std::getenv on Windows crosses the kernel
+    // boundary (~1-3 us) vs Linux vDSO (~20 ns).  With ~40 calls across 30
+    // layers this was ~120 us/token of pure overhead.
+    static const bool env_delta_serial=[]{const char*s=std::getenv("COLIBRI_DELTA_SERIAL");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_persistent=[]{const char*s=std::getenv("COLIBRI_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc=[]{const char*s=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc_trace=std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
+    static const bool env_nvfp4_tiled=[]{const char*s=std::getenv("COLIBRI_NVFP4_TILED");return s&&s[0]=='1';}();
     for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
         auto&layer=runtime->layers[layer_number];
         auto*profile=runtime->cuda_profile?&runtime->cuda_layer_profiles[layer_number]:nullptr;
@@ -11944,7 +11952,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             if(profile)profile_record(profile->recurrent_start);
             int recurrent_slices=head_dim>0?1024/head_dim:0;
             if(recurrent_slices>4)recurrent_slices=4;
-            if(recurrent_slices>=1&&!std::getenv("COLIBRI_DELTA_SERIAL")){
+            if(recurrent_slices>=1&&!env_delta_serial){
                 const int recurrent_block=head_dim*recurrent_slices;
                 const std::uint32_t recurrent_shared=
                     static_cast<std::uint32_t>((4*head_dim+recurrent_block)*sizeof(float));
@@ -12502,15 +12510,11 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             throw std::runtime_error(
                 "native GPU expert quantization is unsupported: "+
                 std::to_string(gate_type)+"/"+std::to_string(down_type));
-                const char*persistent_env=
-                    std::getenv("COLIBRI_NVFP4_PERSISTENT");
-                const bool persistent_enabled=persistent_env&&
-                    persistent_env[0]=='1'&&runtime->expert_native_cache&&
+                const bool persistent_enabled=env_nvfp4_persistent&&runtime->expert_native_cache&&
                     std::all_of(native_pointers.begin(),
                         native_pointers.begin()+gpu_count,
                         [](std::uint64_t pointer){return pointer!=0;});
-                const char*tc_env=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");
-                const bool tc_enabled=tc_env&&tc_env[0]=='1';
+                const bool tc_enabled=env_nvfp4_tc;
                 bool tc_done=false;
                 if(persistent_enabled&&gate_type==40&&down_type==40){
                     const int tc_status=colibri_gpu_nvfp4_moe_persistent(
@@ -12522,7 +12526,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     else{
                         ++runtime->nvfp4_tensor_core_moe_fallbacks;
                         runtime->nvfp4_tensor_core_moe_last_status=tc_status;
-                        if(std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE"))
+                        if(env_nvfp4_tc_trace)
                             std::fprintf(stderr,"[nvfp4-persistent] hybrid fallback status=%d experts=%d\n",tc_status,gpu_count);
                     }
                 }
@@ -12535,13 +12539,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     else{
                         ++runtime->nvfp4_tensor_core_moe_fallbacks;
                         runtime->nvfp4_tensor_core_moe_last_status=tc_status;
-                        if(std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE"))
+                        if(env_nvfp4_tc_trace)
                             std::fprintf(stderr,"[nvfp4-tc] hybrid fallback status=%d experts=%d\n",tc_status,gpu_count);
                     }
                 }
                 if(!tc_done){
-                    const char* tiled_env=std::getenv("COLIBRI_NVFP4_TILED");
-                    const bool nvfp4_tiled=tiled_env&&tiled_env[0]=='1';
+                    const bool nvfp4_tiled=env_nvfp4_tiled;
                     void*gate_up_args[]={const_cast<std::uint64_t*>(&gate_table),const_cast<std::uint64_t*>(&up_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),&gpu_count,const_cast<std::uint64_t*>(&gate_scale_table),const_cast<std::uint64_t*>(&up_scale_table)};
                     launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(),gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,gpu_count,256,gate_up_args);
                     const int status=qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count);
@@ -12658,8 +12661,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             throw std::runtime_error(
                 "native GPU expert quantization is unsupported: "+
                 std::to_string(gate_type)+"/"+std::to_string(down_type));
-        const char*tc_env=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");
-        const bool tc_enabled=tc_env&&tc_env[0]=='1';
+        const bool tc_enabled=env_nvfp4_tc;
         bool tc_done=false;
         if(tc_enabled&&gate_type==40&&down_type==40){
             const int tc_status=colibri_gpu_nvfp4_moe_cublas(
@@ -12670,13 +12672,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             else{
                 ++runtime->nvfp4_tensor_core_moe_fallbacks;
                 runtime->nvfp4_tensor_core_moe_last_status=tc_status;
-                if(std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE"))
+                if(env_nvfp4_tc_trace)
                     std::fprintf(stderr,"[nvfp4-tc] decode fallback status=%d experts=%d\n",tc_status,top_k);
             }
         }
         if(!tc_done){
-            const char* tiled_env=std::getenv("COLIBRI_NVFP4_TILED");
-            const bool nvfp4_tiled=tiled_env&&tiled_env[0]=='1';
+            const bool nvfp4_tiled=env_nvfp4_tiled;
             void*gate_up_args[]={const_cast<std::uint64_t*>(&gate_table),const_cast<std::uint64_t*>(&up_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),const_cast<std::uint64_t*>(&gate_scale_table),const_cast<std::uint64_t*>(&up_scale_table)};
             launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(),gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,top_k,256,gate_up_args);
             const int down_status=qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,activated,third,route_weights,intermediate,hidden_size,top_k);
@@ -14366,6 +14367,10 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         void* args[] = {const_cast<std::uint64_t*>(&embedding), const_cast<std::uint64_t*>(&s.hidden), const_cast<int*>(&token), &width};
         launch_named(qwen_embedding_kernel(qwen_device_type(*runtime, runtime->token_embeddings), false), (hidden_size + 255) / 256, 1, 256, args);
     }
+    static const bool env_nvfp4_persistent_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc_trace_b=std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
+    static const bool env_nvfp4_tiled_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_TILED");return s&&s[0]=='1';}();
     for (std::uint32_t layer_number = 0; layer_number < runtime->layers.size(); ++layer_number) {
         auto& layer = runtime->layers[layer_number];
         auto tensor = [&](std::size_t role) { return runtime->device_tensors[layer.static_tensors.at(role)]; };
@@ -14722,17 +14727,14 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             throw std::runtime_error(
                 "native GPU expert quantization is unsupported: "+
                 std::to_string(gate_type)+"/"+std::to_string(down_type));
-                    const char* persistent_env =
-                        std::getenv("COLIBRI_NVFP4_PERSISTENT");
                     const bool persistent_enabled =
-                        persistent_env && persistent_env[0]=='1' &&
+                        env_nvfp4_persistent_b &&
                         runtime->expert_native_cache &&
                         std::all_of(
                             native_pointers.begin(),
                             native_pointers.begin()+gpu_count,
                             [](std::uint64_t pointer){return pointer!=0;});
-                    const char* tc_env = std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");
-                    const bool tc_enabled = tc_env && tc_env[0] == '1';
+                    const bool tc_enabled = env_nvfp4_tc_b;
                     bool tc_done = false;
                     if (persistent_enabled && gate_type == 40 &&
                         down_type == 40) {
@@ -14750,8 +14752,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                             ++runtime->nvfp4_tensor_core_moe_fallbacks;
                             runtime->nvfp4_tensor_core_moe_last_status=
                                 tc_status;
-                            if(std::getenv(
-                                   "COLIBRI_NVFP4_TENSOR_CORE_TRACE"))
+                            if(env_nvfp4_tc_trace_b)
                                 std::fprintf(
                                     stderr,
                                     "[nvfp4-persistent] fallback status=%d "
@@ -14771,13 +14772,12 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                         } else {
                             ++runtime->nvfp4_tensor_core_moe_fallbacks;
                             runtime->nvfp4_tensor_core_moe_last_status = tc_status;
-                            if (std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE"))
+                            if (env_nvfp4_tc_trace_b)
                                 std::fprintf(stderr, "[nvfp4-tc] multi-decode fallback status=%d experts=%d\n", tc_status, gpu_count);
                         }
                     }
                     if (!tc_done) {
-                        const char* tiled_env = std::getenv("COLIBRI_NVFP4_TILED");
-                        const bool nvfp4_tiled = tiled_env && tiled_env[0] == '1';
+                        const bool nvfp4_tiled = env_nvfp4_tiled_b;
                         void* gate_up_args[] = {const_cast<std::uint64_t*>(&gate_table), const_cast<std::uint64_t*>(&up_table), &s.normalized, &s.activated, const_cast<int*>(&hidden_size), const_cast<int*>(&intermediate), &gpu_count, const_cast<std::uint64_t*>(&gate_scale_table), const_cast<std::uint64_t*>(&up_scale_table)};
                         launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(), gate_type == 40 && nvfp4_tiled ? (intermediate + 7) / 8 : intermediate, gpu_count, 256, gate_up_args);
                         const int status = qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,s.activated,s.third,weight_table,intermediate,hidden_size,gpu_count);
