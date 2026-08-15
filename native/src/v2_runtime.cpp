@@ -96,6 +96,17 @@ bool timing_enabled() {
     return on;
 }
 
+// COLIBRI_EXPERT_TRACE=<path> writes the decode route stream as packed
+// (uint32 layer, uint32 expert) pairs so expert-cache policies can be replayed
+// offline against a real trace. Diagnostic only; null unless the var is set.
+std::FILE* expert_trace_file() {
+    static std::FILE* const handle = [] () -> std::FILE* {
+        const char* path = std::getenv("COLIBRI_EXPERT_TRACE");
+        return (path && path[0]) ? std::fopen(path, "wb") : nullptr;
+    }();
+    return handle;
+}
+
 struct Tensor : colibri::v2::TensorDescriptor {
     // Null means the primary model mapping. MTP overlays point into the
     // sidecar mapping retained by ColibriV2Model::mtp_sidecar.
@@ -200,6 +211,9 @@ struct QwenLayerPlan {
     std::array<std::uint64_t, 3> expert_tensors{};
     std::uint64_t shared_graph = 0;
     bool shared_graph_attempted = false;
+    // The linear-attention block, captured once and replayed every token.
+    std::uint64_t delta_graph = 0;
+    bool delta_graph_attempted = false;
     // Laguna's router score-correction bias. Kept out of static_tensors so the
     // feed-forward slots line up with the Qwen layout the FFN code addresses.
     std::uint64_t router_bias = std::numeric_limits<std::uint64_t>::max();
@@ -588,7 +602,10 @@ struct ColibriV2QwenRuntime {
     std::uint64_t cuda_graph_builds = 0;
     std::uint64_t cuda_graph_replays = 0;
     std::uint64_t cuda_graph_fallbacks = 0;
-    bool cuda_graph_trace_reported = false;
+    // Host-side submission cost of the delta block, so a graph replay can be
+    // compared against the eager launches it replaces. Trace-gated.
+    std::uint64_t delta_host_ns = 0;
+    std::uint64_t delta_host_calls = 0;
     bool fused_attention = true;
     // Interleaving two distant expert matrices hurts mmap/TLB locality on
     // memory-bound CPU MoE. Keep the experimental kernel opt-in until it can
@@ -1267,6 +1284,12 @@ QwenExpertHistory& record_expert_access(
             ++sequence.prompt_expert_observations;
         }
     }
+    // Every route decision -- hit or miss, on every expert path -- passes through
+    // here, so this is the one place a faithful trace can be tapped.
+    if (expert_trace_file()) {
+        const std::uint32_t record[2] = {layer, expert};
+        std::fwrite(record, sizeof(record), 1, expert_trace_file());
+    }
     auto& history = runtime.expert_history[
         static_cast<std::size_t>(layer) * experts + expert
     ];
@@ -1456,6 +1479,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
         colibri_gpu_graph_destroy(layer.shared_graph);
         layer.shared_graph = 0;
         layer.shared_graph_attempted = false;
+        colibri_gpu_graph_destroy(layer.delta_graph);
+        layer.delta_graph = 0;
+        layer.delta_graph_attempted = false;
     }
     colibri_gpu_free(runtime.workspace);
     colibri_gpu_free(runtime.static_arena);
@@ -1489,7 +1515,7 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.cuda_profile=false;
     runtime.cuda_graphs=false;
     runtime.cuda_graph_builds=runtime.cuda_graph_replays=runtime.cuda_graph_fallbacks=0;
-    runtime.cuda_graph_trace_reported=false;
+    runtime.delta_host_ns=runtime.delta_host_calls=0;
     colibri_gpu_stream_destroy(runtime.prefetch_stream);
     runtime.prefetch_stream = 0;
     colibri_gpu_stream_destroy(runtime.graph_stream);
@@ -11908,9 +11934,18 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     static const bool env_nvfp4_tc=[]{const char*s=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
     static const bool env_nvfp4_tc_trace=std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
     static const bool env_nvfp4_tiled=[]{const char*s=std::getenv("COLIBRI_NVFP4_TILED");return s&&s[0]=='1';}();
+    static const bool env_lm_diag=std::getenv("COLIBRI_LM_DIAG")!=nullptr;
+    static const bool env_graph_trace=std::getenv("COLIBRI_CUDA_GRAPH_TRACE")!=nullptr;
+    // Lets the delta-block capture be A/B'd on its own, with the shared-expert
+    // graphs left enabled either way.
+    static const bool env_graph_delta=[]{const char*s=std::getenv("COLIBRI_CUDA_GRAPH_DELTA");return !s||s[0]!='0';}();
     for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
         auto&layer=runtime->layers[layer_number];
         auto*profile=runtime->cuda_profile?&runtime->cuda_layer_profiles[layer_number]:nullptr;
+        // Profiling and diagnostics both inject event records and stream syncs
+        // into the block below, neither of which survives capture, so they keep
+        // the eager path.
+        const bool graph_eligible=runtime->cuda_graphs&&!profile&&!env_lm_diag&&env_graph_delta;
         if(profile)profile_record(profile->pre_start);
         auto tensor=[&](std::size_t role){return runtime->device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size){dense_matvec(layer.static_tensors.at(role),input,output,input_size,output_size);};
@@ -11923,6 +11958,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             int head_dim=static_cast<int>(runtime->model->tensors[layer.static_tensors[9]].shape[0]);
             int value_dim=value_heads*head_dim;
             int key_heads=(channels-value_dim)/(2*head_dim);
+            // Everything from here to the residual add is token-invariant: no
+            // position, no KV cache, and the recurrent/conv state lives at a
+            // fixed device address that the kernels update in place. That makes
+            // the whole block capturable once and replayable every token, which
+            // is worth ~9 launches x 30 layers of WDDM submission per token.
+            auto enqueue_delta=[&]{
             dense(1,normalized,first,hidden_size,channels);
             dense(2,normalized,second,hidden_size,gate_elements);
             dense(4,normalized,third,hidden_size,value_heads);
@@ -11982,6 +12023,50 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 }
             }
             add(residual,hidden);
+            };
+            // Capture records without executing, so the in-place state update
+            // happens exactly once per token -- via the replay below, never via
+            // the capture pass. The graph is launched on runtime->stream so it
+            // stays ordered behind the eager rms() above.
+            bool delta_launched=false;
+            const auto delta_started=env_graph_trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            if(graph_eligible&&layer.delta_graph){
+                if(colibri_gpu_graph_launch(layer.delta_graph,runtime->stream)==0){
+                    ++runtime->cuda_graph_replays;delta_launched=true;
+                }else{
+                    colibri_gpu_graph_destroy(layer.delta_graph);
+                    layer.delta_graph=0;++runtime->cuda_graph_fallbacks;
+                }
+            }
+            if(graph_eligible&&!delta_launched&&!layer.delta_graph_attempted){
+                layer.delta_graph_attempted=true;
+                if(colibri_gpu_graph_begin(runtime->graph_stream)==0){
+                    bool capture_enqueued=true;
+                    launch_stream=runtime->graph_stream;
+                    try{enqueue_delta();}catch(...){capture_enqueued=false;}
+                    launch_stream=runtime->stream;
+                    std::uint64_t captured_graph=0;
+                    const int capture_status=colibri_gpu_graph_end(runtime->graph_stream,&captured_graph);
+                    if(capture_enqueued&&capture_status==0){
+                        layer.delta_graph=captured_graph;++runtime->cuda_graph_builds;
+                        if(colibri_gpu_graph_launch(layer.delta_graph,runtime->stream)==0){
+                            ++runtime->cuda_graph_replays;delta_launched=true;
+                        }else{
+                            colibri_gpu_graph_destroy(layer.delta_graph);
+                            layer.delta_graph=0;++runtime->cuda_graph_fallbacks;
+                        }
+                    }else{
+                        if(capture_status==0&&captured_graph)colibri_gpu_graph_destroy(captured_graph);
+                        ++runtime->cuda_graph_fallbacks;
+                    }
+                }
+            }
+            if(!delta_launched)enqueue_delta();
+            if(env_graph_trace){
+                runtime->delta_host_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-delta_started).count();
+                ++runtime->delta_host_calls;
+            }
             moe_base=10;
         }else if(runtime->muse){
             // Muse Glimmer attention: plain Q/K/V projections, per-head QK RMS
@@ -12786,15 +12871,23 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     runtime->last_output_token=*output_token;
     runtime->processed_tokens.push_back(input_token);
     ++runtime->position;
-    if(runtime->cuda_graphs&&!runtime->cuda_graph_trace_reported&&
-       std::getenv("COLIBRI_CUDA_GRAPH_TRACE"))
+    // Reported periodically rather than once: the first token pays for capture,
+    // so only the steady state says whether replay is actually cheaper.
+    if(std::getenv("COLIBRI_CUDA_GRAPH_TRACE")&&runtime->decode_calls%500==0)
     {
+        const double per_token=runtime->delta_host_calls
+            ?static_cast<double>(runtime->delta_host_ns)/1e6
+             /static_cast<double>(runtime->decode_calls?runtime->decode_calls:1)
+            :0.0;
         std::fprintf(stderr,
-            "[cuda-graphs] builds=%llu replays=%llu fallbacks=%llu\n",
+            "[cuda-graphs] tok=%llu builds=%llu replays=%llu fallbacks=%llu "
+            "delta_host=%.3f ms/token over %llu blocks\n",
+            static_cast<unsigned long long>(runtime->decode_calls),
             static_cast<unsigned long long>(runtime->cuda_graph_builds),
             static_cast<unsigned long long>(runtime->cuda_graph_replays),
-            static_cast<unsigned long long>(runtime->cuda_graph_fallbacks));
-        runtime->cuda_graph_trace_reported=true;
+            static_cast<unsigned long long>(runtime->cuda_graph_fallbacks),
+            per_token,
+            static_cast<unsigned long long>(runtime->delta_host_calls));
     }
     ++runtime->decode_calls;
     runtime->decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-decode_started).count();
