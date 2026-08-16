@@ -5,6 +5,22 @@
 //     head entirely (only the last prompt token needs logits, and it runs
 //     through the regular single-token decode).
 // Neither advances runtime.position/processed_tokens; callers own that.
+
+// Rows per launch of the batched quantized matvec. Must match COLIBRI_Q8_ROWS
+// in native/include/colibri_v2_qwen_kernels.hpp -- the kernel's accumulators
+// and shared reduction slots are sized by it, and a larger batch would be read
+// past silently.
+static constexpr int kQ8RowBatch=8;
+
+// Tokens per launch of the tiled prefill matmul. Must match
+// COLIBRI_Q8_TILE_TOKENS in native/include/colibri_v2_qwen_kernels.hpp -- the
+// kernel's per-warp accumulator slots are sized by it, and a larger batch would
+// drop the excess rows silently.
+static constexpr int kQ8TileTokens=32;
+
+// Output rows per block of the tiled matmul. Must match COLIBRI_Q8_TILE_ROWS.
+static constexpr int kQ8TileRows=16;
+
 void qwen_forward_rows(
     ColibriV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
     int rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
@@ -126,22 +142,86 @@ void qwen_forward_rows(
                 case 13:q8_kernel="q5k_q8_matvec_transposed_warp";break;
                 case 14:q8_kernel="q6k_q8_matvec_transposed_warp";break;
                 case 16:q8_kernel="iq2xxs_q8_matvec_transposed_warp";break;
+                case 17:q8_kernel="iq2xs_q8_matvec_transposed_warp";break;
                 case 18:q8_kernel="iq3xxs_q8_matvec_transposed_warp";break;
                 case 22:q8_kernel="iq2s_q8_matvec_transposed_warp";break;
                 default:break;
             }
         }
         if(q8_kernel){
+            // The scale rows sit on a float-sized stride (see rows_q8_scales in
+            // colibri_v2_workspace.hpp) though the kernels write halves.
+            int scale_stride=(input_size/32)*2;
             if(q8_cached_input!=input||q8_cached_width!=input_size){
-                for(int row=0;row<rows;++row){
-                    auto row_input=input+static_cast<std::uint64_t>(row)*input_size*sizeof(float);
-                    auto row_q8=small_q8+static_cast<std::uint64_t>(row)*input_size;
-                    auto row_scales=small_q8_scales+
-                        static_cast<std::uint64_t>(row)*(input_size/32)*sizeof(float);
-                    void*quant_args[]={&row_input,&row_q8,&row_scales,&input_size};
+                std::uint64_t all_q8=small_q8,all_scales=small_q8_scales;
+                if(rows>1){
+                    void*quant_args[]={&input,&all_q8,&all_scales,
+                        &input_size,&scale_stride};
+                    launch("quantize_q8_blocks_rows",(input_size+31)/32,
+                           static_cast<std::uint32_t>(rows),32,quant_args);
+                }else{
+                    void*quant_args[]={&input,&all_q8,&all_scales,&input_size};
                     launch("quantize_q8_blocks",(input_size+31)/32,1,32,quant_args);
                 }
                 q8_cached_input=input;q8_cached_width=input_size;
+            }
+            // The codebook formats carry this checkpoint -- IQ2_S the dense FFN,
+            // IQ2_XS the fused QKV, IQ3_XXS and IQ2_XXS the rest of attention --
+            // and each has a matvec that batches rows against a single weight
+            // read. A format without one still pays a full pass per row.
+            const char* rows_kernel=nullptr;
+            switch(type){
+                case 16:rows_kernel="iq2xxs_q8_matvec_transposed_rows";break;
+                case 17:rows_kernel="iq2xs_q8_matvec_transposed_rows";break;
+                case 18:rows_kernel="iq3xxs_q8_matvec_transposed_rows";break;
+                case 22:rows_kernel="iq2s_q8_matvec_transposed_rows";break;
+                case 23:rows_kernel="iq4xs_q8_matvec_transposed_rows";break;
+                default:break;
+            }
+            // Wide batches take the tiled kernel instead: it stages decoded
+            // weights through shared memory and splits tokens across warps, so
+            // it covers kQ8TileTokens per weight pass where the rows kernel
+            // covers kQ8RowBatch. Only worth it once the batch is wider than
+            // the rows kernel handles in one launch -- below that the tiled
+            // kernel leaves most of its warps idle. MTP verification runs a
+            // handful of rows and stays on the rows kernel; chunked prefill
+            // runs prefill_rows (64 on a dense checkpoint) and takes this.
+            const char* tiled_kernel=nullptr;
+            switch(type){
+                case 16:tiled_kernel="iq2xxs_q8_matmul_tiled";break;
+                case 17:tiled_kernel="iq2xs_q8_matmul_tiled";break;
+                case 18:tiled_kernel="iq3xxs_q8_matmul_tiled";break;
+                case 22:tiled_kernel="iq2s_q8_matmul_tiled";break;
+                case 23:tiled_kernel="iq4xs_q8_matmul_tiled";break;
+                default:break;
+            }
+            if(rows>kQ8RowBatch&&tiled_kernel){
+                for(int first=0;first<rows;first+=kQ8TileTokens){
+                    int batch=std::min(kQ8TileTokens,rows-first);
+                    auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
+                    auto batch_scales=small_q8_scales+
+                        static_cast<std::uint64_t>(first)*(input_size/32)*sizeof(float);
+                    auto batch_output=output+
+                        static_cast<std::uint64_t>(first)*output_size*sizeof(float);
+                    void*tiled_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
+                        &input_size,&output_size,&batch,&scale_stride};
+                    launch(tiled_kernel,(output_size+kQ8TileRows-1)/kQ8TileRows,1,256,tiled_args);
+                }
+                return;
+            }
+            if(rows>1&&rows_kernel){
+                for(int first=0;first<rows;first+=kQ8RowBatch){
+                    int batch=std::min(kQ8RowBatch,rows-first);
+                    auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
+                    auto batch_scales=small_q8_scales+
+                        static_cast<std::uint64_t>(first)*(input_size/32)*sizeof(float);
+                    auto batch_output=output+
+                        static_cast<std::uint64_t>(first)*output_size*sizeof(float);
+                    void*rows_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
+                        &input_size,&output_size,&batch,&scale_stride};
+                    launch(rows_kernel,output_size,1,128,rows_args);
+                }
+                return;
             }
             for(int row=0;row<rows;++row){
                 auto row_q8=small_q8+static_cast<std::uint64_t>(row)*input_size;
@@ -957,11 +1037,55 @@ void qwen_forward_rows(
         rms_rows(hidden,runtime.device_tensors[runtime.final_norm],normalized);
         if(colibri_gpu_memset(winners,0,rows*sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward argmax reset failed");
         int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];
-        void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&winners),const_cast<int*>(&hidden_size),&vocabulary,&rows};
-        if(runtime.lm_head_type!=8&&runtime.lm_head_type!=30)
-            throw std::runtime_error(
-                "native Qwen rows LM head type is unsupported: "+std::to_string(runtime.lm_head_type));
-        launch(runtime.lm_head_type==30?"qwen_bf16_lm_head_argmax_rows":"qwen_q8_lm_head_argmax_rows",(vocabulary+7)/8,rows,256,argmax_args);
+        if(runtime.lm_head_type==8||runtime.lm_head_type==30){
+            void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&winners),const_cast<int*>(&hidden_size),&vocabulary,&rows};
+            launch(runtime.lm_head_type==30?"qwen_bf16_lm_head_argmax_rows":"qwen_q8_lm_head_argmax_rows",(vocabulary+7)/8,rows,256,argmax_args);
+        }else{
+            // Quantized heads (K-quants, IQ, F32) have no fused rows kernel, so
+            // stand in with the per-row kernels the single-token decode uses,
+            // one launch per row. They write the same packed winner with an
+            // atomicMax on winners[0] of whatever pointer they are handed, so
+            // the row's own slot is just an offset. `rows` is the MTP verify
+            // batch (<= 9), and each launch does exactly the work the fused
+            // kernel would do for that row, so this only costs the extra
+            // launches. Without it an IQ/K-quant checkpoint served with
+            // --mtp-draft failed on the first decoded token.
+            const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime.lm_head_type);
+            const char*lm_setting=std::getenv("COLIBRI_IQ2_Q8_DECODE");
+            const bool lm_q8_enabled=!lm_setting||lm_setting[0]!='0';
+            if(lm_q8_kernel&&lm_q8_enabled&&(hidden_size&255)==0){
+                // Same trade the decode path makes: quantize the activation to
+                // Q8 blocks and run the group-decode head instead of
+                // reconstructing every weight in float. The head is the largest
+                // tensor read per row and verification reads it once per row,
+                // so the float fallback alone made speculation slower than
+                // ordinary decode on a Q3_K head.
+                for(int row=0;row<rows;++row){
+                    auto row_input=normalized+static_cast<std::uint64_t>(row)*hidden_size*sizeof(float);
+                    auto row_q8=small_q8+static_cast<std::uint64_t>(row)*hidden_size;
+                    auto row_scales=small_q8_scales+
+                        static_cast<std::uint64_t>(row)*(hidden_size/32)*sizeof(float);
+                    void*quant_args[]={&row_input,&row_q8,&row_scales,const_cast<int*>(&hidden_size)};
+                    launch("quantize_q8_blocks",(hidden_size+31)/32,1,32,quant_args);
+                }
+                for(int row=0;row<rows;++row){
+                    auto row_q8=small_q8+static_cast<std::uint64_t>(row)*hidden_size;
+                    auto row_scales=small_q8_scales+
+                        static_cast<std::uint64_t>(row)*(hidden_size/32)*sizeof(float);
+                    auto winner=winners+static_cast<std::uint64_t>(row)*sizeof(std::uint64_t);
+                    void*row_args[]={&lm_head,&row_q8,&row_scales,&winner,const_cast<int*>(&hidden_size),&vocabulary};
+                    launch(lm_q8_kernel,(vocabulary+7)/8,1,256,row_args);
+                }
+            }else{
+                const char*kernel=qwen_lm_head_argmax_kernel(runtime.lm_head_type);
+                for(int row=0;row<rows;++row){
+                    auto vector=normalized+static_cast<std::uint64_t>(row)*hidden_size*sizeof(float);
+                    auto winner=winners+static_cast<std::uint64_t>(row)*sizeof(std::uint64_t);
+                    void*row_args[]={&lm_head,&vector,&winner,const_cast<int*>(&hidden_size),&vocabulary};
+                    launch(kernel,(vocabulary+7)/8,1,256,row_args);
+                }
+            }
+        }
         auto*packed=reinterpret_cast<std::uint64_t*>(staging);
         if(colibri_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
         for(int row=0;row<rows;++row)output_tokens[row]=0xffffffffu-static_cast<std::uint32_t>(packed[row]);

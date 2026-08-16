@@ -935,11 +935,13 @@ extern "C" int colibri_gpu_compile(
              "quantize_q8_blocks", "iq3xxs_matvec_transposed_warp",
              "iq2s_matvec_transposed_warp", "iq3s_matvec_transposed_warp",
              "iq2xs_matvec_transposed_warp", "iq4xs_matvec_transposed_warp",
+             "iq1m_matvec_transposed_warp",
              "q2k_matmul_rows", "q3k_matmul_rows", "q4k_matmul_rows",
              "q5k_matmul_rows", "q6k_matmul_rows",
              "iq2xxs_matmul_rows", "iq3xxs_matmul_rows",
              "iq2s_matmul_rows", "iq3s_matmul_rows",
              "iq2xs_matmul_rows", "iq4xs_matmul_rows",
+             "iq1m_matmul_rows",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",
@@ -947,6 +949,17 @@ extern "C" int colibri_gpu_compile(
              "laguna_attention_gate_rows",
              "muse_head_norm_rope", "muse_logit_softcap",
              "iq2s_q8_matvec_transposed_warp",
+             "iq2s_q8_matvec_transposed_rows",
+             "iq2s_q8_matmul_tiled",
+             "iq2xxs_q8_matmul_tiled", "iq3xxs_q8_matmul_tiled",
+             "iq2xs_q8_matmul_tiled", "iq4xs_q8_matmul_tiled",
+             "iq2xs_q8_matvec_transposed_warp",
+             "iq2xs_q8_matvec_transposed_rows",
+             "iq2xxs_q8_matvec_transposed_rows",
+             "iq3xxs_q8_matvec_transposed_rows",
+             "iq4xs_q8_matvec_transposed_rows",
+             "iq4xs_q8_matvec_transposed_warp",
+             "quantize_q8_blocks_rows",
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",
              // Grouped routed-expert kernels for the IQ codebook formats.
              "iq2xs_grouped_swiglu", "iq2xs_grouped_swiglu_rows",
@@ -998,6 +1011,7 @@ extern "C" int colibri_gpu_compile(
              "iq2s_matvec_transposed", "iq2s_lm_head_argmax_warp",
              "iq2xs_matvec_transposed", "iq2xs_lm_head_argmax_warp",
              "iq4xs_matvec_transposed", "iq4xs_lm_head_argmax_warp",
+             "iq1m_matvec_transposed",
              "qwen_iq2xs_embedding", "qwen_iq2xs_embedding_rows",
              "qwen_iq4xs_embedding", "qwen_iq4xs_embedding_rows",
              "iq3s_matvec_transposed", "iq3s_lm_head_argmax_warp",
@@ -1055,7 +1069,10 @@ extern "C" int colibri_gpu_compile(
              // otherwise, so a build without them still loads.
              "bailing_kda_recurrent_chunk", "bailing_mla_attention",
              "bailing_mla_project", "bailing_mla_scores",
+             "bailing_mla_scores_pair",
              "bailing_mla_softmax", "bailing_mla_accumulate",
+             "bailing_mla_accumulate_split",
+             "bailing_mla_accumulate_reduce",
              "bailing_mla_output",
              "bailing_mla_prepare_rows", "bailing_mla_project_rows",
              "bailing_mla_scores_rows", "bailing_mla_softmax_rows",
@@ -1663,6 +1680,15 @@ extern "C" int colibri_gpu_iq2xxs_matvec_transposed(
 ) {
     return launch_kquant_matvec(
         "iq2xxs_matvec_transposed_warp", "iq2xxs_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq1m_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq1m_matvec_transposed_warp", "iq1m_matvec_transposed",
         packed, input, output, input_size, output_size, stream);
 }
 

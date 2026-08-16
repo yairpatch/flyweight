@@ -26,6 +26,16 @@
 // AVX2 and scalar paths agree, since only one of them has an FMA to fuse into.
 // `hf_quantize_tiling_contract` pins the bytes so this cannot regress silently.
 
+// MSVC has no -ffp-contract=off, so the CMake flag that carries this guarantee
+// everywhere else is a no-op there and the compiler is free to fuse. That is
+// not hypothetical: it is how the Windows build came to emit different bytes
+// than the Linux one for the same input. This pragma is the MSVC spelling of
+// the same guarantee, and it has to sit in the header because both packer
+// translation units get it from here.
+#if defined(_MSC_VER)
+#pragma fp_contract(off)
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>

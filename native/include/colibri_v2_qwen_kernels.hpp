@@ -246,6 +246,38 @@ void quantize_q8_blocks(
     }
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Same quantization as above, one row per blockIdx.y. Prefill quantizes every
+// row of the batch with identical arguments apart from the base pointers, and
+// at 64 rows the launches cost more than the work; scale_stride is in halves
+// because the host lays the scale rows out on a float-sized stride.
+extern "C" __global__
+void quantize_q8_blocks_rows(
+    const float* input,
+    signed char* output,
+    __half* scales,
+    const int elements,
+    const int scale_stride
+) {
+    const int lane = threadIdx.x;
+    const long long row = blockIdx.y;
+    const int index = blockIdx.x * 32 + lane;
+    const float* row_input = input + row * elements;
+    float value = index < elements ? row_input[index] : 0.0f;
+    float maximum = fabsf(value);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, offset));
+    }
+    maximum = __shfl_sync(0xffffffff, maximum, 0);
+    const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+    if (lane == 0) scales[row * scale_stride + blockIdx.x] = __float2half(scale);
+    if (index < elements) {
+        const int quantized = max(-127, min(127, __float2int_rn(value / scale)));
+        output[row * elements + index] = (signed char)quantized;
+    }
+}
+
 extern "C" __global__
 void q4_q8_batched_matvec(
     const unsigned long long* packed_addresses,
@@ -1602,6 +1634,225 @@ extern "C" __global__ void name(                                               \
     }                                                                          \
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Prefill batches token rows against one weight matrix, and the kernel above is
+// launched once per row -- which re-reads the whole matrix per row. On a dense
+// model that is the entire prefill cost: N tokens do N full passes over the
+// weights, which is why prefill ran no faster per token than decode.
+//
+// This decodes each weight group once into eight words of four int8 and dots it
+// against every row in the batch, so the weight traffic is paid once per launch
+// instead of once per row. Splitting decode from dot is the point: calling
+// group_fn once per row would drop the traffic just the same, but for the
+// codebook formats decode is a dependent table load plus sign expansion per
+// eight weights -- more work than the two DP4A that consume it -- so repeating
+// it per row just trades a memory bound for an ALU one.
+//
+// decode_fn fills words[8] and the two half-block scales; formats with a single
+// scale per 32-value group pass it as both. COLIBRI_Q8_ROWS caps the batch: the
+// accumulators are registers and the block reduction needs a shared slot per
+// warp per row. The host chunks a wider batch into this many rows at a time;
+// kQ8RowBatch in native/src/v2_mtp_verifier.inc must match.
+#define COLIBRI_Q8_ROWS 8
+
+#define COLIBRI_Q8_MATVEC_ROWS(name, decode_fn, stride)                        \
+extern "C" __global__ void name(                                               \
+    const unsigned char* packed, const signed char* vectors,                   \
+    const __half* vector_scales, float* outputs,                               \
+    const int input_size, const int output_size,                               \
+    const int rows, const int scale_stride                                     \
+) {                                                                            \
+    const int row = blockIdx.x;                                                \
+    if (row >= output_size) return;                                            \
+    const int blocks_per_row = input_size >> 8;                                \
+    const int groups_per_row = blocks_per_row << 3;                            \
+    const unsigned char* row_data =                                            \
+        packed + (long long)row * blocks_per_row * stride;                     \
+    float partial[COLIBRI_Q8_ROWS];                                            \
+    _Pragma("unroll")                                                          \
+    for (int r = 0; r < COLIBRI_Q8_ROWS; ++r) partial[r] = 0.0f;               \
+    for (int g = threadIdx.x; g < groups_per_row; g += blockDim.x) {           \
+        int words[8];                                                          \
+        float scale_low = 0.0f, scale_high = 0.0f;                             \
+        decode_fn(row_data, g, words, &scale_low, &scale_high);                \
+        /* Unrolled over the compile-time cap and predicated on the runtime   */\
+        /* row count: a runtime bound would index partial dynamically and     */\
+        /* spill the accumulators to local memory.                            */\
+        _Pragma("unroll")                                                      \
+        for (int r = 0; r < COLIBRI_Q8_ROWS; ++r) {                            \
+            if (r >= rows) continue;                                           \
+            const int4* activation_vectors = (const int4*)(                    \
+                vectors + (long long)r * input_size + (long long)g * 32);      \
+            const int4 activation_low = activation_vectors[0];                 \
+            const int4 activation_high = activation_vectors[1];                \
+            const int acts[8] = {                                              \
+                activation_low.x, activation_low.y,                            \
+                activation_low.z, activation_low.w,                            \
+                activation_high.x, activation_high.y,                          \
+                activation_high.z, activation_high.w};                         \
+            int dot_low = 0, dot_high = 0;                                     \
+            _Pragma("unroll")                                                  \
+            for (int step = 0; step < 4; ++step) {                             \
+                int dot = 0;                                                   \
+                dot = __dp4a(words[step * 2], acts[step * 2], dot);            \
+                dot = __dp4a(words[step * 2 + 1], acts[step * 2 + 1], dot);    \
+                if (step < 2) dot_low += dot; else dot_high += dot;            \
+            }                                                                  \
+            partial[r] +=                                                      \
+                ((float)dot_low * scale_low + (float)dot_high * scale_high)    \
+                * __half2float(                                                \
+                    vector_scales[(long long)r * scale_stride + g]);           \
+        }                                                                      \
+    }                                                                          \
+    const int lane = threadIdx.x & 31;                                         \
+    const int warp = threadIdx.x >> 5;                                         \
+    __shared__ float warp_sums[4][COLIBRI_Q8_ROWS];                            \
+    _Pragma("unroll")                                                          \
+    for (int r = 0; r < COLIBRI_Q8_ROWS; ++r) {                                \
+        float value = partial[r];                                              \
+        for (int offset = 16; offset > 0; offset >>= 1)                        \
+            value += __shfl_down_sync(0xffffffffu, value, offset);             \
+        if (lane == 0) warp_sums[warp][r] = value;                             \
+    }                                                                          \
+    __syncthreads();                                                           \
+    if (warp != 0) return;                                                     \
+    _Pragma("unroll")                                                          \
+    for (int r = 0; r < COLIBRI_Q8_ROWS; ++r) {                                \
+        float value = lane < 4 ? warp_sums[lane][r] : 0.0f;                    \
+        for (int offset = 16; offset > 0; offset >>= 1)                        \
+            value += __shfl_down_sync(0xffffffffu, value, offset);             \
+        if (lane == 0 && r < rows)                                             \
+            outputs[(long long)r * output_size + row] = value;                 \
+    }                                                                          \
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Prefill twin of COLIBRI_Q8_MATVEC_ROWS, for wide token batches.
+//
+// The kernel above caps its batch at COLIBRI_Q8_ROWS because `partial[]` is a
+// per-thread register array: every extra token costs a register in every
+// thread, and past eight the accumulators spill and occupancy collapses.
+// Measured on Qwen3.8-27B, raising that cap alone goes the wrong way --
+// 8 -> 92 tok/s, 16 -> 84, 32 -> 48.
+//
+// The cost that matters at prefill widths is not weight *bandwidth* (a 1500
+// token prefill moves ~98 GB/s on a part that can do ~600) but the decode ALU
+// work, which the kernel above pays once per group per eight tokens. So this
+// one decodes a K-tile of groups into shared memory once and lets every warp
+// read it, which unbinds "tokens per decode" from "registers per thread": the
+// tokens are split across warps, so each thread still holds only
+// COLIBRI_Q8_TILE_TOKENS / COLIBRI_Q8_TILE_WARPS accumulators while the block
+// covers eight times the batch.
+//
+// Layout: one block per output row. Lane l of every warp owns group l of the
+// current tile; warp w owns tokens w, w+8, w+16, ... The final reduction is
+// therefore over lanes within a warp, one shuffle chain per token.
+#define COLIBRI_Q8_TILE_GROUPS 32
+#define COLIBRI_Q8_TILE_WARPS 8
+#define COLIBRI_Q8_TILE_TOKENS 32
+#define COLIBRI_Q8_TILE_ROWS 16
+#define COLIBRI_Q8_TILE_SLOTS (COLIBRI_Q8_TILE_TOKENS / COLIBRI_Q8_TILE_WARPS)
+
+#define COLIBRI_Q8_MATMUL_TILED(name, decode_fn, stride)                       \
+extern "C" __global__ void name(                                               \
+    const unsigned char* packed, const signed char* vectors,                   \
+    const __half* vector_scales, float* outputs,                               \
+    const int input_size, const int output_size,                               \
+    const int rows, const int scale_stride                                     \
+) {                                                                            \
+    const int row_base = blockIdx.x * COLIBRI_Q8_TILE_ROWS;                    \
+    if (row_base >= output_size) return;                                       \
+    const int blocks_per_row = input_size >> 8;                                \
+    const int groups_per_row = blocks_per_row << 3;                            \
+    /* [.][9] not [.][8]: lane l reads word k at l*9+k, and 9 is coprime with  */\
+    /* the 32 banks, so the eight reads stay conflict-free. At [.][8] lanes    */\
+    /* l and l+4 collide four ways.                                            */\
+    __shared__ int tile_words[COLIBRI_Q8_TILE_ROWS][COLIBRI_Q8_TILE_GROUPS][9]; \
+    __shared__ float tile_low[COLIBRI_Q8_TILE_ROWS][COLIBRI_Q8_TILE_GROUPS];    \
+    __shared__ float tile_high[COLIBRI_Q8_TILE_ROWS][COLIBRI_Q8_TILE_GROUPS];   \
+    const int lane = threadIdx.x & 31;                                         \
+    const int warp = threadIdx.x >> 5;                                         \
+    float acc[COLIBRI_Q8_TILE_SLOTS][COLIBRI_Q8_TILE_ROWS];                    \
+    _Pragma("unroll")                                                          \
+    for (int s = 0; s < COLIBRI_Q8_TILE_SLOTS; ++s)                            \
+        _Pragma("unroll")                                                      \
+        for (int r = 0; r < COLIBRI_Q8_TILE_ROWS; ++r) acc[s][r] = 0.0f;       \
+    for (int base = 0; base < groups_per_row; base += COLIBRI_Q8_TILE_GROUPS) {\
+        const int remaining = groups_per_row - base;                           \
+        const int count = remaining < COLIBRI_Q8_TILE_GROUPS                   \
+            ? remaining : COLIBRI_Q8_TILE_GROUPS;                              \
+        __syncthreads();                                                       \
+        /* One decode per (row, group) in the tile, spread over the block. */  \
+        for (int i = threadIdx.x; i < COLIBRI_Q8_TILE_ROWS * count;            \
+             i += blockDim.x) {                                                \
+            const int r = i / count;                                           \
+            const int g = i - r * count;                                       \
+            if (row_base + r >= output_size) continue;                         \
+            const unsigned char* row_data = packed                             \
+                + (long long)(row_base + r) * blocks_per_row * stride;         \
+            float low = 0.0f, high = 0.0f;                                     \
+            decode_fn(row_data, base + g, tile_words[r][g], &low, &high);      \
+            tile_low[r][g] = low;                                              \
+            tile_high[r][g] = high;                                            \
+        }                                                                      \
+        __syncthreads();                                                       \
+        if (lane >= count) continue;                                           \
+        const int group = base + lane;                                         \
+        _Pragma("unroll")                                                      \
+        for (int s = 0; s < COLIBRI_Q8_TILE_SLOTS; ++s) {                      \
+            const int token = warp + s * COLIBRI_Q8_TILE_WARPS;                \
+            if (token >= rows) continue;                                       \
+            /* The activation tile does not depend on the output row, so it is */\
+            /* loaded once here and reused across all COLIBRI_Q8_TILE_ROWS of  */\
+            /* them. That reuse is the point of this kernel: with one row per  */\
+            /* block the activation re-reads outweigh the weight reads by two  */\
+            /* orders of magnitude, and they, not the decode, set the pace.    */\
+            const int4* activation_vectors = (const int4*)(                    \
+                vectors + (long long)token * input_size                        \
+                + (long long)group * 32);                                      \
+            const int4 activation_low = activation_vectors[0];                 \
+            const int4 activation_high = activation_vectors[1];                \
+            const int acts[8] = {                                              \
+                activation_low.x, activation_low.y,                            \
+                activation_low.z, activation_low.w,                            \
+                activation_high.x, activation_high.y,                          \
+                activation_high.z, activation_high.w};                         \
+            const float activation_scale = __half2float(                       \
+                vector_scales[(long long)token * scale_stride + group]);       \
+            _Pragma("unroll")                                                  \
+            for (int r = 0; r < COLIBRI_Q8_TILE_ROWS; ++r) {                   \
+                int dot_low = 0, dot_high = 0;                                 \
+                _Pragma("unroll")                                              \
+                for (int step = 0; step < 4; ++step) {                         \
+                    int dot = 0;                                               \
+                    dot = __dp4a(                                              \
+                        tile_words[r][lane][step * 2], acts[step * 2], dot);   \
+                    dot = __dp4a(tile_words[r][lane][step * 2 + 1],            \
+                                 acts[step * 2 + 1], dot);                     \
+                    if (step < 2) dot_low += dot; else dot_high += dot;        \
+                }                                                              \
+                acc[s][r] += ((float)dot_low * tile_low[r][lane]               \
+                              + (float)dot_high * tile_high[r][lane])          \
+                    * activation_scale;                                        \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    _Pragma("unroll")                                                          \
+    for (int s = 0; s < COLIBRI_Q8_TILE_SLOTS; ++s) {                          \
+        const int token = warp + s * COLIBRI_Q8_TILE_WARPS;                    \
+        _Pragma("unroll")                                                      \
+        for (int r = 0; r < COLIBRI_Q8_TILE_ROWS; ++r) {                       \
+            float value = acc[s][r];                                           \
+            for (int offset = 16; offset > 0; offset >>= 1)                    \
+                value += __shfl_down_sync(0xffffffffu, value, offset);         \
+            if (lane == 0 && token < rows && row_base + r < output_size)       \
+                outputs[(long long)token * output_size + row_base + r] = value;\
+        }                                                                      \
+    }                                                                          \
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 // One warp per output row, eight rows per block, argmax fused in. The LM head
 // is ~250k rows of only ~160 groups each, so a block per row would spend most
 // of its time in the cross-warp reduction; a warp per row keeps the reduction
@@ -2176,6 +2427,40 @@ __device__ __forceinline__ float iq2xxs_q8_group(
 
 COLIBRI_Q8_MATVEC(iq2xxs_q8_matvec_transposed_warp, iq2xxs_q8_group, 66)
 COLIBRI_Q8_LM_HEAD(iq2xxs_q8_lm_head_argmax_warp, iq2xxs_q8_group, 66)
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Batched twin of iq2xxs_q8_group. One scale covers the whole 32-value group
+// here, so both halves get it.
+__device__ __forceinline__ void iq2xxs_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 66;
+    unsigned int low, high;
+    memcpy(&low, base + 2 + group * 8, 4);
+    memcpy(&high, base + 2 + group * 8 + 4, 4);
+    #pragma unroll
+    for (int quad = 0; quad < 4; ++quad) {
+        const unsigned int signs =
+            iq2xxs_unpack_signs((high >> (7 * quad)) & 127);
+        const unsigned long long pattern =
+            kIq2xxsGrid[(low >> (8 * quad)) & 255];
+        const int masks_first = __vcmpne4(signs & 0x08040201u, 0);
+        const int masks_second = __vcmpne4(signs & 0x80402010u, 0);
+        words[quad * 2] = __vsub4(
+            (int)(unsigned int)pattern ^ masks_first, masks_first);
+        words[quad * 2 + 1] = __vsub4(
+            (int)(unsigned int)(pattern >> 32) ^ masks_second, masks_second);
+    }
+    const float scale = (float)((int)(high >> 27) | 1) * 0.125f
+        * __half2float(*((const __half*)base));
+    *scale_low = scale;
+    *scale_high = scale;
+}
+
+COLIBRI_Q8_MATVEC_ROWS(iq2xxs_q8_matvec_transposed_rows, iq2xxs_q8_decode, 66)
+COLIBRI_Q8_MATMUL_TILED(iq2xxs_q8_matmul_tiled, iq2xxs_q8_decode, 66)
 
 
 // Decode Q4_K against a vector quantized in independent 32-value Q8 blocks.
@@ -2338,6 +2623,40 @@ __device__ __forceinline__ float iq3xxs_q8_group(
 
 COLIBRI_Q8_MATVEC(iq3xxs_q8_matvec_transposed_warp, iq3xxs_q8_group, 98)
 COLIBRI_Q8_LM_HEAD(iq3xxs_q8_lm_head_argmax_warp, iq3xxs_q8_group, 98)
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Batched twin of iq3xxs_q8_group. One scale covers the whole 32-value group
+// here, so both halves get it.
+__device__ __forceinline__ void iq3xxs_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 98;
+    const unsigned char* quants = base + 2 + group * 8;
+    unsigned int aux;
+    memcpy(&aux, base + 66 + group * 4, 4);
+    #pragma unroll
+    for (int quad = 0; quad < 4; ++quad) {
+        const unsigned int signs =
+            (unsigned int)kIq2xxsSigns[(aux >> (7 * quad)) & 127] * 0x01010101u;
+        const unsigned int pattern_first = kIq3xxsGrid[quants[quad * 2]];
+        const unsigned int pattern_second = kIq3xxsGrid[quants[quad * 2 + 1]];
+        const int masks_first = __vcmpne4(signs & 0x08040201u, 0);
+        const int masks_second = __vcmpne4(signs & 0x80402010u, 0);
+        words[quad * 2] =
+            __vsub4((int)pattern_first ^ masks_first, masks_first);
+        words[quad * 2 + 1] =
+            __vsub4((int)pattern_second ^ masks_second, masks_second);
+    }
+    const float scale = __half2float(*((const __half*)base))
+        * (0.5f + (float)(aux >> 28)) * 0.5f;
+    *scale_low = scale;
+    *scale_high = scale;
+}
+
+COLIBRI_Q8_MATVEC_ROWS(iq3xxs_q8_matvec_transposed_rows, iq3xxs_q8_decode, 98)
+COLIBRI_Q8_MATMUL_TILED(iq3xxs_q8_matmul_tiled, iq3xxs_q8_decode, 98)
 
 
 
@@ -2809,6 +3128,47 @@ __device__ __forceinline__ float iq2s_q8_group(
 
 COLIBRI_Q8_MATVEC(iq2s_q8_matvec_transposed_warp, iq2s_q8_group, 82)
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Batched twin of iq2s_q8_group: decodes the group without applying the scales,
+// which the caller needs held back because the two 16-value halves take
+// different nibbles of the scale byte.
+__device__ __forceinline__ void iq2s_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 82;
+    const unsigned char* quants = base + 2;
+    const unsigned char* signs = base + 34;
+    const unsigned char* high = base + 66;
+    const unsigned char* scales = base + 74;
+    const int first_index = group * 4;
+    const unsigned int qh_byte = high[group];
+    const unsigned int scale_byte = scales[group];
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const int index = first_index + step;
+        const int entry =
+            quants[index] | (int)(((qh_byte >> (2 * step)) & 3u) << 8);
+        const unsigned long long pattern = kIq2sGrid[entry];
+        const unsigned int sign_word = (unsigned int)signs[index] * 0x01010101u;
+        const int masks_first = __vcmpne4(sign_word & 0x08040201u, 0);
+        const int masks_second = __vcmpne4(sign_word & 0x80402010u, 0);
+        words[step * 2] = __vsub4(
+            (int)(unsigned int)pattern ^ masks_first, masks_first);
+        words[step * 2 + 1] = __vsub4(
+            (int)(unsigned int)(pattern >> 32) ^ masks_second, masks_second);
+    }
+    const float block_scale = __half2float(*((const __half*)base)) * 0.25f;
+    *scale_low = (0.5f + (float)(scale_byte & 15u)) * block_scale;
+    *scale_high = (0.5f + (float)((scale_byte >> 4) & 15u)) * block_scale;
+}
+
+COLIBRI_Q8_MATVEC_ROWS(iq2s_q8_matvec_transposed_rows, iq2s_q8_decode, 82)
+COLIBRI_Q8_MATMUL_TILED(iq2s_q8_matmul_tiled, iq2s_q8_decode, 82)
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 __device__ __forceinline__ float iq3s_value(
     const unsigned char* packed, int absolute
 ) {
@@ -3039,6 +3399,106 @@ __device__ __forceinline__ float iq4xs_value(
     return d * (float)scale * (float)kIq4nlValues[code];
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// IQ4_XS against a Q8-quantized activation.
+//
+// This format lines up with Q8 better than any other codebook type here: its
+// 6-bit scale covers exactly 32 values, which is exactly one Q8 block, so a
+// group needs one scale on each side and no split into halves. What it cannot
+// do is feed __dp4a raw -- the 4-bit codes are indices into the non-uniform
+// IQ4_NL levels, not values -- so the codes go through kIq4nlValues first and
+// the dot runs on the reconstructed int8.
+//
+// Byte j of a sub-block holds element j in its low nibble and element j+16 in
+// its high one, which is why the two nibble halves land four words apart.
+__device__ __forceinline__ float iq4xs_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    const int block = linear_group >> 3;
+    const int sub = linear_group & 7;
+    const unsigned char* base = row_data + block * 136;
+    unsigned int codes[4];
+    memcpy(codes, base + 8 + sub * 16, 16);
+    const signed char* activations = vector + linear_group * 32;
+    const int4* activation_vectors = (const int4*)activations;
+    const int4 activation_low = activation_vectors[0];
+    const int4 activation_high = activation_vectors[1];
+    const int acts[8] = {
+        activation_low.x, activation_low.y, activation_low.z, activation_low.w,
+        activation_high.x, activation_high.y, activation_high.z,
+        activation_high.w};
+
+    int dot = 0;
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const unsigned int word = codes[step];
+        const int low_weights =
+            ((int)(unsigned char)kIq4nlValues[(word >> 0) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 8) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 16) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 24) & 15] << 24);
+        const int high_weights =
+            ((int)(unsigned char)kIq4nlValues[(word >> 4) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 12) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 20) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 28) & 15] << 24);
+        dot = __dp4a(low_weights, acts[step], dot);
+        dot = __dp4a(high_weights, acts[step + 4], dot);
+    }
+
+    unsigned short scales_high;
+    memcpy(&scales_high, base + 2, 2);
+    const int low = (base[4 + (sub >> 1)] >> (4 * (sub & 1))) & 15;
+    const int scale = (low | (((scales_high >> (2 * sub)) & 3) << 4)) - 32;
+    const float d = __half2float(*((const __half*)base));
+    return __half2float(vector_scales[linear_group]) * d * (float)scale *
+           (float)dot;
+}
+
+COLIBRI_Q8_MATVEC(iq4xs_q8_matvec_transposed_warp, iq4xs_q8_group, 136)
+
+// Batched twin. One scale for the whole group, so both halves get the same one.
+__device__ __forceinline__ void iq4xs_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int sub = linear_group & 7;
+    const unsigned char* base = row_data + block * 136;
+    unsigned int codes[4];
+    memcpy(codes, base + 8 + sub * 16, 16);
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const unsigned int word = codes[step];
+        words[step] =
+            ((int)(unsigned char)kIq4nlValues[(word >> 0) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 8) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 16) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 24) & 15] << 24);
+        words[step + 4] =
+            ((int)(unsigned char)kIq4nlValues[(word >> 4) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 12) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 20) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 28) & 15] << 24);
+    }
+    unsigned short scales_high;
+    memcpy(&scales_high, base + 2, 2);
+    const int low = (base[4 + (sub >> 1)] >> (4 * (sub & 1))) & 15;
+    const int scale = (low | (((scales_high >> (2 * sub)) & 3) << 4)) - 32;
+    const float combined = __half2float(*((const __half*)base)) * (float)scale;
+    *scale_low = combined;
+    *scale_high = combined;
+}
+
+COLIBRI_Q8_MATVEC_ROWS(iq4xs_q8_matvec_transposed_rows, iq4xs_q8_decode, 136)
+COLIBRI_Q8_MATMUL_TILED(iq4xs_q8_matmul_tiled, iq4xs_q8_decode, 136)
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+
 extern "C" __global__
 void iq2xs_matvec_transposed(
     const unsigned char* packed, const float* vector, float* output,
@@ -3053,6 +3513,691 @@ void iq2xs_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// IQ1_M shares IQ1_S's codebook: 2048 entries, each eight signed bytes packed
+// into a 64-bit word. At 16 KiB this is too large for __constant__ memory and
+// is indexed unpredictably (an 11-bit code per group of eight weights), so it
+// lives in global memory and rides the L2 like the other IQ grids here.
+__device__ const unsigned long long kIq1sGrid[2048] = {
+    0xffffffffffffffffULL, 0xffffffffffffff01ULL, 0xffffffffffff0000ULL, 0xffffffffffff01ffULL,
+    0xffffffffffff0101ULL, 0xffffffffff00ff00ULL, 0xffffffffff000000ULL, 0xffffffffff01ffffULL,
+    0xffffffffff01ff01ULL, 0xffffffffff0101ffULL, 0xffffffffff010101ULL, 0xffffffff00ff0000ULL,
+    0xffffffff0000ff00ULL, 0xffffffff000000ffULL, 0xffffffff00000001ULL, 0xffffffff00010000ULL,
+    0xffffffff01ffffffULL, 0xffffffff01ffff01ULL, 0xffffffff01ff01ffULL, 0xffffffff01ff0101ULL,
+    0xffffffff01000000ULL, 0xffffffff0101ffffULL, 0xffffffff0101ff01ULL, 0xffffffff010101ffULL,
+    0xffffffff01010101ULL, 0xffffff00ffff00ffULL, 0xffffff00ffff0000ULL, 0xffffff00ff00ff00ULL,
+    0xffffff00ff0000ffULL, 0xffffff00ff000001ULL, 0xffffff00ff000100ULL, 0xffffff00ff000101ULL,
+    0xffffff00ff010000ULL, 0xffffff0000ffff00ULL, 0xffffff0000ff0001ULL, 0xffffff0000ff0100ULL,
+    0xffffff000000ff01ULL, 0xffffff0000000000ULL, 0xffffff0000000101ULL, 0xffffff000001ff00ULL,
+    0xffffff00000100ffULL, 0xffffff0000010001ULL, 0xffffff00000101ffULL, 0xffffff0001ff0000ULL,
+    0xffffff000100ff00ULL, 0xffffff00010000ffULL, 0xffffff0001000001ULL, 0xffffff0001010000ULL,
+    0xffffff01ffffffffULL, 0xffffff01ffffff01ULL, 0xffffff01ffff01ffULL, 0xffffff01ffff0101ULL,
+    0xffffff01ff000000ULL, 0xffffff01ff01ffffULL, 0xffffff01ff01ff01ULL, 0xffffff01ff0101ffULL,
+    0xffffff01ff010101ULL, 0xffffff0100ff0000ULL, 0xffffff010000ff00ULL, 0xffffff0100000100ULL,
+    0xffffff01000100ffULL, 0xffffff0100010100ULL, 0xffffff0101ffffffULL, 0xffffff0101ffff01ULL,
+    0xffffff0101ff01ffULL, 0xffffff0101ff0101ULL, 0xffffff010100ff00ULL, 0xffffff0101000000ULL,
+    0xffffff0101000100ULL, 0xffffff010101ffffULL, 0xffffff010101ff01ULL, 0xffffff01010101ffULL,
+    0xffffff0101010101ULL, 0xffff00ffff00ff00ULL, 0xffff00ffff0000ffULL, 0xffff00ffff000001ULL,
+    0xffff00ffff010000ULL, 0xffff00ff00ffff00ULL, 0xffff00ff00ff0100ULL, 0xffff00ff00000000ULL,
+    0xffff00ff00000101ULL, 0xffff00ff000100ffULL, 0xffff00ff00010000ULL, 0xffff00ff0100ff00ULL,
+    0xffff00ff01000100ULL, 0xffff00ff01010000ULL, 0xffff0000ffffff00ULL, 0xffff0000ffff00ffULL,
+    0xffff0000ffff0000ULL, 0xffff0000ffff0001ULL, 0xffff0000ff000000ULL, 0xffff0000ff0001ffULL,
+    0xffff0000ff000101ULL, 0xffff0000ff010100ULL, 0xffff000000ffffffULL, 0xffff000000ff0000ULL,
+    0xffff000000ff0101ULL, 0xffff00000000ffffULL, 0xffff00000000ff00ULL, 0xffff0000000000ffULL,
+    0xffff000000000000ULL, 0xffff000000000001ULL, 0xffff000000000100ULL, 0xffff00000001ffffULL,
+    0xffff00000001ff01ULL, 0xffff000000010000ULL, 0xffff0000000101ffULL, 0xffff000000010101ULL,
+    0xffff000001ffff00ULL, 0xffff00000100ff00ULL, 0xffff000001000000ULL, 0xffff0000010001ffULL,
+    0xffff000001000101ULL, 0xffff00000101ff00ULL, 0xffff0000010100ffULL, 0xffff000001010000ULL,
+    0xffff000001010001ULL, 0xffff000001010100ULL, 0xffff0001ff0000ffULL, 0xffff0001ff000100ULL,
+    0xffff000100ffff00ULL, 0xffff000100ff00ffULL, 0xffff00010000ffffULL, 0xffff00010000ff01ULL,
+    0xffff000100000000ULL, 0xffff0001000001ffULL, 0xffff00010001ffffULL, 0xffff00010001ff00ULL,
+    0xffff000100010001ULL, 0xffff000100010100ULL, 0xffff000101ff0000ULL, 0xffff00010100ff00ULL,
+    0xffff0001010000ffULL, 0xffff000101000100ULL, 0xffff01ffffffffffULL, 0xffff01ffffffff01ULL,
+    0xffff01ffffff01ffULL, 0xffff01ffffff0101ULL, 0xffff01ffff000000ULL, 0xffff01ffff01ffffULL,
+    0xffff01ffff01ff01ULL, 0xffff01ffff0101ffULL, 0xffff01ffff010101ULL, 0xffff01ff00ff0000ULL,
+    0xffff01ff0000ff00ULL, 0xffff01ff00000001ULL, 0xffff01ff00010000ULL, 0xffff01ff01ffffffULL,
+    0xffff01ff01ffff01ULL, 0xffff01ff01ff01ffULL, 0xffff01ff01ff0101ULL, 0xffff01ff01000000ULL,
+    0xffff01ff0101ffffULL, 0xffff01ff0101ff01ULL, 0xffff01ff010101ffULL, 0xffff01ff01010101ULL,
+    0xffff0100ffff0000ULL, 0xffff0100ff00ff00ULL, 0xffff0100ff0000ffULL, 0xffff0100ff000100ULL,
+    0xffff0100ff0100ffULL, 0xffff0100ff010000ULL, 0xffff010000ffff00ULL, 0xffff01000000ffffULL,
+    0xffff01000000ff00ULL, 0xffff010000000000ULL, 0xffff01000001ff00ULL, 0xffff0100000100ffULL,
+    0xffff010000010100ULL, 0xffff01000100ff00ULL, 0xffff0100010000ffULL, 0xffff010001000001ULL,
+    0xffff010001000100ULL, 0xffff010001010000ULL, 0xffff0101ffffffffULL, 0xffff0101ffffff01ULL,
+    0xffff0101ffff01ffULL, 0xffff0101ffff0101ULL, 0xffff0101ff000000ULL, 0xffff0101ff01ffffULL,
+    0xffff0101ff01ff01ULL, 0xffff0101ff0101ffULL, 0xffff0101ff010101ULL, 0xffff010100ff0000ULL,
+    0xffff01010000ff00ULL, 0xffff010100000100ULL, 0xffff01010001ff00ULL, 0xffff010100010000ULL,
+    0xffff010101ffffffULL, 0xffff010101ffff01ULL, 0xffff010101ff0000ULL, 0xffff010101ff01ffULL,
+    0xffff010101ff0101ULL, 0xffff010101000000ULL, 0xffff01010101ffffULL, 0xffff01010101ff01ULL,
+    0xffff0101010101ffULL, 0xffff010101010101ULL, 0xff00ffffff00ffffULL, 0xff00ffffff00ff00ULL,
+    0xff00ffffff0000ffULL, 0xff00ffffff000100ULL, 0xff00ffffff0100ffULL, 0xff00ffffff010000ULL,
+    0xff00ffff00ffff00ULL, 0xff00ffff00ff00ffULL, 0xff00ffff0000ffffULL, 0xff00ffff00000000ULL,
+    0xff00ffff000001ffULL, 0xff00ffff0001ff00ULL, 0xff00ffff000100ffULL, 0xff00ffff00010000ULL,
+    0xff00ffff00010100ULL, 0xff00ffff0100ff00ULL, 0xff00ffff010000ffULL, 0xff00ffff01000001ULL,
+    0xff00ffff0101ff00ULL, 0xff00ffff01010000ULL, 0xff00ff00ffffff00ULL, 0xff00ff00ffff00ffULL,
+    0xff00ff00ffff0001ULL, 0xff00ff00ffff0100ULL, 0xff00ff00ff00ffffULL, 0xff00ff00ff00ff01ULL,
+    0xff00ff00ff000000ULL, 0xff00ff00ff0001ffULL, 0xff00ff00ff01ff00ULL, 0xff00ff00ff0100ffULL,
+    0xff00ff00ff010100ULL, 0xff00ff0000ff0000ULL, 0xff00ff0000ff0101ULL, 0xff00ff000000ffffULL,
+    0xff00ff000000ff00ULL, 0xff00ff000000ff01ULL, 0xff00ff00000000ffULL, 0xff00ff0000000000ULL,
+    0xff00ff0000000001ULL, 0xff00ff0000000100ULL, 0xff00ff000001ffffULL, 0xff00ff0000010000ULL,
+    0xff00ff0001ff00ffULL, 0xff00ff000100ff01ULL, 0xff00ff0001000000ULL, 0xff00ff000101ff00ULL,
+    0xff00ff00010100ffULL, 0xff00ff01ff00ff00ULL, 0xff00ff01ff0000ffULL, 0xff00ff01ff000001ULL,
+    0xff00ff01ff010000ULL, 0xff00ff0100ffffffULL, 0xff00ff0100ff0001ULL, 0xff00ff0100ff0100ULL,
+    0xff00ff010000ff01ULL, 0xff00ff0100000000ULL, 0xff00ff01000001ffULL, 0xff00ff0100000101ULL,
+    0xff00ff01000100ffULL, 0xff00ff0100010001ULL, 0xff00ff0101ff0000ULL, 0xff00ff010100ff00ULL,
+    0xff00ff01010000ffULL, 0xff00ff0101000001ULL, 0xff00ff0101010000ULL, 0xff0000ffffffff00ULL,
+    0xff0000ffffff0001ULL, 0xff0000ffffff0100ULL, 0xff0000ffff0000ffULL, 0xff0000ffff000000ULL,
+    0xff0000ffff0001ffULL, 0xff0000ffff000100ULL, 0xff0000ffff01ff00ULL, 0xff0000ffff010001ULL,
+    0xff0000ff00ffff00ULL, 0xff0000ff00ff0000ULL, 0xff0000ff00ff0001ULL, 0xff0000ff00ff01ffULL,
+    0xff0000ff00ff0101ULL, 0xff0000ff0000ff00ULL, 0xff0000ff000000ffULL, 0xff0000ff00000000ULL,
+    0xff0000ff00000001ULL, 0xff0000ff00000100ULL, 0xff0000ff0001ff01ULL, 0xff0000ff00010000ULL,
+    0xff0000ff000101ffULL, 0xff0000ff01ff00ffULL, 0xff0000ff01ff0100ULL, 0xff0000ff0100ffffULL,
+    0xff0000ff010000ffULL, 0xff0000ff01000000ULL, 0xff0000ff010001ffULL, 0xff0000ff01000100ULL,
+    0xff0000ff01000101ULL, 0xff0000ff0101ff00ULL, 0xff0000ff010100ffULL, 0xff0000ff01010000ULL,
+    0xff0000ff01010100ULL, 0xff000000ffffff01ULL, 0xff000000ffff0000ULL, 0xff000000ffff0101ULL,
+    0xff000000ff00ff00ULL, 0xff000000ff0000ffULL, 0xff000000ff000000ULL, 0xff000000ff000001ULL,
+    0xff000000ff000100ULL, 0xff000000ff01ffffULL, 0xff000000ff01ff01ULL, 0xff000000ff010000ULL,
+    0xff000000ff0101ffULL, 0xff000000ff010101ULL, 0xff00000000ffff00ULL, 0xff00000000ff00ffULL,
+    0xff00000000ff0000ULL, 0xff00000000ff0001ULL, 0xff0000000000ff00ULL, 0xff0000000000ff01ULL,
+    0xff000000000000ffULL, 0xff00000000000000ULL, 0xff00000000000001ULL, 0xff00000000000100ULL,
+    0xff00000000000101ULL, 0xff0000000001ff00ULL, 0xff000000000100ffULL, 0xff00000000010000ULL,
+    0xff00000000010001ULL, 0xff00000000010100ULL, 0xff00000001ffffffULL, 0xff00000001ffff01ULL,
+    0xff00000001ff00ffULL, 0xff00000001ff0000ULL, 0xff00000001ff01ffULL, 0xff00000001ff0101ULL,
+    0xff0000000100ffffULL, 0xff0000000100ff00ULL, 0xff000000010000ffULL, 0xff00000001000000ULL,
+    0xff00000001000001ULL, 0xff00000001000100ULL, 0xff00000001000101ULL, 0xff0000000101ffffULL,
+    0xff0000000101ff01ULL, 0xff00000001010000ULL, 0xff000001ffffff00ULL, 0xff000001ffff00ffULL,
+    0xff000001ffff0000ULL, 0xff000001ffff0001ULL, 0xff000001ff000000ULL, 0xff000001ff000001ULL,
+    0xff000001ff0001ffULL, 0xff000001ff000101ULL, 0xff000001ff01ff00ULL, 0xff000001ff010001ULL,
+    0xff00000100ffffffULL, 0xff00000100ffff01ULL, 0xff00000100ff00ffULL, 0xff00000100ff0000ULL,
+    0xff00000100ff01ffULL, 0xff00000100ff0101ULL, 0xff0000010000ff00ULL, 0xff00000100000000ULL,
+    0xff00000100000001ULL, 0xff000001000001ffULL, 0xff00000100000100ULL, 0xff0000010001ff00ULL,
+    0xff000001000100ffULL, 0xff00000100010000ULL, 0xff000001000101ffULL, 0xff00000100010100ULL,
+    0xff00000100010101ULL, 0xff00000101ff0001ULL, 0xff00000101ff0101ULL, 0xff0000010100ff01ULL,
+    0xff00000101000000ULL, 0xff000001010100ffULL, 0xff00000101010100ULL, 0xff0001ffff00ff00ULL,
+    0xff0001ffff000001ULL, 0xff0001ffff010000ULL, 0xff0001ff00ffff00ULL, 0xff0001ff00ff00ffULL,
+    0xff0001ff00ff0001ULL, 0xff0001ff00ff0100ULL, 0xff0001ff0000ffffULL, 0xff0001ff00000000ULL,
+    0xff0001ff000001ffULL, 0xff0001ff00000101ULL, 0xff0001ff0001ffffULL, 0xff0001ff0001ff00ULL,
+    0xff0001ff000100ffULL, 0xff0001ff00010001ULL, 0xff0001ff00010100ULL, 0xff0001ff01ff0000ULL,
+    0xff0001ff0100ff00ULL, 0xff0001ff010000ffULL, 0xff0001ff01010000ULL, 0xff000100ff00ffffULL,
+    0xff000100ff00ff01ULL, 0xff000100ff000000ULL, 0xff000100ff000101ULL, 0xff000100ff01ff00ULL,
+    0xff000100ff010000ULL, 0xff00010000ffff01ULL, 0xff00010000ff00ffULL, 0xff00010000ff0000ULL,
+    0xff00010000ff01ffULL, 0xff0001000000ff00ULL, 0xff000100000000ffULL, 0xff00010000000000ULL,
+    0xff00010000000001ULL, 0xff00010000000100ULL, 0xff00010000000101ULL, 0xff0001000001ffffULL,
+    0xff00010000010000ULL, 0xff00010000010101ULL, 0xff00010001ff0100ULL, 0xff0001000100ff00ULL,
+    0xff0001000100ff01ULL, 0xff00010001000000ULL, 0xff000100010001ffULL, 0xff0001000101ff00ULL,
+    0xff00010001010001ULL, 0xff00010001010100ULL, 0xff000101ffff0100ULL, 0xff000101ff000001ULL,
+    0xff000101ff0100ffULL, 0xff000101ff010001ULL, 0xff00010100ff00ffULL, 0xff00010100ff0001ULL,
+    0xff00010100ff0100ULL, 0xff0001010000ffffULL, 0xff0001010000ff01ULL, 0xff00010100000000ULL,
+    0xff000101000001ffULL, 0xff0001010001ff00ULL, 0xff00010100010001ULL, 0xff00010100010100ULL,
+    0xff00010101ff0000ULL, 0xff0001010100ff00ULL, 0xff00010101000001ULL, 0xff00010101000101ULL,
+    0xff01ffffffffffffULL, 0xff01ffffffffff01ULL, 0xff01ffffffff01ffULL, 0xff01ffffffff0101ULL,
+    0xff01ffffff000000ULL, 0xff01ffffff01ffffULL, 0xff01ffffff01ff01ULL, 0xff01ffffff010000ULL,
+    0xff01ffffff0101ffULL, 0xff01ffffff010101ULL, 0xff01ffff00ff0000ULL, 0xff01ffff0000ff00ULL,
+    0xff01ffff00000100ULL, 0xff01ffff0001ff00ULL, 0xff01ffff00010000ULL, 0xff01ffff01ffffffULL,
+    0xff01ffff01ffff01ULL, 0xff01ffff01ff01ffULL, 0xff01ffff01ff0101ULL, 0xff01ffff01000000ULL,
+    0xff01ffff0101ffffULL, 0xff01ffff0101ff01ULL, 0xff01ffff01010000ULL, 0xff01ffff010101ffULL,
+    0xff01ffff01010101ULL, 0xff01ff00ffff0000ULL, 0xff01ff00ff00ff00ULL, 0xff01ff00ff0000ffULL,
+    0xff01ff00ff000100ULL, 0xff01ff00ff010000ULL, 0xff01ff0000ffff01ULL, 0xff01ff0000ff00ffULL,
+    0xff01ff0000ff0100ULL, 0xff01ff0000000000ULL, 0xff01ff00000001ffULL, 0xff01ff0000000101ULL,
+    0xff01ff000001ff00ULL, 0xff01ff00000100ffULL, 0xff01ff0000010000ULL, 0xff01ff0000010001ULL,
+    0xff01ff0001ff0000ULL, 0xff01ff000100ffffULL, 0xff01ff0001000001ULL, 0xff01ff0001000100ULL,
+    0xff01ff0001010000ULL, 0xff01ff01ffffff00ULL, 0xff01ff01ffff01ffULL, 0xff01ff01ffff0101ULL,
+    0xff01ff01ff00ff00ULL, 0xff01ff01ff000000ULL, 0xff01ff01ff01ffffULL, 0xff01ff01ff01ff01ULL,
+    0xff01ff01ff0101ffULL, 0xff01ff01ff010101ULL, 0xff01ff0100ff0000ULL, 0xff01ff010000ff00ULL,
+    0xff01ff0100000001ULL, 0xff01ff0100000100ULL, 0xff01ff0100010000ULL, 0xff01ff0101ffff00ULL,
+    0xff01ff0101ff01ffULL, 0xff01ff0101ff0101ULL, 0xff01ff010100ff00ULL, 0xff01ff0101000000ULL,
+    0xff01ff010101ffffULL, 0xff01ff010101ff01ULL, 0xff01ff01010101ffULL, 0xff01ff0101010101ULL,
+    0xff0100ffffff0000ULL, 0xff0100ffff0000ffULL, 0xff0100ffff000001ULL, 0xff0100ffff000100ULL,
+    0xff0100ffff010000ULL, 0xff0100ff00ff00ffULL, 0xff0100ff00ff0000ULL, 0xff0100ff00ff0001ULL,
+    0xff0100ff00ff0100ULL, 0xff0100ff0000ff01ULL, 0xff0100ff00000000ULL, 0xff0100ff000001ffULL,
+    0xff0100ff00000101ULL, 0xff0100ff00010001ULL, 0xff0100ff01ff0000ULL, 0xff0100ff0100ff00ULL,
+    0xff0100ff010000ffULL, 0xff0100ff01000100ULL, 0xff0100ff0101ff00ULL, 0xff0100ff01010000ULL,
+    0xff010000ffff0100ULL, 0xff010000ff000000ULL, 0xff010000ff01ff00ULL, 0xff010000ff010100ULL,
+    0xff01000000ffffffULL, 0xff01000000ff0000ULL, 0xff01000000ff01ffULL, 0xff0100000000ff00ULL,
+    0xff010000000000ffULL, 0xff01000000000000ULL, 0xff01000000000100ULL, 0xff0100000001ff01ULL,
+    0xff01000000010000ULL, 0xff010000000101ffULL, 0xff01000001ff0100ULL, 0xff0100000100ffffULL,
+    0xff010000010000ffULL, 0xff01000001000000ULL, 0xff010000010001ffULL, 0xff01000001000101ULL,
+    0xff0100000101ff00ULL, 0xff010000010100ffULL, 0xff01000001010001ULL, 0xff01000001010100ULL,
+    0xff010001ffff0000ULL, 0xff010001ff00ffffULL, 0xff010001ff00ff01ULL, 0xff010001ff000100ULL,
+    0xff010001ff010000ULL, 0xff01000100ffff00ULL, 0xff01000100ff0100ULL, 0xff01000100000000ULL,
+    0xff0100010001ffffULL, 0xff0100010001ff00ULL, 0xff01000100010100ULL, 0xff01000101ff00ffULL,
+    0xff01000101ff0001ULL, 0xff0100010100ffffULL, 0xff01000101000101ULL, 0xff0101ffffffffffULL,
+    0xff0101ffffffff01ULL, 0xff0101ffffff01ffULL, 0xff0101ffffff0101ULL, 0xff0101ffff000000ULL,
+    0xff0101ffff01ffffULL, 0xff0101ffff01ff01ULL, 0xff0101ffff0101ffULL, 0xff0101ffff010101ULL,
+    0xff0101ff00ff0000ULL, 0xff0101ff0000ff00ULL, 0xff0101ff000000ffULL, 0xff0101ff00010000ULL,
+    0xff0101ff01ffffffULL, 0xff0101ff01ffff01ULL, 0xff0101ff01ff01ffULL, 0xff0101ff01ff0101ULL,
+    0xff0101ff0101ffffULL, 0xff0101ff0101ff01ULL, 0xff0101ff010101ffULL, 0xff0101ff01010101ULL,
+    0xff010100ffff0100ULL, 0xff010100ff00ff00ULL, 0xff010100ff0000ffULL, 0xff010100ff000100ULL,
+    0xff010100ff010000ULL, 0xff01010000ff0001ULL, 0xff01010000ff0100ULL, 0xff0101000000ff01ULL,
+    0xff01010000000000ULL, 0xff0101000001ff00ULL, 0xff010100000100ffULL, 0xff01010000010001ULL,
+    0xff01010000010100ULL, 0xff01010001ff0000ULL, 0xff0101000100ffffULL, 0xff01010001000001ULL,
+    0xff01010001000100ULL, 0xff010100010100ffULL, 0xff01010001010000ULL, 0xff010101ffffffffULL,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+    0xff010101ffffff01ULL, 0xff010101ffff01ffULL, 0xff010101ffff0101ULL, 0xff010101ff01ffffULL,
+    0xff010101ff01ff01ULL, 0xff010101ff0101ffULL, 0xff010101ff010101ULL, 0xff01010100ff0000ULL,
+    0xff0101010000ff00ULL, 0xff01010100000001ULL, 0xff01010100000100ULL, 0xff01010100010000ULL,
+    0xff01010101ffffffULL, 0xff01010101ffff01ULL, 0xff01010101ff01ffULL, 0xff01010101ff0101ULL,
+    0xff01010101000000ULL, 0xff0101010101ffffULL, 0xff0101010101ff01ULL, 0xff010101010101ffULL,
+    0xff01010101010101ULL, 0x00ffffffffff0000ULL, 0x00ffffffff00ff00ULL, 0x00ffffffff000001ULL,
+    0x00ffffffff010000ULL, 0x00ffffff00ff0100ULL, 0x00ffffff0000ff01ULL, 0x00ffffff00000000ULL,
+    0x00ffffff000001ffULL, 0x00ffffff00000101ULL, 0x00ffffff0001ff00ULL, 0x00ffffff000100ffULL,
+    0x00ffffff00010001ULL, 0x00ffffff010000ffULL, 0x00ffffff01000100ULL, 0x00ffffff0101ff00ULL,
+    0x00ffffff01010001ULL, 0x00ffff00ffffffffULL, 0x00ffff00ffffff00ULL, 0x00ffff00ffff00ffULL,
+    0x00ffff00ffff0001ULL, 0x00ffff00ffff0100ULL, 0x00ffff00ff00ff01ULL, 0x00ffff00ff000000ULL,
+    0x00ffff00ff000001ULL, 0x00ffff00ff0001ffULL, 0x00ffff00ff000101ULL, 0x00ffff00ff01ff00ULL,
+    0x00ffff00ff010001ULL, 0x00ffff00ff010100ULL, 0x00ffff0000ff0000ULL, 0x00ffff0000ff01ffULL,
+    0x00ffff0000ff0101ULL, 0x00ffff000000ff00ULL, 0x00ffff00000000ffULL, 0x00ffff0000000000ULL,
+    0x00ffff0000000001ULL, 0x00ffff0000000100ULL, 0x00ffff0000000101ULL, 0x00ffff0000010000ULL,
+    0x00ffff00000101ffULL, 0x00ffff0000010101ULL, 0x00ffff0001ffff00ULL, 0x00ffff0001ff00ffULL,
+    0x00ffff0001ff0001ULL, 0x00ffff000100ffffULL, 0x00ffff000100ff01ULL, 0x00ffff0001000000ULL,
+    0x00ffff000101ffffULL, 0x00ffff000101ff00ULL, 0x00ffff000101ff01ULL, 0x00ffff01ffff0000ULL,
+    0x00ffff01ff00ff00ULL, 0x00ffff01ff0000ffULL, 0x00ffff01ff000001ULL, 0x00ffff01ff010000ULL,
+    0x00ffff0100ffff00ULL, 0x00ffff010000ff01ULL, 0x00ffff0100000000ULL, 0x00ffff0100000101ULL,
+    0x00ffff01000100ffULL, 0x00ffff0100010100ULL, 0x00ffff0101ff0100ULL, 0x00ffff01010000ffULL,
+    0x00ffff0101010000ULL, 0x00ff00ffffffff00ULL, 0x00ff00ffff000000ULL, 0x00ff00ffff000100ULL,
+    0x00ff00ffff010100ULL, 0x00ff00ff00ff0000ULL, 0x00ff00ff00ff01ffULL, 0x00ff00ff00ff0101ULL,
+    0x00ff00ff0000ff00ULL, 0x00ff00ff000000ffULL, 0x00ff00ff00000000ULL, 0x00ff00ff00000001ULL,
+    0x00ff00ff0001ff00ULL, 0x00ff00ff0001ff01ULL, 0x00ff00ff00010000ULL, 0x00ff00ff000101ffULL,
+    0x00ff00ff00010101ULL, 0x00ff00ff01ffff00ULL, 0x00ff00ff01ff0001ULL, 0x00ff00ff01ff0100ULL,
+    0x00ff00ff0100ffffULL, 0x00ff00ff0100ff01ULL, 0x00ff00ff01000000ULL, 0x00ff00ff0101ffffULL,
+    0x00ff00ff0101ff00ULL, 0x00ff00ff01010100ULL, 0x00ff0000ffffff00ULL, 0x00ff0000ffffff01ULL,
+    0x00ff0000ffff0000ULL, 0x00ff0000ffff0101ULL, 0x00ff0000ff00ff00ULL, 0x00ff0000ff0000ffULL,
+    0x00ff0000ff000000ULL, 0x00ff0000ff000001ULL, 0x00ff0000ff000100ULL, 0x00ff0000ff01ffffULL,
+    0x00ff0000ff010000ULL, 0x00ff0000ff010101ULL, 0x00ff000000ffff00ULL, 0x00ff000000ff00ffULL,
+    0x00ff000000ff0000ULL, 0x00ff000000ff0001ULL, 0x00ff000000ff0100ULL, 0x00ff00000000ffffULL,
+    0x00ff00000000ff00ULL, 0x00ff0000000000ffULL, 0x00ff000000000000ULL, 0x00ff000000000001ULL,
+    0x00ff0000000001ffULL, 0x00ff000000000100ULL, 0x00ff00000001ff00ULL, 0x00ff0000000100ffULL,
+    0x00ff000000010000ULL, 0x00ff000000010001ULL, 0x00ff000000010100ULL, 0x00ff000001ffff01ULL,
+    0x00ff000001ff00ffULL, 0x00ff000001ff0000ULL, 0x00ff000001ff01ffULL, 0x00ff00000100ff00ULL,
+    0x00ff0000010000ffULL, 0x00ff000001000000ULL, 0x00ff000001000001ULL, 0x00ff000001000100ULL,
+    0x00ff000001000101ULL, 0x00ff000001010000ULL, 0x00ff0000010101ffULL, 0x00ff000001010101ULL,
+    0x00ff0001ffffff00ULL, 0x00ff0001ffff0000ULL, 0x00ff0001ffff0100ULL, 0x00ff0001ff0000ffULL,
+    0x00ff0001ff000000ULL, 0x00ff0001ff0001ffULL, 0x00ff0001ff000101ULL, 0x00ff0001ff01ff00ULL,
+    0x00ff0001ff0100ffULL, 0x00ff0001ff010100ULL, 0x00ff000100ffffffULL, 0x00ff000100ffff01ULL,
+    0x00ff000100ff0000ULL, 0x00ff000100ff01ffULL, 0x00ff00010000ffffULL, 0x00ff00010000ff00ULL,
+    0x00ff00010000ff01ULL, 0x00ff000100000000ULL, 0x00ff000100000001ULL, 0x00ff000100000100ULL,
+    0x00ff00010001ff01ULL, 0x00ff000100010000ULL, 0x00ff0001000101ffULL, 0x00ff000101ffff00ULL,
+    0x00ff000101ff0000ULL, 0x00ff000101ff0101ULL, 0x00ff0001010000ffULL, 0x00ff000101000000ULL,
+    0x00ff00010101ff00ULL, 0x00ff0001010100ffULL, 0x00ff000101010001ULL, 0x00ff01ffffff0000ULL,
+    0x00ff01ffff00ff00ULL, 0x00ff01ffff000000ULL, 0x00ff01ffff000101ULL, 0x00ff01ffff010000ULL,
+    0x00ff01ff00ffff01ULL, 0x00ff01ff00ff0100ULL, 0x00ff01ff0000ffffULL, 0x00ff01ff00000000ULL,
+    0x00ff01ff000001ffULL, 0x00ff01ff0001ff00ULL, 0x00ff01ff000100ffULL, 0x00ff01ff00010001ULL,
+    0x00ff01ff00010100ULL, 0x00ff01ff01ff0000ULL, 0x00ff01ff0100ff00ULL, 0x00ff01ff010000ffULL,
+    0x00ff01ff01000001ULL, 0x00ff01ff01000100ULL, 0x00ff01ff01010000ULL, 0x00ff0100ffffff00ULL,
+    0x00ff0100ffff0000ULL, 0x00ff0100ffff0001ULL, 0x00ff0100ffff0101ULL, 0x00ff0100ff00ffffULL,
+    0x00ff0100ff0000ffULL, 0x00ff0100ff000000ULL, 0x00ff0100ff0001ffULL, 0x00ff0100ff01ff00ULL,
+    0x00ff0100ff0100ffULL, 0x00ff0100ff010001ULL, 0x00ff010000ffffffULL, 0x00ff010000ff0000ULL,
+    0x00ff010000ff0101ULL, 0x00ff01000000ff00ULL, 0x00ff01000000ff01ULL, 0x00ff0100000000ffULL,
+    0x00ff010000000000ULL, 0x00ff010000000001ULL, 0x00ff010000000100ULL, 0x00ff01000001ffffULL,
+    0x00ff01000001ff01ULL, 0x00ff010000010000ULL, 0x00ff010000010001ULL, 0x00ff010000010101ULL,
+    0x00ff010001ff0001ULL, 0x00ff010001ff0100ULL, 0x00ff01000100ff01ULL, 0x00ff010001000000ULL,
+    0x00ff010001000001ULL, 0x00ff0100010001ffULL, 0x00ff01000101ff00ULL, 0x00ff0100010100ffULL,
+    0x00ff010001010001ULL, 0x00ff010001010100ULL, 0x00ff0101ff000001ULL, 0x00ff010100ff00ffULL,
+    0x00ff010100ff0001ULL, 0x00ff010100ff0100ULL, 0x00ff010100000000ULL, 0x00ff0101000001ffULL,
+    0x00ff010100000101ULL, 0x00ff0101000100ffULL, 0x00ff010100010100ULL, 0x00ff0101010000ffULL,
+    0x00ff010101010000ULL, 0x0000ffffffffff00ULL, 0x0000ffffffff00ffULL, 0x0000ffffffff0000ULL,
+    0x0000ffffffff0001ULL, 0x0000ffffffff0100ULL, 0x0000ffffff00ff01ULL, 0x0000ffffff000000ULL,
+    0x0000ffffff000101ULL, 0x0000ffffff01ff00ULL, 0x0000ffffff0100ffULL, 0x0000ffffff010100ULL,
+    0x0000ffff00ffffffULL, 0x0000ffff00ff0000ULL, 0x0000ffff00ff01ffULL, 0x0000ffff0000ff00ULL,
+    0x0000ffff000000ffULL, 0x0000ffff00000000ULL, 0x0000ffff00000001ULL, 0x0000ffff00000100ULL,
+    0x0000ffff00010000ULL, 0x0000ffff000101ffULL, 0x0000ffff01ff0001ULL, 0x0000ffff01ff0100ULL,
+    0x0000ffff01000000ULL, 0x0000ffff010001ffULL, 0x0000ffff0101ffffULL, 0x0000ffff0101ff00ULL,
+    0x0000ffff01010001ULL, 0x0000ffff01010100ULL, 0x0000ff00ffff0000ULL, 0x0000ff00ffff01ffULL,
+    0x0000ff00ffff0100ULL, 0x0000ff00ffff0101ULL, 0x0000ff00ff00ff00ULL, 0x0000ff00ff0000ffULL,
+    0x0000ff00ff000000ULL, 0x0000ff00ff000001ULL, 0x0000ff00ff0001ffULL, 0x0000ff00ff000100ULL,
+    0x0000ff00ff01ffffULL, 0x0000ff00ff010000ULL, 0x0000ff00ff010001ULL, 0x0000ff00ff0101ffULL,
+    0x0000ff00ff010101ULL, 0x0000ff0000ffff00ULL, 0x0000ff0000ff00ffULL, 0x0000ff0000ff0000ULL,
+    0x0000ff0000ff0001ULL, 0x0000ff0000ff0100ULL, 0x0000ff000000ffffULL, 0x0000ff000000ff00ULL,
+    0x0000ff000000ff01ULL, 0x0000ff00000000ffULL, 0x0000ff0000000000ULL, 0x0000ff0000000001ULL,
+    0x0000ff00000001ffULL, 0x0000ff0000000100ULL, 0x0000ff0000000101ULL, 0x0000ff000001ff00ULL,
+    0x0000ff00000100ffULL, 0x0000ff0000010000ULL, 0x0000ff0000010001ULL, 0x0000ff0000010100ULL,
+    0x0000ff0001ffff01ULL, 0x0000ff0001ff0000ULL, 0x0000ff000100ff00ULL, 0x0000ff00010000ffULL,
+    0x0000ff0001000000ULL, 0x0000ff0001000001ULL, 0x0000ff0001000100ULL, 0x0000ff000101ffffULL,
+    0x0000ff0001010000ULL, 0x0000ff0001010101ULL, 0x0000ff01ffffff00ULL, 0x0000ff01ffff0001ULL,
+    0x0000ff01ff00ff01ULL, 0x0000ff01ff000000ULL, 0x0000ff01ff000101ULL, 0x0000ff01ff01ff00ULL,
+    0x0000ff01ff0100ffULL, 0x0000ff0100ffff01ULL, 0x0000ff0100ff0000ULL, 0x0000ff0100ff0101ULL,
+    0x0000ff010000ff00ULL, 0x0000ff01000000ffULL, 0x0000ff0100000000ULL, 0x0000ff0100000001ULL,
+    0x0000ff0100000100ULL, 0x0000ff010001ff01ULL, 0x0000ff0100010000ULL, 0x0000ff0101ff0000ULL,
+    0x0000ff010100ffffULL, 0x0000ff010100ff01ULL, 0x0000ff0101000000ULL, 0x0000ff0101000100ULL,
+    0x0000ff0101000101ULL, 0x0000ff01010100ffULL, 0x000000ffffff00ffULL, 0x000000ffffff0000ULL,
+    0x000000ffff00ff00ULL, 0x000000ffff0000ffULL, 0x000000ffff000000ULL, 0x000000ffff000001ULL,
+    0x000000ffff0001ffULL, 0x000000ffff000100ULL, 0x000000ffff01ff00ULL, 0x000000ffff010000ULL,
+    0x000000ffff0101ffULL, 0x000000ffff010101ULL, 0x000000ff00ffff00ULL, 0x000000ff00ff00ffULL,
+    0x000000ff00ff0000ULL, 0x000000ff00ff0001ULL, 0x000000ff00ff0100ULL, 0x000000ff00ff0101ULL,
+    0x000000ff0000ffffULL, 0x000000ff0000ff00ULL, 0x000000ff000000ffULL, 0x000000ff00000000ULL,
+    0x000000ff00000001ULL, 0x000000ff000001ffULL, 0x000000ff00000100ULL, 0x000000ff00000101ULL,
+    0x000000ff0001ff00ULL, 0x000000ff0001ff01ULL, 0x000000ff000100ffULL, 0x000000ff00010000ULL,
+    0x000000ff00010001ULL, 0x000000ff00010100ULL, 0x000000ff01ffffffULL, 0x000000ff01ff01ffULL,
+    0x000000ff01ff0101ULL, 0x000000ff0100ff00ULL, 0x000000ff010000ffULL, 0x000000ff01000000ULL,
+    0x000000ff01000001ULL, 0x000000ff01000100ULL, 0x000000ff0101ff00ULL, 0x000000ff010100ffULL,
+    0x000000ff01010000ULL, 0x000000ff01010101ULL, 0x00000000ffffff00ULL, 0x00000000ffffff01ULL,
+    0x00000000ffff00ffULL, 0x00000000ffff0000ULL, 0x00000000ffff0001ULL, 0x00000000ffff0100ULL,
+    0x00000000ff00ffffULL, 0x00000000ff00ff00ULL, 0x00000000ff00ff01ULL, 0x00000000ff0000ffULL,
+    0x00000000ff000000ULL, 0x00000000ff000001ULL, 0x00000000ff000100ULL, 0x00000000ff000101ULL,
+    0x00000000ff01ff00ULL, 0x00000000ff0100ffULL, 0x00000000ff010000ULL, 0x00000000ff010001ULL,
+    0x00000000ff010100ULL, 0x0000000000ffffffULL, 0x0000000000ffff00ULL, 0x0000000000ffff01ULL,
+    0x0000000000ff00ffULL, 0x0000000000ff0000ULL, 0x0000000000ff0001ULL, 0x0000000000ff01ffULL,
+    0x0000000000ff0100ULL, 0x000000000000ffffULL, 0x000000000000ff00ULL, 0x000000000000ff01ULL,
+    0x00000000000000ffULL, 0x0000000000000000ULL, 0x0000000000000001ULL, 0x00000000000001ffULL,
+    0x0000000000000100ULL, 0x0000000000000101ULL, 0x000000000001ffffULL, 0x000000000001ff00ULL,
+    0x00000000000100ffULL, 0x0000000000010000ULL, 0x0000000000010001ULL, 0x00000000000101ffULL,
+    0x0000000000010100ULL, 0x0000000000010101ULL, 0x0000000001ffff00ULL, 0x0000000001ff00ffULL,
+    0x0000000001ff0000ULL, 0x0000000001ff0100ULL, 0x0000000001ff0101ULL, 0x000000000100ffffULL,
+    0x000000000100ff00ULL, 0x00000000010000ffULL, 0x0000000001000000ULL, 0x0000000001000001ULL,
+    0x00000000010001ffULL, 0x0000000001000100ULL, 0x000000000101ff00ULL, 0x00000000010100ffULL,
+    0x0000000001010000ULL, 0x0000000001010001ULL, 0x0000000001010100ULL, 0x00000001ffffffffULL,
+    0x00000001ffffff00ULL, 0x00000001ffffff01ULL, 0x00000001ffff00ffULL, 0x00000001ffff0001ULL,
+    0x00000001ffff01ffULL, 0x00000001ffff0100ULL, 0x00000001ff00ff00ULL, 0x00000001ff0000ffULL,
+    0x00000001ff000000ULL, 0x00000001ff0001ffULL, 0x00000001ff000100ULL, 0x00000001ff01ffffULL,
+    0x00000001ff01ff00ULL, 0x00000001ff01ff01ULL, 0x00000001ff0100ffULL, 0x00000001ff010000ULL,
+    0x00000001ff010001ULL, 0x00000001ff0101ffULL, 0x00000001ff010100ULL, 0x0000000100ffff00ULL,
+    0x0000000100ff0000ULL, 0x0000000100ff0001ULL, 0x0000000100ff01ffULL, 0x0000000100ff0100ULL,
+    0x0000000100ff0101ULL, 0x000000010000ffffULL, 0x000000010000ff00ULL, 0x000000010000ff01ULL,
+    0x00000001000000ffULL, 0x0000000100000000ULL, 0x0000000100000001ULL, 0x00000001000001ffULL,
+    0x0000000100000100ULL, 0x0000000100000101ULL, 0x000000010001ff00ULL, 0x00000001000100ffULL,
+    0x0000000100010000ULL, 0x0000000100010100ULL, 0x0000000101ffff01ULL, 0x0000000101ff0000ULL,
+    0x0000000101ff0001ULL, 0x0000000101ff01ffULL, 0x0000000101ff0100ULL, 0x0000000101ff0101ULL,
+    0x000000010100ff00ULL, 0x0000000101000000ULL, 0x0000000101000101ULL, 0x000000010101ff01ULL,
+    0x0000000101010000ULL, 0x0000000101010001ULL, 0x00000001010101ffULL, 0x0000000101010100ULL,
+    0x000001ffffff00ffULL, 0x000001ffffff0000ULL, 0x000001ffffff0001ULL, 0x000001ffffff0100ULL,
+    0x000001ffff00ffffULL, 0x000001ffff000000ULL, 0x000001ffff0001ffULL, 0x000001ffff01ff00ULL,
+    0x000001ffff010101ULL, 0x000001ff00ff0000ULL, 0x000001ff00ff01ffULL, 0x000001ff00ff0101ULL,
+    0x000001ff0000ff00ULL, 0x000001ff000000ffULL, 0x000001ff00000000ULL, 0x000001ff00000001ULL,
+    0x000001ff000001ffULL, 0x000001ff00000100ULL, 0x000001ff0001ffffULL, 0x000001ff0001ff01ULL,
+    0x000001ff000100ffULL, 0x000001ff00010000ULL, 0x000001ff01ffff01ULL, 0x000001ff01ff0100ULL,
+    0x000001ff0100ffffULL, 0x000001ff0100ff01ULL, 0x000001ff01000000ULL, 0x000001ff010001ffULL,
+    0x000001ff0101ff00ULL, 0x000001ff01010100ULL, 0x00000100ffffff00ULL, 0x00000100ffffff01ULL,
+    0x00000100ffff0000ULL, 0x00000100ffff0101ULL, 0x00000100ff00ff00ULL, 0x00000100ff0000ffULL,
+    0x00000100ff000000ULL, 0x00000100ff000001ULL, 0x00000100ff000100ULL, 0x00000100ff010000ULL,
+    0x0000010000ffff00ULL, 0x0000010000ff00ffULL, 0x0000010000ff0000ULL, 0x0000010000ff0001ULL,
+    0x0000010000ff0100ULL, 0x000001000000ffffULL, 0x000001000000ff00ULL, 0x000001000000ff01ULL,
+    0x00000100000000ffULL, 0x0000010000000000ULL, 0x0000010000000001ULL, 0x00000100000001ffULL,
+    0x0000010000000100ULL, 0x0000010000000101ULL, 0x000001000001ff00ULL, 0x00000100000100ffULL,
+    0x0000010000010000ULL, 0x0000010000010001ULL, 0x0000010000010100ULL, 0x0000010001ffff00ULL,
+    0x0000010001ff0000ULL, 0x0000010001ff0100ULL, 0x000001000100ff00ULL, 0x00000100010000ffULL,
+    0x0000010001000000ULL, 0x0000010001000001ULL, 0x00000100010001ffULL, 0x0000010001000100ULL,
+    0x0000010001010000ULL, 0x00000101ffff00ffULL, 0x00000101ffff01ffULL, 0x00000101ff000000ULL,
+    0x00000101ff000101ULL, 0x00000101ff01ffffULL, 0x00000101ff010000ULL, 0x00000101ff010001ULL,
+    0x00000101ff010100ULL, 0x0000010100ff0000ULL, 0x0000010100ff01ffULL, 0x0000010100ff0100ULL,
+    0x000001010000ff00ULL, 0x0000010100000000ULL, 0x0000010100000001ULL, 0x00000101000001ffULL,
+    0x0000010100000100ULL, 0x000001010001ff01ULL, 0x0000010100010000ULL, 0x00000101000101ffULL,
+    0x0000010100010101ULL, 0x0000010101ffff00ULL, 0x0000010101ff0101ULL, 0x000001010100ff01ULL,
+    0x0000010101000000ULL, 0x0000010101000001ULL, 0x00000101010001ffULL, 0x0000010101000101ULL,
+    0x000001010101ff00ULL, 0x0001ffffffff0000ULL, 0x0001ffffff0000ffULL, 0x0001ffffff000001ULL,
+    0x0001ffffff000100ULL, 0x0001ffffff010000ULL, 0x0001ffff00ff00ffULL, 0x0001ffff0000ffffULL,
+    0x0001ffff00000000ULL, 0x0001ffff00000001ULL, 0x0001ffff000001ffULL, 0x0001ffff00000101ULL,
+    0x0001ffff0001ff00ULL, 0x0001ffff000100ffULL, 0x0001ffff00010001ULL, 0x0001ffff00010100ULL,
+    0x0001ffff01ffff00ULL, 0x0001ffff01000001ULL, 0x0001ffff01010000ULL, 0x0001ff00ffffff00ULL,
+    0x0001ff00ffff00ffULL, 0x0001ff00ffff0001ULL, 0x0001ff00ffff0100ULL, 0x0001ff00ff00ff01ULL,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+    0x0001ff00ff000000ULL, 0x0001ff00ff01ff00ULL, 0x0001ff00ff01ff01ULL, 0x0001ff00ff010001ULL,
+    0x0001ff00ff010100ULL, 0x0001ff0000ff0000ULL, 0x0001ff0000ff0100ULL, 0x0001ff000000ff00ULL,
+    0x0001ff0000000000ULL, 0x0001ff0000000001ULL, 0x0001ff0000000100ULL, 0x0001ff0000010000ULL,
+    0x0001ff0000010001ULL, 0x0001ff0000010101ULL, 0x0001ff0001ff00ffULL, 0x0001ff0001ff0101ULL,
+    0x0001ff000100ff01ULL, 0x0001ff0001000000ULL, 0x0001ff000101ff00ULL, 0x0001ff0001010001ULL,
+    0x0001ff0001010100ULL, 0x0001ff01ff00ff00ULL, 0x0001ff01ff000001ULL, 0x0001ff01ff000100ULL,
+    0x0001ff0100ffffffULL, 0x0001ff0100ffff00ULL, 0x0001ff0100ff0001ULL, 0x0001ff0100000000ULL,
+    0x0001ff0100000001ULL, 0x0001ff01000001ffULL, 0x0001ff010001ffffULL, 0x0001ff0101ff0000ULL,
+    0x0001ff010100ff00ULL, 0x0001ff0101000001ULL, 0x0001ff0101010000ULL, 0x000100ffff00ff00ULL,
+    0x000100ffff00ff01ULL, 0x000100ffff000000ULL, 0x000100ffff000001ULL, 0x000100ffff000101ULL,
+    0x000100ffff01ff00ULL, 0x000100ffff010001ULL, 0x000100ffff010100ULL, 0x000100ff00ffffffULL,
+    0x000100ff00ffff01ULL, 0x000100ff00ff0000ULL, 0x000100ff00ff01ffULL, 0x000100ff00ff0101ULL,
+    0x000100ff0000ff00ULL, 0x000100ff000000ffULL, 0x000100ff00000000ULL, 0x000100ff00000001ULL,
+    0x000100ff00000100ULL, 0x000100ff00000101ULL, 0x000100ff0001ffffULL, 0x000100ff0001ff01ULL,
+    0x000100ff00010000ULL, 0x000100ff01ff00ffULL, 0x000100ff01ff0000ULL, 0x000100ff01ff0100ULL,
+    0x000100ff0100ffffULL, 0x000100ff0100ff01ULL, 0x000100ff010000ffULL, 0x000100ff01000000ULL,
+    0x000100ff01000001ULL, 0x000100ff010001ffULL, 0x000100ff01000101ULL, 0x000100ff0101ff00ULL,
+    0x000100ff010100ffULL, 0x000100ff01010100ULL, 0x00010000ffff0000ULL, 0x00010000ffff01ffULL,
+    0x00010000ffff0101ULL, 0x00010000ff00ff00ULL, 0x00010000ff000000ULL, 0x00010000ff000001ULL,
+    0x00010000ff000100ULL, 0x0001000000ff00ffULL, 0x0001000000ff0000ULL, 0x0001000000ff0001ULL,
+    0x0001000000ff0100ULL, 0x000100000000ffffULL, 0x000100000000ff00ULL, 0x00010000000000ffULL,
+    0x0001000000000000ULL, 0x0001000000000001ULL, 0x0001000000000100ULL, 0x000100000001ff00ULL,
+    0x00010000000100ffULL, 0x0001000000010000ULL, 0x0001000000010001ULL, 0x0001000000010100ULL,
+    0x0001000001ff0001ULL, 0x0001000001ff0100ULL, 0x0001000001ff0101ULL, 0x000100000100ff00ULL,
+    0x0001000001000000ULL, 0x0001000001000001ULL, 0x0001000001000100ULL, 0x0001000001000101ULL,
+    0x000100000101ff01ULL, 0x0001000001010000ULL, 0x0001000001010001ULL, 0x00010000010101ffULL,
+    0x00010001ffffff01ULL, 0x00010001ffff0100ULL, 0x00010001ff000000ULL, 0x00010001ff01ffffULL,
+    0x00010001ff010001ULL, 0x00010001ff0101ffULL, 0x00010001ff010100ULL, 0x0001000100ffffffULL,
+    0x0001000100ff0000ULL, 0x0001000100ff01ffULL, 0x0001000100ff0101ULL, 0x000100010000ff00ULL,
+    0x00010001000000ffULL, 0x0001000100000000ULL, 0x0001000100000001ULL, 0x00010001000001ffULL,
+    0x0001000100000101ULL, 0x000100010001ffffULL, 0x0001000100010000ULL, 0x00010001000101ffULL,
+    0x0001000101ffffffULL, 0x0001000101ffff01ULL, 0x0001000101ff0000ULL, 0x0001000101ff0101ULL,
+    0x00010001010000ffULL, 0x0001000101000001ULL, 0x00010001010001ffULL, 0x0001000101000100ULL,
+    0x000100010101ffffULL, 0x00010001010100ffULL, 0x0001000101010001ULL, 0x0001000101010101ULL,
+    0x000101ffff000001ULL, 0x000101ffff000100ULL, 0x000101ffff010000ULL, 0x000101ff00ffff00ULL,
+    0x000101ff0000ff01ULL, 0x000101ff00000000ULL, 0x000101ff00000101ULL, 0x000101ff0001ff00ULL,
+    0x000101ff00010100ULL, 0x000101ff01ff0000ULL, 0x000101ff0100ff00ULL, 0x000101ff010001ffULL,
+    0x000101ff01010001ULL, 0x00010100ffffff00ULL, 0x00010100ffff00ffULL, 0x00010100ff00ffffULL,
+    0x00010100ff000000ULL, 0x00010100ff01ff00ULL, 0x00010100ff0100ffULL, 0x00010100ff010001ULL,
+    0x00010100ff010100ULL, 0x0001010000ffffffULL, 0x0001010000ffff00ULL, 0x0001010000ff0000ULL,
+    0x0001010000ff0001ULL, 0x0001010000ff01ffULL, 0x000101000000ff00ULL, 0x00010100000000ffULL,
+    0x0001010000000000ULL, 0x0001010000000001ULL, 0x0001010000000100ULL, 0x000101000001ffffULL,
+    0x0001010000010000ULL, 0x0001010000010101ULL, 0x0001010001ffff01ULL, 0x0001010001ff00ffULL,
+    0x0001010001ff0101ULL, 0x0001010001000000ULL, 0x000101000101ff00ULL, 0x00010100010100ffULL,
+    0x0001010001010000ULL, 0x0001010001010100ULL, 0x00010101ff00ff00ULL, 0x00010101ff000001ULL,
+    0x00010101ff0001ffULL, 0x0001010100ffff00ULL, 0x0001010100ff00ffULL, 0x0001010100ff0100ULL,
+    0x000101010000ffffULL, 0x0001010100000000ULL, 0x00010101000001ffULL, 0x0001010100000101ULL,
+    0x00010101000100ffULL, 0x0001010100010000ULL, 0x0001010100010100ULL, 0x0001010101ff0001ULL,
+    0x00010101010000ffULL, 0x00010101010001ffULL, 0x0001010101000101ULL, 0x0001010101010001ULL,
+    0x01ffffffffffffffULL, 0x01ffffffffffff01ULL, 0x01ffffffffff01ffULL, 0x01ffffffffff0101ULL,
+    0x01ffffffff01ffffULL, 0x01ffffffff01ff01ULL, 0x01ffffffff0101ffULL, 0x01ffffffff010101ULL,
+    0x01ffffff00ff0000ULL, 0x01ffffff0000ffffULL, 0x01ffffff0000ff00ULL, 0x01ffffff000000ffULL,
+    0x01ffffff00000001ULL, 0x01ffffff00000100ULL, 0x01ffffff00010000ULL, 0x01ffffff01ffffffULL,
+    0x01ffffff01ffff01ULL, 0x01ffffff01ff01ffULL, 0x01ffffff01ff0101ULL, 0x01ffffff01000000ULL,
+    0x01ffffff0101ffffULL, 0x01ffffff0101ff01ULL, 0x01ffffff010101ffULL, 0x01ffffff01010101ULL,
+    0x01ffff00ffff0000ULL, 0x01ffff00ff00ff00ULL, 0x01ffff00ff0000ffULL, 0x01ffff00ff000001ULL,
+    0x01ffff00ff000100ULL, 0x01ffff00ff010000ULL, 0x01ffff0000ffff00ULL, 0x01ffff0000ff00ffULL,
+    0x01ffff0000ff0100ULL, 0x01ffff000000ffffULL, 0x01ffff000000ff01ULL, 0x01ffff0000000000ULL,
+    0x01ffff0000000001ULL, 0x01ffff00000001ffULL, 0x01ffff0000000100ULL, 0x01ffff00000100ffULL,
+    0x01ffff0000010001ULL, 0x01ffff0000010100ULL, 0x01ffff0001ff0000ULL, 0x01ffff0001ff0100ULL,
+    0x01ffff00010000ffULL, 0x01ffff0001000001ULL, 0x01ffff0001000100ULL, 0x01ffff0001010000ULL,
+    0x01ffff01ffffffffULL, 0x01ffff01ffffff01ULL, 0x01ffff01ffff01ffULL, 0x01ffff01ffff0101ULL,
+    0x01ffff01ff000000ULL, 0x01ffff01ff01ffffULL, 0x01ffff01ff01ff01ULL, 0x01ffff01ff0101ffULL,
+    0x01ffff01ff010101ULL, 0x01ffff010000ff00ULL, 0x01ffff01000000ffULL, 0x01ffff0100000100ULL,
+    0x01ffff0100010000ULL, 0x01ffff0101ffffffULL, 0x01ffff0101ffff01ULL, 0x01ffff0101ff01ffULL,
+    0x01ffff0101ff0101ULL, 0x01ffff0101000000ULL, 0x01ffff010101ffffULL, 0x01ffff010101ff01ULL,
+    0x01ffff01010101ffULL, 0x01ffff0101010101ULL, 0x01ff00ffff0000ffULL, 0x01ff00ffff000100ULL,
+    0x01ff00ff00ffff00ULL, 0x01ff00ff00ff00ffULL, 0x01ff00ff0000ff00ULL, 0x01ff00ff00000000ULL,
+    0x01ff00ff00000101ULL, 0x01ff00ff0001ff00ULL, 0x01ff00ff000100ffULL, 0x01ff00ff00010100ULL,
+    0x01ff00ff010000ffULL, 0x01ff00ff01000100ULL, 0x01ff0000ffffff00ULL, 0x01ff0000ffff0100ULL,
+    0x01ff0000ff00ff01ULL, 0x01ff0000ff000000ULL, 0x01ff0000ff000101ULL, 0x01ff0000ff010001ULL,
+    0x01ff0000ff010100ULL, 0x01ff000000ffffffULL, 0x01ff000000ffff00ULL, 0x01ff000000ff0000ULL,
+    0x01ff000000ff01ffULL, 0x01ff00000000ff00ULL, 0x01ff0000000000ffULL, 0x01ff000000000000ULL,
+    0x01ff000000000001ULL, 0x01ff000000000100ULL, 0x01ff000000000101ULL, 0x01ff000000010000ULL,
+    0x01ff000000010001ULL, 0x01ff0000000101ffULL, 0x01ff000000010101ULL, 0x01ff000001ffff00ULL,
+    0x01ff000001ff00ffULL, 0x01ff000001ff0001ULL, 0x01ff000001ff0100ULL, 0x01ff00000100ffffULL,
+    0x01ff00000100ff01ULL, 0x01ff000001000000ULL, 0x01ff0000010001ffULL, 0x01ff000001010001ULL,
+    0x01ff0001ff00ff00ULL, 0x01ff0001ff000001ULL, 0x01ff0001ff000100ULL, 0x01ff0001ff010000ULL,
+    0x01ff000100ffff00ULL, 0x01ff000100ff00ffULL, 0x01ff000100ff0100ULL, 0x01ff000100ff0101ULL,
+    0x01ff00010000ffffULL, 0x01ff000100000000ULL, 0x01ff000100000100ULL, 0x01ff000100000101ULL,
+    0x01ff00010001ff00ULL, 0x01ff000100010001ULL, 0x01ff000100010101ULL, 0x01ff000101ff0000ULL,
+    0x01ff00010100ff00ULL, 0x01ff000101000101ULL, 0x01ff0001010100ffULL, 0x01ff01ffffffffffULL,
+    0x01ff01ffffffff01ULL, 0x01ff01ffffff01ffULL, 0x01ff01ffffff0101ULL, 0x01ff01ffff000000ULL,
+    0x01ff01ffff01ffffULL, 0x01ff01ffff01ff01ULL, 0x01ff01ffff0101ffULL, 0x01ff01ffff010101ULL,
+    0x01ff01ff00ffff00ULL, 0x01ff01ff00ff0000ULL, 0x01ff01ff0000ff00ULL, 0x01ff01ff000000ffULL,
+    0x01ff01ff00000100ULL, 0x01ff01ff00010000ULL, 0x01ff01ff00010100ULL, 0x01ff01ff01ffffffULL,
+    0x01ff01ff01ffff01ULL, 0x01ff01ff01ff01ffULL, 0x01ff01ff01ff0101ULL, 0x01ff01ff01000000ULL,
+    0x01ff01ff0101ffffULL, 0x01ff01ff0101ff01ULL, 0x01ff01ff010101ffULL, 0x01ff01ff01010101ULL,
+    0x01ff0100ffff0000ULL, 0x01ff0100ffff0001ULL, 0x01ff0100ff00ff00ULL, 0x01ff0100ff0000ffULL,
+    0x01ff0100ff000001ULL, 0x01ff0100ff010000ULL, 0x01ff010000ffff00ULL, 0x01ff010000ff00ffULL,
+    0x01ff010000ff0001ULL, 0x01ff010000ff0100ULL, 0x01ff01000000ffffULL, 0x01ff01000000ff01ULL,
+    0x01ff010000000000ULL, 0x01ff010000000101ULL, 0x01ff01000001ff00ULL, 0x01ff0100000100ffULL,
+    0x01ff010001ff0000ULL, 0x01ff010001000001ULL, 0x01ff010001000100ULL, 0x01ff010001010000ULL,
+    0x01ff0101ffffffffULL, 0x01ff0101ffffff01ULL, 0x01ff0101ffff01ffULL, 0x01ff0101ffff0101ULL,
+    0x01ff0101ff000000ULL, 0x01ff0101ff01ffffULL, 0x01ff0101ff01ff01ULL, 0x01ff0101ff0101ffULL,
+    0x01ff0101ff010101ULL, 0x01ff010100ff0000ULL, 0x01ff01010000ff00ULL, 0x01ff0101000000ffULL,
+    0x01ff010100000001ULL, 0x01ff010101ffffffULL, 0x01ff010101ffff01ULL, 0x01ff010101ff01ffULL,
+    0x01ff010101ff0101ULL, 0x01ff010101000000ULL, 0x01ff01010101ffffULL, 0x01ff01010101ff01ULL,
+    0x01ff0101010101ffULL, 0x01ff010101010101ULL, 0x0100ffffffff0000ULL, 0x0100ffffff00ff00ULL,
+    0x0100ffffff000001ULL, 0x0100ffffff0001ffULL, 0x0100ffffff000100ULL, 0x0100ffffff010000ULL,
+    0x0100ffff00ffff00ULL, 0x0100ffff00ff0001ULL, 0x0100ffff00ff0100ULL, 0x0100ffff00000000ULL,
+    0x0100ffff000001ffULL, 0x0100ffff00000101ULL, 0x0100ffff00010100ULL, 0x0100ffff00010101ULL,
+    0x0100ffff01ff0000ULL, 0x0100ffff0100ff00ULL, 0x0100ffff010000ffULL, 0x0100ffff01000001ULL,
+    0x0100ffff01000100ULL, 0x0100ffff01010000ULL, 0x0100ff00ffffff00ULL, 0x0100ff00ffff00ffULL,
+    0x0100ff00ffff0001ULL, 0x0100ff00ffff0100ULL, 0x0100ff00ff00ffffULL, 0x0100ff00ff000000ULL,
+    0x0100ff00ff0001ffULL, 0x0100ff00ff000101ULL, 0x0100ff00ff01ff00ULL, 0x0100ff00ff0100ffULL,
+    0x0100ff00ff010001ULL, 0x0100ff00ff010100ULL, 0x0100ff0000ffffffULL, 0x0100ff0000ff0000ULL,
+    0x0100ff000000ffffULL, 0x0100ff000000ff00ULL, 0x0100ff00000000ffULL, 0x0100ff0000000000ULL,
+    0x0100ff0000000001ULL, 0x0100ff0000000100ULL, 0x0100ff000001ff01ULL, 0x0100ff0000010000ULL,
+    0x0100ff0001ff00ffULL, 0x0100ff0001ff0001ULL, 0x0100ff000100ff01ULL, 0x0100ff0001000000ULL,
+    0x0100ff00010001ffULL, 0x0100ff000101ff00ULL, 0x0100ff00010100ffULL, 0x0100ff0001010001ULL,
+    0x0100ff0001010100ULL, 0x0100ff01ffff0000ULL, 0x0100ff01ff00ff00ULL, 0x0100ff01ff0000ffULL,
+    0x0100ff01ff000100ULL, 0x0100ff01ff010000ULL, 0x0100ff0100ff00ffULL, 0x0100ff0100ff0001ULL,
+    0x0100ff0100ff0100ULL, 0x0100ff010000ffffULL, 0x0100ff010000ff01ULL, 0x0100ff0100000000ULL,
+    0x0100ff01000001ffULL, 0x0100ff0100010001ULL, 0x0100ff0100010100ULL, 0x0100ff0101ff0000ULL,
+    0x0100ff01010000ffULL, 0x0100ff0101000001ULL, 0x0100ff0101010100ULL, 0x010000ffffffff00ULL,
+    0x010000ffffff00ffULL, 0x010000ffffff0001ULL, 0x010000ffff00ffffULL, 0x010000ffff000000ULL,
+    0x010000ffff0001ffULL, 0x010000ffff010001ULL, 0x010000ff00ffffffULL, 0x010000ff00ff0101ULL,
+    0x010000ff0000ff00ULL, 0x010000ff000000ffULL, 0x010000ff00000000ULL, 0x010000ff00000001ULL,
+    0x010000ff000001ffULL, 0x010000ff00000100ULL, 0x010000ff0001ffffULL, 0x010000ff0001ff00ULL,
+    0x010000ff0001ff01ULL, 0x010000ff00010000ULL, 0x010000ff01ff00ffULL, 0x010000ff01ff0001ULL,
+    0x010000ff0100ff01ULL, 0x010000ff010000ffULL, 0x010000ff01000000ULL, 0x010000ff010001ffULL,
+    0x010000ff0101ff00ULL, 0x010000ff01010100ULL, 0x01000000ffffffffULL, 0x01000000ffff0000ULL,
+    0x01000000ffff01ffULL, 0x01000000ffff0101ULL, 0x01000000ff00ffffULL, 0x01000000ff00ff00ULL,
+    0x01000000ff0000ffULL, 0x01000000ff000000ULL, 0x01000000ff000001ULL, 0x01000000ff000100ULL,
+    0x01000000ff01ff00ULL, 0x01000000ff010000ULL, 0x01000000ff010100ULL, 0x01000000ff010101ULL,
+    0x0100000000ffff00ULL, 0x0100000000ff00ffULL, 0x0100000000ff0000ULL, 0x0100000000ff0001ULL,
+    0x0100000000ff0100ULL, 0x010000000000ffffULL, 0x010000000000ff00ULL, 0x010000000000ff01ULL,
+    0x01000000000000ffULL, 0x0100000000000000ULL, 0x0100000000000001ULL, 0x01000000000001ffULL,
+    0x0100000000000100ULL, 0x0100000000000101ULL, 0x010000000001ff00ULL, 0x01000000000100ffULL,
+    0x0100000000010000ULL, 0x0100000000010001ULL, 0x0100000000010100ULL, 0x0100000001ffff00ULL,
+    0x0100000001ff0000ULL, 0x0100000001ff01ffULL, 0x010000000100ff00ULL, 0x010000000100ff01ULL,
+    0x01000000010000ffULL, 0x0100000001000000ULL, 0x0100000001000001ULL, 0x0100000001000100ULL,
+    0x0100000001000101ULL, 0x010000000101ffffULL, 0x010000000101ff01ULL, 0x0100000001010000ULL,
+    0x01000000010101ffULL, 0x0100000001010101ULL, 0x01000001ffffff00ULL, 0x01000001ffff00ffULL,
+    0x01000001ff00ffffULL, 0x01000001ff000000ULL, 0x01000001ff000100ULL, 0x01000001ff01ffffULL,
+    0x01000001ff010001ULL, 0x01000001ff010100ULL, 0x0100000100ff0000ULL, 0x0100000100ff01ffULL,
+    0x0100000100ff0100ULL, 0x010000010000ff00ULL, 0x010000010000ff01ULL, 0x0100000100000000ULL,
+    0x0100000100000001ULL, 0x0100000100000100ULL, 0x0100000100010000ULL, 0x01000001000101ffULL,
+    0x0100000101ffff01ULL, 0x0100000101ff00ffULL, 0x0100000101ff0100ULL, 0x0100000101ff0101ULL,
+    0x010000010100ff01ULL, 0x01000001010000ffULL, 0x0100000101000000ULL, 0x01000001010100ffULL,
+    0x0100000101010001ULL, 0x0100000101010100ULL, 0x010001ffffff0000ULL, 0x010001ffff000001ULL,
+    0x010001ffff000100ULL, 0x010001ffff010000ULL, 0x010001ff00ffff00ULL, 0x010001ff00ff0001ULL,
+    0x010001ff0000ffffULL, 0x010001ff0000ff01ULL, 0x010001ff00000000ULL, 0x010001ff00000001ULL,
+    0x010001ff00000101ULL, 0x010001ff000100ffULL, 0x010001ff00010000ULL, 0x010001ff01ff0000ULL,
+    0x010001ff0100ff00ULL, 0x010001ff01000001ULL, 0x010001ff01000100ULL, 0x010001ff01010000ULL,
+    0x01000100ffff00ffULL, 0x01000100ffff0001ULL, 0x01000100ffff0100ULL, 0x01000100ff00ffffULL,
+    0x01000100ff00ff01ULL, 0x01000100ff000000ULL, 0x01000100ff0001ffULL, 0x01000100ff000101ULL,
+    0x01000100ff01ffffULL, 0x01000100ff01ff00ULL, 0x01000100ff0100ffULL, 0x01000100ff010001ULL,
+    0x0100010000ffffffULL, 0x0100010000ffff01ULL, 0x0100010000ff0000ULL, 0x0100010000ff01ffULL,
+    0x0100010000ff0101ULL, 0x010001000000ff00ULL, 0x01000100000000ffULL, 0x0100010000000000ULL,
+    0x0100010000000001ULL, 0x0100010000000100ULL, 0x010001000001ff01ULL, 0x0100010000010000ULL,
+    0x0100010000010001ULL, 0x0100010000010101ULL, 0x0100010001ffff00ULL, 0x0100010001ff00ffULL,
+    0x010001000100ffffULL, 0x010001000100ff01ULL, 0x0100010001000000ULL, 0x0100010001000101ULL,
+    0x010001000101ff00ULL, 0x0100010001010001ULL, 0x01000101ffff0000ULL, 0x01000101ff000000ULL,
+    0x01000101ff010000ULL, 0x0100010100ff00ffULL, 0x0100010100ff0001ULL, 0x0100010100ff0100ULL,
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+    0x010001010000ffffULL, 0x0100010100000000ULL, 0x01000101000001ffULL, 0x010001010001ff00ULL,
+    0x0100010101ff0000ULL, 0x010001010100ff00ULL, 0x01000101010000ffULL, 0x0100010101000000ULL,
+    0x0100010101000001ULL, 0x0101ffffffffffffULL, 0x0101ffffffffff01ULL, 0x0101ffffffff01ffULL,
+    0x0101ffffffff0101ULL, 0x0101ffffff000000ULL, 0x0101ffffff01ffffULL, 0x0101ffffff01ff01ULL,
+    0x0101ffffff0101ffULL, 0x0101ffffff010101ULL, 0x0101ffff00ff0000ULL, 0x0101ffff0000ff00ULL,
+    0x0101ffff000000ffULL, 0x0101ffff00000001ULL, 0x0101ffff00000100ULL, 0x0101ffff01ffffffULL,
+    0x0101ffff01ffff01ULL, 0x0101ffff01ff01ffULL, 0x0101ffff01ff0101ULL, 0x0101ffff01000000ULL,
+    0x0101ffff0101ffffULL, 0x0101ffff0101ff01ULL, 0x0101ffff010101ffULL, 0x0101ffff01010101ULL,
+    0x0101ff00ffff0000ULL, 0x0101ff00ffff0100ULL, 0x0101ff00ff00ff00ULL, 0x0101ff00ff0000ffULL,
+    0x0101ff00ff000001ULL, 0x0101ff00ff000100ULL, 0x0101ff00ff000101ULL, 0x0101ff0000ff0001ULL,
+    0x0101ff0000ff0100ULL, 0x0101ff000000ff00ULL, 0x0101ff0000000000ULL, 0x0101ff00000001ffULL,
+    0x0101ff0000000101ULL, 0x0101ff000001ff00ULL, 0x0101ff00000100ffULL, 0x0101ff0001ff0000ULL,
+    0x0101ff000100ffffULL, 0x0101ff000100ff01ULL, 0x0101ff0001000001ULL, 0x0101ff0001000100ULL,
+    0x0101ff01ffffff01ULL, 0x0101ff01ffff01ffULL, 0x0101ff01ffff0101ULL, 0x0101ff01ff00ffffULL,
+    0x0101ff01ff000100ULL, 0x0101ff01ff01ff01ULL, 0x0101ff01ff0101ffULL, 0x0101ff01ff010101ULL,
+    0x0101ff0100ff0000ULL, 0x0101ff010000ff00ULL, 0x0101ff0100000001ULL, 0x0101ff0100000100ULL,
+    0x0101ff0100010000ULL, 0x0101ff0101ffffffULL, 0x0101ff0101ffff01ULL, 0x0101ff0101ff01ffULL,
+    0x0101ff0101ff0101ULL, 0x0101ff0101000000ULL, 0x0101ff010101ffffULL, 0x0101ff010101ff01ULL,
+    0x0101ff01010101ffULL, 0x0101ff0101010101ULL, 0x010100ffff000100ULL, 0x010100ffff010000ULL,
+    0x010100ff00ffff00ULL, 0x010100ff00ff00ffULL, 0x010100ff0000ffffULL, 0x010100ff000000ffULL,
+    0x010100ff00000000ULL, 0x010100ff000001ffULL, 0x010100ff00000101ULL, 0x010100ff0001ff00ULL,
+    0x010100ff00010000ULL, 0x010100ff00010001ULL, 0x010100ff000101ffULL, 0x010100ff00010100ULL,
+    0x010100ff01ff0000ULL, 0x01010000ffff0001ULL, 0x01010000ffff0100ULL, 0x01010000ff00ffffULL,
+    0x01010000ff00ff01ULL, 0x01010000ff000000ULL, 0x01010000ff0001ffULL, 0x01010000ff010001ULL,
+    0x01010000ff010100ULL, 0x0101000000ffff01ULL, 0x0101000000ff0000ULL, 0x010100000000ff00ULL,
+    0x01010000000000ffULL, 0x0101000000000000ULL, 0x0101000000000001ULL, 0x0101000000000100ULL,
+    0x0101000000010000ULL, 0x0101000000010101ULL, 0x0101000001ffff00ULL, 0x0101000001ff00ffULL,
+    0x0101000001ff0000ULL, 0x0101000001ff0001ULL, 0x0101000001ff0100ULL, 0x010100000100ff01ULL,
+    0x0101000001000000ULL, 0x01010000010001ffULL, 0x01010001ffff0000ULL, 0x01010001ff00ff00ULL,
+    0x01010001ff000001ULL, 0x01010001ff000101ULL, 0x01010001ff01ff00ULL, 0x01010001ff010000ULL,
+    0x0101000100ff00ffULL, 0x0101000100ff0001ULL, 0x0101000100ff0101ULL, 0x010100010000ff01ULL,
+    0x0101000100000000ULL, 0x0101000100000001ULL, 0x01010001000001ffULL, 0x010100010001ffffULL,
+    0x010100010001ff01ULL, 0x0101000101ff0001ULL, 0x010100010100ffffULL, 0x0101000101000000ULL,
+    0x0101000101000001ULL, 0x0101000101000100ULL, 0x010100010101ff00ULL, 0x01010001010100ffULL,
+    0x0101000101010001ULL, 0x010101ffffffffffULL, 0x010101ffffffff01ULL, 0x010101ffffff01ffULL,
+    0x010101ffffff0101ULL, 0x010101ffff01ffffULL, 0x010101ffff01ff01ULL, 0x010101ffff0101ffULL,
+    0x010101ffff010101ULL, 0x010101ff0000ff00ULL, 0x010101ff000000ffULL, 0x010101ff00000001ULL,
+    0x010101ff00000100ULL, 0x010101ff01ffffffULL, 0x010101ff01ffff01ULL, 0x010101ff01ff01ffULL,
+    0x010101ff01ff0101ULL, 0x010101ff01000000ULL, 0x010101ff0101ffffULL, 0x010101ff0101ff01ULL,
+    0x010101ff010101ffULL, 0x010101ff01010101ULL, 0x01010100ffff0000ULL, 0x01010100ff0000ffULL,
+    0x01010100ff000100ULL, 0x01010100ff01ff00ULL, 0x01010100ff010000ULL, 0x0101010000ffff00ULL,
+    0x010101000000ffffULL, 0x0101010000000000ULL, 0x0101010000000101ULL, 0x010101000001ff00ULL,
+    0x0101010000010001ULL, 0x0101010000010100ULL, 0x010101000100ffffULL, 0x0101010001000001ULL,
+    0x01010101ffffffffULL, 0x01010101ffffff01ULL, 0x01010101ffff01ffULL, 0x01010101ffff0101ULL,
+    0x01010101ff01ffffULL, 0x01010101ff01ff01ULL, 0x01010101ff0101ffULL, 0x01010101ff010101ULL,
+    0x010101010000ff00ULL, 0x01010101000000ffULL, 0x0101010100000001ULL, 0x0101010101ffffffULL,
+    0x0101010101ffff01ULL, 0x0101010101ff01ffULL, 0x0101010101ff0101ULL, 0x0101010101000000ULL,
+    0x010101010101ffffULL, 0x010101010101ff01ULL, 0x01010101010101ffULL, 0x0101010101010101ULL,
+};
+
+// Scale of an IQ1_M super-block. Unlike every other K-quant here the f16 scale
+// is not a field: its sixteen bits are scattered four at a time across the top
+// nibbles of the four scale halfwords, which also carry the 3-bit sub-scales.
+__device__ __forceinline__ float iq1m_scale(const unsigned char* base) {
+    unsigned short sc[4];
+    memcpy(sc, base + 48, 8);
+    const unsigned short bits = (unsigned short)(
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) |
+        (sc[3] & 0xf000));
+    return __half2float(*((const __half*)&bits));
+}
+
+__device__ __forceinline__ float iq1m_value(
+    const unsigned char* packed, int absolute
+) {
+    // 56 bytes per 256 values: qs[32] qh[16] scales[8]. Every group of eight
+    // weights takes an 11-bit grid index -- eight bits from qs, three from the
+    // nibble of qh that covers it -- plus a per-group sign for a +-0.125 delta.
+    const int block = absolute / 256;
+    const int within = absolute & 255;
+    const unsigned char* base = packed + block * 56;
+    unsigned short sc[4];
+    memcpy(sc, base + 48, 8);
+    const int ib = within / 32;
+    const int group = (within % 32) / 8;
+    const int lane = within & 7;
+    const unsigned char qh = base[32 + ib * 2 + group / 2];
+    const unsigned int index = (unsigned int)base[ib * 4 + group] |
+        (((unsigned int)qh << ((group & 1) ? 4 : 8)) & 0x700u);
+    const float delta = (qh & ((group & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+    // The two halves of a sub-block carry separate 3-bit scales, three bits
+    // apart in the halfword covering this pair of sub-blocks.
+    const int shift = 6 * (ib & 1) + (group < 2 ? 0 : 3);
+    const float scale =
+        iq1m_scale(base) * (float)(2 * ((sc[ib / 2] >> shift) & 7) + 1);
+    const float weight =
+        (float)(signed char)((kIq1sGrid[index] >> (8 * lane)) & 0xffULL);
+    return scale * (weight + delta);
+}
+
+extern "C" __global__
+void iq1m_matvec_transposed(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += iq1m_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// IQ2_XS against a Q8-quantized activation. Structurally this format is IQ2_S
+// with IQ2_XXS's signs: the 4-bit scale nibble per 16 values is IQ2_S's, so the
+// two halves of a 32-value Q8 block must accumulate separately, while the sign
+// selector is the 7-bit codebook index IQ2_XXS uses rather than a literal byte.
+// So the body below is iq2s_q8_group with the sign line swapped.
+//
+// The 9-bit grid index and the 7-bit sign selector share one uint16, which is
+// why this needs no qh: entry & 511 picks the codebook row and entry >> 9 the
+// sign pattern, both from the same load.
+__device__ __forceinline__ float iq2xs_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 74;
+
+    // 74 bytes per super-block leaves qs only 2-byte aligned, so the four
+    // uint16 of this group come through memcpy and the compiler folds them
+    // into whatever width the alignment actually permits.
+    unsigned short entries[4];
+    memcpy(entries, base + 2 + group * 8, 8);
+
+    const int4* activation_vectors = (const int4*)(vector + linear_group * 32);
+    const int4 activation_low = activation_vectors[0];
+    const int4 activation_high = activation_vectors[1];
+    const int acts[8] = {
+        activation_low.x, activation_low.y,
+        activation_low.z, activation_low.w,
+        activation_high.x, activation_high.y,
+        activation_high.z, activation_high.w};
+
+    // Group g spans 16-value scale groups 2g and 2g+1, which are the two
+    // nibbles of a single scale byte.
+    const unsigned int scale_byte = base[66 + group];
+
+    int dot_low = 0, dot_high = 0;
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const unsigned int entry = entries[step];
+        const unsigned long long pattern = kIq2xsGrid[entry & 511];
+        const unsigned int sign_word =
+            (unsigned int)kIq2xxsSigns[entry >> 9] * 0x01010101u;
+        const int masks_first = __vcmpne4(sign_word & 0x08040201u, 0);
+        const int masks_second = __vcmpne4(sign_word & 0x80402010u, 0);
+        const int weights_first = __vsub4(
+            (int)(unsigned int)pattern ^ masks_first, masks_first);
+        const int weights_second = __vsub4(
+            (int)(unsigned int)(pattern >> 32) ^ masks_second, masks_second);
+        int dot = 0;
+        dot = __dp4a(weights_first, acts[step * 2], dot);
+        dot = __dp4a(weights_second, acts[step * 2 + 1], dot);
+        if (step < 2) dot_low += dot; else dot_high += dot;
+    }
+    const float scale_low = 0.5f + (float)(scale_byte & 15u);
+    const float scale_high = 0.5f + (float)((scale_byte >> 4) & 15u);
+    return ((float)dot_low * scale_low + (float)dot_high * scale_high) * 0.25f
+        * __half2float(*((const __half*)base))
+        * __half2float(vector_scales[linear_group]);
+}
+
+COLIBRI_Q8_MATVEC(iq2xs_q8_matvec_transposed_warp, iq2xs_q8_group, 74)
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Batched twin of iq2xs_q8_group, for prefill. Same split as IQ2_S: the scales
+// are held back because the two 16-value halves take different nibbles.
+__device__ __forceinline__ void iq2xs_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 74;
+    unsigned short entries[4];
+    memcpy(entries, base + 2 + group * 8, 8);
+    const unsigned int scale_byte = base[66 + group];
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const unsigned int entry = entries[step];
+        const unsigned long long pattern = kIq2xsGrid[entry & 511];
+        const unsigned int sign_word =
+            (unsigned int)kIq2xxsSigns[entry >> 9] * 0x01010101u;
+        const int masks_first = __vcmpne4(sign_word & 0x08040201u, 0);
+        const int masks_second = __vcmpne4(sign_word & 0x80402010u, 0);
+        words[step * 2] = __vsub4(
+            (int)(unsigned int)pattern ^ masks_first, masks_first);
+        words[step * 2 + 1] = __vsub4(
+            (int)(unsigned int)(pattern >> 32) ^ masks_second, masks_second);
+    }
+    const float block_scale = __half2float(*((const __half*)base)) * 0.25f;
+    *scale_low = (0.5f + (float)(scale_byte & 15u)) * block_scale;
+    *scale_high = (0.5f + (float)((scale_byte >> 4) & 15u)) * block_scale;
+}
+
+COLIBRI_Q8_MATVEC_ROWS(iq2xs_q8_matvec_transposed_rows, iq2xs_q8_decode, 74)
+COLIBRI_Q8_MATMUL_TILED(iq2xs_q8_matmul_tiled, iq2xs_q8_decode, 74)
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 extern "C" __global__
 void iq4xs_matvec_transposed(
     const unsigned char* packed, const float* vector, float* output,
@@ -6256,6 +7401,7 @@ COLIBRI_LOWBIT_MATVEC_WARP(iq2s_matvec_transposed_warp, iq2s_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq3s_matvec_transposed_warp, iq3s_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq2xs_matvec_transposed_warp, iq2xs_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq4xs_matvec_transposed_warp, iq4xs_value)
+COLIBRI_LOWBIT_MATVEC_WARP(iq1m_matvec_transposed_warp, iq1m_value)
 #undef COLIBRI_LOWBIT_MATVEC_WARP
 
 extern "C" __global__ void q5k_matvec_transposed_warp(
@@ -6312,6 +7458,7 @@ COLIBRI_LOWBIT_MATMUL_ROWS(iq2s_matmul_rows, iq2s_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq3s_matmul_rows, iq3s_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq2xs_matmul_rows, iq2xs_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq4xs_matmul_rows, iq4xs_value)
+COLIBRI_LOWBIT_MATMUL_ROWS(iq1m_matmul_rows, iq1m_value)
 #undef COLIBRI_LOWBIT_MATMUL_ROWS
 
 #define KV_ATTENTION_FUSED_TILES_W(name, KT, VT, WIDTH) \

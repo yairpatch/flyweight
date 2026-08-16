@@ -59,7 +59,19 @@ inline std::uint64_t target_block_elements(Target target) {
 
 struct Policy {
     // Applied to the bulk 2-D weights, including the stacked experts.
-    Target weights = Target::Q4_K;
+    //
+    // Q6_K rather than the smaller Q4_K because the device path is not
+    // format-agnostic: the tiled prompt kernels and the grouped expert decode
+    // both decode Q6_K only, and a checkpoint packed as Q4_K silently loses
+    // BOTH -- prefill collapses to stepping the prompt one token at a time.
+    // Measured on Ling-3.0-tiny (RTX 5070 Ti laptop), Q4_K -> Q6_K:
+    //   prefill  8192 tokens   63 -> 486 tok/s
+    //   prefill  4096 tokens   73 -> 739 tok/s
+    //   decode  @8192          54 -> 113 tok/s
+    // for 4354 -> 6176 MiB of weights. Paying 1.8 GB of VRAM for 8x prefill is
+    // not a close call on any checkpoint that still fits; one that does not fit
+    // wants COLIBRI_HF_QUANT=Q4_K, which is why the override stays.
+    Target weights = Target::Q6_K;
     // The embedding table and the output head. These two are ~1 GB of a 15.8 GB
     // checkpoint and are read every token, and low-bit embeddings cost more
     // quality per byte saved than the FFN does -- which is why the mixed GGUF

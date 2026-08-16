@@ -411,6 +411,29 @@ inline std::string split_pattern(const json::Value& pre_tokenizer) {
     return {};
 }
 
+// Pulls the chat template out of a parsed tokenizer_config.json.
+//
+// Only checkpoints published after the split carry chat_template.jinja; older
+// ones keep the template in tokenizer_config.json, under either a bare string
+// or the multi-template array shape ([{name, template}, ...]) that predates it.
+// A checkpoint with neither renders through the runtime's generic fallback
+// markup, which is markup no Bailing turn was trained on, so it is worth
+// reading both.
+inline std::string chat_template_from_tokenizer_config(
+        const json::Value& document) {
+    const auto& value = document["chat_template"];
+    if (value.kind == json::Kind::String) return value.string;
+    if (value.kind != json::Kind::Array) return {};
+    std::string first;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const auto text = value[i]["template"].as_string();
+        if (text.empty()) continue;
+        if (value[i]["name"].as_string() == "default") return text;
+        if (first.empty()) first = text;
+    }
+    return first;
+}
+
 inline Tokenizer tokenizer_from_json(const json::Value& document,
                                      std::uint32_t vocabulary_size) {
     Tokenizer out;

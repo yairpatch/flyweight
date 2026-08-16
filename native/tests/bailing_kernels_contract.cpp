@@ -154,6 +154,106 @@ bool run_mla(int heads, int positions) {
     return ok;
 }
 
+bool run_mla_split(int heads, int positions, int splits) {
+    constexpr int kLora = 512;
+    std::mt19937 rng(1701 + heads * 13 + positions + splits);
+    std::normal_distribution<float> normal(0.0f, 0.2f);
+    auto fill = [&](std::size_t count) {
+        std::vector<float> values(count);
+        for (auto& value : values) value = normal(rng);
+        return values;
+    };
+    auto scores = fill(static_cast<std::size_t>(heads) * positions);
+    auto latents = fill(static_cast<std::size_t>(positions) * kLora);
+    std::vector<float> expected(static_cast<std::size_t>(heads) * kLora);
+    std::vector<float> actual(expected.size());
+    std::vector<float> partials(expected.size() * splits);
+    const float* score_p = scores.data();
+    const float* latent_p = latents.data();
+    float* expected_p = expected.data();
+    int positions_arg = positions, heads_arg = heads, lora_arg = kLora;
+    void* baseline_args[] = {&score_p, &latent_p, &expected_p,
+                             &positions_arg, &heads_arg, &lora_arg};
+    const std::uint32_t columns = (kLora + 127) / 128;
+    if (colibri_cpu_launch_named("bailing_mla_accumulate", heads, columns,
+                                 128, 0, 0, baseline_args) != 0)
+        return false;
+
+    float* partial_p = partials.data();
+    void* split_args[] = {&score_p, &latent_p, &partial_p, &positions_arg,
+                          &heads_arg, &lora_arg, &splits};
+    if (colibri_cpu_launch_named("bailing_mla_accumulate_split",
+                                 heads * splits, columns, 128, 0, 0,
+                                 split_args) != 0)
+        return false;
+    float* actual_p = actual.data();
+    void* reduce_args[] = {&partial_p, &actual_p, &heads_arg, &lora_arg,
+                           &splits};
+    if (colibri_cpu_launch_named("bailing_mla_accumulate_reduce", heads,
+                                 columns, 128, 0, 0, reduce_args) != 0)
+        return false;
+
+    double scale = 0.0;
+    for (const float value : expected) scale += std::fabs(value);
+    scale = scale / static_cast<double>(expected.size()) + 1e-9;
+    double worst = 0.0;
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        worst = std::max(worst,
+            std::fabs(double(actual[i]) - expected[i]) / scale);
+    const bool ok = worst < 2e-5;
+    std::printf("  MLA split heads=%2d positions=%4d splits=%d  %.3e  %s\n",
+                heads, positions, splits, worst, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+bool run_mla_pair_scores(int heads, int positions) {
+    constexpr int kNope = 128, kRope = 64, kLora = 512;
+    std::mt19937 rng(2701 + heads * 17 + positions);
+    std::normal_distribution<float> normal(0.0f, 0.2f);
+    auto fill = [&](std::size_t count) {
+        std::vector<float> values(count);
+        for (auto& value : values) value = normal(rng);
+        return values;
+    };
+    auto projected = fill(static_cast<std::size_t>(heads) * kLora);
+    auto query_rope = fill(static_cast<std::size_t>(heads) * kRope);
+    auto latents = fill(static_cast<std::size_t>(positions) * kLora);
+    auto rope_keys = fill(static_cast<std::size_t>(positions) * kRope);
+    std::vector<float> expected(static_cast<std::size_t>(heads) * positions);
+    std::vector<float> actual(expected.size());
+    const float* projected_p = projected.data();
+    const float* query_p = query_rope.data();
+    const float* latent_p = latents.data();
+    const float* rope_p = rope_keys.data();
+    float* expected_p = expected.data();
+    int positions_arg = positions, heads_arg = heads, nope_arg = kNope;
+    int rope_arg = kRope, lora_arg = kLora;
+    void* baseline_args[] = {&projected_p, &query_p, &latent_p, &rope_p,
+        &expected_p, &positions_arg, &heads_arg, &nope_arg, &rope_arg,
+        &lora_arg};
+    const std::uint32_t position_blocks = (positions + 7) / 8;
+    if (colibri_cpu_launch_named("bailing_mla_scores", heads,
+                                 position_blocks, 256, 0, 0,
+                                 baseline_args) != 0)
+        return false;
+    float* actual_p = actual.data();
+    void* pair_args[] = {&projected_p, &query_p, &latent_p, &rope_p,
+        &actual_p, &positions_arg, &heads_arg, &nope_arg, &rope_arg,
+        &lora_arg};
+    if (colibri_cpu_launch_named("bailing_mla_scores_pair", (heads + 1) / 2,
+                                 position_blocks, 256, 0, 0,
+                                 pair_args) != 0)
+        return false;
+    double worst = 0.0;
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        worst = std::max(worst,
+            std::fabs(double(actual[i]) - expected[i]));
+    const bool ok = worst == 0.0;
+    std::printf("  MLA paired scores heads=%2d positions=%4d  %.3e  %s\n",
+                heads, positions, worst, ok ? "OK" : "FAIL");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -173,5 +273,11 @@ int main() {
     ok &= run_mla(4, 7);
     ok &= run_mla(16, 128);
     ok &= run_mla(8, 257);
+    std::printf("bailing MLA split-K accumulation vs serial accumulation\n");
+    ok &= run_mla_split(4, 257, 2);
+    ok &= run_mla_split(16, 2263, 4);
+    std::printf("bailing MLA paired scores vs independent heads\n");
+    ok &= run_mla_pair_scores(15, 257);
+    ok &= run_mla_pair_scores(16, 1025);
     return ok ? 0 : 1;
 }

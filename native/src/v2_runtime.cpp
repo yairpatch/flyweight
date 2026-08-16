@@ -214,6 +214,11 @@ struct QwenLayerPlan {
     // The linear-attention block, captured once and replayed every token.
     std::uint64_t delta_graph = 0;
     bool delta_graph_attempted = false;
+    // The dense SwiGLU block, same treatment. Nothing in it depends on the
+    // position or the token -- only fixed weights, fixed workspace slots and
+    // fixed widths -- so one capture replays for the whole sequence.
+    std::uint64_t dense_ffn_graph = 0;
+    bool dense_ffn_graph_attempted = false;
     // Laguna's router score-correction bias. Kept out of static_tensors so the
     // feed-forward slots line up with the Qwen layout the FFN code addresses.
     std::uint64_t router_bias = std::numeric_limits<std::uint64_t>::max();
@@ -1482,6 +1487,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
         colibri_gpu_graph_destroy(layer.delta_graph);
         layer.delta_graph = 0;
         layer.delta_graph_attempted = false;
+        colibri_gpu_graph_destroy(layer.dense_ffn_graph);
+        layer.dense_ffn_graph = 0;
+        layer.dense_ffn_graph_attempted = false;
     }
     colibri_gpu_free(runtime.workspace);
     colibri_gpu_free(runtime.static_arena);
@@ -2936,6 +2944,7 @@ int qwen_gpu_matvec_by_type(
         case 17: return colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 22: return colibri_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 23: return colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 29: return colibri_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         default: break;
     }
     return -1;
@@ -2952,6 +2961,26 @@ const char* qwen_q8_lm_head_kernel(std::uint32_t type) {
         case 14: return "q6k_q8_lm_head_argmax_warp";
         case 16: return "iq2xxs_q8_lm_head_argmax_warp";
         case 18: return "iq3xxs_q8_lm_head_argmax_warp";
+        default: return nullptr;
+    }
+}
+
+// Q8-activation group-decode matvec, or null where the type has none. This is
+// the full-logits sibling of qwen_q8_lm_head_kernel above: the fused head only
+// returns an argmax, so anything that needs the distribution itself -- the
+// temperature path -- has to project with one of these instead.
+const char* qwen_q8_matvec_kernel(std::uint32_t type) {
+    switch (type) {
+        case 10: return "q2k_q8_matvec_transposed_warp";
+        case 11: return "q3k_q8_matvec_transposed_warp";
+        case 12: return "q4k_q8_matvec_transposed_warp";
+        case 13: return "q5k_q8_matvec_transposed_warp";
+        case 14: return "q6k_q8_matvec_transposed_warp";
+        case 16: return "iq2xxs_q8_matvec_transposed_warp";
+        case 17: return "iq2xs_q8_matvec_transposed_warp";
+        case 18: return "iq3xxs_q8_matvec_transposed_warp";
+        case 22: return "iq2s_q8_matvec_transposed_warp";
+        case 23: return "iq4xs_q8_matvec_transposed_warp";
         default: return nullptr;
     }
 }
@@ -5145,6 +5174,7 @@ void bailing_gpu_prefill_tiled(
             case 21: return "iq3s_matmul_rows";
             case 22: return "iq2s_matmul_rows";
             case 23: return "iq4xs_matmul_rows";
+            case 29: return "iq1m_matmul_rows";
             default: return nullptr;
         }
     };
@@ -9550,8 +9580,15 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     runtime->cuda_ready=true;
     if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
     if(colibri_gpu_stream_create(&runtime->prefetch_stream)!=0){colibri_gpu_stream_destroy(runtime->stream);throw std::runtime_error("failed to create native Qwen prefetch stream");}
+    // On by default. This started off-by-default because the delta capture
+    // measured neutral on a MoE checkpoint, where decode waits on ~40 blocking
+    // round trips per token for expert routing -- the host already runs ahead,
+    // so freeing host time only lengthens the next wait. A dense model has no
+    // routing round trips, which puts host submission back on the critical path:
+    // 44.6 -> 41.6 ms/token on Qwen3.8-27B IQ2_XXS, generation byte-identical.
+    // Neutral on MoE and a clear win on dense, so the default follows dense.
     const char*graph_setting=std::getenv("COLIBRI_CUDA_GRAPHS");
-    runtime->cuda_graphs=graph_setting&&graph_setting[0]=='1';
+    runtime->cuda_graphs=!graph_setting||graph_setting[0]!='0';
     if(runtime->cuda_graphs&&colibri_gpu_stream_create(&runtime->graph_stream)!=0)
         runtime->cuda_graphs=false;
     runtime->prefill_profile=std::getenv("COLIBRI_PREFILL_PROFILE")&&
@@ -9874,28 +9911,69 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->device_tensor_types.resize(runtime->model->tensors.size());
         for(std::uint64_t index=0;index<runtime->model->tensors.size();++index)
             runtime->device_tensor_types[index]=runtime->model->tensors[index].type;
-        // IQ1_M has no device kernel, and earning one would be wasted work: the
-        // only tensors quantized this way are the two per-head DeltaNet gate
-        // projections (hidden x 48), well under a thousandth of a block's
-        // weights. Decode them once here and upload Q8_0 instead, which every
-        // consumer already dispatches on. This is unconditional, not a policy:
-        // without it the checkpoint cannot run at all. Unlike the bf16 path
-        // below it grows the arena rather than shrinking it -- by about 200 KiB
-        // per converted tensor, ~20 MiB over a 48-layer checkpoint.
+        // IQ1_M reaches the device as itself wherever a kernel can read it, and
+        // as Q8_0 where none can.
+        //
+        // iq1m_matvec_transposed covers the dense projections, which is where
+        // these tensors actually appear: on the checkpoints this was written for
+        // the only IQ1_M weights are the two per-head DeltaNet gate projections
+        // (hidden x 48). Those now run from their packed bytes.
+        //
+        // The head and the embedding table are the gap. Their kernels decode a
+        // row or a token directly rather than going through the matvec dispatch,
+        // and neither qwen_lm_head_argmax_kernel nor qwen_embedding_kernel has
+        // an IQ1_M entry, so those two are converted to Q8_0 here.
+        //
+        // Converting is expensive and has to stay bounded. IQ1_M is 56 bytes per
+        // 256 values against Q8_0's 272, so a converted tensor costs 4.86x its
+        // file bytes -- and the head is one of the largest tensors in a
+        // checkpoint. On a model quantized broadly to IQ1_M (which is what a
+        // 1.75 bpw format exists for) that inflation would surface as an OOM at
+        // the arena allocation with nothing pointing back here, so past a
+        // threshold this stops with the numbers instead of paying it silently.
         {
-            std::uint64_t converted=0,growth=0;
+            std::uint64_t converted=0,growth=0,persistent_source_bytes=0;
+            const char* forced=std::getenv("COLIBRI_IQ1M_REQUANT");
+            const bool force=forced&&forced[0]=='1';
             for(std::uint64_t index=0;index<persistent.size();++index){
                 if(!persistent[index])continue;
                 const auto& tensor=runtime->model->tensors[index];
+                persistent_source_bytes+=tensor.size;
                 if(tensor.type!=29)continue;
+                // Everything else is read through a matvec dispatch that now
+                // has a case 29, so it stays packed.
+                if(index!=runtime->lm_head&&index!=runtime->token_embeddings)
+                    continue;
                 std::uint64_t elements=1;
                 for(auto dimension:tensor.shape)elements*=dimension;
-                // A partial trailing block would need its own padding path.
-                if(elements==0||elements%256)continue;
+                // A partial trailing block would need its own padding path that
+                // the packer does not implement. Skipping would leave the tensor
+                // at type 29, which the head and embedding kernels cannot read,
+                // so the failure would surface later as an unsupported-type
+                // error naming neither the tensor nor the reason. Stop here.
+                if(elements==0||elements%256)
+                    throw std::runtime_error(
+                        "IQ1_M tensor \""+tensor.name+"\" is not a whole number "
+                        "of 256-value blocks and cannot be converted to Q8_0, "
+                        "which is the only form its kernel can read it in");
                 runtime->device_tensor_types[index]=8;
                 ++converted;
                 growth+=(elements/32)*kQ8BlockSize-tensor.size;
             }
+            // A sixteenth of the persistent weights sits well above what the
+            // head and embeddings cost on a checkpoint that is otherwise not
+            // IQ1_M, and well below one whose bulk is, so it separates the two
+            // without tuning.
+            if(converted&&!force&&growth>persistent_source_bytes/16)
+                throw std::runtime_error(
+                    "this checkpoint stores its head or embedding table as "
+                    "IQ1_M, which those kernels cannot read; converting to Q8_0 "
+                    "would add "+std::to_string(growth/(1024ull*1024))+
+                    " MiB to the "+
+                    std::to_string(persistent_source_bytes/(1024ull*1024))+
+                    " MiB of static weights. Use a checkpoint whose head is "
+                    "quantized to a type the device path reads directly, or set "
+                    "COLIBRI_IQ1M_REQUANT=1 to convert anyway");
             if(converted){
                 runtime->static_tensor_bytes+=growth;
                 std::fprintf(stderr,
@@ -9917,7 +9995,13 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             for(std::uint64_t index=0;index<persistent.size();++index){
                 if(!persistent[index])continue;
                 const auto&tensor=runtime->model->tensors[index];
-                persistent_bytes+=device_align(tensor.size);
+                // The effective size, not the file size: the IQ1_M loop above
+                // has already flipped those tensors to Q8_0, and counting their
+                // file bytes here would undercount the arena by 4.86x each --
+                // biasing the auto decision towards keeping bf16 exactly when
+                // memory is tighter than this estimate believes.
+                persistent_bytes+=device_align(
+                    qwen_device_tensor_size(*runtime,index));
                 if(preserve_bf16[index]||tensor.type!=30)continue;
                 std::uint64_t elements=1;
                 for(auto dimension:tensor.shape)elements*=dimension;
@@ -11874,8 +11958,15 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 if(colibri_gpu_iq2s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
                 break;
             case 21:if(colibri_gpu_iq3s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 17:if(colibri_gpu_iq2xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 23:if(colibri_gpu_iq4xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
+            case 17:
+                if(q8_decode("iq2xs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_iq2xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
+            case 23:
+                if(q8_decode("iq4xs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_iq4xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
+            case 29:if(colibri_gpu_iq1m_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
             case 10:
                 if(q8_decode("q2k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
                 if(colibri_gpu_q2k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
@@ -11939,13 +12030,17 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     // Lets the delta-block capture be A/B'd on its own, with the shared-expert
     // graphs left enabled either way.
     static const bool env_graph_delta=[]{const char*s=std::getenv("COLIBRI_CUDA_GRAPH_DELTA");return !s||s[0]!='0';}();
+    // Same, for the dense SwiGLU capture.
+    static const bool env_graph_ffn=[]{const char*s=std::getenv("COLIBRI_CUDA_GRAPH_FFN");return !s||s[0]!='0';}();
     for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
         auto&layer=runtime->layers[layer_number];
         auto*profile=runtime->cuda_profile?&runtime->cuda_layer_profiles[layer_number]:nullptr;
         // Profiling and diagnostics both inject event records and stream syncs
         // into the block below, neither of which survives capture, so they keep
         // the eager path.
-        const bool graph_eligible=runtime->cuda_graphs&&!profile&&!env_lm_diag&&env_graph_delta;
+        const bool graph_capturable=runtime->cuda_graphs&&!profile&&!env_lm_diag;
+        const bool graph_eligible=graph_capturable&&env_graph_delta;
+        const bool ffn_graph_eligible=graph_capturable&&env_graph_ffn;
         if(profile)profile_record(profile->pre_start);
         auto tensor=[&](std::size_t role){return runtime->device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size){dense_matvec(layer.static_tensors.at(role),input,output,input_size,output_size);};
@@ -12328,13 +12423,55 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 if(timing_enabled())runtime->dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-host_started).count();
                 if(colibri_gpu_upload(third,host_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native dense host FFN output transfer failed");
             }else{
-            const auto up_half=first+static_cast<std::uint64_t>(dense_intermediate)*sizeof(float);
-            dense(moe_base+1,normalized,first,hidden_size,dense_intermediate);
-            dense(moe_base+2,normalized,up_half,hidden_size,dense_intermediate);
-            int dense_count=dense_intermediate;
-            void*dense_silu_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&second),&dense_count};
-            launch_named("silu_mul",(static_cast<std::uint32_t>(dense_count)+255)/256,1,256,dense_silu_args);
-            dense(moe_base+3,second,third,dense_intermediate,hidden_size);
+            auto enqueue_dense_ffn=[&]{
+                const auto up_half=first+static_cast<std::uint64_t>(dense_intermediate)*sizeof(float);
+                dense(moe_base+1,normalized,first,hidden_size,dense_intermediate);
+                dense(moe_base+2,normalized,up_half,hidden_size,dense_intermediate);
+                int dense_count=dense_intermediate;
+                void*dense_silu_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&second),&dense_count};
+                launch_named("silu_mul",(static_cast<std::uint32_t>(dense_count)+255)/256,1,256,dense_silu_args);
+                dense(moe_base+3,second,third,dense_intermediate,hidden_size);
+            };
+            // Seven launches a layer -- three quantize, three matvec, one
+            // silu_mul -- none of which reads the position or the token, so a
+            // single capture replays for the whole sequence. On a dense model
+            // this is the largest capturable run of launches in the step; the
+            // delta and shared-expert graphs above never cover it.
+            bool dense_ffn_launched=false;
+            if(ffn_graph_eligible&&layer.dense_ffn_graph){
+                if(colibri_gpu_graph_launch(layer.dense_ffn_graph,runtime->stream)==0){
+                    ++runtime->cuda_graph_replays;dense_ffn_launched=true;
+                }else{
+                    colibri_gpu_graph_destroy(layer.dense_ffn_graph);
+                    layer.dense_ffn_graph=0;++runtime->cuda_graph_fallbacks;
+                }
+            }
+            if(ffn_graph_eligible&&!dense_ffn_launched&&!layer.dense_ffn_graph_attempted){
+                layer.dense_ffn_graph_attempted=true;
+                if(colibri_gpu_graph_begin(runtime->graph_stream)==0){
+                    bool capture_enqueued=true;
+                    launch_stream=runtime->graph_stream;
+                    try{enqueue_dense_ffn();}catch(...){capture_enqueued=false;}
+                    launch_stream=runtime->stream;
+                    std::uint64_t captured_graph=0;
+                    const int capture_status=colibri_gpu_graph_end(runtime->graph_stream,&captured_graph);
+                    if(capture_enqueued&&capture_status==0){
+                        layer.dense_ffn_graph=captured_graph;++runtime->cuda_graph_builds;
+                        if(colibri_gpu_graph_launch(layer.dense_ffn_graph,runtime->stream)==0){
+                            ++runtime->cuda_graph_replays;dense_ffn_launched=true;
+                        }else{
+                            colibri_gpu_graph_destroy(layer.dense_ffn_graph);
+                            layer.dense_ffn_graph=0;++runtime->cuda_graph_fallbacks;
+                        }
+                    }else{
+                        if(capture_status==0&&captured_graph)colibri_gpu_graph_destroy(captured_graph);
+                        ++runtime->cuda_graph_fallbacks;
+                    }
+                }else{
+                    ++runtime->cuda_graph_fallbacks;
+                }
+            }
+            if(!dense_ffn_launched)enqueue_dense_ffn();
             }
             if(profile){profile_record(profile->pre_end);profile_record(profile->shared_start);profile_record(profile->shared_end);profile_record(profile->expert_start);}
         }else{
@@ -12927,26 +13064,62 @@ static std::uint32_t qwen_sample_last_logits(
     // both the second LM-head projection and all candidate transfers.
     if(count==1){runtime.last_output_token=greedy_token;return greedy_token;}
     const auto lm_head=runtime.device_tensors[runtime.lm_head];
-    if(runtime.lm_head_type==12?
-            colibri_gpu_q4k_matvec_transposed(
-                lm_head,runtime.last_sampling_normalized,runtime.last_sampling_logits,
-                static_cast<std::int32_t>(runtime.model->config.hidden_size),
-                static_cast<std::int32_t>(vocabulary),runtime.stream):
-        runtime.lm_head_type==14?
-            colibri_gpu_q6k_matvec_transposed(
-                lm_head,runtime.last_sampling_normalized,runtime.last_sampling_logits,
-                static_cast<std::int32_t>(runtime.model->config.hidden_size),
-                static_cast<std::int32_t>(vocabulary),runtime.stream):
-        runtime.lm_head_type==30?
+    // The head type picks the kernel, exactly as it does for the greedy argmax
+    // above. This used to name Q4_K, Q6_K and bf16 and read every other type as
+    // Q8_0, which reinterprets the bytes of the head outright: a Q3_K head
+    // decodes to noise and pins the distribution to a handful of tokens. It
+    // stayed hidden because greedy decode never calls this -- it runs a fused
+    // argmax kernel that does dispatch on the type -- so the corruption only
+    // appeared once temperature was nonzero.
+    //
+    // Prefer the group-decode kernel, for the reason greedy decode does: the
+    // head is the largest tensor read per token, and the per-element decoder
+    // leaves most of the bandwidth unused -- Q3_K measures 282 GB/s against 72
+    // GB/s for the reference, worth ~6 ms/token on this checkpoint's 0.567 GB
+    // head. Greedy cannot share the projection because its kernel is a fused
+    // argmax that never writes the logits this path needs.
+    const int hidden=static_cast<int>(runtime.model->config.hidden_size);
+    static const bool q8_head_enabled=[]{
+        const char*setting=std::getenv("COLIBRI_IQ2_Q8_DECODE");
+        return !setting||setting[0]!='0';
+    }();
+    const char*q8_kernel=q8_head_enabled?
+        qwen_q8_matvec_kernel(runtime.lm_head_type):nullptr;
+    const std::uint64_t q8_input=
+        runtime.decode_workspace_layout.dense_q8.address(runtime.workspace);
+    const std::uint64_t q8_scales=
+        runtime.decode_workspace_layout.dense_q8_scales.address(runtime.workspace);
+    int projected=-1;
+    if(q8_kernel&&(hidden&255)==0&&q8_input&&q8_scales){
+        void*quantize_args[]={
+            const_cast<std::uint64_t*>(&runtime.last_sampling_normalized),
+            const_cast<std::uint64_t*>(&q8_input),
+            const_cast<std::uint64_t*>(&q8_scales),const_cast<int*>(&hidden)};
+        int vocabulary_rows=static_cast<int>(vocabulary);
+        void*matvec_args[]={const_cast<std::uint64_t*>(&lm_head),
+            const_cast<std::uint64_t*>(&q8_input),
+            const_cast<std::uint64_t*>(&q8_scales),
+            const_cast<std::uint64_t*>(&runtime.last_sampling_logits),
+            const_cast<int*>(&hidden),&vocabulary_rows};
+        projected=colibri_gpu_launch_named("quantize_q8_blocks",
+                (hidden+31)/32,1,32,0,runtime.stream,quantize_args);
+        if(projected==0)
+            projected=colibri_gpu_launch_named(q8_kernel,
+                    vocabulary_rows,1,128,0,runtime.stream,matvec_args);
+    }
+    if(projected!=0)
+        projected=runtime.lm_head_type==30?
             colibri_gpu_bf16_matvec_transposed(
                 lm_head,runtime.last_sampling_normalized,runtime.last_sampling_logits,
-                static_cast<std::int32_t>(runtime.model->config.hidden_size),
-                static_cast<std::int32_t>(vocabulary),runtime.stream):
-            colibri_gpu_q8_matvec_transposed(
-                lm_head,runtime.last_sampling_normalized,runtime.last_sampling_logits,
-                static_cast<std::int32_t>(runtime.model->config.hidden_size),
-                static_cast<std::int32_t>(vocabulary),runtime.stream))
-        throw std::runtime_error("native Qwen sampling LM-head projection failed");
+                hidden,static_cast<std::int32_t>(vocabulary),runtime.stream):
+            qwen_gpu_matvec_by_type(
+                runtime.lm_head_type,lm_head,runtime.last_sampling_normalized,
+                runtime.last_sampling_logits,hidden,
+                static_cast<std::int32_t>(vocabulary),runtime.stream);
+    if(projected!=0)
+        throw std::runtime_error(
+            "native Qwen sampling LM-head projection failed for tensor type "+
+            std::to_string(runtime.lm_head_type));
     // Muse Glimmer scales the head output and then tanh-softcaps it. Both are
     // monotonic, so the greedy argmax path above is unaffected and skips this
     // entirely -- but temperature and top-p read the actual distribution, and
@@ -14424,10 +14597,20 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 if (q8_decode("iq3xxs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
                 if (colibri_gpu_iq3xxs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
                 break;
-            case 22: if (colibri_gpu_iq2s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
+            case 22:
+                if (q8_decode("iq2s_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_iq2s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
             case 21: if (colibri_gpu_iq3s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 17: if (colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 23: if (colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
+            case 17:
+                if (q8_decode("iq2xs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
+            case 23:
+                if (q8_decode("iq4xs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
+            case 29: if (colibri_gpu_iq1m_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
             case 10:
                 if (q8_decode("q2k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
                 if (colibri_gpu_q2k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;

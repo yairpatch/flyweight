@@ -268,6 +268,10 @@ COLIBRI_API int colibri_gpu_iq2xxs_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 );
+COLIBRI_API int colibri_gpu_iq1m_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+);
 COLIBRI_API int colibri_gpu_iq3xxs_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream

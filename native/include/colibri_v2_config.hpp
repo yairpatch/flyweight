@@ -23,6 +23,9 @@ struct ModelConfig {
     // hidden_size / heads: BailingMoE3 is 1536/16 = 96 by that formula but
     // declares head_dim 128, and its KDA projections are heads*head_dim wide.
     std::uint32_t attention_head_dim=0;
+    // Width of the short causal convolution in front of a linear-attention
+    // layer. Zero means the architecture's own default.
+    std::uint32_t conv_kernel=0;
     std::uint32_t key_length_swa=0, value_length_swa=0;
     std::uint32_t rotary_dimension_swa=0;
     float rope_freq_base_swa=0.0f, final_logit_softcap=0.0f;

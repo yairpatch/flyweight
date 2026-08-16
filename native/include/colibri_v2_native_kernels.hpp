@@ -2797,6 +2797,54 @@ void bailing_mla_scores(
             total * rsqrtf((float)(qk_nope + qk_rope));
 }
 
+// Two heads attend to the same compressed MLA cache. A warp computes both
+// head/position dots together so every latent and rope-key value is loaded
+// once instead of twice. Unlike shared-memory head tiling, this retains one
+// independent position per warp and has thousands of blocks at long context.
+extern "C" __global__
+void bailing_mla_scores_pair(
+    const float* projected, const float* query_rope,
+    const float* latents, const float* rope_keys, float* scores,
+    const int positions, const int heads, const int qk_nope,
+    const int qk_rope, const int kv_lora
+) {
+    const int first_head = blockIdx.x * 2;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int position = blockIdx.y * 8 + warp;
+    if (first_head >= heads || position >= positions) return;
+    const bool has_second = first_head + 1 < heads;
+    const float* first_p = projected + (long long)first_head * kv_lora;
+    const float* second_p = first_p + kv_lora;
+    const float* first_query = query_rope + (long long)first_head * qk_rope;
+    const float* second_query = first_query + qk_rope;
+    const float* latent = latents + (long long)position * kv_lora;
+    const float* rope = rope_keys + (long long)position * qk_rope;
+    float first_total = 0.0f, second_total = 0.0f;
+    for (int i = lane; i < kv_lora; i += 32) {
+        const float cache = latent[i];
+        first_total += first_p[i] * cache;
+        if (has_second) second_total += second_p[i] * cache;
+    }
+    for (int i = lane; i < qk_rope; i += 32) {
+        const float cache = rope[i];
+        first_total += first_query[i] * cache;
+        if (has_second) second_total += second_query[i] * cache;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        first_total += __shfl_down_sync(0xffffffff, first_total, offset);
+        second_total += __shfl_down_sync(0xffffffff, second_total, offset);
+    }
+    if (lane == 0) {
+        const float scale = rsqrtf((float)(qk_nope + qk_rope));
+        scores[(long long)first_head * positions + position] =
+            first_total * scale;
+        if (has_second)
+            scores[(long long)(first_head + 1) * positions + position] =
+                second_total * scale;
+    }
+}
+
 extern "C" __global__
 void bailing_mla_softmax(float* scores, const int positions, const int heads) {
     const int head = blockIdx.x;
@@ -2841,6 +2889,45 @@ void bailing_mla_accumulate(
     float total = 0.0f;
     for (int position = 0; position < positions; ++position)
         total += weights[position] * latents[(long long)position * kv_lora + column];
+    accumulated[(long long)head * kv_lora + column] = total;
+}
+
+// Split the long value reduction across independent blocks. The baseline has
+// only heads * ceil(kv_lora / 128) blocks, and every thread carries one serial
+// dependency chain across the entire context. At long context that exposes
+// latency instead of bandwidth. Partial sums provide enough blocks to occupy
+// the GPU; the tiny follow-up reduction combines them.
+extern "C" __global__
+void bailing_mla_accumulate_split(
+    const float* scores, const float* latents, float* partials,
+    const int positions, const int heads, const int kv_lora, const int splits
+) {
+    const int head = blockIdx.x / splits;
+    const int split = blockIdx.x - head * splits;
+    const int column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (head >= heads || column >= kv_lora) return;
+    const int begin = (positions * split) / splits;
+    const int end = (positions * (split + 1)) / splits;
+    const float* weights = scores + (long long)head * positions;
+    float total = 0.0f;
+    for (int position = begin; position < end; ++position)
+        total += weights[position] *
+            latents[(long long)position * kv_lora + column];
+    partials[((long long)split * heads + head) * kv_lora + column] = total;
+}
+
+extern "C" __global__
+void bailing_mla_accumulate_reduce(
+    const float* partials, float* accumulated,
+    const int heads, const int kv_lora, const int splits
+) {
+    const int head = blockIdx.x;
+    const int column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (head >= heads || column >= kv_lora) return;
+    float total = partials[(long long)head * kv_lora + column];
+    for (int split = 1; split < splits; ++split)
+        total += partials[
+            ((long long)split * heads + head) * kv_lora + column];
     accumulated[(long long)head * kv_lora + column] = total;
 }
 
