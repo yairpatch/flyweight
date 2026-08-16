@@ -2,6 +2,7 @@ import http.client
 import itertools
 import json
 import re
+import socket
 import threading
 import time
 import unittest
@@ -476,6 +477,203 @@ class ToolCallParsingTests(unittest.TestCase):
             {"status": "completed", "taskId": "1"},
         )
 
+    def test_native_tool_architecture_keeps_the_round_trip_structured(self) -> None:
+        # What a harness sends on the turn after a tool call: the call it got
+        # back, then the result. For an architecture whose template renders
+        # both, they must survive as structure -- and a tool result is a legal
+        # final message, which the role check used to reject even though its
+        # own error message said otherwise.
+        from colibri_next.server import _chat_messages
+
+        payload = {
+            "messages": [
+                {"role": "user", "content": "Read it"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "read_file",
+                                 "arguments": '{"path": "/etc/hostname"}'},
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "colibri-dev"},
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "read_file",
+                "parameters": {"type": "object",
+                               "properties": {"path": {"type": "string"}}},
+            }}],
+        }
+        messages, enabled = _chat_messages(payload, architecture="bailingmoe3")
+
+        self.assertTrue(enabled)
+        # Schemas ride on the first message, where the template picks them up.
+        self.assertEqual(messages[0]["tools"][0]["function"]["name"], "read_file")
+        # Arguments arrive as a JSON string and templates iterate them as a
+        # mapping, so they are decoded rather than passed through.
+        self.assertEqual(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            {"path": "/etc/hostname"},
+        )
+        self.assertEqual(messages[2]["role"], "tool")
+        self.assertEqual(messages[2]["content"], "colibri-dev")
+
+    def test_tools_survive_a_system_prompt_on_a_native_architecture(self) -> None:
+        # The shape every coding harness sends: a system prompt AND tools. The
+        # schemas were attached to the first message and the system turn was
+        # then inserted ahead of it, so the message the template reads them
+        # from no longer had any -- the model was told about no tools at all.
+        from colibri_next.server import _chat_messages
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are a coding assistant."},
+                {"role": "user", "content": "Read it"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        }
+        messages, enabled = _chat_messages(payload, architecture="bailingmoe3")
+
+        self.assertTrue(enabled)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["tools"][0]["function"]["name"], "read_file")
+
+    def test_anthropic_tool_round_trip_reaches_a_native_template(self) -> None:
+        # Claude Code's wire shape: system as its own field, tool_use blocks on
+        # the assistant turn, tool_result blocks inside the following user turn.
+        from colibri_next.server import _anthropic_to_chat_payload, _chat_messages
+
+        payload = _anthropic_to_chat_payload({
+            "model": "m",
+            "max_tokens": 64,
+            "system": "You are a coding assistant.",
+            "tools": [{"name": "read_file", "description": "Read a file.",
+                       "input_schema": {"type": "object",
+                                        "properties": {"path": {"type": "string"}}}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Read it"}]},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": "read_file",
+                    "input": {"path": "/app/main.py"}}]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_1",
+                    "content": "import server"}]},
+            ],
+        })
+        messages, enabled = _chat_messages(payload, architecture="bailingmoe3")
+
+        self.assertTrue(enabled)
+        self.assertEqual(messages[0]["tools"][0]["function"]["name"], "read_file")
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(
+            messages[2]["tool_calls"][0]["function"]["arguments"],
+            {"path": "/app/main.py"},
+        )
+
+    def test_generic_architecture_still_renders_tools_into_content(self) -> None:
+        # The Hermes prompt and the rendered history remain for checkpoints
+        # whose template knows nothing about tools.
+        from colibri_next.server import _chat_messages
+
+        payload = {
+            "messages": [
+                {"role": "user", "content": "Read it"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "colibri-dev"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        }
+        messages, _ = _chat_messages(payload, architecture="qwen3")
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("read_file", messages[0]["content"])
+        self.assertNotIn("tool_calls", messages[2])
+        self.assertEqual(messages[3]["role"], "user")
+        self.assertIn("<tool_response>", messages[3]["content"])
+
+    def test_reasoning_opened_by_the_prompt_is_not_visible_content(self) -> None:
+        # A reasoning checkpoint is asked to think by ending the PROMPT with an
+        # open <think>, so the turn carries only the closing tag. Treated as
+        # content, the model's private plan was served as its answer -- it read
+        # as the model saying what it was about to do, then doing it.
+        from colibri_next.server import _split_reasoning_content
+
+        visible, reasoning = _split_reasoning_content(
+            "I should call the tool.\n</think>Here is the answer."
+        )
+        self.assertEqual(visible, "Here is the answer.")
+        self.assertEqual(reasoning, "I should call the tool.")
+
+    def test_a_turn_without_thinking_is_untouched(self) -> None:
+        from colibri_next.server import _split_reasoning_content
+
+        visible, reasoning = _split_reasoning_content("Just an answer.")
+        self.assertEqual(visible, "Just an answer.")
+        self.assertIsNone(reasoning)
+
+    def test_streaming_reasoning_is_split_from_the_answer(self) -> None:
+        # The closing tag may arrive in pieces, and nothing before it may be
+        # streamed to the client as content.
+        from colibri_next.server import ThinkingPrefixStream
+
+        stream = ThinkingPrefixStream()
+        deltas = [stream.feed(part)
+                  for part in ("Plan: ", "call it.", "</th", "ink>", "Done.")]
+        visible = "".join(v for v, _ in deltas)
+        reasoning = "".join(r for _, r in deltas)
+        self.assertEqual(visible, "Done.")
+        self.assertEqual(reasoning, "Plan: call it.")
+        self.assertEqual(stream.flush(), ("", ""))
+
+    def test_bailing_tagged_tool_call_is_decoded(self) -> None:
+        # BailingMoE3 names the function on the opening line and tags each
+        # argument. Parsed as neither Hermes nor JSON, the call decoded to no
+        # name and was dropped -- along with the content before it, so a model
+        # that had just called a tool appeared to answer with nothing.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+        content, calls = _parse_tool_calls(
+            "Let me look.\n<tool_call>read_file\n"
+            "<arg_key>path</arg_key>\n<arg_value>/etc/hostname</arg_value>\n"
+            "<arg_key>limit</arg_key>\n<arg_value>10</arg_value>\n"
+            "</tool_call>",
+            tools=tools,
+        )
+        self.assertEqual(content, "Let me look.")
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            # limit follows the declared schema, as it does for every format.
+            {"path": "/etc/hostname", "limit": 10},
+        )
+
+    def test_bailing_tagged_tool_value_keeps_its_whitespace(self) -> None:
+        # The value may be file content, where leading indentation is data.
+        _, calls = _parse_tool_calls(
+            "<tool_call>write\n<arg_key>text</arg_key>\n"
+            "<arg_value>\n    indented\n</arg_value>\n</tool_call>"
+        )
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"])["text"], "    indented"
+        )
+
     def test_incomplete_required_tool_call_is_not_exposed(self) -> None:
         tools = [
             {
@@ -500,6 +698,95 @@ class ToolCallParsingTests(unittest.TestCase):
             tools=tools,
         )
         self.assertEqual(calls, [])
+
+    def test_parameters_after_the_closing_tag_are_recovered(self) -> None:
+        # The shape a low-bit Qwen3.5 actually emits: <tool_call> and
+        # </tool_call> are single tokens and come out right, while </function>
+        # and </parameter> are spelled from ordinary subwords and get
+        # misordered, closing the block before the arguments are written.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_files",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"execute": {"type": "boolean"}},
+                        "required": ["execute"],
+                    },
+                },
+            }
+        ]
+        content, calls = _parse_tool_calls(
+            "I'll explore the project structure.\n"
+            "<tool_call>\n<function=list_files>\n</function>\n</tool_call>\n"
+            "<parameter=execute>\ntrue\n</parameter>\n</function>\n</tool_call>",
+            tools=tools,
+        )
+        self.assertEqual(content, "I'll explore the project structure.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "list_files")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"execute": True}
+        )
+
+    def test_trailing_recovery_does_not_cross_into_the_next_call(self) -> None:
+        # Two well-formed calls: the first must not absorb the second's
+        # parameters just because they follow its closing tag.
+        _, calls = _parse_tool_calls(
+            "<tool_call><function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n"
+            "</function></tool_call>\n"
+            "<tool_call><function=get_time>\n"
+            "<parameter=zone>\nCET\n</parameter>\n"
+            "</function></tool_call>"
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
+        )
+        self.assertEqual(
+            json.loads(calls[1]["function"]["arguments"]), {"zone": "CET"}
+        )
+
+    def test_trailing_parameter_tag_does_not_join_a_complete_call(self) -> None:
+        # A call that already decoded its arguments is complete, so a
+        # <parameter=...> tag in the prose after it -- the model explaining the
+        # format, say -- must not be folded into the call.
+        _, calls = _parse_tool_calls(
+            "<tool_call><function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n"
+            "</function></tool_call>\n"
+            "you can also pass <parameter=verbose>\ntrue\n</parameter>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
+        )
+
+    def test_undeclared_tool_recovers_parameters_after_the_block(self) -> None:
+        # With no schema there is no required list to test against, so recovery
+        # keys off the block having decoded nothing at all.
+        _, calls = _parse_tool_calls(
+            "<tool_call>\n<function=list_files>\n</function>\n</tool_call>\n"
+            "<parameter=execute>\ntrue\n</parameter>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"execute": True}
+        )
+
+    def test_block_parameters_win_over_trailing_ones(self) -> None:
+        _, calls = _parse_tool_calls(
+            "<tool_call><function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n"
+            "</function></tool_call>\n"
+            "<parameter=city>\nBerlin\n</parameter>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"}
+        )
 
     def test_duplicate_tool_calls_are_collapsed(self) -> None:
         block = (
@@ -1520,6 +1807,35 @@ class HTTPServerTests(unittest.TestCase):
         response = self.connection.getresponse()
         return response, json.loads(response.read())
 
+    def test_idle_pooled_connection_outlives_the_request_timeout(self) -> None:
+        # A harness keeps connections pooled and the runtime serves one request
+        # at a time, so a connection routinely sits idle for longer than a
+        # request may take. Applying the request timeout to that wait closed
+        # working connections -- "Request timed out" in the log, a reconnect for
+        # the client -- so the idle wait gets its own, longer limit.
+        service = InferenceService(
+            "qwen-local", StubGenerator(), request_timeout_seconds=0.2
+        )
+        server = ColibriHTTPServer(("127.0.0.1", 0), create_handler(service))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_port, timeout=5
+        )
+        try:
+            connection.request("GET", "/health")
+            self.assertEqual(connection.getresponse().read() and 200, 200)
+            time.sleep(0.5)  # longer than the request timeout, idle throughout
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_chat_ui_static_assets(self) -> None:
         self.connection.request("GET", "/")
         response = self.connection.getresponse()
@@ -1942,6 +2258,376 @@ class StreamKeepaliveTests(unittest.TestCase):
         self.service.stream_chat_completion = failing
         body = self._post("/v1/chat/completions")
         self.assertIn("boom", body)
+
+
+class EndlessStubGenerator(StubGenerator):
+    """Generates until its iterator is closed, recording how far it got."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.produced = 0
+        self.closed = threading.Event()
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        try:
+            index = 0
+            while True:
+                index += 1
+                self.produced = index
+                yield GenerationStep(
+                    token_id=index,
+                    text_delta="word ",
+                    prompt_ids=(1, 2, 3),
+                    generated_ids=tuple(range(index)),
+                    text="word " * index,
+                    stopped_on_eos=False,
+                    finished=False,
+                    state_tokens=index,
+                )
+                time.sleep(0.002)
+        finally:
+            self.closed.set()
+
+
+class AbandonedStreamTests(unittest.TestCase):
+    """A client that walks away must not leave the model generating.
+
+    Writes into an abandoned stream keep succeeding until the socket buffer
+    fills, so a long generation used to run to completion for nobody -- one
+    observed request kept going to 7205 tokens after its client gave up.
+    """
+
+    def setUp(self) -> None:
+        self.generator = EndlessStubGenerator()
+        self.service = InferenceService(
+            "qwen-local", self.generator, max_new_tokens=100000
+        )
+        self.server = ColibriHTTPServer(
+            ("127.0.0.1", 0), create_handler(self.service)
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _abandon_mid_stream(self) -> socket.socket:
+        """Start a stream, then half-close: FIN sent, socket still writable.
+
+        This is the case that used to run forever. A full close makes the next
+        write fail on its own, so it would pass with or without the fix; a
+        half-close leaves the server's writes succeeding, which is exactly what
+        let one request keep generating for a minute after its client gave up.
+        """
+        client = socket.create_connection(("127.0.0.1", self.port))
+        body = json.dumps(
+            {
+                "model": "qwen-local",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            }
+        ).encode()
+        client.sendall(
+            b"POST /v1/chat/completions HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        deadline = time.monotonic() + 10
+        seen = b""
+        while b"\r\n\r\n" not in seen and time.monotonic() < deadline:
+            seen += client.recv(4096)
+        self.assertIn(b"200", seen)
+        client.shutdown(socket.SHUT_WR)
+        return client
+
+    def test_generation_stops_when_the_client_abandons_the_stream(self) -> None:
+        client = self._abandon_mid_stream()
+        try:
+            self.assertTrue(
+                self.generator.closed.wait(timeout=10),
+                "the generator kept running after the client abandoned the stream",
+            )
+            stopped_at = self.generator.produced
+            time.sleep(0.3)
+            self.assertEqual(
+                self.generator.produced,
+                stopped_at,
+                "generation continued after the stream was closed",
+            )
+        finally:
+            client.close()
+
+
+class EndlessToolStubGenerator(StubGenerator):
+    """Opens a <tool_call> and never closes it, as a looping model does."""
+
+    HEAD = "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/a\n</parameter>\n<parameter=content>\n"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.produced = 0
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        text = self.HEAD
+        index = 0
+        yield GenerationStep(
+            token_id=0, text_delta=text, prompt_ids=(1, 2, 3), generated_ids=(0,),
+            text=text, stopped_on_eos=False, finished=False, state_tokens=1,
+        )
+        while index < 1000:  # a bound only so a failing test terminates
+            index += 1
+            self.produced = index
+            text += "loop "
+            yield GenerationStep(
+                token_id=index,
+                text_delta="loop ",
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(range(index + 1)),
+                text=text,
+                stopped_on_eos=False,
+                finished=False,
+                state_tokens=index + 1,
+            )
+        yield GenerationStep(
+            token_id=None, text_delta="", prompt_ids=(1, 2, 3),
+            generated_ids=tuple(range(index + 1)), text=text,
+            stopped_on_eos=False, finished=True, state_tokens=index + 1,
+        )
+
+
+class SlowToolStubGenerator(StubGenerator):
+    """Writes a large parameter one piece at a time, closing the call at the end.
+
+    This is the shape that timed a real client out: the call is valid, but its
+    value takes minutes to write, and nothing about it reached the wire until
+    the closing tag arrived.
+    """
+
+    HEAD = "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/a\n</parameter>\n"
+    BODY_PIECES = [f"line {index}\n" for index in range(40)]
+    TAIL = "\n</parameter>\n</function>\n</tool_call>"
+
+    def _pieces(self):
+        yield self.HEAD
+        yield "<parameter=content>\n"
+        yield from self.BODY_PIECES
+        yield self.TAIL
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        text = ""
+        for index, piece in enumerate(self._pieces()):
+            text += piece
+            yield GenerationStep(
+                token_id=index,
+                text_delta=piece,
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(range(index + 1)),
+                text=text,
+                stopped_on_eos=False,
+                finished=False,
+                state_tokens=index + 1,
+            )
+        yield GenerationStep(
+            token_id=None,
+            text_delta="",
+            prompt_ids=(1, 2, 3),
+            generated_ids=tuple(range(60)),
+            text=text,
+            stopped_on_eos=True,
+            finished=True,
+            state_tokens=60,
+        )
+
+
+WRITE_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+}
+
+
+class ToolCallStreamingTests(unittest.TestCase):
+    """A tool call must reach the client while it is still being written.
+
+    Holding it back until </tool_call> meant a long call produced no content
+    for minutes. Clients abandon such a stream ("no chunks received") however
+    many SSE pings it carries, because a ping is not content.
+    """
+
+    def _anthropic_events(self, generator):
+        service = InferenceService("qwen-local", generator, max_new_tokens=4096)
+        return list(
+            service.stream_anthropic_message(
+                {
+                    "model": "qwen-local",
+                    "messages": [{"role": "user", "content": "write it"}],
+                    "max_tokens": 4096,
+                    "tools": [
+                        {
+                            "name": "write_file",
+                            "input_schema": WRITE_FILE_TOOL["function"]["parameters"],
+                        }
+                    ],
+                }
+            )
+        )
+
+    def test_tool_use_block_opens_before_the_call_is_complete(self) -> None:
+        events = self._anthropic_events(SlowToolStubGenerator())
+        types = [event["type"] for event in events]
+        start = types.index("content_block_start")
+        stop = len(types) - 1 - types[::-1].index("content_block_stop")
+        deltas = [
+            index
+            for index, event in enumerate(events)
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        ]
+        self.assertTrue(deltas, "the tool call produced no input_json_delta events")
+        # Many deltas, spread between the block opening and closing -- not one
+        # lump at the end, which is what the client timed out waiting for.
+        self.assertGreater(len(deltas), 5)
+        self.assertLess(start, deltas[0])
+        self.assertLess(deltas[-1], stop)
+
+    def test_streamed_tool_call_uses_exactly_one_block(self) -> None:
+        events = self._anthropic_events(SlowToolStubGenerator())
+        starts = [e for e in events if e["type"] == "content_block_start"]
+        tool_starts = [
+            e for e in starts if e["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual(len(tool_starts), 1)
+        self.assertEqual(tool_starts[0]["content_block"]["name"], "write_file")
+
+    def test_streamed_fragments_assemble_into_the_parsed_arguments(self) -> None:
+        events = self._anthropic_events(SlowToolStubGenerator())
+        partial = "".join(
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        )
+        # The invariant that matters: streaming the call must deliver exactly
+        # what the non-streaming parse of the same text produces.
+        generator = SlowToolStubGenerator()
+        whole = "".join(generator._pieces())
+        _, calls = _parse_tool_calls(whole, tools=[WRITE_FILE_TOOL])
+        self.assertEqual(
+            json.loads(partial), json.loads(calls[0]["function"]["arguments"])
+        )
+        self.assertEqual(json.loads(partial)["path"], "/tmp/a")
+
+    def test_stop_reason_is_tool_use_when_the_call_was_streamed(self) -> None:
+        events = self._anthropic_events(SlowToolStubGenerator())
+        deltas = [e for e in events if e["type"] == "message_delta"]
+        self.assertEqual(deltas[-1]["delta"]["stop_reason"], "tool_use")
+
+    def test_openai_stream_reports_tool_calls_finish_reason(self) -> None:
+        service = InferenceService(
+            "qwen-local", SlowToolStubGenerator(), max_new_tokens=4096
+        )
+        chunks = list(
+            service.stream_chat_completion(
+                {
+                    "model": "qwen-local",
+                    "messages": [{"role": "user", "content": "write it"}],
+                    "tools": [WRITE_FILE_TOOL],
+                }
+            )
+        )
+        reasons = [
+            choice.get("finish_reason")
+            for chunk in chunks
+            if isinstance(chunk, dict)
+            for choice in chunk.get("choices", [])
+        ]
+        self.assertIn("tool_calls", reasons)
+        arguments = "".join(
+            call.get("function", {}).get("arguments", "")
+            for chunk in chunks
+            if isinstance(chunk, dict)
+            for choice in chunk.get("choices", [])
+            for call in choice.get("delta", {}).get("tool_calls", [])
+        )
+        self.assertEqual(json.loads(arguments)["path"], "/tmp/a")
+
+    def test_truncated_tool_call_still_closes_valid_json(self) -> None:
+        events = self._anthropic_events(TruncatedToolStubGenerator())
+        partial = "".join(
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        )
+        if partial:
+            json.loads(partial)  # must not raise
+        self.assertEqual(
+            len([e for e in events if e["type"] == "message_stop"]), 1
+        )
+
+    def test_max_tool_call_tokens_abandons_a_call_that_never_closes(self) -> None:
+        generator = EndlessToolStubGenerator()
+        service = InferenceService(
+            "qwen-local",
+            generator,
+            max_new_tokens=100000,
+            max_tool_call_tokens=50,
+        )
+        events = list(
+            service.stream_anthropic_message(
+                {
+                    "model": "qwen-local",
+                    "messages": [{"role": "user", "content": "write it"}],
+                    "max_tokens": 100000,
+                    "tools": [
+                        {
+                            "name": "write_file",
+                            "input_schema": WRITE_FILE_TOOL["function"]["parameters"],
+                        }
+                    ],
+                }
+            )
+        )
+        self.assertLess(generator.produced, 400, "the tool call was not bounded")
+        partial = "".join(
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        )
+        if partial:
+            json.loads(partial)  # closed into valid JSON despite the cut
+        self.assertEqual(len([e for e in events if e["type"] == "message_stop"]), 1)
+
+    def test_unbounded_by_default(self) -> None:
+        self.assertEqual(
+            InferenceService("qwen-local", StubGenerator()).max_tool_call_tokens, 0
+        )
+
+    def test_short_tool_call_is_unchanged(self) -> None:
+        events = self._anthropic_events(ToolStubGenerator())
+        partial = "".join(
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        )
+        self.assertEqual(json.loads(partial), {"city": "Paris"})
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import hmac
 import json
 import queue
 import re
+import select
 import socket
 import sys
 import threading
@@ -15,7 +16,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, overload
 from urllib.parse import unquote, urlsplit
 
 from .generation import GenerationResult, GenerationStep
@@ -45,7 +46,7 @@ class Tokenizer(Protocol):
         self,
         messages: Sequence[Mapping[str, str]],
         *,
-        enable_thinking: bool = False,
+        enable_thinking: bool | None = None,
     ) -> list[int]: ...
     def decode(
         self, tokens: list[int], *, skip_special_tokens: bool = True
@@ -106,6 +107,21 @@ TOOL_PARAMETER_LOOSE_PATTERN = re.compile(
 # One newline on each side of a Hermes value is framing, per the layout
 # _tool_prompt() shows the model. Trailing horizontal space is only consumed
 # after that newline, where it is the closing tag's indentation.
+# BailingMoE3's tagged argument pairs. The value is captured verbatim for the
+# same reason a Hermes parameter is: it may be file content whose leading
+# whitespace is meaningful.
+TOOL_ARG_KEY_PATTERN = re.compile(r"<arg_key>")
+TOOL_ARG_PAIR_PATTERN = re.compile(
+    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+)
+# The same pairs with the value still open, so a parameter the model is part way
+# through can be streamed rather than held until its closing tag arrives.
+TOOL_ARG_OPEN_PATTERN = re.compile(
+    r"<arg_key>(.*?)</arg_key>\s*<arg_value>((?:(?!</arg_value>).)*)\Z", re.DOTALL
+)
+TOOL_PARAMETER_OPEN_PATTERN = re.compile(
+    r"<parameter=([^>\n]+)>((?:(?!</parameter>).)*)\Z", re.DOTALL
+)
 TOOL_PARAMETER_LEAD = re.compile(r"\A\r?\n")
 TOOL_PARAMETER_TAIL = re.compile(r"\r?\n[ \t]*\Z")
 DSML_TOOL_CALL_MARKER = "<｜DSML｜tool_calls>"
@@ -141,6 +157,10 @@ class APIError(Exception):
     message: str
     error_type: str = "invalid_request_error"
     parameter: str | None = None
+    # OpenAI's machine-readable error code. Agentic clients branch on
+    # "context_length_exceeded" to compact a conversation and retry, and a null
+    # code leaves them nothing to match on but the prose.
+    code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,13 +169,16 @@ class _GenerationRequest:
     prompt_ids: tuple[int, ...]
     max_new_tokens: int
     sampling: SamplingConfig
-    enable_thinking: bool
+    enable_thinking: bool | None
     tools_enabled: bool = False
     tools: tuple[dict[str, Any], ...] = ()
     # Route a reasoning model's chain-of-thought to `reasoning_content` rather
     # than streaming it as ordinary content. Off by default so output stays
     # live for clients that render only `content`.
     separate_reasoning: bool = False
+    # True when the rendered prompt ends with an open <think>, so the turn
+    # begins inside a reasoning block that only the closing tag will end.
+    thinking_open: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +203,19 @@ class InferenceService:
         strict_model: bool = False,
         max_concurrent_requests: int = 64,
         request_timeout_seconds: float = 30.0,
+        # How long a pooled connection may sit idle between requests. Separate
+        # from the request timeout, and much longer: a harness holds
+        # connections open across a generation it is waiting on elsewhere, and
+        # closing one at the request timeout cost a reconnect and logged an
+        # error for a connection that was behaving perfectly.
+        keepalive_timeout_seconds: float = 900.0,
         sse_keepalive_seconds: float = 10.0,
+        # Tokens a single tool call may run to before it is abandoned. 0 leaves
+        # it bounded only by max_new_tokens, which is the default because a
+        # legitimate call can be large -- writing a file puts the whole file in
+        # one parameter, and a cap that fits a "normal" call would truncate it.
+        # Set it where a model is known to loop inside <tool_call>.
+        max_tool_call_tokens: int = 0,
         generation_defaults: Mapping[str, int | float] | None = None,
     ):
         if max_new_tokens <= 0:
@@ -191,8 +226,12 @@ class InferenceService:
             raise ValueError("max_concurrent_requests must be positive")
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
+        if keepalive_timeout_seconds <= 0:
+            raise ValueError("keepalive_timeout_seconds must be positive")
         if sse_keepalive_seconds <= 0:
             raise ValueError("sse_keepalive_seconds must be positive")
+        if max_tool_call_tokens < 0:
+            raise ValueError("max_tool_call_tokens must be non-negative")
         self.model_name = model_name
         self.generator = generator
         self.max_new_tokens = max_new_tokens
@@ -202,7 +241,9 @@ class InferenceService:
         self.strict_model = strict_model
         self.max_concurrent_requests = max_concurrent_requests
         self.request_timeout_seconds = request_timeout_seconds
+        self.keepalive_timeout_seconds = keepalive_timeout_seconds
         self.sse_keepalive_seconds = sse_keepalive_seconds
+        self.max_tool_call_tokens = max_tool_call_tokens
         defaults: dict[str, int | float] = {
             "temperature": 0.0,
             "top_k": 20,
@@ -426,12 +467,17 @@ class InferenceService:
                 decode_started: float | None = None
                 last_tool_progress_at = 0.0
                 last_tool_progress_tokens = 0
+                tool_body = ""  # text after the marker, fed to the streamer
+                tool_start_tokens = 0  # generated-token count when the call opened
+                tool_streamer: _ToolCallStreamer | None = None
+                tool_stream_id: str | None = None
                 marker = TOOL_CALL_MARKER
                 holdback = len(marker) - 1
                 tool_channels = (
                     MuseChannelStream()
                     if getattr(self.generator.tokenizer, "architecture", None)
                     == "muse-glimmer"
+                    else ThinkingPrefixStream() if request.thinking_open
                     else None
                 )
 
@@ -445,6 +491,26 @@ class InferenceService:
 
                 def _tool_progress_chunk(tokens: int, elapsed: float):
                     chunk = self._chat_chunk(completion_id, created, {})
+                    chunk["colibri"] = {
+                        "generated_tokens": tokens,
+                        "decode_elapsed_seconds": elapsed,
+                        "phase": "tool_call",
+                    }
+                    return chunk
+
+                def _tool_delta_chunk(
+                    call: dict[str, Any], tokens: int, elapsed: float
+                ):
+                    """One incremental tool_calls delta, OpenAI streaming shape.
+
+                    The Anthropic translator already turns these into a
+                    tool_use content block plus input_json_delta events, so
+                    emitting them is what puts real content on the wire while a
+                    long call is still being written.
+                    """
+                    chunk = self._chat_chunk(
+                        completion_id, created, {"tool_calls": [call]}
+                    )
                     chunk["colibri"] = {
                         "generated_tokens": tokens,
                         "decode_elapsed_seconds": elapsed,
@@ -501,7 +567,9 @@ class InferenceService:
                                     delta = pending[:found]
                                     pending = pending[found:]
                                     tool_start = 0
+                                    tool_start_tokens = len(step.generated_ids)
                                     marker_window = pending
+                                    tool_body = pending[len(marker) :]
                                     tool_end_tail = marker_window[
                                         -len(TOOL_CALL_END_MARKER) :
                                     ]
@@ -518,6 +586,7 @@ class InferenceService:
                                     )
                             else:
                                 marker_window = tool_end_tail + delta_text
+                                tool_body += delta_text
                                 tool_end_tail = marker_window[
                                     -len(TOOL_CALL_END_MARKER) :
                                 ]
@@ -532,14 +601,74 @@ class InferenceService:
                                     break
                             if tool_start is not None and not tool_calls:
                                 token_count = len(step.generated_ids)
+                                elapsed = now - decode_started
                                 if (
+                                    self.max_tool_call_tokens
+                                    and token_count - tool_start_tokens
+                                    > self.max_tool_call_tokens
+                                ):
+                                    # A call that never closes would otherwise
+                                    # run to max_new_tokens. Stop here and let
+                                    # the reconciliation below close whatever
+                                    # was streamed.
+                                    break
+                                # Stream the call itself rather than only a
+                                # liveness ping: a ping is not content, and a
+                                # client that waits minutes for content while a
+                                # large parameter is written times the stream
+                                # out no matter how many pings it carries.
+                                if tool_streamer is None:
+                                    tool_streamer = _ToolCallStreamer()
+                                was_started = tool_streamer.started
+                                fragments = tool_streamer.feed(tool_body)
+                                if not was_started and tool_streamer.started:
+                                    # The schema is only resolvable once the
+                                    # name is, and it decides which values may
+                                    # be streamed before they are complete.
+                                    tool_streamer.bind_schema(
+                                        _tool_argument_schema(
+                                            request.tools, tool_streamer.name or ""
+                                        )
+                                    )
+                                    fragments = tool_streamer.feed(tool_body)
+                                    tool_stream_id = f"call_{uuid.uuid4().hex}"
+                                    yield _tool_delta_chunk(
+                                        {
+                                            "index": 0,
+                                            "id": tool_stream_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool_streamer.name,
+                                                "arguments": "",
+                                            },
+                                        },
+                                        token_count,
+                                        elapsed,
+                                    )
+                                    last_tool_progress_at = now
+                                    last_tool_progress_tokens = token_count
+                                if fragments:
+                                    yield _tool_delta_chunk(
+                                        {
+                                            "index": 0,
+                                            "function": {
+                                                "arguments": "".join(fragments)
+                                            },
+                                        },
+                                        token_count,
+                                        elapsed,
+                                    )
+                                    last_tool_progress_at = now
+                                    last_tool_progress_tokens = token_count
+                                elif (
                                     last_tool_progress_tokens == 0
                                     or token_count - last_tool_progress_tokens >= 32
                                     or now - last_tool_progress_at >= 1.0
                                 ):
-                                    yield _tool_progress_chunk(
-                                        token_count, now - decode_started
-                                    )
+                                    # Nothing settled yet -- the name is still
+                                    # arriving, or the open value is of a type
+                                    # that cannot be emitted until it closes.
+                                    yield _tool_progress_chunk(token_count, elapsed)
                                     last_tool_progress_tokens = token_count
                                     last_tool_progress_at = now
                     finally:
@@ -571,16 +700,38 @@ class InferenceService:
                 accumulated = "".join(text_parts)
                 if not tool_calls:
                     _, tool_calls = _parse_tool_calls(accumulated, tools=request.tools)
-                if tool_calls:
+                streamed_tail: list[str] = []
+                produced_tool_call = bool(tool_calls)
+                if tool_streamer is not None and tool_streamer.started:
+                    # Reconcile: whatever was streamed is a prefix of the
+                    # authoritative arguments, and this closes the difference.
+                    # A call that failed to parse still gets its JSON closed so
+                    # the client is never left holding a truncated object.
+                    first = tool_calls[0] if tool_calls else None
+                    streamed_tail = tool_streamer.finish(
+                        json.loads(first["function"]["arguments"])
+                        if first is not None
+                        else None
+                    )
+                    # The streamed block owns index 0 and its own id; only the
+                    # calls after it still need emitting in full.
+                    tool_calls = tool_calls[1:] if tool_calls else []
+                if streamed_tail or tool_calls:
+                    calls: list[dict[str, Any]] = []
+                    if streamed_tail:
+                        calls.append(
+                            {
+                                "index": 0,
+                                "function": {"arguments": "".join(streamed_tail)},
+                            }
+                        )
+                    offset = 1 if tool_streamer is not None and tool_streamer.started else 0
+                    calls.extend(
+                        {"index": index + offset, **call}
+                        for index, call in enumerate(tool_calls)
+                    )
                     chunk = self._chat_chunk(
-                        completion_id,
-                        created,
-                        {
-                            "tool_calls": [
-                                {"index": index, **call}
-                                for index, call in enumerate(tool_calls)
-                            ]
-                        },
+                        completion_id, created, {"tool_calls": calls}
                     )
                     if decode_started is not None:
                         chunk["colibri"] = {
@@ -603,7 +754,7 @@ class InferenceService:
                 # "length"/"stop" so the client knows the tool call was cut off.
                 finish_reason = (
                     "tool_calls"
-                    if tool_calls
+                    if produced_tool_call
                     else ("stop" if final_step.stopped_on_eos else "length")
                 )
                 prompt_count = len(final_step.prompt_ids)
@@ -621,6 +772,7 @@ class InferenceService:
                     MuseChannelStream()
                     if getattr(self.generator.tokenizer, "architecture", None)
                     == "muse-glimmer"
+                    else ThinkingPrefixStream() if request.thinking_open
                     else None
                 )
                 with self._generation_guard():
@@ -772,7 +924,7 @@ class InferenceService:
             _prepend_tool_prompt(messages, tools, payload.get("tool_choice"))
         tokens = self.generator.tokenizer.encode_messages(
             messages,
-            enable_thinking=_boolean_option(payload, "enable_thinking", False),
+            enable_thinking=_boolean_option(payload, "enable_thinking", None),
         )
         return {"object": "response.input_tokens", "input_tokens": len(tokens)}
 
@@ -787,7 +939,7 @@ class InferenceService:
         tokens = self.generator.tokenizer.encode_messages(
             messages,
             enable_thinking=_boolean_option(
-                chat_payload, "enable_thinking", False
+                chat_payload, "enable_thinking", None
             ),
         )
         return {"input_tokens": len(tokens)}
@@ -1176,18 +1328,21 @@ class InferenceService:
                             else {}
                         ),
                     }
-                for call in delta.get("tool_calls", []):
+                for position, call in enumerate(delta.get("tool_calls", [])):
                     stop_reason = "tool_use"
                     function = call.get("function", {})
-                    call_id = call.get("id", f"toolu_{uuid.uuid4().hex}")
-                    if call_id not in tool_blocks:
-                        tool_blocks[call_id] = block_index
+                    # Keyed by the call's index, not its id: a streamed call
+                    # carries its id only on the opening delta, so keying by id
+                    # opened a fresh content block for every argument fragment.
+                    key = call.get("index", position)
+                    if key not in tool_blocks:
+                        tool_blocks[key] = block_index
                         yield {
                             "type": "content_block_start",
                             "index": block_index,
                             "content_block": {
                                 "type": "tool_use",
-                                "id": call_id,
+                                "id": call.get("id", f"toolu_{uuid.uuid4().hex}"),
                                 "name": function.get("name", "tool"),
                                 "input": {},
                             },
@@ -1197,7 +1352,7 @@ class InferenceService:
                     if arguments:
                         yield {
                             "type": "content_block_delta",
-                            "index": tool_blocks[call_id],
+                            "index": tool_blocks[key],
                             "delta": {
                                 "type": "input_json_delta",
                                 "partial_json": arguments,
@@ -1356,7 +1511,7 @@ class InferenceService:
             )
         except ValueError as error:
             raise APIError(400, str(error)) from error
-        enable_thinking = _boolean_option(payload, "enable_thinking", False)
+        enable_thinking = _boolean_option(payload, "enable_thinking", None)
         separate_reasoning = _boolean_option(payload, "separate_reasoning", False)
         try:
             prepare_messages = getattr(self.generator, "prepare_messages", None)
@@ -1385,7 +1540,22 @@ class InferenceService:
             tools_enabled,
             tools,
             separate_reasoning,
+            # Read off the prompt itself rather than inferred from the flag: a
+            # template decides this, and it may reason by default with the flag
+            # never set. Only the tail can carry the marker.
+            self._prompt_opens_thinking(prompt_ids),
         )
+
+    def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
+        tokenizer = self.generator.tokenizer
+        decode = getattr(tokenizer, "decode", None)
+        if decode is None or not prompt_ids:
+            return False
+        try:
+            tail = decode(list(prompt_ids[-8:]), skip_special_tokens=False)
+        except Exception:
+            return False
+        return tail.rstrip().endswith("<think>")
 
     def _fit_max_new_tokens(
         self, requested: int, prompt_tokens: int, *, parameter: str
@@ -1406,6 +1576,7 @@ class InferenceService:
                 f"prompt has {prompt_tokens} tokens, filling the "
                 f"{self.context_window}-token context window",
                 parameter=parameter,
+                code="context_length_exceeded",
             )
         return max(1, min(requested, self.max_new_tokens, room))
 
@@ -1749,7 +1920,22 @@ def create_handler(
 
         def setup(self) -> None:
             super().setup()
+            # Waiting for a request is not the same as servicing one; see
+            # parse_request, which switches to the shorter request timeout as
+            # soon as a request line arrives.
+            self.connection.settimeout(service.keepalive_timeout_seconds)
+
+        def parse_request(self) -> bool:
+            parsed = super().parse_request()
             self.connection.settimeout(service.request_timeout_seconds)
+            return parsed
+
+        def handle_one_request(self) -> None:
+            super().handle_one_request()
+            # Back to idle: this connection may now wait a long time for its
+            # next request while another one occupies the runtime.
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(service.keepalive_timeout_seconds)
 
         def do_OPTIONS(self) -> None:
             self.send_response(204)
@@ -2104,6 +2290,17 @@ def create_handler(
             stream = _sse_with_keepalive(events, service.sse_keepalive_seconds)
             try:
                 for event in stream:
+                    if self._client_is_gone():
+                        # Stop generating for a client that has gone. The
+                        # `finally` below closes the wrapper, which closes the
+                        # upstream generator and releases the model.
+                        self.log_message(
+                            "request abandoned by client: streaming events=%d",
+                            event_count,
+                        )
+                        stream_ok = False
+                        self.close_connection = True
+                        break
                     if event is _SSE_KEEPALIVE:
                         self._write_sse_keepalive(keepalive)
                         continue
@@ -2219,6 +2416,30 @@ def create_handler(
                     except (BrokenPipeError, ConnectionResetError):
                         self.close_connection = True
 
+        def _client_is_gone(self) -> bool:
+            """Whether the peer has closed its end of a stream still in flight.
+
+            A client that abandons a stream stops reading, but writes into it
+            keep succeeding until the socket buffer fills -- so a long
+            generation runs to completion for nobody. Watching the *read* side
+            catches it: mid-response the client owes us no bytes, so a readable
+            socket means either EOF or an early next request, and EOF is the
+            one that says the response has no reader left.
+            """
+            connection = getattr(self, "connection", None)
+            if connection is None:
+                return False
+            try:
+                readable, _, _ = select.select([connection], [], [], 0)
+                if not readable:
+                    return False
+                return connection.recv(1, socket.MSG_PEEK) == b""
+            except (BlockingIOError, InterruptedError):
+                return False
+            except (OSError, ValueError):
+                # A closed or unusable socket has no reader either way.
+                return True
+
         def _write_sse_keepalive(self, event: Mapping[str, Any] | None) -> None:
             if event is not None:
                 self._write_sse_event(json.dumps(event, ensure_ascii=False), event)
@@ -2326,6 +2547,39 @@ def serve(
         server.server_close()
 
 
+# Architectures whose own chat template renders tools: the schemas, the call
+# markup and the result blocks. Anything else gets the generic Hermes prompt and
+# our own rendering, which is what a checkpoint without tool support needs.
+NATIVE_TOOL_ARCHITECTURES = ("deepseek4", "bailingmoe3")
+
+
+def _template_tool_calls(
+    tool_calls: Sequence[Mapping[str, Any]], architecture: str | None
+) -> list[dict[str, Any]]:
+    """Tool calls in the shape this architecture's template reads them.
+
+    The wire format carries `arguments` as a JSON *string*. Most templates
+    iterate it as a mapping (`arguments.items()`), which is a TypeError against
+    a string; DeepSeek-V4's applies `from_json` and so wants the string kept.
+    Decode for everyone except the one template that decodes for itself.
+    """
+    keep_encoded = architecture == "deepseek4"
+    out: list[dict[str, Any]] = []
+    for call in tool_calls:
+        function = dict(call.get("function") or {})
+        arguments = function.get("arguments")
+        if isinstance(arguments, str) and not keep_encoded:
+            try:
+                function["arguments"] = json.loads(arguments)
+            except json.JSONDecodeError:
+                # A template that cannot iterate it would raise; an empty
+                # mapping renders an argument-less call, which at least keeps
+                # the turn structure the conversation depends on.
+                function["arguments"] = {}
+        out.append({**call, "function": function})
+    return out
+
+
 def _chat_messages(
     payload: Mapping[str, Any], *, architecture: str | None = None
 ) -> tuple[list[dict[str, Any]], bool]:
@@ -2356,7 +2610,7 @@ def _chat_messages(
             content = _optional_text_content(message.get("content"), index)
             messages.append(
                 {"role": "tool", "content": content}
-                if architecture == "deepseek4"
+                if architecture in NATIVE_TOOL_ARCHITECTURES
                 else {
                     "role": "user",
                     "content": f"<tool_response>\n{content}\n</tool_response>",
@@ -2365,15 +2619,18 @@ def _chat_messages(
             continue
         content = _optional_text_content(message.get("content"), index)
         if role == "assistant" and message.get("tool_calls"):
-            if architecture != "deepseek4":
+            if architecture not in NATIVE_TOOL_ARCHITECTURES:
                 content = _render_tool_calls(content, message["tool_calls"], index)
         if not content and not (role == "assistant" and message.get("tool_calls")):
             raise APIError(
                 400, f"messages[{index}].content must be text", parameter="messages"
             )
         normalized: dict[str, Any] = {"role": role, "content": content}
-        if role == "assistant" and architecture == "deepseek4" and message.get("tool_calls"):
-            normalized["tool_calls"] = message["tool_calls"]
+        if (role == "assistant" and message.get("tool_calls")
+                and architecture in NATIVE_TOOL_ARCHITECTURES):
+            normalized["tool_calls"] = _template_tool_calls(
+                message["tool_calls"], architecture
+            )
         reasoning = message.get("reasoning_content")
         if role == "assistant" and reasoning is not None:
             if not isinstance(reasoning, str):
@@ -2384,21 +2641,30 @@ def _chat_messages(
                 )
             normalized["reasoning_content"] = reasoning
         messages.append(normalized)
-    if tools and architecture == "deepseek4":
-        # The checkpoint template owns the DSML instructions and schema
-        # rendering. Attach schemas to a message, which its template explicitly
-        # recognizes, instead of injecting the generic Hermes prompt.
-        if messages:
-            messages[0]["tools"] = list(tools)
-    elif tools:
+    if tools and architecture not in NATIVE_TOOL_ARCHITECTURES:
         system_parts.insert(0, _tool_prompt(tools, payload.get("tool_choice")))
     if system_parts:
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+    if tools and architecture in NATIVE_TOOL_ARCHITECTURES:
+        # The checkpoint template owns the tool instructions and the schema
+        # rendering, so the schemas ride on the first message rather than being
+        # injected as a generic prompt.
+        #
+        # After the system turn is inserted, not before: attaching first put
+        # them on what was the first message and the system turn then went in
+        # ahead of it, so every request that carried a system prompt -- which
+        # is every request a coding harness sends -- lost its tools entirely.
+        if messages:
+            messages[0]["tools"] = list(tools)
     # OpenAI-compatible clients may end a request with an assistant message
     # when they are asking the model to continue/prefill that turn. The chat
     # formatter adds the assistant generation marker after the supplied
     # history, so this is a valid prompt for the local runtime as well.
-    if not messages or messages[-1]["role"] not in ("user", "assistant"):
+    # "tool" belongs here for an architecture whose template renders tool
+    # results as their own turn. Elsewhere a tool result was rewritten into a
+    # user turn above and never reached this check, which is why the list did
+    # not match the message it raises.
+    if not messages or messages[-1]["role"] not in ("user", "assistant", "tool"):
         raise APIError(
             400,
             "the last message must have role 'user', 'assistant', or 'tool'",
@@ -2519,8 +2785,12 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "temperature": payload.get("temperature"),
         "top_p": payload.get("top_p"),
         "top_k": payload.get("top_k"),
-        "enable_thinking": bool(
-            isinstance(thinking, dict) and thinking.get("type") == "enabled"
+        # Absent means unstated, which leaves the checkpoint's own default in
+        # place. Answering "false" here turned reasoning off for every Claude
+        # Code request, since that client does not send a thinking block.
+        "enable_thinking": (
+            None if thinking is None
+            else bool(isinstance(thinking, dict) and thinking.get("type") == "enabled")
         ),
     }
     tools = payload.get("tools") or []
@@ -2730,10 +3000,20 @@ def _parse_tool_calls(
 ) -> tuple[str | None, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-    decoded: list[tuple[str | None, dict[str, Any]]] = [
-        _decode_tool_call_body(match.group(1))
-        for match in TOOL_CALL_BLOCK_PATTERN.finditer(text)
-    ]
+    # Each block is carried with the text that follows it, up to the next
+    # <tool_call>, so parameters the model emitted *after* closing the block
+    # can be recovered when -- and only when -- the call turns out incomplete.
+    # See _recover_trailing_parameters for why they land there.
+    decoded: list[tuple[str | None, dict[str, Any], str]] = []
+    blocks = list(TOOL_CALL_BLOCK_PATTERN.finditer(text))
+    for index, match in enumerate(blocks):
+        following = (
+            text[match.end() : blocks[index + 1].start()]
+            if index + 1 < len(blocks)
+            else text[match.end() :]
+        )
+        name, arguments = _decode_tool_call_body(match.group(1))
+        decoded.append((name, arguments, following))
     for block in DSML_TOOL_CALL_BLOCK_PATTERN.finditer(text):
         for invoke in DSML_INVOKE_PATTERN.finditer(block.group(1)):
             arguments: dict[str, Any] = {}
@@ -2746,25 +3026,42 @@ def _parse_tool_calls(
                         arguments[key] = json.loads(raw.strip())
                     except json.JSONDecodeError:
                         arguments[key] = raw
-            decoded.append((invoke.group(1), arguments))
-    for name, arguments in decoded:
+            decoded.append((invoke.group(1), arguments, ""))
+    for name, arguments, following in decoded:
         if name is None:
             continue
         schema = _tool_argument_schema(tools, name)
         if schema is not None:
             arguments = _normalize_schema_value(arguments, schema)
             required = schema.get("required")
-            if isinstance(required, list) and any(
-                isinstance(key, str) and key not in arguments for key in required
-            ):
+
+            def _missing(values: dict[str, Any]) -> bool:
+                return isinstance(required, list) and any(
+                    isinstance(key, str) and key not in values for key in required
+                )
+
+            if _missing(arguments) and following:
+                # Only now, with the schema in hand, is it clear the block came
+                # out short -- so a well-formed call never has trailing text
+                # folded into it.
+                recovered = _normalize_schema_value(
+                    _recover_trailing_parameters(arguments, following), schema
+                )
+                if not _missing(recovered):
+                    arguments = recovered
+            if _missing(arguments):
                 # Do not hand an incomplete call to the client/tool runner.
                 # Models sometimes close a tool block before emitting all
                 # parameters; exposing it produces confusing downstream schema
                 # errors (for example write missing content and filePath).
                 continue
         elif isinstance(arguments, dict):
-            # Undeclared tool: nothing describes these values, so fall back to
-            # inferring each one.
+            # Undeclared tool: no required list to test against, so the only
+            # safe signal that the block came out short is that it decoded
+            # nothing at all. A well-formed call always has its arguments.
+            if not arguments and following:
+                arguments = _recover_trailing_parameters(arguments, following)
+            # Nothing describes these values, so fall back to inferring each.
             arguments = {
                 key: _infer_tool_value(item) for key, item in arguments.items()
             }
@@ -2822,31 +3119,38 @@ def _split_muse_channels(text: str) -> tuple[str, str | None] | None:
 
 
 def _reasoning_delta_field(separate_reasoning: bool) -> str:
-    """Where a streamed reasoning delta belongs.
+    """Where a streamed reasoning delta belongs: never in the answer.
 
-    Muse Glimmer has no setting that stops it reasoning, and the reasoning runs
-    first, so routing it to `reasoning_content` leaves any client that does not
-    render that field watching a dead stream until the answer begins -- often
-    for a long time. Streaming it as ordinary content keeps output live, which
-    is the behaviour worth defaulting to; a client that renders the channels
-    separately opts in with `separate_reasoning`.
+    This used to forward reasoning as ordinary content so that a client which
+    ignores `reasoning_content` still saw a live stream rather than a long
+    silence. That trade is wrong for a model asked to DO something: told to
+    write a file, the model drafts it while thinking, and streaming the draft
+    as content made a coding harness render the file instead of writing it --
+    the tool call, when it came, arrived after the answer had already been
+    shown.
+
+    Reasoning is the model's notes, content is its answer, and the two are not
+    interchangeable at any level of client sophistication. `separate_reasoning`
+    is kept for callers that pass it, but both branches now agree that notes
+    are not the answer.
 
     Either way the protocol framing is stripped: `<|message|>` and friends are
     never content by any reading.
     """
-    return "reasoning_content" if separate_reasoning else "content"
+    return "reasoning_content"
 
 
 def _channel_delta(
-    channels: "MuseChannelStream | None",
+    channels: "MuseChannelStream | ThinkingPrefixStream | None",
     text_delta: str | None,
     *,
     separate_reasoning: bool = False,
 ) -> dict[str, str]:
-    """Shape one streaming delta, splitting Muse Glimmer's channels.
+    """Shape one streaming delta, separating reasoning from the answer.
 
-    Text that carries no Muse markup is forwarded untouched, so every other
-    architecture streams exactly as before.
+    The splitter is whichever one the turn needs -- Muse Glimmer's channels or
+    a thinking block the prompt opened -- and a turn that has neither is
+    forwarded untouched, so every other architecture streams exactly as before.
     """
     if not text_delta:
         return {}
@@ -2869,6 +3173,55 @@ def _without_partial_marker(text: str) -> str:
         if any(marker.startswith(tail) for marker in _MUSE_MARKERS):
             return text[:-size]
     return text
+
+
+class ThinkingPrefixStream:
+    """Splits a turn whose reasoning block was opened by the PROMPT.
+
+    A reasoning checkpoint is asked to think by ending the prompt with an open
+    ``<think>``, so the model emits its reasoning and then only the CLOSING
+    tag. Streaming that raw sends the private reasoning to the client as the
+    assistant's answer -- which reads as the model restating its plan before
+    doing it, then doing it.
+
+    Everything up to ``</think>`` is reasoning and everything after is visible.
+    The tag is withheld while it may still be arriving character by character,
+    for the same reason the Muse stream withholds its markers.
+    """
+
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._closed = False
+
+    def feed(self, delta: str) -> tuple[str, str]:
+        """Return (visible, reasoning) newly settled by this delta."""
+        if self._closed:
+            return delta, ""
+        self._buffer += delta
+        end = self._buffer.find(self._CLOSE)
+        if end == -1:
+            # Hold back a tail that could still become the closing tag.
+            settled = self._buffer
+            for size in range(min(len(settled), len(self._CLOSE) - 1), 0, -1):
+                if self._CLOSE.startswith(settled[-size:]):
+                    settled = settled[:-size]
+                    break
+            self._buffer = self._buffer[len(settled):]
+            return "", settled
+        reasoning = self._buffer[:end]
+        visible = self._buffer[end + len(self._CLOSE):]
+        self._buffer = ""
+        self._closed = True
+        return visible.lstrip(), reasoning
+
+    def flush(self) -> tuple[str, str]:
+        """Release whatever was being withheld as a possible closing tag."""
+        if self._closed or not self._buffer:
+            return "", ""
+        held, self._buffer = self._buffer, ""
+        return "", held
 
 
 class MuseChannelStream:
@@ -2944,11 +3297,17 @@ def _split_reasoning_content(text: str) -> tuple[str, str | None]:
     match = THINKING_BLOCK_PATTERN.match(text)
     if match:
         return text[match.end():], match.group(1)
-    # Non-thinking DeepSeek prompts begin with a closing tag. It is protocol
-    # framing, not user-visible assistant content.
-    stripped = text.lstrip()
-    if stripped.startswith("</think>"):
-        return stripped[len("</think>"):].lstrip(), None
+    # A prompt that ends with an open <think> -- which is how every reasoning
+    # checkpoint here asks for reasoning -- means the model's output carries
+    # only the CLOSING tag: the thinking is everything before it. Left in
+    # place, a turn's private reasoning was served as its visible answer,
+    # restating the plan before doing it and reading exactly like repetition.
+    #
+    # A closing tag with nothing before it is the same case with no reasoning
+    # produced, which is what a non-thinking DeepSeek prompt emits.
+    closing = text.find("</think>")
+    if closing != -1 and "<think>" not in text[:closing]:
+        return text[closing + len("</think>"):].lstrip(), text[:closing].strip() or None
     return text, None
 
 
@@ -3095,9 +3454,311 @@ def _infer_tool_value(value: Any) -> Any:
         return value
 
 
-def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
-    """Decode one <tool_call> body in either the Hermes or JSON tool format."""
+class _ToolCallStreamer:
+    """Turn an accumulating ``<tool_call>`` body into incremental JSON deltas.
+
+    Withholding the whole call until ``</tool_call>`` arrives means a client
+    receives no content for as long as the call takes to write -- minutes, for a
+    tool whose argument is a file. Clients time such a stream out ("no chunks
+    received") no matter how many SSE pings it carries, because a ping is not
+    content. This emits the tool name as soon as it is decodable and then the
+    arguments as JSON fragments, so the wire carries real progress.
+
+    Only the two tag-shaped bodies stream: their values have an unambiguous
+    close, so a value can be emitted before the call ends. A JSON body is
+    unparseable until its last brace, so it is emitted whole at the end.
+
+    The fragments concatenate into exactly ``json.dumps(arguments)`` for the
+    arguments the authoritative parse produces -- ``finish()`` reconciles
+    against it, so a client never assembles something the parser would reject.
+    """
+
+    # A value may be emitted only up to the point where no suffix of what is
+    # held back could still turn out to be the closing tag or the framing
+    # newline that _trim_parameter_text() removes.
+    _FORMATS = (
+        ("<arg_value>", "</arg_value>"),
+        (None, "</parameter>"),
+    )
+
+    def __init__(self, schema: Mapping[str, Any] | None = None) -> None:
+        self._schema = schema
+        self._name: str | None = None
+        self._opened = False
+        self._done: dict[str, Any] = {}
+        self._streaming_key: str | None = None
+        self._streamed = ""  # raw value text already emitted for _streaming_key
+        self._finished = False
+
+    @property
+    def name(self) -> str | None:
+        return self._name
+
+    @property
+    def started(self) -> bool:
+        return self._name is not None
+
+    def bind_schema(self, schema: Mapping[str, Any] | None) -> None:
+        """Attach the declared schema, once the name has identified the tool.
+
+        Nothing may have been emitted yet: the schema decides both which values
+        stream early and how each one is typed.
+        """
+        if self._opened:
+            raise RuntimeError("the tool call is already being streamed")
+        self._schema = schema
+
+    def _property_schema(self, key: str) -> Mapping[str, Any] | None:
+        if not isinstance(self._schema, Mapping):
+            return None
+        properties = self._schema.get("properties")
+        if not isinstance(properties, Mapping):
+            return None
+        candidate = properties.get(key)
+        return candidate if isinstance(candidate, Mapping) else None
+
+    def _streams_as_string(self, key: str) -> bool:
+        """Whether `key` may be emitted before its value is complete.
+
+        Only strings: any other type is decided by _normalize_schema_value once
+        the whole text is known, and a partial number or object cannot be walked
+        back after it is on the wire.
+        """
+        schema = self._property_schema(key)
+        if schema is None:
+            return False
+        declared = schema.get("type")
+        if isinstance(declared, list):
+            return declared == ["string"] or declared == ["string", "null"]
+        return declared == "string"
+
+    def _encode(self, key: str, value: Any) -> str:
+        schema = self._property_schema(key)
+        if schema is not None:
+            value = _normalize_schema_value(value, schema)
+        elif self._schema is None:
+            value = _infer_tool_value(value)
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape `text` as JSON string content, without the framing quotes."""
+        return json.dumps(text, ensure_ascii=False)[1:-1]
+
+    def _separator(self) -> str:
+        if not self._opened:
+            self._opened = True
+            return "{"
+        return ","
+
+    def feed(self, body: str) -> list[str]:
+        """Emit fragments for everything `body` newly settles. Never blocks."""
+        if self._finished:
+            return []
+        fragments: list[str] = []
+        if self._name is None:
+            self._name = _decode_tool_call_name(body)
+            # Emit nothing on the call that discovers the name: the caller has
+            # to bind the schema first, and the schema decides how the very
+            # first value is typed and whether it may stream at all.
+            return fragments
+        for key, value, closed in _iter_tool_call_arguments(body):
+            if key in self._done:
+                continue
+            if closed:
+                if self._streaming_key == key:
+                    # Close the string this value was being streamed into. The
+                    # tail trim only applies once the value is known to be over.
+                    remainder = _trim_parameter_text(value)[len(self._streamed):]
+                    fragments.append(self._escape(remainder) + '"')
+                    self._streaming_key = None
+                    self._streamed = ""
+                else:
+                    fragments.append(
+                        self._separator() + json.dumps(key, ensure_ascii=False)
+                        + ":" + self._encode(key, _trim_parameter_text(value))
+                    )
+                self._done[key] = True
+                continue
+            # An open value: stream it only if its declared type makes the text
+            # final, and only the part no closing tag could still claim.
+            if not self._streams_as_string(key):
+                break
+            if self._streaming_key != key:
+                if self._streaming_key is not None:
+                    break
+                fragments.append(
+                    self._separator() + json.dumps(key, ensure_ascii=False) + ':"'
+                )
+                self._streaming_key = key
+                self._streamed = ""
+            settled = _settled_prefix(_trim_parameter_text(value))
+            if len(settled) > len(self._streamed):
+                fragments.append(self._escape(settled[len(self._streamed):]))
+                self._streamed = settled
+            break
+        return fragments
+
+    def finish(self, arguments: Mapping[str, Any] | None) -> list[str]:
+        """Emit whatever `arguments` still owes the client, and close the object.
+
+        `arguments` is the authoritative parse. Anything streamed already is a
+        prefix of it; anything left is emitted here.
+        """
+        if self._finished:
+            return []
+        self._finished = True
+        fragments: list[str] = []
+        if arguments is None:
+            # The call did not survive parsing. Close what is already on the
+            # wire so the client sees valid JSON rather than a truncated object.
+            if self._streaming_key is not None:
+                fragments.append('"')
+            if self._opened:
+                fragments.append("}")
+            return fragments
+        for key, value in arguments.items():
+            encoded = json.dumps(value, ensure_ascii=False)
+            if self._streaming_key == key:
+                # Close the streamed string against the authoritative value
+                # rather than the raw text, so normalization still decides it.
+                streamed = self._escape(self._streamed)
+                tail = encoded[1:-1] if encoded.startswith('"') else ""
+                fragments.append(
+                    (tail[len(streamed):] if tail.startswith(streamed) else "") + '"'
+                )
+                self._streaming_key = None
+            elif key not in self._done:
+                fragments.append(
+                    self._separator() + json.dumps(key, ensure_ascii=False)
+                    + ":" + encoded
+                )
+            self._done[key] = True
+        if self._streaming_key is not None:
+            fragments.append('"')
+        if not self._opened:
+            self._opened = True
+            fragments.append("{")
+        fragments.append("}")
+        return fragments
+
+
+def _settled_prefix(value: str) -> str:
+    """The part of an open tag value no closing tag or framing could reclaim.
+
+    Holds back the longest suffix that is a prefix of any closing tag, plus a
+    trailing newline run, which _trim_parameter_text() drops if the value ends
+    there.
+    """
+    limit = len(value)
+    for open_tag, close_tag in _ToolCallStreamer._FORMATS:
+        del open_tag
+        for length in range(min(len(close_tag) - 1, len(value)), 0, -1):
+            if value.endswith(close_tag[:length]):
+                limit = min(limit, len(value) - length)
+                break
+    settled = value[:limit]
+    trailing = TOOL_PARAMETER_TAIL.search(settled)
+    return settled[: trailing.start()] if trailing else settled
+
+
+def _decode_tool_call_name(body: str) -> str | None:
+    """The function name from a possibly-incomplete tool-call body."""
     body = body.strip()
+    key_match = TOOL_ARG_KEY_PATTERN.search(body)
+    if key_match:
+        head = body[: key_match.start()].strip()
+        return head.splitlines()[0].strip() if head else None
+    function_match = TOOL_FUNCTION_PATTERN.search(body)
+    if function_match:
+        return function_match.group(1).strip()
+    return None
+
+
+def _iter_tool_call_arguments(body: str):
+    """Yield ``(key, raw_value, closed)`` for a possibly-incomplete body.
+
+    The trailing entry may be open -- its value is still being generated -- which
+    is what lets a long parameter stream instead of landing in one piece.
+    """
+    body = body.strip()
+    if TOOL_ARG_KEY_PATTERN.search(body):
+        pattern, open_pattern = TOOL_ARG_PAIR_PATTERN, TOOL_ARG_OPEN_PATTERN
+    elif TOOL_FUNCTION_PATTERN.search(body):
+        pattern, open_pattern = TOOL_PARAMETER_PATTERN, TOOL_PARAMETER_OPEN_PATTERN
+    else:
+        return
+    end = 0
+    for match in pattern.finditer(body):
+        yield match.group(1).strip(), match.group(2), True
+        end = match.end()
+    trailing = open_pattern.search(body, end)
+    if trailing:
+        yield trailing.group(1).strip(), trailing.group(2), False
+
+
+def _recover_trailing_parameters(
+    arguments: dict[str, Any], following: str
+) -> dict[str, Any]:
+    """Fold in parameters the model emitted after </tool_call>.
+
+    Qwen3.5's format nests three levels deep, and only the outermost pair is
+    atomic in its vocabulary: <tool_call> and </tool_call> are single tokens,
+    while </function> and </parameter> are spelled out in ordinary subwords. So
+    the closers the model has to compose by hand are exactly the ones it
+    misorders, and the common shape is a block that closes early with the
+    arguments trailing behind it:
+
+        <tool_call>
+        <function=list_files>
+        </function>
+        </tool_call>
+        <parameter=execute>
+        true
+        </parameter>
+
+    The block itself parses -- there is a name -- but it decodes to no
+    arguments at all, so the required-parameter check drops the call and the
+    agent loop stalls with nothing saying why. The model's own template warns
+    against this shape ("ONLY reply in the following format with NO suffix",
+    "reasoning ... BEFORE the function call, but NOT after"), which is a fair
+    sign of how often it happens.
+
+    Recovery is deliberately additive: anything the block decoded itself wins,
+    and a well-formed call has no trailing parameters to find, so it is
+    unaffected. Text between calls that is not a <parameter=...> tag is ignored.
+    """
+    if not arguments and TOOL_CALL_MARKER in following:
+        # Defensive: never reach across into a block we did not match.
+        following = following[: following.index(TOOL_CALL_MARKER)]
+    recovered = dict(arguments)
+    for key, value in TOOL_PARAMETER_LOOSE_PATTERN.findall(following):
+        recovered.setdefault(key.strip(), _trim_parameter_text(value))
+    return recovered
+
+
+def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
+    """Decode one <tool_call> body in the Hermes, BailingMoE3 or JSON format."""
+    body = body.strip()
+    # BailingMoE3 puts the function name on the opening line and each argument
+    # in its own tagged pair:
+    #     <tool_call>read_file
+    #     <arg_key>path</arg_key>
+    #     <arg_value>/etc/hosts</arg_value>
+    #     </tool_call>
+    # Checked before the others because a name followed by tags parses as
+    # neither of them -- which is what used to happen, and a block that decodes
+    # to no name is dropped along with the content preceding it, so the model
+    # appeared to answer with nothing at all.
+    key_match = TOOL_ARG_KEY_PATTERN.search(body)
+    if key_match:
+        name = body[: key_match.start()].strip().splitlines()[0].strip()
+        arguments: dict[str, Any] = {}
+        for key, value in TOOL_ARG_PAIR_PATTERN.findall(body):
+            # Text, for the same reason the Hermes branch keeps it as text: the
+            # declared schema decides the type in _normalize_schema_value.
+            arguments[key.strip()] = _trim_parameter_text(value)
+        return (name or None), arguments
     function_match = TOOL_FUNCTION_PATTERN.search(body)
     if function_match:
         arguments: dict[str, Any] = {}
@@ -3482,8 +4143,24 @@ def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
     }
 
 
-def _boolean_option(payload: Mapping[str, Any], key: str, default: bool) -> bool:
+@overload
+def _boolean_option(payload: Mapping[str, Any], key: str, default: bool) -> bool: ...
+@overload
+def _boolean_option(
+    payload: Mapping[str, Any], key: str, default: None
+) -> bool | None: ...
+def _boolean_option(
+    payload: Mapping[str, Any], key: str, default: bool | None
+) -> bool | None:
+    """The flag as the caller set it. A None default means "unstated".
+
+    Whether a request is silent about a setting is information: a chat template
+    may have its own default, and answering "false" on its behalf overrides a
+    choice the checkpoint made.
+    """
     value = payload.get(key, default)
+    if value is None:
+        return None
     if not isinstance(value, bool):
         raise APIError(400, f"{key} must be a boolean", parameter=key)
     return value
@@ -3532,7 +4209,7 @@ def _error_payload(error: APIError) -> dict[str, Any]:
             "message": error.message,
             "type": error.error_type,
             "param": error.parameter,
-            "code": None,
+            "code": error.code,
         }
     }
 
