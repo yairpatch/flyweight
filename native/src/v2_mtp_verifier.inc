@@ -308,6 +308,11 @@ void qwen_forward_rows(
             case 21:launch("iq3s_matmul_rows",output_size,(rows+3)/4,256,args);return;
             case 17:launch("iq2xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
             case 23:launch("iq4xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            // IQ1_M: ssm_alpha/ssm_beta. Without this they fall to the
+            // per-token fallback below -- 64 launches of a 48-block grid per
+            // projection per layer -- which is pure launch latency and was the
+            // bulk of the prefill "proj" phase. Batched, it is one launch.
+            case 29:launch("iq1m_matmul_rows",output_size,(rows+3)/4,256,args);return;
             default:break;
         }
         // Keep an explicit compatibility fallback for future tensor formats.
