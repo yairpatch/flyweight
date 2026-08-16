@@ -1799,42 +1799,62 @@ extern "C" __global__ void name(                                               \
         __syncthreads();                                                       \
         if (lane >= count) continue;                                           \
         const int group = base + lane;                                         \
+        /* Both operands are staged before the row loop, so the row loop reads */\
+        /* each weight word from shared once and reuses it across every token  */\
+        /* slot. With those loads inside the slot loop the kernel issues about */\
+        /* one shared load per dp4a; hoisting them cuts that to one per        */\
+        /* COLIBRI_Q8_TILE_SLOTS. Shared throughput is what sets the pace here */\
+        /* -- row tiling already took the bandwidth terms out of contention.   */\
+        /* Inactive slots are zeroed rather than branched around, so the inner */\
+        /* loop stays straight-line.                                           */\
+        int acts[COLIBRI_Q8_TILE_SLOTS][8];                                    \
+        float activation_scale[COLIBRI_Q8_TILE_SLOTS];                         \
         _Pragma("unroll")                                                      \
         for (int s = 0; s < COLIBRI_Q8_TILE_SLOTS; ++s) {                      \
             const int token = warp + s * COLIBRI_Q8_TILE_WARPS;                \
-            if (token >= rows) continue;                                       \
-            /* The activation tile does not depend on the output row, so it is */\
-            /* loaded once here and reused across all COLIBRI_Q8_TILE_ROWS of  */\
-            /* them. That reuse is the point of this kernel: with one row per  */\
-            /* block the activation re-reads outweigh the weight reads by two  */\
-            /* orders of magnitude, and they, not the decode, set the pace.    */\
-            const int4* activation_vectors = (const int4*)(                    \
-                vectors + (long long)token * input_size                        \
-                + (long long)group * 32);                                      \
-            const int4 activation_low = activation_vectors[0];                 \
-            const int4 activation_high = activation_vectors[1];                \
-            const int acts[8] = {                                              \
-                activation_low.x, activation_low.y,                            \
-                activation_low.z, activation_low.w,                            \
-                activation_high.x, activation_high.y,                          \
-                activation_high.z, activation_high.w};                         \
-            const float activation_scale = __half2float(                       \
-                vector_scales[(long long)token * scale_stride + group]);       \
+            if (token < rows) {                                                \
+                const int4* activation_vectors = (const int4*)(                \
+                    vectors + (long long)token * input_size                    \
+                    + (long long)group * 32);                                  \
+                const int4 activation_low = activation_vectors[0];             \
+                const int4 activation_high = activation_vectors[1];            \
+                acts[s][0] = activation_low.x;                                 \
+                acts[s][1] = activation_low.y;                                 \
+                acts[s][2] = activation_low.z;                                 \
+                acts[s][3] = activation_low.w;                                 \
+                acts[s][4] = activation_high.x;                                \
+                acts[s][5] = activation_high.y;                                \
+                acts[s][6] = activation_high.z;                                \
+                acts[s][7] = activation_high.w;                                \
+                activation_scale[s] = __half2float(                            \
+                    vector_scales[(long long)token * scale_stride + group]);   \
+            } else {                                                           \
+                _Pragma("unroll")                                              \
+                for (int k = 0; k < 8; ++k) acts[s][k] = 0;                    \
+                activation_scale[s] = 0.0f;                                    \
+            }                                                                  \
+        }                                                                      \
+        _Pragma("unroll")                                                      \
+        for (int r = 0; r < COLIBRI_Q8_TILE_ROWS; ++r) {                       \
+            int weights[8];                                                    \
             _Pragma("unroll")                                                  \
-            for (int r = 0; r < COLIBRI_Q8_TILE_ROWS; ++r) {                   \
+            for (int k = 0; k < 8; ++k) weights[k] = tile_words[r][lane][k];   \
+            const float weight_low = tile_low[r][lane];                        \
+            const float weight_high = tile_high[r][lane];                      \
+            _Pragma("unroll")                                                  \
+            for (int s = 0; s < COLIBRI_Q8_TILE_SLOTS; ++s) {                  \
                 int dot_low = 0, dot_high = 0;                                 \
                 _Pragma("unroll")                                              \
                 for (int step = 0; step < 4; ++step) {                         \
                     int dot = 0;                                               \
+                    dot = __dp4a(weights[step * 2], acts[s][step * 2], dot);   \
                     dot = __dp4a(                                              \
-                        tile_words[r][lane][step * 2], acts[step * 2], dot);   \
-                    dot = __dp4a(tile_words[r][lane][step * 2 + 1],            \
-                                 acts[step * 2 + 1], dot);                     \
+                        weights[step * 2 + 1], acts[s][step * 2 + 1], dot);    \
                     if (step < 2) dot_low += dot; else dot_high += dot;        \
                 }                                                              \
-                acc[s][r] += ((float)dot_low * tile_low[r][lane]               \
-                              + (float)dot_high * tile_high[r][lane])          \
-                    * activation_scale;                                        \
+                acc[s][r] += ((float)dot_low * weight_low                      \
+                              + (float)dot_high * weight_high)                 \
+                    * activation_scale[s];                                     \
             }                                                                  \
         }                                                                      \
     }                                                                          \
