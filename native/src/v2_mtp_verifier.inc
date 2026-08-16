@@ -21,6 +21,13 @@ static constexpr int kQ8TileTokens=32;
 // Output rows per block of the tiled matmul. Must match COLIBRI_Q8_TILE_ROWS.
 static constexpr int kQ8TileRows=16;
 
+// The tensor-core matmul's block tile. Must match COLIBRI_MMQ_ROWS and
+// COLIBRI_MMQ_TOKENS in native/include/colibri_v2_qwen_kernels.hpp.
+static constexpr int kQ8MmqRows=16;
+static constexpr int kQ8MmqTokens=64;
+// Threads per block: one warp per 16x8 fragment of the block tile.
+static constexpr int kQ8MmqThreads=(kQ8MmqRows/16)*(kQ8MmqTokens/8)*32;
+
 void qwen_forward_rows(
     ColibriV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
     int rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
@@ -186,6 +193,31 @@ void qwen_forward_rows(
             // kernel leaves most of its warps idle. MTP verification runs a
             // handful of rows and stays on the rows kernel; chunked prefill
             // runs prefill_rows (64 on a dense checkpoint) and takes this.
+            // Tensor cores where the format has an MMQ kernel; the dp4a
+            // tile kernel is the fallback for the rest.
+            const char* mmq_kernel=nullptr;
+            switch(type){
+                case 16:mmq_kernel="iq2xxs_q8_mmq";break;
+                case 17:mmq_kernel="iq2xs_q8_mmq";break;
+                case 18:mmq_kernel="iq3xxs_q8_mmq";break;
+                case 22:mmq_kernel="iq2s_q8_mmq";break;
+                case 23:mmq_kernel="iq4xs_q8_mmq";break;
+                default:break;
+            }
+            if(rows>kQ8RowBatch&&mmq_kernel){
+                for(int first=0;first<rows;first+=kQ8MmqTokens){
+                    int batch=std::min(kQ8MmqTokens,rows-first);
+                    auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
+                    auto batch_scales=small_q8_scales+
+                        static_cast<std::uint64_t>(first)*(input_size/32)*sizeof(float);
+                    auto batch_output=output+
+                        static_cast<std::uint64_t>(first)*output_size*sizeof(float);
+                    void*mmq_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
+                        &input_size,&output_size,&batch,&scale_stride};
+                    launch(mmq_kernel,(output_size+kQ8MmqRows-1)/kQ8MmqRows,1,kQ8MmqThreads,mmq_args);
+                }
+                return;
+            }
             const char* tiled_kernel=nullptr;
             switch(type){
                 case 16:tiled_kernel="iq2xxs_q8_matmul_tiled";break;

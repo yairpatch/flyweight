@@ -1728,6 +1728,62 @@ extern "C" __global__ void name(                                               \
 }
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
+// One warp-level int8 tensor-core step: D[16][8] += A[16][16] * B[16][8].
+//
+// This is the instruction the dp4a path is competing with. A warp issues one
+// of these where the scalar loop issues 32 dp4a for the same 2048 MACs, which
+// is the whole reason llama.cpp's prompt path outruns ours.
+//
+// K=16 rather than the wider m16n8k32 because the codebook formats carry two
+// half-scales per 32-value group (IQ2_S's scale_low/scale_high split at
+// exactly K=16), and a k32 step would mix them into one accumulator with no
+// way to weight the halves differently. Two k16 steps per group keep the
+// scales separable and cost nothing extra -- the format and the instruction
+// happen to divide the same way.
+//
+// Fragment layout (PTX ISA, mma.m16n8k16 with .s8), lane l:
+//   quad = l >> 2, slot = l & 3
+//   A: rows {quad, quad+8}, K = slot*4 + {0,1,2,3}  -> a[0], a[1]
+//   B: col (token) = quad,  K = slot*4 + {0,1,2,3}  -> b
+//   D: rows {quad, quad+8} x cols {slot*2, slot*2+1} -> d[0..3]
+// A's four consecutive K per register is exactly how *_q8_decode already packs
+// words[k] (elements 4k..4k+3), so fragments come straight out of the decoder.
+__device__ __forceinline__ void mma_m16n8k16_s8(int* d, const int* a, int b) {
+#if defined(__CUDA_ARCH__)
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(b));
+#else
+    // Host emulation for the CPU corpus, so the contract can check the layout
+    // maths above without a GPU. Correctness only -- it rebuilds each operand
+    // through the warp shuffle the shim already emulates, which is far slower
+    // than the scalar loop it stands in for and is never compiled for device.
+    const int lane = (int)(threadIdx.x & 31u);
+    const int quad = lane >> 2, slot = lane & 3;
+    #pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int row = (item < 2) ? quad : quad + 8;
+        const int col = slot * 2 + (item & 1);
+        int total = 0;
+        for (int word = 0; word < 4; ++word) {
+            // A[row][*] lives in the lane owning that row, in a[0] for the
+            // top half of the tile and a[1] for the bottom.
+            const int a_word = __shfl_sync(
+                0xffffffffu, (row < 8) ? a[0] : a[1], (row & 7) * 4 + word);
+            const int b_word = __shfl_sync(0xffffffffu, b, col * 4 + word);
+            for (int byte = 0; byte < 4; ++byte) {
+                const int lhs = (int)(signed char)((a_word >> (8 * byte)) & 0xff);
+                const int rhs = (int)(signed char)((b_word >> (8 * byte)) & 0xff);
+                total += lhs * rhs;
+            }
+        }
+        d[item] += total;
+    }
+#endif
+}
+
 // Prefill twin of COLIBRI_Q8_MATVEC_ROWS, for wide token batches.
 //
 // The kernel above caps its batch at COLIBRI_Q8_ROWS because `partial[]` is a
@@ -1871,6 +1927,143 @@ extern "C" __global__ void name(                                               \
         }                                                                      \
     }                                                                          \
 }
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Tensor-core prefill matmul. Same contract as COLIBRI_Q8_MATMUL_TILED, which
+// it replaces wherever the batch is wide enough to fill it.
+//
+// The dp4a tile kernel holds its output tile in per-thread registers, which is
+// what caps it: 128 registers a thread, two blocks an SM, 33% occupancy, and
+// measurements ~8.5x off what its instruction count predicts -- it stalls
+// rather than issues. A tensor-core fragment distributes the same tile across
+// the warp instead, so the accumulators cost four registers a thread rather
+// than sixty-four. The register cliff disappears and the occupancy that hides
+// the latency comes back with it.
+//
+// Shape: a warp owns 16 output rows x 8 tokens (one m16n8k16 fragment). Eight
+// warps tile that 2 deep in rows and 4 wide in tokens, so a block covers 32
+// rows x 32 tokens. K advances COLIBRI_MMQ_GROUPS super-block groups at a
+// time, staged through shared memory.
+//
+// Two things fall out of the format rather than being designed: the decoder
+// already packs words[k] as elements 4k..4k+3, which is exactly A's four
+// consecutive K per register, so fragments load straight from the staged
+// words with no repacking; and a 32-value group is two k16 steps, which is
+// where IQ2_S's scale_low/scale_high divide, so the halves stay separable.
+//
+// No cross-lane reduction at the end: the MMA already summed over K within the
+// warp, so each thread's four accumulators are finished values.
+// Warps split the block tile; a warp always owns one 16x8 fragment. Tokens per
+// launch is the lever that matters most here: every weight is decoded once per
+// launch regardless of tiling, so the decode -- which dominates, being ~8
+// dependent codebook loads per group -- is amortized over exactly this many
+// tokens. The host chunks to COLIBRI_MMQ_TOKENS and must match it.
+#define COLIBRI_MMQ_ROW_WARPS 1
+#define COLIBRI_MMQ_TOKEN_WARPS 8
+#define COLIBRI_MMQ_ROWS (COLIBRI_MMQ_ROW_WARPS * 16)
+#define COLIBRI_MMQ_TOKENS (COLIBRI_MMQ_TOKEN_WARPS * 8)
+#define COLIBRI_MMQ_GROUPS 8
+
+#define COLIBRI_Q8_MMQ(name, decode_fn, stride)                                \
+extern "C" __global__ void name(                                               \
+    const unsigned char* packed, const signed char* vectors,                   \
+    const __half* vector_scales, float* outputs,                               \
+    const int input_size, const int output_size,                               \
+    const int rows, const int scale_stride                                     \
+) {                                                                            \
+    const int row_base = blockIdx.x * COLIBRI_MMQ_ROWS;                        \
+    if (row_base >= output_size) return;                                       \
+    const int blocks_per_row = input_size >> 8;                                \
+    const int groups_per_row = blocks_per_row << 3;                            \
+    /* [.][9] not [.][8]: at 8 the eight row-quads of a warp land on one bank */\
+    /* eight ways over; the odd stride spreads them across all 32.            */\
+    __shared__ int w_words[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS][9];           \
+    __shared__ float w_low[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];              \
+    __shared__ float w_high[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];             \
+    __shared__ int a_words[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS][9];         \
+    __shared__ float a_scale[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS];          \
+    const int lane = threadIdx.x & 31;                                         \
+    const int warp = threadIdx.x >> 5;                                         \
+    const int warp_row = (warp / COLIBRI_MMQ_TOKEN_WARPS) * 16;                \
+    const int warp_token = (warp % COLIBRI_MMQ_TOKEN_WARPS) * 8;               \
+    const int quad = lane >> 2;                                                \
+    const int slot = lane & 3;                                                 \
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};                                   \
+    for (int base = 0; base < groups_per_row; base += COLIBRI_MMQ_GROUPS) {    \
+        __syncthreads();                                                       \
+        for (int i = threadIdx.x;                                              \
+             i < COLIBRI_MMQ_ROWS * COLIBRI_MMQ_GROUPS; i += blockDim.x) {     \
+            const int r = i / COLIBRI_MMQ_GROUPS;                              \
+            const int g = i - r * COLIBRI_MMQ_GROUPS;                          \
+            float low = 0.0f, high = 0.0f;                                     \
+            if (row_base + r < output_size && base + g < groups_per_row) {     \
+                decode_fn(packed + (long long)(row_base + r)                   \
+                              * blocks_per_row * stride,                       \
+                          base + g, w_words[r][g], &low, &high);               \
+            } else {                                                           \
+                _Pragma("unroll")                                              \
+                for (int k = 0; k < 8; ++k) w_words[r][g][k] = 0;              \
+            }                                                                  \
+            w_low[r][g] = low;                                                 \
+            w_high[r][g] = high;                                               \
+        }                                                                      \
+        for (int i = threadIdx.x;                                              \
+             i < COLIBRI_MMQ_TOKENS * COLIBRI_MMQ_GROUPS; i += blockDim.x) {   \
+            const int t = i / COLIBRI_MMQ_GROUPS;                              \
+            const int g = i - t * COLIBRI_MMQ_GROUPS;                          \
+            if (t < rows && base + g < groups_per_row) {                       \
+                const int4* source = (const int4*)(                            \
+                    vectors + (long long)t * input_size                        \
+                    + (long long)(base + g) * 32);                             \
+                const int4 first = source[0], second = source[1];              \
+                a_words[t][g][0] = first.x;  a_words[t][g][1] = first.y;       \
+                a_words[t][g][2] = first.z;  a_words[t][g][3] = first.w;       \
+                a_words[t][g][4] = second.x; a_words[t][g][5] = second.y;      \
+                a_words[t][g][6] = second.z; a_words[t][g][7] = second.w;      \
+                a_scale[t][g] = __half2float(                                  \
+                    vector_scales[(long long)t * scale_stride + base + g]);    \
+            } else {                                                           \
+                _Pragma("unroll")                                              \
+                for (int k = 0; k < 8; ++k) a_words[t][g][k] = 0;              \
+                a_scale[t][g] = 0.0f;                                          \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+        _Pragma("unroll")                                                      \
+        for (int g = 0; g < COLIBRI_MMQ_GROUPS; ++g) {                         \
+            int fragment[2];                                                   \
+            int low_dot[4] = {0, 0, 0, 0};                                     \
+            int high_dot[4] = {0, 0, 0, 0};                                    \
+            fragment[0] = w_words[warp_row + quad][g][slot];                   \
+            fragment[1] = w_words[warp_row + quad + 8][g][slot];               \
+            mma_m16n8k16_s8(                                                   \
+                low_dot, fragment, a_words[warp_token + quad][g][slot]);       \
+            fragment[0] = w_words[warp_row + quad][g][4 + slot];               \
+            fragment[1] = w_words[warp_row + quad + 8][g][4 + slot];           \
+            mma_m16n8k16_s8(                                                   \
+                high_dot, fragment, a_words[warp_token + quad][g][4 + slot]);  \
+            _Pragma("unroll")                                                  \
+            for (int item = 0; item < 4; ++item) {                             \
+                const int r = warp_row + ((item < 2) ? quad : quad + 8);       \
+                const int t = warp_token + slot * 2 + (item & 1);              \
+                acc[item] += ((float)low_dot[item] * w_low[r][g]               \
+                              + (float)high_dot[item] * w_high[r][g])          \
+                    * a_scale[t][g];                                           \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    _Pragma("unroll")                                                          \
+    for (int item = 0; item < 4; ++item) {                                     \
+        const int r = row_base + warp_row + ((item < 2) ? quad : quad + 8);    \
+        const int t = warp_token + slot * 2 + (item & 1);                      \
+        if (r < output_size && t < rows)                                       \
+            outputs[(long long)t * output_size + r] = acc[item];               \
+    }                                                                          \
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
 // One warp per output row, eight rows per block, argmax fused in. The LM head
@@ -2481,6 +2674,7 @@ __device__ __forceinline__ void iq2xxs_q8_decode(
 
 COLIBRI_Q8_MATVEC_ROWS(iq2xxs_q8_matvec_transposed_rows, iq2xxs_q8_decode, 66)
 COLIBRI_Q8_MATMUL_TILED(iq2xxs_q8_matmul_tiled, iq2xxs_q8_decode, 66)
+COLIBRI_Q8_MMQ(iq2xxs_q8_mmq, iq2xxs_q8_decode, 66)
 
 
 // Decode Q4_K against a vector quantized in independent 32-value Q8 blocks.
@@ -2677,6 +2871,7 @@ __device__ __forceinline__ void iq3xxs_q8_decode(
 
 COLIBRI_Q8_MATVEC_ROWS(iq3xxs_q8_matvec_transposed_rows, iq3xxs_q8_decode, 98)
 COLIBRI_Q8_MATMUL_TILED(iq3xxs_q8_matmul_tiled, iq3xxs_q8_decode, 98)
+COLIBRI_Q8_MMQ(iq3xxs_q8_mmq, iq3xxs_q8_decode, 98)
 
 
 
@@ -3187,6 +3382,11 @@ __device__ __forceinline__ void iq2s_q8_decode(
 
 COLIBRI_Q8_MATVEC_ROWS(iq2s_q8_matvec_transposed_rows, iq2s_q8_decode, 82)
 COLIBRI_Q8_MATMUL_TILED(iq2s_q8_matmul_tiled, iq2s_q8_decode, 82)
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+COLIBRI_Q8_MMQ(iq2s_q8_mmq, iq2s_q8_decode, 82)
+
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
 __device__ __forceinline__ float iq3s_value(
@@ -3515,6 +3715,7 @@ __device__ __forceinline__ void iq4xs_q8_decode(
 
 COLIBRI_Q8_MATVEC_ROWS(iq4xs_q8_matvec_transposed_rows, iq4xs_q8_decode, 136)
 COLIBRI_Q8_MATMUL_TILED(iq4xs_q8_matmul_tiled, iq4xs_q8_decode, 136)
+COLIBRI_Q8_MMQ(iq4xs_q8_mmq, iq4xs_q8_decode, 136)
 
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
@@ -4215,6 +4416,7 @@ __device__ __forceinline__ void iq2xs_q8_decode(
 
 COLIBRI_Q8_MATVEC_ROWS(iq2xs_q8_matvec_transposed_rows, iq2xs_q8_decode, 74)
 COLIBRI_Q8_MATMUL_TILED(iq2xs_q8_matmul_tiled, iq2xs_q8_decode, 74)
+COLIBRI_Q8_MMQ(iq2xs_q8_mmq, iq2xs_q8_decode, 74)
 
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(

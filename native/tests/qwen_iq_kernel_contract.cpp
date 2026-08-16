@@ -458,6 +458,11 @@ int main() {
     failures += check_iq4xs_q8_rows();
     failures += check_tiled("iq2s_q8_matmul_tiled", kIq2sBlockBytes,
                             qwen_iq2s_value);
+    failures += check_tiled("iq2s_q8_mmq", kIq2sBlockBytes, qwen_iq2s_value);
+    failures += check_tiled("iq2xxs_q8_mmq", kIq2xxsBlockBytes, qwen_iq2xxs_value);
+    failures += check_tiled("iq3xxs_q8_mmq", kIq3xxsBlockBytes, qwen_iq3xxs_value);
+    failures += check_tiled("iq2xs_q8_mmq", kIq2xsBlockBytes, qwen_iq2xs_value);
+    failures += check_tiled("iq4xs_q8_mmq", kIq4xsBlockBytes, qwen_iq4xs_value);
     failures += check_tiled("iq2xxs_q8_matmul_tiled", kIq2xxsBlockBytes,
                             qwen_iq2xxs_value);
     failures += check_tiled("iq3xxs_q8_matmul_tiled", kIq3xxsBlockBytes,
