@@ -278,6 +278,37 @@ inline QuantizedModel quantize(const std::vector<HfTensor>& tensors,
             const std::uint64_t byte_begin = item.element_begin * width;
             const std::uint64_t byte_size = item.elements * width;
 
+            if (!source.column_order.empty()) {
+                // Row-internal reorder: walk the tile one block at a time and
+                // pull each from wherever it lives. The tile stride is a
+                // multiple of the quantization block and the block width
+                // divides that, so a tile never starts mid-block.
+                const std::uint64_t block = source.column_block_elements;
+                const std::uint64_t row = block * source.column_order.size();
+                bool failed = false;
+                for (std::uint64_t done = 0; done < item.elements; done += block) {
+                    const std::uint64_t destination = item.element_begin + done;
+                    const std::uint64_t source_element =
+                        destination / row * row
+                        + source.column_order[(destination % row) / block] * block;
+                    const std::uint64_t from = source_element * width;
+                    const std::uint64_t span = block * width;
+                    const std::uint8_t* piece = source.window(from, span);
+                    if (!piece) {
+                        gathered.resize(static_cast<std::size_t>(span));
+                        if (!source.read_range(from, span, gathered.data())) {
+                            failed = true;
+                            break;
+                        }
+                        piece = gathered.data();
+                    }
+                    widen_to_f32(piece, source.type, block, tile.data() + done);
+                }
+                if (failed) {
+                    gather_failed = true;
+                    continue;
+                }
+            } else {
             // Straight out of the mapping wherever the tile is interior to one
             // part, which is every tile but the few that cross an expert
             // boundary inside a stacked block.
@@ -292,6 +323,7 @@ inline QuantizedModel quantize(const std::vector<HfTensor>& tensors,
             }
 
             widen_to_f32(bytes, source.type, item.elements, tile.data());
+            }
             // Elementwise, so it composes with the tiling: a tile is a range of
             // values and every adjustment here is per value.
             if (source.adjust == Adjust::add_one)

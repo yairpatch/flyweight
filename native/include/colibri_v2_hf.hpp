@@ -58,6 +58,15 @@ enum class Adjust : std::uint32_t {
 struct HfTensor : TensorDescriptor {
     std::vector<Part> parts;
     Adjust adjust = Adjust::none;
+    // A reorder that falls *inside* each row rather than on whole rows, for a
+    // tensor that consumes a permuted dimension instead of producing one. Each
+    // row is `column_order.size()` blocks of `column_block_elements`, and
+    // destination block i reads source block column_order[i]. Empty is identity.
+    //
+    // Multi-part descriptors cannot express this -- it would need one part per
+    // row per block -- so hf::quantize gathers it explicitly.
+    std::vector<std::uint32_t> column_order;
+    std::uint64_t column_block_elements = 0;
 
     bool contiguous() const { return parts.size() == 1; }
     // Copies the tensor out regardless of how many mappings it spans. This is
@@ -144,34 +153,42 @@ inline bool is_qwen3_5(const std::string& model_type,
 // not, because the layer plan reads those off the tensor shapes instead (see
 // qwen_forward_rows, which derives channels, value_heads and the conv kernel
 // from attn_qkv, ssm_a and ssm_conv1d).
-// INCOMPLETE, but much less so than it was. Verified against the 27B release,
-// tensor by tensor against that model's GGUF:
+// STILL NOT WORKING, though every transformation found so far is implemented
+// and verified. Against the 27B release, checked tensor by tensor against that
+// model's own GGUF:
 //
-//   * every name resolves -- 866 kept, 333 vision dropped, set-equal to the GGUF
-//   * every f32 tensor in the produced arena matches the GGUF exactly: the +1 on
-//     the block, q/k, nextn and final norms (but not ssm_norm), ssm_a as
+//   * all 1199 names resolve; the 866 kept are set-equal to the GGUF's
+//   * every f32 tensor in the produced arena matches the GGUF exactly: the +1
+//     on the block, q/k, nextn and final norms (never ssm_norm), ssm_a as
 //     -exp(A_log[perm]), ssm_dt.bias[perm], and ssm_conv1d's v channels
-//   * the row and block permutations are byte-exact on the fixture for
-//     ssm_alpha, ssm_beta, attn_gate and attn_qkv's v section
+//   * the reorders are byte-exact on the fixture: ssm_alpha and ssm_beta by
+//     row, attn_gate by head block, attn_qkv's v section, and ssm_out by
+//     input column
 //
-// What is still missing is ssm_out. It *consumes* the value-head dimension --
-// dense(3, first, ...) feeds it the head-major delta output -- so the reorder
-// lands on its input columns, 48 blocks of head_dim inside each of its 5120
-// rows, rather than on contiguous row blocks. permute_blocks cannot express
-// that: it would take one part per row per head, and the quantizer would need a
-// gather rather than a range read. Until that lands the model still generates
-// noise, and the gate stays.
+//   perm[i] = (i % key_heads) * (value_heads / key_heads) + i / key_heads
 //
-// perm[i] = (i % linear_key_heads) * (values / keys) + i / linear_key_heads
+// The conv1d match also confirms the fused qkv is laid out [q, k, v] with v
+// starting at 2 * key_heads * head_dim, since permuting from that offset is
+// what made it agree exactly.
+//
+// What it does now is emit end-of-turn almost immediately rather than the
+// high-entropy noise it produced before ssm_out was handled -- a systematic
+// error, not a scrambled one. The leading suspect is attn_q on the
+// full-attention layers: attn_output_gate packs the output gate into q_proj, so
+// it is 2 * heads * head_dim wide, and whether HF orders that [all q][all gate]
+// or interleaved per head -- and whether the GGUF agrees -- cannot be settled
+// by comparison, because both sides are quantized. Note that o_proj on those
+// layers takes attention heads rather than value heads, so it is correctly
+// left unpermuted.
 inline void require_qwen3_5_opt_in() {
     const char* allow = std::getenv("COLIBRI_HF_QWEN35_INCOMPLETE");
     if (allow && allow[0] == '1') return;
     throw std::runtime_error(
-        "Qwen3.5 safetensors loading is incomplete: the value-head reorder is "
-        "not applied to ssm_out's input columns, so the model would generate "
-        "noise. Everything else -- names, config, the norm and decay fixups, "
-        "and the row-wise reorders -- is verified against this family's GGUF. "
-        "Use a GGUF for now; set COLIBRI_HF_QWEN35_INCOMPLETE=1 to load anyway.");
+        "Qwen3.5 safetensors loading does not yet produce a working model: it "
+        "loads, and the norm, decay and value-head-order fixups are verified "
+        "against this family's GGUF, but generation ends immediately -- most "
+        "likely the q/output-gate packing in attn_q. Use a GGUF; set "
+        "COLIBRI_HF_QWEN35_INCOMPLETE=1 to load anyway.");
 }
 
 inline ModelConfig config_from_qwen3_5(const json::Value& config) {
@@ -896,6 +913,15 @@ inline void apply_value_head_order(HfTensor& tensor, const ModelConfig& config,
         const std::uint64_t lead =
             2ull * config.linear_key_heads * head_rows * row;
         permute_blocks(tensor, base, entry.offset, order, lead, head_rows * row);
+        return;
+    }
+    if (ends_with(".ssm_out.weight")) {
+        // out_proj consumes the value-head dimension: dense(3, first, ...)
+        // hands it the head-major delta output, so the reorder lands on its
+        // input columns rather than on its rows. head_dim values per block,
+        // value_heads blocks per row.
+        tensor.column_order = order;
+        tensor.column_block_elements = head_rows;
         return;
     }
     if (ends_with(".ssm_conv1d.weight")) {

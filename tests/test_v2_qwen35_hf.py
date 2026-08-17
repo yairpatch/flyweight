@@ -44,7 +44,7 @@ class Qwen35HuggingFaceLoaderTest(unittest.TestCase):
         try:
             with self.assertRaises(Exception) as caught:
                 V2Model(self.path).close()
-            self.assertIn("incomplete", str(caught.exception))
+            self.assertIn("Qwen3.5 safetensors loading", str(caught.exception))
         finally:
             os.environ["COLIBRI_HF_QWEN35_INCOMPLETE"] = "1"
 
