@@ -46,7 +46,13 @@ inline constexpr std::uint32_t kFormatVersion = 1;
 //    Before that GCC fused their multiply-adds, so the bytes depended on the
 //    build rather than on the input -- a checkpoint quantized on a machine
 //    without FMA did not match one quantized with it.
-inline constexpr std::uint32_t kPackerVersion = 4;
+// 5: the same guarantee reached MSVC. CMake applies -ffp-contract=off only
+//    when NOT MSVC, so the Windows build was free to fuse and emitted
+//    different bytes than every other platform for the same input; a
+//    #pragma fp_contract(off) in qwen_kquant_pack.h now covers it. Any cache
+//    written by an older Windows build was packed by the contracted
+//    arithmetic and must miss.
+inline constexpr std::uint32_t kPackerVersion = 5;
 inline constexpr std::uint32_t kByteOrderProbe = 0x01020304u;
 // The arena starts on a page boundary so a mapped arena keeps the alignment the
 // in-memory one had, and so the mapping's first arena page is not shared with
