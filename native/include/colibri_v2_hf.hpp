@@ -116,9 +116,103 @@ inline bool is_bailing_hybrid(const std::string& model_type,
            model_type == "bailing-hybrid" || architecture == "BailingMoeV3ForCausalLM";
 }
 
+// Qwen3.5 (`Qwen3_5ForConditionalGeneration`). The checkpoint is the
+// vision-language one: `text_config` holds the decoder this runtime implements
+// and `vision_config` a tower it does not, so the visual tensors are dropped
+// rather than mapped. The GGUFs of this family call the text model `qwen35`.
+inline bool is_qwen3_5(const std::string& model_type,
+                       const std::string& architecture) {
+    return model_type == "qwen3_5" || model_type == "qwen3_5_text" ||
+           model_type == "qwen35" ||
+           architecture == "Qwen3_5ForConditionalGeneration" ||
+           architecture == "Qwen3_5ForCausalLM";
+}
+
+// Everything the decoder needs comes out of `text_config`; the SSM widths do
+// not, because the layer plan reads those off the tensor shapes instead (see
+// qwen_forward_rows, which derives channels, value_heads and the conv kernel
+// from attn_qkv, ssm_a and ssm_conv1d).
+inline ModelConfig config_from_qwen3_5(const json::Value& config) {
+    const auto& text =
+        config.contains("text_config") ? config["text_config"] : config;
+    ModelConfig out;
+    out.architecture = "qwen35";
+    out.hidden_size = static_cast<std::uint32_t>(text["hidden_size"].as_uint());
+    out.layer_count =
+        static_cast<std::uint32_t>(text["num_hidden_layers"].as_uint());
+    out.attention_heads =
+        static_cast<std::uint32_t>(text["num_attention_heads"].as_uint());
+    out.attention_kv_heads =
+        static_cast<std::uint32_t>(text["num_key_value_heads"].as_uint());
+    out.context_length =
+        static_cast<std::uint32_t>(text["max_position_embeddings"].as_uint());
+    out.vocabulary_size = static_cast<std::uint32_t>(text["vocab_size"].as_uint());
+    out.intermediate_size =
+        static_cast<std::uint32_t>(text["intermediate_size"].as_uint());
+    out.dense_intermediate_size = out.intermediate_size;
+    out.rms_norm_epsilon =
+        static_cast<float>(text["rms_norm_eps"].as_double(1e-6));
+    out.attention_head_dim =
+        static_cast<std::uint32_t>(text["head_dim"].as_uint());
+    out.key_length = out.attention_head_dim;
+    out.value_length = out.attention_head_dim;
+    out.conv_kernel =
+        static_cast<std::uint32_t>(text["linear_conv_kernel_dim"].as_uint(4));
+
+    // rope_theta and the partial factor live under `rope_parameters` on this
+    // family rather than at the top level.
+    const auto& rope = text.contains("rope_parameters")
+        ? text["rope_parameters"] : text;
+    out.rope_freq_base = static_cast<float>(rope["rope_theta"].as_double(1.0e7));
+    const auto partial = rope["partial_rotary_factor"].as_double(1.0);
+    out.rotary_dimension = static_cast<std::uint32_t>(
+        static_cast<double>(out.attention_head_dim) * partial);
+
+    // One full-attention layer closes each group of `full_attention_interval`;
+    // the rest are gated-delta. True marks the linear layers, matching the
+    // convention the bailing path above uses.
+    out.full_attention_interval =
+        static_cast<std::uint32_t>(text["full_attention_interval"].as_uint(4));
+    if (out.full_attention_interval) {
+        out.sliding_window_pattern.assign(out.layer_count, 0);
+        for (std::uint32_t layer = 0; layer < out.layer_count; ++layer)
+            out.sliding_window_pattern[layer] =
+                ((layer + 1) % out.full_attention_interval == 0) ? 0 : 1;
+    }
+
+    // config.json's eos is <|endoftext|>; the turn actually ends on <|im_end|>,
+    // which only generation_config.json names (and lists first). The caller
+    // overrides this when that file is present -- see hf_generation_eos.
+    if (text.contains("eos_token_id"))
+        out.eos_token_id =
+            static_cast<std::uint32_t>(text["eos_token_id"].as_uint());
+    if (text.contains("bos_token_id"))
+        out.bos_token_id =
+            static_cast<std::uint32_t>(text["bos_token_id"].as_uint());
+    return out;
+}
+
+// First entry of generation_config.json's eos_token_id, which is the real
+// end-of-turn token where config.json carries end-of-document. Returns false
+// when the file says nothing useful, leaving the config value alone.
+inline bool hf_generation_eos(const json::Value& generation, std::uint32_t& out) {
+    if (!generation.contains("eos_token_id")) return false;
+    const auto& eos = generation["eos_token_id"];
+    if (eos.kind == json::Kind::Array) {
+        if (eos.size() == 0) return false;
+        out = static_cast<std::uint32_t>(eos[0].as_uint());
+        return true;
+    }
+    out = static_cast<std::uint32_t>(eos.as_uint());
+    return true;
+}
+
 inline ModelConfig config_from_json(const json::Value& config) {
     const auto model_type = config["model_type"].as_string();
     const auto architecture = config["architectures"][0].as_string();
+
+    if (is_qwen3_5(model_type, architecture))
+        return config_from_qwen3_5(config);
 
     ModelConfig out;
     if (!is_bailing_hybrid(model_type, architecture))
@@ -300,18 +394,163 @@ inline std::string gate_name(bool full_attention) {
     return full_attention ? "attn_gate.weight" : "ssm_g.weight";
 }
 
+// Qwen3.5 name tables. Layer tensors sit under
+// `model.language_model.layers.N.`, the MTP block under `mtp.`, and the vision
+// tower under `model.visual.`.
+//
+// torch stores a Linear as [out, in] row-major, which is byte-identical to
+// GGUF's ne = [in, out]; nothing here needs transposing. The one exception is
+// linear_attn.conv1d.weight, [channels, 1, kernel] against the GGUF's
+// [kernel, channels] -- same bytes, one singleton dimension to drop.
+inline const std::map<std::string, std::string>& qwen3_5_global_names() {
+    static const std::map<std::string, std::string> table = {
+        {"model.language_model.embed_tokens.weight", "token_embd.weight"},
+        {"model.language_model.norm.weight", "output_norm.weight"},
+        {"lm_head.weight", "output.weight"},
+    };
+    return table;
+}
+
+inline const std::map<std::string, std::string>& qwen3_5_layer_names() {
+    static const std::map<std::string, std::string> table = {
+        {"input_layernorm.weight", "attn_norm.weight"},
+        {"post_attention_layernorm.weight", "post_attention_norm.weight"},
+
+        // Full-attention layers.
+        {"self_attn.q_proj.weight", "attn_q.weight"},
+        {"self_attn.k_proj.weight", "attn_k.weight"},
+        {"self_attn.v_proj.weight", "attn_v.weight"},
+        {"self_attn.o_proj.weight", "attn_output.weight"},
+        {"self_attn.q_norm.weight", "attn_q_norm.weight"},
+        {"self_attn.k_norm.weight", "attn_k_norm.weight"},
+
+        // Gated-delta layers. in_proj_a/in_proj_b are the per-head alpha and
+        // beta projections (hidden -> value_heads); in_proj_z is the output
+        // gate, which the GGUF calls attn_gate on these layers.
+        {"linear_attn.in_proj_qkv.weight", "attn_qkv.weight"},
+        {"linear_attn.in_proj_z.weight", "attn_gate.weight"},
+        {"linear_attn.in_proj_a.weight", "ssm_alpha.weight"},
+        {"linear_attn.in_proj_b.weight", "ssm_beta.weight"},
+        {"linear_attn.out_proj.weight", "ssm_out.weight"},
+        {"linear_attn.conv1d.weight", "ssm_conv1d.weight"},
+        {"linear_attn.norm.weight", "ssm_norm.weight"},
+        {"linear_attn.dt_bias", "ssm_dt.bias"},
+        {"linear_attn.A_log", "ssm_a"},
+
+        {"mlp.gate_proj.weight", "ffn_gate.weight"},
+        {"mlp.up_proj.weight", "ffn_up.weight"},
+        {"mlp.down_proj.weight", "ffn_down.weight"},
+    };
+    return table;
+}
+
+// The MTP block's own tensors, which land on the block past the decoder stack.
+inline const std::map<std::string, std::string>& qwen3_5_mtp_names() {
+    static const std::map<std::string, std::string> table = {
+        {"fc.weight", "nextn.eh_proj.weight"},
+        {"pre_fc_norm_embedding.weight", "nextn.enorm.weight"},
+        {"pre_fc_norm_hidden.weight", "nextn.hnorm.weight"},
+        {"norm.weight", "nextn.shared_head_norm.weight"},
+    };
+    return table;
+}
+
 struct ParsedName {
     bool matched = false;
+    // Recognised and deliberately dropped, as against unrecognised: the
+    // vision tower is 333 tensors this runtime has no kernels for, and
+    // silently ignoring an unmapped name would hide a real gap.
+    bool skip = false;
     std::string gguf;       // translated name
     std::uint32_t layer = 0;
     bool is_expert = false;
     std::uint32_t expert = 0;
 };
 
+// Peels `<prefix><digits>.` off `name`, yielding the index and the remainder.
+inline bool split_indexed(const std::string& name, const std::string& prefix,
+                          std::uint32_t& index, std::string& rest) {
+    if (name.rfind(prefix, 0) != 0) return false;
+    std::size_t cursor = prefix.size();
+    if (cursor >= name.size() ||
+        !std::isdigit(static_cast<unsigned char>(name[cursor])))
+        return false;
+    index = 0;
+    while (cursor < name.size() &&
+           std::isdigit(static_cast<unsigned char>(name[cursor])))
+        index = index * 10 + static_cast<std::uint32_t>(name[cursor++] - '0');
+    if (cursor >= name.size() || name[cursor] != '.') return false;
+    rest = name.substr(cursor + 1);
+    return true;
+}
+
+// Qwen3.5. The MTP block is emitted as the block just past the decoder stack,
+// which is where the runtime looks for it -- a block is recognised as MTP by
+// carrying `.nextn.` tensors, so its transformer half takes ordinary attention
+// and feed-forward names on that same index.
+inline ParsedName translate_qwen3_5(const std::string& name,
+                                    const ModelConfig& config) {
+    ParsedName parsed;
+
+    // The vision tower and its merger: recognised, not mapped.
+    if (name.rfind("model.visual.", 0) == 0) {
+        parsed.matched = true;
+        parsed.skip = true;
+        return parsed;
+    }
+
+    const auto& globals = qwen3_5_global_names();
+    if (const auto found = globals.find(name); found != globals.end()) {
+        parsed.matched = true;
+        parsed.gguf = found->second;
+        return parsed;
+    }
+
+    const std::uint32_t mtp_block = config.layer_count;
+    std::uint32_t index = 0;
+    std::string rest;
+
+    // mtp.<name> and mtp.layers.<N>.<rest> both land on mtp_block.
+    static const std::string kMtp = "mtp.";
+    if (name.rfind(kMtp, 0) == 0) {
+        const auto tail = name.substr(kMtp.size());
+        const auto& mtp = qwen3_5_mtp_names();
+        if (const auto found = mtp.find(tail); found != mtp.end()) {
+            parsed.matched = true;
+            parsed.layer = mtp_block;
+            parsed.gguf = "blk." + std::to_string(mtp_block) + "." + found->second;
+            return parsed;
+        }
+        if (split_indexed(tail, "layers.", index, rest)) {
+            const auto& layers = qwen3_5_layer_names();
+            if (const auto found = layers.find(rest); found != layers.end()) {
+                parsed.matched = true;
+                parsed.layer = mtp_block;
+                parsed.gguf =
+                    "blk." + std::to_string(mtp_block) + "." + found->second;
+                return parsed;
+            }
+        }
+        return parsed;
+    }
+
+    if (!split_indexed(name, "model.language_model.layers.", index, rest))
+        return parsed;
+    const auto& layers = qwen3_5_layer_names();
+    const auto found = layers.find(rest);
+    if (found == layers.end()) return parsed;
+    parsed.matched = true;
+    parsed.layer = index;
+    parsed.gguf = "blk." + std::to_string(index) + "." + found->second;
+    return parsed;
+}
+
 // Splits `model.layers.<N>.<rest>` and translates. `full_attention` decides the
 // two ambiguous g_proj cases.
 inline ParsedName translate(const std::string& name,
-                            const std::vector<std::uint8_t>& linear_layer) {
+                            const ModelConfig& config) {
+    if (config.architecture == "qwen35") return translate_qwen3_5(name, config);
+    const auto& linear_layer = config.sliding_window_pattern;
     ParsedName parsed;
     const auto& globals = global_names();
     if (const auto found = globals.find(name); found != globals.end()) {
@@ -519,7 +758,8 @@ inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
 
     for (const auto& shard : shards) {
         for (const auto& entry : shard.header.entries) {
-            const auto parsed = translate(entry.name, config.sliding_window_pattern);
+            const auto parsed = translate(entry.name, config);
+            if (parsed.skip) continue;
             if (!parsed.matched)
                 throw std::runtime_error("unmapped HF tensor: " + entry.name);
 

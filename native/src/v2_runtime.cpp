@@ -4166,6 +4166,15 @@ void load_hf(const char* path, ColibriV2Model& m) {
     const auto slash=directory.find_last_of('/');
     m.name=slash==std::string::npos?directory:directory.substr(slash+1);
     m.chat_template=read_text_file(directory+"/chat_template.jinja");
+    // config.json's eos is end-of-document; the turn ends on a different token
+    // that only generation_config.json names, and it lists that one first.
+    // Getting this wrong does not fail loudly -- generation simply never stops.
+    if(const auto generation=read_text_file(directory+"/generation_config.json");
+       !generation.empty()){
+        std::uint32_t eos=0;
+        if(hf::hf_generation_eos(colibri::v2::json::parse(generation),eos))
+            m.config.eos_token_id=eos;
+    }
     phase("config.json");
 
     // tokenizer.json is ~12 MB of JSON on this checkpoint, most of it the
