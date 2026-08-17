@@ -13,6 +13,7 @@
 // anyway, so the output arena is where multi-part tensors become contiguous
 // again -- and every descriptor this produces is single-part.
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -291,6 +292,13 @@ inline QuantizedModel quantize(const std::vector<HfTensor>& tensors,
             }
 
             widen_to_f32(bytes, source.type, item.elements, tile.data());
+            // Elementwise, so it composes with the tiling: a tile is a range of
+            // values and every adjustment here is per value.
+            if (source.adjust == Adjust::add_one)
+                for (std::uint64_t i = 0; i < item.elements; ++i) tile[i] += 1.0f;
+            else if (source.adjust == Adjust::negative_exponential)
+                for (std::uint64_t i = 0; i < item.elements; ++i)
+                    tile[i] = -std::exp(tile[i]);
             const auto block = target_block_elements(target);
             const std::uint64_t offset =
                 block > 1 ? item.element_begin / block * target_block_bytes(target)

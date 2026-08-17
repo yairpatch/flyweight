@@ -26,6 +26,10 @@ struct ModelConfig {
     // Width of the short causal convolution in front of a linear-attention
     // layer. Zero means the architecture's own default.
     std::uint32_t conv_kernel=0;
+    // Gated-delta geometry. Needed at load time on the HF path, where the
+    // value-head order has to be rewritten; the GGUF path reads these off the
+    // tensor shapes instead.
+    std::uint32_t linear_value_heads=0, linear_key_heads=0, linear_head_dim=0;
     std::uint32_t key_length_swa=0, value_length_swa=0;
     std::uint32_t rotary_dimension_swa=0;
     float rope_freq_base_swa=0.0f, final_logit_softcap=0.0f;

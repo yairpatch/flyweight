@@ -44,8 +44,20 @@ struct Part {
 
 // A descriptor plus where its bytes live. `parts` is authoritative; a
 // single-element list is an ordinary tensor.
+// An elementwise fixup the GGUF conversion bakes in and the widened f32 values
+// therefore have to carry too. Applied by hf::quantize after widening.
+enum class Adjust : std::uint32_t {
+    none = 0,
+    // Qwen3.5 stores its RMS-norm weights as (w - 1): the block norms and the
+    // final norm are used as (1 + w), while the gated-delta output norm is not.
+    add_one = 1,
+    // A_log is the log of the decay magnitude; the kernel wants -A.
+    negative_exponential = 2,
+};
+
 struct HfTensor : TensorDescriptor {
     std::vector<Part> parts;
+    Adjust adjust = Adjust::none;
 
     bool contiguous() const { return parts.size() == 1; }
     // Copies the tensor out regardless of how many mappings it spans. This is
@@ -132,32 +144,34 @@ inline bool is_qwen3_5(const std::string& model_type,
 // not, because the layer plan reads those off the tensor shapes instead (see
 // qwen_forward_rows, which derives channels, value_heads and the conv kernel
 // from attn_qkv, ssm_a and ssm_conv1d).
-// INCOMPLETE. The names and the config below are right -- verified against the
-// 27B release, where all 1199 tensors resolve and the 866 kept are set-equal to
-// that model's GGUF -- but three numeric transformations the GGUF conversion
-// applies are not implemented here, so the weights land in the wrong form and
-// the model generates noise. Measured against the GGUF, on several layers:
+// INCOMPLETE, but much less so than it was. Verified against the 27B release,
+// tensor by tensor against that model's GGUF:
 //
-//   perm[i] = (i % 16) * 3 + i / 16        (48 value heads over 16 key heads)
-//   ssm_dt.bias = dt_bias[perm]
-//   ssm_a       = -exp(A_log[perm])
-//   attn_norm, post_attention_norm, output_norm = hf + 1   (ssm_norm does not)
+//   * every name resolves -- 866 kept, 333 vision dropped, set-equal to the GGUF
+//   * every f32 tensor in the produced arena matches the GGUF exactly: the +1 on
+//     the block, q/k, nextn and final norms (but not ssm_norm), ssm_a as
+//     -exp(A_log[perm]), ssm_dt.bias[perm], and ssm_conv1d's v channels
+//   * the row and block permutations are byte-exact on the fixture for
+//     ssm_alpha, ssm_beta, attn_gate and attn_qkv's v section
 //
-// The permutation additionally has to reach the rows of in_proj_a and in_proj_b
-// and the per-head blocks inside in_proj_qkv and in_proj_z, which is the part
-// that needs care rather than transcription.
+// What is still missing is ssm_out. It *consumes* the value-head dimension --
+// dense(3, first, ...) feeds it the head-major delta output -- so the reorder
+// lands on its input columns, 48 blocks of head_dim inside each of its 5120
+// rows, rather than on contiguous row blocks. permute_blocks cannot express
+// that: it would take one part per row per head, and the quantizer would need a
+// gather rather than a range read. Until that lands the model still generates
+// noise, and the gate stays.
 //
-// Until that lands the path refuses, because a checkpoint that loads and then
-// produces plausible-looking rubbish is worse than one that will not open.
+// perm[i] = (i % linear_key_heads) * (values / keys) + i / linear_key_heads
 inline void require_qwen3_5_opt_in() {
     const char* allow = std::getenv("COLIBRI_HF_QWEN35_INCOMPLETE");
     if (allow && allow[0] == '1') return;
     throw std::runtime_error(
-        "Qwen3.5 safetensors loading is incomplete: tensor names and config "
-        "translate correctly, but the gated-delta head permutation, the "
-        "-exp(A_log) transform and the +1 on the RMS norms are not applied, so "
-        "the model would generate noise. Use a GGUF of this checkpoint. Set "
-        "COLIBRI_HF_QWEN35_INCOMPLETE=1 to load it anyway (for development).");
+        "Qwen3.5 safetensors loading is incomplete: the value-head reorder is "
+        "not applied to ssm_out's input columns, so the model would generate "
+        "noise. Everything else -- names, config, the norm and decay fixups, "
+        "and the row-wise reorders -- is verified against this family's GGUF. "
+        "Use a GGUF for now; set COLIBRI_HF_QWEN35_INCOMPLETE=1 to load anyway.");
 }
 
 inline ModelConfig config_from_qwen3_5(const json::Value& config) {
@@ -187,6 +201,12 @@ inline ModelConfig config_from_qwen3_5(const json::Value& config) {
     out.value_length = out.attention_head_dim;
     out.conv_kernel =
         static_cast<std::uint32_t>(text["linear_conv_kernel_dim"].as_uint(4));
+    out.linear_value_heads =
+        static_cast<std::uint32_t>(text["linear_num_value_heads"].as_uint());
+    out.linear_key_heads =
+        static_cast<std::uint32_t>(text["linear_num_key_heads"].as_uint());
+    out.linear_head_dim =
+        static_cast<std::uint32_t>(text["linear_value_head_dim"].as_uint());
 
     // rope_theta and the partial factor live under `rope_parameters` on this
     // family rather than at the top level.
@@ -777,8 +797,122 @@ struct Shard {
 };
 
 // Merges every shard into one descriptor list under GGUF names, stacking the
+// Value-head order for the gated-delta layers.
+//
+// HF groups the value heads by key head -- 48 values over 16 keys is three per
+// group, laid out [k0v0, k0v1, k0v2, k1v0, ...]. The kernels here instead take
+// the key head as `head % key_heads` (see qwen_delta_recurrent), which wants
+// [k0v0, k1v0, ..., k15v0, k0v1, ...]: the transpose of the same table. So GGUF
+// index v * key_heads + kh reads HF index kh * group + v.
+//
+// Everything indexed by value head has to agree on this: ssm_a and ssm_dt.bias
+// elementwise, ssm_alpha and ssm_beta by row, and the per-head blocks of
+// attn_gate and of attn_qkv's v section. Miss one and the model still runs --
+// it just attends with mismatched decay.
+inline std::vector<std::uint32_t> value_head_order(const ModelConfig& config) {
+    std::vector<std::uint32_t> order;
+    const auto values = config.linear_value_heads;
+    const auto keys = config.linear_key_heads;
+    if (!values || !keys || values % keys) return order;
+    const auto group = values / keys;
+    order.resize(values);
+    for (std::uint32_t index = 0; index < values; ++index)
+        order[index] = (index % keys) * group + index / keys;
+    return order;
+}
+
+// Restates a descriptor so its blocks arrive in `order`: one part per block,
+// `lead_bytes` of unpermuted prefix kept in front. No copy and no transpose --
+// hf::quantize already gathers a multi-part tensor, which is how a stacked
+// expert block is read.
+inline void permute_blocks(HfTensor& tensor, const std::uint8_t* base,
+                           std::uint64_t offset,
+                           const std::vector<std::uint32_t>& order,
+                           std::uint64_t lead_bytes,
+                           std::uint64_t block_bytes) {
+    tensor.parts.clear();
+    if (lead_bytes) tensor.parts.push_back({base, offset, lead_bytes});
+    for (const auto block : order)
+        tensor.parts.push_back(
+            {base, offset + lead_bytes + block * block_bytes, block_bytes});
+}
+
+// Which fixup, if any, a translated tensor needs. Qwen3.5 stores its block and
+// final RMS-norm weights as (w - 1) and its decay as log|A|; the gated-delta
+// output norm is stored as-is, which is why this is a per-name decision rather
+// than one rule for norms.
+inline Adjust adjust_for(const std::string& gguf) {
+    const auto ends_with = [&](const char* suffix) {
+        const std::string tail(suffix);
+        return gguf.size() >= tail.size() &&
+               gguf.compare(gguf.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    if (ends_with(".ssm_a")) return Adjust::negative_exponential;
+    if (gguf == "output_norm.weight" || ends_with(".attn_norm.weight") ||
+        ends_with(".post_attention_norm.weight") ||
+        ends_with(".nextn.enorm.weight") || ends_with(".nextn.hnorm.weight") ||
+        ends_with(".nextn.shared_head_norm.weight") ||
+        ends_with(".attn_q_norm.weight") || ends_with(".attn_k_norm.weight"))
+        return Adjust::add_one;
+    return Adjust::none;
+}
+
 // routed experts. Shard order does not matter: experts are placed by their
 // parsed index, not by the order they are encountered.
+// Applies value_head_order to the tensors that carry a value-head dimension.
+// The width of a block differs per tensor: a whole row for the per-head
+// projections, head_dim rows for the gate, and head_dim rows past the q and k
+// sections for the fused qkv.
+inline void apply_value_head_order(HfTensor& tensor, const ModelConfig& config,
+                                   const std::uint8_t* base,
+                                   const safetensors::Entry& entry) {
+    const auto order = value_head_order(config);
+    if (order.empty()) return;
+    const auto ends_with = [&](const char* suffix) {
+        const std::string tail(suffix);
+        return tensor.name.size() >= tail.size() &&
+               tensor.name.compare(tensor.name.size() - tail.size(),
+                                   tail.size(), tail) == 0;
+    };
+    const auto width = safetensors::dtype_bytes(entry.type);
+    // GGUF order puts the input extent first, so a single output row is
+    // shape[0] values -- and for the 1-D per-head vectors it is one value.
+    const std::uint64_t row =
+        tensor.shape.size() >= 2 ? tensor.shape[0] * width : width;
+    const std::uint64_t head_rows = config.linear_head_dim;
+
+    if (ends_with(".ssm_a") || ends_with(".ssm_dt.bias") ||
+        ends_with(".ssm_alpha.weight") || ends_with(".ssm_beta.weight")) {
+        permute_blocks(tensor, base, entry.offset, order, 0, row);
+        return;
+    }
+    if (ends_with(".attn_gate.weight")) {
+        permute_blocks(tensor, base, entry.offset, order, 0, head_rows * row);
+        return;
+    }
+    if (ends_with(".attn_qkv.weight")) {
+        // q and k come first and are keyed by key head, so they stay put; only
+        // the v section that follows them is reordered.
+        const std::uint64_t lead =
+            2ull * config.linear_key_heads * head_rows * row;
+        permute_blocks(tensor, base, entry.offset, order, lead, head_rows * row);
+        return;
+    }
+    if (ends_with(".ssm_conv1d.weight")) {
+        // The convolution is channel-wise over the fused qkv output, so its
+        // channels have to move exactly as that tensor's rows did. Shape here
+        // is [kernel, 1, channels], so a channel is `kernel` values wide rather
+        // than a row -- getting this one wrong leaves the conv reading a
+        // different head's history than the recurrence does.
+        const std::uint64_t channel = tensor.shape[0] * width;
+        const std::uint64_t lead =
+            2ull * config.linear_key_heads * head_rows * channel;
+        permute_blocks(
+            tensor, base, entry.offset, order, lead, head_rows * channel);
+        return;
+    }
+}
+
 inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
                                            const ModelConfig& config) {
     std::vector<HfTensor> out;
@@ -814,6 +948,10 @@ inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
                 // meaningful because this descriptor is single-part.
                 tensor.offset = entry.offset;
                 tensor.parts.push_back({shard.base, entry.offset, entry.size});
+                if (config.architecture == "qwen35") {
+                    tensor.adjust = adjust_for(parsed.gguf);
+                    apply_value_head_order(tensor, config, shard.base, entry);
+                }
                 out.push_back(std::move(tensor));
                 continue;
             }
