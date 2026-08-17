@@ -30,6 +30,12 @@ struct Entry {
     std::uint32_t type = 0;
     std::uint64_t offset = 0;  // absolute within the file
     std::uint64_t size = 0;
+    // Rank above what the v2 tensor ABI can describe. Recorded rather than
+    // rejected here: a checkpoint may carry tensors its consumer intends to
+    // drop -- Qwen3.5's vision patch embedding is a rank-5 conv -- and the
+    // reader cannot know which. The consumer raises this if it wants the
+    // tensor; see build_tensors.
+    bool rank_exceeded = false;
 };
 
 struct Header {
@@ -88,8 +94,7 @@ inline Header parse_header(const std::uint8_t* data, std::uint64_t size) {
         const auto& shape = value["shape"];
         if (shape.kind != json::Kind::Array)
             throw std::runtime_error("safetensors entry has no shape: " + name);
-        if (shape.size() > 4)
-            throw std::runtime_error("safetensors rank exceeds the v2 ABI: " + name);
+        entry.rank_exceeded = shape.size() > 4;
 
         // A row-major [out_features, in_features] HF matrix and a GGUF
         // [inputs, outputs] descriptor describe the *same bytes*: GGUF counts

@@ -11,6 +11,7 @@ end-of-document.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,16 +23,30 @@ from tests import qwen35_hf_fixture as fixture
 class Qwen35HuggingFaceLoaderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # The path is gated while the numeric transforms are unimplemented; see
+        # require_qwen3_5_opt_in. These tests cover the name and config
+        # translation, which is the part that is finished.
+        os.environ["COLIBRI_HF_QWEN35_INCOMPLETE"] = "1"
         cls._directory = tempfile.TemporaryDirectory()
         cls.path = str(fixture.build(Path(cls._directory.name) / "qwen35"))
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls._directory.cleanup()
+        os.environ.pop("COLIBRI_HF_QWEN35_INCOMPLETE", None)
 
     def names(self) -> set[str]:
         with V2Model(self.path) as model:
             return {str(tensor["name"]) for tensor in model.tensors()}
+
+    def test_it_refuses_without_the_opt_in(self) -> None:
+        os.environ.pop("COLIBRI_HF_QWEN35_INCOMPLETE", None)
+        try:
+            with self.assertRaises(Exception) as caught:
+                V2Model(self.path).close()
+            self.assertIn("incomplete", str(caught.exception))
+        finally:
+            os.environ["COLIBRI_HF_QWEN35_INCOMPLETE"] = "1"
 
     def test_it_opens_the_directory_as_safetensors(self) -> None:
         with V2Model(self.path) as model:

@@ -132,7 +132,36 @@ inline bool is_qwen3_5(const std::string& model_type,
 // not, because the layer plan reads those off the tensor shapes instead (see
 // qwen_forward_rows, which derives channels, value_heads and the conv kernel
 // from attn_qkv, ssm_a and ssm_conv1d).
+// INCOMPLETE. The names and the config below are right -- verified against the
+// 27B release, where all 1199 tensors resolve and the 866 kept are set-equal to
+// that model's GGUF -- but three numeric transformations the GGUF conversion
+// applies are not implemented here, so the weights land in the wrong form and
+// the model generates noise. Measured against the GGUF, on several layers:
+//
+//   perm[i] = (i % 16) * 3 + i / 16        (48 value heads over 16 key heads)
+//   ssm_dt.bias = dt_bias[perm]
+//   ssm_a       = -exp(A_log[perm])
+//   attn_norm, post_attention_norm, output_norm = hf + 1   (ssm_norm does not)
+//
+// The permutation additionally has to reach the rows of in_proj_a and in_proj_b
+// and the per-head blocks inside in_proj_qkv and in_proj_z, which is the part
+// that needs care rather than transcription.
+//
+// Until that lands the path refuses, because a checkpoint that loads and then
+// produces plausible-looking rubbish is worse than one that will not open.
+inline void require_qwen3_5_opt_in() {
+    const char* allow = std::getenv("COLIBRI_HF_QWEN35_INCOMPLETE");
+    if (allow && allow[0] == '1') return;
+    throw std::runtime_error(
+        "Qwen3.5 safetensors loading is incomplete: tensor names and config "
+        "translate correctly, but the gated-delta head permutation, the "
+        "-exp(A_log) transform and the +1 on the RMS norms are not applied, so "
+        "the model would generate noise. Use a GGUF of this checkpoint. Set "
+        "COLIBRI_HF_QWEN35_INCOMPLETE=1 to load it anyway (for development).");
+}
+
 inline ModelConfig config_from_qwen3_5(const json::Value& config) {
+    require_qwen3_5_opt_in();
     const auto& text =
         config.contains("text_config") ? config["text_config"] : config;
     ModelConfig out;
@@ -630,6 +659,13 @@ struct Tokenizer {
 // wrong mis-splits every multi-digit number without ever failing.
 inline std::string pretokenizer_from_regex(const std::string& pattern) {
     if (pattern.empty()) return {};
+    // Qwen2 family (Qwen2 through Qwen3.5): the contraction alternation is
+    // spelled with apostrophes where the GPT one uses a bracketed [sdmt]. The
+    // GGUFs of this family carry "qwen35", and returning the same name is what
+    // keeps the two loaders on one splitter rather than two that agree by
+    // accident.
+    if (pattern.find("(?i:'s|'t|'re|'ve|'m|'ll|'d)") != std::string::npos)
+        return "qwen35";
     const bool gpt_family =
         pattern.find("(?i:[sdmt]|ll|ve|re)") != std::string::npos;
     if (!gpt_family) return {};
@@ -762,6 +798,11 @@ inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
             if (parsed.skip) continue;
             if (!parsed.matched)
                 throw std::runtime_error("unmapped HF tensor: " + entry.name);
+            // Only now that the tensor is known to be wanted is an
+            // undescribable rank an error.
+            if (entry.rank_exceeded)
+                throw std::runtime_error(
+                    "safetensors rank exceeds the v2 ABI: " + entry.name);
 
             if (!parsed.is_expert) {
                 HfTensor tensor;
