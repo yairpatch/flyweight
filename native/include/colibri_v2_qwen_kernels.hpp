@@ -1748,16 +1748,23 @@ R"COLIBRI_CUDA(
 //   D: rows {quad, quad+8} x cols {slot*2, slot*2+1} -> d[0..3]
 // A's four consecutive K per register is exactly how *_q8_decode already packs
 // words[k] (elements 4k..4k+3), so fragments come straight out of the decoder.
+//
+// The PTX form needs sm_75 or newer. NVRTC compiles this corpus for whatever
+// the device actually reports (--gpu-architecture=compute_XY), so an
+// unguarded mma here does not degrade on an older part -- it fails to compile,
+// and every kernel in the corpus goes with it. Below sm_75 the emulation is
+// taken instead, and the host-side dispatch prefers the dp4a tile kernel there
+// so the emulation is never actually the hot path.
 __device__ __forceinline__ void mma_m16n8k16_s8(int* d, const int* a, int b) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(b));
 #else
-    // Host emulation for the CPU corpus, so the contract can check the layout
-    // maths above without a GPU. Correctness only -- it rebuilds each operand
+    // Emulation: the CPU corpus (so the contract can check the layout maths
+    // above without a GPU), and any device below sm_75. Correctness only -- it rebuilds each operand
     // through the warp shuffle the shim already emulates, which is far slower
     // than the scalar loop it stands in for and is never compiled for device.
     const int lane = (int)(threadIdx.x & 31u);

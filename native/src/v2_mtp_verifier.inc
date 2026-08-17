@@ -204,7 +204,7 @@ void qwen_forward_rows(
                 case 23:mmq_kernel="iq4xs_q8_mmq";break;
                 default:break;
             }
-            if(rows>kQ8RowBatch&&mmq_kernel){
+            if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
                 for(int first=0;first<rows;first+=kQ8MmqTokens){
                     int batch=std::min(kQ8MmqTokens,rows-first);
                     auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
@@ -218,6 +218,8 @@ void qwen_forward_rows(
                 }
                 return;
             }
+            // Reached when the device predates sm_75, where the MMQ kernels
+            // would run their emulation instead of real tensor cores.
             const char* tiled_kernel=nullptr;
             switch(type){
                 case 16:tiled_kernel="iq2xxs_q8_matmul_tiled";break;
@@ -799,11 +801,14 @@ void qwen_forward_rows(
             }
             const auto up_half=first+static_cast<std::uint64_t>(rows)*dense_intermediate*sizeof(float);
             dense(moe_base+1,normalized,first,hidden_size,dense_intermediate);
+            phase(layer_number,"ffn_gate");
             dense(moe_base+2,normalized,up_half,hidden_size,dense_intermediate);
+            phase(layer_number,"ffn_up");
             int dense_count=rows*dense_intermediate;
             void*dense_silu_args[]={const_cast<std::uint64_t*>(&first),const_cast<std::uint64_t*>(&second),&dense_count};
             launch("silu_mul",(static_cast<std::uint32_t>(dense_count)+255)/256,1,256,dense_silu_args);
             dense(moe_base+3,second,third,dense_intermediate,hidden_size);
+            phase(layer_number,"ffn");
             // Post-FFN norm, mirroring the post-attention norm above.
             if(runtime.muse)post_rms_rows(third,tensor(13));
             add_rows(residual,third);std::swap(hidden,residual);

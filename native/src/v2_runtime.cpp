@@ -435,6 +435,10 @@ struct ColibriV2QwenRuntime {
     // dispatch must read this rather than model->tensors[i].type; the host
     // paths still decode the mapping with the original type.
     std::vector<std::uint32_t> device_tensor_types;
+    // sm_75 is where mma.*.s8 appears. Below it the MMQ kernels still compile
+    // (the instruction is guarded) but fall back to a shuffle emulation that is
+    // far slower than the dp4a tile kernel, so the host must not pick them.
+    bool int8_tensor_cores=false;
     std::uint64_t requantized_tensors = 0;
     std::uint64_t requantized_saved_bytes = 0;
     std::uint64_t static_arena = 0;
@@ -9908,6 +9912,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // the tensors NVFP4 exists to compress. The public dense_requant policy
         // controls this; COLIBRI_REQUANT_BF16 remains a legacy override only
         // while the policy is auto.
+        {
+            ColibriV2GpuInfo probe{};
+            if(gpu_probe(probe,runtime->options.device)==0)
+                runtime->int8_tensor_cores=
+                    probe.compute_major*10+probe.compute_minor>=75;
+        }
         runtime->device_tensor_types.resize(runtime->model->tensors.size());
         for(std::uint64_t index=0;index<runtime->model->tensors.size();++index)
             runtime->device_tensor_types[index]=runtime->model->tensors[index].type;
@@ -9933,8 +9943,6 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // threshold this stops with the numbers instead of paying it silently.
         {
             std::uint64_t converted=0,growth=0,persistent_source_bytes=0;
-            const char* forced=std::getenv("COLIBRI_IQ1M_REQUANT");
-            const bool force=forced&&forced[0]=='1';
             for(std::uint64_t index=0;index<persistent.size();++index){
                 if(!persistent[index])continue;
                 const auto& tensor=runtime->model->tensors[index];
@@ -9960,20 +9968,23 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 ++converted;
                 growth+=(elements/32)*kQ8BlockSize-tensor.size;
             }
-            // A sixteenth of the persistent weights sits well above what the
-            // head and embeddings cost on a checkpoint that is otherwise not
-            // IQ1_M, and well below one whose bulk is, so it separates the two
-            // without tuning.
-            if(converted&&!force&&growth>persistent_source_bytes/16)
-                throw std::runtime_error(
-                    "this checkpoint stores its head or embedding table as "
-                    "IQ1_M, which those kernels cannot read; converting to Q8_0 "
-                    "would add "+std::to_string(growth/(1024ull*1024))+
-                    " MiB to the "+
-                    std::to_string(persistent_source_bytes/(1024ull*1024))+
-                    " MiB of static weights. Use a checkpoint whose head is "
-                    "quantized to a type the device path reads directly, or set "
-                    "COLIBRI_IQ1M_REQUANT=1 to convert anyway");
+            // Warn rather than refuse. This conversion is mandatory -- the
+            // head and embedding kernels cannot read type 29 at all -- so
+            // failing here does not save the user anything, it just turns a
+            // model that would have run into one that will not load. What the
+            // bound is really for is traceability: at 4.86x, an IQ1_M head can
+            // add enough to make the arena allocation fail much later with
+            // nothing pointing back here, so say so up front and let it run.
+            if(converted&&growth>persistent_source_bytes/16)
+                std::fprintf(stderr,
+                    "[colibri-v2] warning: this checkpoint stores its head or "
+                    "embedding table as IQ1_M, whose kernels cannot read that "
+                    "type. Converting to Q8_0 adds %llu MiB to %llu MiB of "
+                    "static weights (4.86x on those tensors); if the GPU arena "
+                    "allocation fails below, this is why.\n",
+                    static_cast<unsigned long long>(growth/(1024ull*1024)),
+                    static_cast<unsigned long long>(
+                        persistent_source_bytes/(1024ull*1024)));
             if(converted){
                 runtime->static_tensor_bytes+=growth;
                 std::fprintf(stderr,
