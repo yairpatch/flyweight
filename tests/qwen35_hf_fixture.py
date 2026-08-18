@@ -23,7 +23,7 @@ from tests.hf_safetensors_fixture import (
     _write_safetensors,
 )
 
-HIDDEN = 128
+HIDDEN = 256  # a whole number of K-quant blocks per row, as the release is
 LAYERS = 8
 FULL_INTERVAL = 4
 HEADS = 4
@@ -54,6 +54,7 @@ CONFIG = {
         "num_attention_heads": HEADS,
         "num_key_value_heads": KV_HEADS,
         "head_dim": HEAD_DIM,
+        "attn_output_gate": True,
         "max_position_embeddings": 4096,
         "vocab_size": VOCAB,
         "rms_norm_eps": 1e-6,
@@ -124,8 +125,10 @@ def _language_tensors(seed) -> dict[str, tuple[list[int], bytes]]:
 
 def _block(tensors, prefix: str, seed, *, full: bool) -> None:
     if full:
+        # attn_output_gate packs the per-head output gate into q_proj, so it is
+        # twice as wide as the head count would suggest: [q | gate] per head.
         tensors[prefix + "self_attn.q_proj.weight"] = _tensor(
-            [HEADS * HEAD_DIM, HIDDEN], seed())
+            [2 * HEADS * HEAD_DIM, HIDDEN], seed())
         tensors[prefix + "self_attn.k_proj.weight"] = _tensor(
             [KV_HEADS * HEAD_DIM, HIDDEN], seed())
         tensors[prefix + "self_attn.v_proj.weight"] = _tensor(

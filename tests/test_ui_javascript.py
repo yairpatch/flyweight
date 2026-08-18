@@ -40,6 +40,48 @@ class UIJavaScriptTests(unittest.TestCase):
         """The bidi block, which the markdown parser calls into."""
         return self._slice(source, "const RTL_LETTERS", "\nfunction applyMessageDirection(")
 
+    def test_reasoning_effort_is_omitted_unless_it_would_mean_something(self) -> None:
+        """"Model default" must send nothing, and a level needs thinking on.
+
+        The server reads an absent `reasoning_effort` as "the request did not
+        say" and leaves the checkpoint's own level; sending a value overrides
+        it. And the template that grades reasoning skips the instruction
+        entirely when thinking is off, so a level sent then is silently inert.
+        """
+        source = APP.read_text(encoding="utf-8")
+        payload = self._slice(source, "const response = await fetch(\"/v1/chat/completions\"",
+                              "signal: state.controller.signal")
+        self.assertIn("reasoning_effort", payload)
+        self.assertIn('state.settings.reasoningEffort !== "auto"', payload)
+        self.assertIn("state.settings.thinking &&", payload)
+
+        index = Path(__file__).parents[1] / "src" / "colibri_next" / "ui" / "index.html"
+        markup = index.read_text(encoding="utf-8")
+        self.assertIn('id="reasoning-effort"', markup)
+        for level in ("auto", "low", "medium", "high"):
+            self.assertIn(f'value="{level}"', markup)
+        # The control greys out with the toggle rather than contradicting it.
+        self.assertIn("syncReasoningEffortAvailability", source)
+
+    def test_the_composer_chip_cycles_the_whole_reasoning_state(self) -> None:
+        """Reachable in one click, not behind the settings dialog.
+
+        Thinking and its level are one decision -- off is off, and any level
+        implies thinking -- so the chip carries both rather than leaving the
+        per-prompt half of it three clicks and a modal away.
+        """
+        source = APP.read_text(encoding="utf-8")
+        self.assertIn(
+            'const REASONING_STATES = ["off", "auto", "low", "medium", "high"]',
+            source,
+        )
+        self.assertIn('elements.thinkingChip.addEventListener("click", cycleReasoning)',
+                      source)
+        # The chip says which level is live, and the cycle wraps.
+        for state in ("Thinking off", "Thinking on", "Thinking \u00b7 low"):
+            self.assertIn(state, source)
+        self.assertIn("% REASONING_STATES.length", source)
+
     def test_markdown_block_parser_always_advances(self) -> None:
         source = APP.read_text(encoding="utf-8")
         parser = self._slice(
@@ -202,6 +244,49 @@ if (painted !== message.content) throw new Error("the full answer was not painte
 """
         subprocess.run(
             [self.node, "-e", self._reveal_harness(source, body)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    def test_reasoning_repaints_while_the_answer_has_not_started(self) -> None:
+        """Thinking has to stream, not appear finished.
+
+        A reasoning model spends its first seconds emitting only
+        `reasoning_content`, so `message.content` -- and with it the reveal
+        head -- stays at zero. Gating the repaint on the head alone left the
+        thinking panel frozen at whatever had arrived by the first frame and
+        filling in only once the answer began, which is exactly when nobody is
+        reading it any more.
+        """
+        source = APP.read_text(encoding="utf-8")
+        body = """
+const message = { content: "", reasoning: "" };
+beginSmoothStream(message);
+const lengths = [];
+// A second of pure reasoning: the answer has not started.
+for (let i = 0; i < 60; i += 1) {
+  message.reasoning += "step ";
+  frame();
+  lengths.push(paintedReasoning);
+}
+const distinct = new Set(lengths).size;
+if (distinct < 20) {
+  throw new Error(`reasoning repainted ${distinct} times, expected it to follow the stream`);
+}
+if (paintedReasoning !== message.reasoning.length) {
+  throw new Error("the last reasoning delta was never painted");
+}
+if (painted !== "") throw new Error("no answer should have been painted yet");
+"""
+        harness = self._reveal_harness(source, body).replace(
+            'function updateStreamingMessage(message, text) { painted = text; return true; }',
+            "function updateStreamingMessage(message, text) { painted = text; "
+            "paintedReasoning = (message.reasoning || '').length; return true; }",
+        ).replace('let painted = "";', 'let painted = "";\nlet paintedReasoning = -1;')
+        subprocess.run(
+            [self.node, "-e", harness],
             check=True,
             capture_output=True,
             text=True,

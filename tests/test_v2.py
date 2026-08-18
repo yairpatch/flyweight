@@ -1,5 +1,6 @@
 import ctypes
 import os
+import re
 import struct
 import tempfile
 import unittest
@@ -139,10 +140,10 @@ class V2RuntimeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         kernels = (
             root / "native/include/colibri_v2_qwen_kernels.hpp"
-        ).read_text()
-        driver = (root / "native/src/gpu_driver.cpp").read_text()
-        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text()
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
 
         self.assertIn("nvfp4_repack_cublaslt", kernels)
         self.assertIn("nvfp4_quantize_cublaslt", kernels)
@@ -168,9 +169,9 @@ class V2RuntimeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         kernels = (
             root / "native/include/colibri_v2_qwen_kernels.hpp"
-        ).read_text()
-        driver = (root / "native/src/gpu_driver.cpp").read_text()
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
 
         self.assertIn("void q8_grouped_swiglu(", kernels)
         self.assertIn("void q8_grouped_swiglu_rows(", kernels)
@@ -190,7 +191,7 @@ class V2RuntimeTests(unittest.TestCase):
         inflated the baseline enough to keep MTP while it ran ~30% slower.
         """
         root = Path(__file__).resolve().parents[1]
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
 
         self.assertIn("kQwenMtpKeepPercent=80", runtime)
         self.assertIn(
@@ -228,10 +229,10 @@ class V2RuntimeTests(unittest.TestCase):
 
     def test_mtp_small_q8_batches_use_decode_matvecs(self):
         root = Path(__file__).resolve().parents[1]
-        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text()
+        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text(encoding="utf-8")
         kernels = (
             root / "native/include/colibri_v2_qwen_kernels.hpp"
-        ).read_text()
+        ).read_text(encoding="utf-8")
 
         self.assertIn("rows<=8&&type==8", verifier)
         self.assertIn('launch("q8_matvec_transposed_pair"', verifier)
@@ -242,11 +243,11 @@ class V2RuntimeTests(unittest.TestCase):
 
     def test_mtp_prompt_prefill_keeps_the_batched_target_path(self):
         root = Path(__file__).resolve().parents[1]
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
-        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text()
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
+        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text(encoding="utf-8")
         workspace = (
             root / "native/include/colibri_v2_workspace.hpp"
-        ).read_text()
+        ).read_text(encoding="utf-8")
 
         self.assertIn("if(runtime->prefill_rows>1&&prompt_count>1", runtime)
         self.assertNotIn(
@@ -258,8 +259,8 @@ class V2RuntimeTests(unittest.TestCase):
 
     def test_cuda_waits_default_to_blocking_context_scheduling(self):
         root = Path(__file__).resolve().parents[1]
-        driver = (root / "native/src/gpu_driver.cpp").read_text()
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
 
         self.assertIn("cuDevicePrimaryCtxSetFlags", driver)
         self.assertIn("cuCtxSetFlags", driver)
@@ -274,12 +275,12 @@ class V2RuntimeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         kernels = (
             root / "native/include/colibri_v2_qwen_kernels.hpp"
-        ).read_text()
-        driver = (root / "native/src/gpu_driver.cpp").read_text()
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
         policy = (
             root / "native/include/colibri_v2_attention_policy.hpp"
-        ).read_text()
+        ).read_text(encoding="utf-8")
 
         for precision in ("f16", "bf16", "q8"):
             symbol = f"kv_attention_fused_{precision}_tiles"
@@ -294,13 +295,71 @@ class V2RuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("tokens>=4096", runtime)
 
+    def test_sampling_lm_head_dispatches_on_tensor_type(self):
+        """Temperature sampling must pick the head kernel by tensor type.
+
+        This path used to name Q4_K, Q6_K and bf16 and read every other head
+        as Q8_0. A Q3_K head -- what most K-quant checkpoints ship, including
+        Qwen3.8-27B IQ2_XXS -- then decoded to noise, so temperature > 0
+        produced fluent-looking multilingual garbage. Greedy decode was clean
+        throughout because it never calls this: it runs a fused argmax kernel
+        that does dispatch on the type.
+
+        Nothing in the suite could catch it. dense_gguf_fixture only emits
+        Q8_0 and F32, and Q8_0 is the one type the old fallback got right.
+        """
+        root = Path(__file__).resolve().parents[1]
+        runtime = (
+            root / "native/src/v2_runtime.cpp"
+        ).read_text(encoding="utf-8")
+
+        start = runtime.index("static std::uint32_t qwen_sample_last_logits(")
+        body = runtime[start:runtime.index("\n}", start)]
+
+        # The group-decode kernel is preferred, and named by type rather than
+        # assumed: this projection is the largest read in the sampling step.
+        self.assertIn("qwen_q8_matvec_kernel(", body)
+        # The shared dispatch behind it, not a hand-rolled list of types that
+        # can drift away from the one the rest of the runtime uses.
+        self.assertIn("qwen_gpu_matvec_by_type(", body)
+        # A head with no kernel has to fail loudly, not decode as something
+        # else -- silent reinterpretation is what made this look like a model
+        # bug rather than a dispatch bug.
+        self.assertIn("if(projected!=0)", body)
+        self.assertNotIn("colibri_gpu_q8_matvec_transposed(", body)
+
+    def test_q8_matvec_kernel_names_are_registered_with_the_driver(self):
+        """Every name the Q8 matvec map returns must exist in the driver.
+
+        colibri_gpu_launch_named returns -2 for an unknown name and the
+        callers treat a nonzero return as "no kernel, use the fallback", so a
+        typo or a kernel that was never registered does not fail -- it quietly
+        runs the per-element decoder at a fraction of the bandwidth. That is
+        how the IQ2_XS batched-rows kernel sat dead in the prefill path.
+        """
+        root = Path(__file__).resolve().parents[1]
+        runtime = (
+            root / "native/src/v2_runtime.cpp"
+        ).read_text(encoding="utf-8")
+        driver = (
+            root / "native/src/gpu_driver.cpp"
+        ).read_text(encoding="utf-8")
+
+        start = runtime.index("const char* qwen_q8_matvec_kernel(")
+        body = runtime[start:runtime.index("\n}", start)]
+        names = re.findall(r'return "([a-z0-9_]+)";', body)
+
+        self.assertTrue(names, "no kernel names found in qwen_q8_matvec_kernel")
+        for name in names:
+            self.assertIn(f'"{name}"', driver, f"{name} is not registered")
+
     def test_sampled_topk_stays_on_gpu_until_candidates_are_reduced(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
             root / "native/include/colibri_v2_qwen_kernels.hpp"
-        ).read_text()
-        driver = (root / "native/src/gpu_driver.cpp").read_text()
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
         self.assertIn("void sampling_block_topk_logits(", kernels)
         self.assertIn("void sampling_block_topk_pairs(", kernels)
         self.assertIn("cub::BlockRadixSort", kernels)
@@ -400,10 +459,10 @@ class V2RuntimeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         kernels = (
             root / "native/include/colibri_v2_qwen_kernels.hpp"
-        ).read_text()
-        driver = (root / "native/src/gpu_driver.cpp").read_text()
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
-        rows = (root / "native/src/v2_mtp_verifier.inc").read_text()
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
+        rows = (root / "native/src/v2_mtp_verifier.inc").read_text(encoding="utf-8")
 
         # Every turbo kernel has to be defined, registered by name in the driver
         # lookup table, and reachable from a runtime dispatch. Missing the
@@ -454,8 +513,8 @@ class V2RuntimeTests(unittest.TestCase):
 
     def test_turbo_block_sizes_match_the_cpu_reference(self):
         root = Path(__file__).resolve().parents[1]
-        reference = (root / "native/src/turboquant.h").read_text()
-        runtime = (root / "native/src/v2_runtime.cpp").read_text()
+        reference = (root / "native/src/turboquant.h").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
         # 2 bytes of f16 scale plus 32 packed indices: 3.5 and 4.5 bits/value.
         # The arena sizing and the codec must agree or the cache overruns.
         self.assertIn("return 2 + turbo_bits(type) * kTurboBlock / 8;", reference)

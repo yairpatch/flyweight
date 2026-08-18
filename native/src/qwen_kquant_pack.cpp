@@ -9,6 +9,7 @@
 
 #include "qwen_kquant_pack_api.hpp"
 
+#include "qwen_iq_pack.h"
 #include "qwen_kquant_pack.h"
 
 #include <cstdlib>
@@ -69,6 +70,18 @@ const bool installed = [] {
 
 void pack_q8_0(const float* values, std::uint64_t count, std::uint8_t* out) {
     qwen_pack_q8_0(values, count, out);
+}
+
+void pack_q2_k(const float* values, std::uint64_t count, std::uint8_t* out) {
+    qwen_pack_q2_k(values, count, out);
+}
+
+void pack_q3_k(const float* values, std::uint64_t count, std::uint8_t* out) {
+    qwen_pack_q3_k(values, count, out);
+}
+
+void pack_iq3_xxs(const float* values, std::uint64_t count, std::uint8_t* out) {
+    qwen_pack_iq3_xxs(values, count, out);
 }
 
 void pack_q4_k(const float* values, std::uint64_t count, std::uint8_t* out) {

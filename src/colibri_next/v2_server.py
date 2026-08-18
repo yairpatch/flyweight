@@ -3,7 +3,6 @@ from __future__ import annotations
 import codecs
 import datetime
 import json
-import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -18,6 +17,7 @@ from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
 from .server import InferenceService, _parse_tool_calls
 from .v2 import (
+    AUTO_PROMPT_CACHE_MIB,
     TASK_EVENT_DONE,
     TASK_EVENT_ERROR,
     TASK_EVENT_PREFILL,
@@ -154,6 +154,10 @@ class _NativeEngine:
                 temperature=sampling_config.temperature,
                 top_k=sampling_config.top_k,
                 top_p=sampling_config.top_p,
+                repetition_penalty=sampling_config.repetition_penalty,
+                presence_penalty=sampling_config.presence_penalty,
+                frequency_penalty=sampling_config.frequency_penalty,
+                penalty_window=sampling_config.penalty_window,
                 seed=sampling_config.seed,
             )
             self._queues[task_id] = task_queue
@@ -357,10 +361,29 @@ class NativeV2Tokenizer:
         raise ValueError(str(message))
 
     @staticmethod
-    def _to_json(value: object, indent: int | None = None) -> str:
-        if indent is None:
-            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        return json.dumps(value, ensure_ascii=False, indent=indent)
+    def _to_json(
+        value: object, indent: int | None = None, ensure_ascii: bool = False,
+        separators: tuple[str, str] | None = None, sort_keys: bool = False,
+        **_ignored: object,
+    ) -> str:
+        """``tojson`` with the signature and defaults template authors target.
+
+        This mirrors the filter transformers installs for
+        `apply_chat_template`, which is what a checkpoint's template is written
+        and tested against -- keywords included, since BailingMoE3 renders a
+        non-string tool argument with ``tojson(ensure_ascii=False)`` and a
+        filter that refused the keyword failed the whole render.
+
+        The separators matter as much as the keywords: this used to force the
+        compact form, so a tool schema reached the model as
+        `{"name":"write_file"}` where every other runtime -- and the training
+        data -- has `{"name": "write_file"}`. Unknown keywords are swallowed;
+        a rendered prompt is worth more than a formatting argument.
+        """
+        return json.dumps(
+            value, ensure_ascii=ensure_ascii, indent=indent,
+            separators=separators, sort_keys=sort_keys,
+        )
 
     @property
     def turn_separator(self) -> str:
@@ -380,6 +403,16 @@ class NativeV2Tokenizer:
             # message and generation runs on past it, so the token that closes
             # the turn is <|eot|>.
             return "<|eot|>"
+        if self.architecture == "bailingmoe3":
+            # Every turn ends with <|role_end|>, which is one special token and
+            # also this checkpoint's EOS. The ChatML default below is not merely
+            # the wrong markup here -- it is not markup at all: <|im_end|>
+            # tokenizes as five ORDINARY text tokens, so a resumed conversation
+            # carried that literal string in its middle. Which is every turn of
+            # an agentic loop, because a turn that ends in a tool call is
+            # cancelled rather than finished on EOS, and the model answered the
+            # nonsense by repeating itself.
+            return "<|role_end|>"
         return "<|im_end|>\n"
 
     @property
@@ -392,7 +425,11 @@ class NativeV2Tokenizer:
         """
         # Muse Glimmer runs <|start|> straight on from <|eot|> the same way
         # DeepSeek-V4 does; a newline there is markup the template never emits.
-        return "" if self.architecture in ("deepseek4", "muse-glimmer") else "\n"
+        # BailingMoE3 is the same: its template emits <role>HUMAN</role>
+        # immediately after <|role_end|>, with nothing between them.
+        return "" if self.architecture in (
+            "deepseek4", "muse-glimmer", "bailingmoe3"
+        ) else "\n"
 
     @property
     def bos_token_id(self) -> int | None:
@@ -427,8 +464,28 @@ class NativeV2Tokenizer:
         self,
         messages: Sequence[Mapping[str, str]],
         *,
-        enable_thinking: bool = False,
+        enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
+        """Render the prompt. None leaves the checkpoint's own thinking default.
+
+        `reasoning_effort` is the same idea one level down, for a checkpoint
+        that grades its reasoning rather than switching it. Qwen3.5 reads
+        low / medium / xhigh and *defaults to xhigh*, which is its maximum:
+        leaving the variable unset asks a 27B to "think carefully through the
+        task, validate key assumptions, consider plausible alternatives" before
+        answering anything at all. Measured on Qwen3.8-27B at Q2_K, that is 500
+        tokens and a hit output cap for "explain in a short paragraph", against
+        291 at medium. None still means the checkpoint's own default, because
+        quietly asking a model for less reasoning than it was tuned for is the
+        mirror of the enable_thinking mistake described above.
+
+        A template that reasons by default -- BailingMoE3 is one -- turns it off
+        only when `enable_thinking` is defined and false. Passing false on every
+        request that simply never mentioned thinking therefore overrode the
+        checkpoint's choice: it rendered `<think></think>` where llama.cpp
+        renders `<think>`, telling a model trained to reason first not to.
+        """
         if not messages:
             raise ValueError("messages must not be empty")
         compiled_template = getattr(self, "_compiled_chat_template", None)
@@ -444,11 +501,11 @@ class NativeV2Tokenizer:
                 ):
                     raise ValueError("chat message content must not be empty")
                 # Some tokenizer.chat_template variants access tool_calls
-                # unconditionally instead of guarding it with ``is defined``.
-                # Tool-call history has already been rendered into content by
-                # the OpenAI compatibility layer, so expose an empty collection
-                # here to preserve that rendered representation while matching
-                # the message shape expected by those templates.
+                # unconditionally instead of guarding it with ``is defined``,
+                # so the key is always present. It carries real calls only for
+                # the architectures whose template renders them itself; for the
+                # rest the compatibility layer has already put that history in
+                # content, and an empty collection preserves it.
                 normalized.append(
                     {
                         "role": role,
@@ -458,10 +515,16 @@ class NativeV2Tokenizer:
                         "tools": message.get("tools", []),
                     }
                 )
+            thinking_variables: dict[str, object] = (
+                {} if enable_thinking is None
+                else {"enable_thinking": enable_thinking}
+            )
+            if reasoning_effort:
+                thinking_variables["reasoning_effort"] = reasoning_effort
             return compiled_template.render(
                 messages=normalized,
                 add_generation_prompt=True,
-                enable_thinking=enable_thinking,
+                **thinking_variables,
                 # Muse Glimmer's template ignores enable_thinking and reads a
                 # `reasoning_strength` of its own (low / medium / high / xhigh),
                 # defaulting to 'high'. The model has no setting that stops it
@@ -471,16 +534,26 @@ class NativeV2Tokenizer:
                 # enable_thinking is false on every request that never mentions
                 # it. Templates that do not use the variable ignore it.
                 reasoning_strength="xhigh" if enable_thinking else "high",
-                tools=None,
+                # The schemas the caller declared, for a template that renders
+                # its own tool section. The compatibility layer attaches them to
+                # the first message for exactly this hand-off; a template that
+                # does not use the variable ignores it, and one that does now
+                # instructs the model in the format it was trained on rather
+                # than the generic prompt this server would otherwise inject.
+                tools=next(
+                    (message["tools"] for message in normalized
+                     if message.get("tools")),
+                    None,
+                ),
                 documents=None,
                 **self._template_tokens,
             )
         if self.architecture == "gemma4":
-            return self._format_gemma4(messages, enable_thinking=enable_thinking)
+            return self._format_gemma4(messages, enable_thinking=bool(enable_thinking))
         if self.architecture == "laguna":
-            return self._format_laguna(messages, enable_thinking=enable_thinking)
+            return self._format_laguna(messages, enable_thinking=bool(enable_thinking))
         if self.architecture == "deepseek4":
-            return self._format_deepseek4(messages, enable_thinking=enable_thinking)
+            return self._format_deepseek4(messages, enable_thinking=bool(enable_thinking))
         sections: list[str] = []
         for message in messages:
             role = message["role"]
@@ -684,11 +757,20 @@ class NativeV2Tokenizer:
         self,
         messages: Sequence[Mapping[str, str]],
         *,
-        enable_thinking: bool = False,
+        enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[int]:
         return self.encode(
-            self.format_messages(messages, enable_thinking=enable_thinking)
+            self.format_messages(
+                messages, enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort)
         )
+
+
+def _optional_thinking(options: Mapping[str, object]) -> bool | None:
+    """`enable_thinking` as the caller left it, preserving "unstated"."""
+    value = options.get("enable_thinking")
+    return None if value is None else bool(value)
 
 
 class ChatGenerator:
@@ -711,6 +793,7 @@ class ChatGenerator:
         self._chat_generated_ids: tuple[int, ...] = ()
         self._chat_text = ""
         self._chat_thinking = False
+        self._chat_effort: str | None = None
         # Exact generated token IDs must survive unrelated concurrent requests.
         # A single "last chat" record let short agent/title/tool side-calls
         # overwrite the main conversation and forced its next turn to re-tokenize
@@ -749,17 +832,30 @@ class ChatGenerator:
     def prepare_messages(
         self, messages: Sequence[Mapping[str, str]], **options: object
     ) -> list[int]:
-        thinking = bool(options.get("enable_thinking", False))
+        # Tri-state, not a bool. `None` means the request never mentioned
+        # thinking, and only the checkpoint's template can answer that: Qwen3.5
+        # reasons by default and renders `<think>` to start the turn inside a
+        # reasoning block, while an explicit false renders `<think></think>`
+        # and tells a model trained to reason first not to. Coercing None to
+        # False here silently did the latter on every request -- 20 prompt
+        # tokens where the checkpoint's own default is 60 -- and took the
+        # reasoning-effort instruction with it, since the template only grades
+        # reasoning it is doing.
+        thinking = _optional_thinking(options)
+        effort = options.get("reasoning_effort")
         normalized = tuple(
             (message["role"], message["content"].strip()) for message in messages
         )
         with self._chat_lock:
-            return self._continued_chat_prompt(normalized, thinking)
+            return self._continued_chat_prompt(
+                normalized, thinking, messages,
+                reasoning_effort=effort if isinstance(effort, str) else None)
 
     def stream_messages(
         self, messages: Sequence[Mapping[str, str]], **options: object
     ) -> Iterator[GenerationStep]:
-        thinking = bool(options.get("enable_thinking", False))
+        thinking = _optional_thinking(options)
+        effort = options.get("reasoning_effort")
         normalized = tuple(
             (message["role"], message["content"].strip()) for message in messages
         )
@@ -767,7 +863,8 @@ class ChatGenerator:
         prompt_ids = (
             [int(token) for token in prepared]
             if isinstance(prepared, Sequence)
-            else self.prepare_messages(messages, enable_thinking=thinking)
+            else self.prepare_messages(
+                messages, enable_thinking=thinking, reasoning_effort=effort)
         )
         final: GenerationStep | None = None
         for step in self._stream(prompt_ids, **options):
@@ -783,11 +880,13 @@ class ChatGenerator:
                 self._chat_generated_ids = tuple(final.generated_ids)
                 self._chat_text = final.text
                 self._chat_thinking = thinking
+                self._chat_effort = effort if isinstance(effort, str) else None
                 self._chat_continuations[normalized] = (
                     tuple(prompt_ids),
                     tuple(final.generated_ids),
                     final.text,
                     thinking,
+                    self._chat_effort,
                 )
                 self._chat_continuations.move_to_end(normalized)
                 while (
@@ -797,8 +896,22 @@ class ChatGenerator:
                     self._chat_continuations.popitem(last=False)
 
     def _continued_chat_prompt(
-        self, messages: tuple[tuple[str, str], ...], thinking: bool
+        self, messages: tuple[tuple[str, str], ...], thinking: bool,
+        full: Sequence[Mapping[str, object]] | None = None,
+        *, reasoning_effort: str | None = None,
     ) -> list[int]:
+        """Prompt ids for `messages`, reusing a cached prefix where one fits.
+
+        `messages` is the (role, content) reduction the continuation cache is
+        keyed and matched on; `full` is what actually gets rendered. The two are
+        separate because a message carries more than role and content -- the
+        tool schemas and the structured tool calls a native template renders
+        itself -- and reducing before rendering silently dropped them, so a
+        tool-capable model was prompted as though no tools existed.
+        """
+        rendered = list(full) if full is not None else [
+            {"role": role, "content": content} for role, content in messages
+        ]
         candidates = list(self._chat_continuations.items())
         if self._chat_messages is not None:
             candidates.append(
@@ -809,6 +922,7 @@ class ChatGenerator:
                         self._chat_generated_ids,
                         self._chat_text,
                         self._chat_thinking,
+                        self._chat_effort,
                     ),
                 )
             )
@@ -816,9 +930,12 @@ class ChatGenerator:
         # literal prefix of a later turn but cannot reuse as much live state.
         candidates.sort(key=lambda item: len(item[0]), reverse=True)
         for previous, record in candidates:
-            prompt_ids, generated_ids, raw_text, record_thinking = record
+            prompt_ids, generated_ids, raw_text, record_thinking, record_effort = record
             if not (
                 thinking == record_thinking
+                # A prefix rendered at another effort opens with a different
+                # system prompt, so it is not a prefix of this conversation.
+                and reasoning_effort == record_effort
                 and len(messages) > len(previous) + 1
                 and messages[: len(previous)] == previous
                 and messages[len(previous)][0] == "assistant"
@@ -838,11 +955,10 @@ class ChatGenerator:
                     if ended
                     else self.tokenizer.turn_separator
                 )
-                suffix_messages = [
-                    {"role": role, "content": content} for role, content in remaining
-                ]
+                suffix_messages = rendered[len(previous) + 1:]
                 suffix = self.tokenizer.encode_messages(
-                    suffix_messages, enable_thinking=thinking
+                    suffix_messages, enable_thinking=thinking,
+                    reasoning_effort=reasoning_effort
                 )
                 # The suffix is rendered as though it were a whole
                 # conversation, so a template that opens with BOS emits one
@@ -862,9 +978,7 @@ class ChatGenerator:
                     + suffix
                 )
         return self.tokenizer.encode_messages(
-            [{"role": role, "content": content} for role, content in messages],
-            enable_thinking=thinking,
-        )
+            rendered, enable_thinking=thinking, reasoning_effort=reasoning_effort)
 
     def _assistant_continues_previous(
         self, candidate: str, raw_text: str | None = None
@@ -1073,9 +1187,23 @@ class BailingEngine:
 
     _MAX_ACTIVE_TASKS = 32
     _MAX_BUFFERED_EVENTS = 256
+    # Host budget for put-aside sequences when the caller does not say. A
+    # snapshot costs the tokens it holds (~12 KB/token on Ling-3.0-tiny), so
+    # this is a few long conversations or many short ones, and re-prefilling
+    # one of them costs seconds.
+    _DEFAULT_SNAPSHOT_BUDGET_BYTES = 512 * 1024**2
+    # A prefill this long is worth a snapshot of its own. Saving costs one copy
+    # of the live cache; re-running the prompt costs seconds, so the ratio only
+    # goes wrong for prompts that were cheap to begin with.
+    _SNAPSHOT_PREFILL_THRESHOLD = 256
 
-    def __init__(self, runtime: "BailingRuntime"):
+    def __init__(self, runtime: "BailingRuntime", snapshot_budget_bytes: int | None = None):
         self.runtime = runtime
+        self._snapshot_budget = (
+            self._DEFAULT_SNAPSHOT_BUDGET_BYTES
+            if snapshot_budget_bytes is None
+            else max(0, snapshot_budget_bytes)
+        )
         self._lock = threading.Lock()
         self._queues: dict[int, Queue[tuple[str, object]]] = {}
         self._pending: list[tuple[int, list[int], int, tuple[int, ...], object]] = []
@@ -1085,10 +1213,23 @@ class BailingEngine:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         # Exact token sequence represented by the runtime's single live cache.
-        # Bailing cannot rewind yet, but ordinary conversation continuation
-        # extends this sequence exactly and should not pay a full reprefill.
+        # Ordinary conversation continuation extends this sequence exactly.
         self._cached_tokens: list[int] = []
         self._cache_initialized = False
+        # Sequences that are not live, kept so they need not be re-prefilled.
+        #
+        # A coding harness does not send one conversation: a short side-call
+        # (title, summary, a second agent) lands between two turns of the main
+        # one, and with a single set of caches that side-call left nothing of
+        # the main conversation behind -- every turn paid a full prefill of a
+        # prompt the runtime had already seen. Snapshots are also what makes a
+        # prompt that is a strict PREFIX of the live sequence reusable, which is
+        # every regenerate and every client that does not send our reply back:
+        # the recurrent KDA state cannot be rewound, only restored.
+        self._snapshots: OrderedDict[tuple[int, ...], bytes] = OrderedDict()
+        self._snapshot_bytes = 0
+        self.reused_tokens = 0
+        self.prefilled_tokens = 0
 
     def submit(
         self,
@@ -1163,31 +1304,164 @@ class BailingEngine:
                 self._run_task(task_id, prompt_ids, max_new_tokens,
                                stop_tokens, sampling)
             except Exception as error:  # keep the worker alive across failures
+                # What the runtime holds is no longer known. Evaluation
+                # advances the runtime's position token by token and the token
+                # list is only extended once a call returns, so a throw partway
+                # through a prompt leaves the two disagreeing -- and a snapshot
+                # taken from that state would be handed back later as a valid
+                # prefix it is not. Forget the live sequence; existing snapshots
+                # are unaffected, since restoring one sets the position itself.
+                self._cache_initialized = False
+                self._cached_tokens.clear()
                 self._emit(task_id, ("error", str(error)))
+
+    def cache_stats(self) -> dict[str, int]:
+        """Sequences put aside, and how much prefill they have saved.
+
+        Counted in tokens rather than the Qwen runtime's block hits/misses:
+        this cache holds whole sequences, so "how much prefill did it save" is
+        the only number here that means anything.
+        """
+        with self._lock:
+            return {
+                "capacity": len(self._snapshots) + 1,
+                "used": self._snapshot_bytes,
+                "hits": self.reused_tokens,
+                "misses": self.prefilled_tokens,
+            }
+
+    def _drop_snapshot(self, key: tuple[int, ...]) -> None:
+        self._snapshot_bytes -= len(self._snapshots.pop(key))
+
+    def _remember_live_sequence(self, protect: tuple[int, ...] | None = None) -> None:
+        """Put the live sequence aside so it need not be prefilled again.
+
+        `protect` is a snapshot the caller is about to restore from. Two turns
+        of one conversation are nearly the same size, so storing the second can
+        push the store over budget -- and the LRU end is the older snapshot,
+        which is exactly the one being restored. Evicting it turned a hit into a
+        full prefill of a prompt the cache was holding.
+        """
+        if not self._cache_initialized or not self._cached_tokens:
+            return
+        if self._snapshot_budget <= 0:  # --cache off
+            return
+        key = tuple(self._cached_tokens)
+        if key in self._snapshots:
+            self._snapshots.move_to_end(key)
+            return
+        snapshot = self.runtime.save_state()
+        self._snapshots[key] = snapshot
+        self._snapshot_bytes += len(snapshot)
+        for candidate in list(self._snapshots):
+            if self._snapshot_bytes <= self._snapshot_budget:
+                break
+            if candidate == protect or candidate == key:
+                continue
+            self._drop_snapshot(candidate)
+        # Nothing else was expendable: the sequence just stored is the one to
+        # give up, not the one about to be used.
+        if self._snapshot_bytes > self._snapshot_budget:
+            self._drop_snapshot(key)
+
+    def _restore_longest_prefix(self, prompt_ids: list[int]) -> int:
+        """Put the runtime on the longest known prefix of this prompt.
+
+        Returns how many of the prompt's tokens the caches already hold. At
+        least one token is always left to evaluate: the sampler reads the logits
+        of the last token evaluated, and a fully restored prompt would sample
+        from whatever the previous sequence left in the buffer.
+        """
+        limit = len(prompt_ids) - 1
+        live = len(self._cached_tokens)
+        if (
+            self._cache_initialized
+            and live <= limit
+            and prompt_ids[:live] == self._cached_tokens
+        ):
+            self.reused_tokens += live
+            return live
+        # Choose the restore target BEFORE putting the live sequence aside, so
+        # that storing the live one cannot evict the target.
+        best: tuple[int, ...] | None = None
+        for candidate in self._snapshots:
+            length = len(candidate)
+            if length > limit or (best is not None and length <= len(best)):
+                continue
+            if prompt_ids[:length] == list(candidate):
+                best = candidate
+        # Switching away from the live sequence: keep it before it is lost.
+        self._remember_live_sequence(protect=best)
+        if best is not None:
+            self.runtime.load_state(self._snapshots[best])
+            self._snapshots.move_to_end(best)
+            self._cached_tokens = list(best)
+            self._cache_initialized = True
+            self.reused_tokens += len(best)
+            return len(best)
+        self.runtime.reset()
+        self._cached_tokens.clear()
+        self._cache_initialized = True
+        return 0
+
+    def _prefill_progress(self, task_id: int, processed: int, total: int) -> bool:
+        """Report a prompt's progress; False abandons it.
+
+        A full event queue is not a cancellation -- progress is the one event
+        stream that may be dropped, since the next one supersedes it -- so only
+        a cancelled or closing task stops the prompt.
+        """
+        with self._lock:
+            if task_id in self._cancelled or self._closing:
+                return False
+            task_queue = self._queues.get(task_id)
+            if task_queue is None:
+                return False
+        try:
+            task_queue.put_nowait(("prefill", processed))
+        except Full:
+            pass
+        return True
 
     def _run_task(self, task_id, prompt_ids, max_new_tokens, stop_tokens, sampling):
         if not prompt_ids:
             self._emit(task_id, ("done", None))
             return
-        cached = len(self._cached_tokens)
-        reusable = (
-            self._cache_initialized
-            and cached <= len(prompt_ids)
-            and prompt_ids[:cached] == self._cached_tokens
-        )
-        if not reusable:
-            self.runtime.reset()
-            self._cached_tokens.clear()
-            self._cache_initialized = True
-            cached = 0
-        # Make reuse and long blocking prefills visible to the HTTP progress
-        # logger. The runtime has no chunk callbacks yet, so this reports the
-        # exact reused boundary and completion rather than invented progress.
+        cached = self._restore_longest_prefix(prompt_ids)
+        # Make reuse and long prefills visible to the HTTP progress logger. The
+        # runtime reports per tile while the prompt runs, so a long one shows
+        # movement instead of one line minutes later, and a request whose client
+        # has gone is dropped mid-prompt rather than run to completion.
         self._emit(task_id, ("prefill", cached))
         suffix = prompt_ids[cached:]
         if suffix:
-            self.runtime.eval_into(suffix)
-            self._cached_tokens.extend(suffix)
+            self.prefilled_tokens += len(suffix)
+            self.runtime.set_progress(
+                lambda processed, total: self._prefill_progress(
+                    task_id, cached + processed, len(prompt_ids)
+                )
+            )
+            # The prompt is evaluated in two steps so its snapshot can be taken
+            # one token short of the end. A snapshot AT the end is unusable --
+            # restoring it would leave nothing to evaluate and the sampler would
+            # read the logits of whatever ran before -- so the same prompt
+            # arriving again would have to be re-run in full. One token short
+            # serves the repeat and every continuation equally.
+            #
+            # Worth a copy only when the prefill was long enough to dwarf it;
+            # this is what a re-send, a retry after a cancel and a regenerate
+            # land on, none of which carry our reply.
+            try:
+                head = suffix[:-1]
+                if head:
+                    self.runtime.eval_into(head)
+                    self._cached_tokens.extend(head)
+                    if len(head) >= self._SNAPSHOT_PREFILL_THRESHOLD:
+                        self._remember_live_sequence()
+                self.runtime.eval_into(suffix[-1:])
+                self._cached_tokens.append(suffix[-1])
+            finally:
+                self.runtime.set_progress(None)
         self._emit(task_id, ("prefill", len(prompt_ids)))
         stops = set(stop_tokens)
         for _ in range(max_new_tokens):
@@ -1205,14 +1479,14 @@ class BailingGenerator(ChatGenerator):
     """Streaming generator backed by the BailingMoE3 runtime."""
 
     def __init__(self, model: V2Model, runtime: "BailingRuntime",
-                 tokenizer: NativeV2Tokenizer):
-        super().__init__(model, BailingEngine(runtime), tokenizer)
+                 tokenizer: NativeV2Tokenizer,
+                 snapshot_budget_bytes: int | None = None):
+        super().__init__(model, BailingEngine(runtime, snapshot_budget_bytes),
+                         tokenizer)
         self.runtime = runtime
 
     def prefix_cache_stats(self) -> dict[str, int]:
-        # No prefix cache on this path yet; report zeros rather than the Qwen
-        # runtime's numbers, which would be a lie about a different runtime.
-        return {"capacity": 1, "used": 0, "hits": 0, "misses": 0}
+        return self.engine.cache_stats()
 
 
 class NativeV2InferenceService(InferenceService):
@@ -1251,6 +1525,8 @@ class NativeV2InferenceService(InferenceService):
         max_concurrent_requests: int = 64,
         request_timeout_seconds: float = 30.0,
         sse_keepalive_seconds: float = 10.0,
+        max_tool_call_tokens: int = 0,
+        reasoning_effort: str | None = None,
     ):
         generation_defaults, generation_defaults_source = _generation_config_for_model(
             model_path
@@ -1273,7 +1549,10 @@ class NativeV2InferenceService(InferenceService):
                 max_concurrent_requests=max_concurrent_requests,
                 request_timeout_seconds=request_timeout_seconds,
                 sse_keepalive_seconds=sse_keepalive_seconds,
+                max_tool_call_tokens=max_tool_call_tokens,
+                reasoning_effort=reasoning_effort,
                 generation_defaults=generation_defaults,
+                prompt_cache_mib=prompt_cache_mib,
             )
             self.generation_defaults_source = generation_defaults_source
             self.gpu_cache_mib = gpu_cache_mib
@@ -1324,6 +1603,8 @@ class NativeV2InferenceService(InferenceService):
             max_concurrent_requests=max_concurrent_requests,
             request_timeout_seconds=request_timeout_seconds,
             sse_keepalive_seconds=sse_keepalive_seconds,
+            max_tool_call_tokens=max_tool_call_tokens,
+            reasoning_effort=reasoning_effort,
             generation_defaults=generation_defaults,
         )
         self.generation_defaults_source = generation_defaults_source
@@ -1346,13 +1627,22 @@ class NativeV2InferenceService(InferenceService):
     def _init_bailing(self, *, model_name, max_new_tokens, context_window, api_key,
                       cors_origin, strict_model, max_concurrent_requests,
                       request_timeout_seconds, sse_keepalive_seconds,
-                      generation_defaults) -> None:
+                      max_tool_call_tokens, generation_defaults,
+                      reasoning_effort=None, prompt_cache_mib=0) -> None:
         self.v2_runtime = None
         tokenizer = NativeV2Tokenizer(self.v2_model)
         self.bailing_runtime = BailingRuntime(self.v2_model, capacity=context_window)
+        # This runtime's prompt cache is the snapshot store: the same budget,
+        # spent on put-aside sequences rather than the Qwen runtime's blocks.
+        # `auto` is a sentinel the caller passes through, not a size.
+        snapshot_budget = (
+            None if prompt_cache_mib >= AUTO_PROMPT_CACHE_MIB
+            else prompt_cache_mib * 1024**2
+        )
         super().__init__(
             model_name,
-            BailingGenerator(self.v2_model, self.bailing_runtime, tokenizer),
+            BailingGenerator(self.v2_model, self.bailing_runtime, tokenizer,
+                             snapshot_budget),
             max_new_tokens=max_new_tokens,
             context_window=context_window,
             api_key=api_key,
@@ -1361,6 +1651,8 @@ class NativeV2InferenceService(InferenceService):
             max_concurrent_requests=max_concurrent_requests,
             request_timeout_seconds=request_timeout_seconds,
             sse_keepalive_seconds=sse_keepalive_seconds,
+            max_tool_call_tokens=max_tool_call_tokens,
+            reasoning_effort=reasoning_effort,
             generation_defaults=generation_defaults,
         )
         self.requested_expert_mode = "n/a"
@@ -1390,8 +1682,7 @@ class NativeV2InferenceService(InferenceService):
             value["execution"] = {
                 "backend": "native-v2-bailingmoe3",
                 "architecture": self.architecture,
-                "device": "gpu" if os.environ.get("COLIBRI_BAILING_GPU") == "1"
-                          else "cpu",
+                "device": "gpu" if self.bailing_runtime.uses_gpu else "cpu",
                 "parallel_sequences": 1,
             }
             return value

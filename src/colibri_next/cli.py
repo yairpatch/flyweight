@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .server import serve as serve_http
-from .v2 import V2Model
+from .v2 import AUTO_PROMPT_CACHE_MIB as _AUTO_PROMPT_CACHE_MIB, V2Model
 
 
 EXPERT_MODE_CHOICES = (
@@ -18,7 +18,14 @@ EXPERT_MODE_CHOICES = (
     "legacy-paging", "legacy-hybrid",
 )
 KV_TYPES = ("auto", "f32", "f16", "bf16", "q8_0", "turbo3", "turbo4")
-AUTO_PROMPT_CACHE_MIB = (1 << 32) - 1
+AUTO_PROMPT_CACHE_MIB = _AUTO_PROMPT_CACHE_MIB
+# Offered when a safetensors checkpoint is opened, smallest first. GGUF models
+# carry their own quantization and are never asked about.
+QUANT_CHOICES = ("ask", "Q2_K", "IQ3_XXS", "Q3_K", "Q4_K", "Q5_K", "Q6_K",
+                 "Q8_0", "F32")
+# What the loader packs when nothing says otherwise, and so what the prompt
+# offers as its default.
+DEFAULT_QUANT = "Q6_K"
 
 
 def _steady_state_counters(start, end):
@@ -134,6 +141,137 @@ def _prompt_cache_budget(value: str) -> int:
     return budget
 
 
+def _add_quant_option(parser: argparse.ArgumentParser) -> None:
+    """The quantization a safetensors checkpoint is packed to on first open."""
+    parser.add_argument(
+        "--quant", choices=QUANT_CHOICES, default=None,
+        help="quantization for a safetensors checkpoint; 'ask' prompts, and is "
+             f"the default on a terminal (otherwise {DEFAULT_QUANT})",
+    )
+
+
+def _format_bytes(count: int) -> str:
+    value = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:,.1f} {unit}" if unit != "B" else f"{value:,.0f} B"
+        value /= 1024.0
+    raise AssertionError("unreachable")
+
+
+def _quant_menu(options: list[dict[str, object]], default: str) -> str:
+    """The menu text. Separate from the asking so it can be tested as a value."""
+    lines = []
+    for index, option in enumerate(options, start=1):
+        name = str(option["name"])
+        # An option this checkpoint cannot use keeps its number, so the numbering
+        # does not depend on the model and a habit does not misfire.
+        if str(option.get("unavailable", "")):
+            lines.append(f"  {index}) {name:<7} {'--':>11}"
+                         f"   unavailable: {option['unavailable']}")
+            continue
+        cached = int(option["cache_bytes"]) > 0
+        note = ("cached, opens immediately" if cached
+                else f"packs on first open, writes {_format_bytes(int(option['arena_bytes']))}")
+        mark = "  [default]" if name == default else ""
+        lines.append(
+            f"  {index}) {name:<7} {_format_bytes(int(option['arena_bytes'])):>11}"
+            f"   {note}{mark}"
+        )
+    return "\n".join(lines)
+
+
+def _quant_from_answer(
+    answer: str, options: list[dict[str, object]], default: str
+) -> str | None:
+    """A menu answer resolved to a quantization name, or None if it is not one.
+
+    Accepts the number, the name in any case, and the name with the underscore
+    left out -- "q4k" is what a hurried typist writes.
+    """
+    text = answer.strip()
+    if not text:
+        return default
+    # An unavailable option is not an answer: picking it would only fail at
+    # load, and the menu already says why.
+    names = [str(option["name"]) for option in options
+             if not str(option.get("unavailable", ""))]
+    numbered = [str(option["name"]) for option in options]
+    if text.isdigit():
+        index = int(text)
+        chosen = numbered[index - 1] if 1 <= index <= len(numbered) else None
+        return chosen if chosen in names else None
+    folded = text.upper().replace("_", "").replace("-", "")
+    for name in names:
+        if folded == name.upper().replace("_", ""):
+            return name
+    return None
+
+
+def _resolve_quant(args: argparse.Namespace) -> None:
+    """Settle the quantization before anything opens the model.
+
+    The loader reads COLIBRI_HF_QUANT, so a choice made here is published as
+    that variable -- which also means an explicitly exported one wins over the
+    prompt, since the caller has already answered the question.
+
+    Prompting is for a person at a terminal. A pipe, a service manager or CI
+    gets the loader's default, which is what it got before this existed.
+    """
+    requested = getattr(args, "quant", None)
+    if requested and requested != "ask":
+        os.environ["COLIBRI_HF_QUANT"] = requested
+        return
+    if requested is None:
+        if os.environ.get("COLIBRI_HF_QUANT"):
+            return
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            return
+    model = getattr(args, "model", None)
+    if model is None or not Path(model).is_dir():
+        return
+
+    from .v2 import V2Error
+
+    try:
+        options = V2Model.hf_quant_options(model)
+    except (V2Error, OSError):
+        # Not a checkpoint this runtime can describe -- a GGUF, an unsupported
+        # architecture, an unreadable directory. Whatever it is, the load path
+        # reports it far better than a menu could, so leave it to fail there.
+        return
+    if not options:
+        return
+
+    print(f"\n{Path(model).name} is a safetensors checkpoint. "
+          "Choose how to quantize it:", file=sys.stderr)
+    print(_quant_menu(options, DEFAULT_QUANT), file=sys.stderr)
+    for _ in range(3):
+        try:
+            # The question goes to stderr rather than through input()'s own
+            # prompt, which writes to stdout -- `inspect` prints JSON there.
+            print(f"quantization [{DEFAULT_QUANT}]: ", end="", flush=True,
+                  file=sys.stderr)
+            answer = input()
+        except EOFError:
+            # stdin closed under us. Answering for the caller is better than
+            # failing here; the loader's own default is the answer.
+            print(file=sys.stderr)
+            break
+        except KeyboardInterrupt:
+            # Interrupting a question means stop, not "pick the default".
+            print(file=sys.stderr)
+            raise SystemExit(130)
+        chosen = _quant_from_answer(answer, options, DEFAULT_QUANT)
+        if chosen:
+            os.environ["COLIBRI_HF_QUANT"] = chosen
+            return
+        print(f"not one of the options; enter 1-{len(options)} or a name",
+              file=sys.stderr)
+    print(f"using {DEFAULT_QUANT}", file=sys.stderr)
+    os.environ["COLIBRI_HF_QUANT"] = DEFAULT_QUANT
+
+
 def _add_runtime_options(
     parser: argparse.ArgumentParser, *, serving: bool, show_help: bool = True,
     cache_default: int = 0, show_cache_help: bool = False,
@@ -195,12 +333,14 @@ def _parser() -> argparse.ArgumentParser:
         help="show model metadata",
     )
     inspect.add_argument("model", type=Path)
+    _add_quant_option(inspect)
 
     generate = commands.add_parser(
         "generate", aliases=("generate-text-v2",),
         help="generate one response locally",
     )
     generate.add_argument("model", type=Path)
+    _add_quant_option(generate)
     generate.add_argument("--prompt", required=True)
     generate.add_argument("--system")
     generate.add_argument(
@@ -225,6 +365,7 @@ def _parser() -> argparse.ArgumentParser:
 
     benchmark = commands.add_parser("benchmark", aliases=("benchmark-v2",), help="measure local inference speed")
     benchmark.add_argument("model", type=Path)
+    _add_quant_option(benchmark)
     benchmark.add_argument("--tokens", default="0")
     benchmark.add_argument("--prompt")
     benchmark.add_argument("--chat", action="store_true")
@@ -246,6 +387,7 @@ def _parser() -> argparse.ArgumentParser:
         "probe", aliases=("probe-native", "probe-native-v2", "probe-qwen-native-v2"),
     )
     probe.add_argument("model", type=Path)
+    _add_quant_option(probe)
     probe.add_argument("--token-id", type=int, default=0)
     probe.add_argument("--prompt")
     probe.add_argument("--chat", action="store_true")
@@ -258,6 +400,7 @@ def _parser() -> argparse.ArgumentParser:
         help="start the OpenAI/Anthropic-compatible server",
     )
     serve.add_argument("model", type=Path)
+    _add_quant_option(serve)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--model-name")
@@ -270,6 +413,13 @@ def _parser() -> argparse.ArgumentParser:
         default="auto",
         help="execution backend; auto uses CUDA when a driver is present and "
              "falls back to the CPU backend otherwise",
+    )
+    serve.add_argument(
+        "--reasoning-effort", choices=("low", "medium", "high", "xhigh"),
+        default=None,
+        help="default reasoning effort for checkpoints that grade it "
+             "(Qwen3.5 reads low/medium/xhigh and defaults to xhigh, its "
+             "maximum); a request may override it per call",
     )
     serve.add_argument("--strict-model", action="store_true")
     serve.add_argument("--api-key", default=os.environ.get("COLIBRI_API_KEY"))
@@ -290,6 +440,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-connections", type=int, default=128, help=argparse.SUPPRESS)
     serve.add_argument("--request-timeout-seconds", type=float, default=30.0, help=argparse.SUPPRESS)
     serve.add_argument("--sse-keepalive-seconds", type=float, default=10.0, help=argparse.SUPPRESS)
+    serve.add_argument("--max-tool-call-tokens", type=int, default=0, help=argparse.SUPPRESS)
     _add_runtime_options(
         serve, serving=True, show_help=False,
         cache_default=AUTO_PROMPT_CACHE_MIB, show_cache_help=True,
@@ -311,6 +462,8 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         raise SystemExit("--request-timeout-seconds must be positive")
     if getattr(args, "sse_keepalive_seconds", 1.0) <= 0:
         raise SystemExit("--sse-keepalive-seconds must be positive")
+    if getattr(args, "max_tool_call_tokens", 0) < 0:
+        raise SystemExit("--max-tool-call-tokens must be non-negative")
     if args.cpu_prefetch_mib and args.cpu_prefetch_auto:
         raise SystemExit("use either --cpu-prefetch-mib or --cpu-prefetch-auto")
     if not 0 <= args.next_layer_prefetch <= 64:
@@ -491,6 +644,22 @@ _DEEPSEEK4_UNSUPPORTED = (
 )
 
 
+def _stop_tokens(model: V2Model) -> set[int]:
+    """The ids that end a turn, as the runtime's raw generate loop will not.
+
+    `V2QwenRuntime.generate` has no stop set of its own; without this a probe
+    keeps decoding past the model's end token and prints an invented next turn.
+    """
+    config = model.config
+    unset = 0xFFFFFFFF
+    stops = set()
+    for key in ("eos_token_id", "eot_token_id"):
+        value = config.get(key)
+        if isinstance(value, int) and value != unset:
+            stops.add(value)
+    return stops
+
+
 def _architecture(model_path: Path) -> str | None:
     """The checkpoint's architecture, or None if it cannot be read.
 
@@ -572,6 +741,7 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
         max_concurrent_requests=getattr(args, "max_concurrent_requests", 64),
         request_timeout_seconds=getattr(args, "request_timeout_seconds", 30.0),
         sse_keepalive_seconds=getattr(args, "sse_keepalive_seconds", 10.0),
+        max_tool_call_tokens=getattr(args, "max_tool_call_tokens", 0),
     )
 
 
@@ -658,6 +828,8 @@ def _serve(args: argparse.Namespace) -> int:
         max_concurrent_requests=args.max_concurrent_requests,
         request_timeout_seconds=args.request_timeout_seconds,
         sse_keepalive_seconds=args.sse_keepalive_seconds,
+        max_tool_call_tokens=args.max_tool_call_tokens,
+        reasoning_effort=getattr(args, "reasoning_effort", None),
     )
     return _serve_http(args, service)
 
@@ -680,6 +852,7 @@ def _serve_http(args: argparse.Namespace, service) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _resolve_quant(args)
     if args.command in {"inspect", "inspect-gguf-v2", "inspect-gguf"}:
         with V2Model(args.model) as model:
             print(json.dumps({"model": model.info, "config": model.config,
@@ -700,7 +873,15 @@ def main(argv: list[str] | None = None) -> int:
             with model.native_runtime(**options) as runtime:
                 runtime.prepare()
                 output: list[int] = []
-                runtime.generate(prompt, args.generate_tokens, output.append)
+                stops = _stop_tokens(model)
+
+                def collect(token: int) -> bool:
+                    if token in stops:
+                        return False
+                    output.append(token)
+                    return True
+
+                runtime.generate(prompt, args.generate_tokens, collect)
                 info = runtime.info
             print(json.dumps({"generated_tokens": output,
                               "generated_text": model.decode_tokens(output),

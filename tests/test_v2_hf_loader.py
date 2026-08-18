@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,9 +78,11 @@ class HfLoaderTests(unittest.TestCase):
     def test_it_quantizes_weights_and_leaves_small_tensors_alone(self) -> None:
         with self.open_model() as model:
             catalog = {str(t["name"]): t for t in model.tensors()}
-        # 2-D weights become Q4_K (12) by default.
-        self.assertEqual(catalog["blk.1.ffn_gate_exps.weight"]["ggml_type"], 12)
-        self.assertEqual(catalog["blk.3.attn_q_a.weight"]["ggml_type"], 12)
+        # 2-D weights become Q6_K (14) by default: the tiled prompt kernels and
+        # the grouped expert decode only decode Q6_K, and a Q4_K checkpoint
+        # silently loses both.
+        self.assertEqual(catalog["blk.1.ffn_gate_exps.weight"]["ggml_type"], 14)
+        self.assertEqual(catalog["blk.3.attn_q_a.weight"]["ggml_type"], 14)
         # The embedding and head take a higher target.
         self.assertEqual(catalog["token_embd.weight"]["ggml_type"], 14)
         self.assertEqual(catalog["output.weight"]["ggml_type"], 14)
@@ -135,7 +139,7 @@ class HfLoaderTests(unittest.TestCase):
             broken = Path(directory) / "broken"
             shutil.copytree(self.path, broken)
             index_path = broken / "model.safetensors.index.json"
-            index = json.loads(index_path.read_text())
+            index = json.loads(index_path.read_text(encoding="utf-8"))
             # Rename one KDA tensor so its bytes are still present and readable
             # but its meaning is gone -- exactly the failure the byte-level gate
             # cannot see.
@@ -164,7 +168,7 @@ class HfLoaderTests(unittest.TestCase):
             broken = Path(directory) / "broken"
             shutil.copytree(self.path, broken)
             index_path = broken / "model.safetensors.index.json"
-            index = json.loads(index_path.read_text())
+            index = json.loads(index_path.read_text(encoding="utf-8"))
             victim = "model.layers.0.attention.dt_bias"
             renamed = "model.layers.0.attention.mystery"
             shard = index["weight_map"].pop(victim)
@@ -285,7 +289,7 @@ class HfLoaderTests(unittest.TestCase):
             try:
                 with V2Model(copy) as model:
                     self.assertEqual(
-                        model.tensor("blk.3.attn_q_a.weight")["ggml_type"], 12
+                        model.tensor("blk.3.attn_q_a.weight")["ggml_type"], 14
                     )
                 os.environ["COLIBRI_HF_QUANT"] = "Q8_0"
                 with V2Model(copy) as model:
@@ -337,6 +341,14 @@ class HfLoaderTests(unittest.TestCase):
         # it is the control. Only sending the prompt whole splits them, which is
         # why the original bug survived a test suite that only ever did the
         # former. This does both and requires they agree.
+        #
+        # Agreement is close, not exact: the tiled prompt kernels quantize
+        # activations to int8, so the two paths differ by roughly a percent of
+        # the logit scale. What the original bug produced was not a percent --
+        # it was the distribution for an empty prompt, which shifts the top of
+        # the distribution wholesale. Compare the distribution, not sampled ids:
+        # on the fixture's random weights the top few logits sit within noise of
+        # each other, so argmax flips on a difference that means nothing.
         from colibri_next.v2 import BailingRuntime
 
         prompt = [3, 9, 27, 81, 5, 15, 45, 7]
@@ -344,23 +356,21 @@ class HfLoaderTests(unittest.TestCase):
             runtime = BailingRuntime(model, capacity=128)
             try:
                 runtime.reset()
-                runtime.eval(prompt)
-                whole = [runtime.sample()]
-                for _ in range(5):
-                    runtime.eval([whole[-1]])
-                    whole.append(runtime.sample())
+                whole = list(runtime.eval(prompt))
 
                 runtime.reset()
                 for token in prompt:
-                    runtime.eval([token])
-                pieces = [runtime.sample()]
-                for _ in range(5):
-                    runtime.eval([pieces[-1]])
-                    pieces.append(runtime.sample())
+                    pieces = list(runtime.eval([token]))
             finally:
                 runtime.close()
 
-        self.assertEqual(whole, pieces)
+        scale = max(abs(value) for value in whole)
+        difference = max(abs(a - b) for a, b in zip(whole, pieces))
+        self.assertLess(difference, 0.1 * scale, "prompt paths disagree")
+        self.assertEqual(
+            whole.index(max(whole)), pieces.index(max(pieces)),
+            "prompt paths disagree on the most likely token",
+        )
 
     def test_it_generates_from_a_thread_that_did_not_build_the_runtime(self) -> None:
         # CUDA driver contexts are per thread, and a server builds the runtime
@@ -420,6 +430,67 @@ class HfLoaderTests(unittest.TestCase):
             self.assertEqual(tensor["ggml_type"], 8, f"{name} should be Q8_0")
         # The 4-tap conv kernel is still too short for even a 32-element block.
         self.assertEqual(catalog["blk.0.ssm_q_conv1d.weight"]["ggml_type"], 0)
+
+    def test_it_reports_the_device_the_runtime_settled_on(self) -> None:
+        # Creation falls back to the host silently when the device is missing or
+        # preparation fails, so the caller cannot infer this from the request.
+        # COLIBRI_BAILING_GPU=0 is the one answer that holds on every machine.
+        import os
+
+        from colibri_next.v2 import BailingRuntime
+
+        previous = os.environ.get("COLIBRI_BAILING_GPU")
+        os.environ["COLIBRI_BAILING_GPU"] = "0"
+        try:
+            with self.open_model() as model:
+                runtime = BailingRuntime(model, capacity=32)
+                try:
+                    self.assertIs(runtime.uses_gpu, False)
+                finally:
+                    runtime.close()
+        finally:
+            if previous is None:
+                os.environ.pop("COLIBRI_BAILING_GPU", None)
+            else:
+                os.environ["COLIBRI_BAILING_GPU"] = previous
+
+    def _checkpoint_without_template_file(self, tokenizer_config: object) -> Path:
+        """A copy of the fixture whose template lives in tokenizer_config.json."""
+        directory = Path(tempfile.mkdtemp(dir=self._directory.name))
+        copy = directory / self.path.name
+        shutil.copytree(self.path, copy)
+        (copy / "chat_template.jinja").unlink()
+        (copy / "tokenizer_config.json").write_text(
+            json.dumps({"chat_template": tokenizer_config})
+        )
+        return copy
+
+    def test_it_prefers_the_standalone_template_file(self) -> None:
+        with self.open_model() as model:
+            self.assertEqual(model.chat_template, "{{ messages }}")
+
+    def test_it_falls_back_to_the_tokenizer_config_template(self) -> None:
+        # Checkpoints published before chat_template.jinja existed keep the
+        # template here, and reading only the file left them on the runtime's
+        # generic fallback markup.
+        path = self._checkpoint_without_template_file("{{ 'from-config' }}")
+        with V2Model(path) as model:
+            self.assertEqual(model.chat_template, "{{ 'from-config' }}")
+
+    def test_it_picks_the_default_of_several_named_templates(self) -> None:
+        path = self._checkpoint_without_template_file(
+            [
+                {"name": "tool_use", "template": "{{ 'tools' }}"},
+                {"name": "default", "template": "{{ 'chat' }}"},
+            ]
+        )
+        with V2Model(path) as model:
+            self.assertEqual(model.chat_template, "{{ 'chat' }}")
+
+    def test_it_reports_no_template_when_the_checkpoint_has_none(self) -> None:
+        path = self._checkpoint_without_template_file(None)
+        with V2Model(path) as model:
+            self.assertIsNone(model.chat_template)
 
     def test_it_shrinks_the_checkpoint(self) -> None:
         source = sum(

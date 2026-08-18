@@ -11,6 +11,25 @@ const DEFAULT_SETTINGS = Object.freeze({
   topP: 0.95,
   topK: 20,
   thinking: false,
+  // "auto" sends nothing and leaves the checkpoint's own level, which is the
+  // only honest default: a template that does not grade its reasoning ignores
+  // the field, and one that does has a level it was tuned for.
+  reasoningEffort: "auto",
+});
+
+const REASONING_EFFORTS = ["auto", "low", "medium", "high"];
+// The composer chip cycles the whole reasoning state, because thinking and its
+// level are one decision: "off" is off, and any level implies thinking. Keeping
+// them as two controls in a dialog meant the one people actually want to change
+// per prompt was three clicks and a modal away, and the level could be set to
+// something the toggle then made inert.
+const REASONING_STATES = ["off", "auto", "low", "medium", "high"];
+const REASONING_LABELS = Object.freeze({
+  off: "Thinking off",
+  auto: "Thinking on",
+  low: "Thinking · low",
+  medium: "Thinking · medium",
+  high: "Thinking · high",
 });
 
 const elements = {
@@ -54,6 +73,7 @@ const elements = {
   topP: document.querySelector("#top-p"),
   topK: document.querySelector("#top-k"),
   thinkingSetting: document.querySelector("#thinking-setting"),
+  reasoningEffort: document.querySelector("#reasoning-effort"),
   resetSettings: document.querySelector("#reset-settings"),
   saveSettings: document.querySelector("#save-settings"),
   toastRegion: document.querySelector("#toast-region"),
@@ -130,6 +150,9 @@ function normalizeSettings(value) {
     topP: clampNumber(value.topP, 0.01, 1, DEFAULT_SETTINGS.topP),
     topK: clampInteger(value.topK, 0, 200, DEFAULT_SETTINGS.topK),
     thinking: Boolean(value.thinking),
+    reasoningEffort: REASONING_EFFORTS.includes(value.reasoningEffort)
+      ? value.reasoningEffort
+      : DEFAULT_SETTINGS.reasoningEffort,
   };
 }
 
@@ -677,6 +700,10 @@ const smooth = {
   message: null,
   revealed: 0,
   painted: -1,
+  // Reasoning is not revealed on the same clock as the answer -- it arrives on
+  // its own field and is shown as it lands -- so its own painted length is
+  // what says whether there is anything new to draw.
+  paintedReasoning: -1,
   finishing: false,
   instant: false,
   onDone: null,
@@ -690,6 +717,7 @@ function beginSmoothStream(message) {
   smooth.message = message;
   smooth.revealed = 0;
   smooth.painted = -1;
+  smooth.paintedReasoning = -1;
   smooth.finishing = false;
   smooth.instant = false;
   smooth.onDone = null;
@@ -732,8 +760,16 @@ function smoothTick(now) {
   }
 
   const head = Math.floor(smooth.revealed);
-  if (head !== smooth.painted) {
+  // The answer's reveal is not the only thing that moves. A reasoning model
+  // spends its first seconds emitting nothing but `reasoning_content`, so
+  // `content` -- and with it `head` -- stays at zero, and a repaint gated on
+  // `head` alone left the thinking panel frozen at whatever had arrived by the
+  // first frame. It filled in only once the answer began, which is precisely
+  // when it stops being interesting.
+  const reasoningLength = (message.reasoning || "").length;
+  if (head !== smooth.painted || reasoningLength !== smooth.paintedReasoning) {
     smooth.painted = head;
+    smooth.paintedReasoning = reasoningLength;
     // Asked before the text lands, never after: this frame's own lines would
     // otherwise register as the reader having scrolled away from the bottom.
     const following = isFollowingStream();
@@ -959,6 +995,11 @@ function updateStreamingMessage(message, visible) {
    ========================================================================== */
 
 function splitThinking(message, text) {
+  // Streamed separately by the server; stored conversations may still carry
+  // the tags inline, which the rest of this function handles.
+  if (message && typeof message.reasoning === "string" && message.reasoning) {
+    return { reasoning: message.reasoning, answer: text, settled: Boolean(text) };
+  }
   const open = text.indexOf("<think>");
   const close = text.indexOf("</think>");
   if (open !== -1) {
@@ -1708,6 +1749,12 @@ async function sendMessage(promptOverride = null) {
         top_p: state.settings.topP,
         top_k: state.settings.topK,
         enable_thinking: state.settings.thinking,
+        // Omitted at "auto": the server treats an absent field as "the
+        // request did not say" and leaves the checkpoint's own level, where
+        // sending a value would override it.
+        ...(state.settings.thinking && state.settings.reasoningEffort !== "auto"
+          ? { reasoning_effort: state.settings.reasoningEffort }
+          : {}),
       }),
       signal: state.controller.signal,
     });
@@ -1748,16 +1795,25 @@ async function sendMessage(promptOverride = null) {
       if (!delta) {
         return;
       }
+      // Reasoning arrives on its own field: it is the model's notes, and the
+      // server no longer folds it into the answer.
+      if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+        assistant.thinkingStartedAt ??= Date.now();
+        assistant.reasoning = (assistant.reasoning || "") + delta.reasoning_content;
+      }
       if (typeof delta.content === "string") {
         assistant.thinkingStartedAt ??= Date.now();
-        assistant.content += delta.content;
         // Timed off the raw stream, not the reveal, so the reported duration is
-        // the model's and not the animation's.
-        if (assistant.thinking
-          && assistant.thinkingSeconds === undefined
-          && assistant.content.includes("</think>")) {
+        // the model's and not the animation's. The answer beginning is what
+        // ends the thinking, whether it was marked by a tag in the content or
+        // delivered on the reasoning field.
+        if (assistant.thinkingSeconds === undefined
+          && delta.content
+          && (assistant.reasoning
+            || (assistant.thinking && (assistant.content + delta.content).includes("</think>")))) {
           assistant.thinkingSeconds = (Date.now() - assistant.thinkingStartedAt) / 1000;
         }
+        assistant.content += delta.content;
       }
       mergeToolCalls(assistant, delta.tool_calls);
     });
@@ -2077,6 +2133,8 @@ function openSettings() {
   elements.topP.value = state.settings.topP;
   elements.topK.value = state.settings.topK;
   elements.thinkingSetting.checked = state.settings.thinking;
+  elements.reasoningEffort.value = state.settings.reasoningEffort;
+  syncReasoningEffortAvailability();
   if (!elements.settingsDialog.open) {
     elements.settingsDialog.showModal();
   }
@@ -2090,6 +2148,7 @@ function saveSettings() {
     topP: elements.topP.value,
     topK: elements.topK.value,
     thinking: elements.thinkingSetting.checked,
+    reasoningEffort: elements.reasoningEffort.value,
   });
   state.settings.maxTokens = Math.min(
     state.settings.maxTokens,
@@ -2112,18 +2171,53 @@ function resetSettings() {
   elements.topP.value = state.settings.topP;
   elements.topK.value = state.settings.topK;
   elements.thinkingSetting.checked = state.settings.thinking;
+  elements.reasoningEffort.value = state.settings.reasoningEffort;
+  syncReasoningEffortAvailability();
+}
+
+// A graded effort only means something while the model is thinking: the
+// template that reads it skips the instruction entirely when thinking is off,
+// so an enabled control there would silently do nothing.
+function syncReasoningEffortAvailability() {
+  elements.reasoningEffort.disabled = !elements.thinkingSetting.checked;
 }
 
 function renderSettingsSummary() {
-  elements.thinkingChip.setAttribute("aria-pressed", String(state.settings.thinking));
-  elements.thinkingChip.lastChild.textContent = state.settings.thinking ? " Thinking on" : " Thinking off";
+  const reasoning = reasoningState();
+  elements.thinkingChip.setAttribute("aria-pressed", String(reasoning !== "off"));
+  elements.thinkingChip.lastChild.textContent = ` ${REASONING_LABELS[reasoning]}`;
+  elements.thinkingChip.title =
+    reasoning === "off"
+      ? "Reasoning off. Click to let the model use its own level."
+      : reasoning === "auto"
+        ? "Reasoning at the model's own level. Click to set one."
+        : `Reasoning effort ${reasoning}. Click to change.`;
   elements.tokenChip.textContent = `${state.settings.maxTokens} tokens`;
 }
 
-function toggleThinking() {
-  state.settings.thinking = !state.settings.thinking;
+function reasoningState() {
+  if (!state.settings.thinking) return "off";
+  const effort = state.settings.reasoningEffort;
+  return REASONING_EFFORTS.includes(effort) ? effort : "auto";
+}
+
+function applyReasoningState(next) {
+  state.settings.thinking = next !== "off";
+  state.settings.reasoningEffort = next === "off" ? "auto" : next;
+  if (elements.settingsDialog.open) {
+    elements.thinkingSetting.checked = state.settings.thinking;
+    elements.reasoningEffort.value = state.settings.reasoningEffort;
+    syncReasoningEffortAvailability();
+  }
   persistSettings();
   renderSettingsSummary();
+}
+
+function cycleReasoning() {
+  const current = REASONING_STATES.indexOf(reasoningState());
+  applyReasoningState(
+    REASONING_STATES[(current + 1) % REASONING_STATES.length],
+  );
 }
 
 /* =============================================================================
@@ -2562,12 +2656,16 @@ function bindEvents() {
   elements.openSettings.addEventListener("click", openSettings);
   elements.quickSettings.addEventListener("click", openSettings);
   elements.importChat.addEventListener("click", importConversation);
-  elements.thinkingChip.addEventListener("click", toggleThinking);
+  elements.thinkingChip.addEventListener("click", cycleReasoning);
   elements.saveSettings.addEventListener("click", (event) => {
     event.preventDefault();
     saveSettings();
   });
   elements.resetSettings.addEventListener("click", resetSettings);
+  // Toggling thinking inside the dialog has to enable or grey the effort
+  // control with it, or the two read as contradicting each other.
+  elements.thinkingSetting.addEventListener(
+    "change", syncReasoningEffortAvailability);
   elements.clearChat.addEventListener("click", clearConversation);
   elements.exportChat.addEventListener("click", exportConversation);
   elements.themeToggle.addEventListener("click", cycleTheme);

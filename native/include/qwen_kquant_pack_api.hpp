@@ -15,6 +15,10 @@
 namespace qwen_kpack {
 
 void pack_q8_0(const float* values, std::uint64_t count, std::uint8_t* out);
+void pack_q2_k(const float* values, std::uint64_t count, std::uint8_t* out);
+void pack_q3_k(const float* values, std::uint64_t count, std::uint8_t* out);
+// Codebook rather than lattice; see qwen_iq_pack.h.
+void pack_iq3_xxs(const float* values, std::uint64_t count, std::uint8_t* out);
 void pack_q4_k(const float* values, std::uint64_t count, std::uint8_t* out);
 void pack_q5_k(const float* values, std::uint64_t count, std::uint8_t* out);
 void pack_q6_k(const float* values, std::uint64_t count, std::uint8_t* out);

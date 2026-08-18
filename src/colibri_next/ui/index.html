@@ -129,7 +129,8 @@
           <textarea id="prompt-input" rows="1" dir="auto" placeholder="Message Colibri…" aria-label="Message"></textarea>
           <div class="composer-bottom">
             <div class="composer-options">
-              <button class="option-chip" id="thinking-chip" type="button" aria-pressed="false">
+              <button class="option-chip" id="thinking-chip" type="button" aria-pressed="false"
+                      title="Reasoning off. Click to let the model use its own level.">
                 <svg viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M8.2 14.8A7 7 0 1 1 15.8 14.8c-.7.5-.8 1.2-.8 2.2H9c0-1-.1-1.7-.8-2.2Z"/></svg>
                 Thinking off
               </button>
@@ -196,6 +197,16 @@
           <span><strong>Thinking mode</strong><small>Allow the model to use its reasoning template</small></span>
           <input id="thinking-setting" type="checkbox">
           <span class="toggle" aria-hidden="true"></span>
+        </label>
+
+        <label class="field field-wide">
+          <span>Reasoning effort<small>For models that grade their reasoning. Also on the composer chip, which cycles off / on / low / medium / high.</small></span>
+          <select id="reasoning-effort">
+            <option value="auto">Model default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
         </label>
       </div>
 

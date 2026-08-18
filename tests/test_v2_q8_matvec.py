@@ -42,18 +42,36 @@ FORMATS = {
     "Q6_K": (210, "q6k_matvec_transposed", "q6k", (208,)),
     "IQ2_XXS": (66, "iq2xxs_matvec_transposed", "iq2xxs", (0,)),
     "IQ3_XXS": (98, "iq3xxs_matvec_transposed", "iq3xxs", (0,)),
+    "IQ2_S": (82, "iq2s_matvec_transposed", "iq2s", (0,)),
+    "IQ2_XS": (74, "iq2xs_matvec_transposed", "iq2xs", (0,)),
 }
+
+# The LM head has no Q8 group-decode variant for these; they never carry an
+# output projection in the checkpoints that use them.
+NO_Q8_LM_HEAD = {"IQ2_S", "IQ2_XS"}
 
 COLUMNS = 512      # two 256-value super-blocks per row
 ROWS = 96
+
+# Rows per launch of the *_q8_matvec_transposed_rows kernels; COLIBRI_Q8_ROWS
+# in native/include/colibri_v2_qwen_kernels.hpp.
+Q8_ROW_BATCH = 8
+
+# Formats with a batched multi-row matvec. Prefill dispatches on these; see the
+# rows_kernel switch in native/src/v2_mtp_verifier.inc.
+BATCHED_ROWS = ("IQ2_S", "IQ2_XS", "IQ2_XXS", "IQ3_XXS")
 
 
 def _cuda_available() -> bool:
     return bool(V2Model.gpu_info()["available"])
 
 
-class Q8MatvecParityTests(unittest.TestCase):
-    """Each group-decode kernel must agree with its per-element reference."""
+class Q8KernelHarness:
+    """Device buffers and raw kernel launches, shared by the cases below.
+
+    Not a TestCase itself so unittest does not collect it, and so the cases
+    that mix it in do not inherit each other's tests.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -98,12 +116,13 @@ class Q8MatvecParityTests(unittest.TestCase):
             "device allocation failed")
         return pointer.value
 
-    def _launch(self, name: str, grid: int, block: int, args: list) -> None:
+    def _launch(self, name: str, grid: int, block: int, args: list,
+                grid_y: int = 1) -> None:
         array = (ctypes.c_void_p * len(args))(
             *[ctypes.addressof(value) for value in args])
         self.assertEqual(
             self._lib.colibri_gpu_launch_named(
-                name.encode(), grid, 1, block, 0, 0, array),
+                name.encode(), grid, grid_y, block, 0, 0, array),
             0, f"launch failed: {name}")
 
     def _download(self, pointer: int, count: int) -> np.ndarray:
@@ -146,6 +165,10 @@ class Q8MatvecParityTests(unittest.TestCase):
         for start in range(0, COLUMNS, 32):
             vector[start] = 127.0
         return vector
+
+
+class Q8MatvecParityTests(Q8KernelHarness, unittest.TestCase):
+    """Each group-decode kernel must agree with its per-element reference."""
 
     def _run_format(self, label: str, seed: int):
         superblock, reference_kernel, prefix, _ = FORMATS[label]
@@ -209,6 +232,8 @@ class Q8MatvecParityTests(unittest.TestCase):
     def test_lm_head_argmax_matches_matvec(self):
         """The fused LM head must pick the row the matvec's maximum names."""
         for index, label in enumerate(FORMATS):
+            if label in NO_Q8_LM_HEAD:
+                continue
             with self.subTest(quantization=label):
                 superblock, _, prefix, _ = FORMATS[label]
                 weight_bytes = (COLUMNS // 256) * ROWS * superblock
@@ -257,6 +282,127 @@ class Q8MatvecParityTests(unittest.TestCase):
                 self.assertEqual(
                     chosen, int(np.argmax(projected)),
                     f"{label} LM head chose a different row than the matvec")
+
+
+class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
+    """The batched matvecs must match the single-row ones they replace.
+
+    Prefill runs a batch of token rows through one weight matrix.
+    ``<prefix>_q8_matvec_transposed_rows`` decodes each weight group once and
+    dots it against every row, so unlike the single-row kernel it reads the
+    matrix once per launch rather than once per row -- the whole point, and also
+    the only place a row-indexing mistake can hide, since row 0 is laid out
+    identically either way and would pass on its own.
+
+    The scale rows are deliberately on the padded stride the runtime uses
+    (float-sized, though the values are halves): a kernel that ignored
+    ``scale_stride`` and packed the rows tightly would still get row 0 right.
+    """
+
+    def _single_row_reference(self, label: str, packed_ptr,
+                              activations: np.ndarray, batch: int) -> np.ndarray:
+        """Per-row quantize + single-row matvec, the path being replaced."""
+        prefix = FORMATS[label][2]
+        expected = np.zeros((batch, ROWS), dtype=np.float32)
+        columns = ctypes.c_int32(COLUMNS)
+        rows = ctypes.c_int32(ROWS)
+        for row in range(batch):
+            vector_f32 = self._alloc(COLUMNS * 4)
+            contiguous = np.ascontiguousarray(activations[row])
+            self.assertEqual(self._lib.colibri_gpu_upload_sync(
+                vector_f32, contiguous.ctypes.data_as(ctypes.c_void_p),
+                COLUMNS * 4), 0)
+            quantized = self._alloc(COLUMNS)
+            scales = self._alloc((COLUMNS // 32) * 2)
+            output = self._alloc(ROWS * 4)
+            self._launch("quantize_q8_blocks", (COLUMNS + 31) // 32, 32,
+                         [ctypes.c_uint64(vector_f32), ctypes.c_uint64(quantized),
+                          ctypes.c_uint64(scales), columns])
+            self._launch(f"{prefix}_q8_matvec_transposed_warp", ROWS, 128,
+                         [packed_ptr, ctypes.c_uint64(quantized),
+                          ctypes.c_uint64(scales), ctypes.c_uint64(output),
+                          columns, rows])
+            expected[row] = self._download(output, ROWS)
+        return expected
+
+    def _upload_weights(self, label: str, seed: int):
+        superblock = FORMATS[label][0]
+        weight_bytes = (COLUMNS // 256) * ROWS * superblock
+        packed = self._packed_weights(label, weight_bytes, seed)
+        weights = self._alloc(weight_bytes)
+        self.assertEqual(self._lib.colibri_gpu_upload_sync(
+            weights, packed.ctypes.data_as(ctypes.c_void_p), weight_bytes), 0)
+        return ctypes.c_uint64(weights)
+
+    def test_batched_rows_match_single_row_kernel(self):
+        for index, label in enumerate(BATCHED_ROWS):
+            prefix = FORMATS[label][2]
+            packed_ptr = self._upload_weights(label, seed=41 + index)
+            # 1 and the full batch are the edges; 3 leaves the tail of the
+            # unrolled row loop predicated off, which is where an unpredicated
+            # accumulator would read another row's activations.
+            for batch in (1, 3, Q8_ROW_BATCH):
+                with self.subTest(quantization=label, batch=batch):
+                    activations = np.stack([
+                        self._exact_q8_activation(41 + row)
+                        for row in range(batch)])
+                    expected = self._single_row_reference(
+                        label, packed_ptr, activations, batch)
+
+                    # Halves per scale row: the runtime lays these out on a
+                    # float-sized stride even though the kernels write __half.
+                    scale_stride = (COLUMNS // 32) * 2
+                    vectors_f32 = self._alloc(batch * COLUMNS * 4)
+                    flat = np.ascontiguousarray(activations.reshape(-1))
+                    self.assertEqual(self._lib.colibri_gpu_upload_sync(
+                        vectors_f32, flat.ctypes.data_as(ctypes.c_void_p),
+                        batch * COLUMNS * 4), 0)
+                    quantized = self._alloc(batch * COLUMNS)
+                    scales = self._alloc(batch * scale_stride * 2)
+                    output = self._alloc(batch * ROWS * 4)
+
+                    columns = ctypes.c_int32(COLUMNS)
+                    rows = ctypes.c_int32(ROWS)
+                    count = ctypes.c_int32(batch)
+                    stride = ctypes.c_int32(scale_stride)
+                    q8_ptr = ctypes.c_uint64(quantized)
+                    scale_ptr = ctypes.c_uint64(scales)
+
+                    self._launch(
+                        "quantize_q8_blocks_rows", (COLUMNS + 31) // 32, 32,
+                        [ctypes.c_uint64(vectors_f32), q8_ptr, scale_ptr,
+                         columns, stride], grid_y=batch)
+                    self._launch(
+                        f"{prefix}_q8_matvec_transposed_rows", ROWS, 128,
+                        [packed_ptr, q8_ptr, scale_ptr, ctypes.c_uint64(output),
+                         columns, rows, count, stride])
+                    actual = self._download(
+                        output, batch * ROWS).reshape(batch, ROWS)
+
+                    self.assertTrue(
+                        np.isfinite(actual).all(),
+                        f"batched {label} produced non-finite output")
+                    # Both kernels sum the same products in the same order;
+                    # only the final scale multiply is reassociated.
+                    scale = max(1.0, float(np.abs(expected).max()))
+                    np.testing.assert_allclose(
+                        actual, expected, rtol=2e-4, atol=2e-4 * scale,
+                        err_msg=f"batched {label} disagrees with the "
+                                "single-row kernel")
+
+    def test_reference_rows_are_distinct(self):
+        """Guard the guard: identical rows would pass any row-indexing bug."""
+        for index, label in enumerate(BATCHED_ROWS):
+            with self.subTest(quantization=label):
+                packed_ptr = self._upload_weights(label, seed=41 + index)
+                activations = np.stack([
+                    self._exact_q8_activation(41 + row) for row in range(3)])
+                expected = self._single_row_reference(
+                    label, packed_ptr, activations, 3)
+                for row in range(1, 3):
+                    self.assertGreater(
+                        float(np.abs(expected[row] - expected[0]).max()), 1e-3,
+                        "reference rows are too similar to detect a mix-up")
 
 
 if __name__ == "__main__":

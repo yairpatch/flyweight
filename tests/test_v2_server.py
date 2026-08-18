@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from queue import Empty
 
 from colibri_next.cli import _parser
 from colibri_next.sampling import SamplingConfig
@@ -98,10 +99,17 @@ class StubV2Runtime:
         top_k=20,
         top_p=0.95,
         seed=None,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        penalty_window=64,
     ):
         self._tasks = getattr(self, "_tasks", {})
         self._next_task = getattr(self, "_next_task", 0) + 1
         self._last_sampling = (temperature, top_k, top_p, seed)
+        self._last_penalties = (
+            repetition_penalty, presence_penalty, frequency_penalty, penalty_window
+        )
         self._tasks[self._next_task] = (list(prompt), max_tokens, tuple(stop_tokens))
         return self._next_task
 
@@ -135,12 +143,39 @@ class StubBailingRuntime:
         self.resets = 0
         self.eval_calls: list[list[int]] = []
         self.next_token = 20
+        self.uses_gpu = False
+        self.position = 0
+        self.saves = 0
+        self.loads: list[bytes] = []
+        self.progress = None
 
     def reset(self) -> None:
         self.resets += 1
+        self.position = 0
+
+    def set_progress(self, callback) -> None:
+        self.progress = callback
 
     def eval_into(self, tokens) -> None:
-        self.eval_calls.append(list(tokens))
+        tokens = list(tokens)
+        # The runtime reports per tile while a prompt runs and stops when the
+        # watcher says so; a tile here is two tokens, so tests stay small.
+        if self.progress is not None and len(tokens) > 1:
+            for offset in range(0, len(tokens), 2):
+                if self.progress(offset, len(tokens)) is False:
+                    self.position += offset
+                    raise RuntimeError("bailing prompt evaluation was cancelled")
+        self.eval_calls.append(tokens)
+        self.position += len(tokens)
+
+    def save_state(self) -> bytes:
+        self.saves += 1
+        return f"state@{self.position}".encode()
+
+    def load_state(self, snapshot: bytes) -> None:
+        self.loads.append(snapshot)
+        # Trailing padding lets a subclass give a snapshot a realistic size.
+        self.position = int(snapshot.decode().split("@")[1].rstrip("."))
 
     def sample(self, _sampling) -> int:
         self.next_token += 1
@@ -208,9 +243,216 @@ class NativeV2ServerTests(unittest.TestCase):
             engine.close()
 
         self.assertEqual(runtime.resets, 1)
-        self.assertEqual(runtime.eval_calls, [[1, 2], [21], [3], [22]])
+        # A prompt is evaluated as (all but its last token, then that token) so
+        # the snapshot point sits one token short of the end; see _run_task.
+        self.assertEqual(runtime.eval_calls, [[1], [2], [21], [3], [22]])
         self.assertEqual([value for kind, value in first if kind == "prefill"], [0, 2])
         self.assertEqual([value for kind, value in second if kind == "prefill"], [3, 4])
+
+    def test_bailing_engine_survives_a_side_call_between_two_turns(self) -> None:
+        # What a coding harness actually sends: a long conversation, a short
+        # unrelated call (title/summary/second agent), then the next turn of the
+        # long one. With one set of caches and no snapshots the side-call left
+        # nothing behind and that next turn re-prefilled the whole prompt.
+        runtime = StubBailingRuntime()
+        engine = BailingEngine(runtime)  # type: ignore[arg-type]
+
+        def run(prompt: list[int]) -> list[int]:
+            task_id, events = engine.submit(prompt, 1, ())
+            prefills: list[int] = []
+            while True:
+                kind, value = events.get(timeout=2)
+                if kind == "prefill":
+                    prefills.append(int(value))  # type: ignore[arg-type]
+                if kind == "done":
+                    break
+            engine.forget(task_id)
+            return prefills
+
+        conversation = [1, 2, 3, 4, 5]
+        try:
+            run(conversation)
+            run([90, 91])                       # the side-call
+            # The next turn: the conversation, our reply (21), and a new message.
+            resumed = run(conversation + [21, 6, 7])
+        finally:
+            engine.close()
+
+        # Only the two new tokens are evaluated; the conversation and the reply
+        # it ended on come back from the snapshot the side-call displaced.
+        self.assertEqual(runtime.eval_calls[-3:], [[6], [7], [23]])
+        self.assertEqual(resumed, [6, 8])
+        self.assertEqual(engine.reused_tokens, 6)
+        self.assertTrue(runtime.loads, "the displaced sequence was never restored")
+
+    def test_bailing_engine_reports_a_long_prompt_as_it_runs(self) -> None:
+        # A prompt is one call that can run for minutes. Without per-tile
+        # reporting the log went quiet between "starting" and "done", which is
+        # the whole time anyone wants to know what is happening.
+        runtime = StubBailingRuntime()
+        engine = BailingEngine(runtime)  # type: ignore[arg-type]
+        try:
+            task_id, events = engine.submit([1, 2, 3, 4, 5, 6, 7], 1, ())
+            prefills: list[int] = []
+            while True:
+                kind, value = events.get(timeout=2)
+                if kind == "prefill":
+                    prefills.append(int(value))  # type: ignore[arg-type]
+                if kind == "done":
+                    break
+            engine.forget(task_id)
+        finally:
+            engine.close()
+
+        # Movement through the prompt, not just its two ends.
+        self.assertEqual(prefills, [0, 0, 2, 4, 7])
+
+    def test_bailing_engine_abandons_the_prompt_of_a_cancelled_task(self) -> None:
+        # Generation stopped promptly on cancel; the prompt did not, so an
+        # abandoned request still cost its full prefill -- and on this runtime
+        # that also blocks every request behind it.
+        runtime = StubBailingRuntime()
+        engine = BailingEngine(runtime)  # type: ignore[arg-type]
+        try:
+            task_id, events = engine.submit(list(range(40)), 1, ())
+            engine.cancel(task_id)
+            with self.assertRaises(Empty):
+                while True:
+                    if events.get(timeout=0.5)[0] == "done":
+                        break
+        finally:
+            engine.close()
+
+        # It stopped inside the prompt rather than evaluating all of it.
+        self.assertLess(runtime.position, 40)
+        self.assertEqual(runtime.eval_calls, [])
+        # And what the runtime holds is no longer known, so it is forgotten.
+        self.assertFalse(engine._cache_initialized)
+
+    def test_bailing_engine_keeps_the_snapshot_it_is_about_to_restore(self) -> None:
+        # Observed against a real coding-harness session: a 37,810-token turn,
+        # then a 37,830-token one that shared all but its tail, and the log said
+        # "0 reused" -- 267 seconds of prefill that the cache was holding.
+        #
+        # Putting the live sequence aside is what evicted it. The two are nearly
+        # the same size, so saving the second pushed the store over budget and
+        # the LRU end -- the older snapshot, the one this very request was about
+        # to be restored from -- was what went.
+        class SizedRuntime(StubBailingRuntime):
+            """Snapshots that cost in proportion to the tokens they hold."""
+
+            def save_state(self) -> bytes:
+                return super().save_state().ljust(self.position * 10, b".")
+
+        runtime = SizedRuntime()
+        # Room for one sequence of this length, not two.
+        engine = BailingEngine(runtime, 120)
+        engine._SNAPSHOT_PREFILL_THRESHOLD = 1
+
+        def run(prompt: list[int]) -> None:
+            task_id, events = engine.submit(prompt, 1, ())
+            while events.get(timeout=2)[0] != "done":
+                pass
+            engine.forget(task_id)
+
+        conversation = list(range(1, 11))
+        try:
+            run(conversation)
+            # The next turn shares the conversation but not the reply the
+            # engine generated, which is what a harness sending its own
+            # rendering of that turn back produces.
+            runtime.eval_calls.clear()
+            run(conversation + [77, 78])
+        finally:
+            engine.close()
+
+        self.assertEqual(engine.reused_tokens, 9)
+        self.assertEqual(runtime.eval_calls, [[10, 77], [78], [22]])
+
+    def test_bailing_engine_forgets_the_live_sequence_after_a_failed_eval(
+        self,
+    ) -> None:
+        # Evaluation advances the runtime token by token and the token list is
+        # only extended once the call returns, so a throw partway through leaves
+        # the two disagreeing. Snapshotting that state would hand it back later
+        # as a prefix it is not -- the wrong context, with no error to show for
+        # it -- so the live sequence has to be forgotten instead.
+        class FailingRuntime(StubBailingRuntime):
+            def eval_into(self, tokens) -> None:
+                if list(tokens) == [7]:
+                    self.position += 1  # the runtime advanced before it failed
+                    raise RuntimeError("device fell over")
+                super().eval_into(tokens)
+
+        runtime = FailingRuntime()
+        engine = BailingEngine(runtime)  # type: ignore[arg-type]
+
+        def run(prompt: list[int]) -> str:
+            task_id, events = engine.submit(prompt, 1, ())
+            while True:
+                kind, _ = events.get(timeout=2)
+                if kind in ("done", "error"):
+                    engine.forget(task_id)
+                    return kind
+
+        try:
+            self.assertEqual(run([1, 2, 7]), "error")
+            self.assertEqual(engine._cached_tokens, [])
+            self.assertFalse(engine._snapshots)
+            runtime.eval_calls.clear()
+            run([1, 2, 3])
+        finally:
+            engine.close()
+
+        # The next prompt starts from a reset, not from a cache whose contents
+        # nobody can name.
+        self.assertEqual(runtime.resets, 2)
+        self.assertEqual(runtime.eval_calls[:2], [[1, 2], [3]])
+
+    def test_bailing_engine_takes_its_snapshot_budget_from_the_caller(self) -> None:
+        runtime = StubBailingRuntime()
+        engine = BailingEngine(runtime, 0)  # --cache off
+        engine._SNAPSHOT_PREFILL_THRESHOLD = 1
+
+        def run(prompt: list[int]) -> None:
+            task_id, events = engine.submit(prompt, 1, ())
+            while events.get(timeout=2)[0] != "done":
+                pass
+            engine.forget(task_id)
+
+        try:
+            run([1, 2, 3])
+            run([9, 9])
+        finally:
+            engine.close()
+
+        self.assertEqual(runtime.saves, 0)
+        self.assertEqual(engine.cache_stats()["used"], 0)
+
+    def test_bailing_engine_leaves_a_token_to_evaluate_when_a_prompt_repeats(
+        self,
+    ) -> None:
+        # A prompt that is exactly a known sequence must still evaluate its last
+        # token: the sampler reads the logits of the last token evaluated, so a
+        # fully restored prompt would sample from whatever ran before it.
+        runtime = StubBailingRuntime()
+        engine = BailingEngine(runtime)  # type: ignore[arg-type]
+        engine._SNAPSHOT_PREFILL_THRESHOLD = 2
+
+        def run(prompt: list[int]) -> None:
+            task_id, events = engine.submit(prompt, 1, ())
+            while events.get(timeout=2)[0] != "done":
+                pass
+            engine.forget(task_id)
+
+        try:
+            run([1, 2, 3])
+            runtime.eval_calls.clear()
+            run([1, 2, 3])
+        finally:
+            engine.close()
+
+        self.assertEqual(runtime.eval_calls[0], [3])
 
     def test_generation_config_adjacent_to_model_supplies_sampling_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -299,6 +541,27 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(
             execution["expert_fallback_reason"], "working set did not fit"
         )
+
+    def test_health_reports_the_device_the_bailing_runtime_actually_got(self) -> None:
+        # The runtime picks the GPU whenever there is one and falls back to the
+        # host silently, so the environment cannot be used to answer this: a
+        # plain GPU run reported "cpu" while every token ran on the device.
+        for uses_gpu, expected in ((True, "gpu"), (False, "cpu")):
+            with self.subTest(uses_gpu=uses_gpu):
+                runtime = StubBailingRuntime()
+                runtime.uses_gpu = uses_gpu
+                service = object.__new__(NativeV2InferenceService)
+                InferenceService.__init__(
+                    service,
+                    "native-test",
+                    self.make_generator([20])[0],
+                    context_window=128,
+                )
+                service.architecture = "bailingmoe3"
+                service.bailing_runtime = runtime  # type: ignore[assignment]
+                execution = service.health()["execution"]
+                self.assertEqual(execution["device"], expected)
+                self.assertEqual(execution["backend"], "native-v2-bailingmoe3")
 
     def test_native_generator_prefills_and_greedily_decodes(self) -> None:
         generator, runtime = self.make_generator([10, 20, 30])
@@ -405,6 +668,83 @@ class NativeV2ServerTests(unittest.TestCase):
 
         self.assertEqual(prompt, "[user]Hello[assistant]")
 
+    def test_gguf_chat_template_receives_tools_and_calls(self) -> None:
+        # A template that renders its own tool section reads the schemas from
+        # the top-level `tools`, and a previous call from `message.tool_calls`.
+        # Both were dropped on the way in: the compatibility layer attaches them
+        # to a message, and the generator reduced every message to role and
+        # content before rendering -- so a tool-capable model was prompted as
+        # though no tools existed and simply refused the request.
+        class TemplateModel(StubV2Model):
+            config = {}
+            chat_template = (
+                "{% if tools %}[schemas]{% for t in tools %}"
+                "{{ t.function.name }}{% endfor %}{% endif %}"
+                "{% for message in messages %}[{{ message.role }}]"
+                "{{ message.content }}"
+                "{% for call in message.tool_calls %}"
+                "[call]{{ call.function.name }}"
+                "{% for k, v in call.function.arguments.items() %}"
+                "({{ k }}={{ v }}){% endfor %}"
+                "{% endfor %}{% endfor %}"
+                "{% if add_generation_prompt %}[assistant]{% endif %}"
+            )
+
+        tokenizer = NativeV2Tokenizer(TemplateModel())  # type: ignore[arg-type]
+        prompt = tokenizer.format_messages([
+            {
+                "role": "user",
+                "content": "Read it",
+                "tools": [{"type": "function", "function": {"name": "read_file"}}],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": {"path": "/etc"}},
+                }],
+            },
+            {"role": "tool", "content": "ok"},
+        ])
+
+        self.assertEqual(
+            prompt,
+            "[schemas]read_file[user]Read it[assistant]"
+            "[call]read_file(path=/etc)[tool]ok[assistant]",
+        )
+
+    def test_gguf_chat_template_tojson_takes_jinja_keywords(self) -> None:
+        # BailingMoE3 renders a non-string tool argument with
+        # tojson(ensure_ascii=False). Jinja's filter accepts that keyword and
+        # ours did not, so the first tool call carrying a number or an object
+        # -- rather than a string -- failed to render at all.
+        class TemplateModel(StubV2Model):
+            config = {}
+            chat_template = (
+                "{% for message in messages %}"
+                "{% for call in message.tool_calls %}"
+                "{{ call.function.arguments | tojson(ensure_ascii=False) }}"
+                "{% endfor %}{% endfor %}"
+            )
+
+        tokenizer = NativeV2Tokenizer(TemplateModel())  # type: ignore[arg-type]
+        prompt = tokenizer.format_messages([
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"limit": 10}},
+                }],
+            },
+        ])
+
+        # Spacing matters: this is what the model saw in training and what
+        # every other runtime emits. The compact form was ours alone.
+        self.assertEqual(prompt, '{"limit": 10}')
+
     def test_multibyte_character_split_across_tokens_decodes_intact(self) -> None:
         # Byte-level BPE splits "⚽" (e2 9a bd) across tokens 40+41. Per-token
         # string decoding turned each half into U+FFFD, and that corruption was
@@ -434,6 +774,35 @@ class NativeV2ServerTests(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(runtime._last_sampling, (0.5, 7, 0.8, 42))
+
+    def test_native_generator_forwards_penalties_to_engine(self) -> None:
+        # The penalties travel by their own arguments rather than riding on
+        # temperature, so a request that sets them must reach the engine
+        # unchanged -- silently dropping them would restore exactly the
+        # unpenalized sampling that lets the model loop.
+        generator, runtime = self.make_generator([10, 20])
+        generator.generate_text(
+            "Hi",
+            max_new_tokens=1,
+            sampling=SamplingConfig(
+                temperature=0.5,
+                repetition_penalty=1.3,
+                presence_penalty=0.4,
+                frequency_penalty=0.2,
+                penalty_window=128,
+            ),
+        )
+        self.assertEqual(runtime._last_penalties, (1.3, 0.4, 0.2, 128))
+
+    def test_native_generator_penalizes_repetition_by_default(self) -> None:
+        # An unset penalty must not mean "off": no penalty is the setting that
+        # produced the observed loop, so the default carries a real one.
+        generator, runtime = self.make_generator([10, 20])
+        generator.generate_text("Hi", max_new_tokens=1,
+                                sampling=SamplingConfig(temperature=0.5))
+        repetition, _, _, window = runtime._last_penalties
+        self.assertGreater(repetition, 1.0)
+        self.assertGreater(window, 0)
 
     def test_native_generator_reports_runtime_prefix_cache(self) -> None:
         generator, _ = self.make_generator([10])
@@ -502,19 +871,48 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(runtime.cancels, 1)
         generator.close()
 
+    def test_unstated_thinking_is_not_answered_on_the_checkpoint_s_behalf(self) -> None:
+        """None means "the request did not say", and only the template decides.
+
+        Coercing it to False rendered `<think></think>` on every request that
+        never mentioned thinking, which tells a model trained to reason first
+        not to -- and takes any reasoning-effort instruction with it, since a
+        template only grades reasoning it is doing.
+        """
+        generator, _ = self.make_generator([10])
+        seen: list[object] = []
+        original = generator.tokenizer.encode_messages
+
+        def record(messages, **options):
+            seen.append(options.get("enable_thinking"))
+            return original(messages, **options)
+
+        generator.tokenizer.encode_messages = record
+        generator.prepare_messages([{"role": "user", "content": "Hi"}])
+        self.assertEqual(seen, [None])
+        seen.clear()
+        generator.prepare_messages(
+            [{"role": "user", "content": "Hi"}], enable_thinking=False
+        )
+        self.assertEqual(seen, [False])
+
     def test_native_chat_continuation_preserves_generated_token_ids(self) -> None:
         generator, _ = self.make_generator([10, 20, 30])
         first_messages = (("user", "Hi"),)
         generator.generate_messages(
             [{"role": "user", "content": "Hi"}], max_new_tokens=2
         )
+        # None, not False: the generation above never mentioned thinking, and
+        # the two render differently -- a prefix rendered with thinking
+        # explicitly off is not a prefix of a conversation that left it to the
+        # checkpoint.
         continued = generator._continued_chat_prompt(
             (
                 *first_messages,
                 ("assistant", "Hello world"),
                 ("user", "Again"),
             ),
-            False,
+            None,
         )
         self.assertEqual(continued, [1, 2, 20, 30, 1, 2, 1, 2])
 
@@ -555,6 +953,7 @@ class NativeV2ServerTests(unittest.TestCase):
             (20, 30),
             "Hello world",
             False,
+            None,   # the reasoning effort the prefix was rendered at
         )
         # A later short request owns the legacy last-writer fields.
         generator._chat_messages = (("user", "Make a title"),)

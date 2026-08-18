@@ -699,6 +699,46 @@ class ToolCallParsingTests(unittest.TestCase):
         )
         self.assertEqual(calls, [])
 
+    def test_a_finished_call_missing_a_parameter_still_reaches_the_client(self) -> None:
+        """Dropping is for truncation, not for a model that left a field out.
+
+        Qwen omits the parameters that read as optional to it -- a
+        `description` beside a `command` is the common one -- and returning
+        nothing for those leaves the caller with an empty assistant turn and no
+        way to tell a bad call from a bug. The call goes out and the caller's
+        own validator says what is missing, which an agent can retry from.
+        """
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command", "description"],
+                    },
+                },
+            }
+        ]
+        emitted = ("<tool_call><function=bash>\n"
+                   "<parameter=command>\nls -la\n</parameter>\n"
+                   "</function></tool_call>")
+        # The generation ended on its own: the model had its chance.
+        _, finished = _parse_tool_calls(emitted, tools=tools, keep_incomplete=True)
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["function"]["name"], "bash")
+        self.assertEqual(
+            json.loads(finished[0]["function"]["arguments"]), {"command": "ls -la"}
+        )
+        # Cut short by the token budget: the parameters were never written, so
+        # there is no call to make and finish_reason carries the reason.
+        _, truncated = _parse_tool_calls(emitted, tools=tools)
+        self.assertEqual(truncated, [])
+
     def test_parameters_after_the_closing_tag_are_recovered(self) -> None:
         # The shape a low-bit Qwen3.5 actually emits: <tool_call> and
         # </tool_call> are single tokens and come out right, while </function>

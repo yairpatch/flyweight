@@ -1,6 +1,6 @@
 #pragma once
 
-// K-quant *encoders*: f32 -> Q4_K / Q5_K / Q6_K super-blocks.
+// K-quant *encoders*: f32 -> Q2_K / Q3_K / Q4_K / Q5_K / Q6_K super-blocks.
 //
 // The repo has only ever consumed these formats; the sole producer was
 // qwen_pack_q8_0. Loading an HF checkpoint means quantizing at load time, which
@@ -14,7 +14,13 @@
 // perplexity, not as a crash. So the two search routines are ports of
 // `make_qx_quants` and `make_qkx2_quants` rather than inventions.
 //
-// Not covered: the IQ types, which need an importance matrix.
+// Q2_K and Q3_K came later than the rest and exist for one reason: a
+// checkpoint that does not fit. They are only reachable on a dense model --
+// there is no routed-expert kernel for either -- and hf_policy_unavailable is
+// what refuses the combination rather than letting it fail at the first MoE
+// layer.
+//
+// Not covered: the IQ types, whose grids are searched rather than fitted.
 //
 // MUST be compiled with `-ffp-contract=off`, which is why the only supported
 // entry points are the ones in qwen_kquant_pack_api.hpp: their translation unit
@@ -149,9 +155,16 @@ inline float make_qx_quants(int count, int nmax, const float* x, std::int8_t* co
 //
 // `out_min` receives the *negated* minimum, matching the stored convention
 // (decode subtracts dmin*m).
+//
+// `absolute_error` scores a candidate by |error| rather than error^2, which is
+// what Q2_K wants: at two bits the codes are so coarse that the squared form
+// lets one outlier in a 16-element group buy its own accuracy with everything
+// else's. Q4_K and Q5_K keep the squared form, and with it the AVX2 twin below,
+// which is only ever asked for that case.
 inline float make_qkx2_quants(int count, int nmax, const float* x, const float* weights,
                               std::uint8_t* codes, float* out_min,
-                              float rmin, float rdelta, int nstep) {
+                              float rmin, float rdelta, int nstep,
+                              bool absolute_error = false) {
     float minimum = x[0], maximum = x[0];
     float sum_w = weights[0], sum_x = sum_w * x[0];
     for (int i = 1; i < count; ++i) {
@@ -176,7 +189,7 @@ inline float make_qkx2_quants(int count, int nmax, const float* x, const float* 
         const int l = nearest_int(iscale * (x[i] - minimum));
         codes[i] = static_cast<std::uint8_t>(std::max(0, std::min(nmax, l)));
         const float diff = scale * static_cast<float>(codes[i]) + minimum - x[i];
-        best_error += weights[i] * diff * diff;
+        best_error += weights[i] * (absolute_error ? std::fabs(diff) : diff * diff);
     }
 
     std::uint8_t trial_codes[32];
@@ -207,7 +220,7 @@ inline float make_qkx2_quants(int count, int nmax, const float* x, const float* 
         for (int i = 0; i < count; ++i) {
             const float diff =
                 this_scale * static_cast<float>(trial_codes[i]) + this_min - x[i];
-            error += weights[i] * diff * diff;
+            error += weights[i] * (absolute_error ? std::fabs(diff) : diff * diff);
         }
         if (error < best_error) {
             for (int i = 0; i < count; ++i) codes[i] = trial_codes[i];
@@ -218,6 +231,69 @@ inline float make_qkx2_quants(int count, int nmax, const float* x, const float* 
     }
     *out_min = -minimum;
     return scale;
+}
+
+// Symmetric fit for Q3_K, where 3 bits leave too little room for the trial
+// sweep make_qx_quants uses. Instead of re-fitting the whole sub-block at 19
+// candidate scales, this starts from the absmax fit and then moves one code at
+// a time, keeping a move only when it improves the weighted fit -- the same
+// least-squares objective, minimized coordinate-wise. Five passes is what the
+// reference settles for, and it converges well before that on real weights.
+//
+// `codes` comes back biased by nmax, as make_qx_quants' does.
+inline float make_q3_quants(int count, int nmax, const float* x,
+                            std::int8_t* codes) {
+    float max = 0.0f, absmax = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        const float a = std::fabs(x[i]);
+        if (a > absmax) { absmax = a; max = x[i]; }
+    }
+    if (absmax < 1e-30f) {
+        for (int i = 0; i < count; ++i) codes[i] = 0;
+        return 0.0f;
+    }
+
+    const float iscale = -static_cast<float>(nmax) / max;
+    float sumlx = 0.0f, suml2 = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        int l = nearest_int(iscale * x[i]);
+        l = std::max(-nmax, std::min(nmax - 1, l));
+        codes[i] = static_cast<std::int8_t>(l);
+        const float w = x[i] * x[i];
+        sumlx += w * x[i] * static_cast<float>(l);
+        suml2 += w * static_cast<float>(l) * static_cast<float>(l);
+    }
+
+    for (int pass = 0; pass < 5; ++pass) {
+        int changed = 0;
+        for (int i = 0; i < count; ++i) {
+            const float w = x[i] * x[i];
+            // The fit with element i removed, which is what makes its own code
+            // choosable independently of the one it currently holds.
+            float without_lx = sumlx - w * x[i] * static_cast<float>(codes[i]);
+            if (without_lx <= 0.0f) continue;
+            float without_l2 = suml2 - w * static_cast<float>(codes[i]) * codes[i];
+            int candidate = nearest_int(x[i] * without_l2 / without_lx);
+            candidate = std::max(-nmax, std::min(nmax - 1, candidate));
+            if (candidate == codes[i]) continue;
+            const float trial_lx = without_lx + w * x[i] * static_cast<float>(candidate);
+            const float trial_l2 =
+                without_l2 + w * static_cast<float>(candidate) * candidate;
+            // sumlx^2/suml2 is the objective; comparing it cross-multiplied
+            // avoids a division per candidate.
+            if (trial_lx * trial_lx * suml2 > sumlx * sumlx * trial_l2) {
+                codes[i] = static_cast<std::int8_t>(candidate);
+                sumlx = trial_lx;
+                suml2 = trial_l2;
+                ++changed;
+            }
+        }
+        if (!changed) break;
+    }
+
+    for (int i = 0; i < count; ++i)
+        codes[i] = static_cast<std::int8_t>(codes[i] + nmax);
+    return suml2 > 0.0f ? sumlx / suml2 : 0.0f;
 }
 
 // The 6-bit scale/min pair for sub-block `index`, as stored in the 12 shared
@@ -523,6 +599,150 @@ inline void fit_qk_super_block(const float* x, int nmax, float rmin, int nstep,
             codes_out[32 * sub + i] =
                 static_cast<std::uint8_t>(std::max(0, std::min(nmax, l)));
         }
+    }
+}
+
+// The two-bit-per-code planes both formats below share: each 128-element half
+// packs its four 32-element groups into one byte per lane, group g at bit 2g.
+inline void pack_two_bit_halves(const std::uint8_t* codes, std::uint8_t* out) {
+    for (int half = 0; half < 2; ++half)
+        for (int lane = 0; lane < 32; ++lane) {
+            const std::uint8_t* source = codes + half * 128 + lane;
+            out[half * 32 + lane] = static_cast<std::uint8_t>(
+                source[0] | (source[32] << 2) | (source[64] << 4) | (source[96] << 6));
+        }
+}
+
+// Q2_K: 84 bytes per 256 values. 16 scale/min bytes, 64 quant bytes, d, dmin.
+//
+// Two levels of quantization, as Q4_K has, but tighter at both: the codes are
+// 2-bit and the per-group scale and min are 4-bit, over 16-element groups
+// rather than 32. That second level is why the sub-block fit cannot simply be
+// reused from the stored scale -- 4 bits of scale is coarse enough that the
+// codes have to be re-derived against what was actually stored, or a group's
+// reconstruction drifts by more than a code step.
+inline void qwen_pack_q2_k(const float* values, std::uint64_t count, std::uint8_t* out) {
+    constexpr int kGroups = kSuperBlock / 16;
+    for (std::uint64_t block = 0; block * kSuperBlock < count; ++block) {
+        const float* x = values + block * kSuperBlock;
+        std::uint8_t* base = out + block * 84;
+        std::uint8_t codes[kSuperBlock];
+        float scales[kGroups], mins[kGroups], weights[16];
+        float max_scale = 0.0f, max_min = 0.0f;
+
+        for (int group = 0; group < kGroups; ++group) {
+            const float* source = x + 16 * group;
+            // |x| rather than x^2: the reference weights Q2_K by magnitude,
+            // which pairs with the absolute-error score below.
+            for (int i = 0; i < 16; ++i) weights[i] = std::fabs(source[i]);
+            scales[group] = make_qkx2_quants(16, 3, source, weights,
+                                             codes + 16 * group, &mins[group],
+                                             -0.5f, 0.1f, 15, true);
+            max_scale = std::max(max_scale, scales[group]);
+            max_min = std::max(max_min, mins[group]);
+        }
+
+        std::memset(base, 0, 84);
+        std::uint16_t d_bits = 0, dmin_bits = 0;
+        if (max_scale > 0.0f) {
+            const float inverse = 15.0f / max_scale;
+            for (int group = 0; group < kGroups; ++group)
+                base[group] = static_cast<std::uint8_t>(
+                    std::min(15, nearest_int(inverse * scales[group])));
+            d_bits = qwen_half_bits(max_scale / 15.0f);
+        }
+        if (max_min > 0.0f) {
+            const float inverse = 15.0f / max_min;
+            for (int group = 0; group < kGroups; ++group)
+                base[group] |= static_cast<std::uint8_t>(
+                    std::min(15, nearest_int(inverse * mins[group])) << 4);
+            dmin_bits = qwen_half_bits(max_min / 15.0f);
+        }
+        std::memcpy(base + 80, &d_bits, 2);
+        std::memcpy(base + 82, &dmin_bits, 2);
+
+        const float d = qwen_half_value(d_bits), dmin = qwen_half_value(dmin_bits);
+        for (int group = 0; group < kGroups; ++group) {
+            const float step = d * static_cast<float>(base[group] & 15);
+            if (step == 0.0f) {
+                std::memset(codes + 16 * group, 0, 16);
+                continue;
+            }
+            const float offset = dmin * static_cast<float>(base[group] >> 4);
+            for (int i = 0; i < 16; ++i) {
+                const int l = nearest_int((x[16 * group + i] + offset) / step);
+                codes[16 * group + i] = static_cast<std::uint8_t>(std::max(0, std::min(3, l)));
+            }
+        }
+        pack_two_bit_halves(codes, base + 16);
+    }
+}
+
+// Q3_K: 110 bytes per 256 values. 32 high-bit bytes, 64 quant bytes, 12 scale
+// bytes, d.
+//
+// Symmetric, so there is no min: a code is signed in [-4, 3] and the group's
+// 6-bit scale is itself signed by construction (decode subtracts 32). The high
+// bit lives in its own plane, inverted -- a set mask bit means "do not subtract
+// 4" -- which is what lets a decoder skip the plane entirely for the common
+// small codes.
+inline void qwen_pack_q3_k(const float* values, std::uint64_t count, std::uint8_t* out) {
+    constexpr int kGroups = kSuperBlock / 16;
+    for (std::uint64_t block = 0; block * kSuperBlock < count; ++block) {
+        const float* x = values + block * kSuperBlock;
+        std::uint8_t* base = out + block * 110;
+        std::int8_t fitted[kSuperBlock];
+        std::uint8_t codes[kSuperBlock];
+        float scales[kGroups];
+        float max_scale = 0.0f, max_abs_scale = 0.0f;
+
+        for (int group = 0; group < kGroups; ++group) {
+            scales[group] = make_q3_quants(16, 4, x + 16 * group, fitted + 16 * group);
+            const float a = std::fabs(scales[group]);
+            if (a > max_abs_scale) { max_abs_scale = a; max_scale = scales[group]; }
+        }
+
+        std::memset(base, 0, 110);
+        std::uint16_t d_bits = 0;
+        if (max_abs_scale >= 1e-30f) {
+            // Group scales are quantized signed against -32 and stored biased
+            // by 32, which is the +32 decode subtracts back off.
+            const float inverse = -32.0f / max_scale;
+            for (int group = 0; group < kGroups; ++group) {
+                int l = std::max(-32, std::min(31, nearest_int(inverse * scales[group]))) + 32;
+                std::uint8_t* packed = base + 96;
+                if (group < 8) packed[group] = static_cast<std::uint8_t>(l & 15);
+                else packed[group - 8] |= static_cast<std::uint8_t>((l & 15) << 4);
+                packed[8 + (group & 3)] |= static_cast<std::uint8_t>((l >> 4) << (2 * (group / 4)));
+            }
+            d_bits = qwen_half_bits(1.0f / inverse);
+        }
+        std::memcpy(base + 108, &d_bits, 2);
+
+        const float d = qwen_half_value(d_bits);
+        for (int group = 0; group < kGroups; ++group) {
+            // Read the scale back through the decoder's own unpacking, so a
+            // packing bug surfaces here rather than as drift.
+            const float step =
+                d * static_cast<float>(qwen_q3k_scale(base + 96, group) - 32);
+            if (step == 0.0f) {
+                std::memset(codes + 16 * group, 4, 16);
+                continue;
+            }
+            for (int i = 0; i < 16; ++i) {
+                const int l = std::max(-4, std::min(3, nearest_int(x[16 * group + i] / step)));
+                codes[16 * group + i] = static_cast<std::uint8_t>(l + 4);
+            }
+        }
+
+        // The high bit of each code, one bit plane per 32 elements. Lowering
+        // the code by 4 here is what leaves 2 bits for the plane below.
+        for (int i = 0; i < kSuperBlock; ++i) {
+            if (codes[i] <= 3) continue;
+            base[i & 31] |= static_cast<std::uint8_t>(1u << (i / 32));
+            codes[i] = static_cast<std::uint8_t>(codes[i] - 4);
+        }
+        pack_two_bit_halves(codes, base + 32);
     }
 }
 

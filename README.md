@@ -132,6 +132,16 @@ API request values always override model defaults. `GET /props` reports the
 resolved defaults and their sources, and the bundled UI adopts them until the
 user saves custom settings.
 
+Sampling also takes `repetition_penalty` (default 1.1 over the last 64
+generated tokens), plus OpenAI's `presence_penalty` and `frequency_penalty`
+(default 0). These are on by default because "no penalty" is not a neutral
+setting: with nothing discouraging a token the model has just produced, a
+heavily quantized checkpoint can lock onto a line and repeat it until the
+token budget runs out. Only generated tokens are penalized -- penalizing the
+prompt would push the model away from the user's own wording. Set
+`repetition_penalty` to 1 to disable, or raise `penalty_window` to look
+further back.
+
 ## Inspect and generate
 
 ~~~bash
@@ -174,6 +184,8 @@ changes automatic expert-cache sizing.
 
 Important CLI options include:
 
+- `--quant ask|Q2_K|IQ3_XXS|Q3_K|Q4_K|Q5_K|Q6_K|Q8_0|F32`: quantization for a
+  safetensors checkpoint (see below)
 - `--gpu-cache-mib 0`: size allocations from currently free VRAM
 - `--cache-type-k` / `--cache-type-v`: KV precision
 - `--mtp-drafts N`: enable supported Qwen MTP verification
@@ -192,11 +204,79 @@ Runtime diagnostics are exposed through `/health`. Detailed profiling and
 experimental kernel switches use `COLIBRI_*` environment variables; unset
 profiling variables for production serving.
 
+A GGUF arrives quantized; a safetensors checkpoint does not, so the first open
+packs it and caches the result beside the checkpoint. On a terminal the CLI asks
+which quantization to pack, listing the exact size of each and marking the ones
+already cached -- picking a cached one opens in about a second, an uncached one
+costs a repack and the disk to store it. Anything non-interactive keeps the
+default (`Q6_K`), and `--quant`, or `COLIBRI_HF_QUANT`, answers ahead of time:
+
+~~~
+Qwen3.8-27B is a safetensors checkpoint. Choose how to quantize it:
+  1) Q2_K        9.5 GiB   packs on first open, writes 9.5 GiB
+  2) IQ3_XXS    10.8 GiB   packs on first open, writes 10.8 GiB
+  3) Q3_K       11.9 GiB   packs on first open, writes 11.9 GiB
+  4) Q4_K       14.9 GiB   cached, opens immediately
+  5) Q5_K       17.8 GiB   packs on first open, writes 17.8 GiB
+  6) Q6_K       20.9 GiB   cached, opens immediately  [default]
+  7) Q8_0       26.5 GiB   packs on first open, writes 26.5 GiB
+  8) F32       101.8 GiB   packs on first open, writes 101.8 GiB
+quantization [Q6_K]:
+~~~
+
+Below `Q6_K` the tradeoff is accuracy against fit, and fit is what dominates: a
+dense block that does not fit in VRAM is executed on the CPU, at about 3 ms per
+token in decode -- prefill batches those blocks and pays less per token, but not
+little enough to ignore. On a 12 GB card the 27B above spills 51 of 64 dense
+blocks at `Q6_K` and none at `Q2_K`, which is the difference between 4 and 36
+tokens/s of decode. Pick the largest target that still fits, not the largest you
+can pack.
+
+`Q2_K` and `Q3_K` are dense-only: no GPU routed-expert kernel decodes either, so
+a mixture-of-experts checkpoint packed to one would run every routed layer on
+the CPU. Both are refused there rather than silently doing that, and the menu
+marks them unavailable on such a model. `IQ3_XXS` has grouped expert kernels and
+no such restriction.
+
+`IQ3_XXS` is a codebook format -- 3.06 bits per weight, against Q3_K's 3.44 --
+and quantizing to it searches 256 patterns per four weights rather than rounding
+to a lattice, so packing the 27B above takes ~5 minutes against ~40 seconds for
+a K-quant. It is a one-time cost, cached like any other. It also prefills
+fastest of the lot on the checkpoint above (196 tok/s at 1k context, against
+273 for Q2_K only because Q2_K is 1.5 GiB smaller and spills nothing). Note that it is packed
+*without* an importance matrix: llama.cpp weights this search by activation
+statistics gathered over calibration data, and without them IQ3_XXS lands on the
+K-quant accuracy curve rather than above it. What it buys here is size. The
+sub-3-bit IQ formats (IQ2_XXS, IQ1_M) are not offered for the same reason
+llama.cpp refuses them without a matrix: they need one to be worth using.
+
 `--dense-requant auto` keeps the GGUF unchanged and chooses the temporary GPU
 representation from the requested or available VRAM budget. It converts BF16
 dense tensors to Q8_0 when the BF16 working set plus useful routed-expert cache
 would exceed that budget. Use `q8` to force the memory-saving representation or
 `off` to preserve the checkpoint's dense precision exactly.
+
+`--cache-type-k` / `--cache-type-v` default to `f16`, and `auto` only reaches
+for `turbo4` on a checkpoint with routed experts, above 32K context. A *dense*
+checkpoint with a wide `head_dim` is the case that default serves badly, and it
+has to be set by hand. Qwen3.8-27B (`qwen35`) is the worked example: 16 full
+attention layers x 4 KV heads x head_dim 256 is 64 KiB of KV per token, so KV
+competes with the weights for VRAM, and every dense block that loses is re-read
+over PCIe on every token. On a 12 GB card with the UD-IQ2\_XXS build:
+
+| context | KV       | dense blocks spilled | decode      |
+| ------- | -------- | -------------------- | ----------- |
+| 16K     | `f16`    | 5 of 64 (408 MiB)    | 16.6 tok/s  |
+| 16K     | `q8_0`   | none                 | 23.2 tok/s  |
+| 16K     | `turbo4` | none                 | 24.0 tok/s  |
+| 32K     | `f16`    | 16 of 64 (1306 MiB)  | 10.8 tok/s  |
+| 32K     | `q8_0`   | 5 of 64 (408 MiB)    | 15.3 tok/s  |
+| 32K     | `turbo4` | none                 | 22.9 tok/s  |
+
+`q8_0` halves the cache and `turbo4` quarters it, which is why `q8_0` is enough
+to clear the spill at 16K but not at 32K. Needle retrieval stays exact under
+`turbo4` at 32K. The rule of thumb: if `prepare` reports dense blocks on CPU,
+spend KV precision to buy them back before anything else.
 
 Qwen sampling with `top_k <= 32` reduces candidates on the GPU by default.
 `sampling_gpu_topk_*`, `sampling_full_download_bytes`, and

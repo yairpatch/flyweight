@@ -961,6 +961,13 @@ extern "C" int colibri_gpu_compile(
              "iq2xxs_q8_matvec_transposed_rows",
              "iq3xxs_q8_matvec_transposed_rows",
              "iq4xs_q8_matvec_transposed_rows",
+             // The symmetric K-quants take the same batched prompt path.
+             "q3k_q8_matvec_transposed_rows", "q3k_q8_matmul_tiled", "q3k_q8_mmq",
+             "q6k_q8_matvec_transposed_rows", "q6k_q8_matmul_tiled", "q6k_q8_mmq",
+             // And the asymmetric ones, which carry a per-sub-block minimum.
+             "q2k_q8_matvec_transposed_rows", "q2k_q8_mmq",
+             "q4k_q8_matvec_transposed_rows", "q4k_q8_mmq",
+             "q5k_q8_matvec_transposed_rows", "q5k_q8_mmq",
              "iq4xs_q8_matvec_transposed_warp",
              "quantize_q8_blocks_rows",
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",

@@ -172,10 +172,15 @@ void qwen_forward_rows(
                 }
                 q8_cached_input=input;q8_cached_width=input_size;
             }
-            // The codebook formats carry this checkpoint -- IQ2_S the dense FFN,
-            // IQ2_XS the fused QKV, IQ3_XXS and IQ2_XXS the rest of attention --
-            // and each has a matvec that batches rows against a single weight
-            // read. A format without one still pays a full pass per row.
+            // Formats with a batched matvec: one weight read serves 8 rows
+            // here, 32 through the tiled kernel or 64 through MMQ. A format
+            // without one still pays a full pass per row, which makes its
+            // prefill a memory-bound repeat of decode -- the codebook formats
+            // every K-quant now has one. The asymmetric three (Q2_K, Q4_K,
+            // Q5_K) carry a per-sub-block minimum and go through the _MIN
+            // kernels, which correct for it with the activation sums; there is
+            // no tiled variant for those, so a pre-sm_75 device falls back to
+            // the 8-row kernel rather than the 32-token tile.
             const char* rows_kernel=nullptr;
             switch(type){
                 case 16:rows_kernel="iq2xxs_q8_matvec_transposed_rows";break;
@@ -183,6 +188,11 @@ void qwen_forward_rows(
                 case 18:rows_kernel="iq3xxs_q8_matvec_transposed_rows";break;
                 case 22:rows_kernel="iq2s_q8_matvec_transposed_rows";break;
                 case 23:rows_kernel="iq4xs_q8_matvec_transposed_rows";break;
+                case 11:rows_kernel="q3k_q8_matvec_transposed_rows";break;
+                case 14:rows_kernel="q6k_q8_matvec_transposed_rows";break;
+                case 10:rows_kernel="q2k_q8_matvec_transposed_rows";break;
+                case 12:rows_kernel="q4k_q8_matvec_transposed_rows";break;
+                case 13:rows_kernel="q5k_q8_matvec_transposed_rows";break;
                 default:break;
             }
             // Wide batches take the tiled kernel instead: it stages decoded
@@ -202,6 +212,11 @@ void qwen_forward_rows(
                 case 18:mmq_kernel="iq3xxs_q8_mmq";break;
                 case 22:mmq_kernel="iq2s_q8_mmq";break;
                 case 23:mmq_kernel="iq4xs_q8_mmq";break;
+                case 11:mmq_kernel="q3k_q8_mmq";break;
+                case 14:mmq_kernel="q6k_q8_mmq";break;
+                case 10:mmq_kernel="q2k_q8_mmq";break;
+                case 12:mmq_kernel="q4k_q8_mmq";break;
+                case 13:mmq_kernel="q5k_q8_mmq";break;
                 default:break;
             }
             if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
@@ -227,6 +242,8 @@ void qwen_forward_rows(
                 case 18:tiled_kernel="iq3xxs_q8_matmul_tiled";break;
                 case 22:tiled_kernel="iq2s_q8_matmul_tiled";break;
                 case 23:tiled_kernel="iq4xs_q8_matmul_tiled";break;
+                case 11:tiled_kernel="q3k_q8_matmul_tiled";break;
+                case 14:tiled_kernel="q6k_q8_matmul_tiled";break;
                 default:break;
             }
             if(rows>kQ8RowBatch&&tiled_kernel){
@@ -777,22 +794,28 @@ void qwen_forward_rows(
                 :static_cast<int>(runtime.moe_intermediate);
             if(layer.ffn_on_host){
                 // Spilled block: its weights are not on the device at all, so
-                // run the SwiGLU on the host one row at a time through the
-                // single-token scratch.
+                // the SwiGLU runs on the host.
+                //
+                // The whole batch goes over at once. Row at a time -- with a
+                // stream sync per row -- meant this block re-read all of its
+                // weights per token while the device path around it read them
+                // once per 64-token tile, so the spilled fraction did not
+                // shrink as prefill batched and became the entire cost of a
+                // token. It also serialized: the device idled through every
+                // host row and the host idled through every copy.
+                const std::uint64_t batch_bytes=
+                    static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
                 auto*scratch=static_cast<float*>(runtime.dense_host);
                 float*host_input=scratch;
-                float*host_output=host_input+hidden_size;
+                float*host_output=host_input+
+                    static_cast<std::size_t>(rows)*hidden_size;
                 const auto host_started=std::chrono::steady_clock::now();
-                for(int token=0;token<rows;++token){
-                    const auto row_in=normalized+static_cast<std::uint64_t>(token)*hidden_size*sizeof(float);
-                    const auto row_out=third+static_cast<std::uint64_t>(token)*hidden_size*sizeof(float);
-                    if(colibri_gpu_download(host_input,row_in,hidden_size*sizeof(float),runtime.stream)!=0||
-                       colibri_gpu_stream_sync(runtime.stream)!=0)
-                        throw std::runtime_error("native dense host FFN rows input transfer failed");
-                    qwen_cpu_dense_ffn(runtime,layer,host_input,host_output);
-                    if(colibri_gpu_upload(row_out,host_output,hidden_size*sizeof(float),runtime.stream)!=0)
-                        throw std::runtime_error("native dense host FFN rows output transfer failed");
-                }
+                if(colibri_gpu_download(host_input,normalized,batch_bytes,runtime.stream)!=0||
+                   colibri_gpu_stream_sync(runtime.stream)!=0)
+                    throw std::runtime_error("native dense host FFN rows input transfer failed");
+                qwen_cpu_dense_ffn_rows(runtime,layer,host_input,host_output,rows);
+                if(colibri_gpu_upload(third,host_output,batch_bytes,runtime.stream)!=0)
+                    throw std::runtime_error("native dense host FFN rows output transfer failed");
                 runtime.dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-host_started).count();
                 if(runtime.muse)post_rms_rows(third,tensor(13));

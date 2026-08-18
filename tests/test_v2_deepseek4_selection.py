@@ -159,7 +159,7 @@ class IndexerCacheAgainstTheReferenceTests(unittest.TestCase):
     def test_the_keys_match_the_reference(self):
         model = V2Model(CHECKPOINT)
         self.addCleanup(model.close)
-        tokens = list(model.tokenize(self.PROMPT.read_text()))
+        tokens = list(model.tokenize(self.PROMPT.read_text(encoding="utf-8")))
         with Deepseek4Runtime(model, 1024) as runtime:
             for token in tokens:
                 runtime.forward(token, logits=False)

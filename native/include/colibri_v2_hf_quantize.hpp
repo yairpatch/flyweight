@@ -31,6 +31,9 @@ namespace colibri::v2::hf {
 enum class Target : std::uint32_t {
     F32 = 0,
     Q8_0 = 8,
+    Q2_K = 10,
+    Q3_K = 11,
+    IQ3_XXS = 18,
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
@@ -40,6 +43,9 @@ inline std::uint64_t target_block_bytes(Target target) {
     switch (target) {
         case Target::F32: return 4;
         case Target::Q8_0: return 34;
+        case Target::Q2_K: return 84;
+        case Target::Q3_K: return 110;
+        case Target::IQ3_XXS: return 98;
         case Target::Q4_K: return 144;
         case Target::Q5_K: return 176;
         case Target::Q6_K: return 210;
@@ -51,11 +57,44 @@ inline std::uint64_t target_block_elements(Target target) {
     switch (target) {
         case Target::F32: return 1;
         case Target::Q8_0: return 32;
+        case Target::Q2_K:
+        case Target::Q3_K:
+        case Target::IQ3_XXS:
         case Target::Q4_K:
         case Target::Q5_K:
         case Target::Q6_K: return 256;
     }
     throw std::runtime_error("unknown quantization target");
+}
+
+// Targets ordered by bits per weight, which is what "a step up" means below.
+// Q8_0 is last despite its low type code; IQ3_XXS sits between the two K-quants
+// it falls between.
+inline int target_rank(Target target) {
+    switch (target) {
+        case Target::F32: return 6;
+        case Target::Q8_0: return 5;
+        case Target::Q6_K: return 4;
+        case Target::Q5_K: return 3;
+        case Target::Q4_K: return 2;
+        case Target::Q3_K: return 1;
+        case Target::IQ3_XXS: return 0;
+        case Target::Q2_K: return -1;
+    }
+    throw std::runtime_error("unknown quantization target");
+}
+
+// The next target up, capped: nothing here ever promotes past Q6_K, which is
+// where the device path stops caring.
+inline Target target_step_up(Target target) {
+    switch (target) {
+        case Target::Q2_K: return Target::Q3_K;
+        case Target::IQ3_XXS: return Target::Q4_K;
+        case Target::Q3_K: return Target::Q4_K;
+        case Target::Q4_K: return Target::Q5_K;
+        default: break;
+    }
+    return target;
 }
 
 struct Policy {
@@ -71,54 +110,81 @@ struct Policy {
     //   decode  @8192          54 -> 113 tok/s
     // for 4354 -> 6176 MiB of weights. Paying 1.8 GB of VRAM for 8x prefill is
     // not a close call on any checkpoint that still fits; one that does not fit
-    // wants COLIBRI_HF_QUANT=Q4_K, which is why the override stays.
+    // wants a smaller target, which is why the override stays.
     Target weights = Target::Q6_K;
-    // The embedding table and the output head. These two are ~1 GB of a 15.8 GB
-    // checkpoint and are read every token, and low-bit embeddings cost more
-    // quality per byte saved than the FFN does -- which is why the mixed GGUF
-    // recipes keep them higher than the rest.
+    // The embedding table, and the output head separately.
+    //
+    // These used to be pinned at Q6_K whatever the bulk was, on the reasoning
+    // that they are read every token and cost more quality per byte saved than
+    // the FFN does. That reasoning holds right up until the checkpoint stops
+    // fitting, and then it inverts: on Qwen3.8-27B the pair is 2.09 GiB at
+    // Q6_K, and 2.09 GiB is 20 dense blocks spilled to the CPU, which costs
+    // ~6 s per block per 2048 prompt tokens. Nothing an embedding table can do
+    // with four extra bits comes close to paying that back.
+    //
+    // So they follow the bulk down, one step apart: the head produces the
+    // logits and keeps the extra step, the table is a lookup and does not. The
+    // same split the mixed GGUF recipes use -- Qwen3.8-27B-UD-IQ2_XXS spends
+    // 0.90 GiB here against this policy's old 2.09 GiB, and that difference is
+    // most of why it fit in 12 GB when the safetensors build did not.
+    //
+    // `policy_for_weights` is what derives both; setting them apart by hand is
+    // still allowed and is what F32 does.
     Target embedding = Target::Q6_K;
+    Target head = Target::Q6_K;
     // Norms, biases and the router. 1-D tensors are tiny, are read at full
     // width every token, and are exactly where quantization error shows up
     // worst, so the GGUF convention keeps them f32. Follow it.
     Target small = Target::F32;
 };
 
+// The policy a single requested bulk target implies.
+inline Policy policy_for_weights(Target weights) {
+    Policy policy;
+    policy.weights = weights;
+    // F32 means an unquantized model, not "f32 bulk beside a Q6_K embedding".
+    if (weights == Target::F32) {
+        policy.embedding = policy.head = Target::F32;
+        return policy;
+    }
+    policy.embedding = target_rank(weights) < target_rank(Target::Q6_K)
+        ? weights : Target::Q6_K;
+    policy.head = target_rank(target_step_up(weights)) < target_rank(Target::Q6_K)
+        ? target_step_up(weights) : Target::Q6_K;
+    return policy;
+}
+
 // Which target a given tensor gets. Kept as one function so the policy is
 // auditable in one place rather than spread through the loop.
 inline Target target_for(const HfTensor& tensor, const Policy& policy) {
-    if (tensor.name == "token_embd.weight" || tensor.name == "output.weight")
-        return policy.embedding;
     // 1-D: norms, dt_bias, A_log, the router bias.
     if (tensor.shape.size() < 2) return policy.small;
 
-    // A row shorter than 256 cannot hold a K-quant super-block -- the block
-    // would span two rows, and every matvec kernel here indexes by row. That
-    // rules out the K-quants; it does not rule out quantization. Q8_0's block
-    // is 32, so any row that is a multiple of 32 fits it exactly.
-    //
-    // This is not a size optimization. The MLA up-projections (attn_q_b,
-    // attn_kv_b) have q_lora_rank-wide rows -- 128 on this family -- and they
-    // are matvecs on every full-attention layer. The GPU decode path has no f32
-    // matvec kernel at all, so leaving them f32 made `COLIBRI_BAILING_GPU=1`
-    // fail outright with "bailing GPU matvec failed for type 0": an HF
-    // checkpoint could not use the GPU, while the same model from a GGUF could.
-    //
-    // ssm_*_conv1d is the case that still lands on f32: shaped
-    // [kernel, 1, channels], its row is the 4-tap kernel. It is not a matvec.
-    if (tensor.shape[0] < 256) {
-        if (policy.weights == Target::F32) return policy.small;
-        return tensor.shape[0] >= 32 && tensor.shape[0] % 32 == 0 ? Target::Q8_0
-                                                                  : policy.small;
-    }
+    // The embedding table and the head each take their own target.
+    const Target wanted = tensor.name == "token_embd.weight" ? policy.embedding
+        : tensor.name == "output.weight" ? policy.head
+        : policy.weights;
+    if (wanted == Target::F32) return policy.small;
 
-    std::uint64_t elements = 1;
-    for (const auto extent : tensor.shape) elements *= extent;
-    const auto block = target_block_elements(policy.weights);
-    // A partial trailing block would need a padding path that no decoder here
-    // implements; fall back rather than emit something unreadable.
-    if (block && elements % block) return policy.small;
-    return policy.weights;
+    // A block must fit inside one row. Every kernel here -- matvec, tiled GEMM,
+    // embedding lookup -- indexes by row, so a super-block spanning a row
+    // boundary is not a smaller model, it is a wrong one: each row after the
+    // first decodes from a block whose scales belong to its predecessor.
+    //
+    // Falling back to f32 would not do either. The MLA up-projections
+    // (attn_q_b, attn_kv_b) have q_lora_rank-wide rows -- 128 on the bailing
+    // family -- and are matvecs on every full-attention layer, and the GPU
+    // decode path has no f32 matvec at all, so f32 here made
+    // `COLIBRI_BAILING_GPU=1` fail outright with "bailing GPU matvec failed for
+    // type 0": an HF checkpoint could not use the GPU while the same model from
+    // a GGUF could. Q8_0's block is 32, which most narrow rows still fit.
+    //
+    // ssm_conv1d is the case that still lands on f32: its row is the 4-tap
+    // kernel. It is not a matvec.
+    const auto row = tensor.shape[0];
+    const auto block = target_block_elements(wanted);
+    if (block <= 1 || row % block == 0) return wanted;
+    return row % 32 == 0 ? Target::Q8_0 : policy.small;
 }
 
 struct QuantizedTensor {
@@ -176,11 +242,42 @@ inline void pack_to(Target target, const float* values, std::uint64_t elements,
     switch (target) {
         case Target::F32: std::memcpy(out, values, elements * 4); return;
         case Target::Q8_0: qwen_kpack::pack_q8_0(values, elements, out); return;
+        case Target::Q2_K: qwen_kpack::pack_q2_k(values, elements, out); return;
+        case Target::Q3_K: qwen_kpack::pack_q3_k(values, elements, out); return;
+        case Target::IQ3_XXS: qwen_kpack::pack_iq3_xxs(values, elements, out); return;
         case Target::Q4_K: qwen_kpack::pack_q4_k(values, elements, out); return;
         case Target::Q5_K: qwen_kpack::pack_q5_k(values, elements, out); return;
         case Target::Q6_K: qwen_kpack::pack_q6_k(values, elements, out); return;
     }
     throw std::runtime_error("unknown quantization target");
+}
+
+inline std::uint64_t tensor_elements(const HfTensor& tensor) {
+    std::uint64_t elements = 1;
+    for (const auto extent : tensor.shape) elements *= extent;
+    return elements;
+}
+
+// What one tensor occupies once packed. Shared by the sizing pass below and by
+// `arena_bytes`, so a size quoted to a caller before loading is the size the
+// load actually produces rather than an estimate of it.
+inline std::uint64_t packed_bytes(const HfTensor& tensor, Target target) {
+    const auto elements = tensor_elements(tensor);
+    const auto block = target_block_elements(target);
+    if (block > 1 && elements % block)
+        throw std::runtime_error("tensor is not a whole number of blocks: " +
+                                 tensor.name);
+    return block > 1 ? elements / block * target_block_bytes(target)
+                     : elements * target_block_bytes(target);
+}
+
+// The exact arena size a given policy would produce, without packing anything.
+inline std::uint64_t arena_bytes(const std::vector<HfTensor>& tensors,
+                                 const Policy& policy) {
+    std::uint64_t total = 0;
+    for (const auto& tensor : tensors)
+        total += packed_bytes(tensor, target_for(tensor, policy));
+    return total;
 }
 
 // Two passes: size the arena from the descriptors (deterministic, no data
@@ -196,18 +293,9 @@ inline QuantizedModel quantize(const std::vector<HfTensor>& tensors,
     std::uint64_t cursor = 0;
     for (std::size_t i = 0; i < tensors.size(); ++i) {
         const auto& source = tensors[i];
-        std::uint64_t elements = 1;
-        for (const auto extent : source.shape) elements *= extent;
         const Target target = target_for(source, policy);
         targets[i] = target;
-
-        const auto block = target_block_elements(target);
-        if (block > 1 && elements % block)
-            throw std::runtime_error("tensor is not a whole number of blocks: " +
-                                     source.name);
-        const std::uint64_t bytes =
-            block > 1 ? elements / block * target_block_bytes(target)
-                      : elements * target_block_bytes(target);
+        const std::uint64_t bytes = packed_bytes(source, target);
 
         auto& out = model.tensors[i];
         out.name = source.name;

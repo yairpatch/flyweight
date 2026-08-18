@@ -153,46 +153,28 @@ inline bool is_qwen3_5(const std::string& model_type,
 // not, because the layer plan reads those off the tensor shapes instead (see
 // qwen_forward_rows, which derives channels, value_heads and the conv kernel
 // from attn_qkv, ssm_a and ssm_conv1d).
-// STILL NOT WORKING, though every transformation found so far is implemented
-// and verified. Against the 27B release, checked tensor by tensor against that
-// model's own GGUF:
 //
-//   * all 1199 names resolve; the 866 kept are set-equal to the GGUF's
-//   * every f32 tensor in the produced arena matches the GGUF exactly: the +1
-//     on the block, q/k, nextn and final norms (never ssm_norm), ssm_a as
-//     -exp(A_log[perm]), ssm_dt.bias[perm], and ssm_conv1d's v channels
-//   * the reorders are byte-exact on the fixture: ssm_alpha and ssm_beta by
-//     row, attn_gate by head block, attn_qkv's v section, and ssm_out by
-//     input column
+// The weights need four fixups on the way in, all of them verified against
+// transformers' own modeling_qwen3_5.py rather than inferred from a GGUF:
 //
-//   perm[i] = (i % key_heads) * (value_heads / key_heads) + i / key_heads
+//   * the block, q/k, nextn and final RMS norms are stored as (w - 1) and used
+//     as (1 + w); the gated-delta output norm is not (modeling:733 vs :181)
+//   * ssm_a is -exp(A_log) (modeling:499)
+//   * everything indexed by value head is restacked by
+//         perm[i] = (i % key_heads) * (value_heads / key_heads) + i / key_heads
+//     because HF groups the value heads under their key head and repeats the
+//     query with repeat_interleave (:501), while the kernels here take the key
+//     head as `head % key_heads`
+//   * the fused qkv is [q, k, v], so only the v section past
+//     2 * key_heads * head_dim is restacked -- as are ssm_conv1d's matching
+//     channels, attn_gate's head blocks, ssm_alpha/ssm_beta's rows, and
+//     ssm_out's input columns
 //
-// The conv1d match also confirms the fused qkv is laid out [q, k, v] with v
-// starting at 2 * key_heads * head_dim, since permuting from that offset is
-// what made it agree exactly.
-//
-// What it does now is emit end-of-turn almost immediately rather than the
-// high-entropy noise it produced before ssm_out was handled -- a systematic
-// error, not a scrambled one. The leading suspect is attn_q on the
-// full-attention layers: attn_output_gate packs the output gate into q_proj, so
-// it is 2 * heads * head_dim wide, and whether HF orders that [all q][all gate]
-// or interleaved per head -- and whether the GGUF agrees -- cannot be settled
-// by comparison, because both sides are quantized. Note that o_proj on those
-// layers takes attention heads rather than value heads, so it is correctly
-// left unpermuted.
-inline void require_qwen3_5_opt_in() {
-    const char* allow = std::getenv("COLIBRI_HF_QWEN35_INCOMPLETE");
-    if (allow && allow[0] == '1') return;
-    throw std::runtime_error(
-        "Qwen3.5 safetensors loading does not yet produce a working model: it "
-        "loads, and the norm, decay and value-head-order fixups are verified "
-        "against this family's GGUF, but generation ends immediately -- most "
-        "likely the q/output-gate packing in attn_q. Use a GGUF; set "
-        "COLIBRI_HF_QWEN35_INCOMPLETE=1 to load anyway.");
-}
-
+// attn_q on the full-attention layers needs no fixup: attn_output_gate packs
+// the gate into q_proj, and HF's .view(-1, head_dim * 2).chunk(2, -1) (:668) is
+// exactly the [q | gate] per head that qwen_attention_query reads. o_proj there
+// takes attention heads rather than value heads, so it stays unpermuted too.
 inline ModelConfig config_from_qwen3_5(const json::Value& config) {
-    require_qwen3_5_opt_in();
     const auto& text =
         config.contains("text_config") ? config["text_config"] : config;
     ModelConfig out;
@@ -939,6 +921,23 @@ inline void apply_value_head_order(HfTensor& tensor, const ModelConfig& config,
     }
 }
 
+// torch's grouped Conv1d is [channels, 1, kernel], which reverses to
+// [kernel, 1, channels] where the GGUF of the same model carries
+// [kernel, channels]. The bytes are identical, but the extra extent is not
+// cosmetic: the runtime sizes a layer's convolution state from the first two
+// extents of this descriptor, so leaving the 1 in the middle reserves `kernel`
+// floats instead of `kernel * channels` and the conv state then overwrites the
+// recurrent state that follows it.
+inline void drop_conv1d_singleton(HfTensor& tensor) {
+    const std::string tail(".ssm_conv1d.weight");
+    if (tensor.name.size() < tail.size() ||
+        tensor.name.compare(tensor.name.size() - tail.size(), tail.size(), tail))
+        return;
+    tensor.shape.erase(
+        std::remove(tensor.shape.begin(), tensor.shape.end(), std::uint64_t{1}),
+        tensor.shape.end());
+}
+
 inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
                                            const ModelConfig& config) {
     std::vector<HfTensor> out;
@@ -977,6 +976,7 @@ inline std::vector<HfTensor> build_tensors(const std::vector<Shard>& shards,
                 if (config.architecture == "qwen35") {
                     tensor.adjust = adjust_for(parsed.gguf);
                     apply_value_head_order(tensor, config, shard.base, entry);
+                    drop_conv1d_singleton(tensor);
                 }
                 out.push_back(std::move(tensor));
                 continue;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hmac
 import json
 import queue
@@ -21,6 +22,15 @@ from urllib.parse import unquote, urlsplit
 
 from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig
+
+# The penalties a request may override, and the only keys read out of
+# SamplingConfig's defaults into `generation_defaults`.
+_PENALTY_OPTIONS = (
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+    "penalty_window",
+)
 
 
 class Generator(Protocol):
@@ -137,6 +147,11 @@ DSML_PARAMETER_PATTERN = re.compile(
     r'(.*?)</｜DSML｜parameter>', re.DOTALL
 )
 THINKING_BLOCK_PATTERN = re.compile(r"\A\s*<think>(.*?)</think>\s*", re.DOTALL)
+# How hard a checkpoint that grades its reasoning should think. OpenAI spells
+# this low / medium / high; Qwen3.5's template reads low / medium / xhigh and
+# maps high onto xhigh itself, so both vocabularies pass through untouched and
+# a checkpoint that ignores the variable is unaffected.
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 # Muse Glimmer renders an assistant turn as a run of recipient-tagged messages
 # rather than one block with a thinking prefix. The header is optionally
 # preceded by <|start|>assistant (the generation prompt already supplied the
@@ -179,6 +194,12 @@ class _GenerationRequest:
     # True when the rendered prompt ends with an open <think>, so the turn
     # begins inside a reasoning block that only the closing tag will end.
     thinking_open: bool = False
+    # How hard a checkpoint that *grades* its reasoning should think, for one
+    # that reads a level rather than a switch. None leaves the checkpoint's own
+    # default -- which on Qwen3.5 is its maximum, xhigh. Appended rather than
+    # placed beside enable_thinking so the positional constructions elsewhere
+    # keep their meaning.
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +237,7 @@ class InferenceService:
         # one parameter, and a cap that fits a "normal" call would truncate it.
         # Set it where a model is known to loop inside <tool_call>.
         max_tool_call_tokens: int = 0,
+        reasoning_effort: str | None = None,
         generation_defaults: Mapping[str, int | float] | None = None,
     ):
         if max_new_tokens <= 0:
@@ -244,10 +266,26 @@ class InferenceService:
         self.keepalive_timeout_seconds = keepalive_timeout_seconds
         self.sse_keepalive_seconds = sse_keepalive_seconds
         self.max_tool_call_tokens = max_tool_call_tokens
+        if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS))
+        # The default for requests that do not ask. None leaves the
+        # checkpoint's own, which is the only safe answer for a template this
+        # server has never seen.
+        self.reasoning_effort = reasoning_effort
         defaults: dict[str, int | float] = {
             "temperature": 0.0,
             "top_k": 20,
             "top_p": 0.95,
+            # Read from the dataclass rather than restated here, so the one
+            # place that documents the penalty defaults stays the only place.
+            # `slots=True` means the class attribute is a slot descriptor, not
+            # the default, hence the field walk.
+            **{
+                field.name: field.default
+                for field in dataclasses.fields(SamplingConfig)
+                if field.name in _PENALTY_OPTIONS
+            },
             "max_new_tokens": max_new_tokens,
         }
         defaults.update(generation_defaults or {})
@@ -256,6 +294,10 @@ class InferenceService:
                 temperature=float(defaults["temperature"]),
                 top_k=int(defaults["top_k"]),
                 top_p=float(defaults["top_p"]),
+                repetition_penalty=float(defaults["repetition_penalty"]),
+                presence_penalty=float(defaults["presence_penalty"]),
+                frequency_penalty=float(defaults["frequency_penalty"]),
+                penalty_window=int(defaults["penalty_window"]),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"invalid generation defaults: {error}") from error
@@ -266,6 +308,10 @@ class InferenceService:
             "temperature": float(defaults["temperature"]),
             "top_k": int(defaults["top_k"]),
             "top_p": float(defaults["top_p"]),
+            "repetition_penalty": float(defaults["repetition_penalty"]),
+            "presence_penalty": float(defaults["presence_penalty"]),
+            "frequency_penalty": float(defaults["frequency_penalty"]),
+            "penalty_window": int(defaults["penalty_window"]),
             "max_new_tokens": min(configured_max, max_new_tokens),
         }
         self.loaded_at = int(time.time())
@@ -375,6 +421,7 @@ class InferenceService:
                 max_new_tokens=request.max_new_tokens,
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
+                reasoning_effort=request.reasoning_effort,
                 progress=progress,
             )
 
@@ -387,6 +434,7 @@ class InferenceService:
             max_new_tokens=request.max_new_tokens,
             sampling=request.sampling,
             enable_thinking=request.enable_thinking,
+            reasoning_effort=request.reasoning_effort,
             progress=progress,
         )
         try:
@@ -525,6 +573,7 @@ class InferenceService:
                         max_new_tokens=request.max_new_tokens,
                         sampling=request.sampling,
                         enable_thinking=request.enable_thinking,
+                        reasoning_effort=request.reasoning_effort,
                         progress=progress,
                     )
                     try:
@@ -699,7 +748,9 @@ class InferenceService:
                         pending += tail_visible
                 accumulated = "".join(text_parts)
                 if not tool_calls:
-                    _, tool_calls = _parse_tool_calls(accumulated, tools=request.tools)
+                    _, tool_calls = _parse_tool_calls(
+                        accumulated, tools=request.tools,
+                        keep_incomplete=final_step.stopped_on_eos)
                 streamed_tail: list[str] = []
                 produced_tool_call = bool(tool_calls)
                 if tool_streamer is not None and tool_streamer.started:
@@ -782,6 +833,7 @@ class InferenceService:
                         max_new_tokens=request.max_new_tokens,
                         sampling=request.sampling,
                         enable_thinking=request.enable_thinking,
+                        reasoning_effort=request.reasoning_effort,
                         progress=progress,
                     ):
                         if step.finished:
@@ -1097,6 +1149,7 @@ class InferenceService:
                     max_new_tokens=request.max_new_tokens,
                     sampling=request.sampling,
                     enable_thinking=request.enable_thinking,
+                    reasoning_effort=request.reasoning_effort,
                     progress=progress,
                 ):
                     if step.finished:
@@ -1459,6 +1512,26 @@ class InferenceService:
                     payload, "top_p", float(self.generation_defaults["top_p"])
                 ),
                 seed=_optional_integer(payload, "seed"),
+                repetition_penalty=_float_option(
+                    payload,
+                    "repetition_penalty",
+                    float(self.generation_defaults["repetition_penalty"]),
+                ),
+                presence_penalty=_float_option(
+                    payload,
+                    "presence_penalty",
+                    float(self.generation_defaults["presence_penalty"]),
+                ),
+                frequency_penalty=_float_option(
+                    payload,
+                    "frequency_penalty",
+                    float(self.generation_defaults["frequency_penalty"]),
+                ),
+                penalty_window=_integer_option(
+                    payload,
+                    "penalty_window",
+                    default=int(self.generation_defaults["penalty_window"]),
+                ),
             )
         except ValueError as error:
             raise APIError(400, str(error)) from error
@@ -1508,18 +1581,45 @@ class InferenceService:
                     payload, "top_p", float(self.generation_defaults["top_p"])
                 ),
                 seed=_optional_integer(payload, "seed"),
+                repetition_penalty=_float_option(
+                    payload,
+                    "repetition_penalty",
+                    float(self.generation_defaults["repetition_penalty"]),
+                ),
+                presence_penalty=_float_option(
+                    payload,
+                    "presence_penalty",
+                    float(self.generation_defaults["presence_penalty"]),
+                ),
+                frequency_penalty=_float_option(
+                    payload,
+                    "frequency_penalty",
+                    float(self.generation_defaults["frequency_penalty"]),
+                ),
+                penalty_window=_integer_option(
+                    payload,
+                    "penalty_window",
+                    default=int(self.generation_defaults["penalty_window"]),
+                ),
             )
         except ValueError as error:
             raise APIError(400, str(error)) from error
         enable_thinking = _boolean_option(payload, "enable_thinking", None)
         separate_reasoning = _boolean_option(payload, "separate_reasoning", False)
+        # Resolved before the prompt is rendered, not after: this is a template
+        # variable, so it has to be in hand when the template runs. Passing it
+        # only to the generate call left the effort silently ignored -- every
+        # level produced a byte-identical prompt.
+        reasoning_effort = self._reasoning_effort(payload)
         try:
             prepare_messages = getattr(self.generator, "prepare_messages", None)
             prompt_ids = tuple(
-                prepare_messages(messages, enable_thinking=enable_thinking)
+                prepare_messages(messages, enable_thinking=enable_thinking,
+                                 reasoning_effort=reasoning_effort)
                 if callable(prepare_messages)
                 else self.generator.tokenizer.encode_messages(
-                    messages, enable_thinking=enable_thinking
+                    messages, enable_thinking=enable_thinking,
+                    reasoning_effort=reasoning_effort
                 )
             )
         except Exception as error:
@@ -1544,6 +1644,7 @@ class InferenceService:
             # template decides this, and it may reason by default with the flag
             # never set. Only the tail can carry the marker.
             self._prompt_opens_thinking(prompt_ids),
+            reasoning_effort=reasoning_effort,
         )
 
     def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
@@ -1580,6 +1681,24 @@ class InferenceService:
             )
         return max(1, min(requested, self.max_new_tokens, room))
 
+    def _reasoning_effort(self, payload: Mapping[str, Any]) -> str | None:
+        """The effort this request asks for, or the service default.
+
+        Unstated stays unstated: a checkpoint that grades its reasoning has its
+        own default, and answering on its behalf is how `enable_thinking`
+        previously came to override templates that reason by default.
+        """
+        requested = payload.get("reasoning_effort")
+        if requested is None:
+            return self.reasoning_effort
+        if not isinstance(requested, str) or requested not in REASONING_EFFORTS:
+            raise APIError(
+                400,
+                "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS),
+                parameter="reasoning_effort",
+            )
+        return requested
+
     def _validate_model(self, requested_model: Any) -> None:
         if (
             self.strict_model
@@ -1600,7 +1719,8 @@ class InferenceService:
         tools: tuple[dict[str, Any], ...] = (),
     ) -> dict[str, Any]:
         visible, reasoning = _split_reasoning_content(result.text)
-        content, tool_calls = _parse_tool_calls(visible, tools=tools)
+        content, tool_calls = _parse_tool_calls(
+            visible, tools=tools, keep_incomplete=result.stopped_on_eos)
         finish_reason = (
             "tool_calls"
             if tool_calls
@@ -1752,7 +1872,9 @@ class InferenceService:
         created_at = created_at or int(time.time())
         tools = _response_tools(payload)
         _, tool_calls = (
-            _parse_tool_calls(result.text, tools=tools) if tools else (result.text, [])
+            _parse_tool_calls(result.text, tools=tools,
+                              keep_incomplete=result.stopped_on_eos)
+            if tools else (result.text, [])
         )
         incomplete = not result.stopped_on_eos and not tool_calls
         return {
@@ -2997,6 +3119,7 @@ def _parse_tool_calls(
     text: str,
     *,
     tools: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+    keep_incomplete: bool = False,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -3049,11 +3172,20 @@ def _parse_tool_calls(
                 )
                 if not _missing(recovered):
                     arguments = recovered
-            if _missing(arguments):
-                # Do not hand an incomplete call to the client/tool runner.
-                # Models sometimes close a tool block before emitting all
-                # parameters; exposing it produces confusing downstream schema
-                # errors (for example write missing content and filePath).
+            if _missing(arguments) and not keep_incomplete:
+                # A call cut off mid-emission is not a call. Dropping it is
+                # right only when the generation was truncated, because then
+                # the missing parameters were never written and the client can
+                # be told so by finish_reason.
+                #
+                # When the model *finished* and still left a required
+                # parameter out -- which it does, routinely, for the ones that
+                # read as optional to it, like a `description` beside a
+                # `command` -- dropping is wrong. It leaves the caller with an
+                # empty assistant turn and no way to tell whether the model
+                # said nothing, called a tool badly, or hit a bug. The call
+                # goes out and the caller's own validator says what is missing,
+                # which is an error an agent can retry from.
                 continue
         elif isinstance(arguments, dict):
             # Undeclared tool: no required list to test against, so the only
@@ -3861,7 +3993,9 @@ def _response_output(
     tools: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     content, tool_calls = (
-        _parse_tool_calls(result.text, tools=tools) if tools else (result.text, [])
+        _parse_tool_calls(result.text, tools=tools,
+                          keep_incomplete=result.stopped_on_eos)
+        if tools else (result.text, [])
     )
     incomplete = not result.stopped_on_eos and not tool_calls
     output: list[dict[str, Any]] = []

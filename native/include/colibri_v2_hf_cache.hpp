@@ -52,7 +52,13 @@ inline constexpr std::uint32_t kFormatVersion = 1;
 //    #pragma fp_contract(off) in qwen_kquant_pack.h now covers it. Any cache
 //    written by an older Windows build was packed by the contracted
 //    arithmetic and must miss.
-inline constexpr std::uint32_t kPackerVersion = 5;
+// 6: Qwen3.5's ssm_conv1d lost the singleton dimension torch's grouped Conv1d
+//    carries -- the arena bytes are the same, but the cache stores descriptors
+//    too, and a cached [kernel, 1, channels] would still size the convolution
+//    state as `kernel` floats -- and the quantization target now requires a
+//    whole block per row rather than per tensor, which changes the type of any
+//    embedding table whose rows are not a multiple of the K-quant block.
+inline constexpr std::uint32_t kPackerVersion = 6;
 inline constexpr std::uint32_t kByteOrderProbe = 0x01020304u;
 // The arena starts on a page boundary so a mapped arena keeps the alignment the
 // in-memory one had, and so the mapping's first arena page is not shared with
@@ -115,6 +121,15 @@ inline std::uint64_t fingerprint(const std::string& config_text,
     hash_u64(state, static_cast<std::uint64_t>(policy.weights));
     hash_u64(state, static_cast<std::uint64_t>(policy.embedding));
     hash_u64(state, static_cast<std::uint64_t>(policy.small));
+    // The head target is hashed only when it differs from the embedding's.
+    //
+    // It is a later field: before it existed the two were one, and a cache
+    // written then holds exactly what this policy would produce now whenever
+    // they agree. Hashing it unconditionally would invalidate every such cache
+    // -- tens of gigabytes on a large checkpoint -- to describe a difference
+    // that is not there.
+    if (policy.head != policy.embedding)
+        hash_u64(state, static_cast<std::uint64_t>(policy.head));
     hash_bytes(state, config_text.data(), config_text.size());
     hash_u64(state, sources.size());
     for (const auto& source : sources) {

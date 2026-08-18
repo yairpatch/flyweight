@@ -363,9 +363,42 @@ struct QwenSamplingState {
     float temperature = 0.0f;
     std::uint32_t top_k = 20;
     float top_p = 0.95f;
+    // Nothing here used to discourage a token the model had just produced, and
+    // "no penalty" is not the neutral setting it looks like -- it is the
+    // setting that lets a low-bit checkpoint fall into a loop and stay there.
+    // Once the distribution collapses onto `world.add(moonLight);` every
+    // sample redraws the same line, because the only evidence against it is
+    // the very history the sampler was ignoring.
+    //
+    // `repetition_penalty` scales a recent token's logit toward zero (the CTRL
+    // rule: divide when positive, multiply when negative, so it always
+    // discourages). The two OpenAI penalties subtract instead -- `presence`
+    // once for any token seen, `frequency` once per occurrence.
+    float repetition_penalty = 1.0f;
+    float presence_penalty = 0.0f;
+    float frequency_penalty = 0.0f;
+    // How far back the penalties look. Only *generated* tokens are recorded:
+    // penalizing the prompt would push the model away from the user's own
+    // wording, which is a different and much worse failure than a loop.
+    std::uint32_t penalty_window = 64;
     std::uint64_t rng = 0;
+    std::vector<std::uint32_t> recent;
 
     bool enabled() const { return temperature > 0.0f; }
+
+    bool penalizes() const {
+        return penalty_window > 0 &&
+            (repetition_penalty != 1.0f || presence_penalty != 0.0f ||
+             frequency_penalty != 0.0f);
+    }
+
+    void remember(std::uint32_t token) {
+        if (!penalizes()) return;
+        recent.push_back(token);
+        if (recent.size() > penalty_window)
+            recent.erase(recent.begin(),
+                         recent.begin() + (recent.size() - penalty_window));
+    }
 };
 
 // One in-flight engine request. phase: 0 = pending (waiting for a slot),
@@ -1857,6 +1890,16 @@ std::uint64_t tensor_index(const ColibriV2Model& model, const std::string& name)
     throw std::runtime_error("required Qwen tensor is missing: " + name);
 }
 
+// Every extent multiplied out. Descriptors of the same bytes can differ in rank
+// between formats -- torch's grouped conv weight keeps a singleton channel
+// dimension the GGUF drops -- so anything sizing a buffer from a tensor wants
+// this rather than a fixed pair of extents.
+std::uint64_t tensor_elements(const Tensor& tensor) {
+    std::uint64_t elements = 1;
+    for (const auto extent : tensor.shape) elements *= extent;
+    return elements;
+}
+
 bool has_tensor(const ColibriV2Model& model, const std::string& name) {
     for (const auto& tensor : model.tensors) if (tensor.name == name) return true;
     return false;
@@ -2616,6 +2659,16 @@ bool qwen_gpu_expert_type_supported(std::uint32_t type) {
 // Grouped SwiGLU kernel for the routed experts' gate/up type. The trailing
 // k-quant case is the historical default and stays reachable only for types
 // this build actually decodes, because prepare rejects anything else.
+// The message for a type qwen_gpu_expert_type_supported rejects. The two name
+// lookups below used to answer that case by falling through to Q5_K/Q6_K and
+// decoding the bytes as a format they are not; prepare routes such models to
+// the CPU, and this makes the silent path unreachable if that stops holding.
+std::string qwen_grouped_expert_unsupported(std::uint32_t type) {
+    return "no routed-expert kernel decodes weight type "+std::to_string(type)+
+        "; the expert stacks have to be Q4_K, Q5_K, Q6_K, Q8_0, NVFP4 or an IQ "
+        "codebook type";
+}
+
 std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool rows) {
     const char* suffix=rows?"_grouped_swiglu_rows":"_grouped_swiglu";
     auto iq=qwen_iq_grouped_kernel(type,suffix);
@@ -2625,6 +2678,7 @@ std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool 
     if(type==8)return rows?"q8_grouped_swiglu_rows":"q8_grouped_swiglu";
     if(type==14)return rows?"q6k_grouped_swiglu_rows":"q6k_grouped_swiglu";
     if(type==12)return rows?"q4k_grouped_swiglu_rows":"q4k_grouped_swiglu";
+    if(type!=13)throw std::runtime_error(qwen_grouped_expert_unsupported(type));
     return rows?"q5k_grouped_swiglu_rows":"q5k_grouped_swiglu";
 }
 
@@ -2637,6 +2691,7 @@ std::string qwen_grouped_accumulate_rows_name(std::uint32_t type) {
     if(type==40)return "nvfp4_grouped_accumulate_rows";
     if(type==12)return "q4k_grouped_accumulate_rows";
     if(type==13)return "q5k_grouped_accumulate_rows";
+    if(type!=14)throw std::runtime_error(qwen_grouped_expert_unsupported(type));
     return "q6k_grouped_accumulate_rows";
 }
 
@@ -2660,7 +2715,8 @@ int qwen_launch_grouped_accumulate(
         case 40:return colibri_gpu_nvfp4_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
         case 12:return colibri_gpu_q4k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
         case 13:return colibri_gpu_q5k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
-        default:return colibri_gpu_q6_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 14:return colibri_gpu_q6_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        default:throw std::runtime_error(qwen_grouped_expert_unsupported(down_type));
     }
 }
 
@@ -2824,6 +2880,137 @@ void qwen_cpu_dense_ffn(
     #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
     for(int row=0;row<hidden;++row)
         output[row]=qwen_quant_dot(down_data,down_tensor.type,activated,intermediate,row);
+}
+
+void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
+                      std::uint64_t row,float*output);
+
+// The same SwiGLU over a whole prefill batch, decoding each weight row once.
+//
+// The single-row form above is right for decode, where there is one token and
+// nothing to amortize. Prefill is the opposite: the device path reads each
+// weight once per 64-token tile, and calling the single-row form in a loop left
+// a spilled block re-reading all 88 MB of its weights *per token*. That is the
+// whole reason a spilled block costs ~3.4 ms/token against 0.003 ms for a
+// resident one -- a factor of a thousand, from batching alone, on top of the
+// ~8x the host's 51 GB/s gives up against the device's 391 GB/s.
+//
+// Here the loop is inverted: a weight row is dequantized once into per-thread
+// scratch and then dotted against every token in the batch. The weight traffic
+// drops by the batch size and the arithmetic turns into a GEMM, which the host
+// is far better at than a stream of GEMVs.
+void qwen_cpu_dense_ffn_rows(
+    ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
+    const float* input, float* output, int rows
+) {
+    if(rows<=0)return;
+    const int hidden=runtime.model->config.hidden_size;
+    const int intermediate=static_cast<int>(runtime.moe_intermediate);
+    const std::size_t ffn_base=qwen_ffn_base(runtime,layer);
+    const auto&gate_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+1]];
+    const auto&up_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+2]];
+    const auto&down_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+3]];
+    const auto*gate_data=tensor_data(*runtime.model,gate_tensor);
+    const auto*up_data=tensor_data(*runtime.model,up_tensor);
+    const auto*down_data=tensor_data(*runtime.model,down_tensor);
+    const std::size_t batch=static_cast<std::size_t>(rows);
+
+    // Batching pays only where a weight row can be *decoded* quickly. The
+    // K-quants have a SIMD dequantizer; the IQ codebook formats do not, and
+    // their per-element accessor recomputes the block base, the scale word and
+    // the sign lookup for every value -- an order of magnitude worse than
+    // qwen_quant_dot, which reaches the fused row kernel in qwen_kquant.h.
+    // Decoding once per batch is no bargain when the decode is that much
+    // dearer, so those formats keep the row-at-a-time path. Measured on a
+    // 14-block spill at IQ3_XXS: 903 ms/token through the batched form against
+    // 72 ms ordinary.
+    if(!qwen_simd_quant_type(gate_tensor.type)||
+       !qwen_simd_quant_type(up_tensor.type)||
+       !qwen_simd_quant_type(down_tensor.type)){
+        for(std::size_t token=0;token<batch;++token)
+            qwen_cpu_dense_ffn(runtime,layer,
+                               input+token*hidden,output+token*hidden);
+        return;
+    }
+
+    // Mirrored out of the pinned staging buffer for the same reason the
+    // single-row path does it: every weight row re-reads the activations, and
+    // page-locked memory is ~5x slower to read repeatedly.
+    runtime.dense_scratch.resize(batch*(static_cast<std::size_t>(hidden)+intermediate));
+    float*local_input=runtime.dense_scratch.data();
+    float*activated=local_input+batch*hidden;
+    std::memcpy(local_input,input,batch*hidden*sizeof(float));
+
+    // The decoded row is dotted against every token through the same SIMD
+    // helper the single-row path uses, which keeps four token vectors in flight
+    // per weight load. A scalar inner loop here measured *slower* than the
+    // unbatched path it replaces: this translation unit is built for baseline
+    // x86-64, so the saving from decoding once is easily lost to a dot product
+    // that is not vectorized.
+    const bool avx512=(colibri_cpu_features()&2u)!=0;
+    const bool avx2=(colibri_cpu_features()&1u)!=0;
+    auto dot_multi=[&](const float*row,const float*const*inputs,int count,
+                       int elements,float*outputs){
+        if(avx512&&elements%32==0){
+            qwen_f32_dot_multi_avx512(row,inputs,count,elements,outputs);return;
+        }
+        if(avx2&&elements%16==0){
+            qwen_f32_dot_multi_avx2(row,inputs,count,elements,outputs);return;
+        }
+        for(int token=0;token<count;++token){
+            const float*vector=inputs[token];
+            float sum=0.0f;
+            for(int index=0;index<elements;++index)sum+=row[index]*vector[index];
+            outputs[token]=sum;
+        }
+    };
+
+    std::vector<const float*> input_rows(batch),activated_rows(batch);
+    for(std::size_t token=0;token<batch;++token)
+        input_rows[token]=local_input+token*hidden;
+
+    const int threads=qwen_cpu_thread_count(runtime);
+    #pragma omp parallel num_threads(threads)
+    {
+        // One decoded row per thread, reused across the batch, plus the dots it
+        // produces. Sized to the wider projection so both loops share them.
+        std::vector<float> decoded(static_cast<std::size_t>(
+            std::max(hidden,intermediate)));
+        std::vector<float> gate_dots(batch),up_dots(batch);
+        #pragma omp for schedule(static)
+        for(int row=0;row<intermediate;++row){
+            qwen_dequant_row(gate_data,gate_tensor.type,hidden,
+                             static_cast<std::uint64_t>(row),decoded.data());
+            dot_multi(decoded.data(),input_rows.data(),
+                      static_cast<int>(batch),hidden,gate_dots.data());
+            qwen_dequant_row(up_data,up_tensor.type,hidden,
+                             static_cast<std::uint64_t>(row),decoded.data());
+            dot_multi(decoded.data(),input_rows.data(),
+                      static_cast<int>(batch),hidden,up_dots.data());
+            for(std::size_t token=0;token<batch;++token){
+                const float gate=gate_dots[token];
+                activated[token*intermediate+row]=
+                    gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))
+                    *up_dots[token];
+            }
+        }
+    }
+    for(std::size_t token=0;token<batch;++token)
+        activated_rows[token]=activated+token*intermediate;
+    #pragma omp parallel num_threads(threads)
+    {
+        std::vector<float> decoded(static_cast<std::size_t>(intermediate));
+        std::vector<float> dots(batch);
+        #pragma omp for schedule(static)
+        for(int row=0;row<hidden;++row){
+            qwen_dequant_row(down_data,down_tensor.type,intermediate,
+                             static_cast<std::uint64_t>(row),decoded.data());
+            dot_multi(decoded.data(),activated_rows.data(),
+                      static_cast<int>(batch),intermediate,dots.data());
+            for(std::size_t token=0;token<batch;++token)
+                output[token*hidden+row]=dots[token];
+        }
+    }
 }
 
 // Dequantize one weight row to f32 so it can be reused across every token
@@ -4123,6 +4310,100 @@ std::vector<std::string> hf_cache_candidates(const std::string& directory,
     return out;
 }
 
+namespace hf = colibri::v2::hf;
+
+// The quantization policy a name selects, or false when the name is not one.
+// Shared by the loader and by the pre-load preview, so what a caller is offered
+// and what the loader then does cannot drift apart.
+bool hf_policy_for(const std::string& name, hf::Policy& policy) {
+    hf::Target weights;
+    if(name=="Q2_K")weights=hf::Target::Q2_K;
+    else if(name=="IQ3_XXS")weights=hf::Target::IQ3_XXS;
+    else if(name=="Q3_K")weights=hf::Target::Q3_K;
+    else if(name=="Q4_K")weights=hf::Target::Q4_K;
+    else if(name=="Q5_K")weights=hf::Target::Q5_K;
+    else if(name=="Q6_K")weights=hf::Target::Q6_K;
+    else if(name=="Q8_0")weights=hf::Target::Q8_0;
+    else if(name=="F32")weights=hf::Target::F32;
+    else return false;
+    policy=hf::policy_for_weights(weights);
+    return true;
+}
+
+// Empty when `policy` can be loaded for this checkpoint, else why it cannot.
+//
+// The dense path decodes more types than the routed-expert path does: Q2_K and
+// Q3_K have a matvec, a tiled row GEMM and an embedding kernel, but no grouped
+// expert kernel at all. Rather than pack a mixture-of-experts checkpoint into
+// something that will fail at the first routed layer -- or, before
+// qwen_grouped_expert_type_supported existed, decode as the wrong format --
+// the combination is refused where it is chosen.
+std::string hf_policy_unavailable(const hf::Policy& policy,
+                                  const colibri::v2::ModelConfig& config) {
+    const auto type=static_cast<std::uint32_t>(policy.weights);
+    if(config.expert_count&&(type==10||type==11))
+        return "no GPU routed-expert kernel decodes it, which would leave "
+               "every routed layer on the CPU; Q4_K is the smallest a "
+               "mixture-of-experts checkpoint can be packed to";
+    return {};
+}
+
+// Every .safetensors file in the directory, sorted. Shard order must not affect
+// the result -- experts are placed by parsed index, not encounter order -- but
+// sorting keeps logs reproducible and keeps the cache fingerprint off readdir
+// order.
+std::vector<std::string> hf_shard_files(const std::string& directory) {
+    std::vector<std::string> files;
+#if defined(_WIN32)
+    {
+        WIN32_FIND_DATAA find_data;
+        HANDLE hfind = FindFirstFileA((directory+"\\*").c_str(), &find_data);
+        if(hfind != INVALID_HANDLE_VALUE){
+            do {
+                const std::string name=find_data.cFileName;
+                static const std::string suffix=".safetensors";
+                if(name.size()>suffix.size()&&
+                   name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0)
+                    files.push_back(directory+"/"+name);
+            } while(FindNextFileA(hfind, &find_data));
+            FindClose(hfind);
+        }
+    }
+#else
+    if(DIR* handle=opendir(directory.c_str())){
+        while(dirent* entry=readdir(handle)){
+            const std::string name=entry->d_name;
+            static const std::string suffix=".safetensors";
+            if(name.size()>suffix.size()&&
+               name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0)
+                files.push_back(directory+"/"+name);
+        }
+        closedir(handle);
+    }
+#endif
+    if(files.empty())throw std::runtime_error("no .safetensors files in "+directory);
+    std::sort(files.begin(),files.end());
+    return files;
+}
+
+// Fingerprint inputs from metadata alone: every shard is stat'd, none is read.
+// Hashing 15.8 GB of content to decide whether to avoid re-quantizing it would
+// cost more than the packing it saves.
+std::vector<hf::cache::SourceFile> hf_cache_sources(
+    const std::vector<std::string>& files
+) {
+    std::vector<hf::cache::SourceFile> sources;
+    sources.reserve(files.size());
+    for(const auto& file:files){
+        struct stat st{};
+        if(stat(file.c_str(),&st)!=0)throw std::runtime_error("cannot stat "+file);
+        const auto cut=file.find_last_of('/');
+        sources.push_back({cut==std::string::npos?file:file.substr(cut+1),
+                           static_cast<std::uint64_t>(st.st_size),modified_ns(st)});
+    }
+    return sources;
+}
+
 // Load an HF checkpoint: map every shard, translate the descriptors, quantize
 // into an owned arena, then drop the mappings.
 //
@@ -4197,72 +4478,20 @@ void load_hf(const char* path, ColibriV2Model& m) {
     build_tokenizer_tables(m);
     phase("tokenizer tables");
 
-    std::vector<std::string> files;
-#if defined(_WIN32)
-    {
-        WIN32_FIND_DATAA find_data;
-        HANDLE hfind = FindFirstFileA((std::string(path)+"\\*").c_str(), &find_data);
-        if(hfind != INVALID_HANDLE_VALUE){
-            do {
-                const std::string name=find_data.cFileName;
-                static const std::string suffix=".safetensors";
-                if(name.size()>suffix.size()&&
-                   name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0)
-                    files.push_back(directory+"/"+name);
-            } while(FindNextFileA(hfind, &find_data));
-            FindClose(hfind);
-        }
-    }
-#else
-    if(DIR* handle=opendir(path)){
-        while(dirent* entry=readdir(handle)){
-            const std::string name=entry->d_name;
-            static const std::string suffix=".safetensors";
-            if(name.size()>suffix.size()&&
-               name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0)
-                files.push_back(directory+"/"+name);
-        }
-        closedir(handle);
-    }
-#endif
-    if(files.empty())throw std::runtime_error("no .safetensors files in "+directory);
-    // Shard order must not affect the result -- experts are placed by parsed
-    // index, not encounter order -- but sort anyway so logs are reproducible,
-    // and so the cache fingerprint does not depend on readdir order.
-    std::sort(files.begin(),files.end());
+    const auto files=hf_shard_files(directory);
 
     hf::Policy policy;
-    const char* requested=std::getenv("COLIBRI_HF_QUANT");
-    if(requested){
-        const std::string type=requested;
-        if(type=="Q4_K")policy.weights=hf::Target::Q4_K;
-        else if(type=="Q5_K")policy.weights=hf::Target::Q5_K;
-        else if(type=="Q6_K")policy.weights=hf::Target::Q6_K;
-        else if(type=="Q8_0")policy.weights=hf::Target::Q8_0;
-        else if(type=="F32"){
-            // F32 means an unquantized model, not "f32 bulk weights beside a
-            // Q6_K embedding". The embedding otherwise keeps its own higher
-            // target and quietly makes the checkpoint mixed-precision.
-            policy.weights=hf::Target::F32;
-            policy.embedding=hf::Target::F32;
-        }
-        else throw std::runtime_error("COLIBRI_HF_QUANT must be one of "
-            "Q4_K, Q5_K, Q6_K, Q8_0, F32");
-    }
+    if(const char* requested=std::getenv("COLIBRI_HF_QUANT");
+       requested&&!hf_policy_for(requested,policy))
+        throw std::runtime_error("COLIBRI_HF_QUANT must be one of "
+            "Q2_K, IQ3_XXS, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F32");
 
-    // Fingerprint from metadata alone: every shard is stat'd, none is read.
-    // Hashing 15.8 GB of content to decide whether to avoid re-quantizing it
-    // would cost more than the packing it saves.
-    std::vector<hf::cache::SourceFile> sources;
-    sources.reserve(files.size());
-    for(const auto& file:files){
-        struct stat st{};
-        if(stat(file.c_str(),&st)!=0)throw std::runtime_error("cannot stat "+file);
-        const auto cut=file.find_last_of('/');
-        sources.push_back({cut==std::string::npos?file:file.substr(cut+1),
-                           static_cast<std::uint64_t>(st.st_size),modified_ns(st)});
-    }
-    const auto print=hf::cache::fingerprint(config_text,sources,policy);
+    if(const auto refusal=hf_policy_unavailable(policy,m.config);!refusal.empty())
+        throw std::runtime_error(
+            std::string("this checkpoint cannot be quantized as requested: ")+refusal);
+
+    const auto print=hf::cache::fingerprint(
+        config_text,hf_cache_sources(files),policy);
     const auto candidates=hf_cache_candidates(directory,print);
 
     // Publish descriptors against whichever arena we end up with. `base` is
@@ -4282,6 +4511,13 @@ void load_hf(const char* path, ColibriV2Model& m) {
             tensor.source=base;
             m.tensors.push_back(std::move(tensor));
         }
+        // The same scan the GGUF parse runs. Without it an HF checkpoint whose
+        // `mtp.` tensors were translated to `blk.<layers>.nextn.*` still
+        // reported no draft block, so MTP -- the one lever a bandwidth-bound
+        // decode has -- was unavailable on exactly the checkpoints that carry
+        // one. Here rather than at the two call sites because both the cache
+        // hit and the freshly quantized path go through it.
+        detect_mtp_layer(m);
     };
 
     const auto started=std::chrono::steady_clock::now();
@@ -5895,6 +6131,74 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
                                  c.vocabulary_size, logits);
     return 0; });
 }
+
+// The names offered, best-compression first, which is also the order a menu
+// wants. Q6_K is the loader's default and is marked as such by the caller, not
+// here.
+static const char* const kHfQuantNames[] = {
+    "Q2_K","IQ3_XXS","Q3_K","Q4_K","Q5_K","Q6_K","Q8_0","F32"};
+
+int colibri_v2_hf_quant_options(const char* directory,
+    ColibriV2HfQuantOption* out, std::uint32_t capacity, std::uint32_t* count
+) { return guarded([&]{
+    namespace hf = colibri::v2::hf;
+    if(!directory||!out||!count)
+        throw std::runtime_error("directory, output and count are required");
+    const std::size_t options=sizeof(kHfQuantNames)/sizeof(kHfQuantNames[0]);
+    if(capacity<options)
+        throw std::runtime_error("quantization option buffer is too small");
+    *count=0;
+
+    const std::string folder=directory;
+    const auto config_text=read_text_file(folder+"/config.json");
+    if(config_text.empty())throw std::runtime_error("cannot read config.json");
+    const auto config=hf::config_from_json(colibri::v2::json::parse(config_text));
+    const auto files=hf_shard_files(folder);
+    const auto sources=hf_cache_sources(files);
+
+    // Headers only. parse_header touches the JSON at the front of each shard;
+    // the weights behind it are mapped but never faulted in, so this stays a
+    // metadata read even on a 52 GiB checkpoint.
+    std::vector<std::unique_ptr<ColibriV2Model>> mappings;
+    std::vector<hf::Shard> parsed;
+    parsed.reserve(files.size());
+    for(const auto& file:files){
+        auto shard=std::make_unique<ColibriV2Model>();
+        map_file(file.c_str(),*shard);
+        parsed.push_back({colibri::v2::safetensors::parse_header(shard->data,shard->size),
+                          shard->data});
+        mappings.push_back(std::move(shard));
+    }
+    const auto tensors=hf::build_tensors(parsed,config);
+
+    for(std::size_t i=0;i<options;++i){
+        hf::Policy policy;
+        if(!hf_policy_for(kHfQuantNames[i],policy))
+            throw std::runtime_error("unknown quantization name in the option table");
+        auto& entry=out[i];
+        std::memset(&entry,0,sizeof(entry));
+        copy_text(entry.name,sizeof(entry.name),kHfQuantNames[i]);
+        const auto refusal=hf_policy_unavailable(policy,config);
+        copy_text(entry.unavailable,sizeof(entry.unavailable),refusal.c_str());
+        if(!refusal.empty())continue;
+        entry.arena_bytes=hf::arena_bytes(tensors,policy);
+
+        const auto print=hf::cache::fingerprint(config_text,sources,policy);
+        // The first candidate is where a write would go; an existing one
+        // anywhere in the list is what an open would actually use.
+        const auto candidates=hf_cache_candidates(folder,print);
+        if(!candidates.empty())
+            copy_text(entry.cache_path,sizeof(entry.cache_path),candidates.front().c_str());
+        for(const auto& candidate:candidates){
+            struct stat st{};
+            if(stat(candidate.c_str(),&st)!=0||!S_ISREG(st.st_mode))continue;
+            entry.cache_bytes=static_cast<std::uint64_t>(st.st_size);
+            copy_text(entry.cache_path,sizeof(entry.cache_path),candidate.c_str());
+            break;
+        }
+    }
+    *count=static_cast<std::uint32_t>(options);
+    return 0; }); }
 
 int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guarded([&]{
     if(!path||!out) throw std::runtime_error("path and output are required");
@@ -9689,7 +9993,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
                 const auto&norm=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
-                layer.state_first=reserve(conv.shape[0]*conv.shape[1]*sizeof(float));
+                // The whole tensor, not its first two extents: a checkpoint may
+                // describe the same bytes with a singleton dimension in the
+                // middle, and reserving less than the convolution writes puts
+                // the conv state on top of the recurrent state.
+                layer.state_first=reserve(tensor_elements(conv)*sizeof(float));
                 layer.state_second=reserve(a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float));
             }
         }
@@ -10325,11 +10633,19 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     "failed to seed native Qwen embedding row index");
         }
         if(runtime->host_ffn_layers){
-            // Pinned so the per-token round trip to the host SwiGLU is a plain DMA.
-            // Only the DMA endpoints need pinning now: one hidden-sized vector
-            // in, one out. The activation scratch lives on the heap.
+            // Pinned so the round trip to the host SwiGLU is a plain DMA. Only
+            // the DMA endpoints need pinning; the activation scratch lives on
+            // the heap. Sized for a whole prefill batch rather than one row,
+            // because that path now copies the batch in one transfer -- at 128
+            // rows of a 5120-wide hidden state this is 5 MiB, against the 40
+            // KiB a single row needed.
+            // forward_rows_capacity, not prefill_rows: it is the bound
+            // qwen_forward_rows enforces on `rows`, and MTP verification hands
+            // it a batch of its own.
+            const std::uint64_t staged_rows=
+                std::max<std::uint64_t>(runtime->forward_rows_capacity,1);
             runtime->dense_host_bytes=device_align(
-                2ull*runtime->model->config.hidden_size*sizeof(float));
+                2ull*staged_rows*runtime->model->config.hidden_size*sizeof(float));
             if(colibri_gpu_host_alloc(runtime->dense_host_bytes,&runtime->dense_host)!=0)
                 throw std::runtime_error("failed to allocate native Qwen dense host scratch");
         }
@@ -13082,7 +13398,8 @@ static std::uint32_t qwen_sample_last_logits(
         std::min<std::size_t>(sampling.top_k,vocabulary):vocabulary;
     // Sampling from a single candidate is identical to greedy decode. Avoid
     // both the second LM-head projection and all candidate transfers.
-    if(count==1){runtime.last_output_token=greedy_token;return greedy_token;}
+    if(count==1){runtime.last_output_token=greedy_token;
+        sampling.remember(greedy_token);return greedy_token;}
     const auto lm_head=runtime.device_tensors[runtime.lm_head];
     // The head type picks the kernel, exactly as it does for the greedy argmax
     // above. This used to name Q4_K, Q6_K and bf16 and read every other type as
@@ -13200,8 +13517,8 @@ static std::uint32_t qwen_sample_last_logits(
             throw std::runtime_error("native Qwen sampling candidate transfer failed");
         candidates.assign(selected_host,selected_host+count);
         candidate_logits.assign(values_host,values_host+count);
-        if(candidates.empty()||candidates.front()>=vocabulary)
-            return greedy_token;
+        if(candidates.empty()||candidates.front()>=vocabulary){
+            sampling.remember(greedy_token);return greedy_token;}
         ++runtime.sampling_gpu_topk_calls;
         runtime.sampling_gpu_topk_bytes+=candidate_bytes+value_bytes;
     }else{
@@ -13229,6 +13546,44 @@ static std::uint32_t qwen_sample_last_logits(
         candidate_logits.reserve(candidates.size());
         for(const auto token:candidates)candidate_logits.push_back(logits[token]);
     }
+    // Discourage what was just said. This runs over the top-k candidates
+    // rather than the whole vocabulary: a token the model is looping on is by
+    // definition near the top of the distribution, so it is always in this
+    // set, and penalizing 20 entries costs nothing next to a full download.
+    if(sampling.penalizes()&&!sampling.recent.empty()){
+        for(std::size_t index=0;index<candidates.size();++index){
+            std::uint32_t occurrences=0;
+            for(const auto token:sampling.recent)
+                if(token==candidates[index])++occurrences;
+            if(!occurrences)continue;
+            float logit=candidate_logits[index];
+            if(sampling.repetition_penalty!=1.0f)
+                logit=logit>0.0f?logit/sampling.repetition_penalty
+                                :logit*sampling.repetition_penalty;
+            logit-=sampling.presence_penalty;
+            logit-=sampling.frequency_penalty*static_cast<float>(occurrences);
+            candidate_logits[index]=logit;
+        }
+        // Both the nucleus cut and the cumulative draw below read this list as
+        // sorted, and a penalty can demote a candidate past its neighbours.
+        std::vector<std::size_t> order(candidates.size());
+        for(std::size_t index=0;index<order.size();++index)order[index]=index;
+        std::stable_sort(order.begin(),order.end(),
+            [&](std::size_t left,std::size_t right){
+                const float a=candidate_logits[left],b=candidate_logits[right];
+                if(std::isnan(a))return false;
+                if(std::isnan(b))return true;
+                return a!=b?a>b:candidates[left]<candidates[right];
+            });
+        std::vector<std::uint32_t> sorted_candidates(candidates.size());
+        std::vector<float> sorted_logits(candidates.size());
+        for(std::size_t index=0;index<order.size();++index){
+            sorted_candidates[index]=candidates[order[index]];
+            sorted_logits[index]=candidate_logits[order[index]];
+        }
+        candidates.swap(sorted_candidates);
+        candidate_logits.swap(sorted_logits);
+    }
     const double maximum=static_cast<double>(candidate_logits.front())/
         sampling.temperature;
     std::vector<double> probabilities(candidates.size());
@@ -13240,7 +13595,8 @@ static std::uint32_t qwen_sample_last_logits(
             std::exp(scaled-maximum):0.0;
         probabilities[index]=probability;total+=probability;
     }
-    if(!(total>0.0)||!std::isfinite(total))return greedy_token;
+    if(!(total>0.0)||!std::isfinite(total)){
+        sampling.remember(greedy_token);return greedy_token;}
     std::size_t keep=probabilities.size();
     if(sampling.top_p<1.0f){
         double cumulative=0.0;
@@ -13257,10 +13613,12 @@ static std::uint32_t qwen_sample_last_logits(
         cumulative+=probabilities[index];
         if(threshold<=cumulative){
             runtime.last_output_token=candidates[index];
+            sampling.remember(candidates[index]);
             return candidates[index];
         }
     }
     runtime.last_output_token=candidates[keep-1];
+    sampling.remember(candidates[keep-1]);
     return candidates[keep-1];
 }
 
@@ -13344,7 +13702,7 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
             const auto& conv = runtime.model->tensors[layer.static_tensors[6]];
             const auto& a = runtime.model->tensors[layer.static_tensors[8]];
             const auto& norm = runtime.model->tensors[layer.static_tensors[9]];
-            ranges.emplace_back(layer.state_first, conv.shape[0] * conv.shape[1] * sizeof(float));
+            ranges.emplace_back(layer.state_first, tensor_elements(conv) * sizeof(float));
             ranges.emplace_back(layer.state_second, a.shape[0] * norm.shape[0] * norm.shape[0] * sizeof(float));
         }
     }
@@ -14431,8 +14789,9 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
 static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
         const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,
         const uint32_t*stop_tokens,uint64_t stop_count,float temperature,
-        uint32_t top_k,float top_p,uint64_t seed,bool has_seed,
-        uint64_t*task_id) {
+        uint32_t top_k,float top_p,float repetition_penalty,
+        float presence_penalty,float frequency_penalty,uint32_t penalty_window,
+        uint64_t seed,bool has_seed,uint64_t*task_id) {
     if(!runtime||!prompt||!prompt_count||!max_tokens||!task_id)throw std::runtime_error("invalid native Qwen task arguments");
     if(prompt_count>runtime->options.context_limit||
        max_tokens>runtime->options.context_limit-prompt_count)
@@ -14441,6 +14800,21 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
         throw std::runtime_error("native Qwen temperature must be finite and non-negative");
     if(!std::isfinite(top_p)||top_p<=0.0f||top_p>1.0f)
         throw std::runtime_error("native Qwen top_p must be in (0, 1]");
+    // A penalty below 1 rewards repetition, which is the failure this exists
+    // to prevent; an unbounded one silences a token the answer may legitimately
+    // need. Both are far more likely to be a caller's unit mistake than intent.
+    if(!std::isfinite(repetition_penalty)||repetition_penalty<1.0f||
+       repetition_penalty>2.0f)
+        throw std::runtime_error("native Qwen repetition_penalty must be in [1, 2]");
+    // These two carry their OpenAI names, so they take the OpenAI range --
+    // including the negative half, which rewards repetition. Nothing here wants
+    // that, but a client that asks for it is asking deliberately.
+    if(!std::isfinite(presence_penalty)||presence_penalty<-2.0f||
+       presence_penalty>2.0f)
+        throw std::runtime_error("native Qwen presence_penalty must be in [-2, 2]");
+    if(!std::isfinite(frequency_penalty)||frequency_penalty<-2.0f||
+       frequency_penalty>2.0f)
+        throw std::runtime_error("native Qwen frequency_penalty must be in [-2, 2]");
     if(runtime->gemma4&&temperature>0.0f)
         throw std::runtime_error("native Gemma 4 sampling is not implemented yet");
     QwenEngineTask task;
@@ -14450,6 +14824,10 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
     task.sampling.temperature=temperature;
     task.sampling.top_k=top_k;
     task.sampling.top_p=top_p;
+    task.sampling.repetition_penalty=repetition_penalty;
+    task.sampling.presence_penalty=presence_penalty;
+    task.sampling.frequency_penalty=frequency_penalty;
+    task.sampling.penalty_window=penalty_window;
     std::lock_guard<std::mutex> lock(runtime->engine_mutex);
     constexpr std::size_t kMaxQueuedTasks = 256;
     if(runtime->engine_pending.size()>=kMaxQueuedTasks||
@@ -14466,13 +14844,21 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
 
 int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
-        stop_count,0.0f,20,0.95f,0,false,task_id);
+        stop_count,0.0f,20,0.95f,1.0f,0.0f,0.0f,64,0,false,task_id);
+    return 0;
+});}
+
+int colibri_v2_qwen_task_submit_penalties(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
+    qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
+        stop_count,temperature,top_k,top_p,repetition_penalty,presence_penalty,
+        frequency_penalty,penalty_window,seed,has_seed!=0,task_id);
     return 0;
 });}
 
 int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
-        stop_count,temperature,top_k,top_p,seed,has_seed!=0,task_id);
+        stop_count,temperature,top_k,top_p,1.0f,0.0f,0.0f,64,
+        seed,has_seed!=0,task_id);
     return 0;
 });}
 

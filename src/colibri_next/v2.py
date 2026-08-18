@@ -102,6 +102,16 @@ class _TensorInfo(ctypes.Structure):
     ]
 
 
+class _HfQuantOption(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char * 8),
+        ("arena_bytes", ctypes.c_uint64),
+        ("cache_bytes", ctypes.c_uint64),
+        ("cache_path", ctypes.c_char * 512),
+        ("unavailable", ctypes.c_char * 128),
+    ]
+
+
 class _ModelConfig(ctypes.Structure):
     _fields_ = [
         ("architecture", ctypes.c_char * 64),
@@ -405,6 +415,10 @@ TASK_EVENT_DONE = 1
 TASK_EVENT_ERROR = 2
 TASK_EVENT_PREFILL = 3
 NATIVE_ABI_VERSION = 5
+# "Let the runtime pick the size" for the host prompt cache, carried through the
+# option struct as a size. Lives here rather than in the CLI so a caller that is
+# not the CLI -- and the runtimes that read it -- can say the same thing.
+AUTO_PROMPT_CACHE_MIB = (1 << 32) - 1
 
 _cached_library: ctypes.CDLL | None = None
 
@@ -473,6 +487,13 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_char_p,
                 ]
                 lib.colibri_v2_model_attach_mtp.restype = ctypes.c_int
+                lib.colibri_v2_hf_quant_options.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.POINTER(_HfQuantOption),
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_uint32),
+                ]
+                lib.colibri_v2_hf_quant_options.restype = ctypes.c_int
                 lib.colibri_v2_model_attention_window.argtypes = [
                     ctypes.c_void_p,
                     ctypes.c_uint32,
@@ -843,6 +864,25 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_uint64),
                 ]
                 lib.colibri_v2_qwen_task_submit_sampling.restype = ctypes.c_int
+                lib.colibri_v2_qwen_task_submit_penalties.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_float,
+                    ctypes.c_uint32,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_uint32,
+                    ctypes.c_uint64,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_qwen_task_submit_penalties.restype = ctypes.c_int
                 lib.colibri_v2_qwen_engine_step.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(_QwenTaskEvent),
@@ -1017,6 +1057,12 @@ def _library() -> ctypes.CDLL:
     )
 
 
+# int(*)(void* user, uint32_t processed, uint32_t total); non-zero aborts.
+_BAILING_PROGRESS = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32
+)
+
+
 class BailingRuntime:
     """Host execution for BailingMoE3 (Ling 3.0) checkpoints.
 
@@ -1049,11 +1095,60 @@ class BailingRuntime:
         self._logits = (ctypes.c_float * self._vocabulary)()
         # Built on first unseeded sample and reused; see sample().
         self._generator: Any = None
+        # Keeps the progress thunk alive for as long as the native side holds
+        # its pointer; see set_progress.
+        self._progress: Any = None
+        self.uses_gpu = self._query_uses_gpu()
+
+    def _query_uses_gpu(self) -> bool:
+        """Whether creation actually got the device.
+
+        Creation picks the GPU whenever there is one and falls back to the host
+        silently, so the environment does not say which path this runtime is
+        on -- only the runtime does.
+        """
+        try:
+            entry = self._lib.colibri_v2_bailing_uses_gpu
+        except AttributeError:
+            # An older shared library; the host path is the safe thing to claim.
+            return False
+        entry.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        value = ctypes.c_int(0)
+        self._check(entry(self._handle, ctypes.byref(value)))
+        return bool(value.value)
 
     def _check(self, status: int) -> None:
         if status:
             message = self._lib.colibri_v2_last_error() or b"native v2 error"
             raise V2Error(message.decode(errors="replace"))
+
+    def set_progress(self, callback: Any) -> None:
+        """Watch a prompt as it is evaluated, and optionally stop it.
+
+        `callback(processed, total)` runs once per internal tile -- every 128
+        tokens -- and returning False abandons the call, which then raises. A
+        prompt is otherwise one uninterruptible call that can run for minutes:
+        nothing to report while it does, and no way to drop a request whose
+        client has already gone. Pass None to clear.
+        """
+        entry = self._lib.colibri_v2_bailing_set_progress
+        entry.argtypes = [ctypes.c_void_p, _BAILING_PROGRESS, ctypes.c_void_p]
+        if callback is None:
+            self._progress = None
+            self._check(entry(self._handle, _BAILING_PROGRESS(0), None))
+            return
+
+        def trampoline(_user, processed, total) -> int:
+            try:
+                return 0 if callback(int(processed), int(total)) is not False else 1
+            except Exception:
+                # A raising watcher must not unwind through the native frame.
+                return 1
+
+        # Held on the runtime: the native side keeps the pointer, and a
+        # collected thunk would be a call into freed memory.
+        self._progress = _BAILING_PROGRESS(trampoline)
+        self._check(entry(self._handle, self._progress, None))
 
     def _eval_into_buffer(self, tokens: Sequence[int]) -> None:
         if not tokens:
@@ -1082,6 +1177,31 @@ class BailingRuntime:
 
     def reset(self) -> None:
         self._check(self._lib.colibri_v2_bailing_reset(self._handle))
+
+    def save_state(self) -> bytes:
+        """The live sequence's cache, so it can be restored instead of re-run.
+
+        Sized by the tokens the runtime actually holds, not by its capacity: a
+        32-token side-call snapshots a few hundred kilobytes.
+        """
+        save = self._lib.colibri_v2_bailing_cache_save
+        save.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        length = ctypes.c_uint64()
+        self._check(save(self._handle, None, 0, ctypes.byref(length)))
+        buffer = ctypes.create_string_buffer(length.value)
+        self._check(
+            save(self._handle, buffer, length.value, ctypes.byref(length))
+        )
+        return buffer.raw[: length.value]
+
+    def load_state(self, snapshot: bytes) -> None:
+        """Restore a sequence saved by ``save_state``."""
+        load = self._lib.colibri_v2_bailing_cache_load
+        load.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
+        self._check(load(self._handle, snapshot, len(snapshot)))
 
     def eval_into(self, tokens: Sequence[int]) -> None:
         """Advance the caches, leaving the logits in the internal buffer.
@@ -1241,6 +1361,38 @@ class V2Model:
             self.close()
             raise
         self._architecture = str(self.info["architecture"])
+
+    @staticmethod
+    def hf_quant_options(path: str | Path) -> list[dict[str, object]]:
+        """What a safetensors checkpoint could be loaded as, without loading it.
+
+        One entry per quantization, each with the exact ``arena_bytes`` the load
+        would produce and, when a cache for it is already on disk,
+        ``cache_bytes`` and ``cache_path`` -- which is the difference between
+        opening in a second and repacking the whole checkpoint.
+
+        Raises V2Error for anything that is not a readable HF checkpoint this
+        runtime understands, GGUF files included: there is nothing to choose.
+        """
+        lib = _library()
+        buffer = (_HfQuantOption * 16)()
+        count = ctypes.c_uint32()
+        status = lib.colibri_v2_hf_quant_options(
+            str(path).encode(), buffer, len(buffer), ctypes.byref(count)
+        )
+        if status:
+            message = lib.colibri_v2_last_error() or b"native v2 error"
+            raise V2Error(message.decode(errors="replace"))
+        return [
+            {
+                "name": buffer[index].name.decode(),
+                "arena_bytes": int(buffer[index].arena_bytes),
+                "cache_bytes": int(buffer[index].cache_bytes),
+                "cache_path": buffer[index].cache_path.decode(),
+                "unavailable": buffer[index].unavailable.decode(),
+            }
+            for index in range(int(count.value))
+        ]
 
     def _check(self, status: int) -> None:
         if status:
@@ -2326,7 +2478,18 @@ class V2QwenRuntime:
         return int(output.value)
 
     def generate(self, prompt_tokens: list[int], max_tokens: int, callback) -> None:
-        """Run prompt ingestion and greedy decode inside the native token loop."""
+        """Run prompt ingestion and greedy decode inside the native token loop.
+
+        Runs to `max_tokens` and does NOT stop at end-of-turn: the loop has no
+        stop set, so a caller that wants one returns False from `callback` --
+        which is how a fixed-length benchmark and a real generation can share
+        it. Left to run past the model's own end token, generation continues
+        into invented turns (`<|im_end|><|im_start|>Human...`), so anything
+        showing output to a person wants the callback to stop.
+
+        The cooperative engine (`task_submit`) takes a stop-token list instead
+        and is what the server uses.
+        """
         if not prompt_tokens:
             raise ValueError("prompt_tokens must not be empty")
         if max_tokens <= 0:
@@ -2364,6 +2527,10 @@ class V2QwenRuntime:
         temperature: float = 0.0,
         top_k: int = 20,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        penalty_window: int = 64,
         seed: int | None = None,
     ) -> int:
         """Queue a request on the cooperative engine; returns its task id."""
@@ -2375,7 +2542,7 @@ class V2QwenRuntime:
         stops = (ctypes.c_uint32 * len(stop_tokens))(*stop_tokens) if stop_tokens else None
         task_id = ctypes.c_uint64()
         self.model._check(
-            self._lib.colibri_v2_qwen_task_submit_sampling(
+            self._lib.colibri_v2_qwen_task_submit_penalties(
                 self._handle,
                 values,
                 len(prompt_tokens),
@@ -2385,6 +2552,10 @@ class V2QwenRuntime:
                 temperature,
                 top_k,
                 top_p,
+                repetition_penalty,
+                presence_penalty,
+                frequency_penalty,
+                penalty_window,
                 0 if seed is None else seed & ((1 << 64) - 1),
                 int(seed is not None),
                 ctypes.byref(task_id),

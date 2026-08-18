@@ -1150,6 +1150,28 @@ COLIBRI_CPU_NATIVE_KERNEL("route_topk_rows", route_topk_rows);
 COLIBRI_CPU_NATIVE_KERNEL("qwen_shared_scale_rows", qwen_shared_scale_rows);
 COLIBRI_CPU_NATIVE_KERNEL("qwen_attention_query", qwen_attention_query);
 COLIBRI_CPU_NATIVE_KERNEL("qwen_attention_key", qwen_attention_key);
+// --- qwen_imatrix_accumulate ----------------------------------------------
+//
+// Corpus signature:
+//   void qwen_imatrix_accumulate(const float* input, float* sums, int width,
+//                               int rows)
+//
+// Column-major accumulation over a row-major batch, so the host version walks
+// rows outermost and lets the inner loop stream contiguously -- the transpose
+// of the GPU's mapping, and the reason this is not simply the same loop.
+void qwen_imatrix_accumulate(const Launch&, void** arguments) {
+    const float* input = *reinterpret_cast<const float**>(arguments[0]);
+    float* sums = *reinterpret_cast<float**>(arguments[1]);
+    const int width = *reinterpret_cast<const int*>(arguments[2]);
+    const int rows = *reinterpret_cast<const int*>(arguments[3]);
+    for (int row = 0; row < rows; ++row) {
+        const float* source = input + static_cast<std::int64_t>(row) * width;
+        for (int column = 0; column < width; ++column)
+            sums[column] += source[column] * source[column];
+    }
+}
+
+COLIBRI_CPU_NATIVE_KERNEL("qwen_imatrix_accumulate", qwen_imatrix_accumulate);
 COLIBRI_CPU_NATIVE_KERNEL("qwen_delta_recurrent_split", qwen_delta_recurrent_split);
 COLIBRI_CPU_NATIVE_KERNEL("qwen_delta_recurrent_chunk", qwen_delta_recurrent_chunk);
 COLIBRI_CPU_NATIVE_KERNEL("q8_swiglu_transposed_warp", q8_swiglu_transposed_warp);

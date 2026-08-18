@@ -357,31 +357,34 @@ class MuseStreamingEndpointTests(unittest.TestCase):
             if isinstance(event, dict) and event.get("choices")
         )
 
-    def test_by_default_reasoning_streams_live_as_content(self):
-        # This model cannot be told to stop reasoning, and the reasoning comes
-        # first. Withholding it would leave the stream silent until the answer
-        # began, so by default it flows as ordinary content -- minus the
-        # protocol framing, which is never content.
+    def test_reasoning_never_streams_as_the_answer(self):
+        # It used to, for liveness: this model cannot be told to stop reasoning
+        # and withholding it left the stream silent. But a model asked to DO
+        # something drafts it while thinking, and streaming that draft as
+        # content made a coding harness render a file instead of writing it.
+        # Notes are not the answer; liveness is the reasoning field's job.
         events = self._events("muse-glimmer")
         content = self._joined(events, "content")
-        self.assertIn("We need Paris.", content)
-        self.assertIn("The capital of France is Paris.", content)
-        self.assertNotIn("<|", content)
-        self.assertNotIn("to=self", content)
-        self.assertEqual(self._joined(events, "reasoning_content"), "")
+        reasoning = self._joined(events, "reasoning_content")
+        self.assertEqual(content.strip(), "The capital of France is Paris.")
+        self.assertIn("We need Paris.", reasoning)
+        self.assertNotIn("We need Paris", content)
+        self.assertNotIn("<|", content + reasoning)
+        self.assertNotIn("to=self", content + reasoning)
 
     def test_the_first_delta_arrives_before_the_answer(self):
         # The liveness property itself: something is emitted well before the
-        # reasoning ends, rather than one burst at the end.
+        # reasoning ends, rather than one burst at the end. It rides the
+        # reasoning field now, which is where a client should look for it.
         events = [
             event
             for event in self._events("muse-glimmer")
             if isinstance(event, dict)
             and event.get("choices")
-            and event["choices"][0]["delta"].get("content")
+            and event["choices"][0]["delta"].get("reasoning_content")
         ]
         self.assertGreater(len(events), 1)
-        first = events[0]["choices"][0]["delta"]["content"]
+        first = events[0]["choices"][0]["delta"]["reasoning_content"]
         self.assertTrue(first.strip())
         self.assertNotIn("Paris is", first)
 
@@ -418,8 +421,13 @@ class MuseStreamingEndpointTests(unittest.TestCase):
         for label, payload in (("plain", {}), ("tools", {"tools": tools})):
             with self.subTest(stream=label):
                 events = self._events("muse-glimmer", raw=truncated, **payload)
+                # The visible tail survives; the "t" before it was the
+                # reasoning channel, which is no longer content.
                 self.assertEqual(
-                    self._joined(events, "content").strip(), "tUse the tag <"
+                    self._joined(events, "content").strip(), "Use the tag <"
+                )
+                self.assertEqual(
+                    self._joined(events, "reasoning_content").strip(), "t"
                 )
 
     def test_other_architectures_stream_unchanged(self):

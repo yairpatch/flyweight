@@ -267,6 +267,30 @@ typedef struct ColibriV2QwenTaskEvent {
 
 typedef int (*ColibriV2TokenCallback)(uint32_t token, void* user_data);
 
+/* One quantization a safetensors checkpoint could be loaded as. `arena_bytes`
+   is what the load would produce, computed from the descriptors rather than
+   estimated, and `cache_bytes` is non-zero when that arena is already packed on
+   disk -- the difference between opening in a second and repacking the whole
+   checkpoint. */
+typedef struct ColibriV2HfQuantOption {
+    char name[8];
+    uint64_t arena_bytes;
+    uint64_t cache_bytes;
+    char cache_path[512];
+    /* Empty when the option can be loaded. Otherwise why not, and the sizes
+       above are zero: the routed-expert kernels decode fewer types than the
+       dense path does, so the smallest two are unavailable on an MoE
+       checkpoint. */
+    char unavailable[128];
+} ColibriV2HfQuantOption;
+
+/* Describe what `directory` could be loaded as, without loading it: shard
+   headers are parsed, no weight byte is read. Fails on anything that is not a
+   readable HF checkpoint this runtime understands, which a caller offering a
+   choice should treat as "do not offer one". */
+COLIBRI_V2_API int colibri_v2_hf_quant_options(const char* directory,
+    ColibriV2HfQuantOption* out, uint32_t capacity, uint32_t* count);
+
 COLIBRI_V2_API int colibri_v2_model_open(const char* path, ColibriV2Model** out);
 /* Replace only the embedded Qwen MTP block with tensors from a compatible
    MTP-only GGUF. The sidecar mapping is owned by `model` after attachment. */
@@ -515,6 +539,14 @@ COLIBRI_V2_API int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime* runtim
 COLIBRI_V2_API int colibri_v2_qwen_runtime_dump_kv(ColibriV2QwenRuntime* runtime, uint32_t layer_index, const char* path);
 COLIBRI_V2_API int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, uint64_t* task_id);
 COLIBRI_V2_API int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, uint64_t seed, uint32_t has_seed, uint64_t* task_id);
+/* As above, plus the repetition penalties. `repetition_penalty` scales a
+   recently generated token's logit toward zero (1 = off, [1, 2]);
+   `presence_penalty` and `frequency_penalty` subtract from it once per token
+   seen and once per occurrence ([0, 2]). `penalty_window` is how many of the
+   most recent generated tokens are considered -- the prompt is never
+   penalized. Without these a low-bit checkpoint can lock onto a line and
+   repeat it until the token budget runs out. */
+COLIBRI_V2_API int colibri_v2_qwen_task_submit_penalties(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, uint64_t* task_id);
 COLIBRI_V2_API int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime* runtime, ColibriV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 COLIBRI_V2_API int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime* runtime, uint64_t task_id);
 
