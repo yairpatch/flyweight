@@ -280,6 +280,19 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    colibri_tool_grammar_contract
+    tests/tool_grammar_contract.cpp
+)
+target_compile_features(colibri_tool_grammar_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_tool_grammar_contract PRIVATE include src)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_tool_grammar_contract
+        COMMAND colibri_tool_grammar_contract
+    )
+endif()
+
+add_executable(
     colibri_cpu_parity_contract
     tests/cpu_parity_contract.cpp
     src/cpu_backend.cpp
