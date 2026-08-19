@@ -497,6 +497,27 @@ struct ColibriV2QwenRuntime {
     std::uint64_t dense_host_bytes = 0;
     std::uint32_t host_ffn_layers = 0;
     std::uint64_t host_ffn_bytes = 0;
+    // Device staging for one spilled block's feed-forward triple. A spilled
+    // block computes on the host, which is right for a single token and ruinous
+    // for a batch: the CPU has to do rows x 3 x hidden x intermediate MACs that
+    // the GPU would do in a fraction of the time, and on the IQ formats it does
+    // them through a scalar decoder. Above a batch threshold the weights are
+    // streamed here instead and the ordinary device path runs on them.
+    std::uint64_t host_ffn_stage = 0;
+    std::uint64_t host_ffn_stage_bytes = 0;
+    // Spilled feed-forward weights re-encoded as Q8_0, keyed by tensor index.
+    // The host dot for a codebook format converts every weight to float through
+    // a grid lookup and a sign expansion -- about six vector ops per eight MACs,
+    // redone for each of the thousands of output rows, which lands at a couple
+    // of percent of FMA peak. Q8_0 has no codebook and no signs, so it reaches
+    // the existing SIMD row kernels and becomes bandwidth-bound instead. Costs
+    // host RAM (2.56 bpw -> 8.5), which is the resource that is spare precisely
+    // when weights are being spilled. The device keeps reading the original
+    // bytes: its codebook kernels are fast and the compact form is what makes
+    // the batch upload cheap.
+    std::unordered_map<std::uint64_t,std::vector<std::uint8_t>> host_ffn_q8;
+    std::uint64_t host_ffn_q8_bytes = 0;
+    std::uint32_t host_ffn_q8_type = 8;
     std::uint64_t dense_host_nanoseconds = 0;
     // Cacheable mirror of the pinned dense scratch; see qwen_cpu_dense_ffn.
     std::vector<float> dense_scratch;
@@ -1478,6 +1499,10 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     colibri_gpu_host_free(runtime.dense_host);
     runtime.dense_host = nullptr;
     runtime.dense_host_bytes = 0;
+    runtime.host_ffn_stage = 0;
+    runtime.host_ffn_stage_bytes = 0;
+    runtime.host_ffn_q8.clear();
+    runtime.host_ffn_q8_bytes = 0;
     if (runtime.embedding_event) colibri_gpu_event_destroy(runtime.embedding_event);
     colibri_gpu_host_free(runtime.embedding_host);
     colibri_gpu_free(runtime.turbo_kv_stage);
@@ -2374,6 +2399,8 @@ float qwen_bf16_value(std::uint16_t bits) {
 // Pack `count` f32 values (a multiple of 32) into Q8_0 blocks: one f16 scale
 // followed by 32 int8 codes. Matches qwen_q8_value and the q8 CUDA kernels.
 using qwen_kpack::pack_q8_0;
+using qwen_kpack::pack_q2_k;
+using qwen_kpack::pack_q3_k;
 
 // Q2_K and Q3_K element decoders are shared with the SIMD kernels and the
 // contract tests; see src/qwen_kquant.h for the block layouts.
@@ -2850,6 +2877,21 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
 // Host-side dense SwiGLU for a block whose feed-forward weights stayed in the
 // mapping instead of the GPU arena. Reads the quantized bytes directly, so it
 // costs no VRAM at all -- this is what lets a dense model exceed the card.
+// Weights for a spilled block's feed-forward as the host should read them:
+// the Q8_0 re-encoding when prepare made one, otherwise the checkpoint bytes.
+const std::uint8_t* qwen_host_ffn_weights(
+    const ColibriV2QwenRuntime& runtime, std::size_t index, std::uint32_t& type
+) {
+    const auto found = runtime.host_ffn_q8.find(index);
+    if (found != runtime.host_ffn_q8.end()) {
+        type = runtime.host_ffn_q8_type;
+        return found->second.data();
+    }
+    const auto& tensor = runtime.model->tensors[index];
+    type = tensor.type;
+    return tensor_data(*runtime.model, tensor);
+}
+
 void qwen_cpu_dense_ffn(
     ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     const float* input, float* output
@@ -2857,12 +2899,13 @@ void qwen_cpu_dense_ffn(
     const int hidden=runtime.model->config.hidden_size;
     const int intermediate=static_cast<int>(runtime.moe_intermediate);
     const std::size_t ffn_base=qwen_ffn_base(runtime,layer);
-    const auto&gate_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+1]];
-    const auto&up_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+2]];
-    const auto&down_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+3]];
-    const auto*gate_data=tensor_data(*runtime.model,gate_tensor);
-    const auto*up_data=tensor_data(*runtime.model,up_tensor);
-    const auto*down_data=tensor_data(*runtime.model,down_tensor);
+    std::uint32_t gate_type=0,up_type=0,down_type=0;
+    const auto*gate_data=qwen_host_ffn_weights(
+        runtime,layer.static_tensors[ffn_base+1],gate_type);
+    const auto*up_data=qwen_host_ffn_weights(
+        runtime,layer.static_tensors[ffn_base+2],up_type);
+    const auto*down_data=qwen_host_ffn_weights(
+        runtime,layer.static_tensors[ffn_base+3],down_type);
     // The pinned buffers the caller hands over are DMA staging, and every
     // output row re-reads the whole activation vector -- roughly 700 MiB of
     // re-reads per block. Doing that against page-locked memory costs ~5x, so
@@ -2873,13 +2916,13 @@ void qwen_cpu_dense_ffn(
     std::memcpy(local_input,input,static_cast<std::size_t>(hidden)*sizeof(float));
     #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
     for(int row=0;row<intermediate;++row){
-        const float gate=qwen_quant_dot(gate_data,gate_tensor.type,local_input,hidden,row);
-        const float up=qwen_quant_dot(up_data,up_tensor.type,local_input,hidden,row);
+        const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row);
+        const float up=qwen_quant_dot(up_data,up_type,local_input,hidden,row);
         activated[row]=gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))*up;
     }
     #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
     for(int row=0;row<hidden;++row)
-        output[row]=qwen_quant_dot(down_data,down_tensor.type,activated,intermediate,row);
+        output[row]=qwen_quant_dot(down_data,down_type,activated,intermediate,row);
 }
 
 void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
@@ -2907,12 +2950,13 @@ void qwen_cpu_dense_ffn_rows(
     const int hidden=runtime.model->config.hidden_size;
     const int intermediate=static_cast<int>(runtime.moe_intermediate);
     const std::size_t ffn_base=qwen_ffn_base(runtime,layer);
-    const auto&gate_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+1]];
-    const auto&up_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+2]];
-    const auto&down_tensor=runtime.model->tensors[layer.static_tensors[ffn_base+3]];
-    const auto*gate_data=tensor_data(*runtime.model,gate_tensor);
-    const auto*up_data=tensor_data(*runtime.model,up_tensor);
-    const auto*down_data=tensor_data(*runtime.model,down_tensor);
+    std::uint32_t gate_type=0,up_type=0,down_type=0;
+    const auto*gate_data=qwen_host_ffn_weights(
+        runtime,layer.static_tensors[ffn_base+1],gate_type);
+    const auto*up_data=qwen_host_ffn_weights(
+        runtime,layer.static_tensors[ffn_base+2],up_type);
+    const auto*down_data=qwen_host_ffn_weights(
+        runtime,layer.static_tensors[ffn_base+3],down_type);
     const std::size_t batch=static_cast<std::size_t>(rows);
 
     // Batching pays only where a weight row can be *decoded* quickly. The
@@ -2924,9 +2968,9 @@ void qwen_cpu_dense_ffn_rows(
     // dearer, so those formats keep the row-at-a-time path. Measured on a
     // 14-block spill at IQ3_XXS: 903 ms/token through the batched form against
     // 72 ms ordinary.
-    if(!qwen_simd_quant_type(gate_tensor.type)||
-       !qwen_simd_quant_type(up_tensor.type)||
-       !qwen_simd_quant_type(down_tensor.type)){
+    if(!qwen_simd_quant_type(gate_type)||
+       !qwen_simd_quant_type(up_type)||
+       !qwen_simd_quant_type(down_type)){
         for(std::size_t token=0;token<batch;++token)
             qwen_cpu_dense_ffn(runtime,layer,
                                input+token*hidden,output+token*hidden);
@@ -2979,11 +3023,11 @@ void qwen_cpu_dense_ffn_rows(
         std::vector<float> gate_dots(batch),up_dots(batch);
         #pragma omp for schedule(static)
         for(int row=0;row<intermediate;++row){
-            qwen_dequant_row(gate_data,gate_tensor.type,hidden,
+            qwen_dequant_row(gate_data,gate_type,hidden,
                              static_cast<std::uint64_t>(row),decoded.data());
             dot_multi(decoded.data(),input_rows.data(),
                       static_cast<int>(batch),hidden,gate_dots.data());
-            qwen_dequant_row(up_data,up_tensor.type,hidden,
+            qwen_dequant_row(up_data,up_type,hidden,
                              static_cast<std::uint64_t>(row),decoded.data());
             dot_multi(decoded.data(),input_rows.data(),
                       static_cast<int>(batch),hidden,up_dots.data());
@@ -3003,7 +3047,7 @@ void qwen_cpu_dense_ffn_rows(
         std::vector<float> dots(batch);
         #pragma omp for schedule(static)
         for(int row=0;row<hidden;++row){
-            qwen_dequant_row(down_data,down_tensor.type,intermediate,
+            qwen_dequant_row(down_data,down_type,intermediate,
                              static_cast<std::uint64_t>(row),decoded.data());
             dot_multi(decoded.data(),activated_rows.data(),
                       static_cast<int>(batch),intermediate,dots.data());
@@ -9693,14 +9737,19 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // Dense low-bit checkpoints need a much wider gate/up scratch than MoE,
     // and their quantized row kernels amortize weights in small token tiles.
     // A 1024-row allocation consumes ~633 MiB for Qwen3.6-27B and can evict
-    // several whole FFN blocks to the CPU. 64 rows preserves useful batching
-    // without making decode pay that residency penalty.
+    // several whole FFN blocks to the CPU, which decode pays for on every
+    // token. That is what held this at 64, but the residency penalty does not
+    // actually bite until well past it: the workspace grows ~0.7 MiB per row,
+    // and on a 12 GiB card measured decode 32.20 / 32.10 / 32.06 / 30.83 tok/s
+    // at 64 / 128 / 256 / 384 rows. Prefill over the same sweep went 337 / 353
+    // / 366 / 372. 256 is where the curves cross: +8.6% prefill for -0.4%
+    // decode, against 384's +10.4% for -4.3%.
     // Gemma 4 has no rows forward. Laguna does, but its leading dense block is
     // 12x the expert width, so the row scratch is far larger per token than a
     // pure-MoE Qwen checkpoint's; 256 keeps the batch worth batching without
     // sizing every scratch region for a 1024-row dense SwiGLU.
     // Muse Glimmer is dense, so it batches like the other dense checkpoints.
-    runtime->prefill_rows=gemma4?1:(laguna?256:(dense_ffn?64:1024));
+    runtime->prefill_rows=gemma4?1:(laguna?256:(dense_ffn?256:1024));
     if(const char*env=std::getenv("COLIBRI_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
@@ -10155,19 +10204,53 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             // and the snapshot pool land on the same budget, and stopping the
             // spill exactly at the limit leaves the allocation to fail by a
             // rounding error.
-            const std::uint64_t reserved=runtime->workspace_bytes
+            const std::uint64_t reserved_base=runtime->workspace_bytes
                 +std::max<std::uint32_t>(1u,runtime->parallel_sequences)*runtime->state_bytes
                 +runtime->expert_staging_bytes
                 +std::max<std::uint64_t>(1024ull*1024,budget/64);
+            // Room for the batch staging buffer, but only when something is
+            // going to spill -- a model that fits entirely never allocates it.
+            // Sized for the widest feed-forward triple, since one block is
+            // staged at a time.
+            std::uint64_t ffn_stage=0;
+            for(const auto&layer:runtime->layers){
+                if(!layer.dense_ffn)continue;
+                const std::size_t ffn_base=qwen_ffn_base(*runtime,layer);
+                std::uint64_t triple=0;
+                for(std::size_t role=1;role<=3;++role)
+                    triple+=device_align(runtime->model->tensors[
+                        layer.static_tensors[ffn_base+role]].size);
+                ffn_stage=std::max(ffn_stage,triple);
+            }
+            const bool will_spill=
+                resident>(budget>reserved_base?budget-reserved_base:0);
+            const std::uint64_t reserved=reserved_base+(will_spill?ffn_stage:0);
             const std::uint64_t weight_budget=budget>reserved?budget-reserved:0;
             // Mixed-quant checkpoints deliberately assign slower IQ formats
             // to important layers. Their CPU fallback is scalar today, while
             // Q2_K/Q3_K/Q5_K/Q6_K have AVX2/AVX-512 row kernels. Spill the
             // SIMD-capable blocks first instead of blindly taking the tail and
             // turning several IQ3_S/IQ4_XS layers into the decode bottleneck.
+            // Two overrides, both for measurement and for pinning residency on a
+            // card whose free VRAM moves under you (the auto budget probes it
+            // once at startup). COLIBRI_HOST_FFN_BLOCKS=N spills exactly N
+            // blocks regardless of budget -- the equivalent of llama.cpp's
+            // --n-cpu-ffn. COLIBRI_HOST_FFN_ORDER=naive takes them sequentially
+            // from block 0 with no quantization awareness, which is what that
+            // flag does, and exists so the ordering can be A/B'd against the
+            // default on the same runtime.
+            const char* forced_env=std::getenv("COLIBRI_HOST_FFN_BLOCKS");
+            const std::uint32_t forced_blocks=forced_env
+                ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10)):0;
+            const char* order_env=std::getenv("COLIBRI_HOST_FFN_ORDER");
+            const bool naive_order=order_env&&std::strcmp(order_env,"naive")==0;
+            auto want_more=[&]{
+                return forced_env?runtime->host_ffn_layers<forced_blocks
+                                 :resident>weight_budget;
+            };
             auto spill_pass=[&](bool simd_only){
                 for(auto layer=runtime->layers.rbegin();
-                    layer!=runtime->layers.rend()&&resident>weight_budget;++layer){
+                    layer!=runtime->layers.rend()&&want_more();++layer){
                     if(!layer->dense_ffn||layer->ffn_on_host)continue;
                     const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
                     bool all_simd=true;
@@ -10185,8 +10268,106 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     ++runtime->host_ffn_layers;
                 }
             };
-            spill_pass(true);
-            spill_pass(false);
+            auto spill_pass_naive=[&]{
+                for(auto layer=runtime->layers.begin();
+                    layer!=runtime->layers.end()&&want_more();++layer){
+                    if(!layer->dense_ffn||layer->ffn_on_host)continue;
+                    const std::size_t ffn_base=qwen_ffn_base(*runtime,*layer);
+                    std::uint64_t freed=0;
+                    for(std::size_t role=1;role<=3;++role)
+                        freed+=device_align(runtime->model->tensors[
+                            layer->static_tensors[ffn_base+role]].size);
+                    layer->ffn_on_host=true;
+                    resident-=freed;
+                    runtime->host_ffn_bytes+=freed;
+                    ++runtime->host_ffn_layers;
+                }
+            };
+            if(naive_order){
+                spill_pass_naive();
+            }else{
+                spill_pass(true);
+                spill_pass(false);
+            }
+            if(runtime->host_ffn_layers)runtime->host_ffn_stage_bytes=ffn_stage;
+            // Re-encode the spilled feed-forward as Q8_0 for the host dot; see
+            // host_ffn_q8. Bounded because the expansion is ~3.3x and a fully
+            // spilled 27B is ~17 GiB: COLIBRI_HOST_FFN_Q8_MIB caps it (0 turns
+            // the re-encoding off), and blocks past the cap keep the original
+            // format, which still works, just slower.
+            // Which format to re-encode into is a bandwidth question, not a
+            // speed-of-decode one. The host dot on IQ2_S runs at 2.2x its
+            // bandwidth roof, so a format only helps if it is SIMD-capable
+            // *and* no more than ~2.2x the size. Q8_0 is 3.3x and measured
+            // 17% slower than doing nothing -- it is bandwidth-bound at
+            // 89 ms/token where the codebook path was compute-bound at 60.
+            // Q2_K is 1.02x, Q3_K 1.34x, and both have AVX-512 row kernels.
+            std::uint32_t q8_format=11;  // Q3_K
+            if(const char*env=std::getenv("COLIBRI_HOST_FFN_FORMAT")){
+                if(std::strcmp(env,"q2_k")==0)q8_format=10;
+                else if(std::strcmp(env,"q3_k")==0)q8_format=11;
+                else if(std::strcmp(env,"q8_0")==0)q8_format=8;
+                else if(std::strcmp(env,"off")==0)q8_format=0;
+            }
+            std::uint64_t q8_budget=8192ull*1024*1024;
+            if(const char*env=std::getenv("COLIBRI_HOST_FFN_Q8_MIB"))
+                q8_budget=std::strtoull(env,nullptr,10)*1024ull*1024;
+            if(!q8_format)q8_budget=0;
+            if(runtime->host_ffn_layers&&q8_budget){
+                const auto started=std::chrono::steady_clock::now();
+                for(auto&layer:runtime->layers){
+                    if(!layer.ffn_on_host||!layer.dense_ffn)continue;
+                    const std::size_t ffn_base=qwen_ffn_base(*runtime,layer);
+                    for(std::size_t role=1;role<=3;++role){
+                        const auto index=layer.static_tensors[ffn_base+role];
+                        const auto&tensor=runtime->model->tensors[index];
+                        if(qwen_simd_quant_type(tensor.type))continue;
+                        std::uint64_t elements=1;
+                        for(auto dimension:tensor.shape)elements*=dimension;
+                        const std::uint64_t columns=tensor.shape[0];
+                        const std::uint64_t rows_out=elements/std::max<std::uint64_t>(columns,1);
+                        const std::uint64_t grain=q8_format==8?32:256;
+                        if(!columns||columns%grain||!rows_out)continue;
+                        const std::uint64_t row_bytes=q8_format==8
+                            ?(columns/32)*kQ8BlockSize
+                            :(columns/256)*(q8_format==10?kQ2KBlockSize:kQ3KBlockSize);
+                        const std::uint64_t total=row_bytes*rows_out;
+                        if(runtime->host_ffn_q8_bytes+total>q8_budget)continue;
+                        std::vector<std::uint8_t> packed(total);
+                        std::atomic<bool> failed{false};
+                        #pragma omp parallel for schedule(static) \
+                            num_threads(qwen_cpu_thread_count(*runtime))
+                        for(std::int64_t row=0;row<static_cast<std::int64_t>(rows_out);++row){
+                            if(failed.load(std::memory_order_relaxed))continue;
+                            std::vector<float> scratch(columns);
+                            try{
+                                qwen_dequant_row(tensor_data(*runtime->model,tensor),
+                                                 tensor.type,static_cast<int>(columns),
+                                                 static_cast<std::uint64_t>(row),scratch.data());
+                                auto*dst=packed.data()+static_cast<std::uint64_t>(row)*row_bytes;
+                                if(q8_format==8)pack_q8_0(scratch.data(),columns,dst);
+                                else if(q8_format==10)pack_q2_k(scratch.data(),columns,dst);
+                                else pack_q3_k(scratch.data(),columns,dst);
+                            }catch(...){failed.store(true,std::memory_order_relaxed);}
+                        }
+                        if(failed.load())continue;
+                        runtime->host_ffn_q8_bytes+=total;
+                        runtime->host_ffn_q8_type=q8_format;
+                        runtime->host_ffn_q8.emplace(index,std::move(packed));
+                    }
+                }
+                if(runtime->host_ffn_q8_bytes){
+                    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now()-started).count();
+                    std::fprintf(stderr,
+                        "[colibri-v2] spilled feed-forward re-encoded to %s for the host: "
+                        "%zu tensors, %llu MiB of RAM, %lld ms\n",
+                        q8_format==8?"Q8_0":(q8_format==10?"Q2_K":"Q3_K"),
+                        runtime->host_ffn_q8.size(),
+                        static_cast<unsigned long long>(runtime->host_ffn_q8_bytes/(1024ull*1024)),
+                        static_cast<long long>(elapsed));
+                }
+            }
             if(runtime->host_ffn_layers)
                 std::fprintf(stderr,
                     "[colibri-v2] dense feed-forward: %u of %zu blocks on CPU (%llu MiB spilled)\n",
@@ -10451,7 +10632,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(colibri_gpu_event_create(&event)!=0)throw std::runtime_error("failed to create native Qwen slot events");
         if(colibri_gpu_event_create(&runtime->staging_event)!=0)throw std::runtime_error("failed to create native Qwen staging event");
         if(colibri_gpu_event_create(&runtime->prefetch_event)!=0){colibri_gpu_event_destroy(runtime->staging_event);throw std::runtime_error("failed to create native Qwen prefetch event");}
-        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
+        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes;
         const char* nvfp4_persistent_env =
             std::getenv("COLIBRI_NVFP4_PERSISTENT");
         const bool persistent_nvfp4_eligible=
@@ -10648,6 +10829,15 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 2ull*staged_rows*runtime->model->config.hidden_size*sizeof(float));
             if(colibri_gpu_host_alloc(runtime->dense_host_bytes,&runtime->dense_host)!=0)
                 throw std::runtime_error("failed to allocate native Qwen dense host scratch");
+            // Device side of the batch path: one block's feed-forward triple,
+            // uploaded per block per chunk and consumed by the ordinary device
+            // kernels. Reused across blocks, which is safe because the upload
+            // and the kernels that read it are ordered on the one stream.
+            if(runtime->host_ffn_stage_bytes&&
+               colibri_gpu_alloc(runtime->host_ffn_stage_bytes,
+                                 &runtime->host_ffn_stage)!=0)
+                throw std::runtime_error(
+                    "failed to allocate native Qwen host feed-forward staging");
         }
         for(auto&seq:runtime->sequences)if(colibri_gpu_alloc(runtime->state_bytes,&seq.state)!=0)throw std::runtime_error("failed to allocate native Qwen sequence state");
         runtime->state=runtime->sequences[0].state;
@@ -14091,6 +14281,7 @@ static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prom
             if(target>index&&target-index<rows)rows=target-index;
         }
         qwen_prefill_rows(*runtime,prompt+index,static_cast<int>(rows));
+        if(std::getenv("COLIBRI_PREFILL_LAUNCHES"))qwen_prefill_launch_report();
         index+=rows;
         qwen_prompt_checkpoints(runtime,prompt,plan);
         if(index+3<=prompt_count&&!runtime->cancelled)return 0; // more chunks pending

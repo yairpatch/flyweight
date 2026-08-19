@@ -2060,10 +2060,11 @@ R"COLIBRI_CUDA(
 // than sixty-four. The register cliff disappears and the occupancy that hides
 // the latency comes back with it.
 //
-// Shape: a warp owns 16 output rows x 8 tokens (one m16n8k16 fragment). Eight
-// warps tile that 2 deep in rows and 4 wide in tokens, so a block covers 32
-// rows x 32 tokens. K advances COLIBRI_MMQ_GROUPS super-block groups at a
-// time, staged through shared memory.
+// Shape: a warp owns a COLIBRI_MMQ_ROW_FRAGS x COLIBRI_MMQ_TOKEN_FRAGS grid of
+// m16n8k16 fragments -- 4 x 4 here, so 64 rows x 32 tokens per warp. Eight
+// warps tile that 2 deep in rows and 4 wide in tokens, so a block covers
+// 128 rows x 128 tokens with 256 threads. K advances COLIBRI_MMQ_GROUPS
+// super-block groups at a time, staged through shared memory.
 //
 // Two things fall out of the format rather than being designed: the decoder
 // already packs words[k] as elements 4k..4k+3, which is exactly A's four
@@ -2072,17 +2073,72 @@ R"COLIBRI_CUDA(
 // where IQ2_S's scale_low/scale_high divide, so the halves stay separable.
 //
 // No cross-lane reduction at the end: the MMA already summed over K within the
-// warp, so each thread's four accumulators are finished values.
-// Warps split the block tile; a warp always owns one 16x8 fragment. Tokens per
-// launch is the lever that matters most here: every weight is decoded once per
-// launch regardless of tiling, so the decode -- which dominates, being ~8
-// dependent codebook loads per group -- is amortized over exactly this many
-// tokens. The host chunks to COLIBRI_MMQ_TOKENS and must match it.
-#define COLIBRI_MMQ_ROW_WARPS 1
-#define COLIBRI_MMQ_TOKEN_WARPS 8
-#define COLIBRI_MMQ_ROWS (COLIBRI_MMQ_ROW_WARPS * 16)
-#define COLIBRI_MMQ_TOKENS (COLIBRI_MMQ_TOKEN_WARPS * 8)
-#define COLIBRI_MMQ_GROUPS 8
+// warp, so each thread's accumulators are finished values.
+//
+// What the shape is tuned against, measured by ablation on a 27B IQ2_S
+// checkpoint (each figure is the kernel with that part removed):
+//
+//     scaling epilogue   +18%      <- largest single cost
+//     codebook decode    +19%
+//     activation reads    +4%
+//     tensor-core MMA     +3%      <- arithmetic was never the problem
+//
+// So the kernel is bound by shared-memory traffic around the MMA, not by the
+// MMA or by DRAM. Two things follow, and both are why a warp owns a *grid* of
+// fragments rather than one:
+//
+//   - Reuse. A weight fragment and its two scales are loaded once and reused
+//     across TOKEN_FRAGS MMAs; an activation fragment and its two scales once
+//     across ROW_FRAGS. Per group per thread that is 4*TOKEN_FRAGS +
+//     8*ROW_FRAGS shared loads for 2*ROW_FRAGS*TOKEN_FRAGS MMAs: 6 per MMA at
+//     1x1, 3 at 2x2. Measured, at a fixed 64x64 tile: 1x1 403 tok/s (1024
+//     threads), 2x1 441, 1x2 469, 2x2 515, 4x2 472, 4x4 291 -- it tracks the
+//     load count down to 256 threads, then falls off as blocks get too small
+//     to hide latency.
+//   - Tile size. At one fragment per warp the tile *was* the thread count, and
+//     128 rows would have needed 2048 threads. Decoupled, 128x128 fits in 256
+//     threads and beat 64x64 by 6.1% (3/3 paired runs) because it quarters the
+//     activation re-read, which is (output_size/ROWS) x TOKENS x K.
+//
+// GROUPS is the K depth staged per iteration and is also the block's decode
+// parallelism -- the staging loops run over ROWS*GROUPS and TOKENS*GROUPS. It
+// is what pays for the bigger tile here: at GROUPS 4 the 128x128 tile needs
+// 42 KB, under the 48 KB a kernel gets without opting in, and 512 decode items
+// still cover 256 threads twice over. (Cutting GROUPS to 4 at the old 16-row
+// tile was a loss for the opposite reason: 64 items over 512 threads.)
+//
+// Two things that did *not* work, so they are not retried:
+//
+//   - Pipelining the K loop. Prefetching the next step into registers so its
+//     global loads overlap this step's MMAs measured 10% *slower* (3/3 paired),
+//     and prefetching only the weights was a wash (0.993). acc[4][4][4] is
+//     already 64 registers and the 42 KB tile caps occupancy at 2 blocks/SM;
+//     the GPU has enough resident warps to hide the decode without help, and
+//     the prefetch buffer costs more than the latency it hides.
+//   - Raising the >48 KB shared cap (cuFuncSetAttribute + dynamic shared). It
+//     works, but the tiles that win fit statically and it measured a wash.
+//
+#define COLIBRI_MMQ_ROW_WARPS 2
+#define COLIBRI_MMQ_ROW_FRAGS 4
+#define COLIBRI_MMQ_TOKEN_WARPS 4
+#define COLIBRI_MMQ_TOKEN_FRAGS 4
+// The _MIN variant stages four more arrays (the two sub-block minimum offsets
+// and the two activation sums), which at 64 rows would want 50 KB -- past the
+// 48 KB a kernel gets without opting in. It keeps the old 32-row tile, at
+// 37 KB. The host dispatches rows and threads per family; see kQ8MmqMinRows.
+// The _MIN variant still runs one fragment per warp and so keeps its own,
+// smaller tile: the plain kernel's 128x128 would need 1024 threads here and
+// 50 KB of shared for the four extra staged arrays. 32x64 needs 18.5 KB and
+// 512 threads. The host chunks tokens per family -- see kQ8MmqMinTokens.
+#define COLIBRI_MMQ_MIN_TOKEN_WARPS 8
+#define COLIBRI_MMQ_MIN_TOKENS (COLIBRI_MMQ_MIN_TOKEN_WARPS * 8)
+#define COLIBRI_MMQ_MIN_ROW_WARPS 2
+#define COLIBRI_MMQ_MIN_ROWS (COLIBRI_MMQ_MIN_ROW_WARPS * 16)
+#define COLIBRI_MMQ_ROWS \
+    (COLIBRI_MMQ_ROW_WARPS * COLIBRI_MMQ_ROW_FRAGS * 16)
+#define COLIBRI_MMQ_TOKENS \
+    (COLIBRI_MMQ_TOKEN_WARPS * COLIBRI_MMQ_TOKEN_FRAGS * 8)
+#define COLIBRI_MMQ_GROUPS 4
 
 #define COLIBRI_Q8_MMQ(name, decode_fn, stride)                                \
 extern "C" __global__ void name(                                               \
@@ -2104,11 +2160,19 @@ extern "C" __global__ void name(                                               \
     __shared__ float a_scale[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS];          \
     const int lane = threadIdx.x & 31;                                         \
     const int warp = threadIdx.x >> 5;                                         \
-    const int warp_row = (warp / COLIBRI_MMQ_TOKEN_WARPS) * 16;                \
-    const int warp_token = (warp % COLIBRI_MMQ_TOKEN_WARPS) * 8;               \
-    const int quad = lane >> 2;                                                \
-    const int slot = lane & 3;                                                 \
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};                                   \
+    const int warp_row =                                                  \
+        (warp / COLIBRI_MMQ_TOKEN_WARPS) * (COLIBRI_MMQ_ROW_FRAGS * 16);  \
+    const int warp_token =                                                \
+        (warp % COLIBRI_MMQ_TOKEN_WARPS) * (COLIBRI_MMQ_TOKEN_FRAGS * 8); \
+    const int quad = lane >> 2;                                           \
+    const int slot = lane & 3;                                            \
+    float acc[COLIBRI_MMQ_ROW_FRAGS][COLIBRI_MMQ_TOKEN_FRAGS][4];         \
+    _Pragma("unroll")                                                     \
+    for (int rf = 0; rf < COLIBRI_MMQ_ROW_FRAGS; ++rf)                    \
+        _Pragma("unroll")                                                 \
+        for (int tf = 0; tf < COLIBRI_MMQ_TOKEN_FRAGS; ++tf)              \
+            _Pragma("unroll")                                             \
+            for (int i = 0; i < 4; ++i) acc[rf][tf][i] = 0.0f;            \
     for (int base = 0; base < groups_per_row; base += COLIBRI_MMQ_GROUPS) {    \
         __syncthreads();                                                       \
         for (int i = threadIdx.x;                                              \
@@ -2149,36 +2213,67 @@ extern "C" __global__ void name(                                               \
             }                                                                  \
         }                                                                      \
         __syncthreads();                                                       \
-        _Pragma("unroll")                                                      \
-        for (int g = 0; g < COLIBRI_MMQ_GROUPS; ++g) {                         \
-            int fragment[2];                                                   \
-            int low_dot[4] = {0, 0, 0, 0};                                     \
-            int high_dot[4] = {0, 0, 0, 0};                                    \
-            fragment[0] = w_words[warp_row + quad][g][slot];                   \
-            fragment[1] = w_words[warp_row + quad + 8][g][slot];               \
-            mma_m16n8k16_s8(                                                   \
-                low_dot, fragment, a_words[warp_token + quad][g][slot]);       \
-            fragment[0] = w_words[warp_row + quad][g][4 + slot];               \
-            fragment[1] = w_words[warp_row + quad + 8][g][4 + slot];           \
-            mma_m16n8k16_s8(                                                   \
-                high_dot, fragment, a_words[warp_token + quad][g][4 + slot]);  \
-            _Pragma("unroll")                                                  \
-            for (int item = 0; item < 4; ++item) {                             \
-                const int r = warp_row + ((item < 2) ? quad : quad + 8);       \
-                const int t = warp_token + slot * 2 + (item & 1);              \
-                acc[item] += ((float)low_dot[item] * w_low[r][g]               \
-                              + (float)high_dot[item] * w_high[r][g])          \
-                    * a_scale[t][g];                                           \
-            }                                                                  \
-        }                                                                      \
+        _Pragma("unroll")                                                 \
+        for (int g = 0; g < COLIBRI_MMQ_GROUPS; ++g) {                    \
+            /* Activation fragment and its two output-column scales, out */\
+            /* of the row loop: every row fragment reuses them.          */\
+            int a_low[COLIBRI_MMQ_TOKEN_FRAGS];                           \
+            int a_high[COLIBRI_MMQ_TOKEN_FRAGS];                          \
+            float a_s0[COLIBRI_MMQ_TOKEN_FRAGS];                          \
+            float a_s1[COLIBRI_MMQ_TOKEN_FRAGS];                          \
+            _Pragma("unroll")                                             \
+            for (int tf = 0; tf < COLIBRI_MMQ_TOKEN_FRAGS; ++tf) {        \
+                const int tb = warp_token + tf * 8;                       \
+                a_low[tf] = a_words[tb + quad][g][slot];                  \
+                a_high[tf] = a_words[tb + quad][g][4 + slot];             \
+                a_s0[tf] = a_scale[tb + slot * 2][g];                     \
+                a_s1[tf] = a_scale[tb + slot * 2 + 1][g];                 \
+            }                                                             \
+            _Pragma("unroll")                                             \
+            for (int rf = 0; rf < COLIBRI_MMQ_ROW_FRAGS; ++rf) {          \
+                const int rb = warp_row + rf * 16;                        \
+                /* Weight fragment and its two output-row scales, loaded */\
+                /* once and reused across every token fragment.          */\
+                int frag_low[2], frag_high[2];                            \
+                frag_low[0] = w_words[rb + quad][g][slot];                \
+                frag_low[1] = w_words[rb + quad + 8][g][slot];            \
+                frag_high[0] = w_words[rb + quad][g][4 + slot];           \
+                frag_high[1] = w_words[rb + quad + 8][g][4 + slot];       \
+                const float wl0 = w_low[rb + quad][g];                    \
+                const float wl1 = w_low[rb + quad + 8][g];                \
+                const float wh0 = w_high[rb + quad][g];                   \
+                const float wh1 = w_high[rb + quad + 8][g];               \
+                _Pragma("unroll")                                         \
+                for (int tf = 0; tf < COLIBRI_MMQ_TOKEN_FRAGS; ++tf) {    \
+                    int low_dot[4] = {0, 0, 0, 0};                        \
+                    int high_dot[4] = {0, 0, 0, 0};                       \
+                    mma_m16n8k16_s8(low_dot, frag_low, a_low[tf]);        \
+                    mma_m16n8k16_s8(high_dot, frag_high, a_high[tf]);     \
+                    _Pragma("unroll")                                     \
+                    for (int item = 0; item < 4; ++item) {                \
+                        const float wl = (item < 2) ? wl0 : wl1;          \
+                        const float wh = (item < 2) ? wh0 : wh1;          \
+                        const float as = (item & 1) ? a_s1[tf] : a_s0[tf];\
+                        acc[rf][tf][item] += ((float)low_dot[item] * wl   \
+                            + (float)high_dot[item] * wh) * as;           \
+                    }                                                     \
+                }                                                         \
+            }                                                             \
+        }                                                                 \
     }                                                                          \
-    _Pragma("unroll")                                                          \
-    for (int item = 0; item < 4; ++item) {                                     \
-        const int r = row_base + warp_row + ((item < 2) ? quad : quad + 8);    \
-        const int t = warp_token + slot * 2 + (item & 1);                      \
-        if (r < output_size && t < rows)                                       \
-            outputs[(long long)t * output_size + r] = acc[item];               \
-    }                                                                          \
+    _Pragma("unroll")                                                     \
+    for (int rf = 0; rf < COLIBRI_MMQ_ROW_FRAGS; ++rf)                    \
+        _Pragma("unroll")                                                 \
+        for (int tf = 0; tf < COLIBRI_MMQ_TOKEN_FRAGS; ++tf)              \
+            _Pragma("unroll")                                             \
+            for (int item = 0; item < 4; ++item) {                        \
+                const int r = row_base + warp_row + rf * 16               \
+                    + ((item < 2) ? quad : quad + 8);                     \
+                const int t = warp_token + tf * 8 + slot * 2 + (item & 1);\
+                if (r < output_size && t < rows)                          \
+                    outputs[(long long)t * output_size + r] =             \
+                        acc[rf][tf][item];                                \
+            }                                                             \
 }
 
 )COLIBRI_CUDA"
@@ -2198,30 +2293,30 @@ extern "C" __global__ void name(                                               \
     const int input_size, const int output_size,                               \
     const int rows, const int scale_stride                                     \
 ) {                                                                            \
-    const int row_base = blockIdx.x * COLIBRI_MMQ_ROWS;                        \
+    const int row_base = blockIdx.x * COLIBRI_MMQ_MIN_ROWS;                        \
     if (row_base >= output_size) return;                                       \
     const int blocks_per_row = input_size >> 8;                                \
     const int groups_per_row = blocks_per_row << 3;                            \
-    __shared__ int w_words[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS][9];           \
-    __shared__ float w_low[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];              \
-    __shared__ float w_high[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];             \
-    __shared__ float w_off_low[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];          \
-    __shared__ float w_off_high[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];         \
-    __shared__ int a_words[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS][9];         \
-    __shared__ float a_scale[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS];          \
-    __shared__ float a_sum_low[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS];        \
-    __shared__ float a_sum_high[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS];       \
+    __shared__ int w_words[COLIBRI_MMQ_MIN_ROWS][COLIBRI_MMQ_GROUPS][9];           \
+    __shared__ float w_low[COLIBRI_MMQ_MIN_ROWS][COLIBRI_MMQ_GROUPS];              \
+    __shared__ float w_high[COLIBRI_MMQ_MIN_ROWS][COLIBRI_MMQ_GROUPS];             \
+    __shared__ float w_off_low[COLIBRI_MMQ_MIN_ROWS][COLIBRI_MMQ_GROUPS];          \
+    __shared__ float w_off_high[COLIBRI_MMQ_MIN_ROWS][COLIBRI_MMQ_GROUPS];         \
+    __shared__ int a_words[COLIBRI_MMQ_MIN_TOKENS][COLIBRI_MMQ_GROUPS][9];         \
+    __shared__ float a_scale[COLIBRI_MMQ_MIN_TOKENS][COLIBRI_MMQ_GROUPS];          \
+    __shared__ float a_sum_low[COLIBRI_MMQ_MIN_TOKENS][COLIBRI_MMQ_GROUPS];        \
+    __shared__ float a_sum_high[COLIBRI_MMQ_MIN_TOKENS][COLIBRI_MMQ_GROUPS];       \
     const int lane = threadIdx.x & 31;                                         \
     const int warp = threadIdx.x >> 5;                                         \
-    const int warp_row = (warp / COLIBRI_MMQ_TOKEN_WARPS) * 16;                \
-    const int warp_token = (warp % COLIBRI_MMQ_TOKEN_WARPS) * 8;               \
+    const int warp_row = (warp / COLIBRI_MMQ_MIN_TOKEN_WARPS) * 16;                \
+    const int warp_token = (warp % COLIBRI_MMQ_MIN_TOKEN_WARPS) * 8;               \
     const int quad = lane >> 2;                                                \
     const int slot = lane & 3;                                                 \
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};                                   \
     for (int base = 0; base < groups_per_row; base += COLIBRI_MMQ_GROUPS) {    \
         __syncthreads();                                                       \
         for (int i = threadIdx.x;                                              \
-             i < COLIBRI_MMQ_ROWS * COLIBRI_MMQ_GROUPS; i += blockDim.x) {     \
+             i < COLIBRI_MMQ_MIN_ROWS * COLIBRI_MMQ_GROUPS; i += blockDim.x) {     \
             const int r = i / COLIBRI_MMQ_GROUPS;                              \
             const int g = i - r * COLIBRI_MMQ_GROUPS;                          \
             float low = 0.0f, high = 0.0f, off_low = 0.0f, off_high = 0.0f;    \
@@ -2240,7 +2335,7 @@ extern "C" __global__ void name(                                               \
             w_off_high[r][g] = off_high;                                       \
         }                                                                      \
         for (int i = threadIdx.x;                                              \
-             i < COLIBRI_MMQ_TOKENS * COLIBRI_MMQ_GROUPS; i += blockDim.x) {   \
+             i < COLIBRI_MMQ_MIN_TOKENS * COLIBRI_MMQ_GROUPS; i += blockDim.x) {   \
             const int t = i / COLIBRI_MMQ_GROUPS;                              \
             const int g = i - t * COLIBRI_MMQ_GROUPS;                          \
             if (t < rows && base + g < groups_per_row) {                       \

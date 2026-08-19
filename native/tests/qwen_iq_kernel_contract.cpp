@@ -372,8 +372,16 @@ void fill_blocks_scaled(std::mt19937& rng, std::vector<std::uint8_t>& packed,
         std::memcpy(packed.data() + base, &kOne, 2);
 }
 
+// `threads` is the kernel's block size, and it has to be passed in rather than
+// assumed: the tiled and MMQ kernels have different block shapes, and until the
+// MMQ tile went from 16x64 to 32x64 they happened to agree at 256. They no
+// longer do, and an undersized launch does not fail loudly -- the warps that
+// own the upper rows simply never run, and the check reports a plausible-
+// looking ~0.2 error. Must track COLIBRI_Q8_TILE_* / COLIBRI_MMQ_* in
+// native/include/colibri_v2_qwen_kernels.hpp, like kQ8Tile*/kQ8Mmq* on the host.
 int check_tiled(const char* kernel, std::size_t block_bytes,
-                float (*value_at)(const std::uint8_t*, std::uint64_t)) {
+                float (*value_at)(const std::uint8_t*, std::uint64_t),
+                std::uint32_t threads) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
     // {input_size, output_size, tokens}. rows must stay <=
@@ -409,8 +417,8 @@ int check_tiled(const char* kernel, std::size_t block_bytes,
         // row, so output_size blocks covers any tile height without this test
         // having to track the macro.
         colibri_cpu_launch_named(kernel,
-                                 static_cast<std::uint32_t>(output_size), 1, 256,
-                                 0, 0, arguments);
+                                 static_cast<std::uint32_t>(output_size), 1,
+                                 threads, 0, 0, arguments);
 
         const std::size_t blocks = static_cast<std::size_t>(input_size) / 256;
         for (int token = 0; token < rows; ++token) {
@@ -449,6 +457,9 @@ int check_tiled(const char* kernel, std::size_t block_bytes,
 int main() {
     std::printf("IQ kernel contract (corpus CUDA vs CPU reference)\n");
     int failures = 0;
+    // Block sizes of the two tile shapes; see check_tiled.
+    const std::uint32_t kTiledThreads = 256;   // COLIBRI_Q8_TILE_WARPS * 32
+    const std::uint32_t kMmqThreads = 256;     // ROW_WARPS * TOKEN_WARPS * 32
     // One warp per row, eight rows per block.
     failures += check("iq1m_matvec_transposed_warp", true, 256);
     // One block per row, reduced across the block.
@@ -457,20 +468,25 @@ int main() {
     failures += check_iq4xs_q8();
     failures += check_iq4xs_q8_rows();
     failures += check_tiled("iq2s_q8_matmul_tiled", kIq2sBlockBytes,
-                            qwen_iq2s_value);
-    failures += check_tiled("iq2s_q8_mmq", kIq2sBlockBytes, qwen_iq2s_value);
-    failures += check_tiled("iq2xxs_q8_mmq", kIq2xxsBlockBytes, qwen_iq2xxs_value);
-    failures += check_tiled("iq3xxs_q8_mmq", kIq3xxsBlockBytes, qwen_iq3xxs_value);
-    failures += check_tiled("iq2xs_q8_mmq", kIq2xsBlockBytes, qwen_iq2xs_value);
-    failures += check_tiled("iq4xs_q8_mmq", kIq4xsBlockBytes, qwen_iq4xs_value);
+                            qwen_iq2s_value, kTiledThreads);
+    failures += check_tiled("iq2s_q8_mmq", kIq2sBlockBytes, qwen_iq2s_value,
+                            kMmqThreads);
+    failures += check_tiled("iq2xxs_q8_mmq", kIq2xxsBlockBytes, qwen_iq2xxs_value,
+                            kMmqThreads);
+    failures += check_tiled("iq3xxs_q8_mmq", kIq3xxsBlockBytes, qwen_iq3xxs_value,
+                            kMmqThreads);
+    failures += check_tiled("iq2xs_q8_mmq", kIq2xsBlockBytes, qwen_iq2xs_value,
+                            kMmqThreads);
+    failures += check_tiled("iq4xs_q8_mmq", kIq4xsBlockBytes, qwen_iq4xs_value,
+                            kMmqThreads);
     failures += check_tiled("iq2xxs_q8_matmul_tiled", kIq2xxsBlockBytes,
-                            qwen_iq2xxs_value);
+                            qwen_iq2xxs_value, kTiledThreads);
     failures += check_tiled("iq3xxs_q8_matmul_tiled", kIq3xxsBlockBytes,
-                            qwen_iq3xxs_value);
+                            qwen_iq3xxs_value, kTiledThreads);
     failures += check_tiled("iq2xs_q8_matmul_tiled", kIq2xsBlockBytes,
-                            qwen_iq2xs_value);
+                            qwen_iq2xs_value, kTiledThreads);
     failures += check_tiled("iq4xs_q8_matmul_tiled", kIq4xsBlockBytes,
-                            qwen_iq4xs_value);
+                            qwen_iq4xs_value, kTiledThreads);
     std::printf(failures ? "FAILED (%d failures)\n" : "PASSED (%d failures)\n",
                 failures);
     return failures ? 1 : 0;

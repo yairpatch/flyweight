@@ -23,10 +23,67 @@ static constexpr int kQ8TileRows=16;
 
 // The tensor-core matmul's block tile. Must match COLIBRI_MMQ_ROWS and
 // COLIBRI_MMQ_TOKENS in native/include/colibri_v2_qwen_kernels.hpp.
-static constexpr int kQ8MmqRows=16;
-static constexpr int kQ8MmqTokens=64;
-// Threads per block: one warp per 16x8 fragment of the block tile.
-static constexpr int kQ8MmqThreads=(kQ8MmqRows/16)*(kQ8MmqTokens/8)*32;
+static constexpr int kQ8MmqRows=128;
+static constexpr int kQ8MmqTokens=128;
+// The asymmetric K-quants (Q2_K/Q4_K/Q5_K) run the _MIN variant, which stages
+// four more arrays and so cannot afford 64 rows in shared memory. Must match
+// COLIBRI_MMQ_MIN_ROWS.
+static constexpr int kQ8MmqMinRows=32;
+// Must match COLIBRI_MMQ_MIN_TOKENS.
+static constexpr int kQ8MmqMinTokens=64;
+// Fragments per warp. A warp covers kQ8MmqRowFrags*16 rows by
+// kQ8MmqTokenFrags*8 tokens, so the block tile no longer dictates the thread
+// count. Must match COLIBRI_MMQ_ROW_FRAGS / COLIBRI_MMQ_TOKEN_FRAGS.
+static constexpr int kQ8MmqRowFrags=4;
+static constexpr int kQ8MmqTokenFrags=4;
+// Threads per block: one warp per fragment *grid*.
+static constexpr int kQ8MmqThreads=
+    (kQ8MmqRows/16/kQ8MmqRowFrags)*(kQ8MmqTokens/8/kQ8MmqTokenFrags)*32;
+// The _MIN variant still runs one fragment per warp.
+static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
+
+// Launch tally for COLIBRI_PREFILL_LAUNCHES; see the `launch` lambda below.
+struct QwenLaunchStat { std::uint64_t calls=0, blocks=0; };
+inline std::map<std::string,QwenLaunchStat>& qwen_launch_stats(){
+    static std::map<std::string,QwenLaunchStat> stats; return stats;
+}
+inline void qwen_note_launch(const char* name,std::uint32_t gx,std::uint32_t gy){
+    auto& e=qwen_launch_stats()[name];
+    ++e.calls; e.blocks+=static_cast<std::uint64_t>(gx)*gy;
+}
+inline void qwen_prefill_launch_report(){
+    auto& stats=qwen_launch_stats();
+    if(stats.empty())return;
+    std::uint64_t total=0;
+    for(const auto& kv:stats)total+=kv.second.calls;
+    std::vector<std::pair<std::string,QwenLaunchStat>> ordered(stats.begin(),stats.end());
+    std::sort(ordered.begin(),ordered.end(),[](const auto&a,const auto&b){
+        return a.second.calls>b.second.calls;});
+    std::fprintf(stderr,"[launches] %llu total\n",
+                 static_cast<unsigned long long>(total));
+    for(const auto& kv:ordered)
+        std::fprintf(stderr,"[launches] %-34s %8llu calls %5.1f%%  %10llu blocks  %6.1f blocks/call\n",
+            kv.first.c_str(),static_cast<unsigned long long>(kv.second.calls),
+            100.0*kv.second.calls/total,
+            static_cast<unsigned long long>(kv.second.blocks),
+            static_cast<double>(kv.second.blocks)/kv.second.calls);
+    stats.clear();
+}
+
+// Row count at or above which a spilled block streams its weights to the device
+// instead of computing on the host. The upload is a fixed cost per block per
+// chunk (~6.6 ms for an 86 MiB triple over PCIe) where the host compute scales
+// with rows, so the crossover is low; 16 keeps MTP's small verification batches
+// on the host path where they belong. COLIBRI_HOST_FFN_GPU_ROWS overrides it,
+// and 0 disables the batch path entirely.
+inline int qwen_host_ffn_batch_threshold(){
+    static const int threshold=[]{
+        if(const char* env=std::getenv("COLIBRI_HOST_FFN_GPU_ROWS"))
+            return static_cast<int>(std::strtol(env,nullptr,10));
+        return 16;
+    }();
+    return threshold;
+}
 
 void qwen_forward_rows(
     ColibriV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
@@ -95,7 +152,15 @@ void qwen_forward_rows(
     const auto attention_scores=workspace_layout.attention_scores.address(runtime.workspace);
     const auto mtp_prompt_hidden=
         workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
+    // COLIBRI_PREFILL_LAUNCHES=1 tallies launches and total blocks per kernel
+    // name over the whole rows forward, dumped by qwen_prefill_launch_report.
+    // Launch *count* is the thing the phase trace cannot show: a phase that
+    // looks cheap in milliseconds can still be thousands of 4-block grids, and
+    // on this path that is the difference between a kernel problem and a
+    // batching problem.
+    static const bool trace_launches=std::getenv("COLIBRI_PREFILL_LAUNCHES")!=nullptr;
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,std::uint32_t bx,void**args,std::uint32_t shared=0){
+        if(trace_launches)qwen_note_launch(name,gx,gy);
         if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
     };
@@ -131,8 +196,12 @@ void qwen_forward_rows(
     // Qwen3.6 builds, Q8_0 for the older ones. See the matching dispatch in
     // qwen_decode_step; reading one type as the other silently corrupts every
     // activation instead of failing.
-    auto dense_rows=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
-        std::uint64_t matrix=runtime.device_tensors[index];
+    // `staged` overrides the resident device pointer, for weights that live on
+    // the host and were uploaded to a staging buffer for this batch. The type
+    // still comes from the index: a spilled tensor is never requantized, so its
+    // device type and the raw model bytes agree.
+    auto dense_rows=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){
+        std::uint64_t matrix=staged?staged:runtime.device_tensors[index];
         const auto type=qwen_device_type(runtime,index);
         const char* q8_kernel=nullptr;
         // On MoE this stays a small-batch optimization: the row loop below
@@ -206,6 +275,7 @@ void qwen_forward_rows(
             // Tensor cores where the format has an MMQ kernel; the dp4a
             // tile kernel is the fallback for the rest.
             const char* mmq_kernel=nullptr;
+            bool mmq_min=false;
             switch(type){
                 case 16:mmq_kernel="iq2xxs_q8_mmq";break;
                 case 17:mmq_kernel="iq2xs_q8_mmq";break;
@@ -214,14 +284,17 @@ void qwen_forward_rows(
                 case 23:mmq_kernel="iq4xs_q8_mmq";break;
                 case 11:mmq_kernel="q3k_q8_mmq";break;
                 case 14:mmq_kernel="q6k_q8_mmq";break;
-                case 10:mmq_kernel="q2k_q8_mmq";break;
-                case 12:mmq_kernel="q4k_q8_mmq";break;
-                case 13:mmq_kernel="q5k_q8_mmq";break;
+                case 10:mmq_kernel="q2k_q8_mmq";mmq_min=true;break;
+                case 12:mmq_kernel="q4k_q8_mmq";mmq_min=true;break;
+                case 13:mmq_kernel="q5k_q8_mmq";mmq_min=true;break;
                 default:break;
             }
             if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
-                for(int first=0;first<rows;first+=kQ8MmqTokens){
-                    int batch=std::min(kQ8MmqTokens,rows-first);
+                const int mmq_rows=mmq_min?kQ8MmqMinRows:kQ8MmqRows;
+                const int mmq_threads=mmq_min?kQ8MmqMinThreads:kQ8MmqThreads;
+                const int mmq_tokens=mmq_min?kQ8MmqMinTokens:kQ8MmqTokens;
+                for(int first=0;first<rows;first+=mmq_tokens){
+                    int batch=std::min(mmq_tokens,rows-first);
                     auto batch_q8=small_q8+static_cast<std::uint64_t>(first)*input_size;
                     auto batch_scales=small_q8_scales+
                         static_cast<std::uint64_t>(first)*(input_size/32)*sizeof(float);
@@ -229,7 +302,7 @@ void qwen_forward_rows(
                         static_cast<std::uint64_t>(first)*output_size*sizeof(float);
                     void*mmq_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
                         &input_size,&output_size,&batch,&scale_stride};
-                    launch(mmq_kernel,(output_size+kQ8MmqRows-1)/kQ8MmqRows,1,kQ8MmqThreads,mmq_args);
+                    launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,1,mmq_threads,mmq_args);
                 }
                 return;
             }
@@ -413,7 +486,7 @@ void qwen_forward_rows(
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill layer-start profiling event failed");
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
-        auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size){dense_rows(layer.static_tensors.at(role),input,output,input_size,output_size);};
+        auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){dense_rows(layer.static_tensors.at(role),input,output,input_size,output_size,staged);};
         phase(layer_number,"pre");
         rms_rows(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
@@ -610,6 +683,7 @@ void qwen_forward_rows(
             else if(muse)dense(7,normalized,gates,hidden_size,query_elements);
             auto cache_keys=runtime.state+layer.state_first,cache_values=runtime.state+layer.state_second;
             int capacity=static_cast<int>(layer.cache_capacity);
+            phase(layer_number,"qkvproj");
             for(int token=0;token<rows;++token){
                 auto projected=first+static_cast<std::uint64_t>(token)*q_size*sizeof(float);
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
@@ -657,6 +731,7 @@ void qwen_forward_rows(
                 void*v_store_args[]={&value,&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
                 launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,v_store_args);
             }
+            phase(layer_number,"ropestore");
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
             const char*cublas_prefill_env=
                 std::getenv("COLIBRI_CUBLAS_PREFILL_ATTENTION");
@@ -792,6 +867,46 @@ void qwen_forward_rows(
             const int dense_intermediate=runtime.laguna
                 ?static_cast<int>(runtime.model->tensors[layer.static_tensors.at(moe_base+1)].shape[1])
                 :static_cast<int>(runtime.moe_intermediate);
+            // A spilled block still has to produce this batch's feed-forward.
+            // Doing it on the host is right for one token and badly wrong for a
+            // batch: the host pays rows x 3 x hidden x intermediate MACs, and on
+            // the IQ formats it pays them through a scalar decoder, while the
+            // device sits idle. Past a threshold it is cheaper to send the
+            // weights the other way -- one upload of the block's triple, then
+            // the ordinary device path -- because the upload is a fixed cost
+            // per block per chunk while the host compute scales with rows.
+            // Measured on this checkpoint at 16 of 64 blocks spilled: the host
+            // path gives 17.6 tok/s of prefill against 536 resident.
+            const bool stage_ffn=layer.ffn_on_host&&runtime.host_ffn_stage&&
+                rows>=qwen_host_ffn_batch_threshold();
+            if(stage_ffn){
+                const std::size_t ffn_base=qwen_ffn_base(runtime,layer);
+                std::uint64_t offset=0;
+                std::uint64_t staged[4]={0,0,0,0};
+                for(std::size_t role=1;role<=3;++role){
+                    const auto index=layer.static_tensors[ffn_base+role];
+                    const auto&tensor=runtime.model->tensors[index];
+                    staged[role]=runtime.host_ffn_stage+offset;
+                    if(colibri_gpu_upload(staged[role],
+                                          tensor_data(*runtime.model,tensor),
+                                          tensor.size,runtime.stream)!=0)
+                        throw std::runtime_error(
+                            "native Qwen staged feed-forward upload failed");
+                    offset+=device_align(tensor.size);
+                }
+                const auto up_half=first+
+                    static_cast<std::uint64_t>(rows)*dense_intermediate*sizeof(float);
+                dense(moe_base+1,normalized,first,hidden_size,dense_intermediate,staged[1]);
+                dense(moe_base+2,normalized,up_half,hidden_size,dense_intermediate,staged[2]);
+                int staged_count=rows*dense_intermediate;
+                void*staged_silu[]={const_cast<std::uint64_t*>(&first),
+                                    const_cast<std::uint64_t*>(&second),&staged_count};
+                launch("silu_mul",(static_cast<std::uint32_t>(staged_count)+255)/256,1,256,staged_silu);
+                dense(moe_base+3,second,third,dense_intermediate,hidden_size,staged[3]);
+                if(runtime.muse)post_rms_rows(third,tensor(13));
+                add_rows(residual,third);std::swap(hidden,residual);
+                continue;
+            }
             if(layer.ffn_on_host){
                 // Spilled block: its weights are not on the device at all, so
                 // the SwiGLU runs on the host.
