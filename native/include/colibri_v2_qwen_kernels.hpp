@@ -1903,6 +1903,59 @@ __device__ __forceinline__ void mma_m16n8k16_s8(int* d, const int* a, int b) {
 #endif
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Two 8x8 b16 tiles out of shared memory in one instruction.
+//
+// This is the load the MMA above wants, spelled as one instruction instead of
+// four. `mma.m16n8k16.s8` takes A as two registers -- rows {quad, quad+8},
+// four consecutive K bytes each -- which is byte for byte a pair of m8n8.b16
+// tiles. Building that by hand costs four LDS.32 with four computed indices;
+// two of these cost two, and the LSU does the lane shuffle.
+//
+// The contract, which is what dictates the staging layout in the callers:
+// lanes 0-15 supply the address of row (l % 8) of matrix (l / 8), and every
+// lane receives in d[m] the four bytes at offset (l & 3) * 4 of row (l >> 2)
+// of matrix m. So each row of each tile must be 16 contiguous, 16-byte
+// aligned bytes, and the eight rows of a tile must land in eight different
+// 16-byte bank groups or the load serializes -- `ldmatrix` picks up no
+// conflict freedom for free. COLIBRI_MMQ_ROW_UNITS arranges both.
+//
+// x2 rather than the x4 that would fetch both k16 halves at once, which is
+// what this was written as first: x4 needs an aligned register *quad*, and
+// ptxas already clamps the MMQ kernel at 255 registers, so the extra
+// allocation constraint made it spill (156 bytes, and 8% slower measured).
+// The pair constraint of x2 costs nothing -- see the kernel header comment
+// for what the whole exercise was worth.
+__device__ __forceinline__ void ldmatrix_x2_b16(int* d, const void* source) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    unsigned int address;
+    asm("{ .reg .u64 wide;\n"
+        "  cvta.to.shared.u64 wide, %1;\n"
+        "  cvt.u32.u64 %0, wide; }"
+        : "=r"(address) : "l"(source));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+        : "=r"(d[0]), "=r"(d[1])
+        : "r"(address));
+#else
+    const int lane = (int)(threadIdx.x & 31u);
+    const int* held_at = (const int*)source;
+    const int held[4] = {held_at[0], held_at[1], held_at[2], held_at[3]};
+    #pragma unroll
+    for (int matrix = 0; matrix < 2; ++matrix) {
+        const int owner = matrix * 8 + (lane >> 2);
+        int value = 0;
+        #pragma unroll
+        for (int word = 0; word < 4; ++word) {
+            const int candidate = __shfl_sync(0xffffffffu, held[word], owner);
+            if (word == (lane & 3)) value = candidate;
+        }
+        d[matrix] = value;
+    }
+#endif
+}
+
 // Prefill twin of COLIBRI_Q8_MATVEC_ROWS, for wide token batches.
 //
 // The kernel above caps its batch at COLIBRI_Q8_ROWS because `partial[]` is a
@@ -2117,6 +2170,30 @@ R"COLIBRI_CUDA(
 //     the prefetch buffer costs more than the latency it hides.
 //   - Raising the >48 KB shared cap (cuFuncSetAttribute + dynamic shared). It
 //     works, but the tiles that win fit statically and it measured a wash.
+//   - `ldmatrix` for the *activation* fragments. One x4 would fetch all four
+//     token fragments at once, and the staging layout below already supports
+//     it, but it spilled ~100 bytes and cost 8%. See below for why.
+//
+// The weight fragments do come out of `ldmatrix` (see ldmatrix_x2_b16), which
+// is what llama.cpp's mmq does and was the identified gap against it. Honest
+// accounting: it is worth about +0.5%, three paired rounds, 1.006 at pp1024
+// and 1.004 at pp2048 -- a wash, not the 1.7x the gap was supposed to hold.
+// The reason it does not pay, and it is the more useful finding:
+//
+//   ptxas compiles this kernel at 255 registers with 256 threads, which is
+//   65280 of the SM's 65536 -- *one* block per SM, eight warps, 12.5%
+//   occupancy. Registers cap it, not the 42 KB of shared (which would allow
+//   two). So the kernel is latency bound with almost nothing resident to hide
+//   the latency with, and `ldmatrix` does not help that: four LDS.32 and two
+//   LDSM.x2 move the same four 128-byte wavefronts, so it saves issue slots,
+//   which are not the constraint. It also explains the pipelining result
+//   above -- a prefetch buffer has to come out of a register file with no
+//   slack -- and why anything that adds allocation constraints spills.
+//
+// Which is where the next attempt should go: acc[4][4][4] is 64 registers of
+// the budget and forcing __launch_bounds__(256, 2) to get a second block does
+// compile, but spills 792 bytes, so buying occupancy needs the fragment grid
+// to shrink, not just a flag. That trade has not been measured.
 //
 #define COLIBRI_MMQ_ROW_WARPS 2
 #define COLIBRI_MMQ_ROW_FRAGS 4
@@ -2140,6 +2217,29 @@ R"COLIBRI_CUDA(
     (COLIBRI_MMQ_TOKEN_WARPS * COLIBRI_MMQ_TOKEN_FRAGS * 8)
 #define COLIBRI_MMQ_GROUPS 4
 
+// The staged tile is addressed in 16-byte units, because that is what
+// `ldmatrix` reads: one row of an 8x8 b16 tile is 16 contiguous, 16-byte
+// aligned bytes, which is exactly one k16 half of one (row, group). So the
+// staging atom stops being "nine ints with an odd stride" and becomes an
+// int4, two per (row, group).
+//
+// The old [9] padding spread the eight row-quads of a warp across the banks;
+// it cannot survive here, since ldmatrix needs the unit stride to be a whole
+// 16 bytes. Padding by a whole unit per *row* does the same job: the unit
+// index is row * ROW_UNITS + group * 2 + half, and with an odd ROW_UNITS the
+// bank group (unit mod 8) advances by one per row, so the eight rows of a
+// tile land in eight different bank groups. Padding rather than an XOR
+// swizzle because it leaves the two halves of a (row, group) adjacent, which
+// is what lets the decoders keep writing eight contiguous ints -- staging
+// through a register array to reassemble a swizzled pair costs ~45 registers
+// in a kernel that ptxas already clamps at 255, and it spills.
+//
+// This is the same 36 ints per row the [9] layout used, so shared memory is
+// unchanged; only where the slack sits moves.
+#define COLIBRI_MMQ_ROW_UNITS (COLIBRI_MMQ_GROUPS * 2 + 1)
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 #define COLIBRI_Q8_MMQ(name, decode_fn, stride)                                \
 extern "C" __global__ void name(                                               \
     const unsigned char* packed, const signed char* vectors,                   \
@@ -2151,12 +2251,12 @@ extern "C" __global__ void name(                                               \
     if (row_base >= output_size) return;                                       \
     const int blocks_per_row = input_size >> 8;                                \
     const int groups_per_row = blocks_per_row << 3;                            \
-    /* [.][9] not [.][8]: at 8 the eight row-quads of a warp land on one bank */\
-    /* eight ways over; the odd stride spreads them across all 32.            */\
-    __shared__ int w_words[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS][9];           \
+    /* Staged in 16-byte units -- one k16 half of one (row, group), which is */\
+    /* one ldmatrix row. See COLIBRI_MMQ_ROW_UNITS for the padding.          */\
+    __shared__ int4 w_units[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_ROW_UNITS];          \
     __shared__ float w_low[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];              \
     __shared__ float w_high[COLIBRI_MMQ_ROWS][COLIBRI_MMQ_GROUPS];             \
-    __shared__ int a_words[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS][9];         \
+    __shared__ int4 a_units[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_ROW_UNITS];        \
     __shared__ float a_scale[COLIBRI_MMQ_TOKENS][COLIBRI_MMQ_GROUPS];          \
     const int lane = threadIdx.x & 31;                                         \
     const int warp = threadIdx.x >> 5;                                         \
@@ -2180,13 +2280,16 @@ extern "C" __global__ void name(                                               \
             const int r = i / COLIBRI_MMQ_GROUPS;                              \
             const int g = i - r * COLIBRI_MMQ_GROUPS;                          \
             float low = 0.0f, high = 0.0f;                                     \
+            /* The two k16 halves are adjacent units, so this is still the    */\
+            /* eight contiguous ints every decoder writes.                    */\
+            int* const decoded = (int*)&w_units[r][g * 2];                     \
             if (row_base + r < output_size && base + g < groups_per_row) {     \
                 decode_fn(packed + (long long)(row_base + r)                   \
                               * blocks_per_row * stride,                       \
-                          base + g, w_words[r][g], &low, &high);               \
+                          base + g, decoded, &low, &high);                     \
             } else {                                                           \
                 _Pragma("unroll")                                              \
-                for (int k = 0; k < 8; ++k) w_words[r][g][k] = 0;              \
+                for (int k = 0; k < 8; ++k) decoded[k] = 0;                    \
             }                                                                  \
             w_low[r][g] = low;                                                 \
             w_high[r][g] = high;                                               \
@@ -2199,16 +2302,13 @@ extern "C" __global__ void name(                                               \
                 const int4* source = (const int4*)(                            \
                     vectors + (long long)t * input_size                        \
                     + (long long)(base + g) * 32);                             \
-                const int4 first = source[0], second = source[1];              \
-                a_words[t][g][0] = first.x;  a_words[t][g][1] = first.y;       \
-                a_words[t][g][2] = first.z;  a_words[t][g][3] = first.w;       \
-                a_words[t][g][4] = second.x; a_words[t][g][5] = second.y;      \
-                a_words[t][g][6] = second.z; a_words[t][g][7] = second.w;      \
+                a_units[t][g * 2] = source[0];                                 \
+                a_units[t][g * 2 + 1] = source[1];                             \
                 a_scale[t][g] = __half2float(                                  \
                     vector_scales[(long long)t * scale_stride + base + g]);    \
             } else {                                                           \
-                _Pragma("unroll")                                              \
-                for (int k = 0; k < 8; ++k) a_words[t][g][k] = 0;              \
+                a_units[t][g * 2] = make_int4(0, 0, 0, 0);                     \
+                a_units[t][g * 2 + 1] = make_int4(0, 0, 0, 0);                 \
                 a_scale[t][g] = 0.0f;                                          \
             }                                                                  \
         }                                                                      \
@@ -2216,7 +2316,8 @@ extern "C" __global__ void name(                                               \
         _Pragma("unroll")                                                 \
         for (int g = 0; g < COLIBRI_MMQ_GROUPS; ++g) {                    \
             /* Activation fragment and its two output-column scales, out */\
-            /* of the row loop: every row fragment reuses them.          */\
+            /* of the row loop: every row fragment reuses them. Scalar,  */\
+            /* not ldmatrix -- see the header comment.                   */\
             int a_low[COLIBRI_MMQ_TOKEN_FRAGS];                           \
             int a_high[COLIBRI_MMQ_TOKEN_FRAGS];                          \
             float a_s0[COLIBRI_MMQ_TOKEN_FRAGS];                          \
@@ -2224,8 +2325,9 @@ extern "C" __global__ void name(                                               \
             _Pragma("unroll")                                             \
             for (int tf = 0; tf < COLIBRI_MMQ_TOKEN_FRAGS; ++tf) {        \
                 const int tb = warp_token + tf * 8;                       \
-                a_low[tf] = a_words[tb + quad][g][slot];                  \
-                a_high[tf] = a_words[tb + quad][g][4 + slot];             \
+                a_low[tf] = ((const int*)&a_units[tb + quad][g * 2])[slot];\
+                a_high[tf] =                                              \
+                    ((const int*)&a_units[tb + quad][g * 2 + 1])[slot];   \
                 a_s0[tf] = a_scale[tb + slot * 2][g];                     \
                 a_s1[tf] = a_scale[tb + slot * 2 + 1][g];                 \
             }                                                             \
@@ -2233,12 +2335,14 @@ extern "C" __global__ void name(                                               \
             for (int rf = 0; rf < COLIBRI_MMQ_ROW_FRAGS; ++rf) {          \
                 const int rb = warp_row + rf * 16;                        \
                 /* Weight fragment and its two output-row scales, loaded */\
-                /* once and reused across every token fragment.          */\
+                /* once and reused across every token fragment. One      */\
+                /* ldmatrix per k16 half: its two tiles are the two row  */\
+                /* halves the MMA wants, so lane l hands it row l & 15.  */\
                 int frag_low[2], frag_high[2];                            \
-                frag_low[0] = w_words[rb + quad][g][slot];                \
-                frag_low[1] = w_words[rb + quad + 8][g][slot];            \
-                frag_high[0] = w_words[rb + quad][g][4 + slot];           \
-                frag_high[1] = w_words[rb + quad + 8][g][4 + slot];       \
+                ldmatrix_x2_b16(                                          \
+                    frag_low, &w_units[rb + (lane & 15)][g * 2]);         \
+                ldmatrix_x2_b16(                                          \
+                    frag_high, &w_units[rb + (lane & 15)][g * 2 + 1]);    \
                 const float wl0 = w_low[rb + quad][g];                    \
                 const float wl1 = w_low[rb + quad + 8][g];                \
                 const float wh0 = w_high[rb + quad][g];                   \
