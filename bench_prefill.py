@@ -99,7 +99,7 @@ def main() -> int:
 
             before = dict(rt.info)
             t0 = time.perf_counter()
-            rt.generate(prompt, P, lambda t: None)  # ingest P, emit 1
+            rt.generate(prompt, 1, lambda t: None)  # ingest P, emit 1
             wall = time.perf_counter() - t0
             after = dict(rt.info)
 
