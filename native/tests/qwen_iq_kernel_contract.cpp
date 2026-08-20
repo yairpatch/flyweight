@@ -47,7 +47,7 @@ namespace {
 // So the scale's four nibbles are pinned to 1.0 (f16 0x3c00) and everything
 // else stays random. The 3-bit sub-scales still cover 1..15, the grid is still
 // fully exercised, and a row is now a well-conditioned sum.
-void fill_blocks(std::mt19937& rng, std::vector<std::uint8_t>& packed) {
+void fill_iq1m(std::mt19937& rng, std::vector<std::uint8_t>& packed) {
     std::uniform_int_distribution<int> byte(0, 255);
     for (auto& value : packed) value = static_cast<std::uint8_t>(byte(rng));
 
@@ -68,22 +68,58 @@ void fill_blocks(std::mt19937& rng, std::vector<std::uint8_t>& packed) {
     }
 }
 
+// Every other format here keeps its f16 super-block scale in the first two
+// bytes, so pinning it is the whole of what they need; the rest of a block is
+// legal whatever it holds. IQ1_S is one of them -- an 11-bit grid index into a
+// 2048-entry table, a 3-bit multiplier and a sign bit are all unconstrained.
+template <std::size_t kBlockBytes>
+void fill_leading_scale(std::mt19937& rng, std::vector<std::uint8_t>& packed) {
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (auto& value : packed) value = static_cast<std::uint8_t>(byte(rng));
+    constexpr std::uint16_t kOne = 0x3c00;
+    for (std::size_t base = 0; base + kBlockBytes <= packed.size();
+         base += kBlockBytes)
+        std::memcpy(packed.data() + base, &kOne, 2);
+}
+
+// A format under test: how wide its super-block is, how to fill one, and the
+// CPU decoder the corpus kernel has to agree with.
+struct Format {
+    std::size_t block_bytes;
+    void (*fill)(std::mt19937&, std::vector<std::uint8_t>&);
+    float (*value_at)(const std::uint8_t*, std::uint64_t);
+};
+
+const Format kIq1m{kIq1mBlockBytes, fill_iq1m, qwen_iq1m_value};
+const Format kIq1s{
+    kIq1sBlockBytes, fill_leading_scale<kIq1sBlockBytes>, qwen_iq1s_value};
+const Format kIq2s{
+    kIq2sBlockBytes, fill_leading_scale<kIq2sBlockBytes>, qwen_iq2s_value};
+const Format kIq2xxs{
+    kIq2xxsBlockBytes, fill_leading_scale<kIq2xxsBlockBytes>, qwen_iq2xxs_value};
+const Format kIq2xs{
+    kIq2xsBlockBytes, fill_leading_scale<kIq2xsBlockBytes>, qwen_iq2xs_value};
+const Format kIq3xxs{
+    kIq3xxsBlockBytes, fill_leading_scale<kIq3xxsBlockBytes>, qwen_iq3xxs_value};
+const Format kIq4xs{
+    kIq4xsBlockBytes, fill_leading_scale<kIq4xsBlockBytes>, qwen_iq4xs_value};
+
 // The kernel accumulates a row in f32 in a tree; the reference here does it in
 // double, elementwise, through the other decoder. The error that separates them
 // is bounded by the f32 epsilon times the magnitude *accumulated*, not the
 // magnitude *returned* -- a row whose products cancel down to near zero is
 // perfectly correct and still has a huge relative error against its own result.
 // So the denominator is sum|w_i v_i|, which is what conditions the sum.
-float worst_error(const std::vector<std::uint8_t>& packed, const float* vector,
-                  int input_size, int row, float got) {
+float worst_error(const Format& format, const std::vector<std::uint8_t>& packed,
+                  const float* vector, int input_size, int row, float got) {
     const std::size_t blocks = static_cast<std::size_t>(input_size) / 256;
     const std::uint8_t* base =
-        packed.data() + static_cast<std::size_t>(row) * blocks * kIq1mBlockBytes;
+        packed.data() + static_cast<std::size_t>(row) * blocks * format.block_bytes;
     double dot = 0.0;
     double magnitude = 0.0;
     for (int index = 0; index < input_size; ++index) {
         const double term =
-            static_cast<double>(qwen_iq1m_value(base, index)) * vector[index];
+            static_cast<double>(format.value_at(base, index)) * vector[index];
         dot += term;
         magnitude += std::fabs(term);
     }
@@ -110,7 +146,8 @@ const int kShapes[][2] = {
     {256, 8}, {512, 33}, {1024, 1}, {2048, 17},
 };
 
-int check(const char* kernel, bool warp_tiled, std::uint32_t block) {
+int check(const char* kernel, const Format& format, bool warp_tiled,
+          std::uint32_t block) {
     std::mt19937 rng(20260816);
     std::uniform_real_distribution<float> real(-1.0f, 1.0f);
     float worst = 0.0f;
@@ -120,8 +157,8 @@ int check(const char* kernel, bool warp_tiled, std::uint32_t block) {
         int output_size = shape[1];
         std::vector<std::uint8_t> packed(
             static_cast<std::size_t>(input_size) / 256 * output_size *
-            kIq1mBlockBytes);
-        fill_blocks(rng, packed);
+            format.block_bytes);
+        format.fill(rng, packed);
         std::vector<float> vector(input_size);
         for (auto& value : vector) value = real(rng);
 
@@ -138,7 +175,7 @@ int check(const char* kernel, bool warp_tiled, std::uint32_t block) {
             1, block, 0, 0, arguments);
 
         for (int row = 0; row < output_size; ++row)
-            worst = std::fmax(worst, worst_error(packed, vector.data(),
+            worst = std::fmax(worst, worst_error(format, packed, vector.data(),
                                                  input_size, row, output[row]));
     }
     return report(kernel, worst);
@@ -147,7 +184,7 @@ int check(const char* kernel, bool warp_tiled, std::uint32_t block) {
 // The batched twin. Same decoder, so what this adds over the matvec cases is
 // the four-token tiling and the name wiring -- a kernel registered under a name
 // nothing dispatches would otherwise look fine right up until a prefill.
-int check_rows() {
+int check_rows(const char* kernel, const Format& format) {
     std::mt19937 rng(20260816);
     std::uniform_real_distribution<float> real(-1.0f, 1.0f);
     float worst = 0.0f;
@@ -158,8 +195,8 @@ int check_rows() {
         int output_size = 9;
         std::vector<std::uint8_t> packed(
             static_cast<std::size_t>(input_size) / 256 * output_size *
-            kIq1mBlockBytes);
-        fill_blocks(rng, packed);
+            format.block_bytes);
+        format.fill(rng, packed);
         std::vector<float> vectors(
             static_cast<std::size_t>(input_size) * tokens);
         for (auto& value : vectors) value = real(rng);
@@ -171,7 +208,7 @@ int check_rows() {
         float* output_pointer = output.data();
         void* arguments[] = {&packed_pointer, &vectors_pointer, &output_pointer,
                              &input_size, &output_size, &tokens};
-        colibri_cpu_launch_named("iq1m_matmul_rows",
+        colibri_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size),
                                  static_cast<std::uint32_t>((tokens + 3) / 4),
                                  256, 0, 0, arguments);
@@ -179,11 +216,12 @@ int check_rows() {
         for (int token = 0; token < tokens; ++token)
             for (int row = 0; row < output_size; ++row)
                 worst = std::fmax(
-                    worst, worst_error(packed, vectors.data() + token * input_size,
+                    worst, worst_error(format, packed,
+                                       vectors.data() + token * input_size,
                                        input_size, row,
                                        output[token * output_size + row]));
     }
-    return report("iq1m_matmul_rows", worst);
+    return report(kernel, worst);
 }
 
 // ---------------------------------------------------------------------------
@@ -234,25 +272,13 @@ Q8Activations quantize_rows(std::mt19937& rng, int input_size, int rows) {
     return out;
 }
 
-// Random IQ4_XS blocks. The 4-bit codes and the 6-bit sub-block scales are
-// unconstrained, but the f16 super-block scale is pinned to 1.0 for the same
-// reason as the IQ1_M blocks above: random exponent bits there produce Inf and
-// NaN, and a row summing them measures nothing.
-void fill_iq4xs(std::mt19937& rng, std::vector<std::uint8_t>& packed) {
-    std::uniform_int_distribution<int> byte(0, 255);
-    for (auto& value : packed) value = static_cast<std::uint8_t>(byte(rng));
-    constexpr std::uint16_t kOne = 0x3c00;
-    for (std::size_t base = 0; base + kIq4xsBlockBytes <= packed.size();
-         base += kIq4xsBlockBytes)
-        std::memcpy(packed.data() + base, &kOne, 2);
-}
-
-double reference_row(const std::vector<std::uint8_t>& packed, int row,
+double reference_row(const Format& format,
+                     const std::vector<std::uint8_t>& packed, int row,
                      const Q8Activations& activations, int input_size,
                      int activation_row, double* magnitude) {
     const std::size_t blocks = static_cast<std::size_t>(input_size) / 256;
     const std::uint8_t* base =
-        packed.data() + static_cast<std::size_t>(row) * blocks * kIq4xsBlockBytes;
+        packed.data() + static_cast<std::size_t>(row) * blocks * format.block_bytes;
     double dot = 0.0;
     *magnitude = 0.0;
     for (int index = 0; index < input_size; ++index) {
@@ -265,14 +291,14 @@ double reference_row(const std::vector<std::uint8_t>& packed, int row,
             static_cast<double>(activations.codes[code_at]) *
             qwen_half_value(activations.scales[scale_at]);
         const double term =
-            static_cast<double>(qwen_iq4xs_value(base, index)) * activation;
+            static_cast<double>(format.value_at(base, index)) * activation;
         dot += term;
         *magnitude += std::fabs(term);
     }
     return dot;
 }
 
-int check_iq4xs_q8() {
+int check_q8(const char* kernel, const Format& format) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
     for (const auto& shape : kShapes) {
@@ -280,8 +306,8 @@ int check_iq4xs_q8() {
         int output_size = shape[1];
         std::vector<std::uint8_t> packed(
             static_cast<std::size_t>(input_size) / 256 * output_size *
-            kIq4xsBlockBytes);
-        fill_iq4xs(rng, packed);
+            format.block_bytes);
+        format.fill(rng, packed);
         const auto activations = quantize_rows(rng, input_size, 1);
 
         std::vector<float> output(output_size, 0.0f);
@@ -291,23 +317,24 @@ int check_iq4xs_q8() {
         float* output_pointer = output.data();
         void* arguments[] = {&packed_pointer, &codes, &scales, &output_pointer,
                              &input_size, &output_size};
-        colibri_cpu_launch_named("iq4xs_q8_matvec_transposed_warp",
+        colibri_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size), 1, 128,
                                  0, 0, arguments);
 
         for (int row = 0; row < output_size; ++row) {
             double magnitude = 0.0;
-            const double reference = reference_row(packed, row, activations,
-                                                   input_size, 0, &magnitude);
+            const double reference = reference_row(format, packed, row,
+                                                   activations, input_size, 0,
+                                                   &magnitude);
             worst = std::fmax(
                 worst, static_cast<float>(std::fabs(reference - output[row]) /
                                           std::fmax(1.0, magnitude)));
         }
     }
-    return report("iq4xs_q8_matvec_transposed_warp", worst);
+    return report(kernel, worst);
 }
 
-int check_iq4xs_q8_rows() {
+int check_q8_rows(const char* kernel, const Format& format) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
     // Row counts on and off the kernel's compile-time cap of 8.
@@ -317,8 +344,8 @@ int check_iq4xs_q8_rows() {
         int scale_stride = input_size / 32;
         std::vector<std::uint8_t> packed(
             static_cast<std::size_t>(input_size) / 256 * output_size *
-            kIq4xsBlockBytes);
-        fill_iq4xs(rng, packed);
+            format.block_bytes);
+        format.fill(rng, packed);
         const auto activations = quantize_rows(rng, input_size, rows);
 
         std::vector<float> output(
@@ -330,7 +357,7 @@ int check_iq4xs_q8_rows() {
         void* arguments[] = {&packed_pointer, &codes,        &scales,
                              &output_pointer, &input_size,   &output_size,
                              &rows,           &scale_stride};
-        colibri_cpu_launch_named("iq4xs_q8_matvec_transposed_rows",
+        colibri_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size), 1, 128,
                                  0, 0, arguments);
 
@@ -338,7 +365,8 @@ int check_iq4xs_q8_rows() {
             for (int out = 0; out < output_size; ++out) {
                 double magnitude = 0.0;
                 const double reference = reference_row(
-                    packed, out, activations, input_size, row, &magnitude);
+                    format, packed, out, activations, input_size, row,
+                    &magnitude);
                 worst = std::fmax(
                     worst,
                     static_cast<float>(
@@ -349,29 +377,18 @@ int check_iq4xs_q8_rows() {
             }
         }
     }
-    return report("iq4xs_q8_matvec_transposed_rows", worst);
+    return report(kernel, worst);
 }
 
 // ---------------------------------------------------------------------------
 // The tiled prefill GEMM, for every type wired to it.
 //
-// One macro serves all five, so the shared logic -- the barrier, the
+// One macro serves all of them, so the shared logic -- the barrier, the
 // lane->group mapping, the per-warp reduction, the row tile -- is covered by
 // any one of them. What is per-type, and what this therefore has to check once
 // each, is the `stride` the macro is instantiated with: a wrong super-block
 // size walks the wrong bytes and every other type still passes.
-void fill_blocks_scaled(std::mt19937& rng, std::vector<std::uint8_t>& packed,
-                        std::size_t block_bytes) {
-    std::uniform_int_distribution<int> byte(0, 255);
-    for (auto& value : packed) value = static_cast<std::uint8_t>(byte(rng));
-    // Every one of these formats keeps its f16 super-block scale in the first
-    // two bytes; pin it to 1.0 so random exponents cannot put Inf/NaN in a sum.
-    constexpr std::uint16_t kOne = 0x3c00;
-    for (std::size_t base = 0; base + block_bytes <= packed.size();
-         base += block_bytes)
-        std::memcpy(packed.data() + base, &kOne, 2);
-}
-
+//
 // `threads` is the kernel's block size, and it has to be passed in rather than
 // assumed: the tiled and MMQ kernels have different block shapes, and until the
 // MMQ tile went from 16x64 to 32x64 they happened to agree at 256. They no
@@ -379,8 +396,7 @@ void fill_blocks_scaled(std::mt19937& rng, std::vector<std::uint8_t>& packed,
 // own the upper rows simply never run, and the check reports a plausible-
 // looking ~0.2 error. Must track COLIBRI_Q8_TILE_* / COLIBRI_MMQ_* in
 // native/include/colibri_v2_qwen_kernels.hpp, like kQ8Tile*/kQ8Mmq* on the host.
-int check_tiled(const char* kernel, std::size_t block_bytes,
-                float (*value_at)(const std::uint8_t*, std::uint64_t),
+int check_tiled(const char* kernel, const Format& format,
                 std::uint32_t threads) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
@@ -399,8 +415,8 @@ int check_tiled(const char* kernel, std::size_t block_bytes,
         int scale_stride = input_size / 32;
         std::vector<std::uint8_t> packed(
             static_cast<std::size_t>(input_size) / 256 * output_size *
-            block_bytes);
-        fill_blocks_scaled(rng, packed, block_bytes);
+            format.block_bytes);
+        format.fill(rng, packed);
         const auto activations = quantize_rows(rng, input_size, rows);
 
         std::vector<float> output(
@@ -425,7 +441,7 @@ int check_tiled(const char* kernel, std::size_t block_bytes,
             for (int out = 0; out < output_size; ++out) {
                 const std::uint8_t* base =
                     packed.data() +
-                    static_cast<std::size_t>(out) * blocks * block_bytes;
+                    static_cast<std::size_t>(out) * blocks * format.block_bytes;
                 double dot = 0.0, magnitude = 0.0;
                 for (int index = 0; index < input_size; ++index) {
                     const std::size_t code_at =
@@ -437,7 +453,8 @@ int check_tiled(const char* kernel, std::size_t block_bytes,
                         static_cast<double>(activations.codes[code_at]) *
                         qwen_half_value(activations.scales[scale_at]);
                     const double term =
-                        static_cast<double>(value_at(base, index)) * activation;
+                        static_cast<double>(format.value_at(base, index)) *
+                        activation;
                     dot += term;
                     magnitude += std::fabs(term);
                 }
@@ -461,32 +478,38 @@ int main() {
     const std::uint32_t kTiledThreads = 256;   // COLIBRI_Q8_TILE_WARPS * 32
     const std::uint32_t kMmqThreads = 256;     // ROW_WARPS * TOKEN_WARPS * 32
     // One warp per row, eight rows per block.
-    failures += check("iq1m_matvec_transposed_warp", true, 256);
+    failures += check("iq1m_matvec_transposed_warp", kIq1m, true, 256);
     // One block per row, reduced across the block.
-    failures += check("iq1m_matvec_transposed", false, 256);
-    failures += check_rows();
-    failures += check_iq4xs_q8();
-    failures += check_iq4xs_q8_rows();
-    failures += check_tiled("iq2s_q8_matmul_tiled", kIq2sBlockBytes,
-                            qwen_iq2s_value, kTiledThreads);
-    failures += check_tiled("iq2s_q8_mmq", kIq2sBlockBytes, qwen_iq2s_value,
-                            kMmqThreads);
-    failures += check_tiled("iq2xxs_q8_mmq", kIq2xxsBlockBytes, qwen_iq2xxs_value,
-                            kMmqThreads);
-    failures += check_tiled("iq3xxs_q8_mmq", kIq3xxsBlockBytes, qwen_iq3xxs_value,
-                            kMmqThreads);
-    failures += check_tiled("iq2xs_q8_mmq", kIq2xsBlockBytes, qwen_iq2xs_value,
-                            kMmqThreads);
-    failures += check_tiled("iq4xs_q8_mmq", kIq4xsBlockBytes, qwen_iq4xs_value,
-                            kMmqThreads);
-    failures += check_tiled("iq2xxs_q8_matmul_tiled", kIq2xxsBlockBytes,
-                            qwen_iq2xxs_value, kTiledThreads);
-    failures += check_tiled("iq3xxs_q8_matmul_tiled", kIq3xxsBlockBytes,
-                            qwen_iq3xxs_value, kTiledThreads);
-    failures += check_tiled("iq2xs_q8_matmul_tiled", kIq2xsBlockBytes,
-                            qwen_iq2xs_value, kTiledThreads);
-    failures += check_tiled("iq4xs_q8_matmul_tiled", kIq4xsBlockBytes,
-                            qwen_iq4xs_value, kTiledThreads);
+    failures += check("iq1m_matvec_transposed", kIq1m, false, 256);
+    failures += check_rows("iq1m_matmul_rows", kIq1m);
+    failures += check("iq1s_matvec_transposed_warp", kIq1s, true, 256);
+    failures += check("iq1s_matvec_transposed", kIq1s, false, 256);
+    failures += check_rows("iq1s_matmul_rows", kIq1s);
+    failures += check_q8("iq4xs_q8_matvec_transposed_warp", kIq4xs);
+    failures += check_q8_rows("iq4xs_q8_matvec_transposed_rows", kIq4xs);
+    // The IQ1 pair through the Q8 path, where the delta is folded into the int8
+    // weights: a sign error there is invisible to the f32 kernels above, which
+    // never separate the delta from the weight. IQ1_M is the stricter of the
+    // two -- its sign is picked once per eight weights rather than per 32, and
+    // its two sub-scales have to land on the right halves of the block.
+    failures += check_q8("iq1s_q8_matvec_transposed_warp", kIq1s);
+    failures += check_q8_rows("iq1s_q8_matvec_transposed_rows", kIq1s);
+    failures += check_tiled("iq1s_q8_matmul_tiled", kIq1s, kTiledThreads);
+    failures += check_tiled("iq1s_q8_mmq", kIq1s, kMmqThreads);
+    failures += check_q8("iq1m_q8_matvec_transposed_warp", kIq1m);
+    failures += check_q8_rows("iq1m_q8_matvec_transposed_rows", kIq1m);
+    failures += check_tiled("iq1m_q8_matmul_tiled", kIq1m, kTiledThreads);
+    failures += check_tiled("iq1m_q8_mmq", kIq1m, kMmqThreads);
+    failures += check_tiled("iq2s_q8_matmul_tiled", kIq2s, kTiledThreads);
+    failures += check_tiled("iq2s_q8_mmq", kIq2s, kMmqThreads);
+    failures += check_tiled("iq2xxs_q8_mmq", kIq2xxs, kMmqThreads);
+    failures += check_tiled("iq3xxs_q8_mmq", kIq3xxs, kMmqThreads);
+    failures += check_tiled("iq2xs_q8_mmq", kIq2xs, kMmqThreads);
+    failures += check_tiled("iq4xs_q8_mmq", kIq4xs, kMmqThreads);
+    failures += check_tiled("iq2xxs_q8_matmul_tiled", kIq2xxs, kTiledThreads);
+    failures += check_tiled("iq3xxs_q8_matmul_tiled", kIq3xxs, kTiledThreads);
+    failures += check_tiled("iq2xs_q8_matmul_tiled", kIq2xs, kTiledThreads);
+    failures += check_tiled("iq4xs_q8_matmul_tiled", kIq4xs, kTiledThreads);
     std::printf(failures ? "FAILED (%d failures)\n" : "PASSED (%d failures)\n",
                 failures);
     return failures ? 1 : 0;

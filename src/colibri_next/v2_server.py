@@ -14,7 +14,11 @@ from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from .generation import GenerationResult, GenerationStep
-from .sampling import SamplingConfig
+from .sampling import (
+    SERVER_SETTINGS,
+    SamplingConfig,
+    coerce as sampling_coerce,
+)
 from .server import InferenceService, _parse_tool_calls
 from .v2 import (
     AUTO_PROMPT_CACHE_MIB,
@@ -70,17 +74,19 @@ def _generation_config_for_model(
     if not isinstance(raw, dict):
         raise ValueError(f"generation config {config_path} must contain a JSON object")
 
+    # Every server-settable sampling setting, not the three this used to read:
+    # a checkpoint that ships a `repetition_penalty` in its generation config --
+    # which is a standard Hugging Face field -- was having it silently ignored.
     defaults: dict[str, int | float] = {}
-    for key in ("temperature", "top_p"):
-        value = raw.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            defaults[key] = float(value)
-    top_k = raw.get("top_k")
-    if isinstance(top_k, int) and not isinstance(top_k, bool):
-        defaults["top_k"] = top_k
+    for setting in SERVER_SETTINGS:
+        value = sampling_coerce(setting, raw.get(setting.name))
+        if value is not None:
+            defaults[setting.name] = value
     max_new_tokens = raw.get("max_new_tokens")
     if isinstance(max_new_tokens, int) and not isinstance(max_new_tokens, bool):
         defaults["max_new_tokens"] = max_new_tokens
+    # Hugging Face spells "greedy" as do_sample=false rather than temperature 0,
+    # and it wins over any temperature in the same file.
     if raw.get("do_sample") is False:
         defaults["temperature"] = 0.0
     return defaults, str(config_path)
@@ -137,6 +143,7 @@ class _NativeEngine:
         max_new_tokens: int,
         stop_tokens: tuple[int, ...],
         sampling: SamplingConfig | None = None,
+        tools: list[dict[str, object]] | None = None,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         task_queue: Queue[tuple[str, object]] = Queue(
             maxsize=self._MAX_BUFFERED_EVENTS
@@ -159,6 +166,7 @@ class _NativeEngine:
                 frequency_penalty=sampling_config.frequency_penalty,
                 penalty_window=sampling_config.penalty_window,
                 seed=sampling_config.seed,
+                tools=tools,
             )
             self._queues[task_id] = task_queue
             if self._thread is None or not self._thread.is_alive():
@@ -767,6 +775,105 @@ class NativeV2Tokenizer:
         )
 
 
+def _merge_generation_defaults(
+    file_defaults: Mapping[str, float | int],
+    source: str,
+    overrides: Mapping[str, float | int] | None,
+) -> tuple[dict[str, float | int], str]:
+    """Server flags over a generation_config.json next to the checkpoint.
+
+    A flag the operator passed wins: the file describes what the model shipped
+    with, the flag is what this server was told to do. An absent flag must not
+    overwrite the file with an argparse default nobody chose, which is why the
+    caller passes only the values it was actually given.
+
+    The source string records both, so /health cannot report a value as coming
+    from a file that never set it.
+    """
+    merged = dict(file_defaults)
+    given = {
+        key: value
+        for key, value in (overrides or {}).items()
+        if value is not None
+    }
+    if not given:
+        return merged, source
+    merged.update(given)
+    return merged, f"{source}+flags({','.join(sorted(given))})"
+
+
+def _declared_value_type(properties: object, key: str) -> str:
+    """`array` or `object` when the schema says so, else `string`.
+
+    A union (`anyOf`, or a list of types) only counts when every branch agrees:
+    a parameter that may be either an array or a string is legitimately either,
+    and constraining it to JSON would make the string form unsamplable.
+    """
+    if not isinstance(properties, Mapping):
+        return "string"
+    schema = properties.get(key)
+    if not isinstance(schema, Mapping):
+        return "string"
+    declared = schema.get("type")
+    if isinstance(declared, str):
+        return declared if declared in ("array", "object") else "string"
+    if isinstance(declared, list):
+        named = {item for item in declared if isinstance(item, str)}
+        if named in ({"array"}, {"object"}):
+            return next(iter(named))
+    return "string"
+
+
+def _tool_grammar_specification(
+    declarations: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, object]]:
+    """What the sampler needs out of the caller's tool schemas: each tool's
+    name, and which of its parameters are required.
+
+    Only names and requiredness, because that is the whole of what the
+    constraint enforces -- a call may not close while a required parameter is
+    unwritten. Types and descriptions belong to the prompt, not the sampler.
+
+    A schema without a `required` list constrains nothing, which is correct:
+    JSON Schema says every property is optional unless listed, so a tool that
+    declares none has no call this could reject.
+    """
+    if not isinstance(declarations, Sequence) or isinstance(declarations, str):
+        return []
+    specification: list[dict[str, object]] = []
+    for declaration in declarations:
+        if not isinstance(declaration, Mapping):
+            continue
+        function = declaration.get("function")
+        source = function if isinstance(function, Mapping) else declaration
+        name = source.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        schema = source.get("parameters")
+        if not isinstance(schema, Mapping):
+            schema = source.get("input_schema")
+        properties = schema.get("properties") if isinstance(schema, Mapping) else None
+        required = schema.get("required") if isinstance(schema, Mapping) else None
+        required_names = {
+            value for value in (required or []) if isinstance(value, str)
+        }
+        parameters = [
+            {
+                "name": key,
+                "required": key in required_names,
+                # Only array and object matter to the sampler. Those are the
+                # values the server reconstructs by parsing the parameter text
+                # as JSON, so a value that is not JSON reaches the client as a
+                # string and fails its schema. Scalars are already text.
+                "type": _declared_value_type(properties, key),
+            }
+            for key in (properties or {})
+            if isinstance(key, str)
+        ]
+        specification.append({"name": name, "parameters": parameters})
+    return specification
+
+
 def _optional_thinking(options: Mapping[str, object]) -> bool | None:
     """`enable_thinking` as the caller left it, preserving "unstated"."""
     value = options.get("enable_thinking")
@@ -856,6 +963,19 @@ class ChatGenerator:
     ) -> Iterator[GenerationStep]:
         thinking = _optional_thinking(options)
         effort = options.get("reasoning_effort")
+        # Where the schemas are depends on the architecture: the templates that
+        # render their own tool section get them attached to the first message,
+        # and everything else has them rendered into the tool prompt, with the
+        # declarations passed alongside. The sampler wants them either way.
+        if "tool_grammar" not in options:
+            declared = options.get("tools")
+            if not isinstance(declared, Sequence) or isinstance(declared, str):
+                declared = next(
+                    (message["tools"] for message in messages
+                     if isinstance(message, Mapping) and message.get("tools")),
+                    None,
+                )
+            options["tool_grammar"] = _tool_grammar_specification(declared)
         normalized = tuple(
             (message["role"], message["content"].strip()) for message in messages
         )
@@ -1068,11 +1188,13 @@ class ChatGenerator:
         # The cooperative engine interleaves this task with any other in-flight
         # requests (each on its own KV slot); EOS is detected natively via the
         # stop-token list so no token is decoded past it.
+        tool_grammar = options.get("tool_grammar")
         task_id, queue = self.engine.submit(
             prompt_ids,
             max_new_tokens,
             self.tokenizer.eos_token_ids,
             sampling_config,
+            tools=tool_grammar if isinstance(tool_grammar, list) else None,
         )
         try:
             prefill_complete = False
@@ -1237,7 +1359,13 @@ class BailingEngine:
         max_new_tokens: int,
         stop_tokens: tuple[int, ...],
         sampling: SamplingConfig | None = None,
+        tools: list[dict[str, object]] | None = None,
     ) -> tuple[int, Queue[tuple[str, object]]]:
+        # As in the DeepSeek-V4 engine: BailingMoE3 runs its own runtime, whose
+        # sampler has no constrained decoding, so its tool calls stay with the
+        # tolerant parser. The argument is accepted so the shared streaming path
+        # has one calling convention.
+        del tools
         task_queue: Queue[tuple[str, object]] = Queue(maxsize=self._MAX_BUFFERED_EVENTS)
         with self._lock:
             if self._closing:
@@ -1527,9 +1655,10 @@ class NativeV2InferenceService(InferenceService):
         sse_keepalive_seconds: float = 10.0,
         max_tool_call_tokens: int = 0,
         reasoning_effort: str | None = None,
+        generation_defaults: Mapping[str, float | int] | None = None,
     ):
-        generation_defaults, generation_defaults_source = _generation_config_for_model(
-            model_path
+        generation_defaults, generation_defaults_source = _merge_generation_defaults(
+            *_generation_config_for_model(model_path), generation_defaults
         )
         self.v2_model = V2Model(model_path, mtp_model=mtp_model_path)
         # BailingMoE3 runs on its own runtime rather than the Qwen one: 24 of

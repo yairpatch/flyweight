@@ -421,6 +421,24 @@ def _parser() -> argparse.ArgumentParser:
              "(Qwen3.5 reads low/medium/xhigh and defaults to xhigh, its "
              "maximum); a request may override it per call",
     )
+    # Server-wide sampling defaults, one flag per setting in sampling.SETTINGS
+    # so this list cannot fall behind the sampler. Each applies when a request
+    # does not carry its own value, and an absent flag changes nothing, giving
+    # request > flag > generation_config.json beside the model > built-in.
+    #
+    # The penalties matter here because they are not a nicety on a low-bit
+    # checkpoint -- they are what keeps it from looping, and they apply to
+    # greedy decode, which is the default. A client that cannot send extra body
+    # fields, and several coding harnesses cannot, has no other way to set them.
+    from .sampling import SERVER_SETTINGS
+    for setting in SERVER_SETTINGS:
+        built_in = _sampling_defaults().get(setting.name)
+        serve.add_argument(
+            f"--{setting.name.replace('_', '-')}",
+            type=setting.kind, default=None,
+            help=f"default {setting.help}"
+                 + (f" (default: {built_in})" if built_in is not None else ""),
+        )
     serve.add_argument("--strict-model", action="store_true")
     serve.add_argument("--api-key", default=os.environ.get("COLIBRI_API_KEY"))
     serve.add_argument("--cors-origin", default="*")
@@ -781,6 +799,34 @@ def _generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sampling_defaults() -> dict[str, float | int]:
+    from .sampling import defaults
+    return defaults()
+
+
+def _sampling_overrides(args: argparse.Namespace) -> dict[str, float | int]:
+    """The sampling flags the caller actually passed.
+
+    Only the ones given: an absent flag must leave whatever the checkpoint's own
+    generation_config.json says, rather than overwrite it with an argparse
+    default that the caller never chose.
+    """
+    from .sampling import SERVER_SETTINGS, from_values
+    given = {
+        setting.name: getattr(args, setting.name)
+        for setting in SERVER_SETTINGS
+        if getattr(args, setting.name, None) is not None
+    }
+    # Check the ranges here rather than letting the service do it: the service
+    # validates after building the runtime, so a typo would cost a full model
+    # load before saying so.
+    try:
+        from_values(given)
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"invalid sampling default: {error}") from error
+    return given
+
+
 def _serve(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
     from .v2 import V2Model
@@ -830,6 +876,7 @@ def _serve(args: argparse.Namespace) -> int:
         sse_keepalive_seconds=args.sse_keepalive_seconds,
         max_tool_call_tokens=args.max_tool_call_tokens,
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        generation_defaults=_sampling_overrides(args),
     )
     return _serve_http(args, service)
 

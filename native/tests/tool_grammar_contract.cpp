@@ -7,9 +7,11 @@
 // it shows up as the model being unable to finish a sentence.
 
 #include "colibri_v2_tool_grammar.hpp"
+#include "colibri_v2_byte_alphabet.hpp"
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -30,7 +32,11 @@ const char* kSpecification = R"([
   {"name": "write", "parameters": [
     {"name": "filePath", "required": true},
     {"name": "content", "required": true},
-    {"name": "mode", "required": false}]}
+    {"name": "mode", "required": false}]},
+  {"name": "question", "parameters": [
+    {"name": "questions", "required": true, "type": "array"}]},
+  {"name": "configure", "parameters": [
+    {"name": "settings", "required": true, "type": "object"}]}
 ])";
 
 colibri::v2::tools::Grammar build() {
@@ -124,6 +130,141 @@ void check_a_bypassed_sampler_does_not_deadlock() {
     expect(grammar.accepts("whatever follows"), "and stops constraining");
 }
 
+// The sampler does not see text, it sees candidate *tokens*, and a token is
+// stored in the vocabulary's byte-level alphabet. Everything above feeds the
+// grammar plain bytes; these two check the step that gets it there, because a
+// wrong decode does not fail loudly -- it silently stops matching the literals
+// and the constraint quietly permits everything.
+// The layout the server's own tool prompt asks for, which is the one the model
+// imitates: every tag on its own line. The literals here run together, so
+// without whitespace between them the grammar dies on the first newline and
+// stops constraining -- silently, because an unconstrained sampler looks
+// exactly like a working one until you count malformed calls.
+// A parameter the schema declares as an array. The observed failure is the
+// model writing prose there: the client's validator then reports "expected
+// array, received string", and no amount of tolerant parsing can invent the
+// array. So the value is read as JSON rather than passed through.
+void check_a_declared_array_must_be_written_as_json() {
+    const std::string opened = "<tool_call>\n<function=question>\n<parameter=questions>\n";
+    expect(!allows(opened, "What backend would you like"),
+           "prose where an array belongs is refused");
+    expect(!allows(opened, "{\"question\":"),
+           "an object where an array belongs is refused");
+    expect(allows(opened, "["), "an array may open");
+    expect(allows(opened, "[{\"question\": \"Which backend?\", \"header\": \"Backend\"}"),
+           "and may be filled in");
+    expect(allows(opened, "[\n  {\n    \"question\": \"Which?\"\n  }\n]"),
+           "pretty-printed JSON is fine");
+    expect(!allows(opened, "[}"), "an impossible continuation is refused");
+    expect(!allows(opened, "[{\"a\": tru}"), "a broken literal is refused");
+}
+
+void check_a_declared_array_closes_only_when_whole() {
+    const std::string opened = "<tool_call>\n<function=question>\n<parameter=questions>\n";
+    expect(!allows(opened + "[{\"question\": \"Which?\"}", "</parameter>"),
+           "an unterminated array cannot close the parameter");
+    expect(!allows(opened + "[", "</parameter>"),
+           "nor can a bare opening bracket");
+    expect(allows(opened + "[{\"question\": \"Which?\"}]", "</parameter>"),
+           "a complete array can");
+    expect(allows(opened + "[]", "</parameter>"), "an empty array is complete");
+    expect(allows(opened + "[{\"question\": \"Which?\"}]\n", "</parameter>"),
+           "and the layout's trailing newline is allowed before the tag");
+}
+
+void check_a_declared_object_is_held_to_the_same_rule() {
+    const std::string opened = "<tool_call>\n<function=configure>\n<parameter=settings>\n";
+    expect(!allows(opened, "["), "an array where an object belongs is refused");
+    expect(allows(opened, "{\"retries\": 3, \"backoff\": \"exponential\"}"),
+           "an object may be written");
+    expect(!allows(opened + "{\"retries\": 3", "</parameter>"),
+           "an unterminated object cannot close the parameter");
+    expect(allows(opened + "{\"retries\": 3}", "</parameter>"),
+           "a complete one can");
+}
+
+// The escape hatch: a string-typed or undeclared parameter is still free text,
+// including text that looks like broken JSON. Constraining those would break
+// every tool whose value is prose or code.
+void check_untyped_values_stay_free_text() {
+    const std::string opened =
+        "<tool_call>\n<function=write>\n<parameter=content>\n";
+    expect(allows(opened, "def main():\n    print(\"{[unbalanced\")"),
+           "code with unbalanced brackets is still a legal value");
+    expect(allows(opened + "anything at all", "</parameter>"),
+           "and it may close whenever the model likes");
+}
+
+void check_the_prompted_multi_line_layout_is_accepted() {
+    auto grammar = build();
+    grammar.observe("<tool_call>\n<function=bash>\n<parameter=command>\nls -la\n</parameter>\n");
+    expect(grammar.armed(), "a call laid out over lines stays armed");
+    expect(!grammar.accepts("</function>"),
+           "and still refuses to close with a required parameter outstanding");
+    expect(grammar.accepts("<parameter=description>"),
+           "and still allows the outstanding parameter");
+
+    auto complete = build();
+    complete.observe(
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+        "<parameter=description>\nList files\n</parameter>\n");
+    expect(complete.accepts("</function>\n</tool_call>"),
+           "the closing tags may be separated by a newline");
+    complete.observe("</function>\n</tool_call>");
+    expect(!complete.armed(), "and the call closes");
+}
+
+void check_the_byte_alphabet_round_trips() {
+    const char* cases[] = {
+        "<tool_call>", " leading space", "line\nbreak", "tab\there",
+        "plain", "</parameter>", "unicode \xc3\xa9\xe2\x82\xac", " {\"a\": 1}",
+    };
+    for (const char* text : cases) {
+        const std::string encoded = colibri::v2::alphabet::encode(text);
+        expect(colibri::v2::alphabet::decode(encoded) == text,
+               std::string("byte alphabet round-trips: ") + text);
+    }
+    // A space is the case that matters: it is the one character that appears in
+    // most tokens and is spelled as U+0120 rather than 0x20.
+    expect(colibri::v2::alphabet::encode(" ") == "\xc4\xa0",
+           "a space encodes to U+0120");
+    expect(colibri::v2::alphabet::decode("\xc4\xa0") == " ",
+           "U+0120 decodes back to a space");
+    // Special tokens are stored literally, not byte-encoded.
+    expect(colibri::v2::alphabet::decode("<|im_start|>") == "<|im_start|>",
+           "a special token passes through the decoder unchanged");
+}
+
+// The failure in the field, replayed the way the sampler meets it: the model
+// has written the first parameter and the candidates are vocabulary pieces.
+void check_candidate_tokens_are_judged_after_decoding() {
+    auto grammar = build();
+    const char* written[] = {
+        "<tool_call>", "<function=bash>", "<parameter=command>", "ls",
+        " -la", "</parameter>",
+    };
+    for (const char* piece : written)
+        grammar.observe(colibri::v2::alphabet::decode(
+            colibri::v2::alphabet::encode(piece)));
+    expect(grammar.armed(), "the call is still open");
+
+    // Encoded exactly as a vocabulary holds them, leading space and all.
+    const auto encoded = [](const char* text) {
+        return colibri::v2::alphabet::decode(colibri::v2::alphabet::encode(text));
+    };
+    expect(!grammar.accepts(encoded("</function>")),
+           "closing early is refused when the candidate arrives as a token");
+    expect(grammar.accepts(encoded("<parameter=description>")),
+           "the outstanding parameter is allowed as a token");
+    // Without the decode this one silently fails: the raw spelling of a token
+    // carrying a leading space matches no literal, so it would be rejected and
+    // the model would be unable to write a value that starts with a space.
+    auto inside = build();
+    inside.observe("<tool_call><function=write><parameter=content>");
+    expect(inside.accepts(encoded(" indented line")),
+           "a value token with a leading space is accepted");
+}
+
 void check_no_tools_means_no_constraint() {
     colibri::v2::tools::Grammar grammar{};
     expect(grammar.empty(), "an empty specification yields an empty grammar");
@@ -143,6 +284,13 @@ int main() {
     check_the_constraint_disarms();
     check_a_bypassed_sampler_does_not_deadlock();
     check_no_tools_means_no_constraint();
+    check_a_declared_array_must_be_written_as_json();
+    check_a_declared_array_closes_only_when_whole();
+    check_a_declared_object_is_held_to_the_same_rule();
+    check_untyped_values_stay_free_text();
+    check_the_prompted_multi_line_layout_is_accepted();
+    check_the_byte_alphabet_round_trips();
+    check_candidate_tokens_are_judged_after_decoding();
 
     if (failures) {
         std::printf("tool_grammar_contract: %d failure(s)\n", failures);

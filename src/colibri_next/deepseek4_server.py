@@ -196,7 +196,15 @@ class Deepseek4Engine:
         max_new_tokens: int,
         stop_tokens: tuple[int, ...],
         sampling: SamplingConfig | None = None,
+        tools: list[dict[str, object]] | None = None,
     ) -> tuple[int, Queue[tuple[str, object]]]:
+        # Accepted and unused: constrained tool-call decoding lives in the Qwen
+        # sampler, and this runtime has its own. A DeepSeek-V4 tool call is
+        # still recovered by the tolerant parser in the server, which is where
+        # every call was handled before the constraint existed. Taking the
+        # argument keeps one calling convention across the engines rather than
+        # making the shared streaming path ask which one it holds.
+        del tools
         prompt = [int(token) for token in prompt_ids]
         if not prompt:
             raise ValueError("prompt must not be empty")

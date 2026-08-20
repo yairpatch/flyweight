@@ -653,6 +653,77 @@ inline float qwen_iq2xs_dot_row(
     return result;
 }
 
+// IQ1_S (GGML type 19): 50 bytes per 256 values -> d(2) qs[32] qh[8*2].
+// One halfword of qh covers a whole 32-value group: the high three bits of each
+// of its four 11-bit grid indices (the low eight come from qs), the group's own
+// 3-bit scale multiplier in bits 12-14, and in bit 15 the sign of the +-0.125
+// delta added to every weight in the group.
+constexpr std::uint32_t kIq1sBlockBytes = 50;
+constexpr float kIq1sDelta = 0.125f;
+
+// Grid index of one group of eight weights, and the group's scale and delta.
+// The element decoder and the row dot product below want exactly this much of
+// the halfword each, so it is unpacked once here rather than twice there.
+inline std::uint32_t qwen_iq1s_index(
+    const std::uint8_t* base, int group, int part, std::uint16_t qh
+) {
+    return static_cast<std::uint32_t>(base[2 + group * 4 + part]) |
+        ((static_cast<std::uint32_t>(qh >> (3 * part)) & 7u) << 8);
+}
+
+inline float qwen_iq1s_value(const std::uint8_t* packed, std::uint64_t absolute) {
+    const auto block = absolute / 256;
+    const int within = static_cast<int>(absolute & 255);
+    const auto* base = packed + block * kIq1sBlockBytes;
+    // Group of 32, group of 8 within it, element within that.
+    const int group = within / 32, part = (within % 32) / 8, lane = within & 7;
+    std::uint16_t scale_bits = 0, qh = 0;
+    std::memcpy(&scale_bits, base, 2);
+    std::memcpy(&qh, base + 34 + group * 2, 2);
+    const float delta = (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+    const float scale = qwen_half_value(scale_bits) *
+        static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+    const auto weight = static_cast<std::int8_t>(
+        (kIq1sGrid[qwen_iq1s_index(base, group, part, qh)] >> (8 * lane)) & 0xffull);
+    return scale * (static_cast<float>(weight) + delta);
+}
+
+inline float qwen_iq1s_dot_row(
+    const std::uint8_t* packed, const float* input, int elements, std::uint64_t row
+) {
+    const int blocks = elements / 256;
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(blocks) * kIq1sBlockBytes;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const auto* base = row_data + block * kIq1sBlockBytes;
+        std::uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, base, 2);
+        const float d = qwen_half_value(scale_bits);
+        const float* vector = input + block * 256;
+        for (int group = 0; group < 8; ++group) {
+            std::uint16_t qh = 0;
+            std::memcpy(&qh, base + 34 + group * 2, 2);
+            const float scale = d * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+            const float delta = (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+            const float* values = vector + group * 32;
+            float partial = 0.0f;
+            for (int part = 0; part < 4; ++part) {
+                const std::uint64_t entry =
+                    kIq1sGrid[qwen_iq1s_index(base, group, part, qh)];
+                for (int lane = 0; lane < 8; ++lane) {
+                    const auto weight =
+                        static_cast<std::int8_t>((entry >> (8 * lane)) & 0xffull);
+                    partial += (static_cast<float>(weight) + delta) *
+                        values[part * 8 + lane];
+                }
+            }
+            result += scale * partial;
+        }
+    }
+    return result;
+}
+
 // IQ1_M (GGML type 29): 56 bytes per 256 values -> qs[32] qh[16] scales[8].
 // Same 2048-entry grid as IQ1_S, but the super-block scale is not stored as a
 // field of its own: its sixteen half-precision bits are scattered four at a

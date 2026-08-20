@@ -221,6 +221,8 @@ void qwen_forward_rows(
                 case 17:q8_kernel="iq2xs_q8_matvec_transposed_warp";break;
                 case 18:q8_kernel="iq3xxs_q8_matvec_transposed_warp";break;
                 case 22:q8_kernel="iq2s_q8_matvec_transposed_warp";break;
+                case 19:q8_kernel="iq1s_q8_matvec_transposed_warp";break;
+                case 29:q8_kernel="iq1m_q8_matvec_transposed_warp";break;
                 default:break;
             }
         }
@@ -262,6 +264,8 @@ void qwen_forward_rows(
                 case 10:rows_kernel="q2k_q8_matvec_transposed_rows";break;
                 case 12:rows_kernel="q4k_q8_matvec_transposed_rows";break;
                 case 13:rows_kernel="q5k_q8_matvec_transposed_rows";break;
+                case 19:rows_kernel="iq1s_q8_matvec_transposed_rows";break;
+                case 29:rows_kernel="iq1m_q8_matvec_transposed_rows";break;
                 default:break;
             }
             // Wide batches take the tiled kernel instead: it stages decoded
@@ -287,6 +291,13 @@ void qwen_forward_rows(
                 case 10:mmq_kernel="q2k_q8_mmq";mmq_min=true;break;
                 case 12:mmq_kernel="q4k_q8_mmq";mmq_min=true;break;
                 case 13:mmq_kernel="q5k_q8_mmq";mmq_min=true;break;
+                // IQ1_S carries a per-group delta and still lands here rather
+                // than with the asymmetric three: its delta is +-1/8, so it
+                // folds into the int8 weights exactly. See iq1s_q8_words.
+                case 19:mmq_kernel="iq1s_q8_mmq";break;
+                // IQ1_M folds the same way; its two sub-scales per 32 values
+                // are the half-block split the symmetric kernels already carry.
+                case 29:mmq_kernel="iq1m_q8_mmq";break;
                 default:break;
             }
             if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
@@ -315,6 +326,8 @@ void qwen_forward_rows(
                 case 18:tiled_kernel="iq3xxs_q8_matmul_tiled";break;
                 case 22:tiled_kernel="iq2s_q8_matmul_tiled";break;
                 case 23:tiled_kernel="iq4xs_q8_matmul_tiled";break;
+                case 19:tiled_kernel="iq1s_q8_matmul_tiled";break;
+                case 29:tiled_kernel="iq1m_q8_matmul_tiled";break;
                 case 11:tiled_kernel="q3k_q8_matmul_tiled";break;
                 case 14:tiled_kernel="q6k_q8_matmul_tiled";break;
                 default:break;
@@ -400,6 +413,7 @@ void qwen_forward_rows(
             case 21:launch("iq3s_matmul_rows",output_size,(rows+3)/4,256,args);return;
             case 17:launch("iq2xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
             case 23:launch("iq4xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
+            case 19:launch("iq1s_matmul_rows",output_size,(rows+3)/4,256,args);return;
             // IQ1_M: ssm_alpha/ssm_beta. Without this they fall to the
             // per-token fallback below -- 64 launches of a 48-block grid per
             // projection per layer -- which is pure launch latency and was the

@@ -21,16 +21,36 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, overloa
 from urllib.parse import unquote, urlsplit
 
 from .generation import GenerationResult, GenerationStep
-from .sampling import SamplingConfig
+from .sampling import SETTINGS, SamplingConfig
 
-# The penalties a request may override, and the only keys read out of
-# SamplingConfig's defaults into `generation_defaults`.
-_PENALTY_OPTIONS = (
-    "repetition_penalty",
-    "presence_penalty",
-    "frequency_penalty",
-    "penalty_window",
+# The settings a request may override, which is all of them: see
+# sampling.SETTINGS for the one list every surface reads.
+_PENALTY_OPTIONS = tuple(
+    setting.name for setting in SETTINGS if not setting.per_request_only
 )
+
+
+def _sampling_from_payload(
+    payload: Mapping[str, Any], defaults: Mapping[str, Any]
+) -> SamplingConfig:
+    """A request's sampling settings: whatever it sent, else the server default.
+
+    Driven by sampling.SETTINGS so the two endpoints cannot accept different
+    subsets, which is how `seed` came to work on one and not the other.
+    """
+    values: dict[str, Any] = {}
+    for setting in SETTINGS:
+        if setting.optional:
+            values[setting.name] = _optional_integer(payload, setting.name)
+            continue
+        default = defaults[setting.name]
+        if setting.kind is int:
+            values[setting.name] = _integer_option(
+                payload, setting.name, default=int(default))
+        else:
+            values[setting.name] = _float_option(
+                payload, setting.name, float(default))
+    return SamplingConfig(**values)
 
 
 class Generator(Protocol):
@@ -436,6 +456,12 @@ class InferenceService:
             enable_thinking=request.enable_thinking,
             reasoning_effort=request.reasoning_effort,
             progress=progress,
+            # The declarations themselves, for a generator that can constrain
+            # the sampler to them. Only the architectures in
+            # NATIVE_TOOL_ARCHITECTURES carry these on a message; everywhere
+            # else the schemas are rendered into the tool prompt, so a
+            # constraint that read the messages would find nothing.
+            tools=tuple(tools),
         )
         try:
             for step in steps:
@@ -1501,38 +1527,7 @@ class InferenceService:
             parameter="max_tokens",
         )
         try:
-            sampling = SamplingConfig(
-                temperature=_float_option(
-                    payload, "temperature", float(self.generation_defaults["temperature"])
-                ),
-                top_k=_integer_option(
-                    payload, "top_k", default=int(self.generation_defaults["top_k"])
-                ),
-                top_p=_float_option(
-                    payload, "top_p", float(self.generation_defaults["top_p"])
-                ),
-                seed=_optional_integer(payload, "seed"),
-                repetition_penalty=_float_option(
-                    payload,
-                    "repetition_penalty",
-                    float(self.generation_defaults["repetition_penalty"]),
-                ),
-                presence_penalty=_float_option(
-                    payload,
-                    "presence_penalty",
-                    float(self.generation_defaults["presence_penalty"]),
-                ),
-                frequency_penalty=_float_option(
-                    payload,
-                    "frequency_penalty",
-                    float(self.generation_defaults["frequency_penalty"]),
-                ),
-                penalty_window=_integer_option(
-                    payload,
-                    "penalty_window",
-                    default=int(self.generation_defaults["penalty_window"]),
-                ),
-            )
+            sampling = _sampling_from_payload(payload, self.generation_defaults)
         except ValueError as error:
             raise APIError(400, str(error)) from error
         return _TextRequest(prompt, max_new_tokens, sampling)
@@ -1570,38 +1565,7 @@ class InferenceService:
             default=int(self.generation_defaults["max_new_tokens"]),
         )
         try:
-            sampling = SamplingConfig(
-                temperature=_float_option(
-                    payload, "temperature", float(self.generation_defaults["temperature"])
-                ),
-                top_k=_integer_option(
-                    payload, "top_k", default=int(self.generation_defaults["top_k"])
-                ),
-                top_p=_float_option(
-                    payload, "top_p", float(self.generation_defaults["top_p"])
-                ),
-                seed=_optional_integer(payload, "seed"),
-                repetition_penalty=_float_option(
-                    payload,
-                    "repetition_penalty",
-                    float(self.generation_defaults["repetition_penalty"]),
-                ),
-                presence_penalty=_float_option(
-                    payload,
-                    "presence_penalty",
-                    float(self.generation_defaults["presence_penalty"]),
-                ),
-                frequency_penalty=_float_option(
-                    payload,
-                    "frequency_penalty",
-                    float(self.generation_defaults["frequency_penalty"]),
-                ),
-                penalty_window=_integer_option(
-                    payload,
-                    "penalty_window",
-                    default=int(self.generation_defaults["penalty_window"]),
-                ),
-            )
+            sampling = _sampling_from_payload(payload, self.generation_defaults)
         except ValueError as error:
             raise APIError(400, str(error)) from error
         enable_thinking = _boolean_option(payload, "enable_thinking", None)
@@ -2904,9 +2868,15 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "model": payload.get("model"),
         "messages": messages,
         "max_completion_tokens": payload.get("max_tokens"),
-        "temperature": payload.get("temperature"),
-        "top_p": payload.get("top_p"),
-        "top_k": payload.get("top_k"),
+        # Every sampling setting the caller sent, not the three this used to
+        # carry: Anthropic's own schema names only temperature/top_p/top_k, but
+        # a client that adds `repetition_penalty` or `seed` to the body meant
+        # it, and dropping it here left no way to set them from this endpoint.
+        **{
+            setting.name: payload.get(setting.name)
+            for setting in SETTINGS
+            if payload.get(setting.name) is not None
+        },
         # Absent means unstated, which leaves the checkpoint's own default in
         # place. Answering "false" here turned reasoning off for every Claude
         # Code request, since that client does not send a thinking block.

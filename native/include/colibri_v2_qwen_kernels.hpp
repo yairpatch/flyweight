@@ -4837,6 +4837,225 @@ void iq1m_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+// IQ1_S, the format the grid above is named for: 50 bytes per 256 values --
+// d(2) qs[32] qh[8*2]. Everything IQ1_M scatters, this one keeps in one place.
+// A single halfword of qh covers a whole 32-value group: the high three bits of
+// each of its four 11-bit grid indices (the low eight are qs bytes), the
+// group's 3-bit scale multiplier in bits 12-14, and in bit 15 the sign of the
+// +-0.125 delta every weight in the group carries. A group is therefore exactly
+// one Q8 activation block, which is what lets the DP4A path below be a plain
+// *_MIN kernel rather than needing half-group scales.
+__device__ __forceinline__ float iq1s_value(
+    const unsigned char* packed, int absolute
+) {
+    const int block = absolute / 256;
+    const int within = absolute & 255;
+    const unsigned char* base = packed + block * 50;
+    const int group = within >> 5, part = (within >> 3) & 3, lane = within & 7;
+    unsigned short qh;
+    memcpy(&qh, base + 34 + group * 2, 2);
+    const unsigned int index = (unsigned int)base[2 + group * 4 + part] |
+        ((((unsigned int)qh >> (3 * part)) & 7u) << 8);
+    const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    const float scale = __half2float(*((const __half*)base)) *
+        (float)(2 * ((qh >> 12) & 7) + 1);
+    const float weight =
+        (float)(signed char)((kIq1sGrid[index] >> (8 * lane)) & 0xffULL);
+    return scale * (weight + delta);
+}
+
+extern "C" __global__
+void iq1s_matvec_transposed(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size
+) {
+    const int row = blockIdx.x;
+    if (row >= output_size) return;
+    float partial = 0.0f;
+    for (int input = threadIdx.x; input < input_size; input += blockDim.x)
+        partial += iq1s_value(packed, row * input_size + input) * vector[input];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[row] = partial;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// IQ1_S against a Q8-quantized activation.
+//
+// The grid entries are eight int8 in a 64-bit word, so a group of eight weights
+// is two DP4A operands with no unpacking at all -- no sign expansion, no nibble
+// split. The one thing in the way is the delta: a weight reconstructs as
+// scale * (grid_value + delta) with delta = +-1/8 shared by the group, and a
+// constant added to every weight is exactly what the _MIN kernels' offset
+// handles, at the price of the activation sums and their smaller tile.
+//
+// It does not have to be paid, because the delta is a power of two. Grid values
+// are -1, 0 and 1, so 8*grid_value +- 1 is an int8 in [-9, 9] and
+//
+//     scale * (grid_value + delta) == (scale / 8) * (8 * grid_value +- 1)
+//
+// exactly -- no rounding anywhere, the scale only loses an exponent. So the
+// delta folds into the int8 weights themselves and IQ1_S becomes a symmetric
+// format for every kernel downstream, which is what puts it on the wide MMQ
+// tile instead of the 32-row _MIN one.
+//
+// Folding is three SIMD byte operations: shift the packed grid word left by
+// three (masking off the bits that would cross into the next byte, since there
+// is no byte-wise shift) and add the sign word, +1 or -1 per byte.
+__device__ __forceinline__ void iq1s_q8_words(
+    const unsigned long long entry, const unsigned int signs,
+    int* low, int* high
+) {
+    *low = (int)__vadd4(((unsigned int)entry << 3) & 0xf8f8f8f8u, signs);
+    *high = (int)__vadd4(
+        ((unsigned int)(entry >> 32) << 3) & 0xf8f8f8f8u, signs);
+}
+
+__device__ __forceinline__ float iq1s_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 50;
+    unsigned short qh;
+    unsigned int codes;
+    memcpy(&qh, base + 34 + group * 2, 2);
+    memcpy(&codes, base + 2 + group * 4, 4);
+
+    const int4* activation_vectors = (const int4*)(vector + linear_group * 32);
+    const int4 activation_low = activation_vectors[0];
+    const int4 activation_high = activation_vectors[1];
+    const int acts[8] = {
+        activation_low.x, activation_low.y,
+        activation_low.z, activation_low.w,
+        activation_high.x, activation_high.y,
+        activation_high.z, activation_high.w};
+
+    // -1 per byte when the group's delta is negative, +1 per byte when it is
+    // positive. 0xffffffff is that -1: __vadd4 wraps per byte.
+    const unsigned int signs = (qh & 0x8000) ? 0xffffffffu : 0x01010101u;
+    int dot = 0;
+    #pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        const unsigned long long entry = kIq1sGrid[
+            ((codes >> (8 * part)) & 255u) |
+            ((((unsigned int)qh >> (3 * part)) & 7u) << 8)];
+        int low, high;
+        iq1s_q8_words(entry, signs, &low, &high);
+        dot = __dp4a(low, acts[part * 2], dot);
+        dot = __dp4a(high, acts[part * 2 + 1], dot);
+    }
+    const float scale = __half2float(*((const __half*)base)) *
+        (float)(2 * ((qh >> 12) & 7) + 1) * 0.125f;
+    return scale * (float)dot * __half2float(vector_scales[linear_group]);
+}
+
+COLIBRI_Q8_MATVEC(iq1s_q8_matvec_transposed_warp, iq1s_q8_group, 50)
+
+// Batched twin of iq1s_q8_group. A group of 32 is one scale, so both halves of
+// the Q8 block get it.
+__device__ __forceinline__ void iq1s_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 50;
+    unsigned short qh;
+    unsigned int codes;
+    memcpy(&qh, base + 34 + group * 2, 2);
+    memcpy(&codes, base + 2 + group * 4, 4);
+    const unsigned int signs = (qh & 0x8000) ? 0xffffffffu : 0x01010101u;
+    #pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        const unsigned long long entry = kIq1sGrid[
+            ((codes >> (8 * part)) & 255u) |
+            ((((unsigned int)qh >> (3 * part)) & 7u) << 8)];
+        iq1s_q8_words(entry, signs, &words[part * 2], &words[part * 2 + 1]);
+    }
+    const float scale = __half2float(*((const __half*)base)) *
+        (float)(2 * ((qh >> 12) & 7) + 1) * 0.125f;
+    *scale_low = scale;
+    *scale_high = scale;
+}
+
+COLIBRI_Q8_MATVEC_ROWS(iq1s_q8_matvec_transposed_rows, iq1s_q8_decode, 50)
+COLIBRI_Q8_MATMUL_TILED(iq1s_q8_matmul_tiled, iq1s_q8_decode, 50)
+COLIBRI_Q8_MMQ(iq1s_q8_mmq, iq1s_q8_decode, 50)
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// IQ1_M against a Q8-quantized activation.
+//
+// The same fold as IQ1_S, since it is the same grid and the same +-1/8 delta.
+// Two things differ, and both happen to fit what is already here. The sign of
+// the delta is per group of eight rather than per group of 32, so the sign word
+// is picked per grid entry inside the loop instead of once. And the 3-bit
+// sub-scales cover 16 values each, which is exactly the half-block split
+// scale_low/scale_high already carries for IQ2_S -- so the format needs no new
+// kernel shape at all, only this decoder.
+__device__ __forceinline__ void iq1m_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int ib = linear_group & 7;
+    const unsigned char* base = row_data + block * 56;
+    unsigned short sc[4];
+    memcpy(sc, base + 48, 8);
+    // 0.125 is the fold: the weights below carry 8*grid_value +- 1.
+    const float d = iq1m_scale(base) * 0.125f;
+    const int shift = 6 * (ib & 1);
+    *scale_low = d * (float)(2 * ((sc[ib / 2] >> shift) & 7) + 1);
+    *scale_high = d * (float)(2 * ((sc[ib / 2] >> (shift + 3)) & 7) + 1);
+    #pragma unroll
+    for (int group = 0; group < 4; ++group) {
+        const unsigned int qh = base[32 + ib * 2 + group / 2];
+        const unsigned int index = (unsigned int)base[ib * 4 + group] |
+            ((qh << ((group & 1) ? 4 : 8)) & 0x700u);
+        const unsigned int signs =
+            (qh & ((group & 1) ? 0x80u : 0x08u)) ? 0xffffffffu : 0x01010101u;
+        iq1s_q8_words(kIq1sGrid[index], signs,
+                      &words[group * 2], &words[group * 2 + 1]);
+    }
+}
+
+__device__ __forceinline__ float iq1m_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    int words[8];
+    float scale_low, scale_high;
+    iq1m_q8_decode(row_data, linear_group, words, &scale_low, &scale_high);
+
+    const int4* activation_vectors = (const int4*)(vector + linear_group * 32);
+    const int4 activation_low = activation_vectors[0];
+    const int4 activation_high = activation_vectors[1];
+    const int acts[8] = {
+        activation_low.x, activation_low.y,
+        activation_low.z, activation_low.w,
+        activation_high.x, activation_high.y,
+        activation_high.z, activation_high.w};
+
+    int dot_low = 0, dot_high = 0;
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        int dot = 0;
+        dot = __dp4a(words[step * 2], acts[step * 2], dot);
+        dot = __dp4a(words[step * 2 + 1], acts[step * 2 + 1], dot);
+        if (step < 2) dot_low += dot; else dot_high += dot;
+    }
+    return ((float)dot_low * scale_low + (float)dot_high * scale_high)
+        * __half2float(vector_scales[linear_group]);
+}
+
+COLIBRI_Q8_MATVEC(iq1m_q8_matvec_transposed_warp, iq1m_q8_group, 56)
+COLIBRI_Q8_MATVEC_ROWS(iq1m_q8_matvec_transposed_rows, iq1m_q8_decode, 56)
+COLIBRI_Q8_MATMUL_TILED(iq1m_q8_matmul_tiled, iq1m_q8_decode, 56)
+COLIBRI_Q8_MMQ(iq1m_q8_mmq, iq1m_q8_decode, 56)
 
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
@@ -8262,6 +8481,7 @@ COLIBRI_LOWBIT_MATVEC_WARP(iq3s_matvec_transposed_warp, iq3s_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq2xs_matvec_transposed_warp, iq2xs_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq4xs_matvec_transposed_warp, iq4xs_value)
 COLIBRI_LOWBIT_MATVEC_WARP(iq1m_matvec_transposed_warp, iq1m_value)
+COLIBRI_LOWBIT_MATVEC_WARP(iq1s_matvec_transposed_warp, iq1s_value)
 #undef COLIBRI_LOWBIT_MATVEC_WARP
 
 extern "C" __global__ void q5k_matvec_transposed_warp(
@@ -8319,6 +8539,7 @@ COLIBRI_LOWBIT_MATMUL_ROWS(iq3s_matmul_rows, iq3s_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq2xs_matmul_rows, iq2xs_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq4xs_matmul_rows, iq4xs_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq1m_matmul_rows, iq1m_value)
+COLIBRI_LOWBIT_MATMUL_ROWS(iq1s_matmul_rows, iq1s_value)
 #undef COLIBRI_LOWBIT_MATMUL_ROWS
 
 #define KV_ATTENTION_FUSED_TILES_W(name, KT, VT, WIDTH) \

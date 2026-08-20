@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from colibri_next.v2_server import (
     NativeV2InferenceService,
     NativeV2Tokenizer,
     _generation_config_for_model,
+    _merge_generation_defaults,
 )
 from colibri_next.v2 import TASK_EVENT_PREFILL
 
@@ -103,6 +105,7 @@ class StubV2Runtime:
         presence_penalty=0.0,
         frequency_penalty=0.0,
         penalty_window=64,
+        tools=None,
     ):
         self._tasks = getattr(self, "_tasks", {})
         self._next_task = getattr(self, "_next_task", 0) + 1
@@ -110,6 +113,7 @@ class StubV2Runtime:
         self._last_penalties = (
             repetition_penalty, presence_penalty, frequency_penalty, penalty_window
         )
+        self._last_tools = tools
         self._tasks[self._next_task] = (list(prompt), max_tokens, tuple(stop_tokens))
         return self._next_task
 
@@ -508,6 +512,79 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(defaults, {"temperature": 0.4, "top_p": 0.8})
         self.assertEqual(source, str(config))
 
+    def test_every_sampling_setting_is_reachable_from_every_surface(self) -> None:
+        # The point of sampling.SETTINGS: a setting the sampler honours must be
+        # settable by a server flag, by the checkpoint's generation config, and
+        # by a request. These lists were written out by hand once each and
+        # drifted -- `seed` reached only OpenAI requests, the penalties only a
+        # flag or an OpenAI request -- so each surface is checked against the
+        # table rather than against a second hand-written list.
+        from colibri_next.sampling import SERVER_SETTINGS, SETTINGS
+
+        parser = _parser()
+        serve = next(
+            action.choices["serve"]
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        flags = {option for action in serve._actions for option in action.option_strings}
+        for setting in SERVER_SETTINGS:
+            self.assertIn(f"--{setting.name.replace('_', '-')}", flags)
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.gguf"
+            model.write_bytes(b"")
+            values = {
+                "temperature": 0.3, "top_k": 7, "top_p": 0.5,
+                "repetition_penalty": 1.2, "presence_penalty": 0.25,
+                "frequency_penalty": -0.5, "penalty_window": 16,
+            }
+            (model.parent / "generation_config.json").write_text(json.dumps(values))
+            defaults, _ = _generation_config_for_model(model)
+        for setting in SERVER_SETTINGS:
+            self.assertEqual(defaults[setting.name], values[setting.name],
+                             f"{setting.name} was dropped by the config loader")
+
+        # And a request may set every one of them, including seed.
+        from colibri_next.server import _sampling_from_payload
+        from colibri_next.sampling import defaults as builtin_defaults
+        payload = dict(values, seed=99)
+        sampling = _sampling_from_payload(payload, builtin_defaults())
+        for setting in SETTINGS:
+            self.assertEqual(getattr(sampling, setting.name), payload[setting.name],
+                             f"{setting.name} was dropped by the request parser")
+
+    def test_server_flags_win_over_the_checkpoints_generation_config(self) -> None:
+        # The file says what the model shipped with; the flag says what this
+        # server was told to do. Losing that order would mean an operator who
+        # sets --repetition-penalty on the command line silently gets the
+        # checkpoint's value instead.
+        defaults, source = _merge_generation_defaults(
+            {"temperature": 0.4, "top_p": 0.8}, "/models/gen.json",
+            {"temperature": 0.0, "repetition_penalty": 1.15},
+        )
+        self.assertEqual(
+            defaults,
+            {"temperature": 0.0, "top_p": 0.8, "repetition_penalty": 1.15},
+        )
+        self.assertEqual(source, "/models/gen.json+flags(repetition_penalty,temperature)")
+
+    def test_an_unset_flag_leaves_the_checkpoints_value_alone(self) -> None:
+        # The CLI passes only what it was given: an absent flag must not arrive
+        # here as an argparse default and overwrite the file.
+        defaults, source = _merge_generation_defaults(
+            {"temperature": 0.4}, "/models/gen.json", {}
+        )
+        self.assertEqual(defaults, {"temperature": 0.4})
+        self.assertEqual(source, "/models/gen.json")
+        # None is treated the same way, so a caller may pass a full dict of
+        # optional values without filtering it first.
+        defaults, source = _merge_generation_defaults(
+            {"temperature": 0.4}, "engine", {"top_p": None, "penalty_window": 0}
+        )
+        self.assertEqual(defaults, {"temperature": 0.4, "penalty_window": 0})
+        self.assertEqual(source, "engine+flags(penalty_window)")
+
     def test_health_exposes_resolved_expert_policy(self) -> None:
         class Runtime:
             info = {
@@ -803,6 +880,69 @@ class NativeV2ServerTests(unittest.TestCase):
         repetition, _, _, window = runtime._last_penalties
         self.assertGreater(repetition, 1.0)
         self.assertGreater(window, 0)
+
+    def test_native_generator_forwards_tool_schemas_to_the_sampler(self) -> None:
+        # The sampler constrains a tool call to the caller's schemas, so the
+        # names and which parameters are required have to reach the engine. A
+        # request whose tools are dropped here samples freely and produces
+        # exactly the malformed call the constraint exists to prevent.
+        generator, runtime = self.make_generator([10, 20])
+        generator.generate_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "run ls",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {"type": "string"},
+                                        "description": {"type": "string"},
+                                        "timeout": {"type": "number"},
+                                        # The sampler holds this one to JSON:
+                                        # a string here reaches the client as
+                                        # "expected array, received string".
+                                        "questions": {"type": "array"},
+                                    },
+                                    "required": ["command", "description"],
+                                },
+                            },
+                        }
+                    ],
+                }
+            ],
+            max_new_tokens=1,
+        )
+        self.assertEqual(
+            runtime._last_tools,
+            [
+                {
+                    "name": "bash",
+                    "parameters": [
+                        {"name": "command", "required": True, "type": "string"},
+                        {"name": "description", "required": True, "type": "string"},
+                        # A number is text as far as the constraint is
+                        # concerned; the server coerces "5" on the way out.
+                        {"name": "timeout", "required": False, "type": "string"},
+                        {"name": "questions", "required": False, "type": "array"},
+                    ],
+                }
+            ],
+        )
+
+    def test_native_generator_sends_no_schemas_when_there_are_no_tools(self) -> None:
+        # Prose must not be constrained: an empty specification is what leaves
+        # the sampler alone, and sending one anyway would arm a grammar with
+        # nothing to accept.
+        generator, runtime = self.make_generator([10, 20])
+        generator.generate_messages(
+            [{"role": "user", "content": "hello"}], max_new_tokens=1
+        )
+        self.assertIn(runtime._last_tools, (None, []))
 
     def test_native_generator_reports_runtime_prefix_cache(self) -> None:
         generator, _ = self.make_generator([10])

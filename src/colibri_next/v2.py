@@ -7,11 +7,12 @@ native process and Python only owns handles and request-level data.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 try:  # optional: only used to keep the logits path off the Python interpreter
     import numpy as _numpy
@@ -378,6 +379,9 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("route_recurrence_miss_cold", ctypes.c_uint64),
         ("resolved_cache_type_k", ctypes.c_int32),
         ("resolved_cache_type_v", ctypes.c_int32),
+        ("grammar_constrained_steps", ctypes.c_uint64),
+        ("grammar_rejected_candidates", ctypes.c_uint64),
+        ("grammar_empty_candidate_sets", ctypes.c_uint64),
     ]
 
 
@@ -883,6 +887,26 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_uint64),
                 ]
                 lib.colibri_v2_qwen_task_submit_penalties.restype = ctypes.c_int
+                lib.colibri_v2_qwen_task_submit_grammar.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_float,
+                    ctypes.c_uint32,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_uint32,
+                    ctypes.c_uint64,
+                    ctypes.c_uint32,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_qwen_task_submit_grammar.restype = ctypes.c_int
                 lib.colibri_v2_qwen_engine_step.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(_QwenTaskEvent),
@@ -2532,8 +2556,14 @@ class V2QwenRuntime:
         frequency_penalty: float = 0.0,
         penalty_window: int = 64,
         seed: int | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> int:
-        """Queue a request on the cooperative engine; returns its task id."""
+        """Queue a request on the cooperative engine; returns its task id.
+
+        `tools` constrains the sampler while a tool call is open, so a required
+        parameter cannot be skipped: each entry is `{"name": str, "parameters":
+        [{"name": str, "required": bool}]}`. Omitting it samples freely.
+        """
         if not prompt_tokens:
             raise ValueError("prompt_tokens must not be empty")
         if max_tokens <= 0:
@@ -2541,8 +2571,9 @@ class V2QwenRuntime:
         values = (ctypes.c_uint32 * len(prompt_tokens))(*prompt_tokens)
         stops = (ctypes.c_uint32 * len(stop_tokens))(*stop_tokens) if stop_tokens else None
         task_id = ctypes.c_uint64()
+        specification = json.dumps(list(tools)).encode("utf-8") if tools else None
         self.model._check(
-            self._lib.colibri_v2_qwen_task_submit_penalties(
+            self._lib.colibri_v2_qwen_task_submit_grammar(
                 self._handle,
                 values,
                 len(prompt_tokens),
@@ -2558,6 +2589,7 @@ class V2QwenRuntime:
                 penalty_window,
                 0 if seed is None else seed & ((1 << 64) - 1),
                 int(seed is not None),
+                specification,
                 ctypes.byref(task_id),
             )
         )

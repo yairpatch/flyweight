@@ -252,6 +252,9 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t route_recurrence_miss_cold; /* misses outside the recency window */
     int32_t resolved_cache_type_k; /* cache_type_k after `auto` resolution */
     int32_t resolved_cache_type_v; /* cache_type_v after `auto` resolution */
+    uint64_t grammar_constrained_steps; /* decode steps inside an open tool call */
+    uint64_t grammar_rejected_candidates; /* candidates the grammar removed */
+    uint64_t grammar_empty_candidate_sets; /* steps where nothing was allowed */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
@@ -547,6 +550,11 @@ COLIBRI_V2_API int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime* ru
    penalized. Without these a low-bit checkpoint can lock onto a line and
    repeat it until the token budget runs out. */
 COLIBRI_V2_API int colibri_v2_qwen_task_submit_penalties(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, uint64_t* task_id);
+/* As above, plus a tool specification -- `[{"name": ..., "parameters":
+   [{"name": ..., "required": true}]}]` -- that constrains the sampler while a
+   tool call is open, so a required parameter cannot be skipped. Null or empty
+   leaves the sampler unconstrained. */
+COLIBRI_V2_API int colibri_v2_qwen_task_submit_grammar(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, uint64_t* task_id);
 COLIBRI_V2_API int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime* runtime, ColibriV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 COLIBRI_V2_API int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime* runtime, uint64_t task_id);
 

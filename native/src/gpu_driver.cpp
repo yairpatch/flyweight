@@ -935,13 +935,13 @@ extern "C" int colibri_gpu_compile(
              "quantize_q8_blocks", "iq3xxs_matvec_transposed_warp",
              "iq2s_matvec_transposed_warp", "iq3s_matvec_transposed_warp",
              "iq2xs_matvec_transposed_warp", "iq4xs_matvec_transposed_warp",
-             "iq1m_matvec_transposed_warp",
+             "iq1m_matvec_transposed_warp", "iq1s_matvec_transposed_warp",
              "q2k_matmul_rows", "q3k_matmul_rows", "q4k_matmul_rows",
              "q5k_matmul_rows", "q6k_matmul_rows",
              "iq2xxs_matmul_rows", "iq3xxs_matmul_rows",
              "iq2s_matmul_rows", "iq3s_matmul_rows",
              "iq2xs_matmul_rows", "iq4xs_matmul_rows",
-             "iq1m_matmul_rows",
+             "iq1m_matmul_rows", "iq1s_matmul_rows",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",
@@ -968,6 +968,14 @@ extern "C" int colibri_gpu_compile(
              "q2k_q8_matvec_transposed_rows", "q2k_q8_mmq",
              "q4k_q8_matvec_transposed_rows", "q4k_q8_mmq",
              "q5k_q8_matvec_transposed_rows", "q5k_q8_mmq",
+             // The IQ1 pair, symmetric once the delta is folded into the
+             // weights; IQ1_M's sub-scales use the half-block split.
+             "iq1s_q8_matvec_transposed_warp",
+             "iq1s_q8_matvec_transposed_rows", "iq1s_q8_matmul_tiled",
+             "iq1s_q8_mmq",
+             "iq1m_q8_matvec_transposed_warp",
+             "iq1m_q8_matvec_transposed_rows", "iq1m_q8_matmul_tiled",
+             "iq1m_q8_mmq",
              "iq4xs_q8_matvec_transposed_warp",
              "quantize_q8_blocks_rows",
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",
@@ -1021,7 +1029,7 @@ extern "C" int colibri_gpu_compile(
              "iq2s_matvec_transposed", "iq2s_lm_head_argmax_warp",
              "iq2xs_matvec_transposed", "iq2xs_lm_head_argmax_warp",
              "iq4xs_matvec_transposed", "iq4xs_lm_head_argmax_warp",
-             "iq1m_matvec_transposed",
+             "iq1m_matvec_transposed", "iq1s_matvec_transposed",
              "qwen_iq2xs_embedding", "qwen_iq2xs_embedding_rows",
              "qwen_iq4xs_embedding", "qwen_iq4xs_embedding_rows",
              "iq3s_matvec_transposed", "iq3s_lm_head_argmax_warp",
@@ -1699,6 +1707,15 @@ extern "C" int colibri_gpu_iq1m_matvec_transposed(
 ) {
     return launch_kquant_matvec(
         "iq1m_matvec_transposed_warp", "iq1m_matvec_transposed",
+        packed, input, output, input_size, output_size, stream);
+}
+
+extern "C" int colibri_gpu_iq1s_matvec_transposed(
+    std::uint64_t packed, std::uint64_t input, std::uint64_t output,
+    std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
+) {
+    return launch_kquant_matvec(
+        "iq1s_matvec_transposed_warp", "iq1s_matvec_transposed",
         packed, input, output, input_size, output_size, stream);
 }
 

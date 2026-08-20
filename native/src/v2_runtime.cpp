@@ -20,6 +20,8 @@
 #include "colibri_v2_hf_quantize.hpp"
 #include "colibri_v2_hf_cache.hpp"
 #include "colibri_v2_workspace.hpp"
+#include "colibri_v2_tool_grammar.hpp"
+#include "colibri_v2_byte_alphabet.hpp"
 #include "qwen_cpu_kernel.h"
 #include "qwen_kquant.h"
 #include "qwen_kquant_pack_api.hpp"
@@ -399,6 +401,35 @@ struct QwenSamplingState {
             recent.erase(recent.begin(),
                          recent.begin() + (recent.size() - penalty_window));
     }
+
+    // Constrained decoding for tool calls. Empty unless the caller passed a
+    // tool specification, and inert until the model opens a call -- see
+    // colibri_v2_tool_grammar.hpp. It lives here rather than on the task
+    // because both decode paths, single-sequence and engine, reach the sampler
+    // through this state and both have to be constrained the same way.
+    colibri::v2::tools::Grammar grammar;
+
+    // The grammar constrains the candidate set, so a request that has one needs
+    // candidates even when it would otherwise take the fused greedy argmax.
+    bool constrains() const { return grammar.armed(); }
+
+    // Whether this request needs the sampler at all.
+    //
+    // Not the same question as `enabled()`, and this is the trap: `enabled()`
+    // means "temperature > 0", so anything gated on it silently excludes greedy
+    // decode -- which is the default. Two things are needed there anyway.
+    //
+    // A tool specification, because the grammar watches every token for a call
+    // opening and a request that skipped the sampler would never arm.
+    //
+    // And the penalties, which are not a sampling feature: llama.cpp applies
+    // its repeat_penalty to the logits before *any* selection, greedy included.
+    // Gating them on temperature made a configured 1.1 inert on every default
+    // request, which is exactly the regime where a low-bit checkpoint loops --
+    // and measurably so: on Qwen3.8-27B at IQ1_M the same prompt writes a tool
+    // parameter named "questions" without the penalty and the correct
+    // "question" with it.
+    bool active() const { return enabled() || !grammar.empty() || penalizes(); }
 };
 
 // One in-flight engine request. phase: 0 = pending (waiting for a slot),
@@ -626,6 +657,13 @@ struct ColibriV2QwenRuntime {
     std::uint64_t sampling_gpu_topk_bytes = 0;
     std::uint64_t sampling_full_download_bytes = 0;
     std::uint64_t sampling_nanoseconds = 0;
+    // Tool-grammar accounting. `empty_candidate_sets` is the one to watch: it
+    // counts the steps where the constraint had nothing to offer and the
+    // sampler fell back, which is the grammar failing to do its job rather
+    // than a malformed call.
+    std::uint64_t grammar_constrained_steps = 0;
+    std::uint64_t grammar_rejected_candidates = 0;
+    std::uint64_t grammar_empty_candidate_sets = 0;
     std::uint64_t paging_registration_nanoseconds = 0;
     std::uint64_t host_available_bytes = 0;
     std::uint64_t cpu_prefetch_experts = 0;
@@ -795,8 +833,7 @@ constexpr std::uint32_t kQ3KBlockSize = kQ3KBlockBytes;   // Q3_K: 110 bytes per
 constexpr std::uint32_t kIq2xxsBlockSize = kIq2xxsBlockBytes; // IQ2_XXS: 66 bytes per 256 elements
 constexpr std::uint32_t kIq3xxsBlockSize = kIq3xxsBlockBytes; // IQ3_XXS: 98 bytes per 256 elements
 // IQ1_S: d(2) + qs[32] + qh[8*2] = 50 bytes per 256 values, 1.5625 bits each.
-constexpr std::uint32_t kIq1sBlockSize = 50;
-constexpr float kIq1sDelta = 0.125f;
+constexpr std::uint32_t kIq1sBlockSize = kIq1sBlockBytes;
 constexpr std::uint32_t kMxfp4BlockSize = 17;      // MXFP4: e[1] E8M0 scale + qs[16] nibbles
 constexpr std::uint32_t kMxfp4BlockElements = 32;
 // The FP4 codebook, doubled -- which is why the scale is halved to match.
@@ -2532,38 +2569,7 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
     }else if(type==23){
         result+=qwen_iq4xs_dot_row(packed,input,elements,row);
     }else if(type==19){
-        // IQ1_S. Each group of eight weights is one 11-bit index into a shared
-        // grid -- eight bits from qs, three more from qh -- which is what makes
-        // 1.5 bits a weight possible. qh also carries the group's scale in bits
-        // 12-14 and, in its top bit, the sign of a delta applied to every weight
-        // in the group.
-        const int blocks=elements/256;
-        const std::uint64_t row_offset=static_cast<std::uint64_t>(row)*blocks*kIq1sBlockSize;
-        for(int block=0;block<blocks;++block){
-            const auto*base=packed+row_offset+block*kIq1sBlockSize;
-            std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base,2);
-            const float d=qwen_half_value(scale_bits);
-            const auto*qs=base+2;
-            const auto*qh_bytes=base+34;
-            for(int group=0;group<8;++group){
-                std::uint16_t qh=0;std::memcpy(&qh,qh_bytes+group*2,2);
-                const float scale=d*static_cast<float>(2*((qh>>12)&7)+1);
-                const float delta=(qh&0x8000)?-kIq1sDelta:kIq1sDelta;
-                const auto*vector=input+block*256+group*32;
-                float partial=0.0f;
-                for(int part=0;part<4;++part){
-                    const std::uint32_t index=
-                        static_cast<std::uint32_t>(qs[4*group+part])|
-                        ((static_cast<std::uint32_t>(qh>>(3*part))&7u)<<8);
-                    const std::uint64_t entry=kIq1sGrid[index];
-                    for(int lane=0;lane<8;++lane){
-                        const auto weight=static_cast<std::int8_t>((entry>>(8*lane))&0xFF);
-                        partial+=(static_cast<float>(weight)+delta)*vector[part*8+lane];
-                    }
-                }
-                result+=scale*partial;
-            }
-        }
+        result+=qwen_iq1s_dot_row(packed,input,elements,row);
     }else if(type==29){
         result+=qwen_iq1m_dot_row(packed,input,elements,row);
     }else if(type==39){
@@ -3179,6 +3185,7 @@ int qwen_gpu_matvec_by_type(
         case 17: return colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 22: return colibri_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 23: return colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 19: return colibri_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 29: return colibri_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         default: break;
     }
@@ -3214,6 +3221,8 @@ const char* qwen_q8_matvec_kernel(std::uint32_t type) {
         case 16: return "iq2xxs_q8_matvec_transposed_warp";
         case 17: return "iq2xs_q8_matvec_transposed_warp";
         case 18: return "iq3xxs_q8_matvec_transposed_warp";
+        case 19: return "iq1s_q8_matvec_transposed_warp";
+        case 29: return "iq1m_q8_matvec_transposed_warp";
         case 22: return "iq2s_q8_matvec_transposed_warp";
         case 23: return "iq4xs_q8_matvec_transposed_warp";
         default: return nullptr;
@@ -5467,6 +5476,7 @@ void bailing_gpu_prefill_tiled(
             case 21: return "iq3s_matmul_rows";
             case 22: return "iq2s_matmul_rows";
             case 23: return "iq4xs_matmul_rows";
+            case 19: return "iq1s_matmul_rows";
             case 29: return "iq1m_matmul_rows";
             default: return nullptr;
         }
@@ -8904,7 +8914,13 @@ int colibri_v2_qwen_embedding(const ColibriV2Model*m,uint32_t token,float*out,ui
 int colibri_v2_qwen_lm_head(const ColibriV2Model*m,const float*hidden,float*logits,uint64_t vocabulary,uint64_t elements){return guarded([&]{if(!m||!hidden||!logits)throw std::runtime_error("invalid LM-head arguments");const Tensor&t=qwen_role_tensor(*m,"lm_head");if(t.shape.size()!=2)throw std::runtime_error("LM-head shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(vocabulary<vocab||elements<width)throw std::runtime_error("LM-head shape or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t row=0;row<vocab;row++){float sum=0;for(uint64_t column=0;column<width;column++)sum+=tensor_value(data,t.type,row*width+column)*hidden[column];logits[row]=sum;}return 0;});}
 int colibri_v2_qwen_token_text(const ColibriV2Model*m,uint32_t token,char*out,uint64_t capacity){return guarded([&]{if(!m||!out||capacity==0)throw std::runtime_error("invalid token text arguments");if(token>=m->vocabulary.size())throw std::runtime_error("token is outside the GGUF vocabulary");const std::string&value=m->vocabulary[token];if(capacity<=value.size())throw std::runtime_error("token text buffer is too small");std::memcpy(out,value.data(),value.size());out[value.size()]=0;return 0;});}
 int colibri_v2_token_id(const ColibriV2Model*m,const char*text,uint32_t*token){return guarded([&]{if(!m||!text||!token)throw std::runtime_error("invalid token lookup arguments");const auto it=m->vocabulary_ids.find(text);if(it==m->vocabulary_ids.end())throw std::runtime_error("token text is not in the GGUF vocabulary");*token=it->second;return 0;});}
-std::string gguf_byte_encode(const char*text){static const int direct[] = {33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,161,162,163,164,165,166,167,168,169,170,171,172,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255};std::array<int,256>map{};for(int i=0;i<256;i++)map[i]=-1;for(int i=0;i<static_cast<int>(sizeof(direct)/sizeof(direct[0]));i++)map[direct[i]]=direct[i];int extra=0;for(int i=0;i<256;i++)if(map[i]<0)map[i]=256+extra++;std::string out;for(const unsigned char*p=reinterpret_cast<const unsigned char*>(text);*p;p++){int cp=map[*p];if(cp<128)out.push_back(static_cast<char>(cp));else if(cp<2048){out.push_back(static_cast<char>(0xC0|(cp>>6)));out.push_back(static_cast<char>(0x80|(cp&63)));}else{out.push_back(static_cast<char>(0xE0|(cp>>12)));out.push_back(static_cast<char>(0x80|((cp>>6)&63)));out.push_back(static_cast<char>(0x80|(cp&63)));}}return out;}
+std::string gguf_byte_encode(const char*text){return colibri::v2::alphabet::encode(text);}
+// One vocabulary piece back to the bytes it stands for; the tool grammar
+// matches literal bytes against candidate tokens and the vocabulary spells
+// them in the byte-level alphabet. See colibri_v2_byte_alphabet.hpp.
+std::string gguf_byte_decode(const std::string&piece){
+    return colibri::v2::alphabet::decode(piece);
+}
 std::vector<std::string> gguf_utf8_symbols(const std::string&text){std::vector<std::string> symbols;for(size_t i=0;i<text.size();){unsigned char c=text[i];size_t width=(c<0x80)?1:(c<0xE0?2:(c<0xF0?3:4));if(i+width>text.size())width=1;symbols.emplace_back(text.data()+i,width);i+=width;}return symbols;}
 // One UTF-8 codepoint at `offset`, with its encoded width.
 std::uint32_t gguf_utf8_codepoint(const std::string& text, size_t offset, size_t& width) {
@@ -9926,6 +9942,9 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->sampling_gpu_topk_bytes=runtime->sampling_gpu_topk_bytes;
     out->sampling_full_download_bytes=runtime->sampling_full_download_bytes;
     out->sampling_nanoseconds=runtime->sampling_nanoseconds;
+    out->grammar_constrained_steps=runtime->grammar_constrained_steps;
+    out->grammar_rejected_candidates=runtime->grammar_rejected_candidates;
+    out->grammar_empty_candidate_sets=runtime->grammar_empty_candidate_sets;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
@@ -11372,6 +11391,10 @@ void qwen_mtp_dense_projection(
             if (colibri_gpu_iq4xs_matvec_transposed(
                     matrix,input,output,input_size,output_size,runtime.stream)==0) return;
             break;
+        case 19:
+            if (colibri_gpu_iq1s_matvec_transposed(
+                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
+            break;
         case 10:
             if (colibri_gpu_q2k_matvec_transposed(
                     matrix,input,output,input_size,output_size,runtime.stream)==0) return;
@@ -12492,7 +12515,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 if(q8_decode("iq4xs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
                 if(colibri_gpu_iq4xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
                 break;
-            case 29:if(colibri_gpu_iq1m_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
+            case 19:
+                if(q8_decode("iq1s_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_iq1s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
+            case 29:
+                if(q8_decode("iq1m_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
+                if(colibri_gpu_iq1m_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
+                break;
             case 10:
                 if(q8_decode("q2k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
                 if(colibri_gpu_q2k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
@@ -13567,10 +13597,32 @@ static double qwen_sampling_uniform(QwenSamplingState& sampling) {
     return static_cast<double>(random>>11)*(1.0/9007199254740992.0);
 }
 
+// The bytes a token stands for, which is what the tool grammar matches. The
+// vocabulary holds the GGUF byte-level spelling, so this is the same decode the
+// Python side does when it turns generated tokens back into text.
+static std::string qwen_token_bytes(
+        const ColibriV2QwenRuntime& runtime,std::uint32_t token) {
+    if(!runtime.model||token>=runtime.model->vocabulary.size())return std::string();
+    return gguf_byte_decode(runtime.model->vocabulary[token]);
+}
+
 static std::uint32_t qwen_sample_last_logits(
         ColibriV2QwenRuntime& runtime,QwenSamplingState& sampling,
         std::uint32_t greedy_token) {
-    if(!sampling.enabled())return greedy_token;
+    // Every exit runs through this: the penalty window and the tool grammar
+    // both track what was actually emitted, and a path that returns a token
+    // without recording it desynchronizes them from the transcript.
+    const auto commit=[&](std::uint32_t token)->std::uint32_t{
+        sampling.remember(token);
+        if(!sampling.grammar.empty())
+            sampling.grammar.observe(qwen_token_bytes(runtime,token));
+        return token;
+    };
+    // Greedy decode needs the candidate machinery below when a call is open
+    // (to constrain the choice) or when penalties are configured (to apply them
+    // before the choice). Otherwise the fused argmax already has the answer.
+    if(!sampling.enabled()&&!sampling.constrains()&&!sampling.penalizes())
+        return commit(greedy_token);
     struct SamplingTimer {
         std::uint64_t& nanoseconds;
         std::chrono::steady_clock::time_point started;
@@ -13584,12 +13636,25 @@ static std::uint32_t qwen_sample_last_logits(
         throw std::runtime_error("native Qwen sampling state is unavailable");
     const auto vocabulary=runtime.model->config.vocabulary_size;
     const auto bytes=static_cast<std::uint64_t>(vocabulary)*sizeof(float);
-    const std::size_t count=sampling.top_k?
+    const std::size_t requested=sampling.top_k?
         std::min<std::size_t>(sampling.top_k,vocabulary):vocabulary;
+    // A constrained step needs something to choose between: the token the model
+    // wants is precisely the one the grammar may forbid, and a top_k of 1 would
+    // leave no alternative. Widen to the reduction's capacity while a call is
+    // open; outside one this is the caller's top_k untouched.
+    // The same widening serves the penalties: demoting the top candidate only
+    // changes the answer if something else is in the set to take its place, so
+    // a top_k of 1 would make a configured penalty a silent no-op.
+    const std::size_t count=(sampling.constrains()||sampling.penalizes())
+        ?std::min<std::size_t>(
+            std::max<std::size_t>(
+                requested,colibri::v2::workspace::kSamplingTopKCapacity),
+            vocabulary)
+        :requested;
     // Sampling from a single candidate is identical to greedy decode. Avoid
     // both the second LM-head projection and all candidate transfers.
     if(count==1){runtime.last_output_token=greedy_token;
-        sampling.remember(greedy_token);return greedy_token;}
+        return commit(greedy_token);}
     const auto lm_head=runtime.device_tensors[runtime.lm_head];
     // The head type picks the kernel, exactly as it does for the greedy argmax
     // above. This used to name Q4_K, Q6_K and bf16 and read every other type as
@@ -13708,7 +13773,7 @@ static std::uint32_t qwen_sample_last_logits(
         candidates.assign(selected_host,selected_host+count);
         candidate_logits.assign(values_host,values_host+count);
         if(candidates.empty()||candidates.front()>=vocabulary){
-            sampling.remember(greedy_token);return greedy_token;}
+            return commit(greedy_token);}
         ++runtime.sampling_gpu_topk_calls;
         runtime.sampling_gpu_topk_bytes+=candidate_bytes+value_bytes;
     }else{
@@ -13735,6 +13800,39 @@ static std::uint32_t qwen_sample_last_logits(
         }else std::sort(candidates.begin(),candidates.end(),greater);
         candidate_logits.reserve(candidates.size());
         for(const auto token:candidates)candidate_logits.push_back(logits[token]);
+    }
+    // Inside a tool call, keep only the candidates that leave it well-formed.
+    //
+    // This runs before the penalties and the nucleus cut so both operate on the
+    // set the sampler may actually draw from -- in particular, a repetition
+    // penalty must not spend its effect on a token that was never selectable.
+    // The candidate list arrives sorted by logit and this preserves that order.
+    if(sampling.constrains()){
+        std::vector<std::uint32_t> allowed;
+        std::vector<float> allowed_logits;
+        allowed.reserve(candidates.size());
+        allowed_logits.reserve(candidates.size());
+        for(std::size_t index=0;index<candidates.size();++index){
+            if(!sampling.grammar.accepts(
+                    qwen_token_bytes(runtime,candidates[index])))continue;
+            allowed.push_back(candidates[index]);
+            allowed_logits.push_back(candidate_logits[index]);
+        }
+        ++runtime.grammar_constrained_steps;
+        runtime.grammar_rejected_candidates+=candidates.size()-allowed.size();
+        if(allowed.empty()){
+            // Nothing in the candidate set continues the call. Taking the
+            // unconstrained token is deliberate: the grammar disarms itself
+            // once the text leaves the language it describes, which hands the
+            // tail back to the tolerant parser -- whereas forcing a token from
+            // outside the top-k would answer with something the model assigned
+            // almost no probability to. Counted, because a model that lands
+            // here often is one the grammar is failing to help.
+            ++runtime.grammar_empty_candidate_sets;
+            return commit(greedy_token);
+        }
+        candidates.swap(allowed);
+        candidate_logits.swap(allowed_logits);
     }
     // Discourage what was just said. This runs over the top-k candidates
     // rather than the whole vocabulary: a token the model is looping on is by
@@ -13774,6 +13872,14 @@ static std::uint32_t qwen_sample_last_logits(
         candidates.swap(sorted_candidates);
         candidate_logits.swap(sorted_logits);
     }
+    // Greedy decode, now that the candidates carry whatever the grammar and the
+    // penalties had to say about them: the best surviving candidate is the
+    // answer, and it is where the fused argmax's token gets overridden. Below
+    // this point everything reads `temperature`, which is zero here.
+    if(!sampling.enabled()){
+        runtime.last_output_token=candidates.front();
+        return commit(candidates.front());
+    }
     const double maximum=static_cast<double>(candidate_logits.front())/
         sampling.temperature;
     std::vector<double> probabilities(candidates.size());
@@ -13786,7 +13892,7 @@ static std::uint32_t qwen_sample_last_logits(
         probabilities[index]=probability;total+=probability;
     }
     if(!(total>0.0)||!std::isfinite(total)){
-        sampling.remember(greedy_token);return greedy_token;}
+        return commit(greedy_token);}
     std::size_t keep=probabilities.size();
     if(sampling.top_p<1.0f){
         double cumulative=0.0;
@@ -13803,13 +13909,11 @@ static std::uint32_t qwen_sample_last_logits(
         cumulative+=probabilities[index];
         if(threshold<=cumulative){
             runtime.last_output_token=candidates[index];
-            sampling.remember(candidates[index]);
-            return candidates[index];
+            return commit(candidates[index]);
         }
     }
     runtime.last_output_token=candidates[keep-1];
-    sampling.remember(candidates[keep-1]);
-    return candidates[keep-1];
+    return commit(candidates[keep-1]);
 }
 
 // Leading tokens shared by a slot's committed tokens and the new prompt.
@@ -14290,7 +14394,7 @@ static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prom
     for(;index<prompt_count&&budget;--budget,index++){
         const int status=colibri_v2_qwen_runtime_decode(runtime,prompt[index],&next_token);
         if(status)return status;
-        if(sampling&&sampling->enabled()&&index+1==prompt_count)
+        if(sampling&&sampling->active()&&index+1==prompt_count)
             next_token=qwen_sample_last_logits(*runtime,*sampling,next_token);
         qwen_prompt_checkpoints(runtime,prompt,plan);
     }
@@ -14982,7 +15086,8 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
         const uint32_t*stop_tokens,uint64_t stop_count,float temperature,
         uint32_t top_k,float top_p,float repetition_penalty,
         float presence_penalty,float frequency_penalty,uint32_t penalty_window,
-        uint64_t seed,bool has_seed,uint64_t*task_id) {
+        uint64_t seed,bool has_seed,uint64_t*task_id,
+        const char*tool_specification=nullptr) {
     if(!runtime||!prompt||!prompt_count||!max_tokens||!task_id)throw std::runtime_error("invalid native Qwen task arguments");
     if(prompt_count>runtime->options.context_limit||
        max_tokens>runtime->options.context_limit-prompt_count)
@@ -15019,6 +15124,26 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
     task.sampling.presence_penalty=presence_penalty;
     task.sampling.frequency_penalty=frequency_penalty;
     task.sampling.penalty_window=penalty_window;
+    // An escape hatch for the constraint, because it sits between the model and
+    // every tool call: if it ever refuses something a checkpoint legitimately
+    // emits, this restores the previous behaviour without a rebuild, and the
+    // tolerant parser in the server catches what it used to catch.
+    static const bool grammar_enabled=[]{
+        const char*setting=std::getenv("COLIBRI_TOOL_GRAMMAR");
+        return !setting||setting[0]!='0';
+    }();
+    // A specification the caller could not parse is worth failing on: silently
+    // dropping it would serve unconstrained calls that look constrained.
+    if(grammar_enabled&&tool_specification&&*tool_specification){
+        try{
+            task.sampling.grammar=colibri::v2::tools::Grammar(
+                colibri::v2::tools::parse_specification(tool_specification));
+        }catch(const std::exception&error){
+            throw std::runtime_error(
+                std::string("native Qwen tool specification is invalid: ")+
+                error.what());
+        }
+    }
     std::lock_guard<std::mutex> lock(runtime->engine_mutex);
     constexpr std::size_t kMaxQueuedTasks = 256;
     if(runtime->engine_pending.size()>=kMaxQueuedTasks||
@@ -15043,6 +15168,17 @@ int colibri_v2_qwen_task_submit_penalties(ColibriV2QwenRuntime*runtime,const uin
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
         stop_count,temperature,top_k,top_p,repetition_penalty,presence_penalty,
         frequency_penalty,penalty_window,seed,has_seed!=0,task_id);
+    return 0;
+});}
+
+// The penalties entry point plus the tool specification the sampler constrains
+// tool calls to. Null or empty leaves the sampler unconstrained, which is what
+// every request without tools wants.
+int colibri_v2_qwen_task_submit_grammar(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,const char*tool_specification,uint64_t*task_id){return guarded([&]{
+    qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
+        stop_count,temperature,top_k,top_p,repetition_penalty,presence_penalty,
+        frequency_penalty,penalty_window,seed,has_seed!=0,task_id,
+        tool_specification);
     return 0;
 });}
 
@@ -15207,7 +15343,14 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 if (q8_decode("iq4xs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
                 if (colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
                 break;
-            case 29: if (colibri_gpu_iq1m_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
+            case 19:
+                if (q8_decode("iq1s_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_iq1s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
+            case 29:
+                if (q8_decode("iq1m_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
+                if (colibri_gpu_iq1m_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
+                break;
             case 10:
                 if (q8_decode("q2k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
                 if (colibri_gpu_q2k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
@@ -15787,8 +15930,11 @@ static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask&
     runtime.sequences[chosen].clock = ++runtime.sequence_clock;
     runtime.slot_owner[chosen] = static_cast<long long>(task.id);
     task.slot = chosen;
+    // A constrained task reaches the sampler on its very first generated token,
+    // so it needs the prompt's last logits kept for the same reason a sampled
+    // one does.
     if (qwen_prompt_begin(&runtime, prompt, prompt_count, task.plan,
-                          task.sampling.enabled()) != 0)
+                          task.sampling.active()) != 0)
         throw std::runtime_error("native Qwen prompt admission failed");
     task.index = task.plan.prompt_start;
     task.next_token = task.plan.next_token;
@@ -15885,7 +16031,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
         runtime->cache_admission_enabled=true;
         std::size_t batched=0;
         const bool all_greedy=std::all_of(pending_decode.begin(),pending_decode.end(),
-            [](const QwenEngineTask*task){return !task->sampling.enabled();});
+            [](const QwenEngineTask*task){return !task->sampling.active();});
         const auto expert_policy=qwen_expert_policy(
             *runtime,colibri::v2::ExpertExecutionPhase::decode);
         if(all_greedy&&pending_decode.size()>=2&&
@@ -15915,7 +16061,10 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                 // Speculative decoding commits the verifier's greedy argmax, so
                 // it can only serve tasks that are themselves greedy; a sampled
                 // task would silently lose its temperature.
-                if(runtime->options.mtp_drafts&&!task->sampling.enabled()&&
+                // Speculative rounds commit tokens the sampler never sees,
+                // so a constrained task cannot draft either -- its call
+                // would be built out of unchecked tokens.
+                if(runtime->options.mtp_drafts&&!task->sampling.active()&&
                    qwen_mtp_should_draft(*runtime)){
                     const auto wanted=static_cast<uint32_t>(std::min<std::uint64_t>(
                         runtime->options.mtp_drafts,task->max_tokens-task->emitted
@@ -15934,12 +16083,12 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                     const auto decode_started=std::chrono::steady_clock::now();
                     const int status=colibri_v2_qwen_runtime_decode(runtime,task->next_token,&task->next_token);
                     if(status)throw std::runtime_error("native Qwen decode failed");
-                    if(runtime->options.mtp_drafts&&!task->sampling.enabled())
+                    if(runtime->options.mtp_drafts&&!task->sampling.active())
                         qwen_mtp_record_decode(
                             *runtime,
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now()-decode_started).count());
-                    if(task->sampling.enabled())
+                    if(task->sampling.active())
                         task->next_token=qwen_sample_last_logits(*runtime,task->sampling,task->next_token);
                 }
             }catch(const std::exception&error){
