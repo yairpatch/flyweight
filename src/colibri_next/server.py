@@ -83,7 +83,11 @@ class Tokenizer(Protocol):
     ) -> str: ...
 
 
-MAX_REQUEST_BYTES = 1024 * 1024
+# 16 MiB. An agentic session replays its whole history on every request --
+# file contents, tool results, and (now degraded to placeholders) images --
+# and 1 MiB rejected legitimate sessions long before the context window did.
+# The body is read into memory, so the bound stays finite.
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
 UI_DIRECTORY = Path(__file__).with_name("ui")
 UI_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -220,6 +224,10 @@ class _GenerationRequest:
     # placed beside enable_thinking so the positional constructions elsewhere
     # keep their meaning.
     reasoning_effort: str | None = None
+    # Sequences that end the turn when they appear in visible text. Scanned
+    # only there: a stop string inside a tool parameter (file content quoting
+    # "\n\nHuman:") or inside reasoning is data, not a boundary.
+    stop_sequences: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +235,179 @@ class _TextRequest:
     prompt: str
     max_new_tokens: int
     sampling: SamplingConfig
+    stop_sequences: tuple[str, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Internal generation events.
+#
+# The generation pipeline yields these, and each public protocol -- OpenAI
+# chat chunks, Anthropic messages events -- is an encoder over them at the
+# edge. The Anthropic endpoint used to be a client of the OpenAI wire format
+# instead, re-parsing this server's own chunks; every field later added to
+# those chunks (reasoning_content, most recently) was invisible to it, and
+# the drop was silent because a translator has no way to know a key it never
+# read exists. A typed hub makes an unhandled event a visible gap.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Metrics:
+    """Live decode progress riding on an event, for UIs and the server log."""
+
+    tokens: int
+    elapsed: float
+    phase: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TextDelta:
+    """Visible assistant text. Metrics are absent on buffered tail flushes."""
+
+    text: str
+    metrics: _Metrics | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReasoningDelta:
+    """Chain-of-thought: the model's notes, never its answer."""
+
+    text: str
+    metrics: _Metrics | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProgressDelta:
+    """A step that produced no releasable output yet, kept for liveness."""
+
+    metrics: _Metrics
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallOpen:
+    """A tool call whose name has settled while its arguments still stream."""
+
+    call_id: str
+    name: str
+    metrics: _Metrics
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolArgumentsDelta:
+    """A JSON fragment of the streamed call's arguments; fragments always
+    concatenate into a valid prefix of the final argument object."""
+
+    fragment: str
+    metrics: _Metrics
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallsSettled:
+    """The authoritative calls once generation ends.
+
+    `tail` closes the difference between what was streamed for the first call
+    and its parsed arguments -- streamed fragments are always a prefix of the
+    truth, and this is the rest of it. `calls` are complete calls that were
+    never streamed incrementally. `streamed` says whether an open streamed
+    call owns the first position.
+    """
+
+    tail: str
+    calls: tuple[dict[str, Any], ...]
+    streamed: bool
+    metrics: _Metrics | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Finished:
+    finish_reason: str  # "stop" | "length" | "tool_calls"
+    prompt_tokens: int
+    completion_tokens: int
+    # The stop sequence that ended the turn, when one did. Only the Anthropic
+    # protocol has a slot to echo it; OpenAI folds it into "stop".
+    stop_sequence: str | None = None
+    # The raw turn, for encoders that build a complete response object from
+    # the same stream they narrated (the Responses API).
+    result: GenerationResult | None = None
+
+
+_GenerationEvent = (
+    _TextDelta
+    | _ReasoningDelta
+    | _ProgressDelta
+    | _ToolCallOpen
+    | _ToolArgumentsDelta
+    | _ToolCallsSettled
+    | _Finished
+)
+
+
+class _StopSequenceScanner:
+    """Cuts a visible-text stream at the first occurrence of a stop sequence.
+
+    Holds back the longest tail that could still grow into a match, so a
+    sequence split across deltas is caught without re-scanning the turn.
+    Once matched, everything from the sequence on is swallowed.
+    """
+
+    def __init__(self, sequences: Sequence[str]):
+        self._sequences = tuple(sequences)
+        self._holdback = max(
+            (len(sequence) for sequence in self._sequences), default=1
+        ) - 1
+        self._buffer = ""
+        self.matched: str | None = None
+
+    def feed(self, text: str) -> str:
+        if self.matched is not None:
+            return ""
+        self._buffer += text
+        earliest = -1
+        for sequence in self._sequences:
+            found = self._buffer.find(sequence)
+            if found != -1 and (earliest == -1 or found < earliest):
+                earliest = found
+                self.matched = sequence
+        if self.matched is not None:
+            release = self._buffer[:earliest]
+            self._buffer = ""
+            return release
+        safe = max(0, len(self._buffer) - self._holdback)
+        release = self._buffer[:safe]
+        self._buffer = self._buffer[safe:]
+        return release
+
+    def flush(self) -> str:
+        """The held-back tail, once no more text can arrive to complete it."""
+        release = self._buffer
+        self._buffer = ""
+        return release
+
+
+def _truncate_at_stop(
+    text: str, sequences: Sequence[str]
+) -> tuple[str, str | None]:
+    """Cut text at the earliest stop sequence; (text, matched or None)."""
+    earliest = -1
+    matched = None
+    for sequence in sequences:
+        found = text.find(sequence)
+        if found != -1 and (earliest == -1 or found < earliest):
+            earliest = found
+            matched = sequence
+    if matched is None:
+        return text, None
+    return text[:earliest], matched
+
+
+def _metrics_payload(metrics: _Metrics) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "generated_tokens": metrics.tokens,
+        "decode_elapsed_seconds": metrics.elapsed,
+    }
+    if metrics.phase is not None:
+        payload["phase"] = metrics.phase
+    return payload
 
 
 class InferenceService:
@@ -417,7 +598,9 @@ class InferenceService:
             result = self._generate_request(
                 request, tools=request.tools, progress=progress
             )
-        return self._chat_response(result, tools=request.tools)
+        return self._chat_response(
+            result, tools=request.tools, stop_sequences=request.stop_sequences
+        )
 
     def _generate_request(
         self,
@@ -519,6 +702,14 @@ class InferenceService:
             )
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+        reasoning_field = _reasoning_delta_field(request.separate_reasoning)
+
+        def _with_metrics(
+            chunk: dict[str, Any], metrics: _Metrics | None
+        ) -> dict[str, Any]:
+            if metrics is not None:
+                chunk["colibri"] = _metrics_payload(metrics)
+            return chunk
 
         def events() -> Iterator[dict[str, Any] | str]:
             yield self._chat_chunk(
@@ -526,401 +717,532 @@ class InferenceService:
                 created,
                 {"role": "assistant", "content": ""},
             )
-            if request.tools_enabled:
-                # Stream text deltas token-by-token so clients (Claude Code,
-                # Codex, ...) see live output and never hang waiting for the
-                # first token. Raw tool syntax is held back until one complete,
-                # valid call parses; at that point generation is cancelled and
-                # the structured call is emitted immediately.
-                final_step: GenerationStep | None = None
-                text_parts: list[str] = []
-                pending = ""  # bounded tail that may be a partial tool marker
-                tool_start: int | None = None  # index of a <tool_call> marker once seen
-                tool_end_tail = ""
-                tool_calls: list[dict[str, Any]] = []
-                decode_started: float | None = None
-                last_tool_progress_at = 0.0
-                last_tool_progress_tokens = 0
-                tool_body = ""  # text after the marker, fed to the streamer
-                tool_start_tokens = 0  # generated-token count when the call opened
-                tool_streamer: _ToolCallStreamer | None = None
-                tool_stream_id: str | None = None
-                marker = TOOL_CALL_MARKER
-                holdback = len(marker) - 1
-                tool_channels = (
-                    MuseChannelStream()
-                    if getattr(self.generator.tokenizer, "architecture", None)
-                    == "muse-glimmer"
-                    else ThinkingPrefixStream() if request.thinking_open
-                    else None
-                )
-
-                def _content_chunk(text: str, tokens: int, elapsed: float):
-                    chunk = self._chat_chunk(completion_id, created, {"content": text})
-                    chunk["colibri"] = {
-                        "generated_tokens": tokens,
-                        "decode_elapsed_seconds": elapsed,
-                    }
-                    return chunk
-
-                def _tool_progress_chunk(tokens: int, elapsed: float):
-                    chunk = self._chat_chunk(completion_id, created, {})
-                    chunk["colibri"] = {
-                        "generated_tokens": tokens,
-                        "decode_elapsed_seconds": elapsed,
-                        "phase": "tool_call",
-                    }
-                    return chunk
-
-                def _tool_delta_chunk(
-                    call: dict[str, Any], tokens: int, elapsed: float
-                ):
-                    """One incremental tool_calls delta, OpenAI streaming shape.
-
-                    The Anthropic translator already turns these into a
-                    tool_use content block plus input_json_delta events, so
-                    emitting them is what puts real content on the wire while a
-                    long call is still being written.
-                    """
-                    chunk = self._chat_chunk(
-                        completion_id, created, {"tool_calls": [call]}
+            for event in self._generation_events(request, progress=progress):
+                if isinstance(event, _TextDelta):
+                    yield _with_metrics(
+                        self._chat_chunk(
+                            completion_id, created, {"content": event.text}
+                        ),
+                        event.metrics,
                     )
-                    chunk["colibri"] = {
-                        "generated_tokens": tokens,
-                        "decode_elapsed_seconds": elapsed,
-                        "phase": "tool_call",
-                    }
-                    return chunk
-
-                with self._generation_guard():
-                    steps = self.generator.stream_messages(
-                        request.messages,
-                        prepared_prompt_ids=request.prompt_ids,
-                        max_new_tokens=request.max_new_tokens,
-                        sampling=request.sampling,
-                        enable_thinking=request.enable_thinking,
-                        reasoning_effort=request.reasoning_effort,
-                        progress=progress,
+                elif isinstance(event, _ReasoningDelta):
+                    yield _with_metrics(
+                        self._chat_chunk(
+                            completion_id, created, {reasoning_field: event.text}
+                        ),
+                        event.metrics,
                     )
-                    try:
-                        for step in steps:
-                            final_step = step
-                            if step.finished:
-                                continue
-                            if step.token_id is None:
-                                continue
-                            delta_text = step.text_delta or ""
-                            text_parts.append(delta_text)
-                            now = time.perf_counter()
-                            if decode_started is None:
-                                decode_started = now
-                            if tool_channels is not None:
-                                # Hide the reasoning channel before the tool
-                                # marker scan sees it: text_parts keeps the raw
-                                # turn, which is what the tool parser needs.
-                                delta_text, channel_reasoning = tool_channels.feed(
-                                    delta_text
-                                )
-                                if channel_reasoning:
-                                    yield self._chat_chunk(
-                                        completion_id,
-                                        created,
-                                        {
-                                            _reasoning_delta_field(
-                                                request.separate_reasoning
-                                            ): channel_reasoning
-                                        },
-                                    )
-                            marker_window = ""
-                            if tool_start is None:
-                                # Stream clean text, but stop at (and never leak)
-                                # the native marker so clients receive a structured
-                                # tool call rather than raw XML.
-                                pending += delta_text
-                                found = pending.find(marker)
-                                if found != -1:
-                                    delta = pending[:found]
-                                    pending = pending[found:]
-                                    tool_start = 0
-                                    tool_start_tokens = len(step.generated_ids)
-                                    marker_window = pending
-                                    tool_body = pending[len(marker) :]
-                                    tool_end_tail = marker_window[
-                                        -len(TOOL_CALL_END_MARKER) :
-                                    ]
-                                else:
-                                    # Hold back a possible partial marker at the tail.
-                                    safe = max(0, len(pending) - holdback)
-                                    delta = pending[:safe]
-                                    pending = pending[safe:]
-                                if delta:
-                                    yield _content_chunk(
-                                        delta,
-                                        len(step.generated_ids),
-                                        now - decode_started,
-                                    )
-                            else:
-                                marker_window = tool_end_tail + delta_text
-                                tool_body += delta_text
-                                tool_end_tail = marker_window[
-                                    -len(TOOL_CALL_END_MARKER) :
-                                ]
-                            if tool_start is not None and (
-                                TOOL_CALL_END_MARKER in marker_window
-                            ):
-                                accumulated = "".join(text_parts)
-                                _, tool_calls = _parse_tool_calls(
-                                    accumulated, tools=request.tools
-                                )
-                                if tool_calls:
-                                    break
-                            if tool_start is not None and not tool_calls:
-                                token_count = len(step.generated_ids)
-                                elapsed = now - decode_started
-                                if (
-                                    self.max_tool_call_tokens
-                                    and token_count - tool_start_tokens
-                                    > self.max_tool_call_tokens
-                                ):
-                                    # A call that never closes would otherwise
-                                    # run to max_new_tokens. Stop here and let
-                                    # the reconciliation below close whatever
-                                    # was streamed.
-                                    break
-                                # Stream the call itself rather than only a
-                                # liveness ping: a ping is not content, and a
-                                # client that waits minutes for content while a
-                                # large parameter is written times the stream
-                                # out no matter how many pings it carries.
-                                if tool_streamer is None:
-                                    tool_streamer = _ToolCallStreamer()
-                                was_started = tool_streamer.started
-                                fragments = tool_streamer.feed(tool_body)
-                                if not was_started and tool_streamer.started:
-                                    # The schema is only resolvable once the
-                                    # name is, and it decides which values may
-                                    # be streamed before they are complete.
-                                    tool_streamer.bind_schema(
-                                        _tool_argument_schema(
-                                            request.tools, tool_streamer.name or ""
-                                        )
-                                    )
-                                    fragments = tool_streamer.feed(tool_body)
-                                    tool_stream_id = f"call_{uuid.uuid4().hex}"
-                                    yield _tool_delta_chunk(
-                                        {
-                                            "index": 0,
-                                            "id": tool_stream_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_streamer.name,
-                                                "arguments": "",
-                                            },
-                                        },
-                                        token_count,
-                                        elapsed,
-                                    )
-                                    last_tool_progress_at = now
-                                    last_tool_progress_tokens = token_count
-                                if fragments:
-                                    yield _tool_delta_chunk(
-                                        {
-                                            "index": 0,
-                                            "function": {
-                                                "arguments": "".join(fragments)
-                                            },
-                                        },
-                                        token_count,
-                                        elapsed,
-                                    )
-                                    last_tool_progress_at = now
-                                    last_tool_progress_tokens = token_count
-                                elif (
-                                    last_tool_progress_tokens == 0
-                                    or token_count - last_tool_progress_tokens >= 32
-                                    or now - last_tool_progress_at >= 1.0
-                                ):
-                                    # Nothing settled yet -- the name is still
-                                    # arriving, or the open value is of a type
-                                    # that cannot be emitted until it closes.
-                                    yield _tool_progress_chunk(token_count, elapsed)
-                                    last_tool_progress_tokens = token_count
-                                    last_tool_progress_at = now
-                    finally:
-                        close = getattr(steps, "close", None)
-                        if close is not None:
-                            close()
-                if final_step is None:
-                    raise RuntimeError("generation stream ended without a final result")
-                if tool_channels is not None:
-                    # Release what the channel filter was withholding as a
-                    # possible marker. A turn cut short by max_tokens can end on
-                    # a character that begins one -- without this the answer
-                    # loses its last few characters, and only when tools are
-                    # enabled. Routed through `pending` so the tool-marker tail
-                    # flush below is the single place that emits it.
-                    tail_visible, tail_reasoning = tool_channels.flush()
-                    if tail_reasoning:
-                        yield self._chat_chunk(
+                elif isinstance(event, _ProgressDelta):
+                    yield _with_metrics(
+                        self._chat_chunk(completion_id, created, {}), event.metrics
+                    )
+                elif isinstance(event, _ToolCallOpen):
+                    yield _with_metrics(
+                        self._chat_chunk(
                             completion_id,
                             created,
                             {
-                                _reasoning_delta_field(
-                                    request.separate_reasoning
-                                ): tail_reasoning
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": event.call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": event.name,
+                                            "arguments": "",
+                                        },
+                                    }
+                                ]
                             },
-                        )
-                    if tail_visible and tool_start is None:
-                        pending += tail_visible
-                accumulated = "".join(text_parts)
-                if not tool_calls:
-                    _, tool_calls = _parse_tool_calls(
-                        accumulated, tools=request.tools,
-                        keep_incomplete=final_step.stopped_on_eos)
-                streamed_tail: list[str] = []
-                produced_tool_call = bool(tool_calls)
-                if tool_streamer is not None and tool_streamer.started:
-                    # Reconcile: whatever was streamed is a prefix of the
-                    # authoritative arguments, and this closes the difference.
-                    # A call that failed to parse still gets its JSON closed so
-                    # the client is never left holding a truncated object.
-                    first = tool_calls[0] if tool_calls else None
-                    streamed_tail = tool_streamer.finish(
-                        json.loads(first["function"]["arguments"])
-                        if first is not None
-                        else None
+                        ),
+                        event.metrics,
                     )
-                    # The streamed block owns index 0 and its own id; only the
-                    # calls after it still need emitting in full.
-                    tool_calls = tool_calls[1:] if tool_calls else []
-                if streamed_tail or tool_calls:
-                    calls: list[dict[str, Any]] = []
-                    if streamed_tail:
-                        calls.append(
+                elif isinstance(event, _ToolArgumentsDelta):
+                    yield _with_metrics(
+                        self._chat_chunk(
+                            completion_id,
+                            created,
                             {
-                                "index": 0,
-                                "function": {"arguments": "".join(streamed_tail)},
-                            }
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {"arguments": event.fragment},
+                                    }
+                                ]
+                            },
+                        ),
+                        event.metrics,
+                    )
+                elif isinstance(event, _ToolCallsSettled):
+                    calls: list[dict[str, Any]] = []
+                    if event.tail:
+                        calls.append(
+                            {"index": 0, "function": {"arguments": event.tail}}
                         )
-                    offset = 1 if tool_streamer is not None and tool_streamer.started else 0
+                    offset = 1 if event.streamed else 0
                     calls.extend(
                         {"index": index + offset, **call}
-                        for index, call in enumerate(tool_calls)
+                        for index, call in enumerate(event.calls)
                     )
-                    chunk = self._chat_chunk(
-                        completion_id, created, {"tool_calls": calls}
-                    )
-                    if decode_started is not None:
-                        chunk["colibri"] = {
-                            "generated_tokens": len(final_step.generated_ids),
-                            "decode_elapsed_seconds": (
-                                time.perf_counter() - decode_started
+                    if calls:
+                        yield _with_metrics(
+                            self._chat_chunk(
+                                completion_id, created, {"tool_calls": calls}
                             ),
-                            "phase": "tool_call",
-                        }
-                    yield chunk
-                elif tool_start is None and pending:
-                    # No tool-call marker: flush the tail we held back in case it
-                    # was a partial marker, so the turn is never silently empty.
+                            event.metrics,
+                        )
+                elif isinstance(event, _Finished):
                     yield self._chat_chunk(
-                        completion_id, created, {"content": pending}
+                        completion_id,
+                        created,
+                        {},
+                        finish_reason=event.finish_reason,
                     )
-                # else: a <tool_call> marker was seen but produced no parseable
-                # call (truncated by max_tokens or malformed). Suppress the raw
-                # markup from streamed[..] -- the finish_reason below reports
-                # "length"/"stop" so the client knows the tool call was cut off.
-                finish_reason = (
-                    "tool_calls"
-                    if produced_tool_call
-                    else ("stop" if final_step.stopped_on_eos else "length")
-                )
-                prompt_count = len(final_step.prompt_ids)
-                completion_count = len(final_step.generated_ids)
-            else:
-                plain_final_step: GenerationStep | None = None
-                plain_decode_started: float | None = None
-                # Muse Glimmer always reasons, so the raw stream carries its
-                # chain-of-thought and framing; route them to reasoning_content
-                # instead of letting them through as assistant text. Keyed on
-                # the architecture rather than on spotting markup mid-stream,
-                # which would forward the opening "to=self" as content before
-                # there was enough text to recognize it.
-                channels = (
-                    MuseChannelStream()
-                    if getattr(self.generator.tokenizer, "architecture", None)
-                    == "muse-glimmer"
-                    else ThinkingPrefixStream() if request.thinking_open
-                    else None
-                )
-                with self._generation_guard():
-                    for step in self.generator.stream_messages(
-                        request.messages,
-                        prepared_prompt_ids=request.prompt_ids,
-                        max_new_tokens=request.max_new_tokens,
-                        sampling=request.sampling,
-                        enable_thinking=request.enable_thinking,
-                        reasoning_effort=request.reasoning_effort,
-                        progress=progress,
-                    ):
-                        if step.finished:
-                            plain_final_step = step
-                        elif step.token_id is not None:
-                            now = time.perf_counter()
-                            if plain_decode_started is None:
-                                plain_decode_started = now
-                            delta = _channel_delta(
-                                channels,
-                                step.text_delta,
-                                separate_reasoning=request.separate_reasoning,
-                            )
-                            chunk = self._chat_chunk(
-                                completion_id,
-                                created,
-                                delta,
-                            )
-                            # Keep the standard OpenAI chunk shape while exposing
-                            # a small provider extension for live UI metrics.
-                            chunk["colibri"] = {
-                                "generated_tokens": len(step.generated_ids),
-                                "decode_elapsed_seconds": now - plain_decode_started,
-                            }
-                            yield chunk
-                if channels is not None:
-                    # Whatever the marker holdback was still withholding.
-                    tail_visible, tail_reasoning = channels.flush()
-                    tail = {}
-                    if tail_reasoning:
-                        field = _reasoning_delta_field(request.separate_reasoning)
-                        tail[field] = tail_reasoning
-                    if tail_visible:
-                        tail["content"] = tail.get("content", "") + tail_visible
-                    if tail:
-                        yield self._chat_chunk(completion_id, created, tail)
-                if plain_final_step is None:
-                    raise RuntimeError("generation stream ended without a final result")
-                finish_reason = (
-                    "stop" if plain_final_step.stopped_on_eos else "length"
-                )
-                prompt_count = len(plain_final_step.prompt_ids)
-                completion_count = len(plain_final_step.generated_ids)
-            yield self._chat_chunk(
-                completion_id,
-                created,
-                {},
-                finish_reason=finish_reason,
-            )
-            if include_usage:
-                yield {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": self.model_name,
-                    "choices": [],
-                    "usage": _usage(prompt_count, completion_count),
-                }
-            yield "[DONE]"
+                    if include_usage:
+                        yield {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": self.model_name,
+                            "choices": [],
+                            "usage": _usage(
+                                event.prompt_tokens, event.completion_tokens
+                            ),
+                        }
+                    yield "[DONE]"
 
         return events()
+
+    def _generation_events(
+        self,
+        request: _GenerationRequest,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> Iterator[_GenerationEvent]:
+        """Run one generation and narrate it as protocol-neutral events.
+
+        Every streaming protocol encodes from this one stream, so behavior
+        like tool-syntax holdback and the runaway-call bound cannot diverge
+        between endpoints.
+        """
+        if request.tools_enabled:
+            yield from self._tool_generation_events(request, progress)
+        else:
+            yield from self._plain_generation_events(request, progress)
+
+    def _plain_generation_events(
+        self,
+        request: _GenerationRequest,
+        progress: Callable[[int, int], None] | None,
+    ) -> Iterator[_GenerationEvent]:
+        final_step: GenerationStep | None = None
+        last_step: GenerationStep | None = None
+        decode_started: float | None = None
+        text_parts: list[str] = []
+        # Muse Glimmer always reasons, so the raw stream carries its
+        # chain-of-thought and framing; route them to the reasoning events
+        # instead of letting them through as assistant text. Keyed on the
+        # architecture rather than on spotting markup mid-stream, which would
+        # forward the opening "to=self" as content before there was enough
+        # text to recognize it.
+        channels = (
+            MuseChannelStream()
+            if getattr(self.generator.tokenizer, "architecture", None)
+            == "muse-glimmer"
+            else ThinkingPrefixStream() if request.thinking_open
+            else None
+        )
+        scanner = (
+            _StopSequenceScanner(request.stop_sequences)
+            if request.stop_sequences
+            else None
+        )
+        with self._generation_guard():
+            steps = self.generator.stream_messages(
+                request.messages,
+                prepared_prompt_ids=request.prompt_ids,
+                max_new_tokens=request.max_new_tokens,
+                sampling=request.sampling,
+                enable_thinking=request.enable_thinking,
+                reasoning_effort=request.reasoning_effort,
+                progress=progress,
+            )
+            try:
+                for step in steps:
+                    if step.finished:
+                        final_step = step
+                        continue
+                    if step.token_id is None:
+                        continue
+                    last_step = step
+                    now = time.perf_counter()
+                    if decode_started is None:
+                        decode_started = now
+                    metrics = _Metrics(len(step.generated_ids), now - decode_started)
+                    if not step.text_delta:
+                        yield _ProgressDelta(metrics)
+                        continue
+                    text_parts.append(step.text_delta)
+                    if channels is None:
+                        visible, reasoning = step.text_delta, ""
+                    else:
+                        visible, reasoning = channels.feed(step.text_delta)
+                    if scanner is not None and visible:
+                        visible = scanner.feed(visible)
+                    if reasoning:
+                        yield _ReasoningDelta(reasoning, metrics)
+                    if visible:
+                        yield _TextDelta(visible, metrics)
+                    if not reasoning and not visible:
+                        # The channel filter is withholding a possible marker;
+                        # keep the liveness signal the raw token used to carry.
+                        yield _ProgressDelta(metrics)
+                    if scanner is not None and scanner.matched is not None:
+                        break
+            finally:
+                close = getattr(steps, "close", None)
+                if close is not None:
+                    close()
+        if channels is not None and (scanner is None or scanner.matched is None):
+            # Whatever the marker holdback was still withholding.
+            tail_visible, tail_reasoning = channels.flush()
+            if tail_reasoning:
+                yield _ReasoningDelta(tail_reasoning)
+            if tail_visible:
+                if scanner is not None:
+                    tail_visible = scanner.feed(tail_visible)
+                if tail_visible:
+                    yield _TextDelta(tail_visible)
+        if scanner is not None and scanner.matched is None:
+            remainder = scanner.flush()
+            if remainder:
+                yield _TextDelta(remainder)
+        if scanner is not None and scanner.matched is not None:
+            # A stop sequence ended the turn; the generator was cancelled, so
+            # the last decoded step is the turn's extent.
+            step = final_step or last_step
+            if step is None:
+                raise RuntimeError("generation stream ended without a final result")
+            yield _Finished(
+                "stop",
+                len(step.prompt_ids),
+                len(step.generated_ids),
+                stop_sequence=scanner.matched,
+                result=GenerationResult(
+                    prompt_ids=tuple(step.prompt_ids),
+                    generated_ids=tuple(step.generated_ids),
+                    text="".join(text_parts),
+                    stopped_on_eos=False,
+                    state_tokens=step.state_tokens,
+                ),
+            )
+            return
+        if final_step is None:
+            raise RuntimeError("generation stream ended without a final result")
+        yield _Finished(
+            "stop" if final_step.stopped_on_eos else "length",
+            len(final_step.prompt_ids),
+            len(final_step.generated_ids),
+            result=_generation_result(final_step),
+        )
+
+    def _tool_generation_events(
+        self,
+        request: _GenerationRequest,
+        progress: Callable[[int, int], None] | None,
+    ) -> Iterator[_GenerationEvent]:
+        """Stream a tools-enabled turn, holding raw tool syntax back.
+
+        Text deltas flow token-by-token so clients see live output and never
+        hang waiting for the first token. Raw tool markup is held back until
+        one complete, valid call parses; the call itself is streamed as
+        structured argument fragments while it is written, because a ping is
+        not content and a client that waits minutes for content while a large
+        parameter is written times the stream out no matter how many pings it
+        carries.
+        """
+        final_step: GenerationStep | None = None
+        text_parts: list[str] = []
+        pending = ""  # bounded tail that may be a partial tool marker
+        tool_start: int | None = None  # index of a <tool_call> marker once seen
+        tool_end_tail = ""
+        tool_calls: list[dict[str, Any]] = []
+        decode_started: float | None = None
+        last_tool_progress_at = 0.0
+        last_tool_progress_tokens = 0
+        tool_body = ""  # text after the marker, fed to the streamer
+        tool_start_tokens = 0  # generated-token count when the call opened
+        tool_streamer: _ToolCallStreamer | None = None
+        marker = TOOL_CALL_MARKER
+        holdback = len(marker) - 1
+        tool_channels = (
+            MuseChannelStream()
+            if getattr(self.generator.tokenizer, "architecture", None)
+            == "muse-glimmer"
+            else ThinkingPrefixStream() if request.thinking_open
+            else None
+        )
+        scanner = (
+            _StopSequenceScanner(request.stop_sequences)
+            if request.stop_sequences
+            else None
+        )
+        with self._generation_guard():
+            steps = self.generator.stream_messages(
+                request.messages,
+                prepared_prompt_ids=request.prompt_ids,
+                max_new_tokens=request.max_new_tokens,
+                sampling=request.sampling,
+                enable_thinking=request.enable_thinking,
+                reasoning_effort=request.reasoning_effort,
+                progress=progress,
+                # The declarations, so a generator that can constrain the
+                # sampler to them does. Omitted here while the non-streaming
+                # path passed them, which left the grammar switched off for
+                # every agentic client: they all stream.
+                tools=request.tools,
+            )
+            try:
+                for step in steps:
+                    final_step = step
+                    if step.finished:
+                        continue
+                    if step.token_id is None:
+                        continue
+                    delta_text = step.text_delta or ""
+                    text_parts.append(delta_text)
+                    now = time.perf_counter()
+                    if decode_started is None:
+                        decode_started = now
+                    if tool_channels is not None:
+                        # Hide the reasoning channel before the tool marker
+                        # scan sees it: text_parts keeps the raw turn, which
+                        # is what the tool parser needs.
+                        delta_text, channel_reasoning = tool_channels.feed(
+                            delta_text
+                        )
+                        if channel_reasoning:
+                            yield _ReasoningDelta(channel_reasoning)
+                    marker_window = ""
+                    if tool_start is None:
+                        # Stream clean text, but stop at (and never leak) the
+                        # native marker so clients receive a structured tool
+                        # call rather than raw XML.
+                        pending += delta_text
+                        found = pending.find(marker)
+                        if found != -1:
+                            delta = pending[:found]
+                            pending = pending[found:]
+                            tool_start = 0
+                            tool_start_tokens = len(step.generated_ids)
+                            marker_window = pending
+                            tool_body = pending[len(marker) :]
+                            tool_end_tail = marker_window[
+                                -len(TOOL_CALL_END_MARKER) :
+                            ]
+                        else:
+                            # Hold back a possible partial marker at the tail.
+                            safe = max(0, len(pending) - holdback)
+                            delta = pending[:safe]
+                            pending = pending[safe:]
+                        if delta and scanner is not None:
+                            delta = scanner.feed(delta)
+                        if delta:
+                            yield _TextDelta(
+                                delta,
+                                _Metrics(
+                                    len(step.generated_ids), now - decode_started
+                                ),
+                            )
+                        if scanner is not None and scanner.matched is not None:
+                            # A stop sequence ended the turn before any tool
+                            # call did; nothing past it may reach the client.
+                            break
+                    else:
+                        marker_window = tool_end_tail + delta_text
+                        tool_body += delta_text
+                        tool_end_tail = marker_window[
+                            -len(TOOL_CALL_END_MARKER) :
+                        ]
+                    if tool_start is not None and (
+                        TOOL_CALL_END_MARKER in marker_window
+                    ):
+                        accumulated = "".join(text_parts)
+                        _, tool_calls = _parse_tool_calls(
+                            accumulated, tools=request.tools
+                        )
+                        if tool_calls:
+                            break
+                    if tool_start is not None and not tool_calls:
+                        token_count = len(step.generated_ids)
+                        elapsed = now - decode_started
+                        if (
+                            self.max_tool_call_tokens
+                            and token_count - tool_start_tokens
+                            > self.max_tool_call_tokens
+                        ):
+                            # A call that never closes would otherwise run to
+                            # max_new_tokens. Stop here and let the
+                            # reconciliation below close whatever was streamed.
+                            break
+                        if tool_streamer is None:
+                            tool_streamer = _ToolCallStreamer()
+                        was_started = tool_streamer.started
+                        fragments = tool_streamer.feed(tool_body)
+                        if not was_started and tool_streamer.started:
+                            # The schema is only resolvable once the name is,
+                            # and it decides which values may be streamed
+                            # before they are complete.
+                            tool_streamer.bind_schema(
+                                _tool_argument_schema(
+                                    request.tools, tool_streamer.name or ""
+                                )
+                            )
+                            fragments = tool_streamer.feed(tool_body)
+                            yield _ToolCallOpen(
+                                f"call_{uuid.uuid4().hex}",
+                                tool_streamer.name or "tool",
+                                _Metrics(token_count, elapsed, "tool_call"),
+                            )
+                            last_tool_progress_at = now
+                            last_tool_progress_tokens = token_count
+                        if fragments:
+                            yield _ToolArgumentsDelta(
+                                "".join(fragments),
+                                _Metrics(token_count, elapsed, "tool_call"),
+                            )
+                            last_tool_progress_at = now
+                            last_tool_progress_tokens = token_count
+                        elif (
+                            last_tool_progress_tokens == 0
+                            or token_count - last_tool_progress_tokens >= 32
+                            or now - last_tool_progress_at >= 1.0
+                        ):
+                            # Nothing settled yet -- the name is still
+                            # arriving, or the open value is of a type that
+                            # cannot be emitted until it closes.
+                            yield _ProgressDelta(
+                                _Metrics(token_count, elapsed, "tool_call")
+                            )
+                            last_tool_progress_tokens = token_count
+                            last_tool_progress_at = now
+            finally:
+                close = getattr(steps, "close", None)
+                if close is not None:
+                    close()
+        if final_step is None:
+            raise RuntimeError("generation stream ended without a final result")
+        if tool_channels is not None:
+            # Release what the channel filter was withholding as a possible
+            # marker. A turn cut short by max_tokens can end on a character
+            # that begins one -- without this the answer loses its last few
+            # characters, and only when tools are enabled. Routed through
+            # `pending` so the tool-marker tail flush below is the single
+            # place that emits it.
+            tail_visible, tail_reasoning = tool_channels.flush()
+            if tail_reasoning:
+                yield _ReasoningDelta(tail_reasoning)
+            if tail_visible and tool_start is None:
+                pending += tail_visible
+        if scanner is not None:
+            if scanner.matched is None and tool_start is None and pending:
+                pending = scanner.feed(pending)
+                if scanner.matched is None:
+                    pending += scanner.flush()
+            if scanner.matched is not None:
+                # A stop sequence ended the turn. Whatever tool markup may
+                # have started after it was never a call the client asked to
+                # see; the truncated text is the whole answer.
+                if pending:
+                    yield _TextDelta(pending)
+                yield _Finished(
+                    "stop",
+                    len(final_step.prompt_ids),
+                    len(final_step.generated_ids),
+                    stop_sequence=scanner.matched,
+                    result=GenerationResult(
+                        prompt_ids=tuple(final_step.prompt_ids),
+                        generated_ids=tuple(final_step.generated_ids),
+                        text="".join(text_parts),
+                        stopped_on_eos=False,
+                        state_tokens=final_step.state_tokens,
+                    ),
+                )
+                return
+        accumulated = "".join(text_parts)
+        if not tool_calls:
+            _, tool_calls = _parse_tool_calls(
+                accumulated, tools=request.tools,
+                keep_incomplete=final_step.stopped_on_eos)
+        streamed_tail: list[str] = []
+        produced_tool_call = bool(tool_calls)
+        streamed = tool_streamer is not None and tool_streamer.started
+        if streamed:
+            # Reconcile: whatever was streamed is a prefix of the
+            # authoritative arguments, and this closes the difference. A call
+            # that failed to parse still gets its JSON closed so the client is
+            # never left holding a truncated object.
+            first = tool_calls[0] if tool_calls else None
+            streamed_tail = tool_streamer.finish(
+                json.loads(first["function"]["arguments"])
+                if first is not None
+                else None
+            )
+            # The streamed call owns the first position and its own id; only
+            # the calls after it still need emitting in full.
+            tool_calls = tool_calls[1:] if tool_calls else []
+        if streamed_tail or tool_calls:
+            yield _ToolCallsSettled(
+                "".join(streamed_tail),
+                tuple(tool_calls),
+                streamed,
+                (
+                    _Metrics(
+                        len(final_step.generated_ids),
+                        time.perf_counter() - decode_started,
+                        "tool_call",
+                    )
+                    if decode_started is not None
+                    else None
+                ),
+            )
+        elif tool_start is None and pending:
+            # No tool-call marker: flush the tail we held back in case it was
+            # a partial marker, so the turn is never silently empty.
+            yield _TextDelta(pending)
+        elif (
+            tool_start is not None
+            and final_step.stopped_on_eos
+            and not streamed
+        ):
+            # A marker opened, the model finished, and nothing parsed -- and
+            # nothing was streamed for it either, since the streamer never got
+            # a name. Release the raw markup rather than end the turn on
+            # silence; see _turn_is_silent for why an empty turn is what puts
+            # an agent harness into a loop.
+            yield _TextDelta(marker + tool_body)
+        # else: a <tool_call> marker was seen but produced no parseable call,
+        # and the turn was cut short by max_tokens. Suppress the raw markup --
+        # the finish_reason below reports "length" so the client knows the
+        # tool call never finished being written.
+        yield _Finished(
+            "tool_calls"
+            if produced_tool_call
+            else ("stop" if final_step.stopped_on_eos else "length"),
+            len(final_step.prompt_ids),
+            len(final_step.generated_ids),
+            result=(
+                _generation_result(final_step)
+                if final_step.finished
+                else GenerationResult(
+                    prompt_ids=tuple(final_step.prompt_ids),
+                    generated_ids=tuple(final_step.generated_ids),
+                    text="".join(text_parts),
+                    stopped_on_eos=final_step.stopped_on_eos,
+                    state_tokens=final_step.state_tokens,
+                )
+            ),
+        )
 
     def completion(
         self,
@@ -938,6 +1260,16 @@ class InferenceService:
                 sampling=request.sampling,
                 progress=progress,
             )
+        if request.stop_sequences:
+            text, matched = _truncate_at_stop(result.text, request.stop_sequences)
+            if matched is not None:
+                result = GenerationResult(
+                    prompt_ids=result.prompt_ids,
+                    generated_ids=result.generated_ids,
+                    text=text,
+                    stopped_on_eos=True,
+                    state_tokens=result.state_tokens,
+                )
         completion_id = f"cmpl-{uuid.uuid4().hex}"
         return self._completion_response(completion_id, result)
 
@@ -953,22 +1285,50 @@ class InferenceService:
 
         def events() -> Iterator[dict[str, Any] | str]:
             final_step: GenerationStep | None = None
+            scanner = (
+                _StopSequenceScanner(request.stop_sequences)
+                if request.stop_sequences
+                else None
+            )
             with self._generation_guard():
-                for step in self.generator.stream_text(
+                steps = self.generator.stream_text(
                     request.prompt,
                     max_new_tokens=request.max_new_tokens,
                     sampling=request.sampling,
                     progress=progress,
-                ):
-                    if step.finished:
-                        final_step = step
-                    elif step.text_delta:
-                        yield self._completion_chunk(
-                            completion_id, created, step.text_delta, None
-                        )
-            if final_step is None:
-                raise RuntimeError("generation stream ended without a final result")
-            finish_reason = "stop" if final_step.stopped_on_eos else "length"
+                )
+                try:
+                    for step in steps:
+                        if step.finished:
+                            final_step = step
+                        elif step.text_delta:
+                            delta = step.text_delta
+                            if scanner is not None:
+                                delta = scanner.feed(delta)
+                            if delta:
+                                yield self._completion_chunk(
+                                    completion_id, created, delta, None
+                                )
+                            if scanner is not None and scanner.matched is not None:
+                                break
+                finally:
+                    close = getattr(steps, "close", None)
+                    if close is not None:
+                        close()
+            if scanner is not None and scanner.matched is None:
+                remainder = scanner.flush()
+                if remainder:
+                    yield self._completion_chunk(
+                        completion_id, created, remainder, None
+                    )
+            if scanner is not None and scanner.matched is not None:
+                finish_reason = "stop"
+            else:
+                if final_step is None:
+                    raise RuntimeError(
+                        "generation stream ended without a final result"
+                    )
+                finish_reason = "stop" if final_step.stopped_on_eos else "length"
             yield self._completion_chunk(completion_id, created, "", finish_reason)
             yield "[DONE]"
 
@@ -1008,17 +1368,13 @@ class InferenceService:
 
     def count_anthropic_input(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Count the exact prompt produced by the Anthropic compatibility path."""
-        chat_payload = _anthropic_to_chat_payload(
-            {**payload, "max_tokens": payload.get("max_tokens", 1)}
-        )
-        messages, _ = _chat_messages(
-            chat_payload, architecture=getattr(self.generator.tokenizer, "architecture", None)
+        options, messages, _ = _anthropic_request(
+            {**payload, "max_tokens": payload.get("max_tokens", 1)},
+            architecture=getattr(self.generator.tokenizer, "architecture", None),
         )
         tokens = self.generator.tokenizer.encode_messages(
             messages,
-            enable_thinking=_boolean_option(
-                chat_payload, "enable_thinking", None
-            ),
+            enable_thinking=_boolean_option(options, "enable_thinking", None),
         )
         return {"input_tokens": len(tokens)}
 
@@ -1029,7 +1385,10 @@ class InferenceService:
             "total_slots": 1,
             "max_output_tokens": self.max_new_tokens,
             "context_window": self.context_window,
-            "chat_template": "qwen-chatml",
+            "chat_template": (
+                getattr(self.generator.tokenizer, "architecture", None)
+                or "unknown"
+            ),
             "generation_defaults": dict(self.generation_defaults),
             "capabilities": [
                 "completion",
@@ -1069,6 +1428,7 @@ class InferenceService:
             messages,
             max_key="max_output_tokens",
             tools_enabled=bool(tools),
+            tools=tuple(tools),
         )
         with self._generation_guard():
             result = self._generate_request(request, tools=tools, progress=progress)
@@ -1092,167 +1452,260 @@ class InferenceService:
             messages,
             max_key="max_output_tokens",
             tools_enabled=bool(tools),
+            tools=tuple(tools),
         )
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
         created_at = int(time.time())
 
         def events() -> Iterator[dict[str, Any]]:
-            sequence = 0
-            created_response = self._response_shell(
-                payload, response_id, created_at, status="in_progress"
-            )
-            yield {
-                "type": "response.created",
-                "sequence_number": sequence,
-                "response": created_response,
-            }
-            sequence += 1
+            """Encode the internal event stream as Responses API events.
 
-            if request.tools_enabled:
-                with self._generation_guard():
-                    result = self._generate_request(
-                        request, tools=tools, progress=progress
+            Tool calls used to run the whole generation first and dump their
+            events at the end, so a client saw nothing but keepalives while a
+            long call was written; and raw deltas were forwarded as
+            output_text, which served a reasoning model's chain-of-thought as
+            its answer. Encoding the same stream every other protocol reads
+            fixes both by construction.
+            """
+            sequence = 0
+
+            def numbered(event: dict[str, Any]) -> dict[str, Any]:
+                nonlocal sequence
+                event["sequence_number"] = sequence
+                sequence += 1
+                return event
+
+            yield numbered(
+                {
+                    "type": "response.created",
+                    "response": self._response_shell(
+                        payload, response_id, created_at, status="in_progress"
+                    ),
+                }
+            )
+            output_index = -1
+            open_item: dict[str, Any] | None = None
+            text_parts: list[str] = []
+            argument_parts: list[str] = []
+            finish: _Finished | None = None
+
+            def close_item(*, completed: bool = True) -> Iterator[dict[str, Any]]:
+                nonlocal open_item
+                if open_item is None:
+                    return
+                status = "completed" if completed else "incomplete"
+                if open_item["type"] == "message":
+                    text = "".join(text_parts)
+                    part = {
+                        "type": "output_text",
+                        "annotations": [],
+                        "logprobs": [],
+                        "text": text,
+                    }
+                    yield numbered(
+                        {
+                            "type": "response.output_text.done",
+                            "item_id": open_item["id"],
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "text": text,
+                            "logprobs": [],
+                        }
                     )
-                completed_response = self._response_object(
-                    payload,
-                    result,
-                    response_id=response_id,
-                    message_id=message_id,
-                    created_at=created_at,
+                    yield numbered(
+                        {
+                            "type": "response.content_part.done",
+                            "item_id": open_item["id"],
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "part": part,
+                        }
+                    )
+                    yield numbered(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "item": {
+                                **open_item,
+                                "status": status,
+                                "content": [part],
+                            },
+                        }
+                    )
+                else:
+                    arguments = "".join(argument_parts)
+                    yield numbered(
+                        {
+                            "type": "response.function_call_arguments.done",
+                            "item_id": open_item["id"],
+                            "output_index": output_index,
+                            "arguments": arguments,
+                        }
+                    )
+                    yield numbered(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "item": {
+                                **open_item,
+                                "status": status,
+                                "arguments": arguments,
+                            },
+                        }
+                    )
+                open_item = None
+
+            def open_message() -> Iterator[dict[str, Any]]:
+                nonlocal open_item, output_index
+                yield from close_item()
+                output_index += 1
+                text_parts.clear()
+                open_item = {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                }
+                yield numbered(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": dict(open_item),
+                    }
                 )
-                for event in _response_output_events(
-                    completed_response["output"], sequence
-                ):
-                    yield event
-                    sequence = event["sequence_number"] + 1
-                self._store_response(completed_response, history_messages, result)
-                yield {
+                yield numbered(
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": message_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "annotations": [],
+                            "logprobs": [],
+                            "text": "",
+                        },
+                    }
+                )
+
+            def open_function_call(
+                call_id: str, name: str
+            ) -> Iterator[dict[str, Any]]:
+                nonlocal open_item, output_index
+                yield from close_item()
+                output_index += 1
+                argument_parts.clear()
+                open_item = {
+                    "id": f"fc_{uuid.uuid4().hex}",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "arguments": "",
+                    "call_id": call_id,
+                    "name": name,
+                }
+                yield numbered(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": dict(open_item),
+                    }
+                )
+
+            def arguments_delta(fragment: str) -> Iterator[dict[str, Any]]:
+                if not fragment or open_item is None:
+                    return
+                argument_parts.append(fragment)
+                yield numbered(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": open_item["id"],
+                        "output_index": output_index,
+                        "delta": fragment,
+                    }
+                )
+
+            for event in self._generation_events(request, progress=progress):
+                if isinstance(event, _TextDelta):
+                    if not event.text:
+                        continue
+                    if open_item is None or open_item["type"] != "message":
+                        yield from open_message()
+                    text_parts.append(event.text)
+                    yield numbered(
+                        {
+                            "type": "response.output_text.delta",
+                            "item_id": message_id,
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "delta": event.text,
+                            "logprobs": [],
+                        }
+                    )
+                elif isinstance(event, _ToolCallOpen):
+                    yield from open_function_call(event.call_id, event.name)
+                elif isinstance(event, _ToolArgumentsDelta):
+                    yield from arguments_delta(event.fragment)
+                elif isinstance(event, _ToolCallsSettled):
+                    if (
+                        open_item is not None
+                        and open_item["type"] == "function_call"
+                    ):
+                        yield from arguments_delta(event.tail)
+                    for call in event.calls:
+                        function = call.get("function", {})
+                        yield from open_function_call(
+                            call.get("id", f"call_{uuid.uuid4().hex}"),
+                            function.get("name", "tool"),
+                        )
+                        yield from arguments_delta(
+                            function.get("arguments", "")
+                        )
+                elif isinstance(event, _Finished):
+                    finish = event
+                    yield from close_item(
+                        completed=event.finish_reason != "length"
+                    )
+                # _ReasoningDelta and _ProgressDelta have no Responses shape:
+                # reasoning is the model's notes, not its answer, and the SSE
+                # keepalive layer covers liveness while it thinks.
+            if finish is None or finish.result is None:
+                raise RuntimeError("generation stream ended without a final result")
+            completed_response = self._response_object(
+                payload,
+                finish.result,
+                response_id=response_id,
+                message_id=message_id,
+                created_at=created_at,
+            )
+            self._store_response(completed_response, history_messages, finish.result)
+            yield numbered(
+                {
                     "type": (
                         "response.incomplete"
                         if completed_response["status"] == "incomplete"
                         else "response.completed"
                     ),
-                    "sequence_number": sequence,
                     "response": completed_response,
                 }
-                return
-
-            output_item = {
-                "id": message_id,
-                "type": "message",
-                "status": "in_progress",
-                "role": "assistant",
-                "content": [],
-            }
-            yield {
-                "type": "response.output_item.added",
-                "sequence_number": sequence,
-                "output_index": 0,
-                "item": output_item,
-            }
-            sequence += 1
-            content_part = {
-                "type": "output_text",
-                "annotations": [],
-                "logprobs": [],
-                "text": "",
-            }
-            yield {
-                "type": "response.content_part.added",
-                "sequence_number": sequence,
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": content_part,
-            }
-            sequence += 1
-            final_step: GenerationStep | None = None
-            with self._generation_guard():
-                for step in self.generator.stream_messages(
-                    request.messages,
-                    prepared_prompt_ids=request.prompt_ids,
-                    max_new_tokens=request.max_new_tokens,
-                    sampling=request.sampling,
-                    enable_thinking=request.enable_thinking,
-                    reasoning_effort=request.reasoning_effort,
-                    progress=progress,
-                ):
-                    if step.finished:
-                        final_step = step
-                    elif step.text_delta:
-                        yield {
-                            "type": "response.output_text.delta",
-                            "sequence_number": sequence,
-                            "item_id": message_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": step.text_delta,
-                            "logprobs": [],
-                        }
-                        sequence += 1
-            if final_step is None:
-                raise RuntimeError("generation stream ended without a final result")
-            result = GenerationResult(
-                prompt_ids=tuple(final_step.prompt_ids),
-                generated_ids=tuple(final_step.generated_ids),
-                text=final_step.text,
-                stopped_on_eos=final_step.stopped_on_eos,
-                state_tokens=final_step.state_tokens,
             )
-            yield {
-                "type": "response.output_text.done",
-                "sequence_number": sequence,
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": result.text,
-                "logprobs": [],
-            }
-            sequence += 1
-            done_part = {**content_part, "text": result.text}
-            yield {
-                "type": "response.content_part.done",
-                "sequence_number": sequence,
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": done_part,
-            }
-            sequence += 1
-            done_item = {
-                **output_item,
-                "status": (
-                    "completed" if result.stopped_on_eos else "incomplete"
-                ),
-                "content": [done_part],
-            }
-            yield {
-                "type": "response.output_item.done",
-                "sequence_number": sequence,
-                "output_index": 0,
-                "item": done_item,
-            }
-            sequence += 1
-            completed_response = self._response_object(
-                payload,
-                result,
-                response_id=response_id,
-                message_id=message_id,
-                created_at=created_at,
-            )
-            self._store_response(completed_response, history_messages, result)
-            yield {
-                "type": (
-                    "response.incomplete"
-                    if completed_response["status"] == "incomplete"
-                    else "response.completed"
-                ),
-                "sequence_number": sequence,
-                "response": completed_response,
-            }
 
         return events()
+
+    def _prepare_anthropic(self, payload: Mapping[str, Any]) -> _GenerationRequest:
+        options, messages, tools_enabled = _anthropic_request(
+            payload,
+            architecture=getattr(self.generator.tokenizer, "architecture", None),
+        )
+        tools = tuple(_selected_tools(options)) if tools_enabled else ()
+        return self._prepare_generation(
+            options,
+            messages,
+            max_key="max_completion_tokens",
+            tools_enabled=bool(tools),
+            tools=tools,
+        )
 
     def anthropic_message(
         self,
@@ -1260,14 +1713,22 @@ class InferenceService:
         *,
         progress: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
-        chat_payload = _anthropic_to_chat_payload(payload)
-        response = self.chat_completion(chat_payload, progress=progress)
-        choice = response["choices"][0]
-        message = choice["message"]
+        request = self._prepare_anthropic(payload)
+        with self._generation_guard():
+            result = self._generate_request(
+                request, tools=request.tools, progress=progress
+            )
+        content_text, reasoning, tool_calls, finish_reason, stop_sequence = (
+            _finished_turn(result, request.tools, request.stop_sequences)
+        )
         content: list[dict[str, Any]] = []
-        if message.get("content"):
-            content.append({"type": "text", "text": message["content"]})
-        for call in message.get("tool_calls", []):
+        if reasoning:
+            content.append(
+                {"type": "thinking", "thinking": reasoning, "signature": ""}
+            )
+        if content_text:
+            content.append({"type": "text", "text": content_text})
+        for call in tool_calls:
             try:
                 input_value = json.loads(call["function"]["arguments"])
             except (KeyError, json.JSONDecodeError):
@@ -1280,22 +1741,23 @@ class InferenceService:
                     "input": input_value,
                 }
             )
-        finish_reason = choice.get("finish_reason")
-        stop_reason = {
-            "tool_calls": "tool_use",
-            "length": "max_tokens",
-        }.get(finish_reason, "end_turn")
         return {
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
             "role": "assistant",
             "model": payload.get("model", self.model_name),
             "content": content,
-            "stop_reason": stop_reason,
-            "stop_sequence": None,
+            "stop_reason": (
+                "stop_sequence"
+                if stop_sequence is not None
+                else _ANTHROPIC_STOP_REASONS.get(finish_reason, "end_turn")
+            ),
+            "stop_sequence": stop_sequence,
             "usage": {
-                "input_tokens": response["usage"]["prompt_tokens"],
-                "output_tokens": response["usage"]["completion_tokens"],
+                "input_tokens": len(result.prompt_ids),
+                "output_tokens": len(result.generated_ids),
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
             },
         }
 
@@ -1305,145 +1767,175 @@ class InferenceService:
         *,
         progress: Callable[[int, int], None] | None = None,
     ) -> Iterator[dict[str, Any]]:
-        chat_payload = _anthropic_to_chat_payload(payload)
-        chat_payload["stream_options"] = {"include_usage": True}
-        prepared_request = self._prepare_chat(chat_payload)
-        input_tokens = len(prepared_request.prompt_ids)
-        chat_events = self.stream_chat_completion(
-            chat_payload,
-            progress=progress,
-            _prepared_request=prepared_request,
-        )
+        request = self._prepare_anthropic(payload)
+        input_tokens = len(request.prompt_ids)
+        model = payload.get("model", self.model_name)
 
         def events() -> Iterator[dict[str, Any]]:
-            message_id = f"msg_{uuid.uuid4().hex}"
             yield {
                 "type": "message_start",
                 "message": {
-                    "id": message_id,
+                    "id": f"msg_{uuid.uuid4().hex}",
                     "type": "message",
                     "role": "assistant",
-                    "model": payload.get("model", self.model_name),
+                    "model": model,
                     "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
                 },
             }
             # Anthropic's SDK/CLI expect periodic pings on the stream; emit one
             # up front so clients see liveness before the first token arrives.
             yield {"type": "ping"}
-            block_index = 0
-            output_tokens = 0
-            stop_reason = "end_turn"
-            usage: dict[str, Any] | None = None
-            text_block_index = None
-            tool_blocks: dict[str, int] = {}
-            last_colibri: dict[str, Any] | None = None
-            for event in chat_events:
-                if event == "[DONE]":
-                    for open_index in sorted(
-                        i
-                        for i in [text_block_index, *tool_blocks.values()]
-                        if i is not None
-                    ):
-                        yield {"type": "content_block_stop", "index": open_index}
-                    yield {
-                        "type": "message_delta",
-                        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                        "usage": {"output_tokens": output_tokens},
-                        **(
-                            {"colibri": last_colibri}
-                            if last_colibri is not None
-                            else {}
-                        ),
-                    }
-                    yield {"type": "message_stop"}
+            next_index = 0
+            open_index: int | None = None
+            open_type: str | None = None
+            last_metrics: dict[str, Any] | None = None
+
+            def close_block() -> Iterator[dict[str, Any]]:
+                nonlocal open_index, open_type
+                if open_index is None:
                     return
-                if not isinstance(event, dict):
-                    continue
-                colibri = event.get("colibri")
-                if isinstance(colibri, dict):
-                    last_colibri = colibri
-                    if colibri.get("phase") == "tool_call" and not _is_decode_event(
-                        event
-                    ):
-                        # Keep Claude Code's stream alive and expose local
-                        # progress while raw tool syntax remains intentionally
-                        # hidden until the complete call can be parsed.
-                        yield {"type": "ping", "colibri": colibri}
-                        continue
-                if event.get("usage"):
-                    usage = event["usage"]
-                    output_tokens = usage.get("completion_tokens", output_tokens)
-                    continue
-                choices = event.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                delta = choice.get("delta", {})
-                if choice.get("finish_reason"):
-                    stop_reason = {
-                        "tool_calls": "tool_use",
-                        "length": "max_tokens",
-                    }.get(choice["finish_reason"], "end_turn")
-                text = delta.get("content")
-                if text:
-                    if text_block_index is None:
-                        text_block_index = block_index
-                        yield {
-                            "type": "content_block_start",
-                            "index": text_block_index,
-                            "content_block": {"type": "text", "text": ""},
-                        }
-                        block_index += 1
+                if open_type == "thinking":
+                    # The real API closes a thinking block with its signature.
+                    # A local model has none to offer, but the delta keeps
+                    # strict accumulators from seeing the block close wrong.
                     yield {
                         "type": "content_block_delta",
-                        "index": text_block_index,
-                        "delta": {"type": "text_delta", "text": text},
-                        **(
-                            {"colibri": last_colibri}
-                            if last_colibri is not None
-                            else {}
-                        ),
+                        "index": open_index,
+                        "delta": {"type": "signature_delta", "signature": ""},
                     }
-                for position, call in enumerate(delta.get("tool_calls", [])):
-                    stop_reason = "tool_use"
-                    function = call.get("function", {})
-                    # Keyed by the call's index, not its id: a streamed call
-                    # carries its id only on the opening delta, so keying by id
-                    # opened a fresh content block for every argument fragment.
-                    key = call.get("index", position)
-                    if key not in tool_blocks:
-                        tool_blocks[key] = block_index
+                yield {"type": "content_block_stop", "index": open_index}
+                open_index = None
+                open_type = None
+
+            def open_block(
+                block_type: str, block: dict[str, Any]
+            ) -> Iterator[dict[str, Any]]:
+                nonlocal next_index, open_index, open_type
+                yield from close_block()
+                open_index = next_index
+                open_type = block_type
+                next_index += 1
+                yield {
+                    "type": "content_block_start",
+                    "index": open_index,
+                    "content_block": block,
+                }
+
+            def block_delta(delta: dict[str, Any]) -> dict[str, Any]:
+                event: dict[str, Any] = {
+                    "type": "content_block_delta",
+                    "index": open_index,
+                    "delta": delta,
+                }
+                if last_metrics is not None:
+                    event["colibri"] = last_metrics
+                return event
+
+            for event in self._generation_events(request, progress=progress):
+                metrics = getattr(event, "metrics", None)
+                if isinstance(metrics, _Metrics):
+                    last_metrics = _metrics_payload(metrics)
+                if isinstance(event, _ReasoningDelta):
+                    if not event.text:
+                        continue
+                    if open_type != "thinking":
+                        yield from open_block(
+                            "thinking",
+                            {"type": "thinking", "thinking": "", "signature": ""},
+                        )
+                    yield block_delta(
+                        {"type": "thinking_delta", "thinking": event.text}
+                    )
+                elif isinstance(event, _TextDelta):
+                    if not event.text:
+                        continue
+                    if open_type != "text":
+                        yield from open_block("text", {"type": "text", "text": ""})
+                    yield block_delta({"type": "text_delta", "text": event.text})
+                elif isinstance(event, _ProgressDelta):
+                    if event.metrics.phase == "tool_call":
+                        # Keep the stream alive and expose local progress while
+                        # raw tool syntax remains intentionally hidden until
+                        # the complete call can be parsed.
                         yield {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
+                            "type": "ping",
+                            "colibri": _metrics_payload(event.metrics),
+                        }
+                elif isinstance(event, _ToolCallOpen):
+                    yield from open_block(
+                        "tool_use",
+                        {
+                            "type": "tool_use",
+                            "id": event.call_id,
+                            "name": event.name,
+                            "input": {},
+                        },
+                    )
+                elif isinstance(event, _ToolArgumentsDelta):
+                    if event.fragment:
+                        yield block_delta(
+                            {
+                                "type": "input_json_delta",
+                                "partial_json": event.fragment,
+                            }
+                        )
+                elif isinstance(event, _ToolCallsSettled):
+                    if event.tail and open_type == "tool_use":
+                        yield block_delta(
+                            {
+                                "type": "input_json_delta",
+                                "partial_json": event.tail,
+                            }
+                        )
+                    for call in event.calls:
+                        function = call.get("function", {})
+                        yield from open_block(
+                            "tool_use",
+                            {
                                 "type": "tool_use",
                                 "id": call.get("id", f"toolu_{uuid.uuid4().hex}"),
                                 "name": function.get("name", "tool"),
                                 "input": {},
                             },
-                        }
-                        block_index += 1
-                    arguments = function.get("arguments", "")
-                    if arguments:
-                        yield {
-                            "type": "content_block_delta",
-                            "index": tool_blocks[key],
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": arguments,
-                            },
-                            **(
-                                {"colibri": last_colibri}
-                                if last_colibri is not None
-                                else {}
+                        )
+                        arguments = function.get("arguments", "")
+                        if arguments:
+                            yield block_delta(
+                                {
+                                    "type": "input_json_delta",
+                                    "partial_json": arguments,
+                                }
+                            )
+                elif isinstance(event, _Finished):
+                    yield from close_block()
+                    yield {
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": (
+                                "stop_sequence"
+                                if event.stop_sequence is not None
+                                else _ANTHROPIC_STOP_REASONS.get(
+                                    event.finish_reason, "end_turn"
+                                )
                             ),
-                        }
-            if usage is not None:
-                output_tokens = usage.get("completion_tokens", output_tokens)
+                            "stop_sequence": event.stop_sequence,
+                        },
+                        "usage": {"output_tokens": event.completion_tokens},
+                        **(
+                            {"colibri": last_metrics}
+                            if last_metrics is not None
+                            else {}
+                        ),
+                    }
+                    yield {"type": "message_stop"}
 
         return events()
 
@@ -1530,7 +2022,9 @@ class InferenceService:
             sampling = _sampling_from_payload(payload, self.generation_defaults)
         except ValueError as error:
             raise APIError(400, str(error)) from error
-        return _TextRequest(prompt, max_new_tokens, sampling)
+        return _TextRequest(
+            prompt, max_new_tokens, sampling, stop_sequences=_stop_option(payload)
+        )
 
     def _prepare_chat(self, payload: Mapping[str, Any]) -> _GenerationRequest:
         messages, tools_enabled = _chat_messages(
@@ -1609,6 +2103,7 @@ class InferenceService:
             # never set. Only the tail can carry the marker.
             self._prompt_opens_thinking(prompt_ids),
             reasoning_effort=reasoning_effort,
+            stop_sequences=_stop_option(payload),
         )
 
     def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
@@ -1681,14 +2176,10 @@ class InferenceService:
         result: GenerationResult,
         *,
         tools: tuple[dict[str, Any], ...] = (),
+        stop_sequences: tuple[str, ...] = (),
     ) -> dict[str, Any]:
-        visible, reasoning = _split_reasoning_content(result.text)
-        content, tool_calls = _parse_tool_calls(
-            visible, tools=tools, keep_incomplete=result.stopped_on_eos)
-        finish_reason = (
-            "tool_calls"
-            if tool_calls
-            else ("stop" if result.stopped_on_eos else "length")
+        content, reasoning, tool_calls, finish_reason, _ = _finished_turn(
+            result, tools, stop_sequences
         )
         message: dict[str, Any] = {
             "role": "assistant",
@@ -1880,6 +2371,12 @@ class InferenceService:
         }
 
 
+# A client going away mid-connection. Never the server's fault, and never worth
+# a traceback: an agentic harness cancels turns and reaps pooled connections as
+# a matter of course.
+_PEER_GONE = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
 class ColibriHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1921,6 +2418,17 @@ class ColibriHTTPServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._connection_slots.release()
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        """Report a failed request, but stay quiet about disconnects.
+
+        socketserver's default prints a stack trace for anything that escapes
+        the handler, which for a disconnect is noise that hides the exceptions
+        worth seeing. Everything else still gets the full trace.
+        """
+        if isinstance(sys.exc_info()[1], _PEER_GONE):
+            return
+        super().handle_error(request, client_address)
 
 
 _SSE_KEEPALIVE = object()
@@ -2017,7 +2525,19 @@ def create_handler(
             return parsed
 
         def handle_one_request(self) -> None:
-            super().handle_one_request()
+            try:
+                super().handle_one_request()
+            except _PEER_GONE:
+                # A pooled client that abandons a request -- a cancelled turn,
+                # a harness shutting down, a keep-alive connection reaped --
+                # resets it rather than closing cleanly, and the reset surfaces
+                # from the *read* of the next request line. The write paths
+                # already treat this as ordinary; without it here, socketserver
+                # dumps a stack trace per connection, which is both wrong (the
+                # server did nothing incorrect) and expensive, since it buries
+                # the failures that are real.
+                self.close_connection = True
+                return
             # Back to idle: this connection may now wait a long time for its
             # next request while another one occupies the runtime.
             with contextlib.suppress(OSError):
@@ -2029,9 +2549,14 @@ def create_handler(
             self.send_header(
                 "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"
             )
+            # Echo whatever the preflight asks for: SDKs keep growing their
+            # header sets (anthropic-beta, the x-stainless-* telemetry), and
+            # each addition to a static list arrived only after a browser
+            # client had already failed on it.
             self.send_header(
                 "Access-Control-Allow-Headers",
-                "Authorization, Content-Type, x-api-key, anthropic-version",
+                self.headers.get("Access-Control-Request-Headers")
+                or "Authorization, Content-Type, x-api-key, anthropic-version",
             )
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -2469,7 +2994,11 @@ def create_handler(
                 # possible. Send the error as the final SSE event instead.
                 self.log_error("stream request failed: %s", error.message)
                 try:
-                    self._write_sse_event(json.dumps(self._error_body(error)))
+                    # The body doubles as the SSE event so the Anthropic shape
+                    # gets its `event: error` line; SDKs dispatch on the event
+                    # name and a data-only error never reached their handlers.
+                    body = self._error_body(error)
+                    self._write_sse_event(json.dumps(body), body)
                 except (BrokenPipeError, ConnectionResetError):
                     stream_ok = False
                     self.close_connection = True
@@ -2481,13 +3010,10 @@ def create_handler(
                 # waiting on a silent/truncated stream.
                 self.log_error("unhandled stream error: %s", error)
                 try:
-                    self._write_sse_event(
-                        json.dumps(
-                            self._error_body(
-                                APIError(500, "internal server error", "server_error")
-                            )
-                        )
+                    body = self._error_body(
+                        APIError(500, "internal server error", "server_error")
                     )
+                    self._write_sse_event(json.dumps(body), body)
                 except (BrokenPipeError, ConnectionResetError):
                     stream_ok = False
                     self.close_connection = True
@@ -2566,7 +3092,13 @@ def create_handler(
                 return {
                     "type": "error",
                     "error": {
-                        "type": error.error_type,
+                        # Anthropic spells the 500 family "api_error"; the
+                        # other type names already coincide.
+                        "type": (
+                            "api_error"
+                            if error.error_type == "server_error"
+                            else error.error_type
+                        ),
                         "message": error.message,
                     },
                 }
@@ -2607,6 +3139,11 @@ def create_handler(
             self._send_cors_headers()
             if status == 401:
                 self.send_header("WWW-Authenticate", "Bearer")
+            if status == 429:
+                # The queue drains as soon as a running generation finishes;
+                # without the header, SDK backoff starts at multi-second
+                # guesses for a wait that is usually under one.
+                self.send_header("Retry-After", "1")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if not head_only:
@@ -2693,14 +3230,12 @@ def _chat_messages(
         if role == "tool":
             # A tool may legitimately produce no output; keep the (possibly
             # empty) tool_response block so the turn structure is preserved.
-            content = _optional_text_content(message.get("content"), index)
             messages.append(
-                {"role": "tool", "content": content}
-                if architecture in NATIVE_TOOL_ARCHITECTURES
-                else {
-                    "role": "user",
-                    "content": f"<tool_response>\n{content}\n</tool_response>",
-                }
+                _tool_turn(
+                    _optional_text_content(message.get("content"), index),
+                    architecture=architecture,
+                    tool_call_id=message.get("tool_call_id"),
+                )
             )
             continue
         content = _optional_text_content(message.get("content"), index)
@@ -2727,8 +3262,71 @@ def _chat_messages(
                 )
             normalized["reasoning_content"] = reasoning
         messages.append(normalized)
+    format_prompt = _response_format_prompt(payload.get("response_format"))
+    if format_prompt:
+        system_parts.append(format_prompt)
+    return (
+        _assemble_prompt(
+            system_parts, messages, tools, payload.get("tool_choice"), architecture
+        ),
+        bool(tools),
+    )
+
+
+def _response_format_prompt(response_format: Any) -> str | None:
+    """The response_format contract, rendered into the system prompt.
+
+    Best effort rather than sampler-enforced -- the same treatment tool
+    schemas get on architectures without native tool support. Accepting the
+    option while doing nothing was worse: a client that asked for JSON
+    believed its output was constrained when nothing constrained it.
+    """
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise APIError(
+            400, "response_format must be an object", parameter="response_format"
+        )
+    format_type = response_format.get("type")
+    if format_type == "text":
+        return None
+    if format_type == "json_object":
+        return (
+            "# Response format\n\nReply with a single valid JSON object and "
+            "nothing else: no prose before or after it, no code fences."
+        )
+    if format_type == "json_schema":
+        declared = response_format.get("json_schema")
+        schema = declared.get("schema") if isinstance(declared, dict) else None
+        return (
+            "# Response format\n\nReply with a single JSON value matching this "
+            "JSON schema, and nothing else: no prose, no code fences.\n\n"
+            + json.dumps(
+                schema if isinstance(schema, dict) else {}, ensure_ascii=False
+            )
+        )
+    raise APIError(
+        400,
+        "response_format.type must be 'text', 'json_object', or 'json_schema'",
+        parameter="response_format",
+    )
+
+
+def _assemble_prompt(
+    system_parts: list[str],
+    turns: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tool_choice: Any,
+    architecture: str | None,
+) -> list[dict[str, Any]]:
+    """Assemble parsed turns into the prompt list every request parser shares.
+
+    Both protocol parsers end here, so where the tool schemas ride and what a
+    valid final turn is cannot diverge between them.
+    """
+    messages = list(turns)
     if tools and architecture not in NATIVE_TOOL_ARCHITECTURES:
-        system_parts.insert(0, _tool_prompt(tools, payload.get("tool_choice")))
+        system_parts = [_tool_prompt(tools, tool_choice), *system_parts]
     if system_parts:
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
     if tools and architecture in NATIVE_TOOL_ARCHITECTURES:
@@ -2742,10 +3340,10 @@ def _chat_messages(
         # is every request a coding harness sends -- lost its tools entirely.
         if messages:
             messages[0]["tools"] = list(tools)
-    # OpenAI-compatible clients may end a request with an assistant message
-    # when they are asking the model to continue/prefill that turn. The chat
-    # formatter adds the assistant generation marker after the supplied
-    # history, so this is a valid prompt for the local runtime as well.
+    # Clients may end a request with an assistant message when they are asking
+    # the model to continue/prefill that turn. The chat formatter adds the
+    # assistant generation marker after the supplied history, so this is a
+    # valid prompt for the local runtime as well.
     # "tool" belongs here for an architecture whose template renders tool
     # results as their own turn. Elsewhere a tool result was rewritten into a
     # user turn above and never reached this check, which is why the list did
@@ -2756,72 +3354,149 @@ def _chat_messages(
             "the last message must have role 'user', 'assistant', or 'tool'",
             parameter="messages",
         )
-    return messages, bool(tools)
+    return messages
 
 
-def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+_ANTHROPIC_STOP_REASONS = {
+    "tool_calls": "tool_use",
+    "length": "max_tokens",
+    "stop": "end_turn",
+}
+
+
+def _anthropic_request(
+    payload: Mapping[str, Any], *, architecture: str | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    """Parse an Anthropic messages request straight into prompt messages.
+
+    Returns (options, messages, tools_enabled): the internal generation
+    options (sampling names from SETTINGS, token budget, thinking) and the
+    assembled prompt messages. Anthropic payloads used to be rewritten into
+    OpenAI request payloads and re-parsed by that protocol's validator, which
+    imposed OpenAI's rules -- an empty assistant turn, legal here, was a 400
+    there -- and dropped everything the OpenAI shape cannot carry, thinking
+    blocks and tool_use ids among it.
+    """
     if payload.get("max_tokens") is None:
         raise APIError(400, "max_tokens is required", parameter="max_tokens")
-    if payload.get("stop_sequences") not in (None, [], ""):
-        raise APIError(
-            400,
-            "stop_sequences is not supported",
-            parameter="stop_sequences",
-        )
+    stop_sequences = payload.get("stop_sequences")
+    if stop_sequences not in (None, [], ""):
+        if not isinstance(stop_sequences, list) or any(
+            not isinstance(item, str) or not item for item in stop_sequences
+        ):
+            raise APIError(
+                400,
+                "stop_sequences must be an array of non-empty strings",
+                parameter="stop_sequences",
+            )
+    else:
+        stop_sequences = None
     thinking = payload.get("thinking")
     if thinking is not None and not isinstance(thinking, dict):
         raise APIError(400, "thinking must be an object", parameter="thinking")
-    messages: list[dict[str, Any]] = []
-    system = _anthropic_text_strict(payload.get("system"), "system")
+    options: dict[str, Any] = {
+        "model": payload.get("model"),
+        "max_completion_tokens": payload.get("max_tokens"),
+        # Every sampling setting the caller sent, not only the three
+        # Anthropic's own schema names: a client that adds
+        # `repetition_penalty` or `seed` to the body meant it, and dropping it
+        # here left no way to set them from this endpoint.
+        **{
+            setting.name: payload.get(setting.name)
+            for setting in SETTINGS
+            if payload.get(setting.name) is not None
+        },
+        # Absent means unstated, which leaves the checkpoint's own default in
+        # place. Answering "false" here turned reasoning off for every Claude
+        # Code request, since that client does not send a thinking block.
+        "enable_thinking": (
+            None if thinking is None else bool(thinking.get("type") == "enabled")
+        ),
+        "tools": _anthropic_tools(payload),
+        # This protocol's own name for stop sequences, handed to the internal
+        # option every parser reads.
+        **({"stop": list(stop_sequences)} if stop_sequences else {}),
+    }
+    choice = payload.get("tool_choice")
+    if isinstance(choice, dict):
+        choice_type = choice.get("type")
+        if choice_type == "any":
+            options["tool_choice"] = "required"
+        elif choice_type == "none":
+            options["tool_choice"] = "none"
+        elif choice_type == "tool":
+            options["tool_choice"] = {"function": {"name": choice.get("name")}}
+        elif choice_type == "auto":
+            options["tool_choice"] = "auto"
+        else:
+            raise APIError(400, "tool_choice is invalid", parameter="tool_choice")
+    elif choice is not None:
+        options["tool_choice"] = choice
+    tools = _selected_tools(options)
+
+    system_parts: list[str] = []
+    system = _anthropic_prompt_text(payload.get("system"), "system")
     if system:
-        messages.append({"role": "system", "content": system})
+        system_parts.append(system)
     value = payload.get("messages")
     if not isinstance(value, list) or not value:
         raise APIError(400, "messages must be a non-empty array", parameter="messages")
+    turns: list[dict[str, Any]] = []
     for index, message in enumerate(value):
         if not isinstance(message, dict):
             raise APIError(400, f"messages[{index}] is invalid", parameter="messages")
         role = message.get("role")
         if role in {"system", "developer"}:
-            system_text = _anthropic_text_strict(
+            system_text = _anthropic_prompt_text(
                 message.get("content"), f"messages[{index}].content"
             )
             if system_text:
-                messages.append({"role": "system", "content": system_text})
+                system_parts.append(system_text)
             continue
         if role == "tool":
-            messages.append(
-                {
-                    "role": "tool",
-                    "content": _anthropic_text_strict(
+            turns.append(
+                _tool_turn(
+                    _anthropic_prompt_text(
                         message.get("content"), f"messages[{index}].content"
                     ),
-                }
+                    architecture=architecture,
+                    tool_call_id=message.get("tool_call_id"),
+                )
             )
             continue
         if role not in {"user", "assistant"}:
             raise APIError(400, f"messages[{index}] is invalid", parameter="messages")
         content = message.get("content")
         if isinstance(content, str):
-            messages.append({"role": role, "content": content})
+            turns.append({"role": role, "content": content})
             continue
         if not isinstance(content, list):
             raise APIError(
                 400, f"messages[{index}].content is invalid", parameter="messages"
             )
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
-        tool_results: list[dict[str, str]] = []
+        tool_results: list[dict[str, Any]] = []
         for block in content:
             if not isinstance(block, dict):
                 raise APIError(
                     400, f"messages[{index}].content is invalid", parameter="messages"
                 )
             block_type = block.get("type")
-            if block_type in {"text", "input_text", "output_text"}:
+            if block_type in TEXT_PART_TYPES:
                 text = block.get("text")
                 if isinstance(text, str):
                     text_parts.append(text)
+            elif block_type == "thinking" and role == "assistant":
+                # Replayed chain-of-thought from an earlier turn. The template
+                # decides whether history keeps it; dropping it here made the
+                # replayed conversation differ from the one the model saw.
+                thought = block.get("thinking")
+                if isinstance(thought, str) and thought:
+                    reasoning_parts.append(thought)
+            elif block_type == "redacted_thinking" and role == "assistant":
+                continue
             elif block_type == "tool_use" and role == "assistant":
                 tool_calls.append(
                     {
@@ -2837,58 +3512,49 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 )
             elif block_type == "tool_result" and role == "user":
                 tool_results.append(
-                    {
-                        "role": "tool",
-                        "content": _anthropic_text_strict(
-                            block.get("content"),
-                            f"messages[{index}].content",
+                    _tool_turn(
+                        _anthropic_prompt_text(
+                            block.get("content"), f"messages[{index}].content"
                         ),
-                    }
+                        architecture=architecture,
+                        tool_call_id=block.get("tool_use_id"),
+                    )
                 )
             else:
-                raise APIError(
-                    400,
-                    f"messages[{index}].content contains an unsupported block",
-                    parameter="messages",
-                )
+                # A block this server cannot render (an image, a document).
+                # Failing the request would brick the whole session -- the
+                # block is in history now and comes back with every retry --
+                # so degrade it to a visible placeholder instead.
+                text_parts.append(_unsupported_block_text(block_type))
         # A tool result answers the preceding assistant turn, so it must reach
         # the prompt before any new user text carried by the same message.
-        messages.extend(tool_results)
-        if text_parts or tool_calls:
-            item: dict[str, Any] = {
-                "role": role,
-                "content": "".join(text_parts) or None,
-            }
-            if tool_calls:
-                item["tool_calls"] = tool_calls
-            messages.append(item)
+        turns.extend(tool_results)
+        if text_parts or reasoning_parts or tool_calls:
+            content_text = "".join(text_parts)
+            turn: dict[str, Any] = {"role": role, "content": content_text}
+            if tool_calls and architecture in NATIVE_TOOL_ARCHITECTURES:
+                turn["tool_calls"] = _template_tool_calls(tool_calls, architecture)
+            elif tool_calls:
+                turn["content"] = _render_tool_calls(content_text, tool_calls, index)
+            if reasoning_parts and role == "assistant":
+                turn["reasoning_content"] = "\n\n".join(reasoning_parts)
+            turns.append(turn)
         elif not tool_results:
-            messages.append({"role": role, "content": ""})
-    result: dict[str, Any] = {
-        "model": payload.get("model"),
-        "messages": messages,
-        "max_completion_tokens": payload.get("max_tokens"),
-        # Every sampling setting the caller sent, not the three this used to
-        # carry: Anthropic's own schema names only temperature/top_p/top_k, but
-        # a client that adds `repetition_penalty` or `seed` to the body meant
-        # it, and dropping it here left no way to set them from this endpoint.
-        **{
-            setting.name: payload.get(setting.name)
-            for setting in SETTINGS
-            if payload.get(setting.name) is not None
-        },
-        # Absent means unstated, which leaves the checkpoint's own default in
-        # place. Answering "false" here turned reasoning off for every Claude
-        # Code request, since that client does not send a thinking block.
-        "enable_thinking": (
-            None if thinking is None
-            else bool(isinstance(thinking, dict) and thinking.get("type") == "enabled")
-        ),
-    }
+            # An empty turn is legal on this protocol -- an interrupted
+            # assistant message replays as one -- so keep it, and keep history
+            # lined up, rather than reject the whole conversation.
+            turns.append({"role": role, "content": ""})
+    messages = _assemble_prompt(
+        system_parts, turns, tools, options.get("tool_choice"), architecture
+    )
+    return options, messages, bool(tools)
+
+
+def _anthropic_tools(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     tools = payload.get("tools") or []
     if not isinstance(tools, list):
         raise APIError(400, "tools must be an array", parameter="tools")
-    converted_tools: list[dict[str, Any]] = []
+    converted: list[dict[str, Any]] = []
     for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
             raise APIError(400, f"tools[{index}] is invalid", parameter="tools")
@@ -2906,7 +3572,7 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             description = tool.get("description", "")
         if not isinstance(name, str) or not name or not isinstance(parameters, dict):
             raise APIError(400, f"tools[{index}] is invalid", parameter="tools")
-        converted_tools.append(
+        converted.append(
             {
                 "type": "function",
                 "function": {
@@ -2916,42 +3582,16 @@ def _anthropic_to_chat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
                 },
             }
         )
-    result["tools"] = converted_tools
-    choice = payload.get("tool_choice")
-    if isinstance(choice, dict):
-        choice_type = choice.get("type")
-        if choice_type == "any":
-            result["tool_choice"] = "required"
-        elif choice_type == "none":
-            result["tool_choice"] = "none"
-        elif choice_type == "tool":
-            result["tool_choice"] = {"function": {"name": choice.get("name")}}
-        elif choice_type == "auto":
-            result["tool_choice"] = "auto"
-        else:
-            raise APIError(400, "tool_choice is invalid", parameter="tool_choice")
-    elif choice is not None:
-        result["tool_choice"] = choice
-    return result
+    return converted
 
 
-def _anthropic_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        parts: list[str] = []
-        for block in value:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-            elif isinstance(block, dict) and block.get("type") == "tool_result":
-                parts.append(_anthropic_text(block.get("content")))
-        return "".join(parts)
-    return ""
+def _anthropic_prompt_text(value: Any, parameter: str) -> str:
+    """Flatten Anthropic content into prompt text, degrading what cannot be.
 
-
-def _anthropic_text_strict(value: Any, parameter: str) -> str:
+    Text blocks concatenate; anything else -- an image, a document -- becomes
+    a visible placeholder rather than a 400, because a rejected block sits in
+    the client's history and fails every request that replays it.
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -2960,18 +3600,47 @@ def _anthropic_text_strict(value: Any, parameter: str) -> str:
         raise APIError(400, f"{parameter} must be text blocks", parameter=parameter)
     parts: list[str] = []
     for block in value:
-        if (
-            not isinstance(block, dict)
-            or block.get("type") not in {"text", "input_text", "output_text"}
-            or not isinstance(block.get("text"), str)
-        ):
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
             raise APIError(
                 400,
-                f"{parameter} contains an unsupported content block",
+                f"{parameter} contains an invalid content block",
                 parameter=parameter,
             )
-        parts.append(block["text"])
+        if block.get("type") in TEXT_PART_TYPES and isinstance(
+            block.get("text"), str
+        ):
+            parts.append(block["text"])
+        else:
+            parts.append(_unsupported_block_text(block.get("type")))
     return "".join(parts)
+
+
+def _unsupported_block_text(block_type: Any) -> str:
+    label = block_type if isinstance(block_type, str) and block_type else "content"
+    return f"[unsupported {label} block omitted]"
+
+
+def _tool_turn(
+    content: str, *, architecture: str | None, tool_call_id: Any = None
+) -> dict[str, Any]:
+    """One tool result in the prompt shape this architecture reads.
+
+    A template that renders tool turns natively gets the role, and the call id
+    when the client supplied one so parallel calls pair with their results;
+    everywhere else the result is wrapped as user text.
+    """
+    if architecture in NATIVE_TOOL_ARCHITECTURES:
+        turn: dict[str, Any] = {"role": "tool", "content": content}
+        if isinstance(tool_call_id, str) and tool_call_id:
+            turn["tool_call_id"] = tool_call_id
+        return turn
+    return {
+        "role": "user",
+        "content": f"<tool_response>\n{content}\n</tool_response>",
+    }
 
 
 def _selected_tools(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -3411,6 +4080,68 @@ def _split_reasoning_content(text: str) -> tuple[str, str | None]:
     if closing != -1 and "<think>" not in text[:closing]:
         return text[closing + len("</think>"):].lstrip(), text[:closing].strip() or None
     return text, None
+
+
+def _finished_turn(
+    result: GenerationResult,
+    tools: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    stop_sequences: Sequence[str] = (),
+) -> tuple[str | None, str | None, list[dict[str, Any]], str, str | None]:
+    """(content, reasoning, tool_calls, finish_reason, stop_sequence).
+
+    The one reading of a completed generation, shared by every non-streaming
+    protocol encoder so they cannot disagree about what the model said.
+
+    Stop sequences are scanned in visible content only -- a stop string
+    inside a tool parameter or the model's reasoning is data. Non-streaming
+    generations have already run to completion, so the cut cannot save decode
+    time here; the contract is the streaming one all the same: nothing at or
+    after the sequence reaches the client, and a call opened after it was
+    never asked for.
+    """
+    visible, reasoning = _split_reasoning_content(result.text)
+    content, tool_calls = _parse_tool_calls(
+        visible, tools=tools, keep_incomplete=result.stopped_on_eos)
+    if _turn_is_silent(visible, content, tool_calls, result.stopped_on_eos):
+        content = visible.strip()
+    stop_sequence = None
+    if content and stop_sequences:
+        content, stop_sequence = _truncate_at_stop(content, stop_sequences)
+        if stop_sequence is not None:
+            tool_calls = []
+    finish_reason = (
+        "stop"
+        if stop_sequence is not None
+        else "tool_calls"
+        if tool_calls
+        else ("stop" if result.stopped_on_eos else "length")
+    )
+    return content, reasoning, tool_calls, finish_reason, stop_sequence
+
+
+def _turn_is_silent(
+    text: str,
+    content: str | None,
+    tool_calls: Sequence[dict[str, Any]],
+    stopped_on_eos: bool,
+) -> bool:
+    """True when suppressing unparseable markup would leave nothing at all.
+
+    A block the parser rejects yields no call, and content is bounded at the
+    marker, so a turn that was *only* markup reaches the client empty: no text,
+    no call, finish_reason "stop". An agent harness has nothing to act on and
+    nothing to report, so it sends the same conversation back -- which at
+    temperature 0 regenerates the same broken block, and the run never
+    terminates. Returning the raw turn instead is what breaks the cycle: the
+    model sees its own malformed output on the next turn and can correct it.
+
+    Only for a turn the model ended itself. One cut off by the token ceiling is
+    genuinely incomplete, its finish_reason already says "length", and leaking
+    a half-written parameter as prose helps nobody.
+    """
+    if content or tool_calls or not stopped_on_eos:
+        return False
+    return TOOL_CALL_MARKER in text or DSML_TOOL_CALL_MARKER in text
 
 
 def _has_complete_tool_call(text: str, *, tools: Sequence[dict[str, Any]]) -> bool:
@@ -3962,10 +4693,14 @@ def _response_output(
     *,
     tools: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    # Reasoning split off first: a thinking model's chain-of-thought was
+    # served verbatim inside output_text on this endpoint alone, after every
+    # other path had learned that notes are not the answer.
+    visible, _reasoning = _split_reasoning_content(result.text)
     content, tool_calls = (
-        _parse_tool_calls(result.text, tools=tools,
+        _parse_tool_calls(visible, tools=tools,
                           keep_incomplete=result.stopped_on_eos)
-        if tools else (result.text, [])
+        if tools else (visible, [])
     )
     incomplete = not result.stopped_on_eos and not tool_calls
     output: list[dict[str, Any]] = []
@@ -3998,102 +4733,6 @@ def _response_output(
             }
         )
     return output
-
-
-def _response_output_events(
-    output: list[dict[str, Any]], sequence: int
-) -> Iterator[dict[str, Any]]:
-    for output_index, item in enumerate(output):
-        if item["type"] == "function_call":
-            pending_item = {**item, "status": "in_progress", "arguments": ""}
-            yield {
-                "type": "response.output_item.added",
-                "sequence_number": sequence,
-                "output_index": output_index,
-                "item": pending_item,
-            }
-            sequence += 1
-            yield {
-                "type": "response.function_call_arguments.delta",
-                "sequence_number": sequence,
-                "item_id": item["id"],
-                "output_index": output_index,
-                "delta": item["arguments"],
-            }
-            sequence += 1
-            yield {
-                "type": "response.function_call_arguments.done",
-                "sequence_number": sequence,
-                "item_id": item["id"],
-                "output_index": output_index,
-                "arguments": item["arguments"],
-            }
-            sequence += 1
-            yield {
-                "type": "response.output_item.done",
-                "sequence_number": sequence,
-                "output_index": output_index,
-                "item": item,
-            }
-            sequence += 1
-            continue
-
-        text = item["content"][0]["text"]
-        pending_item = {**item, "status": "in_progress", "content": []}
-        yield {
-            "type": "response.output_item.added",
-            "sequence_number": sequence,
-            "output_index": output_index,
-            "item": pending_item,
-        }
-        sequence += 1
-        part = {**item["content"][0], "text": ""}
-        yield {
-            "type": "response.content_part.added",
-            "sequence_number": sequence,
-            "item_id": item["id"],
-            "output_index": output_index,
-            "content_index": 0,
-            "part": part,
-        }
-        sequence += 1
-        if text:
-            yield {
-                "type": "response.output_text.delta",
-                "sequence_number": sequence,
-                "item_id": item["id"],
-                "output_index": output_index,
-                "content_index": 0,
-                "delta": text,
-                "logprobs": [],
-            }
-            sequence += 1
-        yield {
-            "type": "response.output_text.done",
-            "sequence_number": sequence,
-            "item_id": item["id"],
-            "output_index": output_index,
-            "content_index": 0,
-            "text": text,
-            "logprobs": [],
-        }
-        sequence += 1
-        yield {
-            "type": "response.content_part.done",
-            "sequence_number": sequence,
-            "item_id": item["id"],
-            "output_index": output_index,
-            "content_index": 0,
-            "part": item["content"][0],
-        }
-        sequence += 1
-        yield {
-            "type": "response.output_item.done",
-            "sequence_number": sequence,
-            "output_index": output_index,
-            "item": item,
-        }
-        sequence += 1
 
 
 def _validate_response_input(value: Any) -> list[dict[str, str]]:
@@ -4307,6 +4946,24 @@ def _float_option(payload: Mapping[str, Any], key: str, default: float) -> float
     return float(value)
 
 
+def _stop_option(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """The request's stop sequences: OpenAI's `stop`, a string or an array."""
+    value = payload.get("stop")
+    if value is None or value == []:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise APIError(
+            400,
+            "stop must be a string or an array of non-empty strings",
+            parameter="stop",
+        )
+    return tuple(value)
+
+
 def _error_payload(error: APIError) -> dict[str, Any]:
     return {
         "error": {
@@ -4327,6 +4984,8 @@ def _is_decode_event(event: object) -> bool:
         "response.output_text.delta",
         "response.function_call_arguments.delta",
     }:
+        return bool(event.get("delta"))
+    if event_type == "content_block_delta":
         return bool(event.get("delta"))
     choices = event.get("choices")
     if not isinstance(choices, list) or not choices:

@@ -3,6 +3,7 @@ import itertools
 import json
 import re
 import socket
+import struct
 import threading
 import time
 import unittest
@@ -249,6 +250,47 @@ class TruncatedToolStubGenerator(StubGenerator):
             generated_ids=tuple(range(len(self.TEXT) + 1)),
             text=self.TEXT,
             stopped_on_eos=False,  # truncated, not a clean stop
+            finished=True,
+            state_tokens=len(self.TEXT) + 1,
+        )
+
+
+class UnparseableToolStubGenerator(StubGenerator):
+    """Emits a closed <tool_call> whose body decodes to no call at all, and ends
+    on EOS -- the model finished, it just wrote the block wrong."""
+
+    TEXT = "<tool_call>\nget_weather(city='Paris')\n</tool_call>"
+
+    def generate_messages(self, messages, **options) -> GenerationResult:
+        self.calls.append((messages, options))
+        return GenerationResult(
+            prompt_ids=(1, 2, 3),
+            generated_ids=tuple(range(len(self.TEXT))),
+            text=self.TEXT,
+            stopped_on_eos=True,
+            state_tokens=len(self.TEXT),
+        )
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        for index, char in enumerate(self.TEXT):
+            yield GenerationStep(
+                token_id=index,
+                text_delta=char,
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(range(index + 1)),
+                text=self.TEXT[: index + 1],
+                stopped_on_eos=False,
+                finished=False,
+                state_tokens=index + 1,
+            )
+        yield GenerationStep(
+            token_id=None,
+            text_delta="",
+            prompt_ids=(1, 2, 3),
+            generated_ids=tuple(range(len(self.TEXT) + 1)),
+            text=self.TEXT,
+            stopped_on_eos=True,
             finished=True,
             state_tokens=len(self.TEXT) + 1,
         )
@@ -538,9 +580,9 @@ class ToolCallParsingTests(unittest.TestCase):
     def test_anthropic_tool_round_trip_reaches_a_native_template(self) -> None:
         # Claude Code's wire shape: system as its own field, tool_use blocks on
         # the assistant turn, tool_result blocks inside the following user turn.
-        from colibri_next.server import _anthropic_to_chat_payload, _chat_messages
+        from colibri_next.server import _anthropic_request
 
-        payload = _anthropic_to_chat_payload({
+        _, messages, enabled = _anthropic_request({
             "model": "m",
             "max_tokens": 64,
             "system": "You are a coding assistant.",
@@ -556,8 +598,7 @@ class ToolCallParsingTests(unittest.TestCase):
                     "type": "tool_result", "tool_use_id": "toolu_1",
                     "content": "import server"}]},
             ],
-        })
-        messages, enabled = _chat_messages(payload, architecture="bailingmoe3")
+        }, architecture="bailingmoe3")
 
         self.assertTrue(enabled)
         self.assertEqual(messages[0]["tools"][0]["function"]["name"], "read_file")
@@ -569,6 +610,9 @@ class ToolCallParsingTests(unittest.TestCase):
             messages[2]["tool_calls"][0]["function"]["arguments"],
             {"path": "/app/main.py"},
         )
+        # The call id survives to the result turn, so a template that pairs
+        # parallel calls with their results by id can.
+        self.assertEqual(messages[3]["tool_call_id"], "toolu_1")
 
     def test_generic_architecture_still_renders_tools_into_content(self) -> None:
         # The Hermes prompt and the rendered history remain for checkpoints
@@ -1220,68 +1264,29 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "message_stop")
 
     def test_anthropic_stream_text_then_tool_use_gets_separate_blocks(self) -> None:
-        chat_events = [
-            {"choices": [{"index": 0, "delta": {"content": "Let me check."}}]},
-            {
-                "choices": [{"index": 0, "delta": {}}],
-                "colibri": {
-                    "generated_tokens": 32,
-                    "decode_elapsed_seconds": 0.75,
-                    "phase": "tool_call",
-                },
-            },
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "toolu_abc",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": '{"city":',
-                                    },
-                                }
-                            ]
-                        },
-                    }
-                ]
-            },
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "toolu_abc",
-                                    "function": {"arguments": ' "Paris"}'},
-                                }
-                            ]
-                        },
-                    }
-                ]
-            },
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "tool_calls",
-                    }
-                ]
-            },
-            "[DONE]",
+        from colibri_next.server import (
+            _Finished,
+            _Metrics,
+            _ProgressDelta,
+            _TextDelta,
+            _ToolArgumentsDelta,
+            _ToolCallOpen,
+        )
+
+        tool_metrics = _Metrics(32, 0.75, "tool_call")
+        generation_events = [
+            _TextDelta("Let me check.", _Metrics(4, 0.1)),
+            _ProgressDelta(tool_metrics),
+            _ToolCallOpen("toolu_abc", "get_weather", tool_metrics),
+            _ToolArgumentsDelta('{"city":', tool_metrics),
+            _ToolArgumentsDelta(' "Paris"}', tool_metrics),
+            _Finished("tool_calls", 5, 40),
         ]
 
-        def fake_stream(payload, **kwargs):
-            for ev in chat_events:
-                yield ev
+        def fake_events(request, progress=None):
+            return iter(generation_events)
 
-        self.service.stream_chat_completion = fake_stream
+        self.service._generation_events = fake_events
         events = list(
             self.service.stream_anthropic_message(
                 {
@@ -1383,18 +1388,24 @@ class InferenceServiceTests(unittest.TestCase):
             self.service.anthropic_message(
                 {"messages": [{"role": "user", "content": "Hi"}]}
             )
-        with self.assertRaisesRegex(APIError, "unsupported block"):
-            self.service.anthropic_message(
-                {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [{"type": "image", "source": {}}],
-                        }
-                    ],
-                    "max_tokens": 4,
-                }
-            )
+        # A block the model cannot read degrades to a visible placeholder
+        # rather than a 400: the block is part of history, so rejecting it
+        # would fail every request that replays the conversation.
+        self.service.anthropic_message(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "source": {}}],
+                    }
+                ],
+                "max_tokens": 4,
+            }
+        )
+        degraded = self.generator.calls[-1][0]
+        self.assertIn(
+            "[unsupported image block omitted]", degraded[-1]["content"]
+        )
         self.service.anthropic_message(
             {
                 "messages": [{"role": "user", "content": "Think"}],
@@ -1426,6 +1437,119 @@ class InferenceServiceTests(unittest.TestCase):
             }
         )
         self.assertEqual(response["stop_reason"], "max_tokens")
+
+    def test_anthropic_thinking_becomes_a_thinking_block(self) -> None:
+        generator = StubGenerator()
+        generator.generate_messages = Mock(
+            return_value=GenerationResult(
+                prompt_ids=(1,),
+                generated_ids=(2, 3),
+                text="<think>survey the file first</think>Hello!",
+                stopped_on_eos=True,
+                state_tokens=3,
+            )
+        )
+        service = InferenceService("qwen-local", generator)
+        response = service.anthropic_message(
+            {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
+        )
+        self.assertEqual(
+            [block["type"] for block in response["content"]],
+            ["thinking", "text"],
+        )
+        self.assertEqual(
+            response["content"][0]["thinking"], "survey the file first"
+        )
+        self.assertEqual(response["content"][1]["text"], "Hello!")
+
+    def test_anthropic_stream_routes_reasoning_to_thinking_blocks(self) -> None:
+        # Reasoning used to be dropped on this endpoint entirely: the encoder
+        # consumed OpenAI chunks and never read reasoning_content, so a
+        # thinking model produced minutes of silence with only pings.
+        from colibri_next.server import (
+            _Finished,
+            _Metrics,
+            _ReasoningDelta,
+            _TextDelta,
+        )
+
+        events_in = [
+            _ReasoningDelta("plan it", _Metrics(2, 0.1)),
+            _TextDelta("done", _Metrics(4, 0.2)),
+            _Finished("stop", 5, 4),
+        ]
+        self.service._generation_events = (
+            lambda request, progress=None: iter(events_in)
+        )
+        events = list(
+            self.service.stream_anthropic_message(
+                {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
+            )
+        )
+        starts = [e for e in events if e["type"] == "content_block_start"]
+        self.assertEqual(
+            [start["content_block"]["type"] for start in starts],
+            ["thinking", "text"],
+        )
+        thinking = "".join(
+            event["delta"]["thinking"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "thinking_delta"
+        )
+        self.assertEqual(thinking, "plan it")
+        # The thinking block closes with a signature delta before its stop,
+        # the shape a strict accumulator expects.
+        shapes = [
+            (event["type"], event.get("delta", {}).get("type"))
+            for event in events
+        ]
+        self.assertIn(("content_block_delta", "signature_delta"), shapes)
+        self.assertEqual(
+            [e["index"] for e in events if e["type"] == "content_block_stop"],
+            [0, 1],
+        )
+
+    def test_anthropic_accepts_an_empty_assistant_turn(self) -> None:
+        # An interrupted assistant message replays with empty content; the
+        # OpenAI validator's empty-content 400 must not apply on this protocol.
+        response = self.service.anthropic_message(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": ""},
+                    {"role": "user", "content": "Go on"},
+                ],
+                "max_tokens": 4,
+            }
+        )
+        self.assertEqual(response["type"], "message")
+
+    def test_anthropic_replayed_thinking_reaches_the_template(self) -> None:
+        self.service.anthropic_message(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "the plan",
+                                "signature": "",
+                            },
+                            {"type": "text", "text": "Working on it."},
+                        ],
+                    },
+                    {"role": "user", "content": "Continue"},
+                ],
+                "max_tokens": 4,
+            }
+        )
+        replayed = self.generator.calls[-1][0]
+        assistant = [m for m in replayed if m["role"] == "assistant"][0]
+        self.assertEqual(assistant["reasoning_content"], "the plan")
+        self.assertEqual(assistant["content"], "Working on it.")
 
     def test_anthropic_canonical_tools_are_forwarded(self) -> None:
         service = InferenceService("qwen-local", ToolStubGenerator())
@@ -1722,6 +1846,87 @@ class InferenceServiceTests(unittest.TestCase):
         # Truncated (no EOS) tool call reports "length", signalling the cutoff.
         self.assertIn("length", finish_reasons)
 
+    WEATHER_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+
+    def test_streaming_tool_request_passes_declarations_to_the_sampler(self) -> None:
+        # The grammar can only constrain a call it has the schemas for, and
+        # every agentic client streams: passing them on the non-streaming path
+        # alone left the constraint off exactly where it matters.
+        generator = ToolStubGenerator()
+        service = InferenceService("qwen-local", generator)
+        payload = {
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [self.WEATHER_TOOL],
+            "stream": True,
+        }
+        list(service.stream_chat_completion(payload))
+        options = generator.calls[-1][1]
+        self.assertEqual(
+            [tool["function"]["name"] for tool in options["tools"]], ["get_weather"]
+        )
+
+    def test_unparseable_tool_call_is_surfaced_rather_than_left_silent(self) -> None:
+        # Markup that decodes to nothing used to be suppressed with no call and
+        # no text, so a harness received an empty "stop" turn, had nothing to
+        # act on, and resent the same conversation forever.
+        payload = {
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [self.WEATHER_TOOL],
+        }
+        service = InferenceService("qwen-local", UnparseableToolStubGenerator())
+        choice = service.chat_completion(dict(payload))["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", choice["message"])
+        self.assertEqual(
+            choice["message"]["content"], UnparseableToolStubGenerator.TEXT
+        )
+
+        service = InferenceService("qwen-local", UnparseableToolStubGenerator())
+        events = [
+            event
+            for event in service.stream_chat_completion({**payload, "stream": True})
+            if isinstance(event, dict) and event.get("choices")
+        ]
+        content = "".join(
+            event["choices"][0]["delta"].get("content", "") for event in events
+        )
+        # The same turn either way: the two paths disagreeing is what makes a
+        # bug like this survive a test suite.
+        self.assertEqual(content, UnparseableToolStubGenerator.TEXT)
+
+    def test_plain_answer_with_tools_declared_carries_no_markup(self) -> None:
+        # The fallback above must key on a marker actually having opened. A turn
+        # that is ordinary prose ends with nothing held back, and releasing "the
+        # markup" there appends a bare <tool_call> to every plain answer.
+        generator = StubGenerator()
+        service = InferenceService("qwen-local", generator)
+        events = [
+            event
+            for event in service.stream_chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [self.WEATHER_TOOL],
+                    "stream": True,
+                }
+            )
+            if isinstance(event, dict) and event.get("choices")
+        ]
+        content = "".join(
+            event["choices"][0]["delta"].get("content", "") for event in events
+        )
+        self.assertEqual(content, "Hello!")
+
     def test_responses_function_tools_stream_and_continue(self) -> None:
         service = InferenceService("qwen-local", ToolStubGenerator())
         tool = {
@@ -1875,6 +2080,37 @@ class HTTPServerTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_abandoned_connection_is_not_reported_as_a_server_error(self) -> None:
+        # A harness cancelling a turn resets its pooled connections rather than
+        # closing them, and the reset surfaces from the read of the next request
+        # line. That is the client's prerogative, not a server fault: it must
+        # not print a stack trace, or the log fills with them and real failures
+        # go unnoticed.
+        errors = StringIO()
+        with redirect_stderr(errors):
+            raw = socket.create_connection(("127.0.0.1", self.server.server_port))
+            try:
+                raw.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                self.assertIn(b"200", raw.recv(4096))
+                # SO_LINGER with a zero timeout makes close() send RST, which
+                # is what an abandoned connection does.
+                raw.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+            finally:
+                raw.close()
+            # Give the handler thread time to notice the reset and unwind.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not errors.getvalue():
+                time.sleep(0.05)
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertNotIn("ConnectionResetError", errors.getvalue())
+        # The server is still serving.
+        self.connection.request("GET", "/health")
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        response.read()
 
     def test_chat_ui_static_assets(self) -> None:
         self.connection.request("GET", "/")
@@ -2668,6 +2904,291 @@ class ToolCallStreamingTests(unittest.TestCase):
             and event["delta"]["type"] == "input_json_delta"
         )
         self.assertEqual(json.loads(partial), {"city": "Paris"})
+
+
+class PieceGenerator(StubGenerator):
+    """Streams a fixed text piece by piece, recording how far it got."""
+
+    PIECES = ("The answer is 42.", "\n\nHum", "an: and now", " for more")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+        self.consumed = 0
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        text = ""
+        try:
+            for index, piece in enumerate(self.PIECES):
+                text += piece
+                self.consumed = index + 1
+                yield GenerationStep(
+                    token_id=10 + index,
+                    text_delta=piece,
+                    prompt_ids=(1, 2, 3),
+                    generated_ids=tuple(range(10, 11 + index)),
+                    text=text,
+                    stopped_on_eos=False,
+                    finished=False,
+                    state_tokens=3 + index,
+                )
+            yield GenerationStep(
+                token_id=None,
+                text_delta="",
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(range(10, 10 + len(self.PIECES))),
+                text=text,
+                stopped_on_eos=True,
+                finished=True,
+                state_tokens=3 + len(self.PIECES),
+            )
+        finally:
+            self.closed = True
+
+    def generate_messages(self, messages, **options) -> GenerationResult:
+        self.calls.append((messages, options))
+        return GenerationResult(
+            prompt_ids=(1, 2, 3),
+            generated_ids=tuple(range(10, 10 + len(self.PIECES))),
+            text="".join(self.PIECES),
+            stopped_on_eos=True,
+            state_tokens=3 + len(self.PIECES),
+        )
+
+
+class StopSequenceTests(unittest.TestCase):
+    """Stop sequences cut the turn; they used to be ignored or rejected.
+
+    OpenAI's `stop` was read by nothing at all, and the Anthropic endpoint
+    400ed on `stop_sequences` -- one silent, one loud, both unimplemented.
+    """
+
+    STOP = "\n\nHuman:"
+
+    def test_openai_stream_cuts_at_a_stop_sequence_split_across_deltas(self):
+        generator = PieceGenerator()
+        service = InferenceService("qwen-local", generator, max_new_tokens=32)
+        chunks = [
+            chunk
+            for chunk in service.stream_chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "stop": self.STOP,
+                }
+            )
+            if isinstance(chunk, dict) and chunk.get("choices")
+        ]
+        content = "".join(
+            chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+        )
+        self.assertEqual(content, "The answer is 42.")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        # Generation was cancelled at the match, not run to the end.
+        self.assertTrue(generator.closed)
+        self.assertLess(generator.consumed, len(PieceGenerator.PIECES))
+
+    def test_openai_non_streaming_truncates_at_a_stop_sequence(self):
+        service = InferenceService("qwen-local", PieceGenerator(), max_new_tokens=32)
+        response = service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "answer"}],
+                "stop": [self.STOP],
+            }
+        )
+        choice = response["choices"][0]
+        self.assertEqual(choice["message"]["content"], "The answer is 42.")
+        self.assertEqual(choice["finish_reason"], "stop")
+
+    def test_anthropic_reports_the_matched_stop_sequence(self):
+        service = InferenceService("qwen-local", PieceGenerator(), max_new_tokens=32)
+        events = list(
+            service.stream_anthropic_message(
+                {
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "max_tokens": 32,
+                    "stop_sequences": [self.STOP],
+                }
+            )
+        )
+        text = "".join(
+            event["delta"]["text"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "text_delta"
+        )
+        self.assertEqual(text, "The answer is 42.")
+        delta = [e for e in events if e["type"] == "message_delta"][-1]
+        self.assertEqual(delta["delta"]["stop_reason"], "stop_sequence")
+        self.assertEqual(delta["delta"]["stop_sequence"], self.STOP)
+
+        response = service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "answer"}],
+                "max_tokens": 32,
+                "stop_sequences": [self.STOP],
+            }
+        )
+        self.assertEqual(response["stop_reason"], "stop_sequence")
+        self.assertEqual(response["stop_sequence"], self.STOP)
+        self.assertEqual(response["content"][0]["text"], "The answer is 42.")
+
+    def test_stop_sequences_do_not_fire_inside_tool_arguments(self):
+        # "/tmp/a" is being written into a tool parameter; a stop string that
+        # happens to occur there is file content, not a turn boundary.
+        service = InferenceService(
+            "qwen-local", SlowToolStubGenerator(), max_new_tokens=4096
+        )
+        chunks = list(
+            service.stream_chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "write it"}],
+                    "tools": [WRITE_FILE_TOOL],
+                    "stop": ["tmp"],
+                }
+            )
+        )
+        reasons = [
+            choice.get("finish_reason")
+            for chunk in chunks
+            if isinstance(chunk, dict)
+            for choice in chunk.get("choices", [])
+        ]
+        self.assertIn("tool_calls", reasons)
+        arguments = "".join(
+            call.get("function", {}).get("arguments", "")
+            for chunk in chunks
+            if isinstance(chunk, dict)
+            for choice in chunk.get("choices", [])
+            for call in choice.get("delta", {}).get("tool_calls", [])
+        )
+        self.assertEqual(json.loads(arguments)["path"], "/tmp/a")
+
+    def test_legacy_completion_honors_stop(self):
+        service = InferenceService("qwen-local", PieceGenerator(), max_new_tokens=32)
+        response = service.completion(
+            {"prompt": "answer", "stop": self.STOP, "max_tokens": 32}
+        )
+        choice = response["choices"][0]
+        self.assertEqual(choice["text"], "The answer is 42.")
+        self.assertEqual(choice["finish_reason"], "stop")
+
+        events = [
+            event
+            for event in service.stream_completion(
+                {"prompt": "answer", "stop": self.STOP, "max_tokens": 32}
+            )
+            if isinstance(event, dict)
+        ]
+        text = "".join(event["choices"][0]["text"] for event in events)
+        self.assertEqual(text, "The answer is 42.")
+        self.assertEqual(events[-1]["choices"][0]["finish_reason"], "stop")
+
+
+class ResponseFormatTests(unittest.TestCase):
+    """response_format used to be accepted and then read by nothing."""
+
+    def setUp(self) -> None:
+        self.generator = StubGenerator()
+        self.service = InferenceService("qwen-local", self.generator, max_new_tokens=32)
+
+    def test_json_object_renders_into_the_system_prompt(self):
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Give me JSON"}],
+                "response_format": {"type": "json_object"},
+            }
+        )
+        system = self.generator.calls[-1][0][0]
+        self.assertEqual(system["role"], "system")
+        self.assertIn("valid JSON object", system["content"])
+
+    def test_json_schema_is_rendered_verbatim(self):
+        schema = {"type": "object", "properties": {"answer": {"type": "number"}}}
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Give me JSON"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema},
+                },
+            }
+        )
+        system = self.generator.calls[-1][0][0]
+        self.assertIn('"answer"', system["content"])
+
+    def test_unknown_format_type_is_rejected(self):
+        with self.assertRaisesRegex(APIError, "response_format.type"):
+            self.service.chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "x"}],
+                    "response_format": {"type": "grammar"},
+                }
+            )
+
+
+class ResponsesStreamingTests(unittest.TestCase):
+    """The Responses API must stream tool calls live, like every other path."""
+
+    def test_tool_call_streams_before_it_completes(self):
+        service = InferenceService(
+            "qwen-local", SlowToolStubGenerator(), max_new_tokens=4096
+        )
+        events = list(
+            service.stream_response(
+                {
+                    "input": "write it",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "write_file",
+                            "parameters": WRITE_FILE_TOOL["function"]["parameters"],
+                        }
+                    ],
+                    "max_output_tokens": 4096,
+                    "stream": True,
+                }
+            )
+        )
+        delta_positions = [
+            index
+            for index, event in enumerate(events)
+            if event["type"] == "response.function_call_arguments.delta"
+        ]
+        done_position = next(
+            index
+            for index, event in enumerate(events)
+            if event["type"] == "response.function_call_arguments.done"
+        )
+        # Many deltas before the done -- not one lump at the end, which is
+        # what the old path produced and what clients timed out waiting on.
+        self.assertGreater(len(delta_positions), 5)
+        self.assertLess(delta_positions[0], done_position)
+        arguments = "".join(
+            event["delta"]
+            for event in events
+            if event["type"] == "response.function_call_arguments.delta"
+        )
+        self.assertEqual(json.loads(arguments)["path"], "/tmp/a")
+        self.assertEqual(events[-1]["type"], "response.completed")
+        sequence_numbers = [event["sequence_number"] for event in events]
+        self.assertEqual(sequence_numbers, list(range(len(events))))
+
+    def test_output_text_excludes_reasoning(self):
+        generator = StubGenerator()
+        generator.generate_messages = Mock(
+            return_value=GenerationResult(
+                prompt_ids=(1,),
+                generated_ids=(2,),
+                text="<think>plan the answer</think>Answer",
+                stopped_on_eos=True,
+                state_tokens=2,
+            )
+        )
+        service = InferenceService("qwen-local", generator)
+        response = service.response({"input": "hi", "max_output_tokens": 8})
+        message = response["output"][0]
+        self.assertEqual(message["content"][0]["text"], "Answer")
 
 
 if __name__ == "__main__":
