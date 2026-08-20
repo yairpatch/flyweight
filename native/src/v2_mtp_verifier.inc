@@ -203,14 +203,62 @@ void qwen_forward_rows(
     auto dense_rows=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){
         std::uint64_t matrix=staged?staged:runtime.device_tensors[index];
         const auto type=qwen_device_type(runtime,index);
+        // Tensor cores where the format has an MMQ kernel; the dp4a tile
+        // kernel is the fallback for the rest. Both are resolved before the
+        // gate below, because whether either exists is what decides if a wide
+        // MoE batch may enter the block at all.
+        const char* mmq_kernel=nullptr;
+        bool mmq_min=false;
+        switch(type){
+            case 16:mmq_kernel="iq2xxs_q8_mmq";break;
+            case 17:mmq_kernel="iq2xs_q8_mmq";break;
+            case 18:mmq_kernel="iq3xxs_q8_mmq";break;
+            case 22:mmq_kernel="iq2s_q8_mmq";break;
+            case 23:mmq_kernel="iq4xs_q8_mmq";break;
+            case 11:mmq_kernel="q3k_q8_mmq";break;
+            case 14:mmq_kernel="q6k_q8_mmq";break;
+            case 10:mmq_kernel="q2k_q8_mmq";mmq_min=true;break;
+            case 12:mmq_kernel="q4k_q8_mmq";mmq_min=true;break;
+            case 13:mmq_kernel="q5k_q8_mmq";mmq_min=true;break;
+            // IQ1_S carries a per-group delta and still lands here rather
+            // than with the asymmetric three: its delta is +-1/8, so it
+            // folds into the int8 weights exactly. See iq1s_q8_words.
+            case 19:mmq_kernel="iq1s_q8_mmq";break;
+            // IQ1_M folds the same way; its two sub-scales per 32 values
+            // are the half-block split the symmetric kernels already carry.
+            case 29:mmq_kernel="iq1m_q8_mmq";break;
+            default:break;
+        }
+        const char* tiled_kernel=nullptr;
+        switch(type){
+            case 16:tiled_kernel="iq2xxs_q8_matmul_tiled";break;
+            case 17:tiled_kernel="iq2xs_q8_matmul_tiled";break;
+            case 18:tiled_kernel="iq3xxs_q8_matmul_tiled";break;
+            case 22:tiled_kernel="iq2s_q8_matmul_tiled";break;
+            case 23:tiled_kernel="iq4xs_q8_matmul_tiled";break;
+            case 19:tiled_kernel="iq1s_q8_matmul_tiled";break;
+            case 29:tiled_kernel="iq1m_q8_matmul_tiled";break;
+            case 11:tiled_kernel="q3k_q8_matmul_tiled";break;
+            case 14:tiled_kernel="q6k_q8_matmul_tiled";break;
+            default:break;
+        }
         const char* q8_kernel=nullptr;
-        // On MoE this stays a small-batch optimization: the row loop below
-        // re-reads the whole weight matrix per row, which only pays off against
-        // the reconstruct-in-float matmul when there are few rows. A dense
-        // model has no *_matmul_rows kernel that uses DP4A at all, so the same
-        // per-row loop is the faster path at any batch size -- prefill was
-        // running slower than decode without it.
-        if((experts>0?rows<=8:true)&&(input_size&255)==0){
+        // On MoE the *per-row* path below re-reads the whole weight matrix per
+        // row, which only pays off against the reconstruct-in-float matmul when
+        // there are few rows. A dense model has no *_matmul_rows kernel that
+        // uses DP4A at all, so the same per-row loop is the faster path at any
+        // batch size -- prefill was running slower than decode without it.
+        //
+        // The MMQ and tiled kernels do not re-read per row: they cover
+        // kQ8MmqTokens / kQ8TileTokens per weight pass. So a wide MoE batch is
+        // admitted too when one of those is what will actually run. Without
+        // this a K-quant dense projection on an MoE checkpoint fell past this
+        // block to the bottom switch and took *_matmul_rows at 4 rows/block --
+        // Q6_K dense measured 39% slower at pp2048 than an otherwise identical
+        // Q8_0-dense checkpoint, whose type-8 path is already a 32x32 tile.
+        const bool batched_kernel=rows>kQ8RowBatch&&
+            ((mmq_kernel&&runtime.int8_tensor_cores)||tiled_kernel);
+        if((experts>0?(rows<=8||batched_kernel):true)&&(input_size&255)==0){
             switch(type){
                 case 10:q8_kernel="q2k_q8_matvec_transposed_warp";break;
                 case 11:q8_kernel="q3k_q8_matvec_transposed_warp";break;
@@ -276,30 +324,7 @@ void qwen_forward_rows(
             // kernel leaves most of its warps idle. MTP verification runs a
             // handful of rows and stays on the rows kernel; chunked prefill
             // runs prefill_rows (64 on a dense checkpoint) and takes this.
-            // Tensor cores where the format has an MMQ kernel; the dp4a
-            // tile kernel is the fallback for the rest.
-            const char* mmq_kernel=nullptr;
-            bool mmq_min=false;
-            switch(type){
-                case 16:mmq_kernel="iq2xxs_q8_mmq";break;
-                case 17:mmq_kernel="iq2xs_q8_mmq";break;
-                case 18:mmq_kernel="iq3xxs_q8_mmq";break;
-                case 22:mmq_kernel="iq2s_q8_mmq";break;
-                case 23:mmq_kernel="iq4xs_q8_mmq";break;
-                case 11:mmq_kernel="q3k_q8_mmq";break;
-                case 14:mmq_kernel="q6k_q8_mmq";break;
-                case 10:mmq_kernel="q2k_q8_mmq";mmq_min=true;break;
-                case 12:mmq_kernel="q4k_q8_mmq";mmq_min=true;break;
-                case 13:mmq_kernel="q5k_q8_mmq";mmq_min=true;break;
-                // IQ1_S carries a per-group delta and still lands here rather
-                // than with the asymmetric three: its delta is +-1/8, so it
-                // folds into the int8 weights exactly. See iq1s_q8_words.
-                case 19:mmq_kernel="iq1s_q8_mmq";break;
-                // IQ1_M folds the same way; its two sub-scales per 32 values
-                // are the half-block split the symmetric kernels already carry.
-                case 29:mmq_kernel="iq1m_q8_mmq";break;
-                default:break;
-            }
+            // mmq_kernel and tiled_kernel are resolved above the gate.
             if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
                 const int mmq_rows=mmq_min?kQ8MmqMinRows:kQ8MmqRows;
                 const int mmq_threads=mmq_min?kQ8MmqMinThreads:kQ8MmqThreads;
@@ -319,19 +344,6 @@ void qwen_forward_rows(
             }
             // Reached when the device predates sm_75, where the MMQ kernels
             // would run their emulation instead of real tensor cores.
-            const char* tiled_kernel=nullptr;
-            switch(type){
-                case 16:tiled_kernel="iq2xxs_q8_matmul_tiled";break;
-                case 17:tiled_kernel="iq2xs_q8_matmul_tiled";break;
-                case 18:tiled_kernel="iq3xxs_q8_matmul_tiled";break;
-                case 22:tiled_kernel="iq2s_q8_matmul_tiled";break;
-                case 23:tiled_kernel="iq4xs_q8_matmul_tiled";break;
-                case 19:tiled_kernel="iq1s_q8_matmul_tiled";break;
-                case 29:tiled_kernel="iq1m_q8_matmul_tiled";break;
-                case 11:tiled_kernel="q3k_q8_matmul_tiled";break;
-                case 14:tiled_kernel="q6k_q8_matmul_tiled";break;
-                default:break;
-            }
             if(rows>kQ8RowBatch&&tiled_kernel){
                 for(int first=0;first<rows;first+=kQ8TileTokens){
                     int batch=std::min(kQ8TileTokens,rows-first);
