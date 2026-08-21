@@ -3486,12 +3486,7 @@ def _anthropic_request(
             for setting in SETTINGS
             if payload.get(setting.name) is not None
         },
-        # Absent means unstated, which leaves the checkpoint's own default in
-        # place. Answering "false" here turned reasoning off for every Claude
-        # Code request, since that client does not send a thinking block.
-        "enable_thinking": (
-            None if thinking is None else bool(thinking.get("type") == "enabled")
-        ),
+        "enable_thinking": _anthropic_thinking(thinking),
         "tools": _anthropic_tools(payload),
         # This protocol's own name for stop sequences, handed to the internal
         # option every parser reads.
@@ -3628,6 +3623,30 @@ def _anthropic_request(
         system_parts, turns, tools, options.get("tool_choice"), architecture
     )
     return options, messages, bool(tools)
+
+
+def _anthropic_thinking(thinking: Mapping[str, Any] | None) -> bool | None:
+    """The template switch an Anthropic thinking config maps onto.
+
+    "enabled" asks for thinking and "disabled" forbids it. "adaptive" -- what
+    current Claude Code sends on every request -- means "the model decides",
+    and the local equivalent of that decision is the checkpoint's own default,
+    so it maps to unstated. This mapping has been wrong twice in two
+    directions: absent thinking once answered "false" (turning reasoning off
+    for clients that sent no block at all), and then a match on "enabled"
+    alone answered "false" to adaptive -- the client asked for thinking and
+    the template was told to suppress it, which is why Claude Code showed no
+    reasoning while the OpenAI endpoint, asked nothing, showed it.
+    """
+    if thinking is None:
+        return None
+    kind = thinking.get("type")
+    if kind == "enabled":
+        return True
+    if kind == "disabled":
+        return False
+    # "adaptive", and whatever the protocol adds next: the checkpoint decides.
+    return None
 
 
 def _anthropic_tools(payload: Mapping[str, Any]) -> list[dict[str, Any]]:

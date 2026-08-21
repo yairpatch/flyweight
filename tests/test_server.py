@@ -1418,6 +1418,28 @@ class InferenceServiceTests(unittest.TestCase):
         _, options = self.generator.calls[-1]
         self.assertTrue(options["enable_thinking"])
 
+    def test_anthropic_thinking_configs_map_to_the_template_switch(self) -> None:
+        # Current Claude Code sends {"type": "adaptive"} on every request.
+        # Matching on "enabled" alone answered False to it -- the client asked
+        # for thinking and the template was told to suppress it, so the CLI
+        # showed no reasoning while the OpenAI endpoint (asked nothing) did.
+        for config, expected in (
+            ({"type": "adaptive"}, None),
+            ({"type": "enabled", "budget_tokens": 1024}, True),
+            ({"type": "disabled"}, False),
+        ):
+            self.service.anthropic_message(
+                {
+                    "messages": [{"role": "user", "content": "Think"}],
+                    "thinking": config,
+                    "max_tokens": 4,
+                }
+            )
+            _, options = self.generator.calls[-1]
+            self.assertEqual(
+                options["enable_thinking"], expected, msg=str(config)
+            )
+
     def test_anthropic_length_finish_maps_to_max_tokens(self) -> None:
         generator = StubGenerator()
         generator.generate_messages = Mock(
