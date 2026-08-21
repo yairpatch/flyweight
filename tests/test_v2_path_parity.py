@@ -24,7 +24,7 @@ from pathlib import Path
 
 from colibri_next.v2 import V2Model
 
-from tests.dense_gguf_fixture import build_dense_qwen35_gguf
+from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 from tests.laguna_gguf_fixture import build_laguna_gguf
 
 
@@ -230,6 +230,98 @@ class DensePathParityTests(_ParityCase):
         self.assertEqual(finished, {task_a, task_b}, "tasks did not finish")
         self._assert_same("interleaved task A", solo_a, collected[task_a])
         self._assert_same("interleaved task B", solo_b, collected[task_b])
+
+
+class MoeBatchedDecodeParityTests(_ParityCase):
+    """Qwen3.5 MoE fixture: the multi-sequence decode driver vs solo runs.
+
+    CPU-routed experts with two sequence slots is the configuration where
+    concurrent tasks share qwen_decode_multi; every scenario asserts the
+    batched path actually engaged, so a gating change cannot quietly turn
+    these into serial-path tests. First runs of this class caught the driver
+    decoding non-Q8 shared experts as Q8_0 bytes.
+    """
+
+    TOKENS = 6
+    SAMPLING = {"temperature": 0.9, "top_k": 8, "top_p": 0.95}
+
+    @classmethod
+    def setUpClass(cls):
+        path = _workspace("colibri-parity-qwen-moe-") / "moe.gguf"
+        cls._spec = build_dense_qwen35_gguf(
+            path, DenseQwenSpec(experts=8, experts_used=2)
+        )
+        cls._model = V2Model(path)
+        cls._base_options = {
+            "context_limit": 256,
+            "expert_mode": "cpu",
+        }
+        # The expert-history sidecar feeds earlier runs' routing back into
+        # later placement -- an ambient input this parity class must not have.
+        os.environ["COLIBRI_EXPERT_HISTORY"] = "off"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._model.close()
+        del os.environ["COLIBRI_EXPERT_HISTORY"]
+
+    def _prompt_pair(self) -> tuple[list[int], list[int]]:
+        return tuple(_prompts(self._spec.vocabulary, (40, 33)))
+
+    def _run_pair(self, kw_a: dict, kw_b: dict) -> tuple[list[int], list[int]]:
+        prompt_a, prompt_b = self._prompt_pair()
+        runtime = self._runtime(parallel_sequences=2)
+        task_a = runtime.task_submit(prompt_a, self.TOKENS, **kw_a)
+        task_b = runtime.task_submit(prompt_b, self.TOKENS, **kw_b)
+        collected: dict[int, list[int]] = {task_a: [], task_b: []}
+        finished: set[int] = set()
+        for _ in range(64 + 8 * self.TOKENS):
+            for event_task, token, kind in runtime.engine_step():
+                if kind == 0:
+                    collected[event_task].append(token)
+                elif kind == 1:
+                    finished.add(event_task)
+                elif kind == 2:
+                    raise AssertionError("engine task failed")
+            if finished == {task_a, task_b}:
+                break
+        self.assertEqual(finished, {task_a, task_b}, "tasks did not finish")
+        self.assertGreater(
+            runtime.info["multi_decode_batches"], 0,
+            "the batched decode driver did not engage",
+        )
+        return collected[task_a], collected[task_b]
+
+    def _solo(self, prompt: list[int], **kw) -> list[int]:
+        return _engine_run(self._runtime(), prompt, self.TOKENS, **kw)
+
+    def test_batched_greedy_tasks_match_solo_runs(self):
+        prompt_a, prompt_b = self._prompt_pair()
+        solo_a, solo_b = self._solo(prompt_a), self._solo(prompt_b)
+        got_a, got_b = self._run_pair({}, {})
+        self._assert_same("batched greedy A", solo_a, got_a)
+        self._assert_same("batched greedy B", solo_b, got_b)
+
+    def test_batched_sampled_tasks_match_solo_runs(self):
+        # Fixed seeds: each task owns its RNG, so the batch must reproduce
+        # the exact solo draw. This is the capability the batch gate used to
+        # exclude -- sampled tasks decoded serially, one at a time.
+        prompt_a, prompt_b = self._prompt_pair()
+        solo_a = self._solo(prompt_a, seed=41, **self.SAMPLING)
+        solo_b = self._solo(prompt_b, seed=42, **self.SAMPLING)
+        got_a, got_b = self._run_pair(
+            dict(seed=41, **self.SAMPLING), dict(seed=42, **self.SAMPLING)
+        )
+        self._assert_same("batched sampled A", solo_a, got_a)
+        self._assert_same("batched sampled B", solo_b, got_b)
+
+    def test_batched_mixed_tasks_match_solo_runs(self):
+        prompt_a, prompt_b = self._prompt_pair()
+        solo_a = self._solo(prompt_a)
+        solo_b = self._solo(prompt_b, seed=42, **self.SAMPLING)
+        got_a, got_b = self._run_pair({}, dict(seed=42, **self.SAMPLING))
+        self._assert_same("mixed greedy A", solo_a, got_a)
+        self._assert_same("mixed sampled B", solo_b, got_b)
 
 
 class MoePathParityTests(_ParityCase):

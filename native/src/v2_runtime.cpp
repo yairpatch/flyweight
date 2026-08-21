@@ -689,6 +689,8 @@ struct ColibriV2QwenRuntime {
     std::uint64_t grammar_constrained_steps = 0;
     std::uint64_t grammar_rejected_candidates = 0;
     std::uint64_t grammar_empty_candidate_sets = 0;
+    std::uint64_t multi_decode_batches = 0;
+    std::uint64_t multi_decode_tokens = 0;
     std::uint64_t paging_registration_nanoseconds = 0;
     std::uint64_t host_available_bytes = 0;
     std::uint64_t cpu_prefetch_experts = 0;
@@ -9955,6 +9957,8 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->grammar_constrained_steps=runtime->grammar_constrained_steps;
     out->grammar_rejected_candidates=runtime->grammar_rejected_candidates;
     out->grammar_empty_candidate_sets=runtime->grammar_empty_candidate_sets;
+    out->multi_decode_batches=runtime->multi_decode_batches;
+    out->multi_decode_tokens=runtime->multi_decode_tokens;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
@@ -15862,6 +15866,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         ++sequence.position;
     }
     runtime->decode_calls += n;
+    ++runtime->multi_decode_batches;
+    runtime->multi_decode_tokens += n;
     runtime->decode_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - decode_started).count();
 }
 
@@ -16033,11 +16039,9 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
     if(!pending_decode.empty()){
         runtime->cache_admission_enabled=true;
         std::size_t batched=0;
-        const bool all_greedy=std::all_of(pending_decode.begin(),pending_decode.end(),
-            [](const QwenEngineTask*task){return !task->sampling.active();});
         const auto expert_policy=qwen_expert_policy(
             *runtime,colibri::v2::ExpertExecutionPhase::decode);
-        if(all_greedy&&pending_decode.size()>=2&&
+        if(pending_decode.size()>=2&&
            runtime->multi_decode_capacity>=2&&
            !runtime->expert_residency_frozen&&
            expert_policy.routed_cpu_execution_allowed()){
@@ -16046,15 +16050,45 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
             std::vector<std::uint32_t> batch_inputs(batched),batch_outputs(batched);
             for(std::size_t i=0;i<batched;++i){slots[i]=pending_decode[i]->slot;batch_inputs[i]=pending_decode[i]->next_token;}
             qwen_park_active(*runtime,true);
+            bool batch_ok=false;
             try{
                 qwen_decode_multi(runtime,batched,slots.data(),batch_inputs.data(),batch_outputs.data());
                 qwen_park_active(*runtime,false);
                 for(std::size_t i=0;i<batched;++i)pending_decode[i]->next_token=batch_outputs[i];
+                batch_ok=true;
             }catch(const std::exception&error){
                 qwen_park_active(*runtime,false);
                 // The whole batch shares one stream of work; fail all of it.
                 std::fprintf(stderr,"[colibri-v2] engine decode batch failed: %s\n",error.what());
                 for(std::size_t i=0;i<batched;++i){finished.push_back(pending_decode[i]->id);emit(pending_decode[i]->id,0,2);}
+            }
+            // A sampled task in the batch draws from its row's logits: the
+            // multi driver leaves each row's final normalized hidden in its
+            // workspace slice, and the sampler projects the head itself, so
+            // pointing last_sampling_* at row i replays exactly what the
+            // serial decode-then-sample path does. Rows are sampled one at a
+            // time on the shared stream; the sampler's scratch (topk buffers,
+            // Q8 quantization, host staging) lives in regions distinct from
+            // every row's normalized/logits, so later rows stay intact.
+            if(batch_ok)for(std::size_t i=0;i<batched;++i){
+                auto*task=pending_decode[i];
+                if(!task->sampling.active())continue;
+                try{
+                    qwen_switch_sequence(*runtime,task->slot);
+                    const auto row=runtime->workspace+
+                        i*runtime->decode_workspace_layout.bytes;
+                    runtime->last_sampling_normalized=
+                        runtime->decode_workspace_layout.normalized.address(row);
+                    runtime->last_sampling_logits=
+                        runtime->decode_workspace_layout.logits.address(row);
+                    task->next_token=qwen_sample_last_logits(
+                        *runtime,task->sampling,task->next_token);
+                }catch(const std::exception&error){
+                    std::fprintf(stderr,
+                        "[colibri-v2] engine task %llu sampling failed: %s\n",
+                        static_cast<unsigned long long>(task->id),error.what());
+                    finished.push_back(task->id);emit(task->id,0,2);
+                }
             }
         }
         for(std::size_t i=batched;i<pending_decode.size();++i){

@@ -255,6 +255,8 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t grammar_constrained_steps; /* decode steps inside an open tool call */
     uint64_t grammar_rejected_candidates; /* candidates the grammar removed */
     uint64_t grammar_empty_candidate_sets; /* steps where nothing was allowed */
+    uint64_t multi_decode_batches; /* batched multi-sequence decode calls */
+    uint64_t multi_decode_tokens; /* tokens decoded through those batches */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
