@@ -2190,10 +2190,15 @@ class InferenceService:
             raise APIError(400, f"{parameter} must be positive", parameter=parameter)
         room = self.context_window - prompt_tokens
         if room <= 0:
+            # Anthropic's canonical phrasing, verbatim: Claude Code detects a
+            # full context by matching "prompt is too long" in the message and
+            # responds by compacting the conversation; any other wording is an
+            # unrecognized hard error that ends the session instead. OpenAI
+            # clients branch on the `code` and never read the prose.
             raise APIError(
                 400,
-                f"prompt has {prompt_tokens} tokens, filling the "
-                f"{self.context_window}-token context window",
+                f"prompt is too long: {prompt_tokens} tokens > "
+                f"{self.context_window} maximum",
                 parameter=parameter,
                 code="context_length_exceeded",
             )

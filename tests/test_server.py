@@ -1184,7 +1184,10 @@ class InferenceServiceTests(unittest.TestCase):
             max_new_tokens=8,
             context_window=4,
         )
-        with self.assertRaisesRegex(APIError, "filling the"):
+        # The exact phrase matters: Claude Code matches "prompt is too long"
+        # to decide the context is full and compact; other wording is treated
+        # as a fatal API error and the session dead-ends.
+        with self.assertRaisesRegex(APIError, "prompt is too long"):
             service.completion({"prompt": "12345", "max_tokens": 1})
 
     def test_chat_stream_emits_deltas_usage_and_done(self) -> None:
