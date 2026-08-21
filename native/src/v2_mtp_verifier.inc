@@ -100,7 +100,13 @@ void qwen_forward_rows(
         ?colibri::v2::ExpertExecutionPhase::verification
         :colibri::v2::ExpertExecutionPhase::prefill;
     auto expert_policy=qwen_expert_policy(runtime,expert_phase);
+    // The flag must imply routed_gpu_execution_allowed()==false, which the
+    // policy only derives in hybrid mode. Setting it in streamed-GPU mode let
+    // the admission loop below zero resident experts out of weights_host into
+    // GPU tables that the !hybrid_prefill_cpu launch gate never consumed, so
+    // those experts' contributions vanished from every chunked-prefill token.
     expert_policy.hybrid_prefill_cpu=
+        expert_policy.is_hybrid()&&
         expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
         runtime.options.hybrid_prefill_cpu!=0;
     const float epsilon=runtime.model->config.rms_norm_epsilon?runtime.model->config.rms_norm_epsilon:1.0e-6f;

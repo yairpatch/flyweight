@@ -136,6 +136,23 @@ class V2RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expert_residency"):
             V2QwenRuntime(object(), expert_residency="invalid")
 
+    def test_rows_forward_only_honors_hybrid_prefill_cpu_in_hybrid_mode(self):
+        # The policy derives routed_gpu_execution_allowed()==false from
+        # hybrid_prefill_cpu only in hybrid mode. If the rows forward sets the
+        # flag in streamed-GPU mode too, its admission loop zeroes resident
+        # experts out of the CPU pass into GPU tables that the
+        # !hybrid_prefill_cpu launch gate never consumes, silently dropping
+        # those experts from every chunked-prefill token.
+        root = Path(__file__).resolve().parents[1]
+        verifier = (root / "native/src/v2_mtp_verifier.inc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "expert_policy.hybrid_prefill_cpu=\n"
+            "        expert_policy.is_hybrid()&&",
+            verifier,
+        )
+
     def test_nvfp4_prefill_has_blackwell_tensor_core_dispatch_and_fallback(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
@@ -161,7 +178,9 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("colibri_gpu_nvfp4_moe_persistent", runtime)
         self.assertIn("COLIBRI_NVFP4_PERSISTENT_GROUPED", driver)
         self.assertIn("kPreferenceMaxWorkspace = 1", driver)
-        self.assertIn("tc_env&&tc_env[0]=='1'", runtime)
+        self.assertIn(
+            "COLIBRI_NVFP4_DECODE_TENSOR_CORES\");return s&&s[0]=='1'", runtime
+        )
         self.assertIn("COLIBRI_NVFP4_TENSOR_CORES", verifier)
         self.assertIn('launch("nvfp4_matmul_rows"', verifier)
 
