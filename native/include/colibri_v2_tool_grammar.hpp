@@ -58,12 +58,8 @@ struct Tool {
     std::vector<Parameter> parameters;
 };
 
-// `[{"name": "write", "parameters": [{"name": "filePath", "required": true,
-//   "type": "string"}]}]`. An unknown or absent type is text.
-inline std::vector<Tool> parse_specification(const std::string& text) {
+inline std::vector<Tool> parse_tool_entries(const colibri::v2::json::Value& document) {
     std::vector<Tool> tools;
-    if (text.empty()) return tools;
-    const auto document = colibri::v2::json::parse(text);
     for (std::size_t index = 0; index < document.size(); ++index) {
         const auto& entry = document[index];
         Tool tool;
@@ -83,6 +79,45 @@ inline std::vector<Tool> parse_specification(const std::string& text) {
         tools.push_back(std::move(tool));
     }
     return tools;
+}
+
+// `[{"name": "write", "parameters": [{"name": "filePath", "required": true,
+//   "type": "string"}]}]`. An unknown or absent type is text.
+inline std::vector<Tool> parse_specification(const std::string& text) {
+    if (text.empty()) return {};
+    return parse_tool_entries(colibri::v2::json::parse(text));
+}
+
+// Everything one request may constrain the sampler with. The wire form is
+// either the historical bare tool array, or an object carrying both kinds:
+// `{"tools": [...], "response_format": {"shape": "object", "thinking_open":
+// true}}`. The array form stays parseable so an older Python layer keeps
+// working against a newer native library, and vice versa.
+struct RequestConstraints {
+    std::vector<Tool> tools;
+    bool response_enabled = false;
+    ValueShape response_shape = ValueShape::text;
+    bool thinking_open = false;
+};
+
+inline RequestConstraints parse_constraints(const std::string& text) {
+    RequestConstraints constraints;
+    if (text.empty()) return constraints;
+    const auto document = colibri::v2::json::parse(text);
+    if (document.kind == colibri::v2::json::Kind::Array) {
+        constraints.tools = parse_tool_entries(document);
+        return constraints;
+    }
+    constraints.tools = parse_tool_entries(document["tools"]);
+    const auto& format = document["response_format"];
+    if (!format.is_null()) {
+        constraints.response_enabled = true;
+        const auto shape = format["shape"].as_string();
+        if (shape == "object") constraints.response_shape = ValueShape::json_object;
+        else if (shape == "array") constraints.response_shape = ValueShape::json_array;
+        constraints.thinking_open = format["thinking_open"].as_bool();
+    }
+    return constraints;
 }
 
 // Whether a byte stream is still a possible prefix of one JSON value, and
@@ -534,6 +569,117 @@ private:
     std::vector<Position> positions_;
     std::string pending_;
     bool armed_ = false;
+};
+
+// Constrained decoding for response_format: the visible answer must be one
+// JSON value of the declared shape.
+//
+// The server already renders the requirement into the system prompt; this is
+// what makes it a guarantee rather than a request. Prompt-level JSON mode is
+// exactly the failure class the tool grammar was built against -- the option
+// is accepted, nothing enforces it, and the client discovers that at parse
+// time on the far side.
+//
+// Reasoning is carved out, because a checkpoint asked to think must be allowed
+// to: a leading `<think>...</think>` block is free text, and the constraint
+// takes hold on the first byte after it. When the prompt itself opened the
+// block (`thinking_open`), the turn *starts* inside that carve-out. Anything
+// else before the value -- prose, a code fence -- is never a candidate. Once
+// the value is whole the constraint disarms, the same hand-back the tool
+// grammar does after a call closes, so end-of-turn is the model's own choice
+// (in practice EOS, which the constrained tail has made the only likely token).
+class ResponseGrammar {
+public:
+    ResponseGrammar() = default;
+    ResponseGrammar(ValueShape shape, bool thinking_open)
+        : enabled_(true),
+          state_(thinking_open ? State::thinking : State::start),
+          cursor_(shape) {}
+
+    bool empty() const { return !enabled_; }
+    // Inside the thinking carve-out nothing is constrained, so the sampler can
+    // skip candidate filtering for the whole of a long reasoning block.
+    bool armed() const { return enabled_ && state_ != State::thinking; }
+
+    // Feed text the model actually produced.
+    void observe(const std::string& text) {
+        if (!enabled_) return;
+        for (const char byte : text)
+            if (!feed(byte)) {
+                // Only reachable when the sampler was bypassed (a forced
+                // token, a resumed conversation). Disarm rather than deadlock,
+                // exactly as the tool grammar does.
+                enabled_ = false;
+                return;
+            }
+        if (state_ == State::value && cursor_.complete()) enabled_ = false;
+    }
+
+    // Could `text` continue a well-formed response from here?
+    bool accepts(const std::string& text) const {
+        if (!armed()) return true;
+        ResponseGrammar copy = *this;
+        for (const char byte : text)
+            if (!copy.feed(byte)) return false;
+        return true;
+    }
+
+private:
+    // start: leading whitespace, then either `<think>` or the value's first
+    // byte. lead: after a thinking block -- whitespace, then the value; a
+    // second thinking block is not on offer. value: inside the JSON.
+    enum class State { start, think_tag, thinking, lead, value };
+
+    static bool is_space(char byte) {
+        return byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r';
+    }
+
+    bool feed(char byte) {
+        switch (state_) {
+            case State::start:
+                if (is_space(byte)) return true;
+                if (byte == '<') {
+                    // The value cannot begin with '<', so the only legal
+                    // reading is the opening of a thinking block.
+                    state_ = State::think_tag;
+                    consumed_ = 1;
+                    return true;
+                }
+                state_ = State::value;
+                return cursor_.feed(byte);
+            case State::think_tag: {
+                static const std::string open = "<think>";
+                if (consumed_ >= open.size() || byte != open[consumed_]) return false;
+                ++consumed_;
+                if (consumed_ == open.size()) {
+                    state_ = State::thinking;
+                    recent_.clear();
+                }
+                return true;
+            }
+            case State::thinking: {
+                static const std::string close = "</think>";
+                recent_.push_back(byte);
+                if (recent_.size() > close.size())
+                    recent_.erase(0, recent_.size() - close.size());
+                if (recent_ == close) state_ = State::lead;
+                return true;
+            }
+            case State::lead:
+                if (is_space(byte)) return true;
+                state_ = State::value;
+                return cursor_.feed(byte);
+            case State::value:
+                return cursor_.feed(byte);
+        }
+        return false;
+    }
+
+    bool enabled_ = false;
+    State state_ = State::start;
+    std::size_t consumed_ = 0;
+    std::string recent_;
+    JsonCursor cursor_{ValueShape::text};
 };
 
 }  // namespace colibri::v2::tools

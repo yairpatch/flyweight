@@ -2258,6 +2258,28 @@ class V2Model:
             raise V2Error(message.decode(errors="replace"))
 
 
+def _constraint_specification(
+    tools: Sequence[Mapping[str, Any]] | None,
+    response_format: Mapping[str, Any] | None,
+) -> bytes | None:
+    """The sampler-constraint spec as the native library reads it.
+
+    The bare tool array is the historical wire form and stays whenever it
+    suffices, so an older native library keeps parsing what it always did;
+    the object form exists only to carry the response constraint beside it.
+    """
+    if response_format:
+        document: Any = {
+            "tools": list(tools or []),
+            "response_format": dict(response_format),
+        }
+    elif tools:
+        document = list(tools)
+    else:
+        return None
+    return json.dumps(document).encode("utf-8")
+
+
 class V2QwenRuntime:
     """Owns a native Qwen or Gemma 4 execution plan and its CUDA state.
 
@@ -2557,12 +2579,18 @@ class V2QwenRuntime:
         penalty_window: int = 64,
         seed: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
+        response_format: Mapping[str, Any] | None = None,
     ) -> int:
         """Queue a request on the cooperative engine; returns its task id.
 
         `tools` constrains the sampler while a tool call is open, so a required
         parameter cannot be skipped: each entry is `{"name": str, "parameters":
-        [{"name": str, "required": bool}]}`. Omitting it samples freely.
+        [{"name": str, "required": bool}]}`. `response_format` constrains the
+        visible answer to one JSON value: `{"shape": "object" | "array" |
+        "value", "thinking_open": bool}`. Omitting both samples freely.
+
+        The wire spec stays the bare tool array unless a response format is
+        present, so an older native library keeps parsing what it always did.
         """
         if not prompt_tokens:
             raise ValueError("prompt_tokens must not be empty")
@@ -2571,7 +2599,7 @@ class V2QwenRuntime:
         values = (ctypes.c_uint32 * len(prompt_tokens))(*prompt_tokens)
         stops = (ctypes.c_uint32 * len(stop_tokens))(*stop_tokens) if stop_tokens else None
         task_id = ctypes.c_uint64()
-        specification = json.dumps(list(tools)).encode("utf-8") if tools else None
+        specification = _constraint_specification(tools, response_format)
         self.model._check(
             self._lib.colibri_v2_qwen_task_submit_grammar(
                 self._handle,

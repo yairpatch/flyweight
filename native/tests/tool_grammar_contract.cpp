@@ -274,6 +274,88 @@ void check_no_tools_means_no_constraint() {
 
 }  // namespace
 
+// --- response_format ------------------------------------------------------
+//
+// The same two failure directions as the tool constraint: too permissive and
+// json_object mode is back to being a polite request; too strict and the model
+// cannot finish -- or think -- at all.
+
+colibri::v2::tools::ResponseGrammar build_response(
+        colibri::v2::tools::ValueShape shape, bool thinking_open = false) {
+    return colibri::v2::tools::ResponseGrammar(shape, thinking_open);
+}
+
+void check_response_prose_is_unsamplable() {
+    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    expect(grammar.armed(), "the response constraint arms from the first token");
+    expect(!grammar.accepts("Sure"), "prose cannot begin a JSON object");
+    expect(!grammar.accepts("```json"), "a code fence cannot begin a JSON object");
+    expect(grammar.accepts("{\"answer\":"), "the object itself can");
+    expect(grammar.accepts("\n{"), "leading whitespace is fine");
+}
+
+void check_response_shape_is_enforced() {
+    auto object = build_response(colibri::v2::tools::ValueShape::json_object);
+    expect(!object.accepts("["), "an array cannot answer for an object");
+    auto array = build_response(colibri::v2::tools::ValueShape::json_array);
+    expect(array.accepts("[1,"), "an array answers for an array");
+    auto any = build_response(colibri::v2::tools::ValueShape::text);
+    expect(any.accepts("\"just a string\""), "shapeless mode takes any JSON value");
+    expect(!any.accepts("just a string"), "but never bare prose");
+}
+
+void check_response_thinking_is_carved_out() {
+    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    expect(grammar.accepts("<think>"), "the model may open a thinking block");
+    grammar.observe("<think>let me consider { and ] freely");
+    expect(!grammar.armed(), "reasoning is not constrained");
+    expect(grammar.accepts("anything at all"), "reasoning text is free");
+    grammar.observe(" done</think>\n");
+    expect(grammar.armed(), "the constraint takes hold after the block");
+    expect(!grammar.accepts("So the answer is"), "prose after thinking is out");
+    expect(!grammar.accepts("<think>"), "a second thinking block is not on offer");
+    expect(grammar.accepts("{\"a\""), "the value follows the thinking block");
+}
+
+void check_response_prompt_opened_thinking_starts_free() {
+    auto grammar = build_response(
+        colibri::v2::tools::ValueShape::json_object, /*thinking_open=*/true);
+    expect(!grammar.armed(), "a prompt-opened block starts inside the carve-out");
+    grammar.observe("reasoning with no opening tag</think>");
+    expect(grammar.armed(), "the closing tag ends the carve-out");
+    expect(!grammar.accepts("Sure"), "and the value is constrained after it");
+}
+
+void check_response_disarms_once_the_value_is_whole() {
+    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    grammar.observe("{\"answer\": 42");
+    expect(!grammar.accepts("done"), "prose cannot interrupt the value");
+    grammar.observe("}");
+    expect(grammar.empty(), "a whole value hands the tail back");
+    expect(grammar.accepts("<|im_end|>"), "so end-of-turn is samplable");
+}
+
+void check_response_bypassed_sampler_does_not_deadlock() {
+    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    grammar.observe("Sure, here you go: ");  // forced past the constraint
+    expect(grammar.empty(), "text outside the language disarms it");
+    expect(grammar.accepts("anything"), "and nothing is constrained after");
+}
+
+void check_constraint_specifications_parse_both_forms() {
+    const auto bare = colibri::v2::tools::parse_constraints(kSpecification);
+    expect(bare.tools.size() == 4, "the bare tool array still parses");
+    expect(!bare.response_enabled, "and carries no response constraint");
+    const auto combined = colibri::v2::tools::parse_constraints(
+        R"({"tools": [{"name": "bash", "parameters": []}],
+            "response_format": {"shape": "object", "thinking_open": true}})");
+    expect(combined.tools.size() == 1, "the object form carries tools");
+    expect(combined.response_enabled, "and the response constraint");
+    expect(combined.response_shape == colibri::v2::tools::ValueShape::json_object,
+           "with its shape");
+    expect(combined.thinking_open, "and whether the prompt opened thinking");
+}
+
 int main() {
     check_prose_is_untouched();
     check_opening_commits_to_a_tool();
@@ -291,6 +373,13 @@ int main() {
     check_the_prompted_multi_line_layout_is_accepted();
     check_the_byte_alphabet_round_trips();
     check_candidate_tokens_are_judged_after_decoding();
+    check_response_prose_is_unsamplable();
+    check_response_shape_is_enforced();
+    check_response_thinking_is_carved_out();
+    check_response_prompt_opened_thinking_starts_free();
+    check_response_disarms_once_the_value_is_whole();
+    check_response_bypassed_sampler_does_not_deadlock();
+    check_constraint_specifications_parse_both_forms();
 
     if (failures) {
         std::printf("tool_grammar_contract: %d failure(s)\n", failures);

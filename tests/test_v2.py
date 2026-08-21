@@ -712,3 +712,42 @@ class V2RuntimeTests(unittest.TestCase):
                 model.tokenize("a<think>b<div>c"),
                 [1, 248068, 7],
             )
+
+
+class ConstraintSpecificationTests(unittest.TestCase):
+    """The wire spec the native sampler parses; both ends must agree on it."""
+
+    def test_no_constraints_sends_nothing(self):
+        from colibri_next.v2 import _constraint_specification
+
+        self.assertIsNone(_constraint_specification(None, None))
+        self.assertIsNone(_constraint_specification([], None))
+
+    def test_tools_alone_keep_the_historical_array_form(self):
+        # An older native library parses only the bare array; the object form
+        # is reserved for requests that actually need it.
+        from colibri_next.v2 import _constraint_specification
+
+        import json
+
+        tools = [{"name": "bash", "parameters": []}]
+        self.assertEqual(
+            json.loads(_constraint_specification(tools, None)), tools
+        )
+
+    def test_response_format_rides_the_object_form(self):
+        from colibri_next.v2 import _constraint_specification
+
+        import json
+
+        document = json.loads(
+            _constraint_specification(
+                [{"name": "bash", "parameters": []}],
+                {"shape": "object", "thinking_open": True},
+            )
+        )
+        self.assertEqual(document["tools"][0]["name"], "bash")
+        self.assertEqual(
+            document["response_format"],
+            {"shape": "object", "thinking_open": True},
+        )

@@ -409,9 +409,17 @@ struct QwenSamplingState {
     // through this state and both have to be constrained the same way.
     colibri::v2::tools::Grammar grammar;
 
-    // The grammar constrains the candidate set, so a request that has one needs
-    // candidates even when it would otherwise take the fused greedy argmax.
-    bool constrains() const { return grammar.armed(); }
+    // Constrained decoding for response_format: the visible answer must be one
+    // JSON value. Same lifecycle as the tool grammar -- configured per task,
+    // disarms once its job is done or the text leaves its language.
+    colibri::v2::tools::ResponseGrammar response_grammar;
+
+    // The grammars constrain the candidate set, so a request that has one
+    // needs candidates even when it would otherwise take the fused greedy
+    // argmax.
+    bool constrains() const {
+        return grammar.armed() || response_grammar.armed();
+    }
 
     // Whether this request needs the sampler at all.
     //
@@ -429,7 +437,10 @@ struct QwenSamplingState {
     // and measurably so: on Qwen3.8-27B at IQ1_M the same prompt writes a tool
     // parameter named "questions" without the penalty and the correct
     // "question" with it.
-    bool active() const { return enabled() || !grammar.empty() || penalizes(); }
+    bool active() const {
+        return enabled() || !grammar.empty() || !response_grammar.empty() ||
+               penalizes();
+    }
 };
 
 // One in-flight engine request. phase: 0 = pending (waiting for a slot),
@@ -10879,6 +10890,33 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
         }
         if(runtime->expert_slot_bytes)runtime->expert_slots.resize(runtime->expert_cache_bytes/runtime->expert_slot_bytes);
+        // Say how many expert slots this budget bought, and where the budget
+        // came from. Slot count decides expert placement, placement decides
+        // greedy output, and under auto-fit the count follows free VRAM at
+        // startup -- so two boots of the same server can answer differently.
+        // Naming the exact --gpu-cache-mib to pin turns "output changed after
+        // a reboot" from a debugging session into a log line.
+        if(!runtime->expert_slots.empty()){
+            if(auto_fit)
+                std::fprintf(stderr,
+                    "[colibri-v2] expert cache: %zu slots (%llu MiB) from an "
+                    "auto-fit %llu MiB GPU budget; free VRAM varies between "
+                    "runs, pass --gpu-cache-mib %llu to make expert placement "
+                    "reproducible\n",
+                    runtime->expert_slots.size(),
+                    static_cast<unsigned long long>(
+                        runtime->expert_cache_bytes/(1024ull*1024)),
+                    static_cast<unsigned long long>(gpu_budget/(1024ull*1024)),
+                    static_cast<unsigned long long>(gpu_budget/(1024ull*1024)));
+            else
+                std::fprintf(stderr,
+                    "[colibri-v2] expert cache: %zu slots (%llu MiB) within "
+                    "the %llu MiB --gpu-cache-mib budget\n",
+                    runtime->expert_slots.size(),
+                    static_cast<unsigned long long>(
+                        runtime->expert_cache_bytes/(1024ull*1024)),
+                    static_cast<unsigned long long>(gpu_budget/(1024ull*1024)));
+        }
         // Hybrid is an optimization over the CPU expert path, not a hard
         // requirement. Auto-fit can legitimately leave no room for even one
         // routed-expert working set after static weights, KV state, workspace,
@@ -13614,8 +13652,12 @@ static std::uint32_t qwen_sample_last_logits(
     // without recording it desynchronizes them from the transcript.
     const auto commit=[&](std::uint32_t token)->std::uint32_t{
         sampling.remember(token);
-        if(!sampling.grammar.empty())
-            sampling.grammar.observe(qwen_token_bytes(runtime,token));
+        if(!sampling.grammar.empty()||!sampling.response_grammar.empty()){
+            const auto bytes=qwen_token_bytes(runtime,token);
+            if(!sampling.grammar.empty())sampling.grammar.observe(bytes);
+            if(!sampling.response_grammar.empty())
+                sampling.response_grammar.observe(bytes);
+        }
         return token;
     };
     // Greedy decode needs the candidate machinery below when a call is open
@@ -13813,8 +13855,9 @@ static std::uint32_t qwen_sample_last_logits(
         allowed.reserve(candidates.size());
         allowed_logits.reserve(candidates.size());
         for(std::size_t index=0;index<candidates.size();++index){
-            if(!sampling.grammar.accepts(
-                    qwen_token_bytes(runtime,candidates[index])))continue;
+            const auto bytes=qwen_token_bytes(runtime,candidates[index]);
+            if(!sampling.grammar.accepts(bytes))continue;
+            if(!sampling.response_grammar.accepts(bytes))continue;
             allowed.push_back(candidates[index]);
             allowed_logits.push_back(candidate_logits[index]);
         }
@@ -14542,10 +14585,12 @@ static void qwen_seed_prefill_experts(
         pending.clear();cursor=0;
     };
     for(const auto selection:selections){
-        const auto elapsed=static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now()-started).count());
-        if(automatic&&elapsed>=colibri::v2::expert_seed::kAutoMaxNanoseconds){
+        // Bytes, not elapsed time: the stop point decides which experts get
+        // pinned, and pinning decides placement, so it must be a pure function
+        // of the selection list. The wall-clock bound this replaces made the
+        // pinned set -- and therefore greedy output -- vary with upload speed.
+        if(automatic&&
+           uploaded_bytes>=colibri::v2::expert_seed::kAutoMaxUploadBytes){
             ++runtime.prefill_cache_seed_budget_stops;break;
         }
         const auto layer=selection.layer,expert=selection.expert;
@@ -15132,15 +15177,28 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
         const char*setting=std::getenv("COLIBRI_TOOL_GRAMMAR");
         return !setting||setting[0]!='0';
     }();
+    // The same hatch for the response constraint, separately: one can be
+    // switched off without giving up the other.
+    static const bool response_grammar_enabled=[]{
+        const char*setting=std::getenv("COLIBRI_RESPONSE_GRAMMAR");
+        return !setting||setting[0]!='0';
+    }();
     // A specification the caller could not parse is worth failing on: silently
     // dropping it would serve unconstrained calls that look constrained.
-    if(grammar_enabled&&tool_specification&&*tool_specification){
+    if(tool_specification&&*tool_specification){
         try{
-            task.sampling.grammar=colibri::v2::tools::Grammar(
-                colibri::v2::tools::parse_specification(tool_specification));
+            const auto constraints=
+                colibri::v2::tools::parse_constraints(tool_specification);
+            if(grammar_enabled&&!constraints.tools.empty())
+                task.sampling.grammar=
+                    colibri::v2::tools::Grammar(constraints.tools);
+            if(response_grammar_enabled&&constraints.response_enabled)
+                task.sampling.response_grammar=
+                    colibri::v2::tools::ResponseGrammar(
+                        constraints.response_shape,constraints.thinking_open);
         }catch(const std::exception&error){
             throw std::runtime_error(
-                std::string("native Qwen tool specification is invalid: ")+
+                std::string("native Qwen constraint specification is invalid: ")+
                 error.what());
         }
     }

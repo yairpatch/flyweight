@@ -3065,13 +3065,17 @@ class StopSequenceTests(unittest.TestCase):
         self.assertEqual(json.loads(arguments)["path"], "/tmp/a")
 
     def test_legacy_completion_honors_stop(self):
-        service = InferenceService("qwen-local", PieceGenerator(), max_new_tokens=32)
+        generator = PieceGenerator()
+        service = InferenceService("qwen-local", generator, max_new_tokens=32)
         response = service.completion(
             {"prompt": "answer", "stop": self.STOP, "max_tokens": 32}
         )
         choice = response["choices"][0]
         self.assertEqual(choice["text"], "The answer is 42.")
         self.assertEqual(choice["finish_reason"], "stop")
+        # The match cancels generation; it does not truncate a finished one.
+        self.assertTrue(generator.closed)
+        self.assertLess(generator.consumed, len(PieceGenerator.PIECES))
 
         events = [
             event
@@ -3125,6 +3129,45 @@ class ResponseFormatTests(unittest.TestCase):
                     "response_format": {"type": "grammar"},
                 }
             )
+
+    def test_json_format_reaches_the_sampler_constraint(self):
+        # The prompt rendering asks; this is what lets a native runtime
+        # enforce. Both travel, because a runtime without the constraint
+        # still deserves the best effort.
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Give me JSON"}],
+                "response_format": {"type": "json_object"},
+            }
+        )
+        _, options = self.generator.calls[-1]
+        self.assertEqual(
+            options["response_format"],
+            {"shape": "object", "thinking_open": False},
+        )
+
+    def test_json_schema_shape_follows_the_declared_top_type(self):
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "List them"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "items",
+                        "schema": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            }
+        )
+        _, options = self.generator.calls[-1]
+        self.assertEqual(options["response_format"]["shape"], "array")
+
+    def test_absent_format_sends_no_constraint(self):
+        self.service.chat_completion(
+            {"messages": [{"role": "user", "content": "hi"}]}
+        )
+        _, options = self.generator.calls[-1]
+        self.assertIsNone(options["response_format"])
 
 
 class ResponsesStreamingTests(unittest.TestCase):

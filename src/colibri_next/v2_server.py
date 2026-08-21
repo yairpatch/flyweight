@@ -3,6 +3,7 @@ from __future__ import annotations
 import codecs
 import datetime
 import json
+import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -144,6 +145,7 @@ class _NativeEngine:
         stop_tokens: tuple[int, ...],
         sampling: SamplingConfig | None = None,
         tools: list[dict[str, object]] | None = None,
+        response_format: dict[str, object] | None = None,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         task_queue: Queue[tuple[str, object]] = Queue(
             maxsize=self._MAX_BUFFERED_EVENTS
@@ -167,6 +169,7 @@ class _NativeEngine:
                 penalty_window=sampling_config.penalty_window,
                 seed=sampling_config.seed,
                 tools=tools,
+                response_format=response_format,
             )
             self._queues[task_id] = task_queue
             if self._thread is None or not self._thread.is_alive():
@@ -270,6 +273,26 @@ class _NativeEngine:
     def forget(self, task_id: int) -> None:
         with self._lock:
             self._queues.pop(task_id, None)
+
+    def task_is_live(self, task_id: int) -> bool:
+        """Whether `task_id` can still produce events.
+
+        A request waiting for a free KV slot is live and merely silent, which
+        looking at its queue cannot distinguish from a terminal event that was
+        never delivered -- both are "nothing arrived". The difference is here: a
+        task the engine still holds, on a thread still running, gets scheduled
+        eventually. Anything else never will, and a consumer blocked on it would
+        wait forever.
+        """
+        with self._lock:
+            if task_id not in self._queues:
+                return False
+            thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def active_task_count(self) -> int:
+        with self._lock:
+            return len(self._queues)
 
     def close(self) -> None:
         """Cancel active requests and stop touching the runtime before teardown."""
@@ -912,9 +935,44 @@ class ChatGenerator:
         ] = OrderedDict()
         self._chat_continuation_capacity = 32
 
+    # How long a request may hear nothing before its scheduling is checked on.
+    # Generous: it costs one wakeup per request per interval and only ever
+    # decides whether to keep waiting, so the only thing a shorter value buys
+    # is noticing a dead engine sooner.
+    _STALL_POLL_SECONDS = 5.0
+
     def prefix_cache_stats(self) -> dict[str, int]:
         """Reuse counters for ``/health``; shape is the engine's business."""
         raise NotImplementedError
+
+    def _task_is_live(self, task_id: int) -> bool:
+        """Defer to the engine, and assume live for one that cannot say.
+
+        An engine is free to bring its own scheduler; one that does not report
+        liveness gets the old behaviour of waiting indefinitely rather than a
+        spurious failure.
+        """
+        reporter = getattr(self.engine, "task_is_live", None)
+        return True if not callable(reporter) else bool(reporter(task_id))
+
+    def _report_waiting(self, prompt_tokens: int) -> None:
+        """Say why a request that was accepted is producing nothing.
+
+        Queueing for a slot is invisible from the client: it holds a 200 and an
+        SSE stream carrying keepalives, so a request stuck behind a long
+        generation looks identical to one that is thinking. Naming it in the log
+        is what turns "the runtime hung" into "raise --parallel".
+        """
+        counter = getattr(self.engine, "active_task_count", None)
+        active = counter() if callable(counter) else 0
+        if active <= 1:
+            return
+        sys.stderr.write(
+            f"[queue] request of {prompt_tokens} prompt tokens is waiting for a "
+            f"KV slot ({active} requests in flight); raise --parallel to overlap "
+            f"them\n"
+        )
+        sys.stderr.flush()
 
     def close(self) -> None:
         self.engine.close()
@@ -1189,17 +1247,47 @@ class ChatGenerator:
         # requests (each on its own KV slot); EOS is detected natively via the
         # stop-token list so no token is decoded past it.
         tool_grammar = options.get("tool_grammar")
+        response_format = options.get("response_format")
+        # The response constraint reads Qwen-family thinking markup. Muse
+        # Glimmer frames its reasoning with channel tags instead, which the
+        # grammar would reject on the first token -- disarming itself and
+        # logging failure counters for a request that was never constrainable.
+        if getattr(self.tokenizer, "architecture", None) == "muse-glimmer":
+            response_format = None
         task_id, queue = self.engine.submit(
             prompt_ids,
             max_new_tokens,
             self.tokenizer.eos_token_ids,
             sampling_config,
             tools=tool_grammar if isinstance(tool_grammar, list) else None,
+            response_format=(
+                dict(response_format)
+                if isinstance(response_format, Mapping)
+                else None
+            ),
         )
         try:
             prefill_complete = False
+            waiting_reported = False
             while True:
-                kind, value = queue.get()
+                try:
+                    kind, value = queue.get(timeout=self._STALL_POLL_SECONDS)
+                except Empty:
+                    # Silence is normal: with fewer KV slots than concurrent
+                    # requests, a task sits in the engine's pending phase
+                    # producing nothing until a slot frees. Silence from a task
+                    # the engine no longer holds is not -- that is a terminal
+                    # event that never arrived, and an untimed get() would wait
+                    # on it forever while the SSE layer kept the client in a
+                    # "working" state with no output and no error.
+                    if not self._task_is_live(task_id):
+                        raise RuntimeError(
+                            "the native engine stopped scheduling this request"
+                        )
+                    if not waiting_reported and not generated:
+                        waiting_reported = True
+                        self._report_waiting(len(prompt_ids))
+                    continue
                 if kind == "done":
                     break
                 if kind == "error":
@@ -1360,12 +1448,14 @@ class BailingEngine:
         stop_tokens: tuple[int, ...],
         sampling: SamplingConfig | None = None,
         tools: list[dict[str, object]] | None = None,
+        response_format: dict[str, object] | None = None,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         # As in the DeepSeek-V4 engine: BailingMoE3 runs its own runtime, whose
-        # sampler has no constrained decoding, so its tool calls stay with the
-        # tolerant parser. The argument is accepted so the shared streaming path
-        # has one calling convention.
-        del tools
+        # sampler has no constrained decoding, so its tool calls -- and a JSON
+        # response format -- stay with the tolerant parser and the prompt. The
+        # arguments are accepted so the shared streaming path has one calling
+        # convention.
+        del tools, response_format
         task_queue: Queue[tuple[str, object]] = Queue(maxsize=self._MAX_BUFFERED_EVENTS)
         with self._lock:
             if self._closing:
@@ -1395,6 +1485,17 @@ class BailingEngine:
         with self._lock:
             self._queues.pop(task_id, None)
             self._cancelled.discard(task_id)
+
+    def task_is_live(self, task_id: int) -> bool:
+        with self._lock:
+            if task_id not in self._queues:
+                return False
+            thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def active_task_count(self) -> int:
+        with self._lock:
+            return len(self._queues)
 
     def close(self) -> None:
         with self._lock:

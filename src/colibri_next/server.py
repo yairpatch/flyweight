@@ -228,6 +228,12 @@ class _GenerationRequest:
     # only there: a stop string inside a tool parameter (file content quoting
     # "\n\nHuman:") or inside reasoning is data, not a boundary.
     stop_sequences: tuple[str, ...] = ()
+    # The sampler-level response constraint, for a generator whose runtime can
+    # enforce one: {"shape": "object" | "array" | "value", "thinking_open":
+    # bool}. The prompt rendering of the same contract stays regardless -- a
+    # constrained model still answers better told what is wanted, and a
+    # runtime without the constraint still gets its best effort.
+    response_format: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,6 +632,7 @@ class InferenceService:
                 enable_thinking=request.enable_thinking,
                 reasoning_effort=request.reasoning_effort,
                 progress=progress,
+                response_format=request.response_format,
             )
 
         final_step: GenerationStep | None = None
@@ -645,6 +652,7 @@ class InferenceService:
             # else the schemas are rendered into the tool prompt, so a
             # constraint that read the messages would find nothing.
             tools=tuple(tools),
+            response_format=request.response_format,
         )
         try:
             for step in steps:
@@ -866,6 +874,7 @@ class InferenceService:
                 enable_thinking=request.enable_thinking,
                 reasoning_effort=request.reasoning_effort,
                 progress=progress,
+                response_format=request.response_format,
             )
             try:
                 for step in steps:
@@ -1001,6 +1010,7 @@ class InferenceService:
                 # path passed them, which left the grammar switched off for
                 # every agentic client: they all stream.
                 tools=request.tools,
+                response_format=request.response_format,
             )
             try:
                 for step in steps:
@@ -1253,25 +1263,65 @@ class InferenceService:
         if _boolean_option(payload, "stream", False):
             raise APIError(400, "use the streaming response path", parameter="stream")
         request = self._prepare_text(payload)
+        if request.stop_sequences:
+            result = self._generate_text_to_stop(request, progress)
+        else:
+            with self._generation_guard():
+                result = self.generator.generate_text(
+                    request.prompt,
+                    max_new_tokens=request.max_new_tokens,
+                    sampling=request.sampling,
+                    progress=progress,
+                )
+        completion_id = f"cmpl-{uuid.uuid4().hex}"
+        return self._completion_response(completion_id, result)
+
+    def _generate_text_to_stop(
+        self,
+        request: _TextRequest,
+        progress: Callable[[int, int], None] | None,
+    ) -> GenerationResult:
+        """Generate text, cancelling at the first stop-sequence match.
+
+        Streamed rather than generated whole so the match actually ends the
+        decode: truncating a finished generation honors the contract but pays
+        for every token past the boundary anyway.
+        """
+        scanner = _StopSequenceScanner(request.stop_sequences)
+        parts: list[str] = []
+        last_step: GenerationStep | None = None
         with self._generation_guard():
-            result = self.generator.generate_text(
+            steps = self.generator.stream_text(
                 request.prompt,
                 max_new_tokens=request.max_new_tokens,
                 sampling=request.sampling,
                 progress=progress,
             )
-        if request.stop_sequences:
-            text, matched = _truncate_at_stop(result.text, request.stop_sequences)
-            if matched is not None:
-                result = GenerationResult(
-                    prompt_ids=result.prompt_ids,
-                    generated_ids=result.generated_ids,
-                    text=text,
-                    stopped_on_eos=True,
-                    state_tokens=result.state_tokens,
-                )
-        completion_id = f"cmpl-{uuid.uuid4().hex}"
-        return self._completion_response(completion_id, result)
+            try:
+                for step in steps:
+                    if step.finished:
+                        last_step = step
+                        continue
+                    if step.text_delta:
+                        last_step = step
+                        parts.append(scanner.feed(step.text_delta))
+                        if scanner.matched is not None:
+                            break
+            finally:
+                close = getattr(steps, "close", None)
+                if close is not None:
+                    close()
+        if scanner.matched is None:
+            parts.append(scanner.flush())
+        if last_step is None:
+            raise RuntimeError("generation stream ended without a final result")
+        return GenerationResult(
+            prompt_ids=tuple(last_step.prompt_ids),
+            generated_ids=tuple(last_step.generated_ids),
+            text="".join(parts),
+            stopped_on_eos=scanner.matched is not None or last_step.stopped_on_eos,
+            state_tokens=last_step.state_tokens,
+        )
 
     def stream_completion(
         self,
@@ -2089,6 +2139,11 @@ class InferenceService:
         max_new_tokens = self._fit_max_new_tokens(
             requested_max, len(prompt_ids), parameter=max_key
         )
+        # Read off the prompt itself rather than inferred from the flag: a
+        # template decides this, and it may reason by default with the flag
+        # never set. Only the tail can carry the marker.
+        thinking_open = self._prompt_opens_thinking(prompt_ids)
+        format_shape = _response_format_shape(payload.get("response_format"))
         return _GenerationRequest(
             messages,
             prompt_ids,
@@ -2098,12 +2153,16 @@ class InferenceService:
             tools_enabled,
             tools,
             separate_reasoning,
-            # Read off the prompt itself rather than inferred from the flag: a
-            # template decides this, and it may reason by default with the flag
-            # never set. Only the tail can carry the marker.
-            self._prompt_opens_thinking(prompt_ids),
+            thinking_open,
             reasoning_effort=reasoning_effort,
             stop_sequences=_stop_option(payload),
+            response_format=(
+                # thinking_open tells the constraint it starts inside a
+                # reasoning block the prompt already opened.
+                {"shape": format_shape, "thinking_open": thinking_open}
+                if format_shape is not None
+                else None
+            ),
         )
 
     def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
@@ -3310,6 +3369,27 @@ def _response_format_prompt(response_format: Any) -> str | None:
         "response_format.type must be 'text', 'json_object', or 'json_schema'",
         parameter="response_format",
     )
+
+
+def _response_format_shape(response_format: Any) -> str | None:
+    """The JSON shape a response_format asks for, for the sampler constraint.
+
+    json_object is an object; json_schema follows the schema's declared top
+    type, and one that declares none may be any JSON value.
+    """
+    if not isinstance(response_format, dict):
+        return None
+    format_type = response_format.get("type")
+    if format_type == "json_object":
+        return "object"
+    if format_type != "json_schema":
+        return None
+    declared = response_format.get("json_schema")
+    schema = declared.get("schema") if isinstance(declared, dict) else None
+    top = schema.get("type") if isinstance(schema, dict) else None
+    if top in ("object", "array"):
+        return top
+    return "value"
 
 
 def _assemble_prompt(

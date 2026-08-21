@@ -6,7 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
 
 from colibri_next.cli import _parser
 from colibri_next.sampling import SamplingConfig
@@ -106,6 +106,7 @@ class StubV2Runtime:
         frequency_penalty=0.0,
         penalty_window=64,
         tools=None,
+        response_format=None,
     ):
         self._tasks = getattr(self, "_tasks", {})
         self._next_task = getattr(self, "_next_task", 0) + 1
@@ -114,6 +115,7 @@ class StubV2Runtime:
             repetition_penalty, presence_penalty, frequency_penalty, penalty_window
         )
         self._last_tools = tools
+        self._last_response_format = response_format
         self._tasks[self._next_task] = (list(prompt), max_tokens, tuple(stop_tokens))
         return self._next_task
 
@@ -679,6 +681,77 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(steps[-1].generated_ids, (20, 30))
         self.assertEqual(steps[-1].text, "Hello world")
 
+    def test_a_dropped_task_fails_the_stream_instead_of_hanging(self) -> None:
+        # An engine that loses a task's terminal event used to leave the
+        # consumer in an untimed queue.get() forever, and the SSE layer above it
+        # kept writing keepalives -- so the client sat in a "working" state with
+        # no output, no error and no end. The wait is now checked against the
+        # engine's own view of the task.
+        generator, _ = self.make_generator([20])
+        generator._STALL_POLL_SECONDS = 0.05
+
+        class DroppingEngine:
+            """Accepts a task, emits nothing, and forgets it."""
+
+            def submit(self, *args, **kwargs):
+                return 7, Queue()
+
+            def task_is_live(self, task_id: int) -> bool:
+                return False
+
+            def active_task_count(self) -> int:
+                return 0
+
+            def cancel(self, task_id: int) -> None:
+                pass
+
+            def forget(self, task_id: int) -> None:
+                pass
+
+        generator.engine = DroppingEngine()
+        with self.assertRaises(RuntimeError) as caught:
+            list(generator.stream_text("Hi", max_new_tokens=8))
+        self.assertIn("stopped scheduling", str(caught.exception))
+
+    def test_a_task_still_queued_for_a_slot_keeps_waiting(self) -> None:
+        # The counterpart: silence from a task the engine still holds is a
+        # request queued behind another, which must not be failed.
+        generator, _ = self.make_generator([20])
+        generator._STALL_POLL_SECONDS = 0.02
+        events: Queue = Queue()
+
+        class SlowEngine:
+            """Live throughout, but says nothing until released."""
+
+            def __init__(self) -> None:
+                self.polls = 0
+
+            def submit(self, *args, **kwargs):
+                return 7, events
+
+            def task_is_live(self, task_id: int) -> bool:
+                self.polls += 1
+                if self.polls == 3:  # a slot frees on the third check
+                    events.put(("token", 20))
+                    events.put(("done", None))
+                return True
+
+            def active_task_count(self) -> int:
+                return 2
+
+            def cancel(self, task_id: int) -> None:
+                pass
+
+            def forget(self, task_id: int) -> None:
+                pass
+
+        engine = SlowEngine()
+        generator.engine = engine
+        steps = list(generator.stream_text("Hi", max_new_tokens=8))
+        self.assertGreaterEqual(engine.polls, 3)
+        self.assertEqual(steps[-1].generated_ids, (20,))
+        self.assertEqual(steps[-1].text, "Hello")
+
     def test_gemma4_chat_format_uses_turn_and_channel_tokens(self) -> None:
         tokenizer = object.__new__(NativeV2Tokenizer)
         tokenizer.architecture = "gemma4"
@@ -943,6 +1016,21 @@ class NativeV2ServerTests(unittest.TestCase):
             [{"role": "user", "content": "hello"}], max_new_tokens=1
         )
         self.assertIn(runtime._last_tools, (None, []))
+        self.assertIsNone(runtime._last_response_format)
+
+    def test_native_generator_forwards_the_response_constraint(self) -> None:
+        # The server's response_format shape must reach the native sampler;
+        # dropping it here is the prompt-only JSON mode all over again.
+        generator, runtime = self.make_generator([10, 20])
+        generator.generate_messages(
+            [{"role": "user", "content": "give me json"}],
+            max_new_tokens=1,
+            response_format={"shape": "object", "thinking_open": False},
+        )
+        self.assertEqual(
+            runtime._last_response_format,
+            {"shape": "object", "thinking_open": False},
+        )
 
     def test_native_generator_reports_runtime_prefix_cache(self) -> None:
         generator, _ = self.make_generator([10])
