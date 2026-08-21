@@ -3488,7 +3488,18 @@ void qwen_cpu_moe(
     std::array<float, 256> gate_scale{}, up_scale{};
     for (int rank = 0; rank < routed_count; ++rank) {
         if (selected[rank] < 0 || selected[rank] >= experts) {
-            throw std::runtime_error("native CPU MoE selected an invalid expert");
+            // The raw value, in hex, distinguishes the two ways this fires: a
+            // routing bug puts a plausible integer here, where a route buffer
+            // the router never wrote carries whatever the allocator left --
+            // recognisably 0xabababab under COLIBRI_CPU_POISON.
+            throw std::runtime_error(
+                "native CPU MoE selected an invalid expert: rank " +
+                std::to_string(rank) + " of " + std::to_string(routed_count) +
+                " is " + std::to_string(selected[rank]) + " (0x" +
+                [&]{ char hex[16];
+                     std::snprintf(hex, sizeof(hex), "%08x",
+                                   static_cast<unsigned>(selected[rank]));
+                     return std::string(hex); }() + ")");
         }
         for (int role = 0; role < 3; ++role) {
             const auto& t = runtime.model->tensors[layer.expert_tensors[role]];

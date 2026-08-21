@@ -50,10 +50,22 @@ void* aligned_allocate(std::size_t bytes) {
     const std::size_t rounded =
         (bytes + kDeviceAlignment - 1) / kDeviceAlignment * kDeviceAlignment;
 #if defined(_WIN32)
-    return _aligned_malloc(rounded, kDeviceAlignment);
+    void* memory = _aligned_malloc(rounded, kDeviceAlignment);
 #else
-    return std::aligned_alloc(kDeviceAlignment, rounded);
+    void* memory = std::aligned_alloc(kDeviceAlignment, rounded);
 #endif
+    // COLIBRI_CPU_POISON=1 fills fresh "device" memory with a nonzero pattern.
+    // A fresh process reads zero pages out of new allocations, so a kernel
+    // that consumes memory nothing wrote yet looks correct until the heap has
+    // been churned and blocks come back dirty -- the failure then appears
+    // suites away from the cause. Poisoning makes the first such read fail in
+    // the smallest reproduction.
+    static const bool poison = [] {
+        const char* setting = std::getenv("COLIBRI_CPU_POISON");
+        return setting != nullptr && setting[0] == '1';
+    }();
+    if (poison && memory != nullptr) std::memset(memory, 0xAB, rounded);
+    return memory;
 }
 
 void aligned_release(void* pointer) {
