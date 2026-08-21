@@ -214,8 +214,14 @@ struct QwenLayerPlan {
     std::uint64_t shared_graph = 0;
     bool shared_graph_attempted = false;
     // The linear-attention block, captured once and replayed every token.
-    std::uint64_t delta_graph = 0;
-    bool delta_graph_attempted = false;
+    // Per sequence slot: the capture bakes in the conv/recurrent state
+    // addresses of the arena active at capture time, so a graph recorded on
+    // one slot replayed on another reads and writes the wrong sequence's
+    // DeltaNet state (deterministically wrong output for the second slot,
+    // silent corruption of the first). The shared-expert and dense-FFN graphs
+    // below touch only the shared workspace and stay slot-independent.
+    std::vector<std::uint64_t> delta_graphs;
+    std::vector<std::uint8_t> delta_graph_attempted;
     // The dense SwiGLU block, same treatment. Nothing in it depends on the
     // position or the token -- only fixed weights, fixed workspace slots and
     // fixed widths -- so one capture replays for the whole sequence.
@@ -1602,9 +1608,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
         colibri_gpu_graph_destroy(layer.shared_graph);
         layer.shared_graph = 0;
         layer.shared_graph_attempted = false;
-        colibri_gpu_graph_destroy(layer.delta_graph);
-        layer.delta_graph = 0;
-        layer.delta_graph_attempted = false;
+        for (auto& graph : layer.delta_graphs) colibri_gpu_graph_destroy(graph);
+        layer.delta_graphs.clear();
+        layer.delta_graph_attempted.clear();
         colibri_gpu_graph_destroy(layer.dense_ffn_graph);
         layer.dense_ffn_graph = 0;
         layer.dense_ffn_graph_attempted = false;
@@ -12737,16 +12743,23 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             // stays ordered behind the eager rms() above.
             bool delta_launched=false;
             const auto delta_started=env_graph_trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-            if(graph_eligible&&layer.delta_graph){
-                if(colibri_gpu_graph_launch(layer.delta_graph,runtime->stream)==0){
+            // One graph per sequence slot: the capture below records this
+            // slot's conv/recurrent state addresses.
+            const std::size_t graph_slot=runtime->active_sequence;
+            if(layer.delta_graphs.size()<runtime->sequences.size()){
+                layer.delta_graphs.resize(runtime->sequences.size(),0);
+                layer.delta_graph_attempted.resize(runtime->sequences.size(),0);
+            }
+            if(graph_eligible&&layer.delta_graphs[graph_slot]){
+                if(colibri_gpu_graph_launch(layer.delta_graphs[graph_slot],runtime->stream)==0){
                     ++runtime->cuda_graph_replays;delta_launched=true;
                 }else{
-                    colibri_gpu_graph_destroy(layer.delta_graph);
-                    layer.delta_graph=0;++runtime->cuda_graph_fallbacks;
+                    colibri_gpu_graph_destroy(layer.delta_graphs[graph_slot]);
+                    layer.delta_graphs[graph_slot]=0;++runtime->cuda_graph_fallbacks;
                 }
             }
-            if(graph_eligible&&!delta_launched&&!layer.delta_graph_attempted){
-                layer.delta_graph_attempted=true;
+            if(graph_eligible&&!delta_launched&&!layer.delta_graph_attempted[graph_slot]){
+                layer.delta_graph_attempted[graph_slot]=1;
                 if(colibri_gpu_graph_begin(runtime->graph_stream)==0){
                     bool capture_enqueued=true;
                     launch_stream=runtime->graph_stream;
@@ -12755,12 +12768,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     std::uint64_t captured_graph=0;
                     const int capture_status=colibri_gpu_graph_end(runtime->graph_stream,&captured_graph);
                     if(capture_enqueued&&capture_status==0){
-                        layer.delta_graph=captured_graph;++runtime->cuda_graph_builds;
-                        if(colibri_gpu_graph_launch(layer.delta_graph,runtime->stream)==0){
+                        layer.delta_graphs[graph_slot]=captured_graph;++runtime->cuda_graph_builds;
+                        if(colibri_gpu_graph_launch(layer.delta_graphs[graph_slot],runtime->stream)==0){
                             ++runtime->cuda_graph_replays;delta_launched=true;
                         }else{
-                            colibri_gpu_graph_destroy(layer.delta_graph);
-                            layer.delta_graph=0;++runtime->cuda_graph_fallbacks;
+                            colibri_gpu_graph_destroy(layer.delta_graphs[graph_slot]);
+                            layer.delta_graphs[graph_slot]=0;++runtime->cuda_graph_fallbacks;
                         }
                     }else{
                         if(capture_status==0&&captured_graph)colibri_gpu_graph_destroy(captured_graph);
