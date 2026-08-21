@@ -89,6 +89,21 @@ pointer-table staging must be doubled or fenced (halves alternate).
 3. `COLIBRI_PREFILL_PIPELINE=0` (or a runtime option per roadmap rules)
    restores the serial path for rollback and A/B.
 
+## Status (2026-08-21) — both stages landed
+
+- Stage 1 (`6447752`): the three phase functions over a (begin, count) span,
+  single full-range span, bit-identical on live Q5 256/1K/4K/10K + Q6 4K for
+  both hybrid prefill paths.
+- Stage 2 (`72785f3`): the two-half schedule, second route event, engaged
+  only for host-routed-expert configurations. Measured on the motivating
+  config (Q5, hybrid-cpu, 4096 tokens, 5000 MiB cache, interleaved A/B):
+  **413 → 586 tok/s (+41%)**, gate was +25%. Bit-identity held everywhere
+  gate 1 lists, plus Qwen3.8 IQ3_XXS with mtp_drafts=2.
+- Remaining headroom: the max(GPU, CPU) bound projects ~730 tok/s; the gap
+  is the half-grain cost (−5%) plus the tail where the engine thread sits in
+  `qwen_cpu_moe_rows` with no core left to queue. That is the stage-3
+  question (deeper grain or a MoE worker thread) — measure before building.
+
 ## Staging
 
 1. Mechanical: extract the three phase functions over (row_begin, row_count)
