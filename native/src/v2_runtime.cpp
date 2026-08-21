@@ -15290,7 +15290,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         s.winner_host = reinterpret_cast<std::uint64_t*>(
             block+host_layout.winner.offset);
     }
-    auto launch_named = [&](const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t bx, void** args) { if (colibri_gpu_launch_named(name, gx, gy, bx, 0, runtime->stream, args) != 0) throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ") + name); };
+    auto launch_named = [&](const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t bx, void** args, std::uint32_t shared = 0) { if (colibri_gpu_launch_named(name, gx, gy, bx, shared, runtime->stream, args) != 0) throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ") + name); };
     std::uint64_t q8_cached_input = 0, q8_cached_normalized = 0;
     auto rms = [&](std::uint64_t input, std::uint64_t weights, std::uint64_t output) { int one_centered = 0; q8_cached_input = 0; void* args[] = {&input, &weights, &output, const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon), &one_centered}; launch_named("rms_norm", 1, 1, 1024, args); };
     auto q8 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { if (colibri_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) != 0) throw std::runtime_error("native Qwen Q8 projection failed"); };
@@ -15382,7 +15382,25 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 auto decay = tensor(8), dt = tensor(7), norm = tensor(9);
                 std::uint64_t beta = s.third + value_heads * sizeof(float);
                 void* recurrent_args[] = {const_cast<std::uint64_t*>(&s.fourth), const_cast<std::uint64_t*>(&s.second), &beta, const_cast<std::uint64_t*>(&s.third), &decay, &dt, &norm, &recurrent_state, const_cast<std::uint64_t*>(&s.first), &key_heads, &value_heads, &head_dim, const_cast<float*>(&epsilon)};
-                launch_named("qwen_delta_recurrent", value_heads, 1, 256, recurrent_args);
+                // The same kernel selection as single-token decode: the split
+                // form reduces in a different order than the serial one, so a
+                // driver that picked differently would let a batched token
+                // diverge from the identical solo decode.
+                static const bool multi_delta_serial =
+                    std::getenv("COLIBRI_DELTA_SERIAL") != nullptr;
+                int recurrent_slices = head_dim > 0 ? 1024 / head_dim : 0;
+                if (recurrent_slices > 4) recurrent_slices = 4;
+                if (recurrent_slices >= 1 && !multi_delta_serial) {
+                    const int recurrent_block = head_dim * recurrent_slices;
+                    const std::uint32_t recurrent_shared =
+                        static_cast<std::uint32_t>(
+                            (4 * head_dim + recurrent_block) * sizeof(float));
+                    launch_named("qwen_delta_recurrent_split", value_heads, 1,
+                                 recurrent_block, recurrent_args, recurrent_shared);
+                } else {
+                    launch_named("qwen_delta_recurrent", value_heads, 1, 256,
+                                 recurrent_args);
+                }
                 dense(3, s.first, s.residual, value_dim, hidden_size);
                 add(s.residual, s.hidden);
             } else {
@@ -15494,7 +15512,13 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 colibri_gpu_download(s.cpu_input, s.normalized, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native Qwen route transfer failed");
             if (colibri_gpu_event_record(runtime->slot_events[s.slot], runtime->stream) != 0) throw std::runtime_error("native Qwen route event failed");
             auto shared_gate_matrix = tensor(moe_base + 2), shared_up_matrix = tensor(moe_base + 3);
-            const auto shexp_type = runtime->model->tensors[layer.static_tensors.at(moe_base + 2)].type;
+            // The device type, not the stored one, exactly as single decode
+            // dispatches: bf16 shared experts are requantized to Q8_0 on
+            // upload and must still take the fused path. This block used to
+            // hardcode the Q8 kernel for every non-NVFP4 type, which decoded
+            // f32/bf16/K-quant shared experts as Q8_0 bytes -- the parity
+            // harness caught it as token 0 on every batched decode.
+            const auto shexp_type = qwen_device_type(*runtime, layer.static_tensors.at(moe_base + 2));
             if (shexp_type == 40) {
                 auto shared_gate_scale = layer.shared_gate_scale, shared_up_scale = layer.shared_up_scale;
                 void* silu_args[] = {&shared_gate_matrix, &shared_up_matrix, const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.second), const_cast<int*>(&hidden_size), const_cast<int*>(&intermediate), &shared_gate_scale, &shared_up_scale};
@@ -15502,9 +15526,20 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 auto shared_down_matrix = tensor(moe_base + 4); auto shared_down_scale = layer.shared_down_scale;
                 void* down_args[] = {&shared_down_matrix, const_cast<std::uint64_t*>(&s.second), const_cast<std::uint64_t*>(&s.third), const_cast<int*>(&intermediate), const_cast<int*>(&hidden_size), &shared_down_scale};
                 launch_named("nvfp4_matvec_transposed", hidden_size, 1, 256, down_args);
-            } else {
+            } else if (shexp_type == 8) {
                 void* silu_args[] = {&shared_gate_matrix, &shared_up_matrix, const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.second), const_cast<int*>(&hidden_size), const_cast<int*>(&intermediate)};
                 launch_named("q8_swiglu_transposed_warp", (intermediate + 7) / 8, 1, 256, silu_args);
+                dense(moe_base + 4, s.second, s.third, intermediate, hidden_size);
+            } else {
+                // No fused SwiGLU for this type: project gate and up into one
+                // contiguous pair and let silu_mul combine them, as single
+                // decode does.
+                const auto up_half = s.first + static_cast<std::uint64_t>(intermediate) * sizeof(float);
+                dense(moe_base + 2, s.normalized, s.first, hidden_size, intermediate);
+                dense(moe_base + 3, s.normalized, up_half, hidden_size, intermediate);
+                int count = intermediate;
+                void* silu_args[] = {const_cast<std::uint64_t*>(&s.first), const_cast<std::uint64_t*>(&s.second), &count};
+                launch_named("silu_mul", (static_cast<std::uint32_t>(count) + 255) / 256, 1, 256, silu_args);
                 dense(moe_base + 4, s.second, s.third, intermediate, hidden_size);
             }
             auto shared_gate = tensor(moe_base + 5);
@@ -15518,10 +15553,17 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         // One stream wait covers every sequence's upload batch; predictions
         // made below target layer+1 and continue overlapping this layer.
         qwen_wait_for_prefetch_layer(*runtime,layer_number);
+        // The fused two-sequence CPU MoE interleaves both rows through one
+        // weight pass (pair/oct dots, dequant+GEMM), which reduces in a
+        // different order than qwen_cpu_moe -- so a batched token can differ
+        // from the identical request run alone, i.e. whether another request
+        // is in flight changes this one's greedy output. That is the ornith
+        // failure class, so determinism is the default and the fused path is
+        // explicit opt-in until a measured decision promotes it.
         static const char*batch_cpu_moe=std::getenv("COLIBRI_BATCHED_CPU_MOE");
-        const bool batch_cpu_supported=(colibri_cpu_features()&2u)!=0||(batch_cpu_moe&&batch_cpu_moe[0]=='1');
+        const bool batch_cpu_supported=(colibri_cpu_features()&2u)!=0;
         if(expert_policy.is_cpu()&&n==2&&batch_cpu_supported&&
-           !(batch_cpu_moe&&batch_cpu_moe[0]=='0')){
+           batch_cpu_moe&&batch_cpu_moe[0]=='1'){
             const auto expert_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             thread_local std::vector<std::int32_t> batch_selected;
             thread_local std::vector<float> batch_weights,batch_inputs,batch_activated,batch_down,batch_outputs;
