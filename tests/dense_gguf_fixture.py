@@ -79,6 +79,9 @@ class DenseQwenSpec:
         key_heads: int = 4,
         conv_kernel: int = 4,
         attention_every: int = 4,
+        experts: int = 0,
+        experts_used: int = 0,
+        expert_intermediate: int = 64,
     ):
         self.hidden = hidden
         self.layers = layers
@@ -92,6 +95,11 @@ class DenseQwenSpec:
         self.key_heads = key_heads
         self.conv_kernel = conv_kernel
         self.attention_every = attention_every
+        # experts > 0 swaps every block's dense SwiGLU for the MoE layout:
+        # router, sigmoid-gated shared expert, and stacked routed experts.
+        self.experts = experts
+        self.experts_used = experts_used
+        self.expert_intermediate = expert_intermediate
 
     @property
     def value_dim(self) -> int:
@@ -184,9 +192,29 @@ def build_dense_qwen35_gguf(
             ))
             vector(prefix + "ssm_norm.weight", spec.ssm_head_dim, value=1.0)
         vector(prefix + "post_attention_norm.weight", spec.hidden, value=1.0)
-        projection(prefix + "ffn_gate.weight", spec.hidden, spec.intermediate)
-        projection(prefix + "ffn_up.weight", spec.hidden, spec.intermediate)
-        projection(prefix + "ffn_down.weight", spec.intermediate, spec.hidden)
+        if spec.experts:
+            # The Qwen3.5 MoE feed-forward: softmax top-k router, a
+            # sigmoid-gated shared expert, and one stacked tensor per routed
+            # role. Stacked payloads are [expert][output][input]; GGUF reports
+            # the reversed shape.
+            projection(prefix + "ffn_gate_inp.weight", spec.hidden, spec.experts)
+            projection(prefix + "ffn_gate_shexp.weight", spec.hidden, spec.expert_intermediate)
+            projection(prefix + "ffn_up_shexp.weight", spec.hidden, spec.expert_intermediate)
+            projection(prefix + "ffn_down_shexp.weight", spec.expert_intermediate, spec.hidden)
+            vector(prefix + "ffn_gate_inp_shexp.weight", spec.hidden)
+            for name, inputs, outputs in (
+                ("ffn_gate_exps.weight", spec.hidden, spec.expert_intermediate),
+                ("ffn_up_exps.weight", spec.hidden, spec.expert_intermediate),
+                ("ffn_down_exps.weight", spec.expert_intermediate, spec.hidden),
+            ):
+                data = (
+                    rng.standard_normal((spec.experts, outputs, inputs)) * 0.25
+                ).astype(np.float32)
+                tensors.append((prefix + name, (inputs, outputs, spec.experts), data))
+        else:
+            projection(prefix + "ffn_gate.weight", spec.hidden, spec.intermediate)
+            projection(prefix + "ffn_up.weight", spec.hidden, spec.intermediate)
+            projection(prefix + "ffn_down.weight", spec.intermediate, spec.hidden)
 
     if mtp:
         prefix = f"blk.{spec.layers}."
@@ -227,6 +255,16 @@ def build_dense_qwen35_gguf(
         _kv("tokenizer.ggml.vocab_size", GGUF_UINT32, struct.pack("<I", spec.vocabulary)),
         _kv("general.alignment", GGUF_UINT32, struct.pack("<I", ALIGNMENT)),
     ]
+    if spec.experts:
+        metadata += [
+            _kv("qwen35.expert_count", GGUF_UINT32, struct.pack("<I", spec.experts)),
+            _kv("qwen35.expert_used_count", GGUF_UINT32, struct.pack("<I", spec.experts_used)),
+            _kv(
+                "qwen35.expert_feed_forward_length",
+                GGUF_UINT32,
+                struct.pack("<I", spec.expert_intermediate),
+            ),
+        ]
 
     infos = bytearray()
     payloads = bytearray()
