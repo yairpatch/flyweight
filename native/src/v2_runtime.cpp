@@ -276,6 +276,10 @@ struct QwenPrefillSnapshot {
     std::uint64_t device = 0;
     std::vector<std::uint32_t> tokens;
     std::uint32_t last_output = 0;
+    // Whether last_output is the unadjusted argmax. A sampled or
+    // grammar-overridden token must not seed a later greedy request's first
+    // token on a full-prompt hit; only the logits replay can answer that.
+    bool last_output_greedy = false;
     std::uint64_t clock = 0;
     bool valid = false;
 };
@@ -314,6 +318,7 @@ struct QwenSequence {
     std::uint64_t state = 0;            // device KV+DeltaNet arena for this slot
     std::uint64_t position = 0;
     std::uint32_t last_output_token = 0;
+    bool last_output_greedy = true;     // see QwenPrefillSnapshot::last_output_greedy
     std::vector<std::uint32_t> processed_tokens;
     std::vector<QwenPrefillSnapshot> prefill_snapshots; // per-slot reuse checkpoints
     std::uint64_t prefill_snapshot_clock = 0;
@@ -332,6 +337,7 @@ struct QwenHostSnapshot {
     std::vector<std::uint32_t> tokens;
     void* state = nullptr;             // host copy of the DeltaNet checkpoint buffer
     std::uint32_t last_output = 0;
+    bool last_output_greedy = false;   // see QwenPrefillSnapshot::last_output_greedy
 };
 
 // A conversation's full slot state spilled to host RAM (llama.cpp's prompt
@@ -347,6 +353,7 @@ struct QwenHostPrompt {
     std::vector<QwenHostSnapshot> snapshots;
     std::uint64_t position = 0;
     std::uint32_t last_output_token = 0;
+    bool last_output_greedy = true;    // see QwenPrefillSnapshot::last_output_greedy
     std::uint64_t bytes = 0;           // total host bytes held (arena + snapshots)
     std::uint64_t clock = 0;           // LRU stamp within the host cache
 };
@@ -728,6 +735,7 @@ struct ColibriV2QwenRuntime {
     std::uint64_t cuda_lm_end = 0, cuda_tail_end = 0;
     std::uint64_t position = 0;
     std::uint32_t last_output_token = 0;
+    bool last_output_greedy = true;    // see QwenPrefillSnapshot::last_output_greedy
     std::vector<std::uint32_t> processed_tokens;
     // Parallel decode slots (see QwenSequence). sequences[active_sequence] owns
     // the arena that runtime.state currently points at; its bookkeeping is the
@@ -3175,6 +3183,15 @@ int qwen_gpu_matvec_by_type(
     std::uint64_t output, int input_size, int output_size, std::uint64_t stream
 ) {
     switch (type) {
+        // F32 matters to the sampler: the greedy path has a fused f32 argmax,
+        // but a sampled request projects the full logits through this dispatch
+        // and used to throw on an f32 LM head while greedy worked.
+        case 0: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return colibri_gpu_launch_named(
+                "qwen_f32_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
         case 8: return colibri_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 10: return colibri_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 11: return colibri_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
@@ -9958,7 +9975,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->grammar_empty_candidate_sets=runtime->grammar_empty_candidate_sets;
     return 0;
 });}
-int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
+int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
 int colibri_v2_qwen_runtime_cancel(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");runtime->cancelled=true;return 0;});}
 int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
@@ -12346,6 +12363,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
         throw std::runtime_error("native Gemma 4 output synchronization failed");
     output_token=0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
     runtime.last_output_token=output_token;
+    runtime.last_output_greedy=true;
     runtime.processed_tokens.push_back(input_token);
     ++runtime.position;
     ++runtime.decode_calls;
@@ -13600,6 +13618,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             std::fprintf(stderr,"[tok-dbg] step=%d in=%u -> out=%u\n",tc,input_token,*output_token);
     }
     runtime->last_output_token=*output_token;
+    runtime->last_output_greedy=true;
     runtime->processed_tokens.push_back(input_token);
     ++runtime->position;
     // Reported periodically rather than once: the first token pays for capture,
@@ -13696,6 +13715,7 @@ static std::uint32_t qwen_sample_last_logits(
     // Sampling from a single candidate is identical to greedy decode. Avoid
     // both the second LM-head projection and all candidate transfers.
     if(count==1){runtime.last_output_token=greedy_token;
+        runtime.last_output_greedy=true;
         return commit(greedy_token);}
     const auto lm_head=runtime.device_tensors[runtime.lm_head];
     // The head type picks the kernel, exactly as it does for the greedy argmax
@@ -13920,7 +13940,11 @@ static std::uint32_t qwen_sample_last_logits(
     // answer, and it is where the fused argmax's token gets overridden. Below
     // this point everything reads `temperature`, which is zero here.
     if(!sampling.enabled()){
+        // Equality with the fused argmax, not provenance, is what a later
+        // full-prompt reuse needs: a penalty or grammar that happened to keep
+        // the argmax leaves the remembered token valid for a greedy hit.
         runtime.last_output_token=candidates.front();
+        runtime.last_output_greedy=candidates.front()==greedy_token;
         return commit(candidates.front());
     }
     const double maximum=static_cast<double>(candidate_logits.front())/
@@ -13952,10 +13976,12 @@ static std::uint32_t qwen_sample_last_logits(
         cumulative+=probabilities[index];
         if(threshold<=cumulative){
             runtime.last_output_token=candidates[index];
+            runtime.last_output_greedy=candidates[index]==greedy_token;
             return commit(candidates[index]);
         }
     }
     runtime.last_output_token=candidates[keep-1];
+    runtime.last_output_greedy=candidates[keep-1]==greedy_token;
     return commit(candidates[keep-1]);
 }
 
@@ -13987,6 +14013,7 @@ static void qwen_switch_sequence(ColibriV2QwenRuntime& runtime, std::size_t targ
     QwenSequence& cur = runtime.sequences[runtime.active_sequence];
     cur.position = runtime.position;
     cur.last_output_token = runtime.last_output_token;
+    cur.last_output_greedy = runtime.last_output_greedy;
     cur.processed_tokens.swap(runtime.processed_tokens);
     cur.prefill_snapshots.swap(runtime.prefill_snapshots);
     cur.prefill_snapshot_clock = runtime.prefill_snapshot_clock;
@@ -13994,6 +14021,7 @@ static void qwen_switch_sequence(ColibriV2QwenRuntime& runtime, std::size_t targ
     runtime.state = next.state;
     runtime.position = next.position;
     runtime.last_output_token = next.last_output_token;
+    runtime.last_output_greedy = next.last_output_greedy;
     runtime.processed_tokens.swap(next.processed_tokens);
     runtime.prefill_snapshots.swap(next.prefill_snapshots);
     runtime.prefill_snapshot_clock = next.prefill_snapshot_clock;
@@ -14074,6 +14102,8 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
     const auto& tokens = active ? runtime.processed_tokens : seq.processed_tokens;
     const auto position = active ? runtime.position : seq.position;
     const auto last_output = active ? runtime.last_output_token : seq.last_output_token;
+    const auto last_output_greedy =
+        active ? runtime.last_output_greedy : seq.last_output_greedy;
     const auto& snapshots = active ? runtime.prefill_snapshots : seq.prefill_snapshots;
     // Ignore tiny utility prompts, but retain ordinary conversations before a
     // title/quota/subagent request displaces the sole GPU slot.
@@ -14113,6 +14143,7 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
     e.state = buf;
     e.position = position;
     e.last_output_token = last_output;
+    e.last_output_greedy = last_output_greedy;
     e.bytes = packed_bytes;
     std::uint64_t copied_snapshots=0;
     for (const auto& s : snapshots) {
@@ -14121,7 +14152,7 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
         if (!sbuf) break;  // partial checkpoint set is fine; arena reuse still works
         if (colibri_gpu_download(sbuf, s.device, runtime.prefill_snapshot_bytes, runtime.stream) != 0
             || colibri_gpu_stream_sync(runtime.stream) != 0) { std::free(sbuf); break; }
-        e.snapshots.push_back({s.tokens, sbuf, s.last_output});
+        e.snapshots.push_back({s.tokens, sbuf, s.last_output, s.last_output_greedy});
         e.bytes += runtime.prefill_snapshot_bytes;
         ++copied_snapshots;
     }
@@ -14157,9 +14188,11 @@ static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
     if (active) {
         runtime.position = e.position;
         runtime.last_output_token = e.last_output_token;
+        runtime.last_output_greedy = e.last_output_greedy;
     } else {
         seq.position = e.position;
         seq.last_output_token = e.last_output_token;
+        seq.last_output_greedy = e.last_output_greedy;
     }
     std::size_t slot_i = 0;
     for (auto& hs : e.snapshots) {
@@ -14170,6 +14203,7 @@ static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
             break;
         dst.tokens = std::move(hs.tokens);
         dst.last_output = hs.last_output;
+        dst.last_output_greedy = hs.last_output_greedy;
         dst.valid = true;
         dst.clock = ++snapshot_clock;
     }
@@ -14292,7 +14326,12 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
         // An exact full-prompt hit remembers the previously selected token but
         // not the full LM-head logits. Sampling must replay at least the final
         // uncached prompt section so it can draw a fresh token from real logits.
-        if(require_last_logits&&runtime->processed_tokens.size()==prompt_count)
+        // The remembered token cuts the other way too: if the previous request
+        // sampled it (or a grammar overrode it), a greedy hit would emit a
+        // temperature-drawn first token, so only a greedily-selected token may
+        // be reused without replaying.
+        if(runtime->processed_tokens.size()==prompt_count&&
+           (require_last_logits||!runtime->last_output_greedy))
             reusable=false;
     }
     uint32_t next_token=0;
@@ -14315,7 +14354,8 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
         QwenPrefillSnapshot*snapshot=nullptr;
         for(auto&candidate:runtime->prefill_snapshots){
             if(!candidate.valid||candidate.tokens.empty()||candidate.tokens.size()>prompt_count)continue;
-            if(require_last_logits&&candidate.tokens.size()==prompt_count)continue;
+            if(candidate.tokens.size()==prompt_count&&
+               (require_last_logits||!candidate.last_output_greedy))continue;
             if(!swa_snapshot_is_resident(*runtime,candidate.tokens.size(),runtime->position))continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt))continue;
             if(candidate.tokens.size()>runtime->processed_tokens.size())continue;
@@ -14327,6 +14367,7 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
             runtime->processed_tokens.assign(snapshot->tokens.begin(),snapshot->tokens.end());
             runtime->position=snapshot->tokens.size();
             runtime->last_output_token=snapshot->last_output;
+            runtime->last_output_greedy=snapshot->last_output_greedy;
             prompt_start=snapshot->tokens.size();
             next_token=snapshot->last_output;
             snapshot->clock=++runtime->prefill_snapshot_clock;
@@ -14396,6 +14437,7 @@ static void qwen_prompt_checkpoints(ColibriV2QwenRuntime* runtime,
         qwen_prefill_snapshot_copy(*runtime,slot.device,false);
         slot.tokens.assign(prompt,prompt+runtime->position);
         slot.last_output=0; // mid-prefill resume keeps prefilling; last_output unused
+        slot.last_output_greedy=false;
         slot.valid=true;
         slot.clock=++runtime->prefill_snapshot_clock;
         ++plan.next_target;
@@ -14811,6 +14853,9 @@ static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
         qwen_prefill_snapshot_copy(*runtime,slot->device,false);
         slot->tokens.assign(prompt,prompt+prompt_count);
         slot->last_output=next_token;
+        // next_token may have come from the sampler; the runtime flag tracks
+        // whether it still equals the unadjusted argmax (see the sampler).
+        slot->last_output_greedy=runtime->last_output_greedy;
         slot->valid=true;
     }
     slot->clock=++runtime->prefill_snapshot_clock;
@@ -14930,6 +14975,7 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);
         runtime.position+=valid;
         runtime.last_output_token=verified[valid-1];
+        runtime.last_output_greedy=true;
         runtime.decode_calls+=valid;
         runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-replay_started).count();
         if(trace){
@@ -14949,6 +14995,7 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+wanted);
         runtime.position+=wanted;
         runtime.last_output_token=verified[wanted-1];
+        runtime.last_output_greedy=true;
         runtime.decode_calls+=wanted;
         runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-batch_started).count();
         runtime.mtp_accepted_tokens+=rejected?wanted-1:wanted;
@@ -15262,10 +15309,12 @@ static void qwen_park_active(ColibriV2QwenRuntime& rt, bool park) {
     if (park) {
         a.position = rt.position;
         a.last_output_token = rt.last_output_token;
+        a.last_output_greedy = rt.last_output_greedy;
         a.processed_tokens.swap(rt.processed_tokens);
     } else {
         rt.position = a.position;
         rt.last_output_token = a.last_output_token;
+        rt.last_output_greedy = a.last_output_greedy;
         rt.processed_tokens.swap(a.processed_tokens);
     }
 }
@@ -15913,6 +15962,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         outputs[i] = 0xffffffffu - static_cast<std::uint32_t>(*seqs[i].winner_host);
         auto& sequence = runtime->sequences[seqs[i].slot];
         sequence.last_output_token = outputs[i];
+        sequence.last_output_greedy = true;
         sequence.processed_tokens.push_back(inputs[i]);
         ++sequence.position;
     }

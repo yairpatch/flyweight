@@ -53,6 +53,21 @@ def _run_task(runtime, prompt: list[int]) -> None:
     raise AssertionError("native engine task did not finish")
 
 
+def _collect_task(runtime, task_id: int, steps: int = 64) -> list[int]:
+    tokens: list[int] = []
+    for _ in range(steps):
+        for event_task, token, kind in runtime.engine_step():
+            if event_task != task_id:
+                continue
+            if kind == 0:
+                tokens.append(token)
+            elif kind == 1:
+                return tokens
+            elif kind == 2:
+                raise AssertionError("native engine task failed")
+    raise AssertionError("native engine task did not finish")
+
+
 class DensePlanTests(unittest.TestCase):
     def test_config_reports_a_dense_model_with_no_experts(self):
         model, spec, _ = _model()
@@ -140,6 +155,42 @@ class DenseNativeTests(unittest.TestCase):
         finally:
             resident.close()
             spilled.close()
+            model.close()
+
+    def test_greedy_request_does_not_inherit_a_sampled_first_token(self):
+        # An exact full-prompt prefix-cache hit reuses the remembered next
+        # token instead of replaying the last prompt token. If a previous
+        # request *sampled* that token, a later greedy request must not emit
+        # it: greedy output would then depend on which request ran before.
+        model, _, _ = _model()
+        warmed = _native(model)
+        fresh = _native(model)
+        prompt = [5, 9, 3, 7, 2]
+        try:
+            baseline = _collect_task(fresh, fresh.task_submit(prompt, 4))
+            # max_tokens=1 leaves processed_tokens exactly equal to the prompt,
+            # which is the full-prompt prefix-cache hit the greedy request
+            # below will take. Find a seed whose sampled token actually
+            # diverges from the greedy one, so the reuse path is exercised
+            # rather than trivially agreeing.
+            diverged = False
+            for seed in range(8):
+                sampled = _collect_task(
+                    warmed,
+                    warmed.task_submit(prompt, 1, temperature=1.8, seed=seed),
+                )
+                if sampled[0] != baseline[0]:
+                    diverged = True
+                    break
+            greedy = _collect_task(warmed, warmed.task_submit(prompt, 4))
+            self.assertEqual(greedy, baseline)
+            # On this fixture at temperature 1.8 at least one of the seeds is
+            # expected to diverge; if none did, the assertion above proved
+            # nothing about reuse and the fixture needs a new prompt.
+            self.assertTrue(diverged, "no sampled seed diverged from greedy")
+        finally:
+            warmed.close()
+            fresh.close()
             model.close()
 
     def test_parallel_engine_handles_spilled_dense_layers(self):
