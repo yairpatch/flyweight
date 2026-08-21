@@ -117,6 +117,27 @@ void qwen_forward_rows(
         expert_policy.is_hybrid()&&
         expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
         runtime.options.hybrid_prefill_cpu!=0;
+    // The two-half software pipeline (plans/prefill-pipeline.md): while the
+    // engine thread runs one half's routed experts on the CPU, the GPU works
+    // through the other half's queued core. Engaged only where the routed
+    // experts run wholly on the host -- hybrid_prefill_cpu and the CPU expert
+    // modes, the configurations whose serial loop leaves each processor idle
+    // while the other works -- so dense checkpoints and GPU-resident expert
+    // configurations keep the one-span driver and pay nothing. The half is
+    // kept a multiple of the DeltaNet WY chunk; below two chunks there is
+    // nothing to overlap. COLIBRI_PREFILL_PIPELINE=0 restores the serial
+    // driver for rollback and A/B.
+    static const bool pipeline_enabled=[]{
+        const char*setting=std::getenv("COLIBRI_PREFILL_PIPELINE");
+        return !setting||setting[0]!='0';
+    }();
+    const int pipeline_half=
+        total_rows/2/static_cast<int>(colibri::v2::workspace::kDeltaChunk)
+        *static_cast<int>(colibri::v2::workspace::kDeltaChunk);
+    const bool pipelined=pipeline_enabled&&pipeline_half>0&&experts>0&&
+        expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
+        (expert_policy.hybrid_prefill_cpu||
+         !expert_policy.routed_gpu_execution_allowed());
     const float epsilon=runtime.model->config.rms_norm_epsilon?runtime.model->config.rms_norm_epsilon:1.0e-6f;
     for(int row=0;row<rows;++row)
         if(input_tokens[row]>=runtime.model->config.vocabulary_size)
@@ -472,6 +493,11 @@ void qwen_forward_rows(
     struct RowsSpan{
         int begin;int count;
         std::uint64_t hidden;std::uint64_t residual;
+        // Which route event this span records and waits on. The two-half
+        // schedule gives each half its own event; sharing one would re-record
+        // it from the other half's core and stretch this half's route wait
+        // over work it does not depend on.
+        std::uint64_t route_event;
         std::chrono::steady_clock::time_point pager_started;
     };
     const auto scratch_stride=static_cast<std::uint64_t>(runtime.scratch_elements);
@@ -526,10 +552,13 @@ void qwen_forward_rows(
     // so a probe must snapshot them between the prefill and decode phases.
     static const bool verify_profile=
         std::getenv("COLIBRI_MTP_PROFILE")!=nullptr;
-    const bool profile_prefill=
-        (runtime.prefill_profile&&expert_policy.records_prefill_frequency())||
-        (verify_profile&&
-         expert_phase==colibri::v2::ExpertExecutionPhase::verification);
+    // The event split cannot describe two interleaved halves (each half would
+    // re-record the other's start/end markers), so the pipelined driver keeps
+    // only the host-side counters and leaves the prefill_gpu_* split at zero.
+    const bool profile_prefill=!pipelined&&
+        ((runtime.prefill_profile&&expert_policy.records_prefill_frequency())||
+         (verify_profile&&
+          expert_phase==colibri::v2::ExpertExecutionPhase::verification));
     static const bool trace_phases=std::getenv("COLIBRI_PREFILL_TRACE")
         &&std::getenv("COLIBRI_PREFILL_TRACE")[0]=='2';
     auto phase_clock=std::chrono::steady_clock::now();
@@ -1046,7 +1075,7 @@ void qwen_forward_rows(
             static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
         if(colibri_gpu_download(selected_host,selected_device,selected_bytes,runtime.stream)!=0||colibri_gpu_download(weights_host,route_weights,weights_bytes,runtime.stream)!=0||colibri_gpu_download(input_host,normalized,input_bytes,runtime.stream)!=0)
             throw std::runtime_error("native Qwen rows forward route transfer failed");
-        if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward route event failed");
+        if(colibri_gpu_event_record(span.route_event,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward route event failed");
         // Shared expert gate/up as two tiled GEMMs into the halves of the
         // `first` scratch (silu_mul expects gate at [0, n) and up at [n, 2n)
         // of one buffer), then the elementwise swiglu combine.
@@ -1105,7 +1134,7 @@ void qwen_forward_rows(
         install_span(span);
         auto&layer=runtime.layers[layer_number];
         const auto route_wait_started=std::chrono::steady_clock::now();
-        if(colibri_gpu_event_sync(runtime.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
+        if(colibri_gpu_event_sync(span.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
         if(profile_prefill){
             float core_ms=0.0f,router_ms=0.0f,transfer_ms=0.0f;
             if(colibri_gpu_event_elapsed(runtime.prefill_layer_start_event,runtime.prefill_core_end_event,&core_ms)!=0||
@@ -1285,11 +1314,53 @@ void qwen_forward_rows(
         else add_rows(third,first);
         add_rows(residual,third);std::swap(span.hidden,span.residual);
     };
-    // The phase driver: one full-range span through core -> cpu -> combine per
-    // layer, which is exactly the serial order the loop always ran. The
-    // two-half pipeline schedule will replace only this driver.
-    RowsSpan whole{0,total_rows,hidden,residual,{}};
-    for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
+    // The phase driver. Serial: one full-range span through core -> cpu ->
+    // combine per layer, exactly the order the loop always ran. Pipelined:
+    // two halves interleave so the GPU always holds one half-layer of queued
+    // core work while the CPU runs the other half's experts -- half B reads
+    // half A's KV/DeltaNet state through normal stream ordering because A's
+    // core for a layer is always queued before B's.
+    RowsSpan whole{0,total_rows,hidden,residual,runtime.route_event,{}};
+    if(pipelined){
+        RowsSpan front{0,pipeline_half,hidden,residual,
+                       runtime.route_event,{}};
+        RowsSpan back{pipeline_half,total_rows-pipeline_half,hidden,residual,
+                      runtime.route_event_pipeline,{}};
+        // Queue core phases until one is a MoE layer whose expert work is
+        // pending; dense feed-forward layers complete inside queue_core.
+        auto advance=[&](RowsSpan&span,std::uint32_t&next)->bool{
+            while(next<runtime.layers.size()){
+                if(queue_core(span,next))return true;
+                ++next;
+            }
+            return false;
+        };
+        std::uint32_t layer_front=0,layer_back=0;
+        bool pending_front=advance(front,layer_front);
+        bool pending_back=advance(back,layer_back);
+        while(pending_front||pending_back){
+            if(pending_front){
+                cpu_phase(front,layer_front);
+                queue_combine(front);
+                ++layer_front;
+                pending_front=advance(front,layer_front);
+            }
+            if(pending_back){
+                cpu_phase(back,layer_back);
+                queue_combine(back);
+                ++layer_back;
+                pending_back=advance(back,layer_back);
+            }
+        }
+        // Both halves swapped once per layer, so they must end in the same
+        // ping-pong buffer; anything else means the halves diverged and the
+        // full-range head below would read half-stale rows.
+        if(front.hidden!=back.hidden)
+            throw std::runtime_error(
+                "native Qwen prefill pipeline halves diverged");
+        whole.hidden=front.hidden;
+        whole.residual=front.residual;
+    }else for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         if(!queue_core(whole,layer_number))continue;
         cpu_phase(whole,layer_number);
         queue_combine(whole);

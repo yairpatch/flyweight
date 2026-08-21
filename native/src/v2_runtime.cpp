@@ -721,6 +721,10 @@ struct ColibriV2QwenRuntime {
     std::uint64_t stream = 0;
     std::uint64_t graph_stream = 0;
     std::uint64_t route_event = 0;
+    // Second route event for the two-half prefill pipeline: each half syncs
+    // only its own route downloads, so one half's wait never extends to the
+    // other half's queued core work.
+    std::uint64_t route_event_pipeline = 0;
     std::uint64_t prefill_layer_start_event = 0;
     std::uint64_t prefill_core_end_event = 0;
     std::uint64_t prefill_router_end_event = 0;
@@ -1627,6 +1631,7 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     colibri_gpu_event_destroy(runtime.prefetch_event);
     runtime.prefetch_event = 0;
     colibri_gpu_event_destroy(runtime.route_event);
+    colibri_gpu_event_destroy(runtime.route_event_pipeline);
     colibri_gpu_event_destroy(runtime.prefill_layer_start_event);
     colibri_gpu_event_destroy(runtime.prefill_core_end_event);
     colibri_gpu_event_destroy(runtime.prefill_router_end_event);
@@ -1663,6 +1668,7 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.expert_native_cache = 0;
     runtime.static_arena = runtime.stream = 0;
     runtime.route_event = 0;
+    runtime.route_event_pipeline = 0;
     runtime.prefill_layer_start_event=runtime.prefill_core_end_event=
         runtime.prefill_router_end_event=0;
     runtime.prefill_profile=false;
@@ -10008,6 +10014,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         ?colibri_gpu_timed_event_create(&runtime->route_event)
         :colibri_gpu_event_create(&runtime->route_event);
     if(route_event_status!=0){release_qwen_device(*runtime);throw std::runtime_error("failed to create native Qwen route event");}
+    // The pipeline's second event is never measured, so it is always untimed.
+    if(colibri_gpu_event_create(&runtime->route_event_pipeline)!=0){
+        release_qwen_device(*runtime);
+        throw std::runtime_error("failed to create native Qwen pipeline route event");
+    }
     if(runtime->prefill_profile&&(
        colibri_gpu_timed_event_create(&runtime->prefill_layer_start_event)!=0||
        colibri_gpu_timed_event_create(&runtime->prefill_core_end_event)!=0||
