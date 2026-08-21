@@ -87,8 +87,16 @@ inline int qwen_host_ffn_batch_threshold(){
 
 void qwen_forward_rows(
     ColibriV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
-    int rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
+    int total_rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
 ) {
+    // The row range every launch below operates over. The phase driver near
+    // the bottom installs a span's (begin, count) before invoking each phase
+    // function, so `rows` is the current span's row count and `span_begin` its
+    // row offset into the batch; outside the layer loop both cover the whole
+    // batch. Today a single span covers all rows -- the split exists so a
+    // two-half schedule can overlap CPU experts with queued GPU work.
+    int rows=total_rows;
+    int span_begin=0;
     if(rows<=0||rows>static_cast<int>(runtime.forward_rows_capacity))
         throw std::runtime_error("native Qwen rows forward batch exceeds the prepared capacity");
     if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
@@ -119,17 +127,21 @@ void qwen_forward_rows(
         throw std::runtime_error("native Qwen rows forward workspace is too small");
     if(host_layout.bytes>runtime.host_staging_bytes)
         throw std::runtime_error("native Qwen rows forward host workspace overflow");
+    // Mutable rather than const: the phase driver re-derives every row-indexed
+    // region address for the span it is about to run (base plus span_begin
+    // rows of that region's stride), so two spans read and write disjoint
+    // slices of the same regions.
     std::uint64_t hidden=workspace_layout.hidden.address(runtime.workspace);
     std::uint64_t residual=workspace_layout.residual.address(runtime.workspace);
-    const auto normalized=workspace_layout.normalized.address(runtime.workspace);
-    const auto first=workspace_layout.first.address(runtime.workspace);
-    const auto second=workspace_layout.second.address(runtime.workspace);
-    const auto third=workspace_layout.third.address(runtime.workspace);
-    const auto fourth=workspace_layout.fourth.address(runtime.workspace);
-    const auto router_logits=workspace_layout.router_logits.address(runtime.workspace);
-    const auto selected_device=workspace_layout.selected_device.address(runtime.workspace);
-    const auto route_weights=workspace_layout.route_weights.address(runtime.workspace);
-    const auto gpu_activated=workspace_layout.gpu_activated.address(runtime.workspace);
+    std::uint64_t normalized=workspace_layout.normalized.address(runtime.workspace);
+    std::uint64_t first=workspace_layout.first.address(runtime.workspace);
+    std::uint64_t second=workspace_layout.second.address(runtime.workspace);
+    std::uint64_t third=workspace_layout.third.address(runtime.workspace);
+    std::uint64_t fourth=workspace_layout.fourth.address(runtime.workspace);
+    std::uint64_t router_logits=workspace_layout.router_logits.address(runtime.workspace);
+    std::uint64_t selected_device=workspace_layout.selected_device.address(runtime.workspace);
+    std::uint64_t route_weights=workspace_layout.route_weights.address(runtime.workspace);
+    std::uint64_t gpu_activated=workspace_layout.gpu_activated.address(runtime.workspace);
     // Small MTP batches are decode-shaped rather than prefill-shaped.  Their
     // k-quant matrix kernels are dominated by reconstructing weights against
     // f32 activations, while decode's DP4A path quantizes each activation once
@@ -138,21 +150,21 @@ void qwen_forward_rows(
     // only after all dense projections for the layer have finished.
     // Dedicated regions rather than borrowing `gpu_activated`, which is sized
     // off top_k and so is empty on a dense model.
-    const auto small_q8=workspace_layout.rows_q8.address(runtime.workspace);
-    const auto small_q8_scales=
+    std::uint64_t small_q8=workspace_layout.rows_q8.address(runtime.workspace);
+    std::uint64_t small_q8_scales=
         workspace_layout.rows_q8_scales.address(runtime.workspace);
     std::uint64_t q8_cached_input=0;
     int q8_cached_width=0;
-    const auto gpu_table_entries=static_cast<std::uint64_t>(rows)*top_k;
-    const auto gpu_gate_table=workspace_layout.gpu_gate_table.address(runtime.workspace);
-    const auto gpu_up_table=workspace_layout.gpu_up_table.address(runtime.workspace);
-    const auto gpu_down_table=workspace_layout.gpu_down_table.address(runtime.workspace);
-    const auto gpu_weight_table=workspace_layout.gpu_weight_table.address(runtime.workspace);
+    const auto gpu_table_entries=static_cast<std::uint64_t>(total_rows)*top_k;
+    std::uint64_t gpu_gate_table=workspace_layout.gpu_gate_table.address(runtime.workspace);
+    std::uint64_t gpu_up_table=workspace_layout.gpu_up_table.address(runtime.workspace);
+    std::uint64_t gpu_down_table=workspace_layout.gpu_down_table.address(runtime.workspace);
+    std::uint64_t gpu_weight_table=workspace_layout.gpu_weight_table.address(runtime.workspace);
     // NVFP4 weight_scale_2 per route, mirroring the decode path: gate/up before
     // SiLU, the linear down scale folded into `up`.
-    const auto gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(runtime.workspace);
-    const auto gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(runtime.workspace);
-    const auto gpu_count_table=workspace_layout.gpu_count_table.address(runtime.workspace);
+    std::uint64_t gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(runtime.workspace);
+    std::uint64_t gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(runtime.workspace);
+    std::uint64_t gpu_count_table=workspace_layout.gpu_count_table.address(runtime.workspace);
     const auto token_device=workspace_layout.token_device.address(runtime.workspace);
     const auto winners=workspace_layout.winners.address(runtime.workspace);
     const auto attention_scores=workspace_layout.attention_scores.address(runtime.workspace);
@@ -426,10 +438,98 @@ void qwen_forward_rows(
     auto*staging=static_cast<std::uint8_t*>(runtime.host_staging);
     const bool prune_experts=expert_policy.route_pruning_allowed()&&
         (runtime.options.expert_top_k>0||(runtime.options.expert_top_p>0.0f&&runtime.options.expert_top_p<1.0f));
-    std::vector<float>gpu_weights(gpu_table_entries);
-    std::vector<float>gpu_gate_scales(gpu_table_entries),gpu_up_scales(gpu_table_entries);
-    std::vector<std::uint64_t>gate_pointers(gpu_table_entries),up_pointers(gpu_table_entries),down_pointers(gpu_table_entries);
-    std::vector<std::int32_t>gpu_counts(rows);
+    std::vector<float>gpu_weights_store(gpu_table_entries);
+    std::vector<float>gpu_gate_scales_store(gpu_table_entries),gpu_up_scales_store(gpu_table_entries);
+    std::vector<std::uint64_t>gate_pointers_store(gpu_table_entries),up_pointers_store(gpu_table_entries),down_pointers_store(gpu_table_entries);
+    std::vector<std::int32_t>gpu_counts_store(total_rows);
+    // Span views over the stores and the host staging regions, re-sliced by
+    // install_span below just like the device regions.
+    float*gpu_weights=gpu_weights_store.data();
+    float*gpu_gate_scales=gpu_gate_scales_store.data();
+    float*gpu_up_scales=gpu_up_scales_store.data();
+    std::uint64_t*gate_pointers=gate_pointers_store.data();
+    std::uint64_t*up_pointers=up_pointers_store.data();
+    std::uint64_t*down_pointers=down_pointers_store.data();
+    std::int32_t*gpu_counts=gpu_counts_store.data();
+    auto*selected_host=reinterpret_cast<std::int32_t*>(
+        staging+host_layout.selected.offset);
+    auto*weights_host=reinterpret_cast<float*>(
+        staging+host_layout.weights.offset);
+    auto*input_host=reinterpret_cast<float*>(
+        staging+host_layout.input.offset);
+    auto*activated_host=reinterpret_cast<float*>(
+        staging+host_layout.activated.offset);
+    auto*down_host=reinterpret_cast<float*>(
+        staging+host_layout.down_input.offset);
+    auto*output_host=reinterpret_cast<float*>(
+        staging+host_layout.output.offset);
+    // One contiguous slice of the row batch, carried through the three phase
+    // functions below. The driver runs a single full-range span today; a
+    // two-half schedule swaps two of these through the same functions, so a
+    // span owns everything that is per-half state: its row range, which of the
+    // two ping-pong buffers holds its current layer input, and the pager clock
+    // that spans cpu_phase into queue_combine.
+    struct RowsSpan{
+        int begin;int count;
+        std::uint64_t hidden;std::uint64_t residual;
+        std::chrono::steady_clock::time_point pager_started;
+    };
+    const auto scratch_stride=static_cast<std::uint64_t>(runtime.scratch_elements);
+    auto install_span=[&](const RowsSpan&span){
+        rows=span.count;
+        span_begin=span.begin;
+        const auto row=static_cast<std::uint64_t>(span.begin);
+        hidden=span.hidden+row*hidden_size*sizeof(float);
+        residual=span.residual+row*hidden_size*sizeof(float);
+        normalized=workspace_layout.normalized.address(runtime.workspace)+row*hidden_size*sizeof(float);
+        first=workspace_layout.first.address(runtime.workspace)+row*scratch_stride*sizeof(float);
+        second=workspace_layout.second.address(runtime.workspace)+row*scratch_stride*sizeof(float);
+        third=workspace_layout.third.address(runtime.workspace)+row*scratch_stride*sizeof(float);
+        fourth=workspace_layout.fourth.address(runtime.workspace)+row*scratch_stride*sizeof(float);
+        router_logits=workspace_layout.router_logits.address(runtime.workspace)+row*experts*sizeof(float);
+        selected_device=workspace_layout.selected_device.address(runtime.workspace)+row*top_k*sizeof(std::int32_t);
+        route_weights=workspace_layout.route_weights.address(runtime.workspace)+row*top_k*sizeof(float);
+        gpu_activated=workspace_layout.gpu_activated.address(runtime.workspace)+row*top_k*intermediate*sizeof(float);
+        small_q8=workspace_layout.rows_q8.address(runtime.workspace)+row*scratch_stride;
+        small_q8_scales=workspace_layout.rows_q8_scales.address(runtime.workspace)+row*(scratch_stride/32+1)*sizeof(float);
+        gpu_gate_table=workspace_layout.gpu_gate_table.address(runtime.workspace)+row*top_k*sizeof(std::uint64_t);
+        gpu_up_table=workspace_layout.gpu_up_table.address(runtime.workspace)+row*top_k*sizeof(std::uint64_t);
+        gpu_down_table=workspace_layout.gpu_down_table.address(runtime.workspace)+row*top_k*sizeof(std::uint64_t);
+        gpu_weight_table=workspace_layout.gpu_weight_table.address(runtime.workspace)+row*top_k*sizeof(float);
+        gpu_gate_scale_table=workspace_layout.gpu_gate_scale_table.address(runtime.workspace)+row*top_k*sizeof(float);
+        gpu_up_scale_table=workspace_layout.gpu_up_scale_table.address(runtime.workspace)+row*top_k*sizeof(float);
+        gpu_count_table=workspace_layout.gpu_count_table.address(runtime.workspace)+row*sizeof(std::int32_t);
+        gpu_weights=gpu_weights_store.data()+row*top_k;
+        gpu_gate_scales=gpu_gate_scales_store.data()+row*top_k;
+        gpu_up_scales=gpu_up_scales_store.data()+row*top_k;
+        gate_pointers=gate_pointers_store.data()+row*top_k;
+        up_pointers=up_pointers_store.data()+row*top_k;
+        down_pointers=down_pointers_store.data()+row*top_k;
+        gpu_counts=gpu_counts_store.data()+row;
+        selected_host=reinterpret_cast<std::int32_t*>(
+            staging+host_layout.selected.offset)+row*top_k;
+        weights_host=reinterpret_cast<float*>(
+            staging+host_layout.weights.offset)+row*top_k;
+        input_host=reinterpret_cast<float*>(
+            staging+host_layout.input.offset)+row*hidden_size;
+        activated_host=reinterpret_cast<float*>(
+            staging+host_layout.activated.offset)+row*top_k*intermediate;
+        down_host=reinterpret_cast<float*>(
+            staging+host_layout.down_input.offset)+row*top_k*hidden_size;
+        output_host=reinterpret_cast<float*>(
+            staging+host_layout.output.offset)+row*hidden_size;
+    };
+    // The same GPU-event split (core / router / transfer) answers "is
+    // route_wait real GPU work or a bubble?" for MTP verification, which is
+    // the phase that currently stalls more than decode. Opt in with
+    // COLIBRI_MTP_PROFILE=1; it accumulates into the prefill_gpu_* counters,
+    // so a probe must snapshot them between the prefill and decode phases.
+    static const bool verify_profile=
+        std::getenv("COLIBRI_MTP_PROFILE")!=nullptr;
+    const bool profile_prefill=
+        (runtime.prefill_profile&&expert_policy.records_prefill_frequency())||
+        (verify_profile&&
+         expert_phase==colibri::v2::ExpertExecutionPhase::verification);
     static const bool trace_phases=std::getenv("COLIBRI_PREFILL_TRACE")
         &&std::getenv("COLIBRI_PREFILL_TRACE")[0]=='2';
     auto phase_clock=std::chrono::steady_clock::now();
@@ -441,21 +541,17 @@ void qwen_forward_rows(
             std::chrono::duration_cast<std::chrono::nanoseconds>(now-phase_clock).count()/1e6);
         phase_clock=now;
     };
-    for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
+    // Phase one of a layer: everything queued to the GPU with no host
+    // synchronization -- norms, DeltaNet/attention, the router and its result
+    // downloads, the route event, and the shared expert. Dense feed-forward
+    // layers complete entirely here (including their residual join) and return
+    // false; a MoE layer returns true with its routed-expert work pending for
+    // cpu_phase and queue_combine.
+    auto queue_core=[&](RowsSpan&span,std::uint32_t layer_number)->bool{
+        install_span(span);
         if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
         auto&layer=runtime.layers[layer_number];
         q8_cached_input=0;q8_cached_width=0;
-        // The same GPU-event split (core / router / transfer) answers "is
-        // route_wait real GPU work or a bubble?" for MTP verification, which is
-        // the phase that currently stalls more than decode. Opt in with
-        // COLIBRI_MTP_PROFILE=1; it accumulates into the prefill_gpu_* counters,
-        // so a probe must snapshot them between the prefill and decode phases.
-        static const bool verify_profile=
-            std::getenv("COLIBRI_MTP_PROFILE")!=nullptr;
-        const bool profile_prefill=
-            (runtime.prefill_profile&&expert_policy.records_prefill_frequency())||
-            (verify_profile&&
-             expert_phase==colibri::v2::ExpertExecutionPhase::verification);
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill layer-start profiling event failed");
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
@@ -662,7 +758,7 @@ void qwen_forward_rows(
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 auto gate=gates+static_cast<std::uint64_t>(token)*
                     (laguna?heads:query_elements)*sizeof(float);
-                int position=static_cast<int>(runtime.position)+token;
+                int position=static_cast<int>(runtime.position)+span_begin+token;
                 auto projected_key=second+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 auto key=first+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 if(laguna){
@@ -709,7 +805,8 @@ void qwen_forward_rows(
             const char*cublas_prefill_env=
                 std::getenv("COLIBRI_CUBLAS_PREFILL_ATTENTION");
             const std::uint64_t max_tokens=
-                runtime.position+static_cast<std::uint64_t>(rows);
+                runtime.position+static_cast<std::uint64_t>(span_begin)+
+                static_cast<std::uint64_t>(rows);
             // The warp-online kernel wins for short prefixes because it needs
             // one launch and no materialized score tile.  Once the visible
             // prefix reaches 4K, tensor-core QK/PV amortize the tiled cuBLAS
@@ -751,15 +848,15 @@ void qwen_forward_rows(
                     attention_scores,first,second,
                     attention_scores+packed_query_bytes,third,
                     runtime.stream,heads,kv_heads,head_dim,rows,capacity,
-                    static_cast<int>(runtime.position),cublas_tile_rows,
-                    scale,1)==0;
+                    static_cast<int>(runtime.position)+span_begin,
+                    cublas_tile_rows,scale,1)==0;
             if(cublas_prefill_done){
                 // Tensor-core attention wrote the already-gated rows to third.
             }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
                 // One warp streams the KV cache once for 4 query rows: cache
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.
-                int base=static_cast<int>(runtime.position);
+                int base=static_cast<int>(runtime.position)+span_begin;
                 void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale};
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
@@ -775,14 +872,14 @@ void qwen_forward_rows(
                      qwen_turbo_prefill_stage(
                          runtime,layer,queries,cache_keys,cache_values,
                          heads,kv_heads,head_dim,rows,
-                         static_cast<int>(runtime.position),
+                         static_cast<int>(runtime.position)+span_begin,
                          stage_keys,stage_values)){
                 // The staged window is dense and ring-free, so it is indexed
                 // with capacity == window. cuBLAS runs ungated here because the
                 // values are still rotated: the gate is a sigmoid and has to
                 // wait until after the inverse rotation below.
-                const int window=static_cast<int>(runtime.position)+rows;
-                int base=static_cast<int>(runtime.position),staged_capacity=window;
+                const int window=static_cast<int>(runtime.position)+span_begin+rows;
+                int base=static_cast<int>(runtime.position)+span_begin,staged_capacity=window;
                 int vectors=rows*heads,value_stream=1,elements=rows*query_elements;
                 const bool staged_cublas=
                     cublas_prefill_requested&&cublas_tile_rows>0&&
@@ -805,7 +902,7 @@ void qwen_forward_rows(
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 auto gate=gates+static_cast<std::uint64_t>(token)*
                     (laguna?heads:query_elements)*sizeof(float);
-                int position=static_cast<int>(runtime.position)+token;
+                int position=static_cast<int>(runtime.position)+span_begin+token;
                 const auto view=attention_cache_view(layer,static_cast<std::uint64_t>(position));
                 int tokens=view.tokens,first_slot=view.first;
                 void*score_args[]={&query,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
@@ -877,8 +974,8 @@ void qwen_forward_rows(
                 launch("silu_mul",(static_cast<std::uint32_t>(staged_count)+255)/256,1,256,staged_silu);
                 dense(moe_base+3,second,third,dense_intermediate,hidden_size,staged[3]);
                 if(runtime.muse)post_rms_rows(third,tensor(13));
-                add_rows(residual,third);std::swap(hidden,residual);
-                continue;
+                add_rows(residual,third);std::swap(span.hidden,span.residual);
+                return false;
             }
             if(layer.ffn_on_host){
                 // Spilled block: its weights are not on the device at all, so
@@ -907,8 +1004,8 @@ void qwen_forward_rows(
                 runtime.dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-host_started).count();
                 if(runtime.muse)post_rms_rows(third,tensor(13));
-                add_rows(residual,third);std::swap(hidden,residual);
-                continue;
+                add_rows(residual,third);std::swap(span.hidden,span.residual);
+                return false;
             }
             const auto up_half=first+static_cast<std::uint64_t>(rows)*dense_intermediate*sizeof(float);
             dense(moe_base+1,normalized,first,hidden_size,dense_intermediate);
@@ -919,8 +1016,8 @@ void qwen_forward_rows(
             dense(moe_base+3,second,third,dense_intermediate,hidden_size);
             // Post-FFN norm, mirroring the post-attention norm above.
             if(runtime.muse)post_rms_rows(third,tensor(13));
-            add_rows(residual,third);std::swap(hidden,residual);
-            continue;
+            add_rows(residual,third);std::swap(span.hidden,span.residual);
+            return false;
         }
         dense(moe_base+1,normalized,router_logits,hidden_size,experts);
         phase(layer_number,"router");
@@ -947,24 +1044,6 @@ void qwen_forward_rows(
             static_cast<std::uint64_t>(rows)*top_k*sizeof(float);
         const auto input_bytes=
             static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-        const auto activated_bytes=
-            static_cast<std::uint64_t>(rows)*top_k*intermediate*sizeof(float);
-        const auto down_bytes=
-            static_cast<std::uint64_t>(rows)*top_k*hidden_size*sizeof(float);
-        const auto output_bytes=
-            static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-        auto*selected_host=reinterpret_cast<std::int32_t*>(
-            staging+host_layout.selected.offset);
-        auto*weights_host=reinterpret_cast<float*>(
-            staging+host_layout.weights.offset);
-        auto*input_host=reinterpret_cast<float*>(
-            staging+host_layout.input.offset);
-        auto*activated_host=reinterpret_cast<float*>(
-            staging+host_layout.activated.offset);
-        auto*down_host=reinterpret_cast<float*>(
-            staging+host_layout.down_input.offset);
-        auto*output_host=reinterpret_cast<float*>(
-            staging+host_layout.output.offset);
         if(colibri_gpu_download(selected_host,selected_device,selected_bytes,runtime.stream)!=0||colibri_gpu_download(weights_host,route_weights,weights_bytes,runtime.stream)!=0||colibri_gpu_download(input_host,normalized,input_bytes,runtime.stream)!=0)
             throw std::runtime_error("native Qwen rows forward route transfer failed");
         if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward route event failed");
@@ -1015,6 +1094,16 @@ void qwen_forward_rows(
             void*scale_args[]={const_cast<std::uint64_t*>(&normalized),&shared_scale,const_cast<std::uint64_t*>(&third),&rows,const_cast<int*>(&hidden_size)};
             launch(sg_type==30?"qwen_shared_scale_rows_bf16":"qwen_shared_scale_rows",rows,1,256,scale_args);
         }
+        return true;
+    };
+    // Phase two of a layer: the host's turn. Wait on the route event, prune
+    // and record routes, build the GPU-resident expert tables (queueing their
+    // uploads and kernels), then run the span's routed experts on the CPU.
+    // The GPU meanwhile executes whatever work is already queued behind the
+    // route downloads.
+    auto cpu_phase=[&](RowsSpan&span,std::uint32_t layer_number){
+        install_span(span);
+        auto&layer=runtime.layers[layer_number];
         const auto route_wait_started=std::chrono::steady_clock::now();
         if(colibri_gpu_event_sync(runtime.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
         if(profile_prefill){
@@ -1033,7 +1122,7 @@ void qwen_forward_rows(
             runtime.prefill_route_wait_nanoseconds+=route_wait_elapsed;
         static const bool trace_layers=std::getenv("COLIBRI_PREFILL_TRACE")!=nullptr;
         if(trace_layers)std::fprintf(stderr,"[trace] layer %2u %s rows=%d sync=%.1fms\n",layer_number,layer.attention?"attn ":"delta",rows,route_wait_elapsed/1e6);
-        const auto pager_started=std::chrono::steady_clock::now();
+        span.pager_started=std::chrono::steady_clock::now();
         if(prune_experts){
             for(int token=0;token<rows;++token){
                 const int keep=apply_expert_router_policy(
@@ -1061,11 +1150,12 @@ void qwen_forward_rows(
         // must keep training the history without touching residency.
         const bool rows_may_admit=expert_policy.misses_may_be_admitted();
         const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
+        const auto span_entries=static_cast<std::size_t>(rows)*top_k;
         if(gpu_table_path){
-            std::fill(gpu_weights.begin(),gpu_weights.end(),0.0f);
-            std::fill(gpu_gate_scales.begin(),gpu_gate_scales.end(),1.0f);
-            std::fill(gpu_up_scales.begin(),gpu_up_scales.end(),1.0f);
-            std::fill(gpu_counts.begin(),gpu_counts.end(),0);
+            std::fill(gpu_weights,gpu_weights+span_entries,0.0f);
+            std::fill(gpu_gate_scales,gpu_gate_scales+span_entries,1.0f);
+            std::fill(gpu_up_scales,gpu_up_scales+span_entries,1.0f);
+            std::fill(gpu_counts,gpu_counts+rows,0);
         }
         if(gpu_rows_allowed){
             for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
@@ -1138,23 +1228,26 @@ void qwen_forward_rows(
             for(int token=0;token<rows;++token)
                 any_gpu=any_gpu||gpu_counts[token]>0;
         if(gpu_table_path){
+            const auto output_bytes=
+                static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
             if(colibri_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward GPU expert reset failed");
-            const auto pointer_bytes=gpu_table_entries*sizeof(std::uint64_t);
-            const auto scale_bytes=gpu_table_entries*sizeof(float);
-            auto*gate_host=staging+host_layout.gate_table.offset;
-            auto*up_host=staging+host_layout.up_table.offset;
-            auto*down_pointer_host=staging+host_layout.down_table.offset;
-            auto*gpu_weight_host=staging+host_layout.weight_table.offset;
-            auto*gpu_gate_scale_host=staging+host_layout.gate_scale_table.offset;
-            auto*gpu_up_scale_host=staging+host_layout.up_scale_table.offset;
-            auto*gpu_count_host=staging+host_layout.counts.offset;
-            std::memcpy(gate_host,gate_pointers.data(),pointer_bytes);
-            std::memcpy(up_host,up_pointers.data(),pointer_bytes);
-            std::memcpy(down_pointer_host,down_pointers.data(),pointer_bytes);
-            std::memcpy(gpu_weight_host,gpu_weights.data(),scale_bytes);
-            std::memcpy(gpu_gate_scale_host,gpu_gate_scales.data(),scale_bytes);
-            std::memcpy(gpu_up_scale_host,gpu_up_scales.data(),scale_bytes);
-            std::memcpy(gpu_count_host,gpu_counts.data(),rows*sizeof(std::int32_t));
+            const auto pointer_bytes=span_entries*sizeof(std::uint64_t);
+            const auto scale_bytes=span_entries*sizeof(float);
+            const auto table_row=static_cast<std::uint64_t>(span_begin)*top_k;
+            auto*gate_host=staging+host_layout.gate_table.offset+table_row*sizeof(std::uint64_t);
+            auto*up_host=staging+host_layout.up_table.offset+table_row*sizeof(std::uint64_t);
+            auto*down_pointer_host=staging+host_layout.down_table.offset+table_row*sizeof(std::uint64_t);
+            auto*gpu_weight_host=staging+host_layout.weight_table.offset+table_row*sizeof(float);
+            auto*gpu_gate_scale_host=staging+host_layout.gate_scale_table.offset+table_row*sizeof(float);
+            auto*gpu_up_scale_host=staging+host_layout.up_scale_table.offset+table_row*sizeof(float);
+            auto*gpu_count_host=staging+host_layout.counts.offset+static_cast<std::uint64_t>(span_begin)*sizeof(std::int32_t);
+            std::memcpy(gate_host,gate_pointers,pointer_bytes);
+            std::memcpy(up_host,up_pointers,pointer_bytes);
+            std::memcpy(down_pointer_host,down_pointers,pointer_bytes);
+            std::memcpy(gpu_weight_host,gpu_weights,scale_bytes);
+            std::memcpy(gpu_gate_scale_host,gpu_gate_scales,scale_bytes);
+            std::memcpy(gpu_up_scale_host,gpu_up_scales,scale_bytes);
+            std::memcpy(gpu_count_host,gpu_counts,rows*sizeof(std::int32_t));
             if(colibri_gpu_upload(gpu_gate_table,gate_host,pointer_bytes,runtime.stream)!=0||
                colibri_gpu_upload(gpu_up_table,up_host,pointer_bytes,runtime.stream)!=0||
                colibri_gpu_upload(gpu_down_table,down_pointer_host,pointer_bytes,runtime.stream)!=0||
@@ -1177,12 +1270,33 @@ void qwen_forward_rows(
         if(expert_policy.records_prefill_frequency())
             runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now()-cpu_expert_started).count();
+    };
+    // Phase three of a layer: fold the experts back in -- upload the CPU
+    // result, sum the GPU-expert and shared-expert contributions into the
+    // residual, and swap the span's ping-pong buffers for the next layer.
+    auto queue_combine=[&](RowsSpan&span){
+        install_span(span);
+        const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
+        const auto output_bytes=
+            static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
         if(colibri_gpu_upload(first,output_host,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward expert upload failed");
-        runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
+        runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-span.pager_started).count();
         if(gpu_table_path){add_rows(fourth,first);add_rows(third,fourth);}
         else add_rows(third,first);
-        add_rows(residual,third);std::swap(hidden,residual);
+        add_rows(residual,third);std::swap(span.hidden,span.residual);
+    };
+    // The phase driver: one full-range span through core -> cpu -> combine per
+    // layer, which is exactly the serial order the loop always ran. The
+    // two-half pipeline schedule will replace only this driver.
+    RowsSpan whole{0,total_rows,hidden,residual,{}};
+    for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
+        if(!queue_core(whole,layer_number))continue;
+        cpu_phase(whole,layer_number);
+        queue_combine(whole);
     }
+    // Reinstall the full range: the head below reads `hidden` from whichever
+    // ping-pong buffer the last layer left the span in.
+    install_span(whole);
     if(output_tokens){
         rms_rows(hidden,runtime.device_tensors[runtime.final_norm],normalized);
         if(colibri_gpu_memset(winners,0,rows*sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward argmax reset failed");
