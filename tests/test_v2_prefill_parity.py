@@ -50,6 +50,9 @@ class PrefillParityTest(unittest.TestCase):
         fixture.LAYERS = cls._layers
         fixture.CONFIG["text_config"]["num_hidden_layers"] = cls._layers
         cls._directory.cleanup()
+        # The backend selection is process-global; leaving the CPU shim
+        # selected sent every later test file in the run through it.
+        V2Model.select_backend("auto")
 
     @staticmethod
     def continuation(model: V2Model, whole: bool) -> list[int]:
