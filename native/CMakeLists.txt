@@ -144,6 +144,19 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    colibri_qwen_format_dispatch_contract
+    tests/qwen_format_dispatch_contract.cpp
+)
+target_compile_features(colibri_qwen_format_dispatch_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_format_dispatch_contract PRIVATE include)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_qwen_format_dispatch_contract
+        COMMAND colibri_qwen_format_dispatch_contract
+    )
+endif()
+
+add_executable(
     colibri_qwen_expert_seed_contract
     tests/qwen_expert_seed_contract.cpp
 )

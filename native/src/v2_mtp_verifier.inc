@@ -209,45 +209,16 @@ void qwen_forward_rows(
     auto dense_rows=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){
         std::uint64_t matrix=staged?staged:runtime.device_tensors[index];
         const auto type=qwen_device_type(runtime,index);
+        const auto*format=colibri::v2::qwen_format(type);
         // Tensor cores where the format has an MMQ kernel; the dp4a tile
         // kernel is the fallback for the rest. Both are resolved before the
         // gate below, because whether either exists is what decides if a wide
-        // MoE batch may enter the block at all.
-        const char* mmq_kernel=nullptr;
-        bool mmq_min=false;
-        switch(type){
-            case 16:mmq_kernel="iq2xxs_q8_mmq";break;
-            case 17:mmq_kernel="iq2xs_q8_mmq";break;
-            case 18:mmq_kernel="iq3xxs_q8_mmq";break;
-            case 22:mmq_kernel="iq2s_q8_mmq";break;
-            case 23:mmq_kernel="iq4xs_q8_mmq";break;
-            case 11:mmq_kernel="q3k_q8_mmq";break;
-            case 14:mmq_kernel="q6k_q8_mmq";break;
-            case 10:mmq_kernel="q2k_q8_mmq";mmq_min=true;break;
-            case 12:mmq_kernel="q4k_q8_mmq";mmq_min=true;break;
-            case 13:mmq_kernel="q5k_q8_mmq";mmq_min=true;break;
-            // IQ1_S carries a per-group delta and still lands here rather
-            // than with the asymmetric three: its delta is +-1/8, so it
-            // folds into the int8 weights exactly. See iq1s_q8_words.
-            case 19:mmq_kernel="iq1s_q8_mmq";break;
-            // IQ1_M folds the same way; its two sub-scales per 32 values
-            // are the half-block split the symmetric kernels already carry.
-            case 29:mmq_kernel="iq1m_q8_mmq";break;
-            default:break;
-        }
-        const char* tiled_kernel=nullptr;
-        switch(type){
-            case 16:tiled_kernel="iq2xxs_q8_matmul_tiled";break;
-            case 17:tiled_kernel="iq2xs_q8_matmul_tiled";break;
-            case 18:tiled_kernel="iq3xxs_q8_matmul_tiled";break;
-            case 22:tiled_kernel="iq2s_q8_matmul_tiled";break;
-            case 23:tiled_kernel="iq4xs_q8_matmul_tiled";break;
-            case 19:tiled_kernel="iq1s_q8_matmul_tiled";break;
-            case 29:tiled_kernel="iq1m_q8_matmul_tiled";break;
-            case 11:tiled_kernel="q3k_q8_matmul_tiled";break;
-            case 14:tiled_kernel="q6k_q8_matmul_tiled";break;
-            default:break;
-        }
+        // MoE batch may enter the block at all. (IQ1_S/IQ1_M land on the
+        // symmetric MMQ rather than with the asymmetric _MIN three: their
+        // per-group deltas fold into the int8 weights exactly.)
+        const char* mmq_kernel=format?format->matmul_q8_mmq:nullptr;
+        const bool mmq_min=format&&format->mmq_min;
+        const char* tiled_kernel=format?format->matmul_q8_tiled:nullptr;
         const char* q8_kernel=nullptr;
         // On MoE the *per-row* path below re-reads the whole weight matrix per
         // row, which only pays off against the reconstruct-in-float matmul when
@@ -264,22 +235,11 @@ void qwen_forward_rows(
         // Q8_0-dense checkpoint, whose type-8 path is already a 32x32 tile.
         const bool batched_kernel=rows>kQ8RowBatch&&
             ((mmq_kernel&&runtime.int8_tensor_cores)||tiled_kernel);
-        if((experts>0?(rows<=8||batched_kernel):true)&&(input_size&255)==0){
-            switch(type){
-                case 10:q8_kernel="q2k_q8_matvec_transposed_warp";break;
-                case 11:q8_kernel="q3k_q8_matvec_transposed_warp";break;
-                case 12:q8_kernel="q4k_q8_matvec_transposed_warp";break;
-                case 13:q8_kernel="q5k_q8_matvec_transposed_warp";break;
-                case 14:q8_kernel="q6k_q8_matvec_transposed_warp";break;
-                case 16:q8_kernel="iq2xxs_q8_matvec_transposed_warp";break;
-                case 17:q8_kernel="iq2xs_q8_matvec_transposed_warp";break;
-                case 18:q8_kernel="iq3xxs_q8_matvec_transposed_warp";break;
-                case 22:q8_kernel="iq2s_q8_matvec_transposed_warp";break;
-                case 19:q8_kernel="iq1s_q8_matvec_transposed_warp";break;
-                case 29:q8_kernel="iq1m_q8_matvec_transposed_warp";break;
-                default:break;
-            }
-        }
+        // rows_q8_gate, not matvec_q8_warp alone: IQ4_XS has the warp kernel
+        // but has never been admitted here (see the format table's drift note).
+        if((experts>0?(rows<=8||batched_kernel):true)&&(input_size&255)==0&&
+           format&&format->rows_q8_gate)
+            q8_kernel=format->matvec_q8_warp;
         if(q8_kernel){
             // The scale rows sit on a float-sized stride (see rows_q8_scales in
             // colibri_v2_workspace.hpp) though the kernels write halves.
@@ -306,22 +266,7 @@ void qwen_forward_rows(
             // kernels, which correct for it with the activation sums; there is
             // no tiled variant for those, so a pre-sm_75 device falls back to
             // the 8-row kernel rather than the 32-token tile.
-            const char* rows_kernel=nullptr;
-            switch(type){
-                case 16:rows_kernel="iq2xxs_q8_matvec_transposed_rows";break;
-                case 17:rows_kernel="iq2xs_q8_matvec_transposed_rows";break;
-                case 18:rows_kernel="iq3xxs_q8_matvec_transposed_rows";break;
-                case 22:rows_kernel="iq2s_q8_matvec_transposed_rows";break;
-                case 23:rows_kernel="iq4xs_q8_matvec_transposed_rows";break;
-                case 11:rows_kernel="q3k_q8_matvec_transposed_rows";break;
-                case 14:rows_kernel="q6k_q8_matvec_transposed_rows";break;
-                case 10:rows_kernel="q2k_q8_matvec_transposed_rows";break;
-                case 12:rows_kernel="q4k_q8_matvec_transposed_rows";break;
-                case 13:rows_kernel="q5k_q8_matvec_transposed_rows";break;
-                case 19:rows_kernel="iq1s_q8_matvec_transposed_rows";break;
-                case 29:rows_kernel="iq1m_q8_matvec_transposed_rows";break;
-                default:break;
-            }
+            const char* rows_kernel=format->matvec_q8_rows;
             // Wide batches take the tiled kernel instead: it stages decoded
             // weights through shared memory and splits tokens across warps, so
             // it covers kQ8TileTokens per weight pass where the rows kernel
@@ -415,29 +360,25 @@ void qwen_forward_rows(
             }
             return;
         }
-        void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
-        switch(type){
-            case 0:launch("qwen_f32_matmul_rows",output_size,rows,256,args);return;
-            case 8:launch("q8_matmul_tiled",(output_size+31)/32,(static_cast<std::uint32_t>(rows)+31)/32,256,args);return;
-            case 30:launch("bf16_matmul_rows",output_size,rows,256,args);return;
-            case 10:launch("q2k_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 11:launch("q3k_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 12:launch("q4k_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 13:launch("q5k_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 14:launch("q6k_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 16:launch("iq2xxs_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 18:launch("iq3xxs_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 22:launch("iq2s_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 21:launch("iq3s_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 17:launch("iq2xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 23:launch("iq4xs_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            case 19:launch("iq1s_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            // IQ1_M: ssm_alpha/ssm_beta. Without this they fall to the
-            // per-token fallback below -- 64 launches of a 48-block grid per
-            // projection per layer -- which is pure launch latency and was the
-            // bulk of the prefill "proj" phase. Batched, it is one launch.
-            case 29:launch("iq1m_matmul_rows",output_size,(rows+3)/4,256,args);return;
-            default:break;
+        // The reconstruct-in-float batch matmul, one launch for the whole
+        // chunk. A format without one (a *future* format: every current type
+        // has an entry) pays the per-token fallback below -- 64 launches of a
+        // 48-block grid per projection per layer, pure launch latency, which
+        // is what IQ1_M's ssm_alpha/ssm_beta measured as the bulk of the
+        // prefill "proj" phase before it got its rows kernel.
+        if(format&&format->matmul_rows){
+            void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
+            using Grid=colibri::v2::RowsMatmulGrid;
+            switch(format->matmul_rows_grid){
+                case Grid::per_token:
+                    launch(format->matmul_rows,output_size,rows,256,args);return;
+                case Grid::tiled32:
+                    launch(format->matmul_rows,(output_size+31)/32,
+                           (static_cast<std::uint32_t>(rows)+31)/32,256,args);return;
+                case Grid::quad_pack:
+                    launch(format->matmul_rows,output_size,(rows+3)/4,256,args);return;
+                case Grid::none:break;
+            }
         }
         // Keep an explicit compatibility fallback for future tensor formats.
         for(int token=0;token<rows;++token){

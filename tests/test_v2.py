@@ -136,6 +136,32 @@ class V2RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expert_residency"):
             V2QwenRuntime(object(), expert_residency="invalid")
 
+    def test_format_dispatch_table_names_are_registered_kernels(self):
+        """Every kernel name in the format table must exist in the driver.
+
+        colibri_gpu_launch_named returns -2 for an unknown name and several
+        callers treat a nonzero return as "no kernel, use the fallback", so a
+        typo or a kernel that was never registered does not fail -- it quietly
+        runs the per-element decoder at a fraction of the bandwidth. That is
+        how the IQ2_XS batched-rows kernel sat dead in the prefill path.
+        """
+        root = Path(__file__).resolve().parents[1]
+        table = (
+            root / "native/include/colibri_v2_format_dispatch.hpp"
+        ).read_text(encoding="utf-8")
+        driver = (
+            root / "native/src/gpu_driver.cpp"
+        ).read_text(encoding="utf-8")
+        names = {
+            name
+            for name in re.findall(r'"([a-z0-9_]+)"', table)
+            # Family stems and IQ prefixes are name fragments, not kernels.
+            if "_" in name
+        }
+        self.assertGreater(len(names), 100, "table parse found too few names")
+        missing = sorted(name for name in names if f'"{name}"' not in driver)
+        self.assertEqual(missing, [], "unregistered kernel names in the table")
+
     def test_rows_forward_only_honors_hybrid_prefill_cpu_in_hybrid_mode(self):
         # The policy derives routed_gpu_execution_allowed()==false from
         # hybrid_prefill_cpu only in hybrid mode. If the rows forward sets the
@@ -346,31 +372,6 @@ class V2RuntimeTests(unittest.TestCase):
         # bug rather than a dispatch bug.
         self.assertIn("if(projected!=0)", body)
         self.assertNotIn("colibri_gpu_q8_matvec_transposed(", body)
-
-    def test_q8_matvec_kernel_names_are_registered_with_the_driver(self):
-        """Every name the Q8 matvec map returns must exist in the driver.
-
-        colibri_gpu_launch_named returns -2 for an unknown name and the
-        callers treat a nonzero return as "no kernel, use the fallback", so a
-        typo or a kernel that was never registered does not fail -- it quietly
-        runs the per-element decoder at a fraction of the bandwidth. That is
-        how the IQ2_XS batched-rows kernel sat dead in the prefill path.
-        """
-        root = Path(__file__).resolve().parents[1]
-        runtime = (
-            root / "native/src/v2_runtime.cpp"
-        ).read_text(encoding="utf-8")
-        driver = (
-            root / "native/src/gpu_driver.cpp"
-        ).read_text(encoding="utf-8")
-
-        start = runtime.index("const char* qwen_q8_matvec_kernel(")
-        body = runtime[start:runtime.index("\n}", start)]
-        names = re.findall(r'return "([a-z0-9_]+)";', body)
-
-        self.assertTrue(names, "no kernel names found in qwen_q8_matvec_kernel")
-        for name in names:
-            self.assertIn(f'"{name}"', driver, f"{name} is not registered")
 
     def test_sampled_topk_stays_on_gpu_until_candidates_are_reduced(self):
         root = Path(__file__).resolve().parents[1]

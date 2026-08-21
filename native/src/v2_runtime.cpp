@@ -12,6 +12,7 @@
 #include "colibri_v2_config.hpp"
 #include "colibri_v2_attention_policy.hpp"
 #include "colibri_v2_expert_policy.hpp"
+#include "colibri_v2_format_dispatch.hpp"
 #include "colibri_v2_expert_seed.hpp"
 #include "colibri_v2_qwen_kernels.hpp"
 #include "colibri_v2_native_kernels.hpp"
@@ -2695,12 +2696,8 @@ const char* qwen_iq_kernel_prefix(std::uint32_t type) {
     // Only the formats with a device octet decoder. IQ2_XXS, IQ2_S and IQ3_S
     // pack their signs and grid indices differently and have no grouped kernel,
     // so models using them still route experts to the CPU.
-    switch(type){
-        case 17: return "iq2xs";
-        case 18: return "iq3xxs";
-        case 23: return "iq4xs";
-        default: return nullptr;
-    }
+    const auto* format = colibri::v2::qwen_format(type);
+    return format ? format->iq_expert_prefix : nullptr;
 }
 
 // Grouped kernel name for an IQ type, empty when the type is not one.
@@ -2804,14 +2801,8 @@ bool qwen_gpu_experts_executable(const ColibriV2QwenRuntime& runtime) {
 // low-bit MoE checkpoints: their routed experts are IQ2/IQ3/IQ4 even when the
 // dense projections are k-quants.
 bool qwen_cpu_expert_type_supported(std::uint32_t type) {
-    switch(type){
-        case 0: case 2: case 8: case 10: case 11: case 12: case 13: case 14:
-        case 16: case 17: case 18: case 19: case 21: case 22: case 23: case 30:
-        case 39: case 40:
-            return true;
-        default:
-            return false;
-    }
+    const auto* format = colibri::v2::qwen_format(type);
+    return format && format->cpu_expert;
 }
 
 void qwen_quant_dot_two_rows(
@@ -3226,19 +3217,46 @@ int qwen_gpu_matvec_by_type(
     return -1;
 }
 
+// The eager per-element driver matvec the decode paths fall back to when the
+// Q8-activation fast path declines. Distinct from qwen_gpu_matvec_by_type
+// above in exactly one way: Q4_K stays on the plain transposed kernel here,
+// because that is what single decode, multi-decode and MTP verification have
+// always launched -- the subblock preference belongs to by_type's callers
+// (the sampler and the rows-forward compatibility fallback) alone.
+//
+// Returns kQwenMatvecUnsupported for a type with no driver matvec at all, so
+// callers can tell "unknown format" from "the launch failed" -- the driver's
+// own failure codes are not distinguishable from any fixed sentinel.
+constexpr int kQwenMatvecUnsupported = -1000000;
+int qwen_matvec_driver(
+    std::uint32_t type, std::uint64_t matrix, std::uint64_t input,
+    std::uint64_t output, int input_size, int output_size, std::uint64_t stream
+) {
+    switch (type) {
+        case 8: return colibri_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 10: return colibri_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 11: return colibri_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 12: return colibri_gpu_q4k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 13: return colibri_gpu_q5k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 14: return colibri_gpu_q6k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 16: return colibri_gpu_iq2xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 17: return colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 18: return colibri_gpu_iq3xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 19: return colibri_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 21: return colibri_gpu_iq3s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 22: return colibri_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 23: return colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 29: return colibri_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        default: break;
+    }
+    return kQwenMatvecUnsupported;
+}
+
 // Q8-activation group-decode LM head, or null where the type has no such
 // kernel and the per-element fused head has to stand in.
 const char* qwen_q8_lm_head_kernel(std::uint32_t type) {
-    switch (type) {
-        case 10: return "q2k_q8_lm_head_argmax_warp";
-        case 11: return "q3k_q8_lm_head_argmax_warp";
-        case 12: return "q4k_q8_lm_head_argmax_warp";
-        case 13: return "q5k_q8_lm_head_argmax_warp";
-        case 14: return "q6k_q8_lm_head_argmax_warp";
-        case 16: return "iq2xxs_q8_lm_head_argmax_warp";
-        case 18: return "iq3xxs_q8_lm_head_argmax_warp";
-        default: return nullptr;
-    }
+    const auto* format = colibri::v2::qwen_format(type);
+    return format ? format->lm_head_argmax_q8 : nullptr;
 }
 
 // Q8-activation group-decode matvec, or null where the type has none. This is
@@ -3246,41 +3264,13 @@ const char* qwen_q8_lm_head_kernel(std::uint32_t type) {
 // returns an argmax, so anything that needs the distribution itself -- the
 // temperature path -- has to project with one of these instead.
 const char* qwen_q8_matvec_kernel(std::uint32_t type) {
-    switch (type) {
-        case 10: return "q2k_q8_matvec_transposed_warp";
-        case 11: return "q3k_q8_matvec_transposed_warp";
-        case 12: return "q4k_q8_matvec_transposed_warp";
-        case 13: return "q5k_q8_matvec_transposed_warp";
-        case 14: return "q6k_q8_matvec_transposed_warp";
-        case 16: return "iq2xxs_q8_matvec_transposed_warp";
-        case 17: return "iq2xs_q8_matvec_transposed_warp";
-        case 18: return "iq3xxs_q8_matvec_transposed_warp";
-        case 19: return "iq1s_q8_matvec_transposed_warp";
-        case 29: return "iq1m_q8_matvec_transposed_warp";
-        case 22: return "iq2s_q8_matvec_transposed_warp";
-        case 23: return "iq4xs_q8_matvec_transposed_warp";
-        default: return nullptr;
-    }
+    const auto* format = colibri::v2::qwen_format(type);
+    return format ? format->matvec_q8_warp : nullptr;
 }
 
 const char* qwen_lm_head_argmax_kernel(std::uint32_t type) {
-    switch (type) {
-        case 0: return "f32_lm_head_argmax_warp";
-        case 8: return "q8_lm_head_argmax_warp";
-        case 10: return "q2k_lm_head_argmax_warp";
-        case 11: return "q3k_lm_head_argmax_warp";
-        case 12: return "q4k_lm_head_argmax_warp";
-        case 13: return "q5k_lm_head_argmax_warp";
-        case 14: return "q6k_lm_head_argmax_warp";
-        case 16: return "iq2xxs_lm_head_argmax_warp";
-        case 18: return "iq3xxs_lm_head_argmax_warp";
-        case 22: return "iq2s_lm_head_argmax_warp";
-        case 21: return "iq3s_lm_head_argmax_warp";
-        case 17: return "iq2xs_lm_head_argmax_warp";
-        case 23: return "iq4xs_lm_head_argmax_warp";
-        case 30: return "bf16_lm_head_argmax_warp";
-        default: break;
-    }
+    const auto* format = colibri::v2::qwen_format(type);
+    if (format && format->lm_head_argmax) return format->lm_head_argmax;
     throw std::runtime_error(
         "native Qwen LM-head type is unsupported: " + std::to_string(type));
 }
@@ -3344,23 +3334,9 @@ const std::uint8_t* qwen_alias_static_tensor(
 }
 
 const char* qwen_embedding_kernel(std::uint32_t type, bool rows) {
-    switch (type) {
-        case 0: return rows ? "qwen_f32_embedding_rows" : "qwen_f32_embedding";
-        case 8: return rows ? "qwen_q8_embedding_rows" : "qwen_q8_embedding";
-        case 30: return rows ? "qwen_bf16_embedding_rows" : "qwen_bf16_embedding";
-        case 10: return rows ? "qwen_q2k_embedding_rows" : "qwen_q2k_embedding";
-        case 16: return rows ? "qwen_iq2xxs_embedding_rows" : "qwen_iq2xxs_embedding";
-        case 18: return rows ? "qwen_iq3xxs_embedding_rows" : "qwen_iq3xxs_embedding";
-        case 22: return rows ? "qwen_iq2s_embedding_rows" : "qwen_iq2s_embedding";
-        case 21: return rows ? "qwen_iq3s_embedding_rows" : "qwen_iq3s_embedding";
-        case 17: return rows ? "qwen_iq2xs_embedding_rows" : "qwen_iq2xs_embedding";
-        case 23: return rows ? "qwen_iq4xs_embedding_rows" : "qwen_iq4xs_embedding";
-        case 11: return rows ? "qwen_q3k_embedding_rows" : "qwen_q3k_embedding";
-        case 12: return rows ? "qwen_q4k_embedding_rows" : "qwen_q4k_embedding";
-        case 13: return rows ? "qwen_q5k_embedding_rows" : "qwen_q5k_embedding";
-        case 14: return rows ? "qwen_q6k_embedding_rows" : "qwen_q6k_embedding";
-        default: break;
-    }
+    const auto* format = colibri::v2::qwen_format(type);
+    if (format && format->embedding)
+        return rows ? format->embedding_rows : format->embedding;
     throw std::runtime_error(
         "native Qwen embedding table type is unsupported: " + std::to_string(type));
 }
@@ -11424,62 +11400,16 @@ void qwen_mtp_dense_projection(
             launch("bf16_matvec_warp", (output_size + 7) / 8, args);
             return;
         }
-        case 8:
-            if (colibri_gpu_q8_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 16:
-            if (colibri_gpu_iq2xxs_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 18:
-            if (colibri_gpu_iq3xxs_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 22:
-            if (colibri_gpu_iq2s_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 21:
-            if (colibri_gpu_iq3s_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 17:
-            if (colibri_gpu_iq2xs_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 23:
-            if (colibri_gpu_iq4xs_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 19:
-            if (colibri_gpu_iq1s_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 10:
-            if (colibri_gpu_q2k_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 11:
-            if (colibri_gpu_q3k_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 13:
-            if (colibri_gpu_q5k_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 12:
-            if (colibri_gpu_q4k_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        case 14:
-            if (colibri_gpu_q6k_matvec_transposed(
-                    matrix,input,output,input_size,output_size,runtime.stream)==0) return;
-            break;
-        default:
-            throw std::runtime_error(
-                "native MTP dense projection type is unsupported: " +
-                std::to_string(type));
+        default: {
+            const int status = qwen_matvec_driver(
+                type, matrix, input, output, input_size, output_size,
+                runtime.stream);
+            if (status == 0) return;
+            if (status == kQwenMatvecUnsupported)
+                throw std::runtime_error(
+                    "native MTP dense projection type is unsupported: " +
+                    std::to_string(type));
+        }
     }
     throw std::runtime_error("native MTP dense projection failed");
 }
@@ -12551,62 +12481,16 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     auto dense_matvec=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         std::uint64_t matrix=runtime->device_tensors[index];
         const auto type=qwen_device_type(*runtime,index);
-        switch(type){
-            case 0:{void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);return;}
-            // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
-            case 30:{void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
-            case 8:if(colibri_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 16:
-                if(q8_decode("iq2xxs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_iq2xxs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 18:
-                if(q8_decode("iq3xxs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_iq3xxs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 22:
-                if(q8_decode("iq2s_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_iq2s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 21:if(colibri_gpu_iq3s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;break;
-            case 17:
-                if(q8_decode("iq2xs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_iq2xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 23:
-                if(q8_decode("iq4xs_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_iq4xs_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 19:
-                if(q8_decode("iq1s_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_iq1s_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 29:
-                if(q8_decode("iq1m_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_iq1m_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 10:
-                if(q8_decode("q2k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_q2k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 11:
-                if(q8_decode("q3k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_q3k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 13:
-                if(q8_decode("q5k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_q5k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 12:
-                if(q8_decode("q4k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_q4k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            case 14:
-                if(q8_decode("q6k_q8_matvec_transposed_warp",matrix,input,output,input_size,output_size))return;
-                if(colibri_gpu_q6k_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)==0)return;
-                break;
-            default:throw std::runtime_error("native Qwen dense projection type is unsupported: "+std::to_string(type));
-        }
+        if(type==0){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);return;}
+        // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
+        if(type==30){void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
+        const auto*format=colibri::v2::qwen_format(type);
+        if(format&&format->matvec_q8_warp&&
+           q8_decode(format->matvec_q8_warp,matrix,input,output,input_size,output_size))return;
+        const int status=qwen_matvec_driver(type,matrix,input,output,input_size,output_size,launch_stream);
+        if(status==0)return;
+        if(status==kQwenMatvecUnsupported)
+            throw std::runtime_error("native Qwen dense projection type is unsupported: "+std::to_string(type));
         throw std::runtime_error("native Qwen dense projection failed");
     };
     auto add=[&](std::uint64_t target,std::uint64_t source){float scale=1.0f;int count=hidden_size;void*args[]={&target,&source,&scale,&count};launch_named("scaled_add",(hidden_size+255)/256,1,256,args);};
@@ -15438,61 +15322,17 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
     auto dense_matvec = [&](std::size_t index, std::uint64_t input, std::uint64_t output, int in_size, int out_size) {
         std::uint64_t matrix = runtime->device_tensors[index];
         const auto type = qwen_device_type(*runtime, index);
-        switch (type) {
-            case 0: { void* args[] = {&matrix, &input, &output, &in_size, &out_size}; launch_named("qwen_f32_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
-            case 30: { void* args[] = {&matrix, &input, &output, &out_size, &in_size}; launch_named("bf16_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
-            case 8: if (colibri_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 16:
-                if (q8_decode("iq2xxs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_iq2xxs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 18:
-                if (q8_decode("iq3xxs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_iq3xxs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 22:
-                if (q8_decode("iq2s_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_iq2s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 21: if (colibri_gpu_iq3s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return; break;
-            case 17:
-                if (q8_decode("iq2xs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 23:
-                if (q8_decode("iq4xs_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 19:
-                if (q8_decode("iq1s_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_iq1s_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 29:
-                if (q8_decode("iq1m_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_iq1m_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 10:
-                if (q8_decode("q2k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_q2k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 11:
-                if (q8_decode("q3k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_q3k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 13:
-                if (q8_decode("q5k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_q5k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 12:
-                if (q8_decode("q4k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_q4k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            case 14:
-                if (q8_decode("q6k_q8_matvec_transposed_warp", matrix, input, output, in_size, out_size)) return;
-                if (colibri_gpu_q6k_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) == 0) return;
-                break;
-            default: throw std::runtime_error("native Qwen dense projection type is unsupported: " + std::to_string(type));
-        }
+        if (type == 0) { void* args[] = {&matrix, &input, &output, &in_size, &out_size}; launch_named("qwen_f32_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
+        // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
+        if (type == 30) { void* args[] = {&matrix, &input, &output, &out_size, &in_size}; launch_named("bf16_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
+        const auto* format = colibri::v2::qwen_format(type);
+        if (format && format->matvec_q8_warp &&
+            q8_decode(format->matvec_q8_warp, matrix, input, output, in_size, out_size)) return;
+        const int status = qwen_matvec_driver(
+            type, matrix, input, output, in_size, out_size, runtime->stream);
+        if (status == 0) return;
+        if (status == kQwenMatvecUnsupported)
+            throw std::runtime_error("native Qwen dense projection type is unsupported: " + std::to_string(type));
         throw std::runtime_error("native Qwen dense projection failed");
     };
     auto add = [&](std::uint64_t target, std::uint64_t source) { float scale = 1.0f; int count = hidden_size; void* args[] = {&target, &source, &scale, &count}; launch_named("scaled_add", (hidden_size + 255) / 256, 1, 256, args); };
