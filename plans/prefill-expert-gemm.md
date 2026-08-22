@@ -78,3 +78,35 @@ existing suites.
    orchestration behind the same env budget. Gates 1–2.
 2. Live budget sweep, interleaved A/B at the best budget, gate 3. Then
    decide default-on and the promotion of the env knob to an option.
+
+## Status (2026-08-22) — landed, +31% measured
+
+`6753734`. The budget sweep at 4 K (single samples, hot machine):
+
+| budget | tok/s | cpu_moe | streamed |
+|---:|---:|---:|---:|
+| 32 MiB | 767 | 4.21 s | 4.8 GiB |
+| **48 MiB** | **810** | 3.83 s | 6.9 GiB |
+| 64 MiB | 781 | 3.47 s | 9.6 GiB |
+| 128 MiB | 743 | 2.43 s | 19.9 GiB |
+| 256 MiB | 661 | 1.55 s | 39.8 GiB |
+| 1 GiB | 515 | 0.45 s | 77 GiB |
+
+Interleaved A/B at the optimum: **617 → 810 tok/s (+31%)** over the best
+prior config (pipeline + 2048-row chunks). The optimum is small because
+per-half-layer restaging cost scales with budget while the densest-first
+benefit saturates; big budgets drown in their own re-uploads. Gates: budget
+0 bit-identical live, streamed-all ≡ resident-all on the Q8_0 fixture
+through the GEMM path, fixed budget deterministic, suites green.
+
+Open follow-ups, each its own measured decision:
+- Default-on with a small auto-sized budget (and promotion of the env knob
+  to a runtime option) — needs decode-side and multi-model coverage first.
+- Persistent staging across chunks/halves for the stable dense experts
+  would cut the restaging term and move the optimum right.
+- The 2048-row chunk interaction re-measures under streaming (the old 653
+  datum predates it).
+
+Session arc for prompt speed on this configuration: 413 tok/s (serial, two
+days ago) → 586 (pipeline) → 653 (+2048 rows) → **810 (expert GEMM)** —
+**+96%** end to end, bit-identical or gated at every step.
