@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import dataclasses
 import datetime
 import json
 import sys
@@ -1534,6 +1535,23 @@ class NativeV2Generator(ChatGenerator):
         }
 
 
+@dataclasses.dataclass
+class _BailingActive:
+    """One generation in flight, and everything a step of it needs.
+
+    Mutable and held by the engine thread alone: `pending` is the token the
+    next step feeds its slot, which is the prompt's last token to begin with
+    and the previous sample after that.
+    """
+
+    task_id: int
+    slot: int
+    pending: int
+    stops: set
+    sampling: object
+    remaining: int
+
+
 class BailingEngine:
     """Engine adapter for the BailingMoE3 host/GPU runtime.
 
@@ -1570,10 +1588,14 @@ class BailingEngine:
         self._closing = False
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
-        # Exact token sequence represented by the runtime's single live cache.
-        # Ordinary conversation continuation extends this sequence exactly.
-        self._cached_tokens: list[int] = []
-        self._cache_initialized = False
+        # One live sequence per slot, and the exact tokens each holds.
+        # Ordinary conversation continuation extends one of them exactly.
+        self._slot_count = max(1, int(getattr(runtime, "slot_count", 1) or 1))
+        self._slot_tokens: list[list[int]] = [[] for _ in range(self._slot_count)]
+        self._slot_initialized = [False] * self._slot_count
+        self._free_slots = list(range(self._slot_count))
+        # task_id -> the in-flight generation state a step advances.
+        self._active: dict[int, _BailingActive] = {}
         # Sequences that are not live, kept so they need not be re-prefilled.
         #
         # A coding harness does not send one conversation: a short side-call
@@ -1667,30 +1689,147 @@ class BailingEngine:
         return True
 
     def _run(self) -> None:
+        """Admit what fits, then advance every live generation one token.
+
+        One task used to run start to finish before the next was looked at, so
+        a request arriving behind a long generation waited out all of it. With
+        a slot each they interleave: a 4000-token answer no longer holds up
+        the 50-token one behind it.
+
+        Prefill is still done at admission, in one call, so a very long prompt
+        does hold the others for its duration -- a far smaller window than a
+        whole generation, and chunking it is the next step if it bites.
+        """
         while True:
             with self._lock:
-                if self._closing and not self._pending:
+                if self._closing and not self._pending and not self._active:
                     return
-                task = self._pending.pop(0) if self._pending else None
-            if task is None:
+                idle = not self._pending and not self._active
+            if idle:
                 self._wake.wait(timeout=0.05)
                 self._wake.clear()
                 continue
+            self._admit_pending()
+            if not self._step_active():
+                # Nothing advanced: everything is either finished or waiting
+                # for a slot that has not freed yet.
+                self._wake.wait(timeout=0.002)
+                self._wake.clear()
+
+    def _admit_pending(self) -> None:
+        while True:
+            with self._lock:
+                if not self._pending or not self._free_slots or self._closing:
+                    return
+                task = self._pending.pop(0)
+                slot = self._take_slot(task[1])
             task_id, prompt_ids, max_new_tokens, stop_tokens, sampling = task
             try:
-                self._run_task(task_id, prompt_ids, max_new_tokens,
-                               stop_tokens, sampling)
+                active = self._prefill(task_id, slot, prompt_ids,
+                                       max_new_tokens, stop_tokens, sampling)
             except Exception as error:  # keep the worker alive across failures
-                # What the runtime holds is no longer known. Evaluation
-                # advances the runtime's position token by token and the token
-                # list is only extended once a call returns, so a throw partway
-                # through a prompt leaves the two disagreeing -- and a snapshot
-                # taken from that state would be handed back later as a valid
-                # prefix it is not. Forget the live sequence; existing snapshots
-                # are unaffected, since restoring one sets the position itself.
-                self._cache_initialized = False
-                self._cached_tokens.clear()
+                self._forget_slot(slot)
                 self._emit(task_id, ("error", str(error)))
+                continue
+            if active is None:
+                self._release_slot(slot)
+                continue
+            with self._lock:
+                self._active[task_id] = active
+
+    def _take_slot(self, prompt_ids: list[int]) -> int:
+        """The free slot that already holds the most of this prompt.
+
+        Affinity, not round-robin: a conversation's next turn extends the
+        sequence its own slot is still holding, and handing it a different
+        slot would throw that away and re-prefill from a snapshot at best.
+        Called with the lock held.
+        """
+        best, best_live = self._free_slots[0], -1
+        for slot in self._free_slots:
+            live = len(self._slot_tokens[slot])
+            if not self._slot_initialized[slot]:
+                live = 0
+            elif live >= len(prompt_ids) or prompt_ids[:live] != self._slot_tokens[slot]:
+                live = 0  # not a prefix of this prompt: no affinity at all
+            if live > best_live:
+                best, best_live = slot, live
+        self._free_slots.remove(best)
+        return best
+
+    def _release_slot(self, slot: int) -> None:
+        with self._lock:
+            if slot not in self._free_slots:
+                self._free_slots.append(slot)
+
+    def _forget_slot(self, slot: int) -> None:
+        """Give up on what a slot holds, and hand it back.
+
+        Evaluation advances the runtime's position token by token while the
+        token list is only extended once a call returns, so a throw partway
+        through a prompt leaves the two disagreeing -- and a snapshot taken
+        from that state would be handed back later as a valid prefix it is
+        not. Existing snapshots are unaffected: restoring one sets the
+        position itself.
+        """
+        with self._lock:
+            self._slot_initialized[slot] = False
+            self._slot_tokens[slot].clear()
+            if slot not in self._free_slots:
+                self._free_slots.append(slot)
+
+    def _step_active(self) -> bool:
+        """Advance every live generation by one token. False if none moved."""
+        with self._lock:
+            active = list(self._active.values())
+        moved = False
+        for task in active:
+            try:
+                finished = self._step(task)
+            except Exception as error:
+                self._forget_slot(task.slot)
+                with self._lock:
+                    self._active.pop(task.task_id, None)
+                self._emit(task.task_id, ("error", str(error)))
+                continue
+            moved = True
+            if finished:
+                self._release_slot(task.slot)
+                with self._lock:
+                    self._active.pop(task.task_id, None)
+        return moved
+
+    def _step(self, task: "_BailingActive") -> bool:
+        """One token for one slot. True when the generation is over.
+
+        The eval and the sample are one step on purpose. The runtime keeps a
+        single logits buffer that the last evaluation filled, whichever slot
+        it belonged to, so sampling a slot that another slot has evaluated
+        since would read the wrong sequence's logits -- and produce fluent,
+        confidently wrong text rather than an error.
+        """
+        self.runtime.eval_into([task.pending], slot=task.slot)
+        self._slot_tokens[task.slot].append(task.pending)
+        token = self.runtime.sample(task.sampling)
+        if not self._emit(task.task_id, ("token", token)):
+            return True
+        task.remaining -= 1
+        if token in task.stops:
+            # A stop token ends the turn and is not part of what comes back,
+            # so it is never evaluated -- as before slots existed.
+            self._emit(task.task_id, ("done", None))
+            return True
+        if task.remaining <= 0:
+            # Out of budget, but the reply is what the next turn will send
+            # back, so leave the slot holding all of it rather than one token
+            # short. Without this every continuation re-evaluates the last
+            # token it already had.
+            self.runtime.eval_into([token], slot=task.slot)
+            self._slot_tokens[task.slot].append(token)
+            self._emit(task.task_id, ("done", None))
+            return True
+        task.pending = token
+        return False
 
     def cache_stats(self) -> dict[str, int]:
         """Sequences put aside, and how much prefill they have saved.
@@ -1710,8 +1849,9 @@ class BailingEngine:
     def _drop_snapshot(self, key: tuple[int, ...]) -> None:
         self._snapshot_bytes -= len(self._snapshots.pop(key))
 
-    def _remember_live_sequence(self, protect: tuple[int, ...] | None = None) -> None:
-        """Put the live sequence aside so it need not be prefilled again.
+    def _remember_live_sequence(self, slot: int,
+                                protect: tuple[int, ...] | None = None) -> None:
+        """Put a slot's live sequence aside so it need not be prefilled again.
 
         `protect` is a snapshot the caller is about to restore from. Two turns
         of one conversation are nearly the same size, so storing the second can
@@ -1719,15 +1859,15 @@ class BailingEngine:
         which is exactly the one being restored. Evicting it turned a hit into a
         full prefill of a prompt the cache was holding.
         """
-        if not self._cache_initialized or not self._cached_tokens:
+        if not self._slot_initialized[slot] or not self._slot_tokens[slot]:
             return
         if self._snapshot_budget <= 0:  # --cache off
             return
-        key = tuple(self._cached_tokens)
+        key = tuple(self._slot_tokens[slot])
         if key in self._snapshots:
             self._snapshots.move_to_end(key)
             return
-        snapshot = self.runtime.save_state()
+        snapshot = self.runtime.save_state(slot=slot)
         self._snapshots[key] = snapshot
         self._snapshot_bytes += len(snapshot)
         for candidate in list(self._snapshots):
@@ -1741,8 +1881,8 @@ class BailingEngine:
         if self._snapshot_bytes > self._snapshot_budget:
             self._drop_snapshot(key)
 
-    def _restore_longest_prefix(self, prompt_ids: list[int]) -> int:
-        """Put the runtime on the longest known prefix of this prompt.
+    def _restore_longest_prefix(self, slot: int, prompt_ids: list[int]) -> int:
+        """Put one slot on the longest known prefix of this prompt.
 
         Returns how many of the prompt's tokens the caches already hold. At
         least one token is always left to evaluate: the sampler reads the logits
@@ -1750,11 +1890,11 @@ class BailingEngine:
         from whatever the previous sequence left in the buffer.
         """
         limit = len(prompt_ids) - 1
-        live = len(self._cached_tokens)
+        live = len(self._slot_tokens[slot])
         if (
-            self._cache_initialized
+            self._slot_initialized[slot]
             and live <= limit
-            and prompt_ids[:live] == self._cached_tokens
+            and prompt_ids[:live] == self._slot_tokens[slot]
         ):
             self.reused_tokens += live
             return live
@@ -1767,18 +1907,19 @@ class BailingEngine:
                 continue
             if prompt_ids[:length] == list(candidate):
                 best = candidate
-        # Switching away from the live sequence: keep it before it is lost.
-        self._remember_live_sequence(protect=best)
+        # Switching away from this slot's live sequence: keep it before it is
+        # lost. Only this slot's is at risk; the others are untouched.
+        self._remember_live_sequence(slot, protect=best)
         if best is not None:
-            self.runtime.load_state(self._snapshots[best])
+            self.runtime.load_state(self._snapshots[best], slot=slot)
             self._snapshots.move_to_end(best)
-            self._cached_tokens = list(best)
-            self._cache_initialized = True
+            self._slot_tokens[slot] = list(best)
+            self._slot_initialized[slot] = True
             self.reused_tokens += len(best)
             return len(best)
-        self.runtime.reset()
-        self._cached_tokens.clear()
-        self._cache_initialized = True
+        self.runtime.reset(slot=slot)
+        self._slot_tokens[slot].clear()
+        self._slot_initialized[slot] = True
         return 0
 
     def _prefill_progress(self, task_id: int, processed: int, total: int) -> bool:
@@ -1800,11 +1941,18 @@ class BailingEngine:
             pass
         return True
 
-    def _run_task(self, task_id, prompt_ids, max_new_tokens, stop_tokens, sampling):
+    def _prefill(self, task_id, slot, prompt_ids, max_new_tokens, stop_tokens,
+                 sampling) -> "_BailingActive | None":
+        """Put a slot on this prompt. None when there is nothing to generate.
+
+        Everything but the prompt's final token is evaluated here; that last
+        token is left for the first step, which is what keeps every sample
+        immediately behind its own slot's evaluation.
+        """
         if not prompt_ids:
             self._emit(task_id, ("done", None))
-            return
-        cached = self._restore_longest_prefix(prompt_ids)
+            return None
+        cached = self._restore_longest_prefix(slot, prompt_ids)
         # Make reuse and long prefills visible to the HTTP progress logger. The
         # runtime reports per tile while the prompt runs, so a long one shows
         # movement instead of one line minutes later, and a request whose client
@@ -1831,25 +1979,23 @@ class BailingEngine:
             try:
                 head = suffix[:-1]
                 if head:
-                    self.runtime.eval_into(head)
-                    self._cached_tokens.extend(head)
+                    self.runtime.eval_into(head, slot=slot)
+                    self._slot_tokens[slot].extend(head)
                     if len(head) >= self._SNAPSHOT_PREFILL_THRESHOLD:
-                        self._remember_live_sequence()
-                self.runtime.eval_into(suffix[-1:])
-                self._cached_tokens.append(suffix[-1])
+                        self._remember_live_sequence(slot)
             finally:
                 self.runtime.set_progress(None)
         self._emit(task_id, ("prefill", len(prompt_ids)))
-        stops = set(stop_tokens)
-        for _ in range(max_new_tokens):
-            token = self.runtime.sample(sampling)
-            if not self._emit(task_id, ("token", token)):
-                return
-            if token in stops:
-                break
-            self.runtime.eval_into([token])
-            self._cached_tokens.append(token)
-        self._emit(task_id, ("done", None))
+        if max_new_tokens <= 0:
+            self._emit(task_id, ("done", None))
+            return None
+        # The prompt's last token is the first step's input, so the sample that
+        # follows it reads this slot's own logits.
+        return _BailingActive(
+            task_id=task_id, slot=slot, pending=prompt_ids[-1],
+            stops=set(stop_tokens), sampling=sampling,
+            remaining=max_new_tokens,
+        )
 
 
 class BailingGenerator(ChatGenerator):
@@ -1931,6 +2077,7 @@ class NativeV2InferenceService(InferenceService):
                 reasoning_effort=reasoning_effort,
                 generation_defaults=generation_defaults,
                 prompt_cache_mib=prompt_cache_mib,
+                parallel_sequences=parallel_sequences,
             )
             self.generation_defaults_source = generation_defaults_source
             self.gpu_cache_mib = gpu_cache_mib
@@ -2006,10 +2153,18 @@ class NativeV2InferenceService(InferenceService):
                       cors_origin, strict_model, max_concurrent_requests,
                       request_timeout_seconds, sse_keepalive_seconds,
                       max_tool_call_tokens, generation_defaults,
-                      reasoning_effort=None, prompt_cache_mib=0) -> None:
+                      reasoning_effort=None, prompt_cache_mib=0,
+                      parallel_sequences=1) -> None:
         self.v2_runtime = None
         tokenizer = NativeV2Tokenizer(self.v2_model)
-        self.bailing_runtime = BailingRuntime(self.v2_model, capacity=context_window)
+        # --parallel means the same thing here as on the Qwen runtime:
+        # independent sequences that decode without waiting for each other.
+        # A slot costs its caches alone, and the runtime refuses a count that
+        # will not fit rather than allocating until it cannot.
+        self.bailing_runtime = BailingRuntime(
+            self.v2_model, capacity=context_window,
+            slots=max(1, int(parallel_sequences or 1)),
+        )
         # This runtime's prompt cache is the snapshot store: the same budget,
         # spent on put-aside sequences rather than the Qwen runtime's blocks.
         # `auto` is a sentinel the caller passes through, not a size.
@@ -2061,7 +2216,9 @@ class NativeV2InferenceService(InferenceService):
                 "backend": "native-v2-bailingmoe3",
                 "architecture": self.architecture,
                 "device": "gpu" if self.bailing_runtime.uses_gpu else "cpu",
-                "parallel_sequences": 1,
+                "parallel_sequences": int(
+                    getattr(self.bailing_runtime, "slot_count", 1)
+                ),
             }
             return value
         if self.v2_runtime is None:

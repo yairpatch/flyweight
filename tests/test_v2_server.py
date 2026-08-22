@@ -146,43 +146,61 @@ class StubV2Runtime:
 
 
 class StubBailingRuntime:
-    def __init__(self) -> None:
+    """The runtime the engine talks to, with as many slots as asked for.
+
+    Positions are per slot, and `position` reports slot 0's, so the
+    single-slot tests read exactly as they did before slots existed.
+    """
+
+    def __init__(self, slots: int = 1) -> None:
         self.resets = 0
         self.eval_calls: list[list[int]] = []
         self.next_token = 20
         self.uses_gpu = False
-        self.position = 0
+        self.slot_count = slots
+        self.positions = [0] * slots
         self.saves = 0
         self.loads: list[bytes] = []
         self.progress = None
+        # Which slot each evaluation landed on, for the interleaving tests.
+        self.eval_slots: list[int] = []
 
-    def reset(self) -> None:
+    @property
+    def position(self) -> int:
+        return self.positions[0]
+
+    @position.setter
+    def position(self, value: int) -> None:
+        self.positions[0] = value
+
+    def reset(self, slot: int = 0) -> None:
         self.resets += 1
-        self.position = 0
+        self.positions[slot] = 0
 
     def set_progress(self, callback) -> None:
         self.progress = callback
 
-    def eval_into(self, tokens) -> None:
+    def eval_into(self, tokens, slot: int = 0) -> None:
         tokens = list(tokens)
         # The runtime reports per tile while a prompt runs and stops when the
         # watcher says so; a tile here is two tokens, so tests stay small.
         if self.progress is not None and len(tokens) > 1:
             for offset in range(0, len(tokens), 2):
                 if self.progress(offset, len(tokens)) is False:
-                    self.position += offset
+                    self.positions[slot] += offset
                     raise RuntimeError("bailing prompt evaluation was cancelled")
         self.eval_calls.append(tokens)
-        self.position += len(tokens)
+        self.eval_slots.append(slot)
+        self.positions[slot] += len(tokens)
 
-    def save_state(self) -> bytes:
+    def save_state(self, slot: int = 0) -> bytes:
         self.saves += 1
-        return f"state@{self.position}".encode()
+        return f"state@{self.positions[slot]}".encode()
 
-    def load_state(self, snapshot: bytes) -> None:
+    def load_state(self, snapshot: bytes, slot: int = 0) -> None:
         self.loads.append(snapshot)
         # Trailing padding lets a subclass give a snapshot a realistic size.
-        self.position = int(snapshot.decode().split("@")[1].rstrip("."))
+        self.positions[slot] = int(snapshot.decode().split("@")[1].rstrip("."))
 
     def sample(self, _sampling) -> int:
         self.next_token += 1
@@ -334,7 +352,92 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertLess(runtime.position, 40)
         self.assertEqual(runtime.eval_calls, [])
         # And what the runtime holds is no longer known, so it is forgotten.
-        self.assertFalse(engine._cache_initialized)
+        self.assertFalse(engine._slot_initialized[0])
+
+    def test_bailing_engine_interleaves_requests_across_slots(self) -> None:
+        # The point of slots. With one, a request submitted behind a long
+        # generation waited out all of it: a 50-token answer sat behind a
+        # 4000-token one. Two slots must make progress on both at once.
+        class GatedRuntime(StubBailingRuntime):
+            """Holds its very first evaluation until the test says go.
+
+            Without it the stub finishes the long generation microseconds
+            after submit, before the second request is even queued, and the
+            test proves nothing about interleaving.
+            """
+
+            def __init__(self) -> None:
+                super().__init__(slots=2)
+                self.reached = threading.Event()
+                self.gate = threading.Event()
+
+            def eval_into(self, tokens, slot: int = 0) -> None:
+                if not self.reached.is_set():
+                    self.reached.set()
+                    self.gate.wait(2)
+                super().eval_into(tokens, slot)
+
+        runtime = GatedRuntime()
+        engine = BailingEngine(runtime)
+        self.assertEqual(engine._slot_count, 2)
+        try:
+            long_id, long_events = engine.submit([1, 2], 40, ())
+            # The long request is now stopped inside its prompt, so the second
+            # one genuinely arrives behind it rather than racing it.
+            self.assertTrue(runtime.reached.wait(2))
+            short_id, short_events = engine.submit([5, 6], 2, ())
+            runtime.gate.set()
+
+            short_tokens = []
+            while True:
+                kind, value = short_events.get(timeout=2)
+                if kind == "token":
+                    short_tokens.append(value)
+                if kind == "done":
+                    break
+            self.assertEqual(len(short_tokens), 2)
+            while long_events.get(timeout=2)[0] != "done":
+                pass
+        finally:
+            engine.forget(long_id)
+            engine.forget(short_id)
+            engine.close()
+
+        # Each request stayed on its own slot rather than trampling the other.
+        order = runtime.eval_slots
+        self.assertEqual(set(order), {0, 1})
+        # And they alternated: the long generation kept going after the short
+        # one started. Serial execution would put every slot-0 evaluation
+        # before every slot-1 one, whichever ran first.
+        self.assertIn(0, order[order.index(1):],
+                      "the long request stalled until the short one finished")
+
+    def test_bailing_engine_gives_a_conversation_back_its_own_slot(self) -> None:
+        # Affinity, not round-robin. The second turn of a conversation extends
+        # the sequence its slot is still holding; handing it the other slot
+        # would throw that away and re-prefill from a snapshot at best.
+        runtime = StubBailingRuntime(slots=2)
+        engine = BailingEngine(runtime)
+
+        def run(prompt: list[int]) -> None:
+            task_id, events = engine.submit(prompt, 1, ())
+            while events.get(timeout=2)[0] != "done":
+                pass
+            engine.forget(task_id)
+
+        try:
+            run([1, 2])          # lands on a slot, leaves [1, 2, 21] live
+            run([5, 6])          # a different conversation, the other slot
+            runtime.eval_slots.clear()
+            runtime.eval_calls.clear()
+            run([1, 2, 21, 3])   # continues the first
+        finally:
+            engine.close()
+
+        # Only the last token of the continuation had to be evaluated, on the
+        # slot that already held the rest.
+        self.assertEqual(runtime.eval_calls, [[3], [23]])
+        self.assertEqual(set(runtime.eval_slots), {0})
 
     def test_bailing_engine_keeps_the_snapshot_it_is_about_to_restore(self) -> None:
         # Observed against a real coding-harness session: a 37,810-token turn,
@@ -348,8 +451,8 @@ class NativeV2ServerTests(unittest.TestCase):
         class SizedRuntime(StubBailingRuntime):
             """Snapshots that cost in proportion to the tokens they hold."""
 
-            def save_state(self) -> bytes:
-                return super().save_state().ljust(self.position * 10, b".")
+            def save_state(self, slot: int = 0) -> bytes:
+                return super().save_state(slot).ljust(self.positions[slot] * 10, b".")
 
         runtime = SizedRuntime()
         # Room for one sequence of this length, not two.
@@ -385,11 +488,11 @@ class NativeV2ServerTests(unittest.TestCase):
         # as a prefix it is not -- the wrong context, with no error to show for
         # it -- so the live sequence has to be forgotten instead.
         class FailingRuntime(StubBailingRuntime):
-            def eval_into(self, tokens) -> None:
+            def eval_into(self, tokens, slot: int = 0) -> None:
                 if list(tokens) == [7]:
-                    self.position += 1  # the runtime advanced before it failed
+                    self.positions[slot] += 1  # it advanced before it failed
                     raise RuntimeError("device fell over")
-                super().eval_into(tokens)
+                super().eval_into(tokens, slot)
 
         runtime = FailingRuntime()
         engine = BailingEngine(runtime)  # type: ignore[arg-type]
@@ -404,7 +507,7 @@ class NativeV2ServerTests(unittest.TestCase):
 
         try:
             self.assertEqual(run([1, 2, 7]), "error")
-            self.assertEqual(engine._cached_tokens, [])
+            self.assertEqual(engine._slot_tokens[0], [])
             self.assertFalse(engine._snapshots)
             runtime.eval_calls.clear()
             run([1, 2, 3])
