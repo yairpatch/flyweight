@@ -119,6 +119,13 @@ pointer-table staging must be doubled or fenced (halves alternate).
   Prefill is now purely CPU-MoE-bound; the next prompt-speed lever is a
   faster CPU expert path or shifting expert share to the GPU — different
   plans.
+- Chunk-size datum for whoever tunes next: `COLIBRI_PREFILL_ROWS=2048`
+  under the pipeline measures **653 tok/s** at 4K (cpu_moe 7.0 → 5.65 s —
+  each half's expert sweep amortizes over 1024 rows instead of 512), tokens
+  bit-identical on both hybrid paths; 4096 regresses to 599. Not made the
+  default because the rows workspace doubles and costs 93 expert-cache
+  slots (757 → 664) on a 5000 MiB budget — a decode-side trade that needs
+  its own measurement per configuration.
 
 ## Staging
 
