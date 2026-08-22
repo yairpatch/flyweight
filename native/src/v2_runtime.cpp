@@ -5143,7 +5143,7 @@ struct BailingGpu {
     std::uint64_t hidden_a = 0, hidden_b = 0, normalized = 0, branch = 0;
     std::uint64_t wide_a = 0, wide_b = 0, wide_c = 0, wide_d = 0;
     std::uint64_t scores = 0, logits = 0, small = 0;
-    std::uint64_t mla_projected = 0, mla_accumulated = 0;
+    std::uint64_t mla_projected = 0, mla_accumulated = 0, mla_partials = 0;
     // Grouped MoE: device-side arrays of the chosen experts' weight pointers.
     std::uint64_t expert_gate_ptrs = 0, expert_up_ptrs = 0, expert_down_ptrs = 0;
     std::uint64_t expert_weights = 0, expert_activated = 0;
@@ -5435,6 +5435,9 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     gpu.scores = bailing_gpu_scratch(gpu, (std::size_t)g.heads * runtime.capacity * 4);
     gpu.mla_projected = bailing_gpu_scratch(gpu, (std::size_t)g.heads * g.kv_lora * 4);
     gpu.mla_accumulated = bailing_gpu_scratch(gpu, (std::size_t)g.heads * g.kv_lora * 4);
+    // Partial sums for the position-split accumulate: one [heads, kv_lora]
+    // slab per split, 64 splits at most.
+    gpu.mla_partials = bailing_gpu_scratch(gpu, (std::size_t)64 * g.heads * g.kv_lora * 4);
     gpu.logits = bailing_gpu_scratch(gpu, (std::size_t)c.vocabulary_size * 4);
     gpu.small = bailing_gpu_scratch(gpu, widest * 4);
     // One allocation holding gate, up and down pointer arrays followed by the
@@ -5758,31 +5761,82 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 int lora = static_cast<int>(g.kv_lora);
                 const char* tiled_env = std::getenv("COLIBRI_BAILING_MLA_TILED");
                 const bool tiled = !tiled_env || tiled_env[0] != '0';
+                // Fused kernels read each latent cache row once for all heads
+                // instead of once per head; the per-head kernels remain the
+                // A/B fallback. "0" disables both, "s" fuses only the score
+                // phase, "a" only the accumulate phase, anything else both.
+                const char* fused_env = std::getenv("COLIBRI_BAILING_MLA_FUSED");
+                const bool fused_scores =
+                    !fused_env || (fused_env[0] != '0' && fused_env[0] != 'a');
+                const bool fused_accumulate =
+                    !fused_env || (fused_env[0] != '0' && fused_env[0] != 's');
+                const bool fused_any = fused_scores || fused_accumulate;
                 if (tiled) {
                     void* project_args[] = {&gpu.wide_a, &L.kv_b,
                         &gpu.mla_projected, &heads_arg, &nope, &value_dim, &lora};
-                    launch("bailing_mla_project", static_cast<std::uint32_t>(g.heads),
-                           128, project_args);
+                    if (fused_any)
+                        launch_2d("bailing_mla_project_fused",
+                                  static_cast<std::uint32_t>(g.heads),
+                                  static_cast<std::uint32_t>((lora + 127) / 128),
+                                  128, project_args);
+                    else
+                        launch("bailing_mla_project",
+                               static_cast<std::uint32_t>(g.heads), 128,
+                               project_args);
                     void* score_args[] = {&gpu.mla_projected, &gpu.wide_b,
                         &S.latents, &S.rope_keys, &gpu.scores, &positions,
                         &heads_arg, &nope, &rope, &lora};
-                    launch_2d("bailing_mla_scores",
-                              static_cast<std::uint32_t>(g.heads),
-                              static_cast<std::uint32_t>((positions + 7) / 8),
-                              256, score_args);
+                    if (fused_scores)
+                        launch("bailing_mla_scores_fused",
+                               static_cast<std::uint32_t>((positions + 7) / 8),
+                               256, score_args);
+                    else
+                        launch_2d("bailing_mla_scores",
+                                  static_cast<std::uint32_t>(g.heads),
+                                  static_cast<std::uint32_t>((positions + 7) / 8),
+                                  256, score_args);
                     void* softmax_args[] = {&gpu.scores, &positions, &heads_arg};
                     launch("bailing_mla_softmax",
                            static_cast<std::uint32_t>(g.heads), 128, softmax_args);
-                    void* accumulate_args[] = {&gpu.scores, &S.latents,
-                        &gpu.mla_accumulated, &positions, &heads_arg, &lora};
-                    launch_2d("bailing_mla_accumulate",
-                              static_cast<std::uint32_t>(g.heads),
-                              static_cast<std::uint32_t>((lora + 127) / 128),
-                              128, accumulate_args);
+                    if (fused_accumulate) {
+                        int splits = positions / 128;
+                        if (splits < 1) splits = 1;
+                        if (splits > 64) splits = 64;
+                        std::uint64_t target =
+                            splits > 1 ? gpu.mla_partials : gpu.mla_accumulated;
+                        void* accumulate_args[] = {&gpu.scores, &S.latents,
+                            &target, &positions, &heads_arg, &lora, &splits};
+                        launch_2d("bailing_mla_accumulate_fused",
+                                  static_cast<std::uint32_t>(splits),
+                                  static_cast<std::uint32_t>((lora + 127) / 128),
+                                  128, accumulate_args);
+                        if (splits > 1) {
+                            void* reduce_args[] = {&gpu.mla_partials,
+                                &gpu.mla_accumulated, &heads_arg, &lora, &splits};
+                            launch_2d("bailing_mla_accumulate_reduce",
+                                      static_cast<std::uint32_t>(g.heads),
+                                      static_cast<std::uint32_t>((lora + 127) / 128),
+                                      128, reduce_args);
+                        }
+                    } else {
+                        void* accumulate_args[] = {&gpu.scores, &S.latents,
+                            &gpu.mla_accumulated, &positions, &heads_arg, &lora};
+                        launch_2d("bailing_mla_accumulate",
+                                  static_cast<std::uint32_t>(g.heads),
+                                  static_cast<std::uint32_t>((lora + 127) / 128),
+                                  128, accumulate_args);
+                    }
                     void* output_args[] = {&gpu.mla_accumulated, &L.kv_b,
                         &gpu.wide_d, &heads_arg, &nope, &value_dim, &lora};
-                    launch("bailing_mla_output",
-                           static_cast<std::uint32_t>(g.heads), 128, output_args);
+                    if (fused_any)
+                        launch_2d("bailing_mla_output_fused",
+                                  static_cast<std::uint32_t>(g.heads),
+                                  static_cast<std::uint32_t>((value_dim + 7) / 8),
+                                  256, output_args);
+                    else
+                        launch("bailing_mla_output",
+                               static_cast<std::uint32_t>(g.heads), 128,
+                               output_args);
                 } else {
                     void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &L.kv_b,
                         &S.latents, &S.rope_keys, &gpu.scores, &gpu.wide_d,
@@ -6040,6 +6094,9 @@ void bailing_gpu_prefill_tiled(
     const float epsilon = g.epsilon;
     const bool phase_profile = std::getenv("COLIBRI_BAILING_TILED_PROFILE") != nullptr;
     double mla_seconds = 0.0, kda_seconds = 0.0;
+    double mla_proj_seconds = 0.0, mla_scores_seconds = 0.0,
+           mla_softmax_seconds = 0.0, mla_accumulate_seconds = 0.0,
+           mla_out_seconds = 0.0;
     double routed_seconds = 0.0, dense_seconds = 0.0;
     double router_projection_seconds = 0.0, router_selection_seconds = 0.0;
     double expert_gate_seconds = 0.0, expert_down_seconds = 0.0;
@@ -6076,6 +6133,10 @@ void bailing_gpu_prefill_tiled(
     const bool mmq_prefill = !mmq_prefill_env || mmq_prefill_env[0] != '0';
     const char* fused_mla_env = std::getenv("COLIBRI_BAILING_FUSED_MLA");
     const bool fused_mla = fused_mla_env && fused_mla_env[0] == '1';
+    // Head-fused quadratic phase: each latent row is read once for all heads
+    // instead of once per head. Same switch as the decode-side fusion.
+    const char* fused_heads_env = std::getenv("COLIBRI_BAILING_MLA_FUSED");
+    const bool fused_heads = !fused_heads_env || fused_heads_env[0] != '0';
     const char* grouped_moe_env = std::getenv("COLIBRI_BAILING_GROUPED_PREFILL");
     const bool grouped_moe = !grouped_moe_env || grouped_moe_env[0] != '0';
     const char* q8_expert_env = std::getenv("COLIBRI_BAILING_Q8_EXPERT_PREFILL");
@@ -6186,6 +6247,15 @@ void bailing_gpu_prefill_tiled(
                     const_cast<int*>(&value_dim), const_cast<int*>(&lora)};
                 launch("bailing_mla_project_rows", rows * heads, 1, 128,
                        project_args);
+                auto mla_mark = std::chrono::steady_clock::now();
+                auto mla_lap = [&](double& bucket) {
+                    if (!phase_profile) return;
+                    colibri_gpu_sync();
+                    const auto now = std::chrono::steady_clock::now();
+                    bucket += std::chrono::duration<double>(now - mla_mark).count();
+                    mla_mark = now;
+                };
+                mla_lap(mla_proj_seconds);
                 if (fused_mla) {
                     void* fused_args[] = {&gpu.prefill_projected,
                         &gpu.prefill_normalized, &cache.latents, &cache.rope_keys,
@@ -6202,20 +6272,34 @@ void bailing_gpu_prefill_tiled(
                         const_cast<int*>(&base_position), &runtime.capacity,
                         const_cast<int*>(&heads), const_cast<int*>(&qk_nope),
                         const_cast<int*>(&qk_rope), const_cast<int*>(&lora)};
-                    launch("bailing_mla_scores_rows", rows * heads,
-                           (base_position + rows + 7) / 8, 256, score_args);
+                    if (fused_heads)
+                        launch("bailing_mla_scores_rows_gemm",
+                               (rows * heads + 63) / 64,
+                               (base_position + rows + 63) / 64, 256,
+                               score_args);
+                    else
+                        launch("bailing_mla_scores_rows", rows * heads,
+                               (base_position + rows + 7) / 8, 256, score_args);
+                    mla_lap(mla_scores_seconds);
                     void* softmax_args[] = {&gpu.prefill_scores,
                         const_cast<int*>(&rows), const_cast<int*>(&base_position),
                         &runtime.capacity, const_cast<int*>(&heads)};
                     launch("bailing_mla_softmax_rows", rows * heads, 1, 128,
                            softmax_args);
+                    mla_lap(mla_softmax_seconds);
                     void* accumulate_args[] = {&gpu.prefill_scores, &cache.latents,
                         &gpu.prefill_accumulated, const_cast<int*>(&rows),
                         const_cast<int*>(&base_position), &runtime.capacity,
                         const_cast<int*>(&heads), const_cast<int*>(&lora)};
-                    launch("bailing_mla_accumulate_rows", rows * heads,
-                           (lora + 127) / 128, 128, accumulate_args);
+                    if (fused_heads)
+                        launch("bailing_mla_accumulate_rows_gemm",
+                               (rows * heads + 63) / 64, (lora + 63) / 64,
+                               256, accumulate_args);
+                    else
+                        launch("bailing_mla_accumulate_rows", rows * heads,
+                               (lora + 127) / 128, 128, accumulate_args);
                 }
+                mla_lap(mla_accumulate_seconds);
                 void* output_args[] = {&gpu.prefill_accumulated, &layer.kv_b,
                     &gpu.prefill_wide_a, &gpu.prefill_wide_c,
                     const_cast<int*>(&rows), const_cast<int*>(&heads),
@@ -6225,6 +6309,7 @@ void bailing_gpu_prefill_tiled(
                        output_args);
                 matmul(layer.attn_output, gpu.prefill_wide_c, gpu.prefill_branch,
                        heads * value_dim, hidden, rows);
+                mla_lap(mla_out_seconds);
             } else {
                 matmul(layer.ssm_q, gpu.prefill_normalized, gpu.prefill_wide_a,
                        hidden, channels, rows);
@@ -6484,10 +6569,14 @@ void bailing_gpu_prefill_tiled(
     }
     if (phase_profile) std::fprintf(stderr,
         "[bailing-tiled-profile] mla=%.3fs kda=%.3fs routed=%.3fs dense=%.3fs "
-        "router=%.3fs select=%.3fs gate=%.3fs down=%.3fs shared=%.3fs\n",
+        "router=%.3fs select=%.3fs gate=%.3fs down=%.3fs shared=%.3fs\n"
+        "[bailing-tiled-profile] mla split: proj=%.3fs scores=%.3fs "
+        "softmax=%.3fs accumulate=%.3fs out=%.3fs\n",
         mla_seconds, kda_seconds, routed_seconds, dense_seconds,
         router_projection_seconds, router_selection_seconds,
-        expert_gate_seconds, expert_down_seconds, shared_expert_seconds);
+        expert_gate_seconds, expert_down_seconds, shared_expert_seconds,
+        mla_proj_seconds, mla_scores_seconds, mla_softmax_seconds,
+        mla_accumulate_seconds, mla_out_seconds);
     slot.cache_on_device = true;
 }
 

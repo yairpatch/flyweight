@@ -1498,6 +1498,162 @@ void bailing_mla_scores_rows(
             total * rsqrtf((float)(qk_nope + qk_rope));
 }
 
+// bailing_mla_scores_rows with the head dimension folded into the block: a
+// warp owns one (row, position) pair, loads each latent and rope-key value
+// once, and computes every head's dot from it, cutting the quadratic phase's
+// cache traffic by the head count. Per-head order matches
+// bailing_mla_scores_rows exactly, so the scores are bit-identical.
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// The prefill score phase written as the GEMM it is:
+// [rows*heads, kv_lora+qk_rope] x [kv_lora+qk_rope, positions], with the
+// causal mask applied at the store. A 64x64 output tile per 256-thread
+// block, 4x4 accumulators per thread, so each shared-memory value feeds four
+// FMAs -- the pairwise kernels above spend one shared or global load per FMA
+// and are instruction-bound. Every latent value is read once per query tile
+// instead of once per (row, head). Summation runs k-ascending (kv_lora then
+// rope), which rounds differently from the warp-reduced original; the logits
+// gate allows 1e-3.
+extern "C" __global__
+void bailing_mla_scores_rows_gemm(
+    const float* projected, const float* query_rope,
+    const float* latents, const float* rope_keys, float* scores,
+    const int rows, const int base_position, const int capacity,
+    const int heads, const int qk_nope, const int qk_rope, const int kv_lora
+) {
+    const int q0 = blockIdx.x * 64;
+    const int p0 = blockIdx.y * 64;
+    const int queries = rows * heads;
+    if (q0 >= queries) return;
+    // The deepest row in this query tile decides whether any of these
+    // positions are visible at all; whole tiles above the causal diagonal
+    // exit before touching memory.
+    const int row_max = min(rows - 1, (q0 + 63) / heads);
+    if (p0 >= base_position + row_max + 1) return;
+    const int depth = kv_lora + qk_rope;
+    const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    __shared__ float a_tile[16][64];
+    __shared__ float b_tile[16][64];
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < depth; k0 += 16) {
+        __syncthreads();
+        for (int n = threadIdx.x; n < 1024; n += 256) {
+            const int k = n & 15, m = n >> 4;
+            const int c = k0 + k;
+            const int q = q0 + m;
+            float value = 0.0f;
+            if (q < queries && c < depth)
+                value = c < kv_lora
+                    ? projected[(long long)q * kv_lora + c]
+                    : query_rope[(long long)q * qk_rope + (c - kv_lora)];
+            a_tile[k][m] = value;
+            const int p = p0 + m;
+            float key = 0.0f;
+            if (p < base_position + rows && c < depth)
+                key = c < kv_lora
+                    ? latents[(long long)p * kv_lora + c]
+                    : rope_keys[(long long)p * qk_rope + (c - kv_lora)];
+            b_tile[k][m] = key;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float a_frag[4], b_frag[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) a_frag[i] = a_tile[k][ty + 16 * i];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) b_frag[j] = b_tile[k][tx + 16 * j];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    acc[i][j] += a_frag[i] * b_frag[j];
+        }
+    }
+    const float scale = rsqrtf((float)(qk_nope + qk_rope));
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int q = q0 + ty + 16 * i;
+        if (q >= queries) continue;
+        const int visible = base_position + q / heads + 1;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int p = p0 + tx + 16 * j;
+            if (p < visible)
+                scores[(long long)q * capacity + p] = acc[i][j] * scale;
+        }
+    }
+}
+
+// The value phase as the same GEMM shape: [rows*heads, positions] x
+// [positions, kv_lora]. Masked score slots load as zero -- softmax never
+// wrote them -- and the position dimension is the reduction, ascending, so a
+// row's sum matches the serial kernel up to tile-boundary rounding.
+extern "C" __global__
+void bailing_mla_accumulate_rows_gemm(
+    const float* scores, const float* latents, float* accumulated,
+    const int rows, const int base_position, const int capacity,
+    const int heads, const int kv_lora
+) {
+    const int q0 = blockIdx.x * 64;
+    const int c0 = blockIdx.y * 64;
+    const int queries = rows * heads;
+    if (q0 >= queries || c0 >= kv_lora) return;
+    const int row_max = min(rows - 1, (q0 + 63) / heads);
+    const int visible_max = base_position + row_max + 1;
+    const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    __shared__ float a_tile[16][64];
+    __shared__ float b_tile[16][64];
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < visible_max; k0 += 16) {
+        __syncthreads();
+        for (int n = threadIdx.x; n < 1024; n += 256) {
+            const int k = n & 15, m = n >> 4;
+            const int p = k0 + k;
+            const int q = q0 + m;
+            a_tile[k][m] =
+                (q < queries && p < base_position + q / heads + 1)
+                    ? scores[(long long)q * capacity + p] : 0.0f;
+            const int c = c0 + m;
+            b_tile[k][m] = (p < visible_max && c < kv_lora)
+                ? latents[(long long)p * kv_lora + c] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float a_frag[4], b_frag[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) a_frag[i] = a_tile[k][ty + 16 * i];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) b_frag[j] = b_tile[k][tx + 16 * j];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    acc[i][j] += a_frag[i] * b_frag[j];
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int q = q0 + ty + 16 * i;
+        if (q >= queries) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = c0 + tx + 16 * j;
+            if (c < kv_lora)
+                accumulated[(long long)q * kv_lora + c] = acc[i][j];
+        }
+    }
+}
+
 extern "C" __global__
 void bailing_mla_softmax_rows(
     float* scores, const int rows, const int base_position,
@@ -2929,6 +3085,148 @@ void bailing_mla_accumulate_reduce(
         total += partials[
             ((long long)split * heads + head) * kv_lora + column];
     accumulated[(long long)head * kv_lora + column] = total;
+}
+
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Position-parallel decode scores. The latent cache is shared across heads --
+// that is what MLA compression means -- yet bailing_mla_scores re-reads it
+// once per head (a heads-wide grid.x). Here a warp owns one position, loads
+// each latent and rope-key value once, and feeds it to every head's dot
+// product, so cache traffic no longer scales with head count. The per-head
+// accumulation order is identical to bailing_mla_scores (lane-strided sum,
+// then the same warp shuffle reduction), so the scores are bit-identical.
+extern "C" __global__
+void bailing_mla_scores_fused(
+    const float* projected, const float* query_rope,
+    const float* latents, const float* rope_keys, float* scores,
+    const int positions, const int heads, const int qk_nope,
+    const int qk_rope, const int kv_lora
+) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int position = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (position >= positions) return;
+    const float* latent = latents + (long long)position * kv_lora;
+    const float* rope = rope_keys + (long long)position * qk_rope;
+    const float scale = rsqrtf((float)(qk_nope + qk_rope));
+    for (int base = 0; base < heads; base += 16) {
+        float totals[16];
+        #pragma unroll
+        for (int h = 0; h < 16; ++h) totals[h] = 0.0f;
+        for (int i = lane; i < kv_lora; i += 32) {
+            const float cache = latent[i];
+            #pragma unroll
+            for (int h = 0; h < 16; ++h)
+                if (base + h < heads)
+                    totals[h] +=
+                        projected[(long long)(base + h) * kv_lora + i] * cache;
+        }
+        for (int i = lane; i < qk_rope; i += 32) {
+            const float cache = rope[i];
+            #pragma unroll
+            for (int h = 0; h < 16; ++h)
+                if (base + h < heads)
+                    totals[h] +=
+                        query_rope[(long long)(base + h) * qk_rope + i] * cache;
+        }
+        #pragma unroll
+        for (int h = 0; h < 16; ++h) {
+            if (base + h >= heads) continue;
+            float total = totals[h];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                total += __shfl_down_sync(0xffffffff, total, offset);
+            if (lane == 0)
+                scores[(long long)(base + h) * positions + position] =
+                    total * scale;
+        }
+    }
+}
+
+// bailing_mla_project with the column loop unrolled onto a 2D grid. The
+// original runs 16 blocks for an 8.4 MB f32 kv_b walk and is latency-bound;
+// this one is the same serial row sum per column (bit-identical), just with
+// four times the threads in flight.
+extern "C" __global__
+void bailing_mla_project_fused(
+    const float* query_nope, const float* kv_b, float* projected,
+    const int heads, const int qk_nope, const int v_head_dim,
+    const int kv_lora
+) {
+    const int head = blockIdx.x;
+    const int column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (head >= heads || column >= kv_lora) return;
+    const float* weights = kv_b +
+        (long long)head * (qk_nope + v_head_dim) * kv_lora;
+    const float* query = query_nope + (long long)head * qk_nope;
+    float total = 0.0f;
+    for (int row = 0; row < qk_nope; ++row)
+        total += query[row] * weights[(long long)row * kv_lora + column];
+    projected[(long long)head * kv_lora + column] = total;
+}
+
+// bailing_mla_output re-shaped from thread-per-row (each thread streaming its
+// own 2 KB weight row, latency-bound at 16 blocks) to warp-per-row with
+// coalesced lane-strided loads and a shuffle reduction. The reduction tree
+// rounds differently from the serial sum; the logits gate allows 1e-3.
+extern "C" __global__
+void bailing_mla_output_fused(
+    const float* accumulated, const float* kv_b, float* output,
+    const int heads, const int qk_nope, const int v_head_dim,
+    const int kv_lora
+) {
+    const int head = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.y * (blockDim.x >> 5) + warp;
+    if (head >= heads || row >= v_head_dim) return;
+    const float* values = accumulated + (long long)head * kv_lora;
+    const float* source = kv_b +
+        ((long long)head * (qk_nope + v_head_dim) + qk_nope + row) * kv_lora;
+    float total = 0.0f;
+    for (int i = lane; i < kv_lora; i += 32) total += source[i] * values[i];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        total += __shfl_down_sync(0xffffffff, total, offset);
+    if (lane == 0) output[(long long)head * v_head_dim + row] = total;
+}
+
+// The same shared-read restructuring for the value phase. Each block owns a
+// contiguous position range and a column chunk; every latent value in that
+// tile is loaded once and scattered into all heads' accumulators, where
+// bailing_mla_accumulate re-walked the whole cache per head. Partials use the
+// bailing_mla_accumulate_split layout so its reduce kernel finishes the job;
+// within a split the position order matches the serial kernel, so splits == 1
+// is bit-identical and splits > 1 differs only by the split-boundary rounding
+// the _split kernel already introduced.
+extern "C" __global__
+void bailing_mla_accumulate_fused(
+    const float* scores, const float* latents, float* partials,
+    const int positions, const int heads, const int kv_lora, const int splits
+) {
+    const int split = blockIdx.x;
+    const int column = blockIdx.y * blockDim.x + threadIdx.x;
+    if (split >= splits || column >= kv_lora) return;
+    const int begin = (int)(((long long)positions * split) / splits);
+    const int end = (int)(((long long)positions * (split + 1)) / splits);
+    for (int base = 0; base < heads; base += 16) {
+        float totals[16];
+        #pragma unroll
+        for (int h = 0; h < 16; ++h) totals[h] = 0.0f;
+        for (int position = begin; position < end; ++position) {
+            const float cache = latents[(long long)position * kv_lora + column];
+            #pragma unroll
+            for (int h = 0; h < 16; ++h)
+                if (base + h < heads)
+                    totals[h] +=
+                        scores[(long long)(base + h) * positions + position] *
+                        cache;
+        }
+        #pragma unroll
+        for (int h = 0; h < 16; ++h)
+            if (base + h < heads)
+                partials[((long long)split * heads + base + h) * kv_lora +
+                         column] = totals[h];
+    }
 }
 
 extern "C" __global__
