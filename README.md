@@ -13,7 +13,7 @@ Served model families:
 | Muse Glimmer | GGUF | Channel-tagged reasoning; drafts via a DFlash sidecar, no in-model MTP |
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
 | Gemma 4 | GGUF | Greedy decode with penalties disabled only -- see limitations |
-| BailingMoE3 | GGUF, safetensors | One live sequence, with snapshot prefix reuse across conversations; a GGUF conversion answers exactly as the checkpoint it came from |
+| BailingMoE3 | GGUF, safetensors | Independent sequence slots with snapshot prefix reuse across conversations; a GGUF conversion answers exactly as the checkpoint it came from |
 
 A safetensors checkpoint (Qwen 3.5 family and BailingMoE3) is packed to a
 chosen quantization on first open and cached beside the checkpoint --
@@ -453,10 +453,12 @@ device are skipped.
 - The Qwen 3.5 safetensors loader reads only `text_config`: the vision tower
   is dropped and M-RoPE is not implemented, so multimodal checkpoints serve
   as text-only.
-- BailingMoE3 runs one live sequence rather than independent slots, and has
-  no expert paging. Concurrent conversations are served by snapshotting the
-  live cache and restoring the longest matching prefix, so they do not run in
-  parallel and a switch costs a copy rather than a re-evaluation.
+- BailingMoE3 decodes its slots by interleaving rather than batching them, so
+  `--parallel` removes the waiting but does not multiply throughput the way a
+  batched forward would. Its prompt evaluation also runs at admission, so a
+  very long prompt still holds the other slots for its duration. It has no
+  expert paging: a model that does not fit falls back to the host entirely
+  rather than keeping part of itself on the GPU.
 - BailingMoE3's grouped routed-expert GPU kernels cover Q4_K and Q6_K only.
   Every other format its dispatch decodes -- the IQ formats among them --
   runs the routed experts one expert at a time instead, which is correct but
