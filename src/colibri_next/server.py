@@ -1249,21 +1249,26 @@ class InferenceService:
             # No tool-call marker: flush the tail we held back in case it was
             # a partial marker, so the turn is never silently empty.
             yield _TextDelta(pending)
-        elif (
-            tool_start is not None
-            and final_step.stopped_on_eos
-            and not streamed
-        ):
-            # A marker opened, the model finished, and nothing parsed -- and
-            # nothing was streamed for it either, since the streamer never got
-            # a name. Release the raw markup rather than end the turn on
-            # silence; see _turn_is_silent for why an empty turn is what puts
-            # an agent harness into a loop.
+        elif tool_start is not None and not streamed:
+            # A marker opened and nothing parsed -- and nothing was streamed
+            # for it either, since the streamer never got a name. Release the
+            # raw markup rather than end the turn on silence; see
+            # _turn_is_silent for why an empty turn is what puts an agent
+            # harness into a loop.
+            #
+            # This covers the truncated call as well as the finished one. The
+            # truncated case used to be suppressed on the reasoning that
+            # finish_reason "length" already told the client the call never
+            # finished being written -- but a client does not discard the turn
+            # on reading that, it APPENDS it, and an assistant turn with no
+            # content and no tool calls is one this server's own request
+            # parser rejects. So a tool call cut short by max_tokens poisoned
+            # the conversation that produced it: every later request replayed
+            # the empty turn and was answered with
+            # "messages[N].content must be text" until the client rewrote its
+            # own history. Emitting what the model actually wrote costs a
+            # fragment of visible markup and keeps the turn replayable.
             yield _TextDelta(marker + tool_body)
-        # else: a <tool_call> marker was seen but produced no parseable call,
-        # and the turn was cut short by max_tokens. Suppress the raw markup --
-        # the finish_reason below reports "length" so the client knows the
-        # tool call never finished being written.
         yield _Finished(
             "tool_calls"
             if produced_tool_call
@@ -3351,7 +3356,15 @@ def _chat_messages(
         if role == "assistant" and message.get("tool_calls"):
             if architecture not in NATIVE_TOOL_ARCHITECTURES:
                 content = _render_tool_calls(content, message["tool_calls"], index)
-        if not content and not (role == "assistant" and message.get("tool_calls")):
+        # An empty assistant turn is history, not a request: a generation that
+        # was cancelled, truncated mid-tool-call or produced only reasoning
+        # the client stripped all replay as one, and rejecting it 400s the
+        # WHOLE conversation -- unrecoverable for a client that cannot edit
+        # its own history. It renders as a role header with no body, which is
+        # harmless. An empty user turn is still refused: nothing legitimately
+        # produces one, so it is a client bug worth reporting rather than
+        # absorbing.
+        if not content and role != "assistant":
             raise APIError(
                 400, f"messages[{index}].content must be text", parameter="messages"
             )
@@ -4315,11 +4328,17 @@ def _turn_is_silent(
     terminates. Returning the raw turn instead is what breaks the cycle: the
     model sees its own malformed output on the next turn and can correct it.
 
-    Only for a turn the model ended itself. One cut off by the token ceiling is
-    genuinely incomplete, its finish_reason already says "length", and leaking
-    a half-written parameter as prose helps nobody.
+    A turn cut off by the token ceiling is rescued too, though its
+    finish_reason already says "length". That exemption used to stand on
+    "leaking a half-written parameter as prose helps nobody" -- but the empty
+    turn it left behind is one this server's own request parser rejects, so a
+    tool call truncated by max_tokens poisoned the conversation that produced
+    it: the client appended the empty assistant turn, replayed it on the next
+    request, and got "messages[N].content must be text" from then on. Half a
+    parameter helps nobody; an unreplayable conversation is worse.
     """
-    if content or tool_calls or not stopped_on_eos:
+    del stopped_on_eos  # every silent turn is rescued, however it ended
+    if content or tool_calls:
         return False
     return TOOL_CALL_MARKER in text or DSML_TOOL_CALL_MARKER in text
 

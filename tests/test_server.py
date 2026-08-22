@@ -24,6 +24,7 @@ from colibri_next.server import (
     ColibriHTTPServer,
     InferenceService,
     create_handler,
+    _chat_messages,
     _is_decode_event,
     _parse_tool_calls,
     _split_reasoning_content,
@@ -2076,6 +2077,108 @@ class InferenceServiceTests(unittest.TestCase):
         # The same turn either way: the two paths disagreeing is what makes a
         # bug like this survive a test suite.
         self.assertEqual(content, UnparseableToolStubGenerator.TEXT)
+
+    def test_a_tool_call_cut_off_by_max_tokens_stays_replayable(self) -> None:
+        # The turn this server emits must be one this server accepts back.
+        #
+        # A tool call truncated by the token ceiling used to come back as
+        # content null, no tool_calls, finish_reason "length" -- on the
+        # reasoning that "length" told the client the call never finished. A
+        # client does not discard such a turn, it appends it, and the next
+        # request replayed an empty assistant turn straight into
+        # "messages[N].content must be text". Every later request failed the
+        # same way: the conversation was poisoned by its own reply, mid
+        # generation, with no way back but rewriting history.
+        partial = "<tool_call>\n<function=get_weather>\n<parameter=city>\nBer"
+
+        class TruncatedToolGenerator(StubGenerator):
+            def stream_messages(self, messages, **options):
+                generated: list[int] = []
+                for index, character in enumerate(partial):
+                    generated.append(index + 4)
+                    yield GenerationStep(
+                        index + 4, character, (1, 2, 3), tuple(generated),
+                        "", False, False, 3 + len(generated),
+                    )
+                # stopped_on_eos False: the ceiling ended it, not the model.
+                yield GenerationStep(
+                    None, "", (1, 2, 3), tuple(generated), partial,
+                    False, True, 3 + len(generated),
+                )
+
+        payload = {
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [self.WEATHER_TOOL],
+            "max_tokens": 40,
+        }
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                service = InferenceService("qwen-local", TruncatedToolGenerator())
+                if streaming:
+                    events = [
+                        event
+                        for event in service.stream_chat_completion(
+                            {**payload, "stream": True}
+                        )
+                        if isinstance(event, dict) and event.get("choices")
+                    ]
+                    deltas = [event["choices"][0]["delta"] for event in events]
+                    content = "".join(
+                        delta.get("content", "") for delta in deltas
+                    )
+                    message = {"role": "assistant", "content": content}
+                    # Streaming settles a truncated call as a tool call with
+                    # the arguments closed off, rather than as raw markup.
+                    if any(delta.get("tool_calls") for delta in deltas):
+                        message["tool_calls"] = [
+                            {"id": "call_0", "type": "function",
+                             "function": {"name": "get_weather",
+                                          "arguments": "{}"}}
+                        ]
+                else:
+                    choice = service.chat_completion(dict(payload))["choices"][0]
+                    self.assertEqual(choice["finish_reason"], "length")
+                    message = choice["message"]
+                # The turn is never silent: it carries what the model wrote,
+                # or the call the streamer settled -- something to act on.
+                self.assertTrue(
+                    str(message.get("content") or "") or message.get("tool_calls"),
+                    "the truncated call was suppressed into an empty turn",
+                )
+                # ...and the conversation carrying it can be sent back.
+                _chat_messages(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "weather?"},
+                            message,
+                            {"role": "user", "content": "go on"},
+                        ]
+                    },
+                    architecture="qwen3moe",
+                )
+
+    def test_an_empty_assistant_turn_does_not_poison_a_conversation(self) -> None:
+        # Defence in depth for the above: whatever produced it -- a cancelled
+        # generation, a turn of pure reasoning the client stripped, another
+        # server -- an empty assistant turn is history and must replay. An
+        # empty USER turn stays refused: nothing legitimately produces one.
+        for content in ("", None, [], "   "):
+            with self.subTest(content=content):
+                _chat_messages(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "hi"},
+                            {"role": "assistant", "content": content},
+                            {"role": "user", "content": "again"},
+                        ]
+                    },
+                    architecture="qwen3moe",
+                )
+        with self.assertRaisesRegex(APIError, "content must be text"):
+            _chat_messages(
+                {"messages": [{"role": "user", "content": ""}]},
+                architecture="qwen3moe",
+            )
 
     def test_plain_answer_with_tools_declared_carries_no_markup(self) -> None:
         # The fallback above must key on a marker actually having opened. A turn
