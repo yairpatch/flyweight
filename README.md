@@ -13,7 +13,7 @@ Served model families:
 | Muse Glimmer | GGUF | Channel-tagged reasoning; drafts via a DFlash sidecar, no in-model MTP |
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
 | Gemma 4 | GGUF | Greedy decode with penalties disabled only -- see limitations |
-| BailingMoE3 | safetensors | Experimental: single sequence, no prefix cache; the GGUF path is still work in progress |
+| BailingMoE3 | GGUF, safetensors | Single sequence, no prefix cache; a GGUF conversion answers exactly as the checkpoint it came from |
 
 A safetensors checkpoint (Qwen 3.5 family and BailingMoE3) is packed to a
 chosen quantization on first open and cached beside the checkpoint --
@@ -453,12 +453,12 @@ device are skipped.
 - The Qwen 3.5 safetensors loader reads only `text_config`: the vision tower
   is dropped and M-RoPE is not implemented, so multimodal checkpoints serve
   as text-only.
-- BailingMoE3 loads from safetensors on a dedicated single-sequence runtime
-  without prefix caching or expert paging; its GGUF loader is incomplete.
+- BailingMoE3 runs on a dedicated single-sequence runtime without prefix
+  caching or expert paging, and prompt evaluation reports no progress and
+  cannot be cancelled mid-call (the native progress entry point is not
+  implemented).
 - HF safetensors loading covers the Qwen 3.5 family and BailingMoE3 only;
-  other architectures are GGUF-only. The chat-template fallback from a
-  bare `tokenizer_config.json` is currently broken -- checkpoints without an
-  inline template fall back to the architecture formatter.
+  other architectures are GGUF-only.
 - Laguna has no MTP, and supports only the per-head attention gate, so the
   per-element gate the larger Laguna checkpoints use is rejected at load.
 - Laguna prefill uses the warp-online attention kernel. The tensor-core
