@@ -100,3 +100,31 @@ late:
    A/B, gate 4. Document the VRAM/slot trade.
 3. Only if stage 2 shows upload serialization on the main stream: move
    uploads to the prefetch stream with a completion event — measure first.
+
+## Status (2026-08-22) — stage 1 landed, stage 2 measured and FAILED
+
+- Stage 1 (`b6b0ed8`) passed all three gates: budget 0 bit-identical live,
+  streamed-all ≡ resident-all bit-exact on a Q8_0 fixture, deterministic,
+  engagement-counter-guarded. The machinery stays behind the env flag.
+- Stage 2 killed the design as staged. The budget sweep on the motivating
+  config measured **130–245 tok/s against the 653 baseline** — the marginal
+  upload throughput through `colibri_gpu_upload` is ~1–2 GB/s, an order of
+  magnitude under the probe's sequential rate. Two compounding causes:
+  per-half-layer restaging multiplies volume (39.8 GiB moved for a 4 K
+  prompt at a 256 MiB budget), and the copies are `cuMemcpyHtoDAsync` from
+  a **file-backed mmap the driver cannot pin** — `cuMemHostRegister`
+  returns −2 on it (probe_h2d), so every upload bounce-buffers, blocks the
+  engine thread (~10 s of "other"), and serializes into the busy compute
+  stream (~17 s of route wait). The same mechanism taxes decode expert
+  paging ~7× (probe: 15.8 ms/token observed vs 2.2 ms at pinned rates).
+- The upload-free variant — seeded residents serving prefill routes through
+  the split table path — landed as pipeline coverage instead (`1332c26`):
+  serial 440 → 655 tok/s pipelined, bit-identical on/off, but a dead heat
+  with the best CPU-only config under interleaved thermal steady state
+  (median 577 vs 578; the ~18% seeded absorption is repaid by the shared
+  laptop power budget).
+- **Successor lever, out of scope here:** make H2D from the model real —
+  registration with `CU_MEMHOSTREGISTER_READ_ONLY`, or a pinned
+  double-buffered bounce arena fed off the critical path. That would speed
+  decode expert paging as well as revive this plan's streaming math; it is
+  a prerequisite, not a variant, and deserves its own measured plan.
