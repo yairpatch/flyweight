@@ -371,6 +371,11 @@ class PrefillExpertStreamParityTests(_ParityCase):
 
     @classmethod
     def setUpClass(cls):
+        # The CPU backend forces every expert mode to `cpu`, so neither the
+        # resident reference nor the streamed side exists there -- and the
+        # streaming gate itself requires the registered-mmap DMA path.
+        if V2Model.select_backend("auto") != "cuda":
+            raise unittest.SkipTest("prefill expert streaming needs real CUDA")
         path = _workspace("colibri-parity-stream-") / "moe.gguf"
         # Q8_0: the grouped GPU expert kernels have no f32 entry, and f32
         # experts would silently fall both sides back to the CPU MoE.
@@ -393,9 +398,17 @@ class PrefillExpertStreamParityTests(_ParityCase):
 
     def _generate(self, **options):
         prompt = _prompts(self._spec.vocabulary, (40,))[0]
-        runtime = self._runtime(**options)
-        tokens = _blocking_run(runtime, prompt, self.TOKENS)
-        return tokens, int(runtime.info["prefill_streamed_bytes"])
+        # Closed before the next runtime opens, not deferred to test teardown:
+        # mmap registration is exclusive, so a still-open runtime would leave
+        # its successors on staged copies and gate streaming off.
+        runtime = self._model.native_runtime(
+            mtp_drafts=0, **self._options(options))
+        try:
+            runtime.prepare()
+            tokens = _blocking_run(runtime, prompt, self.TOKENS)
+            return tokens, int(runtime.info["prefill_streamed_bytes"])
+        finally:
+            runtime.close()
 
     def test_streamed_all_matches_resident_all(self):
         resident, resident_streamed = self._generate(

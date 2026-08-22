@@ -733,6 +733,15 @@ struct ColibriV2QwenRuntime {
     // only its own route downloads, so one half's wait never extends to the
     // other half's queued core work.
     std::uint64_t route_event_pipeline = 0;
+    // Prefill expert-streaming fences, one pair per span. Uploads ride the
+    // prefetch stream, so the compute stream waits on upload_ready before
+    // the grouped kernels consume staged weights, and the prefetch stream
+    // waits on stream_consumed before overwriting a span's slice with the
+    // next layer's experts.
+    std::uint64_t stream_upload_event = 0;
+    std::uint64_t stream_upload_event_pipeline = 0;
+    std::uint64_t stream_consumed_event = 0;
+    std::uint64_t stream_consumed_event_pipeline = 0;
     std::uint64_t prefill_layer_start_event = 0;
     std::uint64_t prefill_core_end_event = 0;
     std::uint64_t prefill_router_end_event = 0;
@@ -1643,6 +1652,12 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.prefetch_event = 0;
     colibri_gpu_event_destroy(runtime.route_event);
     colibri_gpu_event_destroy(runtime.route_event_pipeline);
+    colibri_gpu_event_destroy(runtime.stream_upload_event);
+    colibri_gpu_event_destroy(runtime.stream_upload_event_pipeline);
+    colibri_gpu_event_destroy(runtime.stream_consumed_event);
+    colibri_gpu_event_destroy(runtime.stream_consumed_event_pipeline);
+    runtime.stream_upload_event=runtime.stream_upload_event_pipeline=0;
+    runtime.stream_consumed_event=runtime.stream_consumed_event_pipeline=0;
     colibri_gpu_event_destroy(runtime.prefill_layer_start_event);
     colibri_gpu_event_destroy(runtime.prefill_core_end_event);
     colibri_gpu_event_destroy(runtime.prefill_router_end_event);
@@ -10038,7 +10053,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         :colibri_gpu_event_create(&runtime->route_event);
     if(route_event_status!=0){release_qwen_device(*runtime);throw std::runtime_error("failed to create native Qwen route event");}
     // The pipeline's second event is never measured, so it is always untimed.
-    if(colibri_gpu_event_create(&runtime->route_event_pipeline)!=0){
+    if(colibri_gpu_event_create(&runtime->route_event_pipeline)!=0||
+       colibri_gpu_event_create(&runtime->stream_upload_event)!=0||
+       colibri_gpu_event_create(&runtime->stream_upload_event_pipeline)!=0||
+       colibri_gpu_event_create(&runtime->stream_consumed_event)!=0||
+       colibri_gpu_event_create(&runtime->stream_consumed_event_pipeline)!=0){
         release_qwen_device(*runtime);
         throw std::runtime_error("failed to create native Qwen pipeline route event");
     }
