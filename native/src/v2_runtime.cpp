@@ -5177,7 +5177,38 @@ struct ColibriV2BailingRuntime {
     // whichever suits the call and moves the cache across when it has to. False
     // means the host copy is authoritative, which is the state after a reset.
     bool cache_on_device = false;
+    // Optional watcher for long prompts; see colibri_v2_bailing_set_progress.
+    // `reported` and `reporting` are per-eval scratch, not configuration: the
+    // internal paths report at whatever granularity is natural for them, and
+    // deduplicating here is what makes the sequence the watcher sees strictly
+    // increasing regardless of which path ran.
+    int (*progress)(void*, std::uint32_t, std::uint32_t) = nullptr;
+    void* progress_user = nullptr;
+    std::uint32_t reported = 0;
+    bool reporting = false;
 };
+
+// Tell the watcher how far a prompt has got, and let it stop the call.
+//
+// Cheap enough to sit in a per-tile or per-layer loop and nowhere near a
+// per-element one: a null callback is a predictable branch, and a live one is
+// one indirect call per ~128 tokens.
+//
+// Cancellation is an exception rather than a status because every caller of
+// this is several frames deep inside a prefill; unwinding is the only way out
+// that does not thread a "stop" return through the whole device path. What it
+// leaves behind is a sequence advanced by however many tokens completed, which
+// is consistent but not what the caller asked for -- hence the documented
+// requirement to reset.
+void bailing_progress(ColibriV2BailingRuntime& runtime, std::uint32_t processed,
+                      std::uint32_t total) {
+    if (!runtime.progress) return;
+    if (runtime.reporting && processed <= runtime.reported) return;
+    runtime.reported = processed;
+    runtime.reporting = true;
+    if (runtime.progress(runtime.progress_user, processed, total) != 0)
+        throw std::runtime_error("bailing prompt evaluation was cancelled");
+}
 
 // A weight in whatever storage the checkpoint used.
 colibri::v2::bailing::Matrix bailing_matrix(const ColibriV2Model& m,
@@ -6320,6 +6351,11 @@ void bailing_gpu_prefill_tiled(
                     static_cast<std::size_t>(c.vocabulary_size) * 4, stream) != 0)
                 throw std::runtime_error("bailing tiled prefill logits download failed");
         }
+        // A tile is the natural report and the natural cancellation point: the
+        // device is idle here, the cache is coherent, and `position` already
+        // counts the rows that landed. Cancelling leaves the sequence short but
+        // not corrupt.
+        if (offset + rows < count) bailing_progress(runtime, offset + rows, count);
     }
     if (phase_profile) std::fprintf(stderr,
         "[bailing-tiled-profile] mla=%.3fs kda=%.3fs routed=%.3fs dense=%.3fs "
@@ -6357,7 +6393,11 @@ int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
     g.head_dim = c.attention_head_dim
         ? c.attention_head_dim
         : c.hidden_size / (c.attention_heads ? c.attention_heads : 1);
-    g.conv_width = 4;
+    // The checkpoint's own width, not a constant: every published BailingMoE3
+    // uses 4, which is why reading the config was never missed, and is also
+    // why a checkpoint that differs would have been silently mis-shaped
+    // rather than refused.
+    g.conv_width = c.conv_kernel ? c.conv_kernel : 4;
     g.dense_size = c.dense_intermediate_size;
     g.expert_size = c.expert_intermediate_size;
     g.shared_size = c.expert_shared_intermediate_size;
@@ -6539,6 +6579,15 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
     if(runtime->position + count > runtime->capacity)
         throw std::runtime_error("bailing sequence exceeds the runtime capacity");
 
+    // A prompt is watchable; a decoded token is not. Reporting count == 1 would
+    // put two indirect calls and a lock acquisition on the server side into
+    // every token of every generation, to say "0 of 1" and then "1 of 1".
+    const bool watched = runtime->progress && count > 1;
+    if(watched){
+        runtime->reporting = false;
+        bailing_progress(*runtime, 0, count);
+    }
+
     // Each path takes the work it is better at, and the cache follows.
     //
     // The host has weight-stationary batched projections and wins on ordinary
@@ -6564,6 +6613,7 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
         bailing_gpu_prefill_tiled_supported(*runtime)) {
         if (!runtime->cache_on_device) bailing_cache_transfer(*runtime, true);
         bailing_gpu_prefill_tiled(*runtime, tokens, count, logits);
+        if(watched) bailing_progress(*runtime, count, count);
         return 0;
     }
     const char* gpu_prefill_env = std::getenv("COLIBRI_BAILING_GPU_PREFILL");
@@ -6582,7 +6632,12 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
             if(runtime->position >= runtime->capacity)
                 throw std::runtime_error("bailing sequence exceeds the runtime capacity");
             bailing_gpu_step(*runtime, tokens[index], logits);
+            // Every 128 tokens, matching the tile the other prefill paths use,
+            // so a watcher sees the same rhythm whichever one ran.
+            if(watched && (index & 127) == 127)
+                bailing_progress(*runtime, index + 1, count);
         }
+        if(watched) bailing_progress(*runtime, count, count);
         return 0;
     }
     // Prefill runs the whole batch through each layer at once so the weights
@@ -6602,11 +6657,23 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
             runtime->embedding_matrix.type, g.hidden,
             current.data() + static_cast<std::size_t>(index) * g.hidden);
     }
-    for(std::size_t layer=0;layer<runtime->layers.size();++layer){
+    const std::size_t depth = runtime->layers.size();
+    for(std::size_t layer=0;layer<depth;++layer){
         colibri::v2::bailing::decoder_layer_batch(
             current.data(), count, runtime->layers[layer], g, runtime->position,
             runtime->caches[layer], next.data());
         current.swap(next);
+        // The whole batch crosses every layer before any one token is finished,
+        // so there is no honest per-token count to report part way through:
+        // scale the depth reached over the batch instead. A layer of a batch is
+        // a prompt answer's worth of work at most, which is prompt enough to
+        // drop a request whose client has gone. Cancelling here leaves the
+        // layers already run holding rows past `position`, which reset clears.
+        if(watched && layer + 1 < depth)
+            bailing_progress(*runtime,
+                static_cast<std::uint32_t>(
+                    static_cast<std::size_t>(count) * (layer + 1) / depth),
+                count);
     }
     runtime->position += count;
     // Only the last token's logits are produced; the earlier ones exist purely
@@ -6617,6 +6684,224 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
                                    g.epsilon, normalized.data());
     colibri::v2::bailing::matvec(runtime->head, normalized.data(), g.hidden,
                                  c.vocabulary_size, logits);
+    if(watched) bailing_progress(*runtime, count, count);
+    return 0; });
+}
+
+int colibri_v2_bailing_uses_gpu(ColibriV2BailingRuntime* runtime, int* out){
+    return guarded([&]{
+    if(!runtime||!out)throw std::runtime_error("invalid bailing uses-gpu arguments");
+    // `gpu` is allocated before preparation and kept afterwards even when
+    // preparation failed part way; `ready` is the flag eval itself tests, so it
+    // is the only one that answers "did this runtime get the device".
+    *out = (runtime->gpu && runtime->gpu->ready) ? 1 : 0;
+    return 0; });
+}
+
+int colibri_v2_bailing_set_progress(ColibriV2BailingRuntime* runtime,
+                                    int (*callback)(void*, uint32_t, uint32_t),
+                                    void* user){
+    return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid bailing runtime");
+    runtime->progress = callback;
+    runtime->progress_user = callback ? user : nullptr;
+    runtime->reporting = false;
+    runtime->reported = 0;
+    return 0; });
+}
+
+// One live BailingMoE3 sequence, serialized.
+//
+// Machine-local like the HF weight cache: native endianness, native float
+// layout, no pretence of portability between builds. What it does carry is
+// enough geometry to prove a snapshot belongs to this runtime, because the
+// failure mode of getting that wrong is not a crash -- it is a model answering
+// fluently from somebody else's context, which nothing downstream can detect.
+//
+// Sized by `position`, not by capacity: a 32-token side-call is a few hundred
+// kilobytes and a 32k conversation is the megabytes it actually occupies. That
+// is the difference between a prefix cache worth keeping and one that stores
+// the same zeros a hundred times.
+struct BailingCacheHeader {
+    char magic[8];
+    std::uint32_t version;
+    std::uint32_t layers;
+    std::uint32_t kv_lora;
+    std::uint32_t qk_rope;
+    std::uint32_t heads;
+    std::uint32_t head_dim;
+    std::uint32_t conv_width;
+    std::uint32_t position;
+    std::uint64_t payload;  // cache bytes following the header and layer map
+};
+static_assert(sizeof(BailingCacheHeader) == 48,
+              "bailing snapshot header must stay packed as written");
+static const char kBailingCacheMagic[8] = "CBLGKV0";
+static const std::uint32_t kBailingCacheVersion = 1;
+
+// How many bytes of cache a sequence of `position` tokens occupies. MLA layers
+// grow with the sequence; KDA layers are a fixed recurrent state and three
+// convolution windows however long the sequence is.
+std::uint64_t bailing_cache_payload_bytes(const ColibriV2BailingRuntime& runtime,
+                                          std::uint64_t position) {
+    const auto& g = runtime.geometry;
+    const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
+    const std::uint64_t history = g.conv_width ? g.conv_width - 1 : 0;
+    std::uint64_t bytes = 0;
+    for (const auto& layer : runtime.layers)
+        bytes += layer.full_attention
+            ? position * (g.kv_lora + g.qk_rope) * 4
+            : (channels * g.head_dim + 3 * channels * history) * 4;
+    return bytes;
+}
+
+int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer,
+                                  uint64_t capacity, uint64_t* length){
+    return guarded([&]{
+    if(!runtime||!length)
+        throw std::runtime_error("invalid bailing cache save arguments");
+    const auto& g = runtime->geometry;
+    const std::uint64_t position = runtime->position;
+    const std::uint64_t payload = bailing_cache_payload_bytes(*runtime, position);
+    const std::uint64_t total =
+        sizeof(BailingCacheHeader) + runtime->layers.size() + payload;
+    *length = total;
+    // The sizing call. It deliberately touches nothing else: a caller that only
+    // wants to know how big a snapshot would be should not move a cache across
+    // the bus to find out.
+    if(!buffer || capacity == 0) return 0;
+    if(capacity < total)
+        throw std::runtime_error("bailing cache snapshot buffer is too small");
+    // Whichever copy last ran is the live one, and after a device prefill or a
+    // device decode that is not the host's. Snapshotting the host copy then
+    // would capture the sequence as it was before that call. The transfer also
+    // clears cache_on_device, which is right: the host copy is now current.
+    if(runtime->cache_on_device) bailing_cache_transfer(*runtime, false);
+
+    auto* out = static_cast<std::uint8_t*>(buffer);
+    BailingCacheHeader header{};
+    std::memcpy(header.magic, kBailingCacheMagic, sizeof(header.magic));
+    header.version = kBailingCacheVersion;
+    header.layers = static_cast<std::uint32_t>(runtime->layers.size());
+    header.kv_lora = static_cast<std::uint32_t>(g.kv_lora);
+    header.qk_rope = static_cast<std::uint32_t>(g.qk_rope);
+    header.heads = static_cast<std::uint32_t>(g.heads);
+    header.head_dim = static_cast<std::uint32_t>(g.head_dim);
+    header.conv_width = static_cast<std::uint32_t>(g.conv_width);
+    header.position = runtime->position;
+    header.payload = payload;
+    std::memcpy(out, &header, sizeof(header));
+    std::uint64_t offset = sizeof(header);
+    // Which layers are MLA and which are KDA. Derived from the model rather
+    // than stored anywhere, so two checkpoints can agree on every number in the
+    // header and still disagree here.
+    for(const auto& layer : runtime->layers)
+        out[offset++] = layer.full_attention ? 1 : 0;
+
+    auto append = [&](const std::vector<float>& source, std::uint64_t elements){
+        if(!elements) return;
+        if(source.size() < elements)
+            throw std::runtime_error("bailing cache is shorter than its sequence");
+        std::memcpy(out + offset, source.data(),
+                    static_cast<std::size_t>(elements) * 4);
+        offset += elements * 4;
+    };
+    const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
+    const std::uint64_t history = g.conv_width ? g.conv_width - 1 : 0;
+    for(std::size_t index=0;index<runtime->layers.size();++index){
+        const auto& cache = runtime->caches[index];
+        if(runtime->layers[index].full_attention){
+            append(cache.latents, position * g.kv_lora);
+            append(cache.rope_keys, position * g.qk_rope);
+        } else {
+            append(cache.state, channels * g.head_dim);
+            append(cache.query_window, channels * history);
+            append(cache.key_window, channels * history);
+            append(cache.value_window, channels * history);
+        }
+    }
+    *length = offset;
+    return 0; });
+}
+
+int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime,
+                                  const void* buffer, uint64_t length){
+    return guarded([&]{
+    if(!runtime||!buffer)
+        throw std::runtime_error("invalid bailing cache load arguments");
+    if(length < sizeof(BailingCacheHeader))
+        throw std::runtime_error("bailing cache snapshot is truncated");
+    BailingCacheHeader header{};
+    std::memcpy(&header, buffer, sizeof(header));
+    if(std::memcmp(header.magic, kBailingCacheMagic, sizeof(header.magic)) != 0)
+        throw std::runtime_error("this is not a bailing cache snapshot");
+    if(header.version != kBailingCacheVersion)
+        throw std::runtime_error(
+            "bailing cache snapshot is version " + std::to_string(header.version) +
+            ", this build writes " + std::to_string(kBailingCacheVersion));
+    const auto& g = runtime->geometry;
+    if(header.layers != runtime->layers.size() ||
+       header.kv_lora != g.kv_lora || header.qk_rope != g.qk_rope ||
+       header.heads != g.heads || header.head_dim != g.head_dim ||
+       header.conv_width != g.conv_width)
+        throw std::runtime_error(
+            "bailing cache snapshot was taken from a differently shaped model");
+    if(header.position > runtime->capacity)
+        throw std::runtime_error(
+            "bailing cache snapshot holds " + std::to_string(header.position) +
+            " tokens, more than the runtime capacity of " +
+            std::to_string(runtime->capacity));
+    const std::uint64_t payload =
+        bailing_cache_payload_bytes(*runtime, header.position);
+    if(header.payload != payload)
+        throw std::runtime_error("bailing cache snapshot payload does not match "
+                                 "the geometry it claims");
+    if(length < sizeof(header) + header.layers + payload)
+        throw std::runtime_error("bailing cache snapshot is truncated");
+
+    const auto* in = static_cast<const std::uint8_t*>(buffer);
+    std::uint64_t offset = sizeof(header);
+    for(std::size_t index=0;index<runtime->layers.size();++index)
+        if((in[offset++] != 0) != runtime->layers[index].full_attention)
+            throw std::runtime_error(
+                "bailing cache snapshot disagrees about which layers attend");
+
+    auto take = [&](std::vector<float>& target, std::uint64_t elements){
+        if(!elements) return;
+        if(target.size() < elements)
+            throw std::runtime_error("bailing cache is shorter than the snapshot");
+        // Bounds-checked before the read, not after: the header is the only
+        // thing that says how long the payload is, and a header is exactly what
+        // a corrupt snapshot has.
+        if(offset + elements * 4 > length)
+            throw std::runtime_error("bailing cache snapshot is truncated");
+        std::memcpy(target.data(), in + offset,
+                    static_cast<std::size_t>(elements) * 4);
+        offset += elements * 4;
+    };
+    const std::uint64_t position = header.position;
+    const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
+    const std::uint64_t history = g.conv_width ? g.conv_width - 1 : 0;
+    for(std::size_t index=0;index<runtime->layers.size();++index){
+        auto& cache = runtime->caches[index];
+        if(runtime->layers[index].full_attention){
+            take(cache.latents, position * g.kv_lora);
+            take(cache.rope_keys, position * g.qk_rope);
+        } else {
+            take(cache.state, channels * g.head_dim);
+            take(cache.query_window, channels * history);
+            take(cache.key_window, channels * history);
+            take(cache.value_window, channels * history);
+        }
+        // Rows past `position` are left as they were. Attention reads exactly
+        // `positions` of them and every position is written before it is read,
+        // so what is beyond is unreachable rather than stale.
+        cache.positions = static_cast<std::size_t>(position);
+    }
+    runtime->position = static_cast<std::uint32_t>(position);
+    // The device copy, if there is one, now holds another sequence entirely.
+    // Saying the host is authoritative makes the next eval upload this one.
+    runtime->cache_on_device = false;
     return 0; });
 }
 

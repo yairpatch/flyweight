@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import BailingRuntime, V2Model
+from colibri_next.v2 import BailingRuntime, V2Error, V2Model
 from tests import bailing_gguf_fixture as gguf
 from tests import hf_safetensors_fixture as safetensors
 
@@ -146,6 +146,175 @@ class BailingGgufTests(unittest.TestCase):
         with self.unquantized():
             original = generate(self.hf_path)
         self.assertEqual(converted, original)
+
+
+class BailingRuntimeStateTests(unittest.TestCase):
+    """Snapshotting a sequence, and watching a prompt while it runs.
+
+    Both are runtime bookkeeping rather than arithmetic, so they run on the host
+    path on purpose: the device keeps its own copy of every cache, and letting
+    the machine decide which one these assertions are about would make them
+    report on the hardware instead of the code.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = tempfile.TemporaryDirectory()
+        root = Path(cls._directory.name)
+        hf_path = safetensors.build(root / "ling-tiny-fixture")
+        cls.gguf_path = gguf.build(root / "converted", hf_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    @contextlib.contextmanager
+    def host_runtime(self, capacity: int = 64):
+        previous = os.environ.get("COLIBRI_BAILING_GPU")
+        os.environ["COLIBRI_BAILING_GPU"] = "0"
+        try:
+            with V2Model(self.gguf_path) as model:
+                runtime = BailingRuntime(model, capacity=capacity)
+                try:
+                    runtime.reset()
+                    yield runtime
+                finally:
+                    runtime.close()
+        finally:
+            if previous is None:
+                os.environ.pop("COLIBRI_BAILING_GPU", None)
+            else:
+                os.environ["COLIBRI_BAILING_GPU"] = previous
+
+    def test_it_reports_the_host_path_it_was_forced_onto(self) -> None:
+        with self.host_runtime() as runtime:
+            self.assertIs(runtime.uses_gpu, False)
+
+    def test_a_restored_snapshot_continues_exactly_as_the_original_would(self) -> None:
+        # The property the prefix cache is built on, and the only one that
+        # proves the serialization is complete: anything left out of the
+        # snapshot -- a convolution window, the KDA recurrent state, the rope
+        # keys -- still produces a plausible continuation, just not this one.
+        #
+        # Decoding several tokens past the restore matters. The recurrent state
+        # is a running summary, so a partial restore is nearly right at the
+        # first token and drifts; a single-token comparison passed against a
+        # snapshot that carried the latents alone.
+        prompt = [5, 11, 23, 4, 9, 17, 3, 8]
+        tail = [12, 6, 19, 2]
+
+        def continue_from(runtime) -> tuple[list[float], list[int]]:
+            logits = list(runtime.eval(tail))
+            decoded = []
+            for _ in range(5):
+                decoded.append(runtime.sample())
+                runtime.eval_into([decoded[-1]])
+            return logits, decoded
+
+        with self.host_runtime() as runtime:
+            runtime.eval_into(prompt)
+            snapshot = runtime.save_state()
+            straight = continue_from(runtime)
+            # Run an unrelated sequence in between. A "restore" that quietly
+            # kept whatever was live would otherwise be flattered by the fact
+            # that the live caches already held the right prompt.
+            runtime.reset()
+            runtime.eval_into([31, 29, 27, 25, 23, 21])
+            runtime.load_state(snapshot)
+            restored = continue_from(runtime)
+        self.assertEqual(restored, straight)
+
+    def test_a_snapshot_is_sized_by_the_sequence_not_the_capacity(self) -> None:
+        short = [(index * 7) % 400 + 1 for index in range(8)]
+        rest = [(index * 13) % 400 + 1 for index in range(1000)]
+        with self.host_runtime(capacity=1024) as runtime:
+            runtime.eval_into(short)
+            brief = runtime.save_state()
+            runtime.eval_into(rest)
+            lengthy = runtime.save_state()
+        # The per-token part of the cache is the MLA latents and rope keys; the
+        # KDA layers are a fixed recurrent state whatever the length. So a
+        # thousand tokens is a multiple of eight tokens, not a thousand times
+        # it -- but the growth has to be there.
+        self.assertGreater(len(lengthy), 2 * len(brief))
+        # And the sixteen-times-smaller runtime snapshots the same eight tokens
+        # to the same bytes. That is the whole claim: capacity is not in the
+        # size, so a 32-token side-call does not pay for a 128k context.
+        with self.host_runtime(capacity=64) as runtime:
+            runtime.eval_into(short)
+            self.assertEqual(runtime.save_state(), brief)
+
+    def test_a_damaged_snapshot_is_refused_rather_than_misread(self) -> None:
+        prompt = [5, 11, 23, 4, 9, 17, 3, 8]
+        with self.host_runtime() as runtime:
+            runtime.eval_into(prompt)
+            snapshot = runtime.save_state()
+            damaged = {
+                "empty": b"",
+                "header only, half of it": snapshot[:20],
+                "wrong magic": b"NOTACACH" + snapshot[8:],
+                "truncated payload": snapshot[:-4],
+                "a byte flipped in the geometry": (
+                    snapshot[:12] + bytes([snapshot[12] ^ 0x7F]) + snapshot[13:]
+                ),
+            }
+            for name, blob in damaged.items():
+                with self.subTest(damage=name):
+                    with self.assertRaises(V2Error):
+                        runtime.load_state(blob)
+            # A refused load must not have consumed the runtime on the way out.
+            runtime.load_state(snapshot)
+            self.assertEqual(len(runtime.save_state()), len(snapshot))
+
+    def test_a_watched_prompt_reports_its_way_through(self) -> None:
+        prompt = [5, 11, 23, 4, 9, 17, 3, 8]
+        seen: list[tuple[int, int]] = []
+        with self.host_runtime() as runtime:
+            runtime.set_progress(lambda processed, total: seen.append(
+                (processed, total)) is None)
+            runtime.eval_into(prompt)
+            # A decoded token is not a prompt: reporting "0 of 1" then "1 of 1"
+            # for every token of every generation is pure overhead.
+            before = len(seen)
+            runtime.eval_into([7])
+            self.assertEqual(len(seen), before)
+            runtime.set_progress(None)
+            runtime.eval_into([7])
+        self.assertEqual(len(seen), before)
+        self.assertEqual([total for _, total in seen], [len(prompt)] * len(seen))
+        processed = [value for value, _ in seen]
+        self.assertGreater(len(processed), 2)
+        self.assertEqual(processed[0], 0)
+        self.assertEqual(processed[-1], len(prompt))
+        # Strictly increasing: a watcher rendering a progress bar has to be able
+        # to treat these as a position, not as a sequence of hints.
+        self.assertEqual(processed, sorted(set(processed)))
+
+    def test_a_watcher_that_says_stop_stops_the_prompt(self) -> None:
+        prompt = [5, 11, 23, 4, 9, 17, 3, 8]
+        with self.host_runtime() as runtime:
+            reference = list(runtime.eval(prompt))
+            runtime.reset()
+
+            reports = []
+
+            def watcher(processed: int, total: int) -> bool:
+                reports.append(processed)
+                # Not on the first call: entering the eval is easy to abandon,
+                # and abandoning it part way through the layers is the case
+                # that has to leave the runtime usable.
+                return len(reports) < 2
+
+            runtime.set_progress(watcher)
+            with self.assertRaises(V2Error):
+                runtime.eval_into(prompt)
+            runtime.set_progress(None)
+            self.assertEqual(len(reports), 2)
+            # A cancelled prompt leaves a partly advanced sequence behind, which
+            # reset is what clears -- and after it the runtime answers exactly
+            # as it did before anything was cancelled.
+            runtime.reset()
+            self.assertEqual(list(runtime.eval(prompt)), reference)
 
 
 if __name__ == "__main__":

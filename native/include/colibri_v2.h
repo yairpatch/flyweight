@@ -516,6 +516,32 @@ COLIBRI_V2_API int colibri_v2_bailing_create(const ColibriV2Model* model, uint32
 COLIBRI_V2_API void colibri_v2_bailing_destroy(ColibriV2BailingRuntime* runtime);
 COLIBRI_V2_API int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime);
 COLIBRI_V2_API int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* tokens, uint32_t count, float* logits);
+/* Whether creation actually got the device. Creation asks for the GPU whenever
+   there is one and falls back to the host silently, so nothing but the runtime
+   knows which path it is on. Writes 1 for the device and 0 for the host. */
+COLIBRI_V2_API int colibri_v2_bailing_uses_gpu(ColibriV2BailingRuntime* runtime, int* out);
+/* Watch a prompt as it is evaluated, and optionally stop it.
+
+   `callback(user, processed, total)` runs on entry, at internal tile
+   boundaries (roughly every 128 tokens) and on completion of a multi-token
+   `colibri_v2_bailing_eval`, with `total` equal to that call's `count`.
+   Returning non-zero abandons the evaluation, which then fails like any other
+   error; the runtime is left usable but with a partially advanced sequence, so
+   reset before using it again. A NULL callback clears the watcher.
+
+   Single-token evaluations are not reported: there is nothing to watch, and a
+   callback per decoded token is pure overhead. */
+COLIBRI_V2_API int colibri_v2_bailing_set_progress(ColibriV2BailingRuntime* runtime, int (*callback)(void* user, uint32_t processed, uint32_t total), void* user);
+/* Snapshot and restore the LIVE sequence, so a prefix can be reused instead of
+   re-evaluated. Sized by the tokens the runtime holds rather than by its
+   capacity, and machine-local (native endianness and float layout) like the HF
+   weight cache: a snapshot is validated on load and rejected, never
+   reinterpreted.
+
+   Two calls. Pass buffer = NULL and capacity = 0 to learn the size, then a
+   buffer of at least that size; `length` receives the size in both cases. */
+COLIBRI_V2_API int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer, uint64_t capacity, uint64_t* length);
+COLIBRI_V2_API int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime, const void* buffer, uint64_t length);
 
 COLIBRI_V2_API int colibri_v2_qwen_validate(const ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_qwen_tensor_role(const ColibriV2Model* model, const char* role, ColibriV2TensorInfo* out);

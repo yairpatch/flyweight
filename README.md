@@ -13,7 +13,7 @@ Served model families:
 | Muse Glimmer | GGUF | Channel-tagged reasoning; drafts via a DFlash sidecar, no in-model MTP |
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
 | Gemma 4 | GGUF | Greedy decode with penalties disabled only -- see limitations |
-| BailingMoE3 | GGUF, safetensors | Single sequence, no prefix cache; a GGUF conversion answers exactly as the checkpoint it came from |
+| BailingMoE3 | GGUF, safetensors | One live sequence, with snapshot prefix reuse across conversations; a GGUF conversion answers exactly as the checkpoint it came from |
 
 A safetensors checkpoint (Qwen 3.5 family and BailingMoE3) is packed to a
 chosen quantization on first open and cached beside the checkpoint --
@@ -453,10 +453,15 @@ device are skipped.
 - The Qwen 3.5 safetensors loader reads only `text_config`: the vision tower
   is dropped and M-RoPE is not implemented, so multimodal checkpoints serve
   as text-only.
-- BailingMoE3 runs on a dedicated single-sequence runtime without prefix
-  caching or expert paging, and prompt evaluation reports no progress and
-  cannot be cancelled mid-call (the native progress entry point is not
-  implemented).
+- BailingMoE3 runs one live sequence rather than independent slots, and has
+  no expert paging. Concurrent conversations are served by snapshotting the
+  live cache and restoring the longest matching prefix, so they do not run in
+  parallel and a switch costs a copy rather than a re-evaluation.
+- BailingMoE3's grouped routed-expert GPU kernels cover Q4_K and Q6_K only.
+  Every other format its dispatch decodes -- the IQ formats among them --
+  runs the routed experts one expert at a time instead, which is correct but
+  much slower. Pack Ling to Q4_K or Q6_K unless the checkpoint does not
+  otherwise fit.
 - HF safetensors loading covers the Qwen 3.5 family and BailingMoE3 only;
   other architectures are GGUF-only.
 - Laguna has no MTP, and supports only the per-head attention gate, so the

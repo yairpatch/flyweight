@@ -198,8 +198,14 @@ inline ModelConfig config_from_qwen3_5(const json::Value& config) {
         static_cast<std::uint32_t>(text["head_dim"].as_uint());
     out.key_length = out.attention_head_dim;
     out.value_length = out.attention_head_dim;
-    out.conv_kernel =
-        static_cast<std::uint32_t>(text["linear_conv_kernel_dim"].as_uint(4));
+    // Two spellings for one field: Qwen3.5 calls it linear_conv_kernel_dim,
+    // BailingMoE3 calls it short_conv_kernel_size. Reading only the first
+    // left every Ling checkpoint on the fallback -- which is 4, and so
+    // happens to be right today, which is exactly why it would go unnoticed
+    // on the checkpoint where it is not.
+    out.conv_kernel = static_cast<std::uint32_t>(
+        text["linear_conv_kernel_dim"].as_uint(
+            text["short_conv_kernel_size"].as_uint(4)));
     out.linear_value_heads =
         static_cast<std::uint32_t>(text["linear_num_value_heads"].as_uint());
     out.linear_key_heads =
