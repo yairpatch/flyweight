@@ -99,10 +99,26 @@ pointer-table staging must be doubled or fenced (halves alternate).
   config (Q5, hybrid-cpu, 4096 tokens, 5000 MiB cache, interleaved A/B):
   **413 → 586 tok/s (+41%)**, gate was +25%. Bit-identity held everywhere
   gate 1 lists, plus Qwen3.8 IQ3_XXS with mtp_drafts=2.
-- Remaining headroom: the max(GPU, CPU) bound projects ~730 tok/s; the gap
-  is the half-grain cost (−5%) plus the tail where the engine thread sits in
-  `qwen_cpu_moe_rows` with no core left to queue. That is the stage-3
-  question (deeper grain or a MoE worker thread) — measure before building.
+- Stage 3 measured (2026-08-22) and **closed: build neither option.** Host
+  counters on the pipelined path, Q5 hybrid-cpu:
+
+  | length | total | cpu_moe | route_wait | other |
+  |---|---:|---:|---:|---:|
+  | 4096, pipe on | 7.55–8.35 s | 6.93–7.65 s | 0.07 s | 0.6 s |
+  | 4096, pipe off | 10.55 s | 6.45 s | 3.50 s | 0.6 s |
+  | 10240, pipe on | 18.30 s | 16.79 s | 0.10 s | 1.4 s |
+  | 10240, pipe off | 26.87 s | 18.10 s | 7.23 s | 1.5 s |
+
+  route_wait fell from 33–27% of prefill to **under 1%**: the GPU never
+  makes the engine thread wait, so the single-thread schedule already
+  captures the max(GPU, CPU) bound — the plan's stage-3 condition held.
+  Quarter chunks have nothing left to overlap and would only deepen the
+  CPU-side halving cost (each routed expert's weights swept once per half;
+  +8–19% at 4K, noise at 10K). A dedicated MoE worker thread could at most
+  absorb `other` (~8%) while contending with the OpenMP MoE team for cores.
+  Prefill is now purely CPU-MoE-bound; the next prompt-speed lever is a
+  faster CPU expert path or shifting expert share to the GPU — different
+  plans.
 
 ## Staging
 
