@@ -31,6 +31,12 @@ struct ModelConfig {
     // tensor shapes instead.
     std::uint32_t linear_value_heads=0, linear_key_heads=0, linear_head_dim=0;
     std::uint32_t key_length_swa=0, value_length_swa=0;
+    // MLA per-head widths as a GGUF carries them. llama.cpp's bailingmoe3
+    // conversion writes `attention.key_length` as the MQA cache-row width
+    // (kv_lora + rope) and the true per-head q/k width under `_mla` keys;
+    // the runtime geometry wants the per-head widths in key_length /
+    // value_length, so these are folded over them post-parse.
+    std::uint32_t key_length_mla=0, value_length_mla=0;
     std::uint32_t rotary_dimension_swa=0;
     float rope_freq_base_swa=0.0f, final_logit_softcap=0.0f;
     float rms_norm_epsilon=0.0f, rope_freq_base=0.0f;

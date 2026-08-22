@@ -1873,6 +1873,17 @@ int parse(ColibriV2Model& m) {
         // otherwise be caught by the shorter generic suffixes below.
         if(suffix(".attention.q_lora_rank"))target=&m.config.q_lora_rank;
         else if(suffix(".attention.kv_lora_rank"))target=&m.config.kv_lora_rank;
+        // BailingMoE3: the per-head MLA widths, the declared KDA head width
+        // (which is NOT hidden/heads on this family), and group-limited
+        // routing. These must precede the generic suffixes below -- and note
+        // `.expert_group_used_count` must be tested before `.expert_used_count`
+        // could ever swallow it.
+        else if(suffix(".attention.key_length_mla"))target=&m.config.key_length_mla;
+        else if(suffix(".attention.value_length_mla"))target=&m.config.value_length_mla;
+        else if(suffix(".kda.head_dim"))target=&m.config.attention_head_dim;
+        else if(suffix(".ssm.conv_kernel"))target=&m.config.conv_kernel;
+        else if(suffix(".expert_group_used_count"))target=&m.config.expert_group_used;
+        else if(suffix(".expert_group_count"))target=&m.config.expert_group_count;
         else if(suffix(".attention.output_lora_rank"))target=&m.config.output_lora_rank;
         else if(suffix(".attention.output_group_count"))target=&m.config.output_group_count;
         else if(suffix(".attention.indexer.head_count"))target=&m.config.indexer_head_count;
@@ -2012,6 +2023,49 @@ int parse(ColibriV2Model& m) {
            m.config.compress_ratios.size()<m.config.layer_count)
             throw std::runtime_error(
                 "deepseek4 compress-ratio array is shorter than the model layer count");
+    }
+    // BailingMoE3 GGUFs carry no full_attention_interval key: the cadence is
+    // written as the per-layer KV-head array, heads on the MLA layers and 0 on
+    // the KDA layers. The interval is the index+1 of the first full layer, and
+    // the whole array is checked against layer_is_full_attention rather than
+    // trusting one entry -- a cadence the runtime mis-derives produces fluent
+    // wrong text, not an error.
+    if(m.architecture=="bailingmoe3"){
+        // `attention.key_length` in these GGUFs is the MQA cache-row width
+        // (kv_lora + rope); the geometry wants the per-head widths.
+        if(m.config.key_length_mla)m.config.key_length=m.config.key_length_mla;
+        if(m.config.value_length_mla)m.config.value_length=m.config.value_length_mla;
+        const auto& kv_heads=m.config.attention_kv_heads_by_layer;
+        if(!m.config.full_attention_interval&&!kv_heads.empty()){
+            std::uint32_t interval=0;
+            for(std::size_t layer=0;layer<kv_heads.size();++layer)
+                if(kv_heads[layer]){interval=static_cast<std::uint32_t>(layer)+1;break;}
+            if(!interval)
+                throw std::runtime_error(
+                    "bailingmoe3 GGUF declares no full-attention layer in "
+                    "attention.head_count_kv");
+            for(std::size_t layer=0;layer<kv_heads.size();++layer){
+                const bool full=colibri::v2::bailing::layer_is_full_attention(
+                    static_cast<std::uint32_t>(layer),
+                    static_cast<std::uint32_t>(kv_heads.size()),interval);
+                if((kv_heads[layer]!=0)!=full)
+                    throw std::runtime_error(
+                        "bailingmoe3 attention.head_count_kv disagrees with a "
+                        "period-"+std::to_string(interval)+" cadence at layer "+
+                        std::to_string(layer));
+            }
+            m.config.full_attention_interval=interval;
+        }
+        // Mirror the HF loader: the pattern marks the linear (KDA) layers.
+        if(m.config.full_attention_interval&&
+           m.config.sliding_window_pattern.empty()&&m.config.layer_count){
+            m.config.sliding_window_pattern.assign(m.config.layer_count,0);
+            for(std::uint32_t layer=0;layer<m.config.layer_count;++layer)
+                m.config.sliding_window_pattern[layer]=
+                    colibri::v2::bailing::layer_is_full_attention(
+                        layer,m.config.layer_count,
+                        m.config.full_attention_interval)?0:1;
+        }
     }
     if(!m.config.sliding_window_pattern.empty()&&m.config.sliding_window_pattern.size()<m.config.layer_count)
         throw std::runtime_error("GGUF sliding-window pattern is shorter than the model layer count");
@@ -4412,6 +4466,166 @@ void bailing_validate_plan(const ColibriV2Model& m) {
         config.expert_group_used,config.expert_shared_count);
 }
 
+// A llama.cpp-style bailingmoe3 GGUF is not this runtime's internal layout
+// under different names: the conversion renames the KDA projections, stores A
+// rather than A_log, and splits the MLA kv_b projection in two with the key
+// half transposed per head. Adapt the descriptors in place so everything
+// downstream -- the layer plan, both eval paths, the GPU upload -- sees exactly
+// what the HF loader produces. Runs only on the GGUF path; the HF path already
+// carries the internal layout.
+//
+// Two tensors differ in content rather than name, so their bytes are
+// synthesized into `owned_arena`, which the model keeps alive for its lifetime
+// (the same indirection the HF loader and split shards already use):
+//   * ssm_a: the GGUF stores +exp(A_log); the kernels here consume A_log
+//     itself and apply -exp() per step (colibri_v2_bailing.hpp:905 and the
+//     device kernel alike), so the load takes log() -- NOT a negation.
+//   * attn_kv_b.weight: rebuilt from attn_k_b (stored [heads][kv_lora][qk_nope],
+//     i.e. transposed per head for llama.cpp's absorbed matmul) and attn_v_b
+//     ([heads][v_head][kv_lora]), un-transposing the key half so the merged
+//     rows match kv_b_proj byte-for-byte with what the HF path yields.
+void bailing_adapt_gguf(ColibriV2Model& m) {
+    namespace bailing = colibri::v2::bailing;
+    const auto& config = m.config;
+    if(!config.layer_count)return;
+
+    const auto find=[&m](const std::string& name)->Tensor*{
+        for(auto& tensor:m.tensors)if(tensor.name==name)return &tensor;
+        return nullptr;
+    };
+
+    struct Pending {
+        std::string name;               // final (internal) tensor name
+        std::vector<std::uint64_t> shape;  // GGUF order; empty = keep existing
+        std::uint64_t offset=0, size=0; // into the synthesized arena
+        bool replace=false;             // patch the descriptor of `name` in place
+    };
+    std::vector<Pending> pending;
+    std::vector<std::uint8_t> arena;
+    const auto reserve=[&arena](std::uint64_t bytes)->std::uint64_t{
+        const auto at=arena.size();
+        arena.resize(at+bytes);
+        return at;
+    };
+
+    static const std::pair<const char*,const char*> kda_renames[]={
+        {"attn_q.weight","ssm_q.weight"},
+        {"attn_k.weight","ssm_k.weight"},
+        {"attn_v.weight","ssm_v.weight"},
+        {"attn_output.weight","ssm_out.weight"},
+        {"ssm_conv1d_q.weight","ssm_q_conv1d.weight"},
+        {"ssm_conv1d_k.weight","ssm_k_conv1d.weight"},
+        {"ssm_conv1d_v.weight","ssm_v_conv1d.weight"},
+        {"ssm_f_a.weight","ssm_f.weight"},
+        {"ssm_beta.weight","ssm_b.weight"},
+        {"ssm_g_a.weight","ssm_g.weight"},
+    };
+
+    std::vector<std::string> dropped;
+    for(std::uint32_t layer=0;layer<config.layer_count;++layer){
+        const std::string prefix="blk."+std::to_string(layer)+".";
+        const bool full=bailing::layer_is_full_attention(
+            layer,config.layer_count,config.full_attention_interval);
+        if(!full){
+            // The KDA projections arrive under ordinary attention names, which
+            // mean different weights on an MLA layer -- hence per-layer rather
+            // than a blanket rename.
+            for(const auto& [from,to]:kda_renames)
+                if(auto* tensor=find(prefix+from);tensor&&!find(prefix+to))
+                    tensor->name=prefix+to;
+            if(auto* a=find(prefix+"ssm_a")){
+                if(a->type!=0)
+                    throw std::runtime_error(
+                        "bailingmoe3 expects "+a->name+" to be f32 but it is "
+                        "type "+std::to_string(a->type));
+                const auto elements=tensor_elements(*a);
+                const auto* values=
+                    reinterpret_cast<const float*>(tensor_data(m,*a));
+                const auto offset=reserve(elements*sizeof(float));
+                auto* out=reinterpret_cast<float*>(arena.data()+offset);
+                for(std::uint64_t i=0;i<elements;++i){
+                    if(!(values[i]>0.0f))
+                        throw std::runtime_error(
+                            "bailingmoe3 "+a->name+" is not the positive "
+                            "exp(A_log) a GGUF conversion writes");
+                    out[i]=std::log(values[i]);
+                }
+                pending.push_back({a->name,{},offset,elements*sizeof(float),true});
+            }
+            continue;
+        }
+        if(find(prefix+"attn_kv_b.weight"))continue;
+        auto* k_b=find(prefix+"attn_k_b.weight");
+        auto* v_b=find(prefix+"attn_v_b.weight");
+        if(!k_b||!v_b)continue;  // the layer plan will name what is missing
+        const std::uint64_t heads=config.attention_heads;
+        const std::uint64_t qk_nope=config.key_length-config.rotary_dimension;
+        const std::uint64_t v_head=config.value_length;
+        const std::uint64_t kv_lora=config.kv_lora_rank;
+        // GGUF extents run fastest-first.
+        const std::vector<std::uint64_t> k_shape{qk_nope,kv_lora,heads};
+        const std::vector<std::uint64_t> v_shape{kv_lora,v_head,heads};
+        if(k_b->shape!=k_shape||v_b->shape!=v_shape)
+            throw std::runtime_error(
+                "bailingmoe3 "+prefix+"attn_k_b/attn_v_b shapes disagree with "
+                "the declared MLA geometry");
+        std::vector<float> keys(heads*kv_lora*qk_nope);
+        std::vector<float> values(heads*v_head*kv_lora);
+        bailing::matrix_decode({tensor_data(m,*k_b),k_b->type},
+                               qk_nope,heads*kv_lora,keys.data());
+        bailing::matrix_decode({tensor_data(m,*v_b),v_b->type},
+                               kv_lora,heads*v_head,values.data());
+        const std::uint64_t merged_rows=heads*(qk_nope+v_head);
+        const auto offset=reserve(merged_rows*kv_lora*sizeof(float));
+        auto* out=reinterpret_cast<float*>(arena.data()+offset);
+        for(std::uint64_t head=0;head<heads;++head){
+            float* block=out+head*(qk_nope+v_head)*kv_lora;
+            const float* k=keys.data()+head*kv_lora*qk_nope;
+            for(std::uint64_t row=0;row<qk_nope;++row)
+                for(std::uint64_t column=0;column<kv_lora;++column)
+                    block[row*kv_lora+column]=k[column*qk_nope+row];
+            std::memcpy(block+qk_nope*kv_lora,
+                        values.data()+head*v_head*kv_lora,
+                        v_head*kv_lora*sizeof(float));
+        }
+        pending.push_back({prefix+"attn_kv_b.weight",{kv_lora,merged_rows},
+                           offset,merged_rows*kv_lora*sizeof(float),false});
+        dropped.push_back(k_b->name);
+        dropped.push_back(v_b->name);
+    }
+
+    // The arena must stop moving before any descriptor points into it.
+    m.owned_arena=std::move(arena);
+    for(const auto& entry:pending){
+        if(entry.replace){
+            auto* tensor=find(entry.name);
+            tensor->type=0;
+            tensor->offset=entry.offset;
+            tensor->size=entry.size;
+            tensor->source=m.owned_arena.data();
+            continue;
+        }
+        Tensor tensor;
+        tensor.name=entry.name;
+        tensor.shape=entry.shape;
+        tensor.type=0;
+        tensor.offset=entry.offset;
+        tensor.size=entry.size;
+        tensor.source=m.owned_arena.data();
+        m.tensors.push_back(std::move(tensor));
+    }
+    // The split halves have no consumer once the merge exists; leaving them
+    // would make the GGUF model's tensor surface differ from the HF one.
+    if(!dropped.empty())
+        m.tensors.erase(
+            std::remove_if(m.tensors.begin(),m.tensors.end(),
+                [&dropped](const Tensor& tensor){
+                    return std::find(dropped.begin(),dropped.end(),tensor.name)
+                        !=dropped.end();
+                }),
+            m.tensors.end());
+}
+
 // An HF checkpoint is a directory: config.json plus one or more safetensors
 // shards. A GGUF is a single file. That is the whole detection rule.
 bool is_hf_directory(const char* path) {
@@ -4677,6 +4891,26 @@ void load_hf(const char* path, ColibriV2Model& m) {
     const auto slash=directory.find_last_of('/');
     m.name=slash==std::string::npos?directory:directory.substr(slash+1);
     m.chat_template=read_text_file(directory+"/chat_template.jinja");
+    // Checkpoints published before chat_template.jinja existed keep the
+    // template in tokenizer_config.json -- one string, or a list of named
+    // templates of which "default" is the conversational one. Reading only
+    // the file left those checkpoints on the runtime's generic fallback
+    // markup, silently.
+    if(m.chat_template.empty()){
+        if(const auto text=read_text_file(directory+"/tokenizer_config.json");
+           !text.empty()){
+            const auto parsed=colibri::v2::json::parse(text);
+            const auto& configured=parsed["chat_template"];
+            if(configured.kind==colibri::v2::json::Kind::String)
+                m.chat_template=configured.string;
+            else if(configured.kind==colibri::v2::json::Kind::Array)
+                for(const auto& entry:configured.array)
+                    if(entry["name"].as_string()=="default"){
+                        m.chat_template=entry["template"].as_string();
+                        break;
+                    }
+        }
+    }
     // config.json's eos is end-of-document; the turn ends on a different token
     // that only generation_config.json names, and it lists that one first.
     // Getting this wrong does not fail loudly -- generation simply never stops.
@@ -6474,6 +6708,12 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
     }else{
         map_and_parse(path,*m);
         attach_split_shards(*m);
+        // After the shards attach, so a split checkpoint's tensors are all
+        // visible to the adaptation and to the plan check alike.
+        if(m->architecture=="bailingmoe3"){
+            bailing_adapt_gguf(*m);
+            bailing_validate_plan(*m);
+        }
     }
     *out=m.release(); return 0; }); }
 int colibri_v2_model_attach_mtp(ColibriV2Model* m,const char*path){return guarded([&]{
