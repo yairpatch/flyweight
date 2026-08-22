@@ -121,3 +121,16 @@ related question: decode's expert bucket is ~96% CPU MoE compute at the
 host bandwidth wall, not transfers, so the prefill fence pattern has no
 decode target; decode's real lever is residency policy (immutable 43 tok/s
 vs mutable+seed 62, the ornith determinism trade).
+
+## Default-on (2026-08-22, `a1ae272`)
+
+Coverage that justified the flip: +31% Q5 (617→810 interleaved), +18% Q6
+(634→751), +27% Ornith Q6 (670→854), exact no-op on dense Qwen3.8, ~2–4%
+decode cost. `prefill_expert_stream_mib` is now a runtime option (−1 auto =
+48 MiB with graceful degradation on tight budgets, 0 = the old bit-exact
+behavior); the env var overrides for A/B. Serving residency defaults were
+already mutable+seed-auto, so the decode-policy question needed no change —
+the immutable/seed-off configs remain the determinism recipe for
+benchmarks. Note for future baselines: default hybrid prefill tokens
+changed at this commit (streamed share computes on Q8 activations); the
+pre-streaming baselines (q5_base et al.) correspond to budget 0.
