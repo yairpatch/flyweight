@@ -110,3 +110,14 @@ Open follow-ups, each its own measured decision:
 Session arc for prompt speed on this configuration: 413 tok/s (serial, two
 days ago) → 586 (pipeline) → 653 (+2048 rows) → **810 (expert GEMM)** —
 **+96%** end to end, bit-identical or gated at every step.
+
+## Decode-side datum (2026-08-22)
+
+With the 48 MiB budget active, decode loses ~2–4% to the arena's slot cost
+(hits/token 137 → 134 mutable, 43 → 40 seeded-immutable; ~40 slots) against
+the +31% prefill gain — favourable for prompt-heavy serving, a per-config
+call for decode-heavy. The same decomposition (COLIBRI_TIMING=1) settled a
+related question: decode's expert bucket is ~96% CPU MoE compute at the
+host bandwidth wall, not transfers, so the prefill fence pattern has no
+decode target; decode's real lever is residency policy (immutable 43 tok/s
+vs mutable+seed 62, the ornith determinism trade).
