@@ -272,9 +272,12 @@ def build_dense_qwen35_gguf(
         offset = len(payloads)
         # Quantize only the wide 2D projections. Norms and other vectors stay
         # f32 exactly as a real checkpoint leaves them.
+        # The stacked expert tensors are 3-D [expert][output][input]; their
+        # contiguous rows are shape[0] long exactly like a 2-D projection's,
+        # so the same per-row packing applies.
         use_q8 = (
             quantize == "q8_0"
-            and len(shape) == 2
+            and len(shape) in (2, 3)
             and shape[0] % 32 == 0
             and name.endswith(".weight")
             and "norm" not in name
@@ -284,7 +287,8 @@ def build_dense_qwen35_gguf(
         infos += b"".join(struct.pack("<Q", dim) for dim in shape)
         infos += struct.pack("<IQ", GGML_Q8_0 if use_q8 else GGML_F32, offset)
         if use_q8:
-            raw = _quantize_q8_0(np.ascontiguousarray(data, dtype=np.float32))
+            raw = _quantize_q8_0(np.ascontiguousarray(
+                data, dtype=np.float32).reshape(-1, shape[0]))
             assert len(raw) == int(np.prod(shape)) // 32 * 34, name
         else:
             raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()

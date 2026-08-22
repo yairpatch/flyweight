@@ -583,6 +583,13 @@ struct ColibriV2QwenRuntime {
     std::uint64_t state_bytes = 0;
     std::uint64_t expert_staging = 0;
     std::uint64_t expert_staging_bytes = 0;
+    // Prefill expert-streaming arena (plans/prefill-expert-stream.md): routed
+    // experts staged here per half-layer so the grouped kernels can take a
+    // byte-budgeted share of the prefill MoE off the CPU. Sized by
+    // COLIBRI_PREFILL_EXPERT_STREAM_MIB at prepare; zero keeps prefill
+    // experts wholly on the host, which is today's behavior.
+    std::uint64_t prefill_stream_arena = 0;
+    std::uint64_t prefill_stream_bytes = 0;
     std::uint64_t expert_cache = 0;
     std::uint64_t expert_cache_bytes = 0;
     std::uint64_t expert_native_cache = 0;
@@ -691,6 +698,7 @@ struct ColibriV2QwenRuntime {
     std::uint64_t grammar_empty_candidate_sets = 0;
     std::uint64_t multi_decode_batches = 0;
     std::uint64_t multi_decode_tokens = 0;
+    std::uint64_t prefill_streamed_bytes = 0;
     std::uint64_t paging_registration_nanoseconds = 0;
     std::uint64_t host_available_bytes = 0;
     std::uint64_t cpu_prefetch_experts = 0;
@@ -1596,6 +1604,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     colibri_gpu_free(runtime.expert_cache);
     colibri_gpu_free(runtime.expert_native_cache);
     colibri_gpu_free(runtime.expert_staging);
+    colibri_gpu_free(runtime.prefill_stream_arena);
+    runtime.prefill_stream_arena = 0;
+    runtime.prefill_stream_bytes = 0;
     // runtime.state aliases sequences[active].state; free each slot's arena +
     // its checkpoint pool once.
     for (auto& seq : runtime.sequences) {
@@ -9976,6 +9987,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->grammar_empty_candidate_sets=runtime->grammar_empty_candidate_sets;
     out->multi_decode_batches=runtime->multi_decode_batches;
     out->multi_decode_tokens=runtime->multi_decode_tokens;
+    out->prefill_streamed_bytes=runtime->prefill_streamed_bytes;
     return 0;
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
@@ -10687,7 +10699,20 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(colibri_gpu_event_create(&event)!=0)throw std::runtime_error("failed to create native Qwen slot events");
         if(colibri_gpu_event_create(&runtime->staging_event)!=0)throw std::runtime_error("failed to create native Qwen staging event");
         if(colibri_gpu_event_create(&runtime->prefetch_event)!=0){colibri_gpu_event_destroy(runtime->staging_event);throw std::runtime_error("failed to create native Qwen prefetch event");}
-        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes;
+        // Prefill expert-streaming arena, env-budgeted while the plan is in
+        // its measured stages (plans/prefill-expert-stream.md). Charged into
+        // the base total below like every other arena, so the expert cache
+        // shrinks by exactly what the stream takes. Meaningless without a
+        // routed-expert model, and the CPU backend would stream to itself.
+        runtime->prefill_stream_bytes=0;
+        if(const char*stream_setting=
+               std::getenv("COLIBRI_PREFILL_EXPERT_STREAM_MIB")){
+            const auto requested=std::strtoull(stream_setting,nullptr,10);
+            if(requested&&runtime->model->config.expert_count&&
+               !colibri_backend_is_cpu())
+                runtime->prefill_stream_bytes=requested*1024ull*1024;
+        }
+        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes;
         const char* nvfp4_persistent_env =
             std::getenv("COLIBRI_NVFP4_PERSISTENT");
         const bool persistent_nvfp4_eligible=
@@ -10826,6 +10851,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         if(colibri_gpu_alloc(runtime->static_arena_bytes,&runtime->static_arena)!=0||
            colibri_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
            (runtime->expert_staging_bytes&&colibri_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0)||
+           (runtime->prefill_stream_bytes&&colibri_gpu_alloc(runtime->prefill_stream_bytes,&runtime->prefill_stream_arena)!=0)||
            (runtime->host_staging_bytes&&colibri_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
         // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
         // attention path can run on it, so this only has to hold the widest

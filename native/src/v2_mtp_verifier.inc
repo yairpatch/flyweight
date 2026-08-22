@@ -498,6 +498,13 @@ void qwen_forward_rows(
         // it from the other half's core and stretch this half's route wait
         // over work it does not depend on.
         std::uint64_t route_event;
+        // This span's slice of the prefill expert-streaming arena (halves get
+        // disjoint slices, reused layer to layer under stream order). Zero
+        // bytes disables streaming for the span.
+        std::uint64_t stream_base;std::uint64_t stream_bytes;
+        // Whether cpu_phase queued GPU expert work whose accumulator
+        // queue_combine must fold into the residual.
+        bool gpu_experts;
         std::chrono::steady_clock::time_point pager_started;
     };
     const auto scratch_stride=static_cast<std::uint64_t>(runtime.scratch_elements);
@@ -1178,7 +1185,17 @@ void qwen_forward_rows(
         // internally, so the real phase has to be checked here: prefill rows
         // must keep training the history without touching residency.
         const bool rows_may_admit=expert_policy.misses_may_be_admitted();
-        const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
+        // Prefill expert streaming engages exactly where the two-half
+        // pipeline does: configurations whose routed prefill experts run
+        // wholly on the host. A budget of zero (the default, and every
+        // config without the arena) leaves this path untouched.
+        const bool stream_experts=span.stream_bytes>0&&
+            expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
+            (expert_policy.hybrid_prefill_cpu||
+             !expert_policy.routed_gpu_execution_allowed());
+        const bool gpu_table_path=
+            !expert_policy.hybrid_prefill_cpu||stream_experts;
+        span.gpu_experts=gpu_table_path;
         const auto span_entries=static_cast<std::size_t>(rows)*top_k;
         if(gpu_table_path){
             std::fill(gpu_weights,gpu_weights+span_entries,0.0f);
@@ -1252,8 +1269,83 @@ void qwen_forward_rows(
                 weights_host[route]=0.0f;
             }
         }
+        // Prefill expert streaming (plans/prefill-expert-stream.md): stage
+        // the densest routed experts of this half-layer into the span's arena
+        // slice and hand their routes to the grouped kernels below; the rest
+        // stay in weights_host for the CPU sweep. Densest first because the
+        // upload is a fixed cost per expert while the saving scales with its
+        // routed tokens; the tie-break on the index keeps the pick a pure
+        // function of the routes, so a fixed budget is deterministic.
+        // Mutually exclusive with the admission loop above by construction:
+        // stream_experts requires the policy that makes gpu_rows_allowed
+        // false, so the two never share gpu_counts.
+        if(stream_experts){
+            std::uint64_t role_bytes[3];std::uint64_t triple_bytes=0;
+            for(int role=0;role<3;++role){
+                role_bytes[role]=
+                    runtime.model->tensors[layer.expert_tensors[role]].size/experts;
+                triple_bytes+=role_bytes[role];
+            }
+            const auto stride=device_align(triple_bytes);
+            std::vector<int> expert_tokens(experts,0);
+            for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
+                const int route=token*top_k+rank;
+                if(weights_host[route]==0.0f)continue;
+                const int expert=selected_host[route];
+                if(expert<0||expert>=experts)
+                    throw std::runtime_error("native Qwen rows forward selected an invalid expert");
+                ++expert_tokens[expert];
+            }
+            std::vector<int> order;order.reserve(experts);
+            for(int expert=0;expert<experts;++expert)
+                if(expert_tokens[expert])order.push_back(expert);
+            std::sort(order.begin(),order.end(),[&](int left,int right){
+                return expert_tokens[left]!=expert_tokens[right]
+                    ?expert_tokens[left]>expert_tokens[right]:left<right;});
+            std::vector<std::uint64_t> staged(experts,0);
+            std::uint64_t cursor=0;
+            for(const int expert:order){
+                if(cursor+stride>span.stream_bytes)break;
+                const auto base=span.stream_base+cursor;
+                std::uint64_t offset=0;
+                for(int role=0;role<3;++role){
+                    const auto&source=
+                        runtime.model->tensors[layer.expert_tensors[role]];
+                    if(colibri_gpu_upload(base+offset,
+                           tensor_data(*runtime.model,source)+
+                               static_cast<std::uint64_t>(expert)*role_bytes[role],
+                           role_bytes[role],runtime.stream)!=0)
+                        throw std::runtime_error(
+                            "native Qwen prefill expert stream upload failed");
+                    offset+=role_bytes[role];
+                }
+                staged[expert]=base;
+                cursor+=stride;
+                runtime.prefill_streamed_bytes+=triple_bytes;
+            }
+            for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
+                const int route=token*top_k+rank;
+                if(weights_host[route]==0.0f)continue;
+                const int expert=selected_host[route];
+                if(!staged[expert])continue;
+                const int compact=token*top_k+gpu_counts[token]++;
+                std::uint64_t offset=0;
+                for(int role=0;role<3;++role){
+                    const auto pointer=staged[expert]+offset;
+                    if(role==0)gate_pointers[compact]=pointer;
+                    else if(role==1)up_pointers[compact]=pointer;
+                    else down_pointers[compact]=pointer;
+                    offset+=role_bytes[role];
+                }
+                gpu_weights[compact]=weights_host[route];
+                gpu_gate_scales[compact]=qwen_expert_role_scale(runtime,layer.expert_gate_scale,expert);
+                gpu_up_scales[compact]=qwen_expert_role_scale(runtime,layer.expert_up_scale,expert)
+                    *qwen_expert_role_scale(runtime,layer.expert_down_scale,expert);
+                weights_host[route]=0.0f;
+            }
+        }
         bool any_gpu=false;
-        if(gpu_rows_allowed)
+        if(gpu_rows_allowed||stream_experts)
             for(int token=0;token<rows;++token)
                 any_gpu=any_gpu||gpu_counts[token]>0;
         if(gpu_table_path){
@@ -1305,7 +1397,9 @@ void qwen_forward_rows(
     // residual, and swap the span's ping-pong buffers for the next layer.
     auto queue_combine=[&](RowsSpan&span){
         install_span(span);
-        const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
+        // Set by cpu_phase: whether the span queued GPU expert work (table
+        // path or streamed) whose accumulator in `fourth` must fold in here.
+        const bool gpu_table_path=span.gpu_experts;
         const auto output_bytes=
             static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
         if(colibri_gpu_upload(first,output_host,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward expert upload failed");
@@ -1320,12 +1414,24 @@ void qwen_forward_rows(
     // core work while the CPU runs the other half's experts -- half B reads
     // half A's KV/DeltaNet state through normal stream ordering because A's
     // core for a layer is always queued before B's.
-    RowsSpan whole{0,total_rows,hidden,residual,runtime.route_event,{}};
+    RowsSpan whole{0,total_rows,hidden,residual,runtime.route_event,
+                   runtime.prefill_stream_arena,runtime.prefill_stream_bytes,
+                   false,{}};
     if(pipelined){
+        // Halves stage into disjoint slices of the streaming arena; round the
+        // front's share down to the device alignment so the back's base stays
+        // aligned.
+        const std::uint64_t stream_half=
+            runtime.prefill_stream_bytes/2
+            /colibri::v2::workspace::kDeviceAlignment
+            *colibri::v2::workspace::kDeviceAlignment;
         RowsSpan front{0,pipeline_half,hidden,residual,
-                       runtime.route_event,{}};
+                       runtime.route_event,
+                       runtime.prefill_stream_arena,stream_half,false,{}};
         RowsSpan back{pipeline_half,total_rows-pipeline_half,hidden,residual,
-                      runtime.route_event_pipeline,{}};
+                      runtime.route_event_pipeline,
+                      runtime.prefill_stream_arena+stream_half,
+                      runtime.prefill_stream_bytes-stream_half,false,{}};
         // Queue core phases until one is a MoE layer whose expert work is
         // pending; dense feed-forward layers complete inside queue_core.
         auto advance=[&](RowsSpan&span,std::uint32_t&next)->bool{

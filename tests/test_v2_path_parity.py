@@ -355,5 +355,78 @@ class MoePathParityTests(_ParityCase):
                 self._assert_same(f"len={len(prompt)} unchunked", blocking, unchunked)
 
 
+class PrefillExpertStreamParityTests(_ParityCase):
+    """Qwen3.5 MoE fixture: streamed prefill experts vs the resident path.
+
+    Prefill expert streaming stages routed experts into a scratch arena and
+    runs the same grouped kernels the resident table path runs, in the same
+    compact order -- so with every expert covered on both sides, the outputs
+    must be bit-identical. Both sides seed the full expert set so decode
+    placement is identical too; only the prefill staging differs. The
+    engagement counter guards against this passing vacuously with the
+    streaming path never taken.
+    """
+
+    TOKENS = 6
+
+    @classmethod
+    def setUpClass(cls):
+        path = _workspace("colibri-parity-stream-") / "moe.gguf"
+        # Q8_0: the grouped GPU expert kernels have no f32 entry, and f32
+        # experts would silently fall both sides back to the CPU MoE.
+        cls._spec = build_dense_qwen35_gguf(
+            path, DenseQwenSpec(experts=8, experts_used=2), quantize="q8_0"
+        )
+        cls._model = V2Model(path)
+        cls._base_options = {
+            "context_limit": 256,
+            "gpu_cache_bytes": 512 * 1024 * 1024,
+            "prefill_cache_seed": 8,
+            "expert_residency": "immutable",
+        }
+        os.environ["COLIBRI_EXPERT_HISTORY"] = "off"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._model.close()
+        del os.environ["COLIBRI_EXPERT_HISTORY"]
+
+    def _generate(self, **options):
+        prompt = _prompts(self._spec.vocabulary, (40,))[0]
+        runtime = self._runtime(**options)
+        tokens = _blocking_run(runtime, prompt, self.TOKENS)
+        return tokens, int(runtime.info["prefill_streamed_bytes"])
+
+    def test_streamed_all_matches_resident_all(self):
+        resident, resident_streamed = self._generate(
+            expert_mode="legacy-hybrid", hybrid_prefill="split"
+        )
+        self.assertEqual(resident_streamed, 0,
+                         "the resident reference must not stream")
+        os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "64"
+        try:
+            streamed_a, streamed_bytes_a = self._generate(expert_mode="auto")
+            streamed_b, streamed_bytes_b = self._generate(expert_mode="auto")
+        finally:
+            del os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"]
+        self.assertGreater(streamed_bytes_a, 0,
+                           "the streaming path did not engage")
+        self.assertEqual(streamed_bytes_a, streamed_bytes_b,
+                         "a fixed budget must stage the same bytes")
+        self._assert_same("stream determinism", streamed_a, streamed_b)
+        self._assert_same("streamed vs resident", resident, streamed_a)
+
+    def test_budget_zero_is_untouched(self):
+        with_default, streamed = self._generate(expert_mode="auto")
+        self.assertEqual(streamed, 0, "no budget must mean no streaming")
+        os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "0"
+        try:
+            with_zero, streamed_zero = self._generate(expert_mode="auto")
+        finally:
+            del os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"]
+        self.assertEqual(streamed_zero, 0)
+        self._assert_same("budget zero", with_default, with_zero)
+
+
 if __name__ == "__main__":
     unittest.main()

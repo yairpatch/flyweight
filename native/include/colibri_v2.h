@@ -257,6 +257,7 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t grammar_empty_candidate_sets; /* steps where nothing was allowed */
     uint64_t multi_decode_batches; /* batched multi-sequence decode calls */
     uint64_t multi_decode_tokens; /* tokens decoded through those batches */
+    uint64_t prefill_streamed_bytes; /* expert bytes staged to the GPU during prefill */
 } ColibriV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

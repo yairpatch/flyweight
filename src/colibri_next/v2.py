@@ -384,6 +384,7 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("grammar_empty_candidate_sets", ctypes.c_uint64),
         ("multi_decode_batches", ctypes.c_uint64),
         ("multi_decode_tokens", ctypes.c_uint64),
+        ("prefill_streamed_bytes", ctypes.c_uint64),
     ]
 
 
