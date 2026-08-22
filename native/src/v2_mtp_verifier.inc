@@ -119,14 +119,15 @@ void qwen_forward_rows(
         runtime.options.hybrid_prefill_cpu!=0;
     // The two-half software pipeline (plans/prefill-pipeline.md): while the
     // engine thread runs one half's routed experts on the CPU, the GPU works
-    // through the other half's queued core. Engaged only where the routed
-    // experts run wholly on the host -- hybrid_prefill_cpu and the CPU expert
-    // modes, the configurations whose serial loop leaves each processor idle
-    // while the other works -- so dense checkpoints and GPU-resident expert
-    // configurations keep the one-span driver and pay nothing. The half is
-    // kept a multiple of the DeltaNet WY chunk; below two chunks there is
-    // nothing to overlap. COLIBRI_PREFILL_PIPELINE=0 restores the serial
-    // driver for rollback and A/B.
+    // through the other half's queued core. Engaged wherever prefill has a
+    // CPU expert share to hide -- the CPU expert modes, hybrid_prefill_cpu,
+    // and the hybrid split path, whose seeded residents run on the GPU while
+    // every other route falls to the host (prefill admission never uploads:
+    // misses_may_be_admitted requires decode). Dense checkpoints and the
+    // fully resident streamed-GPU mode keep the one-span driver and pay
+    // nothing. The half is kept a multiple of the DeltaNet WY chunk; below
+    // two chunks there is nothing to overlap. COLIBRI_PREFILL_PIPELINE=0
+    // restores the serial driver for rollback and A/B.
     static const bool pipeline_enabled=[]{
         const char*setting=std::getenv("COLIBRI_PREFILL_PIPELINE");
         return !setting||setting[0]!='0';
@@ -136,8 +137,7 @@ void qwen_forward_rows(
         *static_cast<int>(colibri::v2::workspace::kDeltaChunk);
     const bool pipelined=pipeline_enabled&&pipeline_half>0&&experts>0&&
         expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
-        (expert_policy.hybrid_prefill_cpu||
-         !expert_policy.routed_gpu_execution_allowed());
+        !expert_policy.is_streamed_gpu();
     const float epsilon=runtime.model->config.rms_norm_epsilon?runtime.model->config.rms_norm_epsilon:1.0e-6f;
     for(int row=0;row<rows;++row)
         if(input_tokens[row]>=runtime.model->config.vocabulary_size)
