@@ -254,6 +254,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("prefill_cache_seed_auto", ctypes.c_uint32),
         ("strict_resident", ctypes.c_uint32),
         ("dense_requant", ctypes.c_uint32),
+        ("prefill_expert_stream_mib", ctypes.c_int32),
     ]
 
 
@@ -1916,6 +1917,7 @@ class V2Model:
         hybrid_prefill: str = "split",
         expert_residency: str | None = None,
         dense_requant: str = "auto",
+        prefill_expert_stream_mib: int = -1,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -1943,6 +1945,7 @@ class V2Model:
             hybrid_prefill=hybrid_prefill,
             expert_residency=expert_residency,
             dense_requant=dense_requant,
+            prefill_expert_stream_mib=prefill_expert_stream_mib,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -2319,6 +2322,7 @@ class V2QwenRuntime:
         hybrid_prefill: str = "split",
         expert_residency: str | None = None,
         dense_requant: str = "auto",
+        prefill_expert_stream_mib: int = -1,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -2377,6 +2381,10 @@ class V2QwenRuntime:
             raise ValueError("expert_residency must be 'mutable' or 'immutable'")
         if dense_requant not in {"auto", "q8", "off"}:
             raise ValueError("dense_requant must be 'auto', 'q8', or 'off'")
+        if prefill_expert_stream_mib < -1 or prefill_expert_stream_mib > 65536:
+            raise ValueError(
+                "prefill_expert_stream_mib must be -1 (auto), 0 (off), or a "
+                "budget in MiB")
         if next_layer_prefetch and mtp_drafts:
             raise ValueError("next_layer_prefetch does not support MTP yet")
         effective_hybrid_prefill = (
@@ -2430,6 +2438,7 @@ class V2QwenRuntime:
             int(prefill_cache_seed_auto),
             int(strict_resident),
             {"auto": 0, "q8": 1, "off": 2}[dense_requant],
+            prefill_expert_stream_mib,
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

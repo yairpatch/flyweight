@@ -128,6 +128,7 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t prefill_cache_seed_auto; /* immutable hybrid: bounded automatic post-prefill placement */
     uint32_t strict_resident; /* streamed GPU: require and prepare the complete routed-expert set */
     uint32_t dense_requant; /* 0=auto from GPU pressure, 1=force BF16->Q8_0, 2=off */
+    int32_t prefill_expert_stream_mib; /* GPU expert-GEMM budget for host-routed prefill: -1 auto, 0 off */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {

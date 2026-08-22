@@ -10736,13 +10736,26 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->prefill_stream_bytes=0;
         runtime->prefill_stream_scratch_bytes=0;
         runtime->prefill_stream_scratch_span=0;
+        // The option decides; the env var overrides it for A/B. Auto (-1)
+        // takes the measured 48 MiB optimum -- small on purpose, because the
+        // restaging cost scales with the budget while the densest-first
+        // benefit saturates -- and, unlike an explicit budget, degrades to
+        // zero below rather than failing prepare when the GPU budget cannot
+        // carry the arena.
+        std::int64_t stream_request=runtime->options.prefill_expert_stream_mib;
         if(const char*stream_setting=
-               std::getenv("COLIBRI_PREFILL_EXPERT_STREAM_MIB")){
-            const auto requested=std::strtoull(stream_setting,nullptr,10);
-            if(requested&&runtime->model->config.expert_count&&
-               !colibri_backend_is_cpu())
-                runtime->prefill_stream_bytes=requested*1024ull*1024;
-        }
+               std::getenv("COLIBRI_PREFILL_EXPERT_STREAM_MIB"))
+            stream_request=std::strtoll(stream_setting,nullptr,10);
+        bool stream_auto=stream_request<0;
+        if(stream_auto)stream_request=48;
+        if(stream_request>0&&runtime->model->config.expert_count&&
+           !colibri_backend_is_cpu()&&
+           qwen_expert_policy(*runtime,
+               colibri::v2::ExpertExecutionPhase::prepare)
+                   .routed_gpu_execution_allowed())
+            runtime->prefill_stream_bytes=
+                static_cast<std::uint64_t>(stream_request)*1024ull*1024;
+        else stream_auto=false;
         if(runtime->prefill_stream_bytes){
             // Expert-GEMM scratch, sized for the widest span. The offset
             // derivation in qwen_forward_rows walks these regions in exactly
@@ -10806,11 +10819,28 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 if(gi.free_memory>margin)gpu_budget=gi.free_memory-margin;
             }
         }
+        // The automatic streaming budget yields before it starves anything:
+        // if the arena plus scratch push the base allocations past the GPU
+        // budget, auto drops to zero where an explicit request would fail
+        // prepare below.
+        std::uint64_t base_total_resolved=base_total;
+        if(stream_auto&&gpu_budget&&base_total_resolved>gpu_budget&&
+           base_total_resolved-runtime->prefill_stream_bytes-
+               runtime->prefill_stream_scratch_bytes<=gpu_budget){
+            base_total_resolved-=runtime->prefill_stream_bytes+
+                runtime->prefill_stream_scratch_bytes;
+            runtime->prefill_stream_bytes=0;
+            runtime->prefill_stream_scratch_bytes=0;
+            runtime->prefill_stream_scratch_span=0;
+            std::fprintf(stderr,
+                "[colibri-v2] prefill expert streaming disabled: the GPU "
+                "budget cannot carry the arena\n");
+        }
         if(!runtime->options.strict_resident&&
-           !auto_fit&&gpu_budget&&base_total>gpu_budget){
+           !auto_fit&&gpu_budget&&base_total_resolved>gpu_budget){
             auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
             throw std::runtime_error(
-                "native Qwen base CUDA allocations ("+mib(base_total)+" MiB = static weights "
+                "native Qwen base CUDA allocations ("+mib(base_total_resolved)+" MiB = static weights "
                 +mib(runtime->static_arena_bytes)+" + workspace "+mib(runtime->workspace_bytes)+" + "
                 +std::to_string(slot_count)+"x KV slot "+mib(runtime->state_bytes)+" ("
                 +mib(slot_count*runtime->state_bytes)+") + staging "+mib(runtime->expert_staging_bytes)
@@ -10820,8 +10850,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // expert_slot_bytes is zero for a dense model, which has no expert set
         // to cache and would trap on the slot arithmetic below.
         if(prepare_policy.routed_gpu_execution_allowed()&&
-           gpu_budget>base_total&&runtime->expert_slot_bytes){
-            auto available=gpu_budget-base_total;
+           gpu_budget>base_total_resolved&&runtime->expert_slot_bytes){
+            auto available=gpu_budget-base_total_resolved;
             const std::uint64_t cache_copies=
                 persistent_nvfp4_requested?2:1;
             const auto slot_budget=runtime->expert_slot_bytes*cache_copies;

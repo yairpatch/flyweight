@@ -416,12 +416,10 @@ class PrefillExpertStreamParityTests(_ParityCase):
         )
         self.assertEqual(resident_streamed, 0,
                          "the resident reference must not stream")
-        os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "64"
-        try:
-            streamed_a, streamed_bytes_a = self._generate(expert_mode="auto")
-            streamed_b, streamed_bytes_b = self._generate(expert_mode="auto")
-        finally:
-            del os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"]
+        streamed_a, streamed_bytes_a = self._generate(
+            expert_mode="auto", prefill_expert_stream_mib=64)
+        streamed_b, streamed_bytes_b = self._generate(
+            expert_mode="auto", prefill_expert_stream_mib=64)
         self.assertGreater(streamed_bytes_a, 0,
                            "the streaming path did not engage")
         self.assertEqual(streamed_bytes_a, streamed_bytes_b,
@@ -429,16 +427,33 @@ class PrefillExpertStreamParityTests(_ParityCase):
         self._assert_same("stream determinism", streamed_a, streamed_b)
         self._assert_same("streamed vs resident", resident, streamed_a)
 
-    def test_budget_zero_is_untouched(self):
-        with_default, streamed = self._generate(expert_mode="auto")
-        self.assertEqual(streamed, 0, "no budget must mean no streaming")
+    def test_default_streams_and_zero_disables(self):
+        # Streaming is on by default (auto budget); an explicit zero -- via
+        # the option or the env override -- restores the CPU-only prefill.
+        _, default_streamed = self._generate(expert_mode="auto")
+        self.assertGreater(default_streamed, 0,
+                           "the auto default did not engage")
+        off_tokens, off_streamed = self._generate(
+            expert_mode="auto", prefill_expert_stream_mib=0)
+        self.assertEqual(off_streamed, 0, "an explicit zero must not stream")
         os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "0"
         try:
-            with_zero, streamed_zero = self._generate(expert_mode="auto")
+            env_tokens, env_streamed = self._generate(expert_mode="auto")
         finally:
             del os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"]
-        self.assertEqual(streamed_zero, 0)
-        self._assert_same("budget zero", with_default, with_zero)
+        self.assertEqual(env_streamed, 0, "the env override must win")
+        self._assert_same("option zero vs env zero", off_tokens, env_tokens)
+
+    def test_option_and_env_budgets_agree(self):
+        by_option, option_streamed = self._generate(
+            expert_mode="auto", prefill_expert_stream_mib=64)
+        os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "64"
+        try:
+            by_env, env_streamed = self._generate(expert_mode="auto")
+        finally:
+            del os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"]
+        self.assertEqual(option_streamed, env_streamed)
+        self._assert_same("option vs env budget", by_option, by_env)
 
 
 if __name__ == "__main__":
