@@ -828,6 +828,18 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p,
                 ]
                 lib.colibri_v2_qwen_runtime_dump_kv.restype = ctypes.c_int
+                lib.colibri_v2_qwen_imatrix_count.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_qwen_imatrix_count.restype = ctypes.c_int
+                lib.colibri_v2_qwen_imatrix_entry.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint64,
+                    ctypes.c_char_p, ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_float), ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.colibri_v2_qwen_imatrix_entry.restype = ctypes.c_int
                 lib.colibri_v2_qwen_runtime_prepare.argtypes = [ctypes.c_void_p]
                 lib.colibri_v2_qwen_runtime_prepare.restype = ctypes.c_int
                 lib.colibri_v2_qwen_runtime_synchronize.argtypes = [ctypes.c_void_p]
@@ -2517,6 +2529,47 @@ class V2QwenRuntime:
                 self._handle, ctypes.c_uint32(layer), str(path).encode("utf-8")
             )
         )
+
+    def imatrix_entries(self) -> list[tuple[str, list[float], int]]:
+        """The importance matrix the run accumulated: (name, sums, rows) each.
+
+        Sums are per-input-channel sums of squared activations, in the layout
+        the imatrix file format stores (per-expert rows concatenated for a
+        stacked tensor). Empty unless the runtime was prepared with
+        COLIBRI_IMATRIX=1 and has prefilled something since.
+        """
+        count = ctypes.c_uint64(0)
+        self.model._check(
+            self._lib.colibri_v2_qwen_imatrix_count(
+                self._handle, ctypes.byref(count)
+            )
+        )
+        entries: list[tuple[str, list[float], int]] = []
+        for slot in range(count.value):
+            name = ctypes.create_string_buffer(512)
+            width = ctypes.c_uint64(0)
+            rows = ctypes.c_uint64(0)
+            self.model._check(
+                self._lib.colibri_v2_qwen_imatrix_entry(
+                    self._handle, ctypes.c_uint64(slot),
+                    name, ctypes.c_uint64(len(name)),
+                    None, ctypes.c_uint64(0),
+                    ctypes.byref(width), ctypes.byref(rows),
+                )
+            )
+            sums = (ctypes.c_float * width.value)()
+            self.model._check(
+                self._lib.colibri_v2_qwen_imatrix_entry(
+                    self._handle, ctypes.c_uint64(slot),
+                    None, ctypes.c_uint64(0),
+                    sums, ctypes.c_uint64(width.value),
+                    ctypes.byref(width), ctypes.byref(rows),
+                )
+            )
+            entries.append(
+                (name.value.decode("utf-8"), list(sums), rows.value)
+            )
+        return entries
 
     def prepare(self) -> None:
         """Allocate native CUDA arenas and upload persistent model weights."""

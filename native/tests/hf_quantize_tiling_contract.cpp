@@ -46,11 +46,13 @@ struct Packer {
 
 const Packer kPackers[] = {
     {"q8_0", qwen_kpack::pack_q8_0, 32, 34},
+    {"iq2_xs", qwen_kpack::pack_iq2_xs, 256, 74},
     {"q2_K", qwen_kpack::pack_q2_k, 256, 84},
     {"q3_K", qwen_kpack::pack_q3_k, 256, 110},
     // A codebook search rather than a lattice fit, and the one packer whose
     // blocks could in principle have shared state -- they must not.
     {"iq3_xxs", qwen_kpack::pack_iq3_xxs, 256, 98},
+    {"iq4_xs", qwen_kpack::pack_iq4_xs, 256, 136},
     {"q4_K", qwen_kpack::pack_q4_k, 256, 144},
     {"q5_K", qwen_kpack::pack_q5_k, 256, 176},
     {"q6_K", qwen_kpack::pack_q6_k, 256, 210},
@@ -119,9 +121,11 @@ struct Golden {
 
 const Golden kGolden[] = {
     {"q8_0", qwen_kpack::pack_q8_0, 32, 34, 0x2c01736abd78f494ull},
+    {"iq2_xs", qwen_kpack::pack_iq2_xs, 256, 74, 0x2d5a8e5462add072ull},
     {"q2_K", qwen_kpack::pack_q2_k, 256, 84, 0x73f68a8976f06085ull},
     {"q3_K", qwen_kpack::pack_q3_k, 256, 110, 0x0874546bd7fc0665ull},
     {"iq3_xxs", qwen_kpack::pack_iq3_xxs, 256, 98, 0x3fc952552f2e3d49ull},
+    {"iq4_xs", qwen_kpack::pack_iq4_xs, 256, 136, 0xe114716bcc53707bull},
     {"q4_K", qwen_kpack::pack_q4_k, 256, 144, 0xd1d80e944961a86aull},
     {"q5_K", qwen_kpack::pack_q5_k, 256, 176, 0x8f750028afb2771eull},
     {"q6_K", qwen_kpack::pack_q6_k, 256, 210, 0x62da10453f32c722ull},
@@ -174,12 +178,20 @@ const RoundTrip kRoundTrips[] = {
     // Measured on the sample below, then rounded up. Each format also has to
     // beat the one before it, which is the property that actually matters: a
     // bit bought must be a bit paid for.
+    // Measured 0.367 *unweighted* -- worse than Q2_K, which is exactly why
+    // the loader refuses this format without an importance matrix. This
+    // entry pins the unweighted floor; the matrix is what buys the rest.
+    {"iq2_xs", qwen_kpack::pack_iq2_xs, 74, qwen_iq2xs_value, 0.38f},
     {"q2_K", qwen_kpack::pack_q2_k, 84, qwen_q2k_value, 0.32f},
     // 3.06 bits, between the two K-quants either side of it. Without an
     // importance matrix it does not beat the K-quant curve -- it sits on it --
     // and the band says so.
     {"iq3_xxs", qwen_kpack::pack_iq3_xxs, 98, qwen_iq3xxs_value, 0.24f},
     {"q3_K", qwen_kpack::pack_q3_k, 110, qwen_q3k_value, 0.18f},
+    // 4.25 bits against Q4_K's 4.5: the nonlinear 16-level table spends its
+    // codes where weights actually live, so it must land between the K-quants
+    // around it despite the eighth of a bit it gives up.
+    {"iq4_xs", qwen_kpack::pack_iq4_xs, 136, qwen_iq4xs_value, 0.11f},
     {"q4_K", qwen_kpack::pack_q4_k, 144, qwen_q4k_value, 0.09f},
     {"q5_K", qwen_kpack::pack_q5_k, 176, qwen_q5_value, 0.05f},
     {"q6_K", qwen_kpack::pack_q6_k, 210, qwen_q6_value, 0.03f},

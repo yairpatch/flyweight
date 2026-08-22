@@ -113,8 +113,8 @@ class Qwen35HuggingFaceLoaderTest(unittest.TestCase):
     def test_the_quantization_options_describe_what_a_load_would_produce(self) -> None:
         options = V2Model.hf_quant_options(self.path)
         self.assertEqual([str(option["name"]) for option in options],
-                         ["Q2_K", "IQ3_XXS", "Q3_K", "Q4_K", "Q5_K", "Q6_K",
-                          "Q8_0", "F32"])
+                         ["IQ2_XS", "Q2_K", "IQ3_XXS", "Q3_K", "IQ4_XS",
+                          "Q4_K", "Q5_K", "Q6_K", "Q8_0", "F32"])
         # Smaller is smaller, all the way down: a menu that quoted sizes out of
         # order would be worse than one that quoted none.
         sizes = [int(option["arena_bytes"]) for option in options]

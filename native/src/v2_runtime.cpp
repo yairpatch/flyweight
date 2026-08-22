@@ -596,6 +596,18 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_stream_scratch = 0;
     std::uint64_t prefill_stream_scratch_bytes = 0;
     std::uint64_t prefill_stream_scratch_span = 0;
+    // Importance-matrix capture (COLIBRI_IMATRIX=1): one f32 accumulator per
+    // input channel of every matmul weight, laid out per tensor by
+    // `imatrix_offsets` (~0 = untracked). The dense prefill path accumulates
+    // on the device via qwen_imatrix_accumulate; the CPU expert path
+    // accumulates into `imatrix_host`; a read merges the two. `imatrix_rows`
+    // counts activation rows seen per tensor, which is the denominator the
+    // imatrix file format stores.
+    std::uint64_t imatrix_sums = 0;
+    std::uint64_t imatrix_elements = 0;
+    std::vector<std::uint64_t> imatrix_offsets;
+    std::vector<float> imatrix_host;
+    std::vector<std::uint64_t> imatrix_rows;
     std::uint64_t expert_cache = 0;
     std::uint64_t expert_cache_bytes = 0;
     std::uint64_t expert_native_cache = 0;
@@ -1626,6 +1638,12 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.prefill_stream_scratch = 0;
     runtime.prefill_stream_scratch_bytes = 0;
     runtime.prefill_stream_scratch_span = 0;
+    colibri_gpu_free(runtime.imatrix_sums);
+    runtime.imatrix_sums = 0;
+    runtime.imatrix_elements = 0;
+    runtime.imatrix_offsets.clear();
+    runtime.imatrix_host.clear();
+    runtime.imatrix_rows.clear();
     // runtime.state aliases sequences[active].state; free each slot's arena +
     // its checkpoint pool once.
     for (auto& seq : runtime.sequences) {
@@ -3859,6 +3877,29 @@ inline std::uint64_t qwen_moe_now() {
         std::chrono::steady_clock::now().time_since_epoch().count());
 }
 
+// Importance-matrix capture for the CPU expert path: the per-expert slice of
+// a stacked tensor accumulates the rows routed to that expert. Host-side --
+// these activations never touch the device -- and merged with the device
+// arena when the matrix is read back. `runtime` arrives const in the callers,
+// but the accumulators are capture state, not model state.
+static void qwen_imatrix_note_expert(
+    const ColibriV2QwenRuntime& runtime, std::uint64_t tensor_index,
+    int expert, const float* const* vectors, int count, int width
+) {
+    auto& capture=const_cast<ColibriV2QwenRuntime&>(runtime);
+    if(capture.imatrix_offsets.empty())return;
+    const auto slot=capture.imatrix_offsets[tensor_index];
+    if(slot==~0ull)return;
+    float* sums=capture.imatrix_host.data()+slot
+        +static_cast<std::uint64_t>(expert)*static_cast<std::uint64_t>(width);
+    for(int row=0;row<count;++row){
+        const float* values=vectors[row];
+        for(int column=0;column<width;++column)
+            sums[column]+=values[column]*values[column];
+    }
+    capture.imatrix_rows[tensor_index]+=static_cast<std::uint64_t>(count);
+}
+
 void qwen_cpu_moe_rows(
     const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     const std::int32_t* selected, const float* weights, int rows,
@@ -3931,6 +3972,15 @@ void qwen_cpu_moe_rows(
     group_experts.reserve(256);
     for(int expert=0;expert<experts;++expert)if(counts[expert])group_experts.push_back(expert);
     const int group_count=static_cast<int>(group_experts.size());
+    if(!runtime.imatrix_offsets.empty())
+        for(const int expert:group_experts){
+            // Gate and up read the same activations; each keeps its own entry
+            // so the written matrix matches llama.cpp's per-tensor layout.
+            qwen_imatrix_note_expert(runtime,layer.expert_tensors[0],expert,
+                                     &vectors[offsets[expert]],counts[expert],hidden);
+            qwen_imatrix_note_expert(runtime,layer.expert_tensors[1],expert,
+                                     &vectors[offsets[expert]],counts[expert],hidden);
+        }
     if(moe_profile){g_cpu_moe_profile.setup+=qwen_moe_now()-t_setup0;
         ++g_cpu_moe_profile.calls;}
     constexpr int kRowBlock=4;
@@ -4036,6 +4086,11 @@ void qwen_cpu_moe_rows(
     activated_vectors.resize(offsets[experts]);
     for(int slot=0;slot<offsets[experts];++slot)
         activated_vectors[slot]=activated+static_cast<std::size_t>(occurrences[slot])*intermediate;
+    if(!runtime.imatrix_offsets.empty())
+        for(const int expert:group_experts)
+            qwen_imatrix_note_expert(runtime,layer.expert_tensors[2],expert,
+                                     &activated_vectors[offsets[expert]],
+                                     counts[expert],intermediate);
     const int down_blocks=(hidden+kRowBlock-1)/kRowBlock;
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*down_blocks;++task){
@@ -4435,9 +4490,11 @@ namespace hf = colibri::v2::hf;
 // and what the loader then does cannot drift apart.
 bool hf_policy_for(const std::string& name, hf::Policy& policy) {
     hf::Target weights;
-    if(name=="Q2_K")weights=hf::Target::Q2_K;
+    if(name=="IQ2_XS")weights=hf::Target::IQ2_XS;
+    else if(name=="Q2_K")weights=hf::Target::Q2_K;
     else if(name=="IQ3_XXS")weights=hf::Target::IQ3_XXS;
     else if(name=="Q3_K")weights=hf::Target::Q3_K;
+    else if(name=="IQ4_XS")weights=hf::Target::IQ4_XS;
     else if(name=="Q4_K")weights=hf::Target::Q4_K;
     else if(name=="Q5_K")weights=hf::Target::Q5_K;
     else if(name=="Q6_K")weights=hf::Target::Q6_K;
@@ -4446,6 +4503,28 @@ bool hf_policy_for(const std::string& name, hf::Policy& policy) {
     else return false;
     policy=hf::policy_for_weights(weights);
     return true;
+}
+
+// The targets whose packer reads an importance matrix. Everything else must
+// not hash one into its cache fingerprint: a Q6_K cache going stale over a
+// file only the IQ searches read would repack gigabytes for nothing.
+bool hf_policy_reads_imatrix(const hf::Policy& policy) {
+    return policy.weights==hf::Target::IQ3_XXS
+        ||policy.weights==hf::Target::IQ4_XS
+        ||policy.weights==hf::Target::IQ2_XS;
+}
+
+// IQ2_XS is the one target the matrix is mandatory for, not merely useful:
+// at 2.31 bits the unweighted search cannot tell which channels can afford
+// to be wrong, and llama.cpp refuses the format without a matrix for the
+// same reason. Shared by the loader and the menu so an offer and a refusal
+// cannot drift apart.
+std::string hf_policy_needs_missing_imatrix(const hf::Policy& policy,
+                                            bool imatrix_present) {
+    if(policy.weights!=hf::Target::IQ2_XS||imatrix_present)return {};
+    return "needs an importance matrix: place imatrix.dat beside the "
+           "checkpoint, pass --imatrix, or gather one with "
+           "`colibri-next imatrix`";
 }
 
 // Empty when `policy` can be loaded for this checkpoint, else why it cannot.
@@ -4520,6 +4599,39 @@ std::vector<hf::cache::SourceFile> hf_cache_sources(
                            static_cast<std::uint64_t>(st.st_size),modified_ns(st)});
     }
     return sources;
+}
+
+// The importance matrix a quantization would read: COLIBRI_HF_IMATRIX names
+// one (or switches it off), and otherwise an `imatrix.dat` beside the
+// checkpoint is picked up on its own -- that is where the ecosystem publishes
+// them. Returns the path, or empty when there is none. `identity` is filled
+// for the cache fingerprint; only a policy whose target consumes the matrix
+// should hash it, so a Q6_K cache does not go stale over a file only IQ3_XXS
+// reads.
+std::string hf_imatrix_path(const std::string& directory,
+                            hf::cache::SourceFile& identity) {
+    std::string path;
+    if(const char* configured=std::getenv("COLIBRI_HF_IMATRIX")){
+        const std::string value=configured;
+        if(value=="0"||value=="off"||value.empty())return {};
+        path=value;
+    }else{
+        path=directory+"/imatrix.dat";
+    }
+    struct stat st{};
+    if(stat(path.c_str(),&st)!=0||!S_ISREG(st.st_mode)){
+        // A configured path that does not exist is an error worth raising --
+        // the user asked for weighted packing and silence would pack without
+        // it. The automatic probe simply found nothing.
+        if(std::getenv("COLIBRI_HF_IMATRIX"))
+            throw std::runtime_error("COLIBRI_HF_IMATRIX points at "+path+
+                                     ", which cannot be read");
+        return {};
+    }
+    const auto cut=path.find_last_of('/');
+    identity={cut==std::string::npos?path:path.substr(cut+1),
+              static_cast<std::uint64_t>(st.st_size),modified_ns(st)};
+    return path;
 }
 
 // Load an HF checkpoint: map every shard, translate the descriptors, quantize
@@ -4602,14 +4714,25 @@ void load_hf(const char* path, ColibriV2Model& m) {
     if(const char* requested=std::getenv("COLIBRI_HF_QUANT");
        requested&&!hf_policy_for(requested,policy))
         throw std::runtime_error("COLIBRI_HF_QUANT must be one of "
-            "Q2_K, IQ3_XXS, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F32");
+            "IQ2_XS, Q2_K, IQ3_XXS, Q3_K, IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, "
+            "F32");
 
     if(const auto refusal=hf_policy_unavailable(policy,m.config);!refusal.empty())
         throw std::runtime_error(
             std::string("this checkpoint cannot be quantized as requested: ")+refusal);
 
+    hf::cache::SourceFile imatrix_identity;
+    const auto imatrix_path=hf_imatrix_path(directory,imatrix_identity);
+    const bool imatrix_applies=
+        !imatrix_path.empty()&&hf_policy_reads_imatrix(policy);
+    if(const auto missing=
+           hf_policy_needs_missing_imatrix(policy,!imatrix_path.empty());
+       !missing.empty())
+        throw std::runtime_error("IQ2_XS "+missing);
+
     const auto print=hf::cache::fingerprint(
-        config_text,hf_cache_sources(files),policy);
+        config_text,hf_cache_sources(files),policy,
+        imatrix_applies?&imatrix_identity:nullptr);
     const auto candidates=hf_cache_candidates(directory,print);
 
     // Publish descriptors against whichever arena we end up with. `base` is
@@ -4680,7 +4803,19 @@ void load_hf(const char* path, ColibriV2Model& m) {
 
     const auto tensors=hf::build_tensors(parsed,m.config);
     phase("build_tensors");
-    auto quantized=hf::quantize(tensors,policy);
+    // Loaded on the miss path only: a cache hit never packs, so it never needs
+    // the matrix the pack would have read.
+    hf::ImportanceMatrix imatrix;
+    if(imatrix_applies){
+        imatrix=hf::load_imatrix(imatrix_path);
+        std::fprintf(stderr,
+            "[colibri-v2] safetensors: weighting the pack with %s "
+            "(%zu tensors)\n",
+            imatrix_path.c_str(),imatrix.entries.size());
+    }
+    phase("imatrix");
+    auto quantized=hf::quantize(tensors,policy,
+                                imatrix_applies?&imatrix:nullptr);
     phase("quantize");
     const double seconds=std::chrono::duration<double>(
         std::chrono::steady_clock::now()-started).count();
@@ -6255,7 +6390,8 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
 // wants. Q6_K is the loader's default and is marked as such by the caller, not
 // here.
 static const char* const kHfQuantNames[] = {
-    "Q2_K","IQ3_XXS","Q3_K","Q4_K","Q5_K","Q6_K","Q8_0","F32"};
+    "IQ2_XS","Q2_K","IQ3_XXS","Q3_K","IQ4_XS","Q4_K","Q5_K","Q6_K","Q8_0",
+    "F32"};
 
 int colibri_v2_hf_quant_options(const char* directory,
     ColibriV2HfQuantOption* out, std::uint32_t capacity, std::uint32_t* count
@@ -6297,12 +6433,23 @@ int colibri_v2_hf_quant_options(const char* directory,
         auto& entry=out[i];
         std::memset(&entry,0,sizeof(entry));
         copy_text(entry.name,sizeof(entry.name),kHfQuantNames[i]);
-        const auto refusal=hf_policy_unavailable(policy,config);
+        // The same imatrix conditions the loader applies, so an offer here is
+        // a load that would succeed and a "cached" mark is a cache the open
+        // would actually hit.
+        hf::cache::SourceFile imatrix_identity;
+        const auto imatrix_path=hf_imatrix_path(folder,imatrix_identity);
+        const bool imatrix_applies=
+            !imatrix_path.empty()&&hf_policy_reads_imatrix(policy);
+        auto refusal=hf_policy_unavailable(policy,config);
+        if(refusal.empty())
+            refusal=hf_policy_needs_missing_imatrix(
+                policy,!imatrix_path.empty());
         copy_text(entry.unavailable,sizeof(entry.unavailable),refusal.c_str());
         if(!refusal.empty())continue;
         entry.arena_bytes=hf::arena_bytes(tensors,policy);
-
-        const auto print=hf::cache::fingerprint(config_text,sources,policy);
+        const auto print=hf::cache::fingerprint(
+            config_text,sources,policy,
+            imatrix_applies?&imatrix_identity:nullptr);
         // The first candidate is where a write would go; an existing one
         // anywhere in the list is what an open would actually use.
         const auto candidates=hf_cache_candidates(folder,print);
@@ -10957,6 +11104,33 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     throw std::runtime_error("failed to allocate native Qwen turbo KV staging");
             }
         }
+        // Importance-matrix capture. A slot per input channel of every 2-D
+        // weight and per (expert, channel) of every stacked 3-D one; tensors
+        // the forward never projects through simply stay at zero rows and are
+        // skipped on read-back. Allocated only under the switch: the arena is
+        // tens of MB on a large checkpoint and calibration is a dedicated run,
+        // not a serving mode.
+        if(const char* capture=std::getenv("COLIBRI_IMATRIX");
+           capture&&capture[0]&&std::strcmp(capture,"0")!=0){
+            const auto& tensors=runtime->model->tensors;
+            runtime->imatrix_offsets.assign(tensors.size(),~0ull);
+            std::uint64_t total=0;
+            for(std::size_t i=0;i<tensors.size();++i){
+                const auto& shape=tensors[i].shape;
+                if(shape.size()<2||shape.size()>3)continue;
+                runtime->imatrix_offsets[i]=total;
+                total+=shape[0]*(shape.size()==3?shape[2]:1);
+            }
+            runtime->imatrix_elements=total;
+            runtime->imatrix_host.assign(total,0.0f);
+            runtime->imatrix_rows.assign(tensors.size(),0);
+            if(colibri_gpu_alloc(total*sizeof(float),&runtime->imatrix_sums)!=0||
+               colibri_gpu_memset(runtime->imatrix_sums,0,total*sizeof(float),
+                                  runtime->stream)!=0||
+               colibri_gpu_stream_sync(runtime->stream)!=0)
+                throw std::runtime_error(
+                    "failed to allocate the native Qwen imatrix arena");
+        }
         if(runtime->embeddings_host_resident){
             // Sized for the widest gather: the rows forward embeds a whole
             // prefill chunk in one launch, single-token decode uses row 0 only.
@@ -12056,6 +12230,55 @@ inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.opti
 // window is written: for a sliding-window layer the ring has stale slots
 // outside it, and feeding those to the harness would skew the norm statistics
 // that drive the K/V bit allocation.
+// The tensors the capture actually saw, in model order. Deterministic, so a
+// caller can enumerate entries by slot across two calls.
+static std::vector<std::size_t> qwen_imatrix_active(
+    const ColibriV2QwenRuntime& runtime
+) {
+    std::vector<std::size_t> active;
+    for(std::size_t i=0;i<runtime.imatrix_rows.size();++i)
+        if(runtime.imatrix_rows[i])active.push_back(i);
+    return active;
+}
+
+int colibri_v2_qwen_imatrix_count(
+    ColibriV2QwenRuntime* runtime, uint64_t* count
+){return guarded([&]{
+    if(!runtime||!count)throw std::runtime_error("invalid Qwen imatrix arguments");
+    *count=qwen_imatrix_active(*runtime).size();
+    return 0;
+});}
+
+int colibri_v2_qwen_imatrix_entry(
+    ColibriV2QwenRuntime* runtime, uint64_t slot, char* name,
+    uint64_t name_capacity, float* sums, uint64_t sums_capacity,
+    uint64_t* width, uint64_t* rows_seen
+){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid Qwen imatrix arguments");
+    const auto active=qwen_imatrix_active(*runtime);
+    if(slot>=active.size())
+        throw std::runtime_error("Qwen imatrix entry slot out of range");
+    const auto index=active[slot];
+    const auto& tensor=runtime->model->tensors[index];
+    const auto& shape=tensor.shape;
+    const std::uint64_t channels=shape[0]*(shape.size()==3?shape[2]:1);
+    if(name&&name_capacity)copy_text(name,name_capacity,tensor.name);
+    if(width)*width=channels;
+    if(rows_seen)*rows_seen=runtime->imatrix_rows[index];
+    if(!sums)return 0;
+    if(sums_capacity<channels)
+        throw std::runtime_error("Qwen imatrix entry buffer is too small");
+    const auto offset=runtime->imatrix_offsets[index];
+    if(colibri_gpu_download(sums,runtime->imatrix_sums+offset*sizeof(float),
+                            channels*sizeof(float),runtime->stream)!=0||
+       colibri_gpu_stream_sync(runtime->stream)!=0)
+        throw std::runtime_error("failed to download the Qwen imatrix arena");
+    // The CPU expert path accumulated beside the device, not into it.
+    const float* host=runtime->imatrix_host.data()+offset;
+    for(std::uint64_t i=0;i<channels;++i)sums[i]+=host[i];
+    return 0;
+});}
+
 int colibri_v2_qwen_runtime_dump_kv(
     ColibriV2QwenRuntime* runtime, uint32_t layer_index, const char* path
 ){return guarded([&]{

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "colibri_v2_hf.hpp"
+#include "colibri_v2_imatrix.hpp"
 // The decode side is header-only; the packers are not -- they need
 // `-ffp-contract=off` and so live in their own translation unit.
 #include "qwen_kquant.h"
@@ -31,9 +32,11 @@ namespace colibri::v2::hf {
 enum class Target : std::uint32_t {
     F32 = 0,
     Q8_0 = 8,
+    IQ2_XS = 17,
     Q2_K = 10,
     Q3_K = 11,
     IQ3_XXS = 18,
+    IQ4_XS = 23,
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
@@ -43,9 +46,11 @@ inline std::uint64_t target_block_bytes(Target target) {
     switch (target) {
         case Target::F32: return 4;
         case Target::Q8_0: return 34;
+        case Target::IQ2_XS: return 74;
         case Target::Q2_K: return 84;
         case Target::Q3_K: return 110;
         case Target::IQ3_XXS: return 98;
+        case Target::IQ4_XS: return 136;
         case Target::Q4_K: return 144;
         case Target::Q5_K: return 176;
         case Target::Q6_K: return 210;
@@ -57,9 +62,11 @@ inline std::uint64_t target_block_elements(Target target) {
     switch (target) {
         case Target::F32: return 1;
         case Target::Q8_0: return 32;
+        case Target::IQ2_XS:
         case Target::Q2_K:
         case Target::Q3_K:
         case Target::IQ3_XXS:
+        case Target::IQ4_XS:
         case Target::Q4_K:
         case Target::Q5_K:
         case Target::Q6_K: return 256;
@@ -68,29 +75,35 @@ inline std::uint64_t target_block_elements(Target target) {
 }
 
 // Targets ordered by bits per weight, which is what "a step up" means below.
-// Q8_0 is last despite its low type code; IQ3_XXS sits between the two K-quants
-// it falls between.
+// Q8_0 is last despite its low type code; the IQ formats sit between the
+// K-quants they fall between (IQ4_XS's 4.25 bpw is just under Q4_K's 4.5).
 inline int target_rank(Target target) {
     switch (target) {
-        case Target::F32: return 6;
-        case Target::Q8_0: return 5;
-        case Target::Q6_K: return 4;
-        case Target::Q5_K: return 3;
-        case Target::Q4_K: return 2;
+        case Target::F32: return 7;
+        case Target::Q8_0: return 6;
+        case Target::Q6_K: return 5;
+        case Target::Q5_K: return 4;
+        case Target::Q4_K: return 3;
+        case Target::IQ4_XS: return 2;
         case Target::Q3_K: return 1;
         case Target::IQ3_XXS: return 0;
         case Target::Q2_K: return -1;
+        case Target::IQ2_XS: return -2;
     }
     throw std::runtime_error("unknown quantization target");
 }
 
 // The next target up, capped: nothing here ever promotes past Q6_K, which is
-// where the device path stops caring.
+// where the device path stops caring. The IQ formats promote into the K-quant
+// ladder rather than along their own: the promoted tensor is the head or the
+// embedding, whose kernels favour the K-quants.
 inline Target target_step_up(Target target) {
     switch (target) {
+        case Target::IQ2_XS: return Target::Q3_K;
         case Target::Q2_K: return Target::Q3_K;
         case Target::IQ3_XXS: return Target::Q4_K;
         case Target::Q3_K: return Target::Q4_K;
+        case Target::IQ4_XS: return Target::Q5_K;
         case Target::Q4_K: return Target::Q5_K;
         default: break;
     }
@@ -238,13 +251,29 @@ inline std::uint64_t source_element_bytes(std::uint32_t type) {
 }
 
 inline void pack_to(Target target, const float* values, std::uint64_t elements,
-                    std::uint8_t* out) {
+                    std::uint8_t* out, const ImportanceView& importance = {},
+                    std::uint64_t element_begin = 0) {
     switch (target) {
         case Target::F32: std::memcpy(out, values, elements * 4); return;
         case Target::Q8_0: qwen_kpack::pack_q8_0(values, elements, out); return;
         case Target::Q2_K: qwen_kpack::pack_q2_k(values, elements, out); return;
         case Target::Q3_K: qwen_kpack::pack_q3_k(values, elements, out); return;
-        case Target::IQ3_XXS: qwen_kpack::pack_iq3_xxs(values, elements, out); return;
+        case Target::IQ3_XXS:
+            // The IQ searches read the matrix; see qwen_iq_pack.h.
+            qwen_kpack::pack_iq3_xxs(values, elements, out, importance.values,
+                                     importance.row, importance.chunk,
+                                     element_begin);
+            return;
+        case Target::IQ4_XS:
+            qwen_kpack::pack_iq4_xs(values, elements, out, importance.values,
+                                    importance.row, importance.chunk,
+                                    element_begin);
+            return;
+        case Target::IQ2_XS:
+            qwen_kpack::pack_iq2_xs(values, elements, out, importance.values,
+                                    importance.row, importance.chunk,
+                                    element_begin);
+            return;
         case Target::Q4_K: qwen_kpack::pack_q4_k(values, elements, out); return;
         case Target::Q5_K: qwen_kpack::pack_q5_k(values, elements, out); return;
         case Target::Q6_K: qwen_kpack::pack_q6_k(values, elements, out); return;
@@ -285,16 +314,24 @@ inline std::uint64_t arena_bytes(const std::vector<HfTensor>& tensors,
 // every tensor's destination is known before any work starts, so the threads
 // never coordinate.
 inline QuantizedModel quantize(const std::vector<HfTensor>& tensors,
-                               const Policy& policy) {
+                               const Policy& policy,
+                               const ImportanceMatrix* imatrix = nullptr) {
     QuantizedModel model;
     model.tensors.resize(tensors.size());
     std::vector<Target> targets(tensors.size());
+    // Resolved once per tensor: which slice of the matrix, if any, weights its
+    // packing. Only the IQ3_XXS search reads it, and a tensor the matrix does
+    // not cover (norms, embeddings, a mismatched geometry) packs unweighted.
+    std::vector<ImportanceView> importance(tensors.size());
 
     std::uint64_t cursor = 0;
     for (std::size_t i = 0; i < tensors.size(); ++i) {
         const auto& source = tensors[i];
         const Target target = target_for(source, policy);
         targets[i] = target;
+        if (target == Target::IQ3_XXS || target == Target::IQ4_XS
+            || target == Target::IQ2_XS)
+            importance[i] = importance_for(imatrix, source.name, source.shape);
         const std::uint64_t bytes = packed_bytes(source, target);
 
         auto& out = model.tensors[i];
@@ -424,7 +461,8 @@ inline QuantizedModel quantize(const std::vector<HfTensor>& tensors,
                 block > 1 ? item.element_begin / block * target_block_bytes(target)
                           : item.element_begin * target_block_bytes(target);
             pack_to(target, tile.data(), item.elements,
-                    model.arena.data() + model.tensors[item.tensor].offset + offset);
+                    model.arena.data() + model.tensors[item.tensor].offset + offset,
+                    importance[item.tensor], item.element_begin);
         }
     }
     if (gather_failed)

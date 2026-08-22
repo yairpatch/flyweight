@@ -240,6 +240,20 @@ void qwen_forward_rows(
     // still comes from the index: a spilled tensor is never requantized, so its
     // device type and the raw model bytes agree.
     auto dense_rows=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){
+        // Importance-matrix capture: every dense projection funnels through
+        // here, so one accumulation covers them all. Stream-ordered like the
+        // matmul it precedes, so it reads exactly the activations the
+        // projection reads.
+        if(runtime.imatrix_sums){
+            const auto slot=runtime.imatrix_offsets[index];
+            if(slot!=~0ull){
+                std::uint64_t sums=runtime.imatrix_sums+slot*sizeof(float);
+                void*args[]={&input,&sums,&input_size,const_cast<int*>(&rows)};
+                launch("qwen_imatrix_accumulate",
+                       (static_cast<std::uint32_t>(input_size)+255)/256,1,256,args);
+                runtime.imatrix_rows[index]+=static_cast<std::uint64_t>(rows);
+            }
+        }
         std::uint64_t matrix=staged?staged:runtime.device_tensors[index];
         const auto type=qwen_device_type(runtime,index);
         const auto*format=colibri::v2::qwen_format(type);

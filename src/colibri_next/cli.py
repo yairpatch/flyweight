@@ -21,7 +21,8 @@ KV_TYPES = ("auto", "f32", "f16", "bf16", "q8_0", "turbo3", "turbo4")
 AUTO_PROMPT_CACHE_MIB = _AUTO_PROMPT_CACHE_MIB
 # Offered when a safetensors checkpoint is opened, smallest first. GGUF models
 # carry their own quantization and are never asked about.
-QUANT_CHOICES = ("ask", "Q2_K", "IQ3_XXS", "Q3_K", "Q4_K", "Q5_K", "Q6_K",
+QUANT_CHOICES = ("ask", "IQ2_XS", "Q2_K", "IQ3_XXS", "Q3_K", "IQ4_XS", "Q4_K",
+                 "Q5_K", "Q6_K",
                  "Q8_0", "F32")
 # What the loader packs when nothing says otherwise, and so what the prompt
 # offers as its default.
@@ -148,6 +149,12 @@ def _add_quant_option(parser: argparse.ArgumentParser) -> None:
         help="quantization for a safetensors checkpoint; 'ask' prompts, and is "
              f"the default on a terminal (otherwise {DEFAULT_QUANT})",
     )
+    parser.add_argument(
+        "--imatrix", type=Path, default=None,
+        help="importance matrix (llama.cpp imatrix.dat) that weights IQ "
+             "packing; an imatrix.dat beside the checkpoint is used "
+             "automatically, and 'off' disables that",
+    )
 
 
 def _format_bytes(count: int) -> str:
@@ -218,6 +225,12 @@ def _resolve_quant(args: argparse.Namespace) -> None:
     Prompting is for a person at a terminal. A pipe, a service manager or CI
     gets the loader's default, which is what it got before this existed.
     """
+    # Published the same way the quantization is: the loader reads the
+    # variable, and an explicitly exported one wins over the flag.
+    imatrix = getattr(args, "imatrix", None)
+    if imatrix is not None and "COLIBRI_HF_IMATRIX" not in os.environ:
+        os.environ["COLIBRI_HF_IMATRIX"] = str(imatrix)
+
     requested = getattr(args, "quant", None)
     if requested and requested != "ask":
         os.environ["COLIBRI_HF_QUANT"] = requested
@@ -321,7 +334,7 @@ def _add_runtime_options(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="colibri-next",
-        description="Native GGUF inference for Qwen and Gemma models",
+        description="Native GGUF inference for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models",
     )
     commands = parser.add_subparsers(
         dest="command", required=True,
@@ -394,6 +407,31 @@ def _parser() -> argparse.ArgumentParser:
     probe.add_argument("--generate-tokens", type=int, default=2)
     probe.add_argument("--context", type=int, default=2048)
     _add_runtime_options(probe, serving=False)
+
+    imatrix = commands.add_parser(
+        "imatrix",
+        help="gather an importance matrix over calibration text",
+    )
+    imatrix.add_argument("model", type=Path)
+    _add_quant_option(imatrix)
+    imatrix.add_argument(
+        "--text", type=Path, required=True,
+        help="calibration text; general prose plus some code is the usual mix",
+    )
+    imatrix.add_argument(
+        "--output", type=Path, default=Path("imatrix.dat"),
+        help="where to write the matrix (llama.cpp legacy .dat layout)",
+    )
+    imatrix.add_argument(
+        "--chunk", type=int, default=512,
+        help="tokens per prefill chunk (default: 512)",
+    )
+    imatrix.add_argument(
+        "--max-chunks", type=int, default=0,
+        help="cap on chunks processed; 0 means the whole file",
+    )
+    imatrix.add_argument("--context", type=int, default=2048)
+    _add_runtime_options(imatrix, serving=False, show_help=False)
 
     serve = commands.add_parser(
         "serve", aliases=("serve-v2",),
@@ -897,6 +935,76 @@ def _serve_http(args: argparse.Namespace, service) -> int:
     return 0
 
 
+def _gather_imatrix(args: argparse.Namespace) -> int:
+    """Prefill calibration text and write the accumulated importance matrix.
+
+    The capture hooks cover the dense prefill path and the CPU expert path,
+    so the run pins routed experts to the CPU and switches the streamed GPU
+    expert GEMM off -- a matrix that silently missed every routed layer would
+    be worse than an error. Decode contributes nothing: each chunk runs as
+    prefill plus a single discarded token, which is also how llama.cpp
+    gathers its matrices.
+    """
+    import struct
+
+    _validate_runtime_args(args)
+    os.environ["COLIBRI_IMATRIX"] = "1"
+    os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "0"
+    args.expert_mode = "cpu"
+    args.mtp_drafts = 0
+
+    text = args.text.read_text(encoding="utf-8")
+    if not text.strip():
+        print("calibration text is empty", file=sys.stderr)
+        return 2
+    chunk = max(32, int(args.chunk))
+    with V2Model(args.model) as model:
+        tokens = model.tokenize(text, capacity=len(text.encode()) + 16)
+        pieces = [tokens[i:i + chunk] for i in range(0, len(tokens), chunk)]
+        # A short tail skews the statistics of every channel it touches
+        # without adding coverage; llama.cpp drops it too.
+        pieces = [piece for piece in pieces if len(piece) >= 32]
+        if args.max_chunks:
+            pieces = pieces[: args.max_chunks]
+        if not pieces:
+            print("calibration text is shorter than one chunk", file=sys.stderr)
+            return 2
+        options = _runtime_options(args)
+        options["context_limit"] = max(args.context, chunk + 8)
+        with model.native_runtime(**options) as runtime:
+            runtime.prepare()
+            for index, piece in enumerate(pieces):
+                runtime.reset()
+                runtime.generate(piece, 1, lambda _token: False)
+                print(f"\r[imatrix] chunk {index + 1}/{len(pieces)}",
+                      end="", file=sys.stderr, flush=True)
+            print(file=sys.stderr)
+            entries = runtime.imatrix_entries()
+
+    if not entries:
+        print("no activations were captured; is this a supported "
+              "architecture for the native Qwen runtime?", file=sys.stderr)
+        return 1
+    # The legacy llama.cpp layout the packer's loader reads back: per entry a
+    # name, a call count, and per-channel values. Values are means, so the
+    # file does not depend on how much text was run beyond its distribution.
+    blob = struct.pack("<i", len(entries))
+    for name, sums, rows in entries:
+        encoded = name.encode()
+        mean = [value / max(1, rows) for value in sums]
+        blob += struct.pack("<i", len(encoded)) + encoded
+        blob += struct.pack("<ii", len(pieces), len(mean))
+        blob += struct.pack(f"<{len(mean)}f", *mean)
+    blob += struct.pack("<i", len(pieces))
+    dataset = str(args.text).encode()
+    blob += struct.pack("<i", len(dataset)) + dataset
+    args.output.write_bytes(blob)
+    total = sum(len(piece) for piece in pieces)
+    print(f"wrote {args.output}: {len(entries)} tensors over {total} tokens "
+          f"({len(pieces)} chunks)", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     _resolve_quant(args)
@@ -911,6 +1019,8 @@ def main(argv: list[str] | None = None) -> int:
         return _generate(args)
     if args.command in {"serve-v2", "serve"}:
         return _serve(args)
+    if args.command == "imatrix":
+        return _gather_imatrix(args)
     if args.command in {"probe", "probe-native-v2", "probe-qwen-native-v2", "probe-native"}:
         _validate_runtime_args(args)
         with V2Model(args.model, mtp_model=args.mtp_model) as model:

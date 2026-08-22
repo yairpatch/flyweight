@@ -84,6 +84,47 @@ void pack_iq3_xxs(const float* values, std::uint64_t count, std::uint8_t* out) {
     qwen_pack_iq3_xxs(values, count, out);
 }
 
+void pack_iq3_xxs(const float* values, std::uint64_t count, std::uint8_t* out,
+                  const float* importance, std::uint64_t row,
+                  std::uint64_t chunk, std::uint64_t element_begin) {
+    if (!importance || !row) {
+        qwen_pack_iq3_xxs(values, count, out);
+        return;
+    }
+    const Iq3Importance weights{importance, row, chunk, element_begin};
+    qwen_pack_iq3_xxs(values, count, out, &weights);
+}
+
+void pack_iq4_xs(const float* values, std::uint64_t count, std::uint8_t* out) {
+    qwen_pack_iq4_xs(values, count, out);
+}
+
+void pack_iq2_xs(const float* values, std::uint64_t count, std::uint8_t* out) {
+    qwen_pack_iq2_xs(values, count, out);
+}
+
+void pack_iq2_xs(const float* values, std::uint64_t count, std::uint8_t* out,
+                 const float* importance, std::uint64_t row,
+                 std::uint64_t chunk, std::uint64_t element_begin) {
+    if (!importance || !row) {
+        qwen_pack_iq2_xs(values, count, out);
+        return;
+    }
+    const Iq3Importance weights{importance, row, chunk, element_begin};
+    qwen_pack_iq2_xs(values, count, out, &weights);
+}
+
+void pack_iq4_xs(const float* values, std::uint64_t count, std::uint8_t* out,
+                 const float* importance, std::uint64_t row,
+                 std::uint64_t chunk, std::uint64_t element_begin) {
+    if (!importance || !row) {
+        qwen_pack_iq4_xs(values, count, out);
+        return;
+    }
+    const Iq3Importance weights{importance, row, chunk, element_begin};
+    qwen_pack_iq4_xs(values, count, out, &weights);
+}
+
 void pack_q4_k(const float* values, std::uint64_t count, std::uint8_t* out) {
     qwen_pack_q4_k(values, count, out);
 }

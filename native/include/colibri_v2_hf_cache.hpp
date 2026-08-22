@@ -112,9 +112,15 @@ inline void hash_u64(std::uint64_t& state, std::uint64_t value) {
 
 // `config_text` is hashed whole rather than through ModelConfig: the parsed
 // struct is a lossy view, and a field it ignores today may matter tomorrow.
+//
+// `imatrix` is the importance matrix the packing would read, when the target
+// consumes one. It is hashed only when present, the same bargain policy.head
+// makes below: an arena packed without a matrix is still exactly what a
+// matrix-less open produces, so those caches keep validating.
 inline std::uint64_t fingerprint(const std::string& config_text,
                                  const std::vector<SourceFile>& sources,
-                                 const Policy& policy) {
+                                 const Policy& policy,
+                                 const SourceFile* imatrix = nullptr) {
     std::uint64_t state = 0xcbf29ce484222325ull;
     hash_u64(state, kFormatVersion);
     hash_u64(state, kPackerVersion);
@@ -136,6 +142,12 @@ inline std::uint64_t fingerprint(const std::string& config_text,
         hash_bytes(state, source.name.data(), source.name.size());
         hash_u64(state, source.size);
         hash_u64(state, static_cast<std::uint64_t>(source.modified_ns));
+    }
+    if (imatrix) {
+        hash_bytes(state, "imatrix", 7);
+        hash_bytes(state, imatrix->name.data(), imatrix->name.size());
+        hash_u64(state, imatrix->size);
+        hash_u64(state, static_cast<std::uint64_t>(imatrix->modified_ns));
     }
     return state;
 }

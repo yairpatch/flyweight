@@ -544,6 +544,14 @@ COLIBRI_V2_API int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime* runtim
 /* Writes one attention layer's live KV window as f32 for the TurboQuant
    quality harness: int32 count, int32 head_dim, then the keys and the values. */
 COLIBRI_V2_API int colibri_v2_qwen_runtime_dump_kv(ColibriV2QwenRuntime* runtime, uint32_t layer_index, const char* path);
+/* Importance-matrix capture, armed by COLIBRI_IMATRIX=1 at prepare. `count`
+   is how many weight tensors have seen activations. `entry` reads one of
+   them: the tensor name, its channel width (input channels, times experts
+   for a stacked tensor), the activation rows accumulated, and -- when `sums`
+   is non-null and `sums_capacity` covers the width -- the per-channel sums
+   of squared activations, device and host accumulators merged. */
+COLIBRI_V2_API int colibri_v2_qwen_imatrix_count(ColibriV2QwenRuntime* runtime, uint64_t* count);
+COLIBRI_V2_API int colibri_v2_qwen_imatrix_entry(ColibriV2QwenRuntime* runtime, uint64_t slot, char* name, uint64_t name_capacity, float* sums, uint64_t sums_capacity, uint64_t* width, uint64_t* rows_seen);
 COLIBRI_V2_API int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, uint64_t* task_id);
 COLIBRI_V2_API int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, uint64_t seed, uint32_t has_seed, uint64_t* task_id);
 /* As above, plus the repetition penalties. `repetition_penalty` scales a
