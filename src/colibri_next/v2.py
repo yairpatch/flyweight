@@ -1170,8 +1170,19 @@ class BailingRuntime:
         prompt is otherwise one uninterruptible call that can run for minutes:
         nothing to report while it does, and no way to drop a request whose
         client has already gone. Pass None to clear.
+
+        A library without the entry point gets the pre-progress behaviour --
+        the watcher is never called and a prompt runs uninterruptible --
+        rather than failing every generation over an optional report. The
+        uses_gpu accessor above guards the same way; this one reached
+        production without the guard, and the miss cost every BailingMoE3
+        request a stream error.
         """
-        entry = self._lib.colibri_v2_bailing_set_progress
+        try:
+            entry = self._lib.colibri_v2_bailing_set_progress
+        except AttributeError:
+            self._progress = None
+            return
         entry.argtypes = [ctypes.c_void_p, _BAILING_PROGRESS, ctypes.c_void_p]
         if callback is None:
             self._progress = None

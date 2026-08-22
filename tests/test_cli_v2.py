@@ -278,6 +278,28 @@ class QuantPromptTests(unittest.TestCase):
                 self.assertIsNone(
                     _quant_from_answer(answer, self.OPTIONS, DEFAULT_QUANT))
 
+    def test_choosing_an_unavailable_option_names_its_reason(self) -> None:
+        # "not one of the options" against a menu that plainly shows the
+        # number reads as a broken prompt; the refusal has to say why.
+        from colibri_next.cli import _unavailable_reason
+
+        options = [
+            {"name": "IQ2_XS", "arena_bytes": 0, "cache_bytes": 0,
+             "unavailable": "needs an importance matrix"},
+            *self.OPTIONS,
+        ]
+        for answer in ("1", "iq2_xs", "IQ2XS"):
+            with self.subTest(answer=answer):
+                self.assertIsNone(
+                    _quant_from_answer(answer, options, DEFAULT_QUANT))
+                reason = _unavailable_reason(answer, options)
+                self.assertIn("IQ2_XS is unavailable here", reason)
+                self.assertIn("importance matrix", reason)
+        # Answers that are merely wrong keep the generic rejection.
+        self.assertEqual(_unavailable_reason("0", options), "")
+        self.assertEqual(_unavailable_reason("yes", options), "")
+        self.assertEqual(_unavailable_reason("2", options), "")
+
     def test_the_menu_separates_a_cached_arena_from_one_that_must_be_packed(self) -> None:
         menu = _quant_menu(self.OPTIONS, DEFAULT_QUANT)
         lines = menu.splitlines()

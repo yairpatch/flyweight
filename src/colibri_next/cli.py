@@ -215,6 +215,26 @@ def _quant_from_answer(
     return None
 
 
+def _unavailable_reason(text: str, options: list[dict[str, object]]) -> str:
+    """Why `text` named an option that cannot be chosen, or empty."""
+    text = text.strip()
+    selected: dict[str, object] | None = None
+    if text.isdigit():
+        index = int(text)
+        if 1 <= index <= len(options):
+            selected = options[index - 1]
+    else:
+        folded = text.upper().replace("_", "").replace("-", "")
+        for option in options:
+            if folded == str(option["name"]).upper().replace("_", ""):
+                selected = option
+                break
+    if selected is None:
+        return ""
+    reason = str(selected.get("unavailable", ""))
+    return f"{selected['name']} is unavailable here: {reason}" if reason else ""
+
+
 def _resolve_quant(args: argparse.Namespace) -> None:
     """Settle the quantization before anything opens the model.
 
@@ -279,6 +299,13 @@ def _resolve_quant(args: argparse.Namespace) -> None:
         if chosen:
             os.environ["COLIBRI_HF_QUANT"] = chosen
             return
+        # Picking an unavailable option deserves its reason, not the generic
+        # rejection: "not one of the options" against a menu that plainly
+        # shows the number reads as a broken prompt.
+        unavailable = _unavailable_reason(answer, options)
+        if unavailable:
+            print(unavailable, file=sys.stderr)
+            continue
         print(f"not one of the options; enter 1-{len(options)} or a name",
               file=sys.stderr)
     print(f"using {DEFAULT_QUANT}", file=sys.stderr)

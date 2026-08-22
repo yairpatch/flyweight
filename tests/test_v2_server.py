@@ -753,6 +753,26 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(steps[-1].generated_ids, (20,))
         self.assertEqual(steps[-1].text, "Hello")
 
+    def test_bailing_progress_survives_a_library_without_the_entry_point(
+        self,
+    ) -> None:
+        # colibri_v2_bailing_set_progress shipped in the bindings before any
+        # native implementation existed, and the unguarded lookup failed
+        # every BailingMoE3 generation with an undefined-symbol stream error.
+        # The guard restores the pre-progress behaviour instead: no reports,
+        # an uninterruptible prompt, and a working answer.
+        from colibri_next.v2 import BailingRuntime
+
+        class SymbolFreeLibrary:
+            def __getattr__(self, name):
+                raise AttributeError(name)
+
+        runtime = object.__new__(BailingRuntime)
+        runtime._lib = SymbolFreeLibrary()
+        runtime.set_progress(lambda processed, total: True)
+        self.assertIsNone(runtime._progress)
+        runtime.set_progress(None)
+
     def _budget_generator(self):
         """A generator over a scripted engine, for thinking-budget tests.
 
