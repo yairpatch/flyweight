@@ -337,6 +337,50 @@ if(BUILD_TESTING)
     )
 endif()
 
+# Shares the CPU backend sources with the parity contract: it runs the emulated
+# corpus kernel, so it needs the shim that resolves a kernel by name.
+add_executable(
+    colibri_qwen_expert_precision_contract
+    tests/qwen_expert_precision_contract.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx512.cpp
+    src/cpu_backend.cpp
+    src/cpu_kernels.cpp
+    src/cpu_native_kernels.cpp
+    src/cpu_q8_dot_avx2.cpp
+    src/cpu_q8_dot_avx512.cpp
+    src/cpu_shim.cpp
+    src/q4_dispatch.cpp
+    src/q4_scalar.cpp
+    src/q4_avx2.cpp
+    src/q4_avx512.cpp
+)
+target_compile_features(colibri_qwen_expert_precision_contract PRIVATE cxx_std_20)
+target_compile_definitions(
+    colibri_qwen_expert_precision_contract PRIVATE COLIBRI_V2_STATIC
+)
+target_include_directories(
+    colibri_qwen_expert_precision_contract
+    PRIVATE include src ${COLIBRI_CPU_KERNEL_DIR}
+)
+add_dependencies(
+    colibri_qwen_expert_precision_contract colibri_cpu_kernel_sources
+)
+if(NOT WIN32)
+    target_link_libraries(
+        colibri_qwen_expert_precision_contract PRIVATE ${CMAKE_DL_LIBS}
+    )
+endif()
+target_link_libraries(
+    colibri_qwen_expert_precision_contract PRIVATE Threads::Threads
+)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_qwen_expert_precision_contract
+        COMMAND colibri_qwen_expert_precision_contract
+    )
+endif()
+
 add_executable(
     colibri_iq_kernel_contract
     tests/qwen_iq_kernel_contract.cpp
