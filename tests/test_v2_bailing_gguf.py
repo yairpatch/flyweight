@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -315,6 +316,229 @@ class BailingRuntimeStateTests(unittest.TestCase):
             # as it did before anything was cancelled.
             runtime.reset()
             self.assertEqual(list(runtime.eval(prompt)), reference)
+
+
+def gpu_present() -> bool:
+    try:
+        return bool(V2Model.gpu_info()["available"])
+    except Exception:
+        return False
+
+
+class BailingSlotTests(unittest.TestCase):
+    """Several sequences in one runtime, running INTERLEAVED.
+
+    Coexistence is not the property. Two sequences that each run to completion
+    before the other starts will agree with their solo runs even if the slots
+    share every buffer they own, because nothing is ever live at the same time.
+    The property is that a token of A between two tokens of B changes neither.
+
+    This codebase has already paid for the difference: a DeltaNet CUDA graph
+    captured against one slot corrupted another (f00b4fe), and only an
+    interleaved test saw it. So every case below alternates, and the two
+    sequences are given DIFFERENT prompt lengths so their positions diverge --
+    a shared position would otherwise be right by coincidence.
+
+    Both paths run: the host is the oracle, and the device is where the bug
+    class lives.
+
+    One device path is out of reach here. The fixture is f32 on purpose -- it
+    exists to check mapping, not quantization -- and the tiled GPU prefill only
+    takes Q6_K experts, so these runs go through the host batched prefill and
+    the device decode instead. The tiled path's slot threading was checked
+    against a real Ling-3.0-tiny: a tiled prefill and a decode on slot 1
+    between two of slot 0's tokens leaves slot 0 bit-identical. If this fixture
+    ever gains quantized experts, that case starts running here for free.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = tempfile.TemporaryDirectory()
+        root = Path(cls._directory.name)
+        hf_path = safetensors.build(root / "ling-tiny-fixture")
+        cls.gguf_path = gguf.build(root / "converted", hf_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    # Deliberately different lengths.
+    PROMPT_A = [5, 11, 23, 4, 9, 17, 3, 8]
+    PROMPT_B = [31, 29, 27, 25, 23, 21, 19, 15, 13, 2, 1, 6]
+
+    @contextlib.contextmanager
+    def runtime(self, on_gpu: bool, slots: int = 1, capacity: int = 64):
+        previous = os.environ.get("COLIBRI_BAILING_GPU")
+        os.environ["COLIBRI_BAILING_GPU"] = "1" if on_gpu else "0"
+        try:
+            with V2Model(self.gguf_path) as model:
+                runtime = BailingRuntime(model, capacity=capacity, slots=slots)
+                self.assertIs(runtime.uses_gpu, on_gpu)
+                try:
+                    yield runtime
+                finally:
+                    runtime.close()
+        finally:
+            if previous is None:
+                os.environ.pop("COLIBRI_BAILING_GPU", None)
+            else:
+                os.environ["COLIBRI_BAILING_GPU"] = previous
+
+    def paths(self):
+        """The device path only when there is a device to run it on."""
+        yield False
+        if gpu_present():
+            yield True
+
+    def solo(self, runtime, prompt, slot: int = 0, steps: int = 6):
+        """Run one sequence to completion, recording everything it produced.
+
+        Greedy, and the tokens are recorded as well as the logits: a drifting
+        cache shows up in the logits first, but a differing token is the thing
+        a caller would actually see.
+        """
+        runtime.reset(slot)
+        logits = [list(runtime.eval(prompt, slot=slot))]
+        tokens = []
+        for _ in range(steps):
+            tokens.append(runtime.sample())
+            logits.append(list(runtime.eval([tokens[-1]], slot=slot)))
+        return tokens, logits
+
+    @staticmethod
+    def snapshot_position(snapshot: bytes) -> int:
+        # magic[8], version, layers, kv_lora, qk_rope, heads, head_dim,
+        # conv_width, position -- the last of the nine header words.
+        return struct.unpack_from("<I", snapshot, 8 + 7 * 4)[0]
+
+    def test_interleaved_sequences_answer_exactly_as_they_do_alone(self) -> None:
+        for on_gpu in self.paths():
+            with self.subTest(gpu=on_gpu):
+                with self.runtime(on_gpu) as reference:
+                    tokens_a, solo_a = self.solo(reference, self.PROMPT_A)
+                    tokens_b, solo_b = self.solo(reference, self.PROMPT_B)
+                # Distinct sequences, or the comparison proves nothing.
+                self.assertNotEqual(tokens_a, tokens_b)
+
+                with self.runtime(on_gpu, slots=2) as runtime:
+                    runtime.reset(0)
+                    runtime.reset(1)
+                    # Prompts first, alternating, then a token each in turn.
+                    both_a = [list(runtime.eval(self.PROMPT_A, slot=0))]
+                    both_b = [list(runtime.eval(self.PROMPT_B, slot=1))]
+                    for step in range(len(tokens_a)):
+                        both_a.append(
+                            list(runtime.eval([tokens_a[step]], slot=0)))
+                        both_b.append(
+                            list(runtime.eval([tokens_b[step]], slot=1)))
+                        # The token each slot would decode next, checked at
+                        # every step rather than only at the end: a slot that
+                        # reads another's cache diverges once and then carries
+                        # on consistently from the wrong place.
+                        self.assertEqual(both_a[-1], solo_a[step + 1])
+                        self.assertEqual(both_b[-1], solo_b[step + 1])
+                    self.assertEqual(both_a, solo_a)
+                    self.assertEqual(both_b, solo_b)
+
+    def test_a_slot_nobody_touched_stays_where_it_started(self) -> None:
+        for on_gpu in self.paths():
+            with self.subTest(gpu=on_gpu):
+                with self.runtime(on_gpu, slots=3) as runtime:
+                    for slot in range(3):
+                        runtime.reset(slot)
+                    untouched = runtime.save_state(slot=2)
+                    self.assertEqual(self.snapshot_position(untouched), 0)
+                    runtime.eval_into(self.PROMPT_A, slot=0)
+                    runtime.eval_into(self.PROMPT_B, slot=1)
+                    for step in range(4):
+                        runtime.eval_into([step + 1], slot=0)
+                        runtime.eval_into([step + 2], slot=1)
+                    after = runtime.save_state(slot=2)
+                self.assertEqual(self.snapshot_position(after), 0)
+                # Byte-identical, which covers the KDA recurrent state and the
+                # convolution windows -- the parts that are the same size at
+                # position zero as at any other, and so the parts a leak
+                # between slots would quietly modify without moving anything.
+                self.assertEqual(after, untouched)
+
+    def test_slot_isolation_survives_a_snapshot_and_restore(self) -> None:
+        for on_gpu in self.paths():
+            with self.subTest(gpu=on_gpu):
+                with self.runtime(on_gpu) as reference:
+                    tokens_a, solo_a = self.solo(reference, self.PROMPT_A)
+                    tokens_b, _ = self.solo(reference, self.PROMPT_B)
+
+                with self.runtime(on_gpu, slots=2) as runtime:
+                    runtime.reset(0)
+                    runtime.reset(1)
+                    runtime.eval_into(self.PROMPT_A, slot=0)
+                    snapshot = runtime.save_state(slot=0)
+                    self.assertEqual(
+                        self.snapshot_position(snapshot), len(self.PROMPT_A))
+                    # Run slot 1 far enough to overwrite anything shared, and
+                    # run slot 0 somewhere else entirely, so the restore has
+                    # something to undo rather than something to confirm.
+                    runtime.eval_into(self.PROMPT_B, slot=1)
+                    for token in tokens_b:
+                        runtime.eval_into([token], slot=1)
+                    for token in [40, 41, 42]:
+                        runtime.eval_into([token], slot=0)
+                    runtime.load_state(snapshot, slot=0)
+                    # And keep slot 1 moving while slot 0 continues, so the
+                    # restored slot is interleaved rather than alone.
+                    restored = []
+                    for step, token in enumerate(tokens_a):
+                        restored.append(list(runtime.eval([token], slot=0)))
+                        runtime.eval_into([tokens_b[step]], slot=1)
+                self.assertEqual(restored, solo_a[1:])
+
+    def test_a_slot_index_past_the_end_is_refused(self) -> None:
+        with self.runtime(False, slots=2) as runtime:
+            self.assertEqual(runtime.slot_count, 2)
+            for call in (
+                lambda: runtime.eval([5], slot=2),
+                lambda: runtime.eval_into([5], slot=7),
+                lambda: runtime.reset(2),
+                lambda: runtime.save_state(slot=2),
+                lambda: runtime.load_state(b"", slot=2),
+            ):
+                with self.subTest(call=call):
+                    with self.assertRaises(V2Error) as failure:
+                        call()
+                    # The message has to name the runtime's actual count: "out
+                    # of range" alone leaves the caller guessing whether they
+                    # asked for too many or built too few.
+                    self.assertIn("2 slots", str(failure.exception))
+
+    def test_one_slot_is_the_runtime_that_was_always_there(self) -> None:
+        for on_gpu in self.paths():
+            with self.subTest(gpu=on_gpu):
+                with self.runtime(on_gpu, slots=1) as single:
+                    self.assertEqual(single.slot_count, 1)
+                    explicit = self.solo(single, self.PROMPT_A)
+                # The pre-slots constructor call, unchanged, and the pre-slots
+                # methods with no slot argument.
+                previous = os.environ.get("COLIBRI_BAILING_GPU")
+                os.environ["COLIBRI_BAILING_GPU"] = "1" if on_gpu else "0"
+                try:
+                    with V2Model(self.gguf_path) as model:
+                        old = BailingRuntime(model, capacity=64)
+                        try:
+                            self.assertEqual(old.slot_count, 1)
+                            old.reset()
+                            logits = [list(old.eval(self.PROMPT_A))]
+                            tokens = []
+                            for _ in range(6):
+                                tokens.append(old.sample())
+                                logits.append(list(old.eval([tokens[-1]])))
+                        finally:
+                            old.close()
+                finally:
+                    if previous is None:
+                        os.environ.pop("COLIBRI_BAILING_GPU", None)
+                    else:
+                        os.environ["COLIBRI_BAILING_GPU"] = previous
+                self.assertEqual((tokens, logits), explicit)
 
 
 if __name__ == "__main__":

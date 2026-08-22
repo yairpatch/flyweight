@@ -5114,16 +5114,29 @@ struct BailingGpuLayer {
     BailingGpuMatrix shared_gate, shared_up, shared_down;
     std::uint64_t router_bias = 0;
     std::uint64_t attn_norm = 0, ffn_norm = 0;
-    // Per-layer state that must persist across tokens.
+};
+
+// The per-layer state that must persist across tokens -- and therefore the
+// only thing on the device that belongs to ONE sequence rather than to the
+// model. Everything in BailingGpuLayer above is a weight and everything in
+// BailingGpu below is scratch that lives inside a single token's forward, so
+// this struct is exactly the slot boundary.
+struct BailingGpuSlotLayer {
     std::uint64_t latents = 0, rope_keys = 0;   // MLA cache
     std::uint64_t state = 0;                    // KDA recurrent state
     std::uint64_t conv_windows = 0;             // three windows, packed
+};
+
+struct BailingGpuSlot {
+    std::vector<BailingGpuSlotLayer> layers;
 };
 
 struct BailingGpu {
     bool ready = false;
     std::uint64_t stream = 0;
     std::vector<BailingGpuLayer> layers;
+    // One entry per sequence slot, each with one entry per layer.
+    std::vector<BailingGpuSlot> slots;
     BailingGpuMatrix embedding, head;
     std::uint64_t output_norm = 0;
     // Scratch, sized once for the widest use.
@@ -5158,25 +5171,52 @@ struct BailingGpu {
 // bailing::decoder_layer. Deliberately plain: this is the correctness path and
 // the oracle the eventual GPU kernels are measured against, so it favours being
 // obviously right over being fast.
+// One independent sequence. Slots run interleaved -- one forward pass at a
+// time, a token at a time, round-robined by the caller -- so what a slot owns
+// is state that PERSISTS between tokens, and nothing else. The scratch every
+// forward pass writes and reads within one token stays shared.
+struct BailingSlot {
+    std::vector<colibri::v2::bailing::LayerCache> caches;
+    std::uint32_t position = 0;
+    // Which copy of this slot's per-layer cache is current. The host and device
+    // each keep their own, and the two paths play to different strengths -- the
+    // host has a batched prefill, the device has the faster decode -- so eval
+    // uses whichever suits the call and moves the cache across when it has to.
+    // False means the host copy is authoritative, the state after a reset.
+    //
+    // Per slot rather than per runtime: with several sequences live, one of
+    // them taking a host prefill says nothing about where another one's cache
+    // is, and a single shared flag would have each slot answering for the last
+    // call any slot made.
+    bool cache_on_device = false;
+};
+
 struct ColibriV2BailingRuntime {
     const ColibriV2Model* model = nullptr;
     colibri::v2::bailing::Geometry geometry;
     std::vector<colibri::v2::bailing::LayerWeights> layers;
-    std::vector<colibri::v2::bailing::LayerCache> caches;
     colibri::v2::bailing::Matrix embedding_matrix;
     const float* output_norm = nullptr;
     colibri::v2::bailing::Matrix head;
     std::uint32_t capacity = 0;
-    std::uint32_t position = 0;
+    // At least one, always; slot 0 is the sequence a single-sequence caller
+    // gets without knowing slots exist.
+    std::vector<BailingSlot> slots;
     // kv_b decoded to f32 per MLA layer; see MlaWeights::kv_b for why.
     std::vector<std::vector<float>> decoded_kv_b;
     std::unique_ptr<BailingGpu> gpu;
-    // Which copy of the per-layer cache is current. The host and device each
-    // keep their own, and the two paths play to different strengths -- the host
-    // has a batched prefill, the device has the faster decode -- so eval uses
-    // whichever suits the call and moves the cache across when it has to. False
-    // means the host copy is authoritative, which is the state after a reset.
-    bool cache_on_device = false;
+    // Checked, not assumed. Every entry point that names a slot comes through
+    // here, so an out-of-range index is an error the caller sees rather than a
+    // read past the end of the vector.
+    BailingSlot& slot(std::uint32_t index) {
+        if (index >= slots.size())
+            throw std::runtime_error(
+                "bailing slot " + std::to_string(index) +
+                " is out of range; this runtime has " +
+                std::to_string(slots.size()) +
+                (slots.size() == 1 ? " slot" : " slots"));
+        return slots[index];
+    }
     // Optional watcher for long prompts; see colibri_v2_bailing_set_progress.
     // `reported` and `reporting` are per-eval scratch, not configuration: the
     // internal paths report at whatever granularity is natural for them, and
@@ -5273,6 +5313,25 @@ std::uint64_t bailing_gpu_scratch(BailingGpu& gpu, std::size_t bytes) {
     return pointer;
 }
 
+// What one sequence slot costs on the device: the MLA caches sized to the full
+// capacity, plus the fixed KDA recurrent state and convolution windows.
+//
+// Computed rather than discovered, because discovering it means allocating
+// until the driver refuses -- which leaves a half-built runtime and an error
+// naming a scratch buffer instead of the decision that caused it.
+std::uint64_t bailing_slot_device_bytes(const ColibriV2BailingRuntime& runtime) {
+    const auto& g = runtime.geometry;
+    const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
+    const std::uint64_t history = g.conv_width ? g.conv_width - 1 : 0;
+    std::uint64_t bytes = 0;
+    for (const auto& layer : runtime.layers)
+        bytes += layer.full_attention
+            ? static_cast<std::uint64_t>(runtime.capacity) *
+                  (g.kv_lora + g.qk_rope) * 4
+            : (channels * g.head_dim + 3 * channels * history) * 4;
+    return bytes;
+}
+
 // Bring the whole model onto the device. Q4_K is 4.4 GB, which fits the 12 GB
 // card with room for the caches and scratch.
 void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
@@ -5332,8 +5391,6 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
                 throw std::runtime_error("out of device memory for kv_b");
             colibri_gpu_upload_sync(L.kv_b, decoded.data(), decoded.size() * 4);
             gpu.owned.push_back(L.kv_b);
-            L.latents = bailing_gpu_scratch(gpu, (std::size_t)runtime.capacity * g.kv_lora * 4);
-            L.rope_keys = bailing_gpu_scratch(gpu, (std::size_t)runtime.capacity * g.qk_rope * 4);
         } else {
             L.ssm_q = bailing_gpu_matrix(gpu, m, prefix + "ssm_q.weight");
             L.ssm_k = bailing_gpu_matrix(gpu, m, prefix + "ssm_k.weight");
@@ -5348,8 +5405,6 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
             L.ssm_a = bailing_gpu_upload(gpu, m, prefix + "ssm_a");
             L.ssm_dt = bailing_gpu_upload(gpu, m, prefix + "ssm_dt.bias");
             L.ssm_norm = bailing_gpu_upload(gpu, m, prefix + "ssm_norm.weight");
-            L.state = bailing_gpu_scratch(gpu, channels * g.head_dim * 4);
-            L.conv_windows = bailing_gpu_scratch(gpu, 3 * channels * (g.conv_width - 1) * 4);
         }
         if (weights.routed) {
             L.router = bailing_gpu_matrix(gpu, m, prefix + "ffn_gate_inp.weight");
@@ -5427,9 +5482,66 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     gpu.prefill_q8 = bailing_gpu_scratch(gpu, q8_elements);
     gpu.prefill_q8_scales = bailing_gpu_scratch(
         gpu, ((q8_elements + 31) / 32) * sizeof(std::uint16_t));
+
+    // The per-slot caches go last, once the weights and the shared scratch are
+    // already resident, so the free-memory reading below is what is actually
+    // left for them rather than a guess with the rest subtracted by hand.
+    //
+    // A slot is the expensive part of a second sequence -- ~918 MiB on
+    // Ling-3.0-tiny at a 65k capacity -- so a caller who asks for more than
+    // fits deserves to be told the number they should have asked for, not a
+    // "cuMemAlloc failed" from whichever layer happened to be next.
+    const std::uint64_t per_slot = bailing_slot_device_bytes(runtime);
+    const std::uint64_t wanted = per_slot * runtime.slots.size();
+    ColibriV2GpuInfo memory{};
+    if (gpu_probe(memory, 0) == 0 && memory.available && memory.free_memory) {
+        // A margin, not a rounding error: the driver keeps its own allocations
+        // in this pool and a slot that fits with nothing to spare would leave
+        // the first kernel launch to fail instead.
+        const std::uint64_t margin = 64ull << 20;
+        if (wanted + margin > memory.free_memory) {
+            const std::uint64_t available =
+                memory.free_memory > margin ? memory.free_memory - margin : 0;
+            const auto mib = [](std::uint64_t bytes) {
+                return std::to_string((bytes + (1ull << 20) - 1) >> 20);
+            };
+            const std::uint64_t fits = available / (per_slot ? per_slot : 1);
+            throw std::runtime_error(
+                "bailingmoe3 cannot fit " + std::to_string(runtime.slots.size()) +
+                " sequence slot" + (runtime.slots.size() == 1 ? "" : "s") +
+                " at a capacity of " + std::to_string(runtime.capacity) +
+                " tokens: each slot needs " + mib(per_slot) + " MiB of device "
+                "memory, " + std::to_string(runtime.slots.size()) + " need " +
+                mib(wanted) + " MiB, and only " + mib(available) + " MiB is "
+                "free after the weights and scratch -- short by " +
+                mib(wanted + margin - memory.free_memory) + " MiB. Ask for " +
+                std::to_string(fits) + " slot" + (fits == 1 ? "" : "s") +
+                " at this capacity, or reduce the capacity.");
+        }
+    }
+    gpu.slots.resize(runtime.slots.size());
+    for (auto& slot : gpu.slots) {
+        slot.layers.resize(c.layer_count);
+        for (std::uint32_t index = 0; index < c.layer_count; ++index) {
+            auto& S = slot.layers[index];
+            if (runtime.layers[index].full_attention) {
+                S.latents = bailing_gpu_scratch(
+                    gpu, (std::size_t)runtime.capacity * g.kv_lora * 4);
+                S.rope_keys = bailing_gpu_scratch(
+                    gpu, (std::size_t)runtime.capacity * g.qk_rope * 4);
+            } else {
+                S.state = bailing_gpu_scratch(gpu, channels * g.head_dim * 4);
+                S.conv_windows = bailing_gpu_scratch(
+                    gpu, 3 * channels * (g.conv_width - 1) * 4);
+            }
+        }
+    }
     gpu.ready = true;
-    std::fprintf(stderr, "[colibri-v2] bailingmoe3: %zu tensors resident on device\n",
-                 gpu.owned.size());
+    std::fprintf(stderr,
+                 "[colibri-v2] bailingmoe3: %zu tensors resident on device, "
+                 "%zu sequence slot(s) at %llu MiB each\n",
+                 gpu.owned.size(), gpu.slots.size(),
+                 static_cast<unsigned long long>((per_slot + (1ull << 20) - 1) >> 20));
 }
 
 // One token through the whole model, on the device.
@@ -5469,11 +5581,18 @@ void bailing_gpu_bind_thread() {
 // Cost is small enough not to need managing: ~1 MB of MLA cache per 512
 // positions plus a fixed ~1 MB of recurrent state per KDA layer, once per
 // prefill/decode transition rather than per token.
-void bailing_cache_transfer(ColibriV2BailingRuntime& runtime, bool to_device) {
+//
+// One slot's cache, never all of them: with several sequences live, moving
+// somebody else's cache across would at best waste the bus and at worst
+// overwrite a sequence that is only paused.
+void bailing_cache_transfer(ColibriV2BailingRuntime& runtime,
+                            std::uint32_t slot_index, bool to_device) {
     if (!runtime.gpu || !runtime.gpu->ready) return;
     bailing_gpu_bind_thread();
+    auto& slot = runtime.slot(slot_index);
+    auto& device_slot = runtime.gpu->slots[slot_index];
     const auto& g = runtime.geometry;
-    const std::size_t position = runtime.position;
+    const std::size_t position = slot.position;
     const std::size_t channels = g.heads * g.head_dim;
     const std::size_t history = g.conv_width - 1;
 
@@ -5492,34 +5611,36 @@ void bailing_cache_transfer(ColibriV2BailingRuntime& runtime, bool to_device) {
     };
 
     for (std::size_t index = 0; index < runtime.layers.size(); ++index) {
-        auto& L = runtime.gpu->layers[index];
-        auto& cache = runtime.caches[index];
+        auto& S = device_slot.layers[index];
+        auto& cache = slot.caches[index];
         if (runtime.layers[index].full_attention) {
-            move("latents", index, L.latents, cache.latents.data(),
+            move("latents", index, S.latents, cache.latents.data(),
                  position * g.kv_lora);
-            move("rope keys", index, L.rope_keys, cache.rope_keys.data(),
+            move("rope keys", index, S.rope_keys, cache.rope_keys.data(),
                  position * g.qk_rope);
         } else {
-            move("state", index, L.state, cache.state.data(), channels * g.head_dim);
+            move("state", index, S.state, cache.state.data(), channels * g.head_dim);
             const std::size_t window = channels * history;
-            move("query window", index, L.conv_windows,
+            move("query window", index, S.conv_windows,
                  cache.query_window.data(), window);
-            move("key window", index, L.conv_windows + window * 4,
+            move("key window", index, S.conv_windows + window * 4,
                  cache.key_window.data(), window);
-            move("value window", index, L.conv_windows + window * 8,
+            move("value window", index, S.conv_windows + window * 8,
                  cache.value_window.data(), window);
         }
     }
     if (colibri_gpu_sync() != 0)
         throw std::runtime_error("bailing cache transfer failed to synchronize");
-    runtime.cache_on_device = to_device;
+    slot.cache_on_device = to_device;
 }
 
-void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
-                      float* logits) {
+void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index,
+                      std::uint32_t token, float* logits) {
     namespace bailing = colibri::v2::bailing;
     bailing_gpu_bind_thread();
     auto& gpu = *runtime.gpu;
+    auto& slot = runtime.slot(slot_index);
+    auto& device_slot = gpu.slots[slot_index];
     const auto& g = runtime.geometry;
     const auto& c = runtime.model->config;
     // Everything on the default stream. colibri_gpu_rms_norm and
@@ -5530,7 +5651,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
     const std::uint64_t stream = 0;
     const std::size_t channels = g.heads * g.head_dim;
     const std::size_t qk = g.qk_nope + g.qk_rope;
-    const std::size_t position = runtime.position;
+    const std::size_t position = slot.position;
     const char* grouped_q6_env =
         std::getenv("COLIBRI_BAILING_GROUPED_Q6_DECODE");
     const bool grouped_q6 = !grouped_q6_env || grouped_q6_env[0] != '0';
@@ -5582,6 +5703,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
     for (std::size_t index = 0; index < runtime.layers.size(); ++index) {
         const auto& weights = runtime.layers[index];
         auto& L = gpu.layers[index];
+        auto& S = device_slot.layers[index];
         colibri_gpu_rms_norm(current, L.attn_norm, gpu.normalized,
                              static_cast<int>(g.hidden), g.epsilon, 0);
         if (weights.full_attention) {
@@ -5592,12 +5714,12 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
             matvec(L.kv_a_mqa, gpu.normalized, gpu.wide_d, g.hidden,
                    g.kv_lora + g.qk_rope);
             colibri_gpu_rms_norm(gpu.wide_d, L.kv_a_norm,
-                                 L.latents + position * g.kv_lora * 4,
+                                 S.latents + position * g.kv_lora * 4,
                                  static_cast<int>(g.kv_lora), g.epsilon, 0);
             {
                 // rope the shared key half, in place at its cache slot.
                 std::uint64_t source = gpu.wide_d + g.kv_lora * 4;
-                std::uint64_t target = L.rope_keys + position * g.qk_rope * 4;
+                std::uint64_t target = S.rope_keys + position * g.qk_rope * 4;
                 int count = static_cast<int>(g.qk_rope);
                 void* copy_args[] = {&target, &source, &count};
                 launch("bailing_copy", 1, 64, copy_args);
@@ -5642,7 +5764,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
                     launch("bailing_mla_project", static_cast<std::uint32_t>(g.heads),
                            128, project_args);
                     void* score_args[] = {&gpu.mla_projected, &gpu.wide_b,
-                        &L.latents, &L.rope_keys, &gpu.scores, &positions,
+                        &S.latents, &S.rope_keys, &gpu.scores, &positions,
                         &heads_arg, &nope, &rope, &lora};
                     launch_2d("bailing_mla_scores",
                               static_cast<std::uint32_t>(g.heads),
@@ -5651,7 +5773,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
                     void* softmax_args[] = {&gpu.scores, &positions, &heads_arg};
                     launch("bailing_mla_softmax",
                            static_cast<std::uint32_t>(g.heads), 128, softmax_args);
-                    void* accumulate_args[] = {&gpu.scores, &L.latents,
+                    void* accumulate_args[] = {&gpu.scores, &S.latents,
                         &gpu.mla_accumulated, &positions, &heads_arg, &lora};
                     launch_2d("bailing_mla_accumulate",
                               static_cast<std::uint32_t>(g.heads),
@@ -5663,7 +5785,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
                            static_cast<std::uint32_t>(g.heads), 128, output_args);
                 } else {
                     void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &L.kv_b,
-                        &L.latents, &L.rope_keys, &gpu.scores, &gpu.wide_d,
+                        &S.latents, &S.rope_keys, &gpu.scores, &gpu.wide_d,
                         &positions, &heads_arg, &nope, &rope, &value_dim, &lora};
                     launch("bailing_mla_attention",
                            static_cast<std::uint32_t>(g.heads), 128, arguments);
@@ -5686,8 +5808,8 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
             {
                 int channels_arg = static_cast<int>(channels);
                 int width = static_cast<int>(g.conv_width);
-                std::uint64_t wq = L.conv_windows;
-                std::uint64_t wk = L.conv_windows + channels * (g.conv_width - 1) * 4;
+                std::uint64_t wq = S.conv_windows;
+                std::uint64_t wk = S.conv_windows + channels * (g.conv_width - 1) * 4;
                 std::uint64_t wv = wk + channels * (g.conv_width - 1) * 4;
                 void* a1[] = {&gpu.wide_a, &L.ssm_q_conv, &wq, &channels_arg, &width};
                 launch("bailing_short_conv", 32, 256, a1);
@@ -5705,7 +5827,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
                 std::uint64_t out = gpu.wide_a;   // reuse: queries are consumed
                 void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &gpu.wide_c,
                                      &gpu.wide_d, &gpu.small, &L.ssm_a, &L.ssm_dt,
-                                     &L.state, &out, &rows, &heads_arg, &head_dim,
+                                     &S.state, &out, &rows, &heads_arg, &head_dim,
                                      &epsilon};
                 launch("bailing_kda_recurrent_chunk",
                        static_cast<std::uint32_t>(g.heads), 128, arguments);
@@ -5870,7 +5992,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t token,
     colibri_gpu_sync();
     colibri_gpu_download(logits, gpu.logits, (std::size_t)c.vocabulary_size * 4, 0);
     if (timing) bailing::profile().tokens += 1;
-    ++runtime.position;
+    ++slot.position;
 }
 
 bool bailing_gpu_prefill_tiled_supported(const ColibriV2BailingRuntime& runtime) {
@@ -5889,12 +6011,14 @@ bool bailing_gpu_prefill_tiled_supported(const ColibriV2BailingRuntime& runtime)
 }
 
 void bailing_gpu_prefill_tiled(
-    ColibriV2BailingRuntime& runtime, const std::uint32_t* tokens,
-    std::uint32_t count, float* logits
+    ColibriV2BailingRuntime& runtime, std::uint32_t slot_index,
+    const std::uint32_t* tokens, std::uint32_t count, float* logits
 ) {
     namespace bailing = colibri::v2::bailing;
     bailing_gpu_bind_thread();
     auto& gpu = *runtime.gpu;
+    auto& slot = runtime.slot(slot_index);
+    auto& device_slot = gpu.slots[slot_index];
     const auto& g = runtime.geometry;
     const auto& c = runtime.model->config;
     const std::uint64_t stream = 0;
@@ -6015,7 +6139,7 @@ void bailing_gpu_prefill_tiled(
     for (std::uint32_t offset = 0; offset < count; offset += gpu.prefill_rows) {
         const int rows = static_cast<int>(std::min<std::uint32_t>(
             gpu.prefill_rows, count - offset));
-        const int base_position = static_cast<int>(runtime.position);
+        const int base_position = static_cast<int>(slot.position);
         if (colibri_gpu_upload_sync(gpu.prefill_tokens, tokens + offset,
                                     rows * sizeof(std::uint32_t)) != 0)
             throw std::runtime_error("bailing tiled prefill token upload failed");
@@ -6033,6 +6157,7 @@ void bailing_gpu_prefill_tiled(
              ++layer_index) {
             const auto& weights = runtime.layers[layer_index];
             auto& layer = gpu.layers[layer_index];
+            auto& cache = device_slot.layers[layer_index];
             const auto attention_start = std::chrono::steady_clock::now();
             rms(current, layer.attn_norm, gpu.prefill_normalized, rows, hidden);
             q8_cached_input = 0;
@@ -6048,7 +6173,7 @@ void bailing_gpu_prefill_tiled(
                 matmul(layer.attn_gate, gpu.prefill_normalized, gpu.prefill_wide_a,
                        hidden, heads, rows);
                 void* prepare_args[] = {&gpu.prefill_wide_d, &gpu.prefill_wide_c,
-                    &layer.kv_a_norm, &layer.latents, &layer.rope_keys,
+                    &layer.kv_a_norm, &cache.latents, &cache.rope_keys,
                     &gpu.prefill_wide_b, &gpu.prefill_normalized,
                     const_cast<int*>(&rows), const_cast<int*>(&base_position),
                     const_cast<int*>(&heads), const_cast<int*>(&qk_nope),
@@ -6063,7 +6188,7 @@ void bailing_gpu_prefill_tiled(
                        project_args);
                 if (fused_mla) {
                     void* fused_args[] = {&gpu.prefill_projected,
-                        &gpu.prefill_normalized, &layer.latents, &layer.rope_keys,
+                        &gpu.prefill_normalized, &cache.latents, &cache.rope_keys,
                         &gpu.prefill_accumulated, const_cast<int*>(&rows),
                         const_cast<int*>(&base_position), const_cast<int*>(&heads),
                         const_cast<int*>(&qk_nope), const_cast<int*>(&qk_rope),
@@ -6072,7 +6197,7 @@ void bailing_gpu_prefill_tiled(
                            fused_args);
                 } else {
                     void* score_args[] = {&gpu.prefill_projected,
-                        &gpu.prefill_normalized, &layer.latents, &layer.rope_keys,
+                        &gpu.prefill_normalized, &cache.latents, &cache.rope_keys,
                         &gpu.prefill_scores, const_cast<int*>(&rows),
                         const_cast<int*>(&base_position), &runtime.capacity,
                         const_cast<int*>(&heads), const_cast<int*>(&qk_nope),
@@ -6084,7 +6209,7 @@ void bailing_gpu_prefill_tiled(
                         &runtime.capacity, const_cast<int*>(&heads)};
                     launch("bailing_mla_softmax_rows", rows * heads, 1, 128,
                            softmax_args);
-                    void* accumulate_args[] = {&gpu.prefill_scores, &layer.latents,
+                    void* accumulate_args[] = {&gpu.prefill_scores, &cache.latents,
                         &gpu.prefill_accumulated, const_cast<int*>(&rows),
                         const_cast<int*>(&base_position), &runtime.capacity,
                         const_cast<int*>(&heads), const_cast<int*>(&lora)};
@@ -6115,9 +6240,9 @@ void bailing_gpu_prefill_tiled(
                        gpu.prefill_wide_e, hidden, channels, rows);
                 int width = static_cast<int>(g.conv_width);
                 std::uint64_t windows[] = {
-                    layer.conv_windows,
-                    layer.conv_windows + static_cast<std::uint64_t>(channels) * (width - 1) * 4,
-                    layer.conv_windows + static_cast<std::uint64_t>(channels) * (width - 1) * 8};
+                    cache.conv_windows,
+                    cache.conv_windows + static_cast<std::uint64_t>(channels) * (width - 1) * 4,
+                    cache.conv_windows + static_cast<std::uint64_t>(channels) * (width - 1) * 8};
                 std::uint64_t values[] = {gpu.prefill_wide_a, gpu.prefill_wide_b,
                                           gpu.prefill_wide_c};
                 std::uint64_t conv_weights[] = {layer.ssm_q_conv, layer.ssm_k_conv,
@@ -6131,7 +6256,7 @@ void bailing_gpu_prefill_tiled(
                 void* recurrent_args[] = {&gpu.prefill_wide_a,
                     &gpu.prefill_wide_b, &gpu.prefill_wide_c,
                     &gpu.prefill_wide_d, &gpu.prefill_branch, &layer.ssm_a,
-                    &layer.ssm_dt, &layer.state, &gpu.prefill_wide_a,
+                    &layer.ssm_dt, &cache.state, &gpu.prefill_wide_a,
                     const_cast<int*>(&rows), const_cast<int*>(&heads),
                     const_cast<int*>(&head_dim), const_cast<float*>(&epsilon)};
                 launch("bailing_kda_recurrent_chunk", heads, 1, 128,
@@ -6335,7 +6460,7 @@ void bailing_gpu_prefill_tiled(
             }
             std::swap(current, next);
         }
-        runtime.position += rows;
+        slot.position += rows;
         if (offset + rows == count) {
             std::uint64_t last = current +
                 static_cast<std::uint64_t>(rows - 1) * g.hidden * 4;
@@ -6363,13 +6488,14 @@ void bailing_gpu_prefill_tiled(
         mla_seconds, kda_seconds, routed_seconds, dense_seconds,
         router_projection_seconds, router_selection_seconds,
         expert_gate_seconds, expert_down_seconds, shared_expert_seconds);
-    runtime.cache_on_device = true;
+    slot.cache_on_device = true;
 }
 
-int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
-                              ColibriV2BailingRuntime** out) {
+int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capacity,
+                                    uint32_t slots,
+                                    ColibriV2BailingRuntime** out) {
     return guarded([&]{
-    if(!model||!out||!capacity)throw std::runtime_error("invalid bailing runtime arguments");
+    if(!model||!out||!capacity||!slots)throw std::runtime_error("invalid bailing runtime arguments");
     if(model->architecture!="bailingmoe3")
         throw std::runtime_error("model architecture is not bailingmoe3");
     namespace bailing = colibri::v2::bailing;
@@ -6377,6 +6503,7 @@ int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
     auto runtime = std::make_unique<ColibriV2BailingRuntime>();
     runtime->model = model;
     runtime->capacity = capacity;
+    runtime->slots.resize(slots);
 
     auto& g = runtime->geometry;
     g.hidden = c.hidden_size;
@@ -6416,7 +6543,7 @@ int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
     runtime->head = bailing_matrix(*model, "output.weight");
 
     runtime->layers.resize(c.layer_count);
-    runtime->caches.resize(c.layer_count);
+    for(auto& slot : runtime->slots) slot.caches.resize(c.layer_count);
     runtime->decoded_kv_b.resize(c.layer_count);
     for(std::uint32_t index=0;index<c.layer_count;++index){
         auto& w = runtime->layers[index];
@@ -6473,7 +6600,8 @@ int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
             w.ffn.up = bailing_matrix(*model, prefix + "ffn_up.weight");
             w.ffn.down = bailing_matrix(*model, prefix + "ffn_down.weight");
         }
-        bailing::reset_cache(runtime->caches[index], w, g, capacity);
+        for(auto& slot : runtime->slots)
+            bailing::reset_cache(slot.caches[index], w, g, capacity);
     }
     // On by default wherever there is a device to use.
     //
@@ -6502,6 +6630,16 @@ int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
             runtime->gpu = std::make_unique<BailingGpu>();
             bailing_gpu_prepare(*runtime);
         } catch(const std::exception& failure) {
+            // Hand the device back whatever preparation had already taken.
+            // Failing part way is now a routine outcome -- asking for more
+            // sequence slots than the card has room for is refused rather than
+            // discovered -- and a half-uploaded model left behind would make
+            // the fallback host runtime share the card with several gigabytes
+            // of nothing.
+            if(runtime->gpu){
+                for(const auto pointer:runtime->gpu->owned)colibri_gpu_free(pointer);
+                runtime->gpu->owned.clear();
+            }
             if(forced_on) throw;
             runtime->gpu.reset();
             std::fprintf(stderr,
@@ -6510,6 +6648,20 @@ int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
         }
     }
     *out = runtime.release();
+    return 0; });
+}
+
+// The single-sequence spelling, which is what every existing caller wants and
+// is exactly one slot.
+int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
+                              ColibriV2BailingRuntime** out) {
+    return colibri_v2_bailing_create_slots(model, capacity, 1, out);
+}
+
+int colibri_v2_bailing_slot_count(ColibriV2BailingRuntime* runtime, uint32_t* out){
+    return guarded([&]{
+    if(!runtime||!out)throw std::runtime_error("invalid bailing slot count arguments");
+    *out = static_cast<std::uint32_t>(runtime->slots.size());
     return 0; });
 }
 
@@ -6525,11 +6677,12 @@ void colibri_v2_bailing_destroy(ColibriV2BailingRuntime* runtime){
     }catch(...){}
 }
 
-int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime){
+int colibri_v2_bailing_reset_slot(ColibriV2BailingRuntime* runtime, uint32_t slot_index){
     return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid bailing runtime");
+    auto& slot = runtime->slot(slot_index);
     for(std::size_t index=0;index<runtime->layers.size();++index)
-        colibri::v2::bailing::reset_cache(runtime->caches[index],
+        colibri::v2::bailing::reset_cache(slot.caches[index],
             runtime->layers[index], runtime->geometry, runtime->capacity);
     // The DEVICE caches need clearing too. Missing this leaked a KDA layer's
     // recurrent state from one request into the next -- and because that state
@@ -6542,10 +6695,14 @@ int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime){
     // so stale contents past `position` are never consulted. They are cleared
     // anyway because "reset" that leaves some state behind is the kind of
     // distinction nobody remembers a year later.
+    //
+    // This slot's device buffers only. Zeroing every slot's would make a reset
+    // of one sequence silently destroy the others, which is the same class of
+    // bug the paragraph above describes and the opposite direction.
     if(runtime->gpu && runtime->gpu->ready){
         const auto& g = runtime->geometry;
         const std::size_t channels = g.heads * g.head_dim;
-        for(auto& layer : runtime->gpu->layers){
+        for(auto& layer : runtime->gpu->slots[slot_index].layers){
             if(layer.state)
                 colibri_gpu_memset(layer.state, 0,
                     channels * g.head_dim * 4, 0);
@@ -6564,19 +6721,29 @@ int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime){
     // Both copies are now zero, so neither is stale and the host one is as good
     // a starting point as the other. Saying so avoids a pointless transfer on
     // the first eval after a reset.
-    runtime->cache_on_device = false;
-    runtime->position = 0;
+    slot.cache_on_device = false;
+    slot.position = 0;
     return 0; });
 }
 
-int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* tokens,
-                            uint32_t count, float* logits){
+int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime){
+    return colibri_v2_bailing_reset_slot(runtime, 0);
+}
+
+int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot_index,
+                                 const uint32_t* tokens, uint32_t count,
+                                 float* logits){
     return guarded([&]{
     if(!runtime||!tokens||!count||!logits)
         throw std::runtime_error("invalid bailing eval arguments");
     const auto& g = runtime->geometry;
     const auto& c = runtime->model->config;
-    if(runtime->position + count > runtime->capacity)
+    // Named once, up front. Every path below reads and writes THIS slot's
+    // position and caches and nothing else, which is the whole property that
+    // makes interleaving two sequences give the same answers as running each
+    // of them alone.
+    auto& slot = runtime->slot(slot_index);
+    if(slot.position + count > runtime->capacity)
         throw std::runtime_error("bailing sequence exceeds the runtime capacity");
 
     // A prompt is watchable; a decoded token is not. Reporting count == 1 would
@@ -6611,8 +6778,8 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
         tiled_prefill_env[0] != '0';
     if (count > 1 && tiled_prefill &&
         bailing_gpu_prefill_tiled_supported(*runtime)) {
-        if (!runtime->cache_on_device) bailing_cache_transfer(*runtime, true);
-        bailing_gpu_prefill_tiled(*runtime, tokens, count, logits);
+        if (!slot.cache_on_device) bailing_cache_transfer(*runtime, slot_index, true);
+        bailing_gpu_prefill_tiled(*runtime, slot_index, tokens, count, logits);
         if(watched) bailing_progress(*runtime, count, count);
         return 0;
     }
@@ -6621,17 +6788,17 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
         ? gpu_prefill_env[0] == '1'
         : count >= 4096;
     if(runtime->gpu && runtime->gpu->ready && count > 1 && !gpu_prefill){
-        if(runtime->cache_on_device) bailing_cache_transfer(*runtime,false);
+        if(slot.cache_on_device) bailing_cache_transfer(*runtime,slot_index,false);
         // Falls through to the host batched path below, which leaves the cache
         // on the host; the next single-token eval moves it back.
     } else if(runtime->gpu && runtime->gpu->ready){
-        if(!runtime->cache_on_device) bailing_cache_transfer(*runtime,true);
+        if(!slot.cache_on_device) bailing_cache_transfer(*runtime,slot_index,true);
         for(std::uint32_t index=0;index<count;++index){
             if(tokens[index] >= c.vocabulary_size)
                 throw std::runtime_error("token id is outside the vocabulary");
-            if(runtime->position >= runtime->capacity)
+            if(slot.position >= runtime->capacity)
                 throw std::runtime_error("bailing sequence exceeds the runtime capacity");
-            bailing_gpu_step(*runtime, tokens[index], logits);
+            bailing_gpu_step(*runtime, slot_index, tokens[index], logits);
             // Every 128 tokens, matching the tile the other prefill paths use,
             // so a watcher sees the same rhythm whichever one ran.
             if(watched && (index & 127) == 127)
@@ -6660,8 +6827,8 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
     const std::size_t depth = runtime->layers.size();
     for(std::size_t layer=0;layer<depth;++layer){
         colibri::v2::bailing::decoder_layer_batch(
-            current.data(), count, runtime->layers[layer], g, runtime->position,
-            runtime->caches[layer], next.data());
+            current.data(), count, runtime->layers[layer], g, slot.position,
+            slot.caches[layer], next.data());
         current.swap(next);
         // The whole batch crosses every layer before any one token is finished,
         // so there is no honest per-token count to report part way through:
@@ -6675,7 +6842,7 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
                     static_cast<std::size_t>(count) * (layer + 1) / depth),
                 count);
     }
-    runtime->position += count;
+    slot.position += count;
     // Only the last token's logits are produced; the earlier ones exist purely
     // to advance the caches.
     std::vector<float> normalized(g.hidden);
@@ -6686,6 +6853,11 @@ int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* to
                                  c.vocabulary_size, logits);
     if(watched) bailing_progress(*runtime, count, count);
     return 0; });
+}
+
+int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* tokens,
+                            uint32_t count, float* logits){
+    return colibri_v2_bailing_eval_slot(runtime, 0, tokens, count, logits);
 }
 
 int colibri_v2_bailing_uses_gpu(ColibriV2BailingRuntime* runtime, int* out){
@@ -6755,13 +6927,15 @@ std::uint64_t bailing_cache_payload_bytes(const ColibriV2BailingRuntime& runtime
     return bytes;
 }
 
-int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer,
-                                  uint64_t capacity, uint64_t* length){
+int colibri_v2_bailing_cache_save_slot(ColibriV2BailingRuntime* runtime,
+                                       uint32_t slot_index, void* buffer,
+                                       uint64_t capacity, uint64_t* length){
     return guarded([&]{
     if(!runtime||!length)
         throw std::runtime_error("invalid bailing cache save arguments");
     const auto& g = runtime->geometry;
-    const std::uint64_t position = runtime->position;
+    auto& slot = runtime->slot(slot_index);
+    const std::uint64_t position = slot.position;
     const std::uint64_t payload = bailing_cache_payload_bytes(*runtime, position);
     const std::uint64_t total =
         sizeof(BailingCacheHeader) + runtime->layers.size() + payload;
@@ -6776,7 +6950,7 @@ int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer
     // device decode that is not the host's. Snapshotting the host copy then
     // would capture the sequence as it was before that call. The transfer also
     // clears cache_on_device, which is right: the host copy is now current.
-    if(runtime->cache_on_device) bailing_cache_transfer(*runtime, false);
+    if(slot.cache_on_device) bailing_cache_transfer(*runtime, slot_index, false);
 
     auto* out = static_cast<std::uint8_t*>(buffer);
     BailingCacheHeader header{};
@@ -6788,7 +6962,7 @@ int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer
     header.heads = static_cast<std::uint32_t>(g.heads);
     header.head_dim = static_cast<std::uint32_t>(g.head_dim);
     header.conv_width = static_cast<std::uint32_t>(g.conv_width);
-    header.position = runtime->position;
+    header.position = slot.position;
     header.payload = payload;
     std::memcpy(out, &header, sizeof(header));
     std::uint64_t offset = sizeof(header);
@@ -6809,7 +6983,7 @@ int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer
     const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
     const std::uint64_t history = g.conv_width ? g.conv_width - 1 : 0;
     for(std::size_t index=0;index<runtime->layers.size();++index){
-        const auto& cache = runtime->caches[index];
+        const auto& cache = slot.caches[index];
         if(runtime->layers[index].full_attention){
             append(cache.latents, position * g.kv_lora);
             append(cache.rope_keys, position * g.qk_rope);
@@ -6824,11 +6998,18 @@ int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer
     return 0; });
 }
 
-int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime,
-                                  const void* buffer, uint64_t length){
+int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer,
+                                  uint64_t capacity, uint64_t* length){
+    return colibri_v2_bailing_cache_save_slot(runtime, 0, buffer, capacity, length);
+}
+
+int colibri_v2_bailing_cache_load_slot(ColibriV2BailingRuntime* runtime,
+                                       uint32_t slot_index, const void* buffer,
+                                       uint64_t length){
     return guarded([&]{
     if(!runtime||!buffer)
         throw std::runtime_error("invalid bailing cache load arguments");
+    auto& slot = runtime->slot(slot_index);
     if(length < sizeof(BailingCacheHeader))
         throw std::runtime_error("bailing cache snapshot is truncated");
     BailingCacheHeader header{};
@@ -6883,7 +7064,7 @@ int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime,
     const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
     const std::uint64_t history = g.conv_width ? g.conv_width - 1 : 0;
     for(std::size_t index=0;index<runtime->layers.size();++index){
-        auto& cache = runtime->caches[index];
+        auto& cache = slot.caches[index];
         if(runtime->layers[index].full_attention){
             take(cache.latents, position * g.kv_lora);
             take(cache.rope_keys, position * g.qk_rope);
@@ -6898,11 +7079,16 @@ int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime,
         // so what is beyond is unreachable rather than stale.
         cache.positions = static_cast<std::size_t>(position);
     }
-    runtime->position = static_cast<std::uint32_t>(position);
+    slot.position = static_cast<std::uint32_t>(position);
     // The device copy, if there is one, now holds another sequence entirely.
     // Saying the host is authoritative makes the next eval upload this one.
-    runtime->cache_on_device = false;
+    slot.cache_on_device = false;
     return 0; });
+}
+
+int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime,
+                                  const void* buffer, uint64_t length){
+    return colibri_v2_bailing_cache_load_slot(runtime, 0, buffer, length);
 }
 
 // The names offered, best-compression first, which is also the order a menu

@@ -1113,23 +1113,39 @@ class BailingRuntime:
     The runtime owns a position: ``eval`` continues from wherever the last call
     left off, so a prompt is one call and each generated token is another.
     ``reset`` starts a new sequence.
+
+    With ``slots > 1`` it owns that many independent sequences instead, each
+    with its own position and caches. They run INTERLEAVED, not batched: one
+    forward pass at a time, and the caller decides whose turn it is by naming a
+    slot. What that buys is that a long prompt on one sequence stops blocking a
+    decode on another. Every method defaults to slot 0, so a caller that has
+    never heard of slots keeps the single-sequence runtime it always had.
     """
 
-    def __init__(self, model: "V2Model", capacity: int = 4096):
+    def __init__(self, model: "V2Model", capacity: int = 4096, slots: int = 1):
         self._model = model
         self._lib = model._lib
         self._handle = ctypes.c_void_p()
         self._vocabulary = int(model.config["vocabulary_size"])
-        self._lib.colibri_v2_bailing_create.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+        self._lib.colibri_v2_bailing_create_slots.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p)
         ]
         self._lib.colibri_v2_bailing_eval.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_float)
         ]
+        self._lib.colibri_v2_bailing_eval_slot.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)
+        ]
+        self._lib.colibri_v2_bailing_reset_slot.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32
+        ]
         self._check(
-            self._lib.colibri_v2_bailing_create(
-                model._handle, ctypes.c_uint32(capacity), ctypes.byref(self._handle)
+            self._lib.colibri_v2_bailing_create_slots(
+                model._handle, ctypes.c_uint32(capacity), ctypes.c_uint32(slots),
+                ctypes.byref(self._handle)
             )
         )
         self._logits = (ctypes.c_float * self._vocabulary)()
@@ -1139,6 +1155,19 @@ class BailingRuntime:
         # its pointer; see set_progress.
         self._progress: Any = None
         self.uses_gpu = self._query_uses_gpu()
+        self._slots = self._query_slot_count()
+
+    @property
+    def slot_count(self) -> int:
+        """How many independent sequences this runtime holds."""
+        return self._slots
+
+    def _query_slot_count(self) -> int:
+        entry = self._lib.colibri_v2_bailing_slot_count
+        entry.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        value = ctypes.c_uint32(0)
+        self._check(entry(self._handle, ctypes.byref(value)))
+        return int(value.value)
 
     def _query_uses_gpu(self) -> bool:
         """Whether creation actually got the device.
@@ -1201,17 +1230,29 @@ class BailingRuntime:
         self._progress = _BAILING_PROGRESS(trampoline)
         self._check(entry(self._handle, self._progress, None))
 
-    def _eval_into_buffer(self, tokens: Sequence[int]) -> None:
+    def _eval_into_buffer(self, tokens: Sequence[int], slot: int = 0) -> None:
         if not tokens:
             raise ValueError("eval needs at least one token")
         buffer = (ctypes.c_uint32 * len(tokens))(*tokens)
+        # Slot 0 goes through the original entry point rather than through the
+        # slot-taking one it now aliases. They do the same thing; calling both
+        # is what keeps the alias covered, since every existing caller is a
+        # slot-0 caller and would otherwise leave it untested.
+        if slot == 0:
+            self._check(
+                self._lib.colibri_v2_bailing_eval(
+                    self._handle, buffer, ctypes.c_uint32(len(tokens)), self._logits
+                )
+            )
+            return
         self._check(
-            self._lib.colibri_v2_bailing_eval(
-                self._handle, buffer, ctypes.c_uint32(len(tokens)), self._logits
+            self._lib.colibri_v2_bailing_eval_slot(
+                self._handle, ctypes.c_uint32(slot), buffer,
+                ctypes.c_uint32(len(tokens)), self._logits
             )
         )
 
-    def eval(self, tokens: Sequence[int]) -> Any:
+    def eval(self, tokens: Sequence[int], slot: int = 0) -> Any:
         """Advance by `tokens` and return the logits for the last one.
 
         Returns a numpy array when numpy is available and a list otherwise.
@@ -1219,49 +1260,74 @@ class BailingRuntime:
         Python list costs ~7 ms, which was larger than the entire GPU forward
         pass it was reporting on.
         """
-        self._eval_into_buffer(tokens)
+        self._eval_into_buffer(tokens, slot)
         if _numpy is not None:
             # Copy: the buffer is reused by the next call, so handing back a
             # view would alias.
             return _numpy.frombuffer(self._logits, dtype=_numpy.float32).copy()
         return list(self._logits)
 
-    def reset(self) -> None:
-        self._check(self._lib.colibri_v2_bailing_reset(self._handle))
+    def reset(self, slot: int = 0) -> None:
+        if slot == 0:
+            self._check(self._lib.colibri_v2_bailing_reset(self._handle))
+            return
+        self._check(
+            self._lib.colibri_v2_bailing_reset_slot(
+                self._handle, ctypes.c_uint32(slot)
+            )
+        )
 
-    def save_state(self) -> bytes:
+    def save_state(self, slot: int = 0) -> bytes:
         """The live sequence's cache, so it can be restored instead of re-run.
 
         Sized by the tokens the runtime actually holds, not by its capacity: a
         32-token side-call snapshots a few hundred kilobytes.
         """
-        save = self._lib.colibri_v2_bailing_cache_save
-        save.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
-            ctypes.POINTER(ctypes.c_uint64),
-        ]
+        if slot == 0:
+            save = self._lib.colibri_v2_bailing_cache_save
+            save.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            leading: tuple = (self._handle,)
+        else:
+            save = self._lib.colibri_v2_bailing_cache_save_slot
+            save.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+                ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
+            ]
+            leading = (self._handle, ctypes.c_uint32(slot))
+        # Two calls: the first asks how big the snapshot is and deliberately
+        # touches nothing else, the second fills a buffer of that size.
         length = ctypes.c_uint64()
-        self._check(save(self._handle, None, 0, ctypes.byref(length)))
+        self._check(save(*leading, None, 0, ctypes.byref(length)))
         buffer = ctypes.create_string_buffer(length.value)
-        self._check(
-            save(self._handle, buffer, length.value, ctypes.byref(length))
-        )
+        self._check(save(*leading, buffer, length.value, ctypes.byref(length)))
         return buffer.raw[: length.value]
 
-    def load_state(self, snapshot: bytes) -> None:
+    def load_state(self, snapshot: bytes, slot: int = 0) -> None:
         """Restore a sequence saved by ``save_state``."""
-        load = self._lib.colibri_v2_bailing_cache_load
-        load.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
-        self._check(load(self._handle, snapshot, len(snapshot)))
+        if slot == 0:
+            load = self._lib.colibri_v2_bailing_cache_load
+            load.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
+            self._check(load(self._handle, snapshot, len(snapshot)))
+            return
+        load = self._lib.colibri_v2_bailing_cache_load_slot
+        load.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint64
+        ]
+        self._check(
+            load(self._handle, ctypes.c_uint32(slot), snapshot, len(snapshot))
+        )
 
-    def eval_into(self, tokens: Sequence[int]) -> None:
+    def eval_into(self, tokens: Sequence[int], slot: int = 0) -> None:
         """Advance the caches, leaving the logits in the internal buffer.
 
         The server path never wants the logits as Python objects -- it samples
         from them and discards them -- and materializing 157k floats per token
         costs more than the model does.
         """
-        self._eval_into_buffer(tokens)
+        self._eval_into_buffer(tokens, slot)
 
     def sample(self, config: Any = None) -> int:
         """Pick the next token from the logits currently in the buffer.

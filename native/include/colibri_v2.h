@@ -542,6 +542,31 @@ COLIBRI_V2_API int colibri_v2_bailing_set_progress(ColibriV2BailingRuntime* runt
    buffer of at least that size; `length` receives the size in both cases. */
 COLIBRI_V2_API int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer, uint64_t capacity, uint64_t* length);
 COLIBRI_V2_API int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime, const void* buffer, uint64_t length);
+/* Independent sequence slots.
+
+   A runtime created with `slots > 1` holds that many complete sequences: each
+   has its own position, its own per-layer caches on the host, and its own
+   MLA/KDA state on the device. Everything else -- the weights, the scratch,
+   the compiled kernels -- is shared, because slots run INTERLEAVED rather than
+   batched: exactly one forward pass is in flight at a time and the caller
+   round-robins a token per slot. What that buys is that a long prompt on one
+   sequence no longer blocks a decode on another; it is not a throughput
+   feature.
+
+   Every call above is the slot-0 alias of the corresponding call here, and
+   `colibri_v2_bailing_create` means `slots = 1`. A slot index at or past the
+   count is an error, never a read past the end.
+
+   Sizing is checked up front: creation fails with the per-slot cost and the
+   shortfall rather than running out of device memory part way through. On
+   Ling-3.0-tiny at a 65k capacity a slot is roughly 918 MiB, so asking for
+   several is a decision, not a detail. */
+COLIBRI_V2_API int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capacity, uint32_t slots, ColibriV2BailingRuntime** out);
+COLIBRI_V2_API int colibri_v2_bailing_slot_count(ColibriV2BailingRuntime* runtime, uint32_t* out);
+COLIBRI_V2_API int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot, const uint32_t* tokens, uint32_t count, float* logits);
+COLIBRI_V2_API int colibri_v2_bailing_reset_slot(ColibriV2BailingRuntime* runtime, uint32_t slot);
+COLIBRI_V2_API int colibri_v2_bailing_cache_save_slot(ColibriV2BailingRuntime* runtime, uint32_t slot, void* buffer, uint64_t capacity, uint64_t* length);
+COLIBRI_V2_API int colibri_v2_bailing_cache_load_slot(ColibriV2BailingRuntime* runtime, uint32_t slot, const void* buffer, uint64_t length);
 
 COLIBRI_V2_API int colibri_v2_qwen_validate(const ColibriV2Model* model);
 COLIBRI_V2_API int colibri_v2_qwen_tensor_role(const ColibriV2Model* model, const char* role, ColibriV2TensorInfo* out);
