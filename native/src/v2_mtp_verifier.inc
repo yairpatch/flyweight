@@ -505,6 +505,7 @@ void qwen_forward_rows(
         // read staged weights, consumed fences the prefetch stream before the
         // next layer's uploads overwrite the slice.
         std::uint64_t stream_base;std::uint64_t stream_bytes;
+        std::uint64_t stream_scratch;
         std::uint64_t upload_ready_event;std::uint64_t consumed_event;
         // Whether cpu_phase queued GPU expert work whose accumulator
         // queue_combine must fold into the residual.
@@ -1198,8 +1199,7 @@ void qwen_forward_rows(
             expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
             (expert_policy.hybrid_prefill_cpu||
              !expert_policy.routed_gpu_execution_allowed());
-        const bool gpu_table_path=
-            !expert_policy.hybrid_prefill_cpu||stream_experts;
+        const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
         span.gpu_experts=gpu_table_path;
         const auto span_entries=static_cast<std::size_t>(rows)*top_k;
         if(gpu_table_path){
@@ -1274,22 +1274,61 @@ void qwen_forward_rows(
                 weights_host[route]=0.0f;
             }
         }
-        // Prefill expert streaming (plans/prefill-expert-stream.md): stage
-        // the densest routed experts of this half-layer into the span's arena
-        // slice and hand their routes to the grouped kernels below; the rest
-        // stay in weights_host for the CPU sweep. Densest first because the
-        // upload is a fixed cost per expert while the saving scales with its
-        // routed tokens; the tie-break on the index keeps the pick a pure
-        // function of the routes, so a fixed budget is deterministic.
-        // Mutually exclusive with the admission loop above by construction:
-        // stream_experts requires the policy that makes gpu_rows_allowed
-        // false, so the two never share gpu_counts.
+        // Prefill expert GEMM (plans/prefill-expert-gemm.md): stage the
+        // densest routed experts of this half-layer into the span's arena
+        // slice, pack each staged expert's tokens into a contiguous tile and
+        // run the dense batch kernels over the staged weights -- decoded once
+        // per token tile instead of once per routed token, which is what
+        // killed the per-token grouped kernels for prefill-sized route
+        // counts. Densest first because the upload is a fixed cost per
+        // expert while the saving scales with its routed tokens; every pick
+        // and every token list is a pure function of the routes, so a fixed
+        // budget is deterministic. The scratch walk mirrors the prepare-time
+        // sizing exactly.
+        struct StreamGroup{int expert;std::uint64_t matrix;int offset;int count;};
+        std::vector<StreamGroup> stream_groups;
+        std::uint64_t stream_role_bytes[3]={0,0,0};
+        const std::uint64_t stream_cap=runtime.forward_rows_capacity;
+        std::uint64_t stream_cursor=span.stream_scratch;
+        auto stream_take=[&](std::uint64_t bytes){
+            const auto at=stream_cursor;
+            stream_cursor+=device_align(bytes);
+            return at;
+        };
+        const auto stream_idx_dev=stream_take(stream_cap*top_k*sizeof(std::int32_t));
+        const auto stream_wts_dev=stream_take(stream_cap*top_k*sizeof(float));
+        const auto stream_packed=stream_take(stream_cap*hidden_size*sizeof(float));
+        const auto stream_packed_q8=stream_take(stream_cap*hidden_size);
+        const auto stream_packed_scales=
+            stream_take(stream_cap*(hidden_size/32+1)*sizeof(float));
+        const auto stream_act=stream_take(stream_cap*2*intermediate*sizeof(float));
+        const auto stream_silu=stream_take(stream_cap*intermediate*sizeof(float));
+        const auto stream_act_q8=stream_take(stream_cap*intermediate);
+        const auto stream_act_scales=
+            stream_take(stream_cap*(intermediate/32+1)*sizeof(float));
+        const auto stream_down=stream_take(stream_cap*hidden_size*sizeof(float));
         if(stream_experts){
-            std::uint64_t role_bytes[3];std::uint64_t triple_bytes=0;
+            // Every role needs a batched kernel: MMQ over Q8 activations
+            // where the format has one, else the reconstruct-in-float tile
+            // kernel. A format with neither keeps its experts on the CPU.
+            auto stream_role_ok=[&](int role,int in_size){
+                const auto type=
+                    runtime.model->tensors[layer.expert_tensors[role]].type;
+                const auto*format=colibri::v2::qwen_format(type);
+                if(!format)return false;
+                if(format->matmul_q8_mmq&&runtime.int8_tensor_cores&&
+                   (in_size&255)==0)return true;
+                return format->matmul_rows!=nullptr&&
+                    format->matmul_rows_grid!=
+                        colibri::v2::RowsMatmulGrid::per_token;
+            };
+            if(stream_role_ok(0,hidden_size)&&stream_role_ok(1,hidden_size)&&
+               stream_role_ok(2,intermediate)){
+            std::uint64_t triple_bytes=0;
             for(int role=0;role<3;++role){
-                role_bytes[role]=
+                stream_role_bytes[role]=
                     runtime.model->tensors[layer.expert_tensors[role]].size/experts;
-                triple_bytes+=role_bytes[role];
+                triple_bytes+=stream_role_bytes[role];
             }
             const auto stride=device_align(triple_bytes);
             std::vector<int> expert_tokens(experts,0);
@@ -1307,20 +1346,25 @@ void qwen_forward_rows(
             std::sort(order.begin(),order.end(),[&](int left,int right){
                 return expert_tokens[left]!=expert_tokens[right]
                     ?expert_tokens[left]>expert_tokens[right]:left<right;});
-            std::vector<std::uint64_t> staged(experts,0);
+            std::vector<std::int32_t> group_of(experts,-1);
             std::uint64_t cursor=0;
             // The uploads ride the prefetch stream: interleaving thousands of
-            // small copies with kernels on the compute stream is what sank
-            // the first cut of this path (~2 GB/s effective against the 26
-            // GB/s the registered mapping serves on an uncontended stream).
-            // The slice was last read by this span's previous layer's grouped
-            // kernels, so overwriting waits for that consumption first.
+            // small copies with kernels on the compute stream serializes both.
+            // The slice was last read by this span's previous layer's GEMMs,
+            // so overwriting waits for that consumption first.
             if(colibri_gpu_stream_wait_event(
                    runtime.prefetch_stream,span.consumed_event)!=0)
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
             for(const int expert:order){
                 if(cursor+stride>span.stream_bytes)break;
+                // NVFP4-style per-expert scales fold into the kernels the
+                // grouped path runs; the GEMM path has no seam for them, so
+                // scaled experts stay on the CPU.
+                if(qwen_expert_role_scale(runtime,layer.expert_gate_scale,expert)!=1.0f||
+                   qwen_expert_role_scale(runtime,layer.expert_up_scale,expert)!=1.0f||
+                   qwen_expert_role_scale(runtime,layer.expert_down_scale,expert)!=1.0f)
+                    continue;
                 const auto base=span.stream_base+cursor;
                 std::uint64_t offset=0;
                 for(int role=0;role<3;++role){
@@ -1328,13 +1372,14 @@ void qwen_forward_rows(
                         runtime.model->tensors[layer.expert_tensors[role]];
                     if(colibri_gpu_upload(base+offset,
                            tensor_data(*runtime.model,source)+
-                               static_cast<std::uint64_t>(expert)*role_bytes[role],
-                           role_bytes[role],runtime.prefetch_stream)!=0)
+                               static_cast<std::uint64_t>(expert)*stream_role_bytes[role],
+                           stream_role_bytes[role],runtime.prefetch_stream)!=0)
                         throw std::runtime_error(
                             "native Qwen prefill expert stream upload failed");
-                    offset+=role_bytes[role];
+                    offset+=stream_role_bytes[role];
                 }
-                staged[expert]=base;
+                group_of[expert]=static_cast<std::int32_t>(stream_groups.size());
+                stream_groups.push_back({expert,base,0,0});
                 cursor+=stride;
                 runtime.prefill_streamed_bytes+=triple_bytes;
             }
@@ -1345,29 +1390,45 @@ void qwen_forward_rows(
                     runtime.stream,span.upload_ready_event)!=0))
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
+            // Token lists per group, tokens ascending. The streamed routes
+            // leave weights_host so the CPU sweep skips them; their route
+            // weights ride the scatter instead.
             for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
                 const int route=token*top_k+rank;
                 if(weights_host[route]==0.0f)continue;
-                const int expert=selected_host[route];
-                if(!staged[expert])continue;
-                const int compact=token*top_k+gpu_counts[token]++;
-                std::uint64_t offset=0;
-                for(int role=0;role<3;++role){
-                    const auto pointer=staged[expert]+offset;
-                    if(role==0)gate_pointers[compact]=pointer;
-                    else if(role==1)up_pointers[compact]=pointer;
-                    else down_pointers[compact]=pointer;
-                    offset+=role_bytes[role];
-                }
-                gpu_weights[compact]=weights_host[route];
-                gpu_gate_scales[compact]=qwen_expert_role_scale(runtime,layer.expert_gate_scale,expert);
-                gpu_up_scales[compact]=qwen_expert_role_scale(runtime,layer.expert_up_scale,expert)
-                    *qwen_expert_role_scale(runtime,layer.expert_down_scale,expert);
+                const int group=group_of[selected_host[route]];
+                if(group>=0)++stream_groups[group].count;
+            }
+            int stream_total=0;
+            for(auto&group:stream_groups){
+                group.offset=stream_total;
+                stream_total+=group.count;
+                group.count=0;
+            }
+            std::vector<std::int32_t> stream_tokens(stream_total);
+            std::vector<float> stream_route_weights(stream_total);
+            for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
+                const int route=token*top_k+rank;
+                if(weights_host[route]==0.0f)continue;
+                const int index=group_of[selected_host[route]];
+                if(index<0)continue;
+                auto&group=stream_groups[index];
+                stream_tokens[group.offset+group.count]=token;
+                stream_route_weights[group.offset+group.count]=weights_host[route];
+                ++group.count;
                 weights_host[route]=0.0f;
+            }
+            if(stream_total&&
+               (colibri_gpu_upload(stream_idx_dev,stream_tokens.data(),
+                    stream_total*sizeof(std::int32_t),runtime.stream)!=0||
+                colibri_gpu_upload(stream_wts_dev,stream_route_weights.data(),
+                    stream_total*sizeof(float),runtime.stream)!=0))
+                throw std::runtime_error(
+                    "native Qwen prefill expert stream index upload failed");
             }
         }
         bool any_gpu=false;
-        if(gpu_rows_allowed||stream_experts)
+        if(gpu_rows_allowed)
             for(int token=0;token<rows;++token)
                 any_gpu=any_gpu||gpu_counts[token]>0;
         if(gpu_table_path){
@@ -1407,12 +1468,118 @@ void qwen_forward_rows(
                 void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
                 launch(qwen_grouped_accumulate_rows_name(down_type).c_str(),hidden_size,rows,256,down_args);
             }
-            // The grouped kernels above are the last readers of this span's
-            // streamed slice; the next layer's uploads wait on this marker.
-            if(stream_experts&&colibri_gpu_event_record(
-                   span.consumed_event,runtime.stream)!=0)
+        }
+        // Expert-GEMM execution: pack, project, activate, project, fold back.
+        if(!stream_groups.empty()){
+            if(!gpu_table_path){
+                const auto output_bytes=
+                    static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
+                if(colibri_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)
+                    throw std::runtime_error("native Qwen rows forward GPU expert reset failed");
+            }
+            const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
+            const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
+            const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
+            auto stream_needs_q8=[&](std::uint32_t type,int in_size){
+                const auto*format=colibri::v2::qwen_format(type);
+                return format->matmul_q8_mmq&&runtime.int8_tensor_cores&&
+                    (in_size&255)==0;
+            };
+            auto expert_matmul=[&](std::uint32_t type,std::uint64_t matrix,
+                                   std::uint64_t f32_input,std::uint64_t q8_input,
+                                   std::uint64_t q8_scales,std::uint64_t output,
+                                   int in_size,int out_size,int count){
+                const auto*format=colibri::v2::qwen_format(type);
+                if(stream_needs_q8(type,in_size)){
+                    const int mmq_rows=format->mmq_min?kQ8MmqMinRows:kQ8MmqRows;
+                    const int mmq_threads=format->mmq_min?kQ8MmqMinThreads:kQ8MmqThreads;
+                    const int mmq_tokens=format->mmq_min?kQ8MmqMinTokens:kQ8MmqTokens;
+                    int scale_stride=(in_size/32)*2;
+                    for(int start=0;start<count;start+=mmq_tokens){
+                        int batch=std::min(mmq_tokens,count-start);
+                        auto batch_q8=q8_input+static_cast<std::uint64_t>(start)*in_size;
+                        auto batch_scales=q8_scales+
+                            static_cast<std::uint64_t>(start)*(in_size/32)*sizeof(float);
+                        auto batch_output=output+
+                            static_cast<std::uint64_t>(start)*out_size*sizeof(float);
+                        void*args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
+                            &in_size,&out_size,&batch,&scale_stride};
+                        launch(format->matmul_q8_mmq,
+                               (out_size+mmq_rows-1)/mmq_rows,1,mmq_threads,args);
+                    }
+                    return;
+                }
+                void*args[]={&matrix,&f32_input,&output,&in_size,&out_size,&count};
+                if(format->matmul_rows_grid==colibri::v2::RowsMatmulGrid::tiled32){
+                    launch(format->matmul_rows,(out_size+31)/32,
+                           (static_cast<std::uint32_t>(count)+31)/32,256,args);
+                    return;
+                }
+                launch(format->matmul_rows,out_size,(count+3)/4,256,args);
+            };
+            auto stream_quantize=[&](std::uint64_t input,std::uint64_t q8,
+                                     std::uint64_t scales,int width,int count){
+                int scale_stride=(width/32)*2;
+                void*args[]={&input,&q8,&scales,&width,&scale_stride};
+                launch("quantize_q8_blocks_rows",(width+31)/32,
+                       static_cast<std::uint32_t>(count),32,args);
+            };
+            const bool gate_up_q8=stream_needs_q8(gate_type,hidden_size)||
+                stream_needs_q8(up_type,hidden_size);
+            const bool down_q8=stream_needs_q8(down_type,intermediate);
+            for(const auto&group:stream_groups){
+                if(!group.count)continue;
+                int count=group.count;
+                const auto indices=stream_idx_dev+
+                    static_cast<std::uint64_t>(group.offset)*sizeof(std::int32_t);
+                const auto route_weights=stream_wts_dev+
+                    static_cast<std::uint64_t>(group.offset)*sizeof(float);
+                void*gather_args[]={const_cast<std::uint64_t*>(&normalized),
+                    const_cast<std::uint64_t*>(&indices),
+                    const_cast<std::uint64_t*>(&stream_packed),
+                    const_cast<int*>(&hidden_size),&count};
+                launch("qwen_gather_rows",
+                       (static_cast<std::uint32_t>(hidden_size)+255)/256,
+                       static_cast<std::uint32_t>(count),256,gather_args);
+                if(gate_up_q8)
+                    stream_quantize(stream_packed,stream_packed_q8,
+                                    stream_packed_scales,hidden_size,count);
+                const auto up_half=stream_act+
+                    static_cast<std::uint64_t>(count)*intermediate*sizeof(float);
+                expert_matmul(gate_type,group.matrix,
+                    stream_packed,stream_packed_q8,stream_packed_scales,
+                    stream_act,hidden_size,intermediate,count);
+                expert_matmul(up_type,group.matrix+stream_role_bytes[0],
+                    stream_packed,stream_packed_q8,stream_packed_scales,
+                    up_half,hidden_size,intermediate,count);
+                int silu_count=count*intermediate;
+                void*silu_args[]={const_cast<std::uint64_t*>(&stream_act),
+                    const_cast<std::uint64_t*>(&stream_silu),&silu_count};
+                launch("silu_mul",
+                       (static_cast<std::uint32_t>(silu_count)+255)/256,1,256,
+                       silu_args);
+                if(down_q8)
+                    stream_quantize(stream_silu,stream_act_q8,stream_act_scales,
+                                    intermediate,count);
+                expert_matmul(down_type,
+                    group.matrix+stream_role_bytes[0]+stream_role_bytes[1],
+                    stream_silu,stream_act_q8,stream_act_scales,
+                    stream_down,intermediate,hidden_size,count);
+                void*scatter_args[]={const_cast<std::uint64_t*>(&stream_down),
+                    const_cast<std::uint64_t*>(&indices),
+                    const_cast<std::uint64_t*>(&route_weights),
+                    const_cast<std::uint64_t*>(&fourth),
+                    const_cast<int*>(&hidden_size),&count};
+                launch("qwen_scatter_add_rows",
+                       (static_cast<std::uint32_t>(hidden_size)+255)/256,
+                       static_cast<std::uint32_t>(count),256,scatter_args);
+            }
+            // The GEMMs above are the last readers of this span's streamed
+            // slice; the next layer's uploads wait on this marker.
+            if(colibri_gpu_event_record(span.consumed_event,runtime.stream)!=0)
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
+            span.gpu_experts=true;
         }
         const auto cpu_expert_started=std::chrono::steady_clock::now();
         qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);
@@ -1444,6 +1611,7 @@ void qwen_forward_rows(
     // core for a layer is always queued before B's.
     RowsSpan whole{0,total_rows,hidden,residual,runtime.route_event,
                    runtime.prefill_stream_arena,runtime.prefill_stream_bytes,
+                   runtime.prefill_stream_scratch,
                    runtime.stream_upload_event,runtime.stream_consumed_event,
                    false,{}};
     if(pipelined){
@@ -1457,12 +1625,15 @@ void qwen_forward_rows(
         RowsSpan front{0,pipeline_half,hidden,residual,
                        runtime.route_event,
                        runtime.prefill_stream_arena,stream_half,
+                       runtime.prefill_stream_scratch,
                        runtime.stream_upload_event,
                        runtime.stream_consumed_event,false,{}};
         RowsSpan back{pipeline_half,total_rows-pipeline_half,hidden,residual,
                       runtime.route_event_pipeline,
                       runtime.prefill_stream_arena+stream_half,
                       runtime.prefill_stream_bytes-stream_half,
+                      runtime.prefill_stream_scratch+
+                          runtime.prefill_stream_scratch_span,
                       runtime.stream_upload_event_pipeline,
                       runtime.stream_consumed_event_pipeline,false,{}};
         // Queue core phases until one is a MoE layer whose expert work is

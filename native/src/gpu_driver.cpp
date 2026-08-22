@@ -993,6 +993,7 @@ extern "C" int colibri_gpu_compile(
              "kv_attention_scores", "kv_attention_values",
              "qwen_shared_scale", "qwen_argmax", "qwen_concat_pair",
              "qwen_shared_scale_bf16", "qwen_copy_vector", "silu_mul",
+             "qwen_gather_rows", "qwen_scatter_add_rows",
              "q8_swiglu_transposed_warp", "q8_lm_head_argmax_warp",
              "qwen_q8_embedding_rows", "qwen_f32_matmul_rows",
              "qwen_q8_matmul_rows", "qwen_q8_swiglu_rows",

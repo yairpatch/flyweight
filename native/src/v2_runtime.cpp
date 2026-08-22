@@ -590,6 +590,12 @@ struct ColibriV2QwenRuntime {
     // experts wholly on the host, which is today's behavior.
     std::uint64_t prefill_stream_arena = 0;
     std::uint64_t prefill_stream_bytes = 0;
+    // Scratch for the expert-GEMM path: packed activation tiles, their Q8
+    // form, the SwiGLU intermediates and the down output, two span slices.
+    // Layout order must match the offsets qwen_forward_rows derives.
+    std::uint64_t prefill_stream_scratch = 0;
+    std::uint64_t prefill_stream_scratch_bytes = 0;
+    std::uint64_t prefill_stream_scratch_span = 0;
     std::uint64_t expert_cache = 0;
     std::uint64_t expert_cache_bytes = 0;
     std::uint64_t expert_native_cache = 0;
@@ -1616,6 +1622,10 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     colibri_gpu_free(runtime.prefill_stream_arena);
     runtime.prefill_stream_arena = 0;
     runtime.prefill_stream_bytes = 0;
+    colibri_gpu_free(runtime.prefill_stream_scratch);
+    runtime.prefill_stream_scratch = 0;
+    runtime.prefill_stream_scratch_bytes = 0;
+    runtime.prefill_stream_scratch_span = 0;
     // runtime.state aliases sequences[active].state; free each slot's arena +
     // its checkpoint pool once.
     for (auto& seq : runtime.sequences) {
@@ -10724,6 +10734,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // shrinks by exactly what the stream takes. Meaningless without a
         // routed-expert model, and the CPU backend would stream to itself.
         runtime->prefill_stream_bytes=0;
+        runtime->prefill_stream_scratch_bytes=0;
+        runtime->prefill_stream_scratch_span=0;
         if(const char*stream_setting=
                std::getenv("COLIBRI_PREFILL_EXPERT_STREAM_MIB")){
             const auto requested=std::strtoull(stream_setting,nullptr,10);
@@ -10731,7 +10743,31 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                !colibri_backend_is_cpu())
                 runtime->prefill_stream_bytes=requested*1024ull*1024;
         }
-        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes;
+        if(runtime->prefill_stream_bytes){
+            // Expert-GEMM scratch, sized for the widest span. The offset
+            // derivation in qwen_forward_rows walks these regions in exactly
+            // this order; the two must not drift.
+            const std::uint64_t stream_rows=runtime->forward_rows_capacity;
+            const std::uint64_t stream_hidden=
+                runtime->model->config.hidden_size;
+            const std::uint64_t stream_inter=runtime->moe_intermediate;
+            const std::uint64_t stream_top_k=
+                runtime->model->config.expert_used_count;
+            std::uint64_t span=0;
+            span+=device_align(stream_rows*stream_top_k*sizeof(std::int32_t));
+            span+=device_align(stream_rows*stream_top_k*sizeof(float));
+            span+=device_align(stream_rows*stream_hidden*sizeof(float));
+            span+=device_align(stream_rows*stream_hidden);
+            span+=device_align(stream_rows*(stream_hidden/32+1)*sizeof(float));
+            span+=device_align(stream_rows*2*stream_inter*sizeof(float));
+            span+=device_align(stream_rows*stream_inter*sizeof(float));
+            span+=device_align(stream_rows*stream_inter);
+            span+=device_align(stream_rows*(stream_inter/32+1)*sizeof(float));
+            span+=device_align(stream_rows*stream_hidden*sizeof(float));
+            runtime->prefill_stream_scratch_span=span;
+            runtime->prefill_stream_scratch_bytes=2*span;
+        }
+        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
         const char* nvfp4_persistent_env =
             std::getenv("COLIBRI_NVFP4_PERSISTENT");
         const bool persistent_nvfp4_eligible=
@@ -10871,6 +10907,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
            colibri_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
            (runtime->expert_staging_bytes&&colibri_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0)||
            (runtime->prefill_stream_bytes&&colibri_gpu_alloc(runtime->prefill_stream_bytes,&runtime->prefill_stream_arena)!=0)||
+           (runtime->prefill_stream_scratch_bytes&&colibri_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
            (runtime->host_staging_bytes&&colibri_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
         // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
         // attention path can run on it, so this only has to hold the widest

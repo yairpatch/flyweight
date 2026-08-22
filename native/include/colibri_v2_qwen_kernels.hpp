@@ -907,6 +907,42 @@ void qwen_copy_vector(
     if (index < elements) output[index] = input[index];
 }
 
+// Expert grouping for the prefill GEMM path: pack the rows routed to one
+// expert into a contiguous tile so the batched matmul kernels see an
+// ordinary matrix, and fold the result back weighted per route. Rows within
+// one launch are distinct tokens (a router picks each expert at most once
+// per token), so the scatter needs no atomics.
+extern "C" __global__
+void qwen_gather_rows(
+    const float* source,
+    const int* indices,
+    float* destination,
+    const int width,
+    const int count
+) {
+    const int row = blockIdx.y;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= count || column >= width) return;
+    destination[(long long)row * width + column] =
+        source[(long long)indices[row] * width + column];
+}
+
+extern "C" __global__
+void qwen_scatter_add_rows(
+    const float* source,
+    const int* indices,
+    const float* weights,
+    float* destination,
+    const int width,
+    const int count
+) {
+    const int row = blockIdx.y;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= count || column >= width) return;
+    destination[(long long)indices[row] * width + column] +=
+        weights[row] * source[(long long)row * width + column];
+}
+
 extern "C" __global__
 void q4_batched_matvec(
     const unsigned long long* packed_addresses,
