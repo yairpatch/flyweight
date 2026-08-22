@@ -128,3 +128,29 @@ late:
   double-buffered bounce arena fed off the critical path. That would speed
   decode expert paging as well as revive this plan's streaming math; it is
   a prerequisite, not a variant, and deserves its own measured plan.
+
+## Stage 3 (2026-08-22) — fenced dual-stream uploads, and the real wall
+
+Both stage-2 explanations above were wrong, and the corrections are the
+plan's lasting output. probe_registered.py shows the loader's COW mapping
+**does** register (the earlier rc=−2 was the probe's own read-only mapping)
+and serves random 3 MiB expert uploads at **26.4 GB/s** — the copies were
+never slow. Moving the runtime's uploads to the prefetch stream with
+two-way event fencing (`af6092f`) changed the sweep not at all: 128–143
+tok/s either way.
+
+The wall is the grouped expert kernels. They are decode-shaped — one
+full-width matvec block per (token, route), 524,288 blocks per
+`q5k_grouped_swiglu_rows` call at 1024 rows — so every expert's weights are
+re-decoded from VRAM once per routed token: ~70 GiB of reads per fully
+streamed half-layer, ~0.18 s at the 391 GB/s ceiling, ~15 s per chunk.
+That is also the quiet reason `hybrid_prefill=split` never won and `auto`
+forces cpu prefill.
+
+**Verdict: this plan is closed.** No placement or transfer strategy can
+matter until the GPU has expert-grouped GEMM kernels — tokens sorted by
+expert, an MMQ-style tile per expert over its token group, the same class
+of work that took dense prefill 353 → 533 tok/s. That is a kernel project
+with its own plan; the streaming arena, fences, engagement counter, and
+the streamed≡resident parity class stay as its ready-made substrate and
+gates.
