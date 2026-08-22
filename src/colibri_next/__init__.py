@@ -1,4 +1,4 @@
-"""Native GGUF inference runtime for Qwen and Gemma models."""
+"""Native GGUF inference runtime for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models."""
 
 from .generation import GenerationResult, GenerationStep
 from .sampling import SamplingConfig

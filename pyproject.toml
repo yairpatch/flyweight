@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "colibri-next"
 version = "0.2.0"
-description = "Native GGUF inference runtime for Qwen and Gemma models"
+description = "Native GGUF inference runtime for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
