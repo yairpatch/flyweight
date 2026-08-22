@@ -903,6 +903,65 @@ def _optional_thinking(options: Mapping[str, object]) -> bool | None:
     return None if value is None else bool(value)
 
 
+# Qwen's own budget-exhaustion wrap-up, from their thinking-budget reference
+# implementation. A model conditions better on a sentence that says time is
+# up than on a bare closing tag dropped mid-thought, and the phrase is short
+# enough that even a 512-token budget barely notices it.
+THINKING_BUDGET_CLOSE = (
+    "\n\nConsidering the limited time by the user, I have to give the "
+    "solution based on the thinking directly now.\n</think>\n\n"
+)
+
+
+class _ThinkingBudget:
+    """Token meter over a stream's thinking block, for a hard budget.
+
+    `reasoning_effort` asks a checkpoint to think less and the checkpoint is
+    free to overrun; this is the enforcement the request names in tokens.
+    The block boundaries are tracked textually because the markers are the
+    one signal every <think>-family architecture shares, with a rolling
+    window so a marker split across tokens is still seen. spend() is called
+    once per sampled token and answers whether the budget just ran out, at
+    which point the caller forces the block closed. The meter stays armed
+    after a forced close: a checkpoint that immediately reopens a block is
+    closed again on its first counted token rather than granted a second
+    budget.
+    """
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self, budget: int, thinking_open: bool):
+        self.budget = budget
+        self.inside = thinking_open
+        self.spent = 0
+        self._window = ""
+
+    def close(self) -> None:
+        """Record that the caller forced the block shut."""
+        self.inside = False
+        self._window = ""
+
+    def spend(self, delta: str) -> bool:
+        self._window += delta
+        if not self.inside:
+            if self._OPEN not in self._window:
+                self._window = self._window[-(len(self._OPEN) - 1):]
+                return False
+            self.inside = True
+            self._window = self._window.split(self._OPEN, 1)[1]
+        if self._CLOSE in self._window:
+            self.inside = False
+            self._window = self._window.split(self._CLOSE, 1)[1]
+            self._window = self._window[-(len(self._OPEN) - 1):]
+            return False
+        self._window = self._window[-(len(self._CLOSE) - 1):]
+        # Undecodable and partial-UTF-8 tokens carry an empty delta but were
+        # sampled all the same; the budget counts tokens, not characters.
+        self.spent += 1
+        return self.spent >= self.budget
+
+
 class ChatGenerator:
     """Chat formatting, continuation reuse and streaming over a task engine.
 
@@ -934,6 +993,7 @@ class ChatGenerator:
             tuple[tuple[int, ...], tuple[int, ...], str, bool],
         ] = OrderedDict()
         self._chat_continuation_capacity = 32
+        self._forced_close_ids: list[int] | None = None
 
     # How long a request may hear nothing before its scheduling is checked on.
     # Generous: it costs one wakeup per request per interval and only ever
@@ -1218,6 +1278,23 @@ class ChatGenerator:
             final.state_tokens,
         )
 
+    def _thinking_close_ids(self) -> list[int]:
+        if self._forced_close_ids is None:
+            self._forced_close_ids = [
+                int(token) for token in self.tokenizer.encode(THINKING_BUDGET_CLOSE)
+            ]
+        return self._forced_close_ids
+
+    def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
+        """Whether the rendered prompt leaves the turn inside a think block."""
+        try:
+            tail = self.tokenizer.decode(
+                list(prompt_ids[-8:]), skip_special_tokens=False
+            )
+        except Exception:
+            return False
+        return tail.rstrip().endswith("<think>")
+
     def _stream(
         self, prompt_ids: list[int], **options: object
     ) -> Iterator[GenerationStep]:
@@ -1254,6 +1331,24 @@ class ChatGenerator:
         # logging failure counters for a request that was never constrainable.
         if getattr(self.tokenizer, "architecture", None) == "muse-glimmer":
             response_format = None
+        # A hard thinking budget, enforced here because only this loop can
+        # cancel the task and force the block closed. Muse Glimmer is out for
+        # the same reason as above: no <think> markers to meter.
+        budget = options.get("reasoning_budget_tokens")
+        meter = None
+        if (
+            isinstance(budget, int)
+            and not isinstance(budget, bool)
+            and budget > 0
+            and getattr(self.tokenizer, "architecture", None) != "muse-glimmer"
+        ):
+            opens = options.get("thinking_open")
+            meter = _ThinkingBudget(
+                budget,
+                self._prompt_opens_thinking(prompt_ids)
+                if opens is None
+                else bool(opens),
+            )
         task_id, queue = self.engine.submit(
             prompt_ids,
             max_new_tokens,
@@ -1329,6 +1424,59 @@ class ChatGenerator:
                 )
                 if stopped:
                     continue
+                if meter is not None and meter.spend(delta):
+                    # The budget is spent with the block still open: force it
+                    # closed and resume the answer on a fresh task whose
+                    # prompt is everything decoded so far plus the close. The
+                    # engine treats that prompt like any other, so a prefix
+                    # cache absorbs the restage where one exists.
+                    self.engine.cancel(task_id)
+                    self.engine.forget(task_id)
+                    meter.close()
+                    for forced in self._thinking_close_ids():
+                        generated.append(forced)
+                        try:
+                            forced_delta = utf8.decode(
+                                self.tokenizer.token_bytes(forced)
+                            )
+                        except Exception:
+                            forced_delta = ""
+                        text_parts.append(forced_delta)
+                        yield GenerationStep(
+                            forced,
+                            forced_delta,
+                            prompt_snapshot,
+                            _TokenSnapshot(generated, len(generated)),
+                            "",
+                            False,
+                            False,
+                            len(prompt_ids) + len(generated),
+                        )
+                    remaining = max_new_tokens - len(generated)
+                    if remaining <= 0:
+                        break
+                    if isinstance(response_format, Mapping):
+                        # The old task's constraint tracked its own text; the
+                        # new one starts after a close the prompt now carries.
+                        response_format = {
+                            **response_format, "thinking_open": False
+                        }
+                    task_id, queue = self.engine.submit(
+                        list(prompt_snapshot) + generated,
+                        remaining,
+                        self.tokenizer.eos_token_ids,
+                        sampling_config,
+                        tools=(
+                            tool_grammar
+                            if isinstance(tool_grammar, list)
+                            else None
+                        ),
+                        response_format=(
+                            dict(response_format)
+                            if isinstance(response_format, Mapping)
+                            else None
+                        ),
+                    )
             # Flush any dangling partial UTF-8 sequence (a truncated character
             # at the very end of generation becomes a single visible U+FFFD).
             tail = utf8.decode(b"", True)

@@ -16,6 +16,7 @@ from colibri_next.v2_server import (
     NativeV2Generator,
     NativeV2InferenceService,
     NativeV2Tokenizer,
+    THINKING_BUDGET_CLOSE,
     _generation_config_for_model,
     _merge_generation_defaults,
 )
@@ -751,6 +752,131 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertGreaterEqual(engine.polls, 3)
         self.assertEqual(steps[-1].generated_ids, (20,))
         self.assertEqual(steps[-1].text, "Hello")
+
+    def _budget_generator(self):
+        """A generator over a scripted engine, for thinking-budget tests.
+
+        The stub model gains think markers and encodes the forced-close text
+        to a single `</think>` token so the splice is visible in token IDs.
+        """
+
+        class ThinkModel(StubV2Model):
+            pieces = {
+                **StubV2Model.pieces,
+                50: "<think>", 51: "mull", 52: "</think>", 60: "done",
+            }
+            piece_bytes = {
+                **StubV2Model.piece_bytes,
+                50: b"<think>", 51: b"mull", 52: b"</think>", 60: b"done",
+            }
+
+            def tokenize(self, text: str) -> list[int]:
+                return [52] if text == THINKING_BUDGET_CLOSE else [1, 2]
+
+        class ScriptedEngine:
+            """Serves one queue of events per submit, recording each."""
+
+            def __init__(self, scripts: list[list[tuple[str, object]]]):
+                self.scripts = scripts
+                self.submits: list[tuple[list[int], int, object]] = []
+                self.cancelled: list[int] = []
+
+            def submit(
+                self, prompt, max_new_tokens, stop_tokens, sampling,
+                tools=None, response_format=None,
+            ):
+                self.submits.append(
+                    (list(prompt), max_new_tokens, response_format)
+                )
+                events: Queue = Queue()
+                for event in self.scripts[len(self.submits) - 1]:
+                    events.put(event)
+                return len(self.submits), events
+
+            def cancel(self, task_id: int) -> None:
+                self.cancelled.append(task_id)
+
+            def forget(self, task_id: int) -> None:
+                pass
+
+        model = ThinkModel()
+        tokenizer = NativeV2Tokenizer(model)  # type: ignore[arg-type]
+        generator = NativeV2Generator(  # type: ignore[arg-type]
+            model, StubV2Runtime([]), tokenizer
+        )
+        return generator, ScriptedEngine
+
+    def test_reasoning_budget_forces_the_thinking_block_closed(self) -> None:
+        # The model opens a think block and would mull forever; the budget
+        # counts tokens from the opening marker on, cancels the task at the
+        # limit, splices the forced close, and resumes the answer on a fresh
+        # task whose prompt carries everything decoded so far.
+        generator, ScriptedEngine = self._budget_generator()
+        engine = ScriptedEngine([
+            [("token", 50)] + [("token", 51)] * 10,
+            [("token", 60), ("token", 99), ("done", None)],
+        ])
+        generator.engine = engine
+
+        steps = list(generator.stream_text(
+            "Hi", max_new_tokens=8, reasoning_budget_tokens=3,
+            thinking_open=False,
+        ))
+
+        final = steps[-1]
+        # The opening marker's own token is the first spent; two "mull"
+        # tokens exhaust the budget of 3, and 52 is the forced close.
+        self.assertEqual(tuple(final.generated_ids), (50, 51, 51, 52, 60, 99))
+        self.assertEqual(final.text, "<think>mullmull</think>done")
+        self.assertTrue(final.stopped_on_eos)
+        self.assertEqual(engine.cancelled, [1])
+        resumed_prompt, resumed_max, _ = engine.submits[1]
+        self.assertEqual(resumed_prompt, [1, 2, 50, 51, 51, 52])
+        self.assertEqual(resumed_max, 4)
+
+    def test_reasoning_budget_meters_a_prompt_opened_block(self) -> None:
+        # thinking_open says the prompt already ended with <think>, so every
+        # generated token counts from the first one on.
+        generator, ScriptedEngine = self._budget_generator()
+        engine = ScriptedEngine([
+            [("token", 51)] * 10,
+            [("token", 60), ("token", 99), ("done", None)],
+        ])
+        generator.engine = engine
+
+        steps = list(generator.stream_text(
+            "Hi", max_new_tokens=8, reasoning_budget_tokens=2,
+            thinking_open=True,
+        ))
+
+        self.assertEqual(
+            tuple(steps[-1].generated_ids), (51, 51, 52, 60, 99)
+        )
+        self.assertEqual(steps[-1].text, "mullmull</think>done")
+
+    def test_a_closed_block_spends_no_further_budget(self) -> None:
+        # A model that finishes thinking within the budget is untouched:
+        # answer tokens after </think> are free, no matter how many.
+        generator, ScriptedEngine = self._budget_generator()
+        engine = ScriptedEngine([
+            [
+                ("token", 50), ("token", 51), ("token", 52),
+                ("token", 60), ("token", 60), ("token", 60),
+                ("token", 99), ("done", None),
+            ],
+        ])
+        generator.engine = engine
+
+        steps = list(generator.stream_text(
+            "Hi", max_new_tokens=16, reasoning_budget_tokens=3,
+            thinking_open=False,
+        ))
+
+        self.assertEqual(engine.cancelled, [])
+        self.assertEqual(len(engine.submits), 1)
+        self.assertEqual(
+            steps[-1].text, "<think>mull</think>donedonedone"
+        )
 
     def test_gemma4_chat_format_uses_turn_and_channel_tokens(self) -> None:
         tokenizer = object.__new__(NativeV2Tokenizer)

@@ -176,6 +176,23 @@ THINKING_BLOCK_PATTERN = re.compile(r"\A\s*<think>(.*?)</think>\s*", re.DOTALL)
 # maps high onto xhigh itself, so both vocabularies pass through untouched and
 # a checkpoint that ignores the variable is unaffected.
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+# Levels other protocols grade past this scale's ends: OpenAI's "minimal"
+# sits below low, Anthropic's "max" above xhigh. Both clamp to the nearest
+# level a checkpoint was trained on rather than 400 on a request whose intent
+# is unambiguous.
+EFFORT_ALIASES = {"minimal": "low", "max": "xhigh"}
+
+
+def _normalized_effort(value: Any, parameter: str) -> str:
+    if isinstance(value, str):
+        effort = EFFORT_ALIASES.get(value, value)
+        if effort in REASONING_EFFORTS:
+            return effort
+    raise APIError(
+        400,
+        parameter + " must be one of " + ", ".join(REASONING_EFFORTS),
+        parameter=parameter,
+    )
 # Muse Glimmer renders an assistant turn as a run of recipient-tagged messages
 # rather than one block with a thinking prefix. The header is optionally
 # preceded by <|start|>assistant (the generation prompt already supplied the
@@ -234,6 +251,10 @@ class _GenerationRequest:
     # constrained model still answers better told what is wanted, and a
     # runtime without the constraint still gets its best effort.
     response_format: Mapping[str, Any] | None = None
+    # A hard ceiling on tokens spent inside a thinking block, enforced by the
+    # generator forcing the block closed -- unlike reasoning_effort, which is
+    # a request the checkpoint is free to overrun. None means unlimited.
+    reasoning_budget_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,6 +652,8 @@ class InferenceService:
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
                 reasoning_effort=request.reasoning_effort,
+                reasoning_budget_tokens=request.reasoning_budget_tokens,
+                thinking_open=request.thinking_open,
                 progress=progress,
                 response_format=request.response_format,
             )
@@ -645,6 +668,8 @@ class InferenceService:
             sampling=request.sampling,
             enable_thinking=request.enable_thinking,
             reasoning_effort=request.reasoning_effort,
+            reasoning_budget_tokens=request.reasoning_budget_tokens,
+            thinking_open=request.thinking_open,
             progress=progress,
             # The declarations themselves, for a generator that can constrain
             # the sampler to them. Only the architectures in
@@ -873,6 +898,8 @@ class InferenceService:
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
                 reasoning_effort=request.reasoning_effort,
+                reasoning_budget_tokens=request.reasoning_budget_tokens,
+                thinking_open=request.thinking_open,
                 progress=progress,
                 response_format=request.response_format,
             )
@@ -1004,6 +1031,8 @@ class InferenceService:
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
                 reasoning_effort=request.reasoning_effort,
+                reasoning_budget_tokens=request.reasoning_budget_tokens,
+                thinking_open=request.thinking_open,
                 progress=progress,
                 # The declarations, so a generator that can constrain the
                 # sampler to them does. Omitted here while the non-streaming
@@ -2113,6 +2142,13 @@ class InferenceService:
         except ValueError as error:
             raise APIError(400, str(error)) from error
         enable_thinking = _boolean_option(payload, "enable_thinking", None)
+        # vLLM's spelling of template variables, which harness reasoning
+        # presets are written against; the flat field wins when both appear.
+        template_kwargs = _chat_template_kwargs(payload)
+        if enable_thinking is None:
+            enable_thinking = _boolean_option(
+                template_kwargs, "enable_thinking", None
+            )
         separate_reasoning = _boolean_option(payload, "separate_reasoning", False)
         # Resolved before the prompt is rendered, not after: this is a template
         # variable, so it has to be in hand when the template runs. Passing it
@@ -2163,6 +2199,7 @@ class InferenceService:
                 if format_shape is not None
                 else None
             ),
+            reasoning_budget_tokens=_reasoning_budget(payload),
         )
 
     def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
@@ -2210,17 +2247,25 @@ class InferenceService:
         Unstated stays unstated: a checkpoint that grades its reasoning has its
         own default, and answering on its behalf is how `enable_thinking`
         previously came to override templates that reason by default.
+
+        The flat `reasoning_effort` is Chat Completions' spelling; the
+        Responses API nests the same value as `reasoning.effort`, and clients
+        built against that shape send it on both endpoints, where it used to
+        pass through unread.
         """
         requested = payload.get("reasoning_effort")
-        if requested is None:
-            return self.reasoning_effort
-        if not isinstance(requested, str) or requested not in REASONING_EFFORTS:
-            raise APIError(
-                400,
-                "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS),
-                parameter="reasoning_effort",
+        if requested is not None:
+            return _normalized_effort(requested, "reasoning_effort")
+        reasoning = payload.get("reasoning")
+        if isinstance(reasoning, Mapping) and reasoning.get("effort") is not None:
+            return _normalized_effort(reasoning["effort"], "reasoning.effort")
+        template_kwargs = _chat_template_kwargs(payload)
+        if template_kwargs.get("reasoning_effort") is not None:
+            return _normalized_effort(
+                template_kwargs["reasoning_effort"],
+                "chat_template_kwargs.reasoning_effort",
             )
-        return requested
+        return self.reasoning_effort
 
     def _validate_model(self, requested_model: Any) -> None:
         if (
@@ -3492,6 +3537,16 @@ def _anthropic_request(
             if payload.get(setting.name) is not None
         },
         "enable_thinking": _anthropic_thinking(thinking),
+        "reasoning_effort": _anthropic_effort(payload),
+        # Anthropic's own hard cap, carried under the internal name so the
+        # shared parser enforces it; it used to be read for nothing at all.
+        **(
+            {"reasoning_budget_tokens": thinking["budget_tokens"]}
+            if isinstance(thinking, Mapping)
+            and thinking.get("type") == "enabled"
+            and thinking.get("budget_tokens") is not None
+            else {}
+        ),
         "tools": _anthropic_tools(payload),
         # This protocol's own name for stop sequences, handed to the internal
         # option every parser reads.
@@ -3652,6 +3707,27 @@ def _anthropic_thinking(thinking: Mapping[str, Any] | None) -> bool | None:
         return False
     # "adaptive", and whatever the protocol adds next: the checkpoint decides.
     return None
+
+
+def _anthropic_effort(payload: Mapping[str, Any]) -> str | None:
+    """The template effort an Anthropic output_config maps onto.
+
+    Claude Code's /effort slider arrives here as `output_config.effort`
+    alongside `thinking: {"type": "adaptive"}`. The levels are the local
+    vocabulary plus "max", which clamps to xhigh; until this was read, the
+    slider changed nothing against a checkpoint that grades its reasoning.
+    """
+    config = payload.get("output_config")
+    if config is None:
+        return None
+    if not isinstance(config, Mapping):
+        raise APIError(
+            400, "output_config must be an object", parameter="output_config"
+        )
+    effort = config.get("effort")
+    if effort is None:
+        return None
+    return _normalized_effort(effort, "output_config.effort")
 
 
 def _anthropic_tools(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -4973,6 +5049,39 @@ def _optional_text_content(value: Any, message_index: int) -> str:
 def _reject_unsupported_generation_options(payload: Mapping[str, Any]) -> None:
     if payload.get("n", 1) != 1:
         raise APIError(400, "only n=1 is supported", parameter="n")
+
+
+def _chat_template_kwargs(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The template-variable object, or empty for a request without one.
+
+    Keys nobody reads pass through unremarked, as they do in vLLM: a template
+    simply does not use them, and clients send preset bundles where rejecting
+    one unknown key would fail the whole request.
+    """
+    kwargs = payload.get("chat_template_kwargs")
+    if kwargs is None:
+        return {}
+    if not isinstance(kwargs, Mapping):
+        raise APIError(
+            400,
+            "chat_template_kwargs must be an object",
+            parameter="chat_template_kwargs",
+        )
+    return kwargs
+
+
+def _reasoning_budget(payload: Mapping[str, Any]) -> int | None:
+    """The hard thinking-token ceiling this request asks for, if any."""
+    value = payload.get("reasoning_budget_tokens")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise APIError(
+            400,
+            "reasoning_budget_tokens must be a positive integer",
+            parameter="reasoning_budget_tokens",
+        )
+    return value
 
 
 def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:

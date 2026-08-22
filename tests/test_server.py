@@ -1443,6 +1443,153 @@ class InferenceServiceTests(unittest.TestCase):
                 options["enable_thinking"], expected, msg=str(config)
             )
 
+    def test_anthropic_output_config_effort_reaches_the_template(self) -> None:
+        # Claude Code's /effort slider arrives as output_config.effort beside
+        # adaptive thinking. Until it was read, every level produced a
+        # byte-identical prompt against a checkpoint that grades its
+        # reasoning; "max" has no local level and clamps to xhigh.
+        for config, expected in (
+            ({"output_config": {"effort": "low"}}, "low"),
+            ({"output_config": {"effort": "max"}}, "xhigh"),
+            ({"output_config": {}}, None),
+            ({}, None),
+        ):
+            self.service.anthropic_message(
+                {
+                    "messages": [{"role": "user", "content": "Think"}],
+                    "thinking": {"type": "adaptive"},
+                    "max_tokens": 4,
+                    **config,
+                }
+            )
+            _, options = self.generator.calls[-1]
+            self.assertEqual(
+                options["reasoning_effort"], expected, msg=str(config)
+            )
+        with self.assertRaisesRegex(APIError, "output_config.effort"):
+            self.service.anthropic_message(
+                {
+                    "messages": [{"role": "user", "content": "Think"}],
+                    "output_config": {"effort": "extreme"},
+                    "max_tokens": 4,
+                }
+            )
+
+    def test_chat_completion_reads_nested_reasoning_effort(self) -> None:
+        # The Responses API nests effort as reasoning.effort, and harnesses
+        # built on that shape send it to chat completions too, where it used
+        # to pass through unread. OpenAI's "minimal" sits below the local
+        # scale and clamps to low; the flat spelling wins when both appear.
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "reasoning": {"effort": "minimal"},
+            }
+        )
+        self.assertEqual(self.generator.calls[-1][1]["reasoning_effort"], "low")
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "reasoning_effort": "high",
+                "reasoning": {"effort": "low"},
+            }
+        )
+        self.assertEqual(self.generator.calls[-1][1]["reasoning_effort"], "high")
+        with self.assertRaisesRegex(APIError, "reasoning.effort"):
+            self.service.chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "Think"}],
+                    "reasoning": {"effort": "extreme"},
+                }
+            )
+
+    def test_reasoning_budget_reaches_the_generator_from_both_protocols(
+        self,
+    ) -> None:
+        # The OpenAI extension field and Anthropic's budget_tokens are the
+        # same request -- a hard thinking cap -- and both used to be dropped
+        # unread. thinking_open rides along so the generator's meter knows
+        # whether the prompt already opened the block.
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "reasoning_budget_tokens": 512,
+            }
+        )
+        options = self.generator.calls[-1][1]
+        self.assertEqual(options["reasoning_budget_tokens"], 512)
+        self.assertIn("thinking_open", options)
+        self.service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "max_tokens": 4,
+            }
+        )
+        self.assertEqual(
+            self.generator.calls[-1][1]["reasoning_budget_tokens"], 2048
+        )
+        # Adaptive carries no budget even if a client sends one: the field is
+        # only defined alongside "enabled".
+        self.service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "thinking": {"type": "adaptive", "budget_tokens": 2048},
+                "max_tokens": 4,
+            }
+        )
+        self.assertIsNone(
+            self.generator.calls[-1][1]["reasoning_budget_tokens"]
+        )
+        with self.assertRaisesRegex(APIError, "reasoning_budget_tokens"):
+            self.service.chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "Think"}],
+                    "reasoning_budget_tokens": 0,
+                }
+            )
+
+    def test_chat_template_kwargs_supply_template_variables(self) -> None:
+        # vLLM's spelling, which harness reasoning presets are written
+        # against: {"chat_template_kwargs": {"enable_thinking": false}} must
+        # mean what enable_thinking means, and the flat field wins when both
+        # appear. Unknown keys pass unremarked, as a template that never
+        # reads them would treat them anyway.
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                    "preserve_thinking": False,
+                },
+            }
+        )
+        self.assertIs(self.generator.calls[-1][1]["enable_thinking"], False)
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "enable_thinking": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        )
+        self.assertIs(self.generator.calls[-1][1]["enable_thinking"], True)
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "chat_template_kwargs": {"reasoning_effort": "low"},
+            }
+        )
+        self.assertEqual(
+            self.generator.calls[-1][1]["reasoning_effort"], "low"
+        )
+        with self.assertRaisesRegex(APIError, "chat_template_kwargs"):
+            self.service.chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "Think"}],
+                    "chat_template_kwargs": "none",
+                }
+            )
+
     def test_anthropic_length_finish_maps_to_max_tokens(self) -> None:
         generator = StubGenerator()
         generator.generate_messages = Mock(
