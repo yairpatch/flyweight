@@ -1302,6 +1302,59 @@ extern "C" __global__ void gemma_q4_0_grouped_accumulate(
     if(lane==0)output[row]+=total;
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(// Whole-layer-pinned variants: every expert of the layer is resident in the
+// cache at a fixed slot (layer_base + expert * slot_bytes), so the routed
+// expert indices never leave the device. `selected` and `routing_weights` are
+// route_topk's outputs read in rank order, exactly as the host pointer-table
+// path consumed them; the per-expert f32 scale rides at the tail of each
+// bundle, and the weight product keeps the host path's multiplication order
+// so pinned layers stay bit-identical to the hybrid path they replace.
+extern "C" __global__ void gemma_q4_0_pinned_geglu(
+    const unsigned long long layer_base,const unsigned long long slot_bytes,
+    const int* selected,const float* input,float* output,
+    const int input_size,const int intermediate,const int expert_count
+) {
+    const int rank=blockIdx.y;
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
+    if(rank>=expert_count||row>=intermediate)return;
+    const unsigned char* gate_up=(const unsigned char*)(
+        layer_base+(unsigned long long)selected[rank]*slot_bytes);
+    float g=0.0f,u=0.0f;
+    for(int i=lane;i<input_size;i+=32){
+        const float x=input[i];
+        g+=ggml_q4_0_load(gate_up,(long long)row*input_size+i)*x;
+        u+=ggml_q4_0_load(gate_up,(long long)(row+intermediate)*input_size+i)*x;
+    }
+    for(int offset=16;offset;offset>>=1){g+=__shfl_down_sync(0xffffffff,g,offset);u+=__shfl_down_sync(0xffffffff,u,offset);}
+    if(lane==0)output[(long long)rank*intermediate+row]=gemma_gelu(g)*u;
+}
+
+extern "C" __global__ void gemma_q4_0_pinned_accumulate(
+    const unsigned long long layer_base,const unsigned long long slot_bytes,
+    const unsigned long long down_offset,const unsigned long long scale_offset,
+    const int* selected,const float* activated,float* output,
+    const float* routing_weights,const int intermediate,const int hidden,
+    const int expert_count
+) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*8+warp;
+    if(row>=hidden)return;
+    float total=0.0f;
+    for(int rank=0;rank<expert_count;++rank){
+        const unsigned long long base=
+            layer_base+(unsigned long long)selected[rank]*slot_bytes;
+        const unsigned char* down=(const unsigned char*)(base+down_offset);
+        const float scale=*(const float*)(base+scale_offset);
+        const float* vector=activated+(long long)rank*intermediate;
+        float sum=0.0f;
+        for(int i=lane;i<intermediate;i+=32)
+            sum+=ggml_q4_0_load(down,(long long)row*intermediate+i)*vector[i];
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down_sync(0xffffffff,sum,offset);
+        if(lane==0)total+=(routing_weights[rank]*scale)*sum;
+    }
+    if(lane==0)output[row]+=total;
+}
+
 extern "C" __global__ void gemma_head_norm_rope(
     const float* projected,const float* weights,float* output,
     const int heads,const int head_dim,const int rotary_dim,const int position,

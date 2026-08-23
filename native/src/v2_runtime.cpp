@@ -13761,6 +13761,57 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                                  experts,top_k,runtime.stream)!=0)
             throw std::runtime_error("native Gemma 4 routing failed");
         rms(hidden,tensor(15),normalized);
+        // A whole-layer-pinned layer holds all of its experts on device by
+        // construction, so the routed indices never need to visit the host:
+        // route_topk's outputs feed the pinned grouped kernels directly and
+        // this layer costs no download and no event sync.
+        const bool layer_pinned=!expert_policy.is_cpu()&&
+            layer_number<runtime.whole_expert_layer_slots.size()&&
+            runtime.whole_expert_layer_slots[layer_number]>=0;
+        if(layer_pinned){
+            runtime.route_expert_sum+=top_k;
+            runtime.expert_cache_hits+=top_k;
+            const auto layer_base=runtime.expert_cache+
+                static_cast<std::uint64_t>(
+                    runtime.whole_expert_layer_slots[layer_number])*
+                    runtime.expert_slot_bytes;
+            const auto& gate_up_tensor=runtime.model->tensors[layer.expert_tensors[0]];
+            const auto& down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
+            const std::uint64_t down_offset=gate_up_tensor.size/experts;
+            const std::uint64_t scale_offset=down_offset+down_tensor.size/experts;
+            if(colibri_gpu_memset(fourth,0,hidden_size*sizeof(float),runtime.stream)!=0)
+                throw std::runtime_error("native Gemma 4 pinned output reset failed");
+            const int intermediate=static_cast<int>(runtime.moe_intermediate);
+            void* gate_args[]={const_cast<std::uint64_t*>(&layer_base),
+                               const_cast<std::uint64_t*>(&runtime.expert_slot_bytes),
+                               const_cast<std::uint64_t*>(&selected_device),
+                               const_cast<std::uint64_t*>(&normalized),
+                               const_cast<std::uint64_t*>(&activated),
+                               const_cast<int*>(&hidden_size),
+                               const_cast<int*>(&intermediate),
+                               const_cast<int*>(&top_k)};
+            launch("gemma_q4_0_pinned_geglu",(intermediate+7)/8,top_k,256,gate_args);
+            void* down_args[]={const_cast<std::uint64_t*>(&layer_base),
+                               const_cast<std::uint64_t*>(&runtime.expert_slot_bytes),
+                               const_cast<std::uint64_t*>(&down_offset),
+                               const_cast<std::uint64_t*>(&scale_offset),
+                               const_cast<std::uint64_t*>(&selected_device),
+                               const_cast<std::uint64_t*>(&activated),
+                               const_cast<std::uint64_t*>(&fourth),
+                               const_cast<std::uint64_t*>(&route_weights),
+                               const_cast<int*>(&intermediate),
+                               const_cast<int*>(&hidden_size),
+                               const_cast<int*>(&top_k)};
+            launch("gemma_q4_0_pinned_accumulate",(hidden_size+7)/8,1,256,down_args);
+            rms(fourth,tensor(16),first);
+            add(third,first);
+            rms(third,tensor(17),residual);
+            add(hidden,residual);
+            auto layer_scale=tensor(18);
+            void* scale_args[]={&hidden,&layer_scale,const_cast<int*>(&hidden_size)};
+            launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
+            continue;
+        }
         if(colibri_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||
            colibri_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||
            colibri_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)
