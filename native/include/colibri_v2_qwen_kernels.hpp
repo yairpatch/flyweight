@@ -1650,6 +1650,68 @@ extern "C" __global__ void gemma_q4_0_q8_mmq_rows(
         outputs[(long long)token*output_stride+output_row]=total;
 }
 
+// The fused chunk-attention template caps at head_dim 256 (q and acc live in
+// registers), but Gemma 4's five global layers run head_dim 512 -- and they
+// are exactly the layers whose per-row scores/values passes scale with the
+// full context (measured 23.6 ms/token of a 24.6 ms total at 13k). Same
+// online-softmax, two query rows per warp instead of four so the register
+// budget stays near 100.
+extern "C" __global__ void gemma_kv_prefill_wide_f16(
+    const float* queries,const __half* keys,const __half* values,
+    float* output,const int heads,const int kv_heads,
+    const int head_dim,const int base_position,const int rows,
+    const int capacity,const float scale
+) {
+    const int head=blockIdx.x;if(head>=heads)return;
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5,warps=blockDim.x>>5;
+    const int tile=(blockIdx.y*warps+warp)*2;
+    if(tile>=rows)return;
+    const int kv_head=head/(heads/kv_heads);
+    const int dims=head_dim/32;
+    const int count=min(2,rows-tile);
+    float q[2][16],acc[2][16],m[2],l[2];
+    for(int i=0;i<2;++i){
+        m[i]=-3.402823466e+38F;l[i]=0.0f;
+        for(int d=0;d<16;++d){
+            acc[i][d]=0.0f;
+            q[i][d]=(i<count&&d<dims)
+                ?queries[(long long)(tile+i)*heads*head_dim
+                         +head*head_dim+lane+32*d]
+                :0.0f;
+        }
+    }
+    const int last=base_position+tile+count-1;
+    for(int position=0;position<=last;++position){
+        float k[16],v[16];
+        const __half* key_row=keys+((long long)kv_head*capacity+position)*head_dim;
+        const __half* value_row=values+((long long)kv_head*capacity+position)*head_dim;
+        for(int d=0;d<16;++d){
+            k[d]=d<dims?__half2float(key_row[lane+32*d]):0.0f;
+            v[d]=d<dims?__half2float(value_row[lane+32*d]):0.0f;
+        }
+        for(int i=0;i<count;++i){
+            if(position>base_position+tile+i)continue;
+            float partial=0.0f;
+            for(int d=0;d<16;++d)partial+=q[i][d]*k[d];
+            for(int offset=16;offset>0;offset>>=1)
+                partial+=__shfl_xor_sync(0xffffffff,partial,offset);
+            const float score=partial*scale;
+            const float peak=fmaxf(m[i],score);
+            const float rescale=expf(m[i]-peak);
+            const float weight=expf(score-peak);
+            l[i]=l[i]*rescale+weight;
+            for(int d=0;d<16;++d)acc[i][d]=acc[i][d]*rescale+weight*v[d];
+            m[i]=peak;
+        }
+    }
+    for(int i=0;i<count;++i){
+        const float inverse=1.0f/l[i];
+        for(int d=0;d<dims;++d)
+            output[(long long)(tile+i)*heads*head_dim+head*head_dim+lane+32*d]
+                =acc[i][d]*inverse;
+    }
+}
+
 extern "C" __global__ void gemma_geglu_combine_rows(
     const float* gates,const float* ups,float* outputs,
     const int intermediate,const int rows,

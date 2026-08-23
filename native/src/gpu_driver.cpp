@@ -1086,7 +1086,7 @@ extern "C" int colibri_gpu_compile(
              "gemma_head_rms_rows", "gemma_router_input_rows",
              "gemma_f32_matvec_rows", "gemma_scale_vector_rows",
              "gemma_quantize_q8_rows", "gemma_q4_0_q8_mmq_rows",
-             "gemma_geglu_combine_rows",
+             "gemma_geglu_combine_rows", "gemma_kv_prefill_wide_f16",
              "gemma_head_norm_rope", "gemma_head_rms", "gemma_router_input", "gemma_scale_vector",
              "gemma_q4_0_lm_argmax",
              // DeepSeek-V4. Resolved the same way and simply absent when the

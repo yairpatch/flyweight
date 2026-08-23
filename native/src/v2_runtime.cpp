@@ -13531,10 +13531,36 @@ void gemma4_prefill_rows(
     auto*host_weights=reinterpret_cast<float*>(staging+host_layout.weights.offset);
     auto*host_input=reinterpret_cast<float*>(staging+host_layout.input.offset);
     auto*host_output=reinterpret_cast<float*>(staging+host_layout.output.offset);
+    // COLIBRI_KERNEL_PROFILE=1 brackets every rows launch with CUDA events,
+    // same mechanism as the Qwen decode profiler: relative split only, since
+    // the events serialize the stream. Reported once per chunk.
+    static const bool kernel_profile=
+        std::getenv("COLIBRI_KERNEL_PROFILE")&&
+        std::getenv("COLIBRI_KERNEL_PROFILE")[0]=='1';
+    struct RowsProfileEntry{double milliseconds=0.0;std::uint64_t calls=0;};
+    static std::map<std::string,RowsProfileEntry> rows_profile_totals;
+    static constexpr std::size_t kRowsProfileCapacity=49152;
+    static std::vector<std::uint64_t> rows_profile_events;
+    static std::vector<const char*> rows_profile_labels;
+    static std::size_t rows_profile_used=0;
+    if(kernel_profile&&rows_profile_events.empty()){
+        rows_profile_events.resize(2*kRowsProfileCapacity);
+        rows_profile_labels.resize(kRowsProfileCapacity);
+        for(auto&event:rows_profile_events)
+            colibri_gpu_timed_event_create(&event);
+    }
     auto launch=[&](const char* name,std::uint32_t grid_x,std::uint32_t grid_y,
                     std::uint32_t block_x,void** arguments,std::uint32_t shared=0){
+        const bool traced=kernel_profile&&rows_profile_used<kRowsProfileCapacity;
+        const std::size_t slot=rows_profile_used;
+        if(traced)colibri_gpu_event_record(rows_profile_events[2*slot],runtime.stream);
         if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,runtime.stream,arguments)!=0)
             throw std::runtime_error(std::string("native Gemma 4 CUDA kernel failed: ")+name);
+        if(traced){
+            colibri_gpu_event_record(rows_profile_events[2*slot+1],runtime.stream);
+            rows_profile_labels[slot]=name;
+            ++rows_profile_used;
+        }
     };
     auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
         int one_centered=0;
@@ -13657,6 +13683,24 @@ void gemma4_prefill_rows(
                 q4_rows(tensor(2),normalized_rows,second_rows,hidden_size,kv_elements,h_elems,s_elems);
                 q4_rows(tensor(3),normalized_rows,third_rows,hidden_size,kv_elements,h_elems,s_elems);
             }
+            // Fused chunk attention for global layers: queries and attended
+            // rows sit on a compact heads*head_dim stride (that is the layout
+            // the kv prefill kernel assumes), and one launch replaces the
+            // per-row scores/values pairs. Window layers keep the per-row ring
+            // path, whose cost the window bounds.
+            static const bool env_prefill_attention=[]{
+                const char*s=std::getenv("COLIBRI_GEMMA_PREFILL_ATTENTION");
+                return !s||s[0]!='0';}();
+            // Gemma 4 global layers run head_dim 512, past the shared fused
+            // kernel's register budget; the wide twin covers them when the
+            // cache is f16 (the default).
+            const bool layer_wide_attention=head_dim>256&&head_dim<=512&&
+                runtime.options.cache_type_k==1&&runtime.options.cache_type_v==1;
+            const bool layer_fused_attention=env_prefill_attention&&
+                !layer.attention_window&&head_dim%32==0&&
+                (head_dim<=256||layer_wide_attention)&&
+                kv_fused_prefill_ok(runtime);
+            const long long a_elems=q_elements;
             auto qnorm=tensor(5),knorm=tensor(6);
             void* q_args[]={const_cast<std::uint64_t*>(&first_rows),&qnorm,
                             const_cast<std::uint64_t*>(&fourth_rows),const_cast<int*>(&heads),
@@ -13664,7 +13708,7 @@ void gemma4_prefill_rows(
                             const_cast<int*>(&base_position_int),const_cast<float*>(&theta),
                             const_cast<float*>(&epsilon),const_cast<std::uint64_t*>(&rope_factors),
                             const_cast<int*>(&rows),const_cast<long long*>(&s_elems),
-                            const_cast<long long*>(&s_elems)};
+                            const_cast<long long*>(&a_elems)};
             launch("gemma_head_norm_rope_rows",heads,rows,256,q_args);
             void* k_args[]={const_cast<std::uint64_t*>(&second_rows),&knorm,
                             const_cast<std::uint64_t*>(&first_rows),const_cast<int*>(&kv_heads),
@@ -13685,8 +13729,8 @@ void gemma4_prefill_rows(
             for(int row=0;row<rows;++row){
                 const std::uint64_t first_r=first_rows+row*scratch_stride;
                 const std::uint64_t second_r=second_rows+row*scratch_stride;
-                const std::uint64_t third_r=third_rows+row*scratch_stride;
-                const std::uint64_t fourth_r=fourth_rows+row*scratch_stride;
+                const std::uint64_t third_r=third_rows+row*a_elems*sizeof(float);
+                const std::uint64_t fourth_r=fourth_rows+row*a_elems*sizeof(float);
                 const int position=static_cast<int>(base_position)+row;
                 const auto view=attention_cache_view(layer,position);
                 int slot=view.slot,capacity=view.capacity;
@@ -13698,6 +13742,7 @@ void gemma4_prefill_rows(
                                       const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
                                       &slot,&capacity};
                 launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,v_store_args);
+                if(layer_fused_attention)continue;
                 int visible=view.tokens,first_slot=view.first;float attention_scale=1.0f;
                 void* score_args[]={const_cast<std::uint64_t*>(&fourth_r),&cache_keys,
                                     const_cast<std::uint64_t*>(&attention_scores),
@@ -13711,11 +13756,32 @@ void gemma4_prefill_rows(
                                     &visible,&capacity,&first_slot};
                 launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
             }
+            if(layer_fused_attention){
+                // Every row's KV is stored above; the kernel masks causally,
+                // so row r still attends to exactly positions 0..base+r.
+                const auto view=attention_cache_view(layer,base_position);
+                int capacity=view.capacity;float attention_scale=1.0f;
+                void* attention_args[]={const_cast<std::uint64_t*>(&fourth_rows),
+                                        &cache_keys,&cache_values,
+                                        const_cast<std::uint64_t*>(&third_rows),
+                                        const_cast<int*>(&heads),
+                                        const_cast<int*>(&kv_heads),
+                                        const_cast<int*>(&head_dim),
+                                        const_cast<int*>(&base_position_int),
+                                        const_cast<int*>(&rows),&capacity,
+                                        &attention_scale};
+                if(layer_wide_attention)
+                    launch("gemma_kv_prefill_wide_f16",heads,
+                           (static_cast<std::uint32_t>(rows)+15)/16,256,attention_args);
+                else
+                    launch(kv_prefill_kernel(runtime),heads,
+                           (static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
+            }
             if(layer_mmq){
-                quantize_rows(third_rows,s_elems,q_elements);
+                quantize_rows(third_rows,a_elems,q_elements);
                 mmq_rows(tensor(4),residual_rows,q_elements,hidden_size,h_elems);
             }else{
-                q4_rows(tensor(4),third_rows,residual_rows,q_elements,hidden_size,s_elems,h_elems);
+                q4_rows(tensor(4),third_rows,residual_rows,q_elements,hidden_size,a_elems,h_elems);
             }
             rms_rows(residual_rows,tensor(7),normalized_rows,h_elems,h_elems);
             add_rows(hidden_rows,normalized_rows,h_elems,h_elems);
@@ -13926,6 +13992,37 @@ void gemma4_prefill_rows(
     }
     if(colibri_gpu_stream_sync(runtime.stream)!=0)
         throw std::runtime_error("native Gemma 4 rows synchronization failed");
+    if(kernel_profile){
+        for(std::size_t slot=0;slot<rows_profile_used;++slot){
+            float milliseconds=0.0f;
+            if(colibri_gpu_event_elapsed(rows_profile_events[2*slot],
+                                         rows_profile_events[2*slot+1],
+                                         &milliseconds)!=0)continue;
+            auto&entry=rows_profile_totals[rows_profile_labels[slot]];
+            entry.milliseconds+=milliseconds;++entry.calls;
+        }
+        const std::size_t untraced=rows_profile_used>=kRowsProfileCapacity
+            ?rows_profile_used-kRowsProfileCapacity:0;
+        rows_profile_used=0;
+        double total=0.0;
+        for(const auto&entry:rows_profile_totals)total+=entry.second.milliseconds;
+        std::vector<std::pair<std::string,RowsProfileEntry>> sorted(
+            rows_profile_totals.begin(),rows_profile_totals.end());
+        std::sort(sorted.begin(),sorted.end(),[](const auto&a,const auto&b){
+            return a.second.milliseconds>b.second.milliseconds;});
+        std::fprintf(stderr,
+            "[rows-profile] chunk of %d rows at position %llu: %.2f ms/token "
+            "kernel time (untraced=%zu)\n",rows,
+            static_cast<unsigned long long>(base_position),
+            total/rows,untraced);
+        for(const auto&entry:sorted)
+            std::fprintf(stderr,
+                "[rows-profile]   %-40s %7.3f ms/tok %5.1f%% %7.1f calls/chunk\n",
+                entry.first.c_str(),entry.second.milliseconds/rows,
+                100.0*entry.second.milliseconds/total,
+                static_cast<double>(entry.second.calls));
+        rows_profile_totals.clear();
+    }
     runtime.processed_tokens.insert(runtime.processed_tokens.end(),tokens,tokens+rows);
     runtime.position+=static_cast<std::uint64_t>(rows);
     runtime.decode_calls+=static_cast<std::uint64_t>(rows);
