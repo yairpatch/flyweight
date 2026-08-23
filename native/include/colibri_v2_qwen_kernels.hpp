@@ -1566,6 +1566,105 @@ extern "C" __global__ void gemma_scale_vector_rows(
 }
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
+// Batched-GEMM prefill for the Gemma dense projections. Activations quantize
+// once per distinct input into a tight [row * elements] int8 layout (same
+// max/127 half-scale convention as quantize_q8_blocks_rows, plus an input
+// stride because the rows workspace interleaves widths), and the DP4A tile
+// kernel reads each decoded weight block once for eight tokens instead of
+// re-reading the whole matrix per row the way the matvec twins do.
+extern "C" __global__ void gemma_quantize_q8_rows(
+    const float* input,const long long input_stride,
+    signed char* output,__half* scales,const int elements,const int rows
+) {
+    const int lane=threadIdx.x;
+    const long long row=blockIdx.y;
+    if(row>=rows)return;
+    const int index=blockIdx.x*32+lane;
+    const float* row_input=input+row*input_stride;
+    float value=index<elements?row_input[index]:0.0f;
+    float maximum=fabsf(value);
+    for(int offset=16;offset>0;offset>>=1)
+        maximum=fmaxf(maximum,__shfl_down_sync(0xffffffff,maximum,offset));
+    maximum=__shfl_sync(0xffffffff,maximum,0);
+    const float scale=maximum>0.0f?maximum/127.0f:1.0f;
+    if(lane==0)scales[row*(elements/32)+blockIdx.x]=__float2half(scale);
+    if(index<elements){
+        const int quantized=max(-127,min(127,__float2int_rn(value/scale)));
+        output[row*elements+index]=(signed char)quantized;
+    }
+}
+
+extern "C" __global__ void gemma_q4_0_q8_mmq_rows(
+    const unsigned char* packed,const signed char* vectors,
+    const __half* vector_scales,float* outputs,
+    const int input_size,const int output_size,const int rows,
+    const long long output_stride
+) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const int output_base=blockIdx.x*32;
+    const int token_base=blockIdx.y*8;
+    if(output_base>=output_size||token_base>=rows)return;
+    __shared__ int w_vals[32][8];
+    __shared__ float w_scale[32];
+    __shared__ int a_vals[8][8];
+    __shared__ float a_scale[8];
+    const int kblocks=input_size/32;
+    float total=0.0f;
+    for(int block=0;block<kblocks;++block){
+        __syncthreads();
+        {
+            // 256 threads stage 32 weight rows x 8 ints: thread (r, i) decodes
+            // int i of row r. Values 0..15 are the low nibbles of the 16
+            // payload bytes, 16..31 the high, so ints 0..3 mask and 4..7
+            // shift the same four packed words.
+            const int r=threadIdx.x>>3,i=threadIdx.x&7;
+            const int source_row=min(output_base+r,output_size-1);
+            const unsigned char* base=packed+
+                ((long long)source_row*kblocks+block)*18;
+            int word;
+            memcpy(&word,base+2+(i&3)*4,4);
+            const int nibbles=(i<4?word:(word>>4))&0x0f0f0f0f;
+            w_vals[r][i]=__vsub4(nibbles,0x08080808);
+            if(i==0)w_scale[r]=__half2float(*((const __half*)base));
+        }
+        if(threadIdx.x<64){
+            const int t=threadIdx.x>>3,i=threadIdx.x&7;
+            const int source_token=min(token_base+t,rows-1);
+            const signed char* values=vectors+
+                (long long)source_token*input_size+block*32;
+            int word;
+            memcpy(&word,values+i*4,4);
+            a_vals[t][i]=word;
+            if(i==0)a_scale[t]=__half2float(
+                vector_scales[(long long)source_token*kblocks+block]);
+        }
+        __syncthreads();
+        int dot=0;
+        #pragma unroll
+        for(int i=0;i<8;++i)dot=__dp4a(w_vals[lane][i],a_vals[warp][i],dot);
+        total+=w_scale[lane]*a_scale[warp]*(float)dot;
+    }
+    const int output_row=output_base+lane;
+    const int token=token_base+warp;
+    if(output_row<output_size&&token<rows)
+        outputs[(long long)token*output_stride+output_row]=total;
+}
+
+extern "C" __global__ void gemma_geglu_combine_rows(
+    const float* gates,const float* ups,float* outputs,
+    const int intermediate,const int rows,
+    const long long gate_stride,const long long up_stride,
+    const long long output_stride
+) {
+    const int row=blockIdx.y;if(row>=rows)return;
+    const float* gate=gates+row*gate_stride;
+    const float* up=ups+row*up_stride;
+    float* output=outputs+row*output_stride;
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<intermediate;i+=blockDim.x*gridDim.x)
+        output[i]=gemma_gelu(gate[i])*up[i];
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 extern "C" __global__ void gemma_q4_0_lm_argmax(
     const unsigned char* packed,const float* input,unsigned long long* winner,
     const int hidden,const int vocabulary

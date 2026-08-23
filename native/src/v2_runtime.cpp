@@ -13600,6 +13600,33 @@ void gemma4_prefill_rows(
                       const_cast<int*>(&rows),&in_stride,&out_stride};
         launch("gemma_q4_0_matvec_rows",(output_size+7)/8,rows,256,args);
     };
+    // DP4A GEMMs over Q8 activations for the dense projections: one weight
+    // pass serves 8 tokens instead of one. Changes the numerics (activations
+    // quantize to int8, like llama.cpp's default MMQ prefill), hence its own
+    // off-switch. Requires the scratch regions to carry the widest GEMM input.
+    static const bool env_mmq=[]{
+        const char*s=std::getenv("COLIBRI_GEMMA_MMQ");return !s||s[0]!='0';}();
+    const std::uint64_t q8_rows_base=rows_layout.rows_q8.address(runtime.workspace);
+    const std::uint64_t q8_scales_base=rows_layout.rows_q8_scales.address(runtime.workspace);
+    const bool use_mmq=env_rows_kernels&&env_mmq&&hidden_size%32==0&&
+        static_cast<std::uint64_t>(hidden_size)<=runtime.scratch_elements;
+    auto quantize_rows=[&](std::uint64_t input,long long in_stride,int elements){
+        void* args[]={&input,&in_stride,
+                      const_cast<std::uint64_t*>(&q8_rows_base),
+                      const_cast<std::uint64_t*>(&q8_scales_base),
+                      &elements,const_cast<int*>(&rows)};
+        launch("gemma_quantize_q8_rows",(elements+31)/32,rows,32,args);
+    };
+    auto mmq_rows=[&](std::uint64_t matrix,std::uint64_t outputs,
+                      int input_size,int output_size,long long out_stride){
+        void* args[]={&matrix,
+                      const_cast<std::uint64_t*>(&q8_rows_base),
+                      const_cast<std::uint64_t*>(&q8_scales_base),
+                      &outputs,&input_size,&output_size,
+                      const_cast<int*>(&rows),&out_stride};
+        launch("gemma_q4_0_q8_mmq_rows",(output_size+31)/32,
+               (static_cast<std::uint32_t>(rows)+7)/8,256,args);
+    };
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         auto& layer=runtime.layers[layer_number];
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
@@ -13614,10 +13641,22 @@ void gemma4_prefill_rows(
             ?0:runtime.device_tensors[runtime.rope_factors];
         if(env_rows_kernels){
             const int base_position_int=static_cast<int>(base_position);
+            // K dims must divide 32 for the DP4A tile loop; output dims are
+            // bounds-guarded and free.
+            const bool layer_mmq=use_mmq&&q_elements%32==0&&
+                static_cast<std::uint64_t>(q_elements)<=runtime.scratch_elements&&
+                dense_intermediate%32==0;
             rms_rows(hidden_rows,tensor(0),normalized_rows,h_elems,h_elems);
-            q4_rows(tensor(1),normalized_rows,first_rows,hidden_size,q_elements,h_elems,s_elems);
-            q4_rows(tensor(2),normalized_rows,second_rows,hidden_size,kv_elements,h_elems,s_elems);
-            q4_rows(tensor(3),normalized_rows,third_rows,hidden_size,kv_elements,h_elems,s_elems);
+            if(layer_mmq){
+                quantize_rows(normalized_rows,h_elems,hidden_size);
+                mmq_rows(tensor(1),first_rows,hidden_size,q_elements,s_elems);
+                mmq_rows(tensor(2),second_rows,hidden_size,kv_elements,s_elems);
+                mmq_rows(tensor(3),third_rows,hidden_size,kv_elements,s_elems);
+            }else{
+                q4_rows(tensor(1),normalized_rows,first_rows,hidden_size,q_elements,h_elems,s_elems);
+                q4_rows(tensor(2),normalized_rows,second_rows,hidden_size,kv_elements,h_elems,s_elems);
+                q4_rows(tensor(3),normalized_rows,third_rows,hidden_size,kv_elements,h_elems,s_elems);
+            }
             auto qnorm=tensor(5),knorm=tensor(6);
             void* q_args[]={const_cast<std::uint64_t*>(&first_rows),&qnorm,
                             const_cast<std::uint64_t*>(&fourth_rows),const_cast<int*>(&heads),
@@ -13672,21 +13711,46 @@ void gemma4_prefill_rows(
                                     &visible,&capacity,&first_slot};
                 launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
             }
-            q4_rows(tensor(4),third_rows,residual_rows,q_elements,hidden_size,s_elems,h_elems);
+            if(layer_mmq){
+                quantize_rows(third_rows,s_elems,q_elements);
+                mmq_rows(tensor(4),residual_rows,q_elements,hidden_size,h_elems);
+            }else{
+                q4_rows(tensor(4),third_rows,residual_rows,q_elements,hidden_size,s_elems,h_elems);
+            }
             rms_rows(residual_rows,tensor(7),normalized_rows,h_elems,h_elems);
             add_rows(hidden_rows,normalized_rows,h_elems,h_elems);
             rms_rows(hidden_rows,tensor(8),normalized_rows,h_elems,h_elems);
             auto dense_gate=tensor(9),dense_up=tensor(10);
-            void* dense_args[]={&dense_gate,&dense_up,
-                                const_cast<std::uint64_t*>(&normalized_rows),
-                                const_cast<std::uint64_t*>(&first_rows),
-                                const_cast<int*>(&hidden_size),
-                                const_cast<int*>(&dense_intermediate),
-                                const_cast<int*>(&rows),
-                                const_cast<long long*>(&h_elems),
-                                const_cast<long long*>(&s_elems)};
-            launch("gemma_q4_0_geglu_rows",(dense_intermediate+7)/8,rows,256,dense_args);
-            q4_rows(tensor(11),first_rows,second_rows,dense_intermediate,hidden_size,s_elems,s_elems);
+            if(layer_mmq){
+                // fourth (Q) and second (V projection) are both consumed by
+                // the attention loop above, so they carry the gate and up
+                // halves until the combine writes first.
+                quantize_rows(normalized_rows,h_elems,hidden_size);
+                mmq_rows(dense_gate,fourth_rows,hidden_size,dense_intermediate,s_elems);
+                mmq_rows(dense_up,second_rows,hidden_size,dense_intermediate,s_elems);
+                void* combine_args[]={const_cast<std::uint64_t*>(&fourth_rows),
+                                      const_cast<std::uint64_t*>(&second_rows),
+                                      const_cast<std::uint64_t*>(&first_rows),
+                                      const_cast<int*>(&dense_intermediate),
+                                      const_cast<int*>(&rows),
+                                      const_cast<long long*>(&s_elems),
+                                      const_cast<long long*>(&s_elems),
+                                      const_cast<long long*>(&s_elems)};
+                launch("gemma_geglu_combine_rows",(dense_intermediate+255)/256,rows,256,combine_args);
+                quantize_rows(first_rows,s_elems,dense_intermediate);
+                mmq_rows(tensor(11),second_rows,dense_intermediate,hidden_size,s_elems);
+            }else{
+                void* dense_args[]={&dense_gate,&dense_up,
+                                    const_cast<std::uint64_t*>(&normalized_rows),
+                                    const_cast<std::uint64_t*>(&first_rows),
+                                    const_cast<int*>(&hidden_size),
+                                    const_cast<int*>(&dense_intermediate),
+                                    const_cast<int*>(&rows),
+                                    const_cast<long long*>(&h_elems),
+                                    const_cast<long long*>(&s_elems)};
+                launch("gemma_q4_0_geglu_rows",(dense_intermediate+7)/8,rows,256,dense_args);
+                q4_rows(tensor(11),first_rows,second_rows,dense_intermediate,hidden_size,s_elems,s_elems);
+            }
             rms_rows(second_rows,tensor(12),third_rows,s_elems,s_elems);
             auto router_scale=tensor(13);
             void* router_args[]={const_cast<std::uint64_t*>(&hidden_rows),&router_scale,
