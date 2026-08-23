@@ -3034,6 +3034,104 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
     }
 }
 
+// The same expert math over a whole prefill chunk, gathered by expert so each
+// routed expert's weights stream from RAM once per chunk instead of once per
+// token. Weight-row outer, token inner: the 1.6 KB quantized row stays in L1
+// across every token routed to it, which is where the chunk's bandwidth win
+// actually comes from. `selected`/`weights`/`inputs`/`outputs` are the pinned
+// rows staging regions; the hot loops re-read only cacheable mirrors because
+// repeated reads against page-locked memory measure ~5x slower (see
+// qwen_cpu_dense_ffn).
+void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
+        int rows,const std::int32_t*selected,const float*weights,
+        const float*inputs,float*outputs){
+    const int experts=runtime.model->config.expert_count;
+    const int top_k=static_cast<int>(runtime.model->config.expert_used_count);
+    const int hidden=runtime.model->config.hidden_size,intermediate=runtime.moe_intermediate;
+    const auto&gate_up_tensor=runtime.model->tensors[layer.expert_tensors[0]];
+    const auto&down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
+    const auto&scale_tensor=runtime.model->tensors[layer.expert_tensors[2]];
+    if(gate_up_tensor.type!=2||down_tensor.type!=2||scale_tensor.type!=0)
+        throw std::runtime_error("native Gemma 4 expects Q4_0 experts and f32 expert scales");
+    const auto gate_up_bytes=gate_up_tensor.size/experts,down_bytes=down_tensor.size/experts;
+    const auto*expert_scales=reinterpret_cast<const float*>(tensor_data(*runtime.model,scale_tensor));
+    std::vector<std::vector<std::pair<int,int>>> gathered(experts);
+    for(int row=0;row<rows;++row)for(int rank=0;rank<top_k;++rank){
+        const int expert=selected[row*top_k+rank];
+        if(expert>=0&&expert<experts)gathered[expert].push_back({row,rank});
+    }
+    std::vector<int> used;
+    for(int expert=0;expert<experts;++expert)
+        if(!gathered[expert].empty())used.push_back(expert);
+    auto&scratch=const_cast<ColibriV2QwenRuntime&>(runtime).dense_scratch;
+    const std::size_t input_floats=static_cast<std::size_t>(rows)*hidden;
+    const std::size_t activated_floats=static_cast<std::size_t>(rows)*top_k*intermediate;
+    const std::size_t partial_floats=static_cast<std::size_t>(rows)*top_k*hidden;
+    scratch.resize(input_floats+activated_floats+partial_floats);
+    float*local_inputs=scratch.data();
+    float*activated=local_inputs+input_floats;
+    float*partial=activated+activated_floats;
+    std::memcpy(local_inputs,inputs,input_floats*sizeof(float));
+    // A routing gap (an invalid expert) would leave its partial slice unread
+    // by the expert loop but still summed by the reduction below.
+    std::fill(partial,partial+partial_floats,0.0f);
+    #pragma omp parallel num_threads(qwen_cpu_thread_count(runtime))
+    {
+        // Experts carry work proportional to how many rows routed to them, so
+        // this one stays dynamic; the uniform reduction below is static.
+        #pragma omp for schedule(dynamic,1)
+        for(std::size_t index=0;index<used.size();++index){
+            const int expert=used[index];
+            const auto*gate_up=tensor_data(*runtime.model,gate_up_tensor)+
+                static_cast<std::uint64_t>(expert)*gate_up_bytes;
+            const auto*down=tensor_data(*runtime.model,down_tensor)+
+                static_cast<std::uint64_t>(expert)*down_bytes;
+            for(int g=0;g<intermediate;++g){
+                for(const auto&pair:gathered[expert]){
+                    const float*input=local_inputs+
+                        static_cast<std::size_t>(pair.first)*hidden;
+                    const float gate=qwen_quant_dot(gate_up,2,input,hidden,g);
+                    const float up=qwen_quant_dot(gate_up,2,input,hidden,g+intermediate);
+                    const float cubic=gate*gate*gate;
+                    const float gelu=0.5f*gate*(1.0f+std::tanh(
+                        0.7978845608028654f*(gate+0.044715f*cubic)));
+                    activated[(static_cast<std::size_t>(pair.first)*top_k+
+                               pair.second)*intermediate+g]=gelu*up;
+                }
+            }
+            for(int h=0;h<hidden;++h){
+                for(const auto&pair:gathered[expert]){
+                    const float*acts=activated+(static_cast<std::size_t>(
+                        pair.first)*top_k+pair.second)*intermediate;
+                    partial[(static_cast<std::size_t>(pair.first)*top_k+
+                             pair.second)*hidden+h]=
+                        qwen_quant_dot(down,2,acts,intermediate,h);
+                }
+            }
+            // The routing weight and expert scale fold in afterwards, once per
+            // element instead of once per dot, and reading the pinned weights
+            // staging only here rather than from the hot loop above.
+            for(const auto&pair:gathered[expert]){
+                const float folded=weights[pair.first*top_k+pair.second]*
+                    expert_scales[expert];
+                float*slice=partial+(static_cast<std::size_t>(pair.first)*top_k+
+                                     pair.second)*hidden;
+                for(int h=0;h<hidden;++h)slice[h]*=folded;
+            }
+        }
+        #pragma omp for schedule(static)
+        for(int row=0;row<rows;++row){
+            float*output=outputs+static_cast<std::size_t>(row)*hidden;
+            for(int h=0;h<hidden;++h){
+                float sum=0.0f;
+                for(int rank=0;rank<top_k;++rank)
+                    sum+=partial[(static_cast<std::size_t>(row)*top_k+rank)*hidden+h];
+                output[h]=sum;
+            }
+        }
+    }
+}
+
 // Host-side dense SwiGLU for a block whose feed-forward weights stayed in the
 // mapping instead of the GPU arena. Reads the quantized bytes directly, so it
 // costs no VRAM at all -- this is what lets a dense model exceed the card.
@@ -10844,8 +10942,6 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // CPU MoE reads each routed expert once per chunk); the cost is ~200MB
     // of workspace + pinned staging at 1024. 0 or 1 falls back to
     // one-token-at-a-time decode.
-    // Gemma 4 prefill uses a single-row path for now. Raise to align
-    // with the Qwen default when batching is supported.
     // Dense low-bit checkpoints need a much wider gate/up scratch than MoE,
     // and their quantized row kernels amortize weights in small token tiles.
     // A 1024-row allocation consumes ~633 MiB for Qwen3.6-27B and can evict
@@ -10856,12 +10952,16 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // at 64 / 128 / 256 / 384 rows. Prefill over the same sweep went 337 / 353
     // / 366 / 372. 256 is where the curves cross: +8.6% prefill for -0.4%
     // decode, against 384's +10.4% for -4.3%.
-    // Gemma 4 has no rows forward. Laguna does, but its leading dense block is
+    // Gemma 4 chunks through its own layer-synchronous rows driver; 256 rows
+    // spread each layer's routed-expert reads over enough tokens that the CPU
+    // MoE stops being the prefill wall, without sizing the row scratch past
+    // what its 8192-wide global-attention projections already need.
+    // Laguna has a rows forward too, but its leading dense block is
     // 12x the expert width, so the row scratch is far larger per token than a
     // pure-MoE Qwen checkpoint's; 256 keeps the batch worth batching without
     // sizing every scratch region for a 1024-row dense SwiGLU.
     // Muse Glimmer is dense, so it batches like the other dense checkpoints.
-    runtime->prefill_rows=gemma4?1:(laguna?256:(dense_ffn?256:1024));
+    runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:1024));
     if(const char*env=std::getenv("COLIBRI_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
@@ -13241,7 +13341,238 @@ int colibri_v2_qwen_runtime_dump_kv(
     return 0;
 });}
 
+// Defined below gemma4_decode; the rows driver in v2_mtp_verifier.inc
+// dispatches here for Gemma 4 chunks.
+void gemma4_prefill_rows(
+    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows);
+
 #include "v2_mtp_verifier.inc"
+
+// Layer-synchronous chunked prefill. Attention stays a per-row pass with the
+// decode kernels -- a row's attention at layer L needs only earlier rows' KV
+// at L, which the in-order pass has already stored -- while the expert FFN
+// batches across the whole chunk on the CPU, where gathering rows by expert
+// is what turns 793 MB of expert reads per token into one read per chunk.
+// No logits and no argmax: the caller keeps the prompt tail on the one-token
+// path, exactly like the Qwen rows forward.
+void gemma4_prefill_rows(
+    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows) {
+    const auto started=std::chrono::steady_clock::now();
+    if(rows<1||rows>static_cast<int>(runtime.forward_rows_capacity))
+        throw std::runtime_error("native Gemma 4 prefill chunk exceeds the rows capacity");
+    const int hidden_size=static_cast<int>(runtime.model->config.hidden_size);
+    const int experts=static_cast<int>(runtime.model->config.expert_count);
+    const int top_k=static_cast<int>(runtime.model->config.expert_used_count);
+    const int dense_intermediate=static_cast<int>(runtime.model->config.dense_intermediate_size);
+    const float epsilon=runtime.model->config.rms_norm_epsilon
+        ?runtime.model->config.rms_norm_epsilon:1.0e-6f;
+    const auto&rows_layout=runtime.rows_workspace_layout;
+    if(rows_layout.bytes>runtime.workspace_bytes)
+        throw std::runtime_error("native Gemma 4 rows workspace is too small");
+    const std::uint64_t hidden_stride=static_cast<std::uint64_t>(hidden_size)*sizeof(float);
+    const std::uint64_t scratch_stride=static_cast<std::uint64_t>(runtime.scratch_elements)*sizeof(float);
+    const std::uint64_t hidden_rows=rows_layout.hidden.address(runtime.workspace);
+    const std::uint64_t residual_rows=rows_layout.residual.address(runtime.workspace);
+    const std::uint64_t normalized_rows=rows_layout.normalized.address(runtime.workspace);
+    const std::uint64_t first_rows=rows_layout.first.address(runtime.workspace);
+    const std::uint64_t second_rows=rows_layout.second.address(runtime.workspace);
+    const std::uint64_t third_rows=rows_layout.third.address(runtime.workspace);
+    const std::uint64_t router_rows=rows_layout.router_logits.address(runtime.workspace);
+    const std::uint64_t selected_rows=rows_layout.selected_device.address(runtime.workspace);
+    const std::uint64_t weight_rows=rows_layout.route_weights.address(runtime.workspace);
+    const std::uint64_t attention_scores=rows_layout.attention_scores.address(runtime.workspace);
+    auto*staging=static_cast<std::uint8_t*>(runtime.host_staging);
+    const auto&host_layout=runtime.rows_host_layout;
+    auto*host_selected=reinterpret_cast<std::int32_t*>(staging+host_layout.selected.offset);
+    auto*host_weights=reinterpret_cast<float*>(staging+host_layout.weights.offset);
+    auto*host_input=reinterpret_cast<float*>(staging+host_layout.input.offset);
+    auto*host_output=reinterpret_cast<float*>(staging+host_layout.output.offset);
+    auto launch=[&](const char* name,std::uint32_t grid_x,std::uint32_t grid_y,
+                    std::uint32_t block_x,void** arguments,std::uint32_t shared=0){
+        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,runtime.stream,arguments)!=0)
+            throw std::runtime_error(std::string("native Gemma 4 CUDA kernel failed: ")+name);
+    };
+    auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
+        int one_centered=0;
+        void* args[]={&input,&weights,&output,const_cast<int*>(&hidden_size),
+                      const_cast<float*>(&epsilon),&one_centered};
+        launch("rms_norm",1,1,256,args);
+    };
+    auto q4=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,
+                int input_size,int output_size){
+        void* args[]={&matrix,&input,&output,&input_size,&output_size};
+        launch("gemma_q4_0_matvec",(output_size+7)/8,1,256,args);
+    };
+    auto f32=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,
+                 int input_size,int output_size){
+        void* args[]={&matrix,&input,&output,&input_size,&output_size};
+        launch("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);
+    };
+    auto add=[&](std::uint64_t target,std::uint64_t source){
+        float scale=1.0f;int count=hidden_size;
+        void* args[]={&target,&source,&scale,&count};
+        launch("scaled_add",(hidden_size+255)/256,1,256,args);
+    };
+    {
+        const auto embedding=runtime.device_tensors[runtime.token_embeddings];
+        const float scale=std::sqrt(static_cast<float>(hidden_size));
+        for(int row=0;row<rows;++row){
+            if(tokens[row]>=runtime.model->config.vocabulary_size)
+                throw std::runtime_error("native Gemma 4 prompt token is out of range");
+            const std::uint64_t hidden_r=hidden_rows+row*hidden_stride;
+            const int token=static_cast<int>(tokens[row]);
+            void* args[]={const_cast<std::uint64_t*>(&embedding),
+                          const_cast<std::uint64_t*>(&hidden_r),
+                          const_cast<int*>(&token),const_cast<int*>(&hidden_size),
+                          const_cast<float*>(&scale)};
+            launch("gemma_q4_0_embedding",(hidden_size+255)/256,1,256,args);
+        }
+    }
+    const std::uint64_t base_position=runtime.position;
+    for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
+        auto& layer=runtime.layers[layer_number];
+        auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
+        const int heads=static_cast<int>(layer.attention_heads);
+        const int kv_heads=static_cast<int>(layer.kv_heads);
+        const int head_dim=static_cast<int>(layer.head_dim);
+        const int q_elements=heads*head_dim,kv_elements=kv_heads*head_dim;
+        const int rotary=static_cast<int>(layer.rotary_dim);
+        const float theta=layer.rope_theta;
+        const std::uint64_t rope_factors=layer.attention_window||
+            runtime.rope_factors==std::numeric_limits<std::uint64_t>::max()
+            ?0:runtime.device_tensors[runtime.rope_factors];
+        for(int row=0;row<rows;++row){
+            const std::uint64_t hidden_r=hidden_rows+row*hidden_stride;
+            const std::uint64_t residual_r=residual_rows+row*hidden_stride;
+            const std::uint64_t normalized_r=normalized_rows+row*hidden_stride;
+            const std::uint64_t first_r=first_rows+row*scratch_stride;
+            const std::uint64_t second_r=second_rows+row*scratch_stride;
+            const std::uint64_t third_r=third_rows+row*scratch_stride;
+            const std::uint64_t fourth_r=rows_layout.fourth.address(runtime.workspace)+row*scratch_stride;
+            const int position=static_cast<int>(base_position)+row;
+            rms(hidden_r,tensor(0),normalized_r);
+            q4(tensor(1),normalized_r,first_r,hidden_size,q_elements);
+            q4(tensor(2),normalized_r,second_r,hidden_size,kv_elements);
+            q4(tensor(3),normalized_r,third_r,hidden_size,kv_elements);
+            auto qnorm=tensor(5),knorm=tensor(6);
+            void* q_args[]={const_cast<std::uint64_t*>(&first_r),&qnorm,
+                            const_cast<std::uint64_t*>(&fourth_r),const_cast<int*>(&heads),
+                            const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                            const_cast<int*>(&position),const_cast<float*>(&theta),
+                            const_cast<float*>(&epsilon),const_cast<std::uint64_t*>(&rope_factors)};
+            launch("gemma_head_norm_rope",heads,1,256,q_args);
+            void* k_args[]={const_cast<std::uint64_t*>(&second_r),&knorm,
+                            const_cast<std::uint64_t*>(&first_r),const_cast<int*>(&kv_heads),
+                            const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                            const_cast<int*>(&position),const_cast<float*>(&theta),
+                            const_cast<float*>(&epsilon),const_cast<std::uint64_t*>(&rope_factors)};
+            launch("gemma_head_norm_rope",kv_heads,1,256,k_args);
+            void* v_norm_args[]={const_cast<std::uint64_t*>(&third_r),
+                                 const_cast<std::uint64_t*>(&second_r),const_cast<int*>(&kv_heads),
+                                 const_cast<int*>(&head_dim),const_cast<float*>(&epsilon)};
+            launch("gemma_head_rms",kv_heads,1,256,v_norm_args);
+            std::uint64_t cache_keys=runtime.state+layer.state_first;
+            std::uint64_t cache_values=runtime.state+layer.state_second;
+            const auto view=attention_cache_view(layer,position);
+            int slot=view.slot,capacity=view.capacity;
+            void* k_store_args[]={const_cast<std::uint64_t*>(&first_r),&cache_keys,
+                                  const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                                  &slot,&capacity};
+            launch(kv_store_kernel(runtime.options.cache_type_k,true),kv_heads,1,256,k_store_args);
+            void* v_store_args[]={const_cast<std::uint64_t*>(&second_r),&cache_values,
+                                  const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                                  &slot,&capacity};
+            launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,v_store_args);
+            int visible=view.tokens,first_slot=view.first;float attention_scale=1.0f;
+            void* score_args[]={const_cast<std::uint64_t*>(&fourth_r),&cache_keys,
+                                const_cast<std::uint64_t*>(&attention_scores),
+                                const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                                const_cast<int*>(&head_dim),&visible,&capacity,&first_slot,
+                                &attention_scale};
+            launch(kv_scores_ring_kernel(runtime),heads,(visible+255)/256,256,score_args);
+            void* value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,
+                                const_cast<std::uint64_t*>(&third_r),const_cast<int*>(&heads),
+                                const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                                &visible,&capacity,&first_slot};
+            launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
+            q4(tensor(4),third_r,residual_r,q_elements,hidden_size);
+            rms(residual_r,tensor(7),normalized_r);
+            add(hidden_r,normalized_r);
+            rms(hidden_r,tensor(8),normalized_r);
+            auto dense_gate=tensor(9),dense_up=tensor(10);
+            void* dense_args[]={&dense_gate,&dense_up,const_cast<std::uint64_t*>(&normalized_r),
+                                const_cast<std::uint64_t*>(&first_r),const_cast<int*>(&hidden_size),
+                                const_cast<int*>(&dense_intermediate)};
+            launch("gemma_q4_0_geglu",(dense_intermediate+7)/8,1,256,dense_args);
+            q4(tensor(11),first_r,second_r,dense_intermediate,hidden_size);
+            rms(second_r,tensor(12),third_r);
+            auto router_scale=tensor(13);
+            void* router_input_args[]={const_cast<std::uint64_t*>(&hidden_r),&router_scale,
+                                       const_cast<std::uint64_t*>(&normalized_r),
+                                       const_cast<int*>(&hidden_size),
+                                       const_cast<float*>(&epsilon)};
+            launch("gemma_router_input",1,1,256,router_input_args);
+            const std::uint64_t router_r=router_rows+static_cast<std::uint64_t>(row)*experts*sizeof(float);
+            const std::uint64_t selected_r=selected_rows+static_cast<std::uint64_t>(row)*top_k*sizeof(std::int32_t);
+            const std::uint64_t weights_r=weight_rows+static_cast<std::uint64_t>(row)*top_k*sizeof(float);
+            f32(tensor(14),normalized_r,router_r,hidden_size,experts);
+            if(colibri_gpu_route_topk(router_r,selected_r,weights_r,
+                                     experts,top_k,runtime.stream)!=0)
+                throw std::runtime_error("native Gemma 4 routing failed");
+            rms(hidden_r,tensor(15),normalized_r);
+            if(colibri_gpu_download(host_selected+static_cast<std::size_t>(row)*top_k,
+                                    selected_r,top_k*sizeof(std::int32_t),runtime.stream)!=0||
+               colibri_gpu_download(host_weights+static_cast<std::size_t>(row)*top_k,
+                                    weights_r,top_k*sizeof(float),runtime.stream)!=0||
+               colibri_gpu_download(host_input+static_cast<std::size_t>(row)*hidden_size,
+                                    normalized_r,hidden_size*sizeof(float),runtime.stream)!=0)
+                throw std::runtime_error("native Gemma 4 rows MoE input transfer failed");
+        }
+        const auto wait_started=std::chrono::steady_clock::now();
+        if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0||
+           colibri_gpu_event_sync(runtime.route_event)!=0)
+            throw std::runtime_error("native Gemma 4 rows route synchronization failed");
+        runtime.route_wait_nanoseconds+=std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now()-wait_started).count();
+        runtime.route_expert_sum+=static_cast<std::uint64_t>(rows)*top_k;
+        const auto expert_started=std::chrono::steady_clock::now();
+        gemma_cpu_moe_rows(runtime,layer,rows,host_selected,host_weights,
+                           host_input,host_output);
+        runtime.expert_compute_nanoseconds+=std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now()-expert_started).count();
+        // One contiguous upload for the whole chunk; residual is free until
+        // the combine below rewrites it row by row.
+        if(colibri_gpu_upload(residual_rows,host_output,
+                              static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float),
+                              runtime.stream)!=0)
+            throw std::runtime_error("native Gemma 4 rows MoE output upload failed");
+        for(int row=0;row<rows;++row){
+            const std::uint64_t hidden_r=hidden_rows+row*hidden_stride;
+            const std::uint64_t residual_r=residual_rows+row*hidden_stride;
+            const std::uint64_t normalized_r=normalized_rows+row*hidden_stride;
+            const std::uint64_t first_r=first_rows+row*scratch_stride;
+            const std::uint64_t third_r=third_rows+row*scratch_stride;
+            rms(residual_r,tensor(16),first_r);
+            add(third_r,first_r);
+            rms(third_r,tensor(17),normalized_r);
+            add(hidden_r,normalized_r);
+            auto layer_scale=tensor(18);
+            void* scale_args[]={const_cast<std::uint64_t*>(&hidden_r),&layer_scale,
+                                const_cast<int*>(&hidden_size)};
+            launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
+        }
+    }
+    if(colibri_gpu_stream_sync(runtime.stream)!=0)
+        throw std::runtime_error("native Gemma 4 rows synchronization failed");
+    runtime.processed_tokens.insert(runtime.processed_tokens.end(),tokens,tokens+rows);
+    runtime.position+=static_cast<std::uint64_t>(rows);
+    runtime.decode_calls+=static_cast<std::uint64_t>(rows);
+    runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
+    ++runtime.prefill_calls;
+    runtime.prefill_tokens+=static_cast<std::uint64_t>(rows);
+    runtime.prefill_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-started).count();
+}
 
 static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_token,
                          std::uint32_t& output_token) {

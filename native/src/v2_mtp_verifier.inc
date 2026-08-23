@@ -1779,6 +1779,9 @@ void qwen_verify_target_rows(
 void qwen_prefill_rows(
     ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows
 ) {
+    // Gemma 4 has its own layer-synchronous chunk driver (and no MTP), with
+    // the same bookkeeping contract as the tail below.
+    if(runtime.gemma4){gemma4_prefill_rows(runtime,tokens,rows);return;}
     const auto started=std::chrono::steady_clock::now();
     const bool had_mtp_target_hidden=runtime.mtp_has_target_hidden;
     qwen_forward_rows(runtime,tokens,rows,nullptr,nullptr);
