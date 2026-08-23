@@ -601,6 +601,35 @@ float q8_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return horizontal_sum(_mm256_add_ps(sum0, sum1));
 }
 
+// Q4_0: 18-byte blocks of one f16 scale and 16 packed nibbles, split-half like
+// Q4_K -- byte j holds element j in the low nibble and element j+16 in the
+// high. Gemma 4's experts ship in this type, and its 704-wide intermediate is
+// not a multiple of the K-quant super-block, so this gates on 32 elements.
+float q40_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m128i center = _mm_set1_epi8(8);
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * 18;
+        const __m256 scale = _mm256_set1_ps(half_value(base));
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i low = _mm_sub_epi8(
+            _mm_and_si128(bytes, nibble_mask), center);
+        const __m128i high = _mm_sub_epi8(
+            _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask), center);
+        const __m128i quarters[4] = {
+            low, _mm_srli_si128(low, 8), high, _mm_srli_si128(high, 8)};
+        for (int part = 0; part < 4; ++part) {
+            const __m256 q = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(quarters[part]));
+            const __m256 values = _mm256_loadu_ps(input + block * 32 + part * 8);
+            if (part & 1) sum1 = _mm256_fmadd_ps(_mm256_mul_ps(q, scale), values, sum1);
+            else sum0 = _mm256_fmadd_ps(_mm256_mul_ps(q, scale), values, sum0);
+        }
+    }
+    return horizontal_sum(_mm256_add_ps(sum0, sum1));
+}
+
 void q4_dot_quad(const std::uint8_t*row_data,const float*const inputs[4],int elements,float outputs[4]){
     __m256 sums[4][2];for(auto&pair:sums)for(auto&sum:pair)sum=_mm256_setzero_ps();const __m128i nibble_mask=_mm_set1_epi8(15);
     for(int block=0;block<elements/256;++block){const auto*base=row_data+block*144;const float d=half_value(base),dmin=half_value(base+2);const auto*scales=base+4;const auto*quants=base+16;
@@ -1109,6 +1138,7 @@ bool qwen_quant_dot_iq_multi_avx2(
 float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const float* input,int elements,std::uint64_t row){
     if(type==1)return f16_dot(packed+row*static_cast<std::uint64_t>(elements)*2,input,elements);
     if(type==30)return bf16_dot(packed+row*static_cast<std::uint64_t>(elements)*2,input,elements);
+    if(type==2)return q40_dot(packed+row*static_cast<std::uint64_t>(elements/32)*18,input,elements);
     if(type==16)return iq2xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,input,elements);
     if(type==17)return iq2xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,input,elements);
     if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);

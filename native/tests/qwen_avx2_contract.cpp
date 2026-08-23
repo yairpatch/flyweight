@@ -220,6 +220,50 @@ bool quant_contract(std::uint32_t type,int row_bytes,bool avx512){
     return true;
 }
 
+bool q40_contract(bool avx512){
+    // 704 elements on purpose: Gemma 4's expert intermediate, a whole number
+    // of Q4_0 blocks but NOT of K-quant super-blocks -- the width the %256
+    // admission gate used to exclude.
+    constexpr int elements=704,rows=3,row_bytes=(elements/32)*18;
+    std::vector<std::uint8_t> packed(static_cast<std::size_t>(rows)*row_bytes);
+    for(std::size_t i=0;i<packed.size();++i)
+        packed[i]=static_cast<std::uint8_t>((i*73+19)&255);
+    for(int row=0;row<rows;++row)
+        for(int block=0;block<elements/32;++block)
+            set_half(packed.data()+static_cast<std::size_t>(row)*row_bytes+block*18,
+                     0x3c00-static_cast<std::uint16_t>(block%3)*0x400);
+    std::vector<float> input(elements);
+    for(int i=0;i<elements;++i)input[i]=std::sin(i*0.071f)*0.75f;
+    const auto half_to_float=[](std::uint16_t bits){
+        const std::uint32_t widened=(static_cast<std::uint32_t>(bits&0x8000)<<16)|
+            ((static_cast<std::uint32_t>((bits>>10)&31)+112)<<23)|
+            (static_cast<std::uint32_t>(bits&1023)<<13);
+        float value;std::memcpy(&value,&widened,sizeof(value));return value;
+    };
+    const auto q40_value=[&](const std::uint8_t*row_data,int index){
+        const auto*base=row_data+(index/32)*18;
+        std::uint16_t bits;std::memcpy(&bits,base,2);
+        const int within=index%32;
+        const auto byte=base[2+within%16];
+        const int quant=(within<16?(byte&15):(byte>>4))-8;
+        return half_to_float(bits)*quant;
+    };
+    for(int row=0;row<rows;++row){
+        const auto*row_data=packed.data()+static_cast<std::size_t>(row)*row_bytes;
+        float reference=0.0f;
+        for(int i=0;i<elements;++i)reference+=q40_value(row_data,i)*input[i];
+        const float avx2=qwen_quant_dot_avx2(
+            packed.data(),2,input.data(),elements,row);
+        if(!close(reference,avx2))return false;
+        if(avx512){
+            const float wide=qwen_quant_dot_avx512(
+                packed.data(),2,input.data(),elements,row);
+            if(!close(reference,wide))return false;
+        }
+    }
+    return true;
+}
+
 bool iq_q8_contract(std::uint32_t type,int row_bytes){
     constexpr int elements=256;
     std::vector<std::uint8_t> packed(row_bytes);
@@ -383,6 +427,7 @@ int main(){
        !require(iq_q8_contract(18,98),"IQ3_XXS x Q8_K")||
        !require(quant_contract(40,4*36,avx512),"NVFP4")||
        !require(quant_contract(8,8*34,avx512),"Q8_0")||
+       !require(q40_contract(avx512),"Q4_0")||
        !require(f32_contract(),"F32")||
        !require(half_contract(false,avx512),"F16")||
        !require(half_contract(true,avx512),"BF16")||

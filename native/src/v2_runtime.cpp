@@ -2635,6 +2635,13 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         if(!setting||setting[0]!='0')
             return qwen_quant_dot_avx512(packed,type,input,elements,row);
     }
+    // Q4_0's native block is 32 elements, so it takes its own admission: the
+    // K-quant super-block gate would exclude Gemma 4's 704-wide expert rows
+    // (704 % 256 != 0), which is exactly where this type dominates decode.
+    if(type==2&&(colibri_cpu_features()&2u)!=0&&elements%32==0)
+        return qwen_quant_dot_avx512(packed,type,input,elements,row);
+    if(type==2&&(colibri_cpu_features()&1u)!=0&&elements%32==0)
+        return qwen_quant_dot_avx2(packed,type,input,elements,row);
     if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
@@ -3004,7 +3011,11 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         throw std::runtime_error("native Gemma 4 expects Q4_0 experts and f32 expert scales");
     const auto gate_up_bytes=gate_up_tensor.size/experts,down_bytes=down_tensor.size/experts;
     const auto*expert_scales=reinterpret_cast<const float*>(tensor_data(*runtime.model,scale_tensor));
-    #pragma omp parallel for schedule(dynamic,4) num_threads(qwen_cpu_thread_count(runtime))
+    // Every task is the same two fixed-width dots, so static scheduling costs
+    // nothing in balance and removes the chunk-queue contention that made this
+    // loop run SLOWER with more threads (measured 40ms/token at 16 threads
+    // against 21ms at 8 with dynamic,4 on a 16-core Zen 5).
+    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<routed_count*intermediate;++task){
         const int rank=task/intermediate,row=task%intermediate,expert=selected[rank];
         if(expert<0||expert>=experts)continue;
@@ -3015,7 +3026,7 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         const float gelu=0.5f*gate*(1.0f+std::tanh(0.7978845608028654f*(gate+0.044715f*cubic)));
         activated[task]=gelu*up;
     }
-    #pragma omp parallel for schedule(dynamic,4) num_threads(qwen_cpu_thread_count(runtime))
+    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
     for(int row=0;row<hidden;++row){
         float sum=0.0f;
         for(int rank=0;rank<routed_count;++rank){const int expert=selected[rank];if(expert<0||expert>=experts)continue;const auto*down=tensor_data(*runtime.model,down_tensor)+static_cast<std::uint64_t>(expert)*down_bytes;sum+=weights[rank]*expert_scales[expert]*qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);}

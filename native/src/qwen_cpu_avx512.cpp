@@ -627,6 +627,36 @@ float q8_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
 }
 
+// Q4_0: 18-byte blocks of one f16 scale and 16 packed nibbles, split-half like
+// Q4_K -- byte j holds element j in the low nibble and element j+16 in the
+// high. Gemma 4's experts ship in this type, and its 704-wide intermediate is
+// not a multiple of the K-quant super-block, so this gates on 32 elements.
+float q40_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m128i center = _mm_set1_epi8(8);
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * 18;
+        const __m512 scale = _mm512_set1_ps(half_value(base));
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i low = _mm_sub_epi8(
+            _mm_and_si128(bytes, nibble_mask), center);
+        const __m128i high = _mm_sub_epi8(
+            _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask), center);
+        const __m512 q0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(low));
+        const __m512 q1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(high));
+        sum0 = _mm512_fmadd_ps(
+            _mm512_mul_ps(q0, scale), _mm512_loadu_ps(input + block * 32), sum0
+        );
+        sum1 = _mm512_fmadd_ps(
+            _mm512_mul_ps(q1, scale), _mm512_loadu_ps(input + block * 32 + 16), sum1
+        );
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
+}
+
 void q5_dot_pair(const std::uint8_t* row_data,const float*first,const float*second,int elements,float&out_first,float&out_second){
     __m512 a0=_mm512_setzero_ps(),a1=_mm512_setzero_ps(),b0=_mm512_setzero_ps(),b1=_mm512_setzero_ps();
     const __m128i nibble_mask=_mm_set1_epi8(15),bit_mask=_mm_set1_epi8(1);
@@ -1177,6 +1207,11 @@ float qwen_quant_dot_avx512(
     if (type == 30) {
         return half_dot<true>(
             packed + row * static_cast<std::uint64_t>(elements) * 2,
+            input, elements);
+    }
+    if (type == 2) {
+        return q40_dot(
+            packed + row * static_cast<std::uint64_t>(elements / 32) * 18,
             input, elements);
     }
     if (type == 17) {
