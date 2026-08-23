@@ -13573,6 +13573,33 @@ void gemma4_prefill_rows(
         }
     }
     const std::uint64_t base_position=runtime.position;
+    // Rows-batched kernels collapse the ~27 per-row launches per layer into
+    // ~16 per-layer ones (the attention core stays per-row: a row's scores
+    // must see exactly the stores of earlier rows). Off-switch for A/B.
+    static const bool env_rows_kernels=[]{
+        const char*s=std::getenv("COLIBRI_GEMMA_ROWS_KERNELS");return !s||s[0]!='0';}();
+    const long long h_elems=hidden_size;
+    const long long s_elems=static_cast<long long>(runtime.scratch_elements);
+    const std::uint64_t fourth_rows=rows_layout.fourth.address(runtime.workspace);
+    auto rms_rows=[&](std::uint64_t inputs,std::uint64_t weights,std::uint64_t outputs,
+                      long long in_stride,long long out_stride){
+        void* args[]={&inputs,&weights,&outputs,const_cast<int*>(&hidden_size),
+                      const_cast<int*>(&rows),&in_stride,&out_stride,
+                      const_cast<float*>(&epsilon)};
+        launch("gemma_rms_rows",rows,1,256,args);
+    };
+    auto add_rows=[&](std::uint64_t targets,std::uint64_t sources,
+                      long long t_stride,long long s_stride){
+        void* args[]={&targets,&sources,const_cast<int*>(&hidden_size),
+                      const_cast<int*>(&rows),&t_stride,&s_stride};
+        launch("gemma_scaled_add_rows",(hidden_size+255)/256,rows,256,args);
+    };
+    auto q4_rows=[&](std::uint64_t matrix,std::uint64_t inputs,std::uint64_t outputs,
+                     int input_size,int output_size,long long in_stride,long long out_stride){
+        void* args[]={&matrix,&inputs,&outputs,&input_size,&output_size,
+                      const_cast<int*>(&rows),&in_stride,&out_stride};
+        launch("gemma_q4_0_matvec_rows",(output_size+7)/8,rows,256,args);
+    };
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         auto& layer=runtime.layers[layer_number];
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
@@ -13585,6 +13612,122 @@ void gemma4_prefill_rows(
         const std::uint64_t rope_factors=layer.attention_window||
             runtime.rope_factors==std::numeric_limits<std::uint64_t>::max()
             ?0:runtime.device_tensors[runtime.rope_factors];
+        if(env_rows_kernels){
+            const int base_position_int=static_cast<int>(base_position);
+            rms_rows(hidden_rows,tensor(0),normalized_rows,h_elems,h_elems);
+            q4_rows(tensor(1),normalized_rows,first_rows,hidden_size,q_elements,h_elems,s_elems);
+            q4_rows(tensor(2),normalized_rows,second_rows,hidden_size,kv_elements,h_elems,s_elems);
+            q4_rows(tensor(3),normalized_rows,third_rows,hidden_size,kv_elements,h_elems,s_elems);
+            auto qnorm=tensor(5),knorm=tensor(6);
+            void* q_args[]={const_cast<std::uint64_t*>(&first_rows),&qnorm,
+                            const_cast<std::uint64_t*>(&fourth_rows),const_cast<int*>(&heads),
+                            const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                            const_cast<int*>(&base_position_int),const_cast<float*>(&theta),
+                            const_cast<float*>(&epsilon),const_cast<std::uint64_t*>(&rope_factors),
+                            const_cast<int*>(&rows),const_cast<long long*>(&s_elems),
+                            const_cast<long long*>(&s_elems)};
+            launch("gemma_head_norm_rope_rows",heads,rows,256,q_args);
+            void* k_args[]={const_cast<std::uint64_t*>(&second_rows),&knorm,
+                            const_cast<std::uint64_t*>(&first_rows),const_cast<int*>(&kv_heads),
+                            const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                            const_cast<int*>(&base_position_int),const_cast<float*>(&theta),
+                            const_cast<float*>(&epsilon),const_cast<std::uint64_t*>(&rope_factors),
+                            const_cast<int*>(&rows),const_cast<long long*>(&s_elems),
+                            const_cast<long long*>(&s_elems)};
+            launch("gemma_head_norm_rope_rows",kv_heads,rows,256,k_args);
+            void* v_args[]={const_cast<std::uint64_t*>(&third_rows),
+                            const_cast<std::uint64_t*>(&second_rows),const_cast<int*>(&kv_heads),
+                            const_cast<int*>(&head_dim),const_cast<float*>(&epsilon),
+                            const_cast<int*>(&rows),const_cast<long long*>(&s_elems),
+                            const_cast<long long*>(&s_elems)};
+            launch("gemma_head_rms_rows",kv_heads,rows,256,v_args);
+            std::uint64_t cache_keys=runtime.state+layer.state_first;
+            std::uint64_t cache_values=runtime.state+layer.state_second;
+            for(int row=0;row<rows;++row){
+                const std::uint64_t first_r=first_rows+row*scratch_stride;
+                const std::uint64_t second_r=second_rows+row*scratch_stride;
+                const std::uint64_t third_r=third_rows+row*scratch_stride;
+                const std::uint64_t fourth_r=fourth_rows+row*scratch_stride;
+                const int position=static_cast<int>(base_position)+row;
+                const auto view=attention_cache_view(layer,position);
+                int slot=view.slot,capacity=view.capacity;
+                void* k_store_args[]={const_cast<std::uint64_t*>(&first_r),&cache_keys,
+                                      const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                                      &slot,&capacity};
+                launch(kv_store_kernel(runtime.options.cache_type_k,true),kv_heads,1,256,k_store_args);
+                void* v_store_args[]={const_cast<std::uint64_t*>(&second_r),&cache_values,
+                                      const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                                      &slot,&capacity};
+                launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,v_store_args);
+                int visible=view.tokens,first_slot=view.first;float attention_scale=1.0f;
+                void* score_args[]={const_cast<std::uint64_t*>(&fourth_r),&cache_keys,
+                                    const_cast<std::uint64_t*>(&attention_scores),
+                                    const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                                    const_cast<int*>(&head_dim),&visible,&capacity,&first_slot,
+                                    &attention_scale};
+                launch(kv_scores_ring_kernel(runtime),heads,(visible+255)/256,256,score_args);
+                void* value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,
+                                    const_cast<std::uint64_t*>(&third_r),const_cast<int*>(&heads),
+                                    const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                                    &visible,&capacity,&first_slot};
+                launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
+            }
+            q4_rows(tensor(4),third_rows,residual_rows,q_elements,hidden_size,s_elems,h_elems);
+            rms_rows(residual_rows,tensor(7),normalized_rows,h_elems,h_elems);
+            add_rows(hidden_rows,normalized_rows,h_elems,h_elems);
+            rms_rows(hidden_rows,tensor(8),normalized_rows,h_elems,h_elems);
+            auto dense_gate=tensor(9),dense_up=tensor(10);
+            void* dense_args[]={&dense_gate,&dense_up,
+                                const_cast<std::uint64_t*>(&normalized_rows),
+                                const_cast<std::uint64_t*>(&first_rows),
+                                const_cast<int*>(&hidden_size),
+                                const_cast<int*>(&dense_intermediate),
+                                const_cast<int*>(&rows),
+                                const_cast<long long*>(&h_elems),
+                                const_cast<long long*>(&s_elems)};
+            launch("gemma_q4_0_geglu_rows",(dense_intermediate+7)/8,rows,256,dense_args);
+            q4_rows(tensor(11),first_rows,second_rows,dense_intermediate,hidden_size,s_elems,s_elems);
+            rms_rows(second_rows,tensor(12),third_rows,s_elems,s_elems);
+            auto router_scale=tensor(13);
+            void* router_args[]={const_cast<std::uint64_t*>(&hidden_rows),&router_scale,
+                                 const_cast<std::uint64_t*>(&normalized_rows),
+                                 const_cast<int*>(&hidden_size),
+                                 const_cast<float*>(&epsilon),
+                                 const_cast<int*>(&rows),
+                                 const_cast<long long*>(&h_elems),
+                                 const_cast<long long*>(&h_elems)};
+            launch("gemma_router_input_rows",rows,1,256,router_args);
+            const long long experts_stride=experts;
+            auto router_matrix=tensor(14);
+            void* logits_args[]={&router_matrix,
+                                 const_cast<std::uint64_t*>(&normalized_rows),
+                                 const_cast<std::uint64_t*>(&router_rows),
+                                 const_cast<int*>(&hidden_size),
+                                 const_cast<int*>(&experts),
+                                 const_cast<int*>(&rows),
+                                 const_cast<long long*>(&h_elems),
+                                 const_cast<long long*>(&experts_stride)};
+            launch("gemma_f32_matvec_rows",(experts+7)/8,rows,256,logits_args);
+            void* topk_args[]={const_cast<std::uint64_t*>(&router_rows),
+                               const_cast<std::uint64_t*>(&selected_rows),
+                               const_cast<std::uint64_t*>(&weight_rows),
+                               const_cast<int*>(&rows),
+                               const_cast<int*>(&experts),
+                               const_cast<int*>(&top_k)};
+            launch("route_topk_rows",rows,1,256,topk_args,
+                   static_cast<std::uint32_t>(experts*sizeof(float)));
+            rms_rows(hidden_rows,tensor(15),normalized_rows,h_elems,h_elems);
+            if(colibri_gpu_download(host_selected,selected_rows,
+                                    static_cast<std::uint64_t>(rows)*top_k*sizeof(std::int32_t),
+                                    runtime.stream)!=0||
+               colibri_gpu_download(host_weights,weight_rows,
+                                    static_cast<std::uint64_t>(rows)*top_k*sizeof(float),
+                                    runtime.stream)!=0||
+               colibri_gpu_download(host_input,normalized_rows,
+                                    static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float),
+                                    runtime.stream)!=0)
+                throw std::runtime_error("native Gemma 4 rows MoE input transfer failed");
+        }else{
         for(int row=0;row<rows;++row){
             const std::uint64_t hidden_r=hidden_rows+row*hidden_stride;
             const std::uint64_t residual_r=residual_rows+row*hidden_stride;
@@ -13672,6 +13815,7 @@ void gemma4_prefill_rows(
                                     normalized_r,hidden_size*sizeof(float),runtime.stream)!=0)
                 throw std::runtime_error("native Gemma 4 rows MoE input transfer failed");
         }
+        }
         const auto wait_started=std::chrono::steady_clock::now();
         if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0||
            colibri_gpu_event_sync(runtime.route_event)!=0)
@@ -13690,7 +13834,17 @@ void gemma4_prefill_rows(
                               static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float),
                               runtime.stream)!=0)
             throw std::runtime_error("native Gemma 4 rows MoE output upload failed");
-        for(int row=0;row<rows;++row){
+        if(env_rows_kernels){
+            rms_rows(residual_rows,tensor(16),first_rows,h_elems,s_elems);
+            add_rows(third_rows,first_rows,s_elems,s_elems);
+            rms_rows(third_rows,tensor(17),normalized_rows,s_elems,h_elems);
+            add_rows(hidden_rows,normalized_rows,h_elems,h_elems);
+            auto layer_scale=tensor(18);
+            void* scale_args[]={const_cast<std::uint64_t*>(&hidden_rows),&layer_scale,
+                                const_cast<int*>(&hidden_size),const_cast<int*>(&rows),
+                                const_cast<long long*>(&h_elems)};
+            launch("gemma_scale_vector_rows",(hidden_size+255)/256,rows,256,scale_args);
+        }else for(int row=0;row<rows;++row){
             const std::uint64_t hidden_r=hidden_rows+row*hidden_stride;
             const std::uint64_t residual_r=residual_rows+row*hidden_stride;
             const std::uint64_t normalized_r=normalized_rows+row*hidden_stride;
