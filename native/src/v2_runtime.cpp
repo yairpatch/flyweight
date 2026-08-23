@@ -16460,6 +16460,30 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
         ++runtime->prefix_cache_hits;
         runtime->prefix_cache_reused_tokens+=prompt_start;
         runtime->cancelled=false;
+    }else if(runtime->gemma4&&runtime->prefix_cache_last_lcp_live>0){
+        // Attention-only state can REWIND to a shared prefix: a KV row below
+        // the cut depends only on tokens below it, so truncating position and
+        // processed_tokens splices nothing. Recurrent archs cannot (that is
+        // what the exact-prefix rule and the snapshots exist for). The cut
+        // must stay inside every sliding-window ring's rollback room -- the
+        // batch_room slack past the window -- exactly like a snapshot
+        // restore; past it the ring has overwritten the window's oldest
+        // slots. This is what lets a re-sent or tail-diverged prompt reuse
+        // the conversation the host cache just restored instead of
+        // reprefilling it cold.
+        const std::uint64_t cut=std::min<std::uint64_t>(
+            runtime->prefix_cache_last_lcp_live,prompt_count-1);
+        if(cut&&swa_snapshot_is_resident(*runtime,cut,runtime->position)){
+            runtime->processed_tokens.resize(cut);
+            runtime->position=cut;
+            prompt_start=cut;
+            ++runtime->prefix_cache_hits;
+            runtime->prefix_cache_reused_tokens+=cut;
+            runtime->cancelled=false;
+        }else{
+            ++runtime->prefix_cache_misses;
+            const int status=colibri_v2_qwen_runtime_reset(runtime);if(status)return status;
+        }
     }else{
         // The live state diverged (typically: the client re-encoded the
         // previous assistant reply differently than it was generated), but a
