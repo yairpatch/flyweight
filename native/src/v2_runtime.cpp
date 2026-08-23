@@ -228,6 +228,12 @@ struct QwenLayerPlan {
     // fixed widths -- so one capture replays for the whole sequence.
     std::uint64_t dense_ffn_graph = 0;
     bool dense_ffn_graph_attempted = false;
+    // Gemma 4's dense GEGLU + router + whole-layer-pinned MoE chain. Only
+    // capturable when every expert of the layer is device-resident, because
+    // the hybrid path's route download and host sync cannot live in a graph.
+    // Slot-independent for the same reason the dense-FFN graph is.
+    std::uint64_t gemma_ffn_graph = 0;
+    bool gemma_ffn_graph_attempted = false;
     // Laguna's router score-correction bias. Kept out of static_tensors so the
     // feed-forward slots line up with the Qwen layout the FFN code addresses.
     std::uint64_t router_bias = std::numeric_limits<std::uint64_t>::max();
@@ -1669,6 +1675,9 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
         colibri_gpu_graph_destroy(layer.dense_ffn_graph);
         layer.dense_ffn_graph = 0;
         layer.dense_ffn_graph_attempted = false;
+        colibri_gpu_graph_destroy(layer.gemma_ffn_graph);
+        layer.gemma_ffn_graph = 0;
+        layer.gemma_ffn_graph_attempted = false;
     }
     colibri_gpu_free(runtime.workspace);
     colibri_gpu_free(runtime.static_arena);
@@ -13638,9 +13647,21 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
     auto* cpu_output=reinterpret_cast<float*>(staging+output_offset);
     if(output_offset+hidden_size*sizeof(float)>runtime.host_staging_bytes)
         throw std::runtime_error("native Gemma 4 CPU MoE workspace overflow");
+    // Kernels enqueue on launch_stream so a CUDA-graph capture can redirect
+    // the same lambdas onto the capture stream; outside capture it is always
+    // runtime.stream.
+    std::uint64_t launch_stream=runtime.stream;
+    // Opt-in: capturing the pinned FFN chain measured 2% SLOWER than eager
+    // launches on Linux (56.3 vs 57.6 tok/s, 3x interleaved A/B) -- decode
+    // submission overhead is already hidden behind the serial CPU-expert
+    // layers. Kept for WDDM, where per-launch submission costs several times
+    // more and the delta-block graphs measurably pay.
+    static const bool env_graph_gemma=[]{
+        const char*s=std::getenv("COLIBRI_CUDA_GRAPH_GEMMA");return s&&s[0]=='1';}();
+    const bool gemma_graph_eligible=runtime.cuda_graphs&&env_graph_gemma;
     auto launch=[&](const char* name,std::uint32_t grid_x,std::uint32_t grid_y,
                     std::uint32_t block_x,void** arguments,std::uint32_t shared=0){
-        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,runtime.stream,arguments)!=0)
+        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)
             throw std::runtime_error(std::string("native Gemma 4 CUDA kernel failed: ")+name);
     };
     auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
@@ -13738,33 +13759,38 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
         rms(residual,tensor(7),normalized);
         add(hidden,normalized);
 
-        // Dense GEGLU path.
-        rms(hidden,tensor(8),normalized);
-        auto dense_gate=tensor(9),dense_up=tensor(10);
-        void* dense_args[]={&dense_gate,&dense_up,const_cast<std::uint64_t*>(&normalized),
-                            const_cast<std::uint64_t*>(&first),const_cast<int*>(&hidden_size),
-                            const_cast<int*>(&dense_intermediate)};
-        launch("gemma_q4_0_geglu",(dense_intermediate+7)/8,1,256,dense_args);
-        q4(tensor(11),first,second,dense_intermediate,hidden_size);
-        rms(second,tensor(12),third);
-
-        // Router consumes the pre-FFN residual. Experts consume their own
-        // learned normalization of that same residual and execute on CPU.
-        auto router_scale=tensor(13);
-        void* router_input_args[]={&hidden,&router_scale,
-                                   const_cast<std::uint64_t*>(&normalized),
-                                   const_cast<int*>(&hidden_size),
-                                   const_cast<float*>(&epsilon)};
-        launch("gemma_router_input",1,1,256,router_input_args);
-        f32(tensor(14),normalized,router_logits,hidden_size,experts);
-        if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,
-                                 experts,top_k,runtime.stream)!=0)
-            throw std::runtime_error("native Gemma 4 routing failed");
-        rms(hidden,tensor(15),normalized);
+        // Dense GEGLU path and the router. Token-invariant launches: fixed
+        // weights, fixed workspace slots, no position and no KV cache, so a
+        // pinned layer's capture below can record this chain into its graph.
+        auto enqueue_ffn_router=[&]{
+            rms(hidden,tensor(8),normalized);
+            auto dense_gate=tensor(9),dense_up=tensor(10);
+            void* dense_args[]={&dense_gate,&dense_up,const_cast<std::uint64_t*>(&normalized),
+                                const_cast<std::uint64_t*>(&first),const_cast<int*>(&hidden_size),
+                                const_cast<int*>(&dense_intermediate)};
+            launch("gemma_q4_0_geglu",(dense_intermediate+7)/8,1,256,dense_args);
+            q4(tensor(11),first,second,dense_intermediate,hidden_size);
+            rms(second,tensor(12),third);
+            // Router consumes the pre-FFN residual. Experts consume their own
+            // learned normalization of that same residual.
+            auto router_scale=tensor(13);
+            void* router_input_args[]={&hidden,&router_scale,
+                                       const_cast<std::uint64_t*>(&normalized),
+                                       const_cast<int*>(&hidden_size),
+                                       const_cast<float*>(&epsilon)};
+            launch("gemma_router_input",1,1,256,router_input_args);
+            f32(tensor(14),normalized,router_logits,hidden_size,experts);
+            if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,
+                                     experts,top_k,launch_stream)!=0)
+                throw std::runtime_error("native Gemma 4 routing failed");
+            rms(hidden,tensor(15),normalized);
+        };
         // A whole-layer-pinned layer holds all of its experts on device by
         // construction, so the routed indices never need to visit the host:
         // route_topk's outputs feed the pinned grouped kernels directly and
-        // this layer costs no download and no event sync.
+        // this layer costs no download and no event sync. That also makes the
+        // whole dense+router+MoE chain graph-capturable -- one submission per
+        // token instead of ~16.
         const bool layer_pinned=!expert_policy.is_cpu()&&
             layer_number<runtime.whole_expert_layer_slots.size()&&
             runtime.whole_expert_layer_slots[layer_number]>=0;
@@ -13779,39 +13805,90 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
             const auto& down_tensor=runtime.model->tensors[layer.expert_tensors[1]];
             const std::uint64_t down_offset=gate_up_tensor.size/experts;
             const std::uint64_t scale_offset=down_offset+down_tensor.size/experts;
-            if(colibri_gpu_memset(fourth,0,hidden_size*sizeof(float),runtime.stream)!=0)
-                throw std::runtime_error("native Gemma 4 pinned output reset failed");
             const int intermediate=static_cast<int>(runtime.moe_intermediate);
-            void* gate_args[]={const_cast<std::uint64_t*>(&layer_base),
-                               const_cast<std::uint64_t*>(&runtime.expert_slot_bytes),
-                               const_cast<std::uint64_t*>(&selected_device),
-                               const_cast<std::uint64_t*>(&normalized),
-                               const_cast<std::uint64_t*>(&activated),
-                               const_cast<int*>(&hidden_size),
-                               const_cast<int*>(&intermediate),
-                               const_cast<int*>(&top_k)};
-            launch("gemma_q4_0_pinned_geglu",(intermediate+7)/8,top_k,256,gate_args);
-            void* down_args[]={const_cast<std::uint64_t*>(&layer_base),
-                               const_cast<std::uint64_t*>(&runtime.expert_slot_bytes),
-                               const_cast<std::uint64_t*>(&down_offset),
-                               const_cast<std::uint64_t*>(&scale_offset),
-                               const_cast<std::uint64_t*>(&selected_device),
-                               const_cast<std::uint64_t*>(&activated),
-                               const_cast<std::uint64_t*>(&fourth),
-                               const_cast<std::uint64_t*>(&route_weights),
-                               const_cast<int*>(&intermediate),
-                               const_cast<int*>(&hidden_size),
-                               const_cast<int*>(&top_k)};
-            launch("gemma_q4_0_pinned_accumulate",(hidden_size+7)/8,1,256,down_args);
-            rms(fourth,tensor(16),first);
-            add(third,first);
-            rms(third,tensor(17),residual);
-            add(hidden,residual);
-            auto layer_scale=tensor(18);
-            void* scale_args[]={&hidden,&layer_scale,const_cast<int*>(&hidden_size)};
-            launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
+            auto enqueue_pinned_moe=[&]{
+                if(colibri_gpu_memset(fourth,0,hidden_size*sizeof(float),launch_stream)!=0)
+                    throw std::runtime_error("native Gemma 4 pinned output reset failed");
+                void* gate_args[]={const_cast<std::uint64_t*>(&layer_base),
+                                   const_cast<std::uint64_t*>(&runtime.expert_slot_bytes),
+                                   const_cast<std::uint64_t*>(&selected_device),
+                                   const_cast<std::uint64_t*>(&normalized),
+                                   const_cast<std::uint64_t*>(&activated),
+                                   const_cast<int*>(&hidden_size),
+                                   const_cast<int*>(&intermediate),
+                                   const_cast<int*>(&top_k)};
+                launch("gemma_q4_0_pinned_geglu",(intermediate+7)/8,top_k,256,gate_args);
+                void* down_args[]={const_cast<std::uint64_t*>(&layer_base),
+                                   const_cast<std::uint64_t*>(&runtime.expert_slot_bytes),
+                                   const_cast<std::uint64_t*>(&down_offset),
+                                   const_cast<std::uint64_t*>(&scale_offset),
+                                   const_cast<std::uint64_t*>(&selected_device),
+                                   const_cast<std::uint64_t*>(&activated),
+                                   const_cast<std::uint64_t*>(&fourth),
+                                   const_cast<std::uint64_t*>(&route_weights),
+                                   const_cast<int*>(&intermediate),
+                                   const_cast<int*>(&hidden_size),
+                                   const_cast<int*>(&top_k)};
+                launch("gemma_q4_0_pinned_accumulate",(hidden_size+7)/8,1,256,down_args);
+                rms(fourth,tensor(16),first);
+                add(third,first);
+                rms(third,tensor(17),residual);
+                add(hidden,residual);
+                auto layer_scale=tensor(18);
+                void* scale_args[]={&hidden,&layer_scale,const_cast<int*>(&hidden_size)};
+                launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
+            };
+            bool ffn_launched=false;
+            if(gemma_graph_eligible&&layer.gemma_ffn_graph){
+                if(colibri_gpu_graph_launch(layer.gemma_ffn_graph,runtime.stream)==0){
+                    ++runtime.cuda_graph_replays;ffn_launched=true;
+                }else{
+                    colibri_gpu_graph_destroy(layer.gemma_ffn_graph);
+                    layer.gemma_ffn_graph=0;++runtime.cuda_graph_fallbacks;
+                }
+            }
+            if(gemma_graph_eligible&&!ffn_launched&&!layer.gemma_ffn_graph_attempted){
+                // Capture records without executing; the replay below is the
+                // only execution this token, keeping it ordered on
+                // runtime.stream behind the eager attention above.
+                layer.gemma_ffn_graph_attempted=true;
+                if(colibri_gpu_graph_begin(runtime.graph_stream)==0){
+                    bool capture_enqueued=true;
+                    launch_stream=runtime.graph_stream;
+                    try{enqueue_ffn_router();enqueue_pinned_moe();}
+                    catch(...){capture_enqueued=false;}
+                    launch_stream=runtime.stream;
+                    std::uint64_t captured_graph=0;
+                    const int capture_status=colibri_gpu_graph_end(
+                        runtime.graph_stream,&captured_graph);
+                    if(capture_enqueued&&capture_status==0){
+                        layer.gemma_ffn_graph=captured_graph;++runtime.cuda_graph_builds;
+                        if(std::getenv("COLIBRI_CUDA_GRAPH_TRACE"))
+                            std::fprintf(stderr,
+                                "[cuda-graphs] gemma layer %u FFN captured\n",
+                                layer_number);
+                        if(colibri_gpu_graph_launch(layer.gemma_ffn_graph,runtime.stream)==0){
+                            ++runtime.cuda_graph_replays;ffn_launched=true;
+                        }else{
+                            colibri_gpu_graph_destroy(layer.gemma_ffn_graph);
+                            layer.gemma_ffn_graph=0;++runtime.cuda_graph_fallbacks;
+                        }
+                    }else{
+                        if(capture_status==0&&captured_graph)
+                            colibri_gpu_graph_destroy(captured_graph);
+                        ++runtime.cuda_graph_fallbacks;
+                        if(std::getenv("COLIBRI_CUDA_GRAPH_TRACE"))
+                            std::fprintf(stderr,
+                                "[cuda-graphs] gemma layer %u FFN capture failed "
+                                "(enqueued=%d status=%d)\n",
+                                layer_number,capture_enqueued?1:0,capture_status);
+                    }
+                }
+            }
+            if(!ffn_launched){enqueue_ffn_router();enqueue_pinned_moe();}
             continue;
         }
+        enqueue_ffn_router();
         if(colibri_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||
            colibri_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||
            colibri_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)
