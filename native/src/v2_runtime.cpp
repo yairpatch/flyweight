@@ -13243,24 +13243,26 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
     const int dense_intermediate=static_cast<int>(runtime.model->config.dense_intermediate_size);
     const float epsilon=runtime.model->config.rms_norm_epsilon
         ?runtime.model->config.rms_norm_epsilon:1.0e-6f;
-    std::uint64_t cursor=runtime.workspace;
-    const auto workspace_end=runtime.workspace+runtime.workspace_bytes;
-    auto take=[&](std::uint64_t bytes){const auto result=cursor;cursor+=device_align(bytes);if(cursor>workspace_end)throw std::runtime_error("native Gemma 4 workspace is too small");return result;};
-    std::uint64_t hidden=take(hidden_size*sizeof(float));
-    std::uint64_t residual=take(hidden_size*sizeof(float));
-    const std::uint64_t normalized=take(hidden_size*sizeof(float));
-    const std::uint64_t first=take(runtime.scratch_elements*sizeof(float));
-    const std::uint64_t second=take(runtime.scratch_elements*sizeof(float));
-    const std::uint64_t third=take(runtime.scratch_elements*sizeof(float));
-    const std::uint64_t fourth=take(runtime.scratch_elements*sizeof(float));
-    const std::uint64_t activated=take(static_cast<std::uint64_t>(top_k)*runtime.moe_intermediate*sizeof(float));
-    const std::uint64_t router_logits=take(experts*sizeof(float));
-    const std::uint64_t selected_device=take(top_k*sizeof(std::int32_t));
-    const std::uint64_t route_weights=take(top_k*sizeof(float));
-    const std::uint64_t argmax_device=take(sizeof(std::uint64_t));
-    const std::uint64_t attention_scores=take(
-        static_cast<std::uint64_t>(runtime.model->config.attention_heads)*
-        runtime.options.context_limit*sizeof(float));
+    // The canonical decode layout carves the same regions this used to take()
+    // ad hoc, from the same configuration values -- and it is what the sampler
+    // reads: its logits buffer and top-k scratch must not overlap the buffers
+    // holding the final normalized hidden state this decode leaves behind.
+    const auto&workspace_layout=runtime.decode_workspace_layout;
+    if(workspace_layout.bytes>runtime.workspace_bytes)
+        throw std::runtime_error("native Gemma 4 workspace is too small");
+    std::uint64_t hidden=workspace_layout.hidden.address(runtime.workspace);
+    std::uint64_t residual=workspace_layout.residual.address(runtime.workspace);
+    const std::uint64_t normalized=workspace_layout.normalized.address(runtime.workspace);
+    const std::uint64_t first=workspace_layout.first.address(runtime.workspace);
+    const std::uint64_t second=workspace_layout.second.address(runtime.workspace);
+    const std::uint64_t third=workspace_layout.third.address(runtime.workspace);
+    const std::uint64_t fourth=workspace_layout.fourth.address(runtime.workspace);
+    const std::uint64_t activated=workspace_layout.activated.address(runtime.workspace);
+    const std::uint64_t router_logits=workspace_layout.router_logits.address(runtime.workspace);
+    const std::uint64_t selected_device=workspace_layout.selected_device.address(runtime.workspace);
+    const std::uint64_t route_weights=workspace_layout.route_weights.address(runtime.workspace);
+    const std::uint64_t argmax_device=workspace_layout.argmax_device.address(runtime.workspace);
+    const std::uint64_t attention_scores=workspace_layout.attention_scores.address(runtime.workspace);
     auto* staging=static_cast<std::uint8_t*>(runtime.host_staging);
     auto* selected_host=reinterpret_cast<std::int32_t*>(staging);
     const auto weights_offset=device_align(top_k*sizeof(std::int32_t));
@@ -13519,6 +13521,11 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
         launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
     }
     rms(hidden,runtime.device_tensors[runtime.final_norm],normalized);
+    // A sampled or penalized step re-projects the head from this normalized
+    // state into the layout's logits region; the fused argmax below never
+    // writes logits, exactly like the Qwen greedy path.
+    runtime.last_sampling_normalized=normalized;
+    runtime.last_sampling_logits=workspace_layout.logits.address(runtime.workspace);
     const int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);
     if(colibri_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)
         throw std::runtime_error("native Gemma 4 argmax reset failed");
@@ -14822,8 +14829,6 @@ static std::uint32_t qwen_sample_last_logits(
             std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();}
     } sampling_timer{runtime.sampling_nanoseconds,
                      std::chrono::steady_clock::now()};
-    if(runtime.gemma4)throw std::runtime_error(
-        "native Gemma 4 sampling is not implemented yet");
     if(!runtime.last_sampling_normalized||!runtime.last_sampling_logits)
         throw std::runtime_error("native Qwen sampling state is unavailable");
     const auto vocabulary=runtime.model->config.vocabulary_size;
@@ -14875,7 +14880,21 @@ static std::uint32_t qwen_sample_last_logits(
     const std::uint64_t q8_scales=
         runtime.decode_workspace_layout.dense_q8_scales.address(runtime.workspace);
     int projected=-1;
-    if(q8_kernel&&(hidden&255)==0&&q8_input&&q8_scales){
+    if(runtime.gemma4){
+        // Gemma 4's head is the tied Q4_0 embedding table, which the generic
+        // dispatch below carries no kernel for; project with the same matvec
+        // the Gemma decode path uses for its dense Q4_0 projections.
+        int vocabulary_rows=static_cast<int>(vocabulary);
+        void*matvec_args[]={const_cast<std::uint64_t*>(&lm_head),
+            &runtime.last_sampling_normalized,
+            &runtime.last_sampling_logits,
+            const_cast<int*>(&hidden),&vocabulary_rows};
+        projected=colibri_gpu_launch_named("gemma_q4_0_matvec",
+                (vocabulary_rows+7)/8,1,256,0,runtime.stream,matvec_args);
+        if(projected!=0)
+            throw std::runtime_error(
+                "native Gemma 4 sampling LM-head projection failed");
+    }else if(q8_kernel&&(hidden&255)==0&&q8_input&&q8_scales){
         void*quantize_args[]={
             const_cast<std::uint64_t*>(&runtime.last_sampling_normalized),
             const_cast<std::uint64_t*>(&q8_input),
@@ -14905,12 +14924,14 @@ static std::uint32_t qwen_sample_last_logits(
         throw std::runtime_error(
             "native Qwen sampling LM-head projection failed for tensor type "+
             std::to_string(runtime.lm_head_type));
-    // Muse Glimmer scales the head output and then tanh-softcaps it. Both are
-    // monotonic, so the greedy argmax path above is unaffected and skips this
-    // entirely -- but temperature and top-p read the actual distribution, and
-    // the softcap compresses it, so it has to run before candidate selection.
-    if(runtime.muse&&(runtime.model->config.logit_scale!=0.0f||
-                      runtime.model->config.final_logit_softcap!=0.0f)){
+    // Muse Glimmer scales the head output and then tanh-softcaps it, and
+    // Gemma 4 softcaps without the scale. Both are monotonic, so the greedy
+    // argmax path above is unaffected and skips this entirely -- but
+    // temperature and top-p read the actual distribution, and the softcap
+    // compresses it, so it has to run before candidate selection.
+    if((runtime.muse||runtime.gemma4)&&
+       (runtime.model->config.logit_scale!=0.0f||
+        runtime.model->config.final_logit_softcap!=0.0f)){
         const float scale=runtime.model->config.logit_scale!=0.0f
             ?runtime.model->config.logit_scale:1.0f;
         const float softcap=runtime.model->config.final_logit_softcap;
@@ -16334,8 +16355,6 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
     if(!std::isfinite(frequency_penalty)||frequency_penalty<-2.0f||
        frequency_penalty>2.0f)
         throw std::runtime_error("native Qwen frequency_penalty must be in [-2, 2]");
-    if(runtime->gemma4&&temperature>0.0f)
-        throw std::runtime_error("native Gemma 4 sampling is not implemented yet");
     QwenEngineTask task;
     task.prompt.assign(prompt,prompt+prompt_count);
     if(stop_tokens&&stop_count)task.stop_tokens.assign(stop_tokens,stop_tokens+stop_count);
