@@ -2921,6 +2921,20 @@ bool qwen_model_has_iq_experts(const ColibriV2QwenRuntime& runtime) {
 
 // True when every routed expert tensor in the model can run on the GPU.
 bool qwen_gpu_experts_executable(const ColibriV2QwenRuntime& runtime) {
+    // Gemma 4's hybrid decode has its own grouped kernels for the fused Q4_0
+    // gate_up bundle and its f32 expert scales; the generic grouped dispatch
+    // knows neither, so testing its type list here parked a cache the decode
+    // path could actually serve.
+    if(runtime.gemma4){
+        for(const auto& layer:runtime.layers){
+            if(layer.dense_ffn||!layer.expert_tensors[0])continue;
+            if(runtime.model->tensors[layer.expert_tensors[0]].type!=2||
+               runtime.model->tensors[layer.expert_tensors[1]].type!=2||
+               runtime.model->tensors[layer.expert_tensors[2]].type!=0)
+                return false;
+        }
+        return true;
+    }
     for(const auto& layer:runtime.layers){
         if(layer.dense_ffn||!layer.expert_tensors[0])continue;
         for(const auto index:layer.expert_tensors)
@@ -11995,8 +12009,14 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(cache>max_cache)cache=max_cache;
             const char*whole_layer_setting=
                 std::getenv("COLIBRI_LAGUNA_WHOLE_LAYERS");
-            const bool whole_layer_enabled=runtime->laguna&&
-                qwen_model_has_iq_experts(*runtime)&&
+            // Gemma 4 takes the same placement: its expert selection is close
+            // to uniform, so per-expert paging replaces a miss with a 3.3 MB
+            // PCIe upload every few tokens and eats what the cache saves --
+            // measured 85% hits and still no faster than pure-CPU experts.
+            // Whole pinned layers page each bundle once and never again,
+            // which is the static GPU/CPU layer split llama.cpp runs.
+            const bool whole_layer_enabled=(runtime->gemma4||
+                (runtime->laguna&&qwen_model_has_iq_experts(*runtime)))&&
                 (!whole_layer_setting||whole_layer_setting[0]!='0');
             if(whole_layer_enabled&&!runtime->options.strict_resident){
                 const auto experts=runtime->model->config.expert_count;
