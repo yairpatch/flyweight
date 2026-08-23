@@ -1937,7 +1937,7 @@ void bailing_q6_expert_swiglu_rows(
     const unsigned char* gate_base, const unsigned char* up_base,
     const int* selected, const float* input, float* activated,
     const unsigned long long expert_stride, const int rows, const int top_k,
-    const int input_size, const int output_size
+    const int input_size, const int output_size, const float limit
 ) {
     const int output_row = blockIdx.x, route = blockIdx.y;
     if (output_row >= output_size || route >= rows * top_k) return;
@@ -1959,9 +1959,15 @@ void bailing_q6_expert_swiglu_rows(
     g = block_reduce_sum(g);
     __syncthreads();
     u = block_reduce_sum(u);
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0) {
+        // The routed SwiGLU clamp, matching bailing_swiglu: off at limit <= 0.
+        if (limit > 0.0f) {
+            g = fminf(fmaxf(g, -limit), limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
         activated[(long long)route * output_size + output_row] =
             (g / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, g))))) * u;
+    }
 }
 
 extern "C" __global__
@@ -1997,7 +2003,8 @@ void bailing_q6_expert_swiglu_grouped_rows(
     const int* expert_counts, const int* expert_routes,
     const float* input, float* activated,
     const unsigned long long expert_stride, const int max_routes,
-    const int top_k, const int input_size, const int output_size
+    const int top_k, const int input_size, const int output_size,
+    const float limit
 ) {
     const int output_row = blockIdx.x, expert = blockIdx.y;
     if (output_row >= output_size) return;
@@ -2055,6 +2062,10 @@ void bailing_q6_expert_swiglu_grouped_rows(
                 }
                 const int route = expert_routes[
                     (long long)expert * max_routes + assignment];
+                if (limit > 0.0f) {
+                    gate_sum = fminf(fmaxf(gate_sum, -limit), limit);
+                    up_sum = fminf(fmaxf(up_sum, -limit), limit);
+                }
                 activated[(long long)route * output_size + output_row] =
                     (gate_sum / (1.0f + expf(-fminf(80.0f,
                         fmaxf(-80.0f, gate_sum))))) * up_sum;
@@ -2360,7 +2371,8 @@ void bailing_q6_q8_expert_swiglu_mmq_rows(
     const int* expert_counts, const int* expert_routes,
     const signed char* input, const __half* input_scales, float* activated,
     const unsigned long long expert_stride, const int max_routes,
-    const int top_k, const int input_size, const int output_size
+    const int top_k, const int input_size, const int output_size,
+    const float limit
 ) {
     const int expert = blockIdx.y;
     const int output_base = blockIdx.x * 32;
@@ -2396,10 +2408,15 @@ void bailing_q6_q8_expert_swiglu_mmq_rows(
             output_base, weight_values, weight_d, weight_scales,
             activation_values, activation_d);
         const int output_row = output_base + lane;
-        if (valid[warp] && output_row < output_size)
+        if (valid[warp] && output_row < output_size) {
+            float g = gate_total, u = up_total;
+            if (limit > 0.0f) {
+                g = fminf(fmaxf(g, -limit), limit);
+                u = fminf(fmaxf(u, -limit), limit);
+            }
             activated[(long long)routes[warp] * output_size + output_row] =
-                (gate_total / (1.0f + expf(-fminf(80.0f,
-                    fmaxf(-80.0f, gate_total))))) * up_total;
+                (g / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, g))))) * u;
+        }
         __syncthreads();
     }
 }
@@ -2604,7 +2621,8 @@ void bailing_q6_q8_expert_swiglu_grouped_rows(
     const int* expert_counts, const int* expert_routes,
     const signed char* input, const __half* input_scales, float* activated,
     const unsigned long long expert_stride, const int max_routes,
-    const int top_k, const int input_size, const int output_size
+    const int top_k, const int input_size, const int output_size,
+    const float limit
 ) {
     const int output_row = blockIdx.x, expert = blockIdx.y;
     if (output_row >= output_size) return;
@@ -2691,6 +2709,10 @@ void bailing_q6_q8_expert_swiglu_grouped_rows(
                 }
                 const int route = expert_routes[
                     (long long)expert * max_routes + assignment];
+                if (limit > 0.0f) {
+                    gate_sum = fminf(fmaxf(gate_sum, -limit), limit);
+                    up_sum = fminf(fmaxf(up_sum, -limit), limit);
+                }
                 activated[(long long)route * output_size + output_row] =
                     (gate_sum / (1.0f + expf(-fminf(80.0f,
                         fmaxf(-80.0f, gate_sum))))) * up_sum;

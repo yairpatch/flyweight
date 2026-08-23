@@ -403,8 +403,9 @@ inline const std::map<std::string, std::string>& layer_names() {
         {"attention.kv_b_proj.weight", "attn_kv_b.weight"},
         {"attention.dense.weight", "attn_output.weight"},
 
-        // KDA (linear-attention layers)
-        {"attention.q_proj.weight", "ssm_q.weight"},
+        // KDA (linear-attention layers). `attention.q_proj.weight` is NOT here:
+        // it is ambiguous by layer kind and translate() resolves it, the same
+        // way it resolves g_proj.
         {"attention.k_proj.weight", "ssm_k.weight"},
         {"attention.v_proj.weight", "ssm_v.weight"},
         {"attention.q_conv1d.weight", "ssm_q_conv1d.weight"},
@@ -650,6 +651,19 @@ inline ParsedName translate(const std::string& name,
     if (rest == "attention.g_proj.weight") {
         parsed.matched = true;
         parsed.gguf = "blk." + std::to_string(layer) + "." + gate_name(full);
+        return parsed;
+    }
+
+    // The other name that means two things by layer kind. `q_proj` is the KDA
+    // query on a linear layer; on a full-attention layer it only exists when
+    // the checkpoint declares no `q_lora_rank` (Ling 3.0 Flash), in which case
+    // it is the un-factored MLA query. Left in the flat table it would map
+    // every MLA query onto `ssm_q`, and the layer plan would then report the
+    // real query as missing.
+    if (rest == "attention.q_proj.weight") {
+        parsed.matched = true;
+        parsed.gguf = "blk." + std::to_string(layer) + "." +
+                      (full ? "attn_q.weight" : "ssm_q.weight");
         return parsed;
     }
 

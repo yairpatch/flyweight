@@ -1485,11 +1485,111 @@ venv, which also removes the three shims above; or run the reference elsewhere.
 The shims exist because the installed stack is years newer than the modeling
 code, and that mismatch is the most likely source of the bad buffer.
 
+### Ling 3.0 Flash -- DONE. Loads, generates, serves.
+
+`Ling-3.0-flash-IQ2_XXS.gguf` (43 blocks, 512 experts top-8 in 8 groups
+keeping 4, 262k context) is the same architecture with four differences, all of
+which were silent-or-fatal rather than merely new:
+
+* **No query LoRA.** `q_lora_rank: null`, so an MLA layer carries an
+  un-factored `attn_q` (hidden -> heads*qk) instead of q_a/q_a_norm/q_b. The
+  layer plan, both host paths and both device paths now branch on
+  `Geometry::q_lora == 0`. On the HF side `attention.q_proj.weight` had to come
+  out of the flat rename table: it means the KDA query on a linear layer and
+  the MLA query on a full-attention one, the same ambiguity `g_proj` already
+  had.
+* **IQ4_NL (GGML type 20).** The quantizer falls back to it for rows that are
+  not a multiple of 256, which here is `attn_k_b` at 128 elements a row. Only
+  the load-time decode needs it -- k_b/v_b are merged into an f32 `attn_kv_b`
+  and dropped -- so it is a decoder, not a kernel. Verified bit-identical
+  against the `gguf` package's own `IQ4_NL.dequantize_blocks` on the real
+  tensor, through the per-head un-transpose.
+* **Per-layer SwiGLU clamps.** `swiglu_clamp_exp` is 4.0 on blocks 35-41 and
+  `swiglu_clamp_shexp` is 5.0/7.0 on 34-41. Both arrays were parsed and then
+  dropped at the Geometry boundary (`g.swiglu_limit = 0.0f`, hardcoded). They
+  are per LAYER and differ between the routed and the shared half, so they now
+  live on `LayerWeights`; `Geometry::swiglu_limit` is gone rather than left as
+  a field nothing reads. The three fused device expert kernels took a `limit`
+  argument for the same reason.
+* **An MTP draft block that is present.** `block_count` is 43 and blk.42 is the
+  nextn block, written entirely at Q4_0. `detect_mtp_layer` already trimmed
+  `layer_count` to 42, but the device-support scan walked every tensor in the
+  file, so one unexecuted Q4_0 tensor vetoed the GPU for the whole model.
+
+`kda.safe_gate`/`kda.gate_lower_bound` are carried in the file and still
+deliberately unimplemented -- see the KDA oracle note above: fla 0.4.1 discards
+both, so the reference model's observable behaviour has no clamp.
+
+Not addressed: at 35 GB the model does not fit a 12 GB card, and the bailing
+device path is all-or-nothing about residency, so it runs on the host
+(9.1 tok/s decode measured, which is the memory wall for a file this size).
+Partial residency for bailing is its own piece of work and has never existed
+for any checkpoint of this family.
+
+### Host decode -- 13.5 -> 15.3 tok/s, and the profiler that was lying
+
+The first thing found was not a slow kernel, it was a blind instrument.
+`decoder_layer_batch` delegates to `decoder_layer` at `tokens == 1`, and the
+single-token path carried NO ProfileScopes at all -- nor did `moe_block`. So
+`COLIBRI_BAILING_PROFILE=1` reported prefill and silently omitted every decode
+token, while presenting its buckets as percentages of the whole. The lm head
+and the embedding gather sat outside every bucket on both paths as well, so
+even the prefill numbers were shares of about half the work.
+
+Instrumenting decode closed the accounting to 66.7 ms accounted against
+66.1 ms wall. What it shows, per token, against a measured 52 GB/s DRAM read
+wall (and note that ONE core reaches 52 GB/s on this part -- threads buy 12%,
+not 16x):
+
+| phase | ms | bytes | GB/s | vs wall |
+|---|---|---|---|---|
+| KDA proj + conv + recurrence | 26.2 | 1.33 GB | 51 | 98% |
+| routed expert matmuls | 20.6 | 0.49 GB | 24 | 46% |
+| lm head | 4.5 | 0.28 GB | 62 | at wall |
+| MLA | 4.3 | -- | -- | -- |
+| shared expert | 4.2 | 0.19 GB | 46 | 92% |
+| routing | 4.0 | 0.21 GB | 51 | 98% |
+
+Everything is at the memory wall except the routed experts. The experts are
+the one phase that is COMPUTE-bound rather than bandwidth-bound: a single core
+sustains only 3.1 GB/s on IQ2_XXS, because the cost is the grid lookup. So
+they need every core -- and calling `matvec` once per expert per projection
+fired 24 OpenMP regions a layer, 960 a token, each over ~0.5 MB.
+
+Fixed by giving the CALLER the parallel region: `RowKernel`/`row_kernel()`
+resolve the ISA/type dispatch once, and `moe_block` now runs all the chosen
+experts in TWO regions -- one over (gate|up) x slot x row, one over output rows
+with the expert loop inside, so each thread owns its rows and no reduction is
+needed (the shape the device's `bailing_q6_expert_accumulate_rows` already
+used). Measured 29.8 -> 40.5 GB/s in isolation; the expert bucket fell 26% and
+decode went 13.5 -> 15.3 tok/s. Logits are unchanged -- the GGUF/HF parity test
+is what says so.
+
+Measured and rejected, so they are not tried again:
+
+* **An AVX-512 IQ2_XXS kernel.** Type 16 is absent from the AVX-512 allowlist
+  and this part has full-width AVX-512, which looks like an obvious gap. It is
+  not: IQ2_XS *on AVX-512* manages 3.4 GB/s/core against IQ2_XXS *on AVX2* at
+  3.1. SIMD width does not fix a grid lookup. (For scale, Q4_K reaches 14.4 and
+  Q6_K 15.3 GB/s/core -- the IQ2 family is ~4x more expensive per core.)
+* **More threads.** 16 (one per physical core) is right; 24 is slightly worse
+  and 32 -- the SMT siblings -- collapses decode to 6.2 tok/s.
+* **Cold page faults / huge pages.** The file reads back at 15 GB/s, already
+  resident, and the loader already calls `madvise(MADV_HUGEPAGE)`.
+* **The scattered access pattern.** 8 experts drawn at random from 512 costs
+  ~8% against 8 contiguous, not the 1.7x that would explain the gap.
+
+The experts are still at ~46% of the wall in situ against ~80% in isolation,
+and that residue is NOT explained. Repeated attempts to isolate it gave
+inconsistent answers (28-48 GB/s depending on how the benchmark was warmed),
+so no further claim is made about it and no fix is proposed on a guess.
+
 ## Sequencing
 
 Stages 1 and 2 are useful on their own and de-risk stage 3 (a bug in stage 3 is
 otherwise indistinguishable from a loader bug). Stage 3 is the long pole and is
 where the schedule will actually go.
 
-Explicitly out of scope: MTP/nextn (absent from this checkpoint), vision,
-DFlash drafting, IQ-type quantization at load.
+Explicitly out of scope: MTP/nextn *execution* (the flash checkpoints ship a
+draft block; it is skipped, not run), vision, DFlash drafting, IQ-type
+quantization at load.

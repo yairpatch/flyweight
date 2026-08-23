@@ -124,7 +124,7 @@ bool the_shared_expert_ignores_the_routing_scale() {
             hidden_state.data(), router.data(), bias.data(), zeros.data(),
             zeros.data(), zeros.data(), shared_gate.data(), shared_up.data(),
             shared_down.data(), hidden, expert_size, shared_size, experts, 2, 2, 1,
-            scale, true, 0.0f, out.data());
+            scale, true, 0.0f, 0.0f, out.data());
         return out;
     };
     const auto plain = run(1.0f), scaled = run(2.5f);

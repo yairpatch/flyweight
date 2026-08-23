@@ -149,6 +149,72 @@ class BailingGgufTests(unittest.TestCase):
         self.assertEqual(converted, original)
 
 
+class BailingFlashGgufTests(unittest.TestCase):
+    """The Ling 3.0 Flash shape: no query LoRA, per-layer SwiGLU clamps, MTP.
+
+    Same weights through both loaders again -- the assertion that catches a
+    mapping mistake -- but over the three things this checkpoint family does
+    differently from the larger Ling models. Each is silent when dropped: an
+    un-factored query reads the wrong tensor, a dropped clamp changes only the
+    tails of the last layers, and a draft block treated as executable adds a
+    layer that was never trained to run.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = tempfile.TemporaryDirectory()
+        root = Path(cls._directory.name)
+        cls.hf_path = safetensors.build(root / "flash-fixture", flash=True)
+        cls.gguf_path = gguf.build(root / "converted", cls.hf_path, flash=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    def test_the_draft_block_is_not_part_of_the_decoder_stack(self) -> None:
+        with V2Model(self.gguf_path) as model:
+            # block_count counts the draft block; layer_count must not.
+            self.assertEqual(model.config["layer_count"], safetensors.LAYERS)
+            self.assertEqual(model.config["q_lora_rank"], 0)
+            names = {tensor["name"] for tensor in model.tensors()}
+            self.assertIn(f"blk.{safetensors.LAYERS}.nextn.enorm.weight", names)
+
+    def test_the_un_factored_query_answers_as_the_checkpoint_it_came_from(self) -> None:
+        prompt = [5, 11, 23, 4, 9, 17, 3, 8]
+        for length in (1, 2, len(prompt)):
+            with self.subTest(prompt_tokens=length):
+                converted = BailingGgufTests.logits(self, self.gguf_path, prompt[:length])
+                with BailingGgufTests.unquantized():
+                    original = BailingGgufTests.logits(self, self.hf_path, prompt[:length])
+                self.assertEqual(len(converted), len(original))
+                worst = max(abs(a - b) for a, b in zip(converted, original))
+                scale = max(abs(value) for value in original)
+                self.assertLess(worst, 1e-3 * max(scale, 1.0))
+                self.assertEqual(
+                    converted.index(max(converted)),
+                    original.index(max(original)),
+                )
+
+    def test_the_swiglu_clamp_changes_the_answer(self) -> None:
+        """A clamp that is read must be a clamp that binds.
+
+        The parity test above cannot see this: both files carry the same
+        clamps, so a runtime that ignores them on both sides still agrees with
+        itself. The same weights written without the clamp metadata must give
+        different logits, or the arrays are being parsed and dropped.
+        """
+        prompt = [5, 11, 23, 4, 9, 17, 3, 8]
+        with tempfile.TemporaryDirectory() as directory:
+            unclamped_path = gguf.build(
+                Path(directory) / "unclamped", self.hf_path, flash=True,
+                clamps=False,
+            )
+            unclamped = BailingGgufTests.logits(self, unclamped_path, prompt)
+        clamped = BailingGgufTests.logits(self, self.gguf_path, prompt)
+        worst = max(abs(a - b) for a, b in zip(clamped, unclamped))
+        self.assertGreater(worst, 1e-4)
+
+
 class BailingRuntimeStateTests(unittest.TestCase):
     """Snapshotting a sequence, and watching a prompt while it runs.
 

@@ -54,6 +54,12 @@ def _uint_array(values) -> bytes:
     )
 
 
+def _float_array(values) -> bytes:
+    return struct.pack("<IQ", GGUF_FLOAT32, len(values)) + b"".join(
+        struct.pack("<f", value) for value in values
+    )
+
+
 def _string_array(values) -> bytes:
     return struct.pack("<IQ", GGUF_STRING, len(values)) + b"".join(
         _string(value) for value in values
@@ -103,8 +109,15 @@ def _tokenizer_tokens() -> tuple[list[str], list[int], list[str]]:
     return tokens, types, merges
 
 
-def build(directory: Path, source: Path) -> Path:
-    """Writes `<directory>/bailing.gguf` from the safetensors fixture at `source`."""
+def build(directory: Path, source: Path, flash: bool = False,
+          clamps: bool = True) -> Path:
+    """Writes `<directory>/bailing.gguf` from the safetensors fixture at `source`.
+
+    `flash` mirrors the Ling 3.0 Flash shape: an un-factored MLA query, the
+    per-layer SwiGLU clamps, and a trailing MTP draft block that the decoder
+    stack must ignore. `clamps=False` writes the same file without the clamp
+    metadata, which is what makes "the clamp is read" testable at all.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     weights: dict[str, np.ndarray] = {}
     for shard in sorted(source.glob("*.safetensors")):
@@ -131,10 +144,15 @@ def build(directory: Path, source: Path) -> Path:
         full_attention = (layer + 1) % hf.CONFIG["layer_group_size"] == 0
         attention = source_prefix + "attention."
         if full_attention:
-            tensors[prefix + "attn_q_a.weight"] = weights[attention + "q_a_proj.weight"]
-            tensors[prefix + "attn_q_a_norm.weight"] = weights[
-                attention + "q_a_layernorm.weight"]
-            tensors[prefix + "attn_q_b.weight"] = weights[attention + "q_b_proj.weight"]
+            if flash:
+                tensors[prefix + "attn_q.weight"] = weights[attention + "q_proj.weight"]
+            else:
+                tensors[prefix + "attn_q_a.weight"] = weights[
+                    attention + "q_a_proj.weight"]
+                tensors[prefix + "attn_q_a_norm.weight"] = weights[
+                    attention + "q_a_layernorm.weight"]
+                tensors[prefix + "attn_q_b.weight"] = weights[
+                    attention + "q_b_proj.weight"]
             tensors[prefix + "attn_kv_a_mqa.weight"] = weights[
                 attention + "kv_a_proj_with_mqa.weight"]
             tensors[prefix + "attn_kv_a_norm.weight"] = weights[
@@ -192,12 +210,24 @@ def build(directory: Path, source: Path) -> Path:
                 for expert in range(hf.EXPERTS)
             ])
 
+    # A trailing MTP draft block: llama.cpp counts it in `block_count`, it sits
+    # past the last whole attention group (so its kv-head entry is nonzero),
+    # and nothing executes it. It is written at a storage the device path has
+    # no kernel for, because the bug it guards against is exactly that -- one
+    # unexecuted tensor vetoing the GPU for the whole model.
+    blocks = hf.LAYERS + 1 if flash else hf.LAYERS
+    if flash:
+        draft = f"blk.{hf.LAYERS}."
+        tensors[draft + "nextn.enorm.weight"] = weights["model.norm.weight"]
+        tensors[draft + "nextn.hnorm.weight"] = weights["model.norm.weight"]
+        tensors[draft + "layer_output_norm.weight"] = weights["model.norm.weight"]
+
     tokens, types, merges = _tokenizer_tokens()
     interval = hf.CONFIG["layer_group_size"]
     metadata = [
         _kv("general.architecture", GGUF_STRING, _string("bailingmoe3")),
         _kv("general.name", GGUF_STRING, _string("bailing-gguf-fixture")),
-        _kv("bailingmoe3.block_count", GGUF_UINT32, _uint(hf.LAYERS)),
+        _kv("bailingmoe3.block_count", GGUF_UINT32, _uint(blocks)),
         _kv("bailingmoe3.context_length", GGUF_UINT32, _uint(4096)),
         _kv("bailingmoe3.embedding_length", GGUF_UINT32, _uint(hf.HIDDEN)),
         _kv("bailingmoe3.feed_forward_length", GGUF_UINT32, _uint(hf.DENSE_FFN)),
@@ -205,8 +235,10 @@ def build(directory: Path, source: Path) -> Path:
         # The full-attention layers are marked by a per-layer array rather than
         # by an interval; the loader reads the period off it.
         _kv("bailingmoe3.attention.head_count_kv", GGUF_ARRAY, _uint_array([
-            hf.HEADS if (layer + 1) % interval == 0 else 0
-            for layer in range(hf.LAYERS)
+            hf.HEADS
+            if (layer + 1) % interval == 0 or layer >= blocks // interval * interval
+            else 0
+            for layer in range(blocks)
         ])),
         _kv("bailingmoe3.rope.freq_base", GGUF_FLOAT32,
             struct.pack("<f", hf.CONFIG["rope_theta"])),
@@ -229,8 +261,6 @@ def build(directory: Path, source: Path) -> Path:
         _kv("bailingmoe3.ssm.conv_kernel", GGUF_UINT32,
             _uint(hf.CONFIG["short_conv_kernel_size"])),
         _kv("bailingmoe3.kda.head_dim", GGUF_UINT32, _uint(hf.HEAD_DIM)),
-        _kv("bailingmoe3.attention.q_lora_rank", GGUF_UINT32,
-            _uint(hf.CONFIG["q_lora_rank"])),
         _kv("bailingmoe3.attention.kv_lora_rank", GGUF_UINT32, _uint(kv_lora)),
         _kv("bailingmoe3.rope.dimension_count", GGUF_UINT32, _uint(qk_rope)),
         _kv("bailingmoe3.expert_feed_forward_length", GGUF_UINT32, _uint(hf.MOE_FFN)),
@@ -243,6 +273,21 @@ def build(directory: Path, source: Path) -> Path:
         _kv("bailingmoe3.expert_weights_scale", GGUF_FLOAT32,
             struct.pack("<f", hf.CONFIG["routed_scaling_factor"])),
         _kv("bailingmoe3.expert_weights_norm", GGUF_BOOL, struct.pack("<B", 1)),
+    ]
+    if hf.CONFIG["q_lora_rank"] and not flash:
+        metadata.append(_kv("bailingmoe3.attention.q_lora_rank", GGUF_UINT32,
+                            _uint(hf.CONFIG["q_lora_rank"])))
+    if flash and clamps:
+        # One entry per BLOCK, draft block included -- the arrays are as long
+        # as block_count, not as the executed stack.
+        for key, values in (
+            ("swiglu_clamp_exp", hf.FLASH_OVERRIDES["expert_swiglu_limit_list"]),
+            ("swiglu_clamp_shexp",
+             hf.FLASH_OVERRIDES["share_expert_swiglu_limit_list"]),
+        ):
+            metadata.append(_kv("bailingmoe3." + key, GGUF_ARRAY,
+                                _float_array(list(values) + [0.0])))
+    metadata += [
         _kv("tokenizer.ggml.model", GGUF_STRING, _string("gpt2")),
         _kv("tokenizer.ggml.pre", GGUF_STRING, _string("bailingmoe2")),
         _kv("tokenizer.ggml.tokens", GGUF_ARRAY, _string_array(tokens)),

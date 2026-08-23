@@ -170,10 +170,33 @@ def _tokenizer() -> dict:
     }
 
 
-def build(directory: Path) -> Path:
+# Ling 3.0 Flash differs from the larger checkpoints in two ways that reach the
+# kernels: it sets `q_lora_rank: null`, so the MLA query is one un-factored
+# projection instead of q_a -> RMS norm -> q_b, and it turns the SwiGLU clamps
+# on for its last few blocks -- separately for the routed and the shared half.
+# Both are silent when dropped: the first fails to find a tensor, the second
+# only changes the tails of the last layers' activations.
+# The limits are far below the real checkpoint's 4.0/5.0/7.0 on purpose: this
+# fixture's weights are deliberately small, so a realistic limit would never
+# bind and "the clamp is applied" would be untestable.
+FLASH_OVERRIDES = {
+    "q_lora_rank": None,
+    "expert_swiglu_limit_list": [0.05, 0.0, 0.0, 0.05],
+    "share_expert_swiglu_limit_list": [0.0, 0.0, 0.07, 0.09],
+}
+
+
+def config(flash: bool = False) -> dict:
+    merged = dict(CONFIG)
+    if flash:
+        merged.update(FLASH_OVERRIDES)
+    return merged
+
+
+def build(directory: Path, flash: bool = False) -> Path:
     """Writes the checkpoint and returns its directory."""
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "config.json").write_text(json.dumps(CONFIG))
+    (directory / "config.json").write_text(json.dumps(config(flash)))
     (directory / "chat_template.jinja").write_text("{{ messages }}")
     (directory / "tokenizer.json").write_text(json.dumps(_tokenizer()))
 
@@ -200,9 +223,19 @@ def build(directory: Path) -> Path:
         full_attention = (layer + 1) % CONFIG["layer_group_size"] == 0
         if full_attention:
             proj = HEADS * CONFIG["qk_head_dim"]
-            first[prefix + "attention.q_a_proj.weight"] = _tensor([128, HIDDEN], nxt())
-            first[prefix + "attention.q_a_layernorm.weight"] = _tensor([128], nxt())
-            first[prefix + "attention.q_b_proj.weight"] = _tensor([proj, 128], nxt())
+            if flash:
+                # `q_proj` on a full-attention layer is the whole query; on a
+                # linear layer below it is the KDA query. Same name, different
+                # weight -- the loader has to disambiguate by layer kind.
+                first[prefix + "attention.q_proj.weight"] = _tensor(
+                    [proj, HIDDEN], nxt()
+                )
+            else:
+                first[prefix + "attention.q_a_proj.weight"] = _tensor(
+                    [128, HIDDEN], nxt()
+                )
+                first[prefix + "attention.q_a_layernorm.weight"] = _tensor([128], nxt())
+                first[prefix + "attention.q_b_proj.weight"] = _tensor([proj, 128], nxt())
             first[prefix + "attention.kv_a_proj_with_mqa.weight"] = _tensor(
                 [128 + 64, HIDDEN], nxt()
             )

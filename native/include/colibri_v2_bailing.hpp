@@ -68,14 +68,23 @@ struct Profile {
     double moe_shared = 0.0;    // the always-on shared expert
     double dense_ffn = 0.0;
     double norms = 0.0;
+    // Outside the layer loop, and the reason this report used to be
+    // unfalsifiable: the lm head is one matvec over the whole vocabulary --
+    // 0.26 GiB at Q5_K on Ling 3.0 Flash -- and it was in no bucket at all, so
+    // the percentages were shares of about half the token's work.
+    double head = 0.0;          // final norm + lm head matvec
+    double embedding = 0.0;     // the input row gather
     std::uint64_t tokens = 0;
+    std::uint64_t positions = 0;  // real tokens, not layer-token pairs
 
     void report(std::FILE* out) const {
         // The MoE sub-buckets are inside `moe`, so they are excluded here.
-        const double total = projections + kda + mla + moe + dense_ffn + norms;
+        const double total =
+            projections + kda + mla + moe + dense_ffn + norms + head + embedding;
         if (total <= 0.0) return;
-        std::fprintf(out, "[colibri-v2] bailing profile over %llu tokens "
-                          "(%.3f s total)\n",
+        std::fprintf(out, "[colibri-v2] bailing profile over %llu positions "
+                          "(%llu layer-tokens, %.3f s accounted)\n",
+                     static_cast<unsigned long long>(positions),
                      static_cast<unsigned long long>(tokens), total);
         const struct { const char* name; double value; } rows[] = {
             {"projections (batched)", projections},
@@ -88,10 +97,15 @@ struct Profile {
             {"  .. shared expert", moe_shared},
             {"dense FFN", dense_ffn},
             {"norms", norms},
+            {"lm head (+ final norm)", head},
+            {"embedding gather", embedding},
         };
         for (const auto& row : rows)
             std::fprintf(out, "    %-34s %7.3f s  %5.1f%%\n",
                          row.name, row.value, 100.0 * row.value / total);
+        if (positions)
+            std::fprintf(out, "    %-34s %7.3f ms\n",
+                         "accounted per position", 1000.0 * total / positions);
     }
 };
 
@@ -268,6 +282,9 @@ inline std::size_t row_bytes(std::uint32_t type, std::size_t elements) {
         case 17: return elements / kBlockElements * kIq2xsBlockBytes;
         case 18: return elements / kBlockElements * kIq3xxsBlockBytes;
         case 19: return elements / kBlockElements * kIq1sBlockBytes;
+        // IQ4_NL blocks 32 values, not 256: a quantizer emits it precisely for
+        // the rows a superblock format cannot tile.
+        case 20: return elements / kIq4nlBlockElements * kIq4nlBlockBytes;
         case 21: return elements / kBlockElements * kIq3sBlockBytes;
         case 22: return elements / kBlockElements * kIq2sBlockBytes;
         case 23: return elements / kBlockElements * kIq4xsBlockBytes;
@@ -300,6 +317,7 @@ inline void row_decode(const std::uint8_t* row, std::uint32_t type,
         case 17: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq2xs_value(row, i); return;
         case 18: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq3xxs_value(row, i); return;
         case 19: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq1s_value(row, i); return;
+        case 20: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq4nl_value(row, i); return;
         case 21: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq3s_value(row, i); return;
         case 22: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq2s_value(row, i); return;
         case 23: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq4xs_value(row, i); return;
@@ -354,6 +372,7 @@ inline float row_dot(const std::uint8_t* row, std::uint32_t type,
         case 17: return qwen_iq2xs_dot_row(row, input, static_cast<int>(elements), 0);
         case 18: return qwen_iq3xxs_dot_row(row, input, static_cast<int>(elements), 0);
         case 19: return qwen_iq1s_dot_row(row, input, static_cast<int>(elements), 0);
+        case 20: return qwen_iq4nl_dot_row(row, input, static_cast<int>(elements), 0);
         case 21: return qwen_iq3s_dot_row(row, input, static_cast<int>(elements), 0);
         case 22: return qwen_iq2s_dot_row(row, input, static_cast<int>(elements), 0);
         case 23: return qwen_iq4xs_dot_row(row, input, static_cast<int>(elements), 0);
@@ -647,54 +666,72 @@ inline int matvec_threads() {
 // scalar single-threaded version ran at ~4 GFLOP/s on a 32-core machine, which
 // is one or two orders of magnitude off what the hardware can do.
 //
+// The kernel choice for one storage, resolved once and then applied row by
+// row. Split out of `matvec` so a CALLER can own the parallel region: the
+// routed experts want all of a layer's rows under one `omp parallel`, and
+// calling matvec per expert per projection fires 24 regions where 2 will do.
+//
+// Admission is per ISA and per type, and MUST stay an allowlist: the SIMD
+// entry points decode a type they do not recognize as Q8_0 rather than
+// rejecting it, so a type that falls through by default is silently
+// mis-decoded, not caught.
+struct RowKernel {
+    enum class Path { Scalar, Avx2, Avx512 };
+    Path path = Path::Scalar;
+    std::uint32_t type = 0;
+    std::size_t stride = 0;
+
+    float operator()(const std::uint8_t* base, const float* input,
+                     std::size_t inputs, std::size_t row) const {
+#ifndef COLIBRI_BAILING_NO_SIMD
+        if (path == Path::Avx512)
+            return qwen_quant_dot_avx512(base, type, input,
+                                         static_cast<int>(inputs), row);
+        if (path == Path::Avx2)
+            return qwen_quant_dot_avx2(base, type, input,
+                                       static_cast<int>(inputs), row);
+#endif
+        return row_dot(base + row * stride, type, input, inputs);
+    }
+};
+
+inline RowKernel row_kernel(std::uint32_t type, std::size_t inputs) {
+    RowKernel kernel;
+    kernel.type = type;
+    kernel.stride = row_bytes(type, inputs);
+#ifndef COLIBRI_BAILING_NO_SIMD
+    // The SIMD kernels index rows themselves and want whole granules.
+    if (type != 0 && inputs % simd_dot_granule(type) == 0) {
+        const auto features = colibri_cpu_features();
+        if ((features & 2u) && simd_dot_avx512_type(type))
+            kernel.path = RowKernel::Path::Avx512;
+        else if ((features & 1u) && simd_dot_avx2_type(type))
+            kernel.path = RowKernel::Path::Avx2;
+    }
+#endif
+    return kernel;
+}
+
 // The threshold keeps the small projections -- the 16-wide head gate, the
 // router -- out of the thread pool, where the fork cost dominates the work.
 inline void matvec(
     Matrix weights, const float* input,
     std::size_t inputs, std::size_t outputs, float* output
 ) {
-    const auto stride = row_bytes(weights.type, inputs);
     const auto* base = reinterpret_cast<const std::uint8_t*>(weights.data);
-    const auto type = weights.type;
-
-    // Pick the widest available kernel once, outside the row loop. Admission
-    // is per ISA and per type: the entry points decode unknown types as Q8_0
-    // rather than rejecting them, so anything off the allowlist must take the
-    // scalar path.
-    enum class Path { Scalar, Avx2, Avx512 };
-    Path path = Path::Scalar;
-#ifndef COLIBRI_BAILING_NO_SIMD
-    // The SIMD kernels index rows themselves and want whole granules.
-    if (type != 0 && inputs % simd_dot_granule(type) == 0) {
-        const auto features = colibri_cpu_features();
-        if ((features & 2u) && simd_dot_avx512_type(type)) path = Path::Avx512;
-        else if ((features & 1u) && simd_dot_avx2_type(type)) path = Path::Avx2;
-    }
-#endif
-    const auto compute = [&](std::int64_t row) -> float {
-        const auto index = static_cast<std::size_t>(row);
-#ifndef COLIBRI_BAILING_NO_SIMD
-        if (path == Path::Avx512)
-            return qwen_quant_dot_avx512(base, type, input,
-                                         static_cast<int>(inputs), index);
-        if (path == Path::Avx2)
-            return qwen_quant_dot_avx2(base, type, input,
-                                       static_cast<int>(inputs), index);
-#endif
-        (void)path;
-        return row_dot(base + index * stride, type, input, inputs);
-    };
+    const auto kernel = row_kernel(weights.type, inputs);
 
 #ifdef _OPENMP
     if (outputs * inputs >= 65536) {
 #pragma omp parallel for schedule(static) num_threads(matvec_threads())
         for (std::int64_t row = 0; row < static_cast<std::int64_t>(outputs); ++row)
-            output[row] = compute(row);
+            output[row] = kernel(base, input, inputs,
+                                 static_cast<std::size_t>(row));
         return;
     }
 #endif
     for (std::size_t row = 0; row < outputs; ++row)
-        output[row] = compute(static_cast<std::int64_t>(row));
+        output[row] = kernel(base, input, inputs, row);
 }
 
 // One token through a sparse MoE block: route, run the chosen experts, add the
@@ -727,19 +764,18 @@ inline void moe_block(
     float weight_scale,
     bool normalize,
     float swiglu_limit,
+    float shared_swiglu_limit,
     float* output
 ) {
     std::vector<float> logits(experts);
+    ProfileScope* route = new ProfileScope(profile().moe_route);
     matvec(router_weights, hidden, hidden_size, experts, logits.data());
 
     std::vector<std::int32_t> chosen(used);
     std::vector<float> weights(used);
     moe_router(logits.data(), router_bias, experts, used, groups, groups_used,
                weight_scale, normalize, chosen.data(), weights.data());
-
-    for (std::size_t i = 0; i < hidden_size; ++i) output[i] = 0.0f;
-    std::vector<float> gate(expert_size), up(expert_size), activated(expert_size),
-        projected(hidden_size);
+    delete route;
 
     // One expert's slice, in bytes: the stacked block is expert-major, so the
     // stride is however much one expert's matrix occupies in its own storage.
@@ -749,24 +785,72 @@ inline void moe_block(
     const auto* up_base = reinterpret_cast<const std::uint8_t*>(up_experts.data);
     const auto* down_base = reinterpret_cast<const std::uint8_t*>(down_experts.data);
 
-    for (std::size_t slot = 0; slot < used; ++slot) {
-        const auto expert = static_cast<std::size_t>(chosen[slot]);
-        matvec({gate_base + expert * narrow_stride, gate_experts.type}, hidden,
-               hidden_size, expert_size, gate.data());
-        matvec({up_base + expert * narrow_stride, up_experts.type}, hidden,
-               hidden_size, expert_size, up.data());
-        swiglu(gate.data(), up.data(), expert_size, swiglu_limit, activated.data());
-        matvec({down_base + expert * wide_stride, down_experts.type},
-               activated.data(), expert_size, hidden_size, projected.data());
-        const float weight = weights[slot];
-        for (std::size_t i = 0; i < hidden_size; ++i) output[i] += projected[i] * weight;
+    // All the chosen experts at once, in TWO parallel regions rather than the
+    // three-per-expert that calling matvec here used to make.
+    //
+    // This matters because of what the expert weights are. At IQ2_XXS a single
+    // core sustains ~3 GB/s -- the grid lookup is the cost, not the load -- so
+    // unlike every other phase in this layer, the experts genuinely need all
+    // the cores. But each individual projection is only ~0.5 MB, and 24 forks
+    // a layer (960 a token, at 40 MoE layers) spend more on entering and
+    // leaving the thread pool than they recover. Measured on Ling 3.0 Flash's
+    // geometry: 29.8 GB/s per-expert against 40.5 GB/s fused, same kernel and
+    // same bytes.
+    ProfileScope* work = new ProfileScope(profile().moe_experts);
+    std::vector<float> activated(used * expert_size);
+    {
+        // gate and up over every chosen expert. Row r decodes to (half, slot,
+        // row): the two halves are laid end to end so one loop covers both.
+        std::vector<float> gate_up(2 * used * expert_size);
+        const auto narrow_kernel = row_kernel(gate_experts.type, hidden_size);
+        const auto rows = static_cast<std::int64_t>(2 * used * expert_size);
+        const auto span = static_cast<std::int64_t>(used * expert_size);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(matvec_threads())
+#endif
+        for (std::int64_t r = 0; r < rows; ++r) {
+            const bool is_up = r >= span;
+            const auto within = static_cast<std::size_t>(is_up ? r - span : r);
+            const auto slot = within / expert_size, row = within % expert_size;
+            const auto expert = static_cast<std::size_t>(chosen[slot]);
+            const auto* base = (is_up ? up_base : gate_base) + expert * narrow_stride;
+            gate_up[static_cast<std::size_t>(r)] =
+                narrow_kernel(base, hidden, hidden_size, row);
+        }
+        swiglu(gate_up.data(), gate_up.data() + used * expert_size,
+               used * expert_size, swiglu_limit, activated.data());
     }
+    {
+        // The down projection accumulates into `output`, so parallelize over
+        // OUTPUT rows and keep the expert loop inside: every thread then owns
+        // its rows outright and no reduction is needed. Same shape as the
+        // device's bailing_q6_expert_accumulate_rows.
+        const auto down_kernel = row_kernel(down_experts.type, expert_size);
+        const auto rows = static_cast<std::int64_t>(hidden_size);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(matvec_threads())
+#endif
+        for (std::int64_t r = 0; r < rows; ++r) {
+            const auto row = static_cast<std::size_t>(r);
+            float total = 0.0f;
+            for (std::size_t slot = 0; slot < used; ++slot) {
+                const auto expert = static_cast<std::size_t>(chosen[slot]);
+                total += weights[slot] * down_kernel(
+                    down_base + expert * wide_stride,
+                    activated.data() + slot * expert_size, expert_size, row);
+            }
+            output[row] = total;
+        }
+    }
+    delete work;
 
     if (shared_gate && shared_up && shared_down && shared_size) {
-        std::vector<float> sg(shared_size), su(shared_size), sa(shared_size);
+        ProfileScope shared(profile().moe_shared);
+        std::vector<float> sg(shared_size), su(shared_size), sa(shared_size),
+            projected(hidden_size);
         matvec(shared_gate, hidden, hidden_size, shared_size, sg.data());
         matvec(shared_up, hidden, hidden_size, shared_size, su.data());
-        swiglu(sg.data(), su.data(), shared_size, swiglu_limit, sa.data());
+        swiglu(sg.data(), su.data(), shared_size, shared_swiglu_limit, sa.data());
         matvec(shared_down, sa.data(), shared_size, hidden_size, projected.data());
         for (std::size_t i = 0; i < hidden_size; ++i) output[i] += projected[i];
     }
@@ -793,16 +877,24 @@ struct LayerRequirements {
 };
 
 inline LayerRequirements layer_requirements(
-    bool full_attention, bool routed_experts, bool shared_expert
+    bool full_attention, bool routed_experts, bool shared_expert,
+    bool query_lora
 ) {
     LayerRequirements out;
     out.full_attention = full_attention;
     out.names = {"attn_norm.weight", "ffn_norm.weight"};
     if (full_attention) {
-        // MLA: low-rank query, compressed KV with a shared rope tail, and the
-        // head-wise output gate that DeepSeek's MLA does not have.
+        // MLA: compressed KV with a shared rope tail, and the head-wise output
+        // gate that DeepSeek's MLA does not have. The query is low-rank only
+        // when the checkpoint declares a rank -- Ling 3.0 Flash does not, and
+        // carries an un-factored `attn_q` instead of the q_a/q_b pair.
+        if (query_lora)
+            for (const char* name : {
+                     "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight"})
+                out.names.push_back(name);
+        else
+            out.names.push_back("attn_q.weight");
         for (const char* name : {
-                 "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
                  "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
                  "attn_kv_b.weight", "attn_output.weight", "attn_gate.weight"})
             out.names.push_back(name);
@@ -1208,11 +1300,17 @@ struct Geometry {
     std::size_t dense_size = 0, expert_size = 0, shared_size = 0;
     std::size_t experts = 0, experts_used = 0, groups = 0, groups_used = 0;
     float rope_theta = 0.0f, epsilon = 1e-6f;
-    float weight_scale = 1.0f, swiglu_limit = 0.0f;
+    float weight_scale = 1.0f;
     bool normalize_weights = true;
 };
 
 struct MlaWeights {
+    // The query arrives one of two ways, selected by `Geometry::q_lora`. The
+    // large checkpoints factor it (q_a -> RMS norm -> q_b, the DeepSeek-V2
+    // shape); Ling 3.0 Flash sets `q_lora_rank: null` and projects hidden
+    // straight to heads*qk, so `q` is set and the three below are not. Both
+    // land in the same `query` buffer, and everything after is identical.
+    Matrix q;
     Matrix q_a;
     const float* q_a_norm = nullptr;
     Matrix q_b;
@@ -1264,6 +1362,12 @@ struct LayerWeights {
     bool routed = false;
     const float* attention_norm = nullptr;
     const float* ffn_norm = nullptr;
+    // The SwiGLU clamps are per LAYER and differ between the routed experts
+    // and the shared one, so they live here rather than in Geometry. Ling 3.0
+    // Flash turns them on only for the last eight blocks (4.0 routed; 5.0 then
+    // 7.0 shared) and leaves the rest at zero, which reads as "off".
+    float swiglu_limit_exp = 0.0f;
+    float swiglu_limit_shexp = 0.0f;
     MlaWeights mla;
     KdaWeights kda;
     FfnWeights ffn;
@@ -1316,10 +1420,15 @@ inline void mla_step(
                       static_cast<std::int32_t>(position), g.rope_theta);
     cache.positions = position + 1;
 
-    std::vector<float> low_rank(g.q_lora), normalized(g.q_lora), query(g.heads * qk);
-    matvec(w.q_a, hidden, g.hidden, g.q_lora, low_rank.data());
-    rms_norm(low_rank.data(), w.q_a_norm, g.q_lora, g.epsilon, normalized.data());
-    matvec(w.q_b, normalized.data(), g.q_lora, g.heads * qk, query.data());
+    std::vector<float> query(g.heads * qk);
+    if (g.q_lora) {
+        std::vector<float> low_rank(g.q_lora), normalized(g.q_lora);
+        matvec(w.q_a, hidden, g.hidden, g.q_lora, low_rank.data());
+        rms_norm(low_rank.data(), w.q_a_norm, g.q_lora, g.epsilon, normalized.data());
+        matvec(w.q_b, normalized.data(), g.q_lora, g.heads * qk, query.data());
+    } else {
+        matvec(w.q, hidden, g.hidden, g.heads * qk, query.data());
+    }
     for (std::size_t head = 0; head < g.heads; ++head)
         partial_rope_norm(query.data() + head * qk, qk, g.qk_rope,
                           static_cast<std::int32_t>(position), g.rope_theta);
@@ -1490,7 +1599,7 @@ inline void moe_block_batch(
     std::size_t hidden_size, std::size_t expert_size, std::size_t shared_size,
     std::size_t experts, std::size_t used, std::size_t groups,
     std::size_t groups_used, float weight_scale, bool normalize,
-    float swiglu_limit, float* output
+    float swiglu_limit, float shared_swiglu_limit, float* output
 ) {
     std::vector<float> logits(tokens * experts);
     ProfileScope* route = new ProfileScope(profile().moe_route);
@@ -1570,7 +1679,7 @@ inline void moe_block_batch(
             sa(tokens * shared_size), sp(tokens * hidden_size);
         matmul(shared_gate, hidden, tokens, hidden_size, shared_size, sg.data());
         matmul(shared_up, hidden, tokens, hidden_size, shared_size, su.data());
-        swiglu(sg.data(), su.data(), tokens * shared_size, swiglu_limit, sa.data());
+        swiglu(sg.data(), su.data(), tokens * shared_size, shared_swiglu_limit, sa.data());
         matmul(shared_down, sa.data(), tokens, shared_size, hidden_size, sp.data());
         for (std::size_t i = 0; i < tokens * hidden_size; ++i) output[i] += sp[i];
     }
@@ -1587,26 +1696,39 @@ inline void decoder_layer(
 ) {
     std::vector<float> normalized(g.hidden), branch(g.hidden), residual(g.hidden);
 
-    rms_norm(input, w.attention_norm, g.hidden, g.epsilon, normalized.data());
-    if (w.full_attention)
+    // Instrumented with the same buckets as the batched path. It went without
+    // for a long time, and the consequence was worse than a missing number:
+    // `decoder_layer_batch` delegates here at tokens == 1, so every DECODE
+    // token was invisible and the profile silently reported prefill only.
+    if (profiling()) profile().tokens += 1;
+    { ProfileScope scope(profile().norms);
+      rms_norm(input, w.attention_norm, g.hidden, g.epsilon, normalized.data()); }
+    if (w.full_attention) {
+        ProfileScope scope(profile().mla);
         mla_step(normalized.data(), w.mla, g, position, cache, branch.data());
-    else
+    } else {
+        ProfileScope scope(profile().kda);
         kda_step(normalized.data(), w.kda, g, cache, branch.data());
+    }
     for (std::size_t i = 0; i < g.hidden; ++i) residual[i] = input[i] + branch[i];
 
-    rms_norm(residual.data(), w.ffn_norm, g.hidden, g.epsilon, normalized.data());
+    { ProfileScope scope(profile().norms);
+      rms_norm(residual.data(), w.ffn_norm, g.hidden, g.epsilon, normalized.data()); }
     if (w.routed) {
+        ProfileScope scope(profile().moe);
         moe_block(normalized.data(), w.ffn.router, w.ffn.router_bias,
                   w.ffn.gate_experts, w.ffn.up_experts, w.ffn.down_experts,
                   w.ffn.shared_gate, w.ffn.shared_up, w.ffn.shared_down,
                   g.hidden, g.expert_size, g.shared_size, g.experts,
                   g.experts_used, g.groups, g.groups_used, g.weight_scale,
-                  g.normalize_weights, g.swiglu_limit, branch.data());
+                  g.normalize_weights, w.swiglu_limit_exp, w.swiglu_limit_shexp,
+                  branch.data());
     } else {
+        ProfileScope scope(profile().dense_ffn);
         std::vector<float> gate(g.dense_size), up(g.dense_size), activated(g.dense_size);
         matvec(w.ffn.gate, normalized.data(), g.hidden, g.dense_size, gate.data());
         matvec(w.ffn.up, normalized.data(), g.hidden, g.dense_size, up.data());
-        swiglu(gate.data(), up.data(), g.dense_size, g.swiglu_limit, activated.data());
+        swiglu(gate.data(), up.data(), g.dense_size, w.swiglu_limit_exp, activated.data());
         matvec(w.ffn.down, activated.data(), g.dense_size, g.hidden, branch.data());
     }
     for (std::size_t i = 0; i < g.hidden; ++i) output[i] = residual[i] + branch[i];
@@ -1650,11 +1772,16 @@ inline void decoder_layer_batch(
             query(tokens * g.heads * qk), compressed(tokens * (g.kv_lora + g.qk_rope)),
             gate(tokens * g.heads), attended(tokens * g.heads * g.v_head_dim);
         ProfileScope* stage = new ProfileScope(profile().projections);
-        matmul(w.mla.q_a, normalized.data(), tokens, hidden, g.q_lora, low_rank.data());
-        for (std::size_t t = 0; t < tokens; ++t)
-            rms_norm(low_rank.data() + t * g.q_lora, w.mla.q_a_norm, g.q_lora,
-                     g.epsilon, qnorm.data() + t * g.q_lora);
-        matmul(w.mla.q_b, qnorm.data(), tokens, g.q_lora, g.heads * qk, query.data());
+        if (g.q_lora) {
+            matmul(w.mla.q_a, normalized.data(), tokens, hidden, g.q_lora, low_rank.data());
+            for (std::size_t t = 0; t < tokens; ++t)
+                rms_norm(low_rank.data() + t * g.q_lora, w.mla.q_a_norm, g.q_lora,
+                         g.epsilon, qnorm.data() + t * g.q_lora);
+            matmul(w.mla.q_b, qnorm.data(), tokens, g.q_lora, g.heads * qk, query.data());
+        } else {
+            matmul(w.mla.q, normalized.data(), tokens, hidden, g.heads * qk,
+                   query.data());
+        }
         matmul(w.mla.kv_a_mqa, normalized.data(), tokens, hidden,
                g.kv_lora + g.qk_rope, compressed.data());
         matmul(w.mla.gate, normalized.data(), tokens, hidden, g.heads, gate.data());
@@ -1751,14 +1878,15 @@ inline void decoder_layer_batch(
                         w.ffn.shared_gate, w.ffn.shared_up, w.ffn.shared_down,
                         hidden, g.expert_size, g.shared_size, g.experts,
                         g.experts_used, g.groups, g.groups_used, g.weight_scale,
-                        g.normalize_weights, g.swiglu_limit, branch.data());
+                        g.normalize_weights, w.swiglu_limit_exp,
+                        w.swiglu_limit_shexp, branch.data());
     } else {
         ProfileScope scope(profile().dense_ffn);
         std::vector<float> gate(tokens * g.dense_size), up(tokens * g.dense_size),
             activated(tokens * g.dense_size);
         matmul(w.ffn.gate, normalized.data(), tokens, hidden, g.dense_size, gate.data());
         matmul(w.ffn.up, normalized.data(), tokens, hidden, g.dense_size, up.data());
-        swiglu(gate.data(), up.data(), tokens * g.dense_size, g.swiglu_limit,
+        swiglu(gate.data(), up.data(), tokens * g.dense_size, w.swiglu_limit_exp,
                activated.data());
         matmul(w.ffn.down, activated.data(), tokens, g.dense_size, hidden, branch.data());
     }

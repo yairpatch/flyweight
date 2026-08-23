@@ -4735,7 +4735,7 @@ void bailing_validate_plan(const ColibriV2Model& m) {
         full?++full_layers:++linear_layers;
         const bool routed=config.expert_count&&layer>=config.leading_dense_block_count;
         const auto plan=bailing::layer_requirements(
-            full,routed,config.expert_shared_count!=0);
+            full,routed,config.expert_shared_count!=0,config.q_lora_rank!=0);
         const std::string prefix="blk."+std::to_string(layer)+".";
         for(const char* suffix:plan.names)
             if(!present.count(prefix+suffix))
@@ -4743,12 +4743,23 @@ void bailing_validate_plan(const ColibriV2Model& m) {
                     "bailingmoe3 layer "+std::to_string(layer)+" is missing "+
                     prefix+suffix);
     }
+    // The clamp counts are reported because they are otherwise invisible: a
+    // checkpoint that carries them and a runtime that drops them differ only
+    // in the tails of the last few layers' activations.
+    const auto clamped=[](const std::vector<float>& limits){
+        std::uint32_t count=0;
+        for(const float limit:limits)if(limit>0.0f)++count;
+        return count;
+    };
     std::fprintf(stderr,
         "[colibri-v2] bailingmoe3: %u layers (%u MLA, %u KDA), %u experts "
-        "top-%u in %u groups keeping %u, %u shared\n",
+        "top-%u in %u groups keeping %u, %u shared, query %s, "
+        "swiglu clamp on %u routed / %u shared layers\n",
         config.layer_count,full_layers,linear_layers,config.expert_count,
         config.expert_used_count,config.expert_group_count,
-        config.expert_group_used,config.expert_shared_count);
+        config.expert_group_used,config.expert_shared_count,
+        config.q_lora_rank?"low-rank":"un-factored",
+        clamped(config.swiglu_clamp_exp),clamped(config.swiglu_clamp_shexp));
 }
 
 // A llama.cpp-style bailingmoe3 GGUF is not this runtime's internal layout
@@ -5390,7 +5401,8 @@ struct BailingGpuMatrix {
 };
 
 struct BailingGpuLayer {
-    BailingGpuMatrix q_a, q_b, kv_a_mqa, attn_gate, attn_output;
+    // `q` and the q_a/q_b pair are alternatives, not both: see MlaWeights.
+    BailingGpuMatrix q, q_a, q_b, kv_a_mqa, attn_gate, attn_output;
     std::uint64_t q_a_norm = 0, kv_a_norm = 0, kv_b = 0;
     BailingGpuMatrix ssm_q, ssm_k, ssm_v, ssm_f, ssm_b, ssm_g, ssm_out;
     std::uint64_t ssm_q_conv = 0, ssm_k_conv = 0, ssm_v_conv = 0;
@@ -5617,6 +5629,23 @@ std::uint64_t bailing_slot_device_bytes(const ColibriV2BailingRuntime& runtime) 
     return bytes;
 }
 
+// Whether a tensor belongs to a `blk.N` past the end of the decoder stack --
+// the MTP draft block, and anything else a converter appends. `layer_count` is
+// already trimmed to the executed stack by detect_mtp_layer, so the index is
+// the whole test.
+bool bailing_tensor_is_unexecuted_block(const ColibriV2Model& m,
+                                        const std::string& name) {
+    if (name.rfind("blk.", 0) != 0) return false;
+    const auto dot = name.find('.', 4);
+    if (dot == std::string::npos) return false;
+    std::uint64_t index = 0;
+    for (std::size_t i = 4; i < dot; ++i) {
+        if (name[i] < '0' || name[i] > '9') return false;
+        index = index * 10 + static_cast<std::uint64_t>(name[i] - '0');
+    }
+    return index >= m.config.layer_count;
+}
+
 // Whether the bailing decode path has a device matvec for this storage --
 // exactly the case list of qwen_gpu_matvec_by_type. Checked before anything is
 // uploaded, because the alternative is discovering the gap as a throw out of
@@ -5642,8 +5671,15 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     const auto& c = m.config;
     const auto& g = runtime.geometry;
 
+    // Only what the decoder stack actually runs gets a vote here. A GGUF can
+    // carry blocks past `layer_count` -- the MTP draft block is one, and
+    // quantizers give it its own storage (Ling 3.0 Flash writes the whole
+    // block at Q4_0) -- and nothing uploads or executes them. Letting such a
+    // tensor veto the device path costs the whole model its GPU over bytes
+    // that are never read.
     for (const auto& tensor : m.tensors) {
         if (tensor.shape.size() < 2) continue;
+        if (bailing_tensor_is_unexecuted_block(m, tensor.name)) continue;
         if (!bailing_gpu_weight_type(tensor.type))
             throw std::runtime_error(
                 "bailingmoe3 " + tensor.name + " is stored as type " +
@@ -5697,9 +5733,13 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
         L.attn_norm = bailing_gpu_upload(gpu, m, prefix + "attn_norm.weight");
         L.ffn_norm = bailing_gpu_upload(gpu, m, prefix + "ffn_norm.weight");
         if (weights.full_attention) {
-            L.q_a = bailing_gpu_matrix(gpu, m, prefix + "attn_q_a.weight");
-            L.q_a_norm = bailing_gpu_upload(gpu, m, prefix + "attn_q_a_norm.weight");
-            L.q_b = bailing_gpu_matrix(gpu, m, prefix + "attn_q_b.weight");
+            if (g.q_lora) {
+                L.q_a = bailing_gpu_matrix(gpu, m, prefix + "attn_q_a.weight");
+                L.q_a_norm = bailing_gpu_upload(gpu, m, prefix + "attn_q_a_norm.weight");
+                L.q_b = bailing_gpu_matrix(gpu, m, prefix + "attn_q_b.weight");
+            } else {
+                L.q = bailing_gpu_matrix(gpu, m, prefix + "attn_q.weight");
+            }
             L.kv_a_mqa = bailing_gpu_matrix(gpu, m, prefix + "attn_kv_a_mqa.weight");
             L.kv_a_norm = bailing_gpu_upload(gpu, m, prefix + "attn_kv_a_norm.weight");
             L.attn_gate = bailing_gpu_matrix(gpu, m, prefix + "attn_gate.weight");
@@ -6030,10 +6070,14 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
         colibri_gpu_rms_norm(current, L.attn_norm, gpu.normalized,
                              static_cast<int>(g.hidden), g.epsilon, 0);
         if (weights.full_attention) {
-            matvec(L.q_a, gpu.normalized, gpu.wide_a, g.hidden, g.q_lora);
-            colibri_gpu_rms_norm(gpu.wide_a, L.q_a_norm, gpu.wide_b,
-                                 static_cast<int>(g.q_lora), g.epsilon, 0);
-            matvec(L.q_b, gpu.wide_b, gpu.wide_c, g.q_lora, g.heads * qk);
+            if (g.q_lora) {
+                matvec(L.q_a, gpu.normalized, gpu.wide_a, g.hidden, g.q_lora);
+                colibri_gpu_rms_norm(gpu.wide_a, L.q_a_norm, gpu.wide_b,
+                                     static_cast<int>(g.q_lora), g.epsilon, 0);
+                matvec(L.q_b, gpu.wide_b, gpu.wide_c, g.q_lora, g.heads * qk);
+            } else {
+                matvec(L.q, gpu.normalized, gpu.wide_c, g.hidden, g.heads * qk);
+            }
             matvec(L.kv_a_mqa, gpu.normalized, gpu.wide_d, g.hidden,
                    g.kv_lora + g.qk_rope);
             colibri_gpu_rms_norm(gpu.wide_d, L.kv_a_norm,
@@ -6321,7 +6365,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 matvec(eu, gpu.normalized, gpu.wide_b, g.hidden, g.expert_size);
                 {
                     int size = static_cast<int>(g.expert_size);
-                    float limit = g.swiglu_limit;
+                    float limit = weights.swiglu_limit_exp;
                     void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &size, &limit,
                                          &gpu.wide_c};
                     launch("bailing_swiglu", 32, 256, arguments);
@@ -6335,7 +6379,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 matvec(L.shared_gate, gpu.normalized, gpu.wide_a, g.hidden, g.shared_size);
                 matvec(L.shared_up, gpu.normalized, gpu.wide_b, g.hidden, g.shared_size);
                 int size = static_cast<int>(g.shared_size);
-                float limit = g.swiglu_limit;
+                float limit = weights.swiglu_limit_shexp;
                 void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &size, &limit, &gpu.wide_c};
                 launch("bailing_swiglu", 32, 256, arguments);
                 matvec(L.shared_down, gpu.wide_c, gpu.wide_b, g.shared_size, g.hidden);
@@ -6349,7 +6393,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
             matvec(L.gate_exps, gpu.normalized, gpu.wide_a, g.hidden, g.dense_size);
             matvec(L.up_exps, gpu.normalized, gpu.wide_b, g.hidden, g.dense_size);
             int size = static_cast<int>(g.dense_size);
-            float limit = g.swiglu_limit;
+            float limit = weights.swiglu_limit_exp;
             void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &size, &limit, &gpu.wide_c};
             launch("bailing_swiglu", 32, 256, arguments);
             matvec(L.down_exps, gpu.wide_c, next, g.dense_size, g.hidden);
@@ -6543,12 +6587,17 @@ void bailing_gpu_prefill_tiled(
             rms(current, layer.attn_norm, gpu.prefill_normalized, rows, hidden);
             q8_cached_input = 0;
             if (weights.full_attention) {
-                matmul(layer.q_a, gpu.prefill_normalized, gpu.prefill_wide_a,
-                       hidden, static_cast<int>(g.q_lora), rows);
-                rms(gpu.prefill_wide_a, layer.q_a_norm, gpu.prefill_wide_b,
-                    rows, static_cast<int>(g.q_lora));
-                matmul(layer.q_b, gpu.prefill_wide_b, gpu.prefill_wide_c,
-                       static_cast<int>(g.q_lora), heads * qk, rows);
+                if (g.q_lora) {
+                    matmul(layer.q_a, gpu.prefill_normalized, gpu.prefill_wide_a,
+                           hidden, static_cast<int>(g.q_lora), rows);
+                    rms(gpu.prefill_wide_a, layer.q_a_norm, gpu.prefill_wide_b,
+                        rows, static_cast<int>(g.q_lora));
+                    matmul(layer.q_b, gpu.prefill_wide_b, gpu.prefill_wide_c,
+                           static_cast<int>(g.q_lora), heads * qk, rows);
+                } else {
+                    matmul(layer.q, gpu.prefill_normalized, gpu.prefill_wide_c,
+                           hidden, heads * qk, rows);
+                }
                 matmul(layer.kv_a_mqa, gpu.prefill_normalized, gpu.prefill_wide_d,
                        hidden, lora + qk_rope, rows);
                 matmul(layer.attn_gate, gpu.prefill_normalized, gpu.prefill_wide_a,
@@ -6743,7 +6792,8 @@ void bailing_gpu_prefill_tiled(
                             const_cast<std::uint64_t*>(&narrow),
                             const_cast<int*>(&max_routes),
                             const_cast<int*>(&top_k), const_cast<int*>(&hidden),
-                            const_cast<int*>(&expert_size)};
+                            const_cast<int*>(&expert_size),
+                            const_cast<float*>(&weights.swiglu_limit_exp)};
                         if (mmq_expert)
                             launch("bailing_q6_q8_expert_swiglu_mmq_rows",
                                    (expert_size + 31) / 32, experts, 128,
@@ -6759,7 +6809,8 @@ void bailing_gpu_prefill_tiled(
                             const_cast<std::uint64_t*>(&narrow),
                             const_cast<int*>(&max_routes),
                             const_cast<int*>(&top_k), const_cast<int*>(&hidden),
-                            const_cast<int*>(&expert_size)};
+                            const_cast<int*>(&expert_size),
+                            const_cast<float*>(&weights.swiglu_limit_exp)};
                         launch("bailing_q6_expert_swiglu_grouped_rows",
                                expert_size, experts, 256, gate_args);
                     }
@@ -6804,7 +6855,8 @@ void bailing_gpu_prefill_tiled(
                         const_cast<std::uint64_t*>(&narrow),
                         const_cast<int*>(&rows), const_cast<int*>(&top_k),
                         const_cast<int*>(&hidden),
-                        const_cast<int*>(&expert_size)};
+                        const_cast<int*>(&expert_size),
+                        const_cast<float*>(&weights.swiglu_limit_exp)};
                     launch("bailing_q6_expert_swiglu_rows", expert_size,
                            rows * top_k, 256, gate_args);
                     void* down_args[] = {&layer.down_exps.data,
@@ -6828,7 +6880,8 @@ void bailing_gpu_prefill_tiled(
                     int elements = rows * static_cast<int>(g.shared_size);
                     void* swiglu_args[] = {&gpu.prefill_wide_a,
                         &gpu.prefill_wide_b, &elements,
-                        const_cast<float*>(&g.swiglu_limit), &gpu.prefill_wide_c};
+                        const_cast<float*>(&weights.swiglu_limit_shexp),
+                        &gpu.prefill_wide_c};
                     launch("bailing_swiglu", (elements + 255) / 256, 1, 256,
                            swiglu_args);
                     matmul(layer.shared_down, gpu.prefill_wide_c,
@@ -6850,7 +6903,8 @@ void bailing_gpu_prefill_tiled(
                 int elements = rows * dense_size;
                 void* swiglu_args[] = {&gpu.prefill_wide_a,
                     &gpu.prefill_wide_b, &elements,
-                    const_cast<float*>(&g.swiglu_limit), &gpu.prefill_wide_c};
+                    const_cast<float*>(&weights.swiglu_limit_exp),
+                    &gpu.prefill_wide_c};
                 launch("bailing_swiglu", (elements + 255) / 256, 1, 256,
                        swiglu_args);
                 matmul(layer.down_exps, gpu.prefill_wide_c, next,
@@ -6945,7 +6999,9 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
     g.epsilon = c.rms_norm_epsilon;
     g.weight_scale = c.expert_weights_scale;
     g.normalize_weights = c.expert_weights_norm;
-    g.swiglu_limit = 0.0f;
+    // The SwiGLU clamps are deliberately NOT here: they are per layer and
+    // differ between the routed and the shared half, so they are bound onto
+    // LayerWeights below.
 
     runtime->embedding_matrix = bailing_matrix(*model, "token_embd.weight");
     runtime->output_norm = bailing_f32(*model, "output_norm.weight");
@@ -6960,12 +7016,22 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
         w.full_attention = bailing::layer_is_full_attention(
             index, c.layer_count, c.full_attention_interval);
         w.routed = c.expert_count && index >= c.leading_dense_block_count;
+        // Absent arrays leave both clamps off, which is what every checkpoint
+        // before Ling 3.0 Flash wants.
+        if(index<c.swiglu_clamp_exp.size())
+            w.swiglu_limit_exp=c.swiglu_clamp_exp[index];
+        if(index<c.swiglu_clamp_shexp.size())
+            w.swiglu_limit_shexp=c.swiglu_clamp_shexp[index];
         w.attention_norm = bailing_f32(*model, prefix + "attn_norm.weight");
         w.ffn_norm = bailing_f32(*model, prefix + "ffn_norm.weight");
         if(w.full_attention){
-            w.mla.q_a = bailing_matrix(*model, prefix + "attn_q_a.weight");
-            w.mla.q_a_norm = bailing_f32(*model, prefix + "attn_q_a_norm.weight");
-            w.mla.q_b = bailing_matrix(*model, prefix + "attn_q_b.weight");
+            if(g.q_lora){
+                w.mla.q_a = bailing_matrix(*model, prefix + "attn_q_a.weight");
+                w.mla.q_a_norm = bailing_f32(*model, prefix + "attn_q_a_norm.weight");
+                w.mla.q_b = bailing_matrix(*model, prefix + "attn_q_b.weight");
+            } else {
+                w.mla.q = bailing_matrix(*model, prefix + "attn_q.weight");
+            }
             w.mla.kv_a_mqa = bailing_matrix(*model, prefix + "attn_kv_a_mqa.weight");
             w.mla.kv_a_norm = bailing_f32(*model, prefix + "attn_kv_a_norm.weight");
             {
@@ -7221,6 +7287,11 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
     // same path and degrades to the single-token one inside.
     std::vector<float> current(static_cast<std::size_t>(count) * g.hidden);
     std::vector<float> next(static_cast<std::size_t>(count) * g.hidden);
+    if(colibri::v2::bailing::profiling())
+        colibri::v2::bailing::profile().positions += count;
+    {
+    colibri::v2::bailing::ProfileScope gather(
+        colibri::v2::bailing::profile().embedding);
     for(std::uint32_t index=0;index<count;++index){
         const std::uint32_t token = tokens[index];
         if(token >= c.vocabulary_size)
@@ -7232,6 +7303,7 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
         colibri::v2::bailing::row_decode(base + static_cast<std::size_t>(token)*stride,
             runtime->embedding_matrix.type, g.hidden,
             current.data() + static_cast<std::size_t>(index) * g.hidden);
+    }
     }
     const std::size_t depth = runtime->layers.size();
     for(std::size_t layer=0;layer<depth;++layer){
@@ -7255,11 +7327,15 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
     // Only the last token's logits are produced; the earlier ones exist purely
     // to advance the caches.
     std::vector<float> normalized(g.hidden);
+    {
+    colibri::v2::bailing::ProfileScope stage(
+        colibri::v2::bailing::profile().head);
     const float* last = current.data() + static_cast<std::size_t>(count - 1) * g.hidden;
     colibri::v2::bailing::rms_norm(last, runtime->output_norm, g.hidden,
                                    g.epsilon, normalized.data());
     colibri::v2::bailing::matvec(runtime->head, normalized.data(), g.hidden,
                                  c.vocabulary_size, logits);
+    }
     if(watched) bailing_progress(*runtime, count, count);
     return 0; });
 }

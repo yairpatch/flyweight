@@ -856,3 +856,49 @@ inline float qwen_iq4xs_dot_row(
     }
     return result;
 }
+
+// IQ4_NL (GGML type 20): 18 bytes per 32 values -> d(2) qs[16]. The
+// non-superblock sibling of IQ4_XS -- same sixteen-level codebook, one f16
+// scale per 32 values and no sub-block scales. Quantizers fall back to it for
+// rows whose length is not a multiple of 256, which is why a checkpoint that
+// is otherwise IQ4_XS can still carry a handful of these (bailingmoe3's
+// per-head `attn_k_b`, 128 elements to a row, is exactly that case).
+//
+// The nibble order matches Q4_0 rather than IQ4_XS: byte j holds element j in
+// its low nibble and element j+16 in its high nibble.
+constexpr std::uint32_t kIq4nlBlockBytes = 18;
+constexpr std::uint32_t kIq4nlBlockElements = 32;
+
+inline float qwen_iq4nl_value(const std::uint8_t* packed, std::uint64_t absolute) {
+    const auto block = absolute / kIq4nlBlockElements;
+    const int within = static_cast<int>(absolute % kIq4nlBlockElements);
+    const auto* base = packed + block * kIq4nlBlockBytes;
+    std::uint16_t d_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    const std::uint8_t byte = base[2 + (within & 15)];
+    const int code = within < 16 ? (byte & 15) : (byte >> 4);
+    return qwen_half_value(d_bits) * kIq4nlValues[code];
+}
+
+inline float qwen_iq4nl_dot_row(
+    const std::uint8_t* packed, const float* input, int elements, std::uint64_t row
+) {
+    const int blocks = elements / static_cast<int>(kIq4nlBlockElements);
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(blocks) * kIq4nlBlockBytes;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        const auto* base = row_data + block * kIq4nlBlockBytes;
+        std::uint16_t d_bits = 0;
+        std::memcpy(&d_bits, base, 2);
+        const float* values = input + block * kIq4nlBlockElements;
+        float partial = 0.0f;
+        for (int element = 0; element < 16; ++element) {
+            const std::uint8_t byte = base[2 + element];
+            partial += kIq4nlValues[byte & 15] * values[element]
+                + kIq4nlValues[byte >> 4] * values[element + 16];
+        }
+        result += qwen_half_value(d_bits) * partial;
+    }
+    return result;
+}

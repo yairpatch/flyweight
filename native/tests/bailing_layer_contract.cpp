@@ -64,8 +64,18 @@ bool a_layer_with_no_weights_is_the_identity() {
         w.routed = false;
         w.attention_norm = ones.data();
         w.ffn_norm = ones.data();
-        w.mla = {zeros.data(), zeros.data(), zeros.data(), zeros.data(),
-                 zeros.data(), zeros.data(), zeros.data(), zeros.data()};
+        // Named rather than positional: MlaWeights gains members (the
+        // un-factored `q` did), and a positional list silently reassigns every
+        // field past the new one instead of failing to compile.
+        w.mla.q = zeros.data();
+        w.mla.q_a = zeros.data();
+        w.mla.q_a_norm = zeros.data();
+        w.mla.q_b = zeros.data();
+        w.mla.kv_a_mqa = zeros.data();
+        w.mla.kv_a_norm = zeros.data();
+        w.mla.kv_b = zeros.data();
+        w.mla.gate = zeros.data();
+        w.mla.output = zeros.data();
         w.kda = {zeros.data(), zeros.data(), zeros.data(), zeros.data(),
                  zeros.data(), zeros.data(), zeros.data(), zeros.data(),
                  zeros.data(), zeros.data(), zeros.data(), zeros.data(),
@@ -102,8 +112,15 @@ struct Fixture {
         weights.routed = false;
         weights.attention_norm = norm.data();
         weights.ffn_norm = norm.data();
-        weights.mla = {at(0), norm.data(), at(500), at(1500), norm.data(),
-                       at(2500), at(4000), at(5000)};
+        weights.mla.q = at(0);
+        weights.mla.q_a = at(0);
+        weights.mla.q_a_norm = norm.data();
+        weights.mla.q_b = at(500);
+        weights.mla.kv_a_mqa = at(1500);
+        weights.mla.kv_a_norm = norm.data();
+        weights.mla.kv_b = at(2500);
+        weights.mla.gate = at(4000);
+        weights.mla.output = at(5000);
         weights.kda = {at(0),    at(300),  at(600),  at(900),  at(1000),
                        at(1100), at(1200), at(1500), at(1800), at(2100),
                        at(2200), norm.data(), at(2400)};
@@ -213,6 +230,82 @@ bool a_long_run_stays_finite() {
     return true;
 }
 
+// Ling 3.0 Flash sets `q_lora_rank: null`: the MLA query projects straight
+// from hidden instead of through q_a -> RMS norm -> q_b. `q_lora == 0` is what
+// selects that, and the two must not agree -- if the branch were ignored the
+// factored weights would still be read and the outputs would coincide.
+//
+// The identity check matters more than the difference: with `q` zeroed and the
+// factored pair non-degenerate, an un-factored layer must produce no query at
+// all, which is only true if the low-rank path really was skipped.
+bool the_query_lora_can_be_absent() {
+    const Geometry factored = small_geometry();
+    Geometry direct = small_geometry();
+    direct.q_lora = 0;
+
+    std::vector<float> history(factored.hidden), probe(factored.hidden);
+    for (std::size_t i = 0; i < factored.hidden; ++i) {
+        history[i] = 0.3f * static_cast<float>(i) - 0.5f;
+        probe[i] = -0.45f * static_cast<float>(i % 3) + 0.8f;
+    }
+    // Position 0 cannot see the query at all -- softmax over one key is 1.0
+    // whatever the score -- so every comparison here reads the second token.
+    const auto second_token = [&](const LayerWeights& w, const Geometry& g) {
+        LayerCache cache;
+        reset_cache(cache, w, g, 4);
+        std::vector<float> scratch(g.hidden), out(g.hidden);
+        decoder_layer(history.data(), w, g, 0, cache, scratch.data());
+        decoder_layer(probe.data(), w, g, 1, cache, out.data());
+        return out;
+    };
+
+    Fixture fixture(factored, true);
+    const auto a = second_token(fixture.weights, factored);
+    const auto b = second_token(fixture.weights, direct);
+    float difference = 0.0f;
+    for (std::size_t i = 0; i < factored.hidden; ++i)
+        difference += std::fabs(a[i] - b[i]);
+    if (difference < 1e-4f) return false;
+
+    // Both shapes must reduce to the same thing when the query is zeroed --
+    // uniform attention. A branch that still ran the factored path under
+    // `q_lora == 0` would read the non-degenerate q_a/q_b here and diverge.
+    std::vector<float> zeros(4096, 0.0f);
+    Fixture muted_direct(factored, true), muted_factored(factored, true);
+    muted_direct.weights.mla.q = zeros.data();
+    muted_factored.weights.mla.q_a = zeros.data();
+    const auto c = second_token(muted_direct.weights, direct);
+    const auto d = second_token(muted_factored.weights, factored);
+    for (std::size_t i = 0; i < factored.hidden; ++i)
+        if (std::fabs(c[i] - d[i]) > 1e-6f) return false;
+    return true;
+}
+
+// The SwiGLU clamps are per layer and per half. A dense layer reads the routed
+// clamp; a limit tight enough to bind must change the output, and a limit of
+// zero must mean "off" rather than "clamp everything to zero".
+bool the_swiglu_clamp_is_per_layer() {
+    const Geometry g = small_geometry();
+    Fixture fixture(g, true);
+    std::vector<float> token(g.hidden), unclamped(g.hidden), clamped(g.hidden);
+    for (std::size_t i = 0; i < g.hidden; ++i)
+        token[i] = 1.7f * static_cast<float>(i % 4) - 2.0f;
+
+    LayerCache cache;
+    reset_cache(cache, fixture.weights, g, 4);
+    decoder_layer(token.data(), fixture.weights, g, 0, cache, unclamped.data());
+
+    fixture.weights.swiglu_limit_exp = 1e-3f;
+    LayerCache clamped_cache;
+    reset_cache(clamped_cache, fixture.weights, g, 4);
+    decoder_layer(token.data(), fixture.weights, g, 0, clamped_cache, clamped.data());
+
+    float difference = 0.0f;
+    for (std::size_t i = 0; i < g.hidden; ++i)
+        difference += std::fabs(unclamped[i] - clamped[i]);
+    return difference > 1e-6f;
+}
+
 }  // namespace
 
 int main() {
@@ -221,5 +314,7 @@ int main() {
     if (!only_the_mla_cache_grows_with_context()) return 3;
     if (!the_two_layer_kinds_differ()) return 4;
     if (!a_long_run_stays_finite()) return 5;
+    if (!the_query_lora_can_be_absent()) return 6;
+    if (!the_swiglu_clamp_is_per_layer()) return 7;
     return 0;
 }
