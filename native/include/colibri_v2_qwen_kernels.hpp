@@ -8972,7 +8972,8 @@ extern "C" __global__ void name( \
 }
 #define KV_ATTENTION_FUSED_TILES(name, KT, VT) \
     KV_ATTENTION_FUSED_TILES_W(name, KT, VT, 128) \
-    KV_ATTENTION_FUSED_TILES_W(name##256, KT, VT, 256)
+    KV_ATTENTION_FUSED_TILES_W(name##256, KT, VT, 256) \
+    KV_ATTENTION_FUSED_TILES_W(name##512, KT, VT, 512)
 KV_ATTENTION_FUSED_TILES(
     kv_attention_fused_f16_tiles, __half, __half
 )
@@ -9197,6 +9198,16 @@ extern "C" __global__ void kv_attention_fused_merge256(
     const int heads, const int head_dim, const int tile_count
 ) {
     kv_attention_fused_merge_impl<256>(
+        partial, output, heads, head_dim, tile_count);
+}
+
+// And the 512-dim twin, for Gemma 4's global-attention layers. The per-tile
+// shared buffer grows to 16 KB, still inside the static budget.
+extern "C" __global__ void kv_attention_fused_merge512(
+    const float* partial, float* output,
+    const int heads, const int head_dim, const int tile_count
+) {
+    kv_attention_fused_merge_impl<512>(
         partial, output, heads, head_dim, tile_count);
 }
 

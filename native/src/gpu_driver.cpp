@@ -1072,6 +1072,8 @@ extern "C" int colibri_gpu_compile(
              // (Qwen3.6 runs head_dim 256).
              "kv_attention_fused_f16_tiles256", "kv_attention_fused_bf16_tiles256",
              "kv_attention_fused_q8_tiles256", "kv_attention_fused_merge256",
+             "kv_attention_fused_f16_tiles512", "kv_attention_fused_bf16_tiles512",
+             "kv_attention_fused_q8_tiles512", "kv_attention_fused_merge512",
              // Grouped-query variants: one block per KV head, one warp per
              // query head, KV staged through shared memory.
              "kv_attention_gqa_f16_256_s8", "kv_attention_gqa_f16_256_s4",

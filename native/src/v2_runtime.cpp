@@ -12627,9 +12627,17 @@ inline const char* kv_fused_tiles_kernel256(const ColibriV2QwenRuntime& r){
            t==2?"kv_attention_fused_bf16_tiles256":
            t==1?"kv_attention_fused_f16_tiles256":nullptr;
 }
+// The 512-dim triplet, for Gemma 4's global layers.
+inline const char* kv_fused_tiles_kernel512(const ColibriV2QwenRuntime& r){
+    if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
+    const int t=r.options.cache_type_k;
+    return t==3?"kv_attention_fused_q8_tiles512":
+           t==2?"kv_attention_fused_bf16_tiles512":
+           t==1?"kv_attention_fused_f16_tiles512":nullptr;
+}
 // Width the fused path would run `head_dim` at, or 0 when it cannot.
 inline int kv_fused_width(int head_dim){
-    return head_dim==128?128:head_dim==256?256:0;
+    return head_dim==128?128:head_dim==256?256:head_dim==512?512:0;
 }
 // Grouped-query kernel for `share` query heads per KV head, or nullptr when the
 // shape is not one of the instantiated ones. Opt-out via COLIBRI_GQA_ATTENTION=0.
@@ -14174,17 +14182,50 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                               &slot,&capacity};
         launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,v_store_args);
         int tokens=view.tokens,first_slot=view.first;float attention_scale=1.0f;
-        void* score_args[]={const_cast<std::uint64_t*>(&fourth),&cache_keys,
-                            const_cast<std::uint64_t*>(&attention_scores),
-                            const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
-                            const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,
-                            &attention_scale};
-        launch(kv_scores_ring_kernel(runtime),heads,(tokens+255)/256,256,score_args);
-        void* value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,
-                            const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),
-                            const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
-                            &tokens,&capacity,&first_slot};
-        launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
+        // Tiled online-softmax attention keeps long-context occupancy: the
+        // values-ring kernel's heads-only grid was 70% of prefill GPU time at
+        // 13k for the same reason, and decode pays it once per token. The 512
+        // instantiation covers the five global layers.
+        static const bool env_fused_decode=[]{
+            const char*s=std::getenv("COLIBRI_GEMMA_FUSED_ATTENTION");
+            return !s||s[0]!='0';}();
+        const int fused_width=kv_fused_width(head_dim);
+        const char* fused_tiles_name=!env_fused_decode||!fused_width?nullptr
+            :fused_width==128?kv_fused_tiles_kernel(runtime)
+            :fused_width==256?kv_fused_tiles_kernel256(runtime)
+            :kv_fused_tiles_kernel512(runtime);
+        const int fused_tile_count=(tokens+1023)/1024;
+        if(fused_tiles_name&&heads/kv_heads<=8&&fused_tile_count<=512&&
+           static_cast<std::uint64_t>(fused_tile_count)*
+               kv_fused_record_stride(fused_width)<=runtime.options.context_limit){
+            void* fused_args[]={const_cast<std::uint64_t*>(&fourth),&cache_keys,
+                                &cache_values,
+                                const_cast<std::uint64_t*>(&attention_scores),
+                                const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                                const_cast<int*>(&head_dim),&tokens,&capacity,
+                                &first_slot,&attention_scale};
+            launch(fused_tiles_name,heads,fused_tile_count,256,fused_args);
+            void* merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
+                                const_cast<std::uint64_t*>(&third),
+                                const_cast<int*>(&heads),
+                                const_cast<int*>(&head_dim),
+                                const_cast<int*>(&fused_tile_count)};
+            launch(fused_width==128?"kv_attention_fused_merge"
+                   :fused_width==256?"kv_attention_fused_merge256"
+                   :"kv_attention_fused_merge512",heads,1,256,merge_args);
+        }else{
+            void* score_args[]={const_cast<std::uint64_t*>(&fourth),&cache_keys,
+                                const_cast<std::uint64_t*>(&attention_scores),
+                                const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                                const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,
+                                &attention_scale};
+            launch(kv_scores_ring_kernel(runtime),heads,(tokens+255)/256,256,score_args);
+            void* value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,
+                                const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),
+                                const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
+                                &tokens,&capacity,&first_slot};
+            launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
+        }
         q4(tensor(4),third,residual,q_elements,hidden_size);
         rms(residual,tensor(7),normalized);
         add(hidden,normalized);
@@ -15030,7 +15071,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             }else if(runtime->fused_attention&&kv_fused_width(head_dim)&&
                (kv_fused_width(head_dim)==128
                     ? fused_tiles
-                    : kv_fused_tiles_kernel256(*runtime))&&
+                    : kv_fused_width(head_dim)==256
+                        ? kv_fused_tiles_kernel256(*runtime)
+                        : kv_fused_tiles_kernel512(*runtime))&&
                heads/kv_heads<=8&&
                (tokens+fused_tile_tokens-1)/fused_tile_tokens<=512&&
                static_cast<std::uint64_t>((tokens+fused_tile_tokens-1)/fused_tile_tokens)*
@@ -15038,7 +15081,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                    runtime->options.context_limit){
                 const int width=kv_fused_width(head_dim);
                 const char* tiles=width==128
-                    ? fused_tiles : kv_fused_tiles_kernel256(*runtime);
+                    ? fused_tiles : width==256
+                        ? kv_fused_tiles_kernel256(*runtime)
+                        : kv_fused_tiles_kernel512(*runtime);
                 const int tile_count=(tokens+fused_tile_tokens-1)/fused_tile_tokens;
                 void*fused_args[]={&queries,&cache_keys,&cache_values,
                     const_cast<std::uint64_t*>(&attention_scores),
@@ -15050,7 +15095,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     const_cast<int*>(&head_dim),const_cast<int*>(&tile_count)};
                 launch_named(width==128
                         ? "kv_attention_fused_merge"
-                        : "kv_attention_fused_merge256",
+                        : width==256
+                            ? "kv_attention_fused_merge256"
+                            : "kv_attention_fused_merge512",
                     heads,1,256,merge_args);
             }else{
                 void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
