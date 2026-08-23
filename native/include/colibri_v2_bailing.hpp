@@ -30,10 +30,11 @@
 // decoders live beside their encoders in `src`.
 #include "qwen_kquant.h"
 
-// The AVX2/AVX-512 quantized row dots the CPU backend already carries. They
-// cover exactly the types the HF quantizer emits (Q8_0, Q4_K, Q5_K, Q6_K), so
-// there was no reason to write new ones -- these are already contract-tested
-// against the scalar decoders elsewhere in the tree.
+// The AVX2/AVX-512 quantized row dots the CPU backend already carries. Their
+// coverage is wider than what the HF quantizer emits -- K-quants, most IQ
+// formats, NVFP4, and the f16/bf16 rows -- and the allowlists beside row_dot
+// below record exactly which types each ISA serves, because the entry points
+// themselves decode anything unrecognized as Q8_0 rather than rejecting it.
 //
 // COLIBRI_BAILING_NO_SIMD lets a translation unit that does not link the AVX
 // objects (the standalone contract tests) fall back to the scalar path.
@@ -133,14 +134,146 @@ struct Matrix {
     explicit operator bool() const { return data != nullptr; }
 };
 
+// Element decoders for the storages qwen_kquant.h does not carry. All take a
+// ROW base pointer, matching how this header addresses weights. MXFP4 and
+// NVFP4 exist in the runtime too, but as .cpp-local functions this header
+// cannot reach; the layouts are documented there (v2_runtime.cpp, around the
+// kMxfp4/kNvfp4 constants) and verified against real checkpoints -- keep the
+// two transcriptions in lockstep.
+inline float f16_element(const std::uint8_t* row, std::size_t index) {
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, row + index * 2, 2);
+    return qwen_half_value(bits);
+}
+
+// bf16 is the top half of an f32, so widening is a shift.
+inline float bf16_element(const std::uint8_t* row, std::size_t index) {
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, row + index * 2, 2);
+    const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
+    float value;
+    std::memcpy(&value, &widened, sizeof(value));
+    return value;
+}
+
+// The llama.cpp legacy quants: 32-element blocks, nibbles split low-half /
+// high-half within the block -- byte j holds element j in its low nibble and
+// element j+16 in its high one. Q5's fifth bit for element i is bit i of the
+// 32-bit qh word.
+inline float q4_0_element(const std::uint8_t* row, std::size_t index) {
+    const auto* base = row + index / 32 * 18;
+    const int within = static_cast<int>(index & 31);
+    std::uint16_t d_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    const auto byte = base[2 + (within & 15)];
+    const int quant = (within < 16 ? (byte & 15) : (byte >> 4)) - 8;
+    return qwen_half_value(d_bits) * quant;
+}
+
+inline float q4_1_element(const std::uint8_t* row, std::size_t index) {
+    const auto* base = row + index / 32 * 20;
+    const int within = static_cast<int>(index & 31);
+    std::uint16_t d_bits = 0, m_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&m_bits, base + 2, 2);
+    const auto byte = base[4 + (within & 15)];
+    const int quant = within < 16 ? (byte & 15) : (byte >> 4);
+    return qwen_half_value(d_bits) * quant + qwen_half_value(m_bits);
+}
+
+inline float q5_0_element(const std::uint8_t* row, std::size_t index) {
+    const auto* base = row + index / 32 * 22;
+    const int within = static_cast<int>(index & 31);
+    std::uint16_t d_bits = 0;
+    std::uint32_t high = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&high, base + 2, 4);
+    const auto byte = base[6 + (within & 15)];
+    const int nibble = within < 16 ? (byte & 15) : (byte >> 4);
+    const int quant = static_cast<int>(nibble | (((high >> within) & 1u) << 4)) - 16;
+    return qwen_half_value(d_bits) * quant;
+}
+
+inline float q5_1_element(const std::uint8_t* row, std::size_t index) {
+    const auto* base = row + index / 32 * 24;
+    const int within = static_cast<int>(index & 31);
+    std::uint16_t d_bits = 0, m_bits = 0;
+    std::uint32_t high = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&m_bits, base + 2, 2);
+    std::memcpy(&high, base + 4, 4);
+    const auto byte = base[8 + (within & 15)];
+    const int quant = static_cast<int>(
+        (within < 16 ? (byte & 15) : (byte >> 4)) | (((high >> within) & 1u) << 4));
+    return qwen_half_value(d_bits) * quant + qwen_half_value(m_bits);
+}
+
+inline float mxfp4_element(const std::uint8_t* row, std::size_t index) {
+    // The FP4 codebook, doubled -- which is why the scale below is halved.
+    static constexpr float lut[16] = {
+        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+        0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
+    const auto* base = row + index / 32 * 17;
+    const int within = static_cast<int>(index & 31);
+    // E8M0 exponent to float, halved: 2^(x-128). Values below 2 land in the
+    // denormal range and are built from bit patterns rather than shifted.
+    const std::uint8_t exponent = base[0];
+    const std::uint32_t bits = exponent < 2
+        ? (0x00200000u << exponent)
+        : (static_cast<std::uint32_t>(exponent - 1) << 23);
+    float scale;
+    std::memcpy(&scale, &bits, sizeof(scale));
+    const auto byte = base[1 + (within & 15)];
+    return scale * lut[within < 16 ? (byte & 15) : (byte >> 4)];
+}
+
+inline float nvfp4_element(const std::uint8_t* row, std::size_t index) {
+    // E2M1 LUT: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives).
+    static constexpr float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    const auto* base = row + index / 64 * 36;
+    const int offset = static_cast<int>(index & 63);
+    const int sub = offset / 16, within = offset & 15;
+    // OCP "FN" E4M3 block scale: e==0xF is FINITE except mantissa 7 (NaN);
+    // there are no infinities, and real checkpoints do reach e==0xF.
+    const std::uint8_t bits = base[sub];
+    const int sign = (bits >> 7) & 1, e = (bits >> 3) & 0xF, m = bits & 7;
+    float scale;
+    if (e == 0xF && m == 7) scale = std::numeric_limits<float>::quiet_NaN();
+    else if (e == 0) scale = (m / 8.0f) * std::exp2(-6.0f);
+    else scale = std::exp2(static_cast<float>(e - 7)) * (1.0f + m / 8.0f);
+    if (sign) scale = -scale;
+    const auto byte = base[4 + sub * 8 + (within & 7)];
+    return scale * lut[within < 8 ? (byte & 15) : (byte >> 4)];
+}
+
 // Bytes one row of `elements` occupies in each supported storage.
 inline std::size_t row_bytes(std::uint32_t type, std::size_t elements) {
     switch (type) {
         case 0:  return elements * sizeof(float);
+        case 1:  return elements * 2;                                  // f16
+        case 30: return elements * 2;                                  // bf16
+        case 2:  return elements / 32 * 18;                            // Q4_0
+        case 3:  return elements / 32 * 20;                            // Q4_1
+        case 6:  return elements / 32 * 22;                            // Q5_0
+        case 7:  return elements / 32 * 24;                            // Q5_1
         case 8:  return elements / 32 * kQ8BlockSize;
+        case 10: return elements / kBlockElements * kQ2KBlockBytes;
+        case 11: return elements / kBlockElements * kQ3KBlockBytes;
         case 12: return elements / kBlockElements * kQ4KBlockSize;
         case 13: return elements / kBlockElements * kQ5KBlockSize;
         case 14: return elements / kBlockElements * kQ6KBlockSize;
+        case 16: return elements / kBlockElements * kIq2xxsBlockBytes;
+        case 17: return elements / kBlockElements * kIq2xsBlockBytes;
+        case 18: return elements / kBlockElements * kIq3xxsBlockBytes;
+        case 19: return elements / kBlockElements * kIq1sBlockBytes;
+        case 21: return elements / kBlockElements * kIq3sBlockBytes;
+        case 22: return elements / kBlockElements * kIq2sBlockBytes;
+        case 23: return elements / kBlockElements * kIq4xsBlockBytes;
+        case 29: return elements / kBlockElements * kIq1mBlockBytes;
+        case 39: return elements / 32 * 17;                            // MXFP4
+        case 40: return elements / 64 * 36;                            // NVFP4
         default: throw std::runtime_error(
             "bailing: unsupported weight type " + std::to_string(type));
     }
@@ -151,10 +284,28 @@ inline void row_decode(const std::uint8_t* row, std::uint32_t type,
                        std::size_t elements, float* output) {
     switch (type) {
         case 0:  std::memcpy(output, row, elements * sizeof(float)); return;
+        case 1:  for (std::size_t i = 0; i < elements; ++i) output[i] = f16_element(row, i); return;
+        case 30: for (std::size_t i = 0; i < elements; ++i) output[i] = bf16_element(row, i); return;
+        case 2:  for (std::size_t i = 0; i < elements; ++i) output[i] = q4_0_element(row, i); return;
+        case 3:  for (std::size_t i = 0; i < elements; ++i) output[i] = q4_1_element(row, i); return;
+        case 6:  for (std::size_t i = 0; i < elements; ++i) output[i] = q5_0_element(row, i); return;
+        case 7:  for (std::size_t i = 0; i < elements; ++i) output[i] = q5_1_element(row, i); return;
         case 8:  for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_q8_value(row, i); return;
+        case 10: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_q2k_value(row, i); return;
+        case 11: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_q3k_value(row, i); return;
         case 12: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_q4k_value(row, i); return;
         case 13: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_q5_value(row, i); return;
         case 14: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_q6_value(row, i); return;
+        case 16: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq2xxs_value(row, i); return;
+        case 17: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq2xs_value(row, i); return;
+        case 18: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq3xxs_value(row, i); return;
+        case 19: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq1s_value(row, i); return;
+        case 21: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq3s_value(row, i); return;
+        case 22: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq2s_value(row, i); return;
+        case 23: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq4xs_value(row, i); return;
+        case 29: for (std::size_t i = 0; i < elements; ++i) output[i] = qwen_iq1m_value(row, i); return;
+        case 39: for (std::size_t i = 0; i < elements; ++i) output[i] = mxfp4_element(row, i); return;
+        case 40: for (std::size_t i = 0; i < elements; ++i) output[i] = nvfp4_element(row, i); return;
         default: throw std::runtime_error(
             "bailing: unsupported weight type " + std::to_string(type));
     }
@@ -169,7 +320,11 @@ inline void matrix_decode(Matrix weights, std::size_t inputs, std::size_t output
         row_decode(base + row * stride, weights.type, inputs, output + row * inputs);
 }
 
-// Dot one stored row against an f32 vector.
+// Dot one stored row against an f32 vector. The K-quant helpers take the row
+// pointer directly; the qwen_kquant.h IQ helpers compute their own row offset,
+// so they are handed the row pointer as the matrix and row zero. The remaining
+// storages decode element-wise -- the correctness path; the SIMD entry points
+// carry the hot versions where they exist.
 inline float row_dot(const std::uint8_t* row, std::uint32_t type,
                      const float* input, std::size_t elements) {
     switch (type) {
@@ -179,13 +334,72 @@ inline float row_dot(const std::uint8_t* row, std::uint32_t type,
             for (std::size_t i = 0; i < elements; ++i) total += values[i] * input[i];
             return total;
         }
+        case 1: {
+            float total = 0.0f;
+            for (std::size_t i = 0; i < elements; ++i) total += f16_element(row, i) * input[i];
+            return total;
+        }
+        case 30: {
+            float total = 0.0f;
+            for (std::size_t i = 0; i < elements; ++i) total += bf16_element(row, i) * input[i];
+            return total;
+        }
         case 8:  return qwen_q8_dot_row(row, input, elements);
         case 12: return qwen_q4k_dot_row(row, input, elements);
         case 13: return qwen_q5k_dot_row(row, input, elements);
         case 14: return qwen_q6k_dot_row(row, input, elements);
+        case 10: return qwen_q2k_dot_row(row, input, static_cast<int>(elements), 0);
+        case 11: return qwen_q3k_dot_row(row, input, static_cast<int>(elements), 0);
+        case 16: return qwen_iq2xxs_dot_row(row, input, static_cast<int>(elements), 0);
+        case 17: return qwen_iq2xs_dot_row(row, input, static_cast<int>(elements), 0);
+        case 18: return qwen_iq3xxs_dot_row(row, input, static_cast<int>(elements), 0);
+        case 19: return qwen_iq1s_dot_row(row, input, static_cast<int>(elements), 0);
+        case 21: return qwen_iq3s_dot_row(row, input, static_cast<int>(elements), 0);
+        case 22: return qwen_iq2s_dot_row(row, input, static_cast<int>(elements), 0);
+        case 23: return qwen_iq4xs_dot_row(row, input, static_cast<int>(elements), 0);
+        case 29: return qwen_iq1m_dot_row(row, input, static_cast<int>(elements), 0);
+        case 2: case 3: case 6: case 7: case 39: case 40: {
+            float total = 0.0f;
+            for (std::size_t i = 0; i < elements; ++i) {
+                float value;
+                switch (type) {
+                    case 2:  value = q4_0_element(row, i); break;
+                    case 3:  value = q4_1_element(row, i); break;
+                    case 6:  value = q5_0_element(row, i); break;
+                    case 7:  value = q5_1_element(row, i); break;
+                    case 39: value = mxfp4_element(row, i); break;
+                    default: value = nvfp4_element(row, i); break;
+                }
+                total += value * input[i];
+            }
+            return total;
+        }
         default: throw std::runtime_error(
             "bailing: unsupported weight type " + std::to_string(type));
     }
+}
+
+// Which storages the AVX entry points decode with a dedicated kernel. They
+// fall through to their Q8_0 path for anything they do not recognize, so
+// admission MUST be an allowlist: a new type reaching them by default is
+// silently mis-decoded, not rejected. The f16/bf16 rows (type 1/30) have
+// explicit branches added alongside this change; the rest mirror the dispatch
+// the entry points actually implement.
+inline bool simd_dot_avx512_type(std::uint32_t type) {
+    return type == 1 || type == 8 || type == 10 || type == 11 || type == 12 ||
+           type == 13 || type == 14 || type == 17 || type == 30 || type == 40;
+}
+inline bool simd_dot_avx2_type(std::uint32_t type) {
+    return type == 1 || type == 8 || type == 10 || type == 11 || type == 12 ||
+           type == 13 || type == 14 || type == 16 || type == 17 || type == 18 ||
+           type == 22 || type == 23 || type == 30 || type == 40;
+}
+// The row-length granule each SIMD kernel assumes. f16/bf16 kernels carry
+// their own scalar tails, so any length is admissible.
+inline std::size_t simd_dot_granule(std::uint32_t type) {
+    if (type == 1 || type == 30) return 1;
+    if (type == 40) return 64;
+    return kBlockElements;
 }
 
 // Expert routing for one token: `noaux_tc`, transcribed from
@@ -443,15 +657,18 @@ inline void matvec(
     const auto* base = reinterpret_cast<const std::uint8_t*>(weights.data);
     const auto type = weights.type;
 
-    // Pick the widest available kernel once, outside the row loop.
+    // Pick the widest available kernel once, outside the row loop. Admission
+    // is per ISA and per type: the entry points decode unknown types as Q8_0
+    // rather than rejecting them, so anything off the allowlist must take the
+    // scalar path.
     enum class Path { Scalar, Avx2, Avx512 };
     Path path = Path::Scalar;
 #ifndef COLIBRI_BAILING_NO_SIMD
-    // The SIMD kernels index rows themselves and want whole super-blocks.
-    if (type != 0 && inputs % kBlockElements == 0) {
+    // The SIMD kernels index rows themselves and want whole granules.
+    if (type != 0 && inputs % simd_dot_granule(type) == 0) {
         const auto features = colibri_cpu_features();
-        if (features & 2u) path = Path::Avx512;
-        else if (features & 1u) path = Path::Avx2;
+        if ((features & 2u) && simd_dot_avx512_type(type)) path = Path::Avx512;
+        else if ((features & 1u) && simd_dot_avx2_type(type)) path = Path::Avx2;
     }
 #endif
     const auto compute = [&](std::int64_t row) -> float {
@@ -1191,14 +1408,18 @@ inline void matmul(
 
     enum class Path { Scalar, Avx2, Avx512 };
     [[maybe_unused]] Path path = Path::Scalar;
+    // 8, 12, 13, 14 are the quantized types the register-blocked multi-input
+    // kernels cover (what the HF quantizer emits), plus the f16/bf16 rows
+    // added alongside them. Types with only a single-input SIMD dot still take
+    // `path`; they just skip the quad/oct loops below.
+    [[maybe_unused]] const bool multi =
+        type == 1 || type == 8 || type == 12 || type == 13 || type == 14 ||
+        type == 30;
 #ifndef COLIBRI_BAILING_NO_SIMD
-    // 8, 12, 13, 14 are the types the register-blocked multi-input kernels
-    // cover, which is exactly what the HF quantizer emits.
-    if ((type == 8 || type == 12 || type == 13 || type == 14) &&
-        inputs % kBlockElements == 0) {
+    if (type != 0 && inputs % simd_dot_granule(type) == 0) {
         const auto features = colibri_cpu_features();
-        if (features & 2u) path = Path::Avx512;
-        else if (features & 1u) path = Path::Avx2;
+        if ((features & 2u) && simd_dot_avx512_type(type)) path = Path::Avx512;
+        else if ((features & 1u) && simd_dot_avx2_type(type)) path = Path::Avx2;
     }
 #endif
 
@@ -1215,7 +1436,7 @@ inline void matmul(
         // several activation vectors. That is the actual point of batching --
         // the single-input kernel would re-read and re-decode the row per
         // token, which is why a naive batch only bought ~1.5x.
-        if (path != Path::Scalar) {
+        if (path != Path::Scalar && multi) {
             const int width = static_cast<int>(inputs);
             for (; token + 8 <= tokens && path == Path::Avx512; token += 8) {
                 const float* group[8];

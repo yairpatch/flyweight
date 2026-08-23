@@ -4041,5 +4041,92 @@ void qwen_delta_norm_gate(
         * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// f16 weight rows. Bit-level half decode rather than __half loads so the very
+// same text runs as the CPU backend's emulated kernel; mirrors qwen_half_value
+// in qwen_kquant.h, including the subnormal normalization loop.
+static __device__ __forceinline__ float qwen_f16_bits_value(unsigned short bits) {
+    const unsigned int sign = ((unsigned int)(bits & 0x8000u)) << 16;
+    unsigned int exponent = (bits >> 10) & 0x1fu, fraction = bits & 0x3ffu;
+    unsigned int result;
+    if (exponent == 0) {
+        if (fraction == 0) return __uint_as_float(sign);
+        exponent = 1;
+        while ((fraction & 0x400u) == 0) { fraction <<= 1; --exponent; }
+        result = sign | ((exponent + 112u) << 23) | ((fraction & 0x3ffu) << 13);
+    } else if (exponent == 31) {
+        result = sign | 0x7f800000u | (fraction << 13);
+    } else {
+        result = sign | ((exponent + 112u) << 23) | (fraction << 13);
+    }
+    return __uint_as_float(result);
+}
+
+extern "C" __global__
+void qwen_f16_matvec_warp(
+    const unsigned short* matrix, const float* input, float* output,
+    const int input_size, const int output_size
+) {
+    // Same shape as qwen_f32_matvec_warp: warp per row, eight rows per block.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    const unsigned short* row_matrix =
+        matrix + (long long)row * (long long)input_size;
+    float partial = 0.0f;
+    for (int column = lane; column < input_size; column += 32)
+        partial += qwen_f16_bits_value(row_matrix[column]) * input[column];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+extern "C" __global__
+void qwen_f16_embedding(
+    const unsigned char* packed, float* output,
+    const int token, const int hidden
+) {
+    const unsigned short* row =
+        (const unsigned short*)packed + (long long)token * (long long)hidden;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < hidden; index += blockDim.x * gridDim.x) {
+        output[index] = qwen_f16_bits_value(row[index]);
+    }
+}
+
+extern "C" __global__
+void qwen_f16_embedding_rows(
+    const unsigned char* packed, const unsigned int* tokens, float* output,
+    const int rows, const int hidden
+) {
+    const int row = blockIdx.y;
+    if (row >= rows) return;
+    const unsigned short* source =
+        (const unsigned short*)packed + (long long)tokens[row] * (long long)hidden;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < hidden; index += blockDim.x * gridDim.x) {
+        output[row * hidden + index] = qwen_f16_bits_value(source[index]);
+    }
+}
+
+extern "C" __global__
+void qwen_f16_matmul_rows(
+    const unsigned short* matrix, const float* input, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    const int output_row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (output_row >= output_size || token >= rows) return;
+    float partial = 0.0f;
+    const float* vector = input + token * input_size;
+    const unsigned short* weight_row =
+        matrix + (long long)output_row * (long long)input_size;
+    for (int column = threadIdx.x; column < input_size; column += blockDim.x)
+        partial += qwen_f16_bits_value(weight_row[column]) * vector[column];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) output[token * output_size + output_row] = partial;
+}
 )COLIBRI_CUDA";
 }

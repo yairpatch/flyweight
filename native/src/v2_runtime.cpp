@@ -2746,10 +2746,21 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         }
     }else if(type==30){
         // bf16 experts, as the Qwen3.6 NVFP4 checkpoints ship the nextn (MTP) block.
+        if((colibri_cpu_features()&2u)!=0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+        if((colibri_cpu_features()&1u)!=0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
         const auto*row_data=reinterpret_cast<const std::uint16_t*>(packed)
             +row*static_cast<std::uint64_t>(elements);
         for(int index=0;index<elements;++index)
             result+=qwen_bf16_value(row_data[index])*input[index];
+    }else if(type==1){
+        // f16 rows, as an unquantized GGUF conversion stores every matrix.
+        if((colibri_cpu_features()&2u)!=0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+        if((colibri_cpu_features()&1u)!=0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(elements)*2;
+        for(int index=0;index<elements;++index){
+            std::uint16_t bits=0;std::memcpy(&bits,row_data+index*2,2);
+            result+=qwen_half_value(bits)*input[index];
+        }
     }else if(type==0){
         // Unquantized weights, as the dense host feed-forward can be handed.
         // qwen_f32_dot_multi already has the vectorized single-row case.
@@ -3217,6 +3228,7 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     else if(type==23)for(int index=0;index<elements;++index)output[index]=qwen_iq4xs_value(packed,base+index);
     else if(type==40)for(int index=0;index<elements;++index)output[index]=qwen_nvfp4_value(packed,base+index);
     else if(type==30){const auto*row_data=reinterpret_cast<const std::uint16_t*>(packed)+base;for(int index=0;index<elements;++index)output[index]=qwen_bf16_value(row_data[index]);}
+    else if(type==1){for(int index=0;index<elements;++index){std::uint16_t bits=0;std::memcpy(&bits,packed+(base+index)*2,2);output[index]=qwen_half_value(bits);}}
     else if(type==0){const auto*row_data=reinterpret_cast<const float*>(packed)+base;for(int index=0;index<elements;++index)output[index]=row_data[index];}
     else throw std::runtime_error("unsupported native CPU expert quantization");
 }
@@ -3305,6 +3317,19 @@ int qwen_gpu_matvec_by_type(
                 "qwen_f32_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
+        case 1: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return colibri_gpu_launch_named(
+                "qwen_f16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
+        // bf16_matvec_warp declares (rows, columns), so the extents swap.
+        case 30: {
+            void* args[] = {&matrix, &input, &output, &output_size, &input_size};
+            return colibri_gpu_launch_named(
+                "bf16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
         case 8: return colibri_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 10: return colibri_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 11: return colibri_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
@@ -3349,6 +3374,19 @@ int qwen_matvec_driver(
     std::uint64_t output, int input_size, int output_size, std::uint64_t stream
 ) {
     switch (type) {
+        case 1: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return colibri_gpu_launch_named(
+                "qwen_f16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
+        // bf16_matvec_warp declares (rows, columns), so the extents swap.
+        case 30: {
+            void* args[] = {&matrix, &input, &output, &output_size, &input_size};
+            return colibri_gpu_launch_named(
+                "bf16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
         case 8: return colibri_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 10: return colibri_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 11: return colibri_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
@@ -5332,6 +5370,22 @@ std::uint64_t bailing_slot_device_bytes(const ColibriV2BailingRuntime& runtime) 
     return bytes;
 }
 
+// Whether the bailing decode path has a device matvec for this storage --
+// exactly the case list of qwen_gpu_matvec_by_type. Checked before anything is
+// uploaded, because the alternative is discovering the gap as a throw out of
+// the first forward pass, mid-generation, instead of a clean fall back to the
+// host path at load.
+bool bailing_gpu_weight_type(std::uint32_t type) {
+    switch (type) {
+        case 0: case 1: case 8: case 10: case 11: case 12: case 13: case 14:
+        case 16: case 17: case 18: case 19: case 21: case 22: case 23:
+        case 29: case 30:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Bring the whole model onto the device. Q4_K is 4.4 GB, which fits the 12 GB
 // card with room for the caches and scratch.
 void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
@@ -5340,6 +5394,25 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     const auto& m = *runtime.model;
     const auto& c = m.config;
     const auto& g = runtime.geometry;
+
+    for (const auto& tensor : m.tensors) {
+        if (tensor.shape.size() < 2) continue;
+        if (!bailing_gpu_weight_type(tensor.type))
+            throw std::runtime_error(
+                "bailingmoe3 " + tensor.name + " is stored as type " +
+                std::to_string(tensor.type) +
+                ", which has no GPU kernel; running on the host");
+    }
+    // The embedding gather dispatches through the format table, which covers
+    // a narrower set than the matvecs.
+    for (const auto& tensor : m.tensors)
+        if (tensor.name == "token_embd.weight" &&
+            !(colibri::v2::qwen_format(tensor.type) &&
+              colibri::v2::qwen_format(tensor.type)->embedding))
+            throw std::runtime_error(
+                "bailingmoe3 token_embd.weight is stored as type " +
+                std::to_string(tensor.type) +
+                ", which has no GPU embedding kernel; running on the host");
 
     if (colibri_gpu_init(0) != 0) throw std::runtime_error("failed to initialize CUDA");
     std::vector<std::string> option_storage;

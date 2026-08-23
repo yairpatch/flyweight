@@ -1067,6 +1067,73 @@ void q8_dequant(const std::uint8_t* row_data, float* output, int elements) {
     }
 }
 
+// f16 and bf16 rows: sixteen weights per convert, scalar tails so any row
+// length is admissible (simd_dot_granule in colibri_v2_bailing.hpp relies on
+// that). The multi-input variants decode each weight vector once and apply it
+// to all N activations, same as the quantized quad/oct kernels.
+inline __m512 f16_sixteen(const std::uint8_t* pointer) {
+    return _mm512_cvtph_ps(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer)));
+}
+
+inline __m512 bf16_sixteen(const std::uint8_t* pointer) {
+    const __m256i bits =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer));
+    return _mm512_castsi512_ps(
+        _mm512_slli_epi32(_mm512_cvtepu16_epi32(bits), 16));
+}
+
+float bf16_scalar_value(const std::uint8_t* pointer) {
+    std::uint16_t bits;
+    std::memcpy(&bits, pointer, sizeof(bits));
+    const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
+    float value;
+    std::memcpy(&value, &widened, sizeof(value));
+    return value;
+}
+
+template <bool kBf16>
+float half_dot(const std::uint8_t* row, const float* input, int elements) {
+    __m512 sum = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= elements; i += 16) {
+        const __m512 weights =
+            kBf16 ? bf16_sixteen(row + i * 2) : f16_sixteen(row + i * 2);
+        sum = _mm512_fmadd_ps(weights, _mm512_loadu_ps(input + i), sum);
+    }
+    float total = _mm512_reduce_add_ps(sum);
+    for (; i < elements; ++i) {
+        const float weight = kBf16 ? bf16_scalar_value(row + i * 2)
+                                   : half_value(row + i * 2);
+        total += weight * input[i];
+    }
+    return total;
+}
+
+template <bool kBf16, int kTokens>
+void half_dot_multi(const std::uint8_t* row, const float* const inputs[],
+                    int elements, float outputs[]) {
+    __m512 sums[kTokens];
+    for (int token = 0; token < kTokens; ++token)
+        sums[token] = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= elements; i += 16) {
+        const __m512 weights =
+            kBf16 ? bf16_sixteen(row + i * 2) : f16_sixteen(row + i * 2);
+        for (int token = 0; token < kTokens; ++token)
+            sums[token] = _mm512_fmadd_ps(
+                weights, _mm512_loadu_ps(inputs[token] + i), sums[token]);
+    }
+    for (int token = 0; token < kTokens; ++token)
+        outputs[token] = _mm512_reduce_add_ps(sums[token]);
+    for (; i < elements; ++i) {
+        const float weight = kBf16 ? bf16_scalar_value(row + i * 2)
+                                   : half_value(row + i * 2);
+        for (int token = 0; token < kTokens; ++token)
+            outputs[token] += weight * inputs[token][i];
+    }
+}
+
 } // namespace
 
 void qwen_quant_dot_two_rows_avx512(
@@ -1102,6 +1169,16 @@ float qwen_quant_dot_avx512(
     int elements,
     std::uint64_t row
 ) {
+    if (type == 1) {
+        return half_dot<false>(
+            packed + row * static_cast<std::uint64_t>(elements) * 2,
+            input, elements);
+    }
+    if (type == 30) {
+        return half_dot<true>(
+            packed + row * static_cast<std::uint64_t>(elements) * 2,
+            input, elements);
+    }
     if (type == 17) {
         return iq2xs_dot(
             packed + row * static_cast<std::uint64_t>(elements / 256)
@@ -1162,7 +1239,8 @@ void qwen_quant_dot_pair_avx512(
     const float*second,int elements,std::uint64_t row,
     float*first_output,float*second_output
 ){
-    if(type==17)iq2xs_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,first,second,elements,*first_output,*second_output);
+    if(type==1||type==30){const float*inputs[2]={first,second};float outputs[2]{};if(type==1)half_dot_multi<false,2>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);else half_dot_multi<true,2>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);*first_output=outputs[0];*second_output=outputs[1];}
+    else if(type==17)iq2xs_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,first,second,elements,*first_output,*second_output);
     else if(type==12)q4_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*144,first,second,elements,*first_output,*second_output);
     else if(type==13)q5_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*176,first,second,elements,*first_output,*second_output);
     else if(type==14)q6_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*210,first,second,elements,*first_output,*second_output);
@@ -1174,7 +1252,9 @@ void qwen_quant_dot_quad_avx512(
     const std::uint8_t*packed,std::uint32_t type,const float*const inputs[4],
     int elements,std::uint64_t row,float outputs[4]
 ){
-    if(type==12)q4_dot_multi<4>(packed+row*static_cast<std::uint64_t>(elements/256)*144,inputs,elements,outputs);
+    if(type==1)half_dot_multi<false,4>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);
+    else if(type==30)half_dot_multi<true,4>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);
+    else if(type==12)q4_dot_multi<4>(packed+row*static_cast<std::uint64_t>(elements/256)*144,inputs,elements,outputs);
     else if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
     else if(type==40)nvfp4_dot_multi<4>(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);
@@ -1185,7 +1265,9 @@ void qwen_quant_dot_oct_avx512(
     const std::uint8_t*packed,std::uint32_t type,const float*const inputs[8],
     int elements,std::uint64_t row,float outputs[8]
 ){
-    if(type==12)q4_dot_multi<8>(packed+row*static_cast<std::uint64_t>(elements/256)*144,inputs,elements,outputs);
+    if(type==1)half_dot_multi<false,8>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);
+    else if(type==30)half_dot_multi<true,8>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);
+    else if(type==12)q4_dot_multi<8>(packed+row*static_cast<std::uint64_t>(elements/256)*144,inputs,elements,outputs);
     else if(type==13)q5_dot_oct(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_oct(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
     else if(type==40)nvfp4_dot_multi<8>(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);

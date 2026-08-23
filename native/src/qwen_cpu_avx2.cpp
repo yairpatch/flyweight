@@ -1021,6 +1021,77 @@ bool iq_dot_multi(const std::uint8_t* packed, std::uint32_t type,
     }
 }
 
+// f16 and bf16 rows. No blocks, no scales: convert eight weights at a time
+// and fmadd. The tails are scalar, so any row length is admissible -- the
+// dispatchers rely on that (simd_dot_granule in colibri_v2_bailing.hpp).
+float f16_dot(const std::uint8_t* row, const float* input, int elements) {
+    __m256 sum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= elements; i += 8) {
+        const __m128i bits =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + i * 2));
+        sum = _mm256_fmadd_ps(_mm256_cvtph_ps(bits),
+                              _mm256_loadu_ps(input + i), sum);
+    }
+    float total = horizontal_sum(sum);
+    for (; i < elements; ++i) total += half_value(row + i * 2) * input[i];
+    return total;
+}
+
+inline __m256 bf16_octet(const std::uint8_t* pointer) {
+    const __m128i bits =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(pointer));
+    return _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16));
+}
+
+float bf16_scalar_value(const std::uint8_t* pointer) {
+    std::uint16_t bits;
+    std::memcpy(&bits, pointer, sizeof(bits));
+    const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
+    float value;
+    std::memcpy(&value, &widened, sizeof(value));
+    return value;
+}
+
+float bf16_dot(const std::uint8_t* row, const float* input, int elements) {
+    __m256 sum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= elements; i += 8)
+        sum = _mm256_fmadd_ps(bf16_octet(row + i * 2),
+                              _mm256_loadu_ps(input + i), sum);
+    float total = horizontal_sum(sum);
+    for (; i < elements; ++i) total += bf16_scalar_value(row + i * 2) * input[i];
+    return total;
+}
+
+// The multi-input variants decode each weight octet once and apply it to all
+// four activations -- same reason the quantized quad kernels exist.
+template <bool kBf16>
+void half_dot_quad(const std::uint8_t* row, const float* const inputs[4],
+                   int elements, float outputs[4]) {
+    __m256 sums[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                      _mm256_setzero_ps(), _mm256_setzero_ps()};
+    int i = 0;
+    for (; i + 8 <= elements; i += 8) {
+        const __m256 weights = kBf16
+            ? bf16_octet(row + i * 2)
+            : _mm256_cvtph_ps(_mm_loadu_si128(
+                  reinterpret_cast<const __m128i*>(row + i * 2)));
+        for (int token = 0; token < 4; ++token)
+            sums[token] = _mm256_fmadd_ps(
+                weights, _mm256_loadu_ps(inputs[token] + i), sums[token]);
+    }
+    for (int token = 0; token < 4; ++token)
+        outputs[token] = horizontal_sum(sums[token]);
+    for (; i < elements; ++i) {
+        const float weight = kBf16 ? bf16_scalar_value(row + i * 2)
+                                   : half_value(row + i * 2);
+        for (int token = 0; token < 4; ++token)
+            outputs[token] += weight * inputs[token][i];
+    }
+}
+
 } // namespace
 
 bool qwen_quant_dot_iq_multi_avx2(
@@ -1036,6 +1107,8 @@ bool qwen_quant_dot_iq_multi_avx2(
 }
 
 float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const float* input,int elements,std::uint64_t row){
+    if(type==1)return f16_dot(packed+row*static_cast<std::uint64_t>(elements)*2,input,elements);
+    if(type==30)return bf16_dot(packed+row*static_cast<std::uint64_t>(elements)*2,input,elements);
     if(type==16)return iq2xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,input,elements);
     if(type==17)return iq2xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,input,elements);
     if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);
@@ -1074,7 +1147,9 @@ void qwen_quant_dot_quad_avx2(
     const std::uint8_t*packed,std::uint32_t type,const float*const inputs[4],
     int elements,std::uint64_t row,float outputs[4]
 ){
-    if(type==12)q4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*144,inputs,elements,outputs);
+    if(type==1)half_dot_quad<false>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);
+    else if(type==30)half_dot_quad<true>(packed+row*static_cast<std::uint64_t>(elements)*2,inputs,elements,outputs);
+    else if(type==12)q4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*144,inputs,elements,outputs);
     else if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
     else if(type==40)nvfp4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);

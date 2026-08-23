@@ -77,7 +77,19 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax = "f32_lm_head_argmax_warp",
      .embedding = "qwen_f32_embedding", .embedding_rows = "qwen_f32_embedding_rows",
      .cpu_expert = true},
-    {.type = 2, .family = "f16", .cpu_expert = true},
+    // f16: warp matvec plus embedding/rows; the LM head projects through the
+    // matvec dispatch, so no fused argmax kernel exists yet.
+    {.type = 1, .family = "f16",
+     .matmul_rows = "qwen_f16_matmul_rows",
+     .matmul_rows_grid = RowsMatmulGrid::per_token,
+     .embedding = "qwen_f16_embedding", .embedding_rows = "qwen_f16_embedding_rows",
+     .cpu_expert = true},
+    // GGML type 2 is Q4_0 (this row was historically mislabeled "f16"; the
+    // family string is only a name stem for the contract test, and every
+    // kernel field here is null, so the label was inert either way). Written
+    // "q40" because the table-scan test reads underscored strings as kernel
+    // names.
+    {.type = 2, .family = "q40", .cpu_expert = true},
     {.type = 8, .family = "q8",
      .matmul_rows = "q8_matmul_tiled",
      .matmul_rows_grid = RowsMatmulGrid::tiled32,

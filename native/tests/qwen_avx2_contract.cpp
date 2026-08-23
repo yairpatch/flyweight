@@ -1,4 +1,5 @@
 #include "qwen_cpu_kernel.h"
+#include "qwen_kquant.h"
 
 #include <algorithm>
 #include <cmath>
@@ -265,6 +266,101 @@ bool f32_contract(){
     return true;
 }
 
+// f16 (type 1) and bf16 (type 30) rows: the entry points decode these with
+// dedicated branches added alongside the bailing all-types work. The odd
+// element count is deliberate -- it exercises the scalar tails the kernels
+// carry, since halfword rows have no block-size granule.
+bool half_contract(bool bf16,bool avx512){
+    constexpr int elements=300,rows=3;
+    const std::uint32_t type=bf16?30u:1u;
+    std::vector<std::uint8_t> packed(static_cast<std::size_t>(rows)*elements*2);
+    std::vector<float> decoded(rows*elements);
+    for(int row=0;row<rows;++row)for(int i=0;i<elements;++i){
+        const float value=std::sin((row+1)*(i+1)*0.003f)*2.5f;
+        std::uint16_t bits;
+        if(bf16){
+            std::uint32_t wide;std::memcpy(&wide,&value,sizeof(wide));
+            bits=static_cast<std::uint16_t>(wide>>16);
+            const std::uint32_t back=static_cast<std::uint32_t>(bits)<<16;
+            std::memcpy(&decoded[row*elements+i],&back,sizeof(float));
+        }else{
+            bits=qwen_half_bits(value);
+            decoded[row*elements+i]=qwen_half_value(bits);
+        }
+        set_half(packed.data()+(static_cast<std::size_t>(row)*elements+i)*2,bits);
+    }
+    std::vector<float> vectors(4*elements);
+    const float*inputs[4];
+    for(int token=0;token<4;++token){
+        for(int i=0;i<elements;++i)
+            vectors[token*elements+i]=std::cos((token+2)*(i+1)*0.005f);
+        inputs[token]=vectors.data()+token*elements;
+    }
+    for(int row=0;row<rows;++row){
+        float expected[4]{};
+        for(int token=0;token<4;++token)
+            for(int i=0;i<elements;++i)
+                expected[token]+=decoded[row*elements+i]*inputs[token][i];
+        if(!close(expected[0],
+                  qwen_quant_dot_avx2(packed.data(),type,inputs[0],elements,row)))
+            return false;
+        float quad[4]{};
+        qwen_quant_dot_quad_avx2(packed.data(),type,inputs,elements,row,quad);
+        for(int token=0;token<4;++token)
+            if(!close(expected[token],quad[token]))return false;
+        if(avx512){
+            if(!close(expected[0],
+                      qwen_quant_dot_avx512(packed.data(),type,inputs[0],elements,row)))
+                return false;
+            float quad512[4]{};
+            qwen_quant_dot_quad_avx512(packed.data(),type,inputs,elements,row,quad512);
+            for(int token=0;token<4;++token)
+                if(!close(expected[token],quad512[token]))return false;
+            float first=0.0f,second=0.0f;
+            qwen_quant_dot_pair_avx512(
+                packed.data(),type,inputs[0],inputs[1],elements,row,&first,&second);
+            if(!close(expected[0],first)||!close(expected[1],second))return false;
+        }
+    }
+    return true;
+}
+
+bool half_oct_contract(bool bf16){
+    constexpr int elements=144;
+    const std::uint32_t type=bf16?30u:1u;
+    std::vector<std::uint8_t> packed(elements*2);
+    std::vector<float> decoded(elements);
+    for(int i=0;i<elements;++i){
+        const float value=std::sin((i+1)*0.011f);
+        std::uint16_t bits;
+        if(bf16){
+            std::uint32_t wide;std::memcpy(&wide,&value,sizeof(wide));
+            bits=static_cast<std::uint16_t>(wide>>16);
+            const std::uint32_t back=static_cast<std::uint32_t>(bits)<<16;
+            std::memcpy(&decoded[i],&back,sizeof(float));
+        }else{
+            bits=qwen_half_bits(value);
+            decoded[i]=qwen_half_value(bits);
+        }
+        set_half(packed.data()+static_cast<std::size_t>(i)*2,bits);
+    }
+    std::vector<float> vectors(8*elements);
+    const float*inputs[8];
+    for(int token=0;token<8;++token){
+        for(int i=0;i<elements;++i)
+            vectors[token*elements+i]=std::cos((token+1)*(i+3)*0.007f);
+        inputs[token]=vectors.data()+token*elements;
+    }
+    float expected[8]{},outputs[8]{};
+    for(int token=0;token<8;++token)
+        for(int i=0;i<elements;++i)
+            expected[token]+=decoded[i]*inputs[token][i];
+    qwen_quant_dot_oct_avx512(packed.data(),type,inputs,elements,0,outputs);
+    for(int token=0;token<8;++token)
+        if(!close(expected[token],outputs[token]))return false;
+    return true;
+}
+
 } // namespace
 
 int main(){
@@ -287,7 +383,11 @@ int main(){
        !require(iq_q8_contract(18,98),"IQ3_XXS x Q8_K")||
        !require(quant_contract(40,4*36,avx512),"NVFP4")||
        !require(quant_contract(8,8*34,avx512),"Q8_0")||
-       !require(f32_contract(),"F32"))return 1;
+       !require(f32_contract(),"F32")||
+       !require(half_contract(false,avx512),"F16")||
+       !require(half_contract(true,avx512),"BF16")||
+       (avx512&&(!require(half_oct_contract(false),"F16 oct")||
+                 !require(half_oct_contract(true),"BF16 oct"))))return 1;
 #endif
     return 0;
 }
