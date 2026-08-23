@@ -514,6 +514,6 @@ if(MSVC)
 else()
     set_source_files_properties(
         src/qwen_cpu_avx_vnni.cpp
-        PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni;-mf16c"
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni;-mf16c;-mfma"
     )
 endif()

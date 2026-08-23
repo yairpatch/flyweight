@@ -10,6 +10,41 @@ struct QwenQ8KBlock {
 
 static_assert(sizeof(QwenQ8KBlock) == 292);
 
+// 32-wide activation blocks matching Q4_0's own granularity. Gemma 4's widths
+// (2880 hidden, 704 expert intermediate) divide 32 but not 256, which is what
+// keeps its experts off the Q8-K path above.
+struct QwenQ80Block {
+    float scale;
+    std::int8_t values[32];
+};
+
+static_assert(sizeof(QwenQ80Block) == 36);
+
+void qwen_quantize_q8_0(
+    const float* input,
+    int elements,
+    QwenQ80Block* output
+);
+
+float qwen_quant_dot_q4_0_q8_0_vnni(
+    const std::uint8_t* packed,
+    const QwenQ80Block* input,
+    int elements,
+    std::uint64_t row
+);
+
+// One Q4_0 weight row against up to 8 activation streams: the nibble decode
+// happens once per block and the independent accumulators hide the FMA
+// latency a single stream serializes on.
+void qwen_quant_dot_q4_0_q8_0_multi_vnni(
+    const std::uint8_t* packed,
+    const QwenQ80Block* const* inputs,
+    int count,
+    int elements,
+    std::uint64_t row,
+    float* outputs
+);
+
 float qwen_quant_dot_avx512(
     const std::uint8_t* packed,
     std::uint32_t type,

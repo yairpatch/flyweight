@@ -3022,6 +3022,19 @@ int qwen_cpu_thread_count(const ColibriV2QwenRuntime& runtime) {
 }
 #endif
 
+// Q8 activations for the Q4_0 expert dots: quantize the shared input once and
+// run integer VNNI dots against the raw nibbles. Off-switch because the
+// activation quantization changes the numerics (the checkpoint is QAT'd for
+// Q4_0 weights, and the measured output stays intact -- see the A/B before
+// this landed).
+bool gemma_q8_activations_enabled(){
+    static const bool enabled=[]{
+        const char*setting=std::getenv("COLIBRI_GEMMA_Q8_ACTIVATIONS");
+        return (colibri_cpu_features()&4u)!=0&&(!setting||setting[0]!='0');
+    }();
+    return enabled;
+}
+
 void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         const std::int32_t*selected,const float*weights,int routed_count,const float*input,
         float*activated,float*output){
@@ -3034,6 +3047,13 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         throw std::runtime_error("native Gemma 4 expects Q4_0 experts and f32 expert scales");
     const auto gate_up_bytes=gate_up_tensor.size/experts,down_bytes=down_tensor.size/experts;
     const auto*expert_scales=reinterpret_cast<const float*>(tensor_data(*runtime.model,scale_tensor));
+    const bool use_q8=gemma_q8_activations_enabled()&&hidden%32==0&&intermediate%32==0;
+    thread_local std::vector<QwenQ80Block> input_q8,activated_q8;
+    if(use_q8){
+        input_q8.resize(hidden/32);
+        qwen_quantize_q8_0(input,hidden,input_q8.data());
+    }
+    const auto*input_q8_data=input_q8.data();
     // Every task is the same two fixed-width dots, so static scheduling costs
     // nothing in balance and removes the chunk-queue contention that made this
     // loop run SLOWER with more threads (measured 40ms/token at 16 threads
@@ -3043,16 +3063,37 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         const int rank=task/intermediate,row=task%intermediate,expert=selected[rank];
         if(expert<0||expert>=experts)continue;
         const auto*gate_up=tensor_data(*runtime.model,gate_up_tensor)+static_cast<std::uint64_t>(expert)*gate_up_bytes;
-        const float gate=qwen_quant_dot(gate_up,2,input,hidden,row);
-        const float up=qwen_quant_dot(gate_up,2,input,hidden,row+intermediate);
+        const float gate=use_q8
+            ?qwen_quant_dot_q4_0_q8_0_vnni(gate_up,input_q8_data,hidden,row)
+            :qwen_quant_dot(gate_up,2,input,hidden,row);
+        const float up=use_q8
+            ?qwen_quant_dot_q4_0_q8_0_vnni(gate_up,input_q8_data,hidden,row+intermediate)
+            :qwen_quant_dot(gate_up,2,input,hidden,row+intermediate);
         const float cubic=gate*gate*gate;
         const float gelu=0.5f*gate*(1.0f+std::tanh(0.7978845608028654f*(gate+0.044715f*cubic)));
         activated[task]=gelu*up;
     }
+    if(use_q8){
+        activated_q8.resize(static_cast<std::size_t>(routed_count)*(intermediate/32));
+        for(int rank=0;rank<routed_count;++rank)
+            qwen_quantize_q8_0(activated+rank*intermediate,intermediate,
+                               activated_q8.data()+static_cast<std::size_t>(rank)*(intermediate/32));
+    }
+    const auto*activated_q8_data=activated_q8.data();
     #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
     for(int row=0;row<hidden;++row){
         float sum=0.0f;
-        for(int rank=0;rank<routed_count;++rank){const int expert=selected[rank];if(expert<0||expert>=experts)continue;const auto*down=tensor_data(*runtime.model,down_tensor)+static_cast<std::uint64_t>(expert)*down_bytes;sum+=weights[rank]*expert_scales[expert]*qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);}
+        for(int rank=0;rank<routed_count;++rank){
+            const int expert=selected[rank];
+            if(expert<0||expert>=experts)continue;
+            const auto*down=tensor_data(*runtime.model,down_tensor)+static_cast<std::uint64_t>(expert)*down_bytes;
+            const float expert_value=use_q8
+                ?qwen_quant_dot_q4_0_q8_0_vnni(down,
+                    activated_q8_data+static_cast<std::size_t>(rank)*(intermediate/32),
+                    intermediate,row)
+                :qwen_quant_dot(down,2,activated+rank*intermediate,intermediate,row);
+            sum+=weights[rank]*expert_scales[expert]*expert_value;
+        }
         output[row]=sum;
     }
 }
@@ -3098,8 +3139,26 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
     // A routing gap (an invalid expert) would leave its partial slice unread
     // by the expert loop but still summed by the reduction below.
     std::fill(partial,partial+partial_floats,0.0f);
+    const bool use_q8=gemma_q8_activations_enabled()&&hidden%32==0&&intermediate%32==0;
+    const std::size_t input_blocks=static_cast<std::size_t>(hidden)/32;
+    const std::size_t activated_blocks=static_cast<std::size_t>(intermediate)/32;
+    std::vector<QwenQ80Block> input_q8,activated_q8;
+    if(use_q8){
+        input_q8.resize(static_cast<std::size_t>(rows)*input_blocks);
+        activated_q8.resize(static_cast<std::size_t>(rows)*top_k*activated_blocks);
+    }
+    auto*input_q8_data=input_q8.data();
+    auto*activated_q8_data=activated_q8.data();
     #pragma omp parallel num_threads(qwen_cpu_thread_count(runtime))
     {
+        if(use_q8){
+            // Each row's input quantizes once and serves every expert routed
+            // to it; the implicit barrier orders this before the expert loop.
+            #pragma omp for schedule(static)
+            for(int row=0;row<rows;++row)
+                qwen_quantize_q8_0(local_inputs+static_cast<std::size_t>(row)*hidden,
+                                   hidden,input_q8_data+row*input_blocks);
+        }
         // Experts carry work proportional to how many rows routed to them, so
         // this one stays dynamic; the uniform reduction below is static.
         #pragma omp for schedule(dynamic,1)
@@ -3109,26 +3168,82 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
                 static_cast<std::uint64_t>(expert)*gate_up_bytes;
             const auto*down=tensor_data(*runtime.model,down_tensor)+
                 static_cast<std::uint64_t>(expert)*down_bytes;
-            for(int g=0;g<intermediate;++g){
-                for(const auto&pair:gathered[expert]){
-                    const float*input=local_inputs+
-                        static_cast<std::size_t>(pair.first)*hidden;
-                    const float gate=qwen_quant_dot(gate_up,2,input,hidden,g);
-                    const float up=qwen_quant_dot(gate_up,2,input,hidden,g+intermediate);
-                    const float cubic=gate*gate*gate;
-                    const float gelu=0.5f*gate*(1.0f+std::tanh(
-                        0.7978845608028654f*(gate+0.044715f*cubic)));
-                    activated[(static_cast<std::size_t>(pair.first)*top_k+
-                               pair.second)*intermediate+g]=gelu*up;
+            // The q8 branch batches up to 8 routed tokens through one weight
+            // row so the nibble decode amortizes and the accumulator chains
+            // stay independent; the f32 branch keeps the original per-pair
+            // dots.
+            const auto&pairs=gathered[expert];
+            std::array<const QwenQ80Block*,8> streams{};
+            std::array<float,8> gate_values{},up_values{};
+            if(use_q8){
+                for(std::size_t first=0;first<pairs.size();first+=8){
+                    const int batch=static_cast<int>(
+                        std::min<std::size_t>(8,pairs.size()-first));
+                    for(int t=0;t<batch;++t)
+                        streams[t]=input_q8_data+static_cast<std::size_t>(
+                            pairs[first+t].first)*input_blocks;
+                    for(int g=0;g<intermediate;++g){
+                        qwen_quant_dot_q4_0_q8_0_multi_vnni(
+                            gate_up,streams.data(),batch,hidden,g,gate_values.data());
+                        qwen_quant_dot_q4_0_q8_0_multi_vnni(
+                            gate_up,streams.data(),batch,hidden,g+intermediate,up_values.data());
+                        for(int t=0;t<batch;++t){
+                            const float gate=gate_values[t],up=up_values[t];
+                            const float cubic=gate*gate*gate;
+                            const float gelu=0.5f*gate*(1.0f+std::tanh(
+                                0.7978845608028654f*(gate+0.044715f*cubic)));
+                            const auto&pair=pairs[first+t];
+                            activated[(static_cast<std::size_t>(pair.first)*top_k+
+                                       pair.second)*intermediate+g]=gelu*up;
+                        }
+                    }
                 }
-            }
-            for(int h=0;h<hidden;++h){
-                for(const auto&pair:gathered[expert]){
-                    const float*acts=activated+(static_cast<std::size_t>(
-                        pair.first)*top_k+pair.second)*intermediate;
-                    partial[(static_cast<std::size_t>(pair.first)*top_k+
-                             pair.second)*hidden+h]=
-                        qwen_quant_dot(down,2,acts,intermediate,h);
+                // A (row, rank) pair belongs to exactly one expert, so these
+                // slices are complete here and disjoint across the parallel
+                // loop.
+                for(const auto&pair:pairs){
+                    const std::size_t slice=static_cast<std::size_t>(pair.first)*top_k+pair.second;
+                    qwen_quantize_q8_0(activated+slice*intermediate,intermediate,
+                                       activated_q8_data+slice*activated_blocks);
+                }
+                for(std::size_t first=0;first<pairs.size();first+=8){
+                    const int batch=static_cast<int>(
+                        std::min<std::size_t>(8,pairs.size()-first));
+                    for(int t=0;t<batch;++t)
+                        streams[t]=activated_q8_data+(static_cast<std::size_t>(
+                            pairs[first+t].first)*top_k+pairs[first+t].second)*activated_blocks;
+                    for(int h=0;h<hidden;++h){
+                        qwen_quant_dot_q4_0_q8_0_multi_vnni(
+                            down,streams.data(),batch,intermediate,h,gate_values.data());
+                        for(int t=0;t<batch;++t){
+                            const auto&pair=pairs[first+t];
+                            partial[(static_cast<std::size_t>(pair.first)*top_k+
+                                     pair.second)*hidden+h]=gate_values[t];
+                        }
+                    }
+                }
+            }else{
+                for(int g=0;g<intermediate;++g){
+                    for(const auto&pair:pairs){
+                        const float*input=local_inputs+
+                            static_cast<std::size_t>(pair.first)*hidden;
+                        const float gate=qwen_quant_dot(gate_up,2,input,hidden,g);
+                        const float up=qwen_quant_dot(gate_up,2,input,hidden,g+intermediate);
+                        const float cubic=gate*gate*gate;
+                        const float gelu=0.5f*gate*(1.0f+std::tanh(
+                            0.7978845608028654f*(gate+0.044715f*cubic)));
+                        activated[(static_cast<std::size_t>(pair.first)*top_k+
+                                   pair.second)*intermediate+g]=gelu*up;
+                    }
+                }
+                for(int h=0;h<hidden;++h){
+                    for(const auto&pair:pairs){
+                        const float*acts=activated+(static_cast<std::size_t>(
+                            pair.first)*top_k+pair.second)*intermediate;
+                        partial[(static_cast<std::size_t>(pair.first)*top_k+
+                                 pair.second)*hidden+h]=
+                            qwen_quant_dot(down,2,acts,intermediate,h);
+                    }
                 }
             }
             // The routing weight and expert scale fold in afterwards, once per

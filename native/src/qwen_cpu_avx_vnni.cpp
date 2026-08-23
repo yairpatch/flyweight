@@ -1,5 +1,7 @@
 #include <qwen_cpu_kernel.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
@@ -60,6 +62,127 @@ std::int64_t iq_sign_bytes(std::uint8_t pattern) {
 }
 
 } // namespace
+
+void qwen_quantize_q8_0(
+    const float* input, int elements, QwenQ80Block* output
+) {
+    for (int block = 0; block < elements / 32; ++block) {
+        const float* source = input + block * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i)
+            amax = std::max(amax, std::fabs(source[i]));
+        const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+        output[block].scale = amax / 127.0f;
+        for (int i = 0; i < 32; ++i)
+            output[block].values[i] =
+                static_cast<std::int8_t>(std::lrintf(source[i] * inverse));
+    }
+}
+
+float qwen_quant_dot_q4_0_q8_0_vnni(
+    const std::uint8_t* packed, const QwenQ80Block* input,
+    int elements, std::uint64_t row
+) {
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(elements / 32) * 18;
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m256i zero_point = _mm256_set1_epi8(8);
+    __m256 acc = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * 18;
+        _mm_prefetch(reinterpret_cast<const char*>(base + 1024), _MM_HINT_T0);
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i low = _mm_and_si128(bytes, nibble_mask);
+        const __m128i high = _mm_and_si128(
+            _mm_srli_epi16(bytes, 4), nibble_mask);
+        // GGML Q4_0 order: values 0..15 are the low nibbles, 16..31 the high.
+        const __m256i quantized = _mm256_sub_epi8(
+            _mm256_set_m128i(high, low), zero_point);
+        const __m256i activation = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(input[block].values));
+        // dpbusd wants an unsigned left operand, so move the weight signs onto
+        // the activations: |q4| * sign(q8, q4) == q4 * q8 lane for lane, and
+        // 8 * 127 * 4 stays far from the i32 accumulator's edge.
+        const __m256i dots = _mm256_dpbusd_epi32(
+            _mm256_setzero_si256(),
+            _mm256_sign_epi8(quantized, quantized),
+            _mm256_sign_epi8(activation, quantized));
+        acc = _mm256_fmadd_ps(
+            _mm256_set1_ps(half_value(base) * input[block].scale),
+            _mm256_cvtepi32_ps(dots), acc);
+    }
+    __m128 sum = _mm_add_ps(
+        _mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    sum = _mm_add_ss(sum, _mm_movehdup_ps(sum));
+    return _mm_cvtss_f32(sum);
+}
+
+namespace {
+
+template <int Count>
+void q4_0_q8_0_multi_vnni(
+    const std::uint8_t* packed, const QwenQ80Block* const* inputs,
+    int elements, std::uint64_t row, float* outputs
+) {
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(elements / 32) * 18;
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m256i zero_point = _mm256_set1_epi8(8);
+    __m256 acc[Count];
+    for (int t = 0; t < Count; ++t) acc[t] = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * 18;
+        _mm_prefetch(reinterpret_cast<const char*>(base + 1024), _MM_HINT_T0);
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i low = _mm_and_si128(bytes, nibble_mask);
+        const __m128i high = _mm_and_si128(
+            _mm_srli_epi16(bytes, 4), nibble_mask);
+        const __m256i quantized = _mm256_sub_epi8(
+            _mm256_set_m128i(high, low), zero_point);
+        const __m256i magnitudes = _mm256_sign_epi8(quantized, quantized);
+        const float d4 = half_value(base);
+        for (int t = 0; t < Count; ++t) {
+            const auto& q8 = inputs[t][block];
+            const __m256i activation = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(q8.values));
+            const __m256i dots = _mm256_dpbusd_epi32(
+                _mm256_setzero_si256(), magnitudes,
+                _mm256_sign_epi8(activation, quantized));
+            acc[t] = _mm256_fmadd_ps(
+                _mm256_set1_ps(d4 * q8.scale),
+                _mm256_cvtepi32_ps(dots), acc[t]);
+        }
+    }
+    for (int t = 0; t < Count; ++t) {
+        __m128 sum = _mm_add_ps(
+            _mm256_castps256_ps128(acc[t]), _mm256_extractf128_ps(acc[t], 1));
+        sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+        sum = _mm_add_ss(sum, _mm_movehdup_ps(sum));
+        outputs[t] = _mm_cvtss_f32(sum);
+    }
+}
+
+} // namespace
+
+void qwen_quant_dot_q4_0_q8_0_multi_vnni(
+    const std::uint8_t* packed, const QwenQ80Block* const* inputs,
+    int count, int elements, std::uint64_t row, float* outputs
+) {
+    switch (count) {
+    case 8: q4_0_q8_0_multi_vnni<8>(packed, inputs, elements, row, outputs); return;
+    case 7: q4_0_q8_0_multi_vnni<7>(packed, inputs, elements, row, outputs); return;
+    case 6: q4_0_q8_0_multi_vnni<6>(packed, inputs, elements, row, outputs); return;
+    case 5: q4_0_q8_0_multi_vnni<5>(packed, inputs, elements, row, outputs); return;
+    case 4: q4_0_q8_0_multi_vnni<4>(packed, inputs, elements, row, outputs); return;
+    case 3: q4_0_q8_0_multi_vnni<3>(packed, inputs, elements, row, outputs); return;
+    case 2: q4_0_q8_0_multi_vnni<2>(packed, inputs, elements, row, outputs); return;
+    case 1: q4_0_q8_0_multi_vnni<1>(packed, inputs, elements, row, outputs); return;
+    default: return;
+    }
+}
 
 float qwen_quant_dot_q8_k_avx_vnni(
     const std::uint8_t* packed, std::uint32_t type,
