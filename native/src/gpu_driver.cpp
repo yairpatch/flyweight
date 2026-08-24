@@ -746,8 +746,13 @@ extern "C" int colibri_gpu_init(std::int32_t device) {
             device, kCtxSchedBlockingSync
         );
     }
-    if (g_api.cuDevicePrimaryCtxRetain(&g_context, device) != 0) {
-        return -3;
+    if (g_context == nullptr) {
+        // Retain exactly once per process. Every runtime prepare comes through
+        // here, and an unbalanced retain per open kept the primary context
+        // refcount climbing with nothing ever releasing it.
+        if (g_api.cuDevicePrimaryCtxRetain(&g_context, device) != 0) {
+            return -3;
+        }
     }
     if (g_api.cuCtxSetCurrent(g_context) != 0) {
         return -4;
@@ -831,6 +836,8 @@ extern "C" int colibri_gpu_compile(
     if (!g_api.loaded || g_context == nullptr) {
         return -1;
     }
+    static std::mutex compile_mutex;
+    std::lock_guard<std::mutex> compile_lock(compile_mutex);
     int major = 0;
     int minor = 0;
     g_api.cuDeviceGetAttribute(&major, kAttributeComputeMajor, device);
@@ -875,35 +882,56 @@ extern "C" int colibri_gpu_compile(
     for (std::int32_t index = 0; index < option_count; ++index) {
         all_options.push_back(options[index]);
     }
-    nvrtcProgram program = nullptr;
-    if (g_api.nvrtcCreateProgram(
-            &program, source, "colibri_kernels.cu", 0, nullptr, nullptr
-        ) != 0) {
-        return -2;
+    // One loaded module per distinct (options, source) pair, kept for the
+    // life of the process. Reopening a model used to recompile and overwrite
+    // g_module while the previous module stayed loaded in the context -- a
+    // VRAM leak per reopen, and NVRTC time besides. Unloading old modules is
+    // not an option: g_functions keeps entries resolved from earlier corpora
+    // (another architecture's kernels), and those must stay launchable. The
+    // cache makes the loaded set bounded by the number of distinct corpora.
+    static std::unordered_map<std::string, CUmodule> module_cache;
+    std::string cache_key;
+    cache_key.reserve(std::strlen(source) + 256);
+    for (const char* flag : all_options) {
+        cache_key += flag;
+        cache_key += '\x1f';
     }
-    const nvrtcResult compiled = g_api.nvrtcCompileProgram(
-        program, static_cast<int>(all_options.size()), all_options.data()
-    );
-    if (log_buffer != nullptr && log_capacity > 0) {
-        size_t log_size = 0;
-        g_api.nvrtcGetProgramLogSize(program, &log_size);
-        std::vector<char> log(log_size + 1, '\0');
-        g_api.nvrtcGetProgramLog(program, log.data());
-        std::strncpy(log_buffer, log.data(), log_capacity - 1);
-        log_buffer[log_capacity - 1] = '\0';
-    }
-    if (compiled != 0) {
+    cache_key += source;
+    const auto cached = module_cache.find(cache_key);
+    if (cached != module_cache.end()) {
+        g_module = cached->second;
+    } else {
+        nvrtcProgram program = nullptr;
+        if (g_api.nvrtcCreateProgram(
+                &program, source, "colibri_kernels.cu", 0, nullptr, nullptr
+            ) != 0) {
+            return -2;
+        }
+        const nvrtcResult compiled = g_api.nvrtcCompileProgram(
+            program, static_cast<int>(all_options.size()), all_options.data()
+        );
+        if (log_buffer != nullptr && log_capacity > 0) {
+            size_t log_size = 0;
+            g_api.nvrtcGetProgramLogSize(program, &log_size);
+            std::vector<char> log(log_size + 1, '\0');
+            g_api.nvrtcGetProgramLog(program, log.data());
+            std::strncpy(log_buffer, log.data(), log_capacity - 1);
+            log_buffer[log_capacity - 1] = '\0';
+        }
+        if (compiled != 0) {
+            g_api.nvrtcDestroyProgram(&program);
+            return -3;
+        }
+        size_t ptx_size = 0;
+        g_api.nvrtcGetPTXSize(program, &ptx_size);
+        std::vector<char> ptx(ptx_size);
+        g_api.nvrtcGetPTX(program, ptx.data());
         g_api.nvrtcDestroyProgram(&program);
-        return -3;
-    }
-    size_t ptx_size = 0;
-    g_api.nvrtcGetPTXSize(program, &ptx_size);
-    std::vector<char> ptx(ptx_size);
-    g_api.nvrtcGetPTX(program, ptx.data());
-    g_api.nvrtcDestroyProgram(&program);
-    if (g_api.cuModuleLoadDataEx(&g_module, ptx.data(), 0, nullptr, nullptr)
-        != 0) {
-        return -4;
+        if (g_api.cuModuleLoadDataEx(&g_module, ptx.data(), 0, nullptr, nullptr)
+            != 0) {
+            return -4;
+        }
+        module_cache.emplace(std::move(cache_key), g_module);
     }
     for (const Entry& entry : kNamedKernels) {
         if (g_api.cuModuleGetFunction(entry.slot, g_module, entry.name) != 0) {

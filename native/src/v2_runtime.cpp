@@ -829,8 +829,11 @@ struct ColibriV2QwenRuntime {
     std::uint64_t host_cache_clock = 0;
     // Cooperative engine (see colibri_v2_qwen_engine_step). engine_pending /
     // engine_cancel_requests / engine_next_task_id are guarded by engine_mutex
-    // (submit/cancel arrive from request threads); engine_tasks / slot_owner
-    // are touched only by the single engine-stepping thread.
+    // (submit/cancel arrive from request threads). engine_tasks elements are
+    // touched only by the single engine-stepping thread, but its *size* is
+    // read by submit's queue-full check, so every size change (admission
+    // push, finished-task erase) happens under engine_mutex too. slot_owner
+    // is engine-thread-only.
     std::vector<struct QwenEngineTask> engine_pending;
     std::vector<std::uint64_t> engine_cancel_requests;
     std::uint64_t engine_next_task_id = 1;
@@ -1621,6 +1624,11 @@ std::uint64_t device_align(std::uint64_t bytes) {
 void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     qwen_save_expert_history(runtime);
     if (runtime.stream) colibri_gpu_stream_sync(runtime.stream);
+    // An enqueued expert prefetch DMAs from the model mmap on its own stream,
+    // and the main stream only waits for it at the consumption point -- which
+    // may never come before teardown. Unregistering the mmap under an
+    // in-flight prefetch is a use-after-unregister, so drain it here.
+    if (runtime.prefetch_stream) colibri_gpu_stream_sync(runtime.prefetch_stream);
     if (runtime.model_registered && runtime.model) {
         runtime.model->for_each_mapping([](const std::uint8_t* base, std::uint64_t) {
             colibri_gpu_host_unregister(base);
@@ -19025,12 +19033,24 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
         return 0;
     }
     auto emit=[&](std::uint64_t id,std::uint32_t token,std::uint32_t kind){
+        // The visit-loop guard reserves room for every event this step can
+        // produce, so a full buffer here is a scheduling bug -- but it must
+        // never become a write past the caller's (Python-owned) array.
+        if(*count>=capacity){
+            std::fprintf(stderr,"[colibri-v2] engine event buffer full; dropped event (task %llu kind %u)\n",
+                static_cast<unsigned long long>(id),static_cast<unsigned>(kind));
+            return;
+        }
         events[*count]=ColibriV2QwenTaskEvent{id,token,kind};++*count;
     };
     std::vector<std::uint64_t> finished;
     std::vector<QwenEngineTask*> pending_decode;
     const std::size_t total=runtime->engine_tasks.size();
-    for(std::size_t visit=0;visit<total&&*count+2<=capacity;++visit){
+    // Capacity guard: 2 for this visit, plus one reserved slot per already
+    // deferred task -- each may still emit a terminal failure event after the
+    // loop (batch failure, sampling failure, decode failure), and those emits
+    // are what used to run past the buffer.
+    for(std::size_t visit=0;visit<total&&*count+pending_decode.size()+2<=capacity;++visit){
         auto&task=runtime->engine_tasks[(runtime->engine_cursor+visit)%total];
         try{
             if(task.cancelled&&task.phase!=2){finished.push_back(task.id);emit(task.id,0,1);continue;}
@@ -19187,13 +19207,17 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
         }
     }
     if(total)runtime->engine_cursor=(runtime->engine_cursor+1)%total;
-    for(const auto id:finished){
-        for(std::size_t i=0;i<runtime->slot_owner.size();++i)
-            if(runtime->slot_owner[i]==static_cast<long long>(id))runtime->slot_owner[i]=-1;
-        runtime->engine_tasks.erase(
-            std::remove_if(runtime->engine_tasks.begin(),runtime->engine_tasks.end(),
-                [&](const QwenEngineTask&t){return t.id==id;}),
-            runtime->engine_tasks.end());
+    {   // The erase changes engine_tasks.size(), which submit reads under
+        // engine_mutex for its queue-full check; unlocked it was a data race.
+        std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+        for(const auto id:finished){
+            for(std::size_t i=0;i<runtime->slot_owner.size();++i)
+                if(runtime->slot_owner[i]==static_cast<long long>(id))runtime->slot_owner[i]=-1;
+            runtime->engine_tasks.erase(
+                std::remove_if(runtime->engine_tasks.begin(),runtime->engine_tasks.end(),
+                    [&](const QwenEngineTask&t){return t.id==id;}),
+                runtime->engine_tasks.end());
+        }
     }
     if(!finished.empty())qwen_save_expert_history(*runtime);
     if(runtime->engine_tasks.empty())
