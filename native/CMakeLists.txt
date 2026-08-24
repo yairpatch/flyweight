@@ -227,6 +227,24 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    colibri_qwen_q4_gemm_contract
+    tests/qwen_q4_gemm_contract.cpp
+    src/qwen_cpu_avx_vnni.cpp
+    src/qwen_cpu_q4_gemm_vnni512.cpp
+)
+target_compile_features(colibri_qwen_q4_gemm_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_q4_gemm_contract PRIVATE src)
+if(NOT MSVC)
+    set_source_files_properties(
+        tests/qwen_q4_gemm_contract.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c"
+    )
+endif()
+if(BUILD_TESTING)
+    add_test(NAME colibri_qwen_q4_gemm_contract COMMAND colibri_qwen_q4_gemm_contract)
+endif()
+
+add_executable(
     colibri_qwen_cpu_bench
     tools/bench_q8_cpu.cpp
     src/qwen_cpu_avx2.cpp
@@ -435,6 +453,7 @@ add_library(
     src/qwen_cpu_avx2.cpp
     src/qwen_cpu_avx_vnni.cpp
     src/qwen_cpu_avx512.cpp
+    src/qwen_cpu_q4_gemm_vnni512.cpp
     src/qwen_kquant_pack.cpp
     src/qwen_kquant_pack_avx2.cpp
     ${COLIBRI_CPU_KERNEL_BODY}
@@ -511,9 +530,14 @@ endif()
 
 if(MSVC)
     set_source_files_properties(src/qwen_cpu_avx_vnni.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+    set_source_files_properties(src/qwen_cpu_q4_gemm_vnni512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
 else()
     set_source_files_properties(
         src/qwen_cpu_avx_vnni.cpp
         PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni;-mf16c;-mfma"
+    )
+    set_source_files_properties(
+        src/qwen_cpu_q4_gemm_vnni512.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mf16c;-mfma"
     )
 endif()

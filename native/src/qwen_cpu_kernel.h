@@ -45,6 +45,43 @@ void qwen_quant_dot_q4_0_q8_0_multi_vnni(
     float* outputs
 );
 
+// 8-row interleaved repack of Q4_0 rows for the expert GEMM below. Per 8-row
+// group and 32-element block: 8 f16 scales (2 bytes each), then the rows' two
+// 8-byte nibble units interleaved by row -- 144 bytes, the same total as the
+// 8 source blocks, so a full repack costs no extra memory rate over reading.
+// rows must divide 8 and elements 32.
+void qwen_q4_0_repack_x8(
+    const std::uint8_t* packed,
+    int rows,
+    int elements,
+    std::uint8_t* out
+);
+
+// Q8_0 quantization into flat GEMM layout: contiguous int8 values, per-block
+// scales, and 8*sum(values) per block for the integer zero-point correction.
+// Value-identical to qwen_quantize_q8_0.
+void qwen_quantize_q8_gemm(
+    const float* input,
+    int elements,
+    std::int8_t* values,
+    float* scales,
+    std::int32_t* bsums8
+);
+
+// repacked-Q4_0 x q8 GEMM: 8 output rows per dpbusd via broadcast activations.
+// outputs[t][row] receives the plain dot; routing weights and expert scales
+// fold in by the caller. Requires AVX512-VNNI (feature bit 3).
+void qwen_q4_0x8_q8_gemm_vnni512(
+    const std::uint8_t* repacked,
+    int rows,
+    int elements,
+    const std::int8_t* const* values,
+    const float* const* scales,
+    const std::int32_t* const* bsums8,
+    int tokens,
+    float* const* outputs
+);
+
 float qwen_quant_dot_avx512(
     const std::uint8_t* packed,
     std::uint32_t type,

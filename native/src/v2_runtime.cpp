@@ -591,6 +591,11 @@ struct ColibriV2QwenRuntime {
     std::uint64_t dense_host_nanoseconds = 0;
     // Cacheable mirror of the pinned dense scratch; see qwen_cpu_dense_ffn.
     std::vector<float> dense_scratch;
+    // 8-row interleaved Q4_0 repacks for the expert GEMM, keyed by tensor
+    // index and filled lazily on the first chunk that touches the layer. Same
+    // bytes as the mapping, different order, so this trades RSS (the full
+    // expert set when every layer has run) for the GEMM's contiguous loads.
+    std::unordered_map<std::uint64_t,std::vector<std::uint8_t>> q4_gemm_repack;
     std::uint64_t last_sampling_normalized = 0;
     std::uint64_t last_sampling_logits = 0;
     std::uint64_t state = 0;
@@ -3053,6 +3058,19 @@ bool gemma_q8_activations_enabled(){
     return enabled;
 }
 
+// Expert GEMM for the chunked prefill: repacked Q4_0 weights and 8 output
+// rows per dpbusd instead of the 8-token multi dots. Opt-in while the A/B
+// coverage grows; requires AVX512-VNNI (feature bit 3). Same quantized
+// activations as the q8 path, so the only numeric difference is float
+// summation order inside a block dot.
+bool gemma_expert_gemm_enabled(){
+    static const bool enabled=[]{
+        const char*setting=std::getenv("COLIBRI_GEMMA_EXPERT_GEMM");
+        return setting&&setting[0]=='1'&&(colibri_cpu_features()&8u)!=0;
+    }();
+    return enabled;
+}
+
 void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         const std::int32_t*selected,const float*weights,int routed_count,const float*input,
         float*activated,float*output){
@@ -3160,8 +3178,54 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
     const bool use_q8=gemma_q8_activations_enabled()&&hidden%32==0&&intermediate%32==0;
     const std::size_t input_blocks=static_cast<std::size_t>(hidden)/32;
     const std::size_t activated_blocks=static_cast<std::size_t>(intermediate)/32;
+    const bool use_gemm=use_q8&&gemma_expert_gemm_enabled()&&
+        (2*intermediate)%8==0&&hidden%8==0;
+    const std::uint8_t*gate_up_repacked=nullptr,*down_repacked=nullptr;
+    thread_local std::vector<std::int8_t> gemm_in_values,gemm_act_values;
+    thread_local std::vector<float> gemm_in_scales,gemm_act_scales;
+    thread_local std::vector<std::int32_t> gemm_in_bsums,gemm_act_bsums;
+    if(use_gemm){
+        // Lazy per-tensor repack: first chunk through a layer pays one pass
+        // over the expert bytes, every later chunk reads the repacked copy.
+        // This runs on the prefill driver thread, before the parallel region.
+        auto&cache=const_cast<ColibriV2QwenRuntime&>(runtime).q4_gemm_repack;
+        auto repack=[&](std::size_t tensor_index,int weight_rows,int weight_elements)
+                ->const std::uint8_t*{
+            const auto&tensor=runtime.model->tensors[tensor_index];
+            auto&buffer=cache[tensor_index];
+            if(buffer.empty()){
+                buffer.resize(tensor.size);
+                const auto per_expert=tensor.size/experts;
+                const auto*source=tensor_data(*runtime.model,tensor);
+                #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+                for(int expert=0;expert<experts;++expert)
+                    qwen_q4_0_repack_x8(
+                        source+static_cast<std::uint64_t>(expert)*per_expert,
+                        weight_rows,weight_elements,
+                        buffer.data()+static_cast<std::uint64_t>(expert)*per_expert);
+            }
+            return buffer.data();
+        };
+        gate_up_repacked=repack(layer.expert_tensors[0],2*intermediate,hidden);
+        down_repacked=repack(layer.expert_tensors[1],hidden,intermediate);
+        gemm_in_values.resize(static_cast<std::size_t>(rows)*hidden);
+        gemm_in_scales.resize(static_cast<std::size_t>(rows)*input_blocks);
+        gemm_in_bsums.resize(static_cast<std::size_t>(rows)*input_blocks);
+        gemm_act_values.resize(static_cast<std::size_t>(rows)*top_k*intermediate);
+        gemm_act_scales.resize(static_cast<std::size_t>(rows)*top_k*activated_blocks);
+        gemm_act_bsums.resize(static_cast<std::size_t>(rows)*top_k*activated_blocks);
+    }
+    // Raw views taken on the driver thread: the vectors above are
+    // thread_local, so the parallel workers must reach the storage through
+    // these shared pointers rather than the names.
+    std::int8_t*in_values=gemm_in_values.data();
+    std::int8_t*act_values=gemm_act_values.data();
+    float*in_scales=gemm_in_scales.data();
+    float*act_scales=gemm_act_scales.data();
+    std::int32_t*in_bsums=gemm_in_bsums.data();
+    std::int32_t*act_bsums=gemm_act_bsums.data();
     std::vector<QwenQ80Block> input_q8,activated_q8;
-    if(use_q8){
+    if(use_q8&&!use_gemm){
         input_q8.resize(static_cast<std::size_t>(rows)*input_blocks);
         activated_q8.resize(static_cast<std::size_t>(rows)*top_k*activated_blocks);
     }
@@ -3169,7 +3233,14 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
     auto*activated_q8_data=activated_q8.data();
     #pragma omp parallel num_threads(qwen_cpu_thread_count(runtime))
     {
-        if(use_q8){
+        if(use_gemm){
+            #pragma omp for schedule(static)
+            for(int row=0;row<rows;++row)
+                qwen_quantize_q8_gemm(
+                    local_inputs+static_cast<std::size_t>(row)*hidden,hidden,
+                    in_values+static_cast<std::size_t>(row)*hidden,
+                    in_scales+row*input_blocks,in_bsums+row*input_blocks);
+        }else if(use_q8){
             // Each row's input quantizes once and serves every expert routed
             // to it; the implicit barrier orders this before the expert loop.
             #pragma omp for schedule(static)
@@ -3193,7 +3264,56 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
             const auto&pairs=gathered[expert];
             std::array<const QwenQ80Block*,8> streams{};
             std::array<float,8> gate_values{},up_values{};
-            if(use_q8){
+            if(use_gemm){
+                const int tokens=static_cast<int>(pairs.size());
+                thread_local std::vector<const std::int8_t*> value_pointers;
+                thread_local std::vector<const float*> scale_pointers;
+                thread_local std::vector<const std::int32_t*> bsum_pointers;
+                thread_local std::vector<float*> output_pointers;
+                thread_local std::vector<float> gate_up_out;
+                value_pointers.resize(tokens);scale_pointers.resize(tokens);
+                bsum_pointers.resize(tokens);output_pointers.resize(tokens);
+                gate_up_out.resize(static_cast<std::size_t>(tokens)*2*intermediate);
+                for(int t=0;t<tokens;++t){
+                    const std::size_t row=pairs[t].first;
+                    value_pointers[t]=in_values+row*hidden;
+                    scale_pointers[t]=in_scales+row*input_blocks;
+                    bsum_pointers[t]=in_bsums+row*input_blocks;
+                    output_pointers[t]=gate_up_out.data()+
+                        static_cast<std::size_t>(t)*2*intermediate;
+                }
+                qwen_q4_0x8_q8_gemm_vnni512(
+                    gate_up_repacked+static_cast<std::uint64_t>(expert)*gate_up_bytes,
+                    2*intermediate,hidden,value_pointers.data(),
+                    scale_pointers.data(),bsum_pointers.data(),tokens,
+                    output_pointers.data());
+                for(int t=0;t<tokens;++t){
+                    const float*out=output_pointers[t];
+                    const std::size_t slice=static_cast<std::size_t>(
+                        pairs[t].first)*top_k+pairs[t].second;
+                    float*slot=activated+slice*intermediate;
+                    for(int g=0;g<intermediate;++g){
+                        const float gate=out[g],up=out[g+intermediate];
+                        const float cubic=gate*gate*gate;
+                        const float gelu=0.5f*gate*(1.0f+std::tanh(
+                            0.7978845608028654f*(gate+0.044715f*cubic)));
+                        slot[g]=gelu*up;
+                    }
+                    qwen_quantize_q8_gemm(slot,intermediate,
+                        act_values+slice*intermediate,
+                        act_scales+slice*activated_blocks,
+                        act_bsums+slice*activated_blocks);
+                    value_pointers[t]=act_values+slice*intermediate;
+                    scale_pointers[t]=act_scales+slice*activated_blocks;
+                    bsum_pointers[t]=act_bsums+slice*activated_blocks;
+                    output_pointers[t]=partial+slice*hidden;
+                }
+                qwen_q4_0x8_q8_gemm_vnni512(
+                    down_repacked+static_cast<std::uint64_t>(expert)*down_bytes,
+                    hidden,intermediate,value_pointers.data(),
+                    scale_pointers.data(),bsum_pointers.data(),tokens,
+                    output_pointers.data());
+            }else if(use_q8){
                 for(std::size_t first=0;first<pairs.size();first+=8){
                     const int batch=static_cast<int>(
                         std::min<std::size_t>(8,pairs.size()-first));
