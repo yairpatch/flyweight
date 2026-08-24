@@ -621,14 +621,31 @@ void qwen_forward_rows(
             int head_dim=static_cast<int>(runtime.model->tensors[layer.static_tensors[9]].shape[0]);
             int value_dim=value_heads*head_dim;
             int key_heads=(channels-value_dim)/(2*head_dim);
-            dense(1,normalized,first,hidden_size,channels);
+            // MTP fold capture: the qkv projection and the decay/beta logits
+            // are the recurrence's only sequence-dependent inputs, so during
+            // the batched verify they are written to the layer's retention
+            // arena instead of the shared scratch. A rejected round then
+            // rebuilds the DeltaNet state by replaying just the conv and
+            // recurrence kernels over the accepted prefix from the restored
+            // snapshot (qwen_mtp_fold_delta_state) -- bitwise identical to the
+            // full re-forward it replaces, because it launches the same
+            // kernels on the same inputs. The redirect costs no extra copies.
+            const bool fold_capture=
+                runtime.mtp_fold_capture&&span_begin==0&&rows<=8;
+            if(runtime.mtp_fold_capture&&!fold_capture)
+                runtime.mtp_fold_valid=false;
+            const auto qkv=fold_capture
+                ?runtime.state+layer.mtp_retain_qkv:first;
+            const auto decay_logits=fold_capture
+                ?runtime.state+layer.mtp_retain_logits:third;
+            dense(1,normalized,qkv,hidden_size,channels);
             dense(2,normalized,second,hidden_size,gate_elements);
-            dense(4,normalized,third,hidden_size,value_heads);
-            auto beta_logits=third+static_cast<std::uint64_t>(rows)*value_heads*sizeof(float);
+            dense(4,normalized,decay_logits,hidden_size,value_heads);
+            auto beta_logits=decay_logits+static_cast<std::uint64_t>(rows)*value_heads*sizeof(float);
             dense(5,normalized,beta_logits,hidden_size,value_heads);
             int kernel_size=static_cast<int>(runtime.model->tensors[layer.static_tensors[6]].shape[0]);
             auto conv_state=runtime.state+layer.state_first;auto conv_weights=tensor(6);
-            void*conv_args[]={const_cast<std::uint64_t*>(&first),&conv_weights,&conv_state,const_cast<std::uint64_t*>(&fourth),&rows,&channels,&kernel_size};
+            void*conv_args[]={const_cast<std::uint64_t*>(&qkv),&conv_weights,&conv_state,const_cast<std::uint64_t*>(&fourth),&rows,&channels,&kernel_size};
             phase(layer_number,"proj");
             if(kernel_size<=8)launch("delta_conv_chunk",(static_cast<std::uint32_t>(channels)+255)/256,1,256,conv_args);
             else launch("delta_conv_sequence",channels,1,1,conv_args);
@@ -668,7 +685,7 @@ void qwen_forward_rows(
                     const std::size_t token_count=static_cast<std::size_t>(rows);
                     save("convolved",fourth,token_count*static_cast<std::size_t>(channels));
                     save("gates",second,token_count*static_cast<std::size_t>(gate_elements));
-                    save("decay_logits",third,token_count*static_cast<std::size_t>(value_heads));
+                    save("decay_logits",decay_logits,token_count*static_cast<std::size_t>(value_heads));
                     save("beta_logits",beta_logits,token_count*static_cast<std::size_t>(value_heads));
                     save("state",recurrent_state,
                          static_cast<std::size_t>(value_heads)*head_dim*head_dim);
@@ -689,7 +706,7 @@ void qwen_forward_rows(
                         layer_number,rows,dump_dir);
                 }
             }
-            void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta_logits,const_cast<std::uint64_t*>(&third),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
+            void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta_logits,const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
             // Chunked WY form: the same recurrence with the serial depth cut from
             // `rows` steps to rows/64 and the grid widened past `value_heads`.
             // Requires the workspace regions sized at prepare time, so the guard
@@ -719,7 +736,7 @@ void qwen_forward_rows(
                      +static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaChunk)-1)
                     /static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaChunk);
                 void*score_args[]={const_cast<std::uint64_t*>(&fourth),&beta_logits,
-                    const_cast<std::uint64_t*>(&third),&decay,&dt,
+                    const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,
                     const_cast<std::uint64_t*>(&attn),const_cast<std::uint64_t*>(&pmat),
                     const_cast<std::uint64_t*>(&gcum),const_cast<std::uint64_t*>(&beta_out),
                     const_cast<std::uint64_t*>(&qinv),const_cast<std::uint64_t*>(&kinv),
@@ -874,20 +891,32 @@ void qwen_forward_rows(
             const bool cublas_prefill_requested=
                 !cublas_prefill_disabled&&
                 (cublas_prefill_forced||max_tokens>=4096);
-            const std::uint64_t score_row_bytes=
-                static_cast<std::uint64_t>(heads)*max_tokens*sizeof(float);
+            // Flash-blocked: the score tile is bounded by a KV position block
+            // rather than the whole visible prefix, so the 16-row query tile
+            // no longer shrinks as the context grows (it collapsed to 3 rows
+            // at 70k, streaming the entire cache once per 3 queries -- the
+            // long-context prefill decline). The block is whatever fits the
+            // same score workspace at 16 rows.
+            const int cublas_group=kv_heads?heads/kv_heads:0;
             const std::uint64_t score_workspace_bytes=
                 static_cast<std::uint64_t>(rows)*runtime.scratch_elements*sizeof(float);
-            const int cublas_tile_rows=score_row_bytes
-                ?static_cast<int>(std::min<std::uint64_t>(
-                    16,score_workspace_bytes/score_row_bytes)):0;
+            const std::uint64_t block_capacity=cublas_group
+                ?score_workspace_bytes/
+                    (16ULL*cublas_group*sizeof(float)):0;
+            const int cublas_block_tokens=static_cast<int>(
+                std::min<std::uint64_t>(block_capacity,max_tokens));
+            const int cublas_tile_rows=cublas_block_tokens>=256?16:0;
             const std::uint64_t packed_query_bytes=device_align(
                 static_cast<std::uint64_t>(16)*heads*head_dim*
                 sizeof(std::uint16_t));
             const std::uint64_t packed_output_bytes=device_align(
                 static_cast<std::uint64_t>(16)*heads*head_dim*sizeof(float));
+            const std::uint64_t flash_state_bytes=device_align(
+                static_cast<std::uint64_t>(16)*heads*3*sizeof(float));
+            const auto flash_state=
+                attention_scores+packed_query_bytes+packed_output_bytes;
             const bool cublas_workspace_ok=
-                packed_query_bytes+packed_output_bytes<=
+                packed_query_bytes+packed_output_bytes+flash_state_bytes<=
                 static_cast<std::uint64_t>(heads)*
                     runtime.options.context_limit*sizeof(float);
             // The tensor-core prefill routines fold Qwen's per-channel sigmoid
@@ -901,10 +930,24 @@ void qwen_forward_rows(
                 colibri_gpu_attention_prefill_f16_cublas(
                     queries,gates,cache_keys,cache_values,
                     attention_scores,first,second,
-                    attention_scores+packed_query_bytes,third,
+                    attention_scores+packed_query_bytes,flash_state,third,
                     runtime.stream,heads,kv_heads,head_dim,rows,capacity,
                     static_cast<int>(runtime.position)+span_begin,
-                    cublas_tile_rows,scale,1)==0;
+                    cublas_tile_rows,cublas_block_tokens,scale,1)==0;
+            // COLIBRI_ATTN_PREFILL_TRACE=1: which attention path actually ran,
+            // printed for the first few layers. The cuBLAS attempt fails
+            // silently by design (missing library, kernel, workspace), so a
+            // fallback is invisible without this -- and a dormant tensor-core
+            // path looks exactly like a slow one.
+            if(std::getenv("COLIBRI_ATTN_PREFILL_TRACE")){
+                static int shown=0;
+                if(shown<4){++shown;
+                    std::fprintf(stderr,
+                        "[attn-prefill] layer=%u cublas=%d requested=%d tile=%d block=%d rows=%d\n",
+                        layer_number,(int)cublas_prefill_done,
+                        (int)cublas_prefill_requested,cublas_tile_rows,
+                        cublas_block_tokens,rows);}
+            }
             if(cublas_prefill_done){
                 // Tensor-core attention wrote the already-gated rows to third.
             }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
@@ -942,9 +985,9 @@ void qwen_forward_rows(
                     colibri_gpu_attention_prefill_f16_cublas(
                         queries,gates,stage_keys,stage_values,
                         attention_scores,first,second,
-                        attention_scores+packed_query_bytes,third,
+                        attention_scores+packed_query_bytes,flash_state,third,
                         runtime.stream,heads,kv_heads,head_dim,rows,window,
-                        base,cublas_tile_rows,scale,0)==0;
+                        base,cublas_tile_rows,cublas_block_tokens,scale,0)==0;
                 if(!staged_cublas){
                     void*attention_args[]={const_cast<std::uint64_t*>(&queries),&stage_keys,&stage_values,const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&staged_capacity,&scale};
                     launch("kv_attention_prefill_f16",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);

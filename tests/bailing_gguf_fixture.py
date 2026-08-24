@@ -221,6 +221,19 @@ def build(directory: Path, source: Path, flash: bool = False,
         tensors[draft + "nextn.enorm.weight"] = weights["model.norm.weight"]
         tensors[draft + "nextn.hnorm.weight"] = weights["model.norm.weight"]
         tensors[draft + "layer_output_norm.weight"] = weights["model.norm.weight"]
+        # A complete, runnable draft block, the shape the real Ling 3.0 Flash
+        # ships: eh_proj plus a full MLA+MoE layer of its own. The last decoder
+        # layer's tensors stand in for the draft layer's -- the merge weights
+        # are what the speculative path actually exercises, and sharing the
+        # rest keeps the fixture small. The three norm-only entries above stay
+        # exactly as they were: they are the stub-tolerance guard.
+        last = f"blk.{hf.LAYERS - 1}."
+        for name in [n for n in tensors if n.startswith(last)]:
+            tensors.setdefault(draft + name[len(last):], tensors[name])
+        rng = np.random.default_rng(424242)
+        tensors[draft + "nextn.eh_proj.weight"] = (
+            rng.standard_normal((hf.HIDDEN, 2 * hf.HIDDEN)).astype(np.float32)
+            * 0.05)
 
     tokens, types, merges = _tokenizer_tokens()
     interval = hf.CONFIG["layer_group_size"]

@@ -322,6 +322,35 @@ class _NativeEngine:
                 )
 
 
+def _check_content(role: str, content: str, index: int) -> None:
+    """The empty-turn rule every renderer below shares.
+
+    An assistant turn may carry no text, and so may a tool result: a
+    generation the user cancelled, one the token ceiling cut mid-tool-call,
+    a turn of pure reasoning the client stripped before replaying it, a tool
+    that printed nothing. The protocol layer preserves all of those on
+    purpose (`server._chat_messages`) precisely so a conversation can be
+    replayed -- and then this renderer refused them, so the 400 landed one
+    layer further down as "unable to tokenize the formatted prompt". Every
+    later request in that conversation failed the same way, because the
+    offending turn is history: the client re-sends it forever and cannot
+    edit it. Rendering an empty turn is harmless -- a role header with no
+    body, which is what the turn was.
+
+    An empty user, system or developer turn stays refused: nothing
+    legitimately produces one, so it is a client bug worth reporting rather
+    than absorbing. The index and role travel with the message because the
+    caller sees this through a wrapper that says only that tokenization
+    failed, and "some message was empty" is not a diagnosis.
+    """
+    if content.strip() or role in ("assistant", "tool"):
+        return
+    raise ValueError(
+        f"chat message content must not be empty: messages[{index}] "
+        f"has role {role!r}"
+    )
+
+
 class NativeV2Tokenizer:
     """Chat formatting and tokenizer facade backed directly by GGUF metadata."""
 
@@ -523,15 +552,12 @@ class NativeV2Tokenizer:
         compiled_template = getattr(self, "_compiled_chat_template", None)
         if compiled_template is not None:
             normalized: list[dict[str, object]] = []
-            for message in messages:
+            for index, message in enumerate(messages):
                 role = message["role"]
-                content = message["content"]
+                content = message["content"] or ""
                 if role not in ("system", "developer", "user", "assistant", "tool"):
                     raise ValueError(f"unsupported chat role: {role}")
-                if not content.strip() and not (
-                    role == "assistant" and message.get("tool_calls")
-                ):
-                    raise ValueError("chat message content must not be empty")
+                _check_content(role, content, index)
                 # Some tokenizer.chat_template variants access tool_calls
                 # unconditionally instead of guarding it with ``is defined``,
                 # so the key is always present. It carries real calls only for
@@ -587,14 +613,12 @@ class NativeV2Tokenizer:
         if self.architecture == "deepseek4":
             return self._format_deepseek4(messages, enable_thinking=bool(enable_thinking))
         sections: list[str] = []
-        for message in messages:
+        for index, message in enumerate(messages):
             role = message["role"]
-            content = message["content"].strip()
+            content = (message["content"] or "").strip()
             if role not in ("system", "developer", "user", "assistant", "tool"):
                 raise ValueError(f"unsupported chat role: {role}")
-            tool_calls = message.get("tool_calls", [])
-            if not content and not (role == "assistant" and tool_calls):
-                raise ValueError("chat message content must not be empty")
+            _check_content(role, content, index)
             if role == "assistant" and not content.startswith("<think>"):
                 thinking_prefix = (
                     "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
@@ -617,21 +641,19 @@ class NativeV2Tokenizer:
             if enable_thinking:
                 sections.append("<|think|>\n")
             if messages[0]["role"] in ("system", "developer"):
-                content = messages[0]["content"].strip()
-                if not content:
-                    raise ValueError("chat message content must not be empty")
+                content = (messages[0]["content"] or "").strip()
+                _check_content(messages[0]["role"], content, 0)
                 sections.append(content)
                 start = 1
             sections.append("<turn|>\n")
-        for message in messages[start:]:
+        for index, message in enumerate(messages[start:], start):
             role = message["role"]
             if role not in ("user", "assistant"):
                 raise ValueError(
                     "Gemma 4 text chat currently supports system, developer, user, and assistant messages"
                 )
-            content = message["content"].strip()
-            if not content:
-                raise ValueError("chat message content must not be empty")
+            content = (message["content"] or "").strip()
+            _check_content(role, content, index)
             rendered_role = "model" if role == "assistant" else role
             sections.append(f"<|turn>{rendered_role}\n{content}<turn|>\n")
         sections.append("<|turn>model\n")
@@ -682,10 +704,9 @@ class NativeV2Tokenizer:
             role = message["role"]
             if role == "system" or index in dropped:
                 continue
-            content = message["content"].strip()
+            content = (message["content"] or "").strip()
             tool_calls = message.get("tool_calls", [])
-            if not content and not (role == "assistant" and tool_calls):
-                raise ValueError("chat message content must not be empty")
+            _check_content(role, content, index)
             if role in ("user", "tool"):
                 sections.append("\n\n" if in_user else "<｜User｜>")
                 in_user = True
@@ -763,20 +784,19 @@ class NativeV2Tokenizer:
         system = cls._LAGUNA_SYSTEM
         start = 0
         if messages[0]["role"] in ("system", "developer"):
-            system = messages[0]["content"].strip()
+            system = (messages[0]["content"] or "").strip()
             start = 1
         if system or enable_thinking:
             sections.append(f"<system>{system}</system>\n")
-        for message in messages[start:]:
+        for index, message in enumerate(messages[start:], start):
             role = message["role"]
             if role not in ("user", "assistant"):
                 raise ValueError(
                     "Laguna text chat currently supports system, developer, "
                     "user, and assistant messages"
                 )
-            content = message["content"].strip()
-            if not content:
-                raise ValueError("chat message content must not be empty")
+            content = (message["content"] or "").strip()
+            _check_content(role, content, index)
             if role == "user":
                 sections.append(f"<user>{content}</user>\n")
             else:

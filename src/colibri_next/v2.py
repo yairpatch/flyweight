@@ -1277,6 +1277,58 @@ class BailingRuntime:
             )
         )
 
+    @property
+    def mtp_available(self) -> bool:
+        """Whether the checkpoint carries a nextn draft block."""
+        entry = self._lib.colibri_v2_bailing_mtp_available
+        entry.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        entry.restype = ctypes.c_int
+        out = ctypes.c_int()
+        self._check(entry(self._handle, ctypes.byref(out)))
+        return bool(out.value)
+
+    def mtp_round(self, next_token: int, wanted: int = 4, slot: int = 0) -> list[int]:
+        """One speculative draft-and-verify round; returns the committed tokens.
+
+        ``next_token`` must not have been evaluated yet, and the last returned
+        token is the next round's ``next_token``. Needs a preceding host-path
+        ``eval`` to seed the draft's conditioning hidden. Greedy: the returned
+        tokens are the target's argmax outputs, so drafting quality moves the
+        acceptance rate, never the text.
+        """
+        entry = self._lib.colibri_v2_bailing_mtp_round
+        entry.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        entry.restype = ctypes.c_int
+        produced = (ctypes.c_uint32 * 8)()
+        count = ctypes.c_uint32()
+        self._check(entry(self._handle, ctypes.c_uint32(slot),
+                          ctypes.c_uint32(next_token), ctypes.c_uint32(wanted),
+                          produced, ctypes.byref(count)))
+        return [int(produced[index]) for index in range(count.value)]
+
+    @property
+    def mtp_stats(self) -> dict[str, int]:
+        """Lifetime draft/accept/reject counters for the speculative path."""
+        entry = self._lib.colibri_v2_bailing_mtp_stats
+        entry.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+        ]
+        entry.restype = ctypes.c_int
+        drafted = ctypes.c_uint64()
+        accepted = ctypes.c_uint64()
+        rejected = ctypes.c_uint64()
+        self._check(entry(self._handle, ctypes.byref(drafted),
+                          ctypes.byref(accepted), ctypes.byref(rejected)))
+        return {
+            "drafted": int(drafted.value),
+            "accepted": int(accepted.value),
+            "rejected": int(rejected.value),
+        }
+
     def save_state(self, slot: int = 0) -> bytes:
         """The live sequence's cache, so it can be restored instead of re-run.
 

@@ -520,6 +520,19 @@ COLIBRI_V2_API int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, con
    there is one and falls back to the host silently, so nothing but the runtime
    knows which path it is on. Writes 1 for the device and 0 for the host. */
 COLIBRI_V2_API int colibri_v2_bailing_uses_gpu(ColibriV2BailingRuntime* runtime, int* out);
+
+/* Speculative decode via the checkpoint's nextn draft block, host path.
+   `mtp_available` says whether the checkpoint carries one. A round drafts up
+   to `wanted` (at most 8) tokens from `next_token` -- which must NOT have
+   been evaluated yet -- verifies them in one batched target pass, commits
+   the agreed prefix and writes the target's tokens (at least one) to
+   `out_tokens`. Feed the LAST emitted token back as the next round's
+   `next_token`. Requires a preceding host-path eval to seed the draft's
+   conditioning hidden. `mtp_stats` reports lifetime draft/accept/reject
+   counters. */
+COLIBRI_V2_API int colibri_v2_bailing_mtp_available(ColibriV2BailingRuntime* runtime, int* out);
+COLIBRI_V2_API int colibri_v2_bailing_mtp_round(ColibriV2BailingRuntime* runtime, uint32_t slot_index, uint32_t next_token, uint32_t wanted, uint32_t* out_tokens, uint32_t* out_count);
+COLIBRI_V2_API int colibri_v2_bailing_mtp_stats(ColibriV2BailingRuntime* runtime, uint64_t* drafted, uint64_t* accepted, uint64_t* rejected);
 /* Watch a prompt as it is evaluated, and optionally stop it.
 
    `callback(user, processed, total)` runs on entry, at internal tile

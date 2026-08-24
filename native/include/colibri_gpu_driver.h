@@ -148,6 +148,9 @@ COLIBRI_API int colibri_gpu_attention_prefill_f16_cublas(
     std::uint64_t scores_f32,
     std::uint64_t probabilities_f16,
     std::uint64_t packed_output,
+    /* Running (max, denominator) pairs plus rescale factors for the
+       flash-blocked softmax: tile_rows * heads * 3 floats. */
+    std::uint64_t flash_state,
     std::uint64_t output,
     std::uint64_t stream,
     std::int32_t heads,
@@ -157,6 +160,9 @@ COLIBRI_API int colibri_gpu_attention_prefill_f16_cublas(
     std::int32_t capacity,
     std::int32_t base_position,
     std::int32_t tile_rows,
+    /* KV positions materialized per score tile; bounds the workspace so the
+       query tile no longer shrinks with context length. */
+    std::int32_t block_tokens,
     float scale,
     /* 0 skips the fused output gate, for callers that must post-process the
        attention result before applying an elementwise nonlinearity. */

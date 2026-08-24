@@ -991,7 +991,11 @@ extern "C" int colibri_gpu_compile(
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
              "qwen_attention_prefill_pack_f16",
              "kv_attention_prefill_softmax_f16",
+             "kv_attention_prefill_block_softmax_f16",
+             "qwen_attention_prefill_rescale",
              "qwen_attention_prefill_unpack_gate", "qwen_attention_prefill_unpack",
+             "qwen_attention_prefill_unpack_gate_norm",
+             "qwen_attention_prefill_unpack_norm",
              "kv_attention_scores", "kv_attention_values",
              "qwen_shared_scale", "qwen_argmax", "qwen_concat_pair",
              "qwen_shared_scale_bf16", "qwen_copy_vector", "silu_mul",
@@ -2960,10 +2964,12 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     std::uint64_t keys, std::uint64_t values,
     std::uint64_t packed_queries, std::uint64_t scores_f32,
     std::uint64_t probabilities_f16,
-    std::uint64_t packed_output, std::uint64_t output,
+    std::uint64_t packed_output, std::uint64_t flash_state,
+    std::uint64_t output,
     std::uint64_t stream, std::int32_t heads, std::int32_t kv_heads,
     std::int32_t head_dim, std::int32_t rows, std::int32_t capacity,
-    std::int32_t base_position, std::int32_t tile_rows_limit, float scale,
+    std::int32_t base_position, std::int32_t tile_rows_limit,
+    std::int32_t block_tokens, float scale,
     std::int32_t apply_gate
 ) {
     // Not reachable through launch(), so the CPU backend cannot substitute a
@@ -2976,23 +2982,24 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!queries || !gates || !keys || !values || !packed_queries
         || !scores_f32 || !probabilities_f16 || !packed_output || !output
-        || heads <= 0
+        || !flash_state || heads <= 0
         || kv_heads <= 0 || heads % kv_heads != 0 || head_dim <= 0
         || rows <= 0 || capacity <= 0 || base_position < 0
         || base_position + rows > capacity || tile_rows_limit <= 0
-        || !load_cublas())
+        || block_tokens <= 0 || !load_cublas())
         return -1;
     const auto cuda_stream = reinterpret_cast<CUstream>(stream);
     if (g_cublas.set_stream(g_cublas_handle, cuda_stream) != 0) return -2;
     auto pack = g_functions.find("qwen_attention_prefill_pack_f16");
-    auto softmax = g_functions.find("kv_attention_prefill_softmax_f16");
+    auto softmax = g_functions.find("kv_attention_prefill_block_softmax_f16");
+    auto rescale_fn = g_functions.find("qwen_attention_prefill_rescale");
     // Turbo values arrive rotated, so that caller takes the ungated variant and
     // applies the gate itself after the inverse rotation.
     auto unpack = g_functions.find(
-        apply_gate ? "qwen_attention_prefill_unpack_gate"
-                   : "qwen_attention_prefill_unpack");
+        apply_gate ? "qwen_attention_prefill_unpack_gate_norm"
+                   : "qwen_attention_prefill_unpack_norm");
     if (pack == g_functions.end() || softmax == g_functions.end()
-        || unpack == g_functions.end())
+        || rescale_fn == g_functions.end() || unpack == g_functions.end())
         return -3;
 
     constexpr int kCudaR16F = 2;
@@ -3007,6 +3014,10 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     const float zero = 0.0f;
     const float one = 1.0f;
     const int tile_limit = std::min(16, tile_rows_limit);
+    // The rescale factors live behind the (M, S) pairs in the state buffer.
+    const std::uint64_t rescale_buffer =
+        flash_state + static_cast<std::uint64_t>(tile_limit) * heads * 2
+            * sizeof(float);
     for (int tile_start = 0; tile_start < rows; tile_start += tile_limit) {
         int tile_rows = std::min(tile_limit, rows - tile_start);
         const int columns = tile_rows * group;
@@ -3018,48 +3029,80 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
         if (launch(pack->second, (query_elements + 255) / 256, 1, 256,
                    pack_args, 0, cuda_stream) != 0)
             return -4;
+        // The visible prefix is walked in position blocks so the materialized
+        // score tile is bounded by `block_tokens` rather than the context.
+        // The un-blocked form shrank the query tile to fit `tokens` in the
+        // score workspace, which at 70k context meant streaming the whole KV
+        // cache once per 3 query rows; here the tile stays at 16 and the
+        // running max/denominator carries the softmax across blocks.
         const int tokens = base_position + tile_start + tile_rows;
         const long long query_stride =
             static_cast<long long>(columns) * head_dim;
-        const long long score_stride =
-            static_cast<long long>(tokens) * columns;
-        if (g_cublas.gemm_strided_batched_ex(
-                g_cublas_handle, kCublasOpT, kCublasOpN,
-                tokens, columns, head_dim, &scale,
-                reinterpret_cast<const void*>(keys), kCudaR16F, head_dim,
-                cache_stride,
-                reinterpret_cast<const void*>(packed_queries), kCudaR16F,
-                head_dim, query_stride, &zero,
-                reinterpret_cast<void*>(scores_f32), kCudaR32F, tokens,
-                score_stride, kv_heads, kCompute32F, kTensorOp) != 0)
-            return -5;
-        void* softmax_args[] = {
-            &scores_f32, &probabilities_f16, &tile_start, &tile_rows,
-            &heads, &kv_heads, const_cast<int*>(&tokens), &base_position
-        };
-        if (launch(softmax->second, heads, tile_rows, 256, softmax_args, 0,
-                   cuda_stream) != 0)
-            return -6;
         const long long output_stride =
             static_cast<long long>(head_dim) * columns;
-        if (g_cublas.gemm_strided_batched_ex(
-                g_cublas_handle, kCublasOpN, kCublasOpN,
-                head_dim, columns, tokens, &one,
-                reinterpret_cast<const void*>(values), kCudaR16F, head_dim,
-                cache_stride,
-                reinterpret_cast<const void*>(probabilities_f16), kCudaR16F,
-                tokens,
-                score_stride, &zero,
-                reinterpret_cast<void*>(packed_output), kCudaR32F, head_dim,
-                output_stride, kv_heads, kCompute32F, kTensorOp) != 0)
-            return -7;
+        for (int block_start = 0; block_start < tokens;
+             block_start += block_tokens) {
+            const int block = std::min(block_tokens, tokens - block_start);
+            const long long score_stride =
+                static_cast<long long>(block) * columns;
+            const std::uint64_t block_keys = keys
+                + static_cast<std::uint64_t>(block_start) * head_dim
+                    * sizeof(std::uint16_t);
+            const std::uint64_t block_values = values
+                + static_cast<std::uint64_t>(block_start) * head_dim
+                    * sizeof(std::uint16_t);
+            if (g_cublas.gemm_strided_batched_ex(
+                    g_cublas_handle, kCublasOpT, kCublasOpN,
+                    block, columns, head_dim, &scale,
+                    reinterpret_cast<const void*>(block_keys), kCudaR16F,
+                    head_dim, cache_stride,
+                    reinterpret_cast<const void*>(packed_queries), kCudaR16F,
+                    head_dim, query_stride, &zero,
+                    reinterpret_cast<void*>(scores_f32), kCudaR32F, block,
+                    score_stride, kv_heads, kCompute32F, kTensorOp) != 0)
+                return -5;
+            void* softmax_args[] = {
+                &scores_f32, &probabilities_f16,
+                const_cast<std::uint64_t*>(&flash_state),
+                const_cast<std::uint64_t*>(&rescale_buffer),
+                &tile_start, &tile_rows, &heads, &kv_heads,
+                const_cast<int*>(&block_start), const_cast<int*>(&block),
+                &base_position
+            };
+            if (launch(softmax->second, heads, tile_rows, 256, softmax_args, 0,
+                       cuda_stream) != 0)
+                return -6;
+            const bool first = block_start == 0;
+            if (!first) {
+                void* rescale_args[] = {
+                    const_cast<std::uint64_t*>(&packed_output),
+                    const_cast<std::uint64_t*>(&rescale_buffer),
+                    &tile_rows, &heads, &kv_heads, &head_dim
+                };
+                if (launch(rescale_fn->second, (query_elements + 255) / 256, 1,
+                           256, rescale_args, 0, cuda_stream) != 0)
+                    return -7;
+            }
+            if (g_cublas.gemm_strided_batched_ex(
+                    g_cublas_handle, kCublasOpN, kCublasOpN,
+                    head_dim, columns, block, &one,
+                    reinterpret_cast<const void*>(block_values), kCudaR16F,
+                    head_dim, cache_stride,
+                    reinterpret_cast<const void*>(probabilities_f16), kCudaR16F,
+                    block,
+                    score_stride, first ? &zero : &one,
+                    reinterpret_cast<void*>(packed_output), kCudaR32F, head_dim,
+                    output_stride, kv_heads, kCompute32F, kTensorOp) != 0)
+                return -8;
+        }
         void* unpack_args[] = {
-            &packed_output, &gates, &output, &tile_start, &tile_rows,
+            &packed_output, &gates, const_cast<std::uint64_t*>(&flash_state),
+            &output, &tile_start, &tile_rows,
             &heads, &kv_heads, &head_dim
         };
         if (launch(unpack->second, (query_elements + 255) / 256, 1, 256,
                    unpack_args, 0, cuda_stream) != 0)
-            return -8;
+            return -9;
     }
     return 0;
 }

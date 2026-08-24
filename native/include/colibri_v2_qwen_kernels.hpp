@@ -8684,6 +8684,104 @@ extern "C" __global__ void kv_attention_prefill_softmax_f16(
         output[token] = __float2half(__half2float(output[token]) * inverse);
 }
 
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Flash-blocked variant of the prefill softmax: the visible prefix is walked
+// in position blocks so the materialized score tile is bounded by the block,
+// not by the context -- which is what let the caller's 16-row query tile
+// collapse to 3 rows at 70k tokens and stream the whole cache per 3 queries.
+// Per (head, query row) the kernel keeps a running maximum M and denominator
+// S in `state` ([tile_row][head][2]) across blocks, writes this block's
+// probabilities already on the new-M scale (so the PV GEMM accumulates
+// directly), and leaves exp(M_old - M_new) in `rescale` for the accumulator
+// fix-up that must run before that GEMM. The final normalize (divide by S)
+// happens in the unpack. Same numerics as one big softmax, reassociated.
+extern "C" __global__ void kv_attention_prefill_block_softmax_f16(
+    const float* scores, __half* probabilities, float* state, float* rescale,
+    const int tile_start, const int tile_rows,
+    const int heads, const int kv_heads,
+    const int block_start, const int block_tokens,
+    const int base_position
+) {
+    const int head = blockIdx.x;
+    const int row_index = blockIdx.y;
+    if (head >= heads || row_index >= tile_rows || block_tokens <= 0) return;
+    const int group = heads / kv_heads;
+    const int kv_head = head / group;
+    const int group_head = head - kv_head * group;
+    const int column = row_index * group + group_head;
+    const float* row = scores
+        + (long long)kv_head * block_tokens * tile_rows * group
+        + (long long)column * block_tokens;
+    __half* output = probabilities
+        + (long long)kv_head * block_tokens * tile_rows * group
+        + (long long)column * block_tokens;
+    const int visible_global = base_position + tile_start + row_index + 1;
+    const int visible = min(block_tokens, visible_global - block_start);
+    const int slot = row_index * heads + head;
+    __shared__ float reduction[256];
+    float maximum = -3.402823466e+38F;
+    for (int token = threadIdx.x; token < visible; token += blockDim.x)
+        maximum = fmaxf(maximum, row[token]);
+    reduction[threadIdx.x] = maximum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] =
+                fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const bool first = block_start == 0;
+    const float previous_maximum = first ? -3.402823466e+38F : state[slot * 2];
+    const float previous_sum = first ? 0.0f : state[slot * 2 + 1];
+    const float new_maximum = fmaxf(previous_maximum, reduction[0]);
+    float denominator = 0.0f;
+    for (int token = threadIdx.x; token < visible; token += blockDim.x) {
+        const float probability = __expf(row[token] - new_maximum);
+        output[token] = __float2half(probability);
+        denominator += probability;
+    }
+    for (int token = max(visible, 0) + threadIdx.x; token < block_tokens;
+         token += blockDim.x)
+        output[token] = __float2half(0.0f);
+    reduction[threadIdx.x] = denominator;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        // A fully masked block (visible <= 0) keeps the running state and
+        // contributes zero probabilities; the correction is exp(M - M) = 1.
+        const float correction =
+            first ? 0.0f : __expf(previous_maximum - new_maximum);
+        state[slot * 2] = new_maximum;
+        state[slot * 2 + 1] = previous_sum * correction + reduction[0];
+        rescale[slot] = correction;
+    }
+}
+
+// Multiply the packed flash accumulator by this block's exp(M_old - M_new)
+// before the PV GEMM adds the block's contribution on the new scale.
+extern "C" __global__ void qwen_attention_prefill_rescale(
+    float* packed, const float* rescale, const int tile_rows,
+    const int heads, const int kv_heads, const int head_dim
+) {
+    const int elements = tile_rows * heads * head_dim;
+    const int group = heads / kv_heads;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += blockDim.x * gridDim.x) {
+        const int dimension = index % head_dim;
+        const int column = index / head_dim % (tile_rows * group);
+        const int kv_head = index / (head_dim * tile_rows * group);
+        const int row = column / group;
+        const int head = kv_head * group + column - row * group;
+        packed[((long long)kv_head * tile_rows * group + column) * head_dim
+               + dimension] *= rescale[row * heads + head];
+    }
+}
+
 // Convert the column-major PV result back to row/head order, optionally
 // applying Qwen's attention gate while the value is already in a register.
 //
@@ -8728,6 +8826,59 @@ extern "C" __global__ void qwen_attention_prefill_unpack_gate(
 ) {
     qwen_attention_prefill_unpack_impl<true>(
         packed, gates, output, tile_start, tile_rows, heads, kv_heads, head_dim);
+}
+
+// Flash-blocked unpack: the accumulator holds sum(p * V) with p on the final
+// maximum's scale but unnormalized; divide by the running denominator from
+// the block-softmax state while the value is in a register.
+template<bool GATE>
+__device__ void qwen_attention_prefill_unpack_norm_impl(
+    const float* packed, const float* gates, const float* state, float* output,
+    const int tile_start, const int tile_rows, const int heads,
+    const int kv_heads, const int head_dim
+) {
+    const int elements = tile_rows * heads * head_dim;
+    const int group = heads / kv_heads;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += blockDim.x * gridDim.x) {
+        const int dimension = index % head_dim;
+        const int head = (index / head_dim) % heads;
+        const int row = index / (heads * head_dim);
+        const int kv_head = head / group;
+        const int group_head = head - kv_head * group;
+        const long long column = (long long)row * group + group_head;
+        const float denominator = state[(row * heads + head) * 2 + 1];
+        const float value =
+            packed[((long long)kv_head * tile_rows * group + column) * head_dim
+                   + dimension] / denominator;
+        const long long destination =
+            ((long long)tile_start + row) * heads * head_dim
+            + (long long)head * head_dim + dimension;
+        if (GATE) {
+            const float gate = fminf(80.0f, fmaxf(-80.0f, gates[destination]));
+            output[destination] = value / (1.0f + expf(-gate));
+        } else {
+            output[destination] = value;
+        }
+    }
+}
+extern "C" __global__ void qwen_attention_prefill_unpack_gate_norm(
+    const float* packed, const float* gates, const float* state, float* output,
+    const int tile_start, const int tile_rows, const int heads,
+    const int kv_heads, const int head_dim
+) {
+    qwen_attention_prefill_unpack_norm_impl<true>(
+        packed, gates, state, output, tile_start, tile_rows, heads, kv_heads,
+        head_dim);
+}
+extern "C" __global__ void qwen_attention_prefill_unpack_norm(
+    const float* packed, const float* gates, const float* state, float* output,
+    const int tile_start, const int tile_rows, const int heads,
+    const int kv_heads, const int head_dim
+) {
+    qwen_attention_prefill_unpack_norm_impl<false>(
+        packed, gates, state, output, tile_start, tile_rows, heads, kv_heads,
+        head_dim);
 }
 extern "C" __global__ void qwen_attention_prefill_unpack(
     const float* packed, const float* gates, float* output,

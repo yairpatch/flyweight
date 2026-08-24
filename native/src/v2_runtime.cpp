@@ -249,6 +249,14 @@ struct QwenLayerPlan {
     std::uint64_t state_second = 0;
     std::uint64_t snapshot_first = 0;
     std::uint64_t snapshot_second = 0;
+    // MTP fold retention (ReplaySSM): during verification the qkv projection
+    // and the decay/beta logits -- the only sequence-dependent inputs of the
+    // DeltaNet transition -- are written here instead of the shared scratch,
+    // so a rejected round can rebuild the recurrent state by replaying just
+    // the conv and recurrence kernels over the accepted prefix instead of
+    // re-running the whole forward. Sized for the 8-row verifier maximum.
+    std::uint64_t mtp_retain_qkv = 0;
+    std::uint64_t mtp_retain_logits = 0;
 };
 
 struct QwenExpertSlot {
@@ -693,6 +701,16 @@ struct ColibriV2QwenRuntime {
     std::uint64_t mtp_verified_hidden_offset = 0;
     std::uint64_t mtp_snapshot_offset = 0;
     std::uint64_t mtp_snapshot_bytes = 0;
+    // MTP fold (ReplaySSM-style rejection rollback). `capture` is set only for
+    // the duration of the batched verify pass and redirects each DeltaNet
+    // layer's transition inputs into its retention arena; `valid` says the
+    // arena holds the complete current batch (cleared if a partial span made
+    // the capture unusable); `rows` is the batch row count the retention
+    // layout was written with, which fixes the beta-logit offset during fold.
+    bool mtp_fold_capture = false;
+    bool mtp_fold_valid = false;
+    std::uint32_t mtp_fold_rows = 0;
+    bool mtp_delta_layers = false;
     std::uint64_t mtp_cache_tokens = 0;
     std::uint64_t decode_calls = 0;
     std::uint64_t decode_nanoseconds = 0;
@@ -4818,10 +4836,16 @@ void bailing_adapt_gguf(ColibriV2Model& m) {
     };
 
     std::vector<std::string> dropped;
-    for(std::uint32_t layer=0;layer<config.layer_count;++layer){
+    // One index past the stack when a nextn draft block rides along: its MLA
+    // half ships the same split attn_k_b/attn_v_b as every full-attention
+    // layer and needs the same re-merge before the draft can run.
+    const std::uint32_t adapted_layers=config.layer_count+
+        (m.mtp_layer!=std::numeric_limits<std::uint32_t>::max()?1u:0u);
+    for(std::uint32_t layer=0;layer<adapted_layers;++layer){
         const std::string prefix="blk."+std::to_string(layer)+".";
-        const bool full=bailing::layer_is_full_attention(
-            layer,config.layer_count,config.full_attention_interval);
+        const bool full=layer>=config.layer_count||
+            bailing::layer_is_full_attention(
+                layer,config.layer_count,config.full_attention_interval);
         if(!full){
             // The KDA projections arrive under ordinary attention names, which
             // mean different weights on an MLA layer -- hence per-layer rather
@@ -5475,6 +5499,16 @@ struct BailingGpu {
 struct BailingSlot {
     std::vector<colibri::v2::bailing::LayerCache> caches;
     std::uint32_t position = 0;
+    // MTP: the draft layer's own cache, the target's pre-norm hidden for the
+    // last forwarded token (what the draft block conditions on), and the
+    // per-KDA-layer scratch the fold rollback needs -- the state/window
+    // snapshot taken before a verify and the retained transition inputs the
+    // verify recorded. Persistent per slot so a round allocates nothing.
+    colibri::v2::bailing::LayerCache draft_cache;
+    std::vector<float> target_hidden;
+    bool has_target_hidden = false;
+    std::vector<std::vector<float>> mtp_state, mtp_qwin, mtp_kwin, mtp_vwin;
+    std::vector<std::vector<float>> mtp_q, mtp_k, mtp_v, mtp_decay, mtp_beta;
     // Which copy of this slot's per-layer cache is current. The host and device
     // each keep their own, and the two paths play to different strengths -- the
     // host has a batched prefill, the device has the faster decode -- so eval
@@ -5501,6 +5535,20 @@ struct ColibriV2BailingRuntime {
     std::vector<BailingSlot> slots;
     // kv_b decoded to f32 per MLA layer; see MlaWeights::kv_b for why.
     std::vector<std::vector<float>> decoded_kv_b;
+    // The nextn draft block, when the checkpoint carries one: a full MLA+MoE
+    // decoder layer of its own plus the enorm/hnorm/eh_proj merge and a
+    // dedicated head norm. Loaded host-side; unused unless a caller drives
+    // colibri_v2_bailing_mtp_round.
+    struct {
+        bool available = false;
+        colibri::v2::bailing::LayerWeights layer;
+        std::vector<float> decoded_kv_b;
+        const float* enorm = nullptr;
+        const float* hnorm = nullptr;
+        colibri::v2::bailing::Matrix eh_proj;
+        const float* head_norm = nullptr;
+    } draft;
+    std::uint64_t mtp_drafted = 0, mtp_accepted = 0, mtp_rejected = 0;
     std::unique_ptr<BailingGpu> gpu;
     // Checked, not assumed. Every entry point that names a slot comes through
     // here, so an out-of-range index is an error the caller sees rather than a
@@ -7078,6 +7126,74 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
         for(auto& slot : runtime->slots)
             bailing::reset_cache(slot.caches[index], w, g, capacity);
     }
+    // The nextn draft block, one layer past the executed stack
+    // (detect_mtp_layer trimmed layer_count down to exclude it). A full
+    // MLA+MoE layer of its own plus the merge and head-norm extras. Loading
+    // it costs nothing until a caller drives an MTP round. Gated on eh_proj:
+    // some conversions carry only the nextn norms as a stub, and a stub must
+    // load exactly as before -- present, inert, and not a reason to fail.
+    if(model->mtp_layer != std::numeric_limits<uint32_t>::max() &&
+       bailing_matrix(*model,
+           "blk." + std::to_string(model->mtp_layer) + ".nextn.eh_proj.weight",
+           false).data){
+        auto& d = runtime->draft;
+        auto& w = d.layer;
+        const std::string prefix = "blk." + std::to_string(model->mtp_layer) + ".";
+        w.full_attention = true;
+        w.routed = c.expert_count != 0;
+        if(model->mtp_layer < c.swiglu_clamp_exp.size())
+            w.swiglu_limit_exp = c.swiglu_clamp_exp[model->mtp_layer];
+        if(model->mtp_layer < c.swiglu_clamp_shexp.size())
+            w.swiglu_limit_shexp = c.swiglu_clamp_shexp[model->mtp_layer];
+        w.attention_norm = bailing_f32(*model, prefix + "attn_norm.weight");
+        w.ffn_norm = bailing_f32(*model, prefix + "ffn_norm.weight");
+        if(g.q_lora){
+            w.mla.q_a = bailing_matrix(*model, prefix + "attn_q_a.weight");
+            w.mla.q_a_norm = bailing_f32(*model, prefix + "attn_q_a_norm.weight");
+            w.mla.q_b = bailing_matrix(*model, prefix + "attn_q_b.weight");
+        } else {
+            w.mla.q = bailing_matrix(*model, prefix + "attn_q.weight");
+        }
+        w.mla.kv_a_mqa = bailing_matrix(*model, prefix + "attn_kv_a_mqa.weight");
+        w.mla.kv_a_norm = bailing_f32(*model, prefix + "attn_kv_a_norm.weight");
+        {
+            const auto packed = bailing_matrix(*model, prefix + "attn_kv_b.weight");
+            const std::size_t rows = g.heads * (g.qk_nope + g.v_head_dim);
+            d.decoded_kv_b.resize(rows * g.kv_lora);
+            colibri::v2::bailing::matrix_decode(
+                packed, g.kv_lora, rows, d.decoded_kv_b.data());
+            w.mla.kv_b = d.decoded_kv_b.data();
+        }
+        w.mla.gate = bailing_matrix(*model, prefix + "attn_gate.weight");
+        w.mla.output = bailing_matrix(*model, prefix + "attn_output.weight");
+        if(w.routed){
+            w.ffn.router = bailing_matrix(*model, prefix + "ffn_gate_inp.weight");
+            w.ffn.router_bias = bailing_f32(*model, prefix + "exp_probs_b.bias", false);
+            w.ffn.gate_experts = bailing_matrix(*model, prefix + "ffn_gate_exps.weight");
+            w.ffn.up_experts = bailing_matrix(*model, prefix + "ffn_up_exps.weight");
+            w.ffn.down_experts = bailing_matrix(*model, prefix + "ffn_down_exps.weight");
+            w.ffn.shared_gate = bailing_matrix(*model, prefix + "ffn_gate_shexp.weight", false);
+            w.ffn.shared_up = bailing_matrix(*model, prefix + "ffn_up_shexp.weight", false);
+            w.ffn.shared_down = bailing_matrix(*model, prefix + "ffn_down_shexp.weight", false);
+        } else {
+            w.ffn.gate = bailing_matrix(*model, prefix + "ffn_gate.weight");
+            w.ffn.up = bailing_matrix(*model, prefix + "ffn_up.weight");
+            w.ffn.down = bailing_matrix(*model, prefix + "ffn_down.weight");
+        }
+        d.enorm = bailing_f32(*model, prefix + "nextn.enorm.weight");
+        d.hnorm = bailing_f32(*model, prefix + "nextn.hnorm.weight");
+        d.eh_proj = bailing_matrix(*model, prefix + "nextn.eh_proj.weight");
+        // Some converters carry a dedicated draft-head norm; Ling shares the
+        // per-layer output norm instead, and either may be absent -- fall
+        // back to the trunk's final norm, matching the qwen draft's rule.
+        d.head_norm = bailing_f32(*model, prefix + "nextn.shared_head_norm.weight", false);
+        if(!d.head_norm)
+            d.head_norm = bailing_f32(*model, prefix + "layer_output_norm.weight", false);
+        if(!d.head_norm) d.head_norm = runtime->output_norm;
+        for(auto& slot : runtime->slots)
+            bailing::reset_cache(slot.draft_cache, w, g, capacity);
+        d.available = true;
+    }
     // On by default wherever there is a device to use.
     //
     // It was opt-in while the device had to take prefill as well as decode,
@@ -7159,6 +7275,11 @@ int colibri_v2_bailing_reset_slot(ColibriV2BailingRuntime* runtime, uint32_t slo
     for(std::size_t index=0;index<runtime->layers.size();++index)
         colibri::v2::bailing::reset_cache(slot.caches[index],
             runtime->layers[index], runtime->geometry, runtime->capacity);
+    if(runtime->draft.available){
+        colibri::v2::bailing::reset_cache(slot.draft_cache,
+            runtime->draft.layer, runtime->geometry, runtime->capacity);
+        slot.has_target_hidden = false;
+    }
     // The DEVICE caches need clearing too. Missing this leaked a KDA layer's
     // recurrent state from one request into the next -- and because that state
     // is a running summary of everything seen, the contamination compounds
@@ -7324,6 +7445,16 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
                 count);
     }
     slot.position += count;
+    // The draft block conditions on the target's pre-norm hidden for the last
+    // forwarded token, so the host path preserves it. The device paths do not
+    // produce a host-side hidden; a caller who prefilled there has no draft
+    // conditioning until an MTP round or a host eval provides one.
+    if(runtime->draft.available){
+        const float* last_row = current.data()
+            + static_cast<std::size_t>(count - 1) * g.hidden;
+        slot.target_hidden.assign(last_row, last_row + g.hidden);
+        slot.has_target_hidden = true;
+    }
     // Only the last token's logits are produced; the earlier ones exist purely
     // to advance the caches.
     std::vector<float> normalized(g.hidden);
@@ -7343,6 +7474,311 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
 int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* tokens,
                             uint32_t count, float* logits){
     return colibri_v2_bailing_eval_slot(runtime, 0, tokens, count, logits);
+}
+
+// --- bailingmoe3 MTP (host path) -------------------------------------------
+//
+// Same shape as the qwen runtime's speculative decode, built fold-first: the
+// draft block proposes, one batched verify decides, and a rejection rebuilds
+// only the KDA state from retained transition inputs instead of re-running
+// the forward. Verified tokens are target outputs, so a draft-side defect can
+// only lower the acceptance rate, never change the text.
+
+static std::uint32_t bailing_argmax(const float* values, std::size_t count) {
+    std::size_t winner = 0;
+    for (std::size_t index = 1; index < count; ++index)
+        if (values[index] > values[winner]) winner = index;
+    return static_cast<std::uint32_t>(winner);
+}
+
+// The draft block's forward for one token: embed, merge with the target's
+// preceding hidden through eh_proj, run the draft decoder layer (advancing the
+// draft cache), and leave the pre-norm hidden in `hidden_out`. The merge order
+// -- normalized embedding first, normalized hidden second -- matches the qwen
+// draft and the converter both nextn layouts came from.
+static void bailing_mtp_draft_layer(
+    ColibriV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t token,
+    const float* previous_hidden, float* hidden_out
+) {
+    namespace bailing = colibri::v2::bailing;
+    const auto& g = runtime.geometry;
+    const auto& c = runtime.model->config;
+    if (token >= c.vocabulary_size)
+        throw std::runtime_error("token id is outside the vocabulary");
+    std::vector<float> embedding(g.hidden), merged(2 * g.hidden), input(g.hidden);
+    const auto stride = bailing::row_bytes(runtime.embedding_matrix.type, g.hidden);
+    const auto* base = reinterpret_cast<const std::uint8_t*>(
+        runtime.embedding_matrix.data);
+    bailing::row_decode(base + static_cast<std::size_t>(token) * stride,
+                        runtime.embedding_matrix.type, g.hidden, embedding.data());
+    bailing::rms_norm(embedding.data(), runtime.draft.enorm, g.hidden, g.epsilon,
+                      merged.data());
+    bailing::rms_norm(previous_hidden, runtime.draft.hnorm, g.hidden, g.epsilon,
+                      merged.data() + g.hidden);
+    bailing::matvec(runtime.draft.eh_proj, merged.data(), 2 * g.hidden, g.hidden,
+                    input.data());
+    if (slot.draft_cache.positions >= runtime.capacity)
+        throw std::runtime_error("bailing draft cache exceeds the runtime capacity");
+    bailing::decoder_layer(input.data(), runtime.draft.layer, runtime.geometry,
+                           slot.draft_cache.positions, slot.draft_cache,
+                           hidden_out);
+}
+
+static std::uint32_t bailing_mtp_draft(
+    ColibriV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t token,
+    const float* previous_hidden, float* hidden_out
+) {
+    namespace bailing = colibri::v2::bailing;
+    const auto& g = runtime.geometry;
+    const auto& c = runtime.model->config;
+    bailing_mtp_draft_layer(runtime, slot, token, previous_hidden, hidden_out);
+    std::vector<float> normalized(g.hidden), logits(c.vocabulary_size);
+    bailing::rms_norm(hidden_out, runtime.draft.head_norm, g.hidden, g.epsilon,
+                      normalized.data());
+    bailing::matvec(runtime.head, normalized.data(), g.hidden, c.vocabulary_size,
+                    logits.data());
+    return bailing_argmax(logits.data(), c.vocabulary_size);
+}
+
+// The batched verify: all rows through every layer on the host path, with each
+// KDA layer's transition inputs retained in the slot's fold scratch, then a
+// head and argmax per row. Advances slot.position and every cache by `count`;
+// the caller rolls back on rejection. `hiddens` receives count x hidden
+// pre-norm rows.
+static void bailing_mtp_verify_rows(
+    ColibriV2BailingRuntime& runtime, BailingSlot& slot,
+    const std::uint32_t* tokens, std::uint32_t count,
+    std::uint32_t* winners, float* hiddens
+) {
+    namespace bailing = colibri::v2::bailing;
+    const auto& g = runtime.geometry;
+    const auto& c = runtime.model->config;
+    if (slot.position + count > runtime.capacity)
+        throw std::runtime_error("bailing sequence exceeds the runtime capacity");
+    const std::size_t channels = g.heads * g.head_dim;
+    const std::size_t depth = runtime.layers.size();
+    if (slot.mtp_q.size() != depth) {
+        slot.mtp_q.resize(depth); slot.mtp_k.resize(depth);
+        slot.mtp_v.resize(depth); slot.mtp_decay.resize(depth);
+        slot.mtp_beta.resize(depth);
+    }
+    std::vector<float> current(static_cast<std::size_t>(count) * g.hidden);
+    std::vector<float> next(static_cast<std::size_t>(count) * g.hidden);
+    const auto stride = bailing::row_bytes(runtime.embedding_matrix.type, g.hidden);
+    const auto* base = reinterpret_cast<const std::uint8_t*>(
+        runtime.embedding_matrix.data);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        if (tokens[index] >= c.vocabulary_size)
+            throw std::runtime_error("token id is outside the vocabulary");
+        bailing::row_decode(base + static_cast<std::size_t>(tokens[index]) * stride,
+                            runtime.embedding_matrix.type, g.hidden,
+                            current.data() + static_cast<std::size_t>(index) * g.hidden);
+    }
+    for (std::size_t layer = 0; layer < depth; ++layer) {
+        bailing::KdaCapture capture;
+        bailing::KdaCapture* wanted_capture = nullptr;
+        if (!runtime.layers[layer].full_attention) {
+            slot.mtp_q[layer].resize(static_cast<std::size_t>(count) * channels);
+            slot.mtp_k[layer].resize(static_cast<std::size_t>(count) * channels);
+            slot.mtp_v[layer].resize(static_cast<std::size_t>(count) * channels);
+            slot.mtp_decay[layer].resize(static_cast<std::size_t>(count) * channels);
+            slot.mtp_beta[layer].resize(static_cast<std::size_t>(count) * g.heads);
+            capture.q = slot.mtp_q[layer].data();
+            capture.k = slot.mtp_k[layer].data();
+            capture.v = slot.mtp_v[layer].data();
+            capture.decay = slot.mtp_decay[layer].data();
+            capture.beta = slot.mtp_beta[layer].data();
+            wanted_capture = &capture;
+        }
+        bailing::decoder_layer_batch(
+            current.data(), count, runtime.layers[layer], g, slot.position,
+            slot.caches[layer], next.data(), wanted_capture);
+        current.swap(next);
+    }
+    slot.position += count;
+    std::memcpy(hiddens, current.data(),
+                static_cast<std::size_t>(count) * g.hidden * sizeof(float));
+    std::vector<float> normalized(g.hidden), logits(c.vocabulary_size);
+    for (std::uint32_t row = 0; row < count; ++row) {
+        bailing::rms_norm(current.data() + static_cast<std::size_t>(row) * g.hidden,
+                          runtime.output_norm, g.hidden, g.epsilon,
+                          normalized.data());
+        bailing::matvec(runtime.head, normalized.data(), g.hidden,
+                        c.vocabulary_size, logits.data());
+        winners[row] = bailing_argmax(logits.data(), c.vocabulary_size);
+    }
+}
+
+// Snapshot every KDA layer's recurrent state and convolution windows into the
+// slot's persistent fold scratch (restore=false), or copy them back
+// (restore=true). MLA caches need no copy: their rows are position-indexed,
+// so rollback is truncating `positions`.
+static void bailing_mtp_snapshot(
+    ColibriV2BailingRuntime& runtime, BailingSlot& slot, bool restore
+) {
+    const std::size_t depth = runtime.layers.size();
+    if (slot.mtp_state.size() != depth) {
+        slot.mtp_state.resize(depth); slot.mtp_qwin.resize(depth);
+        slot.mtp_kwin.resize(depth); slot.mtp_vwin.resize(depth);
+    }
+    for (std::size_t layer = 0; layer < depth; ++layer) {
+        if (runtime.layers[layer].full_attention) continue;
+        auto& cache = slot.caches[layer];
+        auto copy = [&](std::vector<float>& saved, std::vector<float>& live) {
+            if (restore) std::copy(saved.begin(), saved.end(), live.begin());
+            else saved = live;
+        };
+        copy(slot.mtp_state[layer], cache.state);
+        copy(slot.mtp_qwin[layer], cache.query_window);
+        copy(slot.mtp_kwin[layer], cache.key_window);
+        copy(slot.mtp_vwin[layer], cache.value_window);
+    }
+}
+
+// The fold: from the restored snapshot, replay only the convolution and the
+// recurrence over the `rows` accepted tokens, reading the transition inputs
+// the verify retained. Mirrors decoder_layer_batch's KDA block exactly --
+// same conv steps, one kda_recurrence call -- so the rebuilt state is the
+// batch's own state after `rows` tokens, bit for bit. The gate and output
+// are not replayed: they never touch state.
+static void bailing_mtp_fold(
+    ColibriV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t rows
+) {
+    namespace bailing = colibri::v2::bailing;
+    const auto& g = runtime.geometry;
+    const std::size_t channels = g.heads * g.head_dim;
+    std::vector<float> qc(rows * channels), kc(rows * channels),
+        vc(rows * channels), attended(rows * channels);
+    for (std::size_t layer = 0; layer < runtime.layers.size(); ++layer) {
+        const auto& w = runtime.layers[layer];
+        if (w.full_attention) continue;
+        auto& cache = slot.caches[layer];
+        for (std::uint32_t t = 0; t < rows; ++t) {
+            bailing::short_conv_step(
+                slot.mtp_q[layer].data() + static_cast<std::size_t>(t) * channels,
+                w.kda.query_conv, channels, g.conv_width,
+                cache.query_window.data(), qc.data() + static_cast<std::size_t>(t) * channels);
+            bailing::short_conv_step(
+                slot.mtp_k[layer].data() + static_cast<std::size_t>(t) * channels,
+                w.kda.key_conv, channels, g.conv_width,
+                cache.key_window.data(), kc.data() + static_cast<std::size_t>(t) * channels);
+            bailing::short_conv_step(
+                slot.mtp_v[layer].data() + static_cast<std::size_t>(t) * channels,
+                w.kda.value_conv, channels, g.conv_width,
+                cache.value_window.data(), vc.data() + static_cast<std::size_t>(t) * channels);
+        }
+        bailing::kda_recurrence(qc.data(), kc.data(), vc.data(),
+                                slot.mtp_decay[layer].data(),
+                                slot.mtp_beta[layer].data(),
+                                w.kda.a_log, w.kda.dt_bias, rows, g.heads,
+                                g.head_dim, g.epsilon, cache.state.data(),
+                                attended.data());
+    }
+}
+
+int colibri_v2_bailing_mtp_available(ColibriV2BailingRuntime* runtime, int* out){
+    return guarded([&]{
+    if(!runtime||!out)throw std::runtime_error("invalid bailing MTP arguments");
+    *out = runtime->draft.available ? 1 : 0;
+    return 0; });
+}
+
+int colibri_v2_bailing_mtp_stats(ColibriV2BailingRuntime* runtime,
+                                 uint64_t* drafted, uint64_t* accepted,
+                                 uint64_t* rejected){
+    return guarded([&]{
+    if(!runtime||!drafted||!accepted||!rejected)
+        throw std::runtime_error("invalid bailing MTP arguments");
+    *drafted = runtime->mtp_drafted;
+    *accepted = runtime->mtp_accepted;
+    *rejected = runtime->mtp_rejected;
+    return 0; });
+}
+
+// One speculative round: draft `wanted` tokens from `next_token` (which has
+// not been forwarded yet), verify them in one batched target pass, commit the
+// agreed prefix and emit the target's tokens for it. Always emits at least
+// one token. The caller feeds the LAST emitted token back as the next round's
+// `next_token`. Host path only: the slot's cache is pulled back from the
+// device if a GPU decode left it there.
+int colibri_v2_bailing_mtp_round(ColibriV2BailingRuntime* runtime,
+                                 uint32_t slot_index, uint32_t next_token,
+                                 uint32_t wanted, uint32_t* out_tokens,
+                                 uint32_t* out_count){
+    return guarded([&]{
+    if(!runtime||!out_tokens||!out_count)
+        throw std::runtime_error("invalid bailing MTP round arguments");
+    if(!runtime->draft.available)
+        throw std::runtime_error("this checkpoint has no nextn draft block");
+    auto& slot = runtime->slot(slot_index);
+    if(!slot.has_target_hidden)
+        throw std::runtime_error(
+            "bailing MTP needs a host-path eval first to seed the draft's "
+            "target hidden");
+    if(slot.cache_on_device) bailing_cache_transfer(*runtime, slot_index, false);
+    if(wanted > 8) wanted = 8;
+    if(!wanted) wanted = 1;
+    const auto& g = runtime->geometry;
+    // The draft cache is context-sized and never rewound; recycle it when the
+    // round would overflow. The cost is a few poor drafts, not a wrong answer.
+    if(slot.draft_cache.positions + wanted + 1 > runtime->capacity)
+        colibri::v2::bailing::reset_cache(slot.draft_cache, runtime->draft.layer,
+                                          g, runtime->capacity);
+    const auto draft_base = slot.draft_cache.positions;
+    std::array<std::uint32_t, 8> drafts{};
+    std::vector<float> draft_hidden(g.hidden);
+    const float* previous = slot.target_hidden.data();
+    std::uint32_t draft_input = next_token;
+    for(std::uint32_t index = 0; index < wanted; ++index){
+        drafts[index] = bailing_mtp_draft(*runtime, slot, draft_input,
+                                          previous, draft_hidden.data());
+        draft_input = drafts[index];
+        previous = draft_hidden.data();
+    }
+    runtime->mtp_drafted += wanted;
+    std::array<std::uint32_t, 8> inputs{}, winners{};
+    inputs[0] = next_token;
+    for(std::uint32_t index = 1; index < wanted; ++index)
+        inputs[index] = drafts[index - 1];
+    bailing_mtp_snapshot(*runtime, slot, false);
+    const auto base_position = slot.position;
+    std::vector<float> hiddens(static_cast<std::size_t>(wanted) * g.hidden);
+    bailing_mtp_verify_rows(*runtime, slot, inputs.data(), wanted,
+                            winners.data(), hiddens.data());
+    std::uint32_t valid = 0;
+    bool rejected = false;
+    for(; valid < wanted; ++valid)
+        if(winners[valid] != drafts[valid]){ ++valid; rejected = true; break; }
+    if(rejected && valid < wanted){
+        // Only the KDA state ran ahead: KV rows, hiddens and winners for the
+        // accepted prefix came from correct inputs. Restore and fold.
+        bailing_mtp_snapshot(*runtime, slot, true);
+        bailing_mtp_fold(*runtime, slot, valid);
+        for(std::size_t layer = 0; layer < runtime->layers.size(); ++layer)
+            if(runtime->layers[layer].full_attention)
+                slot.caches[layer].positions = base_position + valid;
+        slot.position = base_position + valid;
+    }
+    const std::uint32_t committed = rejected && valid < wanted ? valid : wanted;
+    // Rebuild the draft cache on true hiddens: step zero already consumed the
+    // target's real hidden, later steps consumed recursive draft hiddens and
+    // are re-appended conditioned on what the verify actually produced.
+    slot.draft_cache.positions = draft_base + 1;
+    std::vector<float> append_hidden(g.hidden);
+    for(std::uint32_t index = 1; index < committed; ++index)
+        bailing_mtp_draft_layer(*runtime, slot, inputs[index],
+                                hiddens.data() + static_cast<std::size_t>(index - 1) * g.hidden,
+                                append_hidden.data());
+    const float* last_hidden = hiddens.data()
+        + static_cast<std::size_t>(committed - 1) * g.hidden;
+    slot.target_hidden.assign(last_hidden, last_hidden + g.hidden);
+    slot.has_target_hidden = true;
+    runtime->mtp_accepted += rejected ? valid - 1 : wanted;
+    if(rejected) ++runtime->mtp_rejected;
+    for(std::uint32_t index = 0; index < committed; ++index)
+        out_tokens[index] = winners[index];
+    *out_count = committed;
+    return 0; });
 }
 
 int colibri_v2_bailing_uses_gpu(ColibriV2BailingRuntime* runtime, int* out){
@@ -11515,6 +11951,18 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 target.snapshot_second=reserve(a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float));
             }
             runtime->mtp_snapshot_bytes=state_cursor-snapshot_start;
+            // Fold retention: per DeltaNet layer, room for the verifier's
+            // 8-row maximum of qkv projections (conv.shape[1] channels) and
+            // decay+beta logits (2 * value_heads each row). See QwenLayerPlan.
+            for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
+                auto&target=runtime->layers[layer_number];
+                if(target.attention)continue;
+                const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
+                const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
+                target.mtp_retain_qkv=reserve(8ULL*conv.shape[1]*sizeof(float));
+                target.mtp_retain_logits=reserve(16ULL*a.shape[0]*sizeof(float));
+                runtime->mtp_delta_layers=true;
+            }
         }
         runtime->state_bytes=device_align(state_cursor);
         runtime->decode_workspace_layout=colibri::v2::workspace::qwen_decode(
@@ -12052,10 +12500,16 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         }
         runtime->expert_slot_bytes=device_align(one_expert);
         // Prefill snapshot slots hold every DeltaNet layer's conv+recurrent
-        // state; MTP manages its own snapshots inside the state arena, so
-        // the prefix-reuse slots are only allocated without MTP.
+        // state. They coexist with MTP: the MTP round's own snapshot lives in
+        // the state arena and is per-round transient, while these are separate
+        // device buffers written during prefill and read at prompt admission,
+        // when no round is in flight. Gating them off under --mtp-draft (as
+        // this originally did) silently disabled turn-to-turn prefix reuse for
+        // every client that re-renders the previous assistant reply -- each
+        // 70k-token turn reprefilled cold, minutes per turn, for the sake of a
+        // conflict that does not exist.
         std::uint64_t snapshot_floats=0;
-        if(!runtime->options.mtp_drafts)for(const auto&layer:runtime->layers){
+        for(const auto&layer:runtime->layers){
             if(layer.attention)continue;
             const auto&conv=runtime->model->tensors[layer.static_tensors[6]];
             const auto&a=runtime->model->tensors[layer.static_tensors[8]];
@@ -13345,6 +13799,58 @@ void qwen_snapshot_delta_state(ColibriV2QwenRuntime& runtime, bool restore) {
         const auto saved_recurrent=runtime.state+layer.snapshot_second;
         launch_copy(restore?saved_conv:live_conv,restore?live_conv:saved_conv,conv_bytes);
         launch_copy(restore?saved_recurrent:live_recurrent,restore?live_recurrent:saved_recurrent,recurrent_bytes);
+    }
+}
+
+// ReplaySSM-style fold: rebuild the DeltaNet state after an MTP rejection by
+// replaying only the causal-conv and recurrence kernels over the `rows`
+// accepted tokens, reading the transition inputs the verify pass wrote into
+// each layer's retention arena. Bitwise identical to the full re-forward it
+// replaces -- same kernels, same launch geometry, same inputs, same restored
+// snapshot -- while skipping the attention/FFN/projection work whose results
+// (KV rows, hidden states, verified tokens) the batch verify already produced
+// correctly for the accepted prefix. The caller must restore the state
+// snapshot first. The verifier caps at 8 rows, far below the chunked-WY
+// threshold, so mirroring the sequential kernel selection is exhaustive.
+void qwen_mtp_fold_delta_state(ColibriV2QwenRuntime& runtime, int rows) {
+    const auto&layout=runtime.rows_workspace_layout;
+    // Scratch: conv output, recurrence output and the gate operand land in the
+    // idle rows workspace. Gates only shape the (discarded) output, never the
+    // state, so the stale contents of `second` are acceptable.
+    const auto convolved=layout.fourth.address(runtime.workspace);
+    const auto gates=layout.second.address(runtime.workspace);
+    const auto output=layout.first.address(runtime.workspace);
+    const float epsilon=runtime.model->config.rms_norm_epsilon
+        ?runtime.model->config.rms_norm_epsilon:1.0e-6f;
+    auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t bx,void**args){
+        if(colibri_gpu_launch_named(name,gx,1,bx,0,runtime.stream,args)!=0)
+            throw std::runtime_error(std::string("native MTP fold kernel failed: ")+name);
+    };
+    for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
+        auto&layer=runtime.layers[layer_number];
+        if(layer.attention)continue;
+        auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
+        int channels=static_cast<int>(runtime.model->tensors[layer.static_tensors[1]].shape[1]);
+        int value_heads=static_cast<int>(runtime.model->tensors[layer.static_tensors[8]].shape[0]);
+        int head_dim=static_cast<int>(runtime.model->tensors[layer.static_tensors[9]].shape[0]);
+        int value_dim=value_heads*head_dim;
+        int key_heads=(channels-value_dim)/(2*head_dim);
+        int kernel_size=static_cast<int>(runtime.model->tensors[layer.static_tensors[6]].shape[0]);
+        const auto qkv=runtime.state+layer.mtp_retain_qkv;
+        const auto decay_logits=runtime.state+layer.mtp_retain_logits;
+        // The retention layout was written with the full batch's row count,
+        // which places the beta logits behind mtp_fold_rows decay rows even
+        // when the fold replays fewer.
+        const auto beta_logits=decay_logits+
+            static_cast<std::uint64_t>(runtime.mtp_fold_rows)*value_heads*sizeof(float);
+        auto conv_state=runtime.state+layer.state_first;auto conv_weights=tensor(6);
+        void*conv_args[]={const_cast<std::uint64_t*>(&qkv),&conv_weights,&conv_state,const_cast<std::uint64_t*>(&convolved),&rows,&channels,&kernel_size};
+        if(kernel_size<=8)launch("delta_conv_chunk",(static_cast<std::uint32_t>(channels)+255)/256,256,conv_args);
+        else launch("delta_conv_sequence",static_cast<std::uint32_t>(channels),1,conv_args);
+        auto recurrent_state=runtime.state+layer.state_second;auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
+        void*recurrent_args[]={const_cast<std::uint64_t*>(&convolved),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&beta_logits),const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&output),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
+        if(head_dim==128)launch("qwen_delta_recurrent_chunk",static_cast<std::uint32_t>(value_heads),128,recurrent_args);
+        else launch("qwen_delta_recurrent_rows",static_cast<std::uint32_t>(value_heads),256,recurrent_args);
     }
 }
 
@@ -16593,6 +17099,14 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
             ++runtime->prefix_cache_hits;
             runtime->prefix_cache_reused_tokens+=prompt_start;
             runtime->cancelled=false;
+            // The draft block's cache and conditioning hidden describe the
+            // conversation the checkpoint rewound away from. Both are
+            // acceptance-only state -- the verifier guards the text -- so
+            // start them over rather than let stale entries draft from a
+            // history the target no longer has. The suffix prefill reseeds
+            // the target hidden as it runs.
+            runtime->mtp_cache_tokens=0;
+            runtime->mtp_has_target_hidden=false;
         }else{
             ++runtime->prefix_cache_misses;
             const int status=colibri_v2_qwen_runtime_reset(runtime);if(status)return status;
@@ -16632,7 +17146,7 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
     // last slot is reserved for the exact end-of-prompt snapshot saved below.
     // Targets already covered by the reused prefix are skipped.
     plan.targets.clear();
-    if(runtime->prefill_snapshot_bytes&&!runtime->options.mtp_drafts&&
+    if(runtime->prefill_snapshot_bytes&&
        runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1){
         const std::size_t mid_slots=runtime->prefill_snapshots.size()-1;
         const std::uint64_t spacing=std::max<std::uint64_t>(
@@ -17055,7 +17569,7 @@ static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
     runtime->cache_admission_enabled=true;
     qwen_prefetch_cpu_experts(*runtime);
     qwen_seed_prefill_experts(*runtime,requested_generation_tokens);
-    if(!runtime->prefill_snapshot_bytes||runtime->options.mtp_drafts)return;
+    if(!runtime->prefill_snapshot_bytes)return;
     // Prefer the reserved slot when mid checkpoints exist, else the slot already
     // tracking this conversation, else a free slot, else the LRU.
     QwenPrefillSnapshot*slot=nullptr;
@@ -17086,6 +17600,73 @@ static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
 // the target model's true hidden states. Keeping the recursive draft entries
 // makes the cache drift farther from training semantics after every round and
 // rapidly destroys acceptance.
+// COLIBRI_MTP_FOLD_CHECK=1: after a fold rebuilt the DeltaNet state, prove it
+// bit-identical to the full replay forward it replaced. Downloads the folded
+// conv/recurrent state, restores the snapshot a second time, runs the old
+// replay path, downloads again and compares every byte. Replay is idempotent
+// over the accepted prefix (same KV slots, same hidden rows, same argmax), so
+// a passing check leaves the runtime exactly where the fold did. Validating
+// state bits directly -- not output plausibility -- is the discipline that
+// catches a fold drifting from the verify recurrence by a single rounding.
+//
+// The oracle is exact only where the forward is row-count-stable, which the
+// CPU backend is -- the fixture test runs this check green there. On the GPU
+// the check fires at ulp level (measured 4e-6 at the first delta layer) and
+// that is the *replay* drifting, not the fold: dense_rows switches kernels on
+// row count (batched rows kernel above one row, warp matvec at one), so a
+// rows=valid replay never reproduced the rows=wanted batch bit-for-bit. The
+// old rollback path silently committed those drifted bits; the fold preserves
+// the batch's own bits, which is the more faithful of the two. Keep this
+// check for the CPU parity suite and for reading the printed max_diff -- a
+// large value still means a real bug, ulps mean the kernel-selection seam.
+static void qwen_mtp_fold_check(
+    ColibriV2QwenRuntime& runtime, const std::uint32_t* inputs,
+    std::uint32_t valid
+) {
+    struct Saved { std::vector<float> conv, recurrent; };
+    auto capture=[&](std::vector<Saved>&stash){
+        stash.clear();
+        for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
+            auto&layer=runtime.layers[layer_number];
+            if(layer.attention)continue;
+            const auto&conv=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
+            const auto&a=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_a")];
+            const auto&norm=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_norm.weight")];
+            Saved saved;
+            saved.conv.resize(conv.shape[0]*conv.shape[1]);
+            saved.recurrent.resize(a.shape[0]*norm.shape[0]*norm.shape[0]);
+            if(colibri_gpu_download(saved.conv.data(),runtime.state+layer.state_first,saved.conv.size()*sizeof(float),runtime.stream)!=0
+               ||colibri_gpu_download(saved.recurrent.data(),runtime.state+layer.state_second,saved.recurrent.size()*sizeof(float),runtime.stream)!=0)
+                throw std::runtime_error("native MTP fold check download failed");
+            stash.push_back(std::move(saved));
+        }
+        if(colibri_gpu_stream_sync(runtime.stream)!=0)
+            throw std::runtime_error("native MTP fold check sync failed");
+    };
+    std::vector<Saved> folded;
+    capture(folded);
+    qwen_snapshot_delta_state(runtime,true);
+    std::array<std::uint32_t,8> replay_tokens{};
+    std::uint64_t replay_hidden=0;
+    qwen_verify_target_rows(
+        runtime,inputs,static_cast<int>(valid),replay_tokens.data(),&replay_hidden);
+    std::vector<Saved> replayed;
+    capture(replayed);
+    for(std::size_t index=0;index<folded.size();++index){
+        auto compare=[&](const std::vector<float>&fold,const std::vector<float>&replay,const char*what){
+            if(std::memcmp(fold.data(),replay.data(),fold.size()*sizeof(float))==0)return;
+            float maximum=0.0f;
+            for(std::size_t element=0;element<fold.size();++element)
+                maximum=std::max(maximum,std::fabs(fold[element]-replay[element]));
+            std::fprintf(stderr,"mtp fold check failed: delta layer %zu %s state max_diff=%g rows=%u\n",
+                index,what,maximum,valid);
+            throw std::runtime_error("native MTP fold state diverged from replay");
+        };
+        compare(folded[index].conv,replayed[index].conv,"conv");
+        compare(folded[index].recurrent,replayed[index].recurrent,"recurrent");
+    }
+}
+
 static void qwen_mtp_commit_true_cache(
     ColibriV2QwenRuntime& runtime, std::uint64_t base_cache_tokens,
     const std::uint32_t* inputs, std::uint32_t count,
@@ -17166,15 +17747,49 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
     std::array<uint32_t,8>inputs{},verified{};
     inputs[0]=next_token;
     for(uint32_t index=1;index<wanted;++index)inputs[index]=drafts[index-1];
+    // Arm the fold: the verify pass records each DeltaNet layer's transition
+    // inputs in its retention arena so a rejection can rebuild the state
+    // without re-running the forward. COLIBRI_MTP_FOLD=0 restores the full
+    // replay path.
+    const char*fold_env=std::getenv("COLIBRI_MTP_FOLD");
+    const bool fold_enabled=!(fold_env&&fold_env[0]=='0');
+    runtime.mtp_fold_capture=fold_enabled&&runtime.mtp_delta_layers;
+    runtime.mtp_fold_valid=fold_enabled;
+    runtime.mtp_fold_rows=wanted;
     qwen_snapshot_delta_state(runtime,false);
     const auto batch_started=std::chrono::steady_clock::now();
     std::uint64_t batch_hidden=0;
     qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(wanted),verified.data(),&batch_hidden);
+    runtime.mtp_fold_capture=false;
     runtime.mtp_verify_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-batch_started).count();
     uint32_t valid=0;
     bool rejected=false;
     for(;valid<wanted;++valid)if(verified[valid]!=drafts[valid]){++valid;rejected=true;break;}
-    if(rejected&&valid<wanted){
+    if(rejected&&valid<wanted&&runtime.mtp_fold_valid){
+        // Fold rollback: the batch verify already produced correct KV rows,
+        // hidden states and verified tokens for the accepted prefix -- only
+        // the DeltaNet conv/recurrent state ran ahead through the rejected
+        // rows. Restore the snapshot and replay just the recurrence over the
+        // accepted tokens (a no-op for attention-only models) instead of
+        // re-running the whole forward.
+        const auto rollback_started=std::chrono::steady_clock::now();
+        qwen_snapshot_delta_state(runtime,true);
+        qwen_mtp_fold_delta_state(runtime,static_cast<int>(valid));
+        if(std::getenv("COLIBRI_MTP_FOLD_CHECK"))
+            qwen_mtp_fold_check(runtime,inputs.data(),valid);
+        qwen_mtp_commit_true_cache(
+            runtime,base_cache_tokens,inputs.data(),valid,batch_hidden);
+        runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);
+        runtime.position+=valid;
+        runtime.last_output_token=verified[valid-1];
+        runtime.last_output_greedy=true;
+        runtime.decode_calls+=valid;
+        const auto rollback_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-rollback_started).count();
+        runtime.decode_nanoseconds+=rollback_elapsed;
+        runtime.mtp_accepted_tokens+=valid-1;
+        ++runtime.mtp_rejected_tokens;
+        runtime.mtp_rollback_nanoseconds+=rollback_elapsed;
+    }else if(rejected&&valid<wanted){
         const auto rollback_started=std::chrono::steady_clock::now();
         const auto batch_rejected_token=verified[valid-1];
         std::vector<float>batch_trace;

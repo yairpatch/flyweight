@@ -1745,12 +1745,30 @@ inline void decoder_layer(
 //
 // `inputs` and `output` are [tokens][hidden]. `first_position` is the absolute
 // position of the first token.
+// Destination buffers for a KDA layer's per-row transition inputs, recorded
+// during a speculative-verify pass. The recurrence's state update depends on
+// exactly these five projections (the gate only shapes the discarded output),
+// so retaining them lets a rejected round rebuild the recurrent state by
+// replaying only the convolution and recurrence over the accepted prefix --
+// the fold -- instead of re-running the whole forward. Row-major, sized
+// rows x channels for q/k/v/decay and rows x heads for beta.
+struct KdaCapture {
+    float* q = nullptr;
+    float* k = nullptr;
+    float* v = nullptr;
+    float* decay = nullptr;
+    float* beta = nullptr;
+};
+
 inline void decoder_layer_batch(
     const float* inputs, std::size_t tokens, const LayerWeights& w,
     const Geometry& g, std::size_t first_position, LayerCache& cache,
-    float* output
+    float* output, KdaCapture* capture = nullptr
 ) {
-    if (tokens == 1) {
+    // A capture must record what THIS pass computes, so it keeps the batch
+    // path even for one token rather than delegating to the matvec-shaped
+    // single-token layer.
+    if (tokens == 1 && !capture) {
         decoder_layer(inputs, w, g, first_position, cache, output);
         return;
     }
@@ -1835,6 +1853,13 @@ inline void decoder_layer_batch(
         matmul(w.kda.beta, normalized.data(), tokens, hidden, g.heads, beta.data());
         matmul(w.kda.gate, normalized.data(), tokens, hidden, channels, gate.data());
         delete stage;
+        if (capture) {
+            std::memcpy(capture->q, q.data(), tokens * channels * sizeof(float));
+            std::memcpy(capture->k, k.data(), tokens * channels * sizeof(float));
+            std::memcpy(capture->v, v.data(), tokens * channels * sizeof(float));
+            std::memcpy(capture->decay, decay.data(), tokens * channels * sizeof(float));
+            std::memcpy(capture->beta, beta.data(), tokens * g.heads * sizeof(float));
+        }
 
         {
         ProfileScope recurrence(profile().kda);

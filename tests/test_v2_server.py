@@ -10,7 +10,7 @@ from queue import Empty, Queue
 
 from colibri_next.cli import _parser
 from colibri_next.sampling import SamplingConfig
-from colibri_next.server import InferenceService
+from colibri_next.server import InferenceService, _chat_messages
 from colibri_next.v2_server import (
     BailingEngine,
     NativeV2Generator,
@@ -1143,6 +1143,128 @@ class NativeV2ServerTests(unittest.TestCase):
         # Spacing matters: this is what the model saw in training and what
         # every other runtime emits. The compact form was ours alone.
         self.assertEqual(prompt, '{"limit": 10}')
+
+    def test_an_empty_assistant_turn_renders_instead_of_failing(self) -> None:
+        # A cancelled generation, or one the token ceiling cut mid-tool-call,
+        # comes back to the client as an empty assistant turn. The protocol
+        # layer keeps it on purpose so the conversation can replay -- and every
+        # renderer here refused it, so the request 400'd as "unable to tokenize
+        # the formatted prompt" and kept doing so for the rest of that
+        # conversation, because the turn is history the client cannot edit.
+        class TemplateModel(StubV2Model):
+            config = {}
+            chat_template = (
+                "{% for message in messages %}[{{ message.role }}]"
+                "{{ message.content }}{% endfor %}"
+                "{% if add_generation_prompt %}[assistant]{% endif %}"
+            )
+
+        conversation = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "go on"},
+        ]
+
+        templated = NativeV2Tokenizer(TemplateModel())  # type: ignore[arg-type]
+        self.assertEqual(
+            templated.format_messages(conversation),
+            "[user]hi[assistant][user]go on[assistant]",
+        )
+
+        # ...and every architecture fallback, which renders without a template.
+        for architecture in ("qwen3moe", "gemma4", "laguna", "deepseek4"):
+            with self.subTest(architecture=architecture):
+                tokenizer = object.__new__(NativeV2Tokenizer)
+                tokenizer.architecture = architecture
+                rendered = tokenizer.format_messages(conversation)
+                self.assertIn("go on", rendered)
+
+    def test_what_the_protocol_layer_accepts_this_renderer_renders(self) -> None:
+        # The two layers disagreeing is what made the bug survive: the request
+        # parser deliberately preserves empty assistant and tool turns so a
+        # conversation replays, and the renderer one call later refused the
+        # very same turns. Drive the parser's own output through the renderer
+        # so neither side can tighten alone.
+        payload = {
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "read",
+                                     "arguments": '{"path": "/etc"}'},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_0", "content": ""},
+                {"role": "assistant", "content": None},
+                {"role": "user", "content": "go on"},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "read", "parameters": {"type": "object"}},
+            }],
+        }
+        for architecture in ("qwen3moe", "gemma4", "laguna", "deepseek4",
+                             "bailingmoe3"):
+            with self.subTest(architecture=architecture):
+                messages, _ = _chat_messages(payload, architecture=architecture)
+                tokenizer = object.__new__(NativeV2Tokenizer)
+                tokenizer.architecture = architecture
+                if architecture in ("gemma4", "laguna"):
+                    # Neither fallback renders tool turns at all; the parser
+                    # rewrote them into user text for these, so the turn that
+                    # reaches them is an ordinary one.
+                    messages = [
+                        message for message in messages
+                        if message["role"] != "tool"
+                    ]
+                self.assertIn("go on", tokenizer.format_messages(messages))
+
+    def test_an_empty_user_turn_names_the_message_it_rejects(self) -> None:
+        # The other half of the rule: an empty user turn is a client bug, and
+        # the caller sees this through a wrapper that reports only that
+        # tokenization failed -- so the message has to say which turn.
+        tokenizer = object.__new__(NativeV2Tokenizer)
+        tokenizer.architecture = "qwen3moe"
+        with self.assertRaisesRegex(ValueError, r"messages\[1\] has role 'user'"):
+            tokenizer.format_messages([
+                {"role": "user", "content": "hi"},
+                {"role": "user", "content": "   "},
+            ])
+
+    def test_an_empty_tool_result_renders_on_a_native_tool_template(self) -> None:
+        # A tool that printed nothing is a real result. The compatibility layer
+        # keeps the empty tool turn for architectures whose template renders
+        # tool results itself; refusing it here failed the request instead.
+        class TemplateModel(StubV2Model):
+            config = {}
+            chat_template = (
+                "{% for message in messages %}[{{ message.role }}]"
+                "{{ message.content }}{% endfor %}"
+                "{% if add_generation_prompt %}[assistant]{% endif %}"
+            )
+
+        tokenizer = NativeV2Tokenizer(TemplateModel())  # type: ignore[arg-type]
+        prompt = tokenizer.format_messages([
+            {"role": "user", "content": "read it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "/etc"}},
+                }],
+            },
+            {"role": "tool", "content": ""},
+        ])
+
+        self.assertEqual(
+            prompt, "[user]read it[assistant][tool][assistant]"
+        )
 
     def test_multibyte_character_split_across_tokens_decodes_intact(self) -> None:
         # Byte-level BPE splits "⚽" (e2 9a bd) across tokens 40+41. Per-token
