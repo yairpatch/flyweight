@@ -2668,13 +2668,27 @@ float qwen_nvfp4_value(const std::uint8_t*packed,std::uint64_t absolute){
     const int val=(within<8)?(byte&0x0F):(byte>>4);
     return scale*kNvfp4Lut[val];
 }
+// Cached once: these dot functions run per row (x top_k x layers) on
+// CPU-expert decode, and glibc's getenv scans environ linearly -- read raw,
+// the switch cost 10^4-10^5 environ scans per token.
+bool qwen_iq_avx512_enabled(){
+    static const bool enabled=[]{
+        const char*setting=std::getenv("COLIBRI_IQ_AVX512");
+        return !setting||setting[0]!='0';
+    }();
+    return enabled;
+}
+// Same treatment: the diagnostic gate sat as a raw getenv inside per-layer
+// decode code, costing an environ scan per layer per token when it was off.
+bool qwen_lm_diag_enabled(){
+    static const bool enabled=std::getenv("COLIBRI_LM_DIAG")!=nullptr;
+    return enabled;
+}
 float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*input,int elements,std::uint64_t row){
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
-    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0){
-        const char*setting=std::getenv("COLIBRI_IQ_AVX512");
-        if(!setting||setting[0]!='0')
-            return qwen_quant_dot_avx512(packed,type,input,elements,row);
-    }
+    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0&&
+       qwen_iq_avx512_enabled())
+        return qwen_quant_dot_avx512(packed,type,input,elements,row);
     // Q4_0's native block is 32 elements, so it takes its own admission: the
     // K-quant super-block gate would exclude Gemma 4's 704-wide expert rows
     // (704 % 256 != 0), which is exactly where this type dominates decode.
@@ -2849,13 +2863,11 @@ void qwen_quant_dot_rows(
 }
 
 void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const float*first,const float*second,int elements,std::uint64_t row,float&first_output,float&second_output){
-    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0){
-        const char*setting=std::getenv("COLIBRI_IQ_AVX512");
-        if(!setting||setting[0]!='0'){
-            qwen_quant_dot_pair_avx512(
-                packed,type,first,second,elements,row,&first_output,&second_output);
-            return;
-        }
+    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0&&
+       qwen_iq_avx512_enabled()){
+        qwen_quant_dot_pair_avx512(
+            packed,type,first,second,elements,row,&first_output,&second_output);
+        return;
     }
     if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_quant_dot_pair_avx512(packed,type,first,second,elements,row,&first_output,&second_output);return;}
     first_output=qwen_quant_dot(packed,type,first,elements,row);second_output=qwen_quant_dot(packed,type,second,elements,row);
@@ -3022,11 +3034,9 @@ void qwen_quant_dot_two_rows(
     const auto* first_row = first_matrix + row * row_bytes;
     const auto* second_row = second_matrix + row * row_bytes;
     if ((colibri_cpu_features() & 2u) != 0) {
-        const char* iq_setting = std::getenv("COLIBRI_IQ_AVX512");
-        const bool iq_avx512 = !iq_setting || iq_setting[0] != '0';
         const bool supported =
             (type == 8 && elements % 32 == 0)
-            || (type == 17 && iq_avx512 && elements % 256 == 0)
+            || (type == 17 && qwen_iq_avx512_enabled() && elements % 256 == 0)
             || ((type == 12 || type == 13 || type == 14) && elements % 256 == 0);
         if (supported) {
             qwen_quant_dot_two_rows_avx512(
@@ -15426,7 +15436,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             launch_named("gemma_head_rms",1,1,256,norm_args);
         }
     }
-    if(std::getenv("COLIBRI_LM_DIAG")){
+    if(qwen_lm_diag_enabled()){
         static int ec=0;
         if(ec<2){++ec;float v[8]={};if(colibri_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
             std::fprintf(stderr,"[diag] after_embed hidden[0..7]=% .6e % .6e % .6e % .6e % .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);}
@@ -15477,7 +15487,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             dense(2,normalized,second,hidden_size,gate_elements);
             dense(4,normalized,third,hidden_size,value_heads);
             dense(5,normalized,third+value_heads*sizeof(float),hidden_size,value_heads);
-            if(std::getenv("COLIBRI_LM_DIAG")&&layer_number==0){
+            if(qwen_lm_diag_enabled()&&layer_number==0){
                 float v[4]={};colibri_gpu_stream_sync(runtime->stream);
                 if(colibri_gpu_download(v,first,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_qkv first[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
@@ -15511,7 +15521,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 launch_named("qwen_delta_recurrent",value_heads,1,256,recurrent_args);
             }
             if(profile)profile_record(profile->recurrent_end);
-            if(std::getenv("COLIBRI_LM_DIAG")&&layer_number==0){
+            if(qwen_lm_diag_enabled()&&layer_number==0){
                 float v[4]={};colibri_gpu_stream_sync(runtime->stream);
                 if(colibri_gpu_download(v,fourth,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_recur fourth[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
@@ -15519,7 +15529,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     std::fprintf(stderr,"[diag] L0 after_recur first[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
             }
             dense(3,first,residual,value_dim,hidden_size);
-            if(std::getenv("COLIBRI_LM_DIAG")&&layer_number==0){
+            if(qwen_lm_diag_enabled()&&layer_number==0){
                 float v[4]={};colibri_gpu_stream_sync(runtime->stream);
                 if(colibri_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_ssm_out residual[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
@@ -15824,7 +15834,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             moe_base=7;
         }
         rms(residual,tensor(moe_base),normalized);
-        if(std::getenv("COLIBRI_LM_DIAG")&&layer_number==0){
+        if(qwen_lm_diag_enabled()&&layer_number==0){
             float v[4]={};colibri_gpu_stream_sync(runtime->stream);
             if(colibri_gpu_download(v,normalized,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] L0 after_rms normalized[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
@@ -16273,22 +16283,29 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                             std::uint64_t role_offset=0;
                             for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(device_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert DMA upload failed");role_offset+=bytes;}
                         }else{
+                            // Size and bound-check the bundle BEFORE copying:
+                            // the check used to run after the memcpys, so the
+                            // overflow it guards against had already happened
+                            // by the time it could fire.
                             std::uint64_t bundle_bytes=0;
-                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor+bundle_bytes,tensor_data(*runtime->model,t)+offset,bytes);bundle_bytes+=bytes;}
-                            if(staging_cursor+bundle_bytes>runtime->expert_staging_bytes||colibri_gpu_upload(device_base,staging+staging_cursor,bundle_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert upload failed");
+                            for(int role=0;role<3;++role)bundle_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size/experts;
+                            if(staging_cursor+bundle_bytes>runtime->expert_staging_bytes)throw std::runtime_error("native Qwen expert staging overflow");
+                            std::uint64_t copied=0;
+                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor+copied,tensor_data(*runtime->model,t)+offset,bytes);copied+=bytes;}
+                            if(colibri_gpu_upload(device_base,staging+staging_cursor,bundle_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert upload failed");
                             staging_cursor+=bundle_bytes;
                         }
                         std::uint64_t role_offset=0;
                         for(int role=0;role<3;++role){const auto bytes=runtime->model->tensors[layer.expert_tensors[role]].size/experts;const auto pointer=device_base+role_offset;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;role_offset+=bytes;}
                     }else{
                         has_uncached_expert=true;
-                        for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
+                        for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(staging_cursor+bytes>runtime->expert_staging_bytes)throw std::runtime_error("native Qwen expert staging overflow");std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
                     }
                 }
             }else{
                 ++runtime->expert_cache_misses;
                 has_uncached_expert=true;
-                for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
+                for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(staging_cursor+bytes>runtime->expert_staging_bytes)throw std::runtime_error("native Qwen expert staging overflow");std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);const auto pointer=runtime->expert_staging+staging_cursor;if(role==0)gate_pointers[rank]=pointer;else if(role==1)up_pointers[rank]=pointer;else down_pointers[rank]=pointer;staging_cursor+=bytes;}
             }
         }
         const auto table_bytes=static_cast<std::uint64_t>(top_k)*(sizeof(std::uint64_t)*3+sizeof(float)*3);const auto table_host=device_align(staging_cursor);const auto table_device=runtime->expert_staging+runtime->expert_staging_bytes-device_align(table_bytes);const auto gate_table=table_device;const auto up_table=gate_table+top_k*sizeof(std::uint64_t);const auto down_table=up_table+top_k*sizeof(std::uint64_t);std::memcpy(staging+table_host,gate_pointers.data(),top_k*sizeof(std::uint64_t));std::memcpy(staging+table_host+top_k*sizeof(std::uint64_t),up_pointers.data(),top_k*sizeof(std::uint64_t));std::memcpy(staging+table_host+2*top_k*sizeof(std::uint64_t),down_pointers.data(),top_k*sizeof(std::uint64_t));
@@ -16333,7 +16350,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             if(down_status!=0)throw std::runtime_error("native Qwen expert down projection failed");
         }
         }
-        if(std::getenv("COLIBRI_LM_DIAG")&&layer_number==0){
+        if(qwen_lm_diag_enabled()&&layer_number==0){
             float v[4]={};colibri_gpu_stream_sync(runtime->stream);
             if(colibri_gpu_download(v,third,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] L0 before_final_add third[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
@@ -16348,7 +16365,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         add(residual,third);
         if(profile)profile_record(profile->expert_end);
         std::swap(hidden,residual);
-        if(std::getenv("COLIBRI_LM_DIAG")&&(layer_number==0||layer_number==3||layer_number==33||layer_number==39)){
+        if(qwen_lm_diag_enabled()&&(layer_number==0||layer_number==3||layer_number==33||layer_number==39)){
             static int lc=0;
             if(lc<8){++lc;float v[4]={};if(colibri_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] after_layer_%u hidden[0..3]=% .6e % .6e % .6e % .6e\n",layer_number,v[0],v[1],v[2],v[3]);}
@@ -16365,7 +16382,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     if(runtime->cuda_profile)profile_record(runtime->cuda_lm_start);
     runtime->last_sampling_normalized=normalized;
     runtime->last_sampling_logits=logits;
-    if(std::getenv("COLIBRI_LM_DIAG")){
+    if(qwen_lm_diag_enabled()){
         static int diag_count=0;
         if(diag_count<2){
             ++diag_count;
@@ -16620,11 +16637,19 @@ static std::uint32_t qwen_sample_last_logits(
                 (vocabulary_count+255)/256,1,256,0,runtime.stream,args)!=0)
             throw std::runtime_error("native Muse Glimmer logit softcap failed");
     }
-    std::vector<std::uint32_t> candidates;
-    std::vector<float> candidate_logits;
-    const char*gpu_topk_setting=std::getenv("COLIBRI_SAMPLING_GPU_TOPK");
-    const bool gpu_topk_enabled=
-        !gpu_topk_setting||gpu_topk_setting[0]!='0';
+    // Scratch reused across calls: the sampler runs once per generated token,
+    // and fresh vectors here were pure allocator churn -- worst in the
+    // full-download fallback below, which sized one to the vocabulary every
+    // token. thread_local keeps the capacities warm and stays safe if two
+    // runtimes ever sample from different threads.
+    static thread_local std::vector<std::uint32_t> candidates;
+    static thread_local std::vector<float> candidate_logits;
+    candidates.clear();
+    candidate_logits.clear();
+    static const bool gpu_topk_enabled=[]{
+        const char*setting=std::getenv("COLIBRI_SAMPLING_GPU_TOPK");
+        return !setting||setting[0]!='0';
+    }();
     if(gpu_topk_enabled&&sampling.top_k&&
        count<=colibri::v2::workspace::kSamplingTopKCapacity&&
        vocabulary<=colibri::v2::workspace::kSamplingSortItemsPerBlock*
@@ -16699,8 +16724,10 @@ static std::uint32_t qwen_sample_last_logits(
     // penalty must not spend its effect on a token that was never selectable.
     // The candidate list arrives sorted by logit and this preserves that order.
     if(sampling.constrains()){
-        std::vector<std::uint32_t> allowed;
-        std::vector<float> allowed_logits;
+        static thread_local std::vector<std::uint32_t> allowed;
+        static thread_local std::vector<float> allowed_logits;
+        allowed.clear();
+        allowed_logits.clear();
         allowed.reserve(candidates.size());
         allowed_logits.reserve(candidates.size());
         for(std::size_t index=0;index<candidates.size();++index){
@@ -16746,7 +16773,8 @@ static std::uint32_t qwen_sample_last_logits(
         }
         // Both the nucleus cut and the cumulative draw below read this list as
         // sorted, and a penalty can demote a candidate past its neighbours.
-        std::vector<std::size_t> order(candidates.size());
+        static thread_local std::vector<std::size_t> order;
+        order.resize(candidates.size());
         for(std::size_t index=0;index<order.size();++index)order[index]=index;
         std::stable_sort(order.begin(),order.end(),
             [&](std::size_t left,std::size_t right){
@@ -16755,8 +16783,10 @@ static std::uint32_t qwen_sample_last_logits(
                 if(std::isnan(b))return true;
                 return a!=b?a>b:candidates[left]<candidates[right];
             });
-        std::vector<std::uint32_t> sorted_candidates(candidates.size());
-        std::vector<float> sorted_logits(candidates.size());
+        static thread_local std::vector<std::uint32_t> sorted_candidates;
+        static thread_local std::vector<float> sorted_logits;
+        sorted_candidates.resize(candidates.size());
+        sorted_logits.resize(candidates.size());
         for(std::size_t index=0;index<order.size();++index){
             sorted_candidates[index]=candidates[order[index]];
             sorted_logits[index]=candidate_logits[order[index]];
@@ -16778,7 +16808,8 @@ static std::uint32_t qwen_sample_last_logits(
     }
     const double maximum=static_cast<double>(candidate_logits.front())/
         sampling.temperature;
-    std::vector<double> probabilities(candidates.size());
+    static thread_local std::vector<double> probabilities;
+    probabilities.resize(candidates.size());
     double total=0.0;
     for(std::size_t index=0;index<candidates.size();++index){
         const double scaled=static_cast<double>(candidate_logits[index])/

@@ -184,6 +184,9 @@ struct Nvfp4Scratch {
     size_t input_values_bytes = 0, input_scales_bytes = 0;
     size_t projected_bytes = 0, expert_pointers_bytes = 0;
     CUstream stream = nullptr;
+    // Orders cross-stream reuse of this single-buffered scratch without a
+    // host synchronization; see nvfp4_scratch_switch_stream.
+    CUevent handoff = nullptr;
 };
 Nvfp4Scratch g_nvfp4_scratch;
 struct Nvfp4LtPlan {
@@ -2041,6 +2044,26 @@ static void nvfp4_clear_cublas_plans() {
     g_nvfp4_plans.clear();
 }
 
+// The scratch is single-buffered across streams. This used to be a full
+// cuStreamSynchronize whenever prefill and decode alternated streams -- a
+// host stall per alternation. Recording an event on the old stream and
+// making the new one wait keeps the ordering entirely on-device. Callers
+// that free the scratch (the grow path) still host-sync first.
+static int nvfp4_scratch_switch_stream(CUstream cuda_stream) {
+    if (g_nvfp4_scratch.stream == nullptr
+        || g_nvfp4_scratch.stream == cuda_stream)
+        return 0;
+    if (g_nvfp4_scratch.handoff == nullptr
+        && g_api.cuEventCreate(
+               &g_nvfp4_scratch.handoff, 2 /* disable timing */) != 0)
+        return -1;
+    if (g_api.cuEventRecord(
+            g_nvfp4_scratch.handoff, g_nvfp4_scratch.stream) != 0)
+        return -1;
+    return g_api.cuStreamWaitEvent(cuda_stream, g_nvfp4_scratch.handoff, 0)
+               == 0 ? 0 : -1;
+}
+
 static int nvfp4_run_quantized_gemm(
     int input_size, int output_size, int rows, float alpha, float beta,
     std::uint64_t output, CUstream cuda_stream,
@@ -2185,9 +2208,7 @@ extern "C" int colibri_gpu_nvfp4_matmul_cublas(
     const auto quantize = g_functions.find("nvfp4_quantize_cublaslt");
     if (repack == g_functions.end() || quantize == g_functions.end()) return -2;
     const auto cuda_stream = reinterpret_cast<CUstream>(stream);
-    if (g_nvfp4_scratch.stream != nullptr
-        && g_nvfp4_scratch.stream != cuda_stream
-        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -3;
+    if (nvfp4_scratch_switch_stream(cuda_stream) != 0) return -3;
 
     const auto scale_bytes = [](std::int32_t outer, std::int32_t inner) {
         const size_t outer_tiles = (static_cast<size_t>(outer) + 127) / 128;
@@ -2253,89 +2274,14 @@ extern "C" int colibri_gpu_nvfp4_matmul_cublas(
     // Column-major view:
     //   A = W as KxM, op(A)=T; B = X as KxN; D = MxN.
     // D's column-major bytes are the runtime's row-major [N,M] output.
-    constexpr int kCudaR32F = 0;
-    constexpr int kCudaR4E2M1 = 33;
-    constexpr int kCompute32F = 68;
-    constexpr int kOpN = 0, kOpT = 1;
-    constexpr int kDescTransA = 3, kDescTransB = 4;
-    constexpr int kDescAScalePointer = 17, kDescBScalePointer = 18;
-    constexpr int kDescAScaleMode = 31, kDescBScaleMode = 32;
-    constexpr int kScaleVec16Ue4m3 = 1;
-    constexpr int kPreferenceMaxWorkspace = 1;
-    cublasLtMatmulDesc_t operation = nullptr;
-    cublasLtMatrixLayout_t a_layout = nullptr, b_layout = nullptr;
-    cublasLtMatrixLayout_t c_layout = nullptr, d_layout = nullptr;
-    cublasLtMatmulPreference_t preference = nullptr;
-    auto cleanup = [&]() {
-        if (preference) g_cublas_lt.preference_destroy(preference);
-        if (d_layout) g_cublas_lt.layout_destroy(d_layout);
-        if (c_layout) g_cublas_lt.layout_destroy(c_layout);
-        if (b_layout) g_cublas_lt.layout_destroy(b_layout);
-        if (a_layout) g_cublas_lt.layout_destroy(a_layout);
-        if (operation) g_cublas_lt.matmul_desc_destroy(operation);
-    };
-    if (g_cublas_lt.matmul_desc_create(
-            &operation, kCompute32F, kCudaR32F) != 0 ||
-        g_cublas_lt.layout_create(
-            &a_layout, kCudaR4E2M1, input_size, output_size, input_size) != 0 ||
-        g_cublas_lt.layout_create(
-            &b_layout, kCudaR4E2M1, input_size, rows, input_size) != 0 ||
-        g_cublas_lt.layout_create(
-            &c_layout, kCudaR32F, output_size, rows, output_size) != 0 ||
-        g_cublas_lt.layout_create(
-            &d_layout, kCudaR32F, output_size, rows, output_size) != 0 ||
-        g_cublas_lt.preference_create(&preference) != 0) {
-        cleanup();
-        return -8;
-    }
-    const void* a_scale_pointer = reinterpret_cast<const void*>(
-        static_cast<std::uintptr_t>(weight_scales));
-    const void* b_scale_pointer = reinterpret_cast<const void*>(
-        static_cast<std::uintptr_t>(input_scales));
-    size_t no_workspace = 0;
-    if (g_cublas_lt.matmul_desc_set(
-            operation, kDescTransA, &kOpT, sizeof(kOpT)) != 0 ||
-        g_cublas_lt.matmul_desc_set(
-            operation, kDescTransB, &kOpN, sizeof(kOpN)) != 0 ||
-        g_cublas_lt.matmul_desc_set(
-            operation, kDescAScaleMode, &kScaleVec16Ue4m3,
-            sizeof(kScaleVec16Ue4m3)) != 0 ||
-        g_cublas_lt.matmul_desc_set(
-            operation, kDescBScaleMode, &kScaleVec16Ue4m3,
-            sizeof(kScaleVec16Ue4m3)) != 0 ||
-        g_cublas_lt.matmul_desc_set(
-            operation, kDescAScalePointer, &a_scale_pointer,
-            sizeof(a_scale_pointer)) != 0 ||
-        g_cublas_lt.matmul_desc_set(
-            operation, kDescBScalePointer, &b_scale_pointer,
-            sizeof(b_scale_pointer)) != 0 ||
-        g_cublas_lt.preference_set(
-            preference, kPreferenceMaxWorkspace, &no_workspace,
-            sizeof(no_workspace)) != 0) {
-        cleanup();
-        return -9;
-    }
-    CublasLtHeuristicResult result{};
-    int result_count = 0;
-    if (g_cublas_lt.heuristic(
-            g_cublas_lt_handle, operation, a_layout, b_layout, c_layout,
-            d_layout, preference, 1, &result, &result_count) != 0 ||
-        result_count != 1 || result.state != 0) {
-        cleanup();
-        return -10;
-    }
-    const float beta = 0.0f;
-    const void* a = reinterpret_cast<const void*>(
-        static_cast<std::uintptr_t>(weight_values));
-    const void* b = reinterpret_cast<const void*>(
-        static_cast<std::uintptr_t>(input_values));
-    void* d = reinterpret_cast<void*>(static_cast<std::uintptr_t>(output));
-    const int status = g_cublas_lt.matmul(
-        g_cublas_lt_handle, operation, &scale, a, a_layout, b, b_layout,
-        &beta, d, c_layout, d, d_layout, &result.algo, nullptr, 0,
-        cuda_stream);
-    cleanup();
-    return status == 0 ? 0 : -11;
+    // The descriptors, layouts, preference and heuristic query used to be
+    // rebuilt and torn down on every call; nvfp4_run_quantized_gemm keeps a
+    // plan per (K, M, N) -- the same cache the MoE path already uses, cleared
+    // together with it when the scratch grows.
+    const int status = nvfp4_run_quantized_gemm(
+        input_size, output_size, rows, scale, 0.0f, output, cuda_stream,
+        weight_values, weight_scales, input_values, input_scales);
+    return status == 0 ? 0 : -8;
 }
 
 extern "C" int colibri_gpu_nvfp4_moe_cublas(
@@ -2402,9 +2348,7 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
         && validate_gate != g_functions.end()
         && validate_down != g_functions.end();
     const auto cuda_stream = reinterpret_cast<CUstream>(stream);
-    if (g_nvfp4_scratch.stream != nullptr
-        && g_nvfp4_scratch.stream != cuda_stream
-        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -3;
+    if (nvfp4_scratch_switch_stream(cuda_stream) != 0) return -3;
 
     const int gate_rows = 2 * experts * intermediate_size;
     const int down_input = experts * intermediate_size;
