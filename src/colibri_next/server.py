@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import hmac
 import json
+import os
 import queue
 import re
 import select
@@ -2507,7 +2508,15 @@ class ColibriHTTPServer(ThreadingHTTPServer):
         if max_connections <= 0:
             raise ValueError("max_connections must be positive")
         self._connection_slots = threading.BoundedSemaphore(max_connections)
+        self._live_connections: set[socket.socket] = set()
+        self._live_connections_lock = threading.Lock()
         super().__init__(server_address, request_handler, bind_and_activate)
+
+    @staticmethod
+    def _request_socket(
+        request: socket.socket | tuple[bytes, socket.socket],
+    ) -> socket.socket:
+        return request[1] if isinstance(request, tuple) else request
 
     def process_request(
         self,
@@ -2515,12 +2524,16 @@ class ColibriHTTPServer(ThreadingHTTPServer):
         client_address: object,
     ) -> None:
         if not self._connection_slots.acquire(blocking=False):
-            (request[1] if isinstance(request, tuple) else request).close()
+            self._request_socket(request).close()
             return
+        with self._live_connections_lock:
+            self._live_connections.add(self._request_socket(request))
         try:
             super().process_request(request, client_address)
         except BaseException:
             self._connection_slots.release()
+            with self._live_connections_lock:
+                self._live_connections.discard(self._request_socket(request))
             raise
 
     def process_request_thread(
@@ -2532,6 +2545,28 @@ class ColibriHTTPServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._connection_slots.release()
+            with self._live_connections_lock:
+                self._live_connections.discard(self._request_socket(request))
+
+    def server_close(self) -> None:
+        # Handler threads sit inside a generation or a blocked socket send.
+        # Shutting their connections down makes the next read or write fail
+        # through the peer-gone path -- which already cancels the generation --
+        # so the thread join inside super().server_close() completes within a
+        # token or two instead of waiting out every in-flight request.
+        with self._live_connections_lock:
+            live = list(self._live_connections)
+        if live:
+            print(
+                f"shutting down: aborting {len(live)} in-flight connection(s)",
+                file=sys.stderr,
+            )
+        for connection in live:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        super().server_close()
 
     def handle_error(self, request: object, client_address: object) -> None:
         """Report a failed request, but stay quiet about disconnects.
@@ -2564,8 +2599,15 @@ def _sse_with_keepalive(
     token, and pooled HTTP clients (Claude Code, Cline, ...) abandon a stream
     that produces no bytes for that long. Draining the upstream iterator on a
     worker thread lets the caller keep writing liveness markers meanwhile.
+
+    The queue is unbounded on purpose. The upstream generator runs inside
+    _generation_guard, and for a serialized service that lock gates every
+    other request: a bounded queue filling against a stalled client used to
+    block the pump -- and therefore the lock -- for as long as the client
+    dawdled. Unbounded, the pump finishes at model speed and releases the
+    lock; memory is capped by the response itself (one event per token).
     """
-    pending: queue.Queue[object] = queue.Queue(maxsize=1024)
+    pending: queue.Queue[object] = queue.Queue()
     finished = object()
     stop = threading.Event()
     failure: list[BaseException] = []
@@ -2573,14 +2615,9 @@ def _sse_with_keepalive(
     def pump() -> None:
         try:
             for event in events:
-                while not stop.is_set():
-                    try:
-                        pending.put(event, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
                 if stop.is_set():
                     break
+                pending.put(event)
         except BaseException as error:  # re-raised on the consuming thread
             failure.append(error)
         finally:
@@ -2609,13 +2646,11 @@ def _sse_with_keepalive(
             raise failure[0]
     finally:
         stop.set()
-        # Drain briefly so a pump blocked on a full queue notices `stop`. A
-        # pump still inside a long native call cannot be interrupted; it is a
-        # daemon thread, so leave it rather than block the connection.
+        # The pump checks `stop` between events, so it exits within one token.
+        # A pump still inside a long native call cannot be interrupted; it is
+        # a daemon thread, so leave it rather than block the connection.
         deadline = time.monotonic() + 1.0
         while worker.is_alive() and time.monotonic() < deadline:
-            with contextlib.suppress(queue.Empty):
-                pending.get_nowait()
             worker.join(timeout=0.05)
 
 
@@ -3281,7 +3316,15 @@ def serve(
     try:
         server.serve_forever()
     finally:
-        server.server_close()
+        try:
+            server.server_close()
+        except KeyboardInterrupt:
+            # A second interrupt while handlers drain. Returning now would let
+            # the caller free the native runtime under threads still inside
+            # it -- a segfault, not a shutdown. Abandoning the process is the
+            # only exit that stays safe; the OS reclaims everything.
+            print("forced exit before handlers drained", file=sys.stderr)
+            os._exit(130)
 
 
 # Architectures whose own chat template renders tools: the schemas, the call
@@ -4193,27 +4236,40 @@ class MuseChannelStream:
 
     Muse Glimmer has no setting that stops it reasoning, so a stream that
     forwarded raw text would show every client the chain-of-thought and the
-    <|eom|>/<|start|> framing around it. This re-splits the accumulated text on
-    each delta and returns only what is newly settled, which keeps one
-    implementation of the channel rules rather than a second incremental one.
+    <|eom|>/<|start|> framing around it. This walks the markup as a state
+    machine -- outside a message hunting a header, inside one hunting its
+    terminator -- so each delta costs the delta, not the accumulated turn:
+    re-splitting the whole text per token made a long answer quadratic.
 
     Text is emitted only once it cannot still turn out to be the start of a
     marker, so a ``<|eom|>`` arriving one character at a time never leaks a
-    stray ``<|`` into the output. What has already been emitted is tracked by
-    length, which means emission has to be monotonic -- nothing may be sent
-    that a later delta would retract.
+    stray ``<|`` into the output. Emission is monotonic -- nothing may be sent
+    that a later delta would retract -- and joins channels exactly the way the
+    batch splitter joins them, so a stream and a non-streamed response of the
+    same turn read identically.
     """
 
+    # Text between messages carries nothing, but a header may arrive in
+    # pieces, so this much tail is kept for re-inspection. A header is the
+    # optional <|start|>assistant, spacing, an optional to=<recipient> and
+    # <|message|> -- comfortably inside this bound for any real recipient.
+    _OUTSIDE_WINDOW = 512
+
     def __init__(self) -> None:
-        self._raw = ""
-        self._visible = 0
-        self._reasoning = 0
+        self._pieces: list[str] = []  # the verbatim turn, for the fallback
+        self._outside = ""  # unmatched text outside any message
+        self._body = ""  # the open body's held-back tail
+        self._inside = False
+        self._to_reasoning = False  # the open message is addressed to self
+        self._reasoning_messages = 0
         self._saw_header = False
+        self._emitted_visible = 0
+        self._emitted_reasoning = 0
 
     def feed(self, delta: str) -> tuple[str, str]:
         """Return (visible, reasoning) text newly settled by this delta."""
-        self._raw += delta
-        return self._advance(final=False)
+        self._pieces.append(delta)
+        return self._consume(delta, final=False)
 
     def flush(self) -> tuple[str, str]:
         """Release the tail that was being withheld as a possible marker.
@@ -4221,36 +4277,67 @@ class MuseChannelStream:
         A turn that never produced a header carries no channels to separate --
         it is forwarded whole rather than swallowed.
         """
-        visible, reasoning = self._advance(final=True)
-        if not self._saw_header and not self._visible and not self._reasoning:
-            return self._raw, ""
+        visible, reasoning = self._consume("", final=True)
+        if (
+            not self._saw_header
+            and not self._emitted_visible
+            and not self._emitted_reasoning
+        ):
+            return "".join(self._pieces), ""
         return visible, reasoning
 
-    def _advance(self, *, final: bool) -> tuple[str, str]:
-        text = self._raw
+    def _consume(self, delta: str, *, final: bool) -> tuple[str, str]:
         visible: list[str] = []
         reasoning: list[str] = []
-        for header in MUSE_MESSAGE_HEADER.finditer(text):
-            self._saw_header = True
-            start = header.end()
-            terminator = MUSE_MESSAGE_END.search(text, start)
-            if terminator:
-                body = text[start : terminator.start()]
+
+        def emit(text: str) -> None:
+            if not text:
+                return
+            if self._to_reasoning:
+                reasoning.append(text)
+                self._emitted_reasoning += len(text)
             else:
-                # The open message: its tail may still be a partial marker.
-                body = text[start:]
-                if not final:
-                    body = _without_partial_marker(body)
-            (reasoning if header.group("recipient") == "self" else visible).append(body)
-        # Joined the way the batch splitter joins them, so a stream and a
-        # non-streamed response of the same turn read identically.
-        joined_visible = "".join(visible)
-        joined_reasoning = "\n\n".join(reasoning)
-        fresh_visible = joined_visible[self._visible :]
-        fresh_reasoning = joined_reasoning[self._reasoning :]
-        self._visible = len(joined_visible)
-        self._reasoning = len(joined_reasoning)
-        return fresh_visible, fresh_reasoning
+                visible.append(text)
+                self._emitted_visible += len(text)
+
+        text = delta
+        while True:
+            if self._inside:
+                buffer = self._body + text
+                terminator = MUSE_MESSAGE_END.search(buffer)
+                if terminator:
+                    emit(buffer[: terminator.start()])
+                    self._body = ""
+                    self._inside = False
+                    text = buffer[terminator.end() :]
+                    continue
+                if final:
+                    emit(buffer)
+                    self._body = ""
+                else:
+                    # The open message: its tail may still be a partial marker.
+                    settled = _without_partial_marker(buffer)
+                    emit(settled)
+                    self._body = buffer[len(settled) :]
+                return "".join(visible), "".join(reasoning)
+            buffer = self._outside + text
+            header = MUSE_MESSAGE_HEADER.search(buffer)
+            if header is None:
+                self._outside = buffer[-self._OUTSIDE_WINDOW :]
+                return "".join(visible), "".join(reasoning)
+            self._saw_header = True
+            self._inside = True
+            self._to_reasoning = header.group("recipient") == "self"
+            if self._to_reasoning:
+                if self._reasoning_messages:
+                    # The batch splitter joins reasoning messages with a blank
+                    # line; it appears as soon as the next message opens.
+                    reasoning.append("\n\n")
+                    self._emitted_reasoning += 2
+                self._reasoning_messages += 1
+            self._outside = ""
+            self._body = ""
+            text = buffer[header.end() :]
 
 
 def _split_reasoning_content(text: str) -> tuple[str, str | None]:
@@ -4512,6 +4599,13 @@ class _ToolCallStreamer:
         ("<arg_value>", "</arg_value>"),
         (None, "</parameter>"),
     )
+    _BAILING_KEY_OPEN = "<arg_key>"
+    _BAILING_KEY_CLOSE = "</arg_key>"
+    _BAILING_VALUE_OPEN = "<arg_value>"
+    _BAILING_VALUE_CLOSE = "</arg_value>"
+    _HERMES_NAME = "<function="
+    _HERMES_OPEN = "<parameter="
+    _HERMES_CLOSE = "</parameter>"
 
     def __init__(self, schema: Mapping[str, Any] | None = None) -> None:
         self._schema = schema
@@ -4519,8 +4613,28 @@ class _ToolCallStreamer:
         self._opened = False
         self._done: dict[str, Any] = {}
         self._streaming_key: str | None = None
-        self._streamed = ""  # raw value text already emitted for _streaming_key
+        # Raw value text already emitted for _streaming_key. Kept as pieces:
+        # rebuilding one string per token re-copied the whole value each time.
+        self._streamed_parts: list[str] = []
+        self._streamed_len = 0
         self._finished = False
+        # Incremental scanner state. feed() receives the same body grown by
+        # one delta per call; these offsets record what has already been
+        # scanned, so each call touches only the new tail. Rescanning the
+        # whole body per token made a long file argument quadratic on the
+        # decode path.
+        self._seen = 0  # length of the body last fed
+        self._scan = 0  # name/format discovery progress
+        self._format: str | None = None  # "bailing" | "hermes"
+        self._dead = False  # streaming abandoned; finish() still settles
+        self._pos = 0  # start of the unconsumed argument region
+        self._key_scan = 0  # key-tag search progress within that region
+        self._state = "key"  # "key" | "value"
+        self._key = ""  # key of the value currently accumulating
+        self._vstart = 0  # where the current raw value text begins
+        self._value_scan = 0  # closing-tag search progress
+        self._lead = 0  # framing newline length skipped at value start
+        self._lead_done = False
 
     @property
     def name(self) -> str | None:
@@ -4584,52 +4698,247 @@ class _ToolCallStreamer:
         return ","
 
     def feed(self, body: str) -> list[str]:
-        """Emit fragments for everything `body` newly settles. Never blocks."""
-        if self._finished:
+        """Emit fragments for everything `body` newly settles. Never blocks.
+
+        `body` is the previous call's body plus the newest delta; the scanner
+        keeps offsets into it, so each call costs the new text, not the whole
+        accumulated argument. Anything ambiguous stops the streaming side for
+        good -- under-streaming is always safe, because finish() delivers
+        whatever the authoritative parse recovers.
+        """
+        if self._finished or self._dead:
             return []
-        fragments: list[str] = []
+        if len(body) < self._seen:
+            # A rewound body would invalidate every offset kept above.
+            self._dead = True
+            return []
+        self._seen = len(body)
         if self._name is None:
-            self._name = _decode_tool_call_name(body)
+            self._discover(body)
             # Emit nothing on the call that discovers the name: the caller has
             # to bind the schema first, and the schema decides how the very
             # first value is typed and whether it may stream at all.
-            return fragments
-        for key, value, closed in _iter_tool_call_arguments(body):
-            if key in self._done:
-                continue
-            if closed:
-                if self._streaming_key == key:
-                    # Close the string this value was being streamed into. The
-                    # tail trim only applies once the value is known to be over.
-                    remainder = _trim_parameter_text(value)[len(self._streamed):]
-                    fragments.append(self._escape(remainder) + '"')
-                    self._streaming_key = None
-                    self._streamed = ""
-                else:
-                    fragments.append(
-                        self._separator() + json.dumps(key, ensure_ascii=False)
-                        + ":" + self._encode(key, _trim_parameter_text(value))
-                    )
-                self._done[key] = True
-                continue
-            # An open value: stream it only if its declared type makes the text
-            # final, and only the part no closing tag could still claim.
-            if not self._streams_as_string(key):
-                break
-            if self._streaming_key != key:
-                if self._streaming_key is not None:
-                    break
-                fragments.append(
-                    self._separator() + json.dumps(key, ensure_ascii=False) + ':"'
-                )
-                self._streaming_key = key
-                self._streamed = ""
-            settled = _settled_prefix(_trim_parameter_text(value))
-            if len(settled) > len(self._streamed):
-                fragments.append(self._escape(settled[len(self._streamed):]))
-                self._streamed = settled
-            break
+            return []
+        fragments: list[str] = []
+        self._parse(body, fragments)
         return fragments
+
+    def _discover(self, body: str) -> None:
+        """Decide the body's format and tool name, scanning only new text."""
+        overlap = max(len(self._BAILING_KEY_OPEN), len(self._HERMES_NAME)) - 1
+        start = max(0, self._scan - overlap)
+        key_at = body.find(self._BAILING_KEY_OPEN, start)
+        if key_at != -1:
+            # BailingMoE3: the name is the line preceding the first tag.
+            head = body[:key_at].strip()
+            if not head:
+                self._dead = True  # the batch decoder finds no name either
+                return
+            self._name = head.splitlines()[0].strip()
+            self._format = "bailing"
+            self._pos = key_at
+            self._key_scan = key_at
+            return
+        cursor = start
+        while True:
+            tag = body.find(self._HERMES_NAME, cursor)
+            if tag == -1:
+                self._scan = len(body)
+                return
+            after = tag + len(self._HERMES_NAME)
+            close = body.find(">", after)
+            newline = body.find("\n", after)
+            if close == -1 and newline == -1:
+                self._scan = tag  # the tag is still arriving; retry here
+                return
+            if close == -1 or (newline != -1 and newline < close):
+                cursor = tag + 1  # a newline interrupts the tag: not a match
+                continue
+            name = body[after:close].strip()
+            if not name:
+                cursor = tag + 1
+                continue
+            self._name = name
+            self._format = "hermes"
+            self._pos = close + 1
+            self._key_scan = close + 1
+            return
+
+    def _parse(self, body: str, fragments: list[str]) -> None:
+        n = len(body)
+        while not self._dead:
+            if self._state == "key":
+                if not self._begin_pair(body, n):
+                    return
+                continue
+            closer = (
+                self._BAILING_VALUE_CLOSE
+                if self._format == "bailing"
+                else self._HERMES_CLOSE
+            )
+            hunt = max(self._vstart, self._value_scan - (len(closer) - 1))
+            end = body.find(closer, hunt)
+            if end != -1:
+                self._emit_closed(body[self._vstart : end], fragments)
+                self._pos = end + len(closer)
+                self._key_scan = self._pos
+                self._state = "key"
+                continue
+            self._value_scan = n
+            self._stream_open_tail(body, n, fragments)
+            return
+
+    def _begin_pair(self, body: str, n: int) -> bool:
+        """Consume the next key opening; False when more text is needed."""
+        if self._format == "bailing":
+            start = max(
+                self._pos, self._key_scan - (len(self._BAILING_KEY_OPEN) - 1)
+            )
+            tag = body.find(self._BAILING_KEY_OPEN, start)
+            if tag == -1:
+                self._key_scan = n
+                return False
+            key_end = body.find(
+                self._BAILING_KEY_CLOSE, tag + len(self._BAILING_KEY_OPEN)
+            )
+            if key_end == -1:
+                self._key_scan = tag
+                return False
+            cursor = key_end + len(self._BAILING_KEY_CLOSE)
+            while cursor < n and body[cursor].isspace():
+                cursor += 1
+            head = body[cursor : cursor + len(self._BAILING_VALUE_OPEN)]
+            if len(head) < len(self._BAILING_VALUE_OPEN):
+                if self._BAILING_VALUE_OPEN.startswith(head):
+                    self._key_scan = tag  # the opening tag may still arrive
+                else:
+                    self._dead = True
+                return False
+            if head != self._BAILING_VALUE_OPEN:
+                # The strict pattern would not match this pair. A later pair
+                # might, but streaming stops here; finish() recovers the rest.
+                self._dead = True
+                return False
+            self._key = body[tag + len(self._BAILING_KEY_OPEN) : key_end].strip()
+            self._vstart = cursor + len(self._BAILING_VALUE_OPEN)
+        else:
+            start = max(self._pos, self._key_scan - (len(self._HERMES_OPEN) - 1))
+            while True:
+                tag = body.find(self._HERMES_OPEN, start)
+                if tag == -1:
+                    self._key_scan = n
+                    return False
+                after = tag + len(self._HERMES_OPEN)
+                close = body.find(">", after)
+                newline = body.find("\n", after)
+                if close == -1 and newline == -1:
+                    self._key_scan = tag
+                    return False
+                if close == -1 or (newline != -1 and newline < close):
+                    start = tag + 1
+                    continue
+                key = body[after:close].strip()
+                if not key:
+                    start = tag + 1
+                    continue
+                self._key = key
+                self._vstart = close + 1
+                break
+        self._state = "value"
+        self._value_scan = self._vstart
+        self._lead = 0
+        self._lead_done = False
+        return True
+
+    def _emit_closed(self, raw_value: str, fragments: list[str]) -> None:
+        key = self._key
+        if key in self._done:
+            return
+        if self._streaming_key == key:
+            # Close the string this value was being streamed into. The tail
+            # trim only applies once the value is known to be over.
+            remainder = _trim_parameter_text(raw_value)[self._streamed_len :]
+            fragments.append(self._escape(remainder) + '"')
+            self._streaming_key = None
+            self._streamed_parts = []
+            self._streamed_len = 0
+        else:
+            fragments.append(
+                self._separator() + json.dumps(key, ensure_ascii=False)
+                + ":" + self._encode(key, _trim_parameter_text(raw_value))
+            )
+        self._done[key] = True
+
+    def _stream_open_tail(
+        self, body: str, n: int, fragments: list[str]
+    ) -> None:
+        # An open value: stream it only if its declared type makes the text
+        # final, and only the part no closing tag could still claim.
+        key = self._key
+        if key in self._done or not self._streams_as_string(key):
+            return
+        if not self._lead_done:
+            # _trim_parameter_text drops one leading framing newline; skip it
+            # here so streamed offsets index the trimmed value.
+            if self._vstart >= n:
+                return
+            first = body[self._vstart]
+            if first == "\n":
+                self._lead = 1
+            elif first == "\r":
+                if self._vstart + 1 >= n:
+                    return  # a bare \r could still become \r\n framing
+                self._lead = 2 if body[self._vstart + 1] == "\n" else 0
+            self._lead_done = True
+        if self._streaming_key != key:
+            if self._streaming_key is not None:
+                return
+            fragments.append(
+                self._separator() + json.dumps(key, ensure_ascii=False) + ':"'
+            )
+            self._streaming_key = key
+            self._streamed_parts = []
+            self._streamed_len = 0
+        settled = self._settled_end(body, n)
+        emit_from = self._vstart + self._lead + self._streamed_len
+        if settled > emit_from:
+            piece = body[emit_from:settled]
+            fragments.append(self._escape(piece))
+            self._streamed_parts.append(piece)
+            self._streamed_len += len(piece)
+
+    @staticmethod
+    def _cut_trailing_frame(body: str, floor: int, end: int) -> int:
+        """Where TOOL_PARAMETER_TAIL would cut: one \\r?\\n plus trailing
+        horizontal space, or nowhere when no newline frames the tail."""
+        cursor = end
+        while cursor > floor and body[cursor - 1] in " \t":
+            cursor -= 1
+        if cursor > floor and body[cursor - 1] == "\n":
+            cursor -= 1
+            if cursor > floor and body[cursor - 1] == "\r":
+                cursor -= 1
+            return cursor
+        return end
+
+    def _settled_end(self, body: str, n: int) -> int:
+        """The absolute end of what may be emitted from the open value.
+
+        Mirrors _settled_prefix(_trim_parameter_text(value)) on offsets: cut
+        one trailing framing newline, hold back the longest suffix that could
+        still grow into a closing tag, then cut the framing again -- all on
+        the tail, so the cost is the holdback, not the value.
+        """
+        floor = self._vstart + self._lead
+        end = self._cut_trailing_frame(body, floor, n)
+        held = 0
+        for _, closer in self._FORMATS:
+            for length in range(min(len(closer) - 1, end - floor), 0, -1):
+                if body.startswith(closer[:length], end - length):
+                    held = max(held, length)
+                    break
+        end -= held
+        return self._cut_trailing_frame(body, floor, end)
 
     def finish(self, arguments: Mapping[str, Any] | None) -> list[str]:
         """Emit whatever `arguments` still owes the client, and close the object.
@@ -4654,7 +4963,7 @@ class _ToolCallStreamer:
             if self._streaming_key == key:
                 # Close the streamed string against the authoritative value
                 # rather than the raw text, so normalization still decides it.
-                streamed = self._escape(self._streamed)
+                streamed = self._escape("".join(self._streamed_parts))
                 tail = encoded[1:-1] if encoded.startswith('"') else ""
                 fragments.append(
                     (tail[len(streamed):] if tail.startswith(streamed) else "") + '"'
@@ -4673,60 +4982,6 @@ class _ToolCallStreamer:
             fragments.append("{")
         fragments.append("}")
         return fragments
-
-
-def _settled_prefix(value: str) -> str:
-    """The part of an open tag value no closing tag or framing could reclaim.
-
-    Holds back the longest suffix that is a prefix of any closing tag, plus a
-    trailing newline run, which _trim_parameter_text() drops if the value ends
-    there.
-    """
-    limit = len(value)
-    for open_tag, close_tag in _ToolCallStreamer._FORMATS:
-        del open_tag
-        for length in range(min(len(close_tag) - 1, len(value)), 0, -1):
-            if value.endswith(close_tag[:length]):
-                limit = min(limit, len(value) - length)
-                break
-    settled = value[:limit]
-    trailing = TOOL_PARAMETER_TAIL.search(settled)
-    return settled[: trailing.start()] if trailing else settled
-
-
-def _decode_tool_call_name(body: str) -> str | None:
-    """The function name from a possibly-incomplete tool-call body."""
-    body = body.strip()
-    key_match = TOOL_ARG_KEY_PATTERN.search(body)
-    if key_match:
-        head = body[: key_match.start()].strip()
-        return head.splitlines()[0].strip() if head else None
-    function_match = TOOL_FUNCTION_PATTERN.search(body)
-    if function_match:
-        return function_match.group(1).strip()
-    return None
-
-
-def _iter_tool_call_arguments(body: str):
-    """Yield ``(key, raw_value, closed)`` for a possibly-incomplete body.
-
-    The trailing entry may be open -- its value is still being generated -- which
-    is what lets a long parameter stream instead of landing in one piece.
-    """
-    body = body.strip()
-    if TOOL_ARG_KEY_PATTERN.search(body):
-        pattern, open_pattern = TOOL_ARG_PAIR_PATTERN, TOOL_ARG_OPEN_PATTERN
-    elif TOOL_FUNCTION_PATTERN.search(body):
-        pattern, open_pattern = TOOL_PARAMETER_PATTERN, TOOL_PARAMETER_OPEN_PATTERN
-    else:
-        return
-    end = 0
-    for match in pattern.finditer(body):
-        yield match.group(1).strip(), match.group(2), True
-        end = match.end()
-    trailing = open_pattern.search(body, end)
-    if trailing:
-        yield trailing.group(1).strip(), trailing.group(2), False
 
 
 def _recover_trailing_parameters(
