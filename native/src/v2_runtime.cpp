@@ -18483,6 +18483,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 void* shared_args[] = {const_cast<std::uint64_t*>(&s.normalized), &shared_gate, const_cast<std::uint64_t*>(&s.third), const_cast<int*>(&hidden_size)};
                 launch_named(sg_type==30?"qwen_shared_scale_bf16":"qwen_shared_scale", 1, 1, 256, shared_args);
             }
+            }
         }
         // All predictions queued by the preceding layer target this layer.
         // One stream wait covers every sequence's upload batch; predictions
@@ -18771,7 +18772,6 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 }
             }
             if(timing_enabled())runtime->expert_page_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pager_started).count();
-            }
             add(s.residual, s.third);
             std::swap(s.hidden, s.residual);
         }
