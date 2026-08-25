@@ -926,9 +926,15 @@ extern "C" int colibri_gpu_compile(
             return -3;
         }
         size_t ptx_size = 0;
-        g_api.nvrtcGetPTXSize(program, &ptx_size);
+        if (g_api.nvrtcGetPTXSize(program, &ptx_size) != 0 || ptx_size == 0) {
+            g_api.nvrtcDestroyProgram(&program);
+            return -3;
+        }
         std::vector<char> ptx(ptx_size);
-        g_api.nvrtcGetPTX(program, ptx.data());
+        if (g_api.nvrtcGetPTX(program, ptx.data()) != 0) {
+            g_api.nvrtcDestroyProgram(&program);
+            return -3;
+        }
         g_api.nvrtcDestroyProgram(&program);
         if (g_api.cuModuleLoadDataEx(&g_module, ptx.data(), 0, nullptr, nullptr)
             != 0) {
@@ -1485,17 +1491,28 @@ extern "C" int colibri_gpu_stream_destroy(std::uint64_t stream) {
         // model reloads retain VRAM and later try to synchronize a stale handle.
         std::lock_guard<std::mutex> lock(g_cublas_mutex);
         if (g_nvfp4_scratch.stream == cuda_stream) {
-            g_api.cuStreamSynchronize(cuda_stream);
-            const auto release = [](CUdeviceptr pointer) {
-                if (pointer) g_api.cuMemFree(pointer);
-            };
-            release(g_nvfp4_scratch.weight_values);
-            release(g_nvfp4_scratch.weight_scales);
-            release(g_nvfp4_scratch.input_values);
-            release(g_nvfp4_scratch.input_scales);
-            release(g_nvfp4_scratch.projected);
-            release(g_nvfp4_scratch.expert_pointers);
+            // Free only after a successful drain: a failed synchronize means
+            // work may still be reading these buffers, and freeing them then
+            // trades a bounded leak for a use-after-free. The handles are
+            // forgotten either way -- they must not outlive the stream.
+            const bool drained =
+                g_api.cuStreamSynchronize(cuda_stream) == 0;
+            if (drained) {
+                const auto release = [](CUdeviceptr pointer) {
+                    if (pointer) g_api.cuMemFree(pointer);
+                };
+                release(g_nvfp4_scratch.weight_values);
+                release(g_nvfp4_scratch.weight_scales);
+                release(g_nvfp4_scratch.input_values);
+                release(g_nvfp4_scratch.input_scales);
+                release(g_nvfp4_scratch.projected);
+                release(g_nvfp4_scratch.expert_pointers);
+            }
+            const CUevent handoff = g_nvfp4_scratch.handoff;
             g_nvfp4_scratch = Nvfp4Scratch{};
+            // The handoff event belongs to the context, not the stream; it
+            // stays usable for the next scratch owner.
+            g_nvfp4_scratch.handoff = handoff;
         }
     }
     return g_api.cuStreamDestroy(cuda_stream) == 0

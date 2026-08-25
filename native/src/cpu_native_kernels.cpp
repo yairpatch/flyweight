@@ -562,6 +562,12 @@ inline void attention_head_norm_rope(const float* source, const float* norm_weig
                                      float* destination, int head_dim,
                                      int rotary_dim, int position, float theta,
                                      float epsilon) {
+    // rotary_dim flows from GGUF metadata (rope.dimension_count). The partner
+    // lookup below reads up to normalized[rotary_dim - 1] out of a buffer
+    // sized head_dim, so a checkpoint claiming a wider rotary span than the
+    // head would read past the heap. A span wider than the head is
+    // meaningless anyway; clamp rather than trust.
+    if (rotary_dim > head_dim) rotary_dim = head_dim;
     static thread_local std::vector<float> normalized;
     if (static_cast<int>(normalized.size()) < head_dim)
         normalized.resize(head_dim);
@@ -1026,6 +1032,11 @@ inline void kv_values_ring_host(float* scores, const Element* values,
                                 float* output, int heads, int kv_heads,
                                 int head_dim, int tokens, int capacity,
                                 int first, Load load) {
+    // Degenerate shapes are gated upstream, but a zero kv_heads or capacity
+    // reaching this far would be a SIGFPE, not an error; refuse them here so
+    // a bad launch is a no-op instead of a crash.
+    if (heads <= 0 || kv_heads <= 0 || heads < kv_heads || capacity <= 0)
+        return;
     const int group = heads / kv_heads;
     parallel_chunks(static_cast<std::uint64_t>(heads), [&](std::uint64_t head) {
         const int kv_head = static_cast<int>(head) / group;

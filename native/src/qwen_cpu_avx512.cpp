@@ -1245,8 +1245,15 @@ float qwen_quant_dot_avx512(
             packed + row * static_cast<std::uint64_t>(elements / 64) * 36,
             input, elements);
     }
-    return q8_dot(packed + row * static_cast<std::uint64_t>(elements / 32) * 34,
-                  input, elements);
+    if (type == 8) {
+        return q8_dot(packed + row * static_cast<std::uint64_t>(elements / 32) * 34,
+                      input, elements);
+    }
+    // A type this dispatch does not know must not be read as Q8_0: the row
+    // stride would be wrong and the walk runs past the tensor (an mmap'd
+    // model file). The admission allowlists keep this unreachable; if one
+    // ever slips, a zero output is diagnosable where an over-read is not.
+    return 0.0f;
 }
 
 void qwen_quant_dot_rows_avx512(
@@ -1341,6 +1348,10 @@ void qwen_dequant_row_avx512(
     }
 }
 
+// CONTRACT: `elements` must be a multiple of 32 -- the tail loop below steps
+// two 16-lane vectors per iteration with no remainder handling, so a width
+// that violates this reads past every input. Callers gate on it today; a new
+// caller must too.
 void qwen_f32_dot_multi_avx512(
     const float* row,
     const float* const* inputs,

@@ -2201,7 +2201,10 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
             layer.attention_heads=model.config.attention_heads;
             layer.kv_heads=model.config.attention_kv_heads;
             layer.head_dim=static_cast<std::uint32_t>(model.tensors[layer.static_tensors[2]].shape[1]/layer.kv_heads);
-            layer.rotary_dim=model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim;
+            // Clamped: rope.dimension_count comes straight from GGUF metadata,
+            // and the RoPE kernels stage a head_dim-sized buffer that a wider
+            // claimed span would read past.
+            layer.rotary_dim=std::min<std::uint32_t>(model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim,layer.head_dim);
             layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:1000000.0f;
         } else {
             for (const char* suffix : {
@@ -2409,9 +2412,9 @@ void build_laguna_plan(ColibriV2QwenRuntime& runtime) {
         // Full-attention layers run YaRN over a partial rotary span with the
         // long-context theta; sliding-window layers run plain RoPE over the
         // whole head with the short theta.
-        layer.rotary_dim=layer.attention_window
+        layer.rotary_dim=std::min<std::uint32_t>(layer.attention_window
             ?(model.config.rotary_dimension_swa?model.config.rotary_dimension_swa:head_dim)
-            :(model.config.rotary_dimension?model.config.rotary_dimension:head_dim);
+            :(model.config.rotary_dimension?model.config.rotary_dimension:head_dim),head_dim);
         layer.rope_theta=layer.attention_window
             ?(model.config.rope_freq_base_swa?model.config.rope_freq_base_swa:10000.0f)
             :(model.config.rope_freq_base?model.config.rope_freq_base:500000.0f);
@@ -2515,7 +2518,7 @@ void build_muse_glimmer_plan(ColibriV2QwenRuntime& runtime) {
         // is the reverse of the usual arrangement -- the global layers here
         // carry no positional signal of their own at all.
         layer.rotary_dim=layer.attention_window
-            ?(model.config.rotary_dimension?model.config.rotary_dimension:head_dim)
+            ?std::min<std::uint32_t>(model.config.rotary_dimension?model.config.rotary_dimension:head_dim,head_dim)
             :0;
         layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:500000.0f;
         for(const char* suffix:{
@@ -2570,9 +2573,9 @@ void build_gemma4_plan(ColibriV2QwenRuntime& runtime) {
         layer.head_dim=layer.attention_window
             ?(model.config.key_length_swa?model.config.key_length_swa:model.config.rotary_dimension_swa)
             :(model.config.key_length?model.config.key_length:model.config.rotary_dimension);
-        layer.rotary_dim=layer.attention_window
+        layer.rotary_dim=std::min<std::uint32_t>(layer.attention_window
             ?(model.config.rotary_dimension_swa?model.config.rotary_dimension_swa:layer.head_dim)
-            :(model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim);
+            :(model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim),layer.head_dim);
         layer.rope_theta=layer.attention_window
             ?(model.config.rope_freq_base_swa?model.config.rope_freq_base_swa:10000.0f)
             :(model.config.rope_freq_base?model.config.rope_freq_base:1000000.0f);
@@ -13603,8 +13606,8 @@ void qwen_mtp_append_pair(
     qwen_mtp_dense_projection(
         runtime, layer.static_tensors[3], normalized,
         values, hidden, kv_size);
-    const int rotary = static_cast<int>(runtime.model->config.rotary_dimension
-        ? runtime.model->config.rotary_dimension : head_dim);
+    const int rotary = std::min(static_cast<int>(runtime.model->config.rotary_dimension
+        ? runtime.model->config.rotary_dimension : head_dim), static_cast<int>(head_dim));
     const int position = static_cast<int>(runtime.mtp_cache_tokens);
     const float theta = runtime.model->config.rope_freq_base
         ? runtime.model->config.rope_freq_base : 1000000.0f;
@@ -13723,8 +13726,8 @@ void qwen_mtp_append_pair_batch2(
     rms_rows(fused,runtime.device_tensors[layer.static_tensors[0]],normalized);
     dense_pair(layer.static_tensors[2],normalized,keys,hidden,kv_size);
     dense_pair(layer.static_tensors[3],normalized,values,hidden,kv_size);
-    const int rotary=static_cast<int>(runtime.model->config.rotary_dimension
-        ?runtime.model->config.rotary_dimension:head_dim);
+    const int rotary=std::min(static_cast<int>(runtime.model->config.rotary_dimension
+        ?runtime.model->config.rotary_dimension:head_dim),static_cast<int>(head_dim));
     const float theta=runtime.model->config.rope_freq_base
         ?runtime.model->config.rope_freq_base:1000000.0f;
     const auto key_norm=runtime.device_tensors[layer.static_tensors[6]];

@@ -2,6 +2,7 @@
 #include "q4_kernel.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <vector>
@@ -18,6 +19,43 @@
 #endif
 
 namespace {
+
+#if defined(_OPENMP)
+// One thread per PHYSICAL core, detected from Linux's topology rather than
+// assumed. SMT siblings fight over the shared load ports and the spin
+// barriers between phases (measured ~50x slower at 32 threads than 16 on a
+// 16C/32T part) -- but blindly halving omp_get_num_procs() idled half the
+// cores on machines without SMT. Same logic as matvec_threads() in
+// colibri_v2_bailing.hpp; cached, so the OMP_NUM_THREADS getenv that used to
+// run per MoE call per layer happens once.
+int moe_team_threads() {
+    static const int threads = [] {
+        if (std::getenv("OMP_NUM_THREADS")) return omp_get_max_threads();
+        int siblings = 1;
+#if defined(__linux__)
+        if (std::FILE* file = std::fopen(
+                "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+                "r")) {
+            char line[256] = {};
+            if (std::fgets(line, sizeof(line), file)) {
+                // "0,16" or "0-1": one entry per hardware thread on this core.
+                siblings = 1;
+                for (const char* c = line; *c; ++c)
+                    if (*c == ',') ++siblings;
+                    else if (*c == '-') siblings = 2;
+            }
+            std::fclose(file);
+        }
+#endif
+        const int procs = omp_get_num_procs();
+        const int physical = siblings > 1 ? procs / siblings : procs;
+        const int team = physical > 0 ? physical : 1;
+        const int limit = omp_get_max_threads();
+        return team < limit ? team : limit;
+    }();
+    return threads;
+}
+#endif
 
 constexpr std::uint32_t kFeatureAvx2 = 1u << 0;
 constexpr std::uint32_t kFeatureAvx512 = 1u << 1;
@@ -166,17 +204,7 @@ extern "C" int colibri_q4_moe(
     // requires whole Q4 blocks per row.
     if (hidden_size % 32 == 0 && intermediate_size % 32 == 0) {
 #if defined(_OPENMP)
-        // SMT siblings fight over the shared load ports and the spin barriers
-        // between phases, which collapses throughput (measured ~50x slower at
-        // 32 threads than 16 on a 16C/32T part). Default the team to the
-        // physical core count unless the user pinned OMP_NUM_THREADS.
-        int team = omp_get_max_threads();
-        if (std::getenv("OMP_NUM_THREADS") == nullptr) {
-            const int physical = omp_get_num_procs() / 2;
-            if (physical >= 1 && team > physical) {
-                team = physical;
-            }
-        }
+        const int team = moe_team_threads();
 #endif
         constexpr std::int32_t kChunkRows = 64;
         const std::int32_t gate_blocks_per_row = hidden_size / 32;
@@ -187,15 +215,17 @@ extern "C" int colibri_q4_moe(
             (hidden_size + kChunkRows - 1) / kChunkRows;
         const std::int32_t gate_tasks = num_experts * gate_chunks;
         const std::int32_t down_tasks = num_experts * down_chunks;
-        std::vector<float> gate(
-            static_cast<std::size_t>(num_experts) * gate_rows
-        );
-        std::vector<float> activated(
-            static_cast<std::size_t>(num_experts) * intermediate_size
-        );
-        std::vector<float> expert_output(
-            static_cast<std::size_t>(num_experts) * hidden_size
-        );
+        // Reused across calls: sized num_experts x rows, these were multi-MB
+        // heap allocations per layer per token. Every element is overwritten
+        // before it is read, so a warm buffer needs no clearing.
+        static thread_local std::vector<float> gate;
+        static thread_local std::vector<float> activated;
+        static thread_local std::vector<float> expert_output;
+        gate.resize(static_cast<std::size_t>(num_experts) * gate_rows);
+        activated.resize(
+            static_cast<std::size_t>(num_experts) * intermediate_size);
+        expert_output.resize(
+            static_cast<std::size_t>(num_experts) * hidden_size);
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(team)
 #endif
@@ -359,6 +389,7 @@ extern "C" int colibri_q4_moe_grouped(
     float* outputs,
     std::int32_t assignments,
     std::int32_t tokens,
+    std::int32_t num_experts,
     std::int32_t hidden_size,
     std::int32_t intermediate_size
 ) {
@@ -367,21 +398,30 @@ extern "C" int colibri_q4_moe_grouped(
         || assignment_expert == nullptr || assignment_token == nullptr
         || assignment_weight == nullptr || inputs == nullptr
         || outputs == nullptr || assignments <= 0 || tokens <= 0
-        || hidden_size <= 0 || intermediate_size <= 0) {
+        || num_experts <= 0 || hidden_size <= 0 || intermediate_size <= 0) {
         return -1;
     }
     const std::int32_t gate_rows = 2 * intermediate_size;
 
     // Per-assignment expert outputs, reduced per token afterwards so no two
-    // threads ever contend on the same output row.
-    std::vector<float> expert_outputs(
-        static_cast<std::size_t>(assignments) * hidden_size
-    );
+    // threads ever contend on the same output row. Reused across calls: this
+    // was a multi-MB allocation per layer per token, and every element is
+    // written by its assignment before the reduction reads it.
+    static thread_local std::vector<float> expert_outputs;
+    expert_outputs.resize(static_cast<std::size_t>(assignments) * hidden_size);
     // CSR of assignments per token for the reduction phase.
-    std::vector<std::int32_t> token_counts(tokens + 1, 0);
+    static thread_local std::vector<std::int32_t> token_counts;
+    token_counts.assign(tokens + 1, 0);
     for (std::int32_t index = 0; index < assignments; ++index) {
         const std::int32_t token = assignment_token[index];
         if (token < 0 || token >= tokens) {
+            return -1;
+        }
+        // The expert index selects a weight pointer out of the caller's
+        // arrays; validated here, serially, because the parallel loop below
+        // has no way to report it.
+        const std::int32_t expert = assignment_expert[index];
+        if (expert < 0 || expert >= num_experts) {
             return -1;
         }
         ++token_counts[token + 1];
@@ -389,31 +429,29 @@ extern "C" int colibri_q4_moe_grouped(
     for (std::int32_t token = 0; token < tokens; ++token) {
         token_counts[token + 1] += token_counts[token];
     }
-    std::vector<std::int32_t> token_assignments(assignments);
+    static thread_local std::vector<std::int32_t> token_assignments;
+    token_assignments.resize(assignments);
     {
-        std::vector<std::int32_t> cursor(
-            token_counts.begin(), token_counts.end() - 1
-        );
+        static thread_local std::vector<std::int32_t> cursor;
+        cursor.assign(token_counts.begin(), token_counts.end() - 1);
         for (std::int32_t index = 0; index < assignments; ++index) {
             token_assignments[cursor[assignment_token[index]]++] = index;
         }
     }
 
 #if defined(_OPENMP)
-    int team = omp_get_max_threads();
-    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
-        const int physical = omp_get_num_procs() / 2;
-        if (physical >= 1 && team > physical) {
-            team = physical;
-        }
-    }
+    const int team = moe_team_threads();
 #endif
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(team)
 #endif
     {
-        std::vector<float> gate(gate_rows);
-        std::vector<float> activated(intermediate_size);
+        // Per OpenMP worker, reused across calls (thread_local follows the
+        // pool thread, and the team is stable between layers).
+        static thread_local std::vector<float> gate;
+        static thread_local std::vector<float> activated;
+        gate.resize(gate_rows);
+        activated.resize(intermediate_size);
         // Assignments arrive sorted by expert, so consecutive iterations
         // reuse the same expert weights out of cache.
 #if defined(_OPENMP)

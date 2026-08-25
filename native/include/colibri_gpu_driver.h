@@ -60,6 +60,7 @@ COLIBRI_API int colibri_q4_moe_grouped(
     float* outputs,
     std::int32_t assignments,
     std::int32_t tokens,
+    std::int32_t num_experts,
     std::int32_t hidden_size,
     std::int32_t intermediate_size
 );

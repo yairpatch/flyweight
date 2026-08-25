@@ -1150,7 +1150,11 @@ float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const fl
     if(type==13)return q5_dot(packed+row*static_cast<std::uint64_t>(elements/256)*176,input,elements);
     if(type==14)return q6_dot(packed+row*static_cast<std::uint64_t>(elements/256)*210,input,elements);
     if(type==40)return nvfp4_dot(packed+row*static_cast<std::uint64_t>(elements/64)*36,input,elements);
-    return q8_dot(packed+row*static_cast<std::uint64_t>(elements/32)*34,input,elements);
+    if(type==8)return q8_dot(packed+row*static_cast<std::uint64_t>(elements/32)*34,input,elements);
+    // An unknown type must not be read as Q8_0: the row stride would be wrong
+    // and the walk runs past the tensor. The admission allowlists keep this
+    // unreachable; a zero output is diagnosable where an over-read is not.
+    return 0.0f;
 }
 
 void qwen_quant_dot_rows_avx2(

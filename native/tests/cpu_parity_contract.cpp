@@ -814,6 +814,31 @@ void add_cases() {
         },
         1e-5f,
     });
+
+    cases().push_back(Case{
+        "qwen_imatrix_accumulate",
+        [](std::vector<std::vector<float>>& outputs) {
+            // Widths on and off the block boundary, and sums seeded non-zero
+            // because the kernel accumulates rather than overwrites.
+            for (int width : {256, 320, 1024}) {
+                for (int rows : {1, 7}) {
+                    auto input = random_vector(
+                        static_cast<std::size_t>(rows) * width, -2.0f, 2.0f);
+                    auto sums = random_vector(width, 0.0f, 1.0f);
+
+                    const float* input_pointer = input.data();
+                    float* sums_pointer = sums.data();
+                    void* arguments[] = {&input_pointer, &sums_pointer, &width,
+                                         &rows};
+                    colibri_cpu_launch_named("qwen_imatrix_accumulate",
+                                             (width + 255) / 256, 1, 256, 0, 0,
+                                             arguments);
+                    outputs.push_back(std::move(sums));
+                }
+            }
+        },
+        1e-5f,
+    });
 }
 
 }  // namespace

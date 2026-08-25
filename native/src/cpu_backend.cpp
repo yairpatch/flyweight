@@ -25,9 +25,11 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string_view>
 #include <new>
 #include <string>
 #include <thread>
@@ -47,6 +49,11 @@ constexpr std::size_t kDeviceAlignment = 256;
 
 void* aligned_allocate(std::size_t bytes) {
     if (bytes == 0) bytes = 1;
+    // A request near SIZE_MAX would wrap in the rounding below and "succeed"
+    // as a tiny allocation the caller then overruns. Sizes that large are
+    // always arithmetic bugs upstream; fail them like any other exhaustion.
+    if (bytes > std::numeric_limits<std::size_t>::max() - kDeviceAlignment)
+        return nullptr;
     const std::size_t rounded =
         (bytes + kDeviceAlignment - 1) / kDeviceAlignment * kDeviceAlignment;
 #if defined(_WIN32)
@@ -161,7 +168,17 @@ void record_launch(const char* name, std::uint64_t nanoseconds, bool native) {
 // takes the slow path or sees a complete entry. Holding a mutex per launch
 // would serialize every kernel in the model behind one lock.
 std::shared_mutex g_kernel_mutex;
-std::unordered_map<std::string, Resolved> g_kernel_cache;
+// Transparent hashing: find() is called with the launch's const char* name
+// ~1000 times per token, and the default hasher forced a temporary
+// std::string -- a heap allocation per launch for any name past the SSO.
+struct KernelNameHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view name) const noexcept {
+        return std::hash<std::string_view>{}(name);
+    }
+};
+std::unordered_map<std::string, Resolved, KernelNameHash, std::equal_to<>>
+    g_kernel_cache;
 std::atomic<bool> g_kernel_cache_dirty{false};
 
 // COLIBRI_CPU_EMULATE=name1,name2 forces just those kernels back to the
@@ -267,6 +284,10 @@ public:
             return;
         }
 
+        // Plain writes, deliberately: run() has exactly one caller at a time
+        // (the launcher thread drives every kernel serially), and the
+        // generation release below publishes all of these to the workers.
+        // Two concurrent run() calls would be a bug well above this class.
         body_ = body;
         payload_ = payload;
         blocks_ = blocks;
@@ -563,10 +584,16 @@ int colibri_cpu_event_create(std::uint64_t* event) {
 }
 
 int colibri_cpu_timed_event_create(std::uint64_t* event) {
-    const int status = colibri_cpu_event_create(event);
-    if (status != 0) return status;
+    if (event == nullptr) return -1;
+    // Created in one critical section. The old two-lock form published the
+    // handle before marking it timed; a destroy racing in between left
+    // operator[] re-creating the entry as a null unique_ptr.
+    const std::uint64_t handle = g_next_handle.fetch_add(1);
+    auto created = std::make_unique<Event>();
+    created->timed = true;
     std::lock_guard<std::mutex> lock(g_object_mutex);
-    g_events[*event]->timed = true;
+    g_events.emplace(handle, std::move(created));
+    *event = handle;
     return 0;
 }
 
