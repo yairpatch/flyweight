@@ -11948,6 +11948,28 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
 });}
 int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
 int colibri_v2_qwen_runtime_cancel(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");runtime->cancelled=true;return 0;});}
+// The wide MMQ shape: the same 128x128 tile spread over 16 warps at 2x4
+// fragments instead of 8 at 4x4, which halves the per-thread accumulator and
+// brings the kernel from 255 registers / 8 resident warps to 128 / 16. The
+// compile below injects the fragment-grid defines ahead of the corpus, and
+// the two launch sites in v2_mtp_verifier.inc read this same predicate for
+// the 512-thread block size -- the defines and the block size must agree or
+// warps 8..15 index rows past the tile. GPU only: the CPU backend's kernel
+// corpus is generated at build time with the default shape, and occupancy is
+// not its problem anyway.
+//
+// On by default: greedy output is bit-identical (same per-element K order,
+// only the warp->fragment assignment moves), and the 27B IQ2_XXS dense
+// checkpoint measured +6% at pp1024 / +9% at pp2048, 6 of 6 interleaved
+// pairs. COLIBRI_MMQ_WIDE=0 restores the 256-thread shape.
+static bool qwen_mmq_wide(){
+    static const bool wide=[]{
+        if(colibri_backend_is_cpu())return false;
+        const char*setting=std::getenv("COLIBRI_MMQ_WIDE");
+        return !setting||setting[0]!='0';
+    }();
+    return wide;
+}
 int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     if(runtime->static_arena)return 0;
@@ -11959,7 +11981,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     if(const char*cuda_home=std::getenv("CUDA_HOME")){option_storage.push_back(std::string("-I")+cuda_home+"/include");option_storage.push_back(std::string("-I")+cuda_home+"/include/cccl");}
     std::vector<const char*>compile_options;for(const auto&option:option_storage)compile_options.push_back(option.c_str());
     std::array<char,16384>compile_log{};
-    const std::string cuda_source=std::string(colibri::v2::qwen_cuda_source)+colibri::v2::qwen_native_cuda_source;
+    const std::string cuda_source=
+        (qwen_mmq_wide()
+             ?std::string("#define COLIBRI_MMQ_ROW_WARPS 4\n"
+                          "#define COLIBRI_MMQ_ROW_FRAGS 2\n")
+             :std::string())+
+        std::string(colibri::v2::qwen_cuda_source)+colibri::v2::qwen_native_cuda_source;
     if(colibri_gpu_compile(cuda_source.c_str(),compile_options.data(),static_cast<int32_t>(compile_options.size()),runtime->options.device,compile_log.data(),compile_log.size())!=0)throw std::runtime_error(std::string("failed to compile native Qwen CUDA kernels: ")+compile_log.data());
     runtime->cuda_ready=true;
     if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");

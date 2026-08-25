@@ -2607,15 +2607,37 @@ R"COLIBRI_CUDA(
 //   above -- a prefetch buffer has to come out of a register file with no
 //   slack -- and why anything that adds allocation constraints spills.
 //
-// Which is where the next attempt should go: acc[4][4][4] is 64 registers of
-// the budget and forcing __launch_bounds__(256, 2) to get a second block does
-// compile, but spills 792 bytes, so buying occupancy needs the fragment grid
-// to shrink, not just a flag. That trade has not been measured.
+// Which is where the wide shape comes from: acc[4][4][4] is 64 registers of
+// the budget and forcing __launch_bounds__(256, 2) to get a second block
+// spills 792 bytes, so buying occupancy needs the fragment grid to shrink,
+// not just a flag. The ptxas sweep (2026-08-25) found the spill-free point:
+// keep the 128x128 tile -- so none of the weight-decode or activation
+// re-reads the tile size was chosen to avoid come back -- and spread it over
+// 16 warps at 2x4 fragments each instead of 8 warps at 4x4. Same tile, same
+// shared layout, half the accumulator per thread: 128 registers, 8-32 bytes
+// of spill, and 512 threads x 128 registers fills the register file exactly,
+// so 16 warps are resident where the 4x4 shape leaves 8. (Shrinking the tile
+// instead -- 128x64, 64x128, 64x64 at 256 threads -- also reaches 128
+// registers, but every one of those re-pays decode or activation traffic
+// that the 128x128 tile exists to amortize.)
 //
+// The defines are guarded so the GPU compile can inject the wide shape ahead
+// of the corpus (COLIBRI_MMQ_WIDE; see qwen_mmq_wide() on the host). The CPU
+// backend's copy of this corpus is generated at build time with the defaults
+// and its launches stay at 256 threads -- occupancy is a GPU concept, and the
+// shim ignores __launch_bounds__ entirely.
+#ifndef COLIBRI_MMQ_ROW_WARPS
 #define COLIBRI_MMQ_ROW_WARPS 2
+#endif
+#ifndef COLIBRI_MMQ_ROW_FRAGS
 #define COLIBRI_MMQ_ROW_FRAGS 4
+#endif
+#ifndef COLIBRI_MMQ_TOKEN_WARPS
 #define COLIBRI_MMQ_TOKEN_WARPS 4
+#endif
+#ifndef COLIBRI_MMQ_TOKEN_FRAGS
 #define COLIBRI_MMQ_TOKEN_FRAGS 4
+#endif
 // The _MIN variant stages four more arrays (the two sub-block minimum offsets
 // and the two activation sums), which at 64 rows would want 50 KB -- past the
 // 48 KB a kernel gets without opting in. It keeps the old 32-row tile, at
@@ -2658,7 +2680,12 @@ R"COLIBRI_CUDA(
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
 #define COLIBRI_Q8_MMQ(name, decode_fn, stride)                                \
-extern "C" __global__ void name(                                               \
+/* The bound caps registers at what the block's thread count leaves: 255 at  */\
+/* the default 256 threads (no change), 128 at the wide shape's 512, which   */\
+/* is what makes 16 warps launchable at all. The CPU shim defines this away. */\
+extern "C" __global__                                                          \
+__launch_bounds__(COLIBRI_MMQ_ROW_WARPS * COLIBRI_MMQ_TOKEN_WARPS * 32, 1)     \
+void name(                                                                     \
     const unsigned char* packed, const signed char* vectors,                   \
     const __half* vector_scales, float* outputs,                               \
     const int input_size, const int output_size,                               \

@@ -39,6 +39,13 @@ static constexpr int kQ8MmqTokenFrags=4;
 // Threads per block: one warp per fragment *grid*.
 static constexpr int kQ8MmqThreads=
     (kQ8MmqRows/16/kQ8MmqRowFrags)*(kQ8MmqTokens/8/kQ8MmqTokenFrags)*32;
+// The wide shape (COLIBRI_MMQ_WIDE, GPU only): same 128x128 tile over 16
+// warps at 2x4 fragments each. The tile and grid math above stay valid --
+// only the block size changes. Must agree with the defines the GPU compile
+// injects (see qwen_mmq_wide in v2_runtime.cpp); a wide launch against a
+// default-shape kernel sends warps 8..15 past the tile.
+static constexpr int kQ8MmqWideThreads=
+    (kQ8MmqRows/16/2)*(kQ8MmqTokens/8/4)*32;
 // The _MIN variant still runs one fragment per warp.
 static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
 
@@ -325,7 +332,8 @@ void qwen_forward_rows(
             // mmq_kernel and tiled_kernel are resolved above the gate.
             if(rows>kQ8RowBatch&&mmq_kernel&&runtime.int8_tensor_cores){
                 const int mmq_rows=mmq_min?kQ8MmqMinRows:kQ8MmqRows;
-                const int mmq_threads=mmq_min?kQ8MmqMinThreads:kQ8MmqThreads;
+                const int mmq_threads=mmq_min?kQ8MmqMinThreads
+                    :qwen_mmq_wide()?kQ8MmqWideThreads:kQ8MmqThreads;
                 const int mmq_tokens=mmq_min?kQ8MmqMinTokens:kQ8MmqTokens;
                 for(int first=0;first<rows;first+=mmq_tokens){
                     int batch=std::min(mmq_tokens,rows-first);
@@ -1549,7 +1557,8 @@ void qwen_forward_rows(
                 const auto*format=colibri::v2::qwen_format(type);
                 if(stream_needs_q8(type,in_size)){
                     const int mmq_rows=format->mmq_min?kQ8MmqMinRows:kQ8MmqRows;
-                    const int mmq_threads=format->mmq_min?kQ8MmqMinThreads:kQ8MmqThreads;
+                    const int mmq_threads=format->mmq_min?kQ8MmqMinThreads
+                        :qwen_mmq_wide()?kQ8MmqWideThreads:kQ8MmqThreads;
                     const int mmq_tokens=format->mmq_min?kQ8MmqMinTokens:kQ8MmqTokens;
                     int scale_stride=(in_size/32)*2;
                     for(int start=0;start<count;start+=mmq_tokens){
