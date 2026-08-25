@@ -11,14 +11,16 @@ If the GPU is idle a large fraction of the token, route_wait is a bubble
 """
 from __future__ import annotations
 
+import os
 import time
 
 from cupy.cuda import profiler
 
 from colibri_next.v2 import V2Model
 
-MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
-CONTEXT = 8192
+MODEL = os.environ.get(
+    "COLIBRI_MODEL", "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf")
+CONTEXT = int(os.environ.get("COLIBRI_CONTEXT", "8192"))
 WARM_TOKENS = 256
 PROFILE_TOKENS = 128
 PROMPT_TEXT = (
@@ -33,7 +35,8 @@ def main() -> None:
         prompt = model.tokenize(PROMPT_TEXT)
         with model.native_qwen_runtime(
             context_limit=CONTEXT,
-            gpu_cache_bytes=8192 * 1024**2,
+            gpu_cache_bytes=int(
+                os.environ.get("COLIBRI_GPU_CACHE_MIB", "8192")) * 1024**2,
             moe_device="hybrid",
             mtp_drafts=0,
         ) as runtime:
