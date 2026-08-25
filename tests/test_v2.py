@@ -771,3 +771,27 @@ class ConstraintSpecificationTests(unittest.TestCase):
             document["response_format"],
             {"shape": "object", "thinking_open": True},
         )
+
+    def test_the_tool_call_ban_rides_the_object_form(self):
+        # A request that declared no tools bans tool markup outright: nothing
+        # downstream would parse it, so the sampler must not write it. This is
+        # what keeps a compaction/summarize request from storing a phantom
+        # <tool_call> block as conversation state.
+        from colibri_next.v2 import _constraint_specification
+
+        import json
+
+        document = json.loads(
+            _constraint_specification(None, None, forbid_tool_calls=True)
+        )
+        self.assertEqual(document["tool_calls"], "forbidden")
+        self.assertEqual(document["tools"], [])
+        # With tools declared the ban is off, and the historical array form
+        # stays untouched.
+        tools = [{"name": "bash", "parameters": []}]
+        self.assertEqual(
+            json.loads(
+                _constraint_specification(tools, None, forbid_tool_calls=False)
+            ),
+            tools,
+        )

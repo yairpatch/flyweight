@@ -98,6 +98,10 @@ struct RequestConstraints {
     bool response_enabled = false;
     ValueShape response_shape = ValueShape::text;
     bool thinking_open = false;
+    // `{"tool_calls": "forbidden"}`: the request declared no tools (or told
+    // the model not to call any), so tool markup in the output is always a
+    // defect -- nothing will parse it, and it lands verbatim in the text.
+    bool tool_calls_forbidden = false;
 };
 
 inline RequestConstraints parse_constraints(const std::string& text) {
@@ -109,6 +113,8 @@ inline RequestConstraints parse_constraints(const std::string& text) {
         return constraints;
     }
     constraints.tools = parse_tool_entries(document["tools"]);
+    constraints.tool_calls_forbidden =
+        document["tool_calls"].as_string() == "forbidden";
     const auto& format = document["response_format"];
     if (!format.is_null()) {
         constraints.response_enabled = true;
@@ -276,6 +282,47 @@ inline constexpr const char* kFunctionOpen = "<function=";
 inline constexpr const char* kFunctionClose = "</function>";
 inline constexpr const char* kParameterOpen = "<parameter=";
 inline constexpr const char* kParameterClose = "</parameter>";
+
+// The grammar's inverse, for a request that declared no tools (or forbade
+// them with tool_choice "none"): no parser will ever read tool markup out of
+// this response, so the sampler must not let the model write any. Without it,
+// a model whose context is full of earlier tool calls keeps the habit -- a
+// summarization request comes back with a half-finished <tool_call> block in
+// the text, and the harness stores it as conversation state.
+//
+// The mechanism mirrors Grammar's arming watch in reverse: `observe` keeps
+// the last size(kCallOpen)-1 emitted bytes, and `accepts` refuses any token
+// whose bytes would complete the opening tag -- atomically or split across
+// tokens. The sampler consults it on the fused-argmax fast path with a single
+// byte comparison, so an ordinary step pays nothing; only the step where the
+// model actually reaches for the tag is re-routed through the candidate
+// filter, which then takes the best token that is not the tag.
+class MarkupBan {
+public:
+    bool enabled() const { return enabled_; }
+    void enable() { enabled_ = true; }
+
+    void observe(const std::string& text) {
+        if (!enabled_) return;
+        tail_.append(text);
+        const std::size_t window =
+            std::char_traits<char>::length(kCallOpen) - 1;
+        if (tail_.size() > window) tail_.erase(0, tail_.size() - window);
+    }
+
+    // False when appending `text` to what was already emitted would spell the
+    // opening tag.
+    bool accepts(const std::string& text) const {
+        if (!enabled_) return true;
+        std::string merged = tail_;
+        merged.append(text);
+        return merged.find(kCallOpen) == std::string::npos;
+    }
+
+private:
+    bool enabled_ = false;
+    std::string tail_;  // the last size(kCallOpen)-1 emitted bytes
+};
 
 // One position the model could be at inside a call.
 //

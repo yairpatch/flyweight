@@ -2408,18 +2408,21 @@ class V2Model:
 def _constraint_specification(
     tools: Sequence[Mapping[str, Any]] | None,
     response_format: Mapping[str, Any] | None,
+    forbid_tool_calls: bool = False,
 ) -> bytes | None:
     """The sampler-constraint spec as the native library reads it.
 
     The bare tool array is the historical wire form and stays whenever it
     suffices, so an older native library keeps parsing what it always did;
-    the object form exists only to carry the response constraint beside it.
+    the object form exists to carry the response constraint and the tool-call
+    ban beside it.
     """
-    if response_format:
-        document: Any = {
-            "tools": list(tools or []),
-            "response_format": dict(response_format),
-        }
+    if response_format or forbid_tool_calls:
+        document: Any = {"tools": list(tools or [])}
+        if response_format:
+            document["response_format"] = dict(response_format)
+        if forbid_tool_calls:
+            document["tool_calls"] = "forbidden"
     elif tools:
         document = list(tools)
     else:
@@ -2774,6 +2777,7 @@ class V2QwenRuntime:
         seed: int | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         response_format: Mapping[str, Any] | None = None,
+        forbid_tool_calls: bool = False,
     ) -> int:
         """Queue a request on the cooperative engine; returns its task id.
 
@@ -2781,10 +2785,13 @@ class V2QwenRuntime:
         parameter cannot be skipped: each entry is `{"name": str, "parameters":
         [{"name": str, "required": bool}]}`. `response_format` constrains the
         visible answer to one JSON value: `{"shape": "object" | "array" |
-        "value", "thinking_open": bool}`. Omitting both samples freely.
+        "value", "thinking_open": bool}`. `forbid_tool_calls` is for a request
+        that declared no tools: the sampler refuses to open tool markup, which
+        nothing downstream would parse. Omitting all three samples freely.
 
-        The wire spec stays the bare tool array unless a response format is
-        present, so an older native library keeps parsing what it always did.
+        The wire spec stays the bare tool array unless a response format or
+        the ban is present, so an older native library keeps parsing what it
+        always did.
         """
         if not prompt_tokens:
             raise ValueError("prompt_tokens must not be empty")
@@ -2793,7 +2800,9 @@ class V2QwenRuntime:
         values = (ctypes.c_uint32 * len(prompt_tokens))(*prompt_tokens)
         stops = (ctypes.c_uint32 * len(stop_tokens))(*stop_tokens) if stop_tokens else None
         task_id = ctypes.c_uint64()
-        specification = _constraint_specification(tools, response_format)
+        specification = _constraint_specification(
+            tools, response_format, forbid_tool_calls
+        )
         self.model._check(
             self._lib.colibri_v2_qwen_task_submit_grammar(
                 self._handle,

@@ -108,6 +108,7 @@ class StubV2Runtime:
         penalty_window=64,
         tools=None,
         response_format=None,
+        forbid_tool_calls=False,
     ):
         self._tasks = getattr(self, "_tasks", {})
         self._next_task = getattr(self, "_next_task", 0) + 1
@@ -117,6 +118,7 @@ class StubV2Runtime:
         )
         self._last_tools = tools
         self._last_response_format = response_format
+        self._last_forbid_tool_calls = forbid_tool_calls
         self._tasks[self._next_task] = (list(prompt), max_tokens, tuple(stop_tokens))
         return self._next_task
 
@@ -906,7 +908,7 @@ class NativeV2ServerTests(unittest.TestCase):
 
             def submit(
                 self, prompt, max_new_tokens, stop_tokens, sampling,
-                tools=None, response_format=None,
+                tools=None, response_format=None, forbid_tool_calls=False,
             ):
                 self.submits.append(
                     (list(prompt), max_new_tokens, response_format)
@@ -1388,6 +1390,27 @@ class NativeV2ServerTests(unittest.TestCase):
         )
         self.assertIn(runtime._last_tools, (None, []))
         self.assertIsNone(runtime._last_response_format)
+        # And with no tools declared, the markup ban arms: no parser exists
+        # for a <tool_call> block, so the sampler must not write one -- the
+        # opencode compaction bug stored exactly that as its session summary.
+        self.assertTrue(runtime._last_forbid_tool_calls)
+
+    def test_declared_tools_leave_the_markup_ban_off(self) -> None:
+        generator, runtime = self.make_generator([10, 20])
+        generator.generate_messages(
+            [{"role": "user", "content": "hello"}],
+            max_new_tokens=1,
+            tools=[{
+                "type": "function",
+                "function": {"name": "bash", "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                }},
+            }],
+        )
+        self.assertTrue(runtime._last_tools)
+        self.assertFalse(runtime._last_forbid_tool_calls)
 
     def test_native_generator_forwards_the_response_constraint(self) -> None:
         # The server's response_format shape must reach the native sampler;

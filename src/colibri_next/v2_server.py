@@ -147,6 +147,7 @@ class _NativeEngine:
         sampling: SamplingConfig | None = None,
         tools: list[dict[str, object]] | None = None,
         response_format: dict[str, object] | None = None,
+        forbid_tool_calls: bool = False,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         task_queue: Queue[tuple[str, object]] = Queue(
             maxsize=self._MAX_BUFFERED_EVENTS
@@ -171,6 +172,7 @@ class _NativeEngine:
                 seed=sampling_config.seed,
                 tools=tools,
                 response_format=response_format,
+                forbid_tool_calls=forbid_tool_calls,
             )
             self._queues[task_id] = task_queue
             if self._thread is None or not self._thread.is_alive():
@@ -1381,6 +1383,11 @@ class ChatGenerator:
                 if isinstance(response_format, Mapping)
                 else None
             ),
+            # No tools on this request means no parser for tool markup either:
+            # the sampler refuses to open a <tool_call>, so a model steeped in
+            # a tool-heavy transcript cannot leak one into plain text (an
+            # opencode compaction stored exactly that as its summary).
+            forbid_tool_calls=not tool_grammar,
         )
         try:
             prefill_complete = False
@@ -1497,6 +1504,7 @@ class ChatGenerator:
                             if isinstance(response_format, Mapping)
                             else None
                         ),
+                        forbid_tool_calls=not tool_grammar,
                     )
             # Flush any dangling partial UTF-8 sequence (a truncated character
             # at the very end of generation becomes a single visible U+FFFD).
@@ -1639,13 +1647,14 @@ class BailingEngine:
         sampling: SamplingConfig | None = None,
         tools: list[dict[str, object]] | None = None,
         response_format: dict[str, object] | None = None,
+        forbid_tool_calls: bool = False,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         # As in the DeepSeek-V4 engine: BailingMoE3 runs its own runtime, whose
-        # sampler has no constrained decoding, so its tool calls -- and a JSON
-        # response format -- stay with the tolerant parser and the prompt. The
-        # arguments are accepted so the shared streaming path has one calling
-        # convention.
-        del tools, response_format
+        # sampler has no constrained decoding -- the markup ban included -- so
+        # its tool calls and a JSON response format stay with the tolerant
+        # parser and the prompt. The arguments are accepted so the shared
+        # streaming path has one calling convention.
+        del tools, response_format, forbid_tool_calls
         task_queue: Queue[tuple[str, object]] = Queue(maxsize=self._MAX_BUFFERED_EVENTS)
         with self._lock:
             if self._closing:

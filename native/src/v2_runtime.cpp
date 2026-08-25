@@ -442,6 +442,12 @@ struct QwenSamplingState {
     // disarms once its job is done or the text leaves its language.
     colibri::v2::tools::ResponseGrammar response_grammar;
 
+    // The inverse constraint, for requests that declared no tools: markup the
+    // request cannot accept must not be written. Armed for the whole task,
+    // but it costs the fast path one byte comparison per token -- see the
+    // ban check beside the fused-argmax early-out in qwen_sample_last_logits.
+    colibri::v2::tools::MarkupBan markup_ban;
+
     // The grammars constrain the candidate set, so a request that has one
     // needs candidates even when it would otherwise take the fused greedy
     // argmax.
@@ -465,9 +471,12 @@ struct QwenSamplingState {
     // and measurably so: on Qwen3.8-27B at IQ1_M the same prompt writes a tool
     // parameter named "questions" without the penalty and the correct
     // "question" with it.
+    // The markup ban counts too: a banned task must reach the sampler (and,
+    // like every constrained task, must not draft -- speculative rounds
+    // commit tokens the ban never sees).
     bool active() const {
         return enabled() || !grammar.empty() || !response_grammar.empty() ||
-               penalizes();
+               markup_ban.enabled() || penalizes();
     }
 };
 
@@ -16506,18 +16515,25 @@ static std::uint32_t qwen_sample_last_logits(
     // without recording it desynchronizes them from the transcript.
     const auto commit=[&](std::uint32_t token)->std::uint32_t{
         sampling.remember(token);
-        if(!sampling.grammar.empty()||!sampling.response_grammar.empty()){
+        if(!sampling.grammar.empty()||!sampling.response_grammar.empty()||
+           sampling.markup_ban.enabled()){
             const auto bytes=qwen_token_bytes(runtime,token);
             if(!sampling.grammar.empty())sampling.grammar.observe(bytes);
             if(!sampling.response_grammar.empty())
                 sampling.response_grammar.observe(bytes);
+            sampling.markup_ban.observe(bytes);
         }
         return token;
     };
     // Greedy decode needs the candidate machinery below when a call is open
     // (to constrain the choice) or when penalties are configured (to apply them
-    // before the choice). Otherwise the fused argmax already has the answer.
-    if(!sampling.enabled()&&!sampling.constrains()&&!sampling.penalizes())
+    // before the choice). Otherwise the fused argmax already has the answer --
+    // unless that answer is the tool markup a banned request must not emit,
+    // which is the one step a ban re-routes through the candidates.
+    const bool ban_trips=sampling.markup_ban.enabled()&&
+        !sampling.markup_ban.accepts(qwen_token_bytes(runtime,greedy_token));
+    if(!sampling.enabled()&&!sampling.constrains()&&!sampling.penalizes()&&
+       !ban_trips)
         return commit(greedy_token);
     struct SamplingTimer {
         std::uint64_t& nanoseconds;
@@ -16539,7 +16555,8 @@ static std::uint32_t qwen_sample_last_logits(
     // The same widening serves the penalties: demoting the top candidate only
     // changes the answer if something else is in the set to take its place, so
     // a top_k of 1 would make a configured penalty a silent no-op.
-    const std::size_t count=(sampling.constrains()||sampling.penalizes())
+    const std::size_t count=(sampling.constrains()||sampling.penalizes()||
+                             ban_trips)
         ?std::min<std::size_t>(
             std::max<std::size_t>(
                 requested,colibri::v2::workspace::kSamplingTopKCapacity),
@@ -16726,7 +16743,7 @@ static std::uint32_t qwen_sample_last_logits(
     // set the sampler may actually draw from -- in particular, a repetition
     // penalty must not spend its effect on a token that was never selectable.
     // The candidate list arrives sorted by logit and this preserves that order.
-    if(sampling.constrains()){
+    if(sampling.constrains()||ban_trips){
         static thread_local std::vector<std::uint32_t> allowed;
         static thread_local std::vector<float> allowed_logits;
         allowed.clear();
@@ -16737,6 +16754,13 @@ static std::uint32_t qwen_sample_last_logits(
             const auto bytes=qwen_token_bytes(runtime,candidates[index]);
             if(!sampling.grammar.accepts(bytes))continue;
             if(!sampling.response_grammar.accepts(bytes))continue;
+            // The ban filter: on the step where the argmax reached for tool
+            // markup, keep every candidate that is not it. If nothing at all
+            // survives (the whole set completes the tag -- vanishingly rare),
+            // the empty-set fallback below still emits the greedy token: the
+            // ban prefers a marker slipping through over a token the model
+            // assigned no probability to.
+            if(!sampling.markup_ban.accepts(bytes))continue;
             allowed.push_back(candidates[index]);
             allowed_logits.push_back(candidate_logits[index]);
         }
@@ -18233,6 +18257,10 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
             if(grammar_enabled&&!constraints.tools.empty())
                 task.sampling.grammar=
                     colibri::v2::tools::Grammar(constraints.tools);
+            // Same escape hatch as the grammar: COLIBRI_TOOL_GRAMMAR=0
+            // restores the previous (unconstrained) behaviour for both.
+            if(grammar_enabled&&constraints.tool_calls_forbidden)
+                task.sampling.markup_ban.enable();
             if(response_grammar_enabled&&constraints.response_enabled)
                 task.sampling.response_grammar=
                     colibri::v2::tools::ResponseGrammar(

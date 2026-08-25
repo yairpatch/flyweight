@@ -346,6 +346,7 @@ void check_constraint_specifications_parse_both_forms() {
     const auto bare = colibri::v2::tools::parse_constraints(kSpecification);
     expect(bare.tools.size() == 4, "the bare tool array still parses");
     expect(!bare.response_enabled, "and carries no response constraint");
+    expect(!bare.tool_calls_forbidden, "and no ban");
     const auto combined = colibri::v2::tools::parse_constraints(
         R"({"tools": [{"name": "bash", "parameters": []}],
             "response_format": {"shape": "object", "thinking_open": true}})");
@@ -354,6 +355,30 @@ void check_constraint_specifications_parse_both_forms() {
     expect(combined.response_shape == colibri::v2::tools::ValueShape::json_object,
            "with its shape");
     expect(combined.thinking_open, "and whether the prompt opened thinking");
+    const auto forbidden = colibri::v2::tools::parse_constraints(
+        R"({"tools": [], "tool_calls": "forbidden"})");
+    expect(forbidden.tool_calls_forbidden, "the object form carries the ban");
+    expect(forbidden.tools.empty(), "with no tools beside it");
+}
+
+void check_markup_ban_refuses_the_atomic_tag() {
+    colibri::v2::tools::MarkupBan ban;
+    expect(ban.accepts("<tool_call>"), "disabled, everything passes");
+    ban.enable();
+    expect(!ban.accepts("<tool_call>"), "the atomic opening tag is refused");
+    expect(ban.accepts("Here is the summary."), "prose is untouched");
+    expect(ban.accepts("</tool_call>"), "and only the opener is watched");
+}
+
+void check_markup_ban_refuses_a_split_spelling() {
+    colibri::v2::tools::MarkupBan ban;
+    ban.enable();
+    ban.observe("First, let me confirm: <tool");
+    expect(!ban.accepts("_call>"), "a tag split across tokens is refused");
+    expect(!ban.accepts("_call>\n<function=bash>"), "however much follows it");
+    expect(ban.accepts("s are great"), "but the prefix alone commits nothing");
+    ban.observe("s are great");
+    expect(ban.accepts("_call>"), "and once passed, the window has moved on");
 }
 
 int main() {
@@ -380,6 +405,8 @@ int main() {
     check_response_disarms_once_the_value_is_whole();
     check_response_bypassed_sampler_does_not_deadlock();
     check_constraint_specifications_parse_both_forms();
+    check_markup_ban_refuses_the_atomic_tag();
+    check_markup_ban_refuses_a_split_spelling();
 
     if (failures) {
         std::printf("tool_grammar_contract: %d failure(s)\n", failures);

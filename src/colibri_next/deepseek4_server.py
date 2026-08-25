@@ -198,8 +198,11 @@ class Deepseek4Engine:
         sampling: SamplingConfig | None = None,
         tools: list[dict[str, object]] | None = None,
         response_format: dict[str, object] | None = None,
+        forbid_tool_calls: bool = False,
     ) -> tuple[int, Queue[tuple[str, object]]]:
-        del response_format  # as `tools` below: this runtime's sampler has none
+        # As `tools` below: this runtime's sampler has none of the constraint
+        # machinery, the markup ban included.
+        del response_format, forbid_tool_calls
         # Accepted and unused: constrained tool-call decoding lives in the Qwen
         # sampler, and this runtime has its own. A DeepSeek-V4 tool call is
         # still recovered by the tolerant parser in the server, which is where
