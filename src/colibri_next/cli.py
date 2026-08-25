@@ -29,6 +29,33 @@ QUANT_CHOICES = ("ask", "IQ2_XS", "Q2_K", "IQ3_XXS", "Q3_K", "IQ4_XS", "Q4_K",
 DEFAULT_QUANT = "Q6_K"
 
 
+def _version() -> str:
+    """The installed version, or a placeholder when running from a checkout."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("colibri-next")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _select_backend(args: argparse.Namespace) -> str:
+    """Settle CUDA against CPU before anything allocates.
+
+    Every command that builds a runtime calls this: allocations belong to
+    whichever backend was active when they were made, so it has to happen
+    before the model is opened rather than wherever the flag is read.
+    """
+    selected = V2Model.select_backend(getattr(args, "backend", "auto"))
+    if selected == "cpu":
+        print(
+            "[colibri] running on the CPU backend; decode will be far slower "
+            "than a GPU",
+            file=sys.stderr,
+        )
+    return selected
+
+
 def _steady_state_counters(start, end):
     if start is None:
         return None
@@ -142,18 +169,77 @@ def _prompt_cache_budget(value: str) -> int:
     return budget
 
 
-def _add_quant_option(parser: argparse.ArgumentParser) -> None:
-    """The quantization a safetensors checkpoint is packed to on first open."""
-    parser.add_argument(
-        "--quant", choices=QUANT_CHOICES, default=None,
-        help="quantization for a safetensors checkpoint; 'ask' prompts, and is "
-             f"the default on a terminal (otherwise {DEFAULT_QUANT})",
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keeps hand-written epilogs intact and states each default exactly once.
+
+    argparse's own ``ArgumentDefaultsHelpFormatter`` appends a default to every
+    option including the ones whose help already gives theirs, which reads as a
+    stutter, and it reflows the epilog, which is where the examples live.
+    """
+
+    def __init__(self, prog: str) -> None:
+        # The flags here are long; at the default help position most of them
+        # push their description onto a line of its own.
+        super().__init__(prog, max_help_position=34)
+
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        # Raw layout is wanted for the blocks that were laid out by hand -- the
+        # worked examples in an epilog -- and not for a group's one-line
+        # description, which raw formatting would run off the terminal.
+        if "\n" in text.strip():
+            return super()._fill_text(text, width, indent)
+        return argparse.HelpFormatter._fill_text(self, text, width, indent)
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        help_text = action.help or ""
+        default = action.default
+        if not help_text or "default" in help_text or not action.option_strings:
+            return help_text
+        # `is` rather than `in`: 0 == False, and a zero default is meaningful
+        # here -- it is how "automatic" is spelled for most of the budgets.
+        if default is None or default is False or default is argparse.SUPPRESS:
+            return help_text
+        return f"{help_text} (default: %(default)s)"
+
+
+def _add_model_argument(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
+    """The model every command takes, and how it is read.
+
+    Returns the group so a command can keep the checkpoint options together
+    with the path they apply to.
+    """
+    group = parser.add_argument_group("model")
+    group.add_argument(
+        "model", type=Path, metavar="MODEL",
+        help="a .gguf file, or a directory holding a safetensors checkpoint "
+             "(quantized on first open, then cached)",
     )
-    parser.add_argument(
-        "--imatrix", type=Path, default=None,
+    group.add_argument(
+        "--quant", choices=QUANT_CHOICES, default=None, metavar="FORMAT",
+        help="quantization for a safetensors checkpoint, one of "
+             + ", ".join(QUANT_CHOICES)
+             + "; 'ask' prompts and is what a terminal gets, otherwise "
+             + f"{DEFAULT_QUANT}. A .gguf carries its own and ignores this",
+    )
+    group.add_argument(
+        "--imatrix", type=Path, default=None, metavar="PATH",
         help="importance matrix (llama.cpp imatrix.dat) that weights IQ "
              "packing; an imatrix.dat beside the checkpoint is used "
              "automatically, and 'off' disables that",
+    )
+    return group
+
+
+def _add_backend_option(group: argparse._ArgumentGroup) -> None:
+    """Whether a GPU is used at all -- separate from --device, which picks one."""
+    group.add_argument(
+        "--backend", choices=("auto", "cuda", "cpu"), default="auto",
+        help="where the runtime executes; auto uses CUDA when a driver is "
+             "present and falls back to the CPU backend otherwise",
+    )
+    group.add_argument(
+        "--device", type=int, default=0, metavar="N",
+        help="CUDA device index to run on",
     )
 
 
@@ -313,183 +399,347 @@ def _resolve_quant(args: argparse.Namespace) -> None:
 
 
 def _add_runtime_options(
-    parser: argparse.ArgumentParser, *, serving: bool, show_help: bool = True,
-    cache_default: int = 0, show_cache_help: bool = False,
+    parser: argparse.ArgumentParser, *, serving: bool,
+    cache_default: int = 0, omit: tuple[str, ...] = (),
 ) -> None:
-    hidden = None if show_help else argparse.SUPPRESS
-    parser.add_argument("--gpu-cache-mib", type=int, default=0, help=hidden)
-    parser.add_argument(
-        "--expert-mode", "--moe-device", dest="expert_mode",
-        choices=EXPERT_MODE_CHOICES, default="auto", help=hidden,
+    """The knobs shared by every command that builds a native runtime.
+
+    Split by how often a flag is reached for rather than by what it touches:
+    the first group is what a deployment sets when the automatic choice is
+    wrong for its machine, the second is paging and prefix-reuse policy that
+    exists mostly for measurement. Nothing here is hidden -- a flag the caller
+    cannot see is a flag they cannot use, and these are exactly the ones the
+    README recommends when a model does not fit in VRAM.
+
+    `omit` names flags a command overrides for itself, so it does not offer a
+    setting it is going to ignore.
+    """
+    placement = parser.add_argument_group(
+        "hardware and placement",
+        "Where the weights and caches live. Chosen automatically from the "
+        "model and the GPU; set these to override that choice.",
     )
-    parser.add_argument("--hybrid-prefill", choices=("split", "cpu"), default="split", help=hidden)
-    parser.add_argument("--expert-residency", choices=("mutable", "immutable"), help=hidden)
-    parser.add_argument(
-        "--dense-requant", choices=("auto", "q8", "off"), default="auto",
-        help=("BF16 dense-weight GPU policy (default: auto from GPU pressure)"
-              if show_help else argparse.SUPPRESS),
+    tuning = parser.add_argument_group(
+        "advanced tuning",
+        "Paging, prefetch and prefix-reuse policy. The defaults are the "
+        "measured best on the models this runtime ships for.",
     )
-    parser.add_argument("--mtp-drafts", type=int, default=0, help=hidden)
-    parser.add_argument(
-        "--mtp-model", type=Path,
-        help=(("optional MTP-only GGUF overlay; when omitted, use the draft "
-               "head embedded in the target model")
-              if show_help else argparse.SUPPRESS),
+
+    def add(group: argparse._ArgumentGroup, *flags: str, **kwargs: object) -> None:
+        if flags[0] in omit:
+            return
+        group.add_argument(*flags, **kwargs)  # type: ignore[arg-type]
+
+    add(
+        placement, "--expert-mode", "--moe-device", dest="expert_mode",
+        choices=EXPERT_MODE_CHOICES, default="auto",
+        help="where mixture-of-experts weights run: cpu keeps every routed "
+             "expert on the host, auto holds a stable hot set on the GPU, "
+             "resident requires all of them to fit in VRAM. The rest are "
+             "compatibility spellings of the old paging policies",
     )
-    parser.add_argument("--cpu-threads", type=int, default=0, help=hidden)
-    parser.add_argument("--cache-type-k", choices=KV_TYPES, default="f16", help=hidden)
-    parser.add_argument("--cache-type-v", choices=KV_TYPES, default="f16", help=hidden)
-    parser.add_argument("--parallel", type=int, default=1, dest="parallel_sequences", help=hidden)
-    parser.add_argument(
-        "--cache", "--prompt-cache-mib", dest="prompt_cache_mib",
+    add(
+        placement, "--gpu-cache-mib", type=int, default=0, metavar="MIB",
+        help="VRAM budget for the routed-expert cache; 0 fits it to free "
+             "memory at load, which is what makes placement vary run to run",
+    )
+    add(
+        placement, "--cpu-threads", type=int, default=0, metavar="N",
+        help="worker threads for CPU expert execution; 0 picks from the host",
+    )
+    add(
+        placement, "--parallel", type=int, default=1, dest="parallel_sequences",
+        metavar="N",
+        help="independent sequence slots, each with its own KV and recurrent "
+             "state; more slots isolate concurrent conversations and cost VRAM",
+    )
+    add(
+        placement, "--cache", "--prompt-cache-mib", dest="prompt_cache_mib",
         type=_prompt_cache_budget, default=cache_default,
         metavar="{auto,off,MIB}",
-        help=("host prompt cache budget: auto, off, or MiB (default: auto)"
-              if show_help or show_cache_help else argparse.SUPPRESS),
+        help="host RAM budget for displaced conversations, restored by longest "
+             "matching prefix: auto (an eighth of free RAM, capped at 8 GiB), "
+             "off, or a MiB figure"
+             # The budget is carried as a MiB count, so the automatic setting
+             # would otherwise print as its sentinel.
+             + (" (default: auto)" if cache_default else " (default: off)"),
     )
-    parser.add_argument("--swa-full", action="store_true", help=hidden)
-    parser.add_argument("--prefill-cache-seed", type=_prefill_cache_seed, default=None, help=hidden)
-    parser.add_argument("--expert-paging", choices=("auto", "staged", "direct"), default="auto", help=hidden)
-    parser.add_argument("--cpu-prefetch-mib", type=int, default=0, help=hidden)
-    parser.add_argument("--cpu-prefetch-auto", action="store_true", help=hidden)
-    parser.add_argument("--next-layer-prefetch", type=int, default=0, help=hidden)
+    add(
+        placement, "--cache-type-k", choices=KV_TYPES, default="f16",
+        help="KV cache key precision; q8_0 roughly halves KV memory and auto "
+             "grades it per layer. A quantized cache is never selected on your "
+             "behalf, so this stays f16 until it is set",
+    )
+    add(
+        placement, "--cache-type-v", choices=KV_TYPES, default="f16",
+        help="KV cache value precision, as --cache-type-k",
+    )
+    add(
+        placement, "--dense-requant", choices=("auto", "q8", "off"),
+        default="auto",
+        help="whether BF16 dense weights are repacked to Q8_0 for the GPU; "
+             "auto decides from VRAM pressure, off keeps checkpoint precision",
+    )
+    add(
+        placement, "--mtp-drafts", type=int, default=0, metavar="N",
+        help="speculative decode: tokens drafted per verified step, up to 8; "
+             "0 disables it",
+    )
+    add(
+        placement, "--mtp-model", type=Path, metavar="PATH",
+        help="optional MTP-only GGUF overlay; when omitted, the draft head "
+             "embedded in the target model is used",
+    )
+
+    add(
+        tuning, "--hybrid-prefill", choices=("split", "cpu"), default="split",
+        help="during prompt processing, whether routed experts split across "
+             "the resident GPU set and the host, or all run on the host",
+    )
+    add(
+        tuning, "--expert-residency", choices=("mutable", "immutable"),
+        default=None,
+        help="whether the GPU hot set may move during decode; immutable "
+             "freezes it per request, which makes placement reproducible "
+             "(default: mutable -- a frozen set leaves decode stuck with "
+             "whatever the prompt put there, and nearly every lookup misses)",
+    )
+    add(
+        tuning, "--expert-paging", choices=("auto", "staged", "direct"),
+        default="auto",
+        help="how experts reach the GPU: staged copies through a pinned "
+             "buffer, direct DMAs from registered host memory",
+    )
+    add(
+        tuning, "--prefill-cache-seed", type=_prefill_cache_seed, default=None,
+        metavar="{auto,off,N}",
+        help="hottest prompt-routed experts to pin per layer once the prompt "
+             "is done, so decode does not fault them back in one at a time "
+             "(default: auto, or off under a legacy paging mode)",
+    )
+    add(
+        tuning, "--cpu-prefetch-mib", type=int, default=0, metavar="MIB",
+        help="budget for warming host expert pages from the prompt's routing; "
+             "0 disables it",
+    )
+    add(
+        tuning, "--cpu-prefetch-auto", action="store_true",
+        help="size that warmup from host memory instead, and skip it unless "
+             "enough pages are actually cold",
+    )
+    add(
+        tuning, "--next-layer-prefetch", type=int, default=0, metavar="N",
+        help="experts to page-hint per layer from observed layer-to-layer "
+             "routing, within [0, 64]; 0 disables the prediction",
+    )
+    add(
+        tuning, "--swa-full", action="store_true",
+        help="keep full-size KV for sliding-window layers, so any shared "
+             "prefix can be reused rather than only a recent one",
+    )
     if serving:
-        parser.add_argument("--prefill-checkpoint-interval", type=int, default=256, help=hidden)
-        parser.add_argument("--prefill-checkpoint-slots", type=int, default=4, help=hidden)
+        add(
+            tuning, "--prefill-checkpoint-interval", type=int, default=256,
+            metavar="N",
+            help="prompt position of the first mid-prefill snapshot; 0 keeps "
+                 "end-of-prompt snapshots only",
+        )
+        add(
+            tuning, "--prefill-checkpoint-slots", type=int, default=4,
+            metavar="N",
+            help="how many prefix-reuse snapshots are retained at once",
+        )
+
+
+_DESCRIPTION = """\
+Native GGUF inference for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models.
+
+Every command takes a MODEL: a .gguf file, or a directory holding a
+safetensors checkpoint, which is quantized on first open and then cached.\
+"""
+
+_EPILOG = """\
+examples:
+  colibri-next serve model.gguf
+      serve the OpenAI and Anthropic APIs, plus a chat UI, on port 8000
+
+  colibri-next generate model.gguf --prompt "Explain MoE routing." --max-tokens 128
+      one answer on stdout, no server
+
+  colibri-next benchmark model.gguf --prompt hi --chat
+      prompt and steady-state decode speed as JSON
+
+  colibri-next inspect model.gguf
+      metadata, config and tensor list as JSON
+
+Run `colibri-next COMMAND --help` for one command's full options; each groups
+its flags by what they do. The older serve-v2 / generate-text-v2 /
+benchmark-v2 / inspect-gguf / probe-native-v2 spellings are still accepted.\
+"""
+
+
+class _Parser(argparse.ArgumentParser):
+    """A parser whose unknown-command error names only the real commands.
+
+    argparse builds `invalid choice` out of every registered alias, so a typo
+    was answered with fourteen names, ten of which are legacy spellings that
+    the help does not mention and nobody should learn.
+    """
+
+    def _check_value(self, action: argparse.Action, value: object) -> None:
+        if isinstance(action, argparse._SubParsersAction) and (
+            value not in action.choices
+        ):
+            # The canonical name of each command, as set by `_add_command`.
+            names = [str(entry.metavar) for entry in action._choices_actions]
+            raise argparse.ArgumentError(
+                action,
+                f"invalid command {value!r}; choose from " + ", ".join(names),
+            )
+        super()._check_value(action, value)
+
+
+def _add_command(
+    commands: argparse._SubParsersAction, name: str, *,
+    aliases: tuple[str, ...] = (), help: str, description: str = "",
+    usage: str, epilog: str = "",
+) -> argparse.ArgumentParser:
+    """One subcommand, listed under its canonical name.
+
+    `help` is the one-line entry in the command list, kept short enough to fit
+    beside the name; `description` is what the command's own --help opens with.
+
+    Legacy spellings stay accepted but do not appear beside the name they are
+    aliases of: `probe (probe-native, probe-native-v2, probe-qwen-native-v2)`
+    spent four times the width of the command on names nobody should type. The
+    top-level epilog says they still work.
+    """
+    parser = commands.add_parser(
+        name, aliases=aliases, help=help,
+        description=description or help[0].upper() + help[1:] + ".",
+        usage=f"colibri-next {usage}", epilog=epilog,
+        formatter_class=_HelpFormatter,
+    )
+    # argparse renders the aliases into the listing entry, and offers no
+    # supported way to keep them out of it.
+    commands._choices_actions[-1].metavar = name
+    return parser
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="colibri-next",
-        description="Native GGUF inference for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models",
+        description=_DESCRIPTION,
+        epilog=_EPILOG,
+        formatter_class=_HelpFormatter,
     )
+    parser.add_argument(
+        "--version", action="version", version=f"colibri-next {_version()}",
+    )
+    # Listed in the order a new user meets them: serve is the product, the rest
+    # support it. The metavar is spelled out because argparse would otherwise
+    # print every alias of every command in the usage line.
     commands = parser.add_subparsers(
-        dest="command", required=True,
-        metavar="{serve,generate,inspect,benchmark}",
+        dest="command", required=True, title="commands", metavar="COMMAND",
     )
 
-    inspect = commands.add_parser(
-        "inspect", aliases=("inspect-gguf", "inspect-gguf-v2"),
-        help="show model metadata",
-    )
-    inspect.add_argument("model", type=Path)
-    _add_quant_option(inspect)
+    serve = _add_command(
+        commands, "serve", aliases=("serve-v2",),
+        help="serve the OpenAI/Anthropic APIs and chat UI",
+        description="Serve a model over the OpenAI and Anthropic HTTP APIs, "
+                    "with a chat UI at the same address.",
+        usage="serve MODEL [--host ADDR] [--port PORT] [options]",
+        epilog="""\
+examples:
+  colibri-next serve model.gguf
+      http://127.0.0.1:8000/ for the chat UI, /v1 for OpenAI clients and
+      /v1/messages for Anthropic ones
 
-    generate = commands.add_parser(
-        "generate", aliases=("generate-text-v2",),
-        help="generate one response locally",
+  colibri-next serve model.gguf --context 65536 --max-tokens 16384
+      a longer context window, and longer answers within it
+
+  colibri-next serve model.gguf --parallel 2 --cache 4096
+      two isolated conversation slots and 4 GiB of host prompt cache
+
+  colibri-next serve moe.gguf --expert-mode cpu --cpu-threads 12 \\
+      --cache-type-k q8_0 --cache-type-v q8_0
+      a mixture-of-experts checkpoint whose experts do not fit in VRAM
+
+Sampling flags set the server-wide default for a setting. A request that
+carries its own value still wins, and a flag left off leaves whatever the
+checkpoint's generation_config.json says.\
+""",
     )
-    generate.add_argument("model", type=Path)
-    _add_quant_option(generate)
-    generate.add_argument("--prompt", required=True)
-    generate.add_argument("--system")
-    generate.add_argument(
-        "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
-        default=64, help="maximum generated tokens (default: 64)",
+    _add_model_argument(serve)
+    endpoint = serve.add_argument_group("server")
+    endpoint.add_argument(
+        "--host", default="127.0.0.1", metavar="ADDR",
+        help="address to bind; 0.0.0.0 exposes the server beyond this machine",
     )
-    generate.add_argument(
+    endpoint.add_argument(
+        "--port", type=int, default=8000, metavar="PORT", help="port to bind",
+    )
+    endpoint.add_argument(
+        "--model-name", metavar="NAME",
+        help="name this model answers to in the API and in /v1/models "
+             "(default: taken from the checkpoint)",
+    )
+    endpoint.add_argument(
+        "--api-key", default=os.environ.get("COLIBRI_API_KEY"), metavar="KEY",
+        help="require this bearer token on every request; defaults to "
+             "COLIBRI_API_KEY, and no key means no authentication",
+    )
+    endpoint.add_argument(
+        "--cors-origin", default="*", metavar="ORIGIN",
+        help="value for Access-Control-Allow-Origin",
+    )
+    endpoint.add_argument(
+        "--strict-model", action="store_true",
+        help="reject a request naming a model other than the loaded one, "
+             "instead of serving it anyway",
+    )
+    endpoint.add_argument(
+        "--concurrency", "--max-concurrent-requests",
+        dest="max_concurrent_requests", type=int, default=64, metavar="N",
+        help="requests admitted to inference at once; the rest queue",
+    )
+    endpoint.add_argument(
+        "--max-connections", type=int, default=128, metavar="N",
+        help="open HTTP connections accepted at once",
+    )
+    endpoint.add_argument(
+        "--request-timeout-seconds", type=float, default=30.0, metavar="S",
+        help="how long a client may take to send a request before its "
+             "connection is dropped",
+    )
+    endpoint.add_argument(
+        "--sse-keepalive-seconds", type=float, default=10.0, metavar="S",
+        help="interval between keepalive comments on an idle stream",
+    )
+
+    limits = serve.add_argument_group(
+        "generation defaults",
+        "What a request gets when it does not say otherwise.",
+    )
+    limits.add_argument(
         "--context", "--context-window", dest="context_window", type=int,
-        default=32768, help="maximum prompt + output tokens (default: 32768)",
+        default=32768, metavar="N",
+        help="maximum prompt + output tokens per sequence",
     )
-    generate.add_argument("--temperature", type=float, default=0.0)
-    generate.add_argument("--top-k", type=int, default=20)
-    generate.add_argument("--top-p", type=float, default=0.95)
-    generate.add_argument("--seed", type=int)
-    generate.add_argument("--enable-thinking", action="store_true")
-    generate.add_argument("--device", type=int, default=0, help=argparse.SUPPRESS)
-    generate.add_argument(
-        "--backend", choices=("auto", "cuda", "cpu"), default="auto",
-        help="execution backend; auto uses CUDA when a device is present",
+    limits.add_argument(
+        "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
+        default=4096, metavar="N",
+        help="maximum generated tokens per request",
     )
-    _add_runtime_options(generate, serving=True, show_help=False)
-
-    benchmark = commands.add_parser("benchmark", aliases=("benchmark-v2",), help="measure local inference speed")
-    benchmark.add_argument("model", type=Path)
-    _add_quant_option(benchmark)
-    benchmark.add_argument("--tokens", default="0")
-    benchmark.add_argument("--prompt")
-    benchmark.add_argument("--chat", action="store_true")
-    benchmark.add_argument("--warmup", type=int, default=3)
-    benchmark.add_argument(
-        "--iterations", type=int, default=128,
-        help="measured decode tokens after warmup (default: 128)",
-    )
-    benchmark.add_argument("--context", type=int, default=2048)
-    benchmark.add_argument("--expert-top-k", type=int, default=0)
-    benchmark.add_argument("--expert-top-p", type=float, default=0.0)
-    benchmark.add_argument("--temperature", type=float, default=0.0)
-    benchmark.add_argument("--top-k", type=int, default=0)
-    benchmark.add_argument("--top-p", type=float, default=0.0)
-    benchmark.add_argument("--cold-cache", action="store_true")
-    _add_runtime_options(benchmark, serving=False)
-
-    probe = commands.add_parser(
-        "probe", aliases=("probe-native", "probe-native-v2", "probe-qwen-native-v2"),
-    )
-    probe.add_argument("model", type=Path)
-    _add_quant_option(probe)
-    probe.add_argument("--token-id", type=int, default=0)
-    probe.add_argument("--prompt")
-    probe.add_argument("--chat", action="store_true")
-    probe.add_argument("--generate-tokens", type=int, default=2)
-    probe.add_argument("--context", type=int, default=2048)
-    _add_runtime_options(probe, serving=False)
-
-    imatrix = commands.add_parser(
-        "imatrix",
-        help="gather an importance matrix over calibration text",
-    )
-    imatrix.add_argument("model", type=Path)
-    _add_quant_option(imatrix)
-    imatrix.add_argument(
-        "--text", type=Path, required=True,
-        help="calibration text; general prose plus some code is the usual mix",
-    )
-    imatrix.add_argument(
-        "--output", type=Path, default=Path("imatrix.dat"),
-        help="where to write the matrix (llama.cpp legacy .dat layout)",
-    )
-    imatrix.add_argument(
-        "--chunk", type=int, default=512,
-        help="tokens per prefill chunk (default: 512)",
-    )
-    imatrix.add_argument(
-        "--max-chunks", type=int, default=0,
-        help="cap on chunks processed; 0 means the whole file",
-    )
-    imatrix.add_argument("--context", type=int, default=2048)
-    _add_runtime_options(imatrix, serving=False, show_help=False)
-
-    serve = commands.add_parser(
-        "serve", aliases=("serve-v2",),
-        help="start the OpenAI/Anthropic-compatible server",
-    )
-    serve.add_argument("model", type=Path)
-    _add_quant_option(serve)
-    serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8000)
-    serve.add_argument("--model-name")
-    serve.add_argument("--device", type=int, default=0)
-    # Separate from --device, which selects *which* GPU. This selects whether a
-    # GPU is used at all.
-    serve.add_argument(
-        "--backend",
-        choices=("auto", "cuda", "cpu"),
-        default="auto",
-        help="execution backend; auto uses CUDA when a driver is present and "
-             "falls back to the CPU backend otherwise",
-    )
-    serve.add_argument(
+    limits.add_argument(
         "--reasoning-effort", choices=("low", "medium", "high", "xhigh"),
         default=None,
-        help="default reasoning effort for checkpoints that grade it "
-             "(Qwen3.5 reads low/medium/xhigh and defaults to xhigh, its "
-             "maximum); a request may override it per call",
+        help="thinking budget for checkpoints that grade it (Qwen3.5 reads "
+             "low/medium/xhigh and defaults to xhigh, its maximum)",
     )
-    # Server-wide sampling defaults, one flag per setting in sampling.SETTINGS
-    # so this list cannot fall behind the sampler. Each applies when a request
-    # does not carry its own value, and an absent flag changes nothing, giving
-    # request > flag > generation_config.json beside the model > built-in.
+    # One flag per setting in sampling.SERVER_SETTINGS so this list cannot fall
+    # behind the sampler, giving request > flag > generation_config.json beside
+    # the model > built-in.
     #
     # The penalties matter here because they are not a nicety on a low-bit
     # checkpoint -- they are what keeps it from looping, and they apply to
@@ -498,36 +748,284 @@ def _parser() -> argparse.ArgumentParser:
     from .sampling import SERVER_SETTINGS
     for setting in SERVER_SETTINGS:
         built_in = _sampling_defaults().get(setting.name)
-        serve.add_argument(
+        limits.add_argument(
             f"--{setting.name.replace('_', '-')}",
             type=setting.kind, default=None,
-            help=f"default {setting.help}"
+            metavar="N" if setting.kind is int else "X",
+            help=setting.help
                  + (f" (default: {built_in})" if built_in is not None else ""),
         )
-    serve.add_argument("--strict-model", action="store_true")
-    serve.add_argument("--api-key", default=os.environ.get("COLIBRI_API_KEY"))
-    serve.add_argument("--cors-origin", default="*")
-    serve.add_argument(
-        "--context", "--context-window", dest="context_window", type=int,
-        default=32768, help="maximum prompt + output tokens (default: 32768)",
+    limits.add_argument(
+        "--max-tool-call-tokens", type=int, default=0, metavar="N",
+        help="abandon a tool call that has run this long without closing; "
+             "0 leaves it bounded only by --max-tokens, since a legitimate "
+             "call can be as large as the file it writes",
     )
-    serve.add_argument(
-        "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
-        default=4096, help="maximum generated tokens per request (default: 4096)",
+    _add_backend_option(
+        serve.add_argument_group(
+            "backend", "Which processor runs the model.",
+        )
     )
-    serve.add_argument(
-        "--concurrency", "--max-concurrent-requests",
-        dest="max_concurrent_requests", type=int, default=64,
-        help="maximum simultaneous inference requests (default: 64)",
-    )
-    serve.add_argument("--max-connections", type=int, default=128, help=argparse.SUPPRESS)
-    serve.add_argument("--request-timeout-seconds", type=float, default=30.0, help=argparse.SUPPRESS)
-    serve.add_argument("--sse-keepalive-seconds", type=float, default=10.0, help=argparse.SUPPRESS)
-    serve.add_argument("--max-tool-call-tokens", type=int, default=0, help=argparse.SUPPRESS)
     _add_runtime_options(
-        serve, serving=True, show_help=False,
-        cache_default=AUTO_PROMPT_CACHE_MIB, show_cache_help=True,
+        serve, serving=True, cache_default=AUTO_PROMPT_CACHE_MIB,
     )
+
+    generate = _add_command(
+        commands, "generate", aliases=("generate-text-v2",),
+        help="print one response and exit",
+        description="Generate a single response locally and print it, with no "
+                    "server and no conversation state.",
+        usage="generate MODEL --prompt TEXT [options]",
+        epilog="""\
+examples:
+  colibri-next generate model.gguf --prompt "Explain sliding-window attention."
+
+  colibri-next generate model.gguf --prompt "Refactor this." \\
+      --system "You are a terse code reviewer." --max-tokens 512
+
+  colibri-next generate model.gguf --prompt hi --temperature 0.7 --seed 7
+      a sampled answer that repeats exactly on the same seed\
+""",
+    )
+    _add_model_argument(generate)
+    request = generate.add_argument_group("request")
+    request.add_argument(
+        "--prompt", required=True, metavar="TEXT",
+        help="the user message, rendered through the model's chat template",
+    )
+    request.add_argument(
+        "--system", metavar="TEXT", help="optional system message",
+    )
+    request.add_argument(
+        "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
+        default=64, metavar="N", help="maximum generated tokens",
+    )
+    request.add_argument(
+        "--context", "--context-window", dest="context_window", type=int,
+        default=32768, metavar="N", help="maximum prompt + output tokens",
+    )
+    request.add_argument(
+        "--enable-thinking", action="store_true",
+        help="let a thinking model reason before answering, where its template "
+             "makes that optional",
+    )
+    sampling = generate.add_argument_group("sampling")
+    sampling.add_argument(
+        "--temperature", type=float, default=0.0, metavar="X",
+        help="sampling temperature; 0 is greedy",
+    )
+    sampling.add_argument(
+        "--top-k", type=int, default=20, metavar="N",
+        help="how many candidates the sampler considers",
+    )
+    sampling.add_argument(
+        "--top-p", type=float, default=0.95, metavar="X",
+        help="nucleus cut over those candidates, in (0, 1]",
+    )
+    sampling.add_argument(
+        "--seed", type=int, metavar="N",
+        help="fixed RNG seed, for a sample that reproduces",
+    )
+    _add_backend_option(
+        generate.add_argument_group("backend", "Which processor runs the model.")
+    )
+    _add_runtime_options(generate, serving=True)
+
+    benchmark = _add_command(
+        commands, "benchmark", aliases=("benchmark-v2",),
+        help="measure prompt and decode speed",
+        description="Measure preparation, prompt and steady-state decode "
+                    "speed, and print the report as JSON.",
+        usage="benchmark MODEL [--prompt TEXT] [options]",
+        epilog="""\
+examples:
+  colibri-next benchmark model.gguf --prompt "Explain MoE routing." --chat
+      the usual shape: a real chat-formatted prompt, default 128 decode tokens
+
+  colibri-next benchmark model.gguf --prompt hi --chat \\
+      --context 32768 --warmup 10 --iterations 30
+
+  colibri-next benchmark model.gguf --tokens 1,2,3 --cold-cache
+      raw token ids, with the file cache dropped first so the load is timed
+
+The report separates preparation, prompt-plus-first-token, and steady decode,
+and gives the first and last decode windows separately so a rate that decays
+with context cannot hide inside one average.\
+""",
+    )
+    _add_model_argument(benchmark)
+    workload = benchmark.add_argument_group("workload")
+    workload.add_argument(
+        "--prompt", metavar="TEXT",
+        help="prompt text; without it, --tokens is used",
+    )
+    workload.add_argument(
+        "--chat", action="store_true",
+        help="render --prompt through the model's chat template first, which "
+             "is what a served request actually looks like",
+    )
+    workload.add_argument(
+        "--tokens", default="0", metavar="IDS",
+        help="comma-separated prompt token ids, used when --prompt is absent",
+    )
+    workload.add_argument(
+        "--warmup", type=int, default=3, metavar="N",
+        help="decode tokens generated before measurement starts",
+    )
+    workload.add_argument(
+        "--iterations", type=int, default=128, metavar="N",
+        help="measured decode tokens after warmup",
+    )
+    workload.add_argument(
+        "--context", type=int, default=2048, metavar="N",
+        help="context limit the runtime is built with; the prompt plus every "
+             "generated token must fit",
+    )
+    workload.add_argument(
+        "--cold-cache", action="store_true",
+        help="drop the model file from the page cache first, so preparation "
+             "includes reading it from disk",
+    )
+    benchmark_sampling = benchmark.add_argument_group("sampling")
+    benchmark_sampling.add_argument(
+        "--temperature", type=float, default=0.0, metavar="X",
+        help="sampling temperature; 0 is greedy, which is what a speed "
+             "measurement usually wants",
+    )
+    benchmark_sampling.add_argument(
+        "--top-k", type=int, default=0, metavar="N",
+        help="how many candidates the sampler considers; 0 keeps all of them",
+    )
+    benchmark_sampling.add_argument(
+        "--top-p", type=float, default=0.0, metavar="X",
+        help="nucleus cut over those candidates; 0 disables it",
+    )
+    benchmark_sampling.add_argument(
+        "--expert-top-k", type=int, default=0, metavar="N",
+        help="route at most this many experts per token; 0 uses the model's "
+             "own count. Trades output quality for speed, so it measures a "
+             "cheaper model than the one being served",
+    )
+    benchmark_sampling.add_argument(
+        "--expert-top-p", type=float, default=0.0, metavar="X",
+        help="keep routed experts up to this cumulative router probability; "
+             "0 disables the cut",
+    )
+    _add_backend_option(
+        benchmark.add_argument_group("backend", "Which processor runs the model.")
+    )
+    _add_runtime_options(benchmark, serving=False)
+
+    inspect = _add_command(
+        commands, "inspect", aliases=("inspect-gguf", "inspect-gguf-v2"),
+        help="print model metadata as JSON",
+        description="Print the model's file metadata, resolved config and "
+                    "tensor list as JSON.",
+        usage="inspect MODEL [options]",
+        epilog="""\
+examples:
+  colibri-next inspect model.gguf
+  colibri-next inspect model.gguf | jq .config.architecture
+
+A safetensors checkpoint is packed before it can be described, so the first
+inspect of one does the same work as the first serve of it.\
+""",
+    )
+    _add_model_argument(inspect)
+
+    imatrix = _add_command(
+        commands, "imatrix",
+        help="gather an importance matrix over calibration text",
+        usage="imatrix MODEL --text FILE [options]",
+        epilog="""\
+examples:
+  colibri-next imatrix model.gguf --text calibration.txt --output imatrix.dat
+
+  colibri-next imatrix model.gguf --text calibration.txt --max-chunks 64
+      a quicker, coarser matrix
+
+The text is prefilled in chunks and activation energy is accumulated at every
+projection's input. Routed experts are pinned to the CPU path for the run, and
+drafting is off, so no layer goes uncounted -- --expert-mode and --mtp-drafts
+are therefore not offered here. The output is llama.cpp's legacy .dat layout,
+read by both this packer's --imatrix and llama-quantize.\
+""",
+    )
+    _add_model_argument(imatrix)
+    gather = imatrix.add_argument_group("gather")
+    gather.add_argument(
+        "--text", type=Path, required=True, metavar="FILE",
+        help="calibration text; general prose plus some code is the usual mix",
+    )
+    gather.add_argument(
+        "--output", type=Path, default=Path("imatrix.dat"), metavar="FILE",
+        help="where to write the matrix",
+    )
+    gather.add_argument(
+        "--chunk", type=int, default=512, metavar="N",
+        help="tokens per prefill chunk; a trailing chunk under 32 tokens is "
+             "dropped rather than skewing the channels it touches",
+    )
+    gather.add_argument(
+        "--max-chunks", type=int, default=0, metavar="N",
+        help="cap on chunks processed; 0 means the whole file",
+    )
+    gather.add_argument(
+        "--context", type=int, default=2048, metavar="N",
+        help="context limit the runtime is built with",
+    )
+    _add_backend_option(
+        imatrix.add_argument_group("backend", "Which processor runs the model.")
+    )
+    _add_runtime_options(
+        imatrix, serving=False,
+        omit=("--expert-mode", "--mtp-drafts", "--mtp-model"),
+    )
+
+    probe = _add_command(
+        commands, "probe",
+        aliases=("probe-native", "probe-native-v2", "probe-qwen-native-v2"),
+        help="run a few tokens and dump runtime counters",
+        description="Run a few tokens through the runtime and dump what it "
+                    "generated alongside its own counters.",
+        usage="probe MODEL [options]",
+        epilog="""\
+examples:
+  colibri-next probe model.gguf --prompt hi --chat --generate-tokens 8
+  colibri-next probe model.gguf --token-id 151643
+
+A debugging command: it prints the generated ids, their text, and the
+runtime's own placement and cache counters, which is what tells you where the
+experts actually ended up.\
+""",
+    )
+    _add_model_argument(probe)
+    probe_input = probe.add_argument_group("workload")
+    probe_input.add_argument(
+        "--prompt", metavar="TEXT",
+        help="prompt text; without it, --token-id is used",
+    )
+    probe_input.add_argument(
+        "--chat", action="store_true",
+        help="render --prompt through the model's chat template first",
+    )
+    probe_input.add_argument(
+        "--token-id", type=int, default=0, metavar="ID",
+        help="single prompt token id, used when --prompt is absent",
+    )
+    probe_input.add_argument(
+        "--generate-tokens", type=int, default=2, metavar="N",
+        help="tokens to generate, stopping early at the model's end token",
+    )
+    probe_input.add_argument(
+        "--context", type=int, default=2048, metavar="N",
+        help="context limit the runtime is built with",
+    )
+    _add_backend_option(
+        probe.add_argument_group("backend", "Which processor runs the model.")
+    )
+    _add_runtime_options(probe, serving=False)
+
     return parser
 
 
@@ -570,7 +1068,11 @@ def _runtime_options(args: argparse.Namespace) -> dict[str, object]:
 
 def _prompt_tokens(model: V2Model, args: argparse.Namespace) -> list[int]:
     if args.prompt is None:
-        return [int(value) for value in getattr(args, "tokens", "0").split(",") if value.strip()]
+        # `benchmark` takes a list of ids and `probe` takes one; both had read
+        # the list, which left probe's --token-id inert -- it always probed 0.
+        if not hasattr(args, "tokens"):
+            return [int(getattr(args, "token_id", 0))]
+        return [int(value) for value in args.tokens.split(",") if value.strip()]
     text = args.prompt
     if getattr(args, "chat", False):
         from .v2_server import NativeV2Tokenizer
@@ -620,6 +1122,7 @@ def _benchmark_bailing_generate(runtime, prompt, tokens, config):
 
 def _benchmark(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
+    _select_backend(args)
     if args.iterations < 3 or args.warmup < 1 or args.context <= 0:
         raise SystemExit("benchmark requires warmup >= 1, iterations >= 3, and context > 0")
     if args.expert_top_k < 0 or not 0 <= args.expert_top_p <= 1:
@@ -833,6 +1336,9 @@ def _generate(args: argparse.Namespace) -> int:
     if _architecture(args.model) == "deepseek4":
         service = _deepseek4_service(args, "generate")
     else:
+        # `generate` accepted --backend and never acted on it: only `serve`
+        # selected one, so --backend cpu ran on the GPU anyway.
+        _select_backend(args)
         from .v2_server import NativeV2InferenceService
         service = NativeV2InferenceService(
             args.model,
@@ -894,18 +1400,9 @@ def _sampling_overrides(args: argparse.Namespace) -> dict[str, float | int]:
 
 def _serve(args: argparse.Namespace) -> int:
     _validate_runtime_args(args)
-    from .v2 import V2Model
     if _architecture(args.model) == "deepseek4":
         return _serve_http(args, _deepseek4_service(args, "serve"))
-    # Before the service builds a runtime: allocations belong to whichever
-    # backend was active when they were made.
-    selected = V2Model.select_backend(getattr(args, "backend", "auto"))
-    if selected == "cpu":
-        print(
-            "[colibri] running on the CPU backend; decode will be far slower "
-            "than a GPU",
-            file=sys.stderr,
-        )
+    _select_backend(args)
     from .v2_server import NativeV2InferenceService
     service = NativeV2InferenceService(
         args.model,
@@ -975,6 +1472,7 @@ def _gather_imatrix(args: argparse.Namespace) -> int:
     import struct
 
     _validate_runtime_args(args)
+    _select_backend(args)
     os.environ["COLIBRI_IMATRIX"] = "1"
     os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "0"
     args.expert_mode = "cpu"
@@ -1050,6 +1548,7 @@ def main(argv: list[str] | None = None) -> int:
         return _gather_imatrix(args)
     if args.command in {"probe", "probe-native-v2", "probe-qwen-native-v2", "probe-native"}:
         _validate_runtime_args(args)
+        _select_backend(args)
         with V2Model(args.model, mtp_model=args.mtp_model) as model:
             prompt = _prompt_tokens(model, args)
             options = _runtime_options(args)

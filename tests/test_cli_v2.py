@@ -1,3 +1,5 @@
+import argparse
+import io
 import os
 import json
 import tempfile
@@ -7,14 +9,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from colibri_next.cli import (
+    AUTO_PROMPT_CACHE_MIB,
     DEFAULT_QUANT,
     _benchmark_native_generate,
     _benchmark_bailing_generate,
     _architecture,
     _benchmark_native_prefill,
     _drop_file_cache,
+    _generate,
     _parser,
     _prefill_cache_seed,
+    _prompt_tokens,
     _quant_from_answer,
     _stop_tokens,
     _quant_menu,
@@ -210,6 +215,158 @@ class NativeV2BenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(args.context_window, 4096)
         self.assertEqual(args.max_new_tokens, 512)
+
+
+class HelpTests(unittest.TestCase):
+    """What `--help` shows.
+
+    Every runtime flag used to be added with `help=SUPPRESS` on `serve`,
+    `generate` and `imatrix`, so the options the README recommends for a model
+    that does not fit in VRAM -- `--parallel`, `--expert-mode`,
+    `--cache-type-k` -- could not be found from the command itself. The top
+    level had the same problem in miniature: its command list was a hand-written
+    string that two commands had been added without.
+    """
+
+    def _help(self, *argv: str) -> str:
+        parser = _parser()
+        if argv:
+            # The subparser for a command, reached the way argparse reaches it.
+            action = next(
+                action for action in parser._actions
+                if isinstance(action, argparse._SubParsersAction)
+            )
+            parser = action.choices[argv[0]]
+        return parser.format_help()
+
+    def test_every_command_appears_in_the_command_list(self) -> None:
+        listing = self._help()
+        for command in ("serve", "generate", "benchmark", "inspect",
+                        "imatrix", "probe"):
+            self.assertIn(command, listing)
+
+    def test_every_option_a_command_accepts_is_documented(self) -> None:
+        """Nothing is parsed but hidden, and nothing is shown but undescribed."""
+        parser = _parser()
+        action = next(
+            action for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        for command, subparser in action.choices.items():
+            for option in subparser._actions:
+                with self.subTest(command=command, option=option.dest):
+                    self.assertNotEqual(
+                        option.help, argparse.SUPPRESS,
+                        f"{command} hides --{option.dest.replace('_', '-')}",
+                    )
+                    self.assertTrue(
+                        option.help,
+                        f"{command} does not describe "
+                        f"--{option.dest.replace('_', '-')}",
+                    )
+
+    def test_legacy_spellings_stay_out_of_the_command_list(self) -> None:
+        """They are still accepted; the epilog is where they are mentioned."""
+        listing = self._help().split("examples:")[0]
+        for alias in ("serve-v2", "inspect-gguf", "probe-qwen-native-v2"):
+            self.assertNotIn(alias, listing)
+
+    def test_an_unknown_command_is_answered_with_the_real_ones(self) -> None:
+        with self.assertRaises(SystemExit), \
+                patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            _parser().parse_args(["srve", "model.gguf"])
+        message = stderr.getvalue()
+        self.assertIn("invalid command 'srve'", message)
+        self.assertIn("serve, generate, benchmark", message)
+        self.assertNotIn("serve-v2", message)
+
+    def test_serve_shows_the_placement_flags_its_operator_needs(self) -> None:
+        text = self._help("serve")
+        for flag in ("--parallel", "--expert-mode", "--cache-type-k",
+                     "--gpu-cache-mib", "--cpu-threads", "--mtp-drafts",
+                     "--max-connections"):
+            self.assertIn(flag, text)
+
+    def test_a_budget_default_is_named_rather_than_printed_as_a_sentinel(self) -> None:
+        """`--cache auto` is carried as a MiB count no one would recognize."""
+        text = self._help("serve")
+        self.assertIn("(default: auto)", text)
+        self.assertNotIn(str(AUTO_PROMPT_CACHE_MIB), text)
+
+    def test_imatrix_does_not_offer_what_the_gather_overrides(self) -> None:
+        """It pins experts to the CPU and turns drafting off for the run."""
+        imatrix = _parser().parse_args(
+            ["imatrix", "model.gguf", "--text", "calibration.txt"]
+        )
+        self.assertFalse(hasattr(imatrix, "expert_mode"))
+        self.assertFalse(hasattr(imatrix, "mtp_drafts"))
+        with self.assertRaises(SystemExit):
+            _parser().parse_args(
+                ["imatrix", "model.gguf", "--text", "t.txt",
+                 "--expert-mode", "gpu"]
+            )
+
+
+class BackendSelectionTests(unittest.TestCase):
+    """--backend has to reach the runtime, not just the parser.
+
+    Only `serve` selected a backend; `generate --backend cpu` parsed the flag
+    and then ran on the GPU anyway. Every command that builds a runtime now
+    settles it before the model is opened, since allocations belong to whichever
+    backend was active when they were made.
+    """
+
+    def test_every_runtime_command_accepts_a_backend(self) -> None:
+        for command in ("serve", "generate", "benchmark", "probe", "imatrix"):
+            with self.subTest(command=command):
+                argv = [command, "model.gguf", "--backend", "cpu"]
+                if command == "generate":
+                    argv.extend(("--prompt", "hi"))
+                if command == "imatrix":
+                    argv.extend(("--text", "calibration.txt"))
+                self.assertEqual(_parser().parse_args(argv).backend, "cpu")
+
+    def test_generate_settles_the_backend_before_it_loads(self) -> None:
+        args = _parser().parse_args(
+            ["generate", "model.gguf", "--prompt", "hi", "--backend", "cpu"]
+        )
+        service = SimpleNamespace(
+            model_name="m", close=lambda: None,
+            chat_completion=lambda body: {
+                "choices": [{"message": {"content": "ok"}}]
+            },
+        )
+        order: list[str] = []
+
+        def select(backend: str) -> str:
+            order.append(f"select:{backend}")
+            return backend
+
+        def build(*args_, **kwargs):
+            order.append("load")
+            return service
+
+        with patch("colibri_next.cli._architecture", return_value="qwen3"), \
+                patch("colibri_next.cli.V2Model") as model, \
+                patch("colibri_next.v2_server.NativeV2InferenceService", build):
+            model.select_backend.side_effect = select
+            _generate(args)
+        # Selected first: the service is what opens the model and allocates,
+        # and an allocation belongs to the backend that was active for it.
+        self.assertEqual(order, ["select:cpu", "load"])
+
+
+class PromptTokenTests(unittest.TestCase):
+    def test_probe_probes_the_token_it_was_given(self) -> None:
+        """--token-id was inert: probe read benchmark's --tokens list instead."""
+        probe = _parser().parse_args(["probe", "model.gguf", "--token-id", "42"])
+        self.assertEqual(_prompt_tokens(SimpleNamespace(), probe), [42])
+
+    def test_benchmark_still_reads_a_list_of_ids(self) -> None:
+        benchmark = _parser().parse_args(
+            ["benchmark", "model.gguf", "--tokens", "1,2,3"]
+        )
+        self.assertEqual(_prompt_tokens(SimpleNamespace(), benchmark), [1, 2, 3])
 
 
 class ProbeStopTokenTests(unittest.TestCase):

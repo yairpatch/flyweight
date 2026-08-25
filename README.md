@@ -73,6 +73,23 @@ On Windows, activate with `.venv\Scripts\Activate.ps1` and run the same Python
 commands. CUDA kernels are compiled at runtime through the NVIDIA driver API;
 the project does not require a separately installed CUDA toolkit for serving.
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `colibri-next serve MODEL` | serve the OpenAI/Anthropic APIs and chat UI |
+| `colibri-next generate MODEL --prompt TEXT` | print one response and exit |
+| `colibri-next benchmark MODEL` | measure prompt and decode speed as JSON |
+| `colibri-next inspect MODEL` | print model metadata as JSON |
+| `colibri-next imatrix MODEL --text FILE` | gather an importance matrix |
+| `colibri-next probe MODEL` | run a few tokens and dump runtime counters |
+
+`MODEL` is a `.gguf` file or a safetensors checkpoint directory, everywhere.
+`colibri-next COMMAND --help` lists every option that command accepts, grouped
+by what it does: the request, the backend, hardware placement, and advanced
+tuning. The older `serve-v2`, `generate-text-v2`, `benchmark-v2`,
+`inspect-gguf`, and `probe-native-v2` spellings remain accepted.
+
 ## Serve a model
 
 ~~~bash
@@ -80,8 +97,8 @@ colibri-next serve model.gguf
 ~~~
 
 Open `http://127.0.0.1:8000/` for the local chat UI. The defaults select the
-backend and memory policy automatically. The common public options are kept
-small:
+backend and memory policy automatically; the options below are the ones worth
+reaching for first:
 
 ~~~bash
 colibri-next serve model.gguf \
@@ -95,8 +112,8 @@ when only one GPU sequence slot is configured. Use `--cache off` to disable it
 or `--cache 4096` to set an explicit 4 GiB budget. Automatic mode uses one
 eighth of currently available RAM, capped at 8 GiB.
 
-Older `serve-v2`, `--context-window`, and `--max-new-tokens` spellings remain
-accepted for script compatibility.
+The older `--context-window` and `--max-new-tokens` spellings of the limit
+flags remain accepted for script compatibility.
 
 The native expert modes are:
 
