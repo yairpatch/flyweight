@@ -9165,6 +9165,256 @@ KV_ATTENTION_FUSED_TILES(
 #undef KV_ATTENTION_FUSED_TILES_W
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
+// Turbo twin of the fused tiles kernel above. The cache rows live in the
+// rotated (sign-flip + Walsh-Hadamard) domain, and the rotation is
+// orthonormal, so the block rotates its query once into shared memory and
+// every dot product happens in-place against the quantized rows; values
+// accumulate still-rotated and the paired turbo merge applies the single
+// inverse rotation per head. This is what replaces the cuBLAS staging path
+// per decode step: that path first rewrites the whole cache window to f16
+// (two O(context) launches, kv_dequant_turbo*_f16) and then reads the copy,
+// where this grid reads each quantized row exactly once, directly.
+template<int BITS, int maximum_head_dim>
+__device__ void kv_attention_fused_turbo_tiles_impl(
+    const float* query,
+    const unsigned char* keys,
+    const unsigned char* values,
+    float* partial,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const int first,
+    const float scale
+) {
+    constexpr int warp_count = 8;
+    constexpr int parts = maximum_head_dim / 32;
+    constexpr int tokens_per_tile = 1024;
+    const int head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    // Guards stay uniform across the block: every thread must reach the
+    // __syncthreads inside turbo_fwht_shared below. head_dim is a power of
+    // two wherever a turbo cache type is admitted, and the width dispatch
+    // only sends 128/256/512 here, but the kernel re-checks rather than
+    // trusting the host.
+    if (head >= heads || head_dim > maximum_head_dim || head_dim < 32 ||
+        (head_dim & (head_dim - 1)) != 0)
+        return;
+    __shared__ float rotated_query[maximum_head_dim];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        rotated_query[d] = query[head * head_dim + d] * turbo_sign_d(d, 0u);
+    __syncthreads();
+    turbo_fwht_shared(rotated_query, head_dim);
+
+    const int tile_begin = tile * tokens_per_tile;
+    const int tile_end = min(tokens, tile_begin + tokens_per_tile);
+    const int kv_head = head / (heads / kv_heads);
+    const int row_bytes = (head_dim / 32) * turbo_block_bytes<BITS>();
+    const unsigned char* key_base =
+        keys + (long long)kv_head * capacity * row_bytes;
+    const unsigned char* value_base =
+        values + (long long)kv_head * capacity * row_bytes;
+    float accumulator[parts];
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) accumulator[part] = 0.0f;
+    float maximum = -3.402823466e+38F;
+    float denominator = 0.0f;
+
+    for (int token = tile_begin + warp;
+         token < tile_end;
+         token += warp_count) {
+        int slot = first + token;
+        if (slot >= capacity) slot -= capacity;
+        const unsigned char* key_row = key_base + (long long)slot * row_bytes;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const int dimension = lane + part * 32;
+            if (dimension < head_dim)
+                dot += rotated_query[dimension]
+                    * kv_ld_turbo<BITS>(key_row, dimension);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        const float score =
+            __shfl_sync(0xffffffff, dot, 0) * scale;
+        const float next_maximum = fmaxf(maximum, score);
+        const float old_scale = maximum == -3.402823466e+38F
+            ? 0.0f : __expf(maximum - next_maximum);
+        const float token_scale = __expf(score - next_maximum);
+        denominator = denominator * old_scale + token_scale;
+        const unsigned char* value_row =
+            value_base + (long long)slot * row_bytes;
+        #pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const int dimension = lane + part * 32;
+            if (dimension < head_dim)
+                accumulator[part] = accumulator[part] * old_scale
+                    + token_scale
+                    * kv_ld_turbo<BITS>(value_row, dimension);
+        }
+        maximum = next_maximum;
+    }
+
+    __shared__ float warp_maximum[warp_count];
+    __shared__ float warp_denominator[warp_count];
+    __shared__ float warp_scale[warp_count];
+    __shared__ float merged_maximum;
+    __shared__ float merged_denominator;
+    __shared__ float partial_output[warp_count][maximum_head_dim];
+    if (lane == 0) {
+        warp_maximum[warp] = maximum;
+        warp_denominator[warp] = denominator;
+    }
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int dimension = lane + part * 32;
+        if (dimension < head_dim)
+            partial_output[warp][dimension] = accumulator[part];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float tile_maximum = warp_maximum[0];
+        #pragma unroll
+        for (int index = 1; index < warp_count; ++index)
+            tile_maximum = fmaxf(tile_maximum, warp_maximum[index]);
+        float tile_denominator = 0.0f;
+        #pragma unroll
+        for (int index = 0; index < warp_count; ++index) {
+            const float factor = warp_denominator[index] == 0.0f
+                ? 0.0f : __expf(warp_maximum[index] - tile_maximum);
+            warp_scale[index] = factor;
+            tile_denominator += warp_denominator[index] * factor;
+        }
+        merged_maximum = tile_maximum;
+        merged_denominator = tile_denominator;
+    }
+    __syncthreads();
+
+    const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
+    float* record = partial
+        + ((long long)head * tile_count + tile) * (maximum_head_dim + 2);
+    if (threadIdx.x == 0) {
+        record[0] = merged_maximum;
+        record[1] = merged_denominator;
+    }
+    for (int dimension = threadIdx.x;
+         dimension < head_dim;
+         dimension += blockDim.x) {
+        float result = 0.0f;
+        #pragma unroll
+        for (int index = 0; index < warp_count; ++index)
+            result += partial_output[index][dimension] * warp_scale[index];
+        record[dimension + 2] = result;
+    }
+}
+
+#define KV_ATTENTION_FUSED_TURBO_TILES_W(name, BITS, WIDTH) \
+extern "C" __global__ void name( \
+    const float* query, const unsigned char* keys, const unsigned char* values, \
+    float* partial, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first, const float scale \
+) { \
+    kv_attention_fused_turbo_tiles_impl<BITS, WIDTH>( \
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
+        capacity, first, scale \
+    ); \
+}
+#define KV_ATTENTION_FUSED_TURBO_TILES(name, BITS) \
+    KV_ATTENTION_FUSED_TURBO_TILES_W(name, BITS, 128) \
+    KV_ATTENTION_FUSED_TURBO_TILES_W(name##256, BITS, 256) \
+    KV_ATTENTION_FUSED_TURBO_TILES_W(name##512, BITS, 512)
+KV_ATTENTION_FUSED_TURBO_TILES(kv_attention_fused_turbo3_tiles, 3)
+KV_ATTENTION_FUSED_TURBO_TILES(kv_attention_fused_turbo4_tiles, 4)
+#undef KV_ATTENTION_FUSED_TURBO_TILES
+#undef KV_ATTENTION_FUSED_TURBO_TILES_W
+
+// Merge for the turbo tiles: identical tile combine, but the combined vector
+// is still in the rotated domain, so it lands in shared memory and takes the
+// single inverse rotation -- R^-1 = R^T, Walsh-Hadamard first, then the
+// value-stream sign flip -- before the store. Must be paired with the turbo
+// tiles kernel of the same width, exactly like the plain merges.
+template<int maximum_head_dim>
+__device__ void kv_attention_fused_turbo_merge_impl(
+    const float* partial,
+    float* output,
+    const int heads,
+    const int head_dim,
+    const int tile_count
+) {
+    constexpr int maximum_tiles = 512;
+    const int head = blockIdx.x;
+    if (head >= heads || head_dim > maximum_head_dim || head_dim < 32 ||
+        (head_dim & (head_dim - 1)) != 0 ||
+        tile_count <= 0 || tile_count > maximum_tiles)
+        return;
+    const int stride = maximum_head_dim + 2;
+    const float* head_partial =
+        partial + (long long)head * tile_count * stride;
+    __shared__ float tile_scale[maximum_tiles];
+    __shared__ float inverse_denominator;
+    if (threadIdx.x == 0) {
+        float maximum = head_partial[0];
+        for (int tile = 1; tile < tile_count; ++tile)
+            maximum = fmaxf(maximum, head_partial[tile * stride]);
+        float denominator = 0.0f;
+        for (int tile = 0; tile < tile_count; ++tile) {
+            const float factor =
+                __expf(head_partial[tile * stride] - maximum);
+            tile_scale[tile] = factor;
+            denominator += head_partial[tile * stride + 1] * factor;
+        }
+        inverse_denominator = 1.0f / denominator;
+    }
+    __syncthreads();
+    __shared__ float accumulated[maximum_head_dim];
+    for (int dimension = threadIdx.x;
+         dimension < head_dim;
+         dimension += blockDim.x) {
+        float result = 0.0f;
+        for (int tile = 0; tile < tile_count; ++tile) {
+            result += head_partial[tile * stride + dimension + 2]
+                * tile_scale[tile];
+        }
+        accumulated[dimension] = result * inverse_denominator;
+    }
+    __syncthreads();
+    turbo_fwht_shared(accumulated, head_dim);
+    for (int dimension = threadIdx.x;
+         dimension < head_dim;
+         dimension += blockDim.x)
+        output[head * head_dim + dimension] =
+            accumulated[dimension] * turbo_sign_d(dimension, 1u);
+}
+
+extern "C" __global__ void kv_attention_fused_turbo_merge(
+    const float* partial, float* output,
+    const int heads, const int head_dim, const int tile_count
+) {
+    kv_attention_fused_turbo_merge_impl<128>(
+        partial, output, heads, head_dim, tile_count);
+}
+extern "C" __global__ void kv_attention_fused_turbo_merge256(
+    const float* partial, float* output,
+    const int heads, const int head_dim, const int tile_count
+) {
+    kv_attention_fused_turbo_merge_impl<256>(
+        partial, output, heads, head_dim, tile_count);
+}
+extern "C" __global__ void kv_attention_fused_turbo_merge512(
+    const float* partial, float* output,
+    const int heads, const int head_dim, const int tile_count
+) {
+    kv_attention_fused_turbo_merge_impl<512>(
+        partial, output, heads, head_dim, tile_count);
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 // Grouped-query attention that reads each cached byte once per block instead of
 // once per query head.
 //

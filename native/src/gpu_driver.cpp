@@ -1115,6 +1115,13 @@ extern "C" int colibri_gpu_compile(
              "kv_attention_fused_q8_tiles256", "kv_attention_fused_merge256",
              "kv_attention_fused_f16_tiles512", "kv_attention_fused_bf16_tiles512",
              "kv_attention_fused_q8_tiles512", "kv_attention_fused_merge512",
+             // Turbo twins: dot in the rotated domain against the quantized
+             // rows directly, paired with the merge that undoes the rotation.
+             "kv_attention_fused_turbo3_tiles", "kv_attention_fused_turbo4_tiles",
+             "kv_attention_fused_turbo3_tiles256", "kv_attention_fused_turbo4_tiles256",
+             "kv_attention_fused_turbo3_tiles512", "kv_attention_fused_turbo4_tiles512",
+             "kv_attention_fused_turbo_merge", "kv_attention_fused_turbo_merge256",
+             "kv_attention_fused_turbo_merge512",
              // Grouped-query variants: one block per KV head, one warp per
              // query head, KV staged through shared memory.
              "kv_attention_gqa_f16_256_s8", "kv_attention_gqa_f16_256_s4",

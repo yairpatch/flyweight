@@ -11962,13 +11962,19 @@ int colibri_v2_qwen_runtime_cancel(ColibriV2QwenRuntime*runtime){return guarded(
 // only the warp->fragment assignment moves), and the 27B IQ2_XXS dense
 // checkpoint measured +6% at pp1024 / +9% at pp2048, 6 of 6 interleaved
 // pairs. COLIBRI_MMQ_WIDE=0 restores the 256-thread shape.
+//
+// Only the env read is cached: colibri_backend_select can flip the backend
+// between runtimes in one process (the test suite does), and a static that
+// froze the backend answer sent 512-thread launches at the CPU shim's
+// 256-shape kernels -- out-of-tile shared writes in emulation, i.e. heap
+// corruption that surfaced as nondeterministic parity failures two tests
+// later. The backend must be asked every time.
 static bool qwen_mmq_wide(){
-    static const bool wide=[]{
-        if(colibri_backend_is_cpu())return false;
+    static const bool enabled=[]{
         const char*setting=std::getenv("COLIBRI_MMQ_WIDE");
         return !setting||setting[0]!='0';
     }();
-    return wide;
+    return enabled&&!colibri_backend_is_cpu();
 }
 int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
@@ -13317,12 +13323,24 @@ inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){int t=r.optio
 inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4":t==4?"kv_attention_values_turbo3":t==3?"kv_attention_values_q8":t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
 inline const char* kv_scores_ring_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4_ring":t==4?"kv_attention_scores_turbo3_ring":t==3?"kv_attention_scores_q8_ring":t==2?"kv_attention_scores_bf16_ring":t==1?"kv_attention_scores_f16_ring":"kv_attention_scores_ring";}
 inline const char* kv_values_ring_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4_ring":t==4?"kv_attention_values_turbo3_ring":t==3?"kv_attention_values_q8_ring":t==2?"kv_attention_values_bf16_ring":t==1?"kv_attention_values_f16_ring":"kv_attention_values_ring";}
+// The turbo tiles rank below the cuBLAS staging path (see the dispatch) and
+// above the serial per-head kernels; this switch drops them back out of the
+// fallback tier entirely for A/B.
+inline bool qwen_turbo_fused_disabled(){
+    static const bool disabled=[]{
+        const char*s=std::getenv("COLIBRI_TURBO_FUSED_ATTENTION");
+        return s&&s[0]=='0';}();
+    return disabled;
+}
 inline const char* kv_fused_tiles_kernel(const ColibriV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
+    if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
     return t==3?"kv_attention_fused_q8_tiles":
            t==2?"kv_attention_fused_bf16_tiles":
-           t==1?"kv_attention_fused_f16_tiles":nullptr;
+           t==1?"kv_attention_fused_f16_tiles":
+           t==4?"kv_attention_fused_turbo3_tiles":
+           t==5?"kv_attention_fused_turbo4_tiles":nullptr;
 }
 // The 256-dim twin of the above. Kept a separate instantiation rather than
 // widening the 128 one so models with 128-dim heads keep their shared-memory
@@ -13330,17 +13348,35 @@ inline const char* kv_fused_tiles_kernel(const ColibriV2QwenRuntime& r){
 inline const char* kv_fused_tiles_kernel256(const ColibriV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
+    if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
     return t==3?"kv_attention_fused_q8_tiles256":
            t==2?"kv_attention_fused_bf16_tiles256":
-           t==1?"kv_attention_fused_f16_tiles256":nullptr;
+           t==1?"kv_attention_fused_f16_tiles256":
+           t==4?"kv_attention_fused_turbo3_tiles256":
+           t==5?"kv_attention_fused_turbo4_tiles256":nullptr;
 }
 // The 512-dim triplet, for Gemma 4's global layers.
 inline const char* kv_fused_tiles_kernel512(const ColibriV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
+    if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
     return t==3?"kv_attention_fused_q8_tiles512":
            t==2?"kv_attention_fused_bf16_tiles512":
-           t==1?"kv_attention_fused_f16_tiles512":nullptr;
+           t==1?"kv_attention_fused_f16_tiles512":
+           t==4?"kv_attention_fused_turbo3_tiles512":
+           t==5?"kv_attention_fused_turbo4_tiles512":nullptr;
+}
+// The merge must pair with the tiles kernel above it: same record stride, and
+// for the turbo pair the combined vector still carries the cache's rotation,
+// which only the turbo merge undoes. Mixing them returns rotated garbage.
+inline const char* kv_fused_merge_kernel_name(
+    const ColibriV2QwenRuntime& r,int width){
+    const bool turbo=kv_type_is_turbo(r.options.cache_type_k);
+    return width==128
+        ?(turbo?"kv_attention_fused_turbo_merge":"kv_attention_fused_merge")
+        :width==256
+        ?(turbo?"kv_attention_fused_turbo_merge256":"kv_attention_fused_merge256")
+        :(turbo?"kv_attention_fused_turbo_merge512":"kv_attention_fused_merge512");
 }
 // Width the fused path would run `head_dim` at, or 0 when it cannot.
 inline int kv_fused_width(int head_dim){
@@ -14969,9 +15005,8 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                                 const_cast<int*>(&heads),
                                 const_cast<int*>(&head_dim),
                                 const_cast<int*>(&fused_tile_count)};
-            launch(fused_width==128?"kv_attention_fused_merge"
-                   :fused_width==256?"kv_attention_fused_merge256"
-                   :"kv_attention_fused_merge512",heads,1,256,merge_args);
+            launch(kv_fused_merge_kernel_name(runtime,fused_width),
+                   heads,1,256,merge_args);
         }else{
             void* score_args[]={const_cast<std::uint64_t*>(&fourth),&cache_keys,
                                 const_cast<std::uint64_t*>(&attention_scores),
@@ -15786,6 +15821,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             if(profile)profile_record(profile->recurrent_start);
             const char* fused_tiles=kv_fused_tiles_kernel(*runtime);
             const int fused_tile_tokens=kv_fused_tile_tokens(*runtime);
+            // The staging path keeps its priority by measurement, not theory:
+            // rewriting the window to f16 looks like O(context) waste, but the
+            // fused turbo tiles decode every KV row once per *query* head --
+            // an 8x in-loop ALU repeat under GQA -- and measured 25.4 against
+            // cuBLAS' 29.9 tok/s at 12k on the 27B (2/2 interleaved pairs).
+            // The tiles take over where cuBLAS declines (window past the
+            // staging buffer, short windows), which used to fall all the way
+            // to the serial per-head kernels.
             const bool cublas_done=
                 qwen_turbo_cublas_attention(
                     *runtime,queries,first,cache_keys,cache_values,
@@ -15852,11 +15895,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
                     &attended,const_cast<int*>(&heads),
                     const_cast<int*>(&head_dim),const_cast<int*>(&tile_count)};
-                launch_named(width==128
-                        ? "kv_attention_fused_merge"
-                        : width==256
-                            ? "kv_attention_fused_merge256"
-                            : "kv_attention_fused_merge512",
+                launch_named(kv_fused_merge_kernel_name(*runtime,width),
                     heads,1,256,merge_args);
             }else{
                 void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
@@ -18616,8 +18655,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                         &attended, const_cast<int*>(&heads),
                         const_cast<int*>(&head_dim),
                         const_cast<int*>(&tile_count)};
-                    launch_named("kv_attention_fused_merge", heads, 1, 256,
-                                 merge_args);
+                    launch_named(kv_fused_merge_kernel_name(*runtime,128),
+                                 heads, 1, 256, merge_args);
                 }else{
                     void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot, &scale};
                     launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
