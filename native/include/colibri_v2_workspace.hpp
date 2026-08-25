@@ -5,7 +5,21 @@
 namespace colibri::v2::workspace {
 
 constexpr std::uint64_t kDeviceAlignment = 256;
-constexpr std::uint64_t kSamplingTopKCapacity = 32;
+// Largest top_k the GPU reduction serves. Above this the sampler falls back
+// to downloading the full vocabulary and sorting on the host -- a ~600KB
+// transfer plus a partial_sort of ~150K floats, every token. 32 left the
+// common client default of top_k=40 on that fallback. The block-sort/merge
+// is exact for any k (each stage keeps the top k of its 1024 inputs, and a
+// global top-k element always ranks inside its own block's k), but the merge
+// loop only shrinks while k < 1024, so the cap must stay well below that;
+// 256 converges 4x per round and costs ~1MB of workspace.
+constexpr std::uint64_t kSamplingTopKCapacity = 256;
+// How far a constrained or penalized step widens its candidate set so the
+// grammar and the penalties have alternatives to promote. Deliberately NOT
+// the GPU capacity above: widening tracks what the step needs, and raising
+// it with the capacity would change sampled output for every constrained
+// request that predates the wider reduction.
+constexpr std::uint64_t kSamplingConstrainedMinimum = 32;
 constexpr std::uint64_t kSamplingSortItemsPerBlock = 1024;
 constexpr std::uint64_t kSamplingSortBlockCapacity = 256;
 constexpr std::uint64_t kSamplingSortCapacity =

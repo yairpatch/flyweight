@@ -1890,8 +1890,11 @@ extern "C" int colibri_gpu_sampling_topk(
         || !g_kernels.sampling_block_topk_pairs || !logits || !selected
         || !selected_logits || !sort_indices_a || !sort_values_a
         || !sort_indices_b || !sort_values_b
-        || vocabulary <= 0 || top_k <= 0 || top_k > 32
+        || vocabulary <= 0 || top_k <= 0 || top_k > 256
         || top_k > vocabulary) return -1;
+    // 256 must track workspace::kSamplingTopKCapacity: the sort buffers hold
+    // blocks * top_k pairs, and the merge loop below only makes progress
+    // while top_k is comfortably under items_per_block.
     constexpr std::int32_t items_per_block = 1024;
     std::int32_t blocks = (vocabulary + items_per_block - 1) / items_per_block;
     if (blocks > 256) return -1;

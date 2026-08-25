@@ -16586,7 +16586,7 @@ static std::uint32_t qwen_sample_last_logits(
                              ban_trips)
         ?std::min<std::size_t>(
             std::max<std::size_t>(
-                requested,colibri::v2::workspace::kSamplingTopKCapacity),
+                requested,colibri::v2::workspace::kSamplingConstrainedMinimum),
             vocabulary)
         :requested;
     // Sampling from a single candidate is identical to greedy decode. Avoid
