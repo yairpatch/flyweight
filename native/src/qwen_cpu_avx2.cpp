@@ -918,6 +918,81 @@ float iq4xs_dot(const std::uint8_t* row_data, const float* input, int elements) 
     return result;
 }
 
+// IQ4_NL: d(2) qs[16] per 32 values -- IQ4_XS's codebook without super-blocks
+// or sub-scales, so the whole decode is one byte shuffle per nibble half.
+// qwen4exp's expert down projections (640-wide rows, so no 256 super-block
+// fits) and its n-gram table carry this type.
+float iq4nl_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    const __m128i low_nibble = _mm_set1_epi8(15);
+    float result = 0.0f;
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * kIq4nlBlockBytes;
+        const __m128i quants =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i first =
+            _mm_shuffle_epi8(levels, _mm_and_si128(quants, low_nibble));
+        const __m128i second = _mm_shuffle_epi8(
+            levels, _mm_and_si128(_mm_srli_epi16(quants, 4), low_nibble));
+        const float* values = input + block * 32;
+        __m256 accumulator = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(first)),
+            _mm256_loadu_ps(values));
+        accumulator = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(first, 8))),
+            _mm256_loadu_ps(values + 8), accumulator);
+        accumulator = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(second)),
+            _mm256_loadu_ps(values + 16), accumulator);
+        accumulator = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(second, 8))),
+            _mm256_loadu_ps(values + 24), accumulator);
+        result += half_value(base) * horizontal_sum(accumulator);
+    }
+    return result;
+}
+
+// IQ1_S: d(2) qs[32] qh[16] per 256 values. Each 32-value group carries a
+// 3-bit odd scale and a signed +-0.125 delta added to every weight; each
+// group-of-8 is a 2048-entry grid octet indexed by 8 low bits from qs and 3
+// high bits from the group's qh halfword. The delta rides the accumulator as
+// `delta * sum(values)`, so the octet path stays a plain int8 expand + FMA.
+float iq1s_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq1sBlockBytes;
+        const float d = half_value(base);
+        const float* vector = input + block * 256;
+        for (int group = 0; group < 8; ++group) {
+            std::uint16_t qh = 0;
+            std::memcpy(&qh, base + 34 + group * 2, 2);
+            const float scale =
+                d * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+            const float delta = (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+            const float* values = vector + group * 32;
+            __m256 weighted = _mm256_setzero_ps();
+            __m256 plain = _mm256_setzero_ps();
+            for (int part = 0; part < 4; ++part) {
+                const std::uint32_t index =
+                    static_cast<std::uint32_t>(base[2 + group * 4 + part]) |
+                    ((static_cast<std::uint32_t>(qh >> (3 * part)) & 7u) << 8);
+                std::uint64_t grid = 0;
+                std::memcpy(&grid, &kIq1sGrid[index], 8);
+                const __m256 magnitudes = _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(
+                        static_cast<long long>(grid))));
+                const __m256 loaded = _mm256_loadu_ps(values + part * 8);
+                weighted = _mm256_fmadd_ps(magnitudes, loaded, weighted);
+                plain = _mm256_add_ps(plain, loaded);
+            }
+            result += scale *
+                (horizontal_sum(weighted) + delta * horizontal_sum(plain));
+        }
+    }
+    return result;
+}
+
 // One weight row against several activation vectors. Decoding an IQ block is
 // far more expensive than the multiply it feeds, so amortizing that decode
 // across the tokens routed to the same expert is worth more here than in the
@@ -1144,6 +1219,8 @@ float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const fl
     if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);
     if(type==22)return iq2s_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2sBlockBytes,input,elements);
     if(type==23)return iq4xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,input,elements);
+    if(type==20)return iq4nl_dot(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,input,elements);
+    if(type==19)return iq1s_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,input,elements);
     if(type==10)return q2_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ2KBlockBytes,input,elements);
     if(type==11)return q3_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kQ3KBlockBytes,input,elements);
     if(type==12)return q4_dot(packed+row*static_cast<std::uint64_t>(elements/256)*144,input,elements);
@@ -1329,6 +1406,66 @@ float qwen_quant_dot_q8_k_avx2(
     return result;
 }
 
+// Row decode for the batched CPU MoE: same shuffle/expand as the dots above,
+// storing instead of accumulating. This is where chunked prefill spends its
+// expert bytes -- each routed expert's rows decode once per chunk and the f32
+// GEMM amortizes them across every token routed there.
+void iq4nl_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    const __m128i low_nibble = _mm_set1_epi8(15);
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * kIq4nlBlockBytes;
+        const __m256 d = _mm256_set1_ps(half_value(base));
+        const __m128i quants =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i first =
+            _mm_shuffle_epi8(levels, _mm_and_si128(quants, low_nibble));
+        const __m128i second = _mm_shuffle_epi8(
+            levels, _mm_and_si128(_mm_srli_epi16(quants, 4), low_nibble));
+        float* out = output + block * 32;
+        _mm256_storeu_ps(out, _mm256_mul_ps(
+            d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(first))));
+        _mm256_storeu_ps(out + 8, _mm256_mul_ps(
+            d, _mm256_cvtepi32_ps(
+                _mm256_cvtepi8_epi32(_mm_srli_si128(first, 8)))));
+        _mm256_storeu_ps(out + 16, _mm256_mul_ps(
+            d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(second))));
+        _mm256_storeu_ps(out + 24, _mm256_mul_ps(
+            d, _mm256_cvtepi32_ps(
+                _mm256_cvtepi8_epi32(_mm_srli_si128(second, 8)))));
+    }
+}
+
+void iq1s_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq1sBlockBytes;
+        const float d = half_value(base);
+        float* out = output + block * 256;
+        for (int group = 0; group < 8; ++group) {
+            std::uint16_t qh = 0;
+            std::memcpy(&qh, base + 34 + group * 2, 2);
+            const __m256 scale = _mm256_set1_ps(
+                d * static_cast<float>(2 * ((qh >> 12) & 7) + 1));
+            const __m256 delta =
+                _mm256_set1_ps((qh & 0x8000) ? -kIq1sDelta : kIq1sDelta);
+            for (int part = 0; part < 4; ++part) {
+                const std::uint32_t index =
+                    static_cast<std::uint32_t>(base[2 + group * 4 + part]) |
+                    ((static_cast<std::uint32_t>(qh >> (3 * part)) & 7u) << 8);
+                std::uint64_t grid = 0;
+                std::memcpy(&grid, &kIq1sGrid[index], 8);
+                const __m256 magnitudes = _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_cvtsi64_si128(
+                        static_cast<long long>(grid))));
+                _mm256_storeu_ps(
+                    out + group * 32 + part * 8,
+                    _mm256_mul_ps(scale, _mm256_add_ps(magnitudes, delta)));
+            }
+        }
+    }
+}
+
 void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int elements,std::uint64_t row,float* output){
     if(type==10)q2_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kQ2KBlockBytes,output,elements);
     else if(type==11)q3_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kQ3KBlockBytes,output,elements);
@@ -1337,6 +1474,8 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==14)q6_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*210,output,elements);
     else if(type==17){const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes;for(int i=0;i<elements;++i)output[i]=qwen_iq2xs_value(row_data,i);}
     else if(type==18){const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes;for(int i=0;i<elements;++i)output[i]=qwen_iq3xxs_value(row_data,i);}
+    else if(type==19)iq1s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,output,elements);
+    else if(type==20)iq4nl_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,output,elements);
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);
     else q8_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*34,output,elements);
 }

@@ -449,10 +449,14 @@ void add_cases() {
                 float* state_p = state.data();
                 float* output_p = output.data();
                 float epsilon = 1e-6f;
+                // Both gate activations: silu (qwen3.5 lineage) and sigmoid
+                // (qwen4exp's output_gate_type). Derived from the shape index
+                // so the native and emulated passes see identical flags.
+                int gate_sigmoid = static_cast<int>(&shape - shapes) & 1;
                 void* arguments[] = {&convolved_p, &gates_p, &beta_p, &decay_p,
                                      &coeff_p, &dt_p, &norm_p, &state_p,
                                      &output_p, &key_heads, &value_heads,
-                                     &head_dim, &epsilon};
+                                     &head_dim, &epsilon, &gate_sigmoid};
                 // Block geometry exactly as v2_runtime.cpp computes it. The
                 // kernel has an implicit precondition that blockDim.x is a
                 // multiple of head_dim -- otherwise the trailing threads land
@@ -520,10 +524,11 @@ void add_cases() {
                 float* state_p = state.data();
                 float* output_p = output.data();
                 float epsilon = 1e-6f;
+                int gate_sigmoid = static_cast<int>(&shape - shapes) & 1;
                 void* arguments[] = {&convolved_p, &gates_p, &beta_p, &decay_p,
                                      &coeff_p, &dt_p, &norm_p, &state_p,
                                      &output_p, &rows, &key_heads, &value_heads,
-                                     &head_dim, &epsilon};
+                                     &head_dim, &epsilon, &gate_sigmoid};
                 colibri_cpu_launch_named("qwen_delta_recurrent_chunk",
                                          value_heads, 1, 128, 0, 0, arguments);
                 outputs.push_back(std::move(output));

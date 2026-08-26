@@ -79,6 +79,20 @@ struct ModelConfig {
     std::uint32_t hyper_connection_count=0, sinkhorn_iterations=0;
     float sinkhorn_epsilon=0.0f;
     std::uint32_t expert_shared_count=0, hash_layer_count=0;
+    // qwen4exp gated residual: the same hyper_connection_count streams as
+    // deepseek4 above, but mixed by a low-rank silu/sigmoid gate instead of a
+    // Sinkhorn router. Zero low_rank means the architecture has no gated
+    // residual.
+    std::uint32_t hyper_connection_low_rank=0;
+    // qwen4exp PLE: hashed n-gram embeddings added into the residual streams
+    // at these layers (0-based block ids as the GGUF writes them). The u64
+    // hash constants arrive verbatim from the conversion -- they are derived
+    // from a training-time seed and cannot be recomputed here.
+    std::vector<std::uint32_t> ple_layers;
+    std::uint32_t ple_ngram_size=0, ple_heads_per_ngram=0, ple_conv_kernel=0;
+    std::uint32_t ple_eos_token_id=0xffffffffu;
+    std::vector<std::uint64_t> ple_multipliers, ple_head_offsets,
+        ple_head_vocab_sizes;
     std::vector<std::uint32_t> target_layers;
     std::uint32_t draft_block_size=0;
     // Per-layer SwiGLU clamp bounds, routed experts and shared expert.

@@ -75,13 +75,26 @@ struct QwenDecodeWorkspaceLayout {
     Region sampling_sort_values_b;
     Region argmax_device;
     Region attention_scores;
+    // qwen4exp gated residual. Zero-sized on every other architecture.
+    // `streams` is the residual state itself (hc_count x hidden, alive across
+    // the whole token); the rest is boundary scratch. `hc_gates` holds the raw
+    // inject logits between hc_pre and the post-block inject. `ple_embed` is
+    // the uploaded n-gram gather for the current token.
+    Region streams;
+    Region hc_normed;
+    Region hc_wide;
+    Region hc_low;
+    Region hc_gates;
+    Region ple_embed;
     std::uint64_t bytes = 0;
 };
 
 constexpr QwenDecodeWorkspaceLayout qwen_decode(
     std::uint64_t hidden, std::uint64_t scratch, std::uint64_t top_k,
     std::uint64_t intermediate, std::uint64_t experts, std::uint64_t vocabulary,
-    std::uint64_t attention_heads, std::uint64_t context
+    std::uint64_t attention_heads, std::uint64_t context,
+    std::uint64_t hc_count = 0, std::uint64_t hc_low_rank = 0,
+    bool ple = false
 ) {
     Builder builder;
     QwenDecodeWorkspaceLayout layout;
@@ -115,6 +128,12 @@ constexpr QwenDecodeWorkspaceLayout qwen_decode(
     layout.argmax_device = builder.add(sizeof(std::uint64_t));
     layout.attention_scores =
         builder.add(attention_heads * context * sizeof(float));
+    layout.streams = builder.add(hc_count * hidden * sizeof(float));
+    layout.hc_normed = builder.add(hc_count * hidden * sizeof(float));
+    layout.hc_wide = builder.add(hc_count * hidden * sizeof(float));
+    layout.hc_low = builder.add(hc_low_rank * sizeof(float));
+    layout.hc_gates = builder.add(hc_count * sizeof(float));
+    layout.ple_embed = builder.add((ple ? hidden : 0) * sizeof(float));
     layout.bytes = builder.bytes();
     return layout;
 }
@@ -156,6 +175,16 @@ struct QwenRowsWorkspaceLayout {
     // Preserves the target hidden row preceding a chunk plus every output row
     // while the MTP cache builder reuses the rest of the workspace.
     Region mtp_prompt_hidden;
+    // qwen4exp gated residual, rows form; zero-sized on every other arch.
+    // `streams` carries the whole chunk's residual state; the rest is
+    // boundary scratch, also rows-wide because every row's boundary runs in
+    // one batched launch.
+    Region streams;
+    Region hc_normed;
+    Region hc_wide;
+    Region hc_low;
+    Region hc_gates;
+    Region ple_embed;
     std::uint64_t bytes = 0;
 };
 
@@ -175,7 +204,9 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     std::uint64_t rows, std::uint64_t hidden, std::uint64_t scratch,
     std::uint64_t top_k, std::uint64_t intermediate, std::uint64_t experts,
     std::uint64_t attention_heads, std::uint64_t context,
-    std::uint64_t delta_value_heads, bool mtp = false
+    std::uint64_t delta_value_heads, bool mtp = false,
+    std::uint64_t hc_count = 0, std::uint64_t hc_low_rank = 0,
+    bool ple = false
 ) {
     Builder builder;
     QwenRowsWorkspaceLayout layout;
@@ -234,6 +265,12 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     }
     layout.mtp_prompt_hidden =
         builder.add((mtp ? rows + 1 : 0) * hidden * sizeof(float));
+    layout.streams = builder.add(rows * hc_count * hidden * sizeof(float));
+    layout.hc_normed = builder.add(rows * hc_count * hidden * sizeof(float));
+    layout.hc_wide = builder.add(rows * hc_count * hidden * sizeof(float));
+    layout.hc_low = builder.add(rows * hc_low_rank * sizeof(float));
+    layout.hc_gates = builder.add(rows * hc_count * sizeof(float));
+    layout.ple_embed = builder.add((ple ? rows * hidden : 0) * sizeof(float));
     layout.bytes = builder.bytes();
     return layout;
 }

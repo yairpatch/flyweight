@@ -15,8 +15,10 @@
 //
 //   - IQ4_XS (23) has a Q8-activation warp matvec, a tiled kernel and an MMQ
 //     kernel, but the rows forward's admission gate never listed it, so its
-//     chunked prefill still runs the reconstruct-in-float rows matmul at 4
-//     rows per block. `rows_q8_gate` records that exclusion explicitly.
+//     chunked prefill ran the reconstruct-in-float rows matmul at 4 rows per
+//     block -- a full weight read per 4-row group where MMQ covers 128 tokens.
+//     Admitted 2026-08-26 after measuring on the 27B dense checkpoint, whose
+//     16 attn_v projections (and the whole MTP draft layer) carry this type.
 //   - IQ1_M (29) is absent from the CPU expert set even though the CPU dot
 //     decodes IQ1_S; `cpu_expert` records it.
 //
@@ -156,7 +158,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax_q8 = "iq2xxs_q8_lm_head_argmax_warp",
      .embedding = "qwen_iq2xxs_embedding",
      .embedding_rows = "qwen_iq2xxs_embedding_rows",
-     .cpu_expert = true},
+     .iq_expert_prefix = "iq2xxs", .cpu_expert = true},
     {.type = 17, .family = "iq2xs",
      .matvec_q8_warp = "iq2xs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq2xs_q8_matvec_transposed_rows",
@@ -184,7 +186,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_q8_tiled = "iq1s_q8_matmul_tiled", .matmul_q8_mmq = "iq1s_q8_mmq",
      .matmul_rows = "iq1s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     .cpu_expert = true},
+     .iq_expert_prefix = "iq1s", .cpu_expert = true},
     {.type = 21, .family = "iq3s",
      .matmul_rows = "iq3s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
@@ -203,9 +205,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .embedding_rows = "qwen_iq2s_embedding_rows",
      .cpu_expert = true},
     {.type = 23, .family = "iq4xs",
-     .matvec_q8_warp = "iq4xs_q8_matvec_transposed_warp",
-     // Excluded from the rows-forward Q8 block today; see the file comment.
-     .rows_q8_gate = false,
+     .matvec_q8_warp = "iq4xs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq4xs_q8_matvec_transposed_rows",
      .matmul_q8_tiled = "iq4xs_q8_matmul_tiled", .matmul_q8_mmq = "iq4xs_q8_mmq",
      .matmul_rows = "iq4xs_matmul_rows",
@@ -214,6 +214,12 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .embedding = "qwen_iq4xs_embedding",
      .embedding_rows = "qwen_iq4xs_embedding_rows",
      .iq_expert_prefix = "iq4xs", .cpu_expert = true},
+    // IQ4_NL: IQ4_XS's non-superblock sibling (18B per 32 values, same
+    // codebook, no sub-block scales). qwen4exp carries its ffn_down_exps and
+    // the PLE n-gram table in it; the table is host row-gathered, the experts
+    // run on the CPU dots or the grouped device kernels below.
+    {.type = 20, .family = "iq4nl",
+     .iq_expert_prefix = "iq4nl", .cpu_expert = true},
     {.type = 29, .family = "iq1m",
      .matvec_q8_warp = "iq1m_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq1m_q8_matvec_transposed_rows",

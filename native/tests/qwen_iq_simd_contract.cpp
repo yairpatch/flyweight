@@ -89,14 +89,15 @@ void expect_close(const char* label, float actual, float expected, float scale) 
 }
 
 void check(const char* label, std::uint32_t type, std::uint32_t block_bytes,
-           float (*scalar)(const std::uint8_t*, const float*, int, std::uint64_t)) {
+           float (*scalar)(const std::uint8_t*, const float*, int, std::uint64_t),
+           int block_elements = 256) {
     constexpr int kElements = 3072;   // one real expert row width
     constexpr int kRows = 6;
     std::mt19937 generator(1234u + type);
     std::uniform_int_distribution<int> byte(0, 255);
     std::normal_distribution<float> activation(0.0f, 1.0f);
 
-    const std::size_t blocks = kElements / 256;
+    const std::size_t blocks = kElements / block_elements;
     std::vector<std::uint8_t> packed(blocks * block_bytes * kRows);
     for (auto& value : packed) value = static_cast<std::uint8_t>(byte(generator));
     // Random bytes in the block scale would be an arbitrary fp16, including the
@@ -166,6 +167,42 @@ int main() {
     check("iq3xxs", 18, kIq3xxsBlockBytes, qwen_iq3xxs_dot_row);
     check("iq2s", 22, kIq2sBlockBytes, qwen_iq2s_dot_row);
     check("iq4xs", 23, kIq4xsBlockBytes, qwen_iq4xs_dot_row);
+    check("iq1s", 19, kIq1sBlockBytes, qwen_iq1s_dot_row);
+    // The vectorized row decoders feed the chunked-prefill GEMM; pin them
+    // element-for-element against the scalar value decoders.
+    {
+        std::mt19937 generator(4321u);
+        std::uniform_int_distribution<int> byte(0, 255);
+        auto dequant_check = [&](const char* label, std::uint32_t type,
+                                 std::uint32_t block_bytes, int block_elements,
+                                 float (*scalar)(const std::uint8_t*, std::uint64_t)) {
+            const int elements = type == 20 ? 640 : 2560;
+            std::vector<std::uint8_t> packed(
+                static_cast<std::size_t>(elements / block_elements) * block_bytes);
+            for (auto& value : packed)
+                value = static_cast<std::uint8_t>(byte(generator));
+            const std::uint16_t block_scale = 0x2E66;
+            for (std::size_t block = 0; block * block_bytes < packed.size(); ++block)
+                std::memcpy(packed.data() + block * block_bytes, &block_scale, 2);
+            std::vector<float> decoded(elements, 0.0f);
+            qwen_dequant_row_avx2(packed.data(), type, elements, 0, decoded.data());
+            for (int i = 0; i < elements; ++i) {
+                const float expected = scalar(packed.data(), i);
+                if (std::fabs(decoded[i] - expected) >
+                    1e-5f * std::max(1.0f, std::fabs(expected))) {
+                    std::fprintf(stderr, "%s dequant[%d]: %.9g vs %.9g\n",
+                                 label, i, decoded[i], expected);
+                    ++failures;
+                    break;
+                }
+            }
+        };
+        dequant_check("iq1s", 19, kIq1sBlockBytes, 256, qwen_iq1s_value);
+        dequant_check("iq4nl", 20, kIq4nlBlockBytes, 32, qwen_iq4nl_value);
+    }
+    // 32-element native blocks, and 640-wide rows in the wild: the
+    // admission gates on %32, so the contract runs the same width.
+    check("iq4nl", 20, kIq4nlBlockBytes, qwen_iq4nl_dot_row, 32);
     if (failures) {
         std::fprintf(stderr, "%d IQ SIMD mismatches\n", failures);
         return 1;

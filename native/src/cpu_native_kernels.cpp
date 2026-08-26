@@ -702,6 +702,7 @@ void qwen_delta_recurrent_split(const Launch&, void** arguments) {
     const int value_heads = *reinterpret_cast<const int*>(arguments[10]);
     const int head_dim = *reinterpret_cast<const int*>(arguments[11]);
     const float epsilon = *reinterpret_cast<const float*>(arguments[12]);
+    const int gate_sigmoid = *reinterpret_cast<const int*>(arguments[13]);
 
     const int total_key_dim = key_heads * head_dim;
 
@@ -791,8 +792,9 @@ void qwen_delta_recurrent_split(const Launch&, void** arguments) {
             const int output_index = head * head_dim + dim;
             const float gate = gates[output_index];
             const float clamped = std::fmin(80.0f, std::fmax(-80.0f, gate));
+            const float logistic = 1.0f / (1.0f + std::exp(-clamped));
             output[output_index] = core[dim] * inverse_rms * norm_weights[dim] *
-                                   gate / (1.0f + std::exp(-clamped));
+                                   (gate_sigmoid ? logistic : gate * logistic);
         }
     });
 }
@@ -847,6 +849,7 @@ void qwen_delta_recurrent_chunk(const Launch&, void** arguments) {
     const int value_heads = *reinterpret_cast<const int*>(arguments[11]);
     const int head_dim = *reinterpret_cast<const int*>(arguments[12]);
     const float epsilon = *reinterpret_cast<const float*>(arguments[13]);
+    const int gate_sigmoid = *reinterpret_cast<const int*>(arguments[14]);
 
     // Matches the corpus guard exactly: anything else is a silent no-op there.
     if (head_dim != 128) return;
@@ -960,7 +963,8 @@ void qwen_delta_recurrent_chunk(const Launch&, void** arguments) {
                 const float gate = gates[output_base + lane];
                 const float clamped = std::fmin(80.0f, std::fmax(-80.0f, gate));
                 output[output_base + lane] = core[lane] * inverse_rms *
-                                             norm_weights[lane] * gate /
+                                             norm_weights[lane] *
+                                             (gate_sigmoid ? 1.0f : gate) /
                                              (1.0f + std::exp(-clamped));
             }
         }

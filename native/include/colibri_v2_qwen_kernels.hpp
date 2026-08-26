@@ -5671,6 +5671,73 @@ __device__ __forceinline__ void iq3xxs_octet(
     }
 }
 
+// IQ2_XXS: 66-byte super-blocks of 256; each octet is one grid pattern of
+// unsigned magnitudes with a 7-bit sign selector, scaled by the group's
+// 4-bit scale. The unsloth dynamic quants mix this into IQ1_S expert sets on
+// their sensitive layers, so the grouped path has to speak it too.
+__device__ __forceinline__ void iq2xxs_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 66;
+    const float d = __half2float(*((const __half*)base));
+    const int group = octet >> 2;
+    const int quad = octet & 3;
+    unsigned int low, high;
+    memcpy(&low, base + 2 + group * 8, 4);
+    memcpy(&high, base + 2 + group * 8 + 4, 4);
+    const float scale = d * (0.5f + (float)(high >> 28)) * 0.25f;
+    const unsigned char signs = kIq2xxsSigns[(high >> (7 * quad)) & 127];
+    const unsigned long long pattern = kIq2xxsGrid[(low >> (8 * quad)) & 255];
+    for (int k = 0; k < 8; ++k) {
+        const float value = scale *
+            (float)((unsigned char)((pattern >> (8 * k)) & 0xffULL));
+        out[k] = ((signs >> k) & 1) ? -value : value;
+    }
+}
+
+// IQ4_NL: 18-byte blocks of 32 (d + 16 nibble bytes), no super-block. The
+// grouped macro indexes octets in 256-element terms, so the 32-block and the
+// nibble half are re-derived from the absolute octet here. Rows only need to
+// be a multiple of 32 -- qwen4exp's 640-wide expert down rows included.
+__device__ __forceinline__ void iq4nl_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const int absolute_octet = block * 32 + octet;
+    const unsigned char* base = packed + (absolute_octet >> 2) * 18;
+    const float d = __half2float(*((const __half*)base));
+    const int part = absolute_octet & 3;
+    const unsigned char* quants = base + 2 + (part & 1) * 8;
+    const int high = part >> 1;
+    for (int k = 0; k < 8; ++k) {
+        const unsigned char byte = quants[k];
+        out[k] = d * (float)kIq4nlValues[high ? (byte >> 4) : (byte & 15)];
+    }
+}
+
+// IQ1_S: 50-byte super-blocks of 256; each 32-value group carries a 3-bit odd
+// scale and a signed +-0.125 delta, each octet is one 2048-entry grid entry
+// indexed by 8 bits from qs and 3 from the group halfword.
+__device__ __forceinline__ void iq1s_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 50;
+    const float d = __half2float(*((const __half*)base));
+    const int group = octet >> 2;
+    const int part = octet & 3;
+    unsigned short qh;
+    memcpy(&qh, base + 34 + group * 2, 2);
+    const float scale = d * (float)(2 * ((qh >> 12) & 7) + 1);
+    const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    const unsigned int index =
+        (unsigned int)base[2 + group * 4 + part] |
+        (((unsigned int)(qh >> (3 * part)) & 7u) << 8);
+    const unsigned long long entry = kIq1sGrid[index];
+    for (int k = 0; k < 8; ++k) {
+        out[k] = scale *
+            ((float)(signed char)((entry >> (8 * k)) & 0xffULL) + delta);
+    }
+}
+
 __device__ __forceinline__ void iq4xs_octet(
     const unsigned char* packed, int block, int octet, float* out
 ) {
@@ -5822,6 +5889,9 @@ void prefix##_grouped_accumulate_rows(                                          
 COLIBRI_IQ_GROUPED(iq2xs, iq2xs_octet)
 COLIBRI_IQ_GROUPED(iq3xxs, iq3xxs_octet)
 COLIBRI_IQ_GROUPED(iq4xs, iq4xs_octet)
+COLIBRI_IQ_GROUPED(iq1s, iq1s_octet)
+COLIBRI_IQ_GROUPED(iq4nl, iq4nl_octet)
+COLIBRI_IQ_GROUPED(iq2xxs, iq2xxs_octet)
 
 #undef COLIBRI_IQ_GROUPED
 
@@ -9706,5 +9776,293 @@ extern "C" __global__ void name( \
 ) { kv_append_impl<KT, VT>(current_keys, current_values, cache_keys, cache_values, kv_heads, head_dim, position, capacity); }
 KV_APPEND(kv_append, float, float) // combined f32 append, used only by the MTP path
 #undef KV_APPEND
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// ---- qwen4exp gated residual + PLE ----------------------------------------
+// Semantics: plans/qwen4exp-semantics.md, pinned by
+// native/tools/qwen4exp_reference_check.py. The heavy lifting (down/up/inject
+// projections, ple key/value projections) runs through the ordinary dense
+// matvec kernels; these cover only the elementwise/reduction glue.
+
+// Stream init: the token embedding repeated hc times.
+extern "C" __global__
+void qwen4_hc_init(
+    const float* hidden, float* streams, const int hc, const int hidden_size
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= hc * hidden_size) return;
+    streams[index] = hidden[index % hidden_size];
+}
+
+// Grouped RMS norm: each group_size chunk normalized independently, one block
+// per group, weight spanning the full width (baked (1+w) form).
+extern "C" __global__
+void qwen4_group_rms(
+    const float* input, const float* weights, float* output,
+    const int group_size, const float epsilon
+) {
+    const int group = blockIdx.x;
+    const float* in = input + (long long)group * group_size;
+    float* out = output + (long long)group * group_size;
+    const float* w = weights + (long long)group * group_size;
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        partial += in[i] * in[i];
+    }
+    partial = block_reduce_sum(partial);
+    __shared__ float scale;
+    if (threadIdx.x == 0)
+        scale = rsqrtf(partial / (float)group_size + epsilon);
+    __syncthreads();
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x) {
+        out[i] = in[i] * scale * w[i];
+    }
+}
+
+// silu(x / divisor) in place; the low-rank mixer's activation.
+extern "C" __global__
+void qwen4_silu_scale(float* values, const int count, const float divisor) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const float x = values[index] / divisor;
+    values[index] = x / (1.0f + expf(-x));
+}
+
+// block_input = mean over streams of sigmoid(up_out) * normed.
+extern "C" __global__
+void qwen4_hc_mix(
+    const float* normed, const float* up_out, float* block_input,
+    const int hc, const int hidden_size
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden_size) return;
+    float total = 0.0f;
+    for (int s = 0; s < hc; ++s) {
+        const long long at = (long long)s * hidden_size + i;
+        const float gate = 1.0f / (1.0f + expf(-up_out[at]));
+        total += gate * normed[at];
+    }
+    block_input[i] = total / (float)hc;
+}
+
+// streams += 2*sigmoid(inject_raw/hc)[stream] * block_output. The residual
+// base is the pre-norm streams, which is exactly what `streams` still holds.
+extern "C" __global__
+void qwen4_hc_inject(
+    float* streams, const float* block_output, const float* inject_raw,
+    const int hc, const int hidden_size
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= hc * hidden_size) return;
+    const int s = index / hidden_size;
+    const float w =
+        2.0f / (1.0f + expf(-inject_raw[s] / (float)hc));
+    streams[index] += w * block_output[index % hidden_size];
+}
+
+// Per-stream gate: signed sqrt of the key.query dot over sqrt(hidden).
+// Stores the raw gate; the consumer applies the sigmoid.
+extern "C" __global__
+void qwen4_ple_gate(
+    const float* key_normed, const float* query_normed, float* gates,
+    const int hidden_size
+) {
+    const int s = blockIdx.x;
+    const float* k = key_normed + (long long)s * hidden_size;
+    const float* q = query_normed + (long long)s * hidden_size;
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x)
+        partial += k[i] * q[i];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) {
+        float g = partial / sqrtf((float)hidden_size);
+        const float magnitude = sqrtf(fmaxf(fabsf(g), 1e-6f));
+        gates[s] = g < 0.0f ? -magnitude : magnitude;
+    }
+}
+
+// gated value: out[s][i] = sigmoid(gates[s]) * value[i].
+extern "C" __global__
+void qwen4_ple_gv(
+    const float* value, const float* gates, float* out,
+    const int hc, const int hidden_size
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= hc * hidden_size) return;
+    const float gate = 1.0f / (1.0f + expf(-gates[index / hidden_size]));
+    out[index] = gate * value[index % hidden_size];
+}
+
+// Dilated depthwise causal conv, single-token step. State is channel-major
+// [(kernel-1)*dilation] per channel, oldest first; the newest column is the
+// current input, which also shifts in. Output = silu(conv).
+extern "C" __global__
+void qwen4_ple_conv_step(
+    const float* input, const float* weights, float* state, float* output,
+    const int channels, const int kernel_size, const int dilation
+) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const int len = (kernel_size - 1) * dilation;
+    float* channel_state = state + (long long)channel * len;
+    const float* channel_weights = weights + (long long)channel * kernel_size;
+    const float current = input[channel];
+    float value = channel_weights[kernel_size - 1] * current;
+    for (int tap = 0; tap + 1 < kernel_size; ++tap) {
+        // Tap `tap` reads (kernel-1-tap)*dilation steps back; newest state
+        // column is time -1 at index len-1.
+        value += channel_weights[tap] *
+            channel_state[len - (kernel_size - 1 - tap) * dilation];
+    }
+    for (int index = 0; index + 1 < len; ++index)
+        channel_state[index] = channel_state[index + 1];
+    channel_state[len - 1] = current;
+    output[channel] = value / (1.0f + expf(-value));
+}
+
+// streams += gv + conv_out (the PLE delta, added in stream space). Pure
+// elementwise, so the rows path reuses it with count = rows * wide.
+extern "C" __global__
+void qwen4_ple_add(
+    float* streams, const float* gv, const float* conv_out, const int wide
+) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= wide) return;
+    streams[index] += gv[index] + conv_out[index];
+}
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// ---- qwen4exp gated residual + PLE, rows (batched prefill) forms ----------
+// Same math as the single-token kernels above with blockIdx.y as the row.
+// qwen4_silu_scale and qwen4_ple_add serve both paths (elementwise).
+
+extern "C" __global__
+void qwen4_hc_init_rows(
+    const float* hidden, float* streams, const int hc, const int hidden_size
+) {
+    const long long row = blockIdx.y;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= hc * hidden_size) return;
+    streams[row * hc * hidden_size + index] =
+        hidden[row * hidden_size + index % hidden_size];
+}
+
+extern "C" __global__
+void qwen4_group_rms_rows(
+    const float* input, const float* weights, float* output,
+    const int groups, const int group_size, const float epsilon
+) {
+    const long long row = blockIdx.y;
+    const int group = blockIdx.x;
+    const long long at = (row * groups + group) * group_size;
+    const float* in = input + at;
+    float* out = output + at;
+    const float* w = weights + (long long)group * group_size;
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x)
+        partial += in[i] * in[i];
+    partial = block_reduce_sum(partial);
+    __shared__ float scale;
+    if (threadIdx.x == 0)
+        scale = rsqrtf(partial / (float)group_size + epsilon);
+    __syncthreads();
+    for (int i = threadIdx.x; i < group_size; i += blockDim.x)
+        out[i] = in[i] * scale * w[i];
+}
+
+extern "C" __global__
+void qwen4_hc_mix_rows(
+    const float* normed, const float* up_out, float* block_input,
+    const int hc, const int hidden_size
+) {
+    const long long row = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden_size) return;
+    const long long wide = (long long)hc * hidden_size;
+    float total = 0.0f;
+    for (int s = 0; s < hc; ++s) {
+        const long long at = row * wide + (long long)s * hidden_size + i;
+        const float gate = 1.0f / (1.0f + expf(-up_out[at]));
+        total += gate * normed[at];
+    }
+    block_input[row * hidden_size + i] = total / (float)hc;
+}
+
+extern "C" __global__
+void qwen4_hc_inject_rows(
+    float* streams, const float* block_output, const float* inject_raw,
+    const int hc, const int hidden_size
+) {
+    const long long row = blockIdx.y;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= hc * hidden_size) return;
+    const int s = index / hidden_size;
+    const float w = 2.0f /
+        (1.0f + expf(-inject_raw[row * hc + s] / (float)hc));
+    streams[row * (long long)hc * hidden_size + index] +=
+        w * block_output[row * hidden_size + index % hidden_size];
+}
+
+extern "C" __global__
+void qwen4_ple_gate_rows(
+    const float* key_normed, const float* query_normed, float* gates,
+    const int hc, const int hidden_size
+) {
+    const long long row = blockIdx.y;
+    const int s = blockIdx.x;
+    const long long at = (row * hc + s) * (long long)hidden_size;
+    const float* k = key_normed + at;
+    const float* q = query_normed + at;
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x)
+        partial += k[i] * q[i];
+    partial = block_reduce_sum(partial);
+    if (threadIdx.x == 0) {
+        float g = partial / sqrtf((float)hidden_size);
+        const float magnitude = sqrtf(fmaxf(fabsf(g), 1e-6f));
+        gates[row * hc + s] = g < 0.0f ? -magnitude : magnitude;
+    }
+}
+
+extern "C" __global__
+void qwen4_ple_gv_rows(
+    const float* value, const float* gates, float* out,
+    const int hc, const int hidden_size
+) {
+    const long long row = blockIdx.y;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= hc * hidden_size) return;
+    const float gate = 1.0f /
+        (1.0f + expf(-gates[row * hc + index / hidden_size]));
+    out[row * (long long)hc * hidden_size + index] =
+        gate * value[row * hidden_size + index % hidden_size];
+}
+
+// Dilated depthwise causal conv over a whole chunk, sequential in time per
+// channel (like delta_conv_sequence), state carried across chunks.
+extern "C" __global__
+void qwen4_ple_conv_sequence(
+    const float* input, const float* weights, float* state, float* output,
+    const int tokens, const int channels, const int kernel_size,
+    const int dilation
+) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const int len = (kernel_size - 1) * dilation;
+    float* channel_state = state + (long long)channel * len;
+    const float* channel_weights = weights + (long long)channel * kernel_size;
+    for (int token = 0; token < tokens; ++token) {
+        const float current = input[(long long)token * channels + channel];
+        float value = channel_weights[kernel_size - 1] * current;
+        for (int tap = 0; tap + 1 < kernel_size; ++tap)
+            value += channel_weights[tap] *
+                channel_state[len - (kernel_size - 1 - tap) * dilation];
+        for (int index = 0; index + 1 < len; ++index)
+            channel_state[index] = channel_state[index + 1];
+        channel_state[len - 1] = current;
+        output[(long long)token * channels + channel] =
+            value / (1.0f + expf(-value));
+    }
+}
 )COLIBRI_CUDA";
 }

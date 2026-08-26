@@ -289,8 +289,8 @@ void qwen_forward_rows(
         // Q8_0-dense checkpoint, whose type-8 path is already a 32x32 tile.
         const bool batched_kernel=rows>kQ8RowBatch&&
             ((mmq_kernel&&runtime.int8_tensor_cores)||tiled_kernel);
-        // rows_q8_gate, not matvec_q8_warp alone: IQ4_XS has the warp kernel
-        // but has never been admitted here (see the format table's drift note).
+        // rows_q8_gate, not matvec_q8_warp alone: the table records which
+        // formats this block has been measured on (see its drift note).
         if((experts>0?(rows<=8||batched_kernel):true)&&(input_size&255)==0&&
            format&&format->rows_q8_gate)
             q8_kernel=format->matvec_q8_warp;
@@ -460,6 +460,121 @@ void qwen_forward_rows(
                      const_cast<float*>(&post_norm_epsilon),&one_centered};
         launch("rms_norm_rows",rows,1,256,args);
     };
+    // qwen4exp gated-residual bookends, rows form. Same seam as the decode
+    // path: hc_pre_rows replaces the pre-block rms (streams -> `normalized`,
+    // raw inject logits parked per row), hc_post_rows replaces the residual
+    // add. The buffers slice by span_begin exactly like hidden/residual do,
+    // so the two-half pipeline addresses its own rows.
+    const int hc_count=static_cast<int>(runtime.model->config.hyper_connection_count);
+    const int hc_low_rank=static_cast<int>(runtime.model->config.hyper_connection_low_rank);
+    const std::uint64_t hc_wide_size=static_cast<std::uint64_t>(hc_count)*hidden_size;
+    const auto hc_streams_base=workspace_layout.streams.address(runtime.workspace);
+    const auto hc_normed_base=workspace_layout.hc_normed.address(runtime.workspace);
+    const auto hc_wide_base=workspace_layout.hc_wide.address(runtime.workspace);
+    const auto hc_low_base=workspace_layout.hc_low.address(runtime.workspace);
+    const auto hc_gates_base=workspace_layout.hc_gates.address(runtime.workspace);
+    const auto ple_embed_base=workspace_layout.ple_embed.address(runtime.workspace);
+    auto hc_slice=[&](std::uint64_t base,std::uint64_t per_row){
+        return base+static_cast<std::uint64_t>(span_begin)*per_row*sizeof(float);
+    };
+    auto hc_pre_rows=[&](std::uint64_t norm_weights,std::uint64_t down_index,
+                         std::uint64_t up_index,std::uint64_t inject_index){
+        const auto streams=hc_slice(hc_streams_base,hc_wide_size);
+        const auto normed=hc_slice(hc_normed_base,hc_wide_size);
+        const auto wide=hc_slice(hc_wide_base,hc_wide_size);
+        const auto low=hc_slice(hc_low_base,hc_low_rank);
+        const auto gates_raw=hc_slice(hc_gates_base,hc_count);
+        void*norm_args[]={const_cast<std::uint64_t*>(&streams),&norm_weights,
+            const_cast<std::uint64_t*>(&normed),const_cast<int*>(&hc_count),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch("qwen4_group_rms_rows",hc_count,rows,256,norm_args);
+        dense_rows(down_index,normed,low,
+                   static_cast<int>(hc_wide_size),hc_low_rank);
+        float divisor=static_cast<float>(hc_count);
+        int silu_count=rows*hc_low_rank;
+        void*silu_args[]={const_cast<std::uint64_t*>(&low),&silu_count,&divisor};
+        launch("qwen4_silu_scale",
+               (static_cast<std::uint32_t>(silu_count)+255)/256,1,256,silu_args);
+        dense_rows(up_index,low,wide,hc_low_rank,
+                   static_cast<int>(hc_wide_size));
+        if(inject_index!=std::numeric_limits<std::uint64_t>::max())
+            dense_rows(inject_index,normed,gates_raw,
+                       static_cast<int>(hc_wide_size),hc_count);
+        void*mix_args[]={const_cast<std::uint64_t*>(&normed),
+            const_cast<std::uint64_t*>(&wide),
+            const_cast<std::uint64_t*>(&normalized),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch("qwen4_hc_mix_rows",
+               (static_cast<std::uint32_t>(hidden_size)+255)/256,rows,256,mix_args);
+        q8_cached_input=0;q8_cached_width=0;
+    };
+    auto hc_post_rows=[&](std::uint64_t block_output){
+        const auto streams=hc_slice(hc_streams_base,hc_wide_size);
+        const auto gates_raw=hc_slice(hc_gates_base,hc_count);
+        void*inject_args[]={const_cast<std::uint64_t*>(&streams),
+            const_cast<std::uint64_t*>(&block_output),
+            const_cast<std::uint64_t*>(&gates_raw),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch("qwen4_hc_inject_rows",
+               (static_cast<std::uint32_t>(hc_wide_size)+255)/256,rows,256,
+               inject_args);
+    };
+    auto ple_rows=[&](const QwenLayerPlan&layer){
+        const auto streams=hc_slice(hc_streams_base,hc_wide_size);
+        const auto normed=hc_slice(hc_normed_base,hc_wide_size);
+        const auto wide=hc_slice(hc_wide_base,hc_wide_size);
+        const auto embed=hc_slice(ple_embed_base,hidden_size);
+        const auto gates_raw=hc_slice(hc_gates_base,hc_count);
+        dense_rows(layer.ple_key,embed,wide,hidden_size,
+                   static_cast<int>(hc_wide_size));
+        auto norm_key=runtime.device_tensors[layer.ple_norm_key];
+        void*key_args[]={const_cast<std::uint64_t*>(&wide),&norm_key,
+            const_cast<std::uint64_t*>(&wide),const_cast<int*>(&hc_count),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch("qwen4_group_rms_rows",hc_count,rows,256,key_args);
+        auto norm_query=runtime.device_tensors[layer.ple_norm_query];
+        void*query_args[]={const_cast<std::uint64_t*>(&streams),&norm_query,
+            const_cast<std::uint64_t*>(&normed),const_cast<int*>(&hc_count),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch("qwen4_group_rms_rows",hc_count,rows,256,query_args);
+        void*gate_args[]={const_cast<std::uint64_t*>(&wide),
+            const_cast<std::uint64_t*>(&normed),
+            const_cast<std::uint64_t*>(&gates_raw),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch("qwen4_ple_gate_rows",hc_count,rows,256,gate_args);
+        // value borrows `normalized`; hc_pre_rows rewrites it right after.
+        dense_rows(layer.ple_value,embed,normalized,hidden_size,hidden_size);
+        void*gv_args[]={const_cast<std::uint64_t*>(&normalized),
+            const_cast<std::uint64_t*>(&gates_raw),
+            const_cast<std::uint64_t*>(&wide),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch("qwen4_ple_gv_rows",
+               (static_cast<std::uint32_t>(hc_wide_size)+255)/256,rows,256,gv_args);
+        auto norm_conv=runtime.device_tensors[layer.ple_norm_conv];
+        void*gvn_args[]={const_cast<std::uint64_t*>(&wide),&norm_conv,
+            const_cast<std::uint64_t*>(&normed),const_cast<int*>(&hc_count),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch("qwen4_group_rms_rows",hc_count,rows,256,gvn_args);
+        const auto&conv=runtime.model->tensors[layer.ple_conv];
+        int kernel_size=static_cast<int>(conv.shape[0]);
+        int dilation=static_cast<int>(std::max<std::uint32_t>(
+            runtime.model->config.ple_ngram_size,1));
+        int channels=static_cast<int>(hc_wide_size);
+        auto conv_weights=runtime.device_tensors[layer.ple_conv];
+        std::uint64_t conv_state=runtime.state+layer.state_third;
+        void*conv_args[]={const_cast<std::uint64_t*>(&normed),&conv_weights,
+            &conv_state,const_cast<std::uint64_t*>(&normed),&rows,&channels,
+            &kernel_size,&dilation};
+        launch("qwen4_ple_conv_sequence",
+               (static_cast<std::uint32_t>(channels)+255)/256,1,256,conv_args);
+        int add_count=rows*static_cast<int>(hc_wide_size);
+        void*add_args[]={const_cast<std::uint64_t*>(&streams),
+            const_cast<std::uint64_t*>(&wide),
+            const_cast<std::uint64_t*>(&normed),&add_count};
+        launch("qwen4_ple_add",
+               (static_cast<std::uint32_t>(add_count)+255)/256,1,256,add_args);
+        q8_cached_input=0;q8_cached_width=0;
+    };
     if(colibri_gpu_upload(token_device,input_tokens,rows*sizeof(std::uint32_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows token upload failed");
     const auto embedding=qwen_stage_embedding_rows(runtime,input_tokens,rows);
     // Staged rows arrive in chunk order, so they are gathered by the identity
@@ -468,6 +583,19 @@ void qwen_forward_rows(
         ?runtime.embedding_row_index:token_device;
     void*embedding_args[]={const_cast<std::uint64_t*>(&embedding),const_cast<std::uint64_t*>(&embedding_index),&hidden,&rows,const_cast<int*>(&hidden_size)};
     launch(qwen_embedding_kernel(qwen_device_type(runtime,runtime.token_embeddings),true),(hidden_size+255)/256,rows,256,embedding_args);
+    if(runtime.qwen4exp){
+        // Streams init for the whole batch, and the chunk's n-gram gathers
+        // staged up front so the PLE layer finds them uploaded.
+        void*init_args[]={const_cast<std::uint64_t*>(&hidden),
+            const_cast<std::uint64_t*>(&hc_streams_base),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch("qwen4_hc_init_rows",
+               (static_cast<std::uint32_t>(hc_wide_size)+255)/256,rows,256,
+               init_args);
+        if(runtime.ple_table!=std::numeric_limits<std::uint64_t>::max()&&
+           !runtime.model->config.ple_layers.empty())
+            qwen4_stage_ple_embed_rows(runtime,input_tokens,rows,ple_embed_base);
+    }
     // Muse Glimmer RMS-normalizes the raw embedding, with no learned weight,
     // before the first block. The decode path does the same; a row batch that
     // skipped it would disagree with token-by-token prefill immediately.
@@ -620,7 +748,12 @@ void qwen_forward_rows(
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){dense_rows(layer.static_tensors.at(role),input,output,input_size,output_size,staged);};
         phase(layer_number,"pre");
-        rms_rows(hidden,tensor(0),normalized);
+        if(runtime.qwen4exp){
+            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max())
+                ple_rows(layer);
+            hc_pre_rows(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
+                        layer.hc_attn_inject);
+        }else rms_rows(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
         if(!layer.attention){
             int channels=static_cast<int>(runtime.model->tensors[layer.static_tensors[1]].shape[1]);
@@ -714,7 +847,8 @@ void qwen_forward_rows(
                         layer_number,rows,dump_dir);
                 }
             }
-            void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta_logits,const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
+            int gate_sigmoid=runtime.qwen4exp?1:0;
+            void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta_logits,const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon),&gate_sigmoid};
             // Chunked WY form: the same recurrence with the serial depth cut from
             // `rows` steps to rows/64 and the grid widened past `value_heads`.
             // Requires the workspace regions sized at prepare time, so the guard
@@ -770,7 +904,7 @@ void qwen_forward_rows(
                 void*gate_args[]={const_cast<std::uint64_t*>(&core),
                     const_cast<std::uint64_t*>(&second),&norm,
                     const_cast<std::uint64_t*>(&first),&value_heads,
-                    const_cast<float*>(&epsilon)};
+                    const_cast<float*>(&epsilon),&gate_sigmoid};
                 launch("qwen_delta_norm_gate",static_cast<std::uint32_t>(rows),
                     static_cast<std::uint32_t>(value_heads),
                     static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaDim),
@@ -779,7 +913,9 @@ void qwen_forward_rows(
             else launch("qwen_delta_recurrent_rows",value_heads,1,256,recurrent_args);
             phase(layer_number,"recurrent");
             dense(3,first,residual,value_dim,hidden_size);
-            add_rows(residual,hidden);moe_base=10;
+            if(runtime.qwen4exp)hc_post_rows(residual);
+            else add_rows(residual,hidden);
+            moe_base=10;
             phase(layer_number,"outproj");
         }else{
             // Laguna projects the query plainly and carries the attention gate
@@ -1029,11 +1165,16 @@ void qwen_forward_rows(
             // Muse Glimmer normalizes the attention output before the residual
             // join rather than adding it raw.
             if(muse)post_rms_rows(residual,tensor(8));
-            add_rows(residual,hidden);moe_base=qwen_ffn_base(runtime,layer);
+            if(runtime.qwen4exp)hc_post_rows(residual);
+            else add_rows(residual,hidden);
+            moe_base=qwen_ffn_base(runtime,layer);
         }
         if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill core profiling event failed");
-        rms_rows(residual,tensor(moe_base),normalized);
+        if(runtime.qwen4exp)
+            hc_pre_rows(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
+                        layer.hc_ffn_inject);
+        else rms_rows(residual,tensor(moe_base),normalized);
         phase(layer_number,"moerms");
         if(layer.dense_ffn){
             // Dense block over the whole row batch: one SwiGLU per token, no
@@ -1667,7 +1808,9 @@ void qwen_forward_rows(
         runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-span.pager_started).count();
         if(gpu_table_path){add_rows(fourth,first);add_rows(third,fourth);}
         else add_rows(third,first);
-        add_rows(residual,third);std::swap(span.hidden,span.residual);
+        if(runtime.qwen4exp)hc_post_rows(third);
+        else add_rows(residual,third);
+        std::swap(span.hidden,span.residual);
     };
     // The phase driver. Serial: one full-range span through core -> cpu ->
     // combine per layer, exactly the order the loop always ran. Pipelined:
@@ -1745,7 +1888,11 @@ void qwen_forward_rows(
     // ping-pong buffer the last layer left the span in.
     install_span(whole);
     if(output_tokens){
-        rms_rows(hidden,runtime.device_tensors[runtime.final_norm],normalized);
+        if(runtime.qwen4exp)
+            hc_pre_rows(runtime.device_tensors[runtime.output_hc_norm],
+                        runtime.output_hc_down,runtime.output_hc_up,
+                        std::numeric_limits<std::uint64_t>::max());
+        else rms_rows(hidden,runtime.device_tensors[runtime.final_norm],normalized);
         if(colibri_gpu_memset(winners,0,rows*sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward argmax reset failed");
         int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];
         if(runtime.lm_head_type==8||runtime.lm_head_type==30){

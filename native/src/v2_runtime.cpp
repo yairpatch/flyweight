@@ -237,6 +237,32 @@ struct QwenLayerPlan {
     // Laguna's router score-correction bias. Kept out of static_tensors so the
     // feed-forward slots line up with the Qwen layout the FFN code addresses.
     std::uint64_t router_bias = std::numeric_limits<std::uint64_t>::max();
+    // qwen4exp gated residual. Named fields rather than static_tensors slots
+    // for the same reason as router_bias: the positional layout must keep
+    // matching what qwen_ffn_base addresses. Slot 0 holds hc_attn_norm and the
+    // ffn-base slot holds hc_ffn_norm (they stand where attn_norm and
+    // post_attention_norm stand on qwen), so only the projections live here.
+    std::uint64_t hc_attn_down = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t hc_attn_up = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t hc_attn_inject = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t hc_ffn_down = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t hc_ffn_up = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t hc_ffn_inject = std::numeric_limits<std::uint64_t>::max();
+    // QSA indexer projections (full-attention layers). Loaded and resident from
+    // phase 1 so residency accounting is stable, exercised only once the
+    // sparse selection lands (plans/floating-dreaming-moore.md phase 3).
+    std::uint64_t indexer_q = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t indexer_k = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t indexer_q_norm = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t indexer_k_norm = std::numeric_limits<std::uint64_t>::max();
+    // qwen4exp PLE block (only on the layers ple.layers names): conv, key,
+    // value, and the three grouped norms.
+    std::uint64_t ple_conv = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t ple_key = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t ple_value = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t ple_norm_conv = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t ple_norm_key = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t ple_norm_query = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_gate_scale = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_up_scale = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_down_scale = std::numeric_limits<std::uint64_t>::max();
@@ -247,6 +273,10 @@ struct QwenLayerPlan {
     float shared_down_scale = 1.0f;
     std::uint64_t state_first = 0;
     std::uint64_t state_second = 0;
+    // qwen4exp PLE conv ring: (kernel-1)*dilation trailing columns of the
+    // hc-wide gated-value stream. Only meaningful when ple_conv is set; the
+    // block that owns it is a DeltaNet block, so first/second are taken.
+    std::uint64_t state_third = 0;
     std::uint64_t snapshot_first = 0;
     std::uint64_t snapshot_second = 0;
     // MTP fold retention (ReplaySSM): during verification the qkv projection
@@ -505,6 +535,20 @@ struct ColibriV2QwenRuntime {
     bool gemma4 = false;
     bool laguna = false;
     bool muse = false;
+    // qwen4exp (Qwen3.8-Flash-Next): gated-residual streams + PLE n-gram
+    // embeddings on the qwen plan shapes. The flag gates the hc_pre/hc_post
+    // bookends in the forward paths and, at bring-up, disables CUDA graphs
+    // (the delta capture bakes in the plain residual add).
+    bool qwen4exp = false;
+    // Head-collapse weights: the norm doubles as the model's final norm (the
+    // GGUF carries no output_norm.weight; the collapsed stream feeds the LM
+    // head directly).
+    std::uint64_t output_hc_norm = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t output_hc_down = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t output_hc_up = std::numeric_limits<std::uint64_t>::max();
+    // The 320M-row n-gram table. Host-resident always: a token reads 16 rows
+    // of 160 elements, so it is served from the mapping like host embeddings.
+    std::uint64_t ple_table = std::numeric_limits<std::uint64_t>::max();
     ColibriV2QwenRuntimeOptions options{};
     colibri::v2::ExpertExecutionMode expert_mode =
         colibri::v2::ExpertExecutionMode::streamed_gpu;
@@ -1904,6 +1948,29 @@ int parse(ColibriV2Model& m) {
         }
         return values;
     };
+    auto read_u64_array = [&](uint32_t type)->std::vector<std::uint64_t> {
+        // qwen4exp's PLE hash constants genuinely occupy the u64 range
+        // (multipliers approach 2^63/vocab), so they cannot go through
+        // read_uint_array's u32 clamp.
+        if(type!=9)throw std::runtime_error("GGUF architecture value is not an array");
+        const auto element_type=r.get<uint32_t>();const auto count=r.get<uint64_t>();
+        if(element_type!=10&&element_type!=11&&element_type!=4&&element_type!=5)
+            throw std::runtime_error("GGUF architecture array is not integer");
+        std::vector<std::uint64_t> values;values.reserve(static_cast<std::size_t>(count));
+        for(std::uint64_t i=0;i<count;++i){
+            if(element_type==10)values.push_back(r.get<std::uint64_t>());
+            else if(element_type==4)values.push_back(r.get<std::uint32_t>());
+            else {
+                const auto value=element_type==11
+                    ?r.get<std::int64_t>()
+                    :static_cast<std::int64_t>(r.get<std::int32_t>());
+                if(value<0)throw std::runtime_error(
+                    "GGUF architecture array value is negative");
+                values.push_back(static_cast<std::uint64_t>(value));
+            }
+        }
+        return values;
+    };
     auto read_float_array = [&](uint32_t type)->std::vector<float> {
         if(type!=9)throw std::runtime_error("GGUF architecture value is not an array");
         const auto element_type=r.get<uint32_t>();const auto count=r.get<uint64_t>();
@@ -1939,7 +2006,14 @@ int parse(ColibriV2Model& m) {
         else if(suffix(".attention.indexer.key_length"))target=&m.config.indexer_key_length;
         else if(suffix(".attention.indexer.top_k"))target=&m.config.indexer_top_k;
         else if(suffix(".hyper_connection.sinkhorn_iterations"))target=&m.config.sinkhorn_iterations;
+        else if(suffix(".hyper_connection.low_rank"))target=&m.config.hyper_connection_low_rank;
         else if(suffix(".hyper_connection.count"))target=&m.config.hyper_connection_count;
+        // qwen4exp PLE scalars. `.ple.eos_token_id` must precede the generic
+        // tokenizer keys only in spirit -- nothing else ends in these strings.
+        else if(suffix(".ple.ngram_size"))target=&m.config.ple_ngram_size;
+        else if(suffix(".ple.heads_per_ngram"))target=&m.config.ple_heads_per_ngram;
+        else if(suffix(".ple.conv_kernel"))target=&m.config.ple_conv_kernel;
+        else if(suffix(".ple.eos_token_id"))target=&m.config.ple_eos_token_id;
         else if(suffix(".expert_shared_count"))target=&m.config.expert_shared_count;
         else if(suffix(".hash_layer_count"))target=&m.config.hash_layer_count;
         else if(suffix(".block_size"))target=&m.config.draft_block_size;
@@ -2016,6 +2090,12 @@ int parse(ColibriV2Model& m) {
         else if (key.size()>=20 && key.compare(key.size()-20,20,".expert_weights_norm")==0 && type==7) m.config.expert_weights_norm=r.get<std::uint8_t>()!=0;
         else if (key.size()>=26 && key.compare(key.size()-26,26,".attention.compress_ratios")==0 && type==9) m.config.compress_ratios=read_uint_array(type);
         else if (key.size()>=14 && key.compare(key.size()-14,14,".target_layers")==0 && type==9) m.config.target_layers=read_uint_array(type);
+        // qwen4exp PLE arrays. `.ple.layers` cannot swallow the longer keys:
+        // suffix matching compares whole tails and none of them end in it.
+        else if (key.size()>=11 && key.compare(key.size()-11,11,".ple.layers")==0 && type==9) m.config.ple_layers=read_uint_array(type);
+        else if (key.size()>=22 && key.compare(key.size()-22,22,".ple.layer_multipliers")==0 && type==9) m.config.ple_multipliers=read_u64_array(type);
+        else if (key.size()>=17 && key.compare(key.size()-17,17,".ple.head_offsets")==0 && type==9) m.config.ple_head_offsets=read_u64_array(type);
+        else if (key.size()>=21 && key.compare(key.size()-21,21,".ple.head_vocab_sizes")==0 && type==9) m.config.ple_head_vocab_sizes=read_u64_array(type);
         else if (key.size()>=34 && key.compare(key.size()-34,34,".attention.compress_rope_freq_base")==0 && (type==6 || type==12)) m.config.compress_rope_freq_base=read_float(type);
         else if (key.size()>=25 && key.compare(key.size()-25,25,".hyper_connection.epsilon")==0 && (type==6 || type==12)) m.config.sinkhorn_epsilon=read_float(type);
         else if (key.size()>=19 && key.compare(key.size()-19,19,".swiglu_clamp_shexp")==0 && type==9) m.config.swiglu_clamp_shexp=read_float_array(type);
@@ -2115,6 +2195,36 @@ int parse(ColibriV2Model& m) {
                         layer,m.config.layer_count,
                         m.config.full_attention_interval)?0:1;
         }
+    }
+    // qwen4exp: the novel blocks are driven entirely by metadata, and a
+    // missing array degrades to fluent-wrong output rather than an error
+    // later, so the shape of the metadata is checked here once.
+    if(m.architecture=="qwen4exp"){
+        if(!m.config.hyper_connection_count||!m.config.hyper_connection_low_rank)
+            throw std::runtime_error(
+                "qwen4exp GGUF is missing the hyper_connection count/low_rank keys");
+        if(!m.config.ple_layers.empty()){
+            const auto heads=(m.config.ple_ngram_size-1)*m.config.ple_heads_per_ngram;
+            if(m.config.ple_ngram_size<2||!m.config.ple_heads_per_ngram)
+                throw std::runtime_error("qwen4exp PLE geometry keys are missing");
+            if(m.config.ple_multipliers.size()<m.config.ple_ngram_size)
+                throw std::runtime_error(
+                    "qwen4exp ple.layer_multipliers is shorter than ngram_size");
+            if(m.config.ple_head_offsets.size()<heads||
+               m.config.ple_head_vocab_sizes.size()<heads)
+                throw std::runtime_error(
+                    "qwen4exp ple head offset/vocab arrays are shorter than the "
+                    "head count");
+            if(m.config.ple_eos_token_id==0xffffffffu)
+                throw std::runtime_error("qwen4exp ple.eos_token_id is missing");
+            if(!m.config.per_layer_embedding_size)
+                throw std::runtime_error(
+                    "qwen4exp embedding_length_per_layer_input is missing");
+        }
+        if(!m.config.compress_ratios.empty()&&
+           m.config.compress_ratios.size()<m.config.layer_count)
+            throw std::runtime_error(
+                "qwen4exp compress-ratio array is shorter than the model layer count");
     }
     if(!m.config.sliding_window_pattern.empty()&&m.config.sliding_window_pattern.size()<m.config.layer_count)
         throw std::runtime_error("GGUF sliding-window pattern is shorter than the model layer count");
@@ -2354,6 +2464,135 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
     // buffer, so one scratch slot has to hold both halves.
     if(front.dense_ffn)
         runtime.scratch_elements=std::max(runtime.scratch_elements,2u*runtime.moe_intermediate);
+}
+
+// qwen4exp (Qwen3.8-Flash-Next, "a preview of the Qwen4 architecture"): the
+// qwen hybrid layout -- gated DeltaNet on three of every four blocks, gated
+// GQA on the fourth, routed+shared MoE everywhere -- with three additions:
+//
+//   gated residual   hc_count=4 parallel residual streams; every block
+//                    boundary norms the streams (grouped RMS), mixes them to
+//                    one block input through a low-rank silu/sigmoid gate, and
+//                    injects the block output back per stream. There are NO
+//                    attn_norm / post_attention_norm / output_norm tensors:
+//                    hc_attn_norm and hc_ffn_norm stand in their slots so the
+//                    positional layout (and qwen_ffn_base) is unchanged, and
+//                    the head collapse (output_hc_*) doubles as the final norm.
+//   PLE              hashed n-gram embeddings gated into the streams at the
+//                    blocks ple.layers names (blk.1 on the release model). The
+//                    320M-row table stays in the mapping; a token reads 16 rows.
+//   QSA indexer      per full-attention block, a 4-head scorer whose top-k
+//                    mask makes attention sparse. Loaded here for residency
+//                    accounting; the dense fallback ignores it (phase 3).
+//
+// Semantics: plans/qwen4exp-semantics.md, pinned by
+// native/tools/qwen4exp_reference_check.py against transformers.
+void build_qwen4exp_plan(ColibriV2QwenRuntime& runtime) {
+    auto& model = *runtime.model;
+    runtime.token_embeddings = tensor_index(model, "token_embd.weight");
+    // The head collapse ends in a grouped RMS over the streams, so the model
+    // carries no output_norm; final_norm aliases the collapse norm for the
+    // residency/accounting paths, and the decode bookend replaces the final
+    // rms with the collapse when runtime.qwen4exp is set.
+    runtime.output_hc_norm = tensor_index(model, "output_hc_norm.weight");
+    runtime.output_hc_down = tensor_index(model, "output_hc_down.weight");
+    runtime.output_hc_up = tensor_index(model, "output_hc_up.weight");
+    runtime.final_norm = runtime.output_hc_norm;
+    runtime.lm_head = has_tensor(model, "output.weight")
+        ? tensor_index(model, "output.weight") : runtime.token_embeddings;
+    runtime.lm_head_type = model.tensors[runtime.lm_head].type;
+    runtime.static_tensor_bytes += model.tensors[runtime.token_embeddings].size;
+    for (auto index : {runtime.output_hc_norm, runtime.output_hc_down,
+                       runtime.output_hc_up})
+        runtime.static_tensor_bytes += model.tensors[index].size;
+    if (runtime.lm_head != runtime.token_embeddings)
+        runtime.static_tensor_bytes += model.tensors[runtime.lm_head].size;
+    // The n-gram table is never uploaded: it is read 16 rows per token on the
+    // host, like host-resident embeddings, so it joins no byte accounting that
+    // would push it toward the GPU budget.
+    if (has_tensor(model, "per_layer_token_embd.weight"))
+        runtime.ple_table = tensor_index(model, "per_layer_token_embd.weight");
+    else if (!model.config.ple_layers.empty())
+        throw std::runtime_error(
+            "qwen4exp GGUF names PLE layers but carries no per_layer_token_embd");
+    runtime.layers.reserve(model.config.layer_count);
+    for (std::uint32_t layer_index = 0; layer_index < model.config.layer_count; ++layer_index) {
+        const std::string prefix = "blk." + std::to_string(layer_index) + ".";
+        QwenLayerPlan layer;
+        layer.attention = has_tensor(model, prefix + "attn_q.weight");
+        // Slot 0: the attention-boundary stream norm, standing where
+        // attn_norm stands on qwen so every existing slot offset holds.
+        add_static_tensor(runtime, layer, prefix + "hc_attn_norm.weight");
+        if (layer.attention) {
+            for (const char* suffix : {
+                     "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                     "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
+                 }) add_static_tensor(runtime, layer, prefix + suffix);
+            layer.attention_heads=model.config.attention_heads;
+            layer.kv_heads=model.config.attention_kv_heads;
+            layer.head_dim=static_cast<std::uint32_t>(model.tensors[layer.static_tensors[2]].shape[1]/layer.kv_heads);
+            layer.rotary_dim=std::min<std::uint32_t>(model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim,layer.head_dim);
+            layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:1000000.0f;
+        } else {
+            for (const char* suffix : {
+                     "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
+                     "ssm_alpha.weight", "ssm_beta.weight", "ssm_conv1d.weight",
+                     "ssm_dt.bias", "ssm_a", "ssm_norm.weight"
+                 }) add_static_tensor(runtime, layer, prefix + suffix);
+        }
+        // The ffn-base slot: hc_ffn_norm standing where post_attention_norm
+        // stands, then the identical MoE slot list.
+        for (const char* suffix : {
+                 "hc_ffn_norm.weight", "ffn_gate_inp.weight",
+                 "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                 "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight"
+             }) add_static_tensor(runtime, layer, prefix + suffix);
+        // Everything below is appended PAST the positional slots so the qwen
+        // feed-forward addressing is undisturbed; like Laguna's router_bias,
+        // they still have to ride static_tensors to reach the device.
+        auto add_extra = [&](const std::string& name, std::uint64_t& field) {
+            add_static_tensor(runtime, layer, name);
+            field = layer.static_tensors.back();
+        };
+        add_extra(prefix + "hc_attn_down.weight", layer.hc_attn_down);
+        add_extra(prefix + "hc_attn_up.weight", layer.hc_attn_up);
+        add_extra(prefix + "hc_attn_inject.weight", layer.hc_attn_inject);
+        add_extra(prefix + "hc_ffn_down.weight", layer.hc_ffn_down);
+        add_extra(prefix + "hc_ffn_up.weight", layer.hc_ffn_up);
+        add_extra(prefix + "hc_ffn_inject.weight", layer.hc_ffn_inject);
+        if (layer.attention) {
+            // QSA indexer: resident from day one, exercised in phase 3.
+            add_extra(prefix + "indexer.q_proj.weight", layer.indexer_q);
+            add_extra(prefix + "indexer.k_proj.weight", layer.indexer_k);
+            add_extra(prefix + "indexer.q_norm.weight", layer.indexer_q_norm);
+            add_extra(prefix + "indexer.k_norm.weight", layer.indexer_k_norm);
+        }
+        const auto& ple_layers = model.config.ple_layers;
+        if (std::find(ple_layers.begin(), ple_layers.end(), layer_index)
+            != ple_layers.end()) {
+            add_extra(prefix + "ple_conv1d.weight", layer.ple_conv);
+            add_extra(prefix + "ple_key.weight", layer.ple_key);
+            add_extra(prefix + "ple_value.weight", layer.ple_value);
+            add_extra(prefix + "ple_norm_conv.weight", layer.ple_norm_conv);
+            add_extra(prefix + "ple_norm_key.weight", layer.ple_norm_key);
+            add_extra(prefix + "ple_norm_query.weight", layer.ple_norm_query);
+        }
+        const std::array<std::string, 3> experts = {
+            prefix + "ffn_gate_exps.weight",
+            prefix + "ffn_up_exps.weight",
+            prefix + "ffn_down_exps.weight",
+        };
+        for (std::size_t role = 0; role < experts.size(); ++role) {
+            layer.expert_tensors[role] = tensor_index(model, experts[role]);
+            runtime.expert_tensor_bytes += model.tensors[layer.expert_tensors[role]].size;
+        }
+        runtime.layers.push_back(std::move(layer));
+    }
+    for(const auto&layer:runtime.layers)for(auto index:layer.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
+    const auto& front = runtime.layers.front();
+    const std::size_t ffn_base = front.attention ? 7 : 10;
+    const auto& gate = model.tensors[front.static_tensors[ffn_base + 2]];
+    runtime.moe_intermediate=static_cast<std::uint32_t>(gate.shape[1]);
 }
 
 // YaRN correction band. `beta_fast` and `beta_slow` are expressed as numbers of
@@ -2711,7 +2950,12 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
     if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
-    if((type==16||type==17||type==18||type==22||type==23)&&(colibri_cpu_features()&1u)!=0&&elements%256==0)
+    if((type==16||type==17||type==18||type==19||type==22||type==23)&&(colibri_cpu_features()&1u)!=0&&elements%256==0)
+        return qwen_quant_dot_avx2(packed,type,input,elements,row);
+    // IQ4_NL's native block is 32 elements (no super-block), so like Q4_0 it
+    // takes its own admission: qwen4exp's 640-wide expert down rows fail the
+    // 256 gate but are exactly where this type dominates decode.
+    if(type==20&&(colibri_cpu_features()&1u)!=0&&elements%32==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     float result=0.0f;
@@ -2783,6 +3027,8 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         result+=qwen_iq2xs_dot_row(packed,input,elements,row);
     }else if(type==23){
         result+=qwen_iq4xs_dot_row(packed,input,elements,row);
+    }else if(type==20){
+        result+=qwen_iq4nl_dot_row(packed,input,elements,row);
     }else if(type==19){
         result+=qwen_iq1s_dot_row(packed,input,elements,row);
     }else if(type==29){
@@ -2891,8 +3137,8 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
 // Kernel-name prefix for the IQ codebook formats, which share one generated
 // family of grouped expert kernels. Null for everything else.
 const char* qwen_iq_kernel_prefix(std::uint32_t type) {
-    // Only the formats with a device octet decoder. IQ2_XXS, IQ2_S and IQ3_S
-    // pack their signs and grid indices differently and have no grouped kernel,
+    // Only the formats with a device octet decoder. IQ2_S and IQ3_S pack
+    // their signs and grid indices differently and have no grouped kernel,
     // so models using them still route experts to the CPU.
     const auto* format = colibri::v2::qwen_format(type);
     return format ? format->iq_expert_prefix : nullptr;
@@ -3627,6 +3873,12 @@ void qwen_cpu_dense_ffn_rows(
 void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,std::uint64_t row,float*output){
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx512(packed,type,elements,row,output);return;}
     if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    // qwen4exp's expert formats: IQ1_S super-blocks, IQ4_NL 32-wide blocks
+    // (the 640-wide expert down rows fail a 256 gate). Chunked prefill decodes
+    // every routed expert's rows through here once per chunk, so the scalar
+    // form was the whole prefill wall.
+    if(type==19&&(colibri_cpu_features()&1u)!=0&&elements%256==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    if(type==20&&(colibri_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     const auto base=row*static_cast<std::uint64_t>(elements);
     if(type==13)for(int index=0;index<elements;++index)output[index]=qwen_q5_value(packed,base+index);
@@ -3641,6 +3893,8 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     else if(type==21)for(int index=0;index<elements;++index)output[index]=qwen_iq3s_value(packed,base+index);
     else if(type==17)for(int index=0;index<elements;++index)output[index]=qwen_iq2xs_value(packed,base+index);
     else if(type==23)for(int index=0;index<elements;++index)output[index]=qwen_iq4xs_value(packed,base+index);
+    else if(type==20)for(int index=0;index<elements;++index)output[index]=qwen_iq4nl_value(packed,base+index);
+    else if(type==19)for(int index=0;index<elements;++index)output[index]=qwen_iq1s_value(packed,base+index);
     else if(type==40)for(int index=0;index<elements;++index)output[index]=qwen_nvfp4_value(packed,base+index);
     else if(type==30){const auto*row_data=reinterpret_cast<const std::uint16_t*>(packed)+base;for(int index=0;index<elements;++index)output[index]=qwen_bf16_value(row_data[index]);}
     else if(type==1){for(int index=0;index<elements;++index){std::uint16_t bits=0;std::memcpy(&bits,packed+(base+index)*2,2);output[index]=qwen_half_value(bits);}}
@@ -3966,6 +4220,164 @@ std::uint64_t qwen_stage_embedding_rows(
     if (runtime.embedding_event)
         colibri_gpu_event_record(runtime.embedding_event, runtime.stream);
     return runtime.embedding_stage;
+}
+
+// qwen4exp: gather the current token's hashed n-gram embedding (16 rows of the
+// host-resident table, concatenated to one hidden-wide vector) and upload it to
+// the decode workspace. History is EOS-segmented exactly as the reference does
+// it: walking back from the current token, the first eos (or the sequence
+// start) makes every further lookback read eos itself. The hash constants come
+// from GGUF metadata verbatim; all arithmetic is u64 with wraparound, which
+// matches the reference's int64 because the products are bounded below 2^63
+// and xor cannot set the sign bit (plans/qwen4exp-semantics.md).
+void qwen4_stage_ple_embed(
+    ColibriV2QwenRuntime& runtime, std::uint32_t token,
+    const std::vector<std::uint32_t>& history, std::uint64_t destination
+) {
+    const auto& config = runtime.model->config;
+    const std::uint64_t eos = config.ple_eos_token_id;
+    const std::uint64_t t0 = token;
+    std::uint64_t t1 = history.empty() ? eos : history.back();
+    std::uint64_t t2 = (t1 == eos || history.size() < 2)
+        ? eos : history[history.size() - 2];
+    const auto& multipliers = config.ple_multipliers;
+    const std::uint32_t heads_per = config.ple_heads_per_ngram;
+    const std::uint32_t head_count = (config.ple_ngram_size - 1) * heads_per;
+    const auto& table = runtime.model->tensors[runtime.ple_table];
+    const std::uint64_t row_width = config.per_layer_embedding_size;
+    if (table.type != 0 && table.type != 20)
+        throw std::runtime_error(
+            "native qwen4exp PLE table type is not implemented yet: "
+            + std::to_string(table.type));
+    if (table.type == 20 && row_width % kIq4nlBlockElements != 0)
+        throw std::runtime_error(
+            "native qwen4exp IQ4_NL PLE rows must be a multiple of 32 wide");
+    const auto* source = tensor_data(*runtime.model, table);
+    const std::uint64_t rows_total = table.shape[1];  // GGUF shape [width, rows]
+    const std::uint64_t row_bytes = table.type == 20
+        ? row_width / kIq4nlBlockElements * kIq4nlBlockBytes
+        : row_width * sizeof(float);
+    // Pageable source is fine here: an async upload from pageable memory
+    // stages internally before returning, so the buffer can be reused.
+    static thread_local std::vector<float> gathered;
+    gathered.resize(static_cast<std::size_t>(head_count) * row_width);
+    const std::uint64_t bigram = t0 * multipliers[0] ^ t1 * multipliers[1];
+    const std::uint64_t trigram = bigram ^ t2 * multipliers[2];
+    for (std::uint32_t head = 0; head < head_count; ++head) {
+        const std::uint64_t mixed = head < heads_per ? bigram : trigram;
+        const std::uint64_t row = mixed % config.ple_head_vocab_sizes[head]
+            + config.ple_head_offsets[head];
+        if (row >= rows_total)
+            throw std::runtime_error(
+                "native qwen4exp PLE row is out of range");
+        float* destination =
+            gathered.data() + static_cast<std::size_t>(head) * row_width;
+        const auto* row_data = source + row * row_bytes;
+        if (table.type == 20) {
+            for (std::uint64_t block = 0; block * kIq4nlBlockElements < row_width;
+                 ++block) {
+                const auto* base = row_data + block * kIq4nlBlockBytes;
+                std::uint16_t d_bits = 0;
+                std::memcpy(&d_bits, base, 2);
+                const float scale = qwen_half_value(d_bits);
+                float* out = destination + block * kIq4nlBlockElements;
+                for (int element = 0; element < 16; ++element) {
+                    const std::uint8_t byte = base[2 + element];
+                    out[element] = scale * kIq4nlValues[byte & 15];
+                    out[element + 16] = scale * kIq4nlValues[byte >> 4];
+                }
+            }
+        } else {
+            std::memcpy(destination, row_data, row_width * sizeof(float));
+        }
+    }
+    if (colibri_gpu_upload(destination, gathered.data(),
+            gathered.size() * sizeof(float), runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp PLE staging failed");
+}
+
+// Rows form: the whole chunk's n-gram gathers, one upload. In-chunk history
+// comes from the chunk itself; the boundary rows read the sequence tail from
+// processed_tokens, which at this point holds exactly the tokens BEFORE the
+// chunk (qwen_prefill_rows appends after the forward). Same EOS segmentation
+// as the single-token stager.
+void qwen4_stage_ple_embed_rows(
+    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int count,
+    std::uint64_t destination
+) {
+    const auto& config = runtime.model->config;
+    const std::uint64_t eos = config.ple_eos_token_id;
+    const auto& history = runtime.processed_tokens;
+    const auto& multipliers = config.ple_multipliers;
+    const std::uint32_t heads_per = config.ple_heads_per_ngram;
+    const std::uint32_t head_count = (config.ple_ngram_size - 1) * heads_per;
+    const auto& table = runtime.model->tensors[runtime.ple_table];
+    const std::uint64_t row_width = config.per_layer_embedding_size;
+    if (table.type != 0 && table.type != 20)
+        throw std::runtime_error(
+            "native qwen4exp PLE table type is not implemented yet: "
+            + std::to_string(table.type));
+    const auto* source = tensor_data(*runtime.model, table);
+    const std::uint64_t rows_total = table.shape[1];
+    const std::uint64_t row_bytes = table.type == 20
+        ? row_width / kIq4nlBlockElements * kIq4nlBlockBytes
+        : row_width * sizeof(float);
+    static thread_local std::vector<float> gathered;
+    gathered.resize(static_cast<std::size_t>(count) * head_count * row_width);
+    auto back = [&](int position, int shift) -> std::uint64_t {
+        // Token `shift` places before chunk position `position`, stopping at
+        // the first eos (or the sequence start) on the way back.
+        std::uint64_t value = tokens[position];
+        for (int step = 1; step <= shift; ++step) {
+            const int at = position - step;
+            const std::uint64_t token = at >= 0
+                ? tokens[at]
+                : (history.size() >= static_cast<std::size_t>(-at)
+                       ? history[history.size() + at] : eos);
+            if (token == eos && step < shift) return eos;
+            value = token;
+        }
+        return value;
+    };
+    for (int position = 0; position < count; ++position) {
+        const std::uint64_t t0 = tokens[position];
+        std::uint64_t t1 = back(position, 1);
+        std::uint64_t t2 = t1 == eos ? eos : back(position, 2);
+        const std::uint64_t bigram = t0 * multipliers[0] ^ t1 * multipliers[1];
+        const std::uint64_t trigram = bigram ^ t2 * multipliers[2];
+        float* row_out = gathered.data()
+            + static_cast<std::size_t>(position) * head_count * row_width;
+        for (std::uint32_t head = 0; head < head_count; ++head) {
+            const std::uint64_t mixed = head < heads_per ? bigram : trigram;
+            const std::uint64_t row = mixed % config.ple_head_vocab_sizes[head]
+                + config.ple_head_offsets[head];
+            if (row >= rows_total)
+                throw std::runtime_error("native qwen4exp PLE row is out of range");
+            float* destination_row =
+                row_out + static_cast<std::size_t>(head) * row_width;
+            const auto* row_data = source + row * row_bytes;
+            if (table.type == 20) {
+                for (std::uint64_t block = 0;
+                     block * kIq4nlBlockElements < row_width; ++block) {
+                    const auto* base = row_data + block * kIq4nlBlockBytes;
+                    std::uint16_t d_bits = 0;
+                    std::memcpy(&d_bits, base, 2);
+                    const float scale = qwen_half_value(d_bits);
+                    float* out = destination_row + block * kIq4nlBlockElements;
+                    for (int element = 0; element < 16; ++element) {
+                        const std::uint8_t byte = base[2 + element];
+                        out[element] = scale * kIq4nlValues[byte & 15];
+                        out[element + 16] = scale * kIq4nlValues[byte >> 4];
+                    }
+                }
+            } else {
+                std::memcpy(destination_row, row_data, row_width * sizeof(float));
+            }
+        }
+    }
+    if (colibri_gpu_upload(destination, gathered.data(),
+            gathered.size() * sizeof(float), runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp PLE rows staging failed");
 }
 
 // NVFP4 checkpoints carry an optional per-expert f32 scale tensor alongside each
@@ -11633,6 +12045,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     const bool gemma4=m->config.architecture=="gemma4";
     const bool laguna=m->config.architecture=="laguna";
     const bool muse=m->config.architecture=="muse-glimmer";
+    const bool qwen4exp=m->config.architecture=="qwen4exp";
     // DeepSeek-V4 loads and describes itself but has no execution path yet, so
     // it gets its own message rather than looking like an unknown format.
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
@@ -11669,6 +12082,11 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
             colibri::v2::expert_execution_mode_value(runtime->expert_mode);
     }
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
+    // qwen4exp: no MTP draft block exists in the released GGUFs, so the MTP
+    // machinery (which also lacks the gated-residual bookends) stays off.
+    if(qwen4exp&&options&&options->mtp_drafts)
+        throw std::runtime_error(
+            "native qwen4exp has no MTP draft block (not present in the GGUF)");
     if(gemma4&&runtime->options.mtp_drafts)throw std::runtime_error("native Gemma 4 MTP is not implemented");
     if(gemma4&&qwen_expert_policy(
             *runtime,colibri::v2::ExpertExecutionPhase::prepare
@@ -11708,7 +12126,13 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(gemma4)build_gemma4_plan(*runtime);
     else if(laguna)build_laguna_plan(*runtime);
     else if(muse)build_muse_glimmer_plan(*runtime);
+    else if(qwen4exp)build_qwen4exp_plan(*runtime);
     else build_qwen_plan(*runtime);
+    // qwen4exp: the flag gates the gated-residual bookends in the forward
+    // paths, and the graph-capture sites refuse to capture on it at bring-up
+    // (the delta capture would bake in the plain residual add the bookends
+    // replace; a replay would corrupt the streams silently).
+    runtime->qwen4exp=qwen4exp;
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
     // colibri::v2::attention so they can be pinned by a contract test.
@@ -12109,6 +12533,17 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 layer.state_first=reserve(tensor_elements(conv)*sizeof(float));
                 layer.state_second=reserve(a.shape[0]*norm.shape[0]*norm.shape[0]*sizeof(float));
             }
+            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+                // Dilated causal conv: (kernel-1)*dilation past columns, where
+                // the dilation is the n-gram order (transformers sets
+                // conv_dilation = ngram_size).
+                const auto&ple_conv=runtime->model->tensors[layer.ple_conv];
+                const auto kernel=ple_conv.shape[0];
+                const auto wide=ple_conv.shape[1];
+                const auto dilation=std::max<std::uint64_t>(
+                    runtime->model->config.ple_ngram_size,1);
+                layer.state_third=reserve((kernel-1)*dilation*wide*sizeof(float));
+            }
         }
         if(runtime->options.mtp_drafts){
             auto&layer=runtime->mtp_layer_plan;
@@ -12154,7 +12589,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->model->config.expert_count,
             runtime->model->config.vocabulary_size,
             runtime->model->config.attention_heads,
-            runtime->options.context_limit);
+            runtime->options.context_limit,
+            runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
+            runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
+            runtime->qwen4exp&&!runtime->model->config.ple_layers.empty());
         // The batched rows forward (MTP verification and chunked prefill)
         // needs workspace and host staging proportional to its row capacity.
         runtime->forward_rows_capacity=std::max<std::uint32_t>(runtime->prefill_rows,9);
@@ -12178,7 +12616,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->moe_intermediate,runtime->model->config.expert_count,
             runtime->model->config.attention_heads,
             runtime->options.context_limit,delta_value_heads,
-            runtime->options.mtp_drafts!=0);
+            runtime->options.mtp_drafts!=0,
+            runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
+            runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
+            runtime->qwen4exp&&!runtime->model->config.ple_layers.empty());
         runtime->rows_host_layout=
             colibri::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);
@@ -12454,6 +12895,13 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         persistent[runtime->lm_head]=true;
         if(runtime->rope_factors!=std::numeric_limits<std::uint64_t>::max())
             persistent[runtime->rope_factors]=true;
+        // qwen4exp head collapse: the norm rides final_norm above; the low-rank
+        // mixer pair must reach the device too. The n-gram table deliberately
+        // does NOT: it is read 16 rows per token on the host.
+        if(runtime->qwen4exp){
+            persistent[runtime->output_hc_down]=true;
+            persistent[runtime->output_hc_up]=true;
+        }
         for(const auto&layer:runtime->layers){
             const std::size_t ffn_base=qwen_ffn_base(*runtime,layer);
             for(std::size_t slot=0;slot<layer.static_tensors.size();++slot){
@@ -12693,6 +13141,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // conflict that does not exist.
         std::uint64_t snapshot_floats=0;
         for(const auto&layer:runtime->layers){
+            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+                const auto&ple_conv=runtime->model->tensors[layer.ple_conv];
+                snapshot_floats+=(ple_conv.shape[0]-1)*
+                    std::max<std::uint64_t>(runtime->model->config.ple_ngram_size,1)*
+                    ple_conv.shape[1];
+            }
             if(layer.attention)continue;
             const auto&conv=runtime->model->tensors[layer.static_tensors[6]];
             const auto&a=runtime->model->tensors[layer.static_tensors[8]];
@@ -14061,7 +14515,10 @@ void qwen_mtp_fold_delta_state(ColibriV2QwenRuntime& runtime, int rows) {
         if(kernel_size<=8)launch("delta_conv_chunk",(static_cast<std::uint32_t>(channels)+255)/256,256,conv_args);
         else launch("delta_conv_sequence",static_cast<std::uint32_t>(channels),1,conv_args);
         auto recurrent_state=runtime.state+layer.state_second;auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
-        void*recurrent_args[]={const_cast<std::uint64_t*>(&convolved),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&beta_logits),const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&output),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
+        // MTP fold replay is unreachable for qwen4exp (no draft block), so the
+        // gate stays the qwen3.5 silu form.
+        int gate_sigmoid=0;
+        void*recurrent_args[]={const_cast<std::uint64_t*>(&convolved),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&beta_logits),const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&output),&rows,&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon),&gate_sigmoid};
         if(head_dim==128)launch("qwen_delta_recurrent_chunk",static_cast<std::uint32_t>(value_heads),128,recurrent_args);
         else launch("qwen_delta_recurrent_rows",static_cast<std::uint32_t>(value_heads),256,recurrent_args);
     }
@@ -14114,6 +14571,17 @@ void qwen_prefill_snapshot_copy(
     };
     std::uint64_t cursor=snapshot;
     for(const auto&layer:runtime.layers){
+        // qwen4exp: the PLE conv ring is recurrent state exactly like the
+        // DeltaNet conv and must ride every checkpoint/restore with it.
+        if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+            const auto&ple_conv=runtime.model->tensors[layer.ple_conv];
+            const auto ple_bytes=(ple_conv.shape[0]-1)*
+                std::max<std::uint64_t>(runtime.model->config.ple_ngram_size,1)*
+                ple_conv.shape[1]*sizeof(float);
+            const auto live=runtime.state+layer.state_third;
+            launch_copy(restore?cursor:live,restore?live:cursor,ple_bytes);
+            cursor+=ple_bytes;
+        }
         if(layer.attention)continue;
         const auto&conv=runtime.model->tensors[layer.static_tensors[6]];
         const auto&a=runtime.model->tensors[layer.static_tensors[8]];
@@ -15348,6 +15816,15 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     const std::uint64_t logits=workspace_layout.logits.address(runtime->workspace);
     const std::uint64_t argmax_device=workspace_layout.argmax_device.address(runtime->workspace);
     const std::uint64_t attention_scores=workspace_layout.attention_scores.address(runtime->workspace);
+    // qwen4exp gated-residual buffers; the regions are zero-sized elsewhere.
+    const std::uint64_t hc_streams=workspace_layout.streams.address(runtime->workspace);
+    const std::uint64_t hc_normed=workspace_layout.hc_normed.address(runtime->workspace);
+    const std::uint64_t hc_wide=workspace_layout.hc_wide.address(runtime->workspace);
+    const std::uint64_t hc_low=workspace_layout.hc_low.address(runtime->workspace);
+    const std::uint64_t hc_gates=workspace_layout.hc_gates.address(runtime->workspace);
+    const std::uint64_t ple_embed=workspace_layout.ple_embed.address(runtime->workspace);
+    const int hc_count=static_cast<int>(runtime->model->config.hyper_connection_count);
+    const int hc_low_rank=static_cast<int>(runtime->model->config.hyper_connection_low_rank);
     auto*staging=static_cast<std::uint8_t*>(runtime->host_staging);
     auto*selected_host=reinterpret_cast<std::int32_t*>(staging);
     std::uint64_t launch_stream=runtime->stream;
@@ -15490,6 +15967,98 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         throw std::runtime_error("native Qwen dense projection failed");
     };
     auto add=[&](std::uint64_t target,std::uint64_t source){float scale=1.0f;int count=hidden_size;void*args[]={&target,&source,&scale,&count};launch_named("scaled_add",(hidden_size+255)/256,1,256,args);};
+    // qwen4exp gated-residual bookends (plans/qwen4exp-semantics.md, pinned by
+    // qwen4exp_reference_check.py). hc_pre replaces the pre-block rms: it norms
+    // the streams (grouped), mixes them to one block input in `normalized`,
+    // and leaves the raw inject logits in hc_gates. hc_post replaces the
+    // residual add: streams += 2*sigmoid(logits/hc) x block_output, on the
+    // PRE-norm streams. The head collapse is hc_pre without an inject.
+    auto hc_pre=[&](std::uint64_t norm_weights,std::uint64_t down_index,
+                    std::uint64_t up_index,std::uint64_t inject_index){
+        const int hc_wide_size=hc_count*hidden_size;
+        void*norm_args[]={const_cast<std::uint64_t*>(&hc_streams),&norm_weights,
+            const_cast<std::uint64_t*>(&hc_normed),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms",hc_count,1,256,norm_args);
+        dense_matvec(down_index,hc_normed,hc_low,hc_wide_size,hc_low_rank);
+        float divisor=static_cast<float>(hc_count);
+        void*silu_args[]={const_cast<std::uint64_t*>(&hc_low),
+            const_cast<int*>(&hc_low_rank),&divisor};
+        launch_named("qwen4_silu_scale",
+            (static_cast<std::uint32_t>(hc_low_rank)+255)/256,1,256,silu_args);
+        dense_matvec(up_index,hc_low,hc_wide,hc_low_rank,hc_wide_size);
+        if(inject_index!=std::numeric_limits<std::uint64_t>::max())
+            dense_matvec(inject_index,hc_normed,hc_gates,hc_wide_size,hc_count);
+        void*mix_args[]={const_cast<std::uint64_t*>(&hc_normed),
+            const_cast<std::uint64_t*>(&hc_wide),
+            const_cast<std::uint64_t*>(&normalized),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_hc_mix",
+            (static_cast<std::uint32_t>(hidden_size)+255)/256,1,256,mix_args);
+        // `normalized` was rewritten behind the rms memo's back.
+        q8_cached_input=0;
+    };
+    auto hc_post=[&](std::uint64_t block_output){
+        const int hc_wide_size=hc_count*hidden_size;
+        void*inject_args[]={const_cast<std::uint64_t*>(&hc_streams),
+            &block_output,const_cast<std::uint64_t*>(&hc_gates),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_hc_inject",
+            (static_cast<std::uint32_t>(hc_wide_size)+255)/256,1,256,inject_args);
+    };
+    // The PLE block at the top of its layer: gather already uploaded to
+    // ple_embed by qwen4_stage_ple_embed; this runs the key/query gating, the
+    // dilated conv (stateful, state_third), and adds the delta to the streams.
+    auto ple_block=[&](const QwenLayerPlan&layer){
+        const int hc_wide_size=hc_count*hidden_size;
+        dense_matvec(layer.ple_key,ple_embed,hc_wide,hidden_size,hc_wide_size);
+        auto norm_key=runtime->device_tensors[layer.ple_norm_key];
+        void*key_args[]={const_cast<std::uint64_t*>(&hc_wide),&norm_key,
+            const_cast<std::uint64_t*>(&hc_wide),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms",hc_count,1,256,key_args);
+        auto norm_query=runtime->device_tensors[layer.ple_norm_query];
+        void*query_args[]={const_cast<std::uint64_t*>(&hc_streams),&norm_query,
+            const_cast<std::uint64_t*>(&hc_normed),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms",hc_count,1,256,query_args);
+        void*gate_args[]={const_cast<std::uint64_t*>(&hc_wide),
+            const_cast<std::uint64_t*>(&hc_normed),
+            const_cast<std::uint64_t*>(&hc_gates),
+            const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_ple_gate",hc_count,1,256,gate_args);
+        // value borrows `normalized`; the boundary that follows rewrites it.
+        dense_matvec(layer.ple_value,ple_embed,normalized,hidden_size,hidden_size);
+        void*gv_args[]={const_cast<std::uint64_t*>(&normalized),
+            const_cast<std::uint64_t*>(&hc_gates),
+            const_cast<std::uint64_t*>(&hc_wide),
+            const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_ple_gv",
+            (static_cast<std::uint32_t>(hc_wide_size)+255)/256,1,256,gv_args);
+        auto norm_conv=runtime->device_tensors[layer.ple_norm_conv];
+        void*gvn_args[]={const_cast<std::uint64_t*>(&hc_wide),&norm_conv,
+            const_cast<std::uint64_t*>(&hc_normed),
+            const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms",hc_count,1,256,gvn_args);
+        const auto&conv=runtime->model->tensors[layer.ple_conv];
+        int kernel_size=static_cast<int>(conv.shape[0]);
+        int dilation=static_cast<int>(std::max<std::uint32_t>(
+            runtime->model->config.ple_ngram_size,1));
+        auto conv_weights=runtime->device_tensors[layer.ple_conv];
+        std::uint64_t conv_state=runtime->state+layer.state_third;
+        void*conv_args[]={const_cast<std::uint64_t*>(&hc_normed),&conv_weights,
+            &conv_state,const_cast<std::uint64_t*>(&hc_normed),
+            const_cast<int*>(&hc_wide_size),&kernel_size,&dilation};
+        launch_named("qwen4_ple_conv_step",
+            (static_cast<std::uint32_t>(hc_wide_size)+255)/256,1,256,conv_args);
+        void*ple_add_args[]={const_cast<std::uint64_t*>(&hc_streams),
+            const_cast<std::uint64_t*>(&hc_wide),
+            const_cast<std::uint64_t*>(&hc_normed),
+            const_cast<int*>(&hc_wide_size)};
+        launch_named("qwen4_ple_add",
+            (static_cast<std::uint32_t>(hc_wide_size)+255)/256,1,256,ple_add_args);
+        q8_cached_input=0;
+    };
     auto profile_record=[&](std::uint64_t event){if(runtime->cuda_profile&&colibri_gpu_event_record(event,runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA profiling event failed");};
     {
         const std::uint32_t embedding_token=input_token;
@@ -15508,6 +16077,21 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                               const_cast<std::uint64_t*>(&hidden),&heads,&width,
                               const_cast<float*>(&epsilon)};
             launch_named("gemma_head_rms",1,1,256,norm_args);
+        }
+        // qwen4exp: the residual state is hc_count copies of the embedding,
+        // and the PLE gather for this token stages up front so blk.1's ple
+        // block finds it uploaded.
+        if(runtime->qwen4exp){
+            const int hc_wide_size=hc_count*hidden_size;
+            void*init_args[]={const_cast<std::uint64_t*>(&hidden),
+                const_cast<std::uint64_t*>(&hc_streams),
+                const_cast<int*>(&hc_count),const_cast<int*>(&hidden_size)};
+            launch_named("qwen4_hc_init",
+                (static_cast<std::uint32_t>(hc_wide_size)+255)/256,1,256,init_args);
+            if(runtime->ple_table!=std::numeric_limits<std::uint64_t>::max()&&
+               !runtime->model->config.ple_layers.empty())
+                qwen4_stage_ple_embed(*runtime,input_token,
+                                      runtime->processed_tokens,ple_embed);
         }
     }
     if(qwen_lm_diag_enabled()){
@@ -15536,13 +16120,22 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         // Profiling and diagnostics both inject event records and stream syncs
         // into the block below, neither of which survives capture, so they keep
         // the eager path.
-        const bool graph_capturable=runtime->cuda_graphs&&!profile&&!env_lm_diag;
+        // qwen4exp: the delta capture would bake in the skipped residual add
+        // and the streams would never see the inject on replay; graphs stay
+        // off for the arch until the bookends are capture-clean.
+        const bool graph_capturable=runtime->cuda_graphs&&!profile&&!env_lm_diag
+            &&!runtime->qwen4exp;
         const bool graph_eligible=graph_capturable&&env_graph_delta;
         const bool ffn_graph_eligible=graph_capturable&&env_graph_ffn;
         if(profile)profile_record(profile->pre_start);
         auto tensor=[&](std::size_t role){return runtime->device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size){dense_matvec(layer.static_tensors.at(role),input,output,input_size,output_size);};
-        rms(hidden,tensor(0),normalized);
+        if(runtime->qwen4exp){
+            if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max())
+                ple_block(layer);
+            hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
+                   layer.hc_attn_inject);
+        }else rms(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
         if(!layer.attention){
             int channels=static_cast<int>(runtime->model->tensors[layer.static_tensors[1]].shape[1]);
@@ -15576,7 +16169,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             std::uint64_t recurrent_state=runtime->state+layer.state_second;
             auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
             std::uint64_t beta=third+value_heads*sizeof(float);
-            void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta,const_cast<std::uint64_t*>(&third),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon)};
+            int gate_sigmoid=runtime->qwen4exp?1:0;
+            void*recurrent_args[]={const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&second),&beta,const_cast<std::uint64_t*>(&third),&decay,&dt,&norm,&recurrent_state,const_cast<std::uint64_t*>(&first),&key_heads,&value_heads,&head_dim,const_cast<float*>(&epsilon),&gate_sigmoid};
             // Split the key loop across `slices` groups of head_dim threads. Four
             // groups is the most a 1024-thread block allows at head_dim 128, which
             // is what every Qwen3.6 checkpoint uses; wider heads get fewer, and
@@ -15615,7 +16209,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     fprintf(stderr,"[diag] L0 ssm_out bytes[0..33]: %02x %02x %02x %02x %02x %02x\n",buf[0],buf[1],buf[2],buf[3],buf[4],buf[5]);
                 }
             }
-            add(residual,hidden);
+            // qwen4exp replaces the residual add with the gated-residual
+            // inject AFTER the (never-captured) block; see below.
+            if(!runtime->qwen4exp)add(residual,hidden);
             };
             // Capture records without executing, so the in-place state update
             // happens exactly once per token -- via the replay below, never via
@@ -15667,6 +16263,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     std::chrono::steady_clock::now()-delta_started).count();
                 ++runtime->delta_host_calls;
             }
+            if(runtime->qwen4exp)hc_post(residual);
             moe_base=10;
         }else if(runtime->muse){
             // Muse Glimmer attention: plain Q/K/V projections, per-head QK RMS
@@ -15908,10 +16505,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             void*gate_args[]={&attended,&gates,&gated,&elements};
             launch_named("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
             dense(4,gated,residual,elements,hidden_size);
-            add(residual,hidden);
+            if(runtime->qwen4exp)hc_post(residual);
+            else add(residual,hidden);
             moe_base=7;
         }
-        rms(residual,tensor(moe_base),normalized);
+        if(runtime->qwen4exp)
+            hc_pre(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
+                   layer.hc_ffn_inject);
+        else rms(residual,tensor(moe_base),normalized);
         if(qwen_lm_diag_enabled()&&layer_number==0){
             float v[4]={};colibri_gpu_stream_sync(runtime->stream);
             if(colibri_gpu_download(v,normalized,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
@@ -16440,7 +17041,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         // The feed-forward output takes its own norm before rejoining the
         // residual stream, mirroring the post-attention norm above.
         if(runtime->muse)post_rms(third,tensor(13));
-        add(residual,third);
+        if(runtime->qwen4exp)hc_post(third);
+        else add(residual,third);
         if(profile)profile_record(profile->expert_end);
         std::swap(hidden,residual);
         if(qwen_lm_diag_enabled()&&(layer_number==0||layer_number==3||layer_number==33||layer_number==39)){
@@ -16456,7 +17058,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         launch_named("qwen_copy_vector",(hidden_size+255)/256,1,256,copy_args);
         runtime->mtp_has_target_hidden=true;
     }
-    rms(hidden,runtime->device_tensors[runtime->final_norm],normalized);
+    // qwen4exp carries no final norm: the head collapse (the inject-less
+    // gated-residual boundary over output_hc_*) is the last operation before
+    // the LM head, exactly as the reference model ends.
+    if(runtime->qwen4exp)
+        hc_pre(runtime->device_tensors[runtime->output_hc_norm],
+               runtime->output_hc_down,runtime->output_hc_up,
+               std::numeric_limits<std::uint64_t>::max());
+    else rms(hidden,runtime->device_tensors[runtime->final_norm],normalized);
     if(runtime->cuda_profile)profile_record(runtime->cuda_lm_start);
     runtime->last_sampling_normalized=normalized;
     runtime->last_sampling_logits=logits;
@@ -17022,6 +17631,15 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
             const auto& norm = runtime.model->tensors[layer.static_tensors[9]];
             ranges.emplace_back(layer.state_first, tensor_elements(conv) * sizeof(float));
             ranges.emplace_back(layer.state_second, a.shape[0] * norm.shape[0] * norm.shape[0] * sizeof(float));
+        }
+        if (layer.ple_conv != std::numeric_limits<std::uint64_t>::max()) {
+            const auto& ple_conv = runtime.model->tensors[layer.ple_conv];
+            ranges.emplace_back(
+                layer.state_third,
+                (ple_conv.shape[0] - 1) *
+                    std::max<std::uint64_t>(
+                        runtime.model->config.ple_ngram_size, 1) *
+                    ple_conv.shape[1] * sizeof(float));
         }
     }
     return ranges;
@@ -18438,6 +19056,9 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             dense_q8, dense_q8_scales, activated, router_logits,
             selected_device, route_weights, logits, argmax_device,
             attention_scores;
+        // qwen4exp gated-residual slices of this sequence's workspace copy.
+        std::uint64_t hc_streams, hc_normed, hc_wide, hc_low, hc_gates,
+            ple_embed;
         std::int32_t* selected_host; float *cpu_weights, *cpu_input, *cpu_activated, *cpu_output;
         std::uint64_t* winner_host;
     };
@@ -18470,6 +19091,12 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         s.logits = workspace_layout.logits.address(base);
         s.argmax_device = workspace_layout.argmax_device.address(base);
         s.attention_scores = workspace_layout.attention_scores.address(base);
+        s.hc_streams = workspace_layout.streams.address(base);
+        s.hc_normed = workspace_layout.hc_normed.address(base);
+        s.hc_wide = workspace_layout.hc_wide.address(base);
+        s.hc_low = workspace_layout.hc_low.address(base);
+        s.hc_gates = workspace_layout.hc_gates.address(base);
+        s.ple_embed = workspace_layout.ple_embed.address(base);
         auto* block = staging + i * runtime->decode_host_block_bytes;
         s.selected_host = reinterpret_cast<std::int32_t*>(
             block+host_layout.selected.offset);
@@ -18527,12 +19154,114 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         throw std::runtime_error("native Qwen dense projection failed");
     };
     auto add = [&](std::uint64_t target, std::uint64_t source) { float scale = 1.0f; int count = hidden_size; void* args[] = {&target, &source, &scale, &count}; launch_named("scaled_add", (hidden_size + 255) / 256, 1, 256, args); };
+    // qwen4exp gated-residual bookends, per sequence; same math as the
+    // single-sequence decode path, addressed off each Seq's workspace copy.
+    const int hc_count = static_cast<int>(runtime->model->config.hyper_connection_count);
+    const int hc_low_rank = static_cast<int>(runtime->model->config.hyper_connection_low_rank);
+    const int hc_wide_size = hc_count * hidden_size;
+    auto hc_pre_multi = [&](Seq& s, std::uint64_t norm_weights,
+                            std::uint64_t down_index, std::uint64_t up_index,
+                            std::uint64_t inject_index) {
+        void* norm_args[] = {const_cast<std::uint64_t*>(&s.hc_streams), &norm_weights,
+            const_cast<std::uint64_t*>(&s.hc_normed),
+            const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms", hc_count, 1, 256, norm_args);
+        dense_matvec(down_index, s.hc_normed, s.hc_low, hc_wide_size, hc_low_rank);
+        float divisor = static_cast<float>(hc_count);
+        void* silu_args[] = {const_cast<std::uint64_t*>(&s.hc_low),
+            const_cast<int*>(&hc_low_rank), &divisor};
+        launch_named("qwen4_silu_scale",
+            (static_cast<std::uint32_t>(hc_low_rank) + 255) / 256, 1, 256, silu_args);
+        dense_matvec(up_index, s.hc_low, s.hc_wide, hc_low_rank, hc_wide_size);
+        if (inject_index != std::numeric_limits<std::uint64_t>::max())
+            dense_matvec(inject_index, s.hc_normed, s.hc_gates, hc_wide_size, hc_count);
+        void* mix_args[] = {const_cast<std::uint64_t*>(&s.hc_normed),
+            const_cast<std::uint64_t*>(&s.hc_wide),
+            const_cast<std::uint64_t*>(&s.normalized),
+            const_cast<int*>(&hc_count), const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_hc_mix",
+            (static_cast<std::uint32_t>(hidden_size) + 255) / 256, 1, 256, mix_args);
+        q8_cached_input = 0;
+    };
+    auto hc_post_multi = [&](Seq& s, std::uint64_t block_output) {
+        void* inject_args[] = {const_cast<std::uint64_t*>(&s.hc_streams),
+            &block_output, const_cast<std::uint64_t*>(&s.hc_gates),
+            const_cast<int*>(&hc_count), const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_hc_inject",
+            (static_cast<std::uint32_t>(hc_wide_size) + 255) / 256, 1, 256,
+            inject_args);
+    };
+    auto ple_multi = [&](Seq& s, const QwenLayerPlan& layer) {
+        dense_matvec(layer.ple_key, s.ple_embed, s.hc_wide, hidden_size, hc_wide_size);
+        auto norm_key = runtime->device_tensors[layer.ple_norm_key];
+        void* key_args[] = {const_cast<std::uint64_t*>(&s.hc_wide), &norm_key,
+            const_cast<std::uint64_t*>(&s.hc_wide),
+            const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms", hc_count, 1, 256, key_args);
+        auto norm_query = runtime->device_tensors[layer.ple_norm_query];
+        void* query_args[] = {const_cast<std::uint64_t*>(&s.hc_streams), &norm_query,
+            const_cast<std::uint64_t*>(&s.hc_normed),
+            const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms", hc_count, 1, 256, query_args);
+        void* gate_args[] = {const_cast<std::uint64_t*>(&s.hc_wide),
+            const_cast<std::uint64_t*>(&s.hc_normed),
+            const_cast<std::uint64_t*>(&s.hc_gates),
+            const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_ple_gate", hc_count, 1, 256, gate_args);
+        dense_matvec(layer.ple_value, s.ple_embed, s.normalized, hidden_size, hidden_size);
+        void* gv_args[] = {const_cast<std::uint64_t*>(&s.normalized),
+            const_cast<std::uint64_t*>(&s.hc_gates),
+            const_cast<std::uint64_t*>(&s.hc_wide),
+            const_cast<int*>(&hc_count), const_cast<int*>(&hidden_size)};
+        launch_named("qwen4_ple_gv",
+            (static_cast<std::uint32_t>(hc_wide_size) + 255) / 256, 1, 256, gv_args);
+        auto norm_conv = runtime->device_tensors[layer.ple_norm_conv];
+        void* gvn_args[] = {const_cast<std::uint64_t*>(&s.hc_wide), &norm_conv,
+            const_cast<std::uint64_t*>(&s.hc_normed),
+            const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon)};
+        launch_named("qwen4_group_rms", hc_count, 1, 256, gvn_args);
+        const auto& conv = runtime->model->tensors[layer.ple_conv];
+        int kernel_size = static_cast<int>(conv.shape[0]);
+        int dilation = static_cast<int>(std::max<std::uint32_t>(
+            runtime->model->config.ple_ngram_size, 1));
+        auto conv_weights = runtime->device_tensors[layer.ple_conv];
+        std::uint64_t conv_state = s.state + layer.state_third;
+        void* conv_args[] = {const_cast<std::uint64_t*>(&s.hc_normed), &conv_weights,
+            &conv_state, const_cast<std::uint64_t*>(&s.hc_normed),
+            const_cast<int*>(&hc_wide_size), &kernel_size, &dilation};
+        launch_named("qwen4_ple_conv_step",
+            (static_cast<std::uint32_t>(hc_wide_size) + 255) / 256, 1, 256, conv_args);
+        void* ple_add_args[] = {const_cast<std::uint64_t*>(&s.hc_streams),
+            const_cast<std::uint64_t*>(&s.hc_wide),
+            const_cast<std::uint64_t*>(&s.hc_normed),
+            const_cast<int*>(&hc_wide_size)};
+        launch_named("qwen4_ple_add",
+            (static_cast<std::uint32_t>(hc_wide_size) + 255) / 256, 1, 256,
+            ple_add_args);
+        q8_cached_input = 0;
+    };
     for (auto& s : seqs) {
         const std::uint32_t embedding_token = s.input;
         const auto embedding = qwen_stage_embedding_rows(*runtime, &embedding_token, 1);
         const int token = runtime->embeddings_host_resident ? 0 : static_cast<int>(s.input); int width = hidden_size;
         void* args[] = {const_cast<std::uint64_t*>(&embedding), const_cast<std::uint64_t*>(&s.hidden), const_cast<int*>(&token), &width};
         launch_named(qwen_embedding_kernel(qwen_device_type(*runtime, runtime->token_embeddings), false), (hidden_size + 255) / 256, 1, 256, args);
+        if (runtime->qwen4exp) {
+            void* init_args[] = {const_cast<std::uint64_t*>(&s.hidden),
+                const_cast<std::uint64_t*>(&s.hc_streams),
+                const_cast<int*>(&hc_count), const_cast<int*>(&hidden_size)};
+            launch_named("qwen4_hc_init",
+                (static_cast<std::uint32_t>(hc_wide_size) + 255) / 256, 1, 256,
+                init_args);
+            if (runtime->ple_table != std::numeric_limits<std::uint64_t>::max() &&
+                !runtime->model->config.ple_layers.empty())
+                // The engine parks the active slot before batching
+                // (qwen_park_active swaps the mirror into the slot vector), so
+                // the per-slot vector is authoritative for EVERY slot here.
+                qwen4_stage_ple_embed(
+                    *runtime, s.input,
+                    runtime->sequences[s.slot].processed_tokens, s.ple_embed);
+        }
     }
     static const bool env_nvfp4_persistent_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
     static const bool env_nvfp4_tc_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
@@ -18552,7 +19281,12 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             // the memo along with the buffer it referred to.
             q8_cached_normalized = s.normalized;
             q8_cached_input = 0;
-            rms(s.hidden, tensor(0), s.normalized);
+            if (runtime->qwen4exp) {
+                if (layer.ple_conv != std::numeric_limits<std::uint64_t>::max())
+                    ple_multi(s, layer);
+                hc_pre_multi(s, tensor(0), layer.hc_attn_down,
+                             layer.hc_attn_up, layer.hc_attn_inject);
+            } else rms(s.hidden, tensor(0), s.normalized);
             if (!layer.attention) {
                 int channels = static_cast<int>(runtime->model->tensors[layer.static_tensors[1]].shape[1]);
                 int gate_elements = static_cast<int>(runtime->model->tensors[layer.static_tensors[2]].shape[1]);
@@ -18572,7 +19306,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 std::uint64_t recurrent_state = s.state + layer.state_second;
                 auto decay = tensor(8), dt = tensor(7), norm = tensor(9);
                 std::uint64_t beta = s.third + value_heads * sizeof(float);
-                void* recurrent_args[] = {const_cast<std::uint64_t*>(&s.fourth), const_cast<std::uint64_t*>(&s.second), &beta, const_cast<std::uint64_t*>(&s.third), &decay, &dt, &norm, &recurrent_state, const_cast<std::uint64_t*>(&s.first), &key_heads, &value_heads, &head_dim, const_cast<float*>(&epsilon)};
+                int gate_sigmoid = runtime->qwen4exp ? 1 : 0;
+                void* recurrent_args[] = {const_cast<std::uint64_t*>(&s.fourth), const_cast<std::uint64_t*>(&s.second), &beta, const_cast<std::uint64_t*>(&s.third), &decay, &dt, &norm, &recurrent_state, const_cast<std::uint64_t*>(&s.first), &key_heads, &value_heads, &head_dim, const_cast<float*>(&epsilon), &gate_sigmoid};
                 // The same kernel selection as single-token decode: the split
                 // form reduces in a different order than the serial one, so a
                 // driver that picked differently would let a batched token
@@ -18593,7 +19328,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                                  recurrent_args);
                 }
                 dense(3, s.first, s.residual, value_dim, hidden_size);
-                add(s.residual, s.hidden);
+                if (runtime->qwen4exp) hc_post_multi(s, s.residual);
+                else add(s.residual, s.hidden);
             } else {
                 const int heads = static_cast<int>(runtime->model->config.attention_heads);
                 const int kv_heads = static_cast<int>(runtime->model->config.attention_kv_heads);
@@ -18667,9 +19403,13 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 void* gate_args[] = {&attended, &gates, &gated, &elements};
                 launch_named("qwen_attention_gate", (elements + 255) / 256, 1, 256, gate_args);
                 dense(4, gated, s.residual, elements, hidden_size);
-                add(s.residual, s.hidden);
+                if (runtime->qwen4exp) hc_post_multi(s, s.residual);
+                else add(s.residual, s.hidden);
             }
-            rms(s.residual, tensor(moe_base), s.normalized);
+            if (runtime->qwen4exp)
+                hc_pre_multi(s, tensor(moe_base), layer.hc_ffn_down,
+                             layer.hc_ffn_up, layer.hc_ffn_inject);
+            else rms(s.residual, tensor(moe_base), s.normalized);
             if (layer.dense_ffn) {
                 // Dense block: one SwiGLU over the layer's own gate/up/down,
                 // with no router, shared expert or expert paging to run.
@@ -18803,7 +19543,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             qwen_cpu_moe_rows(*runtime,layer,batch_selected.data(),batch_weights.data(),static_cast<int>(n),top_k,batch_inputs.data(),batch_activated.data(),batch_down.data(),batch_outputs.data());
             if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
-            for(std::size_t index=0;index<n;++index){auto&s=seqs[index];if(colibri_gpu_upload(s.fourth,batch_outputs.data()+index*hidden_size,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");add(s.third,s.fourth);add(s.residual,s.third);std::swap(s.hidden,s.residual);}
+            for(std::size_t index=0;index<n;++index){auto&s=seqs[index];if(colibri_gpu_upload(s.fourth,batch_outputs.data()+index*hidden_size,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");add(s.third,s.fourth);if(runtime->qwen4exp)hc_post_multi(s,s.third);else add(s.residual,s.third);std::swap(s.hidden,s.residual);}
             if(timing_enabled())runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-expert_started).count();
             continue;
         }
@@ -19028,12 +19768,17 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 }
             }
             if(timing_enabled())runtime->expert_page_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pager_started).count();
-            add(s.residual, s.third);
+            if (runtime->qwen4exp) hc_post_multi(s, s.third);
+            else add(s.residual, s.third);
             std::swap(s.hidden, s.residual);
         }
     }
     for (auto& s : seqs) {
-        rms(s.hidden, runtime->device_tensors[runtime->final_norm], s.normalized);
+        if (runtime->qwen4exp)
+            hc_pre_multi(s, runtime->device_tensors[runtime->output_hc_norm],
+                         runtime->output_hc_down, runtime->output_hc_up,
+                         std::numeric_limits<std::uint64_t>::max());
+        else rms(s.hidden, runtime->device_tensors[runtime->final_norm], s.normalized);
         int vocabulary = static_cast<int>(runtime->model->config.vocabulary_size);
         if (colibri_gpu_memset(s.argmax_device, 0, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen argmax reset failed");
         auto lm_head = runtime->device_tensors[runtime->lm_head];

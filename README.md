@@ -14,6 +14,7 @@ Served model families:
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
 | Gemma 4 | GGUF | Greedy decode with penalties disabled only -- see limitations |
 | BailingMoE3 | GGUF, safetensors | Independent sequence slots with snapshot prefix reuse across conversations; a GGUF conversion answers exactly as the checkpoint it came from |
+| Qwen3.8-Flash-Next (qwen4exp) | GGUF (split) | Qwen4-preview hybrid: gated-residual streams, hashed n-gram embeddings (host-side table), DeltaNet + gated attention. Sparse attention runs dense for now; no MTP/vision (absent from the GGUF) -- see limitations |
 
 A safetensors checkpoint (Qwen 3.5 family and BailingMoE3) is packed to a
 chosen quantization on first open and cached beside the checkpoint --
@@ -462,6 +463,13 @@ device are skipped.
 
 - CUDA is the only model-execution accelerator; `--backend cpu` serves
   everything on the CPU kernels instead.
+- Qwen3.8-Flash-Next (qwen4exp) runs its 12 sparse-attention layers as dense
+  GQA: exact while the context fits the trained 2048-token selection budget,
+  an approximation beyond it -- the learned indexer is not implemented yet.
+  MTP is rejected at load (the released GGUF carries no draft block). The
+  n-gram embedding table stays in host memory (16 row reads per token), and
+  the IQ1_S/IQ4_NL experts run on the CPU MoE -- prefill is
+  expert-decode-bound until GPU kernels for those formats land.
 - Gemma 4 sampling is not implemented, and that includes the default
   repetition penalty: serving Gemma 4 requires `temperature: 0` **and**
   `repetition_penalty: 1` (or `penalty_window: 0`) on every request. MTP,

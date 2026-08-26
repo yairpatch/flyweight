@@ -94,10 +94,12 @@ int main() {
                f.type, "IQ expert prefix disagrees with the family");
     }
 
-    // The two recorded drifts stay recorded until a measured commit changes
-    // them; if either flips, this contract must flip with it deliberately.
-    expect(v2::qwen_format(23)->rows_q8_gate == false, 23,
-           "IQ4_XS rows gate changed; retire the drift note");
+    // Recorded drifts stay recorded until a measured commit changes them; if
+    // one flips, this contract must flip with it deliberately. IQ4_XS was
+    // admitted to the rows-forward Q8 block 2026-08-26 (measured on the 27B
+    // dense checkpoint, prefill parity green).
+    expect(v2::qwen_format(23)->rows_q8_gate == true, 23,
+           "IQ4_XS rows gate changed; update the admission note");
     expect(v2::qwen_format(29)->cpu_expert == false, 29,
            "IQ1_M CPU expert support changed; retire the drift note");
 

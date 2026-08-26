@@ -1025,6 +1025,12 @@ extern "C" int colibri_gpu_compile(
              "iq3xxs_grouped_accumulate", "iq3xxs_grouped_accumulate_rows",
              "iq4xs_grouped_swiglu", "iq4xs_grouped_swiglu_rows",
              "iq4xs_grouped_accumulate", "iq4xs_grouped_accumulate_rows",
+             "iq1s_grouped_swiglu", "iq1s_grouped_swiglu_rows",
+             "iq1s_grouped_accumulate", "iq1s_grouped_accumulate_rows",
+             "iq4nl_grouped_swiglu", "iq4nl_grouped_swiglu_rows",
+             "iq4nl_grouped_accumulate", "iq4nl_grouped_accumulate_rows",
+             "iq2xxs_grouped_swiglu", "iq2xxs_grouped_swiglu_rows",
+             "iq2xxs_grouped_accumulate", "iq2xxs_grouped_accumulate_rows",
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
              "qwen_attention_prefill_pack_f16",
              "kv_attention_prefill_softmax_f16",
@@ -1175,7 +1181,15 @@ extern "C" int colibri_gpu_compile(
              "bailing_copy", "bailing_partial_rope", "bailing_split_query",
              "bailing_head_gate", "bailing_short_conv",
              "bailing_gated_head_norm", "bailing_swiglu",
-             "bailing_q4k_matvec"
+             "bailing_q4k_matvec",
+             // qwen4exp gated residual + PLE glue
+             "qwen4_hc_init", "qwen4_group_rms", "qwen4_silu_scale",
+             "qwen4_hc_mix", "qwen4_hc_inject", "qwen4_ple_gate",
+             "qwen4_ple_gv", "qwen4_ple_conv_step", "qwen4_ple_add",
+             "qwen4_hc_init_rows", "qwen4_group_rms_rows",
+             "qwen4_hc_mix_rows", "qwen4_hc_inject_rows",
+             "qwen4_ple_gate_rows", "qwen4_ple_gv_rows",
+             "qwen4_ple_conv_sequence"
          }) {
         CUfunction function = nullptr;
         if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)

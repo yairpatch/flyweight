@@ -390,7 +390,8 @@ R"COLIBRI_CUDA(    const int output_size, const int rows
         atomicMax(winners + token, candidate);
     }
 }
-
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
 extern "C" __global__
 void qwen_delta_recurrent(
     const float* convolved, const float* gates,
@@ -398,7 +399,11 @@ void qwen_delta_recurrent(
     const float* decay_coefficients, const float* dt_bias,
     const float* norm_weights, float* state, float* output,
     const int key_heads, const int value_heads,
-    const int head_dim, const float epsilon
+    const int head_dim, const float epsilon,
+    // Output-gate activation: 0 = silu(z), the qwen3.5 lineage default
+    // (output_gate_type unset falls back to hidden_act); 1 = sigmoid(z),
+    // which qwen4exp sets explicitly.
+    const int gate_sigmoid
 ) {
     const int head = blockIdx.x;
     const int lane = threadIdx.x;
@@ -466,8 +471,10 @@ void qwen_delta_recurrent(
     if (lane < head_dim) {
         const int output_index = head * head_dim + lane;
         const float gate = gates[output_index];
+        const float logistic =
+            1.0f / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
         output[output_index] = core * inverse_rms * norm_weights[lane]
-            * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+            * (gate_sigmoid ? logistic : gate * logistic);
     }
 }
 
@@ -498,7 +505,8 @@ void qwen_delta_recurrent_split(
     const float* decay_coefficients, const float* dt_bias,
     const float* norm_weights, float* state, float* output,
     const int key_heads, const int value_heads,
-    const int head_dim, const float epsilon
+    const int head_dim, const float epsilon,
+    const int gate_sigmoid  // see qwen_delta_recurrent
 ) {
     // Same recurrence as qwen_delta_recurrent, mapped differently. There, one
     // thread per output dim walked all head_dim keys on its own, half the block
@@ -603,8 +611,10 @@ void qwen_delta_recurrent_split(
     if (slice == 0) {
         const int output_index = head * head_dim + dim;
         const float gate = gates[output_index];
+        const float logistic =
+            1.0f / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
         output[output_index] = shared_core[dim] * inverse_rms * norm_weights[dim]
-            * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+            * (gate_sigmoid ? logistic : gate * logistic);
     }
 }
 
@@ -615,7 +625,8 @@ void qwen_delta_recurrent_rows(
     const float* decay_coefficients, const float* dt_bias,
     const float* norm_weights, float* state, float* output,
     const int rows, const int key_heads, const int value_heads,
-    const int head_dim, const float epsilon
+    const int head_dim, const float epsilon,
+    const int gate_sigmoid  // see qwen_delta_recurrent
 ) {
     const int head = blockIdx.x;
     const int lane = threadIdx.x;
@@ -684,8 +695,10 @@ void qwen_delta_recurrent_rows(
         if (lane < head_dim) {
             const int output_index = token * value_heads * head_dim + head * head_dim + lane;
             const float gate = gates[output_index];
+            const float logistic =
+                1.0f / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
             output[output_index] = core * inverse_rms * norm_weights[lane]
-                * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+                * (gate_sigmoid ? logistic : gate * logistic);
         }
         __syncthreads();
     }
@@ -1113,7 +1126,8 @@ void qwen_delta_recurrent_chunk(
     const float* decay_coefficients, const float* dt_bias,
     const float* norm_weights, float* state, float* output,
     const int rows, const int key_heads, const int value_heads,
-    const int head_dim, const float epsilon
+    const int head_dim, const float epsilon,
+    const int gate_sigmoid  // see qwen_delta_recurrent
 ) {
     // DeltaNet recurrence over a whole prefill chunk with the per-head state
     // matrix held in registers: the sequential token loop stays on-chip
@@ -1191,8 +1205,10 @@ R"COLIBRI_CUDA(            const float softplus_input = decay_logits[token * val
         __syncthreads();
         const int output_index = token * value_heads * 128 + head * 128 + lane;
         const float gate = gates[output_index];
+        const float logistic =
+            1.0f / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
         output[output_index] = core * inverse_rms * norm_weights[lane]
-            * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+            * (gate_sigmoid ? logistic : gate * logistic);
         __syncthreads();
     }
     #pragma unroll
@@ -4040,7 +4056,8 @@ R"COLIBRI_CUDA(                for (int r = 0; r < 4; ++r)
 extern "C" __global__
 void qwen_delta_norm_gate(
     const float* core, const float* gates, const float* norm_weights,
-    float* output, const int value_heads, const float epsilon
+    float* output, const int value_heads, const float epsilon,
+    const int gate_sigmoid  // see qwen_delta_recurrent
 ) {
     const int token = blockIdx.x;
     const int head = blockIdx.y;
@@ -4059,8 +4076,10 @@ void qwen_delta_norm_gate(
     const float inverse_rms = rsqrtf(total / (float)DELTA_DIM + epsilon);
 
     const float gate = gates[offset];
+    const float logistic =
+        1.0f / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
     output[offset] = value * inverse_rms * norm_weights[lane]
-        * gate / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gate))));
+        * (gate_sigmoid ? logistic : gate * logistic);
 }
 
 )COLIBRI_CUDA"
