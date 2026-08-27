@@ -15,7 +15,23 @@
 > authoritative for every slot — the usual active-mirror accessor is wrong there).
 > Optional follow-ups: real-checkpoint layer-dump audit, prefill perf (GPU
 > IQ1_S/IQ4_NL expert kernels), CUDA-graph re-enable for the arch.
-> Phase 3 (QSA indexer) not started.
+>
+> **STATUS 2026-08-27**: PHASE 3 (QSA indexer) DONE — the sparse selection is
+> live on all three paths and on by default (`COLIBRI_QSA=0` disables). Six
+> parity tests green (transformers-exact with pruning active, prefill==decode,
+> CUDA==CPU, interleaved==solo); ctest 21/21, pytest 567 + 897 subtests.
+> Real UD-IQ1_S: a planted fact 6k tokens back is retrieved correctly with the
+> indexer pruning to 63% of tokens, so selection keeps what matters.
+> Perf is NOT the reason to run it: interleaved A/B measures QSA ~10% SLOWER at
+> a 4.7k prompt (20.9/23.7 vs 21.8/27.6 tok/s) and a wash at 16.3k (22.4/20.9
+> vs 22.3/21.1). Decode on this model is expert-read-bound, not attention-bound
+> (see decode-overhead-audit), and selection adds a host round-trip per
+> selecting layer. It is on by default because ABOVE 2048 tokens the dense
+> fallback is the approximation -- QSA is the model's own trained semantics.
+> Open perf follow-up: the rows path syncs per row per layer (one score
+> download each), inside the phase the prefill pipeline documents as sync-free;
+> batching the download per sub-chunk of rows would collapse that to one sync
+> per chunk per layer without changing semantics.
 > Key findings log: no final norm (head collapse is last); z-gate sigmoid vs qwen35
 > silu; ssm_norm is RMSNormGated = NO +1 baking (all other norms baked);
 > qwen_dequant_row needed types 19/20; PLE conv is dilated (dilation=ngram_size).
@@ -82,9 +98,26 @@ Config fields + u64-array reader; `build_qwen4exp_plan`; state arena + snapshot 
 CUDA twins of the new kernels (register names in `gpu_driver.cpp` — unknown names fail silently as fallback); graphs disabled for the arch; extend `test_v2_path_parity.py` (CUDA vs CPU differential). Download UD-IQ1_S (72.5 GB); serve hybrid: dense + hc weights GPU (small), experts + PLE table host mmap, CPU-expert mode; per-layer dump vs transformers on a short prompt (pattern: `bailing_reference.py`); coherence + throughput; README families row + limitations (no MTP/vision, QSA dense fallback + context caveat).
 *Gate: CUDA fixture parity token-exact vs CPU; real-checkpoint dumps within quant tolerance; coherent chat via server; ctest+pytest green; perf recorded.*
 
-**Phase 3 — QSA indexer.**
+**Phase 3 — QSA indexer. SHIPPED 2026-08-27.**
 Index-key cache (128/token × 12 layers) in the state arena; compressed-block scoring + top-k 2048 selected-slot list into existing score/value kernels. Inactive ≤2048 tokens.
 *Gate: bit-exact vs phase 2 below 2048 tokens; quality spot-checks + long-context perf above.*
+
+What shipped:
+- **Semantics resolved and oracle-pinned** (open question 4 in the semantics doc): raw per-token keys cached un-normed/un-roped; block = `ratio`=4 consecutive positions; block key = fp32 mean → `k_norm` rms → partial half-split rope anchored at the block's FIRST position; score = `sum_h relu(q_h · k_b)/sqrt(128)` over 4 indexer heads; keep top `top_k/ratio`=512 blocks + the always-attended incomplete tail (≤2051 tokens). `qsa_token_mask` in `native/tools/qwen4exp_reference.py` matches `Qwen4ExpTextQSAIndexer` EXACTLY (bool mask, zero tolerance).
+- **State** (`QwenLayerPlan::qsa_blocks/qsa_ring/qsa_ratio`): append-only block-key store `[capacity/ratio+1][128]` f32 — position-bounded like the KV slabs, so it is NOT snapshot-copied — plus a `[ratio][128]` raw-key ring that IS (it holds the partial block behind a checkpoint). All three registration sites covered: arena reserve, snapshot size+copy, host-spill ranges.
+- **Kernels** (GPU + generated CPU twins): `qsa_key_store` (ring write + block close), `qsa_block_scores`, and `kv_attention_{scores,values}_{f32,f16,bf16,q8}_indexed` — the ring kernels with `(first+token)%capacity` replaced by `slots[token]`. Indexer queries reuse `qwen_attention_key` unchanged (per-head rms + partial rope is exactly its shape).
+- **Selection** is host-side (`qwen_qsa_select`): one score download per selecting layer, `nth_element` on (score desc, block asc) — deterministic, unlike `torch.topk` on exact ties. CUDA graphs are already off for the arch, so the sync costs no capture.
+- **All three paths hooked.** Maintenance runs from token 0 on every path; selection fires per query above the budget. The rows path leaves the batched tiers (cuBLAS flash / fused chunk) as soon as ANY row in the chunk prunes, since those compute dense attention for every row, and falls to a per-row loop that mixes sparse and dense rows by position.
+- **Gates.** `COLIBRI_QSA=0` disables; a turbo KV cache keeps the dense fallback (announced once) since those codecs rotate rows. Mixed nonzero compress ratios are refused at prepare.
+- **Tests** (`tests/test_v2_qwen4exp_parity.py`, 6 green): dense-fallback parity vs transformers (unchanged), QSA-active parity vs transformers, prefill(rows)==decode across the pruning onset, CUDA==CPU, interleaved==solo under `--parallel 2`, and `COLIBRI_QSA=0`==QSA-on below the budget. The fixture's indexer q/k projections share a base component on purpose — iid noise zeroes every head's relu on ~25% of blocks, and blocks tied at exactly 0.0 make the top-k depend on `torch.topk`'s internal tie order, which nothing can replicate. ctest 21/21, pytest 567 + 897 subtests green.
+  Positive control for the switch: `COLIBRI_QSA=0` makes the QSA-active parity test FAIL (dense above the budget disagrees with the sparse reference), which is what proves the gate test is not comparing a configuration against itself.
+
+**Review fixes applied the same day** (adversarial pass over the diff):
+- `COLIBRI_QSA` was memoized in a function-local `static`, so the second runtime in a process kept the first one's setting — which made the bit-exactness gate test vacuous. Now resolved per runtime at prepare (`ColibriV2QwenRuntime::qsa_enabled`), like `fused_attention`.
+- The block store is indexed linearly (`position/ratio`), unlike every other position-indexed buffer, which wraps modulo capacity. A prompt longer than the configured context reaches the rows path without a position bound and would have written past the reservation into the next layer's KV slab. `qwen_qsa_in_range` now stops the store at `cache_capacity`.
+- `qsa_ratio` is now the single source of truth for "this layer has QSA state", settled at its one assignment (requires all three indexer scalars) — the arena reserve, snapshot size, snapshot copy and host-spill ranges all key off it alone, so they cannot drift. The rows `qsa_keys` region was gated on the head count while activation was gated on key length/top-k; a file with one and not the other would have overrun it.
+- Windowed layers are excluded structurally: QSA selects in position space and hands those positions to the kernels as cache slots, which only coincides when `capacity == context_limit`. No arch ships both today.
+- Non-finite scores are sunk to `-FLT_MAX` before `nth_element`: NaN made the comparator non-transitive, and that is UB, not just a bad selection.
 
 **Out of scope / later:** MTP (needs separate conversion; not in this GGUF), vision (deferred policy), HF safetensors loader, GPU-resident IQ1_S grouped expert kernels.
 

@@ -86,6 +86,13 @@ struct QwenDecodeWorkspaceLayout {
     Region hc_low;
     Region hc_gates;
     Region ple_embed;
+    // qwen4exp QSA indexer scratch; zero-sized unless the model carries an
+    // indexer. `qsa_query` holds the projected q heads plus the raw key of the
+    // current token; `qsa_block_scores` one f32 per complete block;
+    // `qsa_slots` the uploaded selected-slot list (budget + ratio-1 entries).
+    Region qsa_query;
+    Region qsa_block_scores;
+    Region qsa_slots;
     std::uint64_t bytes = 0;
 };
 
@@ -94,7 +101,9 @@ constexpr QwenDecodeWorkspaceLayout qwen_decode(
     std::uint64_t intermediate, std::uint64_t experts, std::uint64_t vocabulary,
     std::uint64_t attention_heads, std::uint64_t context,
     std::uint64_t hc_count = 0, std::uint64_t hc_low_rank = 0,
-    bool ple = false
+    bool ple = false,
+    std::uint64_t qsa_heads = 0, std::uint64_t qsa_key_len = 0,
+    std::uint64_t qsa_budget = 0, std::uint64_t qsa_ratio = 0
 ) {
     Builder builder;
     QwenDecodeWorkspaceLayout layout;
@@ -134,6 +143,11 @@ constexpr QwenDecodeWorkspaceLayout qwen_decode(
     layout.hc_low = builder.add(hc_low_rank * sizeof(float));
     layout.hc_gates = builder.add(hc_count * sizeof(float));
     layout.ple_embed = builder.add((ple ? hidden : 0) * sizeof(float));
+    layout.qsa_query = builder.add((qsa_heads + 1) * qsa_key_len * sizeof(float));
+    layout.qsa_block_scores =
+        builder.add((qsa_ratio ? context / qsa_ratio + 1 : 0) * sizeof(float));
+    layout.qsa_slots = builder.add(
+        (qsa_ratio ? qsa_budget + qsa_ratio - 1 : 0) * sizeof(std::int32_t));
     layout.bytes = builder.bytes();
     return layout;
 }
@@ -185,6 +199,15 @@ struct QwenRowsWorkspaceLayout {
     Region hc_low;
     Region hc_gates;
     Region ple_embed;
+    // qwen4exp QSA scratch. `qsa_query` and `qsa_keys` are rows-wide (queries
+    // and raw keys for the whole chunk are projected in one batched launch);
+    // the score/slot buffers are single-row -- selection runs per row and the
+    // stream-ordered reuse is safe because a row's scores download drains the
+    // previous row's attention launches first.
+    Region qsa_query;
+    Region qsa_keys;
+    Region qsa_block_scores;
+    Region qsa_slots;
     std::uint64_t bytes = 0;
 };
 
@@ -206,7 +229,9 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     std::uint64_t attention_heads, std::uint64_t context,
     std::uint64_t delta_value_heads, bool mtp = false,
     std::uint64_t hc_count = 0, std::uint64_t hc_low_rank = 0,
-    bool ple = false
+    bool ple = false,
+    std::uint64_t qsa_heads = 0, std::uint64_t qsa_key_len = 0,
+    std::uint64_t qsa_budget = 0, std::uint64_t qsa_ratio = 0
 ) {
     Builder builder;
     QwenRowsWorkspaceLayout layout;
@@ -271,6 +296,18 @@ constexpr QwenRowsWorkspaceLayout qwen_rows(
     layout.hc_low = builder.add(rows * hc_low_rank * sizeof(float));
     layout.hc_gates = builder.add(rows * hc_count * sizeof(float));
     layout.ple_embed = builder.add((ple ? rows * hidden : 0) * sizeof(float));
+    layout.qsa_query =
+        builder.add(rows * qsa_heads * qsa_key_len * sizeof(float));
+    // Gated on the SAME predicate the runtime activates on (a nonzero ratio
+    // and key length), not on the head count: a file with a ratio but no
+    // indexer.head_count would otherwise size this to zero while the raw-key
+    // projection still wrote a whole chunk into it.
+    layout.qsa_keys =
+        builder.add(rows * (qsa_ratio ? 1 : 0) * qsa_key_len * sizeof(float));
+    layout.qsa_block_scores =
+        builder.add((qsa_ratio ? context / qsa_ratio + 1 : 0) * sizeof(float));
+    layout.qsa_slots = builder.add(
+        (qsa_ratio ? qsa_budget + qsa_ratio - 1 : 0) * sizeof(std::int32_t));
     layout.bytes = builder.bytes();
     return layout;
 }

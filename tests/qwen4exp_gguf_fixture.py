@@ -275,9 +275,24 @@ def build_qwen4exp_gguf(
             projection(prefix + "attn_output.weight", spec.heads * spec.head_dim, spec.hidden)
             vector(prefix + "attn_q_norm.weight", spec.head_dim, value=1.0)
             vector(prefix + "attn_k_norm.weight", spec.head_dim, value=1.0)
-            projection(prefix + "indexer.q_proj.weight", spec.hidden,
-                       spec.indexer_heads * spec.indexer_key_dim)
-            projection(prefix + "indexer.k_proj.weight", spec.hidden, spec.indexer_key_dim)
+            # The indexer q/k projections share a base component so the head
+            # dots are mostly positive. Independent noise would zero every
+            # head's relu for ~25% of blocks, and blocks tied at exactly 0.0
+            # make the top-k depend on torch.topk's internal tie order --
+            # which no other engine can (or should) replicate. A trained
+            # indexer has correlated q/k by construction; iid noise does not.
+            base = (rng.standard_normal((spec.indexer_key_dim, spec.hidden))
+                    * 0.25).astype(np.float32)
+            q_data = np.concatenate([
+                base + (rng.standard_normal(base.shape) * 0.08).astype(np.float32)
+                for _ in range(spec.indexer_heads)
+            ], axis=0)
+            tensors.append((prefix + "indexer.q_proj.weight",
+                            (spec.hidden, spec.indexer_heads * spec.indexer_key_dim),
+                            q_data))
+            k_data = base + (rng.standard_normal(base.shape) * 0.08).astype(np.float32)
+            tensors.append((prefix + "indexer.k_proj.weight",
+                            (spec.hidden, spec.indexer_key_dim), k_data))
             vector(prefix + "indexer.q_norm.weight", spec.indexer_key_dim, value=1.0)
             vector(prefix + "indexer.k_norm.weight", spec.indexer_key_dim, value=1.0)
         else:

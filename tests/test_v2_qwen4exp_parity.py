@@ -289,5 +289,159 @@ class Qwen4ExpForwardParityTest(unittest.TestCase):
         self.assertEqual(self.runtime_tokens(), self.reference_tokens())
 
 
+class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
+    """Phase 3: the same parity with the QSA selection ACTIVE.
+
+    The release checkpoint's indexer budget (2048) never prunes inside a test,
+    so this fixture shrinks it to 8 tokens at ratio 4: from position 11 on,
+    every full-attention query keeps only its top 2 blocks plus the incomplete
+    tail. Transformers applies the identical selection per row, so greedy
+    parity now pins the whole indexer: raw-key caching, fp32 block pooling,
+    k_norm + block-anchored rope, relu-sum scoring, deterministic top-k, and
+    the sparse slot-list attention. The base class covers the dense-fallback
+    side (its budget of 2048 never fires in 64 positions) -- together they are
+    the phase-3 gate: bit-exact below the budget, reference-exact above it.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.modeling = _load_transformers()
+        if cls.modeling is None:
+            raise unittest.SkipTest(
+                "torch and a qwen4_exp-capable transformers are needed")
+        cls._directory = tempfile.TemporaryDirectory()
+        cls.path = Path(cls._directory.name) / "qwen4exp_qsa.gguf"
+        cls.spec = build_qwen4exp_gguf(
+            cls.path, Qwen4ExpSpec(indexer_top_k=8))
+
+    def test_qsa_prefill_matches_decode(self) -> None:
+        """Chunked rows prefill (16-row chunks straddling the pruning onset)
+        must continue exactly like the token-by-token decode path."""
+        import os
+
+        continuation = 6
+        V2Model.select_backend("cpu")
+        os.environ["COLIBRI_PREFILL_ROWS"] = "16"
+        try:
+            generated: list[int] = []
+            with V2Model(str(self.path)) as model:
+                with model.native_qwen_runtime(context_limit=256) as runtime:
+                    runtime.prepare()
+                    runtime.generate(
+                        TOKENS, continuation,
+                        lambda token: (generated.append(token)
+                                       or len(generated) < continuation))
+            with V2Model(str(self.path)) as model:
+                with model.native_qwen_runtime(context_limit=256) as runtime:
+                    runtime.prepare()
+                    outputs = [runtime.decode(token) for token in TOKENS]
+                    decoded = [outputs[-1]]
+                    for _ in range(continuation - 1):
+                        decoded.append(runtime.decode(decoded[-1]))
+        finally:
+            del os.environ["COLIBRI_PREFILL_ROWS"]
+            V2Model.select_backend("auto")
+        self.assertEqual(generated, decoded)
+
+
+class Qwen4ExpQsaPathTest(unittest.TestCase):
+    """QSA on the paths transformers cannot referee: CUDA and multi-sequence.
+
+    The CPU parity above fixes what the answer IS; these fix that every other
+    execution path produces the same one. Same shrunken indexer budget (8 at
+    ratio 4), so selection is active for most of the run.
+    """
+
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = tempfile.TemporaryDirectory()
+        cls.path = Path(cls._directory.name) / "qwen4exp_qsa.gguf"
+        cls.spec = build_qwen4exp_gguf(
+            cls.path, Qwen4ExpSpec(indexer_top_k=8))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    def _decode(self, backend: str, tokens: list[int]) -> list[int]:
+        V2Model.select_backend(backend)
+        try:
+            with V2Model(str(self.path)) as model:
+                with model.native_qwen_runtime(context_limit=256) as runtime:
+                    runtime.prepare()
+                    return [runtime.decode(token) for token in tokens]
+        finally:
+            V2Model.select_backend("auto")
+
+    def test_cuda_matches_cpu(self) -> None:
+        if not V2Model.gpu_info()["available"]:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        self.assertEqual(self._decode("cuda", TOKENS), self._decode("cpu", TOKENS))
+
+    def test_interleaved_matches_solo(self) -> None:
+        """Two sequences batched through qwen_decode_multi must each decode
+        exactly as they do alone: the block-key store and raw-key ring live in
+        per-slot arenas, and the parked-slot rule governs which position each
+        slot's indexer reads."""
+        prompt_a, prompt_b = TOKENS[:40], TOKENS[8:41]
+        continuation = 6
+
+        def solo(prompt: list[int]) -> list[int]:
+            with V2Model(str(self.path)) as model:
+                with model.native_qwen_runtime(context_limit=256) as runtime:
+                    runtime.prepare()
+                    out: list[int] = []
+                    runtime.generate(
+                        prompt, continuation,
+                        lambda t: (out.append(t) or len(out) < continuation))
+                    return out
+
+        V2Model.select_backend("cpu")
+        try:
+            expected_a, expected_b = solo(prompt_a), solo(prompt_b)
+            with V2Model(str(self.path)) as model:
+                with model.native_qwen_runtime(
+                        context_limit=256, parallel_sequences=2) as runtime:
+                    runtime.prepare()
+                    task_a = runtime.task_submit(prompt_a, continuation)
+                    task_b = runtime.task_submit(prompt_b, continuation)
+                    collected: dict[int, list[int]] = {task_a: [], task_b: []}
+                    finished: set[int] = set()
+                    for _ in range(64 + 8 * continuation):
+                        for task, token, kind in runtime.engine_step():
+                            if kind == 0:
+                                collected[task].append(token)
+                            elif kind == 1:
+                                finished.add(task)
+                            elif kind == 2:
+                                raise AssertionError("engine task failed")
+                        if finished == {task_a, task_b}:
+                            break
+                    self.assertEqual(finished, {task_a, task_b},
+                                     "tasks did not finish")
+        finally:
+            V2Model.select_backend("auto")
+        self.assertEqual(collected[task_a], expected_a, "interleaved task A")
+        self.assertEqual(collected[task_b], expected_b, "interleaved task B")
+
+    def test_dense_fallback_is_bit_exact_below_the_budget(self) -> None:
+        """The phase-3 gate: with COLIBRI_QSA=0 the runtime must produce the
+        identical tokens, because below the budget the selection keeps every
+        block and the sparse path is mathematically the dense one. Any drift
+        here means the indexer perturbed a path it should not touch."""
+        import os
+
+        short = TOKENS[:11]  # 11 visible tokens: 2 complete blocks, budget 2
+        with_qsa = self._decode("cpu", short)
+        os.environ["COLIBRI_QSA"] = "0"
+        try:
+            without = self._decode("cpu", short)
+        finally:
+            del os.environ["COLIBRI_QSA"]
+        self.assertEqual(with_qsa, without)
+
+
 if __name__ == "__main__":
     unittest.main()

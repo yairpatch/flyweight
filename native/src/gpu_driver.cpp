@@ -1189,7 +1189,13 @@ extern "C" int colibri_gpu_compile(
              "qwen4_hc_init_rows", "qwen4_group_rms_rows",
              "qwen4_hc_mix_rows", "qwen4_hc_inject_rows",
              "qwen4_ple_gate_rows", "qwen4_ple_gv_rows",
-             "qwen4_ple_conv_sequence"
+             "qwen4_ple_conv_sequence",
+             // qwen4exp QSA indexer (phase 3)
+             "qsa_key_store", "qsa_block_scores",
+             "kv_attention_scores_indexed", "kv_attention_scores_f16_indexed",
+             "kv_attention_scores_bf16_indexed", "kv_attention_scores_q8_indexed",
+             "kv_attention_values_indexed", "kv_attention_values_f16_indexed",
+             "kv_attention_values_bf16_indexed", "kv_attention_values_q8_indexed"
          }) {
         CUfunction function = nullptr;
         if (g_api.cuModuleGetFunction(&function, g_module, name) == 0)

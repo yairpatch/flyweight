@@ -172,8 +172,25 @@ layers); vocab 248320; rms_eps 1e-6; rope θ 1e7.
    flag when the rows path is hooked in phase 2.
 3. Real-file norm centering (baked +1): still to eyeball on the downloaded shard
    (phase 2, cheap).
-4. QSA indexer exact scoring/selection math: phase 3, extract from
-   `Qwen4ExpTextQSAIndexer` + refs/qwen4_exp/llamacpp_qwen4exp.cpp.
+4. QSA indexer exact scoring/selection math: RESOLVED 2026-08-27 (phase 3),
+   from `Qwen4ExpTextQSAIndexer` + refs llama.cpp cross-check, oracle-pinned
+   (qsa_token_mask EXACT vs the torch module). The math:
+   - `index_qk_proj [2560 -> (4+1)*128]`, queries first then ONE key head.
+     Per-token keys are cached RAW (no norm, no rope).
+   - Queries: per-head rms (`q_norm`, baked +1, shared across the 4 heads),
+     then the SAME partial half-split rope as attention (rotary 64 of 128,
+     pairs (i, i+32)) at the query position.
+   - Blocks of ratio=4 CONSECUTIVE POSITIONS (block b = positions [4b, 4b+4);
+     position==cache slot on this arch, no window). A block's key: fp32 mean
+     of its 4 raw keys -> rms (`k_norm`) -> rope anchored at position 4b.
+     Only COMPLETE blocks compete; a block's key never changes once complete,
+     so the runtime caches pooled block keys incrementally.
+   - Score = sum over the 4 query heads of relu(q_h . k_b) / sqrt(128), fp32.
+   - Selection per query at position t: top (top_k/ratio)=512 blocks of the
+     (t+1)/4 complete ones (ties: lower block wins in our runtime; torch topk
+     agrees off-tie), PLUS the incomplete tail [4*((t+1)/4), t] always.
+     Max attended = 2048+3. Pruning is a NO-OP until t >= 2051 -- the exact
+     dense-fallback bit-exactness gate.
 5. `embedding_length_per_layer_input = 160` is the per-head table row width; HF
    `ple_embed_dim = 2560` is the 16-head concat. Confirmed by the oracle gather.
 

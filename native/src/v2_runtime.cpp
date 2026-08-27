@@ -277,6 +277,17 @@ struct QwenLayerPlan {
     // hc-wide gated-value stream. Only meaningful when ple_conv is set; the
     // block that owns it is a DeltaNet block, so first/second are taken.
     std::uint64_t state_third = 0;
+    // qwen4exp QSA indexer state (full-attention layers with indexer tensors):
+    // qsa_blocks is the pooled block-key store [capacity/ratio + 1][key_len]
+    // f32, append-only and bounded by position exactly like the KV slabs (so
+    // it is never snapshot-copied); qsa_ring holds the raw per-token index
+    // keys of the last `ratio` positions [ratio][key_len] f32 -- the partial
+    // block a snapshot must restore, copied like the PLE conv ring.
+    std::uint64_t qsa_blocks = 0;
+    std::uint64_t qsa_ring = 0;
+    // Per-layer attention kind from .attention.compress_ratios: 4 = QSA over
+    // 4-token blocks, 0 = no selection (delta layers, or archs without it).
+    std::uint32_t qsa_ratio = 0;
     std::uint64_t snapshot_first = 0;
     std::uint64_t snapshot_second = 0;
     // MTP fold retention (ReplaySSM): during verification the qkv projection
@@ -856,6 +867,12 @@ struct ColibriV2QwenRuntime {
     std::uint64_t delta_host_ns = 0;
     std::uint64_t delta_host_calls = 0;
     bool fused_attention = true;
+    // qwen4exp QSA selection. Resolved once per runtime at prepare rather than
+    // memoized in a process-wide static: two runtimes in one process (the
+    // parity tests, and any embedder holding more than one model) must be able
+    // to disagree, and a latched static made the dense-fallback exactness test
+    // compare a configuration against itself.
+    bool qsa_enabled = true;
     // Interleaving two distant expert matrices hurts mmap/TLB locality on
     // memory-bound CPU MoE. Keep the experimental kernel opt-in until it can
     // demonstrate a win across representative hardware and expert routing.
@@ -2561,11 +2578,24 @@ void build_qwen4exp_plan(ColibriV2QwenRuntime& runtime) {
         add_extra(prefix + "hc_ffn_up.weight", layer.hc_ffn_up);
         add_extra(prefix + "hc_ffn_inject.weight", layer.hc_ffn_inject);
         if (layer.attention) {
-            // QSA indexer: resident from day one, exercised in phase 3.
+            // QSA indexer: resident from day one (phase 1), selecting since
+            // phase 3. The per-layer compress ratio is the selection gate --
+            // 4 on the full-attention layers of the real checkpoint, absent
+            // or 0 means the layer stays dense forever.
             add_extra(prefix + "indexer.q_proj.weight", layer.indexer_q);
             add_extra(prefix + "indexer.k_proj.weight", layer.indexer_k);
             add_extra(prefix + "indexer.q_norm.weight", layer.indexer_q_norm);
             add_extra(prefix + "indexer.k_norm.weight", layer.indexer_k_norm);
+            // `qsa_ratio` is the single source of truth for "this layer has
+            // QSA state": the arena reservation, the snapshot accounting, the
+            // snapshot copy and the host-spill ranges all key off it alone, so
+            // every requirement of the indexer has to be settled HERE or those
+            // four sites drift apart. A file that names a ratio but omits any
+            // of the three indexer scalars keeps the layer dense.
+            if (layer_index < model.config.compress_ratios.size()
+                && model.config.indexer_head_count
+                && model.config.indexer_key_length && model.config.indexer_top_k)
+                layer.qsa_ratio = model.config.compress_ratios[layer_index];
         }
         const auto& ple_layers = model.config.ple_layers;
         if (std::find(ple_layers.begin(), ple_layers.end(), layer_index)
@@ -12440,6 +12470,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->fused_attention=fused[0]!='0'; // legacy name
     if(const char*fused=std::getenv("COLIBRI_FUSED_MOE_GATE_UP"))
         runtime->fused_moe_gate_up=fused[0]!='0';
+    if(const char*qsa=std::getenv("COLIBRI_QSA"))
+        runtime->qsa_enabled=qsa[0]!='0';
     if(const char*strict=std::getenv("COLIBRI_EXPERT_CACHE_STRICT_ADMISSION"))
         runtime->strict_cache_admission=strict[0]!='0';
     // COLIBRI_MTP_PROFILE reuses the prefill profiling events to split MTP
@@ -12544,6 +12576,17 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     runtime->model->config.ple_ngram_size,1);
                 layer.state_third=reserve((kernel-1)*dilation*wide*sizeof(float));
             }
+            if(layer.qsa_ratio&&layer.indexer_q!=std::numeric_limits<std::uint64_t>::max()){
+                // QSA block-key store + raw-key ring, both f32 (the scoring is
+                // fp32 end to end and the store is 1/16th of the f16 KV slab).
+                // +1 block of slack so a chunk that lands exactly on capacity
+                // never writes past the store.
+                const auto key_len=runtime->model->config.indexer_key_length;
+                layer.qsa_blocks=reserve(
+                    (layer.cache_capacity/layer.qsa_ratio+1)*key_len*sizeof(float));
+                layer.qsa_ring=reserve(
+                    static_cast<std::uint64_t>(layer.qsa_ratio)*key_len*sizeof(float));
+            }
         }
         if(runtime->options.mtp_drafts){
             auto&layer=runtime->mtp_layer_plan;
@@ -12583,6 +12626,20 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
         }
         runtime->state_bytes=device_align(state_cursor);
+        // QSA scratch geometry: one shape for every selecting layer. Mixed
+        // nonzero ratios would need per-layer score buffers; no checkpoint
+        // ships them, so refuse instead of sizing for one and overrunning on
+        // the other.
+        std::uint64_t qsa_heads=0,qsa_key_len=0,qsa_budget=0,qsa_ratio=0;
+        if(runtime->qwen4exp)for(const auto&layer:runtime->layers){
+            if(!layer.qsa_ratio||layer.indexer_q==std::numeric_limits<std::uint64_t>::max())continue;
+            if(qsa_ratio&&qsa_ratio!=layer.qsa_ratio)
+                throw std::runtime_error("qwen4exp QSA layers disagree on the compress ratio");
+            qsa_heads=runtime->model->config.indexer_head_count;
+            qsa_key_len=runtime->model->config.indexer_key_length;
+            qsa_budget=runtime->model->config.indexer_top_k;
+            qsa_ratio=layer.qsa_ratio;
+        }
         runtime->decode_workspace_layout=colibri::v2::workspace::qwen_decode(
             runtime->model->config.hidden_size,runtime->scratch_elements,
             runtime->model->config.expert_used_count,runtime->moe_intermediate,
@@ -12592,7 +12649,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->options.context_limit,
             runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
-            runtime->qwen4exp&&!runtime->model->config.ple_layers.empty());
+            runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
+            qsa_heads,qsa_key_len,qsa_budget,qsa_ratio);
         // The batched rows forward (MTP verification and chunked prefill)
         // needs workspace and host staging proportional to its row capacity.
         runtime->forward_rows_capacity=std::max<std::uint32_t>(runtime->prefill_rows,9);
@@ -12619,7 +12677,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->options.mtp_drafts!=0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
-            runtime->qwen4exp&&!runtime->model->config.ple_layers.empty());
+            runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
+            qsa_heads,qsa_key_len,qsa_budget,qsa_ratio);
         runtime->rows_host_layout=
             colibri::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);
@@ -13147,7 +13206,17 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     std::max<std::uint64_t>(runtime->model->config.ple_ngram_size,1)*
                     ple_conv.shape[1];
             }
-            if(layer.attention)continue;
+            if(layer.attention){
+                // The QSA raw-key ring is the one piece of indexer state a
+                // snapshot must carry: the block-key store is position-bounded
+                // (append-only, like the KV slabs), but the ring holds the
+                // partial block behind the snapshot position, whose raw keys
+                // later tokens overwrite.
+                if(layer.qsa_ratio&&layer.indexer_q!=std::numeric_limits<std::uint64_t>::max())
+                    snapshot_floats+=static_cast<std::uint64_t>(layer.qsa_ratio)
+                        *runtime->model->config.indexer_key_length;
+                continue;
+            }
             const auto&conv=runtime->model->tensors[layer.static_tensors[6]];
             const auto&a=runtime->model->tensors[layer.static_tensors[8]];
             const auto&norm=runtime->model->tensors[layer.static_tensors[9]];
@@ -14582,7 +14651,19 @@ void qwen_prefill_snapshot_copy(
             launch_copy(restore?cursor:live,restore?live:cursor,ple_bytes);
             cursor+=ple_bytes;
         }
-        if(layer.attention)continue;
+        if(layer.attention){
+            // QSA raw-key ring: the partial block behind the snapshot position
+            // (the block-key store needs no copy -- position bounds it).
+            // Order and sizes mirror the snapshot_floats accumulator exactly.
+            if(layer.qsa_ratio&&layer.indexer_q!=std::numeric_limits<std::uint64_t>::max()){
+                const auto ring_bytes=static_cast<std::uint64_t>(layer.qsa_ratio)
+                    *runtime.model->config.indexer_key_length*sizeof(float);
+                const auto live=runtime.state+layer.qsa_ring;
+                launch_copy(restore?cursor:live,restore?live:cursor,ring_bytes);
+                cursor+=ring_bytes;
+            }
+            continue;
+        }
         const auto&conv=runtime.model->tensors[layer.static_tensors[6]];
         const auto&a=runtime.model->tensors[layer.static_tensors[8]];
         const auto&norm=runtime.model->tensors[layer.static_tensors[9]];
@@ -14612,6 +14693,109 @@ inline bool swa_snapshot_is_resident(const ColibriV2QwenRuntime& runtime,std::ui
         if(live_position-snapshot_position>rollback_room)return false;
     }
     return true;
+}
+
+// ---- QSA selection (qwen4exp phase 3, plans/qwen4exp-semantics.md) --------
+// The indexer maintenance (raw-key ring + block-key store) runs on every
+// token from position 0 so history exists when the context first crosses the
+// budget; the selection itself is a no-op until (position+1)/ratio exceeds
+// top_k/ratio complete blocks, which keeps the dense path -- and its
+// phase-2 bit-exactness -- untouched below 2051 visible tokens.
+// Sparse attention reads the cache through kv_ld like the ring kernels; the
+// turbo codecs rotate rows and keep their own staged path, so a turbo cache
+// stays on the dense fallback (announced once).
+inline const char* kv_scores_indexed_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_scores_q8_indexed":t==2?"kv_attention_scores_bf16_indexed":t==1?"kv_attention_scores_f16_indexed":t==0?"kv_attention_scores_indexed":nullptr;}
+inline const char* kv_values_indexed_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==3?"kv_attention_values_q8_indexed":t==2?"kv_attention_values_bf16_indexed":t==1?"kv_attention_values_f16_indexed":t==0?"kv_attention_values_indexed":nullptr;}
+// A layer selects when it carries indexer tensors AND a compress ratio. The
+// window exclusion is structural, not incidental: QSA selects in POSITION
+// space and hands the attention kernels those positions as cache slots, which
+// only coincides on a global layer where capacity == context_limit. No arch
+// ships both today; the guard is what keeps the next one from silently
+// addressing the wrong rows.
+inline bool qwen_qsa_layer(const ColibriV2QwenRuntime& r,const QwenLayerPlan& layer){
+    return r.qsa_enabled&&r.qwen4exp&&layer.attention&&layer.qsa_ratio
+        &&!layer.attention_window
+        &&layer.indexer_q!=std::numeric_limits<std::uint64_t>::max()
+        &&r.model->config.indexer_head_count&&r.model->config.indexer_key_length
+        &&r.model->config.indexer_top_k;
+}
+// Whether the block store can still take this position's block. Past the
+// context limit the KV slabs wrap and the conversation is already lost, but
+// the block store is indexed linearly (a block key is not a ring row), so it
+// must stop rather than write past its reservation into the next layer's KV.
+// Only the rows path can get here -- both decode entry points bound the
+// position first -- and only on a prompt longer than the configured context.
+inline bool qwen_qsa_in_range(const QwenLayerPlan& layer,std::uint64_t position){
+    return position<layer.cache_capacity;
+}
+inline bool qwen_qsa_selecting(const ColibriV2QwenRuntime& r,const QwenLayerPlan& layer,std::uint64_t position){
+    const auto ratio=layer.qsa_ratio;
+    if(!ratio||!qwen_qsa_in_range(layer,position))return false;
+    if((position+1)/ratio<=r.model->config.indexer_top_k/ratio)return false;
+    if(kv_scores_indexed_kernel(r)&&kv_values_indexed_kernel(r))return true;
+    static bool announced=false;
+    if(!announced){
+        announced=true;
+        std::fprintf(stderr,"[colibri] QSA selection needs a f32/f16/bf16/q8 KV cache; "
+            "turbo caches keep the dense fallback (approximate past the indexer budget)\n");
+    }
+    return false;
+}
+// Download the block scores, pick the top budget/ratio blocks -- score
+// descending, block index ascending on ties, deterministic -- and upload the
+// slot list: the winning blocks' positions ascending, then the incomplete
+// tail. Positions ARE cache slots here (QSA layers carry no window). Returns
+// the list length. Costs one stream sync per selecting layer; CUDA graphs
+// are already off for the arch.
+inline int qwen_qsa_select(
+    const ColibriV2QwenRuntime& runtime,const QwenLayerPlan& layer,
+    std::uint64_t block_scores_device,std::uint64_t slots_device,
+    std::uint64_t position
+){
+    const int ratio=static_cast<int>(layer.qsa_ratio);
+    const int visible=static_cast<int>(position)+1;
+    const int complete=visible/ratio;
+    const int budget_blocks=static_cast<int>(runtime.model->config.indexer_top_k)/ratio;
+    static thread_local std::vector<float> scores;
+    static thread_local std::vector<std::int32_t> order,slots;
+    scores.resize(complete);
+    if(colibri_gpu_download(scores.data(),block_scores_device,
+            static_cast<std::uint64_t>(complete)*sizeof(float),runtime.stream)!=0
+       ||colibri_gpu_stream_sync(runtime.stream)!=0)
+        throw std::runtime_error("native Qwen QSA score download failed");
+    order.resize(complete);
+    for(int i=0;i<complete;++i)order[i]=i;
+    // A non-finite score would make `better` non-transitive (NaN compares
+    // unequal to everything yet greater than nothing), and nth_element on a
+    // comparator that is not a strict weak ordering is undefined -- it can
+    // walk off the range. Sink them instead: a block whose score overflowed is
+    // exactly the block to drop.
+    for(int i=0;i<complete;++i)
+        if(!std::isfinite(scores[i]))scores[i]=-std::numeric_limits<float>::max();
+    const auto better=[&](std::int32_t a,std::int32_t b){
+        return scores[a]!=scores[b]?scores[a]>scores[b]:a<b;};
+    std::nth_element(order.begin(),order.begin()+budget_blocks,order.end(),better);
+    std::sort(order.begin(),order.begin()+budget_blocks);
+    slots.clear();
+    for(int i=0;i<budget_blocks;++i)
+        for(int j=0;j<ratio;++j)slots.push_back(order[i]*ratio+j);
+    for(int t=complete*ratio;t<visible;++t)slots.push_back(t);
+    if(colibri_gpu_upload(slots_device,slots.data(),
+            slots.size()*sizeof(std::int32_t),runtime.stream)!=0)
+        throw std::runtime_error("native Qwen QSA slot upload failed");
+    // COLIBRI_QSA_TRACE=1: proof the selection is live and how hard it prunes.
+    static const bool trace=std::getenv("COLIBRI_QSA_TRACE")!=nullptr;
+    if(trace){
+        static std::uint64_t calls=0,kept=0,candidates=0;
+        ++calls;kept+=slots.size();candidates+=visible;
+        if(calls==1||calls%4096==0)
+            std::fprintf(stderr,
+                "[qsa] selections=%llu kept=%llu/%llu tokens (%.1f%%)\n",
+                (unsigned long long)calls,(unsigned long long)kept,
+                (unsigned long long)candidates,
+                candidates?100.0*kept/candidates:0.0);
+    }
+    return static_cast<int>(slots.size());
 }
 // No fused turbo prefill kernel yet, so a turbo cache falls back to the
 // separate scores+values path, which handles every precision.
@@ -16415,7 +16599,62 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
             launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
             std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            // QSA indexer: maintain the raw-key ring + block-key store every
+            // token; select once the context outgrows the budget. `first` is
+            // free (the roped attention key was consumed by kv_store) and
+            // becomes the normed+roped indexer queries.
+            int qsa_selected=0;
+            if(qwen_qsa_layer(*runtime,layer)){
+                const int qsa_heads=static_cast<int>(runtime->model->config.indexer_head_count);
+                const int key_len=static_cast<int>(runtime->model->config.indexer_key_length);
+                const int ratio=static_cast<int>(layer.qsa_ratio);
+                const int qsa_rotary=std::min(rotary,key_len);
+                const std::uint64_t qsa_query=workspace_layout.qsa_query.address(runtime->workspace);
+                const std::uint64_t qsa_raw=qsa_query+static_cast<std::uint64_t>(qsa_heads)*key_len*sizeof(float);
+                const std::uint64_t qsa_scores=workspace_layout.qsa_block_scores.address(runtime->workspace);
+                const std::uint64_t qsa_slots=workspace_layout.qsa_slots.address(runtime->workspace);
+                std::uint64_t ring=runtime->state+layer.qsa_ring;
+                std::uint64_t blocks=runtime->state+layer.qsa_blocks;
+                auto knorm_w=runtime->device_tensors[layer.indexer_k_norm];
+                dense_matvec(layer.indexer_k,normalized,qsa_raw,hidden_size,key_len);
+                void*store_args[]={const_cast<std::uint64_t*>(&qsa_raw),&ring,&blocks,&knorm_w,
+                    const_cast<int*>(&position),const_cast<int*>(&ratio),
+                    const_cast<int*>(&key_len),const_cast<int*>(&qsa_rotary),
+                    const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
+                launch_named("qsa_key_store",1,1,256,store_args);
+                if(qwen_qsa_selecting(*runtime,layer,runtime->position)){
+                    const int complete=(position+1)/ratio;
+                    dense_matvec(layer.indexer_q,normalized,qsa_query,hidden_size,qsa_heads*key_len);
+                    auto qnorm_w=runtime->device_tensors[layer.indexer_q_norm];
+                    std::uint64_t prepped=first;
+                    void*prep_args[]={const_cast<std::uint64_t*>(&qsa_query),&qnorm_w,&prepped,
+                        const_cast<int*>(&qsa_heads),const_cast<int*>(&key_len),
+                        const_cast<int*>(&qsa_rotary),const_cast<int*>(&position),
+                        const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
+                    launch_named("qwen_attention_key",qsa_heads,1,256,prep_args);
+                    void*score_args[]={&prepped,&blocks,const_cast<std::uint64_t*>(&qsa_scores),
+                        const_cast<int*>(&complete),const_cast<int*>(&qsa_heads),
+                        const_cast<int*>(&key_len)};
+                    launch_named("qsa_block_scores",
+                        (static_cast<std::uint32_t>(complete)+255)/256,1,256,score_args);
+                    qsa_selected=qwen_qsa_select(*runtime,layer,qsa_scores,qsa_slots,runtime->position);
+                }
+            }
             if(profile)profile_record(profile->recurrent_start);
+            if(qsa_selected){
+                const std::uint64_t qsa_slots=workspace_layout.qsa_slots.address(runtime->workspace);
+                void*score_args[]={&queries,&cache_keys,const_cast<std::uint64_t*>(&qsa_slots),
+                    const_cast<std::uint64_t*>(&attention_scores),
+                    const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                    const_cast<int*>(&head_dim),&qsa_selected,&capacity,&scale};
+                launch_named(kv_scores_indexed_kernel(*runtime),heads,
+                    (static_cast<std::uint32_t>(qsa_selected)+255)/256,256,score_args);
+                void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,
+                    const_cast<std::uint64_t*>(&qsa_slots),&attended,
+                    const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                    const_cast<int*>(&head_dim),&qsa_selected,&capacity};
+                launch_named(kv_values_indexed_kernel(*runtime),heads,1,256,value_args);
+            }else{
             const char* fused_tiles=kv_fused_tiles_kernel(*runtime);
             const int fused_tile_tokens=kv_fused_tile_tokens(*runtime);
             // The staging path keeps its priority by measurement, not theory:
@@ -16499,6 +16738,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
                 void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
                 launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            }
             }
             if(profile)profile_record(profile->recurrent_end);
             std::uint64_t gated=third;int elements=heads*head_dim;
@@ -17624,6 +17864,18 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
                 if (!used) continue;
                 for (std::uint64_t head = 0; head < kv_heads; ++head)
                     ranges.emplace_back(base + head * slab, used);
+            }
+            if (layer.qsa_ratio && layer.indexer_q != std::numeric_limits<std::uint64_t>::max()) {
+                // QSA state: the used [0, position/ratio) prefix of the block-key
+                // store (position-bounded like KV), plus the whole raw-key ring.
+                const auto key_len = runtime.model->config.indexer_key_length;
+                const auto used_blocks =
+                    std::min<std::uint64_t>(position, layer.cache_capacity) / layer.qsa_ratio;
+                if (used_blocks)
+                    ranges.emplace_back(layer.qsa_blocks, used_blocks * key_len * sizeof(float));
+                ranges.emplace_back(
+                    layer.qsa_ring,
+                    static_cast<std::uint64_t>(layer.qsa_ratio) * key_len * sizeof(float));
             }
         } else {
             const auto& conv = runtime.model->tensors[layer.static_tensors[6]];
@@ -19059,6 +19311,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         // qwen4exp gated-residual slices of this sequence's workspace copy.
         std::uint64_t hc_streams, hc_normed, hc_wide, hc_low, hc_gates,
             ple_embed;
+        // qwen4exp QSA scratch slices.
+        std::uint64_t qsa_query, qsa_block_scores, qsa_slots;
         std::int32_t* selected_host; float *cpu_weights, *cpu_input, *cpu_activated, *cpu_output;
         std::uint64_t* winner_host;
     };
@@ -19097,6 +19351,9 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         s.hc_low = workspace_layout.hc_low.address(base);
         s.hc_gates = workspace_layout.hc_gates.address(base);
         s.ple_embed = workspace_layout.ple_embed.address(base);
+        s.qsa_query = workspace_layout.qsa_query.address(base);
+        s.qsa_block_scores = workspace_layout.qsa_block_scores.address(base);
+        s.qsa_slots = workspace_layout.qsa_slots.address(base);
         auto* block = staging + i * runtime->decode_host_block_bytes;
         s.selected_host = reinterpret_cast<std::int32_t*>(
             block+host_layout.selected.offset);
@@ -19357,6 +19614,55 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 launch_named(kv_store_kernel(runtime->options.cache_type_v,false), kv_heads, 1, 256, v_store_args);
                 std::uint64_t attended = s.second; int tokens=view.tokens,first_slot=view.first;
                 float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                // QSA indexer, per slot: same shape as single-token decode --
+                // maintain ring + block keys always, select past the budget.
+                int qsa_selected = 0;
+                if (qwen_qsa_layer(*runtime, layer)) {
+                    const int qsa_heads = static_cast<int>(runtime->model->config.indexer_head_count);
+                    const int key_len = static_cast<int>(runtime->model->config.indexer_key_length);
+                    const int ratio = static_cast<int>(layer.qsa_ratio);
+                    const int qsa_rotary = std::min(rotary, key_len);
+                    const std::uint64_t qsa_raw = s.qsa_query + static_cast<std::uint64_t>(qsa_heads) * key_len * sizeof(float);
+                    std::uint64_t ring = s.state + layer.qsa_ring;
+                    std::uint64_t blocks = s.state + layer.qsa_blocks;
+                    auto knorm_w = runtime->device_tensors[layer.indexer_k_norm];
+                    dense_matvec(layer.indexer_k, s.normalized, qsa_raw, hidden_size, key_len);
+                    void* store_args[] = {const_cast<std::uint64_t*>(&qsa_raw), &ring, &blocks, &knorm_w,
+                        const_cast<int*>(&position), const_cast<int*>(&ratio),
+                        const_cast<int*>(&key_len), const_cast<int*>(&qsa_rotary),
+                        const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
+                    launch_named("qsa_key_store", 1, 1, 256, store_args);
+                    if (qwen_qsa_selecting(*runtime, layer, s.position)) {
+                        const int complete = (position + 1) / ratio;
+                        dense_matvec(layer.indexer_q, s.normalized, s.qsa_query, hidden_size, qsa_heads * key_len);
+                        auto qnorm_w = runtime->device_tensors[layer.indexer_q_norm];
+                        std::uint64_t prepped = s.first;
+                        void* prep_args[] = {const_cast<std::uint64_t*>(&s.qsa_query), &qnorm_w, &prepped,
+                            const_cast<int*>(&qsa_heads), const_cast<int*>(&key_len),
+                            const_cast<int*>(&qsa_rotary), const_cast<int*>(&position),
+                            const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
+                        launch_named("qwen_attention_key", qsa_heads, 1, 256, prep_args);
+                        void* score_args[] = {&prepped, &blocks, const_cast<std::uint64_t*>(&s.qsa_block_scores),
+                            const_cast<int*>(&complete), const_cast<int*>(&qsa_heads),
+                            const_cast<int*>(&key_len)};
+                        launch_named("qsa_block_scores",
+                            (static_cast<std::uint32_t>(complete) + 255) / 256, 1, 256, score_args);
+                        qsa_selected = qwen_qsa_select(*runtime, layer, s.qsa_block_scores, s.qsa_slots, s.position);
+                    }
+                }
+                if (qsa_selected) {
+                    void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&s.qsa_slots),
+                        const_cast<std::uint64_t*>(&s.attention_scores),
+                        const_cast<int*>(&heads), const_cast<int*>(&kv_heads),
+                        const_cast<int*>(&head_dim), &qsa_selected, &capacity, &scale};
+                    launch_named(kv_scores_indexed_kernel(*runtime), heads,
+                        (static_cast<std::uint32_t>(qsa_selected) + 255) / 256, 256, score_args);
+                    void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values,
+                        const_cast<std::uint64_t*>(&s.qsa_slots), &attended,
+                        const_cast<int*>(&heads), const_cast<int*>(&kv_heads),
+                        const_cast<int*>(&head_dim), &qsa_selected, &capacity};
+                    launch_named(kv_values_indexed_kernel(*runtime), heads, 1, 256, value_args);
+                } else {
                 const char* fused_tiles=kv_fused_tiles_kernel(*runtime);
                 const int fused_tile_tokens=kv_fused_tile_tokens(*runtime);
                 const bool cublas_done=
@@ -19398,6 +19704,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
                     void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot};
                     launch_named(kv_values_ring_kernel(*runtime), heads, 1, 256, value_args);
+                }
                 }
                 std::uint64_t gated = s.third; int elements = heads * head_dim;
                 void* gate_args[] = {&attended, &gates, &gated, &elements};

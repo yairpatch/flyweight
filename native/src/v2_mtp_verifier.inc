@@ -474,6 +474,13 @@ void qwen_forward_rows(
     const auto hc_low_base=workspace_layout.hc_low.address(runtime.workspace);
     const auto hc_gates_base=workspace_layout.hc_gates.address(runtime.workspace);
     const auto ple_embed_base=workspace_layout.ple_embed.address(runtime.workspace);
+    // QSA scratch (qwen4exp): NOT span-sliced -- each span's usage is
+    // enqueue-local (projected, consumed, and free before the other span's
+    // layer body queues), and the score/slot buffers are single-row anyway.
+    const auto qsa_query_base=workspace_layout.qsa_query.address(runtime.workspace);
+    const auto qsa_keys_base=workspace_layout.qsa_keys.address(runtime.workspace);
+    const auto qsa_scores_base=workspace_layout.qsa_block_scores.address(runtime.workspace);
+    const auto qsa_slots_base=workspace_layout.qsa_slots.address(runtime.workspace);
     auto hc_slice=[&](std::uint64_t base,std::uint64_t per_row){
         return base+static_cast<std::uint64_t>(span_begin)*per_row*sizeof(float);
     };
@@ -1017,6 +1024,41 @@ void qwen_forward_rows(
                 launch(kv_store_kernel(runtime.options.cache_type_v,false),kv_heads,1,256,v_store_args);
             }
             phase(layer_number,"ropestore");
+            // QSA indexer upkeep for the whole span: batched raw-key
+            // projection, then per-row ring writes + block closes (blocks
+            // straddling the chunk boundary read the older raw keys from the
+            // ring the previous chunk left behind). Runs from position 0 so
+            // the block-key store is complete when selection first fires.
+            const bool qsa_layer_on=qwen_qsa_layer(runtime,layer);
+            const int qsa_heads=qsa_layer_on
+                ?static_cast<int>(runtime.model->config.indexer_head_count):0;
+            const int qsa_key_len=qsa_layer_on
+                ?static_cast<int>(runtime.model->config.indexer_key_length):0;
+            const int qsa_ratio=qsa_layer_on?static_cast<int>(layer.qsa_ratio):0;
+            if(qsa_layer_on){
+                const int qsa_rotary=std::min(rotary,qsa_key_len);
+                std::uint64_t ring=runtime.state+layer.qsa_ring;
+                std::uint64_t blocks=runtime.state+layer.qsa_blocks;
+                auto knorm_w=runtime.device_tensors[layer.indexer_k_norm];
+                dense_rows(layer.indexer_k,normalized,qsa_keys_base,
+                           hidden_size,qsa_key_len);
+                for(int token=0;token<rows;++token){
+                    auto raw=qsa_keys_base+static_cast<std::uint64_t>(token)*qsa_key_len*sizeof(float);
+                    int position=static_cast<int>(runtime.position)+span_begin+token;
+                    if(!qwen_qsa_in_range(layer,static_cast<std::uint64_t>(position)))break;
+                    void*store_args[]={&raw,&ring,&blocks,&knorm_w,&position,
+                        const_cast<int*>(&qsa_ratio),const_cast<int*>(&qsa_key_len),
+                        const_cast<int*>(&qsa_rotary),const_cast<float*>(&theta),
+                        const_cast<float*>(&epsilon)};
+                    launch("qsa_key_store",1,1,256,store_args);
+                }
+            }
+            // Selection is per row; the chunk leaves the batched attention
+            // tiers as soon as ANY of its rows prunes, because those tiers
+            // compute dense attention for every row.
+            const bool qsa_chunk_selecting=qsa_layer_on&&rows>0&&
+                qwen_qsa_selecting(runtime,layer,
+                    runtime.position+static_cast<std::uint64_t>(span_begin)+rows-1);
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
             const char*cublas_prefill_env=
                 std::getenv("COLIBRI_CUBLAS_PREFILL_ATTENTION");
@@ -1067,6 +1109,7 @@ void qwen_forward_rows(
             // gate in themselves, so Laguna, whose gate is a per-head softplus,
             // cannot use them and takes the warp path with its own gate kernel.
             const bool cublas_prefill_done=
+                !qsa_chunk_selecting&&
                 cublas_prefill_requested&&!laguna&&!layer.attention_window&&
                 runtime.options.cache_type_k==1&&
                 runtime.options.cache_type_v==1&&cublas_tile_rows>0&&
@@ -1092,7 +1135,70 @@ void qwen_forward_rows(
                         (int)cublas_prefill_requested,cublas_tile_rows,
                         cublas_block_tokens,rows);}
             }
-            if(cublas_prefill_done){
+            if(qsa_chunk_selecting){
+                // Per-row sparse attention: rows past the indexer budget score
+                // the block keys, keep the top budget/ratio blocks + tail, and
+                // attend over that slot list; rows still below it take the
+                // dense ring pair -- identical math to the batched tiers.
+                dense_rows(layer.indexer_q,normalized,qsa_query_base,
+                           hidden_size,qsa_heads*qsa_key_len);
+                const int qsa_rotary=std::min(rotary,qsa_key_len);
+                auto qnorm_w=runtime.device_tensors[layer.indexer_q_norm];
+                std::uint64_t blocks=runtime.state+layer.qsa_blocks;
+                for(int token=0;token<rows;++token){
+                    auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    int position=static_cast<int>(runtime.position)+span_begin+token;
+                    auto attended=second+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    int n_sel=0;
+                    if(qwen_qsa_selecting(runtime,layer,static_cast<std::uint64_t>(position))){
+                        const int complete=(position+1)/qsa_ratio;
+                        auto projected_q=qsa_query_base+static_cast<std::uint64_t>(token)*qsa_heads*qsa_key_len*sizeof(float);
+                        // `first` is free per row (its roped key went to the
+                        // cache in the store loop); it takes the normed+roped
+                        // indexer queries.
+                        auto prepped=first+static_cast<std::uint64_t>(token)*q_size*sizeof(float);
+                        void*prep_args[]={&projected_q,&qnorm_w,&prepped,
+                            const_cast<int*>(&qsa_heads),const_cast<int*>(&qsa_key_len),
+                            const_cast<int*>(&qsa_rotary),&position,
+                            const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
+                        launch("qwen_attention_key",qsa_heads,1,256,prep_args);
+                        void*bscore_args[]={&prepped,&blocks,
+                            const_cast<std::uint64_t*>(&qsa_scores_base),
+                            const_cast<int*>(&complete),const_cast<int*>(&qsa_heads),
+                            const_cast<int*>(&qsa_key_len)};
+                        launch("qsa_block_scores",
+                            (static_cast<std::uint32_t>(complete)+255)/256,1,256,bscore_args);
+                        n_sel=qwen_qsa_select(runtime,layer,qsa_scores_base,
+                            qsa_slots_base,static_cast<std::uint64_t>(position));
+                    }
+                    if(n_sel){
+                        void*score_args[]={&query,&cache_keys,
+                            const_cast<std::uint64_t*>(&qsa_slots_base),
+                            const_cast<std::uint64_t*>(&attention_scores),
+                            const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                            const_cast<int*>(&head_dim),&n_sel,&capacity,&scale};
+                        launch(kv_scores_indexed_kernel(runtime),heads,
+                            (static_cast<std::uint32_t>(n_sel)+255)/256,256,score_args);
+                        void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),
+                            &cache_values,const_cast<std::uint64_t*>(&qsa_slots_base),
+                            &attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
+                            const_cast<int*>(&head_dim),&n_sel,&capacity};
+                        launch(kv_values_indexed_kernel(runtime),heads,1,256,value_args);
+                    }else{
+                        const auto view=attention_cache_view(layer,static_cast<std::uint64_t>(position));
+                        int tokens=view.tokens,first_slot=view.first;
+                        void*score_args[]={&query,&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+                        launch(kv_scores_ring_kernel(runtime),heads,(tokens+255)/256,256,score_args);
+                        void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+                        launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
+                    }
+                    auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                    int elements=query_elements;
+                    void*token_gate_args[]={&attended,&gate,&gated,&elements};
+                    launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                }
+            }else if(cublas_prefill_done){
                 // Tensor-core attention wrote the already-gated rows to third.
             }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
                 // One warp streams the KV cache once for 4 query rows: cache

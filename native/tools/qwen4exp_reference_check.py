@@ -11,6 +11,9 @@ is pinned here against the merged upstream implementation (transformers PR
                                    whole-sequence AND split prefill+decode to
                                    pin the conv/token-history state handling
     Qwen4ExpTextRMSNorm         -> grouped_rms (baked-weight convention)
+    Qwen4ExpTextQSAIndexer      -> qsa_token_mask (block pooling, scoring and
+                                   top-k selection; the bool mask must match
+                                   EXACTLY, scores have no float ties here)
 
 Weight-baking note: the HF modules compute `normed * (1 + w)` with zero-init
 `w`; the GGUF conversion stores `1 + w`. Torch modules here get random `w`,
@@ -193,6 +196,61 @@ def main() -> int:
         ple.conv1d.weight.detach().numpy()[:, 0, :],
         state, HC, HIDDEN, NGRAM)
     check("ple split==whole", np.concatenate([np_d1, np_d2]), np_delta)
+
+    # --- QSA indexer: selection mask, exact -------------------------------
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextQSAIndexer,
+    )
+
+    qsa_config = Qwen4ExpTextConfig(
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=8,
+        indexer_compress_ratio=4,
+        rms_norm_eps=1e-6,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
+                         "partial_rotary_factor": 0.25},
+    )
+    indexer = Qwen4ExpTextQSAIndexer(qsa_config, layer_idx=3).float().eval()
+    with torch.no_grad():
+        for name, p in indexer.named_parameters():
+            p.copy_(torch.randn_like(p) * (0.1 if "norm" in name else 0.3))
+
+    qsa_rows, rot = 61, 8  # budget 8 / ratio 4: pruning from 12 visible on
+    hidden = rng.standard_normal((qsa_rows, HIDDEN)).astype(np.float32)
+    inv_freq = 10000.0 ** (-np.arange(0, rot, 2, dtype=np.float64) / rot)
+    angles = np.arange(qsa_rows)[:, None] * inv_freq[None, :]
+    cos = np.tile(np.cos(angles), (1, 2)).astype(np.float32)
+    sin = np.tile(np.sin(angles), (1, 2)).astype(np.float32)
+
+    causal = torch.tril(torch.ones(qsa_rows, qsa_rows, dtype=torch.bool))
+    with torch.no_grad():
+        torch_mask = indexer(
+            torch.tensor(hidden[None, :, :]),
+            (torch.tensor(cos[None, :, :]), torch.tensor(sin[None, :, :])),
+            causal[None, None, :, :],
+            None,
+        )[0, 0].numpy()
+
+    qk_w = indexer.index_qk_proj.weight.detach().numpy().T
+    np_mask = ref.qsa_token_mask(
+        hidden, qk_w,
+        1.0 + indexer.q_layernorm.weight.detach().numpy(),
+        1.0 + indexer.k_layernorm.weight.detach().numpy(),
+        cos, sin, n_heads=4, head_dim=16, budget=8, ratio=4)
+    agree = bool((np_mask == torch_mask).all())
+    failures += not agree
+    print(f"{'OK ' if agree else 'BAD'} {'qsa selection mask':34s} "
+          f"{'exact' if agree else f'{int((np_mask != torch_mask).sum())} cells differ'}")
+    # sanity on the gate the runtime relies on: no pruning below the budget
+    assert np_mask[:11, :].sum() == np.tril(np.ones((11, 11))).sum(), \
+        "qsa pruned below the budget threshold"
 
     print("reference matches transformers Qwen4Exp" if not failures
           else "reference DISAGREES with transformers")

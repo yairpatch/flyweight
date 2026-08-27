@@ -10064,5 +10064,207 @@ void qwen4_ple_conv_sequence(
             value / (1.0f + expf(-value));
     }
 }
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// QSA indexer (qwen4exp phase 3). Runs once per token on every selecting
+// layer, in all three forward paths: stores the token's raw 128-wide index
+// key into the per-layer ring and, when the token completes a `ratio`-block,
+// derives the block key -- fp32 mean of the ring, rms with the baked k_norm,
+// then the same partial half-split rope as qwen_attention_key, anchored at
+// the block's FIRST position. A completed block key never changes again.
+// One thread block; blockDim must be >= key_len.
+extern "C" __global__
+void qsa_key_store(
+    const float* raw_key, float* ring, float* block_keys,
+    const float* norm_weights, const int position, const int ratio,
+    const int key_len, const int rotary_dim, const float theta,
+    const float epsilon
+) {
+    const int lane = threadIdx.x;
+    const int row = position % ratio;
+    if (lane < key_len) ring[row * key_len + lane] = raw_key[lane];
+    __syncthreads();
+    if (row != ratio - 1) return;
+    float pooled = 0.0f;
+    if (lane < key_len) {
+        for (int r = 0; r < ratio; ++r) pooled += ring[r * key_len + lane];
+        pooled /= (float)ratio;
+    }
+    float square = block_reduce_sum(pooled * pooled);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) inverse_rms = rsqrtf(square / (float)key_len + epsilon);
+    __syncthreads();
+    // Stage the normed vector in the output row so the rope pair lanes can
+    // read each other, then rotate in place.
+    float* out = block_keys + (long long)(position / ratio) * key_len;
+    const float normed = pooled * inverse_rms *
+        (lane < key_len ? norm_weights[lane] : 0.0f);
+    if (lane < key_len) out[lane] = normed;
+    __syncthreads();
+    float value = normed;
+    if (lane < rotary_dim) {
+        const int half = rotary_dim / 2;
+        const int pair = lane < half ? lane : lane - half;
+        const float other = out[lane < half ? lane + half : lane - half];
+        const float angle = (float)(position - (ratio - 1))
+            / powf(theta, 2.0f * (float)pair / (float)rotary_dim);
+        value = lane < half
+            ? value * cosf(angle) - other * sinf(angle)
+            : value * cosf(angle) + other * sinf(angle);
+    }
+    __syncthreads();
+    if (lane < key_len) out[lane] = value;
+}
+
+// Block scores for one query: sum over the indexer heads of relu(q_h . k_b),
+// scaled by rsqrt(key_len). The query is already normed and roped
+// (qwen_attention_key with the indexer geometry).
+extern "C" __global__
+void qsa_block_scores(
+    const float* query, const float* block_keys, float* scores,
+    const int blocks, const int heads, const int key_len
+) {
+    const int block = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block >= blocks) return;
+    const float* key = block_keys + (long long)block * key_len;
+    float total = 0.0f;
+    for (int head = 0; head < heads; ++head) {
+        const float* q = query + head * key_len;
+        float dot = 0.0f;
+        for (int d = 0; d < key_len; ++d) dot += q[d] * key[d];
+        total += fmaxf(dot, 0.0f);
+    }
+    scores[block] = total * rsqrtf((float)key_len);
+}
+
+// Sparse attention over an explicit slot list -- the ring kernels with the
+// (first+token)%capacity indirection replaced by slots[token]. The list is
+// the QSA selection: the top-k blocks' slots ascending plus the incomplete
+// tail, so `tokens` is at most budget + ratio - 1.
+template<typename KT>
+__device__ void kv_scores_indexed_impl(
+    const float* query, const KT* keys, const int* slots, float* scores,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y * blockDim.x + threadIdx.x;
+    if (head >= heads || token >= tokens) return;
+    const int kv_head = head / (heads / kv_heads);
+    const float* q = query + head * head_dim;
+    const KT* k = keys + ((long long)kv_head * capacity + slots[token]) * head_dim;
+    float score = 0.0f;
+    for (int d = 0; d < head_dim; ++d) score += q[d] * kv_ld(k, d);
+    scores[head * tokens + token] = score * scale;
+}
+#define KV_SCORES_INDEXED(name, T) \
+extern "C" __global__ void name(const float* query, const T* keys, const int* slots, \
+    float* scores, const int heads, const int kv_heads, const int head_dim, \
+    const int tokens, const int capacity, const float scale) { \
+    kv_scores_indexed_impl<T>(query, keys, slots, scores, heads, kv_heads, head_dim, tokens, capacity, scale); \
+}
+KV_SCORES_INDEXED(kv_attention_scores_indexed, float)
+KV_SCORES_INDEXED(kv_attention_scores_f16_indexed, __half)
+KV_SCORES_INDEXED(kv_attention_scores_bf16_indexed, __nv_bfloat16)
+#undef KV_SCORES_INDEXED
+extern "C" __global__ void kv_attention_scores_q8_indexed(
+    const float* query, const unsigned char* keys, const int* slots,
+    float* scores, const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity, const float scale
+) {
+    const int head=blockIdx.x, token=blockIdx.y*blockDim.x+threadIdx.x;
+    if(head>=heads||token>=tokens)return;
+    const int kv_head=head/(heads/kv_heads), blocks=head_dim/32;
+    const float* q=query+head*head_dim;
+    const unsigned char* k=keys+((long long)kv_head*capacity+slots[token])*blocks*34;
+    float score=0.0f;
+    for(int d=0;d<head_dim;++d)score+=q[d]*kv_ld_q8(k,d);
+    scores[head*tokens+token]=score*scale;
+}
+
+template<typename VT>
+__device__ void kv_values_indexed_impl(
+    float* scores, const VT* values, const int* slots, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity
+) {
+    const int head=blockIdx.x;
+    if(head>=heads)return;
+    const int kv_head=head/(heads/kv_heads);
+    float* head_scores=scores+head*tokens;
+    float local_maximum=-3.402823466e+38F;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_maximum=fmaxf(local_maximum,head_scores[token]);
+    const float reduced_maximum=block_reduce_max(local_maximum);
+    __shared__ float maximum;
+    if(threadIdx.x==0)maximum=reduced_maximum;
+    __syncthreads();
+    float local_denominator=0.0f;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x){
+        const float weight=expf(head_scores[token]-maximum);
+        head_scores[token]=weight;
+        local_denominator+=weight;
+    }
+    const float reduced_denominator=block_reduce_sum(local_denominator);
+    __shared__ float inverse_denominator;
+    if(threadIdx.x==0)inverse_denominator=1.0f/reduced_denominator;
+    __syncthreads();
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)
+        head_scores[token]*=inverse_denominator;
+    __syncthreads();
+    for(int d=threadIdx.x;d<head_dim;d+=blockDim.x){
+        float result=0.0f;
+        for(int token=0;token<tokens;++token)
+            result+=head_scores[token]*
+                kv_ld(values,(long long)(kv_head*capacity+slots[token])*head_dim+d);
+        output[head*head_dim+d]=result;
+    }
+}
+#define KV_VALUES_INDEXED(name, T) \
+extern "C" __global__ void name(float* scores, const T* values, const int* slots, \
+    float* output, const int heads, const int kv_heads, const int head_dim, \
+    const int tokens, const int capacity) { \
+    kv_values_indexed_impl<T>(scores, values, slots, output, heads, kv_heads, head_dim, tokens, capacity); \
+}
+KV_VALUES_INDEXED(kv_attention_values_indexed, float)
+KV_VALUES_INDEXED(kv_attention_values_f16_indexed, __half)
+KV_VALUES_INDEXED(kv_attention_values_bf16_indexed, __nv_bfloat16)
+#undef KV_VALUES_INDEXED
+extern "C" __global__ void kv_attention_values_q8_indexed(
+    float* scores, const unsigned char* values, const int* slots, float* output,
+    const int heads, const int kv_heads, const int head_dim,
+    const int tokens, const int capacity
+) {
+    const int head=blockIdx.x;
+    if(head>=heads)return;
+    const int kv_head=head/(heads/kv_heads), blocks=head_dim/32;
+    float* head_scores=scores+head*tokens;
+    float local_maximum=-3.402823466e+38F;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)local_maximum=fmaxf(local_maximum,head_scores[token]);
+    const float reduced_maximum=block_reduce_max(local_maximum);
+    __shared__ float maximum;
+    if(threadIdx.x==0)maximum=reduced_maximum;
+    __syncthreads();
+    float local_denominator=0.0f;
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x){
+        const float weight=expf(head_scores[token]-maximum);
+        head_scores[token]=weight;
+        local_denominator+=weight;
+    }
+    const float reduced_denominator=block_reduce_sum(local_denominator);
+    __shared__ float inverse_denominator;
+    if(threadIdx.x==0)inverse_denominator=1.0f/reduced_denominator;
+    __syncthreads();
+    for(int token=threadIdx.x;token<tokens;token+=blockDim.x)
+        head_scores[token]*=inverse_denominator;
+    __syncthreads();
+    for(int d=threadIdx.x;d<head_dim;d+=blockDim.x){
+        float result=0.0f;
+        for(int token=0;token<tokens;++token){
+            const unsigned char* vrow=values+((long long)kv_head*capacity+slots[token])*blocks*34;
+            result+=head_scores[token]*kv_ld_q8(vrow,d);
+        }
+        output[head*head_dim+d]=result;
+    }
+}
 )COLIBRI_CUDA";
 }
