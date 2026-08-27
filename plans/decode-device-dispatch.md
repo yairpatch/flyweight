@@ -530,3 +530,52 @@ Expected payoff is the *shape* change, not a constant: weight traffic per expert
 falls from `n_tokens x triple` to `ceil(n_tokens/128) x triple`. Prefill is 97.5%
 expert phase, so this is the only lever measured so far that could plausibly move
 a 33 s TTFT by more than 11%.
+
+### IQ4_NL rows matmul shipped — the path engages, and does not pay here
+
+`iq4nl_matmul_rows` added (`COLIBRI_LOWBIT_MATMUL_ROWS(iq4nl_matmul_rows,
+iq4nl_value)`), format entry wired, registered in the driver name table. Verified
+against the independent host decoder by the IQ kernel contract at 1.3e-08.
+
+Two traps on the way, both caught by that contract rather than by a benchmark:
+
+- `iq4nl_value` cannot be derived from `iq4nl_octet`. IQ4_NL's nibble order is
+  Q4_0-style (byte j holds element j low, j+16 high); the octet decoder walks the
+  same bytes in a different traversal, and copying its indexing gave a plausible,
+  wrong kernel.
+- The contract harness hardcoded 256-element blocks in **two** places
+  (`check_rows`'s packed sizing and `worst_error`'s row stride). IQ4_NL is a flat
+  32, so the first failure was the *reference*, not the kernel. `Format` now
+  carries `block_elements`, which any future non-256 format needs too.
+
+`prefill_streamed_bytes` goes from 0 to non-zero: the path engages. Arena sweep on
+a 4243-token prompt:
+
+| arena | prefill | streamed | expert phase |
+|---|---|---|---|
+| 0 (off) | 53.2 tok/s | 0 | 84.0% |
+| 48 (auto default) | 55.0 | 17.8 GiB | 74.4% |
+| 512 | **59.5** | 133.8 GiB | 18.1% |
+| 2048 | 51.6 | 184.2 GiB | 1.2% |
+
+**The GEMM does exactly what it promises and it still does not solve this model.**
+Expert compute collapses 84% -> 1.2%; throughput peaks at +12% and then regresses,
+because the cost moves wholesale into staging traffic. 184 GiB moved for one 4243-
+token prompt is ~2.2 GB/s effective against a 26 GB/s link — thrash, not bandwidth.
+
+The reason is the model's routing shape. 512 experts at top-10 over 1024-row chunks
+touches nearly every expert in every layer of every chunk, so a per-span arena has
+almost no reuse to amortize: each chunk re-uploads what the last one used. Ornith
+wins from this path because far fewer experts carry far more tokens each. Here the
+per-expert token count is ~20, so a staged triple is read about 20 times before
+being evicted — against ~128 needed to break even on the decode-shaped kernel it
+replaces.
+
+Default left at auto/48. 512 MiB is the measured optimum on this box but buys 12%
+for 134 GiB of PCIe traffic, which is a bad trade on a machine also serving.
+
+**What this says about prefill**: the expert phase is reachable — it went to 1.2% —
+but only by paying more in weight movement than it saves in compute. Any real fix
+has to cut weight *movement*, not decode cost: fewer experts touched per chunk
+(smaller chunks trade the same way), or experts that stay resident across chunks
+rather than per-span staging.

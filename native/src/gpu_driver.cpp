@@ -981,6 +981,7 @@ extern "C" int colibri_gpu_compile(
              "iq2s_matmul_rows", "iq3s_matmul_rows",
              "iq2xs_matmul_rows", "iq4xs_matmul_rows",
              "iq1m_matmul_rows", "iq1s_matmul_rows",
+             "iq4nl_matmul_rows",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",

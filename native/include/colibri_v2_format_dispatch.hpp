@@ -219,6 +219,14 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     // the PLE n-gram table in it; the table is host row-gathered, the experts
     // run on the CPU dots or the grouped device kernels below.
     {.type = 20, .family = "iq4nl",
+     // No MMQ entry on purpose: the MMQ branch needs (in_size % 256) == 0 and
+     // this format's consumer here is the 640-wide expert down projection.
+     // The rows matmul is what puts IQ4_NL experts on the prefill expert-GEMM
+     // path -- stream_role_ok is a conjunction over gate/up/down, so without it
+     // a whole checkpoint's experts fall back to the decode-shaped grouped
+     // kernels that re-decode weights once per routed token.
+     .matmul_rows = "iq4nl_matmul_rows",
+     .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .iq_expert_prefix = "iq4nl", .cpu_expert = true},
     {.type = 29, .family = "iq1m",
      .matvec_q8_warp = "iq1m_q8_matvec_transposed_warp", .rows_q8_gate = true,

@@ -5714,6 +5714,30 @@ __device__ __forceinline__ void iq4nl_octet(
     }
 }
 
+// IQ4_NL by element, for the reconstruct-in-float rows matmul.
+//
+// 18 bytes per 32 values: an f16 scale then 16 nibble-packed codes indexing the
+// non-uniform IQ4_NL levels. Flat block of 32 -- no super-block and no
+// per-sub-block scale -- which is why this cannot reuse iq4xs_value, whose
+// 136-byte layout carries a 6-bit scale per 32 inside a 256 super-block.
+//
+// The nibble order matches Q4_0, NOT IQ4_XS: byte j holds element j in its low
+// nibble and element j+16 in its high nibble. (iq4nl_octet above walks the same
+// bytes but indexes them by octet, which is a different traversal of the same
+// layout -- deriving this from it gets the mapping wrong, as the IQ kernel
+// contract catches immediately.)
+__device__ __forceinline__ float iq4nl_value(
+    const unsigned char* packed, int absolute
+) {
+    const int block = absolute / 32;
+    const int element = absolute & 31;
+    const unsigned char* base = packed + (long long)block * 18;
+    const float d = __half2float(*((const __half*)base));
+    const unsigned char byte = base[2 + (element & 15)];
+    const int code = element < 16 ? (byte & 15) : (byte >> 4);
+    return d * (float)kIq4nlValues[code];
+}
+
 // IQ1_S: 50-byte super-blocks of 256; each 32-value group carries a 3-bit odd
 // scale and a signed +-0.125 delta, each octet is one 2048-entry grid entry
 // indexed by 8 bits from qs and 3 from the group halfword.
@@ -9205,6 +9229,7 @@ COLIBRI_LOWBIT_MATMUL_ROWS(iq2xs_matmul_rows, iq2xs_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq4xs_matmul_rows, iq4xs_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq1m_matmul_rows, iq1m_value)
 COLIBRI_LOWBIT_MATMUL_ROWS(iq1s_matmul_rows, iq1s_value)
+COLIBRI_LOWBIT_MATMUL_ROWS(iq4nl_matmul_rows, iq4nl_value)
 #undef COLIBRI_LOWBIT_MATMUL_ROWS
 
 #define KV_ATTENTION_FUSED_TILES_W(name, KT, VT, WIDTH) \

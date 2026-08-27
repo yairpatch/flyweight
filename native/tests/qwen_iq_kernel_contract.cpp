@@ -88,9 +88,16 @@ struct Format {
     std::size_t block_bytes;
     void (*fill)(std::mt19937&, std::vector<std::uint8_t>&);
     float (*value_at)(const std::uint8_t*, std::uint64_t);
+    // Elements per block. Every K-quant and IQ super-block here is 256 wide;
+    // IQ4_NL is a flat 32 with no super-block, so the packed size cannot be
+    // derived from a shared constant.
+    std::uint32_t block_elements = 256;
 };
 
 const Format kIq1m{kIq1mBlockBytes, fill_iq1m, qwen_iq1m_value};
+const Format kIq4nl{
+    kIq4nlBlockBytes, fill_leading_scale<kIq4nlBlockBytes>, qwen_iq4nl_value,
+    kIq4nlBlockElements};
 const Format kIq1s{
     kIq1sBlockBytes, fill_leading_scale<kIq1sBlockBytes>, qwen_iq1s_value};
 const Format kIq2s{
@@ -112,7 +119,8 @@ const Format kIq4xs{
 // So the denominator is sum|w_i v_i|, which is what conditions the sum.
 float worst_error(const Format& format, const std::vector<std::uint8_t>& packed,
                   const float* vector, int input_size, int row, float got) {
-    const std::size_t blocks = static_cast<std::size_t>(input_size) / 256;
+    const std::size_t blocks =
+        static_cast<std::size_t>(input_size) / format.block_elements;
     const std::uint8_t* base =
         packed.data() + static_cast<std::size_t>(row) * blocks * format.block_bytes;
     double dot = 0.0;
@@ -194,8 +202,8 @@ int check_rows(const char* kernel, const Format& format) {
         int input_size = 512;
         int output_size = 9;
         std::vector<std::uint8_t> packed(
-            static_cast<std::size_t>(input_size) / 256 * output_size *
-            format.block_bytes);
+            static_cast<std::size_t>(input_size) / format.block_elements *
+            output_size * format.block_bytes);
         format.fill(rng, packed);
         std::vector<float> vectors(
             static_cast<std::size_t>(input_size) * tokens);
@@ -276,7 +284,8 @@ double reference_row(const Format& format,
                      const std::vector<std::uint8_t>& packed, int row,
                      const Q8Activations& activations, int input_size,
                      int activation_row, double* magnitude) {
-    const std::size_t blocks = static_cast<std::size_t>(input_size) / 256;
+    const std::size_t blocks =
+        static_cast<std::size_t>(input_size) / format.block_elements;
     const std::uint8_t* base =
         packed.data() + static_cast<std::size_t>(row) * blocks * format.block_bytes;
     double dot = 0.0;
@@ -485,6 +494,11 @@ int main() {
     failures += check("iq1s_matvec_transposed_warp", kIq1s, true, 256);
     failures += check("iq1s_matvec_transposed", kIq1s, false, 256);
     failures += check_rows("iq1s_matmul_rows", kIq1s);
+    // IQ4_NL's rows matmul is what puts a checkpoint whose expert down
+    // projection is IQ4_NL onto the prefill expert-GEMM path; its accessor is
+    // hand-written rather than shared with IQ4_XS, whose 256 super-block it
+    // does not use.
+    failures += check_rows("iq4nl_matmul_rows", kIq4nl);
     failures += check_q8("iq4xs_q8_matvec_transposed_warp", kIq4xs);
     failures += check_q8_rows("iq4xs_q8_matvec_transposed_rows", kIq4xs);
     // The IQ1 pair through the Q8 path, where the delta is folded into the int8
