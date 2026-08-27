@@ -2,7 +2,9 @@
 
 > **Goal**: qwen4exp decode from 26 tok/s toward 60. The token is not bandwidth-bound;
 > it is bound by 48 serialized host round-trips, one per MoE layer.
-> **Status 2026-08-27**: Phase 0 and Phase 0b RUN. **The plan's centrepiece is dead.**
+> **Status 2026-08-27**: **Phase 1 SHIPPED — decode ~17 -> ~30 tok/s** by registering
+> the expert tensors instead of the whole mapping. Phase 0 and Phase 0b RUN.
+> **The plan's centrepiece is dead.**
 > Phase 0 killed host-resident expert reads; Phase 0b then showed that the host work
 > Phase 2 would remove is ~0.7 ms/token, while **95-97% of it is one thing the plan
 > barely mentioned: the bundle staging memcpy**. Phase 2 is dropped. Phase 1 is the
@@ -206,8 +208,62 @@ Add sub-timers under `COLIBRI_TIMING` and attribute the 25 ms.
 *Gate: a per-cause ms/token breakdown. This decides whether Phase 1 alone gets most
 of the win, or whether Phase 2 is worth its cost.*
 
-**Phase 1 — the cheap wins, independently shippable.** Now the leading candidate,
-since Phase 2 lost its best property.
+**Phase 1 — SHIPPED 2026-08-27.** Expert-range registration landed; see results
+immediately below. Remaining Phase 1 items (top-k A/B, decay sweep) are unstarted
+and the decay sweep is now known to be 0.04 ms/token, i.e. not worth doing.
+
+### Phase 1 results
+
+Registration is now scoped to the expert tensors and budgeted, instead of testing
+the whole 68 GiB mapping against RAM. On the reference box it registers
+**37.1 GiB covering all 48 expert layers in 22.15 s** and direct paging engages
+where it never had before.
+
+Host-serial MoE work per token, same profile as Phase 0b:
+
+| cause | before | after |
+|---|---|---|
+| bundle staging memcpy | 16.5-34.2 ms | **0.000 ms** |
+| kernel launch + uploads | 0.34-0.45 | 0.168-0.174 |
+| pointer table build | 0.14-0.17 | 0.079-0.087 |
+| residency lookup | 0.14 | 0.078-0.087 |
+| admission victim scan | 0.07 | 0.060-0.062 |
+| access bookkeeping | 0.04 | 0.035-0.038 |
+| role scales (mmap) | 0.01 | 0.009-0.010 |
+| **total** | **17.2-35.1 ms** | **0.43-0.46 ms** |
+
+Interleaved decode A/B (48 iterations, 4 warmup):
+
+| config | run 1 | run 2 |
+|---|---|---|
+| staged (old default) | 19.98 | 13.81 |
+| **direct DMA** | **30.28** | **29.36** |
+| direct DMA + strict admission | 29.77 | 30.59 |
+
+**~17 tok/s -> ~30 tok/s**, and the run-to-run variance largely disappears (the
+staged path's spread was page-cache state).
+
+Two things worth noting:
+
+- **Strict admission is now redundant.** It was worth +8% when every admission cost
+  a host memcpy; with the memcpy gone it measures neutral (29.77/30.59 vs
+  30.28/29.36). It was a workaround for the real problem, and the real problem is
+  fixed. Do not make it a default.
+- **The win is smaller than the 17 ms removed, because the bytes still move.**
+  ~174 MiB/token of admissions now cross PCIe asynchronously instead of being
+  memcpy'd first. That transfer is the next limit, so *reducing admission volume*
+  (which strict admission attacks from the wrong end) is where the next lever is —
+  but it must now be judged against PCIe cost, not host time.
+
+**KNOWN TRADE-OFF, not yet addressed**: registration costs ~22 s at prepare and
+pays back at ~5 ms/token, so it breaks even around **4000 generated tokens**. That
+is right for a server (the stated product target) and wrong for a short one-shot
+`generate`. The fix is to register on a background thread and flip `expert_dma` per
+layer as ranges complete — the staged path stays correct until each flip — which
+needs a CUDA context made current on the worker. Until then, `--expert-paging
+staged` opts out. **This should land before the default is considered settled.**
+
+### Remaining Phase 1 items
 - Expert-range-only, budgeted registration to enable `dma_paging`, killing the
   ~66 MB/token of admission memcpy. Registration costs ~20 s at load (measured
   ~2 GiB/s) and locks the pages, so it needs a budget and a clean fallback rather

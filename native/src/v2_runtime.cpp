@@ -99,6 +99,15 @@ bool timing_enabled() {
     return on;
 }
 
+// Host RAM left unpinned when expert tensors are registered for direct paging.
+// Registration locks pages, so taking everything would trade the staging memcpy
+// for major faults on whatever else needs page cache -- on qwen4exp that is the
+// 25.7 GiB n-gram table, which is read 16 rows per token and must stay cheap.
+constexpr std::uint64_t kRegisterReserveBytes = 8ull * 1024 * 1024 * 1024;
+// Below this there is no point paying registration time for the few layers that
+// would fit.
+constexpr std::uint64_t kRegisterMinimumBytes = 2ull * 1024 * 1024 * 1024;
+
 // COLIBRI_MOE_PROFILE=1 attributes the decode MoE phase's HOST-SERIAL time to its
 // causes. Phase 0b of plans/decode-device-dispatch.md: `expert_page` measures the
 // whole phase (~32 ms/token on the 125B UD-IQ1_S) and `expert_compute` only the
@@ -336,6 +345,11 @@ struct QwenLayerPlan {
     // hc-wide gated-value stream. Only meaningful when ple_conv is set; the
     // block that owns it is a DeltaNet block, so first/second are taken.
     std::uint64_t state_third = 0;
+    // Whether this layer's three expert tensors are inside a CUDA-registered host
+    // range, i.e. whether a cache miss can DMA straight from the mapping instead
+    // of staging through a host memcpy. Per layer, not global: registration is
+    // budgeted and a checkpoint larger than the budget gets partial coverage.
+    bool expert_dma = false;
     // qwen4exp QSA indexer state (full-attention layers with indexer tensors):
     // qsa_blocks is the pooled block-key store [capacity/ratio + 1][key_len]
     // f32, append-only and bounded by position exactly like the KV slabs (so
@@ -993,6 +1007,14 @@ struct ColibriV2QwenRuntime {
     bool cuda_ready = false;
     bool decode_ready = false;
     bool dma_paging = false;       // expert page-ins go straight from the registered mmap
+    // The host ranges actually handed to cuMemHostRegister. Registration used to
+    // be all-or-nothing over the whole mapping, which on a checkpoint bigger than
+    // RAM meant it never happened and every cache miss paid a host memcpy; these
+    // are the expert tensors (and the embedding when it fits) instead, so the
+    // decision scales with what is actually paged rather than with file size.
+    // Kept for unregistration and for the per-range membership test.
+    std::vector<std::pair<const std::uint8_t*,std::uint64_t>> registered_ranges;
+    bool embedding_dma = false;
     bool model_registered = false; // whether we cuMemHostRegister'd model->data
 };
 
@@ -1520,7 +1542,7 @@ static void qwen_observe_and_prefetch_next_layer(
         // through the host. Under direct paging the mmap is CUDA-registered, so
         // its pages are already pinned and resident, and this walk is 432 stray
         // reads per role per expert on the critical path for nothing.
-        if (!runtime.dma_paging) {
+        if (!runtime.layers[layer + 1].expert_dma) {
 #if !defined(_WIN32)
         if (runtime.model->fd >= 0) {
             for (int role = 0; role < 3; ++role) {
@@ -1552,7 +1574,7 @@ static void qwen_observe_and_prefetch_next_layer(
         }
 #endif
         }
-        if (policy.is_streamed_gpu() && runtime.dma_paging &&
+        if (policy.is_streamed_gpu() && runtime.layers[layer + 1].expert_dma &&
             !runtime.expert_slots.empty()) {
             const auto slot_index = select_expert_cache_slot(
                 runtime, layer + 1, expert, true, false
@@ -1759,9 +1781,14 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     // in-flight prefetch is a use-after-unregister, so drain it here.
     if (runtime.prefetch_stream) colibri_gpu_stream_sync(runtime.prefetch_stream);
     if (runtime.model_registered && runtime.model) {
-        runtime.model->for_each_mapping([](const std::uint8_t* base, std::uint64_t) {
+        // Unregister exactly the ranges that were registered -- these are expert
+        // tensor spans, not whole mappings, so the mapping list is not the
+        // inverse of what prepare did.
+        for (const auto& [base, bytes] : runtime.registered_ranges) {
+            (void)bytes;
             colibri_gpu_host_unregister(base);
-        });
+        }
+        runtime.registered_ranges.clear();
         runtime.model_registered = false;
         runtime.dma_paging = false;
     }
@@ -4275,7 +4302,7 @@ std::uint64_t qwen_stage_embedding_rows(
     // the pinned-buffer reuse hazard from the per-token path. A rows chunk
     // gathers scattered rows, so it stays on the pack-then-one-upload path
     // rather than issuing one small DMA per row.
-    if (count == 1 && runtime.dma_paging) {
+    if (count == 1 && runtime.embedding_dma) {
         if (tokens[0] >= vocabulary)
             throw std::runtime_error(
                 "native Qwen embedding token is out of range: "
@@ -13846,8 +13873,15 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         const auto model_bytes=runtime->model->mapped_bytes();
         const auto registration_headroom=std::max<std::uint64_t>(
             4ull*1024*1024*1024,model_bytes/4);
+        // The old all-or-nothing test: the whole mapping plus headroom in RAM.
+        // Kept because when it passes there is nothing to budget.
         const bool auto_direct=runtime->options.expert_paging==0&&
             runtime->host_available_bytes>=model_bytes+registration_headroom;
+        // Otherwise register what fits. A checkpoint larger than RAM is exactly
+        // the case that pages hardest, so declining outright (which is what the
+        // test above does) gets the priority backwards.
+        const bool budgeted_direct=runtime->options.expert_paging==0&&!auto_direct&&
+            runtime->host_available_bytes>kRegisterReserveBytes+kRegisterMinimumBytes;
         // Both GPU-side MoE paths page experts in from the mmap, so both benefit
         // from registering it; only the pure-CPU path never touches the device
         // cache. This used to read `moe_device==2`, which left the streamed-GPU
@@ -13858,28 +13892,114 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         const bool pages_experts=!runtime->options.strict_resident&&
             !runtime->layers.empty()&&!runtime->layers.front().dense_ffn;
         if(pages_experts&&paging_policy.routed_gpu_execution_allowed()&&
-           (forced_direct||auto_direct)){
+           (forced_direct||auto_direct||budgeted_direct)){
             const auto registration_started=std::chrono::steady_clock::now();
-            // Every shard of a split checkpoint has to be registered; a partial
-            // registration is rolled back so the staged path stays coherent.
-            int registration=0;
+            // Register the EXPERT TENSORS, not the whole mapping. Registering the
+            // file wholesale needs the entire checkpoint plus headroom to fit in
+            // RAM, which a 68 GiB model on a 60 GiB box never does -- so direct
+            // paging silently stayed off and every cache miss staged a ~1.2 MiB
+            // expert bundle through a host memcpy (measured 95-97% of the
+            // decode MoE phase's host time; plans/decode-device-dispatch.md
+            // phase 0b). What is paged is the experts, so that is what has to be
+            // pinned, and the budget then scales with them rather than with the
+            // file. Coverage is per layer and may be partial: a layer whose
+            // three tensors did not fit keeps the staged path.
+            //
+            // Page-align each span outward and merge, so adjacent tensors are
+            // registered once and no partial page is left out.
+            constexpr std::uint64_t kPage=4096;
+            struct Span{const std::uint8_t* start;const std::uint8_t* end;};
+            std::vector<Span> spans;
+            std::vector<std::uint32_t> span_layer;
+            auto tensor_span=[&](std::uint64_t index){
+                const auto& t=runtime->model->tensors[index];
+                const auto* base=tensor_data(*runtime->model,t);
+                const auto aligned=reinterpret_cast<std::uintptr_t>(base)/kPage*kPage;
+                return Span{reinterpret_cast<const std::uint8_t*>(aligned),
+                    base+t.size};
+            };
+            std::uint64_t expert_bytes=0;
+            for(const auto& layer:runtime->layers)
+                for(int role=0;role<3;++role)
+                    expert_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
+            // Leave the OS and the host-resident tables (n-gram/PLE, embeddings)
+            // room to keep a page cache; locking every last byte would trade the
+            // memcpy for major faults somewhere else.
+            std::uint64_t budget=runtime->host_available_bytes>kRegisterReserveBytes
+                ?runtime->host_available_bytes-kRegisterReserveBytes:0;
+            if(const char* cap=std::getenv("COLIBRI_EXPERT_REGISTER_MIB"))
+                budget=std::min<std::uint64_t>(budget,
+                    std::strtoull(cap,nullptr,10)*1024ull*1024ull);
+            std::uint64_t planned=0;std::uint32_t covered=0;
+            for(std::uint32_t index=0;index<runtime->layers.size();++index){
+                const auto& layer=runtime->layers[index];
+                std::uint64_t layer_bytes=0;
+                for(int role=0;role<3;++role)
+                    layer_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
+                if(planned+layer_bytes>budget)break;
+                planned+=layer_bytes;++covered;
+                for(int role=0;role<3;++role){
+                    spans.push_back(tensor_span(layer.expert_tensors[role]));
+                    span_layer.push_back(index);
+                }
+            }
+            // The embedding stager DMAs a single row straight from the mapping
+            // when it is registered, so include it if it still fits.
+            const bool want_embedding=
+                runtime->token_embeddings!=std::numeric_limits<std::uint64_t>::max()&&
+                runtime->embeddings_host_resident;
+            std::uint64_t embedding_bytes=want_embedding
+                ?runtime->model->tensors[runtime->token_embeddings].size:0;
+            const bool embedding_fits=want_embedding&&planned+embedding_bytes<=budget;
+            if(embedding_fits){
+                spans.push_back(tensor_span(runtime->token_embeddings));
+                span_layer.push_back(std::numeric_limits<std::uint32_t>::max());
+                planned+=embedding_bytes;
+            }
+            std::sort(spans.begin(),spans.end(),
+                [](const Span& a,const Span& b){return a.start<b.start;});
+            std::vector<Span> merged;
+            for(const auto& span:spans){
+                if(!merged.empty()&&span.start<=merged.back().end)
+                    merged.back().end=std::max(merged.back().end,span.end);
+                else merged.push_back(span);
+            }
+            int registration=covered?0:-1;
             std::vector<const std::uint8_t*> registered;
-            runtime->model->for_each_mapping([&](const std::uint8_t* base,std::uint64_t bytes){
-                if(registration)return;
-                registration=colibri_gpu_host_register(base,bytes);
-                if(!registration)registered.push_back(base);
-            });
-            if(registration)
+            for(const auto& span:merged){
+                if(registration)break;
+                const auto bytes=static_cast<std::uint64_t>(span.end-span.start);
+                registration=colibri_gpu_host_register(span.start,bytes);
+                if(!registration){
+                    registered.push_back(span.start);
+                    runtime->registered_ranges.emplace_back(span.start,bytes);
+                }
+            }
+            if(registration){
                 for(const auto* base:registered)colibri_gpu_host_unregister(base);
+                runtime->registered_ranges.clear();
+            }
             runtime->paging_registration_nanoseconds=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-registration_started).count();
             if(registration==0){
                 runtime->model_registered=true;runtime->dma_paging=true;
+                runtime->embedding_dma=embedding_fits;
+                for(std::size_t index=0;index<span_layer.size();++index)
+                    if(span_layer[index]!=std::numeric_limits<std::uint32_t>::max())
+                        runtime->layers[span_layer[index]].expert_dma=true;
                 std::fprintf(stderr,
-                    "[colibri-v2] direct expert paging on (registered %.1f GiB mmap in %.2fs)\n",
-                    model_bytes/1073741824.0,
+                    "[colibri-v2] direct expert paging on: registered %.1f GiB "
+                    "(%u/%zu expert layers%s) in %.2fs\n",
+                    planned/1073741824.0,covered,runtime->layers.size(),
+                    embedding_fits?" + embeddings":"",
                     runtime->paging_registration_nanoseconds/1e9);
+                if(covered<runtime->layers.size())
+                    std::fprintf(stderr,
+                        "[colibri-v2] %zu expert layers exceed the %.1f GiB "
+                        "registration budget and keep staged copies; raise host RAM "
+                        "or set COLIBRI_EXPERT_REGISTER_MIB to tune\n",
+                        runtime->layers.size()-covered,budget/1073741824.0);
             }else if(forced_direct){
                 throw std::runtime_error(
                     "direct expert paging requested, but CUDA host registration failed");
@@ -17104,7 +17224,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 if(slot_index==kNoExpertSlot)continue;
                 auto&slot=runtime->expert_slots[slot_index];slot.key=cache_key;slot.valid=true;slot.native_valid=false;slot.last_used=++runtime->expert_clock;runtime->expert_residency[cache_key]=slot_index;
                 const auto slot_base=runtime->expert_cache+slot_index*runtime->expert_slot_bytes;
-                if(runtime->dma_paging){
+                if(layer.expert_dma){
                     // DMA each role straight from the registered mmap into the cache slot;
                     // no CPU staging memcpy (the 4.4 ms/token page-in cost we are attacking).
                     std::uint64_t role_offset=0;
@@ -17270,7 +17390,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     if(slot_index!=kNoExpertSlot){
                         auto&slot=runtime->expert_slots[slot_index];slot.key=cache_key;slot.valid=true;slot.last_used=++runtime->expert_clock;runtime->expert_residency[cache_key]=slot_index;
                         device_base=runtime->expert_cache+slot_index*runtime->expert_slot_bytes;
-                        if(runtime->dma_paging){
+                        if(layer.expert_dma){
                             // The mmap is CUDA-registered, so each role goes straight from
                             // the file mapping into the cache slot. That removes the host
                             // memcpy from the critical path -- the CPU has already synced on
@@ -20013,7 +20133,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     if (slot_index == kNoExpertSlot) continue;
                     auto& slot = runtime->expert_slots[slot_index]; slot.key = cache_key; slot.valid = true; slot.native_valid = false; slot.last_used = ++runtime->expert_clock; runtime->expert_residency[cache_key] = slot_index;
                     const auto slot_base = runtime->expert_cache + slot_index * runtime->expert_slot_bytes;
-                    if (runtime->dma_paging) {
+                    if (layer.expert_dma) {
                         std::uint64_t role_offset = 0;
                         for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (colibri_gpu_upload(slot_base + role_offset, tensor_data(*runtime->model,t) + offset, bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE DMA cache upload failed"); role_offset += bytes; }
                         if(runtime->expert_native_cache){

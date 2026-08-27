@@ -1543,7 +1543,7 @@ void qwen_forward_rows(
                     // DMA route is taken: the staged route would need
                     // rows*top_k expert bundles of host staging, and
                     // expert_staging_bytes is sized for top_k*2.
-                    if(rows_may_admit&&runtime.dma_paging)
+                    if(rows_may_admit&&layer.expert_dma)
                         slot_index=select_expert_cache_slot(
                             runtime,layer_number,expert,true);
                     if(slot_index==kNoExpertSlot)continue;
