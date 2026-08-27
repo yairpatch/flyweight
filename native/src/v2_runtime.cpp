@@ -953,7 +953,7 @@ struct ColibriV2QwenRuntime {
     // parity tests, and any embedder holding more than one model) must be able
     // to disagree, and a latched static made the dense-fallback exactness test
     // compare a configuration against itself.
-    bool qsa_enabled = true;
+    bool qsa_enabled = false;  // opt-in: COLIBRI_QSA=1
     // Interleaving two distant expert matrices hurts mmap/TLB locality on
     // memory-bound CPU MoE. Keep the experimental kernel opt-in until it can
     // demonstrate a win across representative hardware and expert routing.
@@ -2719,7 +2719,22 @@ void build_qwen4exp_plan(ColibriV2QwenRuntime& runtime) {
             // every requirement of the indexer has to be settled HERE or those
             // four sites drift apart. A file that names a ratio but omits any
             // of the three indexer scalars keeps the layer dense.
-            if (layer_index < model.config.compress_ratios.size()
+            // QSA is OPT-IN (COLIBRI_QSA=1). It is the attention the model was
+            // trained with above 2048 tokens, so running dense past that is an
+            // approximation -- but it measures 7-10% slower on decode (the
+            // selection costs a host round-trip per selecting layer, and decode
+            // here is expert-read bound, not attention bound), and its block-key
+            // store costs 384 MiB per sequence slot at the native 262144 context,
+            // straight out of the expert cache budget. Correctness above the
+            // budget is available to anyone who asks for it; it is not worth
+            // charging every short-context user for by default.
+            //
+            // Settled HERE and not only at the kernel gate, because the arena is
+            // reserved from `qsa_ratio` alone -- gating just the execution left
+            // the memory allocated for a feature that was switched off.
+            const char* qsa_setting = std::getenv("COLIBRI_QSA");
+            if (qsa_setting && qsa_setting[0] == '1'
+                && layer_index < model.config.compress_ratios.size()
                 && model.config.indexer_head_count
                 && model.config.indexer_key_length && model.config.indexer_top_k)
                 layer.qsa_ratio = model.config.compress_ratios[layer_index];
@@ -12597,8 +12612,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->fused_attention=fused[0]!='0'; // legacy name
     if(const char*fused=std::getenv("COLIBRI_FUSED_MOE_GATE_UP"))
         runtime->fused_moe_gate_up=fused[0]!='0';
-    if(const char*qsa=std::getenv("COLIBRI_QSA"))
-        runtime->qsa_enabled=qsa[0]!='0';
+    // Opt-in; see the plan-builder gate for why. Both sites must agree, or the
+    // arena is reserved for selection that never runs (or vice versa).
+    const char*qsa_setting=std::getenv("COLIBRI_QSA");
+    runtime->qsa_enabled=qsa_setting&&qsa_setting[0]=='1';
     if(const char*strict=std::getenv("COLIBRI_EXPERT_CACHE_STRICT_ADMISSION"))
         runtime->strict_cache_admission=strict[0]!='0';
     // COLIBRI_MTP_PROFILE reuses the prefill profiling events to split MTP

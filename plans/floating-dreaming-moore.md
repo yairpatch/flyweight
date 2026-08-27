@@ -17,7 +17,9 @@
 > IQ1_S/IQ4_NL expert kernels), CUDA-graph re-enable for the arch.
 >
 > **STATUS 2026-08-27**: PHASE 3 (QSA indexer) DONE — the sparse selection is
-> live on all three paths and on by default (`COLIBRI_QSA=0` disables). Six
+> live on all three paths but OPT-IN (`COLIBRI_QSA=1`): measured 7-10% slower
+> on decode, and its block-key arena costs 384 MiB per sequence slot at the
+> native 262144 context. Six
 > parity tests green (transformers-exact with pruning active, prefill==decode,
 > CUDA==CPU, interleaved==solo); ctest 21/21, pytest 567 + 897 subtests.
 > Real UD-IQ1_S: a planted fact 6k tokens back is retrieved correctly with the
@@ -26,8 +28,12 @@
 > a 4.7k prompt (20.9/23.7 vs 21.8/27.6 tok/s) and a wash at 16.3k (22.4/20.9
 > vs 22.3/21.1). Decode on this model is expert-read-bound, not attention-bound
 > (see decode-overhead-audit), and selection adds a host round-trip per
-> selecting layer. It is on by default because ABOVE 2048 tokens the dense
-> fallback is the approximation -- QSA is the model's own trained semantics.
+> selecting layer. It shipped on-by-default on the argument that above 2048
+> tokens the DENSE path is the approximation -- that argument is still true, but
+> it lost: a baseline A/B against 5e8fefe showed QSA-on costing 7-10% (23.56/25.73
+> vs 25.91/27.24 tok/s at 32k), and the block-key arena costs 384 MiB per
+> sequence slot at native context, out of the expert cache budget. Correctness
+> above the budget is now opt-in rather than charged to every short-context user.
 > Open perf follow-up: the rows path syncs per row per layer (one score
 > download each), inside the phase the prefill pipeline documents as sync-free;
 > batching the download per sub-chunk of rows would collapse that to one sync

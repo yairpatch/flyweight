@@ -20,6 +20,7 @@ upstream 2026-08-26).
 from __future__ import annotations
 
 import importlib.machinery
+import os
 import sys
 import tempfile
 import types
@@ -305,6 +306,10 @@ class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
 
     @classmethod
     def setUpClass(cls) -> None:
+        # QSA is opt-in (it costs 7-10% decode and a per-slot block-key arena),
+        # so these tests must ask for it explicitly.
+        cls._qsa_previous = os.environ.get("COLIBRI_QSA")
+        os.environ["COLIBRI_QSA"] = "1"
         cls.modeling = _load_transformers()
         if cls.modeling is None:
             raise unittest.SkipTest(
@@ -313,6 +318,14 @@ class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
         cls.path = Path(cls._directory.name) / "qwen4exp_qsa.gguf"
         cls.spec = build_qwen4exp_gguf(
             cls.path, Qwen4ExpSpec(indexer_top_k=8))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._qsa_previous is None:
+            os.environ.pop("COLIBRI_QSA", None)
+        else:
+            os.environ["COLIBRI_QSA"] = cls._qsa_previous
+        super().tearDownClass()
 
     def test_qsa_prefill_matches_decode(self) -> None:
         """Chunked rows prefill (16-row chunks straddling the pruning onset)
@@ -356,6 +369,8 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        cls._qsa_previous = os.environ.get("COLIBRI_QSA")
+        os.environ["COLIBRI_QSA"] = "1"
         cls._directory = tempfile.TemporaryDirectory()
         cls.path = Path(cls._directory.name) / "qwen4exp_qsa.gguf"
         cls.spec = build_qwen4exp_gguf(
@@ -363,6 +378,10 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        if cls._qsa_previous is None:
+            os.environ.pop("COLIBRI_QSA", None)
+        else:
+            os.environ["COLIBRI_QSA"] = cls._qsa_previous
         cls._directory.cleanup()
 
     def _decode(self, backend: str, tokens: list[int]) -> list[int]:
