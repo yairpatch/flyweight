@@ -657,6 +657,38 @@ float q40_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
 }
 
+// IQ4_NL: the same 18-byte/32-element shape as Q4_0, differing only in how a
+// nibble becomes a weight -- Q4_0 subtracts 8, IQ4_NL indexes a 16-entry
+// non-uniform codebook. `_mm_shuffle_epi8` does that lookup for 16 nibbles in
+// one instruction, so the rest is Q4_0's structure unchanged.
+//
+// Nibble order is Q4_0's: byte j holds element j low and element j+16 high.
+float iq4nl_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    const __m128i nibble_mask = _mm_set1_epi8(15);
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    for (int block = 0; block < elements / 32; ++block) {
+        const auto* base = row_data + block * kIq4nlBlockBytes;
+        const __m512 scale = _mm512_set1_ps(half_value(base));
+        const __m128i bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(base + 2));
+        const __m128i low =
+            _mm_shuffle_epi8(levels, _mm_and_si128(bytes, nibble_mask));
+        const __m128i high = _mm_shuffle_epi8(
+            levels, _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask));
+        const __m512 q0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(low));
+        const __m512 q1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(high));
+        sum0 = _mm512_fmadd_ps(
+            _mm512_mul_ps(q0, scale), _mm512_loadu_ps(input + block * 32), sum0);
+        sum1 = _mm512_fmadd_ps(
+            _mm512_mul_ps(q1, scale),
+            _mm512_loadu_ps(input + block * 32 + 16), sum1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1));
+}
+
 void q5_dot_pair(const std::uint8_t* row_data,const float*first,const float*second,int elements,float&out_first,float&out_second){
     __m512 a0=_mm512_setzero_ps(),a1=_mm512_setzero_ps(),b0=_mm512_setzero_ps(),b1=_mm512_setzero_ps();
     const __m128i nibble_mask=_mm_set1_epi8(15),bit_mask=_mm_set1_epi8(1);
@@ -1212,6 +1244,12 @@ float qwen_quant_dot_avx512(
     if (type == 2) {
         return q40_dot(
             packed + row * static_cast<std::uint64_t>(elements / 32) * 18,
+            input, elements);
+    }
+    if (type == 20) {
+        return iq4nl_dot(
+            packed + row * static_cast<std::uint64_t>(elements / 32)
+                * kIq4nlBlockBytes,
             input, elements);
     }
     if (type == 17) {

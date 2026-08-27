@@ -579,3 +579,46 @@ but only by paying more in weight movement than it saves in compute. Any real fi
 has to cut weight *movement*, not decode cost: fewer experts touched per chunk
 (smaller chunks trade the same way), or experts that stay resident across chunks
 rather than per-span staging.
+
+### AVX-512 for IQ4_NL: measured neutral, and why that matters
+
+Added `iq4nl_dot` to `qwen_cpu_avx512.cpp` (Q4_0's structure, with
+`_mm_shuffle_epi8` doing the 16-entry codebook lookup) and a type-20 admission
+ahead of the AVX2 one. Contract-verified; the gate defaults on, so the branch is
+genuinely taken.
+
+| | prefill |
+|---|---|
+| `COLIBRI_IQ_AVX512=0` (AVX2) | 58.0 / 58.5 tok/s |
+| AVX-512 | 56.9 / 58.2 tok/s |
+
+**No gain.** Vector width is not the constraint, and the reason points at the
+actual one. The down projection is `[640 -> 2560]`: 2560 output rows of only 640
+elements each. At 32 elements per block that is a 20-iteration loop per dot,
+after which `_mm512_reduce_add_ps` costs a log2(16) shuffle chain — so a short
+dot is reduction-bound and a wider register buys nothing. AVX2's 8-wide
+horizontal sum is proportionally cheaper.
+
+What is missing is **register blocking across output rows**, so one pass over the
+input feeds several rows and amortises both the loads and the reduction:
+
+```cpp
+constexpr bool qwen_simd_multi_type(std::uint32_t type) {
+    return type == 8 || type == 12 || type == 13 || type == 14;   // K-quants only
+}
+```
+
+The rows MoE calls `qwen_quant_dot_two_rows` / `_pair` / `_oct` in its inner loop,
+but every IQ type falls off that allowlist and reaches SIMD "one row at a time
+through the single-row fallback" — its own comment. The K-quants get the blocked
+kernels; IQ1_S, IQ2_XXS and IQ4_NL, which is the entire expert set of this
+checkpoint, do not.
+
+**That is the next lever, and it is better targeted than vector width**: it
+attacks call overhead and reduction tails on 2560 short dots per expert per token
+batch, which is exactly the shape prefill spends its time in. Wide SIMD only helps
+the 2560-long gate/up dots, where the loop already amortises the tail.
+
+The AVX-512 kernel is kept: correct, contract-pinned, neutral here, and plausibly
+positive wherever IQ4_NL is a wide projection rather than a 640-wide expert down.
+It is NOT evidence that AVX-512 helps this model.

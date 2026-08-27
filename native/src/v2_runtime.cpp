@@ -3126,7 +3126,12 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // IQ4_NL's native block is 32 elements (no super-block), so like Q4_0 it
     // takes its own admission: qwen4exp's 640-wide expert down rows fail the
-    // 256 gate but are exactly where this type dominates decode.
+    // 256 gate but are exactly where this type dominates decode. AVX-512 first
+    // -- prefill on a low-bit MoE is expert-compute bound, and this type is the
+    // down projection of every layer.
+    if(type==20&&(colibri_cpu_features()&2u)!=0&&elements%32==0&&
+       qwen_iq_avx512_enabled())
+        return qwen_quant_dot_avx512(packed,type,input,elements,row);
     if(type==20&&(colibri_cpu_features()&1u)!=0&&elements%32==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
