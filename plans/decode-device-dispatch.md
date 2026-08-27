@@ -668,3 +668,54 @@ per-group dispatch overhead is the whole cost, so collapsing 123k dispatches int
 one launch per layer-role is the change worth making.
 
 Second target, unexamined: the ~22 s of non-expert prefill.
+
+## The non-expert half of prefill (2026-08-27)
+
+`COLIBRI_PREFILL_TRACE=2` with `COLIBRI_PREFILL_PIPELINE=0`, 4243-token prompt.
+**Read the shares, not the totals** — the tracer syncs the stream at every marker.
+
+| phase | seconds | share | layers |
+|---|---|---|---|
+| pre | 39.56 | 72.1% | all |
+| **proj** (DeltaNet qkv) | **8.23** | 15.0% | delta |
+| moerms | 2.25 | 4.1% | all |
+| outproj | 1.59 | 2.9% | delta |
+| router | 1.15 | 2.1% | all |
+| recurrent | 1.02 | 1.9% | delta |
+| qkvproj (attention) | 0.50 | 0.9% | attn |
+| ropestore | 0.37 | 0.7% | attn |
+| conv | 0.19 | 0.4% | delta |
+
+**First: `pre` is not a non-expert phase.** `phase()` reports time since the
+previous marker, and the last marker of a layer is `router` — so `pre` spans the
+preceding layer's entire MoE expert execution plus this layer's bookend. Its 72%
+is mostly the expert phase already accounted for elsewhere. Anyone reading this
+trace should not conclude the hyper-connection bookend costs 40 s.
+
+Genuinely non-expert work is the other ~15.3 s, and `proj` dominates it.
+
+**The number that matters is not the ranking, it is the rate.** `attn_qkv` is
+Q5_K, `[2560 -> 10240]`, on 36 layers: 4 TMAC = 8 TFLOP for this prompt, done in
+8.23 s = **~970 GFLOP/s**. The streamed expert GEMM independently measures
+20 TFLOP in 21.96 s = **~910 GFLOP/s**. Two unrelated code paths, one dense and
+one MoE, land within 7% of each other.
+
+**Unifying hypothesis** (NOT yet confirmed): quantized matmul on this GPU runs at
+~1 TFLOP/s, and that single rate sets prefill. Total prefill arithmetic is roughly
+20 TFLOP of expert plus ~10 TFLOP of dense = ~30 TFLOP; at 1 TFLOP/s that is ~30 s
+against the 55-70 s observed, with the remainder in CPU experts and overheads. If
+true it supersedes every explanation in this document: not dispatch count, not
+upload bandwidth, not vector width, not the fine-grained MoE shape — those all sit
+on top of a matmul that is ~5x slower than this class of GPU should manage for
+K-quant MMQ.
+
+`int8_tensor_cores` is enabled (the probe requires compute >= 7.5; this card is
+well past it) and `2560 % 256 == 0`, so Q5_K should be taking `q5k_q8_mmq`. Either
+it is not, or MMQ itself is underperforming here.
+
+**Next test, and it must come before any code**: a standalone benchmark of
+`q5k_q8_mmq` against `q5k_matmul_rows` at the real shape (1024 x 2560 -> 10240),
+plus a check of which kernel `dense_rows` actually selects. There is no env toggle
+for MMQ today, so the dispatch needs a trace like `COLIBRI_STREAM_TRACE`. That
+distinguishes "MMQ is off" (a wiring bug, cheap fix, precedent: IQ4_NL and
+`--hybrid-prefill`) from "MMQ is on and slow" (a kernel problem, expensive).
