@@ -53,6 +53,7 @@
 #endif
 #include <initializer_list>
 #include <limits>
+#include <thread>
 #include <mutex>
 #include <memory>
 #include <queue>
@@ -98,6 +99,13 @@ bool timing_enabled() {
     }();
     return on;
 }
+
+// Promote any layer whose expert tensors finished registering in the background
+// to the direct-DMA path. Called at token boundaries only: `expert_dma` is then
+// written and read by the same thread, so the per-layer flags need no atomics and
+// a layer can never change execution path mid-token.
+struct ColibriV2QwenRuntime;
+void qwen_absorb_registration(ColibriV2QwenRuntime& runtime);
 
 // Host RAM left unpinned when expert tensors are registered for direct paging.
 // Registration locks pages, so taking everything would trade the staging memcpy
@@ -1015,6 +1023,18 @@ struct ColibriV2QwenRuntime {
     // Kept for unregistration and for the per-range membership test.
     std::vector<std::pair<const std::uint8_t*,std::uint64_t>> registered_ranges;
     bool embedding_dma = false;
+    // Registration runs on a worker so decode does not wait ~20s for it. The
+    // staged path stays correct for any layer not yet registered, so the only
+    // coordination needed is publishing "layer N is now direct". The worker
+    // appends finished layers under `registration_mutex` and bumps
+    // `registration_ready`; the DECODE thread drains that into `expert_dma` at a
+    // token boundary, so those flags are only ever written by the thread that
+    // reads them and no per-layer atomics are needed.
+    std::thread registration_thread;
+    std::mutex registration_mutex;
+    std::vector<std::uint32_t> registration_done;
+    std::atomic<std::uint32_t> registration_ready{0};
+    std::atomic<bool> registration_cancel{false};
     bool model_registered = false; // whether we cuMemHostRegister'd model->data
 };
 
@@ -1772,7 +1792,28 @@ std::uint64_t device_align(std::uint64_t bytes) {
     return colibri::v2::workspace::align(bytes);
 }
 
+// Definition of the token-boundary promotion declared above.
+void qwen_absorb_registration(ColibriV2QwenRuntime& runtime) {
+    if (runtime.registration_ready.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard<std::mutex> guard(runtime.registration_mutex);
+    for (const auto layer : runtime.registration_done) {
+        if (layer == std::numeric_limits<std::uint32_t>::max())
+            runtime.embedding_dma = true;
+        else if (layer < runtime.layers.size())
+            runtime.layers[layer].expert_dma = true;
+    }
+    runtime.registration_done.clear();
+    runtime.registration_ready.store(0, std::memory_order_release);
+}
+
 void release_qwen_device(ColibriV2QwenRuntime& runtime) {
+    // Stop the background registration before anything it writes to goes away.
+    // It checks the flag between layers, so the wait is bounded by one layer's
+    // registration (~0.4s) rather than by the whole checkpoint.
+    if (runtime.registration_thread.joinable()) {
+        runtime.registration_cancel.store(true, std::memory_order_release);
+        runtime.registration_thread.join();
+    }
     qwen_save_expert_history(runtime);
     if (runtime.stream) colibri_gpu_stream_sync(runtime.stream);
     // An enqueued expert prefetch DMAs from the model mmap on its own stream,
@@ -13911,12 +13952,19 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             struct Span{const std::uint8_t* start;const std::uint8_t* end;};
             std::vector<Span> spans;
             std::vector<std::uint32_t> span_layer;
+            // Aligned OUTWARD, then merged below. A registered range has to cover
+            // every byte an upload reads: a copy whose source straddles the edge
+            // of a registration fails (`DMA cache upload failed`), so trimming
+            // inward to avoid shared boundary pages is not an option -- the
+            // ranges must be merged into maximal spans instead.
             auto tensor_span=[&](std::uint64_t index){
                 const auto& t=runtime->model->tensors[index];
                 const auto* base=tensor_data(*runtime->model,t);
-                const auto aligned=reinterpret_cast<std::uintptr_t>(base)/kPage*kPage;
-                return Span{reinterpret_cast<const std::uint8_t*>(aligned),
-                    base+t.size};
+                const auto start=reinterpret_cast<std::uintptr_t>(base)/kPage*kPage;
+                const auto end=(reinterpret_cast<std::uintptr_t>(base+t.size)
+                    +kPage-1)/kPage*kPage;
+                return Span{reinterpret_cast<const std::uint8_t*>(start),
+                    reinterpret_cast<const std::uint8_t*>(end)};
             };
             std::uint64_t expert_bytes=0;
             for(const auto& layer:runtime->layers)
@@ -13956,56 +14004,80 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 span_layer.push_back(std::numeric_limits<std::uint32_t>::max());
                 planned+=embedding_bytes;
             }
-            std::sort(spans.begin(),spans.end(),
+            // Merge into maximal spans. Tensors are laid out in file order, so
+            // this collapses to a handful of ranges (usually one per shard) and
+            // no upload can straddle an edge.
+            auto ordered=spans;
+            std::sort(ordered.begin(),ordered.end(),
                 [](const Span& a,const Span& b){return a.start<b.start;});
             std::vector<Span> merged;
-            for(const auto& span:spans){
+            for(const auto& span:ordered){
                 if(!merged.empty()&&span.start<=merged.back().end)
                     merged.back().end=std::max(merged.back().end,span.end);
                 else merged.push_back(span);
             }
-            int registration=covered?0:-1;
-            std::vector<const std::uint8_t*> registered;
-            for(const auto& span:merged){
-                if(registration)break;
-                const auto bytes=static_cast<std::uint64_t>(span.end-span.start);
-                registration=colibri_gpu_host_register(span.start,bytes);
-                if(!registration){
-                    registered.push_back(span.start);
-                    runtime->registered_ranges.emplace_back(span.start,bytes);
-                }
-            }
-            if(registration){
-                for(const auto* base:registered)colibri_gpu_host_unregister(base);
-                runtime->registered_ranges.clear();
-            }
-            runtime->paging_registration_nanoseconds=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now()-registration_started).count();
-            if(registration==0){
-                runtime->model_registered=true;runtime->dma_paging=true;
-                runtime->embedding_dma=embedding_fits;
-                for(std::size_t index=0;index<span_layer.size();++index)
-                    if(span_layer[index]!=std::numeric_limits<std::uint32_t>::max())
-                        runtime->layers[span_layer[index]].expert_dma=true;
+            // Promotion is therefore all-or-nothing per merged range rather than
+            // per layer; with one range covering every expert it lands as a
+            // single step once the worker finishes.
+            const auto promoted=span_layer;
+            if(!covered&&!embedding_fits){
+                if(forced_direct)
+                    throw std::runtime_error(
+                        "direct expert paging requested, but no expert layer fits the "
+                        "registration budget");
                 std::fprintf(stderr,
-                    "[colibri-v2] direct expert paging on: registered %.1f GiB "
-                    "(%u/%zu expert layers%s) in %.2fs\n",
+                    "[colibri-v2] direct expert paging unavailable; using staged copies\n");
+            }else{
+                // Registration is ~2 GiB/s, so pinning 37 GiB costs ~20s -- which
+                // is why this runs on a worker instead of at the front of the
+                // first token. Until it finishes every layer stays on the staged
+                // path, which is correct and merely slower, so a short one-shot
+                // run no longer pays for a pin it will not use.
+                runtime->model_registered=true;
+                runtime->dma_paging=true;
+                std::fprintf(stderr,
+                    "[colibri-v2] direct expert paging: registering %.1f GiB "
+                    "(%u/%zu expert layers%s) in the background\n",
                     planned/1073741824.0,covered,runtime->layers.size(),
-                    embedding_fits?" + embeddings":"",
-                    runtime->paging_registration_nanoseconds/1e9);
+                    embedding_fits?" + embeddings":"");
                 if(covered<runtime->layers.size())
                     std::fprintf(stderr,
                         "[colibri-v2] %zu expert layers exceed the %.1f GiB "
                         "registration budget and keep staged copies; raise host RAM "
                         "or set COLIBRI_EXPERT_REGISTER_MIB to tune\n",
                         runtime->layers.size()-covered,budget/1073741824.0);
-            }else if(forced_direct){
-                throw std::runtime_error(
-                    "direct expert paging requested, but CUDA host registration failed");
-            }else{
-                std::fprintf(stderr,
-                    "[colibri-v2] direct expert paging unavailable; using staged copies\n");
+                auto* target=runtime;
+                target->registration_thread=std::thread([target,merged,promoted,
+                                                         registration_started]{
+                    std::vector<std::pair<const std::uint8_t*,std::uint64_t>> ranges;
+                    bool ok=true;
+                    for(const auto& span:merged){
+                        if(target->registration_cancel.load(std::memory_order_acquire)){
+                            ok=false;break;
+                        }
+                        const auto bytes=static_cast<std::uint64_t>(span.end-span.start);
+                        if(colibri_gpu_host_register(span.start,bytes)!=0){ok=false;break;}
+                        ranges.emplace_back(span.start,bytes);
+                    }
+                    std::lock_guard<std::mutex> guard(target->registration_mutex);
+                    if(!ok){
+                        // Partial coverage cannot be used: an upload whose source
+                        // straddles the edge of a registration fails outright, and
+                        // the merged spans are exactly where those edges are. Roll
+                        // back and stay staged.
+                        for(const auto& [base,bytes]:ranges){
+                            (void)bytes;colibri_gpu_host_unregister(base);
+                        }
+                    }else{
+                        target->registered_ranges=std::move(ranges);
+                        target->registration_done=promoted;
+                    }
+                    target->paging_registration_nanoseconds=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now()
+                            -registration_started).count();
+                    target->registration_ready.fetch_add(1,std::memory_order_release);
+                });
             }
         }
         runtime->decode_ready=true;
@@ -16144,6 +16216,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     if(input_token>=runtime->model->config.vocabulary_size)throw std::runtime_error("native Qwen input token is out of range");
     if(runtime->cache_admission_enabled)
         qwen_freeze_expert_residency(*runtime);
+    qwen_absorb_registration(*runtime);
     if(runtime->gemma4)return gemma4_decode(*runtime,input_token,*output_token);
     const auto expert_phase=runtime->cache_admission_enabled
         ?colibri::v2::ExpertExecutionPhase::decode
@@ -19490,6 +19563,7 @@ static void qwen_park_active(ColibriV2QwenRuntime& rt, bool park) {
 // mirror; requires a decode policy with CPU expert execution and no MTP.
 static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         const std::size_t* slots, const std::uint32_t* inputs, std::uint32_t* outputs) {
+    qwen_absorb_registration(*runtime);
     const auto decode_started = std::chrono::steady_clock::now();
     const auto expert_policy=qwen_expert_policy(
         *runtime,colibri::v2::ExpertExecutionPhase::decode);

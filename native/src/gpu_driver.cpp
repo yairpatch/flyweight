@@ -1430,6 +1430,11 @@ extern "C" int colibri_gpu_host_register(const void* pointer, std::uint64_t byte
 
     if (pointer == nullptr || bytes == 0) return -1;
     if (g_api.cuMemHostRegister == nullptr) return -3;
+    // Bind the primary context like every other entry point here does. Without
+    // this the call works only on the thread that ran colibri_gpu_init, which
+    // made background registration (a worker pinning expert tensors while the
+    // main thread decodes) fail with INVALID_CONTEXT.
+    if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
     void* host = const_cast<void*>(pointer);
     // READ_ONLY (0x08) is unsupported on many drivers (CUDA_ERROR_NOT_SUPPORTED);
     // PORTABLE (0x01) works once the mapping is writable copy-on-write.
@@ -1444,6 +1449,7 @@ extern "C" int colibri_gpu_host_unregister(const void* pointer) {
 
     if (pointer == nullptr) return 0;
     if (g_api.cuMemHostUnregister == nullptr) return -3;
+    if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
     return g_api.cuMemHostUnregister(const_cast<void*>(pointer)) == 0 ? 0 : -1;
 }
 

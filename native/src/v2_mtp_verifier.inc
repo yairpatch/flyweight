@@ -96,6 +96,8 @@ void qwen_forward_rows(
     ColibriV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
     int total_rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
 ) {
+    // Chunk boundary: pick up any layers the background registration finished.
+    qwen_absorb_registration(runtime);
     // The row range every launch below operates over. The phase driver near
     // the bottom installs a span's (begin, count) before invoking each phase
     // function, so `rows` is the current span's row count and `span_begin` its

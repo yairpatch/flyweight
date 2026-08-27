@@ -255,13 +255,32 @@ Two things worth noting:
   (which strict admission attacks from the wrong end) is where the next lever is —
   but it must now be judged against PCIe cost, not host time.
 
-**KNOWN TRADE-OFF, not yet addressed**: registration costs ~22 s at prepare and
-pays back at ~5 ms/token, so it breaks even around **4000 generated tokens**. That
-is right for a server (the stated product target) and wrong for a short one-shot
-`generate`. The fix is to register on a background thread and flip `expert_dma` per
-layer as ranges complete — the staged path stays correct until each flip — which
-needs a CUDA context made current on the worker. Until then, `--expert-paging
-staged` opts out. **This should land before the default is considered settled.**
+**Trade-off RESOLVED — registration now runs in the background.** It used to cost
+~22 s at prepare, breaking even only around 4000 generated tokens, which was wrong
+for a one-shot `generate`. A worker now does the pinning while decode proceeds on
+the staged path, and a token boundary promotes the layers once it lands. Measured
+24-token `generate` wall time: **staged 23.6 / 21.3 s vs background 20.7 / 22.2 s**
+— indistinguishable, where the synchronous version added ~22 s. Long runs still
+reach 0.435-0.447 ms/token of host-serial MoE work and 27.7-28.9 tok/s.
+
+Three things this needed, each a small trap:
+
+- `colibri_gpu_host_register` did not bind the CUDA primary context, unlike
+  `colibri_gpu_alloc` and friends. On a worker thread that fails with
+  `INVALID_CONTEXT`. Fixed in both register and unregister.
+- **Promotion is all-or-nothing, not per layer, and that is forced.** The first
+  attempt registered each layer separately, trimming spans inward so neighbouring
+  layers could not claim a shared boundary page. It failed with
+  `native hybrid MoE DMA cache upload failed`: **an upload whose source straddles
+  the edge of a registration is rejected**, and per-tensor trimming puts an edge
+  inside every tensor. The ranges must be merged into maximal spans (they collapse
+  to roughly one per shard), so a layer cannot be promoted before the whole span
+  covering it is pinned.
+- `expert_dma` is written only by the decode thread, in `qwen_absorb_registration`
+  at a token boundary. The worker publishes finished layers under a mutex and bumps
+  an atomic counter; the decode thread drains it. That keeps the per-layer flags
+  free of atomics (which `QwenLayerPlan` cannot hold — it is moved into
+  `mtp_layer_plan`) and guarantees a layer never switches path mid-token.
 
 ### Remaining Phase 1 items
 - Expert-range-only, budgeted registration to enable `dma_paging`, killing the
