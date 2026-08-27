@@ -984,6 +984,8 @@ extern "C" int colibri_gpu_compile(
              "iq4nl_matmul_rows",
              // Fused block-major MoE (one launch per layer)
              "iq1s_block_swiglu", "iq4nl_block_swiglu", "iq2xxs_block_swiglu",
+             "iq1s_block_accumulate", "iq4nl_block_accumulate",
+             "iq2xxs_block_accumulate",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",

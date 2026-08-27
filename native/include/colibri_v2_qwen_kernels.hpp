@@ -5990,6 +5990,59 @@ COLIBRI_IQ_BLOCK_SWIGLU(iq1s, iq1s_octet)
 COLIBRI_IQ_BLOCK_SWIGLU(iq4nl, iq4nl_octet)
 COLIBRI_IQ_BLOCK_SWIGLU(iq2xxs, iq2xxs_octet)
 #undef COLIBRI_IQ_BLOCK_SWIGLU
+// The down twin. Block-major like the swiglu above, but it CANNOT accumulate
+// straight into the token's output row: several blocks (different experts) feed
+// the same token, and this corpus has no atomicAdd -- nothing here uses one, and
+// the CPU-emulation generator does not model it. So each slot writes its own
+// weighted row and a scatter folds them into tokens afterwards, which is what the
+// streaming path already does with qwen_scatter_add_rows.
+//
+// Padded slots write 0.0 rather than being skipped, so a scatter may process them
+// unconditionally (adding zero) instead of needing a branch or a sentinel index.
+#define COLIBRI_IQ_BLOCK_ACCUMULATE(prefix, octet_at)                           \
+extern "C" __global__ void prefix##_block_accumulate(                           \
+    const unsigned long long* down_ptrs, const int* block_experts,              \
+    const int* sorted_routes, const float* activated, float* down_out,          \
+    const float* weights, const int input_size, const int output_size,          \
+    const int blocks                                                            \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    const int block = blockIdx.y;                                               \
+    if (row >= output_size || block >= blocks) return;                          \
+    const int slot_base = block * COLIBRI_MOE_BLOCK;                            \
+    const unsigned char* down_packed =                                          \
+        (const unsigned char*)down_ptrs[block_experts[block]];                  \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float partial[COLIBRI_MOE_BLOCK], w[8];                                     \
+    for (int s = 0; s < COLIBRI_MOE_BLOCK; ++s) partial[s] = 0.0f;              \
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int qblock = (int)(absolute >> 8);                                \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        octet_at(down_packed, qblock, within, w);                               \
+        for (int s = 0; s < COLIBRI_MOE_BLOCK; ++s) {                           \
+            if (sorted_routes[slot_base + s] < 0) continue;                     \
+            const float* values =                                               \
+                activated + (long long)(slot_base + s) * input_size + octet * 8;\
+            float a = 0.0f;                                                     \
+            for (int k = 0; k < 8; ++k) a += w[k] * values[k];                  \
+            partial[s] += a;                                                    \
+        }                                                                       \
+    }                                                                           \
+    for (int s = 0; s < COLIBRI_MOE_BLOCK; ++s) {                               \
+        const float total = block_reduce_sum(partial[s]);                       \
+        const int route = sorted_routes[slot_base + s];                         \
+        if (threadIdx.x == 0)                                                   \
+            down_out[(long long)(slot_base + s) * output_size + row] =          \
+                route >= 0 ? total * weights[route] : 0.0f;                     \
+    }                                                                           \
+}
+COLIBRI_IQ_BLOCK_ACCUMULATE(iq1s, iq1s_octet)
+COLIBRI_IQ_BLOCK_ACCUMULATE(iq4nl, iq4nl_octet)
+COLIBRI_IQ_BLOCK_ACCUMULATE(iq2xxs, iq2xxs_octet)
+#undef COLIBRI_IQ_BLOCK_ACCUMULATE
+
 
 
 __device__ __forceinline__ float q2k_value(

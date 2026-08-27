@@ -899,3 +899,31 @@ block per (hidden row, route-block), reading `activated` by slot and scattering
 into the token's output). Until then the kernel is dead code with a contract --
 deliberately, because the wiring is where the sequencing risk is and it should
 land on a kernel that is already proven.
+
+### The down twin, and a constraint the corpus imposes
+
+`iq1s_block_accumulate` / `iq4nl_` / `iq2xxs_` complete the pair. Verified against
+the token-major `*_grouped_accumulate_rows` at worst 5.0e-06 and 5.9e-06 — not
+0.0 like the swiglu, because block-major sums per slot and folds afterwards while
+token-major reduces a token's routes in one pass, so the float reassociation
+differs. Expected, and inside the 1e-5 contract.
+
+**A design constraint worth recording, because it is not obvious and it changed
+the kernel:** the block form cannot accumulate into the token's output row.
+Several blocks (different experts) feed the same token, which needs an atomic —
+and this corpus contains **no `atomicAdd` anywhere**, nor does the CPU-emulation
+generator model one. Introducing the first would silently break every CPU twin and
+the contract tests that depend on them.
+
+So each slot writes its own weighted row and a scatter folds them into tokens,
+which is what the streaming path already does with `qwen_scatter_add_rows`. Padded
+slots write exactly `0.0` rather than being skipped, so a scatter can process them
+unconditionally instead of needing a branch or a sentinel index — the contract
+checks that zero explicitly.
+
+Both kernels are now proven and unwired. Step 3 remains: build the aligned layout
+per layer on the host, upload `sorted_routes` / `block_experts` / the per-block
+pointer table, launch swiglu then accumulate then scatter, and reconcile with the
+CPU-expert path for whatever the GPU does not cover. `align_blocks` already skips
+zero-weight routes, which is exactly the marker the rows path uses for a route
+claimed elsewhere, so that seam is already the right shape.

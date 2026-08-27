@@ -580,6 +580,117 @@ int check_block_swiglu(const char* block_kernel, const char* rows_kernel,
     return report(block_kernel, worst);
 }
 
+
+// The block-major down projection against the token-major kernel it replaces.
+// The block form writes one weighted row per slot (it cannot accumulate into the
+// token directly -- see the corpus note about atomicAdd), so the comparison folds
+// a token's slots first. Padded slots must contribute exactly zero.
+int check_block_accumulate(const char* block_kernel, const char* rows_kernel,
+                           const Format& format) {
+    std::mt19937 rng(20260828);
+    std::uniform_real_distribution<float> real(-1.0f, 1.0f);
+    const int input_size = 512, output_size = 9;
+    const int rows = 7, top_k = 3, experts = 4;
+    const int routes = rows * top_k;
+    const std::size_t matrix_bytes =
+        static_cast<std::size_t>(input_size) / format.block_elements *
+        output_size * format.block_bytes;
+
+    std::vector<std::uint8_t> down(matrix_bytes * experts);
+    format.fill(rng, down);
+    std::vector<std::int32_t> selected(static_cast<std::size_t>(routes));
+    std::uniform_int_distribution<int> pick(0, experts - 1);
+    for (auto& value : selected) value = pick(rng);
+    std::vector<float> weights(static_cast<std::size_t>(routes));
+    for (auto& value : weights) value = real(rng);
+    std::vector<int> counts(static_cast<std::size_t>(rows), top_k);
+    std::vector<float> activated(static_cast<std::size_t>(routes) * input_size);
+    for (auto& value : activated) value = real(rng);
+
+    colibri::v2::moe::AlignedRoutes aligned;
+    colibri::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
+                                   colibri::v2::moe::kBlockSize, aligned);
+    std::vector<float> activated_slots(
+        static_cast<std::size_t>(aligned.padded_total) * input_size, 0.0f);
+    for (std::size_t slot = 0; slot < aligned.sorted_routes.size(); ++slot) {
+        const auto route = aligned.sorted_routes[slot];
+        if (route == colibri::v2::moe::kEmpty) continue;
+        for (int i = 0; i < input_size; ++i)
+            activated_slots[slot * input_size + i] =
+                activated[static_cast<std::size_t>(route) * input_size + i];
+    }
+
+    std::vector<unsigned long long> down_by_route(routes);
+    for (int route = 0; route < routes; ++route)
+        down_by_route[route] = reinterpret_cast<unsigned long long>(
+            down.data() + static_cast<std::size_t>(selected[route]) * matrix_bytes);
+    std::vector<float> reference(
+        static_cast<std::size_t>(rows) * output_size, 0.0f);
+    {
+        const unsigned long long* d = down_by_route.data();
+        const float* a = activated.data();
+        float* out = reference.data();
+        const float* w = weights.data();
+        const int* c = counts.data();
+        int in = input_size, on = output_size, tk = top_k, rw = rows;
+        void* args[] = {&d, &a, &out, &w, &c, &in, &on, &tk, &rw};
+        colibri_cpu_launch_named(rows_kernel, static_cast<std::uint32_t>(output_size),
+                                 static_cast<std::uint32_t>(rows), 256, 0, 0, args);
+    }
+
+    std::vector<unsigned long long> down_by_slot;
+    std::vector<std::int32_t> block_slot;
+    for (const auto expert : aligned.block_experts) {
+        block_slot.push_back(static_cast<std::int32_t>(down_by_slot.size()));
+        down_by_slot.push_back(reinterpret_cast<unsigned long long>(
+            down.data() + static_cast<std::size_t>(expert) * matrix_bytes));
+    }
+    std::vector<float> per_slot(
+        static_cast<std::size_t>(aligned.padded_total) * output_size, 1e30f);
+    {
+        const unsigned long long* d = down_by_slot.data();
+        const int* be = block_slot.data();
+        const int* sr = aligned.sorted_routes.data();
+        const float* a = activated_slots.data();
+        float* out = per_slot.data();
+        const float* w = weights.data();
+        int in = input_size, on = output_size;
+        int blocks = static_cast<int>(aligned.block_experts.size());
+        void* args[] = {&d, &be, &sr, &a, &out, &w, &in, &on, &blocks};
+        colibri_cpu_launch_named(block_kernel, static_cast<std::uint32_t>(output_size),
+                                 static_cast<std::uint32_t>(blocks), 256, 0, 0, args);
+    }
+
+    std::vector<float> folded(static_cast<std::size_t>(rows) * output_size, 0.0f);
+    for (std::size_t slot = 0; slot < aligned.sorted_routes.size(); ++slot) {
+        const auto route = aligned.sorted_routes[slot];
+        if (route == colibri::v2::moe::kEmpty) {
+            for (int row = 0; row < output_size; ++row)
+                if (per_slot[slot * output_size + row] != 0.0f) {
+                    std::printf("  %-28s FAIL (padded slot not zero)\n", block_kernel);
+                    return 1;
+                }
+            continue;
+        }
+        const int token = route / top_k;
+        for (int row = 0; row < output_size; ++row)
+            folded[static_cast<std::size_t>(token) * output_size + row] +=
+                per_slot[slot * output_size + row];
+    }
+
+    float worst = 0.0f;
+    for (int token = 0; token < rows; ++token)
+        for (int row = 0; row < output_size; ++row) {
+            const double expected =
+                reference[static_cast<std::size_t>(token) * output_size + row];
+            const double actual =
+                folded[static_cast<std::size_t>(token) * output_size + row];
+            worst = std::fmax(worst, static_cast<float>(
+                std::fabs(expected - actual) / std::fmax(1.0, std::fabs(expected))));
+        }
+    return report(block_kernel, worst);
+}
+
 int main() {
     std::printf("IQ kernel contract (corpus CUDA vs CPU reference)\n");
     int failures = 0;
@@ -604,6 +715,10 @@ int main() {
                                    "iq1s_grouped_swiglu_rows", kIq1s);
     failures += check_block_swiglu("iq2xxs_block_swiglu",
                                    "iq2xxs_grouped_swiglu_rows", kIq2xxs);
+    failures += check_block_accumulate("iq1s_block_accumulate",
+                                       "iq1s_grouped_accumulate_rows", kIq1s);
+    failures += check_block_accumulate("iq2xxs_block_accumulate",
+                                       "iq2xxs_grouped_accumulate_rows", kIq2xxs);
     failures += check_q8("iq4xs_q8_matvec_transposed_warp", kIq4xs);
     failures += check_q8_rows("iq4xs_q8_matvec_transposed_rows", kIq4xs);
     // The IQ1 pair through the Q8 path, where the delta is folded into the int8
