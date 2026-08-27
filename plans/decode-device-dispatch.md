@@ -817,3 +817,46 @@ kernel whoseCTA reads its expert id from a per-block table.
 Expected: 153,440 launches -> a few hundred, with weights still read once per
 expert. Everything measured this session says that is the last big factor; uploads
 (near link speed) and CPU experts (already ~0 under staging) are not.
+
+### Step 1 shipped: the block-aligned route layout
+
+`native/include/colibri_v2_moe_align.hpp` — routes grouped by expert and padded to
+a block multiple, the layout a single fused kernel walks. Host reference and
+production builder in one small header, pinned by
+`native/tests/qwen_moe_align_contract.cpp` (ctest is now 22).
+
+The contract checks the properties a consumer actually depends on, over
+randomised batches at the real shape rather than hand-written cases: every kept
+route present exactly once, all routes in a block belong to that block's expert,
+padding only ever at the tail of a run, an expert's blocks contiguous, and
+determinism. A lost or duplicated route is invisible in a small example and
+produces fluent-wrong output downstream, which is why it is randomised.
+
+Zero-weight routes are skipped — the rows path uses a zero weight to mark a route
+already claimed by the GPU expert cache or pruned by top-k/top-p.
+
+**Block size, measured at the real shape** (1024 rows, top-10, 512 experts; all
+512 touched, mean 20 routes each, max 36):
+
+| block | blocks/layer | padding waste |
+|---|---|---|
+| 4 | 2750 | 6.9% |
+| **8** | **1495** | **14.4%** |
+| 16 | 904 | 29.2% |
+| 32 | 513 | 37.6% |
+| 64 | 512 | 68.8% |
+| 128 | 512 | 84.4% |
+
+Past 32 every expert takes exactly one block (max count is 36) and the padding
+runs away. **8-16 is the usable range.**
+
+**This has a consequence for step 2 that was not obvious before measuring it: the
+existing MMQ kernels are the wrong shape for this model.** They tile 16 or 64
+tokens (`kQ8MmqTokens=128`, `kQ8MmqMinTokens=64`), sized for dense projections
+where every token participates. An expert here has ~20 routes, so a 64-token tile
+is 69% padding. The fused kernel needs its own geometry -- closer to a warp per
+8-token block -- rather than reusing `*_q8_mmq`.
+
+The prize is unchanged and now precise: today the streaming path issues ~4096
+launches per layer-chunk at **5 blocks each**; this layout is **one launch of
+~1495 blocks**.

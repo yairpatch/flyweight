@@ -131,6 +131,19 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    colibri_qwen_moe_align_contract
+    tests/qwen_moe_align_contract.cpp
+)
+target_compile_features(colibri_qwen_moe_align_contract PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_moe_align_contract PRIVATE include)
+if(BUILD_TESTING)
+    add_test(
+        NAME colibri_qwen_moe_align_contract
+        COMMAND colibri_qwen_moe_align_contract
+    )
+endif()
+
+add_executable(
     colibri_qwen_expert_policy_contract
     tests/qwen_expert_policy_contract.cpp
 )
