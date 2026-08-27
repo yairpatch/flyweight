@@ -1513,6 +1513,18 @@ void qwen_forward_rows(
             expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
             (expert_policy.hybrid_prefill_cpu||
              !expert_policy.routed_gpu_execution_allowed());
+        if(std::getenv("COLIBRI_STREAM_TRACE")){
+            static int shown=0;
+            if(shown<3){++shown;
+                std::fprintf(stderr,
+                    "[stream-gate] stream_bytes=%llu dma=%d phase_prefill=%d "
+                    "hybrid_prefill_cpu=%d routed_gpu_allowed=%d => %d\n",
+                    (unsigned long long)span.stream_bytes,(int)runtime.dma_paging,
+                    (int)(expert_phase==colibri::v2::ExpertExecutionPhase::prefill),
+                    (int)expert_policy.hybrid_prefill_cpu,
+                    (int)expert_policy.routed_gpu_execution_allowed(),
+                    (int)stream_experts);}
+        }
         const bool gpu_table_path=!expert_policy.hybrid_prefill_cpu;
         span.gpu_experts=gpu_table_path;
         const auto span_entries=static_cast<std::size_t>(rows)*top_k;

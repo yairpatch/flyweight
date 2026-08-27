@@ -492,9 +492,10 @@ def _add_runtime_options(
     )
 
     add(
-        tuning, "--hybrid-prefill", choices=("split", "cpu"), default="split",
+        tuning, "--hybrid-prefill", choices=("split", "cpu"), default=None,
         help="during prompt processing, whether routed experts split across "
-             "the resident GPU set and the host, or all run on the host",
+             "the resident GPU set and the host, or all run on the host "
+             "(default: cpu under --expert-mode auto, split otherwise)",
     )
     add(
         tuning, "--expert-residency", choices=("mutable", "immutable"),
@@ -1026,6 +1027,39 @@ experts actually ended up.\
     )
     _add_runtime_options(probe, serving=False)
 
+    audit = _add_command(
+        commands, "transcript-audit",
+        help="explain a coding harness's bad edits from a request dump",
+        description="Audit a request dump for edits the model made without "
+                    "the file's text in front of it.",
+        usage="transcript-audit DIR [--verbose]",
+        epilog="""\
+examples:
+  COLIBRI_TRANSCRIPT_DUMP=/tmp/dump colibri-next serve model.gguf
+      record every request while a coding harness works
+
+  colibri-next transcript-audit /tmp/dump
+      then say which side lost the file
+
+Each edit is checked twice: was the text it replaces anywhere in the
+transcript the client sent, and was it in the prompt the model was actually
+given? Absent from both is the model editing blind, which no change here
+fixes. Present in the transcript and missing from the prompt is this server's
+bug, and the report names the request that dropped it.
+
+COLIBRI_TRANSCRIPT_PROMPT=0 records a digest instead of the prompt text, which
+is much smaller but can only answer the first question.\
+""",
+    )
+    audit.add_argument(
+        "directory", type=Path, metavar="DIR",
+        help="directory COLIBRI_TRANSCRIPT_DUMP wrote to",
+    )
+    audit.add_argument(
+        "--verbose", action="store_true",
+        help="list every finding rather than the twenty most serious",
+    )
+
     return parser
 
 
@@ -1530,6 +1564,22 @@ def _gather_imatrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def _transcript_audit(args: argparse.Namespace) -> int:
+    from . import transcript_audit
+
+    if not args.directory.is_dir():
+        print(f"{args.directory} is not a directory", file=sys.stderr)
+        return 2
+    records = transcript_audit.load(args.directory)
+    if not records:
+        print(f"no request dumps in {args.directory}", file=sys.stderr)
+        return 2
+    report = transcript_audit.audit(records)
+    print(transcript_audit.format_report(report, verbose=args.verbose))
+    # Non-zero when the server itself lost something, so this can gate a run.
+    return 1 if report.by_verdict("runtime-dropped") else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     _resolve_quant(args)
@@ -1546,6 +1596,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.command == "imatrix":
         return _gather_imatrix(args)
+    if args.command == "transcript-audit":
+        return _transcript_audit(args)
     if args.command in {"probe", "probe-native-v2", "probe-qwen-native-v2", "probe-native"}:
         _validate_runtime_args(args)
         _select_backend(args)

@@ -1624,7 +1624,12 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertFalse(args.cpu_prefetch_auto)
         self.assertEqual(args.next_layer_prefetch, 0)
         self.assertEqual(args.cpu_threads, 0)
-        self.assertEqual(args.hybrid_prefill, "split")
+        # No parser default: "not asked" has to be distinguishable from an
+        # explicit choice, because the runtime defaults prompt processing to the
+        # host under `auto` expert placement. The parser used to say "split"
+        # here and the runtime replaced it with "cpu" regardless, so the flag
+        # silently did nothing.
+        self.assertIsNone(args.hybrid_prefill)
         self.assertIsNone(args.expert_residency)
         self.assertEqual(args.dense_requant, "auto")
         self.assertEqual(args.prompt_cache_mib, (1 << 32) - 1)

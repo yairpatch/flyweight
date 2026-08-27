@@ -453,3 +453,37 @@ Whether the gather/GEMM/scatter path from `plans/prefill-expert-gemm.md` (810 to
 on Ornith) engages here at all is unverified and worth checking before anything is
 designed — it is silently off whenever hybrid falls back to CPU MoE, which at a 21%
 hit rate is most of the time.
+
+## The override that made `--hybrid-prefill` a no-op (2026-08-27)
+
+Chasing why the prefill expert-GEMM/streaming path never ran
+(`prefill_streamed_bytes = 0` in every arm), a `COLIBRI_STREAM_TRACE` at its gate
+showed the gate passing — and, unexpectedly, `hybrid_prefill_cpu=1` and
+`routed_gpu_allowed=0` **even under `--hybrid-prefill split`**.
+
+`src/colibri_next/v2.py`:
+
+```python
+effective_hybrid_prefill = ("cpu" if resolved_expert_mode == "auto" else hybrid_prefill)
+```
+
+Under the default `--expert-mode auto` this **replaced** the caller's choice rather
+than defaulting it, so `--hybrid-prefill split` silently got `cpu` and every routed
+expert ran on the host for the whole prompt. That is why the earlier sweep saw
+`split` and `cpu` measure identically: they were the same configuration.
+
+Measured cost, 4243-token prompt, two rounds each:
+
+| | prefill |
+|---|---|
+| default (`auto` -> forced `cpu`) | 55.8 / 60.2 tok/s |
+| `--expert-mode hybrid --hybrid-prefill split` | **63.6 / 65.0 tok/s** |
+
+**~+11%**, and steadier. Fixed by giving the flag no parser default, so "not asked"
+is distinguishable from an explicit choice; only the former is defaulted (`cpu`
+under `auto`, `split` otherwise). The existing default behaviour is unchanged.
+
+Note this does NOT explain the bulk of TTFT: the expert phase is still 97.5% of
+prefill in the `split` arm. Getting routed experts onto the GPU during prompt
+processing is worth ~11%, not the 2x that ~33 s TTFT needs. The phase is still the
+target; this was a flag that lied about what it did.

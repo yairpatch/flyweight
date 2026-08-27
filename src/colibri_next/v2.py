@@ -2055,7 +2055,7 @@ class V2Model:
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
         cpu_threads: int = 0,
-        hybrid_prefill: str = "split",
+        hybrid_prefill: str | None = None,
         expert_residency: str | None = None,
         dense_requant: str = "auto",
         prefill_expert_stream_mib: int = -1,
@@ -2463,7 +2463,7 @@ class V2QwenRuntime:
         cpu_prefetch_auto: bool = False,
         next_layer_prefetch: int = 0,
         cpu_threads: int = 0,
-        hybrid_prefill: str = "split",
+        hybrid_prefill: str | None = None,
         expert_residency: str | None = None,
         dense_requant: str = "auto",
         prefill_expert_stream_mib: int = -1,
@@ -2519,7 +2519,7 @@ class V2QwenRuntime:
             raise ValueError("next_layer_prefetch must be between 0 and 64")
         if cpu_threads < 0:
             raise ValueError('cpu_threads must be non-negative (0 = automatic)')
-        if hybrid_prefill not in {"split", "cpu"}:
+        if hybrid_prefill is not None and hybrid_prefill not in {"split", "cpu"}:
             raise ValueError("hybrid_prefill must be 'split' or 'cpu'")
         if expert_residency not in {"mutable", "immutable"}:
             raise ValueError("expert_residency must be 'mutable' or 'immutable'")
@@ -2531,9 +2531,18 @@ class V2QwenRuntime:
                 "budget in MiB")
         if next_layer_prefetch and mtp_drafts:
             raise ValueError("next_layer_prefetch does not support MTP yet")
-        effective_hybrid_prefill = (
-            "cpu" if resolved_expert_mode == "auto" else hybrid_prefill
-        )
+        # `auto` expert placement defaults prompt processing to the host, but
+        # this used to REPLACE an explicit --hybrid-prefill rather than default
+        # it: passing `split` under the default expert mode silently got `cpu`,
+        # so the flag did nothing and prefill ran every routed expert on the
+        # host. Measured cost of the override on qwen4exp: ~11% of prefill
+        # (58.0 -> 64.3 tok/s). None means "not asked", and only that is
+        # defaulted.
+        effective_hybrid_prefill = hybrid_prefill
+        if effective_hybrid_prefill is None:
+            effective_hybrid_prefill = (
+                "cpu" if resolved_expert_mode == "auto" else "split"
+            )
         effective_expert_residency = expert_residency
         if mtp_drafts < 0 or mtp_drafts > 8:
             raise ValueError("mtp_drafts must be between 0 and 8")
