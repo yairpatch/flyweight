@@ -719,3 +719,53 @@ plus a check of which kernel `dense_rows` actually selects. There is no env togg
 for MMQ today, so the dispatch needs a trace like `COLIBRI_STREAM_TRACE`. That
 distinguishes "MMQ is off" (a wiring bug, cheap fix, precedent: IQ4_NL and
 `--hybrid-prefill`) from "MMQ is on and slow" (a kernel problem, expensive).
+
+## Prefill, resolved (2026-08-27)
+
+Two hypotheses from this file are now FALSIFIED by direct per-kernel measurement,
+both of them mine, and both from the same mistake.
+
+**Dead: "quantized matmul runs at ~1 TFLOP/s and that sets prefill."** It came from
+the phase tracer putting `proj` at 8.23 s. But `phase()` syncs the stream before
+reading the clock, so `proj`'s window charges that phase for whatever was still
+queued from the previous layer -- the same contamination already noted for `pre`.
+The tracer is fine for ordering and useless for rates.
+
+**Dead: "the kernel is 20x slower in situ than standalone."** Same cause.
+
+`COLIBRI_PREFILL_LAUNCH_TIME=1` now brackets every rows-path launch with CUDA
+events, so each kernel's own duration is measured. (Wall time under it is
+meaningless -- everything is serialized -- but a kernel's duration is not affected
+by serialization, which is the whole point.) On a 784-token prompt:
+
+| | time |
+|---|---|
+| **every GPU kernel combined** | **6.4 s** |
+| **CPU expert phase** | **17.63 s** |
+
+Top GPU kernels: `q5k_q8_mmq` 1.57 s (24.5%, 848 calls = **1.85 ms/call**),
+`q8_matmul_tiled` 0.87 s, `qwen_f32_matmul_rows` 0.79 s, `qwen4_hc_mix_rows`
+0.41 s, `quantize_q8_blocks_rows` 0.38 s, `qwen4_group_rms_rows` 0.35 s,
+`iq4nl_matmul_rows` 0.28 s. A standalone benchmark of `q5k_q8_mmq` at
+`[1024x2560]x[2560x10240]` gives **19.06 TFLOP/s** / 2.82 ms, consistent with the
+in-situ per-call figure once shapes are accounted. And `COLIBRI_DENSE_TRACE=1`
+confirms every dense projection takes MMQ: `q5k_q8_mmq`, `q6k_q8_mmq`.
+
+**The GPU is not the problem, at all.** Prefill is bound by CPU expert execution,
+which is ~2.75x the entire GPU kernel budget. That is the same conclusion the very
+first measurement reached (expert phase 84-92% of prefill) and every subsequent
+theory -- weight re-reads, upload bandwidth, dispatch count, vector width, matmul
+throughput -- was a detour off it.
+
+**Which makes the ranking clear.** Getting experts off the CPU is the only lever
+that matters, and staging already does it: at a 2048 MiB arena the expert phase
+falls to 1.2% and prefill goes 69 s -> 55.6 s, with the remaining budget split
+uploads 11.75 s / group compute 21.96 s / non-expert ~22 s. So:
+
+1. **Raise the staged fraction** -- it is the measured win, and the default arena
+   (48 MiB) captures almost none of it. The blocker is that a per-span arena
+   re-uploads every chunk; experts persisting across chunks would amortise it ~4x
+   on a 4k prompt.
+2. **Then** the 122,848 tiny per-expert-group dispatches, via the sorted-buffer
+   fused kernel vLLM and llama.cpp use.
+3. Non-expert GPU work is ~6.4 s of kernels and is not worth touching.

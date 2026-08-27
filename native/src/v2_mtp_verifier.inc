@@ -50,13 +50,28 @@ static constexpr int kQ8MmqWideThreads=
 static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
 
 // Launch tally for COLIBRI_PREFILL_LAUNCHES; see the `launch` lambda below.
-struct QwenLaunchStat { std::uint64_t calls=0, blocks=0; };
+struct QwenLaunchStat { std::uint64_t calls=0, blocks=0; double milliseconds=0.0; };
 inline std::map<std::string,QwenLaunchStat>& qwen_launch_stats(){
     static std::map<std::string,QwenLaunchStat> stats; return stats;
 }
 inline void qwen_note_launch(const char* name,std::uint32_t gx,std::uint32_t gy){
     auto& e=qwen_launch_stats()[name];
     ++e.calls; e.blocks+=static_cast<std::uint64_t>(gx)*gy;
+}
+// COLIBRI_PREFILL_LAUNCH_TIME=1 adds each kernel's own GPU duration to the tally.
+// It brackets every launch with events and syncs, so the WALL time of the run is
+// meaningless -- but a kernel's measured duration is not affected by being
+// serialized, which is the point: it answers "is this kernel slow here?" against
+// the same kernel benchmarked alone.
+inline bool qwen_launch_time_enabled(){
+    static const bool on=[]{
+        const char* v=std::getenv("COLIBRI_PREFILL_LAUNCH_TIME");
+        return v&&v[0]=='1';
+    }();
+    return on;
+}
+inline void qwen_note_launch_time(const char* name,double milliseconds){
+    qwen_launch_stats()[name].milliseconds+=milliseconds;
 }
 inline void qwen_prefill_launch_report(){
     auto& stats=qwen_launch_stats();
@@ -66,12 +81,16 @@ inline void qwen_prefill_launch_report(){
     std::vector<std::pair<std::string,QwenLaunchStat>> ordered(stats.begin(),stats.end());
     std::sort(ordered.begin(),ordered.end(),[](const auto&a,const auto&b){
         return a.second.calls>b.second.calls;});
-    std::fprintf(stderr,"[launches] %llu total\n",
-                 static_cast<unsigned long long>(total));
+    double total_ms=0.0;
+    for(const auto& kv:stats)total_ms+=kv.second.milliseconds;
+    std::fprintf(stderr,"[launches] %llu total, %.1f s of measured kernel time\n",
+                 static_cast<unsigned long long>(total),total_ms/1000.0);
     for(const auto& kv:ordered)
-        std::fprintf(stderr,"[launches] %-34s %8llu calls %5.1f%%  %10llu blocks  %6.1f blocks/call\n",
+        std::fprintf(stderr,"[launches] %-34s %8llu calls %5.1f%%  %8.2f s %5.1f%%  %10llu blocks  %6.1f blocks/call\n",
             kv.first.c_str(),static_cast<unsigned long long>(kv.second.calls),
             100.0*kv.second.calls/total,
+            kv.second.milliseconds/1000.0,
+            total_ms>0?100.0*kv.second.milliseconds/total_ms:0.0,
             static_cast<unsigned long long>(kv.second.blocks),
             static_cast<double>(kv.second.blocks)/kv.second.calls);
     stats.clear();
@@ -209,6 +228,21 @@ void qwen_forward_rows(
     static const bool trace_launches=std::getenv("COLIBRI_PREFILL_LAUNCHES")!=nullptr;
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,std::uint32_t bx,void**args,std::uint32_t shared=0){
         if(trace_launches)qwen_note_launch(name,gx,gy);
+        if(qwen_launch_time_enabled()){
+            static std::uint64_t start=0,stop=0;
+            if(!start){colibri_gpu_timed_event_create(&start);
+                       colibri_gpu_timed_event_create(&stop);}
+            colibri_gpu_event_record(start,runtime.stream);
+            if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
+                throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
+            colibri_gpu_event_record(stop,runtime.stream);
+            colibri_gpu_event_sync(stop);
+            float ms=0.0f;
+            if(colibri_gpu_event_elapsed(start,stop,&ms)==0)
+                qwen_note_launch_time(name,ms);
+            if(!trace_launches)qwen_note_launch(name,gx,gy);
+            return;
+        }
         if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
     };
@@ -272,6 +306,19 @@ void qwen_forward_rows(
         // MoE batch may enter the block at all. (IQ1_S/IQ1_M land on the
         // symmetric MMQ rather than with the asymmetric _MIN three: their
         // per-group deltas fold into the int8 weights exactly.)
+        // COLIBRI_DENSE_TRACE=1: which kernel each dense projection actually
+        // takes. Reasoning about these gates has been wrong twice (IQ4_NL's
+        // missing format row, --hybrid-prefill's silent override), so the
+        // dispatch reports itself.
+        auto dense_trace=[&](const char* picked){
+            static const bool on=std::getenv("COLIBRI_DENSE_TRACE")!=nullptr;
+            if(!on)return;
+            static std::set<std::string> seen;
+            char key[256];
+            std::snprintf(key,sizeof(key),"type=%u %dx%d rows=%d -> %s",
+                          type,input_size,output_size,rows,picked?picked:"float-fallback");
+            if(seen.insert(key).second)std::fprintf(stderr,"[dense] %s\n",key);
+        };
         const char* mmq_kernel=format?format->matmul_q8_mmq:nullptr;
         const bool mmq_min=format&&format->mmq_min;
         const char* tiled_kernel=format?format->matmul_q8_tiled:nullptr;
@@ -348,6 +395,7 @@ void qwen_forward_rows(
                         &input_size,&output_size,&batch,&scale_stride};
                     launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,1,mmq_threads,mmq_args);
                 }
+                dense_trace(mmq_kernel);
                 return;
             }
             // Reached when the device predates sm_75, where the MMQ kernels
@@ -364,6 +412,7 @@ void qwen_forward_rows(
                         &input_size,&output_size,&batch,&scale_stride};
                     launch(tiled_kernel,(output_size+kQ8TileRows-1)/kQ8TileRows,1,256,tiled_args);
                 }
+                dense_trace(tiled_kernel);
                 return;
             }
             if(rows>1&&rows_kernel){
