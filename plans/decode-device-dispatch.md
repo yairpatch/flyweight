@@ -243,6 +243,15 @@ Interleaved decode A/B (48 iterations, 4 warmup):
 **~17 tok/s -> ~30 tok/s**, and the run-to-run variance largely disappears (the
 staged path's spread was page-cache state).
 
+**REVISED 2026-08-27, and the headline above is overstated.** Those arms compare
+staged against direct *inside HEAD* at a moment when the page cache was in an
+unusually bad state for the staged arm, so the 17 is too low. A later A/B against
+the actual pre-session commit (5e8fefe), at 32k context with a warm cache, puts the
+session's net decode win at **22.70 -> 27.24 tok/s, about +14-20%** -- real, but not
++77%. Quote the baseline comparison, not the staged-vs-direct one. Neither figure
+has been re-measured since the registration budget narrowed to 19.1 GiB / 25 of 48
+layers, so even +14-20% is provisional.
+
 Two things worth noting:
 
 - **Strict admission is now redundant.** It was worth +8% when every admission cost
