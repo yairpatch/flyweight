@@ -346,6 +346,38 @@ The honest caveat: the fastest configuration measured so far (strict admission,
 than removing it. The big number depends on DMA paging actually being enable-able
 within this box's RAM, which is now Phase 1's real risk and the next thing to test.
 
+## Server validation (2026-08-27) — the win does NOT show up under `serve`
+
+Everything above was measured with `colibri-next benchmark`. The product is the
+server, which goes through the cooperative engine, the prompt cache and the
+multi-sequence path instead. Measured through the OpenAI streaming API against a
+real `serve` process, 32k context, `--gpu-cache-mib 9000`, decode rate taken from
+the server's own `colibri.decode_elapsed_seconds`:
+
+| | baseline 5e8fefe | HEAD |
+|---|---|---|
+| short prompt, TTFT | 2.21 s | 2.19 s |
+| short prompt, decode | 29.65 tok/s | 31.38 tok/s |
+| ~3k prompt, TTFT | **33.08 s** | **32.76 s** |
+| ~3k prompt, decode | 26.10 tok/s | 24.41 tok/s |
+| 4 concurrent, decode | 31.17 tok/s | 32.67 tok/s |
+| 4 concurrent, aggregate | 14.26 tok/s | 14.16 tok/s |
+
+Both arms auto-fit the identical expert cache (1992 slots, 3355 MiB), so this is a
+clean comparison. **It is a wash.** The +14-20% the CLI benchmark showed does not
+reach a served request: the server's workload keeps the expert cache warm, so few
+admissions happen, so removing the admission memcpy buys little. The benchmark
+harness exercised exactly the case the fix helps and the server does not.
+
+What the session actually delivers to the server, then: no ~22 s startup stall, the
+QSA regression removed by making it opt-in, an attribution tool, and a dispatch
+rewrite correctly not built. Throughput: neutral.
+
+**And the number that matters is not decode.** TTFT for a ~3k-token prompt is
+**~33 seconds**, identical on both arms and untouched by any of this. At ~30 tok/s
+decode, a served request spends its first half-minute in prefill. That is the
+server's real problem, and this whole plan was aimed at the wrong phase.
+
 ## What this exercise is worth remembering for
 
 The plan was written around a dispatch redesign, and two rounds of measurement
