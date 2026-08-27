@@ -769,3 +769,51 @@ uploads 11.75 s / group compute 21.96 s / non-expert ~22 s. So:
 2. **Then** the 122,848 tiny per-expert-group dispatches, via the sorted-buffer
    fused kernel vLLM and llama.cpp use.
 3. Non-expert GPU work is ~6.4 s of kernels and is not worth touching.
+
+## The prefill bottleneck, established (2026-08-28)
+
+Measured with `COLIBRI_PREFILL_LAUNCH_TIME=1`, 784-token prompt, at the two ends
+of the staging range:
+
+| | default arena (48 MiB) | full staging (2048 MiB) |
+|---|---|---|
+| CPU expert phase | **17.63 s** | **0.26 s** |
+| GPU kernel time | 6.4 s | 14.7 s |
+| launches | 24,919 | **153,440** |
+
+**Staging solves the CPU problem outright** — the expert phase goes to 0.26 s. It
+buys that by moving the work onto the GPU as ~150k dispatches, and *that* is the
+new limit: `iq1s_q8_mmq` alone is 27,942 calls at **5 blocks per call**. A 5-block
+kernel cannot fill this GPU; the 66 us the events attribute to each call is
+mostly launch latency, not arithmetic.
+
+Confirmed by a chunk-size test rather than assumed. Doubling `COLIBRI_PREFILL_ROWS`
+1024 -> 2048 at a 2048 MiB arena cuts uploads 184.6 -> 145.6 GiB and groups
+122,333 -> 96,472, both -21%, and moves prefill 66.6 -> 68.2 tok/s: **+2.4%**.
+Reducing dispatches proportionally reduces time proportionally, which is what a
+launch-bound regime looks like. 21% is not enough; the gap needs ~100x.
+
+**Why neither existing path can close it.** The two GPU expert paths trade the same
+pair of costs in opposite directions:
+
+- *Table path* (`*_grouped_swiglu_rows`): ONE launch for all routes, grid
+  `(out_size, rows*top_k)` — but one block per *(token, route)*, so an expert's
+  weights are re-read once per routed token. Decode-shaped.
+- *Streaming path*: weights read once per expert — but a host loop issuing ~8
+  launches per expert, hence the 150k.
+
+Neither is "one launch, weights read once per expert-block". That is precisely what
+vLLM's `moe_align_block_size` + `fused_moe_kernel` and llama.cpp's grouped
+`mul_mat_id` are: sort tokens by expert into a block-padded buffer, then a single
+kernel whoseCTA reads its expert id from a per-block table.
+
+**Scope of the remaining work**, in order:
+1. A sort/align step producing `sorted_token_ids`, `expert_ids` (one per block) and
+   the padded count — self-contained and unit-testable against a host reference.
+2. A fused MoE kernel over that buffer for the three IQ formats, replacing both the
+   per-expert loop and the per-route grouped kernel.
+3. Rewire the rows path to call it once per layer instead of per expert.
+
+Expected: 153,440 launches -> a few hundred, with weights still read once per
+expert. Everything measured this session says that is the last big factor; uploads
+(near link speed) and CPU experts (already ~0 under staging) are not.
