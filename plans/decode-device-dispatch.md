@@ -487,3 +487,46 @@ Note this does NOT explain the bulk of TTFT: the expert phase is still 97.5% of
 prefill in the `split` arm. Getting routed experts onto the GPU during prompt
 processing is worth ~11%, not the 2x that ~33 s TTFT needs. The phase is still the
 target; this was a flag that lied about what it did.
+
+## Why qwen3.5 prefills at 810 tok/s and qwen4exp at 61 (2026-08-27)
+
+`plans/prefill-expert-gemm.md` is the reason for the qwen3.5-family number: the
+grouped expert kernels are *decode-shaped* (one full-width matvec block per
+(token, route), so a staged expert's weights are re-decoded once per routed
+token), and the fix was gather -> MMQ GEMM -> scatter, decoding weights once per
+128-token tile instead. That shipped and took Ornith to 810 tok/s (+31%).
+
+qwen4exp never enters it. The engagement test is `stream_role_ok` in
+`v2_mtp_verifier.inc:1640`, applied as a conjunction over gate, up AND down:
+
+```cpp
+if (format->matmul_q8_mmq && int8_tensor_cores && (in_size & 255) == 0) return true;
+return format->matmul_rows != nullptr &&
+       format->matmul_rows_grid != RowsMatmulGrid::per_token;
+```
+
+Against this checkpoint's formats (34 layers IQ1_S + 14 IQ2_XXS gate/up, **all 48
+layers IQ4_NL down**):
+
+| role | format | `matmul_q8_mmq` | `matmul_rows` | passes? |
+|---|---|---|---|---|
+| gate/up | IQ1_S (19) | `iq1s_q8_mmq` | `iq1s_matmul_rows`, quad_pack | yes |
+| gate/up | IQ2_XXS (16) | `iq2xxs_q8_mmq` | `iq2xxs_matmul_rows`, quad_pack | yes |
+| **down** | **IQ4_NL (20)** | **none** | **none** | **NO** |
+
+The IQ4_NL entry carries only `iq_expert_prefix` and `cpu_expert` — the
+decode-shaped grouped kernel and a CPU dot, nothing batched. One missing format
+entry fails the conjunction for every layer, so prefill falls back to exactly the
+wall `prefill-expert-gemm.md` was written to remove. That, not policy or budget,
+is why `prefill_streamed_bytes` is 0 with the gate reporting true.
+
+**The work**: give IQ4_NL a rows matmul. Note the MMQ branch is unavailable to it
+regardless — the expert intermediate is 640 and `640 & 255 != 0` — so what is
+needed is `iq4nl_matmul_rows` with a non-`per_token` grid, the shape IQ1_S/IQ2_XXS/
+IQ4_XS already have. IQ4_NL is block-32 rather than 256-super-block (see the %32
+admission in [[qwen4exp-support]]), so it cannot copy IQ4_XS's kernel verbatim.
+
+Expected payoff is the *shape* change, not a constant: weight traffic per expert
+falls from `n_tokens x triple` to `ceil(n_tokens/128) x triple`. Prefill is 97.5%
+expert phase, so this is the only lever measured so far that could plausibly move
+a 33 s TTFT by more than 11%.
