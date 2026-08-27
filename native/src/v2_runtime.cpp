@@ -99,6 +99,65 @@ bool timing_enabled() {
     return on;
 }
 
+// COLIBRI_MOE_PROFILE=1 attributes the decode MoE phase's HOST-SERIAL time to its
+// causes. Phase 0b of plans/decode-device-dispatch.md: `expert_page` measures the
+// whole phase (~32 ms/token on the 125B UD-IQ1_S) and `expert_compute` only the
+// CPU expert dots inside it (~7 ms), leaving ~25 ms/token attributed to nothing.
+// The dispatch rewrite that gap motivates is far too large to build on a guess,
+// so this splits the gap by cause. Separate from COLIBRI_TIMING because these are
+// finer-grained clocks inside the per-expert loop, which is exactly where clock
+// overhead would distort what it measures -- read the totals, not the absolute
+// token rate, when this is on.
+struct QwenMoeProfile {
+    double lookup = 0;      // expert_residency hash find, per selected expert
+    double access = 0;      // record_expert_access + cache-hit bookkeeping
+    double scales = 0;      // the three qwen_expert_role_scale mmap touches
+    double admission = 0;   // select_expert_cache_slot's victim scan
+    double staging = 0;     // memcpy of a missed expert bundle into pinned staging
+    double table = 0;       // the seven pointer/scale memcpys + their upload
+    double queue = 0;       // grouped kernel launches + deferred cache uploads
+    std::uint64_t tokens = 0, lookups = 0, admissions = 0, staged_bytes = 0;
+};
+inline QwenMoeProfile& qwen_moe_profile() { static QwenMoeProfile p; return p; }
+inline bool moe_profile_enabled() {
+    static const bool on = [] {
+        const char* s = std::getenv("COLIBRI_MOE_PROFILE");
+        return s && s[0] == '1';
+    }();
+    return on;
+}
+inline double moe_now() {
+    return moe_profile_enabled()
+        ? std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now().time_since_epoch()).count()
+        : 0.0;
+}
+void qwen_moe_profile_report() {
+    if (!moe_profile_enabled()) return;
+    auto& p = qwen_moe_profile();
+    if (!p.tokens) return;
+    const double t = static_cast<double>(p.tokens);
+    const double sum = p.lookup + p.access + p.scales + p.admission +
+                       p.staging + p.table + p.queue;
+    std::fprintf(stderr,
+        "\n[moe-profile] %llu decode tokens, host-serial MoE work per token:\n",
+        static_cast<unsigned long long>(p.tokens));
+    const std::pair<const char*, double> rows[] = {
+        {"residency lookup", p.lookup}, {"access bookkeeping", p.access},
+        {"role scales (mmap)", p.scales}, {"admission victim scan", p.admission},
+        {"bundle staging memcpy", p.staging}, {"pointer table build", p.table},
+        {"kernel launch + uploads", p.queue},
+    };
+    for (const auto& [name, ms] : rows)
+        std::fprintf(stderr, "  %-26s %7.3f ms/token  %5.1f%%\n",
+                     name, ms / t, sum > 0 ? 100.0 * ms / sum : 0.0);
+    std::fprintf(stderr, "  %-26s %7.3f ms/token\n", "TOTAL attributed", sum / t);
+    std::fprintf(stderr,
+        "  (%.1f lookups, %.1f admissions, %.1f MiB staged per token)\n\n",
+        p.lookups / t, p.admissions / t,
+        p.staged_bytes / t / (1024.0 * 1024.0));
+}
+
 // COLIBRI_EXPERT_TRACE=<path> writes the decode route stream as packed
 // (uint32 layer, uint32 expert) pairs so expert-cache policies can be replayed
 // offline against a real trace. Diagnostic only; null unless the var is set.
@@ -16995,17 +17054,22 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 std::size_t slot_index;
             };
             std::array<PendingUpload,256>pending{};int pending_count=0;
+            auto&moe_prof=qwen_moe_profile();
             for(int rank=0;rank<route_count;++rank){
                 const int expert=selected_host[rank];if(expert<0||expert>=experts)throw std::runtime_error("native hybrid MoE selected an invalid expert");
                 const auto cache_key=(static_cast<std::uint64_t>(layer_number)<<32)|static_cast<std::uint32_t>(expert);
+                const double t_lookup=moe_now();
                 auto resident=runtime->expert_residency.find(cache_key);
+                if(moe_profile_enabled()){moe_prof.lookup+=moe_now()-t_lookup;++moe_prof.lookups;}
                 if(resident!=runtime->expert_residency.end()){
                     const auto slot_index=resident->second;auto&slot=runtime->expert_slots[slot_index];
+                    const double t_access=moe_now();
                     const auto&history=record_expert_access(
                         *runtime,layer_number,expert);
                     if(expert_policy.residency_may_change())
                         slot.last_used=history.last_used;
                     record_expert_cache_hit(*runtime,slot);
+                    if(moe_profile_enabled())moe_prof.access+=moe_now()-t_access;
                     const auto device_base=runtime->expert_cache+slot_index*runtime->expert_slot_bytes;std::uint64_t role_offset=0;
                     for(int role=0;role<3;++role){const auto bytes=runtime->model->tensors[layer.expert_tensors[role]].size/experts;const auto pointer=device_base+role_offset;if(role==0)gate_pointers[gpu_count]=pointer;else if(role==1)up_pointers[gpu_count]=pointer;else down_pointers[gpu_count]=pointer;role_offset+=bytes;}
                     if(slot.native_valid&&runtime->expert_native_cache)
@@ -17017,10 +17081,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     // non-linear, so gate/up must be applied before the activation; the
                     // down projection is linear, so its scale rides on `up` and comes
                     // out of the accumulate unchanged.
+                    const double t_scales=moe_now();
                     gpu_gate_scales[gpu_count]=qwen_expert_role_scale(*runtime,layer.expert_gate_scale,expert);
                     gpu_down_scales[gpu_count]=qwen_expert_role_scale(*runtime,layer.expert_down_scale,expert);
                     gpu_up_scales[gpu_count]=qwen_expert_role_scale(*runtime,layer.expert_up_scale,expert)
                         *gpu_down_scales[gpu_count];
+                    if(moe_profile_enabled())moe_prof.scales+=moe_now()-t_scales;
                     ++gpu_count;continue;
                 }
                 ++runtime->expert_cache_misses;cpu_selected[cpu_count]=expert;cpu_compact_weights[cpu_count]=cpu_weights[rank];
@@ -17032,7 +17098,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     cpu_compact_weights[cpu_count]*=ds;
                 }
                 ++cpu_count;
+                const double t_admit=moe_now();
                 const auto slot_index=select_expert_cache_slot(*runtime,layer_number,expert,true);
+                if(moe_profile_enabled()){moe_prof.admission+=moe_now()-t_admit;++moe_prof.admissions;}
                 if(slot_index==kNoExpertSlot)continue;
                 auto&slot=runtime->expert_slots[slot_index];slot.key=cache_key;slot.valid=true;slot.native_valid=false;slot.last_used=++runtime->expert_clock;runtime->expert_residency[cache_key]=slot_index;
                 const auto slot_base=runtime->expert_cache+slot_index*runtime->expert_slot_bytes;
@@ -17058,11 +17126,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     }
                 }else{
                     const auto bundle_start=staging_cursor;
+                    const double t_stage=moe_now();
                     for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(staging_cursor+bytes>runtime->expert_staging_bytes)throw std::runtime_error("native hybrid MoE staging overflow");std::memcpy(staging+staging_cursor,tensor_data(*runtime->model,t)+offset,bytes);staging_cursor+=bytes;}
+                    if(moe_profile_enabled()){moe_prof.staging+=moe_now()-t_stage;moe_prof.staged_bytes+=staging_cursor-bundle_start;}
                     pending[pending_count++]={slot_base,bundle_start,
                         staging_cursor-bundle_start,slot_index};
                 }
             }
+            const double t_table=moe_now();
             if(gpu_count){
                 const auto table_bytes=static_cast<std::uint64_t>(gpu_count)*(3*sizeof(std::uint64_t)+4*sizeof(float));
                 const auto table_host=device_align(staging_cursor);const auto table_device=runtime->expert_staging+runtime->expert_staging_bytes-device_align(table_bytes);
@@ -17077,6 +17148,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 if(colibri_gpu_upload(table_device,staging+table_host,table_bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE table upload failed");
                 const auto gate_table=table_device,up_table=gate_table+gpu_count*sizeof(std::uint64_t),down_table=up_table+gpu_count*sizeof(std::uint64_t),weight_table=down_table+gpu_count*sizeof(std::uint64_t);
                 const auto gate_scale_table=weight_table+gpu_count*sizeof(float),up_scale_table=gate_scale_table+gpu_count*sizeof(float),down_scale_table=up_scale_table+gpu_count*sizeof(float);
+                if(moe_profile_enabled())moe_prof.table+=moe_now()-t_table;
                 const auto gate_type=runtime->model->tensors[layer.expert_tensors[0]].type;
                 const auto down_type=runtime->model->tensors[layer.expert_tensors[2]].type;
         // The grouped dispatch below ends in a k-quant fallback, so an
@@ -17122,13 +17194,16 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     }
                 }
                 if(!tc_done){
+                    const double t_launch=moe_now();
                     const bool nvfp4_tiled=env_nvfp4_tiled;
                     void*gate_up_args[]={const_cast<std::uint64_t*>(&gate_table),const_cast<std::uint64_t*>(&up_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),&gpu_count,const_cast<std::uint64_t*>(&gate_scale_table),const_cast<std::uint64_t*>(&up_scale_table)};
                     launch_named(qwen_grouped_swiglu_name(gate_type,nvfp4_tiled,false).c_str(),gate_type==40&&nvfp4_tiled?(intermediate+7)/8:intermediate,gpu_count,256,gate_up_args);
                     const int status=qwen_launch_grouped_accumulate(runtime->stream,down_type,down_table,activated,third,weight_table,intermediate,hidden_size,gpu_count);
                     if(status!=0)throw std::runtime_error("native hybrid MoE down projection failed");
+                    if(moe_profile_enabled())moe_prof.queue+=moe_now()-t_launch;
                 }
             }
+            const double t_queue=moe_now();
             for(int index=0;index<pending_count;++index){
                 const auto&upload=pending[index];
                 if(colibri_gpu_upload(upload.device,
@@ -17153,6 +17228,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                         upload.slot_index].native_valid=true;
                 }
             }
+            if(moe_profile_enabled())moe_prof.queue+=moe_now()-t_queue;
             if(cpu_count){
                 const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 qwen_cpu_moe(*runtime,layer,cpu_selected.data(),cpu_compact_weights.data(),cpu_count,cpu_input,cpu_activated,cpu_output);
@@ -17401,6 +17477,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     ++runtime->decode_calls;
     runtime->decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-decode_started).count();
     if(runtime->decode_calls%50==0)kernel_profile_report();
+    if(moe_profile_enabled()){
+        ++qwen_moe_profile().tokens;
+        if(runtime->decode_calls%50==0)qwen_moe_profile_report();
+    }
     return 0;
 });}
 

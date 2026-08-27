@@ -2,8 +2,11 @@
 
 > **Goal**: qwen4exp decode from 26 tok/s toward 60. The token is not bandwidth-bound;
 > it is bound by 48 serialized host round-trips, one per MoE layer.
-> **Status 2026-08-27**: Phase 0 RUN — one gate failed, and the design changed
-> because of it. See "Phase 0 results" below. Phases 1-3 revised accordingly.
+> **Status 2026-08-27**: Phase 0 and Phase 0b RUN. **The plan's centrepiece is dead.**
+> Phase 0 killed host-resident expert reads; Phase 0b then showed that the host work
+> Phase 2 would remove is ~0.7 ms/token, while **95-97% of it is one thing the plan
+> barely mentioned: the bundle staging memcpy**. Phase 2 is dropped. Phase 1 is the
+> whole plan now. See "Phase 0b results".
 
 ## Measured baseline (real UD-IQ1_S, `COLIBRI_TIMING=1`, 109-128 decode calls)
 
@@ -139,6 +142,51 @@ makes DMA paging available where it is silently off today.
 gate 1 and remains the Phase 1 win. What failed is *kernels dereferencing host
 pointers*, which is a different access pattern entirely.
 
+## Phase 0b results (2026-08-27) — the 25 ms, attributed
+
+`COLIBRI_MOE_PROFILE=1` (added in this commit), real UD-IQ1_S, two windows of the
+same run:
+
+| cause | ms/token (39 tok) | ms/token (89 tok) | share |
+|---|---|---|---|
+| **bundle staging memcpy** | **34.220** | **16.501** | **95.7-97.5%** |
+| kernel launch + uploads | 0.451 | 0.335 | 1.3-1.9% |
+| pointer table build | 0.172 | 0.138 | 0.5-0.8% |
+| residency lookup | 0.143 | 0.139 | 0.4-0.8% |
+| admission victim scan | 0.073 | 0.075 | 0.2-0.4% |
+| access bookkeeping | 0.039 | 0.038 | 0.1-0.2% |
+| role scales (mmap) | 0.009 | 0.009 | 0.0-0.1% |
+| total attributed | 35.106 | 17.235 | |
+
+480 routed experts/token (the earlier hit/miss counters undercount — they are
+incremented in only some branches), **134-160 admissions/token**, and
+**95-174 MiB/token memcpy'd** from the mmap into pinned staging at `:17061`.
+
+**Consequences, in order of importance:**
+
+1. **Phase 2 is worthless and is dropped.** The device slot table plus pointer-free
+   grouped kernels would remove the pointer table build and part of the residency
+   lookup: **~0.3 ms/token of a 42 ms token.** That is weeks of kernel work, a new
+   device-side cache mirror, and a rewrite of the IQ grouped family, for 0.7%.
+   Two rounds of measurement cost an afternoon and saved all of it.
+2. **The disease is admission volume, not dispatch.** Every miss stages a ~1.24 MB
+   expert bundle through a single-threaded host memcpy, ~140 times per token. The
+   cache holds ~3200 slots and churns ~140 of them per token — it is thrashing, and
+   [[qwen4exp-qsa]]'s recurrence measurement already said reuse is weak (only 18% of
+   misses were predictable from recent tokens). We are paying 174 MiB/token of
+   transfer to populate a cache whose contents largely do not survive to be reused.
+3. **Two independent fixes, both cheap:**
+   - *Stop copying*: DMA paging uploads straight from the registered mmap with no
+     host memcpy (`:17039-17043`). Off here only because the heuristic tests the
+     whole 68 GB mapping. This removes the 16-34 ms outright.
+   - *Stop admitting so much*: `COLIBRI_EXPERT_CACHE_STRICT_ADMISSION=1` measures
+     **27.42 / 27.36 tok/s against a 23.91 / 26.69 baseline** — about +8% and a large
+     drop in run-to-run variance, from one environment variable. A miss runs on the
+     CPU either way; admitting it is pure speculation about reuse.
+
+   These compose: strict admission cuts how many bundles move, DMA paging makes the
+   ones that do move cost no host time.
+
 ## Phases and gates
 
 **Phase 0 — retire the two risky assumptions. DONE, results above.**
@@ -172,16 +220,10 @@ since Phase 2 lost its best property.
   32768 ticks) off the critical path.
 *Gate: interleaved A/B decode tok/s; greedy output unchanged for the paging change.*
 
-**Phase 2 — the device slot table and pointer-free kernels.** Steps 1, 2 and 4 only
-(step 3 is dead). The kernel computes resident experts' addresses in-kernel from
-`slot_of`, so the host no longer builds or uploads pointer tables; the sync moves to
-*after* the GPU expert work is queued and carries only the miss list, which the
-kernel can write with an `atomicAdd` compaction. Keep the host path behind
-`COLIBRI_DEVICE_DISPATCH=0` for A/B and rollback.
-*Gate: greedy tokens bit-identical to the host path on the fixture AND on 48 real
-tokens; ctest + pytest green; interleaved A/B decode tok/s recorded.*
-*Only worth building if Phase 0b attributes real time to the table build and the
-per-expert host loop.*
+**Phase 2 — the device slot table and pointer-free kernels. DROPPED.**
+Phase 0b measured the work it would remove at ~0.3 ms of a 42 ms token. Kept here
+only so the next person does not re-derive it: *the reason Qwen downloads routing
+is real, but what the download costs is not the download.*
 
 **Phase 3 — CUDA graphs.** Blocked today by the hc/PLE hooks not being capture-clean
 and by QSA's host sync. Note Phase 0's finding removes one argument for this: since
@@ -189,17 +231,28 @@ the sync survives, a layer cannot be captured end to end. Lower the priority
 accordingly, and recall [[decode-overhead-audit]] measured graphs-off as a wash on
 dense.
 
-## Expected arithmetic (revised after Phase 0)
+## Expected arithmetic (revised after Phase 0b)
 
-The sync survives, so the target is no longer "remove the round-trip" but "make the
-host work between round-trips negligible and let CPU and GPU expert work overlap".
+Removing the staging memcpy takes the token from ~42 ms to roughly 25 ms on its own
+(~40 tok/s), and strict admission is worth a further ~8% measured. Neither touches
+the dispatch path. With both, plus the residual PCIe cost of whatever admissions
+survive (asynchronous rather than host-blocking), **15-25 ms/token is 40-65 tok/s** —
+the 60 roof is in range, from configuration and admission policy rather than from a
+kernel rewrite.
 
-Per layer the two expert paths are already comparable: 0.059 ms for 10 resident IQ1_S
-experts on the GPU (measured above) against ~0.13-0.17 ms for the ~3-expert CPU miss
-set. If the ~25 ms of host overhead goes away and those overlap, the token approaches
-`48 x max(GPU, CPU) + non-MoE` ≈ 7 + 7.5 ≈ **15 ms, i.e. ~65 tok/s**. That still
-clears 60 — but every bit of it now depends on Phase 0b's breakdown being addressable,
-not on the dispatch redesign. **Phase 0b before Phase 2.**
+The honest caveat: the fastest configuration measured so far (strict admission,
+27.4 tok/s) is only +8%, because it reduces *how often* the memcpy happens rather
+than removing it. The big number depends on DMA paging actually being enable-able
+within this box's RAM, which is now Phase 1's real risk and the next thing to test.
+
+## What this exercise is worth remembering for
+
+The plan was written around a dispatch redesign, and two rounds of measurement
+retired it before a line of product code was written: Phase 0 killed the mechanism
+(host-resident expert reads, 20-47x too slow), Phase 0b killed the motivation (the
+host work it targeted is 0.7% of the token). The real cost was a `std::memcpy` on one
+line that the original plan mentioned only in passing. Measure the gap before
+designing for it.
 
 Orthogonal multiplier, not in this plan: **MTP**. Decode is dominated by per-token
 expert traffic, so verifying k drafted tokens in one batched pass amortizes it
