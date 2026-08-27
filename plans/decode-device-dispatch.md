@@ -405,3 +405,51 @@ that is the only reason it is out of scope, not the payoff.
 - Prior art: `plans/prefill-pipeline.md` (how the rows path got route_wait <1% — by
   schedule depth, not transfer cleverness), `plans/concurrent-decode.md` (the same
   trick across sequences, 1.46x at N=2)
+
+---
+
+# Prefill / TTFT (2026-08-27) — the phase that actually matters
+
+The server measurement above put a ~3k-token request's TTFT at ~33 s against ~30
+tok/s decode. Measured directly on a 4243-token prompt (`COLIBRI_TIMING=1`):
+
+| | |
+|---|---|
+| prefill wall | **69.35 s — 61.2 tok/s** |
+| expert phase | **91.7%** |
+| route wait | 1.1% |
+| remainder | 7.3% |
+| expert cache hit rate | **21%** (decode gets 69%) |
+
+Route wait being 1.1% is the prefill pipeline working exactly as
+`plans/prefill-pipeline.md` claims. Everything else is expert execution.
+
+**Why the hit rate is 21%.** `expert_cache_prompt_bypasses = 480`: the cache
+deliberately refuses admissions during prompt processing, so ~79% of prefill's
+expert work runs on the host. And `--prefill-cache-seed` — which did place 192
+experts — is documented as pinning "the hottest prompt-routed experts **once the
+prompt is done**, so decode does not fault them back in". The seeding is aimed at
+decode and happens *after* prefill, which is precisely too late to help it.
+
+**Configuration cannot reach it.** A sweep moves nothing:
+
+| arm | prefill | expert phase | hit |
+|---|---|---|---|
+| default (split, seed auto) | 56.2 tok/s | 84.5% | 21.4% |
+| `--hybrid-prefill cpu` | 55.1 tok/s | 84.3% | 21.4% |
+| `--expert-mode hybrid` | 62.3 tok/s | 97.6% | 0.0% |
+| `--gpu-cache-mib 10500` | 58.9 tok/s | 90.3% | 21.4% |
+
+**The hypothesis to test next**, and it is a code change, not a flag: *admit or seed
+during prefill rather than after it*. A 4243-token prompt is processed in 8 chunks;
+chunk 1's routing already names most of the experts chunks 2-8 will want, and the
+cache is being told to ignore exactly that signal. Unlike decode — where the
+recurrence data showed only 18% of misses were predictable — a prompt re-routes the
+same experts across its own chunks, so the predictor here is far better.
+
+Note `prefill_streamed_bytes = 0`: the prefill expert-streaming arena
+(`plans/prefill-expert-stream.md`, marked closed, default budget 0) never runs.
+Whether the gather/GEMM/scatter path from `plans/prefill-expert-gemm.md` (810 tok/s
+on Ornith) engages here at all is unverified and worth checking before anything is
+designed — it is silently off whenever hybrid falls back to CPU MoE, which at a 21%
+hit rate is most of the time.
