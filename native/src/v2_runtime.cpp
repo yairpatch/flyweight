@@ -13970,11 +13970,25 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             for(const auto& layer:runtime->layers)
                 for(int role=0;role<3;++role)
                     expert_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
-            // Leave the OS and the host-resident tables (n-gram/PLE, embeddings)
-            // room to keep a page cache; locking every last byte would trade the
-            // memcpy for major faults somewhere else.
-            std::uint64_t budget=runtime->host_available_bytes>kRegisterReserveBytes
-                ?runtime->host_available_bytes-kRegisterReserveBytes:0;
+            // Registration LOCKS pages, so anything else the decode reads out of
+            // the mapping has to keep its page cache or the memcpy this removes
+            // simply reappears as major faults. Measured on qwen4exp: pinning all
+            // 37 GiB of experts on a 60 GiB box cut the MoE phase from ~118 ms to
+            // ~21 ms per token and pushed ~85 ms into the PLE n-gram gathers,
+            // for no net win. So the budget subtracts the host-resident tables
+            // (the 25.7 GiB n-gram table, host embeddings) as well as a reserve
+            // for the OS -- partial expert coverage beats starving them.
+            // Only tables we will NOT register are subtracted: the n-gram table is
+            // gathered on the host (16 rows a token), so pinning it would buy
+            // nothing and cost 25.7 GiB. The embedding IS registerable, so it is
+            // charged to the budget below rather than reserved from it.
+            std::uint64_t host_resident_bytes=0;
+            if(runtime->ple_table!=std::numeric_limits<std::uint64_t>::max())
+                host_resident_bytes+=
+                    runtime->model->tensors[runtime->ple_table].size;
+            const auto floor_bytes=kRegisterReserveBytes+host_resident_bytes;
+            std::uint64_t budget=runtime->host_available_bytes>floor_bytes
+                ?runtime->host_available_bytes-floor_bytes:0;
             if(const char* cap=std::getenv("COLIBRI_EXPERT_REGISTER_MIB"))
                 budget=std::min<std::uint64_t>(budget,
                     std::strtoull(cap,nullptr,10)*1024ull*1024ull);

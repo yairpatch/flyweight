@@ -263,6 +263,23 @@ the staged path, and a token boundary promotes the layers once it lands. Measure
 — indistinguishable, where the synchronous version added ~22 s. Long runs still
 reach 0.435-0.447 ms/token of host-serial MoE work and 27.7-28.9 tok/s.
 
+**BUDGET CORRECTED, AND THE PHASE 1 NUMBERS NEED RE-VALIDATING.** The first budget
+reserved a flat 8 GiB and pinned all 37.1 GiB of experts. A later run showed the
+pinned config moving cost rather than removing it — MoE phase ~118 ms -> ~21 ms per
+token but "other" ~6 ms -> ~90 ms, with tens of thousands of major faults — which
+looks exactly like the 25.7 GiB n-gram table losing its page cache to the pin. The
+budget now subtracts host-resident tables it will never register (the n-gram table)
+on top of the OS reserve, so this box registers **19.1 GiB / 25 of 48 layers**
+instead of all 48, and partial coverage keeps the rest staged.
+
+*Caveat, stated plainly*: that diagnosis is **not confirmed**. The runs behind it
+had a cold page cache (`buff/cache` was later 5 GiB with 49 GiB free), so both arms
+were re-reading the checkpoint from NVMe and both measured 7-8 tok/s — nothing like
+the 27-30 tok/s the earlier warm-cache runs showed. The corrected budget is the
+conservative choice either way, but **the headline "17 -> 30 tok/s" was measured with
+the old all-experts pin on a warm cache and has not been re-measured since.** Re-run
+the A/B on a warmed cache before quoting it.
+
 Three things this needed, each a small trap:
 
 - `colibri_gpu_host_register` did not bind the CUDA primary context, unlike
