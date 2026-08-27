@@ -1682,6 +1682,7 @@ void qwen_forward_rows(
                    runtime.prefetch_stream,span.consumed_event)!=0)
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
+            const double t_upload=moe_now();
             for(const int expert:order){
                 if(cursor+stride>span.stream_bytes)break;
                 // NVFP4-style per-expert scales fold into the kernels the
@@ -1709,6 +1710,8 @@ void qwen_forward_rows(
                 cursor+=stride;
                 runtime.prefill_streamed_bytes+=triple_bytes;
             }
+            if(moe_profile_enabled())
+                qwen_moe_profile().stream_upload+=moe_now()-t_upload;
             if(cursor&&
                (colibri_gpu_event_record(
                     span.upload_ready_event,runtime.prefetch_stream)!=0||
@@ -1854,9 +1857,12 @@ void qwen_forward_rows(
             const bool gate_up_q8=stream_needs_q8(gate_type,hidden_size)||
                 stream_needs_q8(up_type,hidden_size);
             const bool down_q8=stream_needs_q8(down_type,intermediate);
+            const double t_groups=moe_now();
+            std::uint64_t group_launches=0,group_tokens=0;
             for(const auto&group:stream_groups){
                 if(!group.count)continue;
                 int count=group.count;
+                if(moe_profile_enabled()){++group_launches;group_tokens+=count;}
                 const auto indices=stream_idx_dev+
                     static_cast<std::uint64_t>(group.offset)*sizeof(std::int32_t);
                 const auto route_weights=stream_wts_dev+
@@ -1900,6 +1906,12 @@ void qwen_forward_rows(
                 launch("qwen_scatter_add_rows",
                        (static_cast<std::uint32_t>(hidden_size)+255)/256,
                        static_cast<std::uint32_t>(count),256,scatter_args);
+            }
+            if(moe_profile_enabled()){
+                auto&prof=qwen_moe_profile();
+                prof.stream_compute+=moe_now()-t_groups;
+                prof.stream_groups+=group_launches;
+                prof.stream_group_tokens+=group_tokens;
             }
             // The GEMMs above are the last readers of this span's streamed
             // slice; the next layer's uploads wait on this marker.

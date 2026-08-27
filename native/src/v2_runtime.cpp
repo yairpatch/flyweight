@@ -133,6 +133,11 @@ struct QwenMoeProfile {
     double staging = 0;     // memcpy of a missed expert bundle into pinned staging
     double table = 0;       // the seven pointer/scale memcpys + their upload
     double queue = 0;       // grouped kernel launches + deferred cache uploads
+    // Prefill streaming path: the per-expert-group gather/quantize/GEMM/scatter
+    // launches, separated from the staging uploads that precede them. ~200k
+    // groups of ~20 tokens each per prompt is the shape under suspicion.
+    double stream_upload = 0, stream_compute = 0;
+    std::uint64_t stream_groups = 0, stream_group_tokens = 0;
     std::uint64_t tokens = 0, lookups = 0, admissions = 0, staged_bytes = 0;
 };
 inline QwenMoeProfile& qwen_moe_profile() { static QwenMoeProfile p; return p; }
@@ -149,6 +154,13 @@ inline double moe_now() {
               std::chrono::steady_clock::now().time_since_epoch()).count()
         : 0.0;
 }
+void qwen_moe_profile_report();
+// Prefill can finish without ever reaching the decode-side report (a probe that
+// generates a handful of tokens never hits the every-50 tick), so guarantee the
+// numbers reach stderr.
+struct QwenMoeProfileAtExit { ~QwenMoeProfileAtExit(){ qwen_moe_profile_report(); } };
+static QwenMoeProfileAtExit qwen_moe_profile_at_exit;
+
 void qwen_moe_profile_report() {
     if (!moe_profile_enabled()) return;
     auto& p = qwen_moe_profile();
@@ -169,6 +181,13 @@ void qwen_moe_profile_report() {
         std::fprintf(stderr, "  %-26s %7.3f ms/token  %5.1f%%\n",
                      name, ms / t, sum > 0 ? 100.0 * ms / sum : 0.0);
     std::fprintf(stderr, "  %-26s %7.3f ms/token\n", "TOTAL attributed", sum / t);
+    if (p.stream_groups)
+        std::fprintf(stderr,
+            "  [prefill stream] uploads %.2f s, group compute %.2f s over "
+            "%llu groups (%.1f tokens each)\n",
+            p.stream_upload / 1000.0, p.stream_compute / 1000.0,
+            (unsigned long long)p.stream_groups,
+            (double)p.stream_group_tokens / (double)p.stream_groups);
     std::fprintf(stderr,
         "  (%.1f lookups, %.1f admissions, %.1f MiB staged per token)\n\n",
         p.lookups / t, p.admissions / t,

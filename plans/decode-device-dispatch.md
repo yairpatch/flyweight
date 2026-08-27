@@ -622,3 +622,49 @@ the 2560-long gate/up dots, where the loop already amortises the tail.
 The AVX-512 kernel is kept: correct, contract-pinned, neutral here, and plausibly
 positive wherever IQ4_NL is a wide projection rather than a 640-wide expert down.
 It is NOT evidence that AVX-512 helps this model.
+
+## Prefill, finally measured rather than inferred (2026-08-27)
+
+Three hypotheses about the streaming path were killed by direct test, in order:
+
+1. **Transfer shape.** An isolated upload benchmark from registered host memory
+   hits **26 GB/s at every granularity** — 540 KiB, 1.6 MiB, 16 MiB, 256 MiB — and
+   **26 GB/s with an event record + cross-stream wait after every copy**. Neither
+   small transfers nor fencing costs anything.
+2. **Source residency.** During a full-staging prefill that streamed 198.6 GB, the
+   host read only **25.8 GB from disk** (13%, 0.45 GB/s). The mmap pages are
+   overwhelmingly resident; the uploads are not secretly disk reads.
+3. **My own "~2.9 GB/s upload rate".** That was arithmetic on cross-run deltas with
+   a guessed constant baseline, and it was wrong. It is recorded here because it
+   drove two proposals before anyone measured the thing directly.
+
+Direct instrumentation (`COLIBRI_MOE_PROFILE=1` now reports the streaming split,
+and prints at exit so a short probe still gets it), 4243-token prompt, 2048 MiB
+arena, 55.6 s total:
+
+| phase | time | note |
+|---|---|---|
+| non-expert | ~22 s | attention, DeltaNet, dense, hyper-connections, PLE |
+| expert uploads | **11.75 s** | 198 GB at **16.9 GB/s** — near link speed |
+| expert group compute | **21.96 s** | **122,848 groups, 16.6 tokens each** |
+
+**What this establishes.**
+
+- Uploads are close to the hardware and are not worth optimising.
+- The expert cost is not bandwidth, not disk, not vector width, not row blocking.
+  It is **122,848 per-expert-group dispatches of ~17 tokens each**, ~179 us per
+  group, each doing gather -> quantize -> gate MMQ -> up MMQ -> silu_mul ->
+  quantize -> down MMQ -> scatter. About a million launches for one prompt.
+- **Non-expert work is ~40% of prefill and has never been looked at.** At full
+  staging it is the same size as the expert phase.
+
+**The fix this points to** is the one vLLM and llama.cpp already use, and it is
+structural rather than a tuning knob: *one* kernel over a sorted, block-padded
+token buffer, each CTA reading its expert id from a per-block table, instead of a
+host loop issuing eight launches per expert. `moe_align_block_size` +
+`fused_moe_kernel` is exactly this; llama.cpp's `mul_mat_id` fast path groups rows
+by expert into one batched GEMM. With 512 fine-grained experts at top-10 the
+per-group dispatch overhead is the whole cost, so collapsing 123k dispatches into
+one launch per layer-role is the change worth making.
+
+Second target, unexamined: the ~22 s of non-expert prefill.
