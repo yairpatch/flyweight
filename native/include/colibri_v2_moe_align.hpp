@@ -35,6 +35,12 @@ namespace colibri::v2::moe {
 // length of `sorted_routes`; anything past it is not written.
 inline constexpr std::int32_t kEmpty = -1;
 
+// Tokens per block. MUST match COLIBRI_MOE_BLOCK in colibri_v2_qwen_kernels.hpp,
+// which sizes the kernel's per-token accumulators. 8 by measurement: at this
+// model's ~20 routes per expert the padding waste is 14.4% here against 37.6% at
+// 32 and 68.8% at 64 (plans/decode-device-dispatch.md).
+inline constexpr int kBlockSize = 8;
+
 struct AlignedRoutes {
     std::vector<std::int32_t> sorted_routes;
     std::vector<std::int32_t> block_experts;

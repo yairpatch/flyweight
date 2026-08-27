@@ -19,6 +19,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include "colibri_v2_moe_align.hpp"
+
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -480,6 +482,104 @@ int check_tiled(const char* kernel, const Format& format,
 
 }  // namespace
 
+
+// The fused block-major MoE kernel against the route-major grouped kernel it
+// replaces: identical arithmetic, different traversal, so any disagreement is a
+// traversal bug -- a block reading the wrong expert's weights, or a padded slot
+// overwriting a real one. Both run on the emulated corpus.
+int check_block_swiglu(const char* block_kernel, const char* rows_kernel,
+                       const Format& format) {
+    std::mt19937 rng(20260828);
+    std::uniform_real_distribution<float> real(-1.0f, 1.0f);
+    const int input_size = 512, output_size = 9;
+    const int rows = 7, top_k = 3, experts = 4;
+    const int routes = rows * top_k;
+    const std::size_t matrix_bytes =
+        static_cast<std::size_t>(input_size) / format.block_elements *
+        output_size * format.block_bytes;
+
+    std::vector<std::uint8_t> gate(matrix_bytes * experts);
+    std::vector<std::uint8_t> up(matrix_bytes * experts);
+    format.fill(rng, gate);
+    format.fill(rng, up);
+    std::vector<float> vectors(static_cast<std::size_t>(rows) * input_size);
+    for (auto& value : vectors) value = real(rng);
+    std::vector<std::int32_t> selected(static_cast<std::size_t>(routes));
+    std::uniform_int_distribution<int> pick(0, experts - 1);
+    for (auto& value : selected) value = pick(rng);
+    std::vector<int> counts(static_cast<std::size_t>(rows), top_k);
+
+    std::vector<unsigned long long> gate_by_route(routes), up_by_route(routes);
+    for (int route = 0; route < routes; ++route) {
+        gate_by_route[route] = reinterpret_cast<unsigned long long>(
+            gate.data() + static_cast<std::size_t>(selected[route]) * matrix_bytes);
+        up_by_route[route] = reinterpret_cast<unsigned long long>(
+            up.data() + static_cast<std::size_t>(selected[route]) * matrix_bytes);
+    }
+    std::vector<float> reference(
+        static_cast<std::size_t>(routes) * output_size, 0.0f);
+    {
+        const unsigned long long* g = gate_by_route.data();
+        const unsigned long long* u = up_by_route.data();
+        const int* c = counts.data();
+        const float* v = vectors.data();
+        float* out = reference.data();
+        int in = input_size, on = output_size, tk = top_k, rw = rows;
+        void* args[] = {&g, &u, &c, &v, &out, &in, &on, &tk, &rw};
+        colibri_cpu_launch_named(rows_kernel, static_cast<std::uint32_t>(output_size),
+                                 static_cast<std::uint32_t>(routes), 256, 0, 0, args);
+    }
+
+    colibri::v2::moe::AlignedRoutes aligned;
+    colibri::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
+                                   colibri::v2::moe::kBlockSize, aligned);
+    std::vector<unsigned long long> gate_by_slot, up_by_slot;
+    std::vector<std::int32_t> block_slot;
+    for (const auto expert : aligned.block_experts) {
+        block_slot.push_back(static_cast<std::int32_t>(gate_by_slot.size()));
+        gate_by_slot.push_back(reinterpret_cast<unsigned long long>(
+            gate.data() + static_cast<std::size_t>(expert) * matrix_bytes));
+        up_by_slot.push_back(reinterpret_cast<unsigned long long>(
+            up.data() + static_cast<std::size_t>(expert) * matrix_bytes));
+    }
+    std::vector<float> got(
+        static_cast<std::size_t>(aligned.padded_total) * output_size, 0.0f);
+    {
+        const unsigned long long* g = gate_by_slot.data();
+        const unsigned long long* u = up_by_slot.data();
+        const int* be = block_slot.data();
+        const int* sr = aligned.sorted_routes.data();
+        const float* v = vectors.data();
+        float* out = got.data();
+        int in = input_size, on = output_size, tk = top_k;
+        int blocks = static_cast<int>(aligned.block_experts.size());
+        void* args[] = {&g, &u, &be, &sr, &v, &out, &in, &on, &tk, &blocks};
+        colibri_cpu_launch_named(block_kernel, static_cast<std::uint32_t>(output_size),
+                                 static_cast<std::uint32_t>(blocks), 256, 0, 0, args);
+    }
+
+    float worst = 0.0f;
+    int compared = 0;
+    for (std::size_t slot = 0; slot < aligned.sorted_routes.size(); ++slot) {
+        const auto route = aligned.sorted_routes[slot];
+        if (route == colibri::v2::moe::kEmpty) continue;
+        for (int row = 0; row < output_size; ++row) {
+            const double expected =
+                reference[static_cast<std::size_t>(route) * output_size + row];
+            const double actual = got[slot * output_size + row];
+            worst = std::fmax(worst, static_cast<float>(
+                std::fabs(expected - actual) /
+                std::fmax(1.0, std::fabs(expected))));
+            ++compared;
+        }
+    }
+    if (!compared) {
+        std::printf("  %-28s FAIL (nothing compared)\n", block_kernel);
+        return 1;
+    }
+    return report(block_kernel, worst);
+}
+
 int main() {
     std::printf("IQ kernel contract (corpus CUDA vs CPU reference)\n");
     int failures = 0;
@@ -499,6 +599,11 @@ int main() {
     // hand-written rather than shared with IQ4_XS, whose 256 super-block it
     // does not use.
     failures += check_rows("iq4nl_matmul_rows", kIq4nl);
+    // Block-major MoE against the route-major kernel it replaces.
+    failures += check_block_swiglu("iq1s_block_swiglu",
+                                   "iq1s_grouped_swiglu_rows", kIq1s);
+    failures += check_block_swiglu("iq2xxs_block_swiglu",
+                                   "iq2xxs_grouped_swiglu_rows", kIq2xxs);
     failures += check_q8("iq4xs_q8_matvec_transposed_warp", kIq4xs);
     failures += check_q8_rows("iq4xs_q8_matvec_transposed_rows", kIq4xs);
     // The IQ1 pair through the Q8 path, where the delta is folded into the int8

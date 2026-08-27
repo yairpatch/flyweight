@@ -5918,6 +5918,79 @@ COLIBRI_IQ_GROUPED(iq4nl, iq4nl_octet)
 COLIBRI_IQ_GROUPED(iq2xxs, iq2xxs_octet)
 
 #undef COLIBRI_IQ_GROUPED
+)COLIBRI_CUDA"
+R"COLIBRI_CUDA(
+// Fused block-major MoE, the shape neither existing path has.
+//
+// The grouped kernels above are route-major: one CUDA block per (output row,
+// route), so an expert's weight row is re-decoded once per routed token. The
+// streaming path avoids that by staging an expert and running a GEMM per expert
+// -- ~8 launches each, 153,440 for a 784-token prompt at 5 CUDA blocks apiece,
+// which cannot fill the device.
+//
+// This is route-major over BLOCKS instead: routes arrive grouped by expert and
+// padded to kMoeBlock (colibri_v2_moe_align.hpp), so one CUDA block covers one
+// output row for up to kMoeBlock tokens that share an expert. The weight row is
+// decoded once and dotted against all of them, and the whole layer is ONE launch
+// of ~1495*output_size blocks rather than thousands of 5-block launches.
+//
+// Block size is 8 by measurement, not taste: at this model's ~20 routes per
+// expert, padding waste is 14.4% at 8 and 69% at 64, which is why the existing
+// 64/128-token MMQ tiles are the wrong instrument here.
+// MUST match colibri::v2::moe::kBlockSize in colibri_v2_moe_align.hpp.
+#define COLIBRI_MOE_BLOCK 8
+#define COLIBRI_IQ_BLOCK_SWIGLU(prefix, octet_at)                               \
+extern "C" __global__ void prefix##_block_swiglu(                               \
+    const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,     \
+    const int* block_experts, const int* sorted_routes,                         \
+    const float* vectors, float* activated,                                     \
+    const int input_size, const int output_size,                                \
+    const int top_k, const int blocks                                           \
+) {                                                                             \
+    const int row = blockIdx.x;                                                 \
+    const int block = blockIdx.y;                                               \
+    if (row >= output_size || block >= blocks) return;                          \
+    const int slot_base = block * COLIBRI_MOE_BLOCK;                            \
+    const int slot = block_experts[block];                                      \
+    const unsigned char* gate_packed = (const unsigned char*)gate_ptrs[slot];   \
+    const unsigned char* up_packed = (const unsigned char*)up_ptrs[slot];       \
+    const int octets = input_size >> 3;                                         \
+    const long long row_base = (long long)row * input_size;                     \
+    float gate[COLIBRI_MOE_BLOCK], up[COLIBRI_MOE_BLOCK], g[8], u[8];           \
+    for (int s = 0; s < COLIBRI_MOE_BLOCK; ++s) { gate[s] = 0.0f; up[s] = 0.0f; }\
+    for (int octet = threadIdx.x; octet < octets; octet += blockDim.x) {        \
+        const long long absolute = row_base + (long long)octet * 8;             \
+        const int qblock = (int)(absolute >> 8);                                \
+        const int within = (int)((absolute & 255) >> 3);                        \
+        octet_at(gate_packed, qblock, within, g);                               \
+        octet_at(up_packed, qblock, within, u);                                 \
+        for (int s = 0; s < COLIBRI_MOE_BLOCK; ++s) {                           \
+            const int route = sorted_routes[slot_base + s];                     \
+            if (route < 0) continue;                                            \
+            const float* values =                                               \
+                vectors + (long long)(route / top_k) * input_size + octet * 8;  \
+            float ga = 0.0f, ua = 0.0f;                                         \
+            for (int k = 0; k < 8; ++k) {                                       \
+                ga += g[k] * values[k];                                         \
+                ua += u[k] * values[k];                                         \
+            }                                                                   \
+            gate[s] += ga; up[s] += ua;                                         \
+        }                                                                       \
+    }                                                                           \
+    for (int s = 0; s < COLIBRI_MOE_BLOCK; ++s) {                               \
+        const float gs = block_reduce_sum(gate[s]);                             \
+        const float us = block_reduce_sum(up[s]);                               \
+        const int route = sorted_routes[slot_base + s];                         \
+        if (threadIdx.x == 0 && route >= 0)                                     \
+            activated[(long long)(slot_base + s) * output_size + row] =         \
+                (gs / (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, gs))))) * us;    \
+    }                                                                           \
+}
+COLIBRI_IQ_BLOCK_SWIGLU(iq1s, iq1s_octet)
+COLIBRI_IQ_BLOCK_SWIGLU(iq4nl, iq4nl_octet)
+COLIBRI_IQ_BLOCK_SWIGLU(iq2xxs, iq2xxs_octet)
+#undef COLIBRI_IQ_BLOCK_SWIGLU
+
 
 __device__ __forceinline__ float q2k_value(
     const unsigned char* packed, int absolute

@@ -860,3 +860,42 @@ is 69% padding. The fused kernel needs its own geometry -- closer to a warp per
 The prize is unchanged and now precise: today the streaming path issues ~4096
 launches per layer-chunk at **5 blocks each**; this layout is **one launch of
 ~1495 blocks**.
+
+### Step 2 shipped: the fused block-major MoE kernel
+
+`iq1s_block_swiglu`, `iq4nl_block_swiglu`, `iq2xxs_block_swiglu` — one CUDA block
+per (output row, route-block), decoding an expert's weight row once and dotting it
+against up to `kBlockSize`=8 tokens that share that expert. Registered in the
+driver name table; CPU twins generated from the same source as always.
+
+Verified against `*_grouped_swiglu_rows` — the route-major kernel it replaces —
+on the same routing: **worst 0.000e+00**, i.e. bit-identical. That is the right
+reference precisely because the arithmetic is identical and only the traversal
+differs, so any disagreement is a traversal bug (a block reading the wrong
+expert's weights, a padded slot overwriting a real one) rather than a numerics
+question.
+
+Weight traffic, at the real per-layer shape (640 output rows, 10240 routes over
+512 experts, 1495 blocks at kBlockSize 8):
+
+| path | launches/layer | weight-row reads |
+|---|---|---|
+| route-major grouped | 1 | 640 x 10240 = 6.55M |
+| streaming per-expert | ~4096 | 640 x 512 = 0.33M |
+| **block-major fused** | **1** | **640 x 1495 = 0.96M** |
+
+So it keeps the grouped path's single launch while cutting its weight traffic
+**6.8x**, and keeps most of the streaming path's traffic advantage without any of
+its 4096 launches or its uploads. The residual gap to the streaming path's 0.33M
+is the padding plus the fact that an expert spanning several blocks re-reads its
+row once per block -- 14.4% and ~2.9 blocks per expert at this shape.
+
+`kBlockSize` lives in `colibri_v2_moe_align.hpp` and `COLIBRI_MOE_BLOCK` in the
+kernel corpus; each names the other, because they size the same accumulator.
+
+**Not yet wired in.** Step 3 is the rows path calling this once per layer instead
+of the per-expert loop, which also needs the down-projection twin (symmetric: one
+block per (hidden row, route-block), reading `activated` by slot and scattering
+into the token's output). Until then the kernel is dead code with a contract --
+deliberately, because the wiring is where the sequencing risk is and it should
+land on a kernel that is already proven.
