@@ -1263,3 +1263,46 @@ dispatch shape.
 Until that kernel exists, wiring step 3 would make prefill slower. The aligned
 layout (`colibri_v2_moe_align.hpp`) survives unchanged and is still the right
 input for it; the two `_block_*` kernels are the part to replace.
+
+### Step 2b: the routed MMQ — the block table over the tensor-core core
+
+`iq1s_q8_mmq_routed` and its four siblings (`iq2xxs`, `iq2xs`, `iq3xxs`,
+`iq4xs`). `COLIBRI_Q8_MMQ_ROUTED` is `COLIBRI_Q8_MMQ` with the staging loop
+changed and nothing else: `blockIdx.y` picks a route-block, its expert comes
+from `block_experts`, and a slot's token is `sorted_routes[slot] / top_k`. The
+ldmatrix pairs, the `m16n8k16` MMAs and the scale folding are the proven core,
+untouched.
+
+Measured at the real per-layer shape, against the octet kernel it replaces:
+
+| | ms/layer (gate+up) | achieved |
+|---|---|---|
+| `iq1s_block_swiglu` | 58.73 | 571 GMAC/s |
+| **`iq1s_q8_mmq_routed` x2** | **4.55** | **7381 GMAC/s** |
+
+**12.9x**, and 0.22 s per 48-layer chunk against the ~3.4 s the CPU spends on
+the same two projections. That is the piece the whole GPU route was missing.
+
+**The tile is 128 rows x 32 tokens, not the plain kernel's 128x128.** An expert
+holds ~20 routes here, so a 128-token tile would be 84% padding. 32 costs 37.7%
+padding against kBlockSize 8's 14.4%, and buys 2.9x fewer weight decodes --
+the right trade because this kernel is decode-bound, not MMA-bound (it reads
+weights at 46 GB/s of a 391 GB/s bus). `kMmqBlockSize` in the align header and
+`COLIBRI_MOE_MMQ_TOKENS` in the corpus name each other.
+
+Correctness is pinned by `check_routed_mmq` against a double-precision
+reference over the block table, not against the plain MMQ: a plain-kernel
+reference would pass an off-by-one in the expert pointer whenever the two
+experts landed adjacent in memory. Worst 2.4e-8 across all five formats, and
+padded slots are checked to be exactly 0.0 — the SwiGLU and scatter behind this
+run over them unconditionally, so a stale value there is a wrong answer for a
+real token rather than wasted work.
+
+**What is still missing: the down projection.** IQ4_NL has no MMQ and cannot
+have this one — the macro needs `input_size % 256 == 0` and the expert down
+rows are 640 wide, which is exactly the note in the format table. So the down
+half is still the octet kernel at 76.8 ms/layer, which is worse than the CPU.
+Until a routed form of `iq4nl_matmul_rows` exists, the reachable shape is
+gate+up on the device and down on the host: ~0.22 s + ~2.0 s against ~5.4 s per
+chunk, so ~2.4x before uploads. The routed down kernel is the next piece, and
+it wants the `quad_pack` rows engine rather than this one.

@@ -41,6 +41,17 @@ inline constexpr std::int32_t kEmpty = -1;
 // 32 and 68.8% at 64 (plans/decode-device-dispatch.md).
 inline constexpr int kBlockSize = 8;
 
+// Tokens per block for the routed MMQ path, which consumes the same layout with
+// a different tile. MUST match COLIBRI_MOE_MMQ_TOKENS in the kernel corpus.
+//
+// 32 rather than kBlockSize's 8 because the two kernels are bound by different
+// things. The octet kernels decode a weight row in scalar float, so padding is
+// what hurts them (14.4% at 8, 37.6% at 32). The MMQ tile decodes into shared
+// memory and reuses it through tensor-core MMAs, so the padded lanes are nearly
+// free and what matters is decoding an expert's rows once for 32 tokens instead
+// of once for 8 -- 2.9x fewer decodes at this model's ~20 routes per expert.
+inline constexpr int kMmqBlockSize = 32;
+
 struct AlignedRoutes {
     std::vector<std::int32_t> sorted_routes;
     std::vector<std::int32_t> block_experts;

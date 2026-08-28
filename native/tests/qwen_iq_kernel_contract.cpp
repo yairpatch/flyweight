@@ -480,6 +480,117 @@ int check_tiled(const char* kernel, const Format& format,
     return report(kernel, worst);
 }
 
+// The routed MMQ against a double-precision reference over the block table.
+//
+// This checks the two things the routed form adds to the MMQ core at once: that
+// a CUDA block reads the expert its block table names, and that slot s of that
+// block computes the token `sorted_routes[s] / top_k` and no other. A reference
+// built from the plain kernel would only catch the second, and would pass an
+// off-by-one in the expert pointer whenever the two experts happened to be
+// adjacent in memory.
+//
+// Padded slots must be exactly 0.0: the SwiGLU and the scatter behind this run
+// over the padded buffer unconditionally, so a stale value there is a wrong
+// answer for some real token, not merely wasted work.
+int check_routed_mmq(const char* kernel, const Format& format,
+                     std::uint32_t threads) {
+    std::mt19937 rng(20260828);
+    const int input_size = 512, output_size = 9;
+    const int rows = 7, top_k = 3, experts = 4;
+    const int routes = rows * top_k;
+    const int scale_stride = input_size / 32;
+    const std::size_t matrix_bytes =
+        static_cast<std::size_t>(input_size) / format.block_elements *
+        output_size * format.block_bytes;
+
+    std::vector<std::uint8_t> weights(matrix_bytes * experts);
+    format.fill(rng, weights);
+    const auto activations = quantize_rows(rng, input_size, rows);
+    std::vector<std::int32_t> selected(static_cast<std::size_t>(routes));
+    std::uniform_int_distribution<int> pick(0, experts - 1);
+    for (auto& value : selected) value = pick(rng);
+
+    colibri::v2::moe::AlignedRoutes aligned;
+    colibri::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
+                                   colibri::v2::moe::kMmqBlockSize, aligned);
+    const int blocks = static_cast<int>(aligned.block_experts.size());
+    std::vector<unsigned long long> expert_ptrs(
+        static_cast<std::size_t>(experts));
+    for (int expert = 0; expert < experts; ++expert)
+        expert_ptrs[expert] = reinterpret_cast<unsigned long long>(
+            weights.data() + static_cast<std::size_t>(expert) * matrix_bytes);
+
+    std::vector<float> output(
+        static_cast<std::size_t>(aligned.padded_total) * output_size, -1.0f);
+    {
+        const unsigned long long* ptrs = expert_ptrs.data();
+        const int* be = aligned.block_experts.data();
+        const int* sr = aligned.sorted_routes.data();
+        const std::int8_t* codes = activations.codes.data();
+        const std::uint16_t* scales = activations.scales.data();
+        float* out = output.data();
+        int in = input_size, on = output_size, tk = top_k, ss = scale_stride;
+        int nb = blocks;
+        void* arguments[] = {&ptrs, &be, &sr, &codes, &scales, &out,
+                             &in,   &on, &tk, &ss,    &nb};
+        colibri_cpu_launch_named(kernel, static_cast<std::uint32_t>(output_size),
+                                 static_cast<std::uint32_t>(blocks), threads, 0,
+                                 0, arguments);
+    }
+
+    float worst = 0.0f;
+    int compared = 0;
+    for (int block = 0; block < blocks; ++block) {
+        const int expert = aligned.block_experts[block];
+        for (int s = 0; s < colibri::v2::moe::kMmqBlockSize; ++s) {
+            const std::size_t slot =
+                static_cast<std::size_t>(block) * colibri::v2::moe::kMmqBlockSize + s;
+            const auto route = aligned.sorted_routes[slot];
+            for (int out = 0; out < output_size; ++out) {
+                const double got = output[slot * output_size + out];
+                if (route == colibri::v2::moe::kEmpty) {
+                    if (got != 0.0) {
+                        std::printf("  %-28s FAIL (padded slot %zu row %d = %g)\n",
+                                    kernel, slot, out, got);
+                        return 1;
+                    }
+                    continue;
+                }
+                const std::uint8_t* base =
+                    weights.data() + static_cast<std::size_t>(expert) * matrix_bytes +
+                    static_cast<std::size_t>(out) *
+                        (input_size / format.block_elements) * format.block_bytes;
+                // Not reference_row: that one indexes rows from the start of
+                // the buffer, and here the row lives inside a chosen expert's
+                // slice, which is precisely the addressing under test.
+                double expected = 0.0, magnitude = 0.0;
+                for (int index = 0; index < input_size; ++index) {
+                    const std::size_t code_at =
+                        static_cast<std::size_t>(route / top_k) * input_size + index;
+                    const std::size_t scale_at =
+                        static_cast<std::size_t>(route / top_k) * scale_stride +
+                        index / 32;
+                    const double activation =
+                        static_cast<double>(activations.codes[code_at]) *
+                        qwen_half_value(activations.scales[scale_at]);
+                    const double term =
+                        static_cast<double>(format.value_at(base, index)) * activation;
+                    expected += term;
+                    magnitude += std::fabs(term);
+                }
+                worst = std::fmax(worst, static_cast<float>(
+                    std::fabs(expected - got) / std::fmax(1.0, magnitude)));
+                ++compared;
+            }
+        }
+    }
+    if (!compared) {
+        std::printf("  %-28s FAIL (nothing compared)\n", kernel);
+        return 1;
+    }
+    return report(kernel, worst);
+}
+
 }  // namespace
 
 
@@ -740,6 +851,14 @@ int main() {
     failures += check_tiled("iq3xxs_q8_mmq", kIq3xxs, kMmqThreads);
     failures += check_tiled("iq2xs_q8_mmq", kIq2xs, kMmqThreads);
     failures += check_tiled("iq4xs_q8_mmq", kIq4xs, kMmqThreads);
+    // The same core driven by a block table. Its thread count is fixed by
+    // COLIBRI_MOE_MMQ_ROW_WARPS * COLIBRI_MOE_MMQ_TOKEN_WARPS * 32, which is
+    // the same 256 -- a different split of the warps, not a different budget.
+    failures += check_routed_mmq("iq1s_q8_mmq_routed", kIq1s, kMmqThreads);
+    failures += check_routed_mmq("iq2xxs_q8_mmq_routed", kIq2xxs, kMmqThreads);
+    failures += check_routed_mmq("iq2xs_q8_mmq_routed", kIq2xs, kMmqThreads);
+    failures += check_routed_mmq("iq3xxs_q8_mmq_routed", kIq3xxs, kMmqThreads);
+    failures += check_routed_mmq("iq4xs_q8_mmq_routed", kIq4xs, kMmqThreads);
     failures += check_tiled("iq2xxs_q8_matmul_tiled", kIq2xxs, kTiledThreads);
     failures += check_tiled("iq3xxs_q8_matmul_tiled", kIq3xxs, kTiledThreads);
     failures += check_tiled("iq2xs_q8_matmul_tiled", kIq2xs, kTiledThreads);
