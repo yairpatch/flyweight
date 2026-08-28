@@ -12,6 +12,7 @@
 #include "colibri_v2_config.hpp"
 #include "colibri_v2_attention_policy.hpp"
 #include "colibri_v2_expert_policy.hpp"
+#include "colibri_v2_moe_align.hpp"
 #include "colibri_v2_format_dispatch.hpp"
 #include "colibri_v2_expert_seed.hpp"
 #include "colibri_v2_qwen_kernels.hpp"
@@ -13504,6 +13505,23 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             span+=device_align(stream_rows*stream_inter);
             span+=device_align(stream_rows*(stream_inter/32+1)*sizeof(float));
             span+=device_align(stream_rows*stream_hidden*sizeof(float));
+            // The routed MMQ's index and pointer tables. Small -- ~200 KiB at
+            // this model's shape -- but they ride the same walk, so the worst
+            // case has to be sized here and taken in the same order there.
+            // Worst-case padding is one short block per expert.
+            const std::uint64_t stream_routes=stream_rows*stream_top_k;
+            const std::uint64_t stream_experts=
+                runtime->model->config.expert_count;
+            const std::uint64_t stream_padded=stream_routes+
+                stream_experts*(colibri::v2::moe::kMmqBlockSize-1);
+            const std::uint64_t stream_blocks=
+                stream_padded/colibri::v2::moe::kMmqBlockSize+1;
+            for(int role=0;role<3;++role)
+                span+=device_align(stream_experts*sizeof(std::uint64_t));
+            span+=device_align(stream_blocks*sizeof(std::int32_t));
+            span+=device_align(stream_padded*sizeof(std::int32_t));
+            span+=device_align(stream_routes*sizeof(std::int32_t));
+            span+=device_align(stream_routes*sizeof(float));
             runtime->prefill_stream_scratch_span=span;
             runtime->prefill_stream_scratch_bytes=2*span;
         }

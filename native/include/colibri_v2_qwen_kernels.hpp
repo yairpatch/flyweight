@@ -943,6 +943,45 @@ void qwen_scatter_add_rows(
         weights[row] * source[(long long)row * width + column];
 }
 
+// Fold a slot-major expert result back onto its tokens, token-major.
+//
+// qwen_scatter_add_rows above is only safe when a launch touches each token
+// once, which is true of the streaming path (one expert per launch, and a token
+// routes to an expert at most once) and false of a routed MMQ tile, where
+// several experts -- and so several of the same token's routes -- land in one
+// launch. The corpus has no atomicAdd, so the fix is to own the output row
+// instead of contending for it: one block per (token, column chunk), summing
+// the token's own routes.
+//
+// `slot_of_route` maps route -> slot in the aligned layout, or -1 for a route
+// this pass does not cover (claimed by the expert cache, pruned, or belonging
+// to another tile). `slot_begin` shifts into the tile's window, so the caller
+// can hold one tile of rows rather than the whole padded buffer.
+extern "C" __global__
+void qwen_slot_accumulate_rows(
+    const float* slots,
+    const int* slot_of_route,
+    const float* weights,
+    float* destination,
+    const int width,
+    const int rows,
+    const int top_k,
+    const int slot_begin,
+    const int slot_count
+) {
+    const int token = blockIdx.y;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= rows || column >= width) return;
+    float total = 0.0f;
+    for (int rank = 0; rank < top_k; ++rank) {
+        const int route = token * top_k + rank;
+        const int slot = slot_of_route[route] - slot_begin;
+        if (slot < 0 || slot >= slot_count) continue;
+        total += weights[route] * slots[(long long)slot * width + column];
+    }
+    destination[(long long)token * width + column] += total;
+}
+
 extern "C" __global__
 void q4_batched_matvec(
     const unsigned long long* packed_addresses,

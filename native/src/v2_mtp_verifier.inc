@@ -1662,6 +1662,11 @@ void qwen_forward_rows(
         // sizing exactly.
         struct StreamGroup{int expert;std::uint64_t matrix;int offset;int count;};
         std::vector<StreamGroup> stream_groups;
+        // Hoisted out of the staging block for the routed MMQ below: which
+        // group holds an expert, and what the route weights were before
+        // staging zeroed the ones it claimed.
+        std::vector<std::int32_t> group_of;
+        std::vector<float> routed_route_weights;
         std::uint64_t stream_role_bytes[3]={0,0,0};
         const std::uint64_t stream_cap=runtime.forward_rows_capacity;
         std::uint64_t stream_cursor=span.stream_scratch;
@@ -1682,6 +1687,24 @@ void qwen_forward_rows(
         const auto stream_act_scales=
             stream_take(stream_cap*(intermediate/32+1)*sizeof(float));
         const auto stream_down=stream_take(stream_cap*hidden_size*sizeof(float));
+        // Routed MMQ tables. Same order and same worst cases as the sizing in
+        // prepare; the two walks must not drift.
+        const std::uint64_t routed_routes=stream_cap*top_k;
+        const std::uint64_t routed_padded=
+            routed_routes+static_cast<std::uint64_t>(experts)*
+                (colibri::v2::moe::kMmqBlockSize-1);
+        const std::uint64_t routed_blocks=
+            routed_padded/colibri::v2::moe::kMmqBlockSize+1;
+        std::uint64_t routed_role_ptrs[3];
+        for(int role=0;role<3;++role)
+            routed_role_ptrs[role]=
+                stream_take(static_cast<std::uint64_t>(experts)*sizeof(std::uint64_t));
+        const auto routed_block_experts=
+            stream_take(routed_blocks*sizeof(std::int32_t));
+        const auto routed_sorted=stream_take(routed_padded*sizeof(std::int32_t));
+        const auto routed_slot_of_route=
+            stream_take(routed_routes*sizeof(std::int32_t));
+        const auto routed_weights=stream_take(routed_routes*sizeof(float));
         if(stream_experts){
             // Every role needs a batched kernel: MMQ over Q8 activations
             // where the format has one, else the reconstruct-in-float tile
@@ -1721,7 +1744,7 @@ void qwen_forward_rows(
             std::sort(order.begin(),order.end(),[&](int left,int right){
                 return expert_tokens[left]!=expert_tokens[right]
                     ?expert_tokens[left]>expert_tokens[right]:left<right;});
-            std::vector<std::int32_t> group_of(experts,-1);
+            group_of.assign(static_cast<std::size_t>(experts),-1);
             std::uint64_t cursor=0;
             // The uploads ride the prefetch stream: interleaving thousands of
             // small copies with kernels on the compute stream serializes both.
@@ -1785,6 +1808,11 @@ void qwen_forward_rows(
             }
             std::vector<std::int32_t> stream_tokens(stream_total);
             std::vector<float> stream_route_weights(stream_total);
+            // The loop below zeroes a claimed route's weight so the CPU sweep
+            // skips it; the routed MMQ still needs the value, and the aligned
+            // layout is built from a non-zero weight.
+            routed_route_weights.assign(
+                weights_host,weights_host+static_cast<std::size_t>(rows)*top_k);
             for(int token=0;token<rows;++token)for(int rank=0;rank<top_k;++rank){
                 const int route=token*top_k+rank;
                 if(weights_host[route]==0.0f)continue;
@@ -1906,9 +1934,183 @@ void qwen_forward_rows(
             const bool gate_up_q8=stream_needs_q8(gate_type,hidden_size)||
                 stream_needs_q8(up_type,hidden_size);
             const bool down_q8=stream_needs_q8(down_type,intermediate);
+            // The routed MMQ: one aligned layout per layer, then a handful of
+            // launches per tile, instead of ~8 launches per staged expert. The
+            // kernels measure 12.6x (gate/up) and 25x (down) over the octet
+            // block-major pair, and 14.6x over the CPU expert phase -- see
+            // plans/decode-device-dispatch.md. Opt-in for now: this is the
+            // first path to run them end to end, and the project does not turn
+            // on a numerics-affecting route silently.
+            static const bool routed_setting=[]{
+                const char*value=std::getenv("COLIBRI_ROUTED_MOE");
+                return value&&value[0]=='1';
+            }();
+            // A format reaches the routed kernel when it has one and the width
+            // divides its blocking: 256 for the super-block formats, 32 for
+            // IQ4_NL's flat blocks, which is what lets the 640-wide down
+            // projection in at all.
+            auto routed_kernel=[&](std::uint32_t type,int in_size){
+                auto name=qwen_iq_grouped_kernel(type,"_q8_mmq_routed");
+                const int unit=type==20?32:256;
+                return (!name.empty()&&in_size%unit==0)?name:std::string();
+            };
+            const auto routed_gate=routed_kernel(gate_type,hidden_size);
+            const auto routed_up=routed_kernel(up_type,hidden_size);
+            const auto routed_down=routed_kernel(down_type,intermediate);
+            const bool routed_moe=routed_setting&&runtime.int8_tensor_cores&&
+                !routed_gate.empty()&&!routed_up.empty()&&!routed_down.empty()&&
+                !routed_route_weights.empty();
+            if(routed_moe){
+                colibri::v2::moe::AlignedRoutes aligned;
+                {
+                    // Routes the staging claimed, keyed by group rather than by
+                    // expert, so the kernel's block table indexes the compact
+                    // pointer tables directly.
+                    std::vector<std::int32_t> route_group(
+                        static_cast<std::size_t>(rows)*top_k,-1);
+                    for(int route=0;route<rows*top_k;++route)
+                        if(routed_route_weights[route]!=0.0f)
+                            route_group[route]=group_of[selected_host[route]];
+                    colibri::v2::moe::align_blocks(
+                        route_group.data(),routed_route_weights.data(),
+                        rows*top_k,static_cast<int>(stream_groups.size()),
+                        colibri::v2::moe::kMmqBlockSize,aligned);
+                }
+                const int blocks=static_cast<int>(aligned.block_experts.size());
+                if(blocks){
+                    std::vector<std::int32_t> slot_of_route(
+                        static_cast<std::size_t>(rows)*top_k,-1);
+                    for(std::size_t slot=0;slot<aligned.sorted_routes.size();++slot){
+                        const auto route=aligned.sorted_routes[slot];
+                        if(route>=0)
+                            slot_of_route[static_cast<std::size_t>(route)]=
+                                static_cast<std::int32_t>(slot);
+                    }
+                    const std::uint64_t role_offset[3]={
+                        0,stream_role_bytes[0],
+                        stream_role_bytes[0]+stream_role_bytes[1]};
+                    std::vector<std::uint64_t> role_table[3];
+                    for(const auto&group:stream_groups)
+                        for(int role=0;role<3;++role)
+                            role_table[role].push_back(
+                                group.matrix+role_offset[role]);
+                    for(int role=0;role<3;++role)
+                        if(colibri_gpu_upload(routed_role_ptrs[role],
+                               role_table[role].data(),
+                               role_table[role].size()*sizeof(std::uint64_t),
+                               runtime.stream)!=0)
+                            throw std::runtime_error(
+                                "native Qwen routed MoE pointer upload failed");
+                    if(colibri_gpu_upload(routed_block_experts,
+                           aligned.block_experts.data(),
+                           aligned.block_experts.size()*sizeof(std::int32_t),
+                           runtime.stream)!=0||
+                       colibri_gpu_upload(routed_sorted,
+                           aligned.sorted_routes.data(),
+                           aligned.sorted_routes.size()*sizeof(std::int32_t),
+                           runtime.stream)!=0||
+                       colibri_gpu_upload(routed_slot_of_route,
+                           slot_of_route.data(),
+                           slot_of_route.size()*sizeof(std::int32_t),
+                           runtime.stream)!=0||
+                       colibri_gpu_upload(routed_weights,
+                           routed_route_weights.data(),
+                           routed_route_weights.size()*sizeof(float),
+                           runtime.stream)!=0)
+                        throw std::runtime_error(
+                            "native Qwen routed MoE table upload failed");
+                    // Once per layer, not once per expert: every routed token
+                    // reads the same activation row, and the per-expert gather
+                    // the streaming path needs disappears with it.
+                    stream_quantize(normalized,stream_packed_q8,
+                                    stream_packed_scales,hidden_size,rows);
+                    const int block_size=colibri::v2::moe::kMmqBlockSize;
+                    // Tiles are sized so every per-slot buffer below is the
+                    // scratch the streaming path already owns.
+                    const int tile_blocks=
+                        std::max(1,static_cast<int>(stream_cap)/block_size);
+                    int gate_scale_stride=(hidden_size/32)*2;
+                    int down_scale_stride=(intermediate/32)*2;
+                    // Mutable copies: the launch shim takes void* to each
+                    // argument, so a const int cannot be handed over.
+                    int slot_major=0,routed_top_k=top_k;
+                    const double t_routed=moe_now();
+                    for(int begin=0;begin<blocks;begin+=tile_blocks){
+                        const int count=std::min(tile_blocks,blocks-begin);
+                        int slots=count*block_size;
+                        const int slot_begin=begin*block_size;
+                        const auto tile_experts=routed_block_experts+
+                            static_cast<std::uint64_t>(begin)*sizeof(std::int32_t);
+                        const auto tile_sorted=routed_sorted+
+                            static_cast<std::uint64_t>(slot_begin)*sizeof(std::int32_t);
+                        const auto up_half=stream_act+
+                            static_cast<std::uint64_t>(slots)*intermediate*sizeof(float);
+                        int tile_count=count;
+                        auto routed_launch=[&](const std::string&name,
+                                               std::uint64_t table,
+                                               std::uint64_t input,
+                                               std::uint64_t scales,
+                                               std::uint64_t output,
+                                               int in_size,int out_size,
+                                               int*token_map,int*scale_stride){
+                            void*args[]={&table,
+                                const_cast<std::uint64_t*>(&tile_experts),
+                                const_cast<std::uint64_t*>(&tile_sorted),
+                                const_cast<std::uint64_t*>(&input),
+                                const_cast<std::uint64_t*>(&scales),
+                                const_cast<std::uint64_t*>(&output),
+                                &in_size,&out_size,token_map,scale_stride,
+                                &tile_count};
+                            launch(name.c_str(),
+                                   (static_cast<std::uint32_t>(out_size)+127)/128,
+                                   static_cast<std::uint32_t>(count),256,args);
+                        };
+                        routed_launch(routed_gate,routed_role_ptrs[0],
+                            stream_packed_q8,stream_packed_scales,stream_act,
+                            hidden_size,intermediate,&routed_top_k,&gate_scale_stride);
+                        routed_launch(routed_up,routed_role_ptrs[1],
+                            stream_packed_q8,stream_packed_scales,up_half,
+                            hidden_size,intermediate,&routed_top_k,&gate_scale_stride);
+                        int silu_count=slots*intermediate;
+                        void*silu_args[]={const_cast<std::uint64_t*>(&stream_act),
+                            const_cast<std::uint64_t*>(&stream_silu),&silu_count};
+                        launch("silu_mul",
+                               (static_cast<std::uint32_t>(silu_count)+255)/256,
+                               1,256,silu_args);
+                        stream_quantize(stream_silu,stream_act_q8,
+                                        stream_act_scales,intermediate,slots);
+                        // top_k 0: the down projection's input is the per-slot
+                        // SwiGLU output, not a token row.
+                        routed_launch(routed_down,routed_role_ptrs[2],
+                            stream_act_q8,stream_act_scales,stream_down,
+                            intermediate,hidden_size,&slot_major,
+                            &down_scale_stride);
+                        // Token-major fold: several experts in one tile means
+                        // several of a token's routes land here, and the corpus
+                        // has no atomicAdd. Each block owns one token's row.
+                        int tile_slot_begin=slot_begin,tile_slots=slots;
+                        void*fold_args[]={const_cast<std::uint64_t*>(&stream_down),
+                            const_cast<std::uint64_t*>(&routed_slot_of_route),
+                            const_cast<std::uint64_t*>(&routed_weights),
+                            const_cast<std::uint64_t*>(&fourth),
+                            const_cast<int*>(&hidden_size),&rows,
+                            const_cast<int*>(&top_k),&tile_slot_begin,
+                            &tile_slots};
+                        launch("qwen_slot_accumulate_rows",
+                               (static_cast<std::uint32_t>(hidden_size)+255)/256,
+                               static_cast<std::uint32_t>(rows),256,fold_args);
+                    }
+                    if(moe_profile_enabled()){
+                        auto&prof=qwen_moe_profile();
+                        prof.stream_compute+=moe_now()-t_routed;
+                        prof.stream_groups+=static_cast<std::uint64_t>(blocks);
+                    }
+                }
+            }
             const double t_groups=moe_now();
             std::uint64_t group_launches=0,group_tokens=0;
             for(const auto&group:stream_groups){
+                if(routed_moe)break;
                 if(!group.count)continue;
                 int count=group.count;
                 if(moe_profile_enabled()){++group_launches;group_tokens+=count;}

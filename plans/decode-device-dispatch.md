@@ -1322,11 +1322,48 @@ is ~1.4 s, so a wired path lands near ~1.4-1.8 s per chunk against 5.4 s —
 about **3x on prefill**, upload-bound, exactly the ceiling this document
 predicted before the kernel existed.
 
-**Step 3 is now worth wiring**, and for a measured reason rather than a traffic
-ratio. What it needs, in order: the aligned layout per layer at
-`kMmqBlockSize`; the chunk's activations quantized to Q8 **once per layer**
-rather than once per expert; three launches (gate, up, down) plus `silu_mul`
-and a scatter; and the reconciliation with the CPU path for routes the GPU does
-not cover. The remaining risk is buffer sizing, not throughput — `down_out` at
-`padded_total x hidden` is ~168 MB at 1024 rows, which wants tiling over blocks
-on a 12 GB card that is already holding an expert cache.
+### Step 3 SHIPPED: the rows path drives it, opt-in
+
+`COLIBRI_ROUTED_MOE=1` replaces the streaming path's per-expert loop with one
+aligned layout per layer and a handful of launches per tile. Measured at 2048
+tokens, first token identical in every configuration:
+
+| configuration | wall | prompt tok/s |
+|---|---|---|
+| streaming path (what it replaces) | 22.27 s | 92 |
+| CPU expert phase (today's default) | 11.73 s | 175 |
+| **routed MMQ, 512 MiB arena** | **8.33 s** | **246** |
+
+**2.7x over the path it replaces and 1.4x over the CPU default** — the first
+time the device expert route has beaten the host on this box. Greedy tokens are
+*identical* to both the streaming path and the CPU path over 16 tokens, which is
+the check that matters: the routed form changes only which CUDA block computes
+a route, not the arithmetic.
+
+Arena sweep, routed: 512 MiB 8.33 s, 1024 MiB 9.42 s, 2048 MiB 9.80 s. Smaller
+still wins, for the reason the auto default already encodes -- restaging scales
+with the budget while densest-first saturates -- but the optimum has moved up
+from 48 MiB, and the knee below 512 MiB was not searched.
+
+How it fits the existing path, which is most of why the change is small:
+- the layout is built from the routes staging already claimed, keyed by
+  **group** rather than expert, so the block table indexes the compact pointer
+  tables directly;
+- activations are quantized **once per layer** instead of once per expert,
+  which also deletes the per-expert `qwen_gather_rows`;
+- tiles are sized so every per-slot buffer is scratch the streaming path
+  already owns (`stream_cap / kMmqBlockSize` blocks), so no new large
+  allocation -- only ~200 KiB of index and pointer tables, sized in prepare and
+  taken in the forward in the same order, as that walk requires;
+- `qwen_slot_accumulate_rows` folds slots back onto tokens **token-major**.
+  `qwen_scatter_add_rows` is only safe when a launch touches each token once,
+  which holds for one-expert-per-launch and fails for a mixed-expert tile, and
+  the corpus has no atomicAdd. Owning the output row is the fix.
+
+Opt-in rather than default: this is the first path to run these kernels end to
+end, and the gate combination that reaches it (`--hybrid-prefill cpu`, a cache
+seed, forced DMA paging, a stream arena) is narrow enough that the default
+deserves its own A/B before moving. Note that on this box the streaming path is
+otherwise **unreachable**: DMA registration needs routed GPU execution allowed,
+and the stream gate needs `hybrid_prefill_cpu` once it is -- so the two
+conditions exclude each other unless `--hybrid-prefill cpu` is set explicitly.
