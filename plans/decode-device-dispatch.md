@@ -232,7 +232,7 @@ Host-serial MoE work per token, same profile as Phase 0b:
 | role scales (mmap) | 0.01 | 0.009-0.010 |
 | **total** | **17.2-35.1 ms** | **0.43-0.46 ms** |
 
-Interleaved decode A/B (48 iterations, 4 warmup):
+Interleaved decode A/B (48 iterations, 4 warmup), **on a warm, healthy page cache**:
 
 | config | run 1 | run 2 |
 |---|---|---|
@@ -242,6 +242,26 @@ Interleaved decode A/B (48 iterations, 4 warmup):
 
 **~17 tok/s -> ~30 tok/s**, and the run-to-run variance largely disappears (the
 staged path's spread was page-cache state).
+
+**CAVEAT, found later the same day and only partly resolved.** Those numbers were
+taken with the page cache warm and the box otherwise idle. Repeating the comparison
+after many back-to-back model loads, with RAM oversubscribed, told a different
+story: both configurations collapsed to 7-8 tok/s, and the within-run split showed
+pinning had *moved* the cost rather than removed it —
+
+| paging | MoE phase | "other" (incl. PLE gathers) | major faults |
+|---|---|---|---|
+| staged | 116-119 ms | 5-9 ms | 42k-63k |
+| auto (37 GiB pinned) | ~21 ms | 88-93 ms | 14k-97k |
+
+Pinning all 37 GiB starved the 25.7 GiB n-gram table's page cache, so the memcpy
+came back as major faults in the PLE gathers. The budget now subtracts the
+host-resident tables it will never register (the n-gram table) on top of the OS
+reserve, which on this box registers **19.1 GiB / 25 of 48 expert layers** instead
+of everything. Partial coverage is exactly what the per-layer `expert_dma` flag was
+built for. **This corrected budget has NOT been re-benchmarked** — the box needed to
+settle and the run was cut short. Re-run the interleaved A/B on an idle machine with
+a warm cache before quoting any speedup.
 
 **REVISED 2026-08-27, and the headline above is overstated.** Those arms compare
 staged against direct *inside HEAD* at a moment when the page cache was in an
