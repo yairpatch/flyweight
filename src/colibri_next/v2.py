@@ -345,6 +345,11 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefill_gpu_core_nanoseconds", ctypes.c_uint64),
         ("prefill_gpu_router_nanoseconds", ctypes.c_uint64),
         ("prefill_gpu_transfer_nanoseconds", ctypes.c_uint64),
+        # Zero means the gpu_* split above was not measured, not that the work
+        # was free: the pipelined prefill driver cannot record the event pairs.
+        # COLIBRI_PREFILL_PIPELINE=0 brings the split back.
+        ("prefill_gpu_split_layers", ctypes.c_uint64),
+        ("prefill_ple_nanoseconds", ctypes.c_uint64),
         ("expert_history_loaded_entries", ctypes.c_uint64),
         ("expert_history_saves", ctypes.c_uint64),
         ("next_layer_prefetch_predictions", ctypes.c_uint64),

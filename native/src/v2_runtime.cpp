@@ -930,6 +930,16 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_gpu_core_nanoseconds = 0;
     std::uint64_t prefill_gpu_router_nanoseconds = 0;
     std::uint64_t prefill_gpu_transfer_nanoseconds = 0;
+    // How many layers fed the three counters above. Zero distinguishes "not
+    // measured" from "measured as zero" -- the pipelined driver cannot record
+    // the event pairs, and a bare 0.00 there reads as though the GPU did no
+    // work at all.
+    std::uint64_t prefill_gpu_split_layers = 0;
+    // The n-gram engram staging: hash, decode rows out of the 26.8 GiB
+    // per_layer_token_embd mmap, upload. Host work, so it is measured in both
+    // drivers -- and it is the largest single tensor in the checkpoint, so its
+    // share rises as the expert phase falls.
+    std::uint64_t prefill_ple_nanoseconds = 0;
     std::uint8_t cpu_prefetch_checksum = 0;
     void* host_staging = nullptr;
     std::uint64_t host_staging_bytes = 0;
@@ -12576,6 +12586,8 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->prefill_gpu_core_nanoseconds=runtime->prefill_gpu_core_nanoseconds;
     out->prefill_gpu_router_nanoseconds=runtime->prefill_gpu_router_nanoseconds;
     out->prefill_gpu_transfer_nanoseconds=runtime->prefill_gpu_transfer_nanoseconds;
+    out->prefill_gpu_split_layers=runtime->prefill_gpu_split_layers;
+    out->prefill_ple_nanoseconds=runtime->prefill_ple_nanoseconds;
     out->expert_history_loaded_entries=runtime->expert_history_loaded_entries;
     out->expert_history_saves=runtime->expert_history_saves;
     out->next_layer_prefetch_predictions=runtime->next_layer_prefetch_predictions;

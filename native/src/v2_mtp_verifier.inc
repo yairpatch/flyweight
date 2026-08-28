@@ -651,8 +651,18 @@ void qwen_forward_rows(
                (static_cast<std::uint32_t>(hc_wide_size)+255)/256,rows,256,
                init_args);
         if(runtime.ple_table!=std::numeric_limits<std::uint64_t>::max()&&
-           !runtime.model->config.ple_layers.empty())
+           !runtime.model->config.ple_layers.empty()){
+            // Timed because it is the one large cost the prefill split could
+            // not see: the gpu_* event pairs are unavailable under the
+            // pipelined driver, so everything that was not the CPU expert
+            // phase landed in one unattributed bucket. This is host work, so a
+            // steady_clock reads it in either driver.
+            const auto ple_started=std::chrono::steady_clock::now();
             qwen4_stage_ple_embed_rows(runtime,input_tokens,rows,ple_embed_base);
+            runtime.prefill_ple_nanoseconds+=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-ple_started).count();
+        }
     }
     // Muse Glimmer RMS-normalizes the raw embedding, with no learned weight,
     // before the first block. The decode path does the same; a row batch that
@@ -1516,6 +1526,7 @@ void qwen_forward_rows(
                colibri_gpu_event_elapsed(runtime.prefill_core_end_event,runtime.prefill_router_end_event,&router_ms)!=0||
                colibri_gpu_event_elapsed(runtime.prefill_router_end_event,runtime.route_event,&transfer_ms)!=0)
                 throw std::runtime_error("native Qwen prefill profiling measurement failed");
+            ++runtime.prefill_gpu_split_layers;
             runtime.prefill_gpu_core_nanoseconds+=static_cast<std::uint64_t>(core_ms*1.0e6f);
             runtime.prefill_gpu_router_nanoseconds+=static_cast<std::uint64_t>(router_ms*1.0e6f);
             runtime.prefill_gpu_transfer_nanoseconds+=static_cast<std::uint64_t>(transfer_ms*1.0e6f);

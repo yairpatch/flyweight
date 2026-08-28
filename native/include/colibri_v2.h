@@ -218,6 +218,16 @@ typedef struct ColibriV2QwenRuntimeInfo {
     uint64_t prefill_gpu_core_nanoseconds; /* DeltaNet/attention CUDA work before MoE */
     uint64_t prefill_gpu_router_nanoseconds; /* MoE norm, router projection, and top-k */
     uint64_t prefill_gpu_transfer_nanoseconds; /* selected routes, weights, and activations DtoH */
+    uint64_t prefill_gpu_split_layers; /* layers that contributed to the three gpu_* figures
+                                          above; ZERO means the split was not measured, not
+                                          that the work was free. The two-half pipelined
+                                          driver cannot record the event pairs (each half
+                                          would overwrite the other's markers), so it leaves
+                                          them at zero -- set COLIBRI_PREFILL_PIPELINE=0 to
+                                          get the split back. */
+    uint64_t prefill_ple_nanoseconds; /* per-layer-token-embedding (n-gram engram) staging:
+                                         host-side hash, row decode from the mmap, and upload.
+                                         Measured in both drivers, unlike the gpu_* split. */
     uint64_t expert_history_loaded_entries; /* nonzero persisted expert counters restored */
     uint64_t expert_history_saves; /* successful atomic sidecar replacements */
     uint64_t next_layer_prefetch_predictions; /* predicted expert IDs issued */
