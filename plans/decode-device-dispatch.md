@@ -866,7 +866,97 @@ quant, so it may be benign — but prefill should not be that chunk-sensitive, a
 this was not run on real text. Check before treating `COLIBRI_PREFILL_ROWS` as a
 tuning knob.
 
-## NEXT AREA: colibri's CPU expert path is several times slower than llama.cpp's
+## RESOLVED (2026-08-28): one weight type had no vectorized row decoder
+
+**Prefill 50.4 -> 156.5 tok/s at 2048 tokens, 36.5 -> 140.1 at 256** (100% of
+experts on CPU, the same configuration llama.cpp's `-ncmoe 48` measures). The
+whole gap below was `IQ2_XXS` falling through `qwen_dequant_row` to the
+per-element scalar form. The section that follows it — the q8-activation
+integer-dot theory — is **falsified**; keep reading only for the record.
+
+**How it was found, in the order that worked.** The mechanism was never guessed:
+
+1. *Isolate the kernel.* A standalone benchmark at the real shape (640x2560
+   IQ1_S, 2560x640 IQ4_NL, 20 routed tokens) put dequant+f32-GEMM at **55-80
+   GMAC/s per core**, with dequant only **0.28-0.69x** the GEMM it feeds — not
+   the 3.75x the in-situ counters reported. A genuinely DRAM-cold working set
+   (1.2 GiB, ~50x L3) changed it by 4%, so weight-read latency was not it.
+2. *Account for I/O and threads.* `ru_majflt`, `ru_minflt` and
+   `/proc/self/io` across the timed prefill: **zero major faults, zero block
+   reads, 15.9 of 16 cores busy.** Not paging, not thread starvation, not the
+   68 GB model against 60 GB of RAM.
+3. *Reproduce the loop.* The same kernels in the same CSR-grouped, 4-row,
+   `dynamic,4` loop at production buffer sizes hit **598 GMAC/s on 16 threads**
+   with dequant/gemm at 0.76 — 5x what production delivered. Same kernel, same
+   schedule, same shapes: whatever was wrong was not in any of them.
+4. *Ask what production has that the reproduction does not.* Mixed weight
+   types. `qwen_simd_quant_type` is `{8,10,11,12,13,14}`; types 19 and 20 got
+   explicit AVX2 admissions when qwen4exp landed. **16 got none**, and the
+   unsloth UD mix puts IQ2_XXS on the gate and up of **14 of 48 layers** (5.64
+   GiB of 37 GiB of expert weights). Those layers re-derived a weight's block,
+   group, scale, sign byte and grid entry **per element**.
+
+**The fix**: `iq2xxs_dequant`, the store form of the `iq2xxs_dot` that was
+already there, plus the admission. Bit-exact against `qwen_iq2xxs_value` —
+the sign is an XOR of a magnitude and the scale multiply is in the same order,
+so the contract's element-for-element check is exact, not approximate.
+
+Effect on the in-situ counters, per gate task: **50.6 us -> 4.78 us**. The phase
+split now reads gate{dequant 115.3s gemm 156.6s} against gate{dequant 893.9s
+gemm 100.2s} — a dequant/gemm ratio of 0.74, which is what the isolated
+benchmark said it should be all along.
+
+**Why it hid for two sessions.** Every symptom pointed somewhere else. The
+scalar path is *correct*, so nothing failed. It is spread across a third of the
+layers, so no single tensor looked wrong. And the in-situ profile attributed the
+cost to "dequant", which read as "decoding is inherently expensive, quantize the
+activations instead" — the theory in the next section — rather than "this
+format is not using the decoder that exists". The isolated kernel measurement
+is what separated the two, and it should have come first.
+
+**Two things now guard it.**
+- `g_scalar_dequant_types` (v2_runtime.cpp): the scalar tail records the type,
+  and the batched MoE prints one line naming the offenders. Verified by
+  disabling the new admission and watching it fire, then restoring it.
+  A configuration that lands there now says so instead of just being slow.
+- `native/tools/bench_moe_cpu_layer.cpp`: the batched CPU MoE at production
+  shape and threading, per weight type. It prints dequant/gemm per format; a
+  format on the scalar path stands out immediately. Post-fix it reads IQ1_S
+  0.72, IQ2_XXS 0.36.
+
+**Still on the scalar path, unmeasured**: types 17 (IQ2_XS) and 18 (IQ3_XXS)
+have SIMD dots and q8-K integer dots but no store-form dequant, so any model
+with those expert stacks pays the same 10x in batched prefill. That is exactly
+Laguna's layout (gate/up 17, down 18), and it is very likely why
+`COLIBRI_PREFILL_DIRECT_QUANT` is gated on for Laguna and measured 2x *slower*
+here: its dequant-then-GEMM comparison point is the scalar one. No Laguna
+checkpoint on this box to confirm, but the tripwire will announce it.
+
+## FALSIFIED: colibri's CPU expert path is several times slower than llama.cpp's
+
+**This section's conclusion was wrong.** Its measurements were sound and its
+inference was not: it compared configurations end to end and concluded the
+*kernel* was the gap, without ever measuring the kernel. See the section above.
+The q8-activation prototype was built and measured anyway, at the real shape,
+against the path it would replace:
+
+| shape | dequant+f32 GEMM | q8 activations + integer dot |
+|---|---|---|
+| IQ1_S 640x2560, 20 tokens | **58.4 GMAC/s** | 37.9 (0.65x) |
+| IQ4_NL 2560x640, 20 tokens | **80.1 GMAC/s** | 60.5 (0.76x) |
+
+Output agreed to 0.5-0.7% relative, so the arithmetic was right; it is just
+slower. Both forms accumulate per token in vector floats with no per-block
+horizontal reduction, so this is not a strawman — the first cut was 0.38x and
+was fixed before drawing the comparison. The reason is that dequant-then-GEMM
+already decodes a row once and amortizes it over all ~20 routed tokens through
+a register-blocked f32 GEMM, while the integer form must re-apply signs and
+scales per token. **The mechanism llama.cpp uses is not the mechanism that makes
+llama.cpp faster here.**
+
+The original reasoning is kept below because the measurements in it are real and
+the cross-check is still the right instinct — only the conclusion drawn from it
+was unfounded.
 
 The cross-check that localises it. Same GGUF, same box, `llama-bench`:
 
@@ -901,6 +991,11 @@ dequant+GEMM against a q8-activation int-dot prototype, at the real shape
 (2560x640, ~20 tokens). The end-to-end numbers above compare configurations with
 different expert placement, so they bound the opportunity but do not prove the
 mechanism. Do not repeat this session's mistake of designing from an inferred cause.
+
+> That instruction was followed, and it is the reason this section is now
+> marked falsified: the isolated measurement showed the prototype **losing**,
+> and the same isolated number is what exposed the real cause. It was the right
+> instruction. It just needed to come one session earlier.
 
 ## The prefill bottleneck, established (2026-08-28)
 

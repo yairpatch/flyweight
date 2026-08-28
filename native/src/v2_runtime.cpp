@@ -4064,6 +4064,13 @@ void qwen_cpu_dense_ffn_rows(
     }
 }
 
+// Weight types that fell through every vectorized decoder below to the
+// per-element form, one bit each. A set rather than a count because the useful
+// question is which format is paying, not how often -- the batched MoE reads it
+// to name the offender among a layer's three.
+std::atomic<std::uint64_t> g_scalar_dequant_types{0};
+constexpr std::uint32_t kScalarDequantTypeLimit = 64;
+
 // Dequantize one weight row to f32 so it can be reused across every token
 // routed to the same expert within a batch: the quantized bytes are decoded
 // once per batch instead of once per token.
@@ -4074,9 +4081,22 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     // (the 640-wide expert down rows fail a 256 gate). Chunked prefill decodes
     // every routed expert's rows through here once per chunk, so the scalar
     // form was the whole prefill wall.
+    // IQ2_XXS belongs here too, and its absence was the wall that remained:
+    // the unsloth UD mix puts it on the gate and up of 14 of 48 layers, and
+    // those alone were 80% of the CPU expert phase's thread time.
+    if(type==16&&(colibri_cpu_features()&1u)!=0&&elements%256==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==19&&(colibri_cpu_features()&1u)!=0&&elements%256==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==20&&(colibri_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    // Everything past here re-derives a weight's block, group, scale and grid
+    // entry per element. It is correct and roughly 10x slower, and nothing
+    // said so: IQ2_XXS sat here for two sessions on 14 of qwen4exp's 48 layers
+    // while the prefill work looked for the cost in kernels and dispatch. The
+    // counter is read once per batched MoE call, off this path, so a
+    // configuration that lands here announces itself instead of just being
+    // slow. Relaxed ordering: it is a tripwire, not a synchronizer.
+    if(type<kScalarDequantTypeLimit)
+        g_scalar_dequant_types.fetch_or(1ull<<type,std::memory_order_relaxed);
     const auto base=row*static_cast<std::uint64_t>(elements);
     if(type==13)for(int index=0;index<elements;++index)output[index]=qwen_q5_value(packed,base+index);
     else if(type==14)for(int index=0;index<elements;++index)output[index]=qwen_q6_value(packed,base+index);
@@ -5099,6 +5119,12 @@ void qwen_cpu_moe_rows(
         }
     if(moe_profile){g_cpu_moe_profile.setup+=qwen_moe_now()-t_setup0;
         ++g_cpu_moe_profile.calls;}
+    // A scalar decoder here costs ~10x, and the only previous symptom was a
+    // slow prefill with no attribution. One line, once per process, naming the
+    // types that are paying: the phase counters then read as expected instead
+    // of pointing at the GEMM they feed.
+    const auto scalar_types_before=
+        g_scalar_dequant_types.load(std::memory_order_relaxed);
     constexpr int kRowBlock=4;
     // Direct IQ rows are already grouped by expert and have thousands of tasks
     // available. Larger hand-out chunks avoid making OpenMP's dynamic scheduler
@@ -5284,6 +5310,29 @@ void qwen_cpu_moe_rows(
         output[task]=value;
     }
     if(moe_profile)g_cpu_moe_profile.combine+=qwen_moe_now()-t_comb0;
+    const auto scalar_types_after=
+        g_scalar_dequant_types.load(std::memory_order_relaxed);
+    if(scalar_types_after!=scalar_types_before){
+        static std::once_flag once;
+        std::call_once(once,[&]{
+            std::string offenders;
+            std::uint64_t listed=0;
+            for(const auto type:{gate_type,up_type,down_type}){
+                if(type>=kScalarDequantTypeLimit)continue;
+                const auto bit=1ull<<type;
+                if((scalar_types_after&bit)==0||(listed&bit)!=0)continue;
+                listed|=bit;
+                if(!offenders.empty())offenders+=", ";
+                offenders+=std::to_string(type);
+            }
+            std::fprintf(stderr,
+                "[colibri-v2] expert weight type(s) %s decode a row at a time "
+                "on this CPU -- no vectorized decoder is admitted for them at "
+                "widths %d/%d, which costs the batched MoE several times its "
+                "speed on the affected layers\n",
+                offenders.c_str(),hidden,intermediate);
+        });
+    }
     if (std::getenv("COLIBRI_MOE_DEBUG")) {
         static int rcalls = 0;
         int n = rcalls++;

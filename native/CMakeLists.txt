@@ -267,6 +267,20 @@ add_executable(
 target_compile_features(colibri_qwen_cpu_bench PRIVATE cxx_std_20)
 target_include_directories(colibri_qwen_cpu_bench PRIVATE src)
 
+# The batched CPU MoE at production shape and threading, per weight type. It
+# separates "the kernel is slow" from "the loop around it is slow", which is the
+# distinction end-to-end prefill numbers cannot make.
+add_executable(
+    colibri_qwen_moe_layer_bench
+    tools/bench_moe_cpu_layer.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx512.cpp
+)
+target_compile_features(colibri_qwen_moe_layer_bench PRIVATE cxx_std_20)
+target_include_directories(colibri_qwen_moe_layer_bench PRIVATE src)
+find_package(Threads REQUIRED)
+target_link_libraries(colibri_qwen_moe_layer_bench PRIVATE Threads::Threads)
+
 add_executable(
     colibri_bailing_kernels_contract
     tests/bailing_kernels_contract.cpp
