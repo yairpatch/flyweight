@@ -13960,10 +13960,16 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // Kept because when it passes there is nothing to budget.
         const bool auto_direct=runtime->options.expert_paging==0&&
             runtime->host_available_bytes>=model_bytes+registration_headroom;
-        // Otherwise register what fits. A checkpoint larger than RAM is exactly
-        // the case that pages hardest, so declining outright (which is what the
-        // test above does) gets the priority backwards.
-        const bool budgeted_direct=runtime->options.expert_paging==0&&!auto_direct&&
+        // Partial coverage: register what fits when the whole mapping does not.
+        // OPT-IN, not automatic, and the measurement is why. On the reference box
+        // (68 GiB checkpoint, 60 GiB RAM) this pins 19.1 GiB over 25 of 48 layers
+        // and a warm interleaved A/B measured 25.4 tok/s staged against 24.4
+        // direct -- no win, inside the noise. Half the admissions still stage,
+        // and the working set (39.8 experts + 25.7 n-gram + dense) exceeds RAM
+        // whatever the pinning, so page pressure dominates either way. It stays
+        // available for boxes where the numbers come out differently, but it does
+        // not turn itself on to buy nothing and lock pages doing it.
+        const bool budgeted_direct=forced_direct&&!auto_direct&&
             runtime->host_available_bytes>kRegisterReserveBytes+kRegisterMinimumBytes;
         // Both GPU-side MoE paths page experts in from the mmap, so both benefit
         // from registering it; only the pure-CPU path never touches the device

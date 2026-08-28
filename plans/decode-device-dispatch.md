@@ -259,9 +259,37 @@ came back as major faults in the PLE gathers. The budget now subtracts the
 host-resident tables it will never register (the n-gram table) on top of the OS
 reserve, which on this box registers **19.1 GiB / 25 of 48 expert layers** instead
 of everything. Partial coverage is exactly what the per-layer `expert_dma` flag was
-built for. **This corrected budget has NOT been re-benchmarked** — the box needed to
-settle and the run was cut short. Re-run the interleaved A/B on an idle machine with
-a warm cache before quoting any speedup.
+built for.
+
+**Then the corrected budget was benchmarked, and it does not win.** Interleaved,
+warm cache, idle box:
+
+| | staged | auto (19.1 GiB pinned) |
+|---|---|---|
+| run 1 | 25.87 | 23.10 |
+| run 2 | 23.73 | 28.37 |
+| run 3 | 26.51 | 21.71 |
+| **mean** | **25.4** | **24.4** |
+
+Inside the noise, with thousands of major faults per run either way. Two reasons,
+and the second is the one that matters: only 25 of 48 layers are pinned so half the
+admissions still stage, and **the working set does not fit RAM at all** — 39.8 GiB
+of experts plus the 25.7 GiB n-gram table plus dense weights against 60 GiB. Page
+pressure dominates however the pinning is arranged. The 17 -> 30 tok/s figure above
+came from a page-cache state that flattered the pinned side; it is not reproducible
+as a steady-state result on this box.
+
+**So budgeted registration is now OPT-IN** (`--expert-paging direct`), not something
+`auto` turns on. The all-fits path (`auto_direct`) is untouched and still automatic:
+where RAM genuinely holds the checkpoint, pinning costs nothing and the staging
+memcpy is pure loss. What changed is that a RAM-short box no longer locks 19 GiB to
+buy nothing.
+
+**What this says about the roof**: on *this* hardware the remaining decode cost is
+not addressable by paging policy — it is that the model does not fit. The levers
+that survive are the ones that shrink the working set or the traffic (a smaller
+expert quant, `--expert-top-k`, MTP amortising per-token expert reads), not ones
+that rearrange where the bytes are copied from.
 
 **REVISED 2026-08-27, and the headline above is overstated.** Those arms compare
 staged against direct *inside HEAD* at a moment when the page cache was in an
