@@ -84,6 +84,24 @@ void fill_leading_scale(std::mt19937& rng, std::vector<std::uint8_t>& packed) {
         std::memcpy(packed.data() + base, &kOne, 2);
 }
 
+// The K-quants keep their f16 scales at a per-format offset rather than the
+// front of the block, and two of them carry a second one for the group minimum.
+// Random bits there are infinities and NaNs, which decode at a different speed
+// and compare to nothing, so both are pinned to 1.0 and everything else stays
+// random.
+template <std::size_t kBlockBytes, std::size_t kFirst, std::size_t kSecond>
+void fill_scales_at(std::mt19937& rng, std::vector<std::uint8_t>& packed) {
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (auto& value : packed) value = static_cast<std::uint8_t>(byte(rng));
+    constexpr std::uint16_t kOne = 0x3c00;
+    for (std::size_t base = 0; base + kBlockBytes <= packed.size();
+         base += kBlockBytes) {
+        std::memcpy(packed.data() + base + kFirst, &kOne, 2);
+        if (kSecond != kFirst)
+            std::memcpy(packed.data() + base + kSecond, &kOne, 2);
+    }
+}
+
 // A format under test: how wide its super-block is, how to fill one, and the
 // CPU decoder the corpus kernel has to agree with.
 struct Format {
@@ -112,6 +130,15 @@ const Format kIq3xxs{
     kIq3xxsBlockBytes, fill_leading_scale<kIq3xxsBlockBytes>, qwen_iq3xxs_value};
 const Format kIq4xs{
     kIq4xsBlockBytes, fill_leading_scale<kIq4xsBlockBytes>, qwen_iq4xs_value};
+
+// The K-quants, for the routed MMQ. Q4_K and Q5_K are what most MoE
+// checkpoints in the wild actually ship their experts as, which is the whole
+// reason the _MIN macro needed a routed form too.
+const Format kQ4k{144, fill_scales_at<144, 0, 2>, qwen_q4k_value};
+const Format kQ5k{176, fill_scales_at<176, 0, 2>, qwen_q5_value};
+const Format kQ6k{210, fill_scales_at<210, 208, 208>, qwen_q6_value};
+const Format kQ2k{84, fill_scales_at<84, 80, 82>, qwen_q2k_value};
+const Format kQ3k{110, fill_scales_at<110, 108, 108>, qwen_q3k_value};
 
 // The kernel accumulates a row in f32 in a tree; the reference here does it in
 // double, elementwise, through the other decoder. The error that separates them
@@ -863,6 +890,17 @@ int main() {
     // super-block (8, 3) every other format above takes, which is the whole
     // reason the expert down projection can reach this kernel at all.
     failures += check_routed_mmq("iq4nl_q8_mmq_routed", kIq4nl, kMmqThreads);
+    failures += check_routed_mmq("iq2s_q8_mmq_routed", kIq2s, kMmqThreads);
+    failures += check_routed_mmq("iq1m_q8_mmq_routed", kIq1m, kMmqThreads);
+    failures += check_routed_mmq("q3k_q8_mmq_routed", kQ3k, kMmqThreads);
+    failures += check_routed_mmq("q6k_q8_mmq_routed", kQ6k, kMmqThreads);
+    // The _MIN routed macro: 64x32 over 16 warps, so 512 threads rather than
+    // the plain form's 256. Its extra staged arrays carry the group minimum
+    // and the activation sums that cancel it.
+    const std::uint32_t kMmqMinRoutedThreads = 512;
+    failures += check_routed_mmq("q4k_q8_mmq_routed", kQ4k, kMmqMinRoutedThreads);
+    failures += check_routed_mmq("q5k_q8_mmq_routed", kQ5k, kMmqMinRoutedThreads);
+    failures += check_routed_mmq("q2k_q8_mmq_routed", kQ2k, kMmqMinRoutedThreads);
     failures += check_tiled("iq2xxs_q8_matmul_tiled", kIq2xxs, kTiledThreads);
     failures += check_tiled("iq3xxs_q8_matmul_tiled", kIq3xxs, kTiledThreads);
     failures += check_tiled("iq2xs_q8_matmul_tiled", kIq2xs, kTiledThreads);

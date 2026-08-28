@@ -990,6 +990,11 @@ extern "C" int colibri_gpu_compile(
              "iq1s_q8_mmq_routed", "iq2xxs_q8_mmq_routed",
              "iq2xs_q8_mmq_routed", "iq3xxs_q8_mmq_routed",
              "iq4xs_q8_mmq_routed", "iq4nl_q8_mmq_routed",
+             "iq2s_q8_mmq_routed", "iq1m_q8_mmq_routed",
+             "q3k_q8_mmq_routed", "q6k_q8_mmq_routed",
+             // The asymmetric K-quants, through the _MIN routed macro
+             "q4k_q8_mmq_routed", "q5k_q8_mmq_routed",
+             "q2k_q8_mmq_routed",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",

@@ -1965,8 +1965,21 @@ void qwen_forward_rows(
             // projection in at all.
             auto routed_kernel=[&](std::uint32_t type,int in_size){
                 auto name=qwen_iq_grouped_kernel(type,"_q8_mmq_routed");
+                if(name.empty()){
+                    // The K-quant names are not derived from an IQ prefix.
+                    const char*family=type==10?"q2k":type==11?"q3k"
+                        :type==12?"q4k":type==13?"q5k":type==14?"q6k":nullptr;
+                    if(family)name=std::string(family)+"_q8_mmq_routed";
+                }
                 const int unit=type==20?32:256;
                 return (!name.empty()&&in_size%unit==0)?name:std::string();
+            };
+            // Q2_K, Q4_K and Q5_K carry a per-group minimum, so they come from
+            // the _MIN routed macro: 64 rows over 16 warps rather than 128 over
+            // 8. Launching one with the other's geometry reads past the staged
+            // tile, so the shape travels with the type.
+            auto routed_is_min=[](std::uint32_t type){
+                return type==10||type==12||type==13;
             };
             const auto routed_gate=routed_kernel(gate_type,hidden_size);
             const auto routed_up=routed_kernel(up_type,hidden_size);
@@ -2060,7 +2073,7 @@ void qwen_forward_rows(
                         const auto up_half=stream_act+
                             static_cast<std::uint64_t>(slots)*intermediate*sizeof(float);
                         int tile_count=count;
-                        auto routed_launch=[&](const std::string&name,
+                        auto routed_launch=[&](const std::string&name,bool is_min,
                                                std::uint64_t table,
                                                std::uint64_t input,
                                                std::uint64_t scales,
@@ -2075,14 +2088,19 @@ void qwen_forward_rows(
                                 const_cast<std::uint64_t*>(&output),
                                 &in_size,&out_size,token_map,scale_stride,
                                 &tile_count};
+                            const std::uint32_t row_tile=is_min?64u:128u;
                             launch(name.c_str(),
-                                   (static_cast<std::uint32_t>(out_size)+127)/128,
-                                   static_cast<std::uint32_t>(count),256,args);
+                                   (static_cast<std::uint32_t>(out_size)+row_tile-1)
+                                       /row_tile,
+                                   static_cast<std::uint32_t>(count),
+                                   is_min?512u:256u,args);
                         };
-                        routed_launch(routed_gate,routed_role_ptrs[0],
+                        routed_launch(routed_gate,routed_is_min(gate_type),
+                            routed_role_ptrs[0],
                             stream_packed_q8,stream_packed_scales,stream_act,
                             hidden_size,intermediate,&routed_top_k,&gate_scale_stride);
-                        routed_launch(routed_up,routed_role_ptrs[1],
+                        routed_launch(routed_up,routed_is_min(up_type),
+                            routed_role_ptrs[1],
                             stream_packed_q8,stream_packed_scales,up_half,
                             hidden_size,intermediate,&routed_top_k,&gate_scale_stride);
                         int silu_count=slots*intermediate;
@@ -2095,7 +2113,8 @@ void qwen_forward_rows(
                                         stream_act_scales,intermediate,slots);
                         // top_k 0: the down projection's input is the per-slot
                         // SwiGLU output, not a token row.
-                        routed_launch(routed_down,routed_role_ptrs[2],
+                        routed_launch(routed_down,routed_is_min(down_type),
+                            routed_role_ptrs[2],
                             stream_act_q8,stream_act_scales,stream_down,
                             intermediate,hidden_size,&slot_major,
                             &down_scale_stride);

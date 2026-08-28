@@ -1360,6 +1360,39 @@ How it fits the existing path, which is most of why the change is small:
   which holds for one-expert-per-launch and fails for a mixed-expert tile, and
   the corpus has no atomicAdd. Owning the output row is the fix.
 
+### Step 4: the K-quants, and what the win actually scales with
+
+The routed treatment applied twice, because `COLIBRI_Q8_MMQ_MIN` is a separate
+macro: Q4_K, Q5_K and Q2_K carry a per-group minimum that has to be cancelled
+against the activation's own sum, which is four extra staged arrays. That is
+what most MoE checkpoints in the wild ship, so leaving them out left the whole
+mechanism applicable to IQ quants only. `COLIBRI_Q8_MMQ_MIN_ROUTED` is 64 rows
+x 32 tokens over 16 warps -- 512 threads against the plain form's 256, so the
+launch geometry has to travel with the weight type or a launch reads past its
+staged tile.
+
+Thirteen routed kernels are now contract-pinned (worst 2.4e-8): the six IQ
+formats, iq2s, iq1m, q3k and q6k through the plain macro, and q4k, q5k, q2k
+through the MIN one.
+
+Measured end to end at 2048 tokens, greedy output token-identical in every case:
+
+| checkpoint | expert types | routed off | routed on | |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next UD-IQ1_S (68 GiB) | IQ1_S/IQ2_XXS/IQ4_NL | 22.27 s | 8.33 s | **2.7x** |
+| Qwen3.6-35B-A3B Q5_K_M (27 GiB) | Q5_K/Q6_K | 6.49 s | 5.85 s | 1.11x |
+| Ornith-1.5-35B Q4_K_M (21.7 GiB) | Q4_K/Q6_K | 5.15 s | 4.23 s | 1.22x |
+
+**The win scales with how much of the model does not fit, not with the kernel.**
+qwen4exp is 68 GiB against 12 GiB of VRAM, so prefill sweeps experts the cache
+cannot hold and nearly all of that work was on the host. At 21-27 GiB a much
+larger share is already GPU-resident through the expert cache, so there is
+correspondingly less host work for the routed path to take over. Both smaller
+figures are real and both are modest; neither is the 2.7x, and quoting the 2.7x
+as the feature's number would be wrong.
+
+That also says where the remaining headroom is for those checkpoints: not here.
+
 Opt-in rather than default: this is the first path to run these kernels end to
 end, and the gate combination that reaches it (`--hybrid-prefill cpu`, a cache
 seed, forced DMA paging, a stream arena) is narrow enough that the default
