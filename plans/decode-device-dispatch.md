@@ -924,13 +924,26 @@ is what separated the two, and it should have come first.
   format on the scalar path stands out immediately. Post-fix it reads IQ1_S
   0.72, IQ2_XXS 0.36.
 
-**Still on the scalar path, unmeasured**: types 17 (IQ2_XS) and 18 (IQ3_XXS)
-have SIMD dots and q8-K integer dots but no store-form dequant, so any model
-with those expert stacks pays the same 10x in batched prefill. That is exactly
-Laguna's layout (gate/up 17, down 18), and it is very likely why
-`COLIBRI_PREFILL_DIRECT_QUANT` is gated on for Laguna and measured 2x *slower*
-here: its dequant-then-GEMM comparison point is the scalar one. No Laguna
-checkpoint on this box to confirm, but the tripwire will announce it.
+**The same omission, two formats over — measured and fixed.** Types 17 (IQ2_XS)
+and 18 (IQ3_XXS) had SIMD dots and q8-K integer dots but no store-form dequant
+either. `colibri_qwen_moe_layer_bench` at the real shape, before and after:
+
+| format | before | after | dequant/gemm |
+|---|---|---|---|
+| IQ2_XS (17) | 44.5 GMAC/s | **626.4** | 27.9 -> 0.58 |
+| IQ3_XXS (18) | 43.6 GMAC/s | **649.7** | 28.0 -> 0.59 |
+
+**14-15x**, worse than the IQ2_XXS case that started this. `iq2xs_dequant` and
+`iq3xxs_dequant` are the store forms of the dots directly above them, pinned
+element-for-element by the contract. All four IQ expert formats now sit at
+0.46-0.84.
+
+Not validated end to end: no checkpoint on this box has 17/18 *expert* stacks
+(the local IQ2_XXS/IQ3_XXS models are dense). The exactness is contract-proven
+and the speedup is measured at the real shape, but the first model that runs
+this should be checked. That layout is Laguna's (gate/up 17, down 18), which
+also makes `COLIBRI_PREFILL_DIRECT_QUANT` worth re-measuring there: the gate
+exists because dequant-then-GEMM was the scalar path, and it no longer is.
 
 ### The split after the fix, and why the CPU path is now done
 

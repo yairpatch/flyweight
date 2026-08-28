@@ -4084,8 +4084,12 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     // IQ2_XXS belongs here too, and its absence was the wall that remained:
     // the unsloth UD mix puts it on the gate and up of 14 of 48 layers, and
     // those alone were 80% of the CPU expert phase's thread time.
-    if(type==16&&(colibri_cpu_features()&1u)!=0&&elements%256==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
-    if(type==19&&(colibri_cpu_features()&1u)!=0&&elements%256==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    // 17 and 18 were the same omission one model over: measured 44 GMAC/s
+    // against 623-768 for the formats that had a decoder, which is the expert
+    // layout Laguna ships.
+    if((type==16||type==17||type==18||type==19)&&
+       (colibri_cpu_features()&1u)!=0&&elements%256==0){
+        qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==20&&(colibri_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     // Everything past here re-derives a weight's block, group, scale and grid

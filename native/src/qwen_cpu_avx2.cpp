@@ -1466,6 +1466,60 @@ void iq2xxs_dequant(const std::uint8_t* row_data, float* output, int elements) {
     }
 }
 
+// IQ2_XS and IQ3_XXS, the two formats left on the per-element path after
+// IQ2_XXS came off it. Measured at the real shape by
+// tools/bench_moe_cpu_layer.cpp: 44 GMAC/s against 623-768 for the formats that
+// have a decoder, a dequant/gemm ratio of 27.9 against 0.4-0.8. Both are the
+// store form of the dot directly above them, and both keep the scalar's
+// operation order -- the group scale folds into one float and the sign is an
+// XOR of a magnitude -- so the contract pins them element for element.
+void iq2xs_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq2xsBlockBytes;
+        const float d = half_value(base);
+        float* out = output + block * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int scale = (base[66 + (group >> 1)] >> (4 * (group & 1))) & 15;
+            const __m256 weight =
+                _mm256_set1_ps(d * (0.5f + static_cast<float>(scale)) * 0.25f);
+            for (int half = 0; half < 2; ++half) {
+                std::uint16_t entry = 0;
+                std::memcpy(&entry, base + 2 + (group * 2 + half) * 2, 2);
+                const __m256 magnitudes = iq_signed_octet(
+                    kIq2xsGrid[entry & 511], kIq2xxsSigns[entry >> 9]);
+                _mm256_storeu_ps(out + group * 16 + half * 8,
+                                 _mm256_mul_ps(magnitudes, weight));
+            }
+        }
+    }
+}
+
+void iq3xxs_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq3xxsBlockBytes;
+        const float d = half_value(base);
+        float* out = output + block * 256;
+        for (int group = 0; group < 8; ++group) {
+            std::uint32_t aux = 0;
+            std::memcpy(&aux, base + 2 + 64 + group * 4, 4);
+            const __m256 weight =
+                _mm256_set1_ps(d * (0.5f + static_cast<float>(aux >> 28)) * 0.5f);
+            for (int quad = 0; quad < 4; ++quad) {
+                const auto* indices = base + 2 + group * 8 + quad * 2;
+                // The quad's eight magnitudes are two 4-byte grid entries laid
+                // end to end, which is exactly one signed octet.
+                const std::uint64_t grid =
+                    static_cast<std::uint64_t>(kIq3xxsGrid[indices[0]]) |
+                    (static_cast<std::uint64_t>(kIq3xxsGrid[indices[1]]) << 32);
+                const __m256 magnitudes = iq_signed_octet(
+                    grid, kIq2xxsSigns[(aux >> (7 * quad)) & 127]);
+                _mm256_storeu_ps(out + group * 32 + quad * 8,
+                                 _mm256_mul_ps(magnitudes, weight));
+            }
+        }
+    }
+}
+
 void iq1s_dequant(const std::uint8_t* row_data, float* output, int elements) {
     for (int block = 0; block < elements / 256; ++block) {
         const auto* base = row_data + block * kIq1sBlockBytes;
@@ -1502,8 +1556,8 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==13)q5_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*176,output,elements);
     else if(type==14)q6_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*210,output,elements);
     else if(type==16)iq2xxs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,output,elements);
-    else if(type==17){const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes;for(int i=0;i<elements;++i)output[i]=qwen_iq2xs_value(row_data,i);}
-    else if(type==18){const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes;for(int i=0;i<elements;++i)output[i]=qwen_iq3xxs_value(row_data,i);}
+    else if(type==17)iq2xs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,output,elements);
+    else if(type==18)iq3xxs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,output,elements);
     else if(type==19)iq1s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,output,elements);
     else if(type==20)iq4nl_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,output,elements);
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);

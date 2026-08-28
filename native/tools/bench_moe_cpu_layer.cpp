@@ -58,11 +58,23 @@ double now_seconds() {
 
 std::size_t block_bytes_of(std::uint32_t type) {
     if (type == 16) return kIq2xxsBlockBytes;
+    if (type == 17) return kIq2xsBlockBytes;
+    if (type == 18) return kIq3xxsBlockBytes;
     if (type == 19) return kIq1sBlockBytes;
     return kIq4nlBlockBytes;
 }
 
 int block_elements_of(std::uint32_t type) { return type == 20 ? 32 : 256; }
+
+const char* name_of(std::uint32_t type) {
+    switch (type) {
+        case 16: return "IQ2_XXS gate+up";
+        case 17: return "IQ2_XS  gate+up";
+        case 18: return "IQ3_XXS gate+up";
+        case 19: return "IQ1_S   gate+up";
+        default: return "IQ4_NL  gate+up";
+    }
+}
 
 // Random codes with sane f16 block scales. Random scale bit patterns would be
 // infinities and NaNs, which decode at a different speed and compare to
@@ -244,12 +256,13 @@ int main(int argc, char** argv) {
         kHidden;
     std::printf("%d rows, %d experts, top-%d, %d threads -- %.1f GMAC of gate+up\n",
                 rows, kExperts, kTopK, threads, macs / 1e9);
-    for (const std::uint32_t type : {std::uint32_t{19}, std::uint32_t{16}}) {
+    for (const std::uint32_t type : {std::uint32_t{19}, std::uint32_t{16},
+                                     std::uint32_t{17}, std::uint32_t{18}}) {
         const std::size_t expert_bytes = block_bytes_of(type) *
             (kHidden / block_elements_of(type)) * kIntermediate;
         const auto gate = random_packed(expert_bytes * kExperts, type, engine);
         const auto up = random_packed(expert_bytes * kExperts, type, engine);
-        const char* label = type == 19 ? "IQ1_S gate+up" : "IQ2_XXS gate+up";
+        const char* label = name_of(type);
         gate_phase(type, gate, up, routing, vectors, activated, threads);  // warm
         report(label, type,
                gate_phase(type, gate, up, routing, vectors, activated, threads),

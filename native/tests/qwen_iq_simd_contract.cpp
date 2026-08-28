@@ -200,6 +200,8 @@ int main() {
         dequant_check("iq1s", 19, kIq1sBlockBytes, 256, qwen_iq1s_value);
         dequant_check("iq4nl", 20, kIq4nlBlockBytes, 32, qwen_iq4nl_value);
         dequant_check("iq2xxs", 16, kIq2xxsBlockBytes, 256, qwen_iq2xxs_value);
+        dequant_check("iq2xs", 17, kIq2xsBlockBytes, 256, qwen_iq2xs_value);
+        dequant_check("iq3xxs", 18, kIq3xxsBlockBytes, 256, qwen_iq3xxs_value);
     }
     // 32-element native blocks, and 640-wide rows in the wild: the
     // admission gates on %32, so the contract runs the same width.
