@@ -4462,6 +4462,42 @@ std::uint64_t qwen_stage_embedding_rows(
 // from GGUF metadata verbatim; all arithmetic is u64 with wraparound, which
 // matches the reference's int64 because the products are bounded below 2^63
 // and xor cannot set the sign bit (plans/qwen4exp-semantics.md).
+// Tell the kernel how the big host-resident tensors are actually read.
+//
+// The mapping is opened POSIX_FADV_SEQUENTIAL because the loader walks tensors
+// in order and the weights are then read densely. The n-gram table is the
+// exception and it is a large one: 26.8 GiB, 40% of a qwen4exp checkpoint, and
+// qwen4_stage_ple_embed gathers a handful of 90-byte rows out of 320 million by
+// hash. Sequential readahead into that is pure waste -- the kernel faults in a
+// readahead window to use ninety bytes of it, and evicts expert weights that
+// are read densely to make room.
+//
+// This is llama.cpp's lazy-range idea (llama-mmap.cpp: tensors it will not
+// prefetch get POSIX_MADV_RANDOM, and MAP_POPULATE is dropped entirely when any
+// exist, because POPULATE cannot be selective). The policy has to be per range,
+// not per file.
+void qwen_advise_access_pattern(const ColibriV2QwenRuntime& runtime) {
+#if !defined(_WIN32) && defined(MADV_RANDOM)
+    // Kill switch: this is a hint whose effect is invisible in correctness and
+    // only shows up in I/O, so it needs to be switchable to be measurable.
+    static const char* setting = std::getenv("COLIBRI_ADVISE_RANDOM");
+    if (setting && setting[0] == '0') return;
+    if (runtime.ple_table == std::numeric_limits<std::uint64_t>::max()) return;
+    const auto& table = runtime.model->tensors[runtime.ple_table];
+    const auto* address = tensor_data(*runtime.model, table);
+    if (!address || !table.size) return;
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto begin = reinterpret_cast<std::uintptr_t>(address) & ~(page - 1);
+    const auto end = (reinterpret_cast<std::uintptr_t>(address) + table.size
+                      + page - 1) & ~(page - 1);
+    // Advisory: a failure here costs readahead, not correctness.
+    (void)madvise(reinterpret_cast<void*>(begin),
+                  static_cast<std::size_t>(end - begin), MADV_RANDOM);
+#else
+    (void)runtime;
+#endif
+}
+
 void qwen4_stage_ple_embed(
     ColibriV2QwenRuntime& runtime, std::uint32_t token,
     const std::vector<std::uint32_t>& history, std::uint64_t destination
@@ -5412,6 +5448,14 @@ int colibri_v2_gpu_decoder_attention_cached(ColibriV2KvCache*cache,uint64_t inpu
 void map_file(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&model; m->path=path;
 #if !defined(_WIN32)
     m->fd=open(path,O_RDONLY); if(m->fd<0) throw std::runtime_error("cannot open GGUF"); struct stat st{}; if(fstat(m->fd,&st)!=0) throw std::runtime_error("cannot stat GGUF"); m->size=static_cast<size_t>(st.st_size);
+#if defined(POSIX_FADV_SEQUENTIAL)
+    // Weights are read front to back as the loader walks tensors, so tell the
+    // kernel to read ahead accordingly. Advisory and free. The one region this
+    // is wrong for -- the hashed n-gram table, which is gathered a row at a
+    // time -- is marked back to random once the tensor map says where it is;
+    // see qwen_advise_access_pattern.
+    (void)posix_fadvise(m->fd,0,0,POSIX_FADV_SEQUENTIAL);
+#endif
     const char* lock_env=std::getenv("COLIBRI_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
     int map_flags=MAP_PRIVATE;
 #ifdef MAP_POPULATE
@@ -12664,6 +12708,9 @@ static bool qwen_mmq_wide(){
     return enabled&&!colibri_backend_is_cpu();
 }
 int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded([&]{
+    // Before anything reads weights in bulk: the hashed n-gram table is not
+    // read the way the rest of the mapping is, and the kernel cannot know that.
+    qwen_advise_access_pattern(*runtime);
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     if(runtime->static_arena)return 0;
     if(colibri_gpu_init(runtime->options.device)!=0)throw std::runtime_error("failed to initialize native CUDA runtime");
