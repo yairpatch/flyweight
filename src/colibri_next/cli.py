@@ -512,6 +512,16 @@ def _add_runtime_options(
              "buffer, direct DMAs from registered host memory",
     )
     add(
+        tuning, "--routed-moe", action="store_true",
+        help="run prompt processing's routed experts through the block-table "
+             "MMQ kernels, which is several times faster than the host expert "
+             "phase on checkpoints whose experts do not fit in VRAM. Supplies "
+             "the settings it depends on (direct expert paging, a prefill "
+             "expert stream budget, a prefill cache seed, host-side prefill "
+             "placement) unless you asked for something else, in which case it "
+             "refuses to start rather than quietly not engaging",
+    )
+    add(
         tuning, "--prefill-cache-seed", type=_prefill_cache_seed, default=None,
         metavar="{auto,off,N}",
         help="hottest prompt-routed experts to pin per layer once the prompt "
@@ -1090,7 +1100,7 @@ def _runtime_options(args: argparse.Namespace) -> dict[str, object]:
         "device", "expert_mode", "mtp_drafts", "cache_type_k", "cache_type_v",
         "prefill_checkpoint_interval", "prefill_checkpoint_slots",
         "parallel_sequences", "prompt_cache_mib", "swa_full",
-        "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
+        "routed_moe", "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
         "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
         "hybrid_prefill", "expert_residency", "expert_top_k", "expert_top_p",
         "dense_requant",
@@ -1258,7 +1268,7 @@ _DEEPSEEK4_UNSUPPORTED = (
     "gpu_cache_mib", "expert_mode", "hybrid_prefill",
     "expert_residency", "dense_requant",
     "cache_type_k", "cache_type_v", "prompt_cache_mib", "swa_full",
-    "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
+    "routed_moe", "prefill_cache_seed", "expert_paging", "cpu_prefetch_mib",
     "cpu_prefetch_auto", "next_layer_prefetch", "cpu_threads",
     "prefill_checkpoint_interval", "prefill_checkpoint_slots",
 )
@@ -1456,6 +1466,7 @@ def _serve(args: argparse.Namespace) -> int:
         prompt_cache_mib=args.prompt_cache_mib,
         swa_full=args.swa_full,
         prefill_cache_seed=args.prefill_cache_seed,
+        routed_moe=args.routed_moe,
         expert_paging=args.expert_paging,
         cpu_prefetch_mib=args.cpu_prefetch_mib,
         cpu_prefetch_auto=args.cpu_prefetch_auto,

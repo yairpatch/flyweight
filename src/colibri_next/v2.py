@@ -255,6 +255,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("strict_resident", ctypes.c_uint32),
         ("dense_requant", ctypes.c_uint32),
         ("prefill_expert_stream_mib", ctypes.c_int32),
+        ("routed_moe", ctypes.c_uint32),
     ]
 
 
@@ -2064,6 +2065,7 @@ class V2Model:
         expert_residency: str | None = None,
         dense_requant: str = "auto",
         prefill_expert_stream_mib: int = -1,
+        routed_moe: bool = False,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -2092,6 +2094,7 @@ class V2Model:
             expert_residency=expert_residency,
             dense_requant=dense_requant,
             prefill_expert_stream_mib=prefill_expert_stream_mib,
+            routed_moe=routed_moe,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -2472,6 +2475,7 @@ class V2QwenRuntime:
         expert_residency: str | None = None,
         dense_requant: str = "auto",
         prefill_expert_stream_mib: int = -1,
+        routed_moe: bool = False,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -2503,6 +2507,10 @@ class V2QwenRuntime:
             "legacy-hybrid",
             "legacy-paging",
         }
+        # Captured before the default below overwrites it: routed_moe must be
+        # able to tell "the caller asked for off" from "a legacy policy chose
+        # off for them", and only refuse the first.
+        prefill_cache_seed_requested = prefill_cache_seed is not None
         if prefill_cache_seed is None:
             prefill_cache_seed = "off" if legacy_policy else "auto"
         if expert_residency is None:
@@ -2548,6 +2556,44 @@ class V2QwenRuntime:
             effective_hybrid_prefill = (
                 "cpu" if resolved_expert_mode == "auto" else "split"
             )
+        # The routed MoE path needs four other settings to line up, and its
+        # failure mode when they do not is silence: the stream gate closes and
+        # prefill runs exactly as before, several times slower, with nothing
+        # said. So this supplies each prerequisite only where the caller left it
+        # unset, and refuses outright where the caller asked for the opposite.
+        # `None` is what makes that distinction expressible, which is why the
+        # defaulting lives here and not in the native prepare.
+        if routed_moe:
+            if hybrid_prefill == "split":
+                raise ValueError(
+                    "routed_moe needs hybrid_prefill='cpu': the streaming path "
+                    "it runs in is gated on host-side prefill placement, and "
+                    "'split' leaves the routed experts on the per-route cache "
+                    "path instead"
+                )
+            if hybrid_prefill is None:
+                effective_hybrid_prefill = "cpu"
+            if expert_paging == "staged":
+                raise ValueError(
+                    "routed_moe needs expert_paging='direct': staging copies "
+                    "leave dma_paging off, and the streaming path requires it"
+                )
+            expert_paging = "direct"
+            if prefill_cache_seed_requested and prefill_cache_seed == "off":
+                raise ValueError(
+                    "routed_moe needs a prefill cache seed: direct paging only "
+                    "registers expert tensors when routed GPU execution is "
+                    "allowed, which seeding is what turns on"
+                )
+            if prefill_cache_seed == "off":
+                prefill_cache_seed_count, prefill_cache_seed_auto = (
+                    _normalize_prefill_cache_seed("auto")
+                )
+            # -1 is "auto", which resolves to the 48 MiB tuned for the old
+            # per-expert path. The routed kernels measured best at 512 MiB
+            # (246 tok/s against 217 at 1024 and 209 at 2048).
+            if prefill_expert_stream_mib < 0:
+                prefill_expert_stream_mib = 512
         effective_expert_residency = expert_residency
         if mtp_drafts < 0 or mtp_drafts > 8:
             raise ValueError("mtp_drafts must be between 0 and 8")
@@ -2597,6 +2643,7 @@ class V2QwenRuntime:
             int(strict_resident),
             {"auto": 0, "q8": 1, "off": 2}[dense_requant],
             prefill_expert_stream_mib,
+            int(routed_moe),
         )
         model._check(
             self._lib.colibri_v2_qwen_runtime_create(

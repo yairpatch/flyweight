@@ -48,6 +48,78 @@ class V2RuntimeTests(unittest.TestCase):
                 object(), expert_mode="auto", moe_device="cpu"
             )
 
+    def test_routed_moe_supplies_its_prerequisites(self):
+        """--routed-moe fills in what it needs, so one flag is enough."""
+
+        class FakeLibrary:
+            def __init__(self):
+                self.options = b""
+
+            def colibri_v2_qwen_runtime_create(self, _model, options, _runtime):
+                self.options = ctypes.string_at(
+                    options, ctypes.sizeof(_QwenRuntimeOptions)
+                )
+                return 0
+
+        class FakeModel:
+            def __init__(self):
+                self._lib = FakeLibrary()
+                self._handle = ctypes.c_void_p(1)
+
+            def _check(self, status):
+                self.assert_status = status
+
+        model = FakeModel()
+        V2QwenRuntime(model, routed_moe=True)
+        native = _QwenRuntimeOptions.from_buffer_copy(model._lib.options)
+        self.assertEqual(native.routed_moe, 1)
+        # Host-side prefill placement, or the stream gate the routed kernels
+        # run behind never opens.
+        self.assertEqual(native.hybrid_prefill_cpu, 1)
+        # Direct paging, or dma_paging stays off and the gate closes again.
+        self.assertEqual(native.expert_paging, 2)
+        # A seed, because direct registration only happens when routed GPU
+        # execution is allowed, which seeding is what turns on.
+        self.assertEqual(native.prefill_cache_seed_auto, 1)
+        # The arena the routed kernels measured best with, rather than the
+        # 48 MiB auto tuned for the per-expert path they replace.
+        self.assertEqual(native.prefill_expert_stream_mib, 512)
+
+    def test_routed_moe_refuses_settings_that_would_disable_it(self):
+        """Silently not engaging is the failure this flag exists to prevent."""
+        with self.assertRaisesRegex(ValueError, "hybrid_prefill"):
+            V2QwenRuntime(object(), routed_moe=True, hybrid_prefill="split")
+        with self.assertRaisesRegex(ValueError, "expert_paging"):
+            V2QwenRuntime(object(), routed_moe=True, expert_paging="staged")
+        with self.assertRaisesRegex(ValueError, "prefill cache seed"):
+            V2QwenRuntime(object(), routed_moe=True, prefill_cache_seed="off")
+
+    def test_routed_moe_leaves_explicit_choices_alone(self):
+        """Only unset settings are defaulted; a compatible explicit one stands."""
+
+        class FakeLibrary:
+            def __init__(self):
+                self.options = b""
+
+            def colibri_v2_qwen_runtime_create(self, _model, options, _runtime):
+                self.options = ctypes.string_at(
+                    options, ctypes.sizeof(_QwenRuntimeOptions)
+                )
+                return 0
+
+        class FakeModel:
+            def __init__(self):
+                self._lib = FakeLibrary()
+                self._handle = ctypes.c_void_p(1)
+
+            def _check(self, status):
+                self.assert_status = status
+
+        model = FakeModel()
+        V2QwenRuntime(model, routed_moe=True, prefill_expert_stream_mib=1024)
+        native = _QwenRuntimeOptions.from_buffer_copy(model._lib.options)
+        self.assertEqual(native.prefill_expert_stream_mib, 1024)
+
     def test_expert_mode_aliases_build_identical_native_options(self):
         class FakeLibrary:
             def __init__(self):

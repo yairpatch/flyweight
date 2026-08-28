@@ -129,6 +129,13 @@ typedef struct ColibriV2QwenRuntimeOptions {
     uint32_t strict_resident; /* streamed GPU: require and prepare the complete routed-expert set */
     uint32_t dense_requant; /* 0=auto from GPU pressure, 1=force BF16->Q8_0, 2=off */
     int32_t prefill_expert_stream_mib; /* GPU expert-GEMM budget for host-routed prefill: -1 auto, 0 off */
+    uint32_t routed_moe; /* run prefill's routed experts through the block-table MMQ.
+                            Turning this on supplies the prerequisites it needs
+                            (direct paging, a stream arena, a prefill cache seed,
+                            host-side prefill placement) wherever the caller left
+                            them at their defaults, and refuses to prepare if the
+                            caller asked for something incompatible -- the failure
+                            it exists to prevent is engaging silently. */
 } ColibriV2QwenRuntimeOptions;
 
 typedef struct ColibriV2QwenRuntimeInfo {

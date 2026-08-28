@@ -1952,10 +1952,13 @@ void qwen_forward_rows(
             // plans/decode-device-dispatch.md. Opt-in for now: this is the
             // first path to run them end to end, and the project does not turn
             // on a numerics-affecting route silently.
-            static const bool routed_setting=[]{
-                const char*value=std::getenv("COLIBRI_ROUTED_MOE");
-                return value&&value[0]=='1';
-            }();
+            // The option is the supported switch; the env var stays as an
+            // override so the path can be A/B'd against itself without
+            // rebuilding a runtime.
+            static const char*routed_env=std::getenv("COLIBRI_ROUTED_MOE");
+            const bool routed_setting=routed_env
+                ? routed_env[0]=='1'
+                : runtime.options.routed_moe!=0;
             // A format reaches the routed kernel when it has one and the width
             // divides its blocking: 256 for the super-block formats, 32 for
             // IQ4_NL's flat blocks, which is what lets the 640-wide down
