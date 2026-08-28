@@ -818,6 +818,90 @@ uploads 11.75 s / group compute 21.96 s / non-expert ~22 s. So:
    fused kernel vLLM and llama.cpp use.
 3. Non-expert GPU work is ~6.4 s of kernels and is not worth touching.
 
+## CORRECTION (2026-08-28, later): that bottleneck is the STAGING regime only
+
+Everything in the section below was measured with a **full 2048 MiB staging arena**,
+which is not the default — expert streaming defaults off. Under the shipped default
+the picture is completely different, and the dispatch count is not the problem.
+
+**Wall-clock phase split, 4158-token prefill, default config** (`COLIBRI_TIMING=1`
++ `COLIBRI_PREFILL_PROFILE=1`, 8 prefill calls):
+
+| phase | seconds | share |
+|---|---|---|
+| **CPU expert phase** | **44.25** | **96.3%** |
+| route wait | 0.74 | 1.6% |
+| GPU core | 0.41 | 0.9% |
+| unattributed | 0.54 | 1.2% |
+| total | 45.94 | 90.5 tok/s |
+
+The GPU does ~1% of prefill. Dispatch count, kernel shape and upload bandwidth are
+all irrelevant here. **~65-70% of routed experts run on the CPU**, because the GPU
+expert cache hits only 30-35% during prefill (against ~69% in decode), and the CPU
+is ~8x slower per byte (51 vs 391 GB/s).
+
+Why the cache cannot fix itself: a 4158-token prefill issues ~41,580 routes spread
+over essentially all 24,576 expert instances, while the cache holds ~3,226 slots
+(13%). Prefill touches nearly everything once; there is no reuse for an LRU to
+exploit. Decode is the opposite — 480 routes per token with strong recurrence.
+
+**Three hypotheses falsified, in order, each by measurement:**
+1. *Dispatch count* — that is the staging regime, not the default (see split above).
+2. *Direct-quant dots* (`COLIBRI_PREFILL_DIRECT_QUANT=1`, which lifts the Laguna-only
+   gate): **2x SLOWER** — 45.8/43.8 tok/s against 89.0/84.6. Identical output. The
+   existing dequant-then-GEMM decodes each weight row once and GEMMs it against all
+   ~20 tokens routed to that expert; the direct path re-decodes per 8-token tile.
+   The gate is correct and should stay.
+3. *Bigger chunks to amortise dequant further* — flat: 89.7 / 90.5 / 89.2 tok/s at
+   `COLIBRI_PREFILL_ROWS` 1024 / 2048 / 4096. Dequant is already amortised as far as
+   chunking takes it.
+
+**Lesson: phase split before mechanism.** All three cost a measurement that reading
+the wall-clock split first would have avoided.
+
+**Open correctness flag**: chunk size changed the first generated token (1024 ->
+`201`, 2048/4096 -> `248046` = EOS). The prompt was synthetic near-tied garbage and
+[[qwen4exp-support]] already records batch-vs-single CPU-MoE summation drift on this
+quant, so it may be benign — but prefill should not be that chunk-sensitive, and
+this was not run on real text. Check before treating `COLIBRI_PREFILL_ROWS` as a
+tuning knob.
+
+## NEXT AREA: colibri's CPU expert path is several times slower than llama.cpp's
+
+The cross-check that localises it. Same GGUF, same box, `llama-bench`:
+
+| engine | expert placement | pp512 |
+|---|---|---|
+| llama.cpp `-ncmoe 48` | **100%** of experts on CPU | **196.5 tok/s** |
+| llama.cpp `-ncmoe 44` | 4 layers GPU, 44 on CPU | 367.9 tok/s |
+| colibri (default) | ~30-35% GPU, 65-70% CPU | ~45 tok/s at 591 tokens |
+
+llama.cpp doing **more** CPU expert work than colibri is still ~4x faster. So the
+gap is not expert placement and not the GPU path — **it is the CPU expert kernel
+itself**, and that is where prefill work should go next.
+
+The likely mechanism, and it matches what [[qwen4exp-support]] already flagged
+("the remaining 98% of prefill is the f32 dot_multi GEMM over decoded rows —
+quantized dot_multi templates for 19/20 are the next lever"):
+
+- colibri decodes IQ1_S/IQ2_XXS/IQ4_NL weight rows to **f32** and runs an f32 GEMM.
+  That is a 2-4x byte expansion plus float math, and the measured
+  `gate{dequant=446s gemm=119s}` says the decode alone is 3.75x the GEMM it feeds.
+- llama.cpp quantizes the **activations** to Q8_K once per chunk and does **integer
+  dot products** straight against the packed weights (`ggml_vec_dot_iq1_s_q8_K` and
+  friends, VNNI/AVX2). No weight decode at all.
+
+So the target is a third path, distinct from both existing ones: **quantize the
+chunk's activations to Q8 once, then int8-dot against the packed expert weights.**
+The GPU side of the runtime already does exactly this (`stream_quantize`,
+`iq1s_q8_mmq`); the CPU MoE never got it.
+
+*Before building it*: measure a single CPU expert matmul in isolation, colibri's
+dequant+GEMM against a q8-activation int-dot prototype, at the real shape
+(2560x640, ~20 tokens). The end-to-end numbers above compare configurations with
+different expert placement, so they bound the opportunity but do not prove the
+mechanism. Do not repeat this session's mistake of designing from an inferred cause.
+
 ## The prefill bottleneck, established (2026-08-28)
 
 Measured with `COLIBRI_PREFILL_LAUNCH_TIME=1`, 784-token prompt, at the two ends
