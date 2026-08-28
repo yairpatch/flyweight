@@ -989,7 +989,7 @@ extern "C" int colibri_gpu_compile(
              // The same dispatch shape over the MMQ tensor-core core
              "iq1s_q8_mmq_routed", "iq2xxs_q8_mmq_routed",
              "iq2xs_q8_mmq_routed", "iq3xxs_q8_mmq_routed",
-             "iq4xs_q8_mmq_routed",
+             "iq4xs_q8_mmq_routed", "iq4nl_q8_mmq_routed",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",

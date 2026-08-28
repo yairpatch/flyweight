@@ -1298,11 +1298,35 @@ padded slots are checked to be exactly 0.0 — the SwiGLU and scatter behind thi
 run over them unconditionally, so a stale value there is a wrong answer for a
 real token rather than wasted work.
 
-**What is still missing: the down projection.** IQ4_NL has no MMQ and cannot
-have this one — the macro needs `input_size % 256 == 0` and the expert down
-rows are 640 wide, which is exactly the note in the format table. So the down
-half is still the octet kernel at 76.8 ms/layer, which is worse than the CPU.
-Until a routed form of `iq4nl_matmul_rows` exists, the reachable shape is
-gate+up on the device and down on the host: ~0.22 s + ~2.0 s against ~5.4 s per
-chunk, so ~2.4x before uploads. The routed down kernel is the next piece, and
-it wants the `quad_pack` rows engine rather than this one.
+**The down projection, on the same kernel.** IQ4_NL's exclusion from MMQ was
+arithmetic, not layout: the macro hardcoded `input_size >> 8` and 640-wide
+expert rows are not a whole number of 256-element super-blocks. Two parameters
+fix that — `block_shift` / `group_shift` carry the format's blocking, (8, 3)
+for a super-block and **(5, 0) for IQ4_NL's flat 32**, whose block simply *is*
+a group. `iq4nl_q8_decode` reconstructs the nibbles through `kIq4nlValues` the
+same way `iq4xs_q8_group` already did.
+
+The down projection also needs **slot-major** activations — its input is the
+per-slot SwiGLU output, not a token row — which `top_k == 0` selects.
+
+| | ms/layer | achieved | against the octet kernel |
+|---|---|---|---|
+| `iq1s_q8_mmq_routed` x2 (gate+up) | 4.57 | 7348 GMAC/s | **12.6x** |
+| `iq4nl_q8_mmq_routed` (down) | 3.05 | 5507 GMAC/s | **25.0x** |
+| **whole expert phase** | **7.61** | | **0.37 s per 48-layer chunk** |
+
+Against the ~5.4 s the CPU spends per chunk today, that is **14.6x on the
+expert compute**, and it moves the bound where the earlier estimate said it
+would go: **uploads**. 37 GiB of expert weights per 1024-row chunk at ~26 GB/s
+is ~1.4 s, so a wired path lands near ~1.4-1.8 s per chunk against 5.4 s —
+about **3x on prefill**, upload-bound, exactly the ceiling this document
+predicted before the kernel existed.
+
+**Step 3 is now worth wiring**, and for a measured reason rather than a traffic
+ratio. What it needs, in order: the aligned layout per layer at
+`kMmqBlockSize`; the chunk's activations quantized to Q8 **once per layer**
+rather than once per expert; three launches (gate, up, down) plus `silu_mul`
+and a scatter; and the reconciliation with the CPU path for routes the GPU does
+not cover. The remaining risk is buffer sizing, not throughput — `down_out` at
+`padded_total x hidden` is ~168 MB at 1024 rows, which wants tiling over blocks
+on a 12 GB card that is already holding an expert cache.

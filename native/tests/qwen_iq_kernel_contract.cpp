@@ -859,6 +859,10 @@ int main() {
     failures += check_routed_mmq("iq2xs_q8_mmq_routed", kIq2xs, kMmqThreads);
     failures += check_routed_mmq("iq3xxs_q8_mmq_routed", kIq3xxs, kMmqThreads);
     failures += check_routed_mmq("iq4xs_q8_mmq_routed", kIq4xs, kMmqThreads);
+    // IQ4_NL exercises the flat-block shifts (5, 0) rather than the
+    // super-block (8, 3) every other format above takes, which is the whole
+    // reason the expert down projection can reach this kernel at all.
+    failures += check_routed_mmq("iq4nl_q8_mmq_routed", kIq4nl, kMmqThreads);
     failures += check_tiled("iq2xxs_q8_matmul_tiled", kIq2xxs, kTiledThreads);
     failures += check_tiled("iq3xxs_q8_matmul_tiled", kIq3xxs, kTiledThreads);
     failures += check_tiled("iq2xs_q8_matmul_tiled", kIq2xs, kTiledThreads);

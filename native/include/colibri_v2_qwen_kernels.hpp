@@ -2856,7 +2856,17 @@ R"COLIBRI_CUDA(
 #define COLIBRI_MOE_MMQ_ROWS (COLIBRI_MOE_MMQ_ROW_WARPS * COLIBRI_MOE_MMQ_ROW_FRAGS * 16)
 // MUST match colibri::v2::moe::kMmqBlockSize in colibri_v2_moe_align.hpp.
 #define COLIBRI_MOE_MMQ_TOKENS (COLIBRI_MOE_MMQ_TOKEN_WARPS * COLIBRI_MOE_MMQ_TOKEN_FRAGS * 8)
-#define COLIBRI_Q8_MMQ_ROUTED(name, decode_fn, stride)                         \
+// `block_shift` / `group_shift` carry the format's blocking: a 256-element
+// super-block with eight 32-wide groups is (8, 3), and IQ4_NL's flat 32-element
+// block is (5, 0). The plain COLIBRI_Q8_MMQ hardcodes the first, which is the
+// reason the expert down projection -- 640 wide, so not a whole number of
+// super-blocks -- has no MMQ of its own.
+//
+// `top_k` of 0 means the activations are already slot-major, which is what the
+// down projection needs: its input is the per-slot SwiGLU output, not a token
+// row. Any positive value means token-major, and a slot reads the token its
+// route names.
+#define COLIBRI_Q8_MMQ_ROUTED(name, decode_fn, stride, block_shift, group_shift)\
 extern "C" __global__                                                          \
 __launch_bounds__(COLIBRI_MOE_MMQ_ROW_WARPS * COLIBRI_MOE_MMQ_TOKEN_WARPS * 32, 1)\
 void name(                                                                     \
@@ -2872,8 +2882,8 @@ void name(                                                                     \
     const int slot_base = route_block * COLIBRI_MOE_MMQ_TOKENS;                \
     const unsigned char* packed =                                              \
         (const unsigned char*)expert_ptrs[block_experts[route_block]];         \
-    const int blocks_per_row = input_size >> 8;                                \
-    const int groups_per_row = blocks_per_row << 3;                            \
+    const int blocks_per_row = input_size >> (block_shift);                    \
+    const int groups_per_row = blocks_per_row << (group_shift);                \
     __shared__ int4 w_units[COLIBRI_MOE_MMQ_ROWS][COLIBRI_MMQ_ROW_UNITS];      \
     __shared__ float w_low[COLIBRI_MOE_MMQ_ROWS][COLIBRI_MMQ_GROUPS];          \
     __shared__ float w_high[COLIBRI_MOE_MMQ_ROWS][COLIBRI_MMQ_GROUPS];         \
@@ -2922,7 +2932,8 @@ void name(                                                                     \
             const int g = i - t * COLIBRI_MMQ_GROUPS;                          \
             const int route = sorted_routes[slot_base + t];                    \
             if (route >= 0 && base + g < groups_per_row) {                     \
-                const long long token = route / top_k;                         \
+                const long long token = top_k > 0                              \
+                    ? (long long)(route / top_k) : (long long)(slot_base + t); \
                 const int4* source = (const int4*)(                            \
                     vectors + token * input_size                               \
                     + (long long)(base + g) * 32);                             \
@@ -3782,7 +3793,7 @@ __device__ __forceinline__ void iq2xxs_q8_decode(
 COLIBRI_Q8_MATVEC_ROWS(iq2xxs_q8_matvec_transposed_rows, iq2xxs_q8_decode, 66)
 COLIBRI_Q8_MATMUL_TILED(iq2xxs_q8_matmul_tiled, iq2xxs_q8_decode, 66)
 COLIBRI_Q8_MMQ(iq2xxs_q8_mmq, iq2xxs_q8_decode, 66)
-COLIBRI_Q8_MMQ_ROUTED(iq2xxs_q8_mmq_routed, iq2xxs_q8_decode, 66)
+COLIBRI_Q8_MMQ_ROUTED(iq2xxs_q8_mmq_routed, iq2xxs_q8_decode, 66, 8, 3)
 
 
 // Decode Q4_K against a vector quantized in independent 32-value Q8 blocks.
@@ -4015,7 +4026,7 @@ __device__ __forceinline__ void iq3xxs_q8_decode(
 COLIBRI_Q8_MATVEC_ROWS(iq3xxs_q8_matvec_transposed_rows, iq3xxs_q8_decode, 98)
 COLIBRI_Q8_MATMUL_TILED(iq3xxs_q8_matmul_tiled, iq3xxs_q8_decode, 98)
 COLIBRI_Q8_MMQ(iq3xxs_q8_mmq, iq3xxs_q8_decode, 98)
-COLIBRI_Q8_MMQ_ROUTED(iq3xxs_q8_mmq_routed, iq3xxs_q8_decode, 98)
+COLIBRI_Q8_MMQ_ROUTED(iq3xxs_q8_mmq_routed, iq3xxs_q8_decode, 98, 8, 3)
 
 
 
@@ -4860,7 +4871,43 @@ __device__ __forceinline__ void iq4xs_q8_decode(
 COLIBRI_Q8_MATVEC_ROWS(iq4xs_q8_matvec_transposed_rows, iq4xs_q8_decode, 136)
 COLIBRI_Q8_MATMUL_TILED(iq4xs_q8_matmul_tiled, iq4xs_q8_decode, 136)
 COLIBRI_Q8_MMQ(iq4xs_q8_mmq, iq4xs_q8_decode, 136)
-COLIBRI_Q8_MMQ_ROUTED(iq4xs_q8_mmq_routed, iq4xs_q8_decode, 136)
+COLIBRI_Q8_MMQ_ROUTED(iq4xs_q8_mmq_routed, iq4xs_q8_decode, 136, 8, 3)
+
+// IQ4_NL for the routed MMQ: 18 bytes per 32 values -- d(2) then sixteen
+// nibble pairs -- so one block IS one group and the (5, 0) shifts apply. Byte j
+// holds element j in its low nibble and element j+16 in its high one, the same
+// split iq4xs_q8_group describes, which is why the halves land four words
+// apart. Both k16 halves share the block scale, so low and high are equal.
+//
+// This is the format the expert down projection carries, and the reason it had
+// no MMQ before is arithmetic, not layout: 640-wide rows are not a whole number
+// of 256-element super-blocks. Nothing about the codes needed a new idea.
+__device__ __forceinline__ void iq4nl_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const unsigned char* base = row_data + linear_group * 18;
+    unsigned int codes[4];
+    memcpy(codes, base + 2, 16);
+    #pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        const unsigned int word = codes[step];
+        words[step] =
+            ((int)(unsigned char)kIq4nlValues[(word >> 0) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 8) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 16) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 24) & 15] << 24);
+        words[step + 4] =
+            ((int)(unsigned char)kIq4nlValues[(word >> 4) & 15])
+            | ((int)(unsigned char)kIq4nlValues[(word >> 12) & 15] << 8)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 20) & 15] << 16)
+            | ((int)(unsigned char)kIq4nlValues[(word >> 28) & 15] << 24);
+    }
+    const float d = __half2float(*((const __half*)base));
+    *scale_low = d;
+    *scale_high = d;
+}
+
+COLIBRI_Q8_MMQ_ROUTED(iq4nl_q8_mmq_routed, iq4nl_q8_decode, 18, 5, 0)
 
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
@@ -5607,7 +5654,7 @@ __device__ __forceinline__ void iq1s_q8_decode(
 COLIBRI_Q8_MATVEC_ROWS(iq1s_q8_matvec_transposed_rows, iq1s_q8_decode, 50)
 COLIBRI_Q8_MATMUL_TILED(iq1s_q8_matmul_tiled, iq1s_q8_decode, 50)
 COLIBRI_Q8_MMQ(iq1s_q8_mmq, iq1s_q8_decode, 50)
-COLIBRI_Q8_MMQ_ROUTED(iq1s_q8_mmq_routed, iq1s_q8_decode, 50)
+COLIBRI_Q8_MMQ_ROUTED(iq1s_q8_mmq_routed, iq1s_q8_decode, 50, 8, 3)
 
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
@@ -5782,7 +5829,7 @@ __device__ __forceinline__ void iq2xs_q8_decode(
 COLIBRI_Q8_MATVEC_ROWS(iq2xs_q8_matvec_transposed_rows, iq2xs_q8_decode, 74)
 COLIBRI_Q8_MATMUL_TILED(iq2xs_q8_matmul_tiled, iq2xs_q8_decode, 74)
 COLIBRI_Q8_MMQ(iq2xs_q8_mmq, iq2xs_q8_decode, 74)
-COLIBRI_Q8_MMQ_ROUTED(iq2xs_q8_mmq_routed, iq2xs_q8_decode, 74)
+COLIBRI_Q8_MMQ_ROUTED(iq2xs_q8_mmq_routed, iq2xs_q8_decode, 74, 8, 3)
 
 )COLIBRI_CUDA"
 R"COLIBRI_CUDA(
