@@ -987,10 +987,14 @@ measured interleaved, three paired rounds (off 184.3/169.1/164.9, auto
 which is this box's clock drift, not a result. Default left alone.
 
 So the bulk can only move by **streaming experts per chunk**, whose blocker is
-the ~150k tiny dispatches — the thing the block-major fused kernels below were
-built for and have not yet been wired to. Rough ceiling for that route: 37 GiB
-of expert weights per 1024-row chunk at ~26 GB/s H2D is ~1.4 s per chunk
-against the CPU phase's ~4.9 s, so **~2-3x on prefill**, upload-bound.
+the ~150k tiny dispatches. Rough ceiling for that route: 37 GiB of expert
+weights per 1024-row chunk at ~26 GB/s H2D is ~1.4 s per chunk against the CPU
+phase's ~5.4 s, so **~2-3x on prefill**, upload-bound.
+
+The block-major fused kernels built for exactly this were then timed, and they
+do not deliver it — see "STOP: step 3 must not be wired" at the end of this
+document. The prize above stands; the kernel that collects it does not exist
+yet.
 
 ## FALSIFIED: colibri's CPU expert path is several times slower than llama.cpp's
 
@@ -1214,3 +1218,48 @@ pointer table, launch swiglu then accumulate then scatter, and reconcile with th
 CPU-expert path for whatever the GPU does not cover. `align_blocks` already skips
 zero-weight routes, which is exactly the marker the rows path uses for a route
 claimed elsewhere, so that seam is already the right shape.
+
+### STOP (2026-08-28): step 3 must not be wired -- the kernels were never timed
+
+Everything above about these two kernels is a **weight-traffic** argument. They
+were verified for correctness and their launch counts were counted, and then the
+conclusion "6.8x less traffic in one launch" was carried forward as if it were a
+throughput result. It is not. Timed on the real card at the real per-layer shape
+(1024 rows, top-10, 512 experts, 1504 blocks, random codes so the codebook
+lookups diverge -- the caution `bench_matvec_kernel.py` carries):
+
+| kernel | ms/layer | achieved | weight read |
+|---|---|---|---|
+| `iq1s_block_swiglu` | 58.1 | 577 GMAC/s | 17 GB/s |
+| `iq4nl_block_accumulate` | 76.5 | 219 GMAC/s | 18 GB/s |
+| **fused total** | **134.6** | | **6.46 s per 48-layer chunk** |
+
+The CPU expert phase this is meant to replace costs **~5.4 s per chunk** today.
+**The fused path is slower than the CPU it would offload, before adding the
+~1.4 s of uploads it needs.** And against the route-major kernel it was built to
+replace it is **1.3x**, not the 6.8x the traffic ratio implied.
+
+17-18 GB/s on a 391 GB/s card is 4-5% of bandwidth, and both kernels sit 20-36x
+above their own bandwidth floor, so this is geometry, not physics. Reading them
+back with that in mind, the causes are visible in the source:
+
+- `_block_swiglu` calls `block_reduce_sum` **16 times per CUDA block** (8 slots
+  x gate and up), each a 256-thread tree reduction with its own `__syncthreads`.
+  The useful work between them is ~320 octets of decode.
+- `_block_accumulate` is worse: `octets = 640/8 = 80` against `blockDim.x` of
+  256, so **69% of its threads are idle for the whole kernel**, and it still
+  pays 8 block reductions.
+
+**What this changes.** The dispatch shape was right and the inner engine was
+wrong. The streaming path's per-expert `*_q8_mmq` GEMMs are the efficient
+compute engine on this card -- the plan's own standalone measurement puts
+`q5k_q8_mmq` at 19.06 TFLOP/s, roughly 25x the rate these octet kernels reach --
+and their only defect was that the host issues ~4096 launches per layer to use
+them. So the target is not "block-major instead of MMQ"; it is **MMQ-quality
+tiles driven by a block table**, which is what vLLM's `fused_moe_kernel`
+actually is. These two kernels are a naive octet decoder wearing the right
+dispatch shape.
+
+Until that kernel exists, wiring step 3 would make prefill slower. The aligned
+layout (`colibri_v2_moe_align.hpp`) survives unchanged and is still the right
+input for it; the two `_block_*` kernels are the part to replace.
