@@ -932,6 +932,53 @@ Laguna's layout (gate/up 17, down 18), and it is very likely why
 here: its dequant-then-GEMM comparison point is the scalar one. No Laguna
 checkpoint on this box to confirm, but the tripwire will announce it.
 
+### The split after the fix, and why the CPU path is now done
+
+Re-measured immediately, because the split that justifies a piece of work is
+stale the moment that work lands. 2048 tokens, all experts on CPU, 166 tok/s:
+
+| phase | seconds | share |
+|---|---|---|
+| CPU expert phase | 11.89 | **96.4%** |
+| route wait | 0.03 | 0.2% |
+| unattributed (incl. all GPU work) | 0.41 | 3.4% |
+
+Still 96% CPU expert — the same share as before, three times faster in absolute
+terms. Inside it (thread-seconds): **GEMM 52%**, dequant 36%, down store 8.8%,
+activate 2.5%. The f32 GEMM is now the top term.
+
+**And it is close to the metal.** Production runs the expert phase at ~392
+GMAC/s where the isolated harness reaches 599; that 1.5x is accounted for, not
+a defect:
+
+- **Sustained thermals, -19%.** `colibri_qwen_moe_layer_bench 1024 16 25` holds
+  16 cores in AVX-512 for 25 s: 665 GMAC/s on the first pass, ~540 by pass 418.
+  A 50 ms benchmark reads the clocks at boost; a prefill does not.
+- **File-backed pages, -9%.** Same bytes, page-cache resident either way,
+  anonymous (THP, 2 MiB) against a file mapping (4 KiB): 636.7 vs 582.3
+  GMAC/s. Real, and much smaller than the TLB argument predicts.
+- 665 x 0.81 x 0.91 = 490 against production's ~413 leaves ~1.2x, inside the
+  error of splitting production's counters between gate+up and down.
+
+Single-core the f32 GEMM already runs at **64% of this machine's AVX-512 FMA
+peak**. There is perhaps 1.2x left in the CPU expert path, not 4x. **Further
+CPU kernel work on this path is not where the remaining prefill time is.**
+
+**Where it is instead.** With the CPU side at its limit, prefill is bounded by
+how much of the expert work can leave the CPU at all, and today almost none
+can: the expert cache holds **2825 slots against 24,576 expert instances**
+(48 layers x 512), ~11% of a chunk's working set, and prefill touches nearly
+all of it once. `prefill_cache_seed=auto` is worth **+4-5%** and no more —
+measured interleaved, three paired rounds (off 184.3/169.1/164.9, auto
+186.8/177.9/174.9), auto ahead every round. A single unpaired run showed +19%,
+which is this box's clock drift, not a result. Default left alone.
+
+So the bulk can only move by **streaming experts per chunk**, whose blocker is
+the ~150k tiny dispatches — the thing the block-major fused kernels below were
+built for and have not yet been wired to. Rough ceiling for that route: 37 GiB
+of expert weights per 1024-row chunk at ~26 GB/s H2D is ~1.4 s per chunk
+against the CPU phase's ~4.9 s, so **~2-3x on prefill**, upload-bound.
+
 ## FALSIFIED: colibri's CPU expert path is several times slower than llama.cpp's
 
 **This section's conclusion was wrong.** Its measurements were sound and its

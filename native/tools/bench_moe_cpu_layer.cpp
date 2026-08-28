@@ -18,7 +18,13 @@
 // Threads are plain std::thread over an atomic task counter, which is what
 // `schedule(dynamic, chunk)` is, so the tool needs no OpenMP of its own.
 //
-//   colibri_qwen_moe_layer_bench [rows] [threads]
+// The optional third argument repeats the measured pass for that many seconds
+// and prints every pass. A prefill runs this loop on every core for tens of
+// seconds; a benchmark that measures a 50 ms burst reads the clocks at boost
+// and flatters itself. Comparing the first pass against the last is how you
+// tell a software limit from a thermal one.
+//
+//   colibri_qwen_moe_layer_bench [rows] [threads] [sustain-seconds]
 
 #include <qwen_cpu_kernel.h>
 
@@ -213,8 +219,10 @@ int main(int argc, char** argv) {
     const int threads = argc > 2
         ? std::atoi(argv[2])
         : std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
-    if (rows <= 0 || threads <= 0) {
-        std::fprintf(stderr, "usage: %s [rows] [threads]\n", argv[0]);
+    const double sustain = argc > 3 ? std::atof(argv[3]) : 0.0;
+    if (rows <= 0 || threads <= 0 || sustain < 0.0) {
+        std::fprintf(stderr, "usage: %s [rows] [threads] [sustain-seconds]\n",
+                     argv[0]);
         return 2;
     }
     std::mt19937 engine(99);
@@ -241,11 +249,20 @@ int main(int argc, char** argv) {
             (kHidden / block_elements_of(type)) * kIntermediate;
         const auto gate = random_packed(expert_bytes * kExperts, type, engine);
         const auto up = random_packed(expert_bytes * kExperts, type, engine);
+        const char* label = type == 19 ? "IQ1_S gate+up" : "IQ2_XXS gate+up";
         gate_phase(type, gate, up, routing, vectors, activated, threads);  // warm
-        const Split split =
-            gate_phase(type, gate, up, routing, vectors, activated, threads);
-        report(type == 19 ? "IQ1_S gate+up" : "IQ2_XXS gate+up", type, split,
+        report(label, type,
+               gate_phase(type, gate, up, routing, vectors, activated, threads),
                macs, threads);
+        if (sustain <= 0.0) continue;
+        const double until = now_seconds() + sustain;
+        int pass = 0;
+        while (now_seconds() < until) {
+            const Split repeated =
+                gate_phase(type, gate, up, routing, vectors, activated, threads);
+            std::printf("      sustained pass %2d  %7.1f GMAC/s\n", ++pass,
+                        macs / repeated.wall / 1e9);
+        }
     }
     return 0;
 }
