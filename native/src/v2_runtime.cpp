@@ -14304,8 +14304,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
         // attention path can run on it, so this only has to hold the widest
         // attention layer's live window (K and V), not the whole cache.
-        if(kv_type_is_turbo(runtime->options.cache_type_k)
-           ||kv_type_is_turbo(runtime->options.cache_type_v)){
+        // q8_0 shares the buffer: staged for the same reason, and the same
+        // f16 window once expanded.
+        auto stages_kv=[](int t){return kv_type_is_turbo(t)||t==3;};
+        if(stages_kv(runtime->options.cache_type_k)
+           ||stages_kv(runtime->options.cache_type_v)){
             std::uint64_t widest=0;
             for(const auto& layer:runtime->layers){
                 if(!layer.attention)continue;
@@ -14972,24 +14975,35 @@ inline int kv_fused_record_stride(int width){return width+2;}
 // the caller to run either cuBLAS or the fused kernel over the staged copy and
 // then inverse-rotate and gate. Returns false, having touched nothing, when the
 // configuration is not eligible.
-inline bool qwen_turbo_prefill_stage(
+// Widen one layer's live KV window into f16 so the tensor-core path can read
+// it. Turbo has always come through here; q8_0 now does too, and only when the
+// caller says the cuBLAS path will actually be taken -- for a short prefix the
+// warp kernel wins and staging the window would be work for nothing. `rotated`
+// Returns 0 when it declines, 1 when it staged, and 2 when it staged AND
+// rotated the queries -- only turbo's are, and the caller has to undo exactly
+// what was done. A code rather than an out-parameter because the call sits in
+// an if-init, which holds one declaration statement.
+inline int qwen_kv_prefill_stage(
     FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     std::uint64_t queries, std::uint64_t cache_keys, std::uint64_t cache_values,
     int heads, int kv_heads, int head_dim, int rows, int base,
+    bool cublas_available,
     std::uint64_t& stage_keys, std::uint64_t& stage_values
 ){
     const int ck=runtime.options.cache_type_k, cv=runtime.options.cache_type_v;
-    if(ck!=cv||!kv_type_is_turbo(ck))return false;
-    if(!runtime.turbo_kv_stage||rows<=0||heads<=0||kv_heads<=0)return false;
-    if(heads%kv_heads!=0||head_dim<32||(head_dim&31)!=0||head_dim>256)return false;
-    if(layer.attention_window)return false;  // ring layers keep the per-token path
+    if(ck!=cv)return 0;
+    const bool turbo=kv_type_is_turbo(ck);
+    if(!turbo&&!(ck==3&&cublas_available))return 0;
+    if(!runtime.turbo_kv_stage||rows<=0||heads<=0||kv_heads<=0)return 0;
+    if(heads%kv_heads!=0||head_dim<32||(head_dim&31)!=0||head_dim>256)return 0;
+    if(layer.attention_window)return 0;  // ring layers keep the per-token path
     const char*env=std::getenv("FLYWEIGHT_TURBO_CUBLAS");
-    if(env&&env[0]=='0')return false;
+    if(env&&env[0]=='0')return 0;
     const int window=base+rows;
-    if(window<=0||static_cast<std::uint64_t>(window)>layer.cache_capacity)return false;
+    if(window<=0||static_cast<std::uint64_t>(window)>layer.cache_capacity)return 0;
     const std::uint64_t needed=
         static_cast<std::uint64_t>(kv_heads)*window*head_dim*sizeof(std::uint16_t);
-    if(needed>runtime.turbo_kv_stage_stride)return false;
+    if(needed>runtime.turbo_kv_stage_stride)return 0;
 
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,void**args){
         if(flyweight_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)
@@ -14997,7 +15011,8 @@ inline bool qwen_turbo_prefill_stage(
     };
     stage_keys=runtime.turbo_kv_stage;
     stage_values=runtime.turbo_kv_stage+runtime.turbo_kv_stage_stride;
-    const char*dequant=ck==5?"kv_dequant_turbo4_f16":"kv_dequant_turbo3_f16";
+    const char*dequant=ck==5?"kv_dequant_turbo4_f16":
+                       ck==4?"kv_dequant_turbo3_f16":"kv_dequant_q8_f16";
     const std::uint32_t token_blocks=(static_cast<std::uint32_t>(window)+7)/8;
     int tokens=window,slot_capacity=static_cast<int>(layer.cache_capacity),origin=0;
     void*key_args[]={&cache_keys,&stage_keys,&kv_heads,&head_dim,&tokens,&slot_capacity,&origin};
@@ -15005,12 +15020,18 @@ inline bool qwen_turbo_prefill_stage(
     void*value_args[]={&cache_values,&stage_values,&kv_heads,&head_dim,&tokens,&slot_capacity,&origin};
     launch(dequant,static_cast<std::uint32_t>(kv_heads),token_blocks,value_args);
 
-    // Queries and attended rows are both [row][head][head_dim] contiguous, so
-    // the rotation runs over rows*heads vectors in one launch.
-    int vectors=rows*heads,key_stream=0;
-    void*rotate_args[]={&queries,&vectors,&head_dim,&key_stream};
-    launch("turbo_rotate_rows",static_cast<std::uint32_t>(vectors),1,rotate_args);
-    return true;
+    // Only turbo stores rotated: q8_0 is a plain codec, so its staged window
+    // is already in the query's basis and the gate can be left to the
+    // attention kernel rather than undone afterwards.
+    if(turbo){
+        // Queries and attended rows are both [row][head][head_dim] contiguous,
+        // so the rotation runs over rows*heads vectors in one launch.
+        int vectors=rows*heads,key_stream=0;
+        void*rotate_args[]={&queries,&vectors,&head_dim,&key_stream};
+        launch("turbo_rotate_rows",static_cast<std::uint32_t>(vectors),1,rotate_args);
+        return 2;
+    }
+    return 1;
 }
 
 inline int kv_fused_tile_tokens(const FlyweightV2QwenRuntime&){return 1024;}

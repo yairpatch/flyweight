@@ -593,8 +593,13 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("qwen_attention_prefill_unpack", kernels)
         self.assertIn("qwen_attention_prefill_unpack_gate", kernels)
         self.assertIn("apply_gate", driver)
-        self.assertIn("qwen_turbo_prefill_stage", runtime)
-        self.assertIn("qwen_turbo_prefill_stage(", rows)
+        # Renamed from qwen_turbo_prefill_stage when q8_0 joined it: the
+        # staging is not turbo-specific, it widens any codec the tensor-core
+        # path cannot read in place.
+        self.assertIn("qwen_kv_prefill_stage", runtime)
+        self.assertIn("qwen_kv_prefill_stage(", rows)
+        self.assertIn("kv_dequant_q8_f16", kernels)
+        self.assertIn('"kv_dequant_q8_f16"', driver)
         self.assertIn("qwen_turbo_cublas_attention", runtime)
 
         # The Walsh-Hadamard butterfly needs a power-of-two head_dim, and the

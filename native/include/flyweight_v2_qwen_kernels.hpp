@@ -8986,6 +8986,33 @@ __device__ void kv_dequant_turbo_impl(
     for (int d = lane; d < head_dim; d += 32)
         destination[d] = __float2half(kv_ld_turbo<BITS>(row, d));
 }
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// The q8_0 twin of the turbo expander above. Same job -- widen one layer's
+// live KV window into the f16 staging buffer so the tensor-core path can read
+// it -- and the same shape, differing only in the codec: 34-byte blocks of
+// [f16 scale | 32 int8] against turbo's bit-packed ones, and no rotation, so
+// the caller keeps the gated variant rather than undoing a transform.
+extern "C" __global__ void kv_dequant_q8_f16(
+    const unsigned char* cache, __half* out,
+    const int kv_heads, const int head_dim, const int tokens,
+    const int capacity, const int first
+) {
+    constexpr int tokens_per_block = 8;
+    const int kv_head = blockIdx.x;
+    if (kv_head >= kv_heads) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int token = blockIdx.y * tokens_per_block + warp;
+    if (token >= tokens) return;
+    const int row_bytes = (head_dim / 32) * 34;
+    int slot = first + token;
+    if (slot >= capacity) slot -= capacity;
+    const unsigned char* row = cache + ((long long)kv_head * capacity + slot) * row_bytes;
+    __half* destination = out + ((long long)kv_head * tokens + token) * head_dim;
+    for (int d = lane; d < head_dim; d += 32)
+        destination[d] = __float2half(kv_ld_q8(row, d));
+}
+
 #define KV_DEQUANT_TURBO(name, BITS) \
 extern "C" __global__ void name(const unsigned char* cache, __half* out, \
     const int kv_heads, const int head_dim, const int tokens, \

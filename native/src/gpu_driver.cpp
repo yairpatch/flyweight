@@ -1052,6 +1052,7 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_prefill_softmax_f16",
              "kv_attention_prefill_block_softmax_f16",
              "qwen_attention_prefill_pack_bf16",
+             "kv_dequant_q8_f16",
              "kv_attention_prefill_block_softmax_bf16",
              "qwen_attention_prefill_rescale",
              "qwen_attention_prefill_unpack_gate", "qwen_attention_prefill_unpack",

@@ -1269,7 +1269,16 @@ void qwen_forward_rows(
                 }
             }else if(cublas_prefill_done){
                 // Tensor-core attention wrote the already-gated rows to third.
-            }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&kv_fused_prefill_ok(runtime)){
+            }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&
+                     kv_fused_prefill_ok(runtime)&&
+                     // ...unless the cache is one that stages onto the
+                     // tensor-core path and the prefix is long enough to take
+                     // it. q8_0 measured 266 tok/s here at 48k against f16's
+                     // 712 on that path, and the gap grows with context.
+                     !(runtime.options.cache_type_k==3&&
+                       runtime.options.cache_type_v==3&&
+                       cublas_prefill_requested&&cublas_tile_rows>0&&
+                       cublas_workspace_ok)){
                 // One warp streams the KV cache once for 4 query rows: cache
                 // traffic per chunk stops scaling with per-token passes, which
                 // dominated long-context prefill.
@@ -1284,13 +1293,16 @@ void qwen_forward_rows(
                     void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
                     launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
                 }
-            }else if(std::uint64_t stage_keys=0,stage_values=0;
+            }else if(std::uint64_t stage_keys=0,stage_values=0,staged=0;
                      !laguna&&
-                     qwen_turbo_prefill_stage(
+                     (staged=qwen_kv_prefill_stage(
                          runtime,layer,queries,cache_keys,cache_values,
                          heads,kv_heads,head_dim,rows,
                          static_cast<int>(runtime.position)+span_begin,
-                         stage_keys,stage_values)){
+                         cublas_prefill_requested&&cublas_tile_rows>0&&
+                             cublas_workspace_ok,
+                         stage_keys,stage_values))!=0){
+                const bool rotated=staged==2;
                 // The staged window is dense and ring-free, so it is indexed
                 // with capacity == window. cuBLAS runs ungated here because the
                 // values are still rotated: the gate is a sigmoid and has to
@@ -1302,20 +1314,33 @@ void qwen_forward_rows(
                     cublas_prefill_requested&&cublas_tile_rows>0&&
                     cublas_workspace_ok&&
                     flyweight_gpu_attention_prefill_cublas(
-                    runtime.options.cache_type_k,
+                        // The staged window is ALREADY f16: the dequant above
+                        // is what this path exists for. Passing the cache's own
+                        // type here would describe the source, not the buffers
+                        // the GEMM is handed.
+                        1,
                         queries,gates,stage_keys,stage_values,
                         attention_scores,first,second,
                         attention_scores+packed_query_bytes,flash_state,third,
                         runtime.stream,heads,kv_heads,head_dim,rows,window,
-                        base,cublas_tile_rows,cublas_block_tokens,scale,0)==0;
+                        base,cublas_tile_rows,cublas_block_tokens,scale,
+                        rotated?0:1)==0;
                 if(!staged_cublas){
                     void*attention_args[]={const_cast<std::uint64_t*>(&queries),&stage_keys,&stage_values,const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&staged_capacity,&scale};
                     launch("kv_attention_prefill_f16",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 }
-                void*unrotate_args[]={const_cast<std::uint64_t*>(&third),&vectors,const_cast<int*>(&head_dim),&value_stream};
-                launch("turbo_unrotate_rows",static_cast<std::uint32_t>(vectors),1,256,unrotate_args);
-                void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
-                launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
+                // Undo exactly what the staging did. A rotated cache owes an
+                // inverse transform and then the gate; an unrotated one was
+                // gated by the attention kernel itself, unless the fallback
+                // above ran, which never gates.
+                if(rotated){
+                    void*unrotate_args[]={const_cast<std::uint64_t*>(&third),&vectors,const_cast<int*>(&head_dim),&value_stream};
+                    launch("turbo_unrotate_rows",static_cast<std::uint32_t>(vectors),1,256,unrotate_args);
+                }
+                if(rotated||!staged_cublas){
+                    void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
+                    launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
+                }
             }else for(int token=0;token<rows;++token){
                 auto query=queries+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 auto gate=gates+static_cast<std::uint64_t>(token)*
