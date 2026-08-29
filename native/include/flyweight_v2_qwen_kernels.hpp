@@ -9544,6 +9544,105 @@ extern "C" __global__ void kv_attention_prefill_block_softmax_f16(
     }
 }
 
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// The bf16 twins of the two kernels above. The tensor-core prefill path hands
+// the KV cache straight to cuBLAS, so its element type has to be the cache's:
+// an f16 pack against a bf16 cache is not a slow path, it is the wrong bits.
+// Generated from one macro rather than copied, because the only difference is
+// the conversion and a divergence between them would be silent -- the GEMM
+// would still run.
+#define FLYWEIGHT_PREFILL_TYPED(SUFFIX, ELEMENT, TO_ELEMENT)                   \
+extern "C" __global__ void qwen_attention_prefill_pack_##SUFFIX(               \
+    const float* queries, ELEMENT* packed, const int tile_start,               \
+    const int tile_rows, const int heads, const int kv_heads,                  \
+    const int head_dim                                                         \
+) {                                                                            \
+    const int elements = tile_rows * heads * head_dim;                         \
+    const int group = heads / kv_heads;                                        \
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;                    \
+         index < elements; index += blockDim.x * gridDim.x) {                  \
+        const int dimension = index % head_dim;                                \
+        const int head = (index / head_dim) % heads;                           \
+        const int row = index / (heads * head_dim);                            \
+        const int kv_head = head / group;                                      \
+        const int group_head = head - kv_head * group;                         \
+        const long long column = (long long)row * group + group_head;          \
+        packed[((long long)kv_head * tile_rows * group + column) * head_dim    \
+               + dimension] =                                                  \
+            TO_ELEMENT(queries[((long long)tile_start + row) * heads * head_dim\
+                               + (long long)head * head_dim + dimension]);     \
+    }                                                                          \
+}                                                                              \
+extern "C" __global__ void kv_attention_prefill_block_softmax_##SUFFIX(        \
+    const float* scores, ELEMENT* probabilities, float* state, float* rescale, \
+    const int tile_start, const int tile_rows,                                 \
+    const int heads, const int kv_heads,                                       \
+    const int block_start, const int block_tokens,                             \
+    const int base_position                                                    \
+) {                                                                            \
+    const int head = blockIdx.x;                                               \
+    const int row_index = blockIdx.y;                                          \
+    if (head >= heads || row_index >= tile_rows || block_tokens <= 0) return;  \
+    const int group = heads / kv_heads;                                        \
+    const int kv_head = head / group;                                          \
+    const int group_head = head - kv_head * group;                             \
+    const int column = row_index * group + group_head;                         \
+    const float* row = scores                                                  \
+        + (long long)kv_head * block_tokens * tile_rows * group                \
+        + (long long)column * block_tokens;                                    \
+    ELEMENT* output = probabilities                                            \
+        + (long long)kv_head * block_tokens * tile_rows * group                \
+        + (long long)column * block_tokens;                                    \
+    const int visible_global = base_position + tile_start + row_index + 1;     \
+    const int visible = min(block_tokens, visible_global - block_start);       \
+    const int slot = row_index * heads + head;                                 \
+    __shared__ float reduction[256];                                           \
+    float maximum = -3.402823466e+38F;                                         \
+    for (int token = threadIdx.x; token < visible; token += blockDim.x)        \
+        maximum = fmaxf(maximum, row[token]);                                  \
+    reduction[threadIdx.x] = maximum;                                          \
+    __syncthreads();                                                           \
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {              \
+        if (threadIdx.x < stride)                                              \
+            reduction[threadIdx.x] =                                           \
+                fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);\
+        __syncthreads();                                                       \
+    }                                                                          \
+    const bool first = block_start == 0;                                       \
+    const float previous_maximum = first ? -3.402823466e+38F : state[slot * 2];\
+    const float previous_sum = first ? 0.0f : state[slot * 2 + 1];             \
+    const float new_maximum = fmaxf(previous_maximum, reduction[0]);           \
+    float denominator = 0.0f;                                                  \
+    for (int token = threadIdx.x; token < visible; token += blockDim.x) {      \
+        const float probability = __expf(row[token] - new_maximum);            \
+        output[token] = TO_ELEMENT(probability);                               \
+        denominator += probability;                                            \
+    }                                                                          \
+    for (int token = max(visible, 0) + threadIdx.x; token < block_tokens;      \
+         token += blockDim.x)                                                  \
+        output[token] = TO_ELEMENT(0.0f);                                      \
+    reduction[threadIdx.x] = denominator;                                      \
+    __syncthreads();                                                           \
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {              \
+        if (threadIdx.x < stride)                                              \
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];         \
+        __syncthreads();                                                       \
+    }                                                                          \
+    if (threadIdx.x == 0) {                                                    \
+        const float correction =                                               \
+            first ? 0.0f : __expf(previous_maximum - new_maximum);             \
+        state[slot * 2] = new_maximum;                                         \
+        state[slot * 2 + 1] = previous_sum * correction + reduction[0];        \
+        rescale[slot] = correction;                                            \
+    }                                                                          \
+}
+
+FLYWEIGHT_PREFILL_TYPED(bf16, __nv_bfloat16, __float2bfloat16)
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+
 // Multiply the packed flash accumulator by this block's exp(M_old - M_new)
 // before the PV GEMM adds the block's contribution on the new scale.
 extern "C" __global__ void qwen_attention_prefill_rescale(

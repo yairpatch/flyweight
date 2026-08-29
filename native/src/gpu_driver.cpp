@@ -1051,6 +1051,8 @@ extern "C" int flyweight_gpu_compile(
              "qwen_attention_prefill_pack_f16",
              "kv_attention_prefill_softmax_f16",
              "kv_attention_prefill_block_softmax_f16",
+             "qwen_attention_prefill_pack_bf16",
+             "kv_attention_prefill_block_softmax_bf16",
              "qwen_attention_prefill_rescale",
              "qwen_attention_prefill_unpack_gate", "qwen_attention_prefill_unpack",
              "qwen_attention_prefill_unpack_gate_norm",
@@ -3015,7 +3017,8 @@ extern "C" int flyweight_gpu_attention_f16_cublas(
     return 0;
 }
 
-extern "C" int flyweight_gpu_attention_prefill_f16_cublas(
+extern "C" int flyweight_gpu_attention_prefill_cublas(
+    std::int32_t kv_type,
     std::uint64_t queries, std::uint64_t gates,
     std::uint64_t keys, std::uint64_t values,
     std::uint64_t packed_queries, std::uint64_t scores_f32,
@@ -3028,6 +3031,19 @@ extern "C" int flyweight_gpu_attention_prefill_f16_cublas(
     std::int32_t block_tokens, float scale,
     std::int32_t apply_gate
 ) {
+    // The GEMM reads the KV cache in place, so its element type is the cache's
+    // and the packed queries and probabilities must match it. Both are 16 bit,
+    // so every stride and offset below is unchanged -- only the type code and
+    // the two kernels that write those buffers differ.
+    constexpr int kCudaR16BF = 14;
+    const bool bf16 = kv_type == 2;
+    if (kv_type != 1 && kv_type != 2) return -1;
+    const int element_type = bf16 ? kCudaR16BF : 2 /* kCudaR16F */;
+    const char* pack_name = bf16 ? "qwen_attention_prefill_pack_bf16"
+                                 : "qwen_attention_prefill_pack_f16";
+    const char* softmax_name = bf16
+        ? "kv_attention_prefill_block_softmax_bf16"
+        : "kv_attention_prefill_block_softmax_f16";
     // Not reachable through launch(), so the CPU backend cannot substitute a
     // host kernel for it: this bottoms out in cuBLAS directly. Report failure
     // so the runtime falls back to the kernel path it already has. Returning
@@ -3046,8 +3062,8 @@ extern "C" int flyweight_gpu_attention_prefill_f16_cublas(
         return -1;
     const auto cuda_stream = reinterpret_cast<CUstream>(stream);
     if (g_cublas.set_stream(g_cublas_handle, cuda_stream) != 0) return -2;
-    auto pack = g_functions.find("qwen_attention_prefill_pack_f16");
-    auto softmax = g_functions.find("kv_attention_prefill_block_softmax_f16");
+    auto pack = g_functions.find(pack_name);
+    auto softmax = g_functions.find(softmax_name);
     auto rescale_fn = g_functions.find("qwen_attention_prefill_rescale");
     // Turbo values arrive rotated, so that caller takes the ungated variant and
     // applies the gate itself after the inverse rotation.
@@ -3110,9 +3126,9 @@ extern "C" int flyweight_gpu_attention_prefill_f16_cublas(
             if (g_cublas.gemm_strided_batched_ex(
                     g_cublas_handle, kCublasOpT, kCublasOpN,
                     block, columns, head_dim, &scale,
-                    reinterpret_cast<const void*>(block_keys), kCudaR16F,
+                    reinterpret_cast<const void*>(block_keys), element_type,
                     head_dim, cache_stride,
-                    reinterpret_cast<const void*>(packed_queries), kCudaR16F,
+                    reinterpret_cast<const void*>(packed_queries), element_type,
                     head_dim, query_stride, &zero,
                     reinterpret_cast<void*>(scores_f32), kCudaR32F, block,
                     score_stride, kv_heads, kCompute32F, kTensorOp) != 0)
@@ -3142,9 +3158,9 @@ extern "C" int flyweight_gpu_attention_prefill_f16_cublas(
             if (g_cublas.gemm_strided_batched_ex(
                     g_cublas_handle, kCublasOpN, kCublasOpN,
                     head_dim, columns, block, &one,
-                    reinterpret_cast<const void*>(block_values), kCudaR16F,
+                    reinterpret_cast<const void*>(block_values), element_type,
                     head_dim, cache_stride,
-                    reinterpret_cast<const void*>(probabilities_f16), kCudaR16F,
+                    reinterpret_cast<const void*>(probabilities_f16), element_type,
                     block,
                     score_stride, first ? &zero : &one,
                     reinterpret_cast<void*>(packed_output), kCudaR32F, head_dim,

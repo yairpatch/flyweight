@@ -140,7 +140,11 @@ FLYWEIGHT_API int flyweight_gpu_attention_f16_cublas(
     std::int32_t first,
     float scale
 );
-FLYWEIGHT_API int flyweight_gpu_attention_prefill_f16_cublas(
+/* Tensor-core prefill attention. `kv_type` is the cache's element code (1 f16,
+   2 bf16); the GEMM reads the cache in place, so the packed queries and the
+   probabilities are written in that same type. */
+FLYWEIGHT_API int flyweight_gpu_attention_prefill_cublas(
+    std::int32_t kv_type,
     std::uint64_t queries,
     std::uint64_t gates,
     std::uint64_t keys,

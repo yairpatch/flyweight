@@ -1172,10 +1172,18 @@ void qwen_forward_rows(
             const bool cublas_prefill_done=
                 !qsa_chunk_selecting&&
                 cublas_prefill_requested&&!laguna&&!layer.attention_window&&
-                runtime.options.cache_type_k==1&&
-                runtime.options.cache_type_v==1&&cublas_tile_rows>0&&
+                // f16 and bf16 both: the cache is handed to cuBLAS in
+                // place, so what matters is that it is a 16-bit float the GEMM
+                // has a type code for, and that K and V agree -- one code feeds
+                // both. bf16 was excluded for no reason inherent to the path,
+                // and paid ~2.5x prefill for it at 48k.
+                (runtime.options.cache_type_k==1||
+                 runtime.options.cache_type_k==2)&&
+                runtime.options.cache_type_v==runtime.options.cache_type_k&&
+                cublas_tile_rows>0&&
                 cublas_workspace_ok&&
-                flyweight_gpu_attention_prefill_f16_cublas(
+                flyweight_gpu_attention_prefill_cublas(
+                    runtime.options.cache_type_k,
                     queries,gates,cache_keys,cache_values,
                     attention_scores,first,second,
                     attention_scores+packed_query_bytes,flash_state,third,
@@ -1293,7 +1301,8 @@ void qwen_forward_rows(
                 const bool staged_cublas=
                     cublas_prefill_requested&&cublas_tile_rows>0&&
                     cublas_workspace_ok&&
-                    flyweight_gpu_attention_prefill_f16_cublas(
+                    flyweight_gpu_attention_prefill_cublas(
+                    runtime.options.cache_type_k,
                         queries,gates,stage_keys,stage_values,
                         attention_scores,first,second,
                         attention_scores+packed_query_bytes,flash_state,third,
