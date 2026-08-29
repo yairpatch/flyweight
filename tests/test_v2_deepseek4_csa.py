@@ -27,7 +27,7 @@ import unittest
 import numpy as np
 
 from flyweight.deepseek4 import rms_norm
-from flyweight.deepseek4_layer import CompressedState, DeepSeek4Block, _f32
+from flyweight.deepseek4_layer import CompressedState, DeepSeek4Block
 from flyweight.v2 import V2Model
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")

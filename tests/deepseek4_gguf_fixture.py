@@ -181,7 +181,6 @@ def build_deepseek4_gguf(
     projection("output_hc_fn.weight", spec.hyper_connections * spec.hidden, spec.hyper_connections)
     vector("output_hc_scale.weight", 1)
 
-    head_dim = spec.hidden // spec.heads
     for layer in range(spec.layers):
         prefix = f"blk.{layer}."
         ratios = spec.compress_ratios

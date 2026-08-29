@@ -63,6 +63,19 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn("python -m flyweight.native_build", output)
         self.assertIn("wheel", output)
 
+    def test_an_installed_copy_shadowing_the_checkout_is_reported(self) -> None:
+        # Installing a built wheel into the same environment as a checkout
+        # makes every import resolve to site-packages: edits look inert, and
+        # the library check still passes because the installed copy brings a
+        # library of its own. It happened twice in one afternoon.
+        with patch.object(
+            native_build, "default_output",
+            return_value=Path("/elsewhere/flyweight/_native"),
+        ):
+            _, output = self._run()
+        self.assertIn("not /", output)
+        self.assertIn("shadowing the checkout", output)
+
     def test_a_healthy_checkout_reports_that_it_can_serve(self) -> None:
         if not any(
             (native_build.default_output() / f"{native_build.LIBRARY_STEM}{suffix}").is_file()

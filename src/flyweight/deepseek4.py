@@ -381,12 +381,18 @@ class _Deepseek4Snapshot:
             raise V2Error((self.runtime._library.flyweight_v2_last_error() or b"restore failed").decode(errors="replace"))
     def close(self):
         if self.handle:
-            self.runtime._library.flyweight_v2_deepseek4_snapshot_free(self.handle); self.handle = None
-    def __enter__(self): return self
-    def __exit__(self, *_): self.close()
+            self.runtime._library.flyweight_v2_deepseek4_snapshot_free(self.handle)
+            self.handle = None
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
     def __del__(self):
-        try: self.close()
-        except Exception: pass
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def half_round_trip(value: float) -> float:

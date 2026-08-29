@@ -29,8 +29,19 @@ flyweight = [
 ]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 ignore_missing_imports = true
 # ctypes field declarations may contain a third bit-width element, and values
 # returned from C-backed metadata dictionaries are necessarily runtime-typed.
 disable_error_code = ["misc", "call-overload"]
+
+# numpy 2.5's stubs are written in 3.12 syntax (`type` statements), which mypy
+# parses with the grammar of `python_version` above -- so checking our code
+# against the oldest Python we support failed inside a dependency before it
+# reached a line of ours. Skipping the import types numpy as Any, which is all
+# `ignore_missing_imports` was already giving it here anyway.
+[[tool.mypy.overrides]]
+# Both spellings: "numpy.*" does not match the top-level `numpy` module, which
+# is the one whose __init__.pyi carries the 3.12 syntax.
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"

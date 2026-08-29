@@ -196,7 +196,7 @@ class LagunaNativeTests(unittest.TestCase):
             info = runtime.info
             # Twelve of forty-eight in the real model; two of eight here.
             self.assertEqual(
-                info["swa_layers"], sum(1 for l in range(spec.layers) if l % 4)
+                info["swa_layers"], sum(1 for layer in range(spec.layers) if layer % 4)
             )
             token = runtime.decode(5)
             self.assertGreaterEqual(token, 0)

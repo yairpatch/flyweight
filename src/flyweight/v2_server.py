@@ -961,9 +961,17 @@ def _tool_grammar_specification(
     return specification
 
 
-def _chat_key(
-    messages: Sequence[Mapping[str, object]]
-) -> tuple[tuple[str, str, str], ...]:
+# (role, visible content, replayed reasoning) per turn.
+ChatKey = tuple[tuple[str, str, str], ...]
+# What a matched prefix carries: its prompt and generated ids, the raw text, and
+# the three render settings it was produced under, all of which have to agree
+# before it is a prefix of THIS conversation rather than a similar one.
+ChatRecord = tuple[
+    tuple[int, ...], tuple[int, ...], str, bool | None, str | None, bool | None
+]
+
+
+def _chat_key(messages: Sequence[Mapping[str, object]]) -> ChatKey:
     """The continuation cache's key: role, visible content, replayed reasoning.
 
     Index 0 and 1 stay role and content, which the prefix matcher indexes
@@ -1087,11 +1095,11 @@ class ChatGenerator:
         self.tokenizer = tokenizer
         self.engine = engine
         self._chat_lock = threading.Lock()
-        self._chat_messages: tuple[tuple[str, str], ...] | None = None
+        self._chat_messages: ChatKey | None = None
         self._chat_prompt_ids: tuple[int, ...] = ()
         self._chat_generated_ids: tuple[int, ...] = ()
         self._chat_text = ""
-        self._chat_thinking = False
+        self._chat_thinking: bool | None = False
         self._chat_effort: str | None = None
         self._chat_preserve: bool | None = None
         # Exact generated token IDs must survive unrelated concurrent requests.
@@ -1099,10 +1107,7 @@ class ChatGenerator:
         # overwrite the main conversation and forced its next turn to re-tokenize
         # (usually diverging at structured tool markup). Keep a small LRU keyed
         # by the request history instead.
-        self._chat_continuations: OrderedDict[
-            tuple[tuple[str, str], ...],
-            tuple[tuple[int, ...], tuple[int, ...], str, bool],
-        ] = OrderedDict()
+        self._chat_continuations: OrderedDict[ChatKey, ChatRecord] = OrderedDict()
         self._chat_continuation_capacity = 32
         self._forced_close_ids: list[int] | None = None
 
@@ -1251,7 +1256,7 @@ class ChatGenerator:
                     self._chat_continuations.popitem(last=False)
 
     def _continued_chat_prompt(
-        self, messages: tuple[tuple[str, str, str], ...], thinking: bool,
+        self, messages: ChatKey, thinking: bool | None,
         full: Sequence[Mapping[str, object]] | None = None,
         *, reasoning_effort: str | None = None,
         preserve_thinking: bool | None = None,

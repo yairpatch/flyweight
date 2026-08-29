@@ -1669,13 +1669,27 @@ def _doctor() -> int:
     # Which copy of the package is actually imported. Installing a built wheel
     # into the same environment as a checkout shadows it: `pytest` from the
     # repo then imports site-packages, every edit looks like it did nothing,
-    # and nothing says so. The library check below would still pass, because
-    # the installed copy carries a library of its own.
-    package = Path(__file__).resolve().parent
-    if source is not None and package != source.parent / "src" / "flyweight":
-        report("package", None, f"imported from {package}, not this checkout",
-               "an installed copy is shadowing the sources: "
-               "pip uninstall flyweight && pip install -e .")
+    # and nothing says so. The library check below still passes, because the
+    # installed copy brings a library of its own.
+    #
+    # The checkout is found from the WORKING DIRECTORY, not from the package:
+    # when the shadowing copy is the one running, it has no sources beside it
+    # and would report itself healthy. Standing in a checkout and importing
+    # something else is the whole signal.
+    package = native_build.default_output().parent
+    checkout = next(
+        (
+            parent
+            for parent in (Path.cwd(), *Path.cwd().parents)
+            if (parent / "native" / "CMakeLists.txt").is_file()
+            and (parent / "src" / "flyweight").is_dir()
+        ),
+        None,
+    )
+    if checkout is not None and package != checkout / "src" / "flyweight":
+        report("package", None, f"imported from {package}, not {checkout}",
+               "an installed copy is shadowing the checkout you are standing "
+               "in: pip uninstall flyweight && pip install -e .")
     else:
         report("package", True, str(package))
 

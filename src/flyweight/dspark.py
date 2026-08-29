@@ -84,7 +84,8 @@ class DsparkRuntime:
                     int(self._model.config["hidden_size"]))
         if values.ndim != 3 or values.shape[1:] != expected:
             raise ValueError("streams must have shape [rows, hc, hidden]")
-        output = np.empty_like(values); fp = ctypes.POINTER(ctypes.c_float)
+        output = np.empty_like(values)
+        fp = ctypes.POINTER(ctypes.c_float)
         self._check(self._library.flyweight_v2_dspark_attention_stage(
             self._handle, layer, values.ctypes.data_as(fp), values.shape[0],
             output.ctypes.data_as(fp), output.size,
@@ -97,7 +98,8 @@ class DsparkRuntime:
                     int(self._model.config["hidden_size"]))
         if values.ndim != 3 or values.shape[1:] != expected:
             raise ValueError("streams must have shape [rows, hc, hidden]")
-        output = np.empty_like(values); fp = ctypes.POINTER(ctypes.c_float)
+        output = np.empty_like(values)
+        fp = ctypes.POINTER(ctypes.c_float)
         self._check(self._library.flyweight_v2_dspark_ffn_stage(
             self._handle, layer, values.ctypes.data_as(fp), values.shape[0],
             output.ctypes.data_as(fp), output.size,
@@ -109,7 +111,8 @@ class DsparkRuntime:
         width = int(self._model.config["hidden_size"])
         if values.ndim != 2 or values.shape[1] != width:
             raise ValueError("embeddings must have shape [rows, hidden]")
-        hidden = np.empty_like(values); normalized = np.empty_like(values)
+        hidden = np.empty_like(values)
+        normalized = np.empty_like(values)
         fp = ctypes.POINTER(ctypes.c_float)
         self._check(self._library.flyweight_v2_dspark_decode_hidden(
             self._handle, values.ctypes.data_as(fp), values.shape[0],
