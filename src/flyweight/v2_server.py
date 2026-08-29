@@ -529,8 +529,16 @@ class NativeV2Tokenizer:
         *,
         enable_thinking: bool | None = None,
         reasoning_effort: str | None = None,
+        preserve_thinking: bool | None = None,
     ) -> str:
         """Render the prompt. None leaves the checkpoint's own thinking default.
+
+        `preserve_thinking` decides whether an assistant turn's replayed
+        chain-of-thought reaches the prompt; None leaves that to the
+        architecture's own convention (see keeps_replayed_reasoning). It is
+        only a full override for the formatters written here -- on the jinja
+        path a false can be enforced by withholding the text, but a true cannot
+        make a template that strips history reasoning keep it.
 
         `reasoning_effort` is the same idea one level down, for a checkpoint
         that grades its reasoning rather than switching it. Qwen3.5 reads
@@ -566,12 +574,22 @@ class NativeV2Tokenizer:
                 # the architectures whose template renders them itself; for the
                 # rest the compatibility layer has already put that history in
                 # content, and an empty collection preserves it.
+                # An explicit false is enforced here rather than left to the
+                # template: withholding the text is the only way to make a
+                # template that always replays reasoning stop. The reverse does
+                # not work -- passing it cannot make a template that strips it
+                # keep it -- so `preserve_thinking` is advisory in that
+                # direction, and is also exposed as a template variable for a
+                # template that reads one.
+                reasoning = message.get("reasoning_content", "")
                 normalized.append(
                     {
                         "role": role,
                         "content": content,
                         "tool_calls": message.get("tool_calls", []),
-                        "reasoning_content": message.get("reasoning_content", ""),
+                        "reasoning_content": (
+                            "" if preserve_thinking is False else reasoning
+                        ),
                         "tools": message.get("tools", []),
                     }
                 )
@@ -581,6 +599,8 @@ class NativeV2Tokenizer:
             )
             if reasoning_effort:
                 thinking_variables["reasoning_effort"] = reasoning_effort
+            if preserve_thinking is not None:
+                thinking_variables["preserve_thinking"] = preserve_thinking
             return compiled_template.render(
                 messages=normalized,
                 add_generation_prompt=True,
@@ -613,8 +633,15 @@ class NativeV2Tokenizer:
         if self.architecture == "laguna":
             return self._format_laguna(messages, enable_thinking=bool(enable_thinking))
         if self.architecture == "deepseek4":
-            return self._format_deepseek4(messages, enable_thinking=bool(enable_thinking))
+            return self._format_deepseek4(
+                messages, enable_thinking=bool(enable_thinking),
+                preserve_thinking=preserve_thinking)
         sections: list[str] = []
+        last_user = max(
+            (index for index, message in enumerate(messages)
+             if message["role"] == "user"),
+            default=-1,
+        )
         for index, message in enumerate(messages):
             role = message["role"]
             content = (message["content"] or "").strip()
@@ -622,10 +649,18 @@ class NativeV2Tokenizer:
                 raise ValueError(f"unsupported chat role: {role}")
             _check_content(role, content, index)
             if role == "assistant" and not content.startswith("<think>"):
-                thinking_prefix = (
-                    "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
-                )
-                content = thinking_prefix + content
+                reasoning = str(message.get("reasoning_content", "") or "").strip()
+                if reasoning and keeps_replayed_reasoning(
+                    preserve_thinking, enable_thinking, index, last_user
+                ):
+                    content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+                else:
+                    # A history turn's block is CLOSED whatever this request
+                    # asked for: enable_thinking governs the turn about to be
+                    # generated, and opening one here left an unterminated
+                    # <think> in the middle of the conversation, which no
+                    # training example contains.
+                    content = f"<think>\n\n</think>\n\n{content}"
             sections.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
         sections.append("<|im_start|>assistant\n")
         sections.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
@@ -665,7 +700,8 @@ class NativeV2Tokenizer:
 
     @staticmethod
     def _format_deepseek4(
-        messages: Sequence[Mapping[str, str]], *, enable_thinking: bool
+        messages: Sequence[Mapping[str, str]], *, enable_thinking: bool,
+        preserve_thinking: bool | None = None,
     ) -> str:
         """Render the text-only core of DeepSeek-V4's GGUF chat template.
 
@@ -728,9 +764,12 @@ class NativeV2Tokenizer:
                     predecessor >= 0 and messages[predecessor]["role"] in user_side
                 )
                 # Reasoning survives only on a turn the conversation has not
-                # moved past; ours never carries any, so a kept one is an empty
-                # block and a dropped one leaves just the closing tag.
-                keeps_reasoning = enable_thinking and index > last_user
+                # moved past, unless the caller overrode it. A turn of ours
+                # carries reasoning only when a client replayed it, so a kept
+                # empty one is an empty block and a dropped one leaves just the
+                # closing tag.
+                keeps_reasoning = keeps_replayed_reasoning(
+                    preserve_thinking, enable_thinking, index, last_user)
                 reasoning = str(message.get("reasoning_content", "") or "")
                 if follows_user:
                     sections.append("<｜Assistant｜>")
@@ -813,11 +852,13 @@ class NativeV2Tokenizer:
         *,
         enable_thinking: bool | None = None,
         reasoning_effort: str | None = None,
+        preserve_thinking: bool | None = None,
     ) -> list[int]:
         return self.encode(
             self.format_messages(
                 messages, enable_thinking=enable_thinking,
-                reasoning_effort=reasoning_effort)
+                reasoning_effort=reasoning_effort,
+                preserve_thinking=preserve_thinking)
         )
 
 
@@ -920,10 +961,56 @@ def _tool_grammar_specification(
     return specification
 
 
+def _chat_key(
+    messages: Sequence[Mapping[str, object]]
+) -> tuple[tuple[str, str, str], ...]:
+    """The continuation cache's key: role, visible content, replayed reasoning.
+
+    Index 0 and 1 stay role and content, which the prefix matcher indexes
+    positionally.
+    """
+    return tuple(
+        (
+            str(message["role"]),
+            str(message["content"]).strip(),
+            str(message.get("reasoning_content", "") or "").strip(),
+        )
+        for message in messages
+    )
+
+
 def _optional_thinking(options: Mapping[str, object]) -> bool | None:
     """`enable_thinking` as the caller left it, preserving "unstated"."""
     value = options.get("enable_thinking")
     return None if value is None else bool(value)
+
+
+def _optional_preserve(options: Mapping[str, object]) -> bool | None:
+    """`preserve_thinking` as the caller left it, preserving "unstated"."""
+    value = options.get("preserve_thinking")
+    return None if value is None else bool(value)
+
+
+def keeps_replayed_reasoning(
+    preserve_thinking: bool | None,
+    enable_thinking: bool | None,
+    index: int,
+    last_user: int,
+) -> bool:
+    """Whether an assistant turn's replayed chain-of-thought reaches the prompt.
+
+    The default is the convention every reasoning checkpoint is trained on:
+    keep the reasoning of turns AFTER the last user message -- the tool-call
+    loop the model is still inside, where its own thought is what justifies the
+    call it is about to see the result of -- and drop everything older, which
+    is what stops a long agentic session re-reading every thought it ever had.
+
+    `preserve_thinking` overrides that in either direction and is only ever set
+    when a client asked for it explicitly.
+    """
+    if preserve_thinking is not None:
+        return preserve_thinking
+    return bool(enable_thinking) and index > last_user
 
 
 # Qwen's own budget-exhaustion wrap-up, from their thinking-budget reference
@@ -1006,6 +1093,7 @@ class ChatGenerator:
         self._chat_text = ""
         self._chat_thinking = False
         self._chat_effort: str | None = None
+        self._chat_preserve: bool | None = None
         # Exact generated token IDs must survive unrelated concurrent requests.
         # A single "last chat" record let short agent/title/tool side-calls
         # overwrite the main conversation and forced its next turn to re-tokenize
@@ -1090,14 +1178,19 @@ class ChatGenerator:
         # reasoning-effort instruction with it, since the template only grades
         # reasoning it is doing.
         thinking = _optional_thinking(options)
+        preserve = _optional_preserve(options)
         effort = options.get("reasoning_effort")
-        normalized = tuple(
-            (message["role"], message["content"].strip()) for message in messages
-        )
+        # Replayed reasoning is part of the KEY, not just of the render. It
+        # changes the prompt whenever the architecture keeps it, so a reduction
+        # to (role, content) would match a turn rendered from a different
+        # chain-of-thought and reuse its tokens -- the same trap the docstring
+        # of _continued_chat_prompt records for tool schemas.
+        normalized = _chat_key(messages)
         with self._chat_lock:
             return self._continued_chat_prompt(
                 normalized, thinking, messages,
-                reasoning_effort=effort if isinstance(effort, str) else None)
+                reasoning_effort=effort if isinstance(effort, str) else None,
+                preserve_thinking=preserve)
 
     def stream_messages(
         self, messages: Sequence[Mapping[str, str]], **options: object
@@ -1117,15 +1210,14 @@ class ChatGenerator:
                     None,
                 )
             options["tool_grammar"] = _tool_grammar_specification(declared)
-        normalized = tuple(
-            (message["role"], message["content"].strip()) for message in messages
-        )
+        normalized = _chat_key(messages)
         prepared = options.get("prepared_prompt_ids")
         prompt_ids = (
             [int(token) for token in prepared]
             if isinstance(prepared, Sequence)
             else self.prepare_messages(
-                messages, enable_thinking=thinking, reasoning_effort=effort)
+                messages, enable_thinking=thinking, reasoning_effort=effort,
+                preserve_thinking=_optional_preserve(options))
         )
         final: GenerationStep | None = None
         for step in self._stream(prompt_ids, **options):
@@ -1142,12 +1234,14 @@ class ChatGenerator:
                 self._chat_text = final.text
                 self._chat_thinking = thinking
                 self._chat_effort = effort if isinstance(effort, str) else None
+                self._chat_preserve = _optional_preserve(options)
                 self._chat_continuations[normalized] = (
                     tuple(prompt_ids),
                     tuple(final.generated_ids),
                     final.text,
                     thinking,
                     self._chat_effort,
+                    self._chat_preserve,
                 )
                 self._chat_continuations.move_to_end(normalized)
                 while (
@@ -1157,21 +1251,23 @@ class ChatGenerator:
                     self._chat_continuations.popitem(last=False)
 
     def _continued_chat_prompt(
-        self, messages: tuple[tuple[str, str], ...], thinking: bool,
+        self, messages: tuple[tuple[str, str, str], ...], thinking: bool,
         full: Sequence[Mapping[str, object]] | None = None,
         *, reasoning_effort: str | None = None,
+        preserve_thinking: bool | None = None,
     ) -> list[int]:
         """Prompt ids for `messages`, reusing a cached prefix where one fits.
 
-        `messages` is the (role, content) reduction the continuation cache is
-        keyed and matched on; `full` is what actually gets rendered. The two are
+        `messages` is the (role, content, reasoning) reduction the continuation
+        cache is keyed and matched on; `full` is what actually gets rendered. The two are
         separate because a message carries more than role and content -- the
         tool schemas and the structured tool calls a native template renders
         itself -- and reducing before rendering silently dropped them, so a
         tool-capable model was prompted as though no tools existed.
         """
         rendered = list(full) if full is not None else [
-            {"role": role, "content": content} for role, content in messages
+            {"role": role, "content": content, "reasoning_content": reasoning}
+            for role, content, reasoning in messages
         ]
         candidates = list(self._chat_continuations.items())
         if self._chat_messages is not None:
@@ -1184,6 +1280,7 @@ class ChatGenerator:
                         self._chat_text,
                         self._chat_thinking,
                         self._chat_effort,
+                        self._chat_preserve,
                     ),
                 )
             )
@@ -1191,12 +1288,16 @@ class ChatGenerator:
         # literal prefix of a later turn but cannot reuse as much live state.
         candidates.sort(key=lambda item: len(item[0]), reverse=True)
         for previous, record in candidates:
-            prompt_ids, generated_ids, raw_text, record_thinking, record_effort = record
+            (prompt_ids, generated_ids, raw_text, record_thinking, record_effort,
+             record_preserve) = record
             if not (
                 thinking == record_thinking
                 # A prefix rendered at another effort opens with a different
                 # system prompt, so it is not a prefix of this conversation.
                 and reasoning_effort == record_effort
+                # ...and one rendered while replaying a different amount of the
+                # conversation's own reasoning is a different prefix too.
+                and preserve_thinking == record_preserve
                 and len(messages) > len(previous) + 1
                 and messages[: len(previous)] == previous
                 and messages[len(previous)][0] == "assistant"
@@ -1219,7 +1320,8 @@ class ChatGenerator:
                 suffix_messages = rendered[len(previous) + 1:]
                 suffix = self.tokenizer.encode_messages(
                     suffix_messages, enable_thinking=thinking,
-                    reasoning_effort=reasoning_effort
+                    reasoning_effort=reasoning_effort,
+                    preserve_thinking=preserve_thinking,
                 )
                 # The suffix is rendered as though it were a whole
                 # conversation, so a template that opens with BOS emits one
@@ -1239,7 +1341,8 @@ class ChatGenerator:
                     + suffix
                 )
         return self.tokenizer.encode_messages(
-            rendered, enable_thinking=thinking, reasoning_effort=reasoning_effort)
+            rendered, enable_thinking=thinking, reasoning_effort=reasoning_effort,
+            preserve_thinking=preserve_thinking)
 
     def _assistant_continues_previous(
         self, candidate: str, raw_text: str | None = None

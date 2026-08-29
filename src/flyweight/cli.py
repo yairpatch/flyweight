@@ -1665,6 +1665,20 @@ def _doctor() -> int:
            "" if sys.version_info >= (3, 11) else "flyweight needs Python 3.11+")
 
     source = native_build.source_root()
+
+    # Which copy of the package is actually imported. Installing a built wheel
+    # into the same environment as a checkout shadows it: `pytest` from the
+    # repo then imports site-packages, every edit looks like it did nothing,
+    # and nothing says so. The library check below would still pass, because
+    # the installed copy carries a library of its own.
+    package = Path(__file__).resolve().parent
+    if source is not None and package != source.parent / "src" / "flyweight":
+        report("package", None, f"imported from {package}, not this checkout",
+               "an installed copy is shadowing the sources: "
+               "pip uninstall flyweight && pip install -e .")
+    else:
+        report("package", True, str(package))
+
     library = None
     for suffix in (".so", ".dylib", ".dll"):
         candidate = native_build.default_output() / f"{native_build.LIBRARY_STEM}{suffix}"

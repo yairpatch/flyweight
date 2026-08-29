@@ -257,6 +257,11 @@ class _GenerationRequest:
     # generator forcing the block closed -- unlike reasoning_effort, which is
     # a request the checkpoint is free to overrun. None means unlimited.
     reasoning_budget_tokens: int | None = None
+    # Whether an assistant turn's replayed chain-of-thought reaches the prompt.
+    # None leaves the architecture's own convention, which keeps the reasoning
+    # of the tool-call loop the model is still inside and drops what the
+    # conversation has moved past. Only ever set when a client asked.
+    preserve_thinking: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -657,6 +662,7 @@ class InferenceService:
                 max_new_tokens=request.max_new_tokens,
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
+                preserve_thinking=request.preserve_thinking,
                 reasoning_effort=request.reasoning_effort,
                 reasoning_budget_tokens=request.reasoning_budget_tokens,
                 thinking_open=request.thinking_open,
@@ -673,6 +679,7 @@ class InferenceService:
             max_new_tokens=request.max_new_tokens,
             sampling=request.sampling,
             enable_thinking=request.enable_thinking,
+            preserve_thinking=request.preserve_thinking,
             reasoning_effort=request.reasoning_effort,
             reasoning_budget_tokens=request.reasoning_budget_tokens,
             thinking_open=request.thinking_open,
@@ -903,6 +910,7 @@ class InferenceService:
                 max_new_tokens=request.max_new_tokens,
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
+                preserve_thinking=request.preserve_thinking,
                 reasoning_effort=request.reasoning_effort,
                 reasoning_budget_tokens=request.reasoning_budget_tokens,
                 thinking_open=request.thinking_open,
@@ -1036,6 +1044,7 @@ class InferenceService:
                 max_new_tokens=request.max_new_tokens,
                 sampling=request.sampling,
                 enable_thinking=request.enable_thinking,
+                preserve_thinking=request.preserve_thinking,
                 reasoning_effort=request.reasoning_effort,
                 reasoning_budget_tokens=request.reasoning_budget_tokens,
                 thinking_open=request.thinking_open,
@@ -2166,6 +2175,11 @@ class InferenceService:
             enable_thinking = _boolean_option(
                 template_kwargs, "enable_thinking", None
             )
+        preserve_thinking = _boolean_option(payload, "preserve_thinking", None)
+        if preserve_thinking is None:
+            preserve_thinking = _boolean_option(
+                template_kwargs, "preserve_thinking", None
+            )
         separate_reasoning = _boolean_option(payload, "separate_reasoning", False)
         # Resolved before the prompt is rendered, not after: this is a template
         # variable, so it has to be in hand when the template runs. Passing it
@@ -2176,11 +2190,13 @@ class InferenceService:
             prepare_messages = getattr(self.generator, "prepare_messages", None)
             prompt_ids = tuple(
                 prepare_messages(messages, enable_thinking=enable_thinking,
-                                 reasoning_effort=reasoning_effort)
+                                 reasoning_effort=reasoning_effort,
+                                 preserve_thinking=preserve_thinking)
                 if callable(prepare_messages)
                 else self.generator.tokenizer.encode_messages(
                     messages, enable_thinking=enable_thinking,
-                    reasoning_effort=reasoning_effort
+                    reasoning_effort=reasoning_effort,
+                    preserve_thinking=preserve_thinking,
                 )
             )
         except Exception as error:
@@ -2208,6 +2224,7 @@ class InferenceService:
             separate_reasoning,
             thinking_open,
             reasoning_effort=reasoning_effort,
+            preserve_thinking=preserve_thinking,
             stop_sequences=_stop_option(payload),
             response_format=(
                 # thinking_open tells the constraint it starts inside a
@@ -3638,6 +3655,11 @@ def _anthropic_request(
         },
         "enable_thinking": _anthropic_thinking(thinking),
         "reasoning_effort": _anthropic_effort(payload),
+        # Not an Anthropic field. Carried anyway for the same reason the
+        # sampling settings above are: a client that sent it meant it, and
+        # this endpoint is where replayed thinking blocks arrive, so it is
+        # the one that most needs a say in whether they are rendered.
+        "preserve_thinking": payload.get("preserve_thinking"),
         # Anthropic's own hard cap, carried under the internal name so the
         # shared parser enforces it; it used to be read for nothing at all.
         **(

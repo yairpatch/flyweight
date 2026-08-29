@@ -1527,7 +1527,7 @@ class NativeV2ServerTests(unittest.TestCase):
 
     def test_native_chat_continuation_preserves_generated_token_ids(self) -> None:
         generator, _ = self.make_generator([10, 20, 30])
-        first_messages = (("user", "Hi"),)
+        first_messages = (("user", "Hi", ""),)
         generator.generate_messages(
             [{"role": "user", "content": "Hi"}], max_new_tokens=2
         )
@@ -1538,8 +1538,8 @@ class NativeV2ServerTests(unittest.TestCase):
         continued = generator._continued_chat_prompt(
             (
                 *first_messages,
-                ("assistant", "Hello world"),
-                ("user", "Again"),
+                ("assistant", "Hello world", ""),
+                ("user", "Again", ""),
             ),
             None,
         )
@@ -1547,7 +1547,7 @@ class NativeV2ServerTests(unittest.TestCase):
 
     def test_native_tool_call_round_trip_preserves_generated_token_ids(self) -> None:
         generator, _ = self.make_generator([10])
-        generator._chat_messages = (("user", "Write it"),)
+        generator._chat_messages = (("user", "Write it", ""),)
         generator._chat_prompt_ids = (7, 8)
         generator._chat_generated_ids = (20, 30)
         generator._chat_text = (
@@ -1560,14 +1560,15 @@ class NativeV2ServerTests(unittest.TestCase):
 
         continued = generator._continued_chat_prompt(
             (
-                ("user", "Write it"),
+                ("user", "Write it", ""),
                 (
                     "assistant",
                     "<tool_call>\n<function=write_file>\n"
                     "<parameter=path>\n/tmp/example\n</parameter>\n"
                     "</function>\n</tool_call>",
+                    "",
                 ),
-                ("user", "<tool_response>\ndone\n</tool_response>"),
+                ("user", "<tool_response>\ndone\n</tool_response>", ""),
             ),
             False,
         )
@@ -1576,16 +1577,17 @@ class NativeV2ServerTests(unittest.TestCase):
 
     def test_concurrent_side_chat_does_not_evict_main_continuation(self) -> None:
         generator, _ = self.make_generator([10])
-        main = (("user", "Long main conversation"),)
+        main = (("user", "Long main conversation", ""),)
         generator._chat_continuations[main] = (
             (7, 8),
             (20, 30),
             "Hello world",
             False,
             None,   # the reasoning effort the prefix was rendered at
+            None,   # ...and whether it replayed the conversation's reasoning
         )
         # A later short request owns the legacy last-writer fields.
-        generator._chat_messages = (("user", "Make a title"),)
+        generator._chat_messages = (("user", "Make a title", ""),)
         generator._chat_prompt_ids = (90,)
         generator._chat_generated_ids = (91,)
         generator._chat_text = "Title"
@@ -1594,8 +1596,8 @@ class NativeV2ServerTests(unittest.TestCase):
         continued = generator._continued_chat_prompt(
             (
                 *main,
-                ("assistant", "Hello world"),
-                ("user", "Continue"),
+                ("assistant", "Hello world", ""),
+                ("user", "Continue", ""),
             ),
             False,
         )
