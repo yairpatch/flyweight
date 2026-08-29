@@ -14006,7 +14006,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // headroom margin. Any positive value is an exact manual budget.
         std::uint64_t gpu_budget=runtime->options.gpu_cache_bytes;
         const bool auto_fit=(gpu_budget==0);
-        if(auto_fit&&prepare_policy.routed_gpu_execution_allowed()){
+        // Not gated on routed_gpu_execution_allowed(): the budget bounds the
+        // BASE allocations as well as the expert cache, and every feasibility
+        // check below reads `gpu_budget &&`. Deriving it only for models with
+        // routed experts left a dense one with no budget and therefore no
+        // check at all -- `--parallel 2` on a model that fits exactly once ran
+        // the whole prepare, including a 31 s host re-encode, and then died on
+        // whichever allocation happened to be next.
+        if(auto_fit){
             FlyweightV2GpuInfo gi{};
             if(gpu_probe(gi,runtime->options.device)==0&&gi.free_memory>0){
                 // Leave headroom for the CUDA context, activations and other
@@ -14034,8 +14041,37 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 "[flyweight] prefill expert streaming disabled: the GPU "
                 "budget cannot carry the arena\n");
         }
+        // Auto-fit was exempt from this, on the theory that it yields rather
+        // than fails. It does yield -- but only for the expert cache and the
+        // streaming arena, never for the base allocations, so a request that
+        // does not fit fell straight through to whichever device allocation
+        // happened to be next and died naming its victim ("failed to allocate
+        // native Qwen prefill snapshots") instead of the cause. The same
+        // arithmetic is known here, one message earlier, with the shortfall in
+        // it.
+        // FLYWEIGHT_GPU_PLAN=1 prints what prepare thinks it needs against what
+        // it thinks it has. Every "failed to allocate ..." is one of these two
+        // numbers being wrong, and without them the only evidence is which
+        // allocation happened to be next.
+        if(const char*plan=std::getenv("FLYWEIGHT_GPU_PLAN");plan&&plan[0]=='1'){
+            FlyweightV2GpuInfo now{};
+            gpu_probe(now,runtime->options.device);
+            auto m=[](std::uint64_t b){return static_cast<double>(b)/(1024.0*1024.0);};
+            std::fprintf(stderr,
+                "[flyweight] gpu plan: static %.0f + workspace %.0f + slots %.0f"
+                " + staging %.0f + snapshots %.0f + host-ffn stage %.0f"
+                " + stream %.0f = %.0f MiB; budget %.0f MiB (%s); free now %.0f MiB\n",
+                m(runtime->static_arena_bytes),m(runtime->workspace_bytes),
+                m(runtime->slots_state_bytes),m(runtime->expert_staging_bytes),
+                m(slot_count*runtime->prefill_snapshots.size()*
+                  runtime->prefill_snapshot_bytes),
+                m(runtime->host_ffn_stage_bytes),
+                m(runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes),
+                m(base_total_resolved),m(gpu_budget),auto_fit?"auto":"explicit",
+                m(now.free_memory));
+        }
         if(!runtime->options.strict_resident&&
-           !auto_fit&&gpu_budget&&base_total_resolved>gpu_budget){
+           gpu_budget&&base_total_resolved>gpu_budget){
             auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
             throw std::runtime_error(
                 "native Qwen base CUDA allocations ("+mib(base_total_resolved)+" MiB = static weights "
@@ -14046,9 +14082,13 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                      +mib(runtime->geometries[1].state_bytes)+" ("
                     :std::to_string(slot_count)+"x KV slot "+mib(runtime->state_bytes)+" (")
                 +mib(runtime->slots_state_bytes)+") + staging "+mib(runtime->expert_staging_bytes)
-                +") exceed the --gpu-cache-mib budget ("+mib(gpu_budget)
-                +" MiB), before any expert cache. Lower --parallel or --context-window, "
-                 "shrink the side slots with --scratch-context, or raise --gpu-cache-mib.");
+                +") exceed the "
+                +(auto_fit?"VRAM this device has free (":"--gpu-cache-mib budget (")
+                +mib(gpu_budget)+" MiB), before any expert cache. Short by "
+                +mib(base_total_resolved-gpu_budget)+" MiB. Lower --parallel or "
+                 "--context-window, shrink the side slots with --scratch-context"
+                +(auto_fit?", or free VRAM on this device."
+                          :", or raise --gpu-cache-mib."));
         }
         // expert_slot_bytes is zero for a dense model, which has no expert set
         // to cache and would trap on the slot arithmetic below.
@@ -14677,6 +14717,31 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             }
         }
         runtime->decode_ready=true;
+        // What is left for everything else on this card. On a machine whose GPU
+        // also drives the display, the desktop compositor and the browser
+        // allocate from the same pool, and when they cannot they do not fail
+        // loudly -- they paint stale or torn tiles, which reads as the chat UI
+        // corrupting itself rather than as anything to do with the model. Auto
+        // fit already reserves max(2 GiB, VRAM/8); an explicit --gpu-cache-mib
+        // reserves nothing, so this is the only warning such a run ever gets.
+        {
+            FlyweightV2GpuInfo after{};
+            constexpr std::uint64_t kDesktopHeadroom=768ull*1024*1024;
+            const auto policy=qwen_expert_policy(
+                *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
+            if(policy.routed_gpu_execution_allowed()&&
+               gpu_probe(after,runtime->options.device)==0&&after.available&&
+               after.free_memory&&after.free_memory<kDesktopHeadroom){
+                std::fprintf(stderr,
+                    "[flyweight] only %llu MiB of VRAM is free after loading. "
+                    "If this GPU also drives your display, the desktop and "
+                    "browser draw from the same memory and will render "
+                    "corrupted rather than fail; lower --gpu-cache-mib, "
+                    "--context-window or --parallel if you see that.\n",
+                    static_cast<unsigned long long>(
+                        after.free_memory/(1024ull*1024)));
+            }
+        }
     return 0;
 });}
 

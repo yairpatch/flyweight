@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .server import serve as serve_http
-from .v2 import AUTO_PROMPT_CACHE_MIB as _AUTO_PROMPT_CACHE_MIB, V2Model
+from .v2 import AUTO_PROMPT_CACHE_MIB as _AUTO_PROMPT_CACHE_MIB, V2Error, V2Model
 
 
 EXPERT_MODE_CHOICES = (
@@ -1777,6 +1777,21 @@ def _doctor() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run a command, reporting a runtime refusal as an error rather than a crash.
+
+    Everything the native runtime declines -- a budget that cannot hold the
+    request, an unsupported quantization, a checkpoint it will not load --
+    arrives as V2Error carrying a message written to be read. Letting it
+    propagate printed a ctypes traceback above that message, which reads as the
+    tool falling over rather than as it telling you what to change.
+    """
+    try:
+        return _run(argv)
+    except V2Error as error:
+        raise SystemExit(f"flyweight: {error}") from None
+
+
+def _run(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "doctor":
         return _doctor()
