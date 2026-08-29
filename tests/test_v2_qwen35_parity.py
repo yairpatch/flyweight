@@ -2,7 +2,7 @@
 
 The name-translation tests next door pin what the loader *calls* each tensor.
 This pins what it does to the values: the checkpoint is loaded unquantized
-(``COLIBRI_HF_QUANT=F32``) into both this runtime and transformers'
+(``FLYWEIGHT_HF_QUANT=F32``) into both this runtime and transformers'
 ``Qwen3_5ForCausalLM``, and the greedy token at every position must agree.
 
 That is the only check here that could have caught the two bugs this file was
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 from tests import qwen35_hf_fixture as fixture
 
 TOKENS = [3, 9, 17, 4, 21, 33, 8, 12]
@@ -114,8 +114,8 @@ class Qwen35ForwardParityTest(unittest.TestCase):
         return logits.argmax(-1).tolist()
 
     def runtime_tokens(self) -> list[int]:
-        previous = os.environ.get("COLIBRI_HF_QUANT")
-        os.environ["COLIBRI_HF_QUANT"] = "F32"
+        previous = os.environ.get("FLYWEIGHT_HF_QUANT")
+        os.environ["FLYWEIGHT_HF_QUANT"] = "F32"
         try:
             V2Model.select_backend("cpu")
             with V2Model(str(self.path)) as model:
@@ -124,9 +124,9 @@ class Qwen35ForwardParityTest(unittest.TestCase):
                     return [runtime.decode(token) for token in TOKENS]
         finally:
             if previous is None:
-                os.environ.pop("COLIBRI_HF_QUANT", None)
+                os.environ.pop("FLYWEIGHT_HF_QUANT", None)
             else:
-                os.environ["COLIBRI_HF_QUANT"] = previous
+                os.environ["FLYWEIGHT_HF_QUANT"] = previous
 
     def test_greedy_tokens_match_transformers(self) -> None:
         self.assertEqual(self.runtime_tokens(), self.reference_tokens())

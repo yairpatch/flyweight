@@ -1,14 +1,14 @@
-// Fiber scheduler backing the CUDA-to-host shim. See colibri_cpu_shim.hpp for
+// Fiber scheduler backing the CUDA-to-host shim. See flyweight_cpu_shim.hpp for
 // the execution model and why fibers rather than threads.
 
-#include <colibri_cpu_shim.hpp>
+#include <flyweight_cpu_shim.hpp>
 
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
-namespace colibri::cpu {
+namespace flyweight::cpu {
 
 thread_local Dim3 t_thread_index{};
 thread_local Dim3 t_block_index{};
@@ -19,7 +19,7 @@ thread_local std::uint64_t t_block_generation = 0;
 
 bool shared_zeroing_enabled() {
     static const bool on = [] {
-        const char* setting = std::getenv("COLIBRI_CPU_SHARED_ZERO");
+        const char* setting = std::getenv("FLYWEIGHT_CPU_SHARED_ZERO");
         return setting == nullptr || setting[0] != '0';  // default on
     }();
     return on;
@@ -284,4 +284,4 @@ void fiber_trampoline() {
 
 }  // namespace
 
-}  // namespace colibri::cpu
+}  // namespace flyweight::cpu

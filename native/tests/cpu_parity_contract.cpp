@@ -10,10 +10,10 @@
 // forced, once normally) and compares. Kernels registered without a case are
 // reported as untested and fail the run, so the two cannot drift apart.
 
-#include <colibri_backend.hpp>
-#include <colibri_cpu_kernels_api.hpp>
-#include <colibri_cpu_native.hpp>
-#include <colibri_cpu_shim_geometry.hpp>
+#include <flyweight_backend.hpp>
+#include <flyweight_cpu_kernels_api.hpp>
+#include <flyweight_cpu_native.hpp>
+#include <flyweight_cpu_shim_geometry.hpp>
 
 #include <cmath>
 #include <cstdint>
@@ -25,7 +25,7 @@
 #include <vector>
 
 extern "C" {
-int colibri_cpu_launch_named(const char*, std::uint32_t, std::uint32_t,
+int flyweight_cpu_launch_named(const char*, std::uint32_t, std::uint32_t,
                              std::uint32_t, std::uint32_t, std::uint64_t,
                              void**);
 }
@@ -62,16 +62,16 @@ int run_case(const Case& item) {
     const auto seed = rng();
 
     rng() = seed;
-    colibri::cpu::set_force_emulation(true);
+    flyweight::cpu::set_force_emulation(true);
     std::vector<std::vector<float>> reference;
     item.run(reference);
 
     rng() = seed;
-    colibri::cpu::set_force_emulation(false);
+    flyweight::cpu::set_force_emulation(false);
     std::vector<std::vector<float>> native;
     item.run(native);
 
-    colibri::cpu::set_force_emulation(false);
+    flyweight::cpu::set_force_emulation(false);
 
     if (reference.size() != native.size()) {
         std::printf("  %-28s FAIL (output count %zu vs %zu)\n",
@@ -128,7 +128,7 @@ void add_cases() {
                     void* arguments[] = {&input_pointer, &weight_pointer,
                                          &output_pointer, &elements, &epsilon,
                                          &one_centered};
-                    colibri_cpu_launch_named("rms_norm", 1, 1, 256, 0, 0,
+                    flyweight_cpu_launch_named("rms_norm", 1, 1, 256, 0, 0,
                                              arguments);
                     outputs.push_back(std::move(output));
                 }
@@ -151,7 +151,7 @@ void add_cases() {
                 const float* source_pointer = source.data();
                 void* arguments[] = {&target_pointer, &source_pointer, &scale,
                                      &elements};
-                colibri_cpu_launch_named("scaled_add",
+                flyweight_cpu_launch_named("scaled_add",
                                          (elements + 255) / 256, 1, 256, 0, 0,
                                          arguments);
                 outputs.push_back(std::move(target));
@@ -182,7 +182,7 @@ void add_cases() {
                 float* output_pointer = output.data();
                 void* arguments[] = {&matrix_pointer, &input_pointer,
                                      &output_pointer, &input_size, &output_size};
-                colibri_cpu_launch_named("qwen_f32_matvec_warp",
+                flyweight_cpu_launch_named("qwen_f32_matvec_warp",
                                          (output_size + 7) / 8, 1, 256, 0, 0,
                                          arguments);
                 outputs.push_back(std::move(output));
@@ -217,7 +217,7 @@ void add_cases() {
                 void* arguments[] = {&matrix_pointer, &input_pointer,
                                      &output_pointer, &input_size,
                                      &output_size, &rows};
-                colibri_cpu_launch_named("qwen_f32_matmul_rows", output_size,
+                flyweight_cpu_launch_named("qwen_f32_matmul_rows", output_size,
                                          rows, 256, 0, 0, arguments);
                 outputs.push_back(std::move(output));
             }
@@ -244,7 +244,7 @@ void add_cases() {
                 const float scale = absmax / 127.0f;
                 const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
                 const std::uint16_t bits =
-                    colibri::cpu::float_to_half_bits(scale);
+                    flyweight::cpu::float_to_half_bits(scale);
                 std::memcpy(packed.data() + cursor, &bits, sizeof(bits));
                 for (int index = 0; index < 32; ++index) {
                     const float scaled = slice[index] * inverse;
@@ -279,7 +279,7 @@ void add_cases() {
                 float* output_pointer = output.data();
                 void* arguments[] = {&packed_pointer, &vector_pointer,
                                      &output_pointer, &input_size, &output_size};
-                colibri_cpu_launch_named("q8_matvec_transposed_warp",
+                flyweight_cpu_launch_named("q8_matvec_transposed_warp",
                                          (output_size + 7) / 8, 1, 256, 0, 0,
                                          arguments);
                 outputs.push_back(std::move(output));
@@ -314,7 +314,7 @@ void add_cases() {
                 void* arguments[] = {&packed_pointer, &input_pointer,
                                      &output_pointer, &input_size,
                                      &output_size, &rows};
-                colibri_cpu_launch_named("q8_matmul_tiled",
+                flyweight_cpu_launch_named("q8_matmul_tiled",
                                          (output_size + 31) / 32,
                                          (rows + 31) / 32, 256, 0, 0, arguments);
                 outputs.push_back(std::move(output));
@@ -356,7 +356,7 @@ void add_cases() {
                 unsigned long long* winner_pointer = &winner;
                 void* arguments[] = {&packed_pointer, &vector_pointer,
                                      &winner_pointer, &input_size, &output_size};
-                colibri_cpu_launch_named("q8_lm_head_argmax_warp",
+                flyweight_cpu_launch_named("q8_lm_head_argmax_warp",
                                          (output_size + 7) / 8, 1, 256, 0, 0,
                                          arguments);
                 // Compare the decoded row, not the raw word: an argmax that
@@ -395,7 +395,7 @@ void add_cases() {
                 float* output_pointer = output.data();
                 void* arguments[] = {&gate_pointer, &up_pointer, &vector_pointer,
                                      &output_pointer, &input_size, &output_size};
-                colibri_cpu_launch_named("q8_swiglu_transposed_warp",
+                flyweight_cpu_launch_named("q8_swiglu_transposed_warp",
                                          (output_size + 7) / 8, 1, 256, 0, 0,
                                          arguments);
                 outputs.push_back(std::move(output));
@@ -468,7 +468,7 @@ void add_cases() {
                 const int block = head_dim * slices;
                 const std::uint32_t shared =
                     (head_dim * 4 + block) * sizeof(float);
-                colibri_cpu_launch_named("qwen_delta_recurrent_split",
+                flyweight_cpu_launch_named("qwen_delta_recurrent_split",
                                          value_heads, 1, block, shared, 0,
                                          arguments);
                 // The mutated state matters as much as the output: it is what
@@ -529,7 +529,7 @@ void add_cases() {
                                      &coeff_p, &dt_p, &norm_p, &state_p,
                                      &output_p, &rows, &key_heads, &value_heads,
                                      &head_dim, &epsilon, &gate_sigmoid};
-                colibri_cpu_launch_named("qwen_delta_recurrent_chunk",
+                flyweight_cpu_launch_named("qwen_delta_recurrent_chunk",
                                          value_heads, 1, 128, 0, 0, arguments);
                 outputs.push_back(std::move(output));
                 outputs.push_back(std::move(state));
@@ -557,7 +557,7 @@ void add_cases() {
                     float epsilon = 1e-6f;
                     void* arguments[] = {&input_p, &weight_p, &output_p, &rows,
                                          &columns, &epsilon, &one_centered};
-                    colibri_cpu_launch_named("rms_norm_rows", rows, 1, 256, 0, 0,
+                    flyweight_cpu_launch_named("rms_norm_rows", rows, 1, 256, 0, 0,
                                              arguments);
                     outputs.push_back(std::move(output));
                 }
@@ -577,7 +577,7 @@ void add_cases() {
                 const float* gate_p = gate.data();
                 float* shared_p = shared.data();
                 void* arguments[] = {&input_p, &gate_p, &shared_p, &elements};
-                colibri_cpu_launch_named("qwen_shared_scale", 1, 1, 256, 0, 0,
+                flyweight_cpu_launch_named("qwen_shared_scale", 1, 1, 256, 0, 0,
                                          arguments);
                 outputs.push_back(std::move(shared));
             }
@@ -600,7 +600,7 @@ void add_cases() {
                 float* weights_p = weights.data();
                 void* arguments[] = {&logits_p, &selected_p, &weights_p,
                                      &experts, &top_k};
-                colibri_cpu_launch_named("route_topk", 1, 1, 256,
+                flyweight_cpu_launch_named("route_topk", 1, 1, 256,
                                          experts * sizeof(float), 0, arguments);
                 // Which experts were chosen is discrete and must match exactly;
                 // it is compared alongside the weights, in the same buffer.
@@ -633,7 +633,7 @@ void add_cases() {
                 float* weights_p = weights.data();
                 void* arguments[] = {&logits_p, &selected_p, &weights_p, &rows,
                                      &experts, &top_k};
-                colibri_cpu_launch_named("route_topk_rows", rows, 1, 256,
+                flyweight_cpu_launch_named("route_topk_rows", rows, 1, 256,
                                          experts * sizeof(float), 0, arguments);
                 std::vector<float> combined;
                 for (int value : selected)
@@ -662,7 +662,7 @@ void add_cases() {
                 float* shared_p = shared.data();
                 void* arguments[] = {&input_p, &gate_p, &shared_p, &rows,
                                      &elements};
-                colibri_cpu_launch_named("qwen_shared_scale_rows", rows, 1, 256,
+                flyweight_cpu_launch_named("qwen_shared_scale_rows", rows, 1, 256,
                                          0, 0, arguments);
                 outputs.push_back(std::move(shared));
             }
@@ -698,7 +698,7 @@ void add_cases() {
                                          &gates_p, &heads, &head_dim,
                                          &rotary_dim, &position, &theta,
                                          &epsilon};
-                    colibri_cpu_launch_named("qwen_attention_query", heads, 1,
+                    flyweight_cpu_launch_named("qwen_attention_query", heads, 1,
                                              256, 0, 0, arguments);
                     outputs.push_back(std::move(queries));
                     outputs.push_back(std::move(gates));
@@ -735,7 +735,7 @@ void add_cases() {
                 // Round through fp16 so both paths read identical bits.
                 std::vector<std::uint16_t> values(raw.size());
                 for (std::size_t index = 0; index < raw.size(); ++index)
-                    values[index] = colibri::cpu::float_to_half_bits(raw[index]);
+                    values[index] = flyweight::cpu::float_to_half_bits(raw[index]);
                 std::vector<float> output(
                     static_cast<std::size_t>(heads) * head_dim, 0.0f);
 
@@ -744,7 +744,7 @@ void add_cases() {
                 float* output_p = output.data();
                 void* arguments[] = {&scores_p, &values_p, &output_p, &heads,
                                      &kv_heads, &head_dim, &tokens, &cap, &first};
-                colibri_cpu_launch_named("kv_attention_values_f16_ring", heads,
+                flyweight_cpu_launch_named("kv_attention_values_f16_ring", heads,
                                          1, 256, 0, 0, arguments);
                 outputs.push_back(std::move(output));
                 // The scores buffer is softmaxed in place and read back by the
@@ -780,7 +780,7 @@ void add_cases() {
                 float* output_p = output.data();
                 void* arguments[] = {&scores_p, &values_p, &output_p, &heads,
                                      &kv_heads, &head_dim, &tokens, &cap, &first};
-                colibri_cpu_launch_named("kv_attention_values_ring", heads, 1,
+                flyweight_cpu_launch_named("kv_attention_values_ring", heads, 1,
                                          256, 0, 0, arguments);
                 outputs.push_back(std::move(output));
                 outputs.push_back(std::move(scores));
@@ -811,7 +811,7 @@ void add_cases() {
                     void* arguments[] = {&projected_p, &norm_p, &keys_p, &heads,
                                          &head_dim, &rotary_dim, &position,
                                          &theta, &epsilon};
-                    colibri_cpu_launch_named("qwen_attention_key", heads, 1, 256,
+                    flyweight_cpu_launch_named("qwen_attention_key", heads, 1, 256,
                                              0, 0, arguments);
                     outputs.push_back(std::move(keys));
                 }
@@ -835,7 +835,7 @@ void add_cases() {
                     float* sums_pointer = sums.data();
                     void* arguments[] = {&input_pointer, &sums_pointer, &width,
                                          &rows};
-                    colibri_cpu_launch_named("qwen_imatrix_accumulate",
+                    flyweight_cpu_launch_named("qwen_imatrix_accumulate",
                                              (width + 255) / 256, 1, 256, 0, 0,
                                              arguments);
                     outputs.push_back(std::move(sums));
@@ -849,13 +849,13 @@ void add_cases() {
 }  // namespace
 
 int main() {
-    colibri_backend_select(kColibriBackendCpu);
+    flyweight_backend_select(kFlyweightBackendCpu);
     add_cases();
 
     std::printf("CPU kernel parity (native vs emulated corpus)\n");
     int failures = 0;
     for (const auto& item : cases()) {
-        if (colibri::cpu::find_native_kernel(item.kernel.c_str()) == nullptr) {
+        if (flyweight::cpu::find_native_kernel(item.kernel.c_str()) == nullptr) {
             std::printf("  %-28s FAIL (no native kernel registered)\n",
                         item.kernel.c_str());
             ++failures;
@@ -866,11 +866,11 @@ int main() {
 
     // A native kernel with no case would be serving production traffic with
     // nothing checking it against the reference.
-    const std::size_t total = colibri::cpu::kernel_count();
+    const std::size_t total = flyweight::cpu::kernel_count();
     for (std::size_t index = 0; index < total; ++index) {
-        const char* name = colibri::cpu::kernel_name(index);
+        const char* name = flyweight::cpu::kernel_name(index);
         if (name == nullptr) continue;
-        if (colibri::cpu::find_native_kernel(name) == nullptr) continue;
+        if (flyweight::cpu::find_native_kernel(name) == nullptr) continue;
         bool covered = false;
         for (const auto& item : cases())
             if (item.kernel == name) { covered = true; break; }

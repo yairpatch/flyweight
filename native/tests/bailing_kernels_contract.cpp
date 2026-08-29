@@ -13,9 +13,9 @@
 // back to the reference implementation rather than to another copy of my own
 // reasoning.
 
-#include <colibri_cpu_backend.hpp>
+#include <flyweight_cpu_backend.hpp>
 
-#include "colibri_v2_bailing.hpp"
+#include "flyweight_v2_bailing.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -47,7 +47,7 @@ bool run(int heads, int rows) {
     // Reference: the host implementation, on its own copy of the state.
     std::vector<float> expected_state = initial;
     std::vector<float> expected(width * rows, 0.0f);
-    colibri::v2::bailing::kda_recurrence(
+    flyweight::v2::bailing::kda_recurrence(
         queries.data(), keys.data(), values.data(), gate_raw.data(),
         beta_logits.data(), a_log.data(), dt_bias.data(),
         static_cast<std::size_t>(rows), static_cast<std::size_t>(heads),
@@ -69,7 +69,7 @@ bool run(int heads, int rows) {
     void* arguments[] = {&queries_p, &keys_p, &values_p, &gate_p, &beta_p,
                          &a_p, &dt_p, &state_p, &output_p,
                          &rows_arg, &heads_arg, &head_dim_arg, &epsilon};
-    if (colibri_cpu_launch_named("bailing_kda_recurrent_chunk",
+    if (flyweight_cpu_launch_named("bailing_kda_recurrent_chunk",
                                  static_cast<std::uint32_t>(heads), 1, 128, 0, 0,
                                  arguments) != 0) {
         std::printf("  launch failed for heads=%d rows=%d\n", heads, rows);
@@ -116,7 +116,7 @@ bool run_mla(int heads, int positions) {
     auto rope_keys = fill(static_cast<std::size_t>(positions) * kRope);
 
     std::vector<float> expected(static_cast<std::size_t>(heads) * kValue, 0.0f);
-    colibri::v2::bailing::mla_attention_absorbed(
+    flyweight::v2::bailing::mla_attention_absorbed(
         query_nope.data(), query_rope.data(), kv_b.data(), latents.data(),
         rope_keys.data(), static_cast<std::size_t>(positions),
         static_cast<std::size_t>(heads), kNope, kRope, kValue, kLora,
@@ -136,7 +136,7 @@ bool run_mla(int heads, int positions) {
     void* arguments[] = {&qn, &qr, &kvb, &lat, &rope, &scores, &out,
                          &positions_arg, &heads_arg, &nope, &ropedim,
                          &value_dim, &lora};
-    if (colibri_cpu_launch_named("bailing_mla_attention",
+    if (flyweight_cpu_launch_named("bailing_mla_attention",
                                  static_cast<std::uint32_t>(heads), 1, 128, 0, 0,
                                  arguments) != 0) {
         std::printf("  MLA launch failed heads=%d positions=%d\n", heads, positions);
@@ -175,21 +175,21 @@ bool run_mla_split(int heads, int positions, int splits) {
     void* baseline_args[] = {&score_p, &latent_p, &expected_p,
                              &positions_arg, &heads_arg, &lora_arg};
     const std::uint32_t columns = (kLora + 127) / 128;
-    if (colibri_cpu_launch_named("bailing_mla_accumulate", heads, columns,
+    if (flyweight_cpu_launch_named("bailing_mla_accumulate", heads, columns,
                                  128, 0, 0, baseline_args) != 0)
         return false;
 
     float* partial_p = partials.data();
     void* split_args[] = {&score_p, &latent_p, &partial_p, &positions_arg,
                           &heads_arg, &lora_arg, &splits};
-    if (colibri_cpu_launch_named("bailing_mla_accumulate_split",
+    if (flyweight_cpu_launch_named("bailing_mla_accumulate_split",
                                  heads * splits, columns, 128, 0, 0,
                                  split_args) != 0)
         return false;
     float* actual_p = actual.data();
     void* reduce_args[] = {&partial_p, &actual_p, &heads_arg, &lora_arg,
                            &splits};
-    if (colibri_cpu_launch_named("bailing_mla_accumulate_reduce", heads,
+    if (flyweight_cpu_launch_named("bailing_mla_accumulate_reduce", heads,
                                  columns, 128, 0, 0, reduce_args) != 0)
         return false;
 
@@ -232,7 +232,7 @@ bool run_mla_pair_scores(int heads, int positions) {
         &expected_p, &positions_arg, &heads_arg, &nope_arg, &rope_arg,
         &lora_arg};
     const std::uint32_t position_blocks = (positions + 7) / 8;
-    if (colibri_cpu_launch_named("bailing_mla_scores", heads,
+    if (flyweight_cpu_launch_named("bailing_mla_scores", heads,
                                  position_blocks, 256, 0, 0,
                                  baseline_args) != 0)
         return false;
@@ -240,7 +240,7 @@ bool run_mla_pair_scores(int heads, int positions) {
     void* pair_args[] = {&projected_p, &query_p, &latent_p, &rope_p,
         &actual_p, &positions_arg, &heads_arg, &nope_arg, &rope_arg,
         &lora_arg};
-    if (colibri_cpu_launch_named("bailing_mla_scores_pair", (heads + 1) / 2,
+    if (flyweight_cpu_launch_named("bailing_mla_scores_pair", (heads + 1) / 2,
                                  position_blocks, 256, 0, 0,
                                  pair_args) != 0)
         return false;

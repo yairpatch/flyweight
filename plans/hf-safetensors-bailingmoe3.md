@@ -77,8 +77,8 @@ Note the naming split in the wild: `bailing-hybrid` (prometheusAIR) vs
 
 ## Stage 1 -- safetensors as a WeightProvider
 
-The seam already exists. `ColibriV2Model` implements
-`colibri::v2::WeightProvider` (`v2_runtime.cpp:94`) whose entire surface is
+The seam already exists. `FlyweightV2Model` implements
+`flyweight::v2::WeightProvider` (`v2_runtime.cpp:94`) whose entire surface is
 `format()`, `tensor(index)`, `read_tensor()` (`:122-125`), over descriptors of
 `{name, shape, type, offset, size}` on an mmap. Safetensors is that exact shape:
 JSON header of dtype/shape/byte-range plus a flat blob.
@@ -170,7 +170,7 @@ Two real bugs were found getting there, both silent:
 
 ### Load-time driver -- DONE
 
-`include/colibri_v2_hf_quantize.hpp` sizes an arena from the descriptors, then
+`include/flyweight_v2_hf_quantize.hpp` sizes an arena from the descriptors, then
 fills it in parallel (per tensor, `schedule(dynamic)`). Two passes rather than
 one so every destination is known before any work starts and the threads never
 coordinate.
@@ -198,7 +198,7 @@ bulk, everything else takes the target type. On this checkpoint that is 192 f32
 
 ### Wiring -- DONE
 
-`colibri_v2_model_open` now accepts a directory. Detection is the whole rule: a
+`flyweight_v2_model_open` now accepts a directory. Detection is the whole rule: a
 directory containing `config.json` is HF, anything else is GGUF. `map_and_parse`
 was split into `map_file` (mmap, no interpretation) plus the GGUF parse, so both
 formats share the mapping path including the mlock/madvise behaviour.
@@ -211,12 +211,12 @@ bf16 alive for the process lifetime to serve nothing would be wasteful.
 Verified end to end through the Python `V2Model` on the real checkpoint:
 `format=safetensors`, `arch=bailingmoe3`, 520 tensors, 4.566 GB, ~25 s.
 
-Target type is selectable through `COLIBRI_HF_QUANT` for now.
+Target type is selectable through `FLYWEIGHT_HF_QUANT` for now.
 
 **Trap worth recording:** the Python package loads
-`src/colibri_next/_native/colibri_v2.so`, *not* the `build/cmake-native` output.
+`src/flyweight/_native/flyweight_v2.so`, *not* the `build/cmake-native` output.
 Building with `cmake --build` alone leaves the tests running against a stale
-binary that silently passes. Use `python -m colibri_next.native_build`.
+binary that silently passes. Use `python -m flyweight.native_build`.
 
 Tests: `tests/hf_safetensors_fixture.py` synthesizes a structurally faithful
 BailingMoE3 checkpoint (3:1 cadence, dense leading block, experts deliberately
@@ -239,10 +239,10 @@ per-core packer throughput on the 9955HX (`native` sources, `-O3 -march=native`)
 Ling-3.0-tiny is ~7.9G elements, so Q4_K is ~260 core-seconds of packing *per
 open* -- the ~25 s above, spent again every launch.
 
-So the arena is written to a sidecar (`colibri_v2_hf_cache.hpp`) and mapped
+So the arena is written to a sidecar (`flyweight_v2_hf_cache.hpp`) and mapped
 thereafter. On a 1.5 GiB synthetic checkpoint: **2.79 s cold, 0.00 s warm**, and
 the arena is byte-identical across all 172 tensors (sha256 over every tensor
-with `COLIBRI_HF_CACHE=0` vs. warm). A hit never opens the shards at all.
+with `FLYWEIGHT_HF_CACHE=0` vs. warm). A hit never opens the shards at all.
 
 Three decisions worth keeping:
 
@@ -258,10 +258,10 @@ Three decisions worth keeping:
   The reader bounds-checks every table offset against the mapping for exactly
   this reason, and `write` goes through a temporary + rename so a file is never
   half-there.
-* **Beside the checkpoint first, `$XDG_CACHE_HOME/colibri-next` second.** Hub
+* **Beside the checkpoint first, `$XDG_CACHE_HOME/flyweight` second.** Hub
   caches and shared mounts are read-only often enough to need the fallback. The
   file name carries the fingerprint, so one directory can hold caches for
-  several models or several quantizations. `COLIBRI_HF_CACHE=0` disables it (the
+  several models or several quantizations. `FLYWEIGHT_HF_CACHE=0` disables it (the
   packers cannot be benchmarked otherwise); any other value is a directory.
 
 ### Cold open -- DONE. 22.4s -> 3.1s on the packers.
@@ -277,7 +277,7 @@ With the cache in, the only slow path left is the first open. Measured on a
 
 Full cold open is now 4.36 s (3.1 quantize + 1.0 cache write + 0.14 tokenizer);
 warm open is 0.16 s, of which 0.14 s is parsing tokenizer.json. Phase timings
-are available under `COLIBRI_HF_PROFILE=1`, which is what found all of this.
+are available under `FLYWEIGHT_HF_PROFILE=1`, which is what found all of this.
 
 **Threading was already done.** 1/4/8/16/32 threads gave 286/74/40/21.5/17.0 s
 -- 13.3x at 16 threads, and SMT adds another 27%. There was nothing left there,
@@ -319,7 +319,7 @@ Three things that cost real time to find, all of them invisible in a diff:
   only thing that catches the flag going missing.
 
 Dispatch follows the existing CPU-backend arrangement: baseline library, one TU
-per ISA, hook installed after a CPUID check, and `COLIBRI_CPU_BACKEND=scalar`
+per ISA, hook installed after a CPUID check, and `FLYWEIGHT_CPU_BACKEND=scalar`
 forces the reference path. The contract test passes identically both ways.
 
 Still on the table: `make_qx_quants` (Q6_K, the embedding and head) is still
@@ -366,7 +366,7 @@ and a later `>` in the same string.
 
 Still to do for this stage:
 
-1. Policy: promote `COLIBRI_HF_QUANT` into a real runtime option, folded into
+1. Policy: promote `FLYWEIGHT_HF_QUANT` into a real runtime option, folded into
    `dense_requant` rather than left as a second parallel knob.
 
 ## Stage 3 -- the `bailingmoe3` architecture
@@ -404,7 +404,7 @@ kernels, runtime wiring, a synthetic GGUF fixture, and a parity test.
    top-k over all 128 experts -- correct-looking output, wrong routing. Now in
    `ModelConfig`, in the public ABI (appended, layout-compatible), and asserted
    through Python.
-2. **MoE routing -- DONE.** `include/colibri_v2_bailing.hpp`. The DeepSeek-V4
+2. **MoE routing -- DONE.** `include/flyweight_v2_bailing.hpp`. The DeepSeek-V4
    router here shares the bias-steers-selection structure but scores with
    `sqrt(softplus)` over a flat expert list, where this scores with sigmoid over
    expert groups, so it needed its own implementation rather than a flag.
@@ -454,7 +454,7 @@ kernels, runtime wiring, a synthetic GGUF fixture, and a parity test.
    duplication; the only genuinely common parts are rms_norm, rope and matvec,
    which are already shared helpers.
 
-   Done and pinned in `include/colibri_v2_bailing.hpp`:
+   Done and pinned in `include/flyweight_v2_bailing.hpp`:
 
    * `partial_rope_norm` -- **the trap in this architecture.**
      `apply_rotary_pos_emb_interleave` (modeling:541-577) de-interleaves the
@@ -496,7 +496,7 @@ kernels, runtime wiring, a synthetic GGUF fixture, and a parity test.
    per cached position (17408 vs 5120), which is the right side of the trade on
    a decode this repo has already measured as bandwidth-bound.
 
-   Both forms are implemented in `include/colibri_v2_bailing.hpp`:
+   Both forms are implemented in `include/flyweight_v2_bailing.hpp`:
    `mla_attention_decompressed` (reference), `mla_attention_absorbed` (latent),
    `mla_decompress` (bridge). Checked against a torch transcription of
    `BailingMoeV3MultiLatentAttention.forward` at 1, 2, 7, 64 and 257 positions:
@@ -549,10 +549,10 @@ torch on inputs the harness was not involved in.
 
 ### Execution path -- DONE (host, f32). THE MODEL RUNS.
 
-Four ABI entries: `colibri_v2_bailing_create` / `_reset` / `_eval` / `_destroy`.
+Four ABI entries: `flyweight_v2_bailing_create` / `_reset` / `_eval` / `_destroy`.
 `_eval` consumes tokens from the runtime's current position and returns logits
 for the last one, so repeated calls decode. Weights must be f32 (open with
-`COLIBRI_HF_QUANT=F32`); the quantized path waits on the kernels.
+`FLYWEIGHT_HF_QUANT=F32`); the quantized path waits on the kernels.
 
 **Gate: PASSED.** Full 24-layer forward against the causal reference, real
 checkpoint, prompt "The capital of France is":
@@ -579,7 +579,7 @@ above, where the *reference's* own f32 rounding was 8.1e-05.
    component test passed throughout, because each was handed the correct
    geometry by hand; only assembling the real model from the real config
    exposed it. `ModelConfig::attention_head_dim` now carries it.
-2. **`COLIBRI_HF_QUANT=F32` left the embedding at Q6_K**, because the embedding
+2. **`FLYWEIGHT_HF_QUANT=F32` left the embedding at Q6_K**, because the embedding
    carries its own target in the policy. "Unquantized" has to mean unquantized.
 
 **And one bug in the reference, now corrected in the harness.** The MLA layers
@@ -595,12 +595,12 @@ mask when transformers supplies none.
 
 ### Generation -- WORKING
 
-`colibri_next.v2.BailingRuntime` wraps the ABI: `eval` advances the caches and
+`flyweight.v2.BailingRuntime` wraps the ABI: `eval` advances the caches and
 returns the last token's logits, `generate` greedy-decodes, `reset` starts a new
 sequence. The prompt goes through in one call and each generated token in
 another, which is what the per-layer caches are for.
 
-    COLIBRI_HF_QUANT=F32 python -c "..."   # see /tmp/chat.py pattern
+    FLYWEIGHT_HF_QUANT=F32 python -c "..."   # see /tmp/chat.py pattern
     prompt 'The capital of France is' -> ' Paris.\n\nI want to know the total
     number of ways to arrange the letters of the word "PARIS".'
 
@@ -681,7 +681,7 @@ No new kernels were needed. `qwen_quant_dot_avx2` / `_avx512` already existed in
 the CPU backend and already covered exactly the types the HF quantizer emits
 (Q8_0, Q4_K, Q5_K, Q6_K); `matvec` now selects the widest available path once,
 outside the row loop, and falls back to the scalar `row_dot`. The standalone
-contract tests build with `COLIBRI_BAILING_NO_SIMD` since they do not link the
+contract tests build with `FLYWEIGHT_BAILING_NO_SIMD` since they do not link the
 AVX objects.
 
 Q4_K decode, cumulative:
@@ -736,7 +736,7 @@ Current state, Q4_K on a Ryzen 9 9955HX:
 
 ### Profiling -- and the 3x it found
 
-`COLIBRI_BAILING_PROFILE=1` turns on phase timers (`bailing::Profile`), split
+`FLYWEIGHT_BAILING_PROFILE=1` turns on phase timers (`bailing::Profile`), split
 along the line that matters: what batches versus what is sequential in position.
 Prefill of 256 tokens, Q4_K:
 
@@ -823,7 +823,7 @@ Still to do, in value order:
    weight read is amortized poorly.
 ### KDA CUDA kernel -- DONE (kernel only, not yet wired to the GPU runtime)
 
-`bailing_kda_recurrent_chunk` is in `colibri_v2_native_kernels.hpp`. As
+`bailing_kda_recurrent_chunk` is in `flyweight_v2_native_kernels.hpp`. As
 predicted from reading the DeltaNet kernel, it is that kernel with one change:
 
     DeltaNet   local_state[key] *= decay_scale        (one scalar per head)
@@ -848,8 +848,8 @@ kernel text and compares it to `bailing::kda_recurrence`:
 That chains back to the reference: the host implementation is pinned to
 flash-linear-attention by `kda_reference_check.py` and to the real checkpoint's
 layer 0 at 9.8e-07. This matters on this machine specifically, where PyTorch
-cannot see the GPU at all -- colibri's own CUDA path initializes fine
-(`colibri_v2_gpu_init` returns 0 on the RTX 5070 Ti), but nothing else could
+cannot see the GPU at all -- flyweight's own CUDA path initializes fine
+(`flyweight_v2_gpu_init` returns 0 on the RTX 5070 Ti), but nothing else could
 have tested this kernel here.
 
 Two mechanical notes for whoever adds the next kernel: the corpus is split into
@@ -897,10 +897,10 @@ RTX 5070 Ti (sm_120):
 | `bailing_mla_attention` | output 3.5e-06 |
 
 Worth noting for the record: PyTorch on this machine cannot use this GPU at all
-(its build stops at sm_90), while colibri's own NVRTC path compiles the whole
+(its build stops at sm_90), while flyweight's own NVRTC path compiles the whole
 corpus for it without complaint. The card was never the problem.
 
-**One integration step that is easy to miss.** `colibri_gpu_launch_named`
+**One integration step that is easy to miss.** `flyweight_gpu_launch_named`
 resolves kernels from a hardcoded name list in `gpu_driver.cpp`, not by
 enumerating the module. A kernel that compiles fine and is present in the
 cubin still returns -2 ("not found") until its name is added there. Both are
@@ -913,7 +913,7 @@ is missing is a runtime that calls them instead of the host path.
 
 ### GPU on by default -- DONE. Host prefill + device decode.
 
-The GPU path was opt-in behind `COLIBRI_BAILING_GPU=1` because the device had to
+The GPU path was opt-in behind `FLYWEIGHT_BAILING_GPU=1` because the device had to
 take prefill as well as decode, and device prefill is a token-at-a-time loop
 where the host's is batched. Measured, 12.33 GiB synthetic checkpoint:
 
@@ -927,7 +927,7 @@ Break-even before this was `generated ≈ 1.35 × prompt` at Q4_K -- so on a lon
 prompt with a short answer, which is most of them, the flag-off default really
 was the faster choice. Now the device is not worse at anything, so the flag has
 nothing left to trade and the path is on wherever a device exists.
-`COLIBRI_BAILING_GPU=0` still forces the host, which is what keeps the two
+`FLYWEIGHT_BAILING_GPU=0` still forces the host, which is what keeps the two
 comparable; the host remains the correctness oracle.
 
 **What made this cheap: not writing a batched device prefill.** The obvious
@@ -1025,16 +1025,16 @@ choosing a default for the HF policy should read that table first.
 
 ### GPU decode -- WORKING, bit-identical to the host
 
-`COLIBRI_BAILING_GPU=1` puts decode on the device. Opt-in, because it covers
+`FLYWEIGHT_BAILING_GPU=1` puts decode on the device. Opt-in, because it covers
 decode only: prefill would need either a device-side top-k or a sync per token
 for MoE routing, and neither is worth building before the wiring is proven.
 
 Everything except residency and sequencing already existed --
-`qwen_gpu_matvec_by_type` dispatches the quantized matvecs, `colibri_gpu_rms_norm`
+`qwen_gpu_matvec_by_type` dispatches the quantized matvecs, `flyweight_gpu_rms_norm`
 the norms, and the two kernels above cover KDA and MLA. Seven small helpers were
 added for the rest (rope, query split, head gate, short conv, gated head norm,
 SwiGLU, copy), each the device half of a host function in
-`colibri_v2_bailing.hpp`.
+`flyweight_v2_bailing.hpp`.
 
 Result on Ling-3.0-tiny at Q4_K: 579 tensors resident, **decode 34 -> 50 tok/s**,
 and the logits are **bit-identical to the host path** (relative RMS 0.0000,
@@ -1042,8 +1042,8 @@ same top-5, same argmax). Generation matches too.
 
 **The bug worth recording.** The first working version ran at 96.7 tok/s and
 produced finite but completely uncorrelated logits -- range [-1.28, 0.97]
-against the host's [-12.95, 11.75]. Cause: `colibri_gpu_rms_norm` and
-`colibri_gpu_scaled_add` take no stream argument and run on the DEFAULT stream,
+against the host's [-12.95, 11.75]. Cause: `flyweight_gpu_rms_norm` and
+`flyweight_gpu_scaled_add` take no stream argument and run on the DEFAULT stream,
 while the matvecs and custom launches were issued on `gpu.stream`. The two
 halves of every layer were unordered with respect to each other. Moving
 everything to the default stream fixed it exactly -- and the "speedup" from 50
@@ -1092,7 +1092,7 @@ launch-count work moved 50 to 54 tok/s; deleting a list comprehension moved
 Two smaller wins after that, both found by measurement:
 
 * **92 blocking uploads per token.** The grouped MoE path pushed three expert
-  pointer arrays and the weights separately, four `colibri_gpu_upload_sync`
+  pointer arrays and the weights separately, four `flyweight_gpu_upload_sync`
   calls per MoE layer at ~15 us each -- more than the expert matmuls they fed.
   Packed into one buffer and one transfer: 96 -> 100 tok/s.
 * **A kernel rewrite that did NOT work, kept as a negative result.**
@@ -1231,8 +1231,8 @@ Remaining on the GPU path:
    and routes on the host, 23 times per token. A device-side top-k would remove
    it and is probably most of the gap between 50 tok/s and what the card can do.
 
-2. ~~**Wire the GPU path into `ColibriV2BailingRuntime`**~~ -- done, decode only.
-   (`colibri_v2_native_kernels.hpp`), which is where the real speed is. KDA is a
+2. ~~**Wire the GPU path into `FlyweightV2BailingRuntime`**~~ -- done, decode only.
+   (`flyweight_v2_native_kernels.hpp`), which is where the real speed is. KDA is a
    targeted edit of `qwen_delta_recurrent_chunk`: scalar decay becomes a
    per-channel vector.
 2. **Batched prefill.** Every token currently walks the layer stack alone.
@@ -1279,7 +1279,7 @@ long-context decay only.
 
 ### KDA recurrence -- DONE (host side)
 
-`bailing::kda_recurrence` in `include/colibri_v2_bailing.hpp`, verified against
+`bailing::kda_recurrence` in `include/flyweight_v2_bailing.hpp`, verified against
 the oracle at float32 noise level across every shape that matters:
 
 | shape | output rel-err | state rel-err |
@@ -1311,7 +1311,7 @@ targeted edit of an existing one, not a new kernel.
   context instead of failing outright, so it is driven 256 steps with a large
   positive gate where a wrong sign is unmissable.
 
-Not done: the CUDA/CPU-corpus kernel in `colibri_v2_native_kernels.hpp`. This is
+Not done: the CUDA/CPU-corpus kernel in `flyweight_v2_native_kernels.hpp`. This is
 the host reference it will be built against.
 
 4. **KDA layers.** Closest existing code is the Qwen3-Next gated-delta path
@@ -1531,7 +1531,7 @@ for any checkpoint of this family.
 The first thing found was not a slow kernel, it was a blind instrument.
 `decoder_layer_batch` delegates to `decoder_layer` at `tokens == 1`, and the
 single-token path carried NO ProfileScopes at all -- nor did `moe_block`. So
-`COLIBRI_BAILING_PROFILE=1` reported prefill and silently omitted every decode
+`FLYWEIGHT_BAILING_PROFILE=1` reported prefill and silently omitted every decode
 token, while presenting its buckets as percentages of the whole. The lm head
 and the embedding gather sat outside every bucket on both paths as well, so
 even the prefill numbers were shares of about half the work.

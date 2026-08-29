@@ -5,8 +5,8 @@
 // file should hand-implement a kernel: if the numerics need to change, they
 // change in the CUDA headers and both backends follow.
 
-#include <colibri_cpu_shim.hpp>
-#include <colibri_cpu_kernels_api.hpp>
+#include <flyweight_cpu_shim.hpp>
+#include <flyweight_cpu_kernels_api.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -86,14 +86,14 @@ private:
 // The anonymous namespace is load-bearing. The corpus defines the IQ codebook
 // tables (kIq2xxsGrid, kIq4nlValues, ...) at file scope under the same names
 // the host quant path already defines in qwen_iq_tables.h, and both land in
-// libcolibri_v2. Internal linkage keeps the device-side copies private to this
+// libflyweight_v2. Internal linkage keeps the device-side copies private to this
 // translation unit instead of colliding at link time, and does the same for any
 // helper the two sides happen to name alike in future.
 namespace {
 
-#include "colibri_cpu_kernels.inc"
+#include "flyweight_cpu_kernels.inc"
 
-struct ColibriCpuKernelEntry {
+struct FlyweightCpuKernelEntry {
     const char* name;
     void (*launch)(void** arguments);
     // True when the kernel can reach a barrier, shuffle, or block-wide sort.
@@ -101,24 +101,24 @@ struct ColibriCpuKernelEntry {
     bool cooperative;
 };
 
-#include "colibri_cpu_kernel_table.inc"
+#include "flyweight_cpu_kernel_table.inc"
 
 }  // namespace
 
-namespace colibri::cpu {
+namespace flyweight::cpu {
 
-ColibriCpuKernel find_kernel(const char* name) {
+FlyweightCpuKernel find_kernel(const char* name) {
     // The table is generated in corpus order; a linear scan happens once per
     // launch site during warmup and the runtime caches the result.
-    for (const auto& entry : kColibriCpuKernels) {
+    for (const auto& entry : kFlyweightCpuKernels) {
         if (std::strcmp(entry.name, name) == 0) return entry.launch;
     }
     return nullptr;
 }
 
-bool find_kernel_entry(const char* name, ColibriCpuKernel* kernel,
+bool find_kernel_entry(const char* name, FlyweightCpuKernel* kernel,
                        bool* cooperative) {
-    for (const auto& entry : kColibriCpuKernels) {
+    for (const auto& entry : kFlyweightCpuKernels) {
         if (std::strcmp(entry.name, name) != 0) continue;
         if (kernel != nullptr) *kernel = entry.launch;
         if (cooperative != nullptr) *cooperative = entry.cooperative;
@@ -128,11 +128,11 @@ bool find_kernel_entry(const char* name, ColibriCpuKernel* kernel,
 }
 
 std::size_t kernel_count() {
-    return sizeof(kColibriCpuKernels) / sizeof(kColibriCpuKernels[0]);
+    return sizeof(kFlyweightCpuKernels) / sizeof(kFlyweightCpuKernels[0]);
 }
 
 const char* kernel_name(std::size_t index) {
-    return index < kernel_count() ? kColibriCpuKernels[index].name : nullptr;
+    return index < kernel_count() ? kFlyweightCpuKernels[index].name : nullptr;
 }
 
-}  // namespace colibri::cpu
+}  // namespace flyweight::cpu

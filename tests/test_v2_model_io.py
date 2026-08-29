@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 
 def string(value):

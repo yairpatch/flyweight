@@ -14,7 +14,7 @@
 - Per case: one excluded warm-up and five fresh-runtime measured samples.
 - Per sample: three decode warm-ups and ten measured decode tokens.
 - Raw JSONL during this development session:
-  `/tmp/colibri-q6-58k-hybrid-baseline.jsonl`.
+  `/tmp/flyweight-q6-58k-hybrid-baseline.jsonl`.
 - Raw JSONL SHA-256:
   `2c7c16646b0364cad5b71aa77428c4c32628bbabc72bbd91b8e2511d4c74ade5`.
 

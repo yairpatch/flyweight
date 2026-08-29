@@ -17,10 +17,10 @@ from pathlib import Path
 import cupy as cp
 
 INCLUDE = Path(__file__).resolve().parent.parent / "include"
-HEADERS = ("colibri_v2_qwen_kernels.hpp", "colibri_v2_native_kernels.hpp")
+HEADERS = ("flyweight_v2_qwen_kernels.hpp", "flyweight_v2_native_kernels.hpp")
 
-_OPEN = 'R"COLIBRI_CUDA('
-_CLOSE = ')COLIBRI_CUDA"'
+_OPEN = 'R"FLYWEIGHT_CUDA('
+_CLOSE = ')FLYWEIGHT_CUDA"'
 
 
 def _extract(header: Path) -> str:

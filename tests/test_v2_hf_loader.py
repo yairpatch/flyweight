@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 from tests import hf_safetensors_fixture as fixture
 
 
@@ -204,7 +204,7 @@ class HfLoaderTests(unittest.TestCase):
         cls._rewrite_header(path, lambda header: header.pop(name))
 
     def cache_files(self, directory: Path | None = None) -> list[Path]:
-        return sorted((directory or self.path).glob("colibri-*.cache"))
+        return sorted((directory or self.path).glob("flyweight-*.cache"))
 
     def catalog(self, model: V2Model) -> dict[str, tuple]:
         return {
@@ -274,7 +274,7 @@ class HfLoaderTests(unittest.TestCase):
                 )
 
     def test_it_keeps_a_cache_per_quantization(self) -> None:
-        # The policy is part of the fingerprint, so switching COLIBRI_HF_QUANT
+        # The policy is part of the fingerprint, so switching FLYWEIGHT_HF_QUANT
         # must not hand back the arena packed for the other target.
         import os
         import shutil
@@ -285,22 +285,22 @@ class HfLoaderTests(unittest.TestCase):
             for stale in self.cache_files(copy):
                 stale.unlink()
 
-            previous = os.environ.get("COLIBRI_HF_QUANT")
+            previous = os.environ.get("FLYWEIGHT_HF_QUANT")
             try:
                 with V2Model(copy) as model:
                     self.assertEqual(
                         model.tensor("blk.3.attn_q_a.weight")["ggml_type"], 14
                     )
-                os.environ["COLIBRI_HF_QUANT"] = "Q8_0"
+                os.environ["FLYWEIGHT_HF_QUANT"] = "Q8_0"
                 with V2Model(copy) as model:
                     self.assertEqual(
                         model.tensor("blk.3.attn_q_a.weight")["ggml_type"], 8
                     )
             finally:
                 if previous is None:
-                    os.environ.pop("COLIBRI_HF_QUANT", None)
+                    os.environ.pop("FLYWEIGHT_HF_QUANT", None)
                 else:
-                    os.environ["COLIBRI_HF_QUANT"] = previous
+                    os.environ["FLYWEIGHT_HF_QUANT"] = previous
             self.assertEqual(len(self.cache_files(copy)), 2)
 
     def test_it_can_be_told_not_to_cache(self) -> None:
@@ -312,8 +312,8 @@ class HfLoaderTests(unittest.TestCase):
             shutil.copytree(self.path, copy)
             for stale in self.cache_files(copy):
                 stale.unlink()
-            previous = os.environ.get("COLIBRI_HF_CACHE")
-            os.environ["COLIBRI_HF_CACHE"] = "0"
+            previous = os.environ.get("FLYWEIGHT_HF_CACHE")
+            os.environ["FLYWEIGHT_HF_CACHE"] = "0"
             try:
                 with V2Model(copy) as model:
                     self.assertIn(
@@ -322,9 +322,9 @@ class HfLoaderTests(unittest.TestCase):
                     )
             finally:
                 if previous is None:
-                    os.environ.pop("COLIBRI_HF_CACHE", None)
+                    os.environ.pop("FLYWEIGHT_HF_CACHE", None)
                 else:
-                    os.environ["COLIBRI_HF_CACHE"] = previous
+                    os.environ["FLYWEIGHT_HF_CACHE"] = previous
             self.assertEqual(self.cache_files(copy), [])
 
     def test_a_prompt_means_the_same_whether_it_arrives_whole_or_in_pieces(
@@ -349,7 +349,7 @@ class HfLoaderTests(unittest.TestCase):
         # the distribution wholesale. Compare the distribution, not sampled ids:
         # on the fixture's random weights the top few logits sit within noise of
         # each other, so argmax flips on a difference that means nothing.
-        from colibri_next.v2 import BailingRuntime
+        from flyweight.v2 import BailingRuntime
 
         prompt = [3, 9, 27, 81, 5, 15, 45, 7]
         with self.open_model() as model:
@@ -386,7 +386,7 @@ class HfLoaderTests(unittest.TestCase):
         # closes that gap, and it costs nothing on a host-only machine.
         import threading
 
-        from colibri_next.v2 import BailingRuntime
+        from flyweight.v2 import BailingRuntime
 
         prompt = [3, 9, 27, 81, 5, 15, 45, 7]
         with self.open_model() as model:
@@ -434,13 +434,13 @@ class HfLoaderTests(unittest.TestCase):
     def test_it_reports_the_device_the_runtime_settled_on(self) -> None:
         # Creation falls back to the host silently when the device is missing or
         # preparation fails, so the caller cannot infer this from the request.
-        # COLIBRI_BAILING_GPU=0 is the one answer that holds on every machine.
+        # FLYWEIGHT_BAILING_GPU=0 is the one answer that holds on every machine.
         import os
 
-        from colibri_next.v2 import BailingRuntime
+        from flyweight.v2 import BailingRuntime
 
-        previous = os.environ.get("COLIBRI_BAILING_GPU")
-        os.environ["COLIBRI_BAILING_GPU"] = "0"
+        previous = os.environ.get("FLYWEIGHT_BAILING_GPU")
+        os.environ["FLYWEIGHT_BAILING_GPU"] = "0"
         try:
             with self.open_model() as model:
                 runtime = BailingRuntime(model, capacity=32)
@@ -450,9 +450,9 @@ class HfLoaderTests(unittest.TestCase):
                     runtime.close()
         finally:
             if previous is None:
-                os.environ.pop("COLIBRI_BAILING_GPU", None)
+                os.environ.pop("FLYWEIGHT_BAILING_GPU", None)
             else:
-                os.environ["COLIBRI_BAILING_GPU"] = previous
+                os.environ["FLYWEIGHT_BAILING_GPU"] = previous
 
     def _checkpoint_without_template_file(self, tokenizer_config: object) -> Path:
         """A copy of the fixture whose template lives in tokenizer_config.json."""

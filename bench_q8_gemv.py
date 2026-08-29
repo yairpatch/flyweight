@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from colibri_next.v2 import V2Model, V2QwenRuntime, _library
+from flyweight.v2 import V2Model, V2QwenRuntime, _library
 
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
@@ -74,15 +74,15 @@ class Bench:
         self.runtime.prepare()
 
         lib = _library()
-        lib.colibri_gpu_alloc.argtypes = [
+        lib.flyweight_gpu_alloc.argtypes = [
             ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
-        lib.colibri_gpu_upload_sync.argtypes = [
+        lib.flyweight_gpu_upload_sync.argtypes = [
             ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]
-        lib.colibri_gpu_launch_named.argtypes = [
+        lib.flyweight_gpu_launch_named.argtypes = [
             ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]
-        lib.colibri_gpu_stream_sync.argtypes = [ctypes.c_uint64]
-        lib.colibri_gpu_free.argtypes = [ctypes.c_uint64]
+        lib.flyweight_gpu_stream_sync.argtypes = [ctypes.c_uint64]
+        lib.flyweight_gpu_free.argtypes = [ctypes.c_uint64]
         self.lib = lib
 
     def close(self) -> None:
@@ -92,20 +92,20 @@ class Bench:
 
     def alloc(self, size: int) -> int:
         pointer = ctypes.c_uint64()
-        if self.lib.colibri_gpu_alloc(size, ctypes.byref(pointer)) != 0:
+        if self.lib.flyweight_gpu_alloc(size, ctypes.byref(pointer)) != 0:
             raise RuntimeError(f"device allocation of {size} bytes failed")
         return pointer.value
 
     def launch(self, name: str, grid: int, block: int, args: list) -> None:
         array = (ctypes.c_void_p * len(args))(
             *[ctypes.addressof(value) for value in args])
-        code = self.lib.colibri_gpu_launch_named(
+        code = self.lib.flyweight_gpu_launch_named(
             name.encode(), grid, 1, block, 0, 0, array)
         if code != 0:
             raise RuntimeError(f"launch failed: {name} ({code})")
 
     def sync(self) -> None:
-        if self.lib.colibri_gpu_stream_sync(0) != 0:
+        if self.lib.flyweight_gpu_stream_sync(0) != 0:
             raise RuntimeError("stream sync failed")
 
 
@@ -130,7 +130,7 @@ def main() -> None:
             -126, 127, size=INPUT_SIZE).astype(np.float32)
         activation[::32] = 127.0
         vector_f32 = bench.alloc(INPUT_SIZE * 4)
-        bench.lib.colibri_gpu_upload_sync(
+        bench.lib.flyweight_gpu_upload_sync(
             vector_f32, activation.ctypes.data_as(ctypes.c_void_p),
             INPUT_SIZE * 4)
         quantized = bench.alloc(INPUT_SIZE)
@@ -160,7 +160,7 @@ def main() -> None:
                 packed = packed_weights(
                     label, weight_bytes, seed=hash(label) % 997)
                 weights = bench.alloc(weight_bytes)
-                bench.lib.colibri_gpu_upload_sync(
+                bench.lib.flyweight_gpu_upload_sync(
                     weights, packed.ctypes.data_as(ctypes.c_void_p),
                     weight_bytes)
                 output = bench.alloc(rows * 4)
@@ -195,8 +195,8 @@ def main() -> None:
                          ctypes.c_uint64(scales), ctypes.c_uint64(output),
                          columns, row_count]))
 
-                bench.lib.colibri_gpu_free(weights)
-                bench.lib.colibri_gpu_free(output)
+                bench.lib.flyweight_gpu_free(weights)
+                bench.lib.flyweight_gpu_free(output)
 
         for label in FORMATS:
             rows, weight_bytes = shapes[label]

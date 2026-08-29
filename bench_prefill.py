@@ -8,12 +8,12 @@ plus prompt-cache bypasses).
 Run:
     PYTHONPATH=src python3 bench_prefill.py
 Env knobs:
-    COLIBRI_MODEL      GGUF path (default Qwen3.6-35B-A3B-UD-Q5_K_M.gguf)
-    COLIBRI_MOE_DEVICE gpu|cpu|hybrid (default hybrid)
-    COLIBRI_GPU_CACHE_MIB  total GPU budget in MiB (default 8192)
-    COLIBRI_PREFILL_ROWS  chunk size (default 1024; 0 disables chunked prefill)
-    COLIBRI_CONTEXT    context window (default 8192)
-    COLIBRI_PROMPT_LENGTHS  comma list of P (default 512,1024,2048,4096,8192)
+    FLYWEIGHT_MODEL      GGUF path (default Qwen3.6-35B-A3B-UD-Q5_K_M.gguf)
+    FLYWEIGHT_MOE_DEVICE gpu|cpu|hybrid (default hybrid)
+    FLYWEIGHT_GPU_CACHE_MIB  total GPU budget in MiB (default 8192)
+    FLYWEIGHT_PREFILL_ROWS  chunk size (default 1024; 0 disables chunked prefill)
+    FLYWEIGHT_CONTEXT    context window (default 8192)
+    FLYWEIGHT_PROMPT_LENGTHS  comma list of P (default 512,1024,2048,4096,8192)
 """
 
 from __future__ import annotations
@@ -22,18 +22,18 @@ import os
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = os.environ.get(
-    "COLIBRI_MODEL",
+    "FLYWEIGHT_MODEL",
     "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf",
 )
-MOE_DEVICE = os.environ.get("COLIBRI_MOE_DEVICE", "hybrid")
-GPU_CACHE_MIB = int(os.environ.get("COLIBRI_GPU_CACHE_MIB", "8192"))
-CONTEXT = int(os.environ.get("COLIBRI_CONTEXT", "8192"))
+MOE_DEVICE = os.environ.get("FLYWEIGHT_MOE_DEVICE", "hybrid")
+GPU_CACHE_MIB = int(os.environ.get("FLYWEIGHT_GPU_CACHE_MIB", "8192"))
+CONTEXT = int(os.environ.get("FLYWEIGHT_CONTEXT", "8192"))
 PROMPT_LENGTHS = [
     int(x)
-    for x in os.environ.get("COLIBRI_PROMPT_LENGTHS", "512,1024,2048,4096,8192").split(
+    for x in os.environ.get("FLYWEIGHT_PROMPT_LENGTHS", "512,1024,2048,4096,8192").split(
         ","
     )
     if x

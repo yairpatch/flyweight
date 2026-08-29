@@ -108,7 +108,7 @@ late:
   engagement-counter-guarded. The machinery stays behind the env flag.
 - Stage 2 killed the design as staged. The budget sweep on the motivating
   config measured **130–245 tok/s against the 653 baseline** — the marginal
-  upload throughput through `colibri_gpu_upload` is ~1–2 GB/s, an order of
+  upload throughput through `flyweight_gpu_upload` is ~1–2 GB/s, an order of
   magnitude under the probe's sequential rate. Two compounding causes:
   per-half-layer restaging multiplies volume (39.8 GiB moved for a 4 K
   prompt at a 256 MiB budget), and the copies are `cuMemcpyHtoDAsync` from

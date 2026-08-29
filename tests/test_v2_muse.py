@@ -15,13 +15,13 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from colibri_next.generation import GenerationStep
-from colibri_next.server import (
+from flyweight.generation import GenerationStep
+from flyweight.server import (
     MuseChannelStream,
     _split_muse_channels,
     _split_reasoning_content,
 )
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 from tests.muse_gguf_fixture import MuseSpec, build_muse_gguf
 
@@ -97,7 +97,7 @@ class MuseModelTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.workspace = tempfile.TemporaryDirectory(prefix="colibri-muse-")
+        cls.workspace = tempfile.TemporaryDirectory(prefix="flyweight-muse-")
         cls.spec = MuseSpec()
         cls.path = Path(cls.workspace.name) / "muse.gguf"
         build_muse_gguf(cls.path, cls.spec)
@@ -147,7 +147,7 @@ class MuseModelTests(unittest.TestCase):
 class MusePretokenizerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workspace = tempfile.TemporaryDirectory(prefix="colibri-muse-tok-")
+        cls.workspace = tempfile.TemporaryDirectory(prefix="flyweight-muse-tok-")
         path = Path(cls.workspace.name) / "muse.gguf"
         build_muse_gguf(path)
         cls.model = V2Model(path)
@@ -303,7 +303,7 @@ class MuseStreamingEndpointTests(unittest.TestCase):
     )
 
     def _events(self, architecture: str, raw: str | None = None, **payload):
-        from colibri_next.server import InferenceService
+        from flyweight.server import InferenceService
 
         from tests.test_server import StubGenerator
 
@@ -442,7 +442,7 @@ class MuseNativeTests(unittest.TestCase):
     def _runtime(self):
         if not V2Model.gpu_info()["available"]:
             raise unittest.SkipTest("native CUDA runtime is unavailable")
-        workspace = tempfile.TemporaryDirectory(prefix="colibri-muse-native-")
+        workspace = tempfile.TemporaryDirectory(prefix="flyweight-muse-native-")
         self.addCleanup(workspace.cleanup)
         path = Path(workspace.name) / "muse.gguf"
         spec = build_muse_gguf(path)
@@ -482,7 +482,7 @@ class MuseNativeTests(unittest.TestCase):
         prompt = [7, 11, 3, 29, 5, 17, 23, 2, 13, 19, 31, 37]
         results = {}
         for rows in ("1", "8"):
-            with unittest.mock.patch.dict(os.environ, {"COLIBRI_PREFILL_ROWS": rows}):
+            with unittest.mock.patch.dict(os.environ, {"FLYWEIGHT_PREFILL_ROWS": rows}):
                 runtime, _ = self._runtime()
                 produced: list[int] = []
                 runtime.generate(prompt, 6, produced.append)
@@ -491,9 +491,9 @@ class MuseNativeTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("COLIBRI_TEST_MUSE_MODEL")
-    and Path(os.environ["COLIBRI_TEST_MUSE_MODEL"]).is_file(),
-    "set COLIBRI_TEST_MUSE_MODEL to a Muse Glimmer GGUF checkpoint",
+    os.environ.get("FLYWEIGHT_TEST_MUSE_MODEL")
+    and Path(os.environ["FLYWEIGHT_TEST_MUSE_MODEL"]).is_file(),
+    "set FLYWEIGHT_TEST_MUSE_MODEL to a Muse Glimmer GGUF checkpoint",
 )
 class MuseRealCheckpointTests(unittest.TestCase):
     """Batched prefill against the one-token path, on real quantized weights.
@@ -508,8 +508,8 @@ class MuseRealCheckpointTests(unittest.TestCase):
         # Closed before the next configuration runs: two runtimes of a
         # multi-gigabyte checkpoint do not fit on the card at once, and the
         # second would spill every block and answer a different question.
-        with unittest.mock.patch.dict(os.environ, {"COLIBRI_PREFILL_ROWS": rows}):
-            model = V2Model(os.environ["COLIBRI_TEST_MUSE_MODEL"])
+        with unittest.mock.patch.dict(os.environ, {"FLYWEIGHT_PREFILL_ROWS": rows}):
+            model = V2Model(os.environ["FLYWEIGHT_TEST_MUSE_MODEL"])
             try:
                 runtime = model.native_runtime(context_limit=2048, mtp_drafts=0)
                 try:

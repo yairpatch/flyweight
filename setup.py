@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-import subprocess
+import importlib.util
 from pathlib import Path
 
 from setuptools import Distribution, setup
@@ -17,45 +16,48 @@ class BinaryDistribution(Distribution):
         return True
 
 
+def _native_build_module():
+    """Load `flyweight.native_build` by path, without importing the package.
+
+    Importing `flyweight` would pull in the runtime and its dependencies, which
+    a build has no business requiring. The module itself is dependency-free.
+    """
+    path = Path(__file__).resolve().parent / "src" / "flyweight" / "native_build.py"
+    spec = importlib.util.spec_from_file_location("_flyweight_native_build", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load the native build helper from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class CMakeBuildPy(build_py):
-    """Compile the native runtime directly into the wheel staging directory."""
+    """Compile the native runtime into whichever tree is being installed."""
 
     def run(self) -> None:
         super().run()
+        native_build = _native_build_module()
         root = Path(__file__).resolve().parent
-        build_dir = (Path(self.build_lib).parent / "cmake-native").resolve()
-        output_dir = (
-            Path(self.build_lib) / "colibri_next" / "_native"
-        ).resolve()
-        build_dir.mkdir(parents=True, exist_ok=True)
+        # An editable install must land the library in the SOURCE tree. Its
+        # build_lib is a temporary directory that pip deletes, so building into
+        # the staging path compiled the whole runtime and then threw it away --
+        # `pip install -e .` appeared to succeed and left nothing importable.
+        if getattr(self, "editable_mode", False):
+            output_dir = root / "src" / "flyweight" / "_native"
+        else:
+            output_dir = (Path(self.build_lib) / "flyweight" / "_native").resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         # build_py may have copied a locally built library from the source
         # tree. Remove every platform variant before compiling so a reused
         # build directory can never produce a mixed-OS wheel.
         for suffix in (".so", ".dylib", ".dll"):
-            candidate = output_dir / f"colibri_v2{suffix}"
+            candidate = output_dir / f"{native_build.LIBRARY_STEM}{suffix}"
             if candidate.exists():
                 candidate.unlink()
-        configure = [
-            "cmake",
-            "-S",
-            str(root / "native"),
-            "-B",
-            str(build_dir),
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DBUILD_TESTING=OFF",
-            "-DCOLIBRI_BUILD_DEVELOPMENT_TARGETS=OFF",
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}",
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE={output_dir}",
-            f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={output_dir}",
-            f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE={output_dir}",
-        ]
-        if os.name == "nt":
-            configure.extend(["-G", "NMake Makefiles"])
-        subprocess.run(configure, check=True)
-        subprocess.run(
-            ["cmake", "--build", str(build_dir), "--config", "Release"],
-            check=True,
+        native_build.build_native(
+            output=output_dir,
+            build_dir=root / "build" / "native",
+            development_targets=False,
         )
 
 

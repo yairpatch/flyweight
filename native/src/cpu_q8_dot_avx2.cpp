@@ -42,7 +42,7 @@ inline float horizontal_sum(__m256 value) {
 
 }  // namespace
 
-float colibri_q8_row_dot_avx2(const std::uint8_t* row_packed,
+float flyweight_q8_row_dot_avx2(const std::uint8_t* row_packed,
                               const float* vector, int blocks) {
     __m256 accumulator[4] = {
         _mm256_setzero_ps(), _mm256_setzero_ps(),
@@ -66,7 +66,7 @@ float colibri_q8_row_dot_avx2(const std::uint8_t* row_packed,
         _mm256_add_ps(accumulator[2], accumulator[3])));
 }
 
-void colibri_q8_row_dot_pair_avx2(const std::uint8_t* gate_packed,
+void flyweight_q8_row_dot_pair_avx2(const std::uint8_t* gate_packed,
                                   const std::uint8_t* up_packed,
                                   const float* vector, int blocks,
                                   float* gate_out, float* up_out) {

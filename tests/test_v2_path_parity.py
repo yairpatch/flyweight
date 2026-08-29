@@ -22,7 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 from tests.laguna_gguf_fixture import build_laguna_gguf
@@ -111,7 +111,7 @@ class DensePathParityTests(_ParityCase):
 
     @classmethod
     def setUpClass(cls):
-        path = _workspace("colibri-parity-dense-") / "dense.gguf"
+        path = _workspace("flyweight-parity-dense-") / "dense.gguf"
         cls._spec = build_dense_qwen35_gguf(path)
         cls._model = V2Model(path)
         cls._base_options = {"context_limit": 512}
@@ -130,17 +130,17 @@ class DensePathParityTests(_ParityCase):
                 self._assert_same(f"len={len(prompt)}", blocking, engine)
 
     def test_chunked_and_single_token_prefill_agree(self):
-        # COLIBRI_PREFILL_ROWS=0 disables the batched rows forward, so the
+        # FLYWEIGHT_PREFILL_ROWS=0 disables the batched rows forward, so the
         # whole prompt runs through single-token decode. Both must land on
         # the same state and the same continuation.
         for prompt in _prompts(self._spec.vocabulary, self.LENGTHS):
             with self.subTest(prompt_tokens=len(prompt)):
                 chunked = _engine_run(self._runtime(), prompt, self.TOKENS)
-                os.environ["COLIBRI_PREFILL_ROWS"] = "0"
+                os.environ["FLYWEIGHT_PREFILL_ROWS"] = "0"
                 try:
                     unchunked = _engine_run(self._runtime(), prompt, self.TOKENS)
                 finally:
-                    del os.environ["COLIBRI_PREFILL_ROWS"]
+                    del os.environ["FLYWEIGHT_PREFILL_ROWS"]
                 self._assert_same(f"len={len(prompt)}", chunked, unchunked)
 
     def test_live_continuation_and_exact_resend_match_fresh(self):
@@ -247,7 +247,7 @@ class MoeBatchedDecodeParityTests(_ParityCase):
 
     @classmethod
     def setUpClass(cls):
-        path = _workspace("colibri-parity-qwen-moe-") / "moe.gguf"
+        path = _workspace("flyweight-parity-qwen-moe-") / "moe.gguf"
         cls._spec = build_dense_qwen35_gguf(
             path, DenseQwenSpec(experts=8, experts_used=2)
         )
@@ -258,12 +258,12 @@ class MoeBatchedDecodeParityTests(_ParityCase):
         }
         # The expert-history sidecar feeds earlier runs' routing back into
         # later placement -- an ambient input this parity class must not have.
-        os.environ["COLIBRI_EXPERT_HISTORY"] = "off"
+        os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "off"
 
     @classmethod
     def tearDownClass(cls):
         cls._model.close()
-        del os.environ["COLIBRI_EXPERT_HISTORY"]
+        del os.environ["FLYWEIGHT_EXPERT_HISTORY"]
 
     def _prompt_pair(self) -> tuple[list[int], list[int]]:
         return tuple(_prompts(self._spec.vocabulary, (40, 33)))
@@ -332,7 +332,7 @@ class MoePathParityTests(_ParityCase):
 
     @classmethod
     def setUpClass(cls):
-        path = _workspace("colibri-parity-laguna-") / "laguna.gguf"
+        path = _workspace("flyweight-parity-laguna-") / "laguna.gguf"
         cls._spec = build_laguna_gguf(path)
         cls._model = V2Model(path)
         cls._base_options = {"context_limit": 64, "expert_mode": "cpu"}
@@ -347,11 +347,11 @@ class MoePathParityTests(_ParityCase):
                 blocking = _blocking_run(self._runtime(), prompt, self.TOKENS)
                 engine = _engine_run(self._runtime(), prompt, self.TOKENS)
                 self._assert_same(f"len={len(prompt)} engine", blocking, engine)
-                os.environ["COLIBRI_PREFILL_ROWS"] = "0"
+                os.environ["FLYWEIGHT_PREFILL_ROWS"] = "0"
                 try:
                     unchunked = _engine_run(self._runtime(), prompt, self.TOKENS)
                 finally:
-                    del os.environ["COLIBRI_PREFILL_ROWS"]
+                    del os.environ["FLYWEIGHT_PREFILL_ROWS"]
                 self._assert_same(f"len={len(prompt)} unchunked", blocking, unchunked)
 
 
@@ -376,7 +376,7 @@ class PrefillExpertStreamParityTests(_ParityCase):
         # streaming gate itself requires the registered-mmap DMA path.
         if V2Model.select_backend("auto") != "cuda":
             raise unittest.SkipTest("prefill expert streaming needs real CUDA")
-        path = _workspace("colibri-parity-stream-") / "moe.gguf"
+        path = _workspace("flyweight-parity-stream-") / "moe.gguf"
         # Q8_0: the grouped GPU expert kernels have no f32 entry, and f32
         # experts would silently fall both sides back to the CPU MoE.
         cls._spec = build_dense_qwen35_gguf(
@@ -389,12 +389,12 @@ class PrefillExpertStreamParityTests(_ParityCase):
             "prefill_cache_seed": 8,
             "expert_residency": "immutable",
         }
-        os.environ["COLIBRI_EXPERT_HISTORY"] = "off"
+        os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "off"
 
     @classmethod
     def tearDownClass(cls):
         cls._model.close()
-        del os.environ["COLIBRI_EXPERT_HISTORY"]
+        del os.environ["FLYWEIGHT_EXPERT_HISTORY"]
 
     def _generate(self, **options):
         prompt = _prompts(self._spec.vocabulary, (40,))[0]
@@ -436,22 +436,22 @@ class PrefillExpertStreamParityTests(_ParityCase):
         off_tokens, off_streamed = self._generate(
             expert_mode="auto", prefill_expert_stream_mib=0)
         self.assertEqual(off_streamed, 0, "an explicit zero must not stream")
-        os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "0"
+        os.environ["FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"] = "0"
         try:
             env_tokens, env_streamed = self._generate(expert_mode="auto")
         finally:
-            del os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"]
+            del os.environ["FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"]
         self.assertEqual(env_streamed, 0, "the env override must win")
         self._assert_same("option zero vs env zero", off_tokens, env_tokens)
 
     def test_option_and_env_budgets_agree(self):
         by_option, option_streamed = self._generate(
             expert_mode="auto", prefill_expert_stream_mib=64)
-        os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"] = "64"
+        os.environ["FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"] = "64"
         try:
             by_env, env_streamed = self._generate(expert_mode="auto")
         finally:
-            del os.environ["COLIBRI_PREFILL_EXPERT_STREAM_MIB"]
+            del os.environ["FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"]
         self.assertEqual(option_streamed, env_streamed)
         self._assert_same("option vs env budget", by_option, by_env)
 

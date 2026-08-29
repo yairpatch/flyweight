@@ -1,6 +1,6 @@
 """Is the BailingMoE3 prefill attention worth rewriting, and as what?
 
-MLA is 48% of a prompt's time (COLIBRI_BAILING_TILED_PROFILE on an 8192-token
+MLA is 48% of a prompt's time (FLYWEIGHT_BAILING_TILED_PROFILE on an 8192-token
 prefill: mla 8.25s of 17.1s), and the two shipped implementations are both
 bound by the same thing: each reads the latent cache once per query row per
 head. The three-pass path reads it in the score kernel and again in accumulate;

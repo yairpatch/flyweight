@@ -16,12 +16,12 @@ try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
-from colibri_next.cli import main
-from colibri_next.generation import GenerationResult, GenerationStep
-from colibri_next.sampling import SamplingConfig
-from colibri_next.server import (
+from flyweight.cli import main
+from flyweight.generation import GenerationResult, GenerationStep
+from flyweight.sampling import SamplingConfig
+from flyweight.server import (
     APIError,
-    ColibriHTTPServer,
+    FlyweightHTTPServer,
     InferenceService,
     create_handler,
     _chat_messages,
@@ -526,7 +526,7 @@ class ToolCallParsingTests(unittest.TestCase):
         # both, they must survive as structure -- and a tool result is a legal
         # final message, which the role check used to reject even though its
         # own error message said otherwise.
-        from colibri_next.server import _chat_messages
+        from flyweight.server import _chat_messages
 
         payload = {
             "messages": [
@@ -536,7 +536,7 @@ class ToolCallParsingTests(unittest.TestCase):
                     "function": {"name": "read_file",
                                  "arguments": '{"path": "/etc/hostname"}'},
                 }]},
-                {"role": "tool", "tool_call_id": "call_1", "content": "colibri-dev"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "flyweight-dev"},
             ],
             "tools": [{"type": "function", "function": {
                 "name": "read_file",
@@ -556,14 +556,14 @@ class ToolCallParsingTests(unittest.TestCase):
             {"path": "/etc/hostname"},
         )
         self.assertEqual(messages[2]["role"], "tool")
-        self.assertEqual(messages[2]["content"], "colibri-dev")
+        self.assertEqual(messages[2]["content"], "flyweight-dev")
 
     def test_tools_survive_a_system_prompt_on_a_native_architecture(self) -> None:
         # The shape every coding harness sends: a system prompt AND tools. The
         # schemas were attached to the first message and the system turn was
         # then inserted ahead of it, so the message the template reads them
         # from no longer had any -- the model was told about no tools at all.
-        from colibri_next.server import _chat_messages
+        from flyweight.server import _chat_messages
 
         payload = {
             "messages": [
@@ -581,7 +581,7 @@ class ToolCallParsingTests(unittest.TestCase):
     def test_anthropic_tool_round_trip_reaches_a_native_template(self) -> None:
         # Claude Code's wire shape: system as its own field, tool_use blocks on
         # the assistant turn, tool_result blocks inside the following user turn.
-        from colibri_next.server import _anthropic_request
+        from flyweight.server import _anthropic_request
 
         _, messages, enabled = _anthropic_request({
             "model": "m",
@@ -618,7 +618,7 @@ class ToolCallParsingTests(unittest.TestCase):
     def test_generic_architecture_still_renders_tools_into_content(self) -> None:
         # The Hermes prompt and the rendered history remain for checkpoints
         # whose template knows nothing about tools.
-        from colibri_next.server import _chat_messages
+        from flyweight.server import _chat_messages
 
         payload = {
             "messages": [
@@ -627,7 +627,7 @@ class ToolCallParsingTests(unittest.TestCase):
                     "id": "call_1", "type": "function",
                     "function": {"name": "read_file", "arguments": "{}"},
                 }]},
-                {"role": "tool", "tool_call_id": "call_1", "content": "colibri-dev"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "flyweight-dev"},
             ],
             "tools": [{"type": "function", "function": {"name": "read_file"}}],
         }
@@ -644,7 +644,7 @@ class ToolCallParsingTests(unittest.TestCase):
         # open <think>, so the turn carries only the closing tag. Treated as
         # content, the model's private plan was served as its answer -- it read
         # as the model saying what it was about to do, then doing it.
-        from colibri_next.server import _split_reasoning_content
+        from flyweight.server import _split_reasoning_content
 
         visible, reasoning = _split_reasoning_content(
             "I should call the tool.\n</think>Here is the answer."
@@ -653,7 +653,7 @@ class ToolCallParsingTests(unittest.TestCase):
         self.assertEqual(reasoning, "I should call the tool.")
 
     def test_a_turn_without_thinking_is_untouched(self) -> None:
-        from colibri_next.server import _split_reasoning_content
+        from flyweight.server import _split_reasoning_content
 
         visible, reasoning = _split_reasoning_content("Just an answer.")
         self.assertEqual(visible, "Just an answer.")
@@ -662,7 +662,7 @@ class ToolCallParsingTests(unittest.TestCase):
     def test_streaming_reasoning_is_split_from_the_answer(self) -> None:
         # The closing tag may arrive in pieces, and nothing before it may be
         # streamed to the client as content.
-        from colibri_next.server import ThinkingPrefixStream
+        from flyweight.server import ThinkingPrefixStream
 
         stream = ThinkingPrefixStream()
         deltas = [stream.feed(part)
@@ -1206,14 +1206,14 @@ class InferenceServiceTests(unittest.TestCase):
         live_chunks = [
             event
             for event in events
-            if isinstance(event, dict) and event.get("colibri")
+            if isinstance(event, dict) and event.get("flyweight")
         ]
         self.assertEqual(
-            [event["colibri"]["generated_tokens"] for event in live_chunks],
+            [event["flyweight"]["generated_tokens"] for event in live_chunks],
             [1, 2],
         )
         decode_elapsed = [
-            event["colibri"]["decode_elapsed_seconds"] for event in live_chunks
+            event["flyweight"]["decode_elapsed_seconds"] for event in live_chunks
         ]
         self.assertEqual(decode_elapsed[0], 0.0)
         self.assertGreaterEqual(decode_elapsed[1], decode_elapsed[0])
@@ -1268,7 +1268,7 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "message_stop")
 
     def test_anthropic_stream_text_then_tool_use_gets_separate_blocks(self) -> None:
-        from colibri_next.server import (
+        from flyweight.server import (
             _Finished,
             _Metrics,
             _ProgressDelta,
@@ -1329,9 +1329,9 @@ class InferenceServiceTests(unittest.TestCase):
             event
             for event in events
             if event.get("type") == "ping"
-            and event.get("colibri", {}).get("phase") == "tool_call"
+            and event.get("flyweight", {}).get("phase") == "tool_call"
         ]
-        self.assertEqual(progress_pings[0]["colibri"]["generated_tokens"], 32)
+        self.assertEqual(progress_pings[0]["flyweight"]["generated_tokens"], 32)
 
         stops = [e for e in events if e["type"] == "content_block_stop"]
         self.assertEqual([e["index"] for e in stops], [0, 1])
@@ -1639,7 +1639,7 @@ class InferenceServiceTests(unittest.TestCase):
         # Reasoning used to be dropped on this endpoint entirely: the encoder
         # consumed OpenAI chunks and never read reasoning_content, so a
         # thinking model produced minutes of silence with only pings.
-        from colibri_next.server import (
+        from flyweight.server import (
             _Finished,
             _Metrics,
             _ReasoningDelta,
@@ -1842,10 +1842,10 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertTrue(generator.closed)
         self.assertEqual(generator.consumed, len(generator.TOOL_TEXT))
         progress = [
-            event["colibri"]
+            event["flyweight"]
             for event in events
             if isinstance(event, dict)
-            and event.get("colibri", {}).get("phase") == "tool_call"
+            and event.get("flyweight", {}).get("phase") == "tool_call"
         ]
         self.assertTrue(progress)
         self.assertGreaterEqual(progress[-1]["generated_tokens"], len("<tool_call>"))
@@ -2307,7 +2307,7 @@ class HTTPServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.generator = StubGenerator()
         self.service = InferenceService("qwen-local", self.generator)
-        self.server = ColibriHTTPServer(("127.0.0.1", 0), create_handler(self.service))
+        self.server = FlyweightHTTPServer(("127.0.0.1", 0), create_handler(self.service))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.connection = http.client.HTTPConnection(
@@ -2336,7 +2336,7 @@ class HTTPServerTests(unittest.TestCase):
         service = InferenceService(
             "qwen-local", StubGenerator(), request_timeout_seconds=0.2
         )
-        server = ColibriHTTPServer(("127.0.0.1", 0), create_handler(service))
+        server = FlyweightHTTPServer(("127.0.0.1", 0), create_handler(service))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         connection = http.client.HTTPConnection(
@@ -2396,7 +2396,7 @@ class HTTPServerTests(unittest.TestCase):
         self.assertIn(
             "default-src 'self'", response.getheader("Content-Security-Policy")
         )
-        self.assertIn("Colibri Chat", html)
+        self.assertIn("Flyweight Chat", html)
 
         self.connection.request("GET", "/app.js")
         response = self.connection.getresponse()
@@ -2586,7 +2586,7 @@ class HTTPServerTests(unittest.TestCase):
 
 class AuthenticationTests(unittest.TestCase):
     def test_bearer_auth_and_cors_preflight(self) -> None:
-        server = ColibriHTTPServer(
+        server = FlyweightHTTPServer(
             ("127.0.0.1", 0),
             create_handler(
                 InferenceService(
@@ -2642,7 +2642,7 @@ class AuthenticationTests(unittest.TestCase):
 @unittest.skipIf(OpenAI is None, "OpenAI SDK is not installed")
 class OpenAISDKTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.server = ColibriHTTPServer(
+        self.server = FlyweightHTTPServer(
             ("127.0.0.1", 0),
             create_handler(InferenceService("qwen-local", StubGenerator())),
         )
@@ -2699,8 +2699,8 @@ class OpenAISDKTests(unittest.TestCase):
 
 
 class ServerCLITests(unittest.TestCase):
-    @patch("colibri_next.cli.serve_http")
-    @patch("colibri_next.v2_server.NativeV2InferenceService")
+    @patch("flyweight.cli.serve_http")
+    @patch("flyweight.v2_server.NativeV2InferenceService")
     def test_serve_command_loads_once_and_starts_http(
         self, load_model, serve_http
     ) -> None:
@@ -2740,7 +2740,7 @@ class StreamKeepaliveTests(unittest.TestCase):
         self.service = InferenceService(
             "qwen-local", StubGenerator(), sse_keepalive_seconds=0.05
         )
-        self.server = ColibriHTTPServer(
+        self.server = FlyweightHTTPServer(
             ("127.0.0.1", 0), create_handler(self.service)
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -2854,7 +2854,7 @@ class AbandonedStreamTests(unittest.TestCase):
         self.service = InferenceService(
             "qwen-local", self.generator, max_new_tokens=100000
         )
-        self.server = ColibriHTTPServer(
+        self.server = FlyweightHTTPServer(
             ("127.0.0.1", 0), create_handler(self.service)
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

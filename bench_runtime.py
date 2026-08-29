@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Entry point for the native-v2 baseline and comparison harness."""
 
-from colibri_next.runtime_benchmark import main
+from flyweight.runtime_benchmark import main
 
 
 if __name__ == "__main__":

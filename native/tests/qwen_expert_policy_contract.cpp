@@ -1,9 +1,9 @@
-#include "colibri_v2_expert_policy.hpp"
+#include "flyweight_v2_expert_policy.hpp"
 
 #include <array>
 #include <cstdint>
 
-namespace v2 = colibri::v2;
+namespace v2 = flyweight::v2;
 
 struct Expected {
     v2::ExpertExecutionMode mode;
@@ -107,6 +107,33 @@ int main() {
         frozen_decode.misses_may_be_admitted() ||
         frozen_decode.residency_may_change())
         return 7;
+
+    // Slot admission. Strict refuses a candidate that is not demonstrably
+    // hotter than the resident it would evict; the legacy policy adapts faster
+    // by taking an equally frequent one. A free slot displaces nothing, so it
+    // is never refused -- an admission threshold that did refuse free slots was
+    // measured at -12% decode (see expert_admission_allowed).
+    for (std::uint32_t candidate = 0; candidate <= 4; ++candidate) {
+        for (std::uint32_t victim = 0; victim <= 4; ++victim) {
+            for (const bool strict : {false, true}) {
+                const bool displaces = strict ? candidate > victim
+                                              : candidate >= victim;
+                if (v2::expert_admission_allowed(
+                        candidate, victim, false, true, strict) != displaces)
+                    return 10;
+                if (!v2::expert_admission_allowed(
+                        candidate, victim, true, true, strict))
+                    return 11;
+            }
+        }
+    }
+
+    // The post-prefill seed places by score, not by recurrence, so the
+    // comparison does not apply: it must be able to place a cold expert over a
+    // hot resident, which is exactly what its selection asked for.
+    if (!v2::expert_admission_allowed(0, 9, false, false, true) ||
+        !v2::expert_admission_allowed(0, 9, true, false, true))
+        return 12;
 
     for (std::int32_t value = -2; value <= 4; ++value) {
         const bool expected = value >= 0 && value <= 2;

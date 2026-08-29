@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "/home/yair/Downloads/Qwen3.6-27B-UD-IQ2_XXS.gguf"
 BURST = 96

@@ -116,7 +116,7 @@ days ago) → 586 (pipeline) → 653 (+2048 rows) → **810 (expert GEMM)** —
 With the 48 MiB budget active, decode loses ~2–4% to the arena's slot cost
 (hits/token 137 → 134 mutable, 43 → 40 seeded-immutable; ~40 slots) against
 the +31% prefill gain — favourable for prompt-heavy serving, a per-config
-call for decode-heavy. The same decomposition (COLIBRI_TIMING=1) settled a
+call for decode-heavy. The same decomposition (FLYWEIGHT_TIMING=1) settled a
 related question: decode's expert bucket is ~96% CPU MoE compute at the
 host bandwidth wall, not transfers, so the prefill fence pattern has no
 decode target; decode's real lever is residency policy (immutable 43 tok/s

@@ -3,7 +3,7 @@
 ## Motivation (measured 2026-08-21)
 
 Qwen3.6-35B Q5_K_M, hybrid auto-fit, 4096-token prompt, RTX 5070 Ti Laptop,
-fresh runtime, `COLIBRI_PREFILL_PROFILE=1`, expert history off:
+fresh runtime, `FLYWEIGHT_PREFILL_PROFILE=1`, expert history off:
 
 | phase | time | share |
 |---|---:|---:|
@@ -59,7 +59,7 @@ pointer-table staging must be doubled or fenced (halves alternate).
 
 - Each half flows through the code exactly as a 512-row chunk does today.
   Measured on the live Q5 model at 4096 tokens, fixed 5000 MiB cache:
-  `COLIBRI_PREFILL_ROWS=512` and `256` both emit tokens **identical** to
+  `FLYWEIGHT_PREFILL_ROWS=512` and `256` both emit tokens **identical** to
   `1024`. Chunk-boundary effects (cuBLAS attention tiling, DeltaNet WY
   chunking at 64-row multiples) do not change greedy output.
 - Standalone cost of 512-row chunks: 430 → 409 tok/s (−5%), the price the
@@ -86,7 +86,7 @@ pointer-table staging must be doubled or fenced (halves alternate).
 2. Prefill throughput on the motivating config improves ≥25% (target ~60%);
    no regression >3% on dense checkpoints (no CPU experts — the pipeline
    must no-op or stay neutral there).
-3. `COLIBRI_PREFILL_PIPELINE=0` (or a runtime option per roadmap rules)
+3. `FLYWEIGHT_PREFILL_PIPELINE=0` (or a runtime option per roadmap rules)
    restores the serial path for rollback and A/B.
 
 ## Status (2026-08-21) — both stages landed
@@ -119,7 +119,7 @@ pointer-table staging must be doubled or fenced (halves alternate).
   Prefill is now purely CPU-MoE-bound; the next prompt-speed lever is a
   faster CPU expert path or shifting expert share to the GPU — different
   plans.
-- Chunk-size datum for whoever tunes next: `COLIBRI_PREFILL_ROWS=2048`
+- Chunk-size datum for whoever tunes next: `FLYWEIGHT_PREFILL_ROWS=2048`
   under the pipeline measures **653 tok/s** at 4K (cpu_moe 7.0 → 5.65 s —
   each half's expert sweep amortizes over 1024 rows instead of 512), tokens
   bit-identical on both hybrid paths; 4096 regresses to 599. Not made the

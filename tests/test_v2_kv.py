@@ -1,5 +1,5 @@
 import unittest
-from colibri_next.v2 import V2KvCache
+from flyweight.v2 import V2KvCache
 
 
 class V2KvCacheTests(unittest.TestCase):

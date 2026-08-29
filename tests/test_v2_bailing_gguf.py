@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import BailingRuntime, V2Error, V2Model
+from flyweight.v2 import BailingRuntime, V2Error, V2Model
 from tests import bailing_gguf_fixture as gguf
 from tests import hf_safetensors_fixture as safetensors
 
@@ -46,15 +46,15 @@ class BailingGgufTests(unittest.TestCase):
         The loader otherwise quantizes on the way in, and a difference of that
         size would swamp the mapping mistakes these tests exist to catch.
         """
-        previous = os.environ.get("COLIBRI_HF_QUANT")
-        os.environ["COLIBRI_HF_QUANT"] = "F32"
+        previous = os.environ.get("FLYWEIGHT_HF_QUANT")
+        os.environ["FLYWEIGHT_HF_QUANT"] = "F32"
         try:
             yield
         finally:
             if previous is None:
-                os.environ.pop("COLIBRI_HF_QUANT", None)
+                os.environ.pop("FLYWEIGHT_HF_QUANT", None)
             else:
-                os.environ["COLIBRI_HF_QUANT"] = previous
+                os.environ["FLYWEIGHT_HF_QUANT"] = previous
 
     def test_it_tokenizes_the_same_text_the_same_way(self) -> None:
         text = "the quick brown fox abc 123"
@@ -108,7 +108,7 @@ class BailingGgufTests(unittest.TestCase):
         # five ordinary text tokens, which is a literal string of junk in the
         # middle of the conversation. So assert the separator is a single token
         # and that the template really emits it between turns.
-        from colibri_next.v2_server import NativeV2Tokenizer
+        from flyweight.v2_server import NativeV2Tokenizer
 
         with V2Model(self.gguf_path) as model:
             tokenizer = NativeV2Tokenizer(model)
@@ -237,8 +237,8 @@ class BailingRuntimeStateTests(unittest.TestCase):
 
     @contextlib.contextmanager
     def host_runtime(self, capacity: int = 64):
-        previous = os.environ.get("COLIBRI_BAILING_GPU")
-        os.environ["COLIBRI_BAILING_GPU"] = "0"
+        previous = os.environ.get("FLYWEIGHT_BAILING_GPU")
+        os.environ["FLYWEIGHT_BAILING_GPU"] = "0"
         try:
             with V2Model(self.gguf_path) as model:
                 runtime = BailingRuntime(model, capacity=capacity)
@@ -249,9 +249,9 @@ class BailingRuntimeStateTests(unittest.TestCase):
                     runtime.close()
         finally:
             if previous is None:
-                os.environ.pop("COLIBRI_BAILING_GPU", None)
+                os.environ.pop("FLYWEIGHT_BAILING_GPU", None)
             else:
-                os.environ["COLIBRI_BAILING_GPU"] = previous
+                os.environ["FLYWEIGHT_BAILING_GPU"] = previous
 
     def test_it_reports_the_host_path_it_was_forced_onto(self) -> None:
         with self.host_runtime() as runtime:
@@ -434,8 +434,8 @@ class BailingSlotTests(unittest.TestCase):
 
     @contextlib.contextmanager
     def runtime(self, on_gpu: bool, slots: int = 1, capacity: int = 64):
-        previous = os.environ.get("COLIBRI_BAILING_GPU")
-        os.environ["COLIBRI_BAILING_GPU"] = "1" if on_gpu else "0"
+        previous = os.environ.get("FLYWEIGHT_BAILING_GPU")
+        os.environ["FLYWEIGHT_BAILING_GPU"] = "1" if on_gpu else "0"
         try:
             with V2Model(self.gguf_path) as model:
                 runtime = BailingRuntime(model, capacity=capacity, slots=slots)
@@ -446,9 +446,9 @@ class BailingSlotTests(unittest.TestCase):
                     runtime.close()
         finally:
             if previous is None:
-                os.environ.pop("COLIBRI_BAILING_GPU", None)
+                os.environ.pop("FLYWEIGHT_BAILING_GPU", None)
             else:
-                os.environ["COLIBRI_BAILING_GPU"] = previous
+                os.environ["FLYWEIGHT_BAILING_GPU"] = previous
 
     def paths(self):
         """The device path only when there is a device to run it on."""
@@ -584,8 +584,8 @@ class BailingSlotTests(unittest.TestCase):
                     explicit = self.solo(single, self.PROMPT_A)
                 # The pre-slots constructor call, unchanged, and the pre-slots
                 # methods with no slot argument.
-                previous = os.environ.get("COLIBRI_BAILING_GPU")
-                os.environ["COLIBRI_BAILING_GPU"] = "1" if on_gpu else "0"
+                previous = os.environ.get("FLYWEIGHT_BAILING_GPU")
+                os.environ["FLYWEIGHT_BAILING_GPU"] = "1" if on_gpu else "0"
                 try:
                     with V2Model(self.gguf_path) as model:
                         old = BailingRuntime(model, capacity=64)
@@ -601,9 +601,9 @@ class BailingSlotTests(unittest.TestCase):
                             old.close()
                 finally:
                     if previous is None:
-                        os.environ.pop("COLIBRI_BAILING_GPU", None)
+                        os.environ.pop("FLYWEIGHT_BAILING_GPU", None)
                     else:
-                        os.environ["COLIBRI_BAILING_GPU"] = previous
+                        os.environ["FLYWEIGHT_BAILING_GPU"] = previous
                 self.assertEqual((tokens, logits), explicit)
 
 

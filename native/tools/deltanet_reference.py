@@ -1,6 +1,6 @@
 """NumPy reference for the Qwen gated DeltaNet recurrence.
 
-This mirrors `qwen_delta_recurrent_chunk` in colibri_v2_native_kernels.hpp
+This mirrors `qwen_delta_recurrent_chunk` in flyweight_v2_native_kernels.hpp
 element for element, including the epsilon placements and the exact order of the
 state update, so it can serve as the oracle for the chunked WY kernels.
 
@@ -83,7 +83,7 @@ def checkpoint_decay(path, value_heads, seed=0):
     import sys
 
     sys.path.insert(0, "src")
-    from colibri_next.v2 import V2Model
+    from flyweight.v2 import V2Model
 
     model = V2Model(path)
     names = {t["name"] for t in model.tensors()}

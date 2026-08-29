@@ -1,6 +1,6 @@
-#include "colibri_v2_attention_policy.hpp"
+#include "flyweight_v2_attention_policy.hpp"
 
-namespace attention = colibri::v2::attention;
+namespace attention = flyweight::v2::attention;
 
 int main() {
     constexpr auto threshold = attention::kDefaultCublasMinTokens;

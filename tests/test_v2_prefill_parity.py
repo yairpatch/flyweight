@@ -23,7 +23,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 from tests import qwen35_hf_fixture as fixture
 
 # Long enough to pass the batched thresholds: more than the 8 rows the rows
@@ -71,11 +71,11 @@ class PrefillParityTest(unittest.TestCase):
             return out
 
     def test_every_quantization_prefills_as_it_decodes(self) -> None:
-        previous = os.environ.get("COLIBRI_HF_QUANT")
+        previous = os.environ.get("FLYWEIGHT_HF_QUANT")
         try:
             for quant in ("Q2_K", "IQ3_XXS", "Q3_K", "Q4_K", "Q5_K", "Q6_K"):
                 with self.subTest(quant=quant):
-                    os.environ["COLIBRI_HF_QUANT"] = quant
+                    os.environ["FLYWEIGHT_HF_QUANT"] = quant
                     # One open per quantization: the arena is what the choice
                     # changes, and packing the fixture is most of the cost.
                     with V2Model(self.path) as model:
@@ -83,9 +83,9 @@ class PrefillParityTest(unittest.TestCase):
                                          self.continuation(model, False))
         finally:
             if previous is None:
-                os.environ.pop("COLIBRI_HF_QUANT", None)
+                os.environ.pop("FLYWEIGHT_HF_QUANT", None)
             else:
-                os.environ["COLIBRI_HF_QUANT"] = previous
+                os.environ["FLYWEIGHT_HF_QUANT"] = previous
 
 
 if __name__ == "__main__":

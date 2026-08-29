@@ -6,8 +6,8 @@
 // legitimate continuation unsamplable -- which does not show up as a bad call,
 // it shows up as the model being unable to finish a sentence.
 
-#include "colibri_v2_tool_grammar.hpp"
-#include "colibri_v2_byte_alphabet.hpp"
+#include "flyweight_v2_tool_grammar.hpp"
+#include "flyweight_v2_byte_alphabet.hpp"
 
 #include <cstdio>
 #include <string>
@@ -39,9 +39,9 @@ const char* kSpecification = R"([
     {"name": "settings", "required": true, "type": "object"}]}
 ])";
 
-colibri::v2::tools::Grammar build() {
-    return colibri::v2::tools::Grammar(
-        colibri::v2::tools::parse_specification(kSpecification));
+flyweight::v2::tools::Grammar build() {
+    return flyweight::v2::tools::Grammar(
+        flyweight::v2::tools::parse_specification(kSpecification));
 }
 
 // Feed `text`, then ask whether `candidate` could come next.
@@ -220,18 +220,18 @@ void check_the_byte_alphabet_round_trips() {
         "plain", "</parameter>", "unicode \xc3\xa9\xe2\x82\xac", " {\"a\": 1}",
     };
     for (const char* text : cases) {
-        const std::string encoded = colibri::v2::alphabet::encode(text);
-        expect(colibri::v2::alphabet::decode(encoded) == text,
+        const std::string encoded = flyweight::v2::alphabet::encode(text);
+        expect(flyweight::v2::alphabet::decode(encoded) == text,
                std::string("byte alphabet round-trips: ") + text);
     }
     // A space is the case that matters: it is the one character that appears in
     // most tokens and is spelled as U+0120 rather than 0x20.
-    expect(colibri::v2::alphabet::encode(" ") == "\xc4\xa0",
+    expect(flyweight::v2::alphabet::encode(" ") == "\xc4\xa0",
            "a space encodes to U+0120");
-    expect(colibri::v2::alphabet::decode("\xc4\xa0") == " ",
+    expect(flyweight::v2::alphabet::decode("\xc4\xa0") == " ",
            "U+0120 decodes back to a space");
     // Special tokens are stored literally, not byte-encoded.
-    expect(colibri::v2::alphabet::decode("<|im_start|>") == "<|im_start|>",
+    expect(flyweight::v2::alphabet::decode("<|im_start|>") == "<|im_start|>",
            "a special token passes through the decoder unchanged");
 }
 
@@ -244,13 +244,13 @@ void check_candidate_tokens_are_judged_after_decoding() {
         " -la", "</parameter>",
     };
     for (const char* piece : written)
-        grammar.observe(colibri::v2::alphabet::decode(
-            colibri::v2::alphabet::encode(piece)));
+        grammar.observe(flyweight::v2::alphabet::decode(
+            flyweight::v2::alphabet::encode(piece)));
     expect(grammar.armed(), "the call is still open");
 
     // Encoded exactly as a vocabulary holds them, leading space and all.
     const auto encoded = [](const char* text) {
-        return colibri::v2::alphabet::decode(colibri::v2::alphabet::encode(text));
+        return flyweight::v2::alphabet::decode(flyweight::v2::alphabet::encode(text));
     };
     expect(!grammar.accepts(encoded("</function>")),
            "closing early is refused when the candidate arrives as a token");
@@ -266,7 +266,7 @@ void check_candidate_tokens_are_judged_after_decoding() {
 }
 
 void check_no_tools_means_no_constraint() {
-    colibri::v2::tools::Grammar grammar{};
+    flyweight::v2::tools::Grammar grammar{};
     expect(grammar.empty(), "an empty specification yields an empty grammar");
     grammar.observe("<tool_call>");
     expect(grammar.accepts("anything"), "an empty grammar constrains nothing");
@@ -280,13 +280,13 @@ void check_no_tools_means_no_constraint() {
 // json_object mode is back to being a polite request; too strict and the model
 // cannot finish -- or think -- at all.
 
-colibri::v2::tools::ResponseGrammar build_response(
-        colibri::v2::tools::ValueShape shape, bool thinking_open = false) {
-    return colibri::v2::tools::ResponseGrammar(shape, thinking_open);
+flyweight::v2::tools::ResponseGrammar build_response(
+        flyweight::v2::tools::ValueShape shape, bool thinking_open = false) {
+    return flyweight::v2::tools::ResponseGrammar(shape, thinking_open);
 }
 
 void check_response_prose_is_unsamplable() {
-    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    auto grammar = build_response(flyweight::v2::tools::ValueShape::json_object);
     expect(grammar.armed(), "the response constraint arms from the first token");
     expect(!grammar.accepts("Sure"), "prose cannot begin a JSON object");
     expect(!grammar.accepts("```json"), "a code fence cannot begin a JSON object");
@@ -295,17 +295,17 @@ void check_response_prose_is_unsamplable() {
 }
 
 void check_response_shape_is_enforced() {
-    auto object = build_response(colibri::v2::tools::ValueShape::json_object);
+    auto object = build_response(flyweight::v2::tools::ValueShape::json_object);
     expect(!object.accepts("["), "an array cannot answer for an object");
-    auto array = build_response(colibri::v2::tools::ValueShape::json_array);
+    auto array = build_response(flyweight::v2::tools::ValueShape::json_array);
     expect(array.accepts("[1,"), "an array answers for an array");
-    auto any = build_response(colibri::v2::tools::ValueShape::text);
+    auto any = build_response(flyweight::v2::tools::ValueShape::text);
     expect(any.accepts("\"just a string\""), "shapeless mode takes any JSON value");
     expect(!any.accepts("just a string"), "but never bare prose");
 }
 
 void check_response_thinking_is_carved_out() {
-    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    auto grammar = build_response(flyweight::v2::tools::ValueShape::json_object);
     expect(grammar.accepts("<think>"), "the model may open a thinking block");
     grammar.observe("<think>let me consider { and ] freely");
     expect(!grammar.armed(), "reasoning is not constrained");
@@ -319,7 +319,7 @@ void check_response_thinking_is_carved_out() {
 
 void check_response_prompt_opened_thinking_starts_free() {
     auto grammar = build_response(
-        colibri::v2::tools::ValueShape::json_object, /*thinking_open=*/true);
+        flyweight::v2::tools::ValueShape::json_object, /*thinking_open=*/true);
     expect(!grammar.armed(), "a prompt-opened block starts inside the carve-out");
     grammar.observe("reasoning with no opening tag</think>");
     expect(grammar.armed(), "the closing tag ends the carve-out");
@@ -327,7 +327,7 @@ void check_response_prompt_opened_thinking_starts_free() {
 }
 
 void check_response_disarms_once_the_value_is_whole() {
-    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    auto grammar = build_response(flyweight::v2::tools::ValueShape::json_object);
     grammar.observe("{\"answer\": 42");
     expect(!grammar.accepts("done"), "prose cannot interrupt the value");
     grammar.observe("}");
@@ -336,33 +336,33 @@ void check_response_disarms_once_the_value_is_whole() {
 }
 
 void check_response_bypassed_sampler_does_not_deadlock() {
-    auto grammar = build_response(colibri::v2::tools::ValueShape::json_object);
+    auto grammar = build_response(flyweight::v2::tools::ValueShape::json_object);
     grammar.observe("Sure, here you go: ");  // forced past the constraint
     expect(grammar.empty(), "text outside the language disarms it");
     expect(grammar.accepts("anything"), "and nothing is constrained after");
 }
 
 void check_constraint_specifications_parse_both_forms() {
-    const auto bare = colibri::v2::tools::parse_constraints(kSpecification);
+    const auto bare = flyweight::v2::tools::parse_constraints(kSpecification);
     expect(bare.tools.size() == 4, "the bare tool array still parses");
     expect(!bare.response_enabled, "and carries no response constraint");
     expect(!bare.tool_calls_forbidden, "and no ban");
-    const auto combined = colibri::v2::tools::parse_constraints(
+    const auto combined = flyweight::v2::tools::parse_constraints(
         R"({"tools": [{"name": "bash", "parameters": []}],
             "response_format": {"shape": "object", "thinking_open": true}})");
     expect(combined.tools.size() == 1, "the object form carries tools");
     expect(combined.response_enabled, "and the response constraint");
-    expect(combined.response_shape == colibri::v2::tools::ValueShape::json_object,
+    expect(combined.response_shape == flyweight::v2::tools::ValueShape::json_object,
            "with its shape");
     expect(combined.thinking_open, "and whether the prompt opened thinking");
-    const auto forbidden = colibri::v2::tools::parse_constraints(
+    const auto forbidden = flyweight::v2::tools::parse_constraints(
         R"({"tools": [], "tool_calls": "forbidden"})");
     expect(forbidden.tool_calls_forbidden, "the object form carries the ban");
     expect(forbidden.tools.empty(), "with no tools beside it");
 }
 
 void check_markup_ban_refuses_the_atomic_tag() {
-    colibri::v2::tools::MarkupBan ban;
+    flyweight::v2::tools::MarkupBan ban;
     expect(ban.accepts("<tool_call>"), "disabled, everything passes");
     ban.enable();
     expect(!ban.accepts("<tool_call>"), "the atomic opening tag is refused");
@@ -371,7 +371,7 @@ void check_markup_ban_refuses_the_atomic_tag() {
 }
 
 void check_markup_ban_refuses_a_split_spelling() {
-    colibri::v2::tools::MarkupBan ban;
+    flyweight::v2::tools::MarkupBan ban;
     ban.enable();
     ban.observe("First, let me confirm: <tool");
     expect(!ban.accepts("_call>"), "a tag split across tokens is refused");

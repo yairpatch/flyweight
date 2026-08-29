@@ -1,7 +1,7 @@
 """Generate the native CUDA source header from the parity kernel corpus.
 
 This is a source-generation utility, not a runtime dependency.  The emitted
-header is compiled into colibri_v2 so production initialization and decode do
+header is compiled into flyweight_v2 so production initialization and decode do
 not import Python or CuPy.
 """
 from __future__ import annotations
@@ -20,12 +20,12 @@ def main() -> int:
     end = source.index('\n"""', start)
     cuda = source[start:end]
     # C++ raw-string delimiters are limited to 16 characters.
-    delimiter = "COLIBRI_CUDA"
+    delimiter = "FLYWEIGHT_CUDA"
     if delimiter in cuda:
         raise RuntimeError("CUDA source contains the C++ raw-string delimiter")
     output_path.write_text(
         "#pragma once\n\n"
-        "namespace colibri::v2 {\n"
+        "namespace flyweight::v2 {\n"
         f"inline constexpr char qwen_cuda_source[] = R\"{delimiter}(\n"
         f"{cuda}\n"
         f"){delimiter}\";\n"

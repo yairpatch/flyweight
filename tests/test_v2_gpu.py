@@ -1,6 +1,6 @@
 import unittest
 
-from colibri_next.v2 import V2Error, V2Model
+from flyweight.v2 import V2Error, V2Model
 
 
 class V2GpuFoundationTests(unittest.TestCase):

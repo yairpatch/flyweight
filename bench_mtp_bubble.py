@@ -6,7 +6,7 @@ expert hit rate, which is the last unexplained gap. But route_wait only measures
 "CPU blocked at the route sync" -- that is genuine GPU compute if the GPU is
 saturated, and a bubble only if it is not.
 
-COLIBRI_MTP_PROFILE=1 records GPU-side events inside the verification pass and
+FLYWEIGHT_MTP_PROFILE=1 records GPU-side events inside the verification pass and
 splits it into core (attention + dense projections), router, and the route
 transfer. If core+router+transfer accounts for route_wait, the rows path is
 GPU-bound and overlapping the host round trip buys nothing; the gap would then
@@ -22,10 +22,10 @@ import statistics
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
-os.environ["COLIBRI_V2_DMA_PAGING"] = "1"
-os.environ["COLIBRI_MTP_PROFILE"] = "1"
+os.environ["FLYWEIGHT_V2_DMA_PAGING"] = "1"
+os.environ["FLYWEIGHT_MTP_PROFILE"] = "1"
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 MTP_MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-MTP-BF16.gguf"
@@ -52,9 +52,9 @@ def snapshot(runtime) -> dict:
 
 def run(model: V2Model, prompt: list[int], drafts: int) -> dict:
     if drafts:
-        os.environ["COLIBRI_MTP_ADAPTIVE"] = "0"
+        os.environ["FLYWEIGHT_MTP_ADAPTIVE"] = "0"
     else:
-        os.environ.pop("COLIBRI_MTP_ADAPTIVE", None)
+        os.environ.pop("FLYWEIGHT_MTP_ADAPTIVE", None)
     with model.native_qwen_runtime(
         context_limit=8192, gpu_cache_bytes=8192 * 1024**2,
         moe_device="hybrid", mtp_drafts=drafts,

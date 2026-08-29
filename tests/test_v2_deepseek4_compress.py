@@ -32,7 +32,7 @@ import unittest
 
 import numpy as np
 
-from colibri_next.deepseek4 import compress
+from flyweight.deepseek4 import compress
 
 
 def _reference(values: np.ndarray, scores: np.ndarray) -> np.ndarray:

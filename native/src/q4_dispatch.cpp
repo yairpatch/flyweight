@@ -1,4 +1,4 @@
-#include "colibri_gpu_driver.h"
+#include "flyweight_gpu_driver.h"
 #include "q4_kernel.h"
 
 #include <cmath>
@@ -26,7 +26,7 @@ namespace {
 // barriers between phases (measured ~50x slower at 32 threads than 16 on a
 // 16C/32T part) -- but blindly halving omp_get_num_procs() idled half the
 // cores on machines without SMT. Same logic as matvec_threads() in
-// colibri_v2_bailing.hpp; cached, so the OMP_NUM_THREADS getenv that used to
+// flyweight_v2_bailing.hpp; cached, so the OMP_NUM_THREADS getenv that used to
 // run per MoE call per layer happens once.
 int moe_team_threads() {
     static const int threads = [] {
@@ -145,7 +145,7 @@ Q4MatvecKernel select_kernel(std::uint32_t features) {
 const std::uint32_t kCpuFeatures = detect_features();
 
 std::uint32_t effective_features() {
-    const char* backend=std::getenv("COLIBRI_CPU_BACKEND");
+    const char* backend=std::getenv("FLYWEIGHT_CPU_BACKEND");
     if(backend==nullptr)return kCpuFeatures;
     if(std::strcmp(backend,"scalar")==0)return 0;
     if(std::strcmp(backend,"avx2")==0)return kCpuFeatures&kFeatureAvx2;
@@ -159,11 +159,11 @@ const Q4MatvecKernel kQ4Kernel = select_kernel(kEffectiveCpuFeatures);
 
 }
 
-extern "C" std::uint32_t colibri_cpu_features() {
+extern "C" std::uint32_t flyweight_cpu_features() {
     return kEffectiveCpuFeatures;
 }
 
-extern "C" int colibri_q4_matvec(
+extern "C" int flyweight_q4_matvec(
     const std::uint8_t* packed,
     const std::uint16_t* scales,
     const float* vector,
@@ -178,7 +178,7 @@ extern "C" int colibri_q4_matvec(
     return kQ4Kernel(packed, scales, vector, output, rows, columns);
 }
 
-extern "C" int colibri_q4_moe(
+extern "C" int flyweight_q4_moe(
     const std::uint8_t* const* gate_up_packed,
     const std::uint16_t* const* gate_up_scales,
     const std::uint8_t* const* down_packed,
@@ -377,7 +377,7 @@ extern "C" int colibri_q4_moe(
     return 0;
 }
 
-extern "C" int colibri_q4_moe_grouped(
+extern "C" int flyweight_q4_moe_grouped(
     const std::uint8_t* const* gate_up_packed,
     const std::uint16_t* const* gate_up_scales,
     const std::uint8_t* const* down_packed,

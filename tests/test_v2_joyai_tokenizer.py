@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 from tests.deepseek4_gguf_fixture import build_deepseek4_gguf
 
@@ -182,7 +182,7 @@ def _reference_split(text: str) -> tuple[str, ...]:
 class JoyaiPretokenizerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workspace = tempfile.TemporaryDirectory(prefix="colibri-joyai-")
+        cls.workspace = tempfile.TemporaryDirectory(prefix="flyweight-joyai-")
         path = Path(cls.workspace.name) / "deepseek4.gguf"
         build_deepseek4_gguf(path)
         cls.model = V2Model(path)

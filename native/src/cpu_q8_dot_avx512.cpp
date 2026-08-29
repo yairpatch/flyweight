@@ -30,7 +30,7 @@ inline float scale_of(const std::uint8_t* block) {
 
 }  // namespace
 
-float colibri_q8_row_dot_avx512(const std::uint8_t* row_packed,
+float flyweight_q8_row_dot_avx512(const std::uint8_t* row_packed,
                                 const float* vector, int blocks) {
     // Two accumulators carried across all blocks: no per-block horizontal sum,
     // and the scale is folded into the weights rather than applied after, which
@@ -56,7 +56,7 @@ float colibri_q8_row_dot_avx512(const std::uint8_t* row_packed,
     return _mm512_reduce_add_ps(_mm512_add_ps(accumulator_low, accumulator_high));
 }
 
-void colibri_q8_row_dot_pair_avx512(const std::uint8_t* gate_packed,
+void flyweight_q8_row_dot_pair_avx512(const std::uint8_t* gate_packed,
                                     const std::uint8_t* up_packed,
                                     const float* vector, int blocks,
                                     float* gate_out, float* up_out) {

@@ -16,11 +16,11 @@ import time
 
 from cupy.cuda import profiler
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = os.environ.get(
-    "COLIBRI_MODEL", "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf")
-CONTEXT = int(os.environ.get("COLIBRI_CONTEXT", "8192"))
+    "FLYWEIGHT_MODEL", "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf")
+CONTEXT = int(os.environ.get("FLYWEIGHT_CONTEXT", "8192"))
 WARM_TOKENS = 256
 PROFILE_TOKENS = 128
 PROMPT_TEXT = (
@@ -36,7 +36,7 @@ def main() -> None:
         with model.native_qwen_runtime(
             context_limit=CONTEXT,
             gpu_cache_bytes=int(
-                os.environ.get("COLIBRI_GPU_CACHE_MIB", "8192")) * 1024**2,
+                os.environ.get("FLYWEIGHT_GPU_CACHE_MIB", "8192")) * 1024**2,
             moe_device="hybrid",
             mtp_drafts=0,
         ) as runtime:

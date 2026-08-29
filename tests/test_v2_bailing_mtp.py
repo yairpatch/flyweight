@@ -23,7 +23,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from colibri_next.v2 import BailingRuntime, V2Model
+from flyweight.v2 import BailingRuntime, V2Model
 from tests import bailing_gguf_fixture as gguf
 from tests import hf_safetensors_fixture as safetensors
 
@@ -73,7 +73,7 @@ class BailingMtpTests(unittest.TestCase):
 
     def test_speculative_stream_matches_sequential(self) -> None:
         # The host path is the oracle; keep the device out of both runs.
-        with mock.patch.dict(os.environ, {"COLIBRI_BAILING_GPU": "0"}):
+        with mock.patch.dict(os.environ, {"FLYWEIGHT_BAILING_GPU": "0"}):
             with V2Model(self.gguf_path) as model:
                 sequential = self._sequential(model)
                 for wanted in (2, 4):
@@ -86,7 +86,7 @@ class BailingMtpTests(unittest.TestCase):
         # A tiny random checkpoint disagrees with its own drafts constantly;
         # a run without rejections would leave the fold rollback untested,
         # so its absence is a test defect worth failing on.
-        with mock.patch.dict(os.environ, {"COLIBRI_BAILING_GPU": "0"}):
+        with mock.patch.dict(os.environ, {"FLYWEIGHT_BAILING_GPU": "0"}):
             with V2Model(self.gguf_path) as model:
                 _, stats = self._speculative(model, wanted=4)
                 self.assertGreater(stats["rejected"], 0)

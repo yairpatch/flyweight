@@ -8,7 +8,7 @@ tracks, so the spilled-block cost can be separated from everything else.
 import argparse
 import time
 
-from colibri_next.v2 import V2Model, V2QwenRuntime
+from flyweight.v2 import V2Model, V2QwenRuntime
 
 
 def main() -> int:

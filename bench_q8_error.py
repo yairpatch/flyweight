@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from colibri_next.v2 import V2Model, V2QwenRuntime, _library
+from flyweight.v2 import V2Model, V2QwenRuntime, _library
 
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
@@ -58,38 +58,38 @@ def main() -> None:
     runtime.prepare()
 
     lib = _library()
-    lib.colibri_gpu_alloc.argtypes = [
+    lib.flyweight_gpu_alloc.argtypes = [
         ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
-    lib.colibri_gpu_upload_sync.argtypes = [
+    lib.flyweight_gpu_upload_sync.argtypes = [
         ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]
-    lib.colibri_gpu_download.argtypes = [
+    lib.flyweight_gpu_download.argtypes = [
         ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
-    lib.colibri_gpu_launch_named.argtypes = [
+    lib.flyweight_gpu_launch_named.argtypes = [
         ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
         ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]
-    lib.colibri_gpu_stream_sync.argtypes = [ctypes.c_uint64]
-    lib.colibri_gpu_free.argtypes = [ctypes.c_uint64]
+    lib.flyweight_gpu_stream_sync.argtypes = [ctypes.c_uint64]
+    lib.flyweight_gpu_free.argtypes = [ctypes.c_uint64]
 
     def alloc(size: int) -> int:
         pointer = ctypes.c_uint64()
-        if lib.colibri_gpu_alloc(size, ctypes.byref(pointer)) != 0:
+        if lib.flyweight_gpu_alloc(size, ctypes.byref(pointer)) != 0:
             raise RuntimeError("device allocation failed")
         return pointer.value
 
     def launch(name: str, grid: int, block: int, args: list) -> None:
         array = (ctypes.c_void_p * len(args))(
             *[ctypes.addressof(value) for value in args])
-        code = lib.colibri_gpu_launch_named(
+        code = lib.flyweight_gpu_launch_named(
             name.encode(), grid, 1, block, 0, 0, array)
         if code != 0:
             raise RuntimeError(f"launch failed: {name} ({code})")
 
     def download(pointer: int, count: int) -> np.ndarray:
         out = np.zeros(count, dtype=np.float32)
-        lib.colibri_gpu_stream_sync(0)
-        lib.colibri_gpu_download(
+        lib.flyweight_gpu_stream_sync(0)
+        lib.flyweight_gpu_download(
             out.ctypes.data_as(ctypes.c_void_p), pointer, out.nbytes, 0)
-        lib.colibri_gpu_stream_sync(0)
+        lib.flyweight_gpu_stream_sync(0)
         return out
 
     try:
@@ -97,7 +97,7 @@ def main() -> None:
         rng = np.random.default_rng(11)
         activation = rng.normal(0.0, 1.0, size=INPUT_SIZE).astype(np.float32)
         vector_f32 = alloc(INPUT_SIZE * 4)
-        lib.colibri_gpu_upload_sync(
+        lib.flyweight_gpu_upload_sync(
             vector_f32, activation.ctypes.data_as(ctypes.c_void_p),
             INPUT_SIZE * 4)
         quantized = alloc(INPUT_SIZE)
@@ -106,7 +106,7 @@ def main() -> None:
         launch("quantize_q8_blocks", (INPUT_SIZE + 31) // 32, 32,
                [ctypes.c_uint64(vector_f32), ctypes.c_uint64(quantized),
                 ctypes.c_uint64(scales), columns])
-        lib.colibri_gpu_stream_sync(0)
+        lib.flyweight_gpu_stream_sync(0)
 
         print(f"input {INPUT_SIZE}, {ROWS} rows, Gaussian activation\n")
         print(f"{'format':9} {'rel L2':>10} {'max rel':>10} {'corr':>9}")
@@ -140,7 +140,7 @@ def main() -> None:
                         values.view(np.uint8).reshape(blocks, 2))
 
             weights = alloc(weight_bytes)
-            lib.colibri_gpu_upload_sync(
+            lib.flyweight_gpu_upload_sync(
                 weights, packed.ctypes.data_as(ctypes.c_void_p), weight_bytes)
             exact_out = alloc(ROWS * 4)
             q8_out = alloc(ROWS * 4)
@@ -162,9 +162,9 @@ def main() -> None:
             corr = float(np.corrcoef(exact, approximate)[0, 1])
             print(f"{label:9} {rel_l2:10.2e} {max_rel:10.2e} {corr:9.6f}")
 
-            lib.colibri_gpu_free(weights)
-            lib.colibri_gpu_free(exact_out)
-            lib.colibri_gpu_free(q8_out)
+            lib.flyweight_gpu_free(weights)
+            lib.flyweight_gpu_free(exact_out)
+            lib.flyweight_gpu_free(q8_out)
     finally:
         runtime.close()
         model.close()

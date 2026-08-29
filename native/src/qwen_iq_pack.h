@@ -22,7 +22,7 @@
 //    rather than searched; only its starting point is swept.
 //
 // The search accepts an importance matrix: per-channel activation statistics
-// gathered over calibration data (colibri_v2_imatrix.hpp), applied exactly as
+// gathered over calibration data (flyweight_v2_imatrix.hpp), applied exactly as
 // llama.cpp applies them -- weight = qw[channel] * sqrt(sigma2 + x^2). Without
 // one the weight is sqrt(sigma2 + x^2) alone, which is llama.cpp's own
 // no-matrix fallback, and why IQ3_XXS is the only IQ format offered for

@@ -2,12 +2,12 @@
 
 ## Context
 
-colibri now matches llama.cpp on prefix reuse (LCP slot routing, spread checkpoints,
+flyweight now matches llama.cpp on prefix reuse (LCP slot routing, spread checkpoints,
 host-backed prompt cache), but requests still execute strictly one at a time:
 
 - Python: `InferenceService._generation_lock` (server.py) serializes every endpoint;
   the v2 generation pool is `max_workers=1` (v2_server.py).
-- Native: `colibri_v2_qwen_runtime_generate` is one blocking call — full prefill then
+- Native: `flyweight_v2_qwen_runtime_generate` is one blocking call — full prefill then
   the whole token loop — on a single CUDA stream, one shared workspace arena, the
   shared GPU expert cache, and OpenMP CPU MoE.
 
@@ -56,21 +56,21 @@ Implemented as designed below. Notes from the build:
 Replace the blocking generate with a task engine, all CUDA still on one thread:
 
 - New ABI:
-  - `colibri_v2_qwen_task_submit(runtime, prompt, count, max_tokens, *task_id)` —
+  - `flyweight_v2_qwen_task_submit(runtime, prompt, count, max_tokens, *task_id)` —
     routes to a slot (existing `qwen_route_sequence` logic), computes reuse, queues.
-  - `colibri_v2_qwen_engine_step(runtime, events*, capacity, *count)` — runs ONE
+  - `flyweight_v2_qwen_engine_step(runtime, events*, capacity, *count)` — runs ONE
     scheduling cycle and reports per-task events (token emitted / finished / error).
     A cycle: for each runnable task in round-robin order, either one prefill chunk
     (bounded, e.g. `min(prefill_rows, remaining)`) or one decode token, switching
     slots via `qwen_switch_sequence` between tasks.
-  - `colibri_v2_qwen_task_cancel(runtime, task_id)`.
+  - `flyweight_v2_qwen_task_cancel(runtime, task_id)`.
 - Python: one dedicated engine thread per service loops `engine_step` while tasks are
   live and fans events out to per-request queues (the queue plumbing already exists in
   `NativeV2Generator._stream`). The v2 path drops the global generation lock; requests
   submit + consume their own queue. Legacy blocking `generate` stays for CLI/bench.
 - Preemption granularity: a 1024-row prefill chunk ≈ 2.5 s at ~400 t/s prefill. Good
   enough for v1; chunk can be reduced for latency-sensitive setups via the existing
-  COLIBRI_PREFILL_ROWS. Checkpoint saves stay inside the owning task's prefill steps.
+  FLYWEIGHT_PREFILL_ROWS. Checkpoint saves stay inside the owning task's prefill steps.
 - Semantics preserved per task: same reuse, same checkpoints, same greedy output
   (single-task workloads must remain bit-identical — gate A).
 - Outcome: a short request interleaves with a long prefill/decode instead of waiting
@@ -95,7 +95,7 @@ bottleneck.
 
 ### Design (implemented)
 
-REVISED after a full read of `colibri_v2_qwen_runtime_decode` (2026-07-22): the
+REVISED after a full read of `flyweight_v2_qwen_runtime_decode` (2026-07-22): the
 original "kernels gain a row dimension" plan is NOT the right first move. Everything
 runs on ONE CUDA stream, and the per-layer cost is dominated by the CPU-side MoE
 phase (route event sync -> expert paging memcpy -> `qwen_cpu_moe` GEMMs) while the

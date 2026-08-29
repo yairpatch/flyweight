@@ -26,9 +26,9 @@ import unittest
 
 import numpy as np
 
-from colibri_next.deepseek4 import rms_norm
-from colibri_next.deepseek4_layer import CompressedState, DeepSeek4Block, _f32
-from colibri_next.v2 import V2Model
+from flyweight.deepseek4 import rms_norm
+from flyweight.deepseek4_layer import CompressedState, DeepSeek4Block, _f32
+from flyweight.v2 import V2Model
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
 # A stale path is as good as no path: the variable often outlives the file it
@@ -151,7 +151,7 @@ class CsaVisibilityTests(unittest.TestCase):
     """
 
     def setUp(self):
-        from colibri_next.deepseek4_layer import csa_attention_latents
+        from flyweight.deepseek4_layer import csa_attention_latents
         self.latents = csa_attention_latents
 
     def test_a_block_is_visible_from_the_query_that_completes_it(self):

@@ -12,14 +12,14 @@
 // The reference side is the CPU dot product rather than fresh expectations,
 // which keeps this test one hop from the real-checkpoint fixture.
 
-#include <colibri_backend.hpp>
-#include <colibri_cpu_kernels_api.hpp>
-#include <colibri_cpu_shim_geometry.hpp>
+#include <flyweight_backend.hpp>
+#include <flyweight_cpu_kernels_api.hpp>
+#include <flyweight_cpu_shim_geometry.hpp>
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include "colibri_v2_moe_align.hpp"
+#include "flyweight_v2_moe_align.hpp"
 
 #include <cstdio>
 #include <random>
@@ -28,7 +28,7 @@
 #include "qwen_kquant.h"
 
 extern "C" {
-int colibri_cpu_launch_named(const char*, std::uint32_t, std::uint32_t,
+int flyweight_cpu_launch_named(const char*, std::uint32_t, std::uint32_t,
                              std::uint32_t, std::uint32_t, std::uint64_t,
                              void**);
 }
@@ -205,7 +205,7 @@ int check(const char* kernel, const Format& format, bool warp_tiled,
         float* output_pointer = output.data();
         void* arguments[] = {&packed_pointer, &vector_pointer, &output_pointer,
                              &input_size, &output_size};
-        colibri_cpu_launch_named(
+        flyweight_cpu_launch_named(
             kernel,
             warp_tiled ? static_cast<std::uint32_t>((output_size + 7) / 8)
                        : static_cast<std::uint32_t>(output_size),
@@ -245,7 +245,7 @@ int check_rows(const char* kernel, const Format& format) {
         float* output_pointer = output.data();
         void* arguments[] = {&packed_pointer, &vectors_pointer, &output_pointer,
                              &input_size, &output_size, &tokens};
-        colibri_cpu_launch_named(kernel,
+        flyweight_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size),
                                  static_cast<std::uint32_t>((tokens + 3) / 4),
                                  256, 0, 0, arguments);
@@ -303,7 +303,7 @@ Q8Activations quantize_rows(std::mt19937& rng, int input_size, int rows) {
                     rounded < -127 ? -127 : (rounded > 127 ? 127 : rounded));
             }
             out.scales[static_cast<std::size_t>(row) * (input_size / 32) + block] =
-                colibri::cpu::float_to_half_bits(scale);
+                flyweight::cpu::float_to_half_bits(scale);
         }
     }
     return out;
@@ -355,7 +355,7 @@ int check_q8(const char* kernel, const Format& format) {
         float* output_pointer = output.data();
         void* arguments[] = {&packed_pointer, &codes, &scales, &output_pointer,
                              &input_size, &output_size};
-        colibri_cpu_launch_named(kernel,
+        flyweight_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size), 1, 128,
                                  0, 0, arguments);
 
@@ -395,7 +395,7 @@ int check_q8_rows(const char* kernel, const Format& format) {
         void* arguments[] = {&packed_pointer, &codes,        &scales,
                              &output_pointer, &input_size,   &output_size,
                              &rows,           &scale_stride};
-        colibri_cpu_launch_named(kernel,
+        flyweight_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size), 1, 128,
                                  0, 0, arguments);
 
@@ -432,16 +432,16 @@ int check_q8_rows(const char* kernel, const Format& format) {
 // MMQ tile went from 16x64 to 32x64 they happened to agree at 256. They no
 // longer do, and an undersized launch does not fail loudly -- the warps that
 // own the upper rows simply never run, and the check reports a plausible-
-// looking ~0.2 error. Must track COLIBRI_Q8_TILE_* / COLIBRI_MMQ_* in
-// native/include/colibri_v2_qwen_kernels.hpp, like kQ8Tile*/kQ8Mmq* on the host.
+// looking ~0.2 error. Must track FLYWEIGHT_Q8_TILE_* / FLYWEIGHT_MMQ_* in
+// native/include/flyweight_v2_qwen_kernels.hpp, like kQ8Tile*/kQ8Mmq* on the host.
 int check_tiled(const char* kernel, const Format& format,
                 std::uint32_t threads) {
     std::mt19937 rng(20260816);
     float worst = 0.0f;
     // {input_size, output_size, tokens}. rows must stay <=
-    // COLIBRI_Q8_TILE_TOKENS: the kernel computes that many per launch and the
+    // FLYWEIGHT_Q8_TILE_TOKENS: the kernel computes that many per launch and the
     // host chunks to match (kQ8TileTokens), exactly as the rows kernel pairs
-    // with COLIBRI_Q8_ROWS. A wider batch is dropped, not wrapped, so these sit
+    // with FLYWEIGHT_Q8_ROWS. A wider batch is dropped, not wrapped, so these sit
     // at and just under the cap. output_size values straddle the row tile and
     // input sizes straddle the 32-group K tile.
     const int kCases[][3] = {
@@ -467,10 +467,10 @@ int check_tiled(const char* kernel, const Format& format,
                              &output_pointer, &input_size, &output_size,
                              &rows,           &scale_stride};
         // Over-provision blocks: the kernel derives its row base from
-        // blockIdx.x * COLIBRI_Q8_TILE_ROWS and returns early past the last
+        // blockIdx.x * FLYWEIGHT_Q8_TILE_ROWS and returns early past the last
         // row, so output_size blocks covers any tile height without this test
         // having to track the macro.
-        colibri_cpu_launch_named(kernel,
+        flyweight_cpu_launch_named(kernel,
                                  static_cast<std::uint32_t>(output_size), 1,
                                  threads, 0, 0, arguments);
 
@@ -537,9 +537,9 @@ int check_routed_mmq(const char* kernel, const Format& format,
     std::uniform_int_distribution<int> pick(0, experts - 1);
     for (auto& value : selected) value = pick(rng);
 
-    colibri::v2::moe::AlignedRoutes aligned;
-    colibri::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
-                                   colibri::v2::moe::kMmqBlockSize, aligned);
+    flyweight::v2::moe::AlignedRoutes aligned;
+    flyweight::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
+                                   flyweight::v2::moe::kMmqBlockSize, aligned);
     const int blocks = static_cast<int>(aligned.block_experts.size());
     std::vector<unsigned long long> expert_ptrs(
         static_cast<std::size_t>(experts));
@@ -560,7 +560,7 @@ int check_routed_mmq(const char* kernel, const Format& format,
         int nb = blocks;
         void* arguments[] = {&ptrs, &be, &sr, &codes, &scales, &out,
                              &in,   &on, &tk, &ss,    &nb};
-        colibri_cpu_launch_named(kernel, static_cast<std::uint32_t>(output_size),
+        flyweight_cpu_launch_named(kernel, static_cast<std::uint32_t>(output_size),
                                  static_cast<std::uint32_t>(blocks), threads, 0,
                                  0, arguments);
     }
@@ -569,13 +569,13 @@ int check_routed_mmq(const char* kernel, const Format& format,
     int compared = 0;
     for (int block = 0; block < blocks; ++block) {
         const int expert = aligned.block_experts[block];
-        for (int s = 0; s < colibri::v2::moe::kMmqBlockSize; ++s) {
+        for (int s = 0; s < flyweight::v2::moe::kMmqBlockSize; ++s) {
             const std::size_t slot =
-                static_cast<std::size_t>(block) * colibri::v2::moe::kMmqBlockSize + s;
+                static_cast<std::size_t>(block) * flyweight::v2::moe::kMmqBlockSize + s;
             const auto route = aligned.sorted_routes[slot];
             for (int out = 0; out < output_size; ++out) {
                 const double got = output[slot * output_size + out];
-                if (route == colibri::v2::moe::kEmpty) {
+                if (route == flyweight::v2::moe::kEmpty) {
                     if (got != 0.0) {
                         std::printf("  %-28s FAIL (padded slot %zu row %d = %g)\n",
                                     kernel, slot, out, got);
@@ -664,13 +664,13 @@ int check_block_swiglu(const char* block_kernel, const char* rows_kernel,
         float* out = reference.data();
         int in = input_size, on = output_size, tk = top_k, rw = rows;
         void* args[] = {&g, &u, &c, &v, &out, &in, &on, &tk, &rw};
-        colibri_cpu_launch_named(rows_kernel, static_cast<std::uint32_t>(output_size),
+        flyweight_cpu_launch_named(rows_kernel, static_cast<std::uint32_t>(output_size),
                                  static_cast<std::uint32_t>(routes), 256, 0, 0, args);
     }
 
-    colibri::v2::moe::AlignedRoutes aligned;
-    colibri::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
-                                   colibri::v2::moe::kBlockSize, aligned);
+    flyweight::v2::moe::AlignedRoutes aligned;
+    flyweight::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
+                                   flyweight::v2::moe::kBlockSize, aligned);
     std::vector<unsigned long long> gate_by_slot, up_by_slot;
     std::vector<std::int32_t> block_slot;
     for (const auto expert : aligned.block_experts) {
@@ -692,7 +692,7 @@ int check_block_swiglu(const char* block_kernel, const char* rows_kernel,
         int in = input_size, on = output_size, tk = top_k;
         int blocks = static_cast<int>(aligned.block_experts.size());
         void* args[] = {&g, &u, &be, &sr, &v, &out, &in, &on, &tk, &blocks};
-        colibri_cpu_launch_named(block_kernel, static_cast<std::uint32_t>(output_size),
+        flyweight_cpu_launch_named(block_kernel, static_cast<std::uint32_t>(output_size),
                                  static_cast<std::uint32_t>(blocks), 256, 0, 0, args);
     }
 
@@ -700,7 +700,7 @@ int check_block_swiglu(const char* block_kernel, const char* rows_kernel,
     int compared = 0;
     for (std::size_t slot = 0; slot < aligned.sorted_routes.size(); ++slot) {
         const auto route = aligned.sorted_routes[slot];
-        if (route == colibri::v2::moe::kEmpty) continue;
+        if (route == flyweight::v2::moe::kEmpty) continue;
         for (int row = 0; row < output_size; ++row) {
             const double expected =
                 reference[static_cast<std::size_t>(route) * output_size + row];
@@ -745,14 +745,14 @@ int check_block_accumulate(const char* block_kernel, const char* rows_kernel,
     std::vector<float> activated(static_cast<std::size_t>(routes) * input_size);
     for (auto& value : activated) value = real(rng);
 
-    colibri::v2::moe::AlignedRoutes aligned;
-    colibri::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
-                                   colibri::v2::moe::kBlockSize, aligned);
+    flyweight::v2::moe::AlignedRoutes aligned;
+    flyweight::v2::moe::align_blocks(selected.data(), nullptr, routes, experts,
+                                   flyweight::v2::moe::kBlockSize, aligned);
     std::vector<float> activated_slots(
         static_cast<std::size_t>(aligned.padded_total) * input_size, 0.0f);
     for (std::size_t slot = 0; slot < aligned.sorted_routes.size(); ++slot) {
         const auto route = aligned.sorted_routes[slot];
-        if (route == colibri::v2::moe::kEmpty) continue;
+        if (route == flyweight::v2::moe::kEmpty) continue;
         for (int i = 0; i < input_size; ++i)
             activated_slots[slot * input_size + i] =
                 activated[static_cast<std::size_t>(route) * input_size + i];
@@ -772,7 +772,7 @@ int check_block_accumulate(const char* block_kernel, const char* rows_kernel,
         const int* c = counts.data();
         int in = input_size, on = output_size, tk = top_k, rw = rows;
         void* args[] = {&d, &a, &out, &w, &c, &in, &on, &tk, &rw};
-        colibri_cpu_launch_named(rows_kernel, static_cast<std::uint32_t>(output_size),
+        flyweight_cpu_launch_named(rows_kernel, static_cast<std::uint32_t>(output_size),
                                  static_cast<std::uint32_t>(rows), 256, 0, 0, args);
     }
 
@@ -795,14 +795,14 @@ int check_block_accumulate(const char* block_kernel, const char* rows_kernel,
         int in = input_size, on = output_size;
         int blocks = static_cast<int>(aligned.block_experts.size());
         void* args[] = {&d, &be, &sr, &a, &out, &w, &in, &on, &blocks};
-        colibri_cpu_launch_named(block_kernel, static_cast<std::uint32_t>(output_size),
+        flyweight_cpu_launch_named(block_kernel, static_cast<std::uint32_t>(output_size),
                                  static_cast<std::uint32_t>(blocks), 256, 0, 0, args);
     }
 
     std::vector<float> folded(static_cast<std::size_t>(rows) * output_size, 0.0f);
     for (std::size_t slot = 0; slot < aligned.sorted_routes.size(); ++slot) {
         const auto route = aligned.sorted_routes[slot];
-        if (route == colibri::v2::moe::kEmpty) {
+        if (route == flyweight::v2::moe::kEmpty) {
             for (int row = 0; row < output_size; ++row)
                 if (per_slot[slot * output_size + row] != 0.0f) {
                     std::printf("  %-28s FAIL (padded slot not zero)\n", block_kernel);
@@ -833,7 +833,7 @@ int main() {
     std::printf("IQ kernel contract (corpus CUDA vs CPU reference)\n");
     int failures = 0;
     // Block sizes of the two tile shapes; see check_tiled.
-    const std::uint32_t kTiledThreads = 256;   // COLIBRI_Q8_TILE_WARPS * 32
+    const std::uint32_t kTiledThreads = 256;   // FLYWEIGHT_Q8_TILE_WARPS * 32
     const std::uint32_t kMmqThreads = 256;     // ROW_WARPS * TOKEN_WARPS * 32
     // One warp per row, eight rows per block.
     failures += check("iq1m_matvec_transposed_warp", kIq1m, true, 256);
@@ -879,7 +879,7 @@ int main() {
     failures += check_tiled("iq2xs_q8_mmq", kIq2xs, kMmqThreads);
     failures += check_tiled("iq4xs_q8_mmq", kIq4xs, kMmqThreads);
     // The same core driven by a block table. Its thread count is fixed by
-    // COLIBRI_MOE_MMQ_ROW_WARPS * COLIBRI_MOE_MMQ_TOKEN_WARPS * 32, which is
+    // FLYWEIGHT_MOE_MMQ_ROW_WARPS * FLYWEIGHT_MOE_MMQ_TOKEN_WARPS * 32, which is
     // the same 256 -- a different split of the warps, not a different budget.
     failures += check_routed_mmq("iq1s_q8_mmq_routed", kIq1s, kMmqThreads);
     failures += check_routed_mmq("iq2xxs_q8_mmq_routed", kIq2xxs, kMmqThreads);

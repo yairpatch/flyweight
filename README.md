@@ -1,6 +1,6 @@
-# Colibrì Next
+# Flyweight
 
-Colibrì Next is a native C++/CUDA GGUF inference runtime. Python provides the
+Flyweight is a native C++/CUDA GGUF inference runtime. Python provides the
 CLI, tokenizer-facing server adapter, and OpenAI/Anthropic-compatible HTTP
 API; model execution stays in the native runtime.
 
@@ -66,27 +66,40 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e .
-PYTHONPATH=src python -m colibri_next.native_build
-pytest -q
+flyweight doctor
 ~~~
 
-On Windows, activate with `.venv\Scripts\Activate.ps1` and run the same Python
+`pip install -e .` compiles the native runtime as part of the install; there is
+no second build step. `flyweight doctor` then reports whether this machine can
+serve and names the fix for anything missing — run it first whenever something
+fails to start.
+
+On Windows, activate with `.venv\Scripts\Activate.ps1` and run the same
 commands. CUDA kernels are compiled at runtime through the NVIDIA driver API;
 the project does not require a separately installed CUDA toolkit for serving.
+
+Working on the runtime itself needs the contract tests and benchmarks, which an
+install does not build:
+
+~~~bash
+python -m flyweight.native_build     # same build tree, plus the test binaries
+ctest --test-dir build/native --output-on-failure
+pytest -q
+~~~
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `colibri-next serve MODEL` | serve the OpenAI/Anthropic APIs and chat UI |
-| `colibri-next generate MODEL --prompt TEXT` | print one response and exit |
-| `colibri-next benchmark MODEL` | measure prompt and decode speed as JSON |
-| `colibri-next inspect MODEL` | print model metadata as JSON |
-| `colibri-next imatrix MODEL --text FILE` | gather an importance matrix |
-| `colibri-next probe MODEL` | run a few tokens and dump runtime counters |
+| `flyweight serve MODEL` | serve the OpenAI/Anthropic APIs and chat UI |
+| `flyweight generate MODEL --prompt TEXT` | print one response and exit |
+| `flyweight benchmark MODEL` | measure prompt and decode speed as JSON |
+| `flyweight inspect MODEL` | print model metadata as JSON |
+| `flyweight imatrix MODEL --text FILE` | gather an importance matrix |
+| `flyweight probe MODEL` | run a few tokens and dump runtime counters |
 
 `MODEL` is a `.gguf` file or a safetensors checkpoint directory, everywhere.
-`colibri-next COMMAND --help` lists every option that command accepts, grouped
+`flyweight COMMAND --help` lists every option that command accepts, grouped
 by what it does: the request, the backend, hardware placement, and advanced
 tuning. The older `serve-v2`, `generate-text-v2`, `benchmark-v2`,
 `inspect-gguf`, and `probe-native-v2` spellings remain accepted.
@@ -94,7 +107,7 @@ tuning. The older `serve-v2`, `generate-text-v2`, `benchmark-v2`,
 ## Serve a model
 
 ~~~bash
-colibri-next serve model.gguf
+flyweight serve model.gguf
 ~~~
 
 Open `http://127.0.0.1:8000/` for the local chat UI. The defaults select the
@@ -102,7 +115,7 @@ backend and memory policy automatically; the options below are the ones worth
 reaching for first:
 
 ~~~bash
-colibri-next serve model.gguf \
+flyweight serve model.gguf \
   --context 65536 --max-tokens 16384 \
   --host 127.0.0.1 --port 8000
 ~~~
@@ -133,7 +146,7 @@ For concurrent agent clients, allocate independent sequence slots and optional
 host prompt-cache storage:
 
 ~~~bash
-colibri-next serve model.gguf \
+flyweight serve model.gguf \
   --context 58000 \
   --expert-mode cpu --cpu-threads 12 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
@@ -145,7 +158,7 @@ conversation isolation but consume additional VRAM. Bound both admitted
 inference work and open HTTP connections for public-facing deployments:
 
 ~~~bash
-colibri-next serve model.gguf \
+flyweight serve model.gguf \
   --concurrency 8 --max-connections 64 \
   --request-timeout-seconds 30
 ~~~
@@ -167,7 +180,7 @@ Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (with
 retrieval and deletion by id), `/v1/models`, `/v1/messages` and
 `/v1/messages/count_tokens` (Anthropic), `/v1/responses/input_tokens`,
 `/tokenize`, `/detokenize`, `/health`, `/props`, and `/slots`. All generation
-endpoints stream over SSE. Set `COLIBRI_API_KEY` or pass `--api-key` to
+endpoints stream over SSE. Set `FLYWEIGHT_API_KEY` or pass `--api-key` to
 require bearer authentication (`Authorization: Bearer` or `x-api-key`). Use
 `--strict-model` when request model IDs must exactly match the configured
 server model name.
@@ -211,7 +224,7 @@ name must be a declared one, required parameters must be present, and
 array/object argument values must be complete well-formed JSON. Scalar values
 are free text -- the declared schema types them after parsing.
 `response_format` (`json_object` / `json_schema`) is likewise enforced at the
-sampler. `COLIBRI_TOOL_GRAMMAR=0` and `COLIBRI_RESPONSE_GRAMMAR=0` disable
+sampler. `FLYWEIGHT_TOOL_GRAMMAR=0` and `FLYWEIGHT_RESPONSE_GRAMMAR=0` disable
 each constraint independently without a rebuild. Tool-call arguments stream
 incrementally as JSON fragments, so a long file-writing call produces wire
 progress instead of a timeout. DeepSeek-V4 and BailingMoE3 templates render
@@ -236,9 +249,9 @@ per request.
 ## Inspect and generate
 
 ~~~bash
-colibri-next inspect model.gguf
+flyweight inspect model.gguf
 
-colibri-next generate model.gguf \
+flyweight generate model.gguf \
   --prompt "Explain mixture-of-experts routing." \
   --max-tokens 128 --temperature 0
 ~~~
@@ -248,7 +261,7 @@ colibri-next generate model.gguf \
 The direct benchmark separates preparation, prompt prefill, and steady decode:
 
 ~~~bash
-colibri-next benchmark model.gguf \
+flyweight benchmark model.gguf \
   --prompt "Explain sliding-window attention." --chat \
   --context 32768 --iterations 30 --warmup 10 \
   --expert-mode auto --cache-type-k f16 --cache-type-v f16
@@ -303,15 +316,15 @@ are accepted everywhere:
 
 Prefill expert streaming (staging routed experts to the GPU for the batched
 prefill kernels) is on by default with an automatically sized budget and has
-no CLI flag; `COLIBRI_PREFILL_EXPERT_STREAM_MIB` overrides the budget in MiB
-(`0` disables). `COLIBRI_PREFILL_PIPELINE=0` restores the serial prefill and
-`COLIBRI_CUDA_GRAPHS=0` disables graph replay, both for comparison only.
+no CLI flag; `FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB` overrides the budget in MiB
+(`0` disables). `FLYWEIGHT_PREFILL_PIPELINE=0` restores the serial prefill and
+`FLYWEIGHT_CUDA_GRAPHS=0` disables graph replay, both for comparison only.
 
 Runtime diagnostics are exposed through `/health`, including prefix-cache
 counters and the sampler-grammar counters
 (`grammar_constrained_steps`, `grammar_rejected_candidates`,
 `grammar_empty_candidate_sets`). Detailed profiling and experimental kernel
-switches use `COLIBRI_*` environment variables; unset profiling variables for
+switches use `FLYWEIGHT_*` environment variables; unset profiling variables for
 production serving.
 
 ## Quantization
@@ -322,7 +335,7 @@ CLI asks which quantization to pack, listing the exact size of each and
 marking the ones already cached -- picking a cached one opens in about a
 second, an uncached one costs a repack and the disk to store it. Anything
 non-interactive keeps the default (`Q6_K`), and `--quant`, or
-`COLIBRI_HF_QUANT`, answers ahead of time:
+`FLYWEIGHT_HF_QUANT`, answers ahead of time:
 
 ~~~
 Qwen3.8-27B is a safetensors checkpoint. Choose how to quantize it:
@@ -365,7 +378,7 @@ nothing).
 The search accepts an importance matrix -- per-channel activation statistics
 gathered over calibration data, the `imatrix.dat` the ecosystem publishes
 beside checkpoints. An `imatrix.dat` in the checkpoint directory is picked up
-automatically, `--imatrix path` (or `COLIBRI_HF_IMATRIX`) names one
+automatically, `--imatrix path` (or `FLYWEIGHT_HF_IMATRIX`) names one
 elsewhere, and `off` disables the probe. With a matrix the codebook search
 weights each channel by how hard the model actually drives it, which is what
 lifts IQ3_XXS above the K-quant accuracy curve; without one it uses
@@ -377,7 +390,7 @@ The runtime can also gather its own matrix, over any Qwen-family model it
 serves:
 
 ~~~bash
-colibri-next imatrix model.gguf \
+flyweight imatrix model.gguf \
   --text calibration.txt --output imatrix.dat
 ~~~
 
@@ -440,7 +453,7 @@ on CPU, spend KV precision to buy them back before anything else.
 
 Qwen sampling with `top_k <= 32` reduces candidates on the GPU by default.
 `sampling_gpu_topk_*`, `sampling_full_download_bytes`, and
-`sampling_nanoseconds` expose its behavior; set `COLIBRI_SAMPLING_GPU_TOPK=0`
+`sampling_nanoseconds` expose its behavior; set `FLYWEIGHT_SAMPLING_GPU_TOPK=0`
 only when comparing against the full-vocabulary host fallback.
 
 ## Testing
@@ -450,11 +463,11 @@ weights:
 
 ~~~bash
 ruff check src tests setup.py
-mypy src/colibri_next
+mypy src/flyweight
 pytest -q
 ~~~
 
-Set `COLIBRI_TEST_MODEL=/path/to/model.gguf` to opt into the real Qwen
+Set `FLYWEIGHT_TEST_MODEL=/path/to/model.gguf` to opt into the real Qwen
 reference tests. A configured model path that is missing or fails to load is
 treated as a test failure; only an unset opt-in and an unavailable CUDA
 device are skipped.
@@ -502,17 +515,17 @@ device are skipped.
   from the reference tokenizer.
 - Laguna concentrates available expert-cache VRAM into a contiguous suffix of
   complete layers and pins every expert in those layers, using the CPU path
-  for earlier layers. Set `COLIBRI_LAGUNA_WHOLE_LAYERS=0` to restore
+  for earlier layers. Set `FLYWEIGHT_LAGUNA_WHOLE_LAYERS=0` to restore
   per-expert placement for comparison, or to a positive integer to cap the
   number of complete GPU layers.
 - Laguna prefill over IQ2_XS, IQ3_XXS or IQ4_XS experts uses the direct
   quantized 8-token CPU kernel by default instead of expanding expert rows to
-  f32. Set `COLIBRI_PREFILL_DIRECT_QUANT=0` only for comparison; `=1`
+  f32. Set `FLYWEIGHT_PREFILL_DIRECT_QUANT=0` only for comparison; `=1`
   continues to opt other supported architectures into the same path.
 - On AVX-512 hosts, IQ2_XS decode widens a complete 16-value scale group at a
   time and fuses the gate/up projections so they share each activation load.
-  Set `COLIBRI_IQ_AVX512=0` to compare with the AVX2 kernel, or
-  `COLIBRI_FUSED_MOE_GATE_UP=0` to disable only the automatic IQ2_XS fusion.
+  Set `FLYWEIGHT_IQ_AVX512=0` to compare with the AVX2 kernel, or
+  `FLYWEIGHT_FUSED_MOE_GATE_UP=0` to disable only the automatic IQ2_XS fusion.
 - IQ expert decode is sensitive to memory bandwidth, clock sharing and thread
   placement. The default uses physical cores; tune `--cpu-threads` for the
   machine rather than assuming SMT helps (14 workers beat 8, 16 and 32 on the
@@ -534,16 +547,16 @@ device are skipped.
   model orchestration, prefix reuse, and native runtime ABI
 - `native/src/gpu_driver.cpp`: CUDA driver, NVRTC, cuBLAS/cuBLASLt, graph,
   and transfer integration
-- `native/include/colibri_v2_qwen_kernels.hpp`: generated CUDA model kernels
-- `native/include/colibri_v2_tool_grammar.hpp`: sampler-side tool and JSON
+- `native/include/flyweight_v2_qwen_kernels.hpp`: generated CUDA model kernels
+- `native/include/flyweight_v2_tool_grammar.hpp`: sampler-side tool and JSON
   response constraints
-- `src/colibri_next/v2.py`: Python bindings for the native ABI
-- `src/colibri_next/v2_server.py`: tokenizer, cooperative engine thread, and
+- `src/flyweight/v2.py`: Python bindings for the native ABI
+- `src/flyweight/v2_server.py`: tokenizer, cooperative engine thread, and
   native inference service
-- `src/colibri_next/deepseek4_server.py`: the dedicated DeepSeek-V4 service
-- `src/colibri_next/server.py`: shared HTTP protocol implementation
-- `src/colibri_next/sampling.py`: the sampling settings every surface shares
-- `src/colibri_next/runtime_benchmark.py`: benchmark capture and comparison
+- `src/flyweight/deepseek4_server.py`: the dedicated DeepSeek-V4 service
+- `src/flyweight/server.py`: shared HTTP protocol implementation
+- `src/flyweight/sampling.py`: the sampling settings every surface shares
+- `src/flyweight/runtime_benchmark.py`: benchmark capture and comparison
 
 ## License
 

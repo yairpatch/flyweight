@@ -1,6 +1,6 @@
-[colibri-v2] prompt cache budget 5.8 GiB (auto)
-[colibri-v2] restored 2779 learned expert entries from C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q4_K_S.gguf.expert-history
-[colibri-v2] direct expert paging on (registered 19.9 GiB mmap in 0.00s)
+[flyweight] prompt cache budget 5.8 GiB (auto)
+[flyweight] restored 2779 learned expert entries from C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q4_K_S.gguf.expert-history
+[flyweight] direct expert paging on (registered 19.9 GiB mmap in 0.00s)
 Serving Qwen3.6-35B-A3B-UD-Q4_K_S at http://127.0.0.1:8000
 127.0.0.1 - - [15/Aug/2026 09:45:38] "GET /sw.js HTTP/1.1" 404 -
 127.0.0.1 - - [15/Aug/2026 09:45:41] "GET /sw.js HTTP/1.1" 404 -
@@ -94,7 +94,7 @@ Traceback (most recent call last):
     self.handle()
   File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\http\server.py", line 438, in handle
     self.handle_one_request()
-  File "C:\Users\thegr\OneDrive\Documents\colibri-next\src\colibri_next\server.py", line 1934, in handle_one_request
+  File "C:\Users\thegr\OneDrive\Documents\flyweight\src\flyweight\server.py", line 1934, in handle_one_request
     super().handle_one_request()
   File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\http\server.py", line 404, in handle_one_request
     self.raw_requestline = self.rfile.readline(65537)

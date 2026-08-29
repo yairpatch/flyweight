@@ -1,7 +1,7 @@
 """Replay a decode route trace against candidate expert-cache policies.
 
 Reads the packed (uint32 layer, uint32 expert) stream written by
-COLIBRI_EXPERT_TRACE and reports the hit rate each policy would have achieved,
+FLYWEIGHT_EXPERT_TRACE and reports the hit rate each policy would have achieved,
 so a policy change can be justified before it is written in C++.
 
 The device cache is statically partitioned per layer, so every policy is

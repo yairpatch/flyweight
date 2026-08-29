@@ -2,7 +2,7 @@
 
 ## Context
 
-We want `colibri-next` to serve `unsloth/DeepSeek-V4-Flash-0731-GGUF`, primarily the
+We want `flyweight` to serve `unsloth/DeepSeek-V4-Flash-0731-GGUF`, primarily the
 `UD-IQ3_XXS` build. Today the native runtime accepts only Qwen, Gemma 4 and Laguna
 (`native/src/v2_runtime.cpp:3662`), so the model cannot even be opened.
 
@@ -63,15 +63,15 @@ Work lands in gated stages; each stage is independently useful and mergeable.
 ## What already exists and should be reused
 
 - Memory-mapped GGUF load with `MADV_HUGEPAGE`, optional mlock, CUDA host registration:
-  `colibri_v2_model_open`, `native/src/v2_runtime.cpp:3246`
+  `flyweight_v2_model_open`, `native/src/v2_runtime.cpp:3246`
 - Suffix-matched GGUF metadata parsing: `parse()`, `native/src/v2_runtime.cpp:1294`.
   Most `deepseek4.*` keys (block_count, embedding_length, head_count(_kv), key/value_length,
   expert_count, expert_used_count, expert_feed_forward_length, rope.*, YaRN,
   expert_weights_scale/norm, sliding_window) already land through existing suffix rules.
 - DeepSeek-V3-style sigmoid top-k routing with score-correction bias:
-  `native/include/colibri_v2_native_kernels.hpp:867`
+  `native/include/flyweight_v2_native_kernels.hpp:867`
 - Shared-expert and leading-dense-block config plumbing: `ModelConfig`,
-  `native/include/colibri_v2_config.hpp`
+  `native/include/flyweight_v2_config.hpp`
 - IQ3_XXS decode and dot kernels on CPU: `native/src/qwen_kquant.h:207`,
   `native/src/qwen_cpu_avx2.cpp:737`, `native/src/qwen_cpu_avx512.cpp`, block-size
   constant at `native/src/v2_runtime.cpp:620`
@@ -79,17 +79,17 @@ Work lands in gated stages; each stage is independently useful and mergeable.
   (`native/src/v2_runtime.cpp:4778` onward)
 - Hand-transcribed BPE pre-tokenizer precedent: `laguna_pretokenize`,
   `native/src/v2_runtime.cpp:3436`
-- Second-GGUF sidecar precedent for the MTP module: `ColibriV2Model::mtp_sidecar`,
-  `native/src/v2_runtime.cpp:88` and `colibri_v2_model_attach_mtp`, `:3323`
+- Second-GGUF sidecar precedent for the MTP module: `FlyweightV2Model::mtp_sidecar`,
+  `native/src/v2_runtime.cpp:88` and `flyweight_v2_model_attach_mtp`, `:3323`
 
 ## Stage A — load, describe, tokenize (no execution)
 
-Goal: `colibri-next` opens the 4-shard IQ3_XXS checkpoint, reports a correct config and
+Goal: `flyweight` opens the 4-shard IQ3_XXS checkpoint, reports a correct config and
 tensor plan, and tokenizes text identically to the reference.
 
-1. **Split-GGUF mapping.** `colibri_v2_model_open` maps exactly one file today and
+1. **Split-GGUF mapping.** `flyweight_v2_model_open` maps exactly one file today and
    `Tensor::offset` is an offset into that single mapping. Add a shard vector to
-   `ColibriV2Model` (fd/handle, base pointer, size), derive sibling paths from the
+   `FlyweightV2Model` (fd/handle, base pointer, size), derive sibling paths from the
    `-0000N-of-0000M.gguf` name when `split.count > 1`, map each shard, and give `Tensor` a
    shard index so `WeightProvider` resolves `shard_base + offset`. Every place that
    assumes `m->data`/`m->size` is the whole model must iterate shards: mlock, `madvise`,
@@ -98,7 +98,7 @@ tensor plan, and tokenizes text identically to the reference.
    derives `Tensor::size` from the next tensor's offset (that must become per-shard).
    Validate `split.no`, `split.count` and `split.tensors.count` across shards and fail
    loudly on a missing or mismatched shard.
-2. **`deepseek4` metadata.** Extend `ModelConfig` (`native/include/colibri_v2_config.hpp`)
+2. **`deepseek4` metadata.** Extend `ModelConfig` (`native/include/flyweight_v2_config.hpp`)
    with: `q_lora_rank`, `kv_lora_rank` (from `key_length`), `output_lora_rank`,
    `output_group_count`, `indexer_head_count`, `indexer_key_length`, `indexer_top_k`,
    `compress_ratios` (vector), `compress_rope_freq_base`, `hyper_connection_count`,
@@ -122,7 +122,7 @@ tensor plan, and tokenizes text identically to the reference.
    `<｜User｜>`, `<｜Assistant｜>`, `｜DSML｜`, `<think>`) so they never split.
 5. **Arch gate and Python surface.** Accept `deepseek4` for inspection at
    `native/src/v2_runtime.cpp:3662`, and extend the arch branches in
-   `src/colibri_next/v2.py` (`_architecture` at `:719`, the gemma4 branch at `:1071`, the
+   `src/flyweight/v2.py` (`_architecture` at `:719`, the gemma4 branch at `:1071`, the
    dispatch at `:1144`) plus whatever the CLI needs to print the new config fields.
 
 Stage A verification: a new `tests/test_v2_deepseek4.py` opens the local checkpoint (skipped
@@ -431,7 +431,7 @@ Order of work, each diffed against the reference before moving on:
 4. The three per-layer caches (SWA K, compressed K, indexer K) and their compression plans.
 5. MoE: 256 experts / 6 active with `expert_weights_scale` 1.5 and norm, the shared expert,
    and the per-layer swiglu clamps — extending the existing sigmoid-router kernel at
-   `native/include/colibri_v2_native_kernels.hpp:867` rather than writing a new one.
+   `native/include/flyweight_v2_native_kernels.hpp:867` rather than writing a new one.
 6. Output head with `output_lora_rank` 1024 / `output_group_count` 8.
 
 Context length must be capped well below 1M initially (32–64k) — the three-cache layout at
@@ -444,11 +444,11 @@ reference.
 
 ## Working setup
 
-- Repo `/home/yair/Desktop/colibri-next`, branch `v2-native-runtime`.
+- Repo `/home/yair/Desktop/flyweight`, branch `v2-native-runtime`.
 - Checkpoint: `export DEEPSEEK4_GGUF=/home/yair/Downloads/DeepSeek-V4-Flash-IQ3_XXS/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf`.
   The deepseek4 tests skip without it, so the suite passing means little unless
   it is set.
-- Build: `PYTHONPATH=src python -m colibri_next.native_build`.
+- Build: `PYTHONPATH=src python -m flyweight.native_build`.
   Tests: `PYTHONPATH=src python -m unittest discover -s tests`.
 - Reference: `/home/yair/Desktop/llama.cpp-ref`, built. `llama-simple` needs
   `-ngl 0` or it tries to put 98 GiB on the GPU; `llama-cli` needs
@@ -463,7 +463,7 @@ reference.
   extend). Regenerate with
   `llama-eval-callback -m <shard 1> -f <prompt> -n 1 -c 1024 --temp 0`. Keep
   them out of `/tmp`, which is a RAM-backed tmpfs here.
-- Serving: `colibri-next serve <shard 1> --context 2048`. The runtime knobs are
+- Serving: `flyweight serve <shard 1> --context 2048`. The runtime knobs are
   refused on this architecture, so pass none of them.
 - **The working tree carries unrelated uncommitted work** on a prompt-cache
   feature, in README.md, cli.py, v2.py, v2_server.py and two test files. Stage
@@ -478,13 +478,13 @@ MXFP4, all three attention kinds with both compressors, hyper-connections, the
 router, the head, and a native forward loop over all 43 layers whose logits are
 *identical* to the composed model -- which is itself verified against llama.cpp.
 It answers "The capital city of France is" with " Paris." and "2 + 2 =" with
-" 4", runs from `colibri-next generate`, and streams GenerationStep events.
+" 4", runs from `flyweight generate`, and streams GenerationStep events.
 
 Throughput is 4.5 tok/s warm in the raw loop and 3.1 through the server, against
 roughly 3 for the reference, measured after the page cache settles rather than
 cold. It drops to about 3 and 2.2 when the routed experts are paging.
 
-It now also **serves, hybrid**: `colibri-next serve` starts the OpenAI/Anthropic
+It now also **serves, hybrid**: `flyweight serve` starts the OpenAI/Anthropic
 API on this checkpoint, puts the dense half on the GPU and keeps the routed
 experts on the host, answers `/v1/chat/completions` (streaming and not), and
 reports `native-v2-deepseek4-hybrid` with its resident byte count through
@@ -549,7 +549,7 @@ paging machinery exists to manage.
 
 ## Engine integration: done, and what it cost
 
-The service layer is now reachable. `colibri-next serve` and `generate` both
+The service layer is now reachable. `flyweight serve` and `generate` both
 dispatch on architecture, and the model answers over HTTP with the chat
 template, streaming, keepalives and `/v1/models` intact.
 
@@ -705,7 +705,7 @@ ones during the earlier ones' arithmetic. With the page cache dropped first:
 The halved disk traffic was the surprise: an explicit range read fetches what
 was asked for where fault-driven readahead guesses and over-fetches. Fully
 resident the hints cost two to three percent, which is the trade;
-`COLIBRI_DS4_PREFETCH=off` re-measures it. Batching the ranges through
+`FLYWEIGHT_DS4_PREFETCH=off` re-measures it. Batching the ranges through
 `process_madvise` would remove even that.
 
 What is left of residency is the 6% of expert bytes that miss when warm, and
@@ -761,14 +761,14 @@ Two facts, both against the real checkpoint, both now tests
   per iteration measures **300 GiB/s**, same layout, same answers. That restores
   the 2x: 111 ms a token of attention projections becomes about 17.
 
-The new kernel is deepseek4's own (`colibri_v2_deepseek4_kernels.hpp`, launched
+The new kernel is deepseek4's own (`flyweight_v2_deepseek4_kernels.hpp`, launched
 by name) rather than a change to the shared one, since the Qwen path's numbers
 are not measured here and should not move as a side effect. The same trick very
 likely helps it too -- worth an afternoon and a benchmark.
 
 Also landed: `ds4_gpu_compile` (the deepseek4 source is concatenated onto the
 Qwen set), a type dispatch for Q8_0/Q6_K/BF16, and
-`colibri_v2_deepseek4_gpu_matvec_check`, which runs one tensor both ways and
+`flyweight_v2_deepseek4_gpu_matvec_check`, which runs one tensor both ways and
 optionally loops it for timing.
 
 **The dense weights are now resident and the matvecs run there.** 6.9 GiB
@@ -883,7 +883,7 @@ needed them:
     BF16     86 MiB   bf16_matvec_warp
 
 plus `rms_norm`, the softmax and argmax kernels. Kernels are NVRTC-compiled at
-runtime from `colibri_v2_qwen_kernels.hpp` and `colibri_v2_native_kernels.hpp`,
+runtime from `flyweight_v2_qwen_kernels.hpp` and `flyweight_v2_native_kernels.hpp`,
 and libcuda is dlopen'd, so adding to them is additive and the library still
 builds and runs with no CUDA present.
 
@@ -932,10 +932,10 @@ with `nvidia-smi` and `gpu_info()` before trusting any Stage C measurement.
 ## Stage D — MTP and serving polish
 
 Attach the speculative-decoding module through the existing sidecar mechanism
-(`colibri_v2_model_attach_mtp`, `native/src/v2_runtime.cpp:3323`), and teach the server the
+(`flyweight_v2_model_attach_mtp`, `native/src/v2_runtime.cpp:3323`), and teach the server the
 DSML tool-call dialect — the chat template emits `<｜DSML｜tool_calls>` / `invoke` /
 `parameter string="true|false"` blocks, which none of the existing parsers in
-`src/colibri_next/server.py:83` understand. Also handle the `thinking` /
+`src/flyweight/server.py:83` understand. Also handle the `thinking` /
 `reasoning_content` fields the template expects.
 
 ## Prerequisites

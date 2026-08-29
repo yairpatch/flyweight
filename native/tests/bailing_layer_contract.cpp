@@ -12,7 +12,7 @@
 // arithmetic inside each piece is already pinned against torch by the router,
 // KDA and attention contracts.
 
-#include "colibri_v2_bailing.hpp"
+#include "flyweight_v2_bailing.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -21,9 +21,9 @@
 
 namespace {
 
-using colibri::v2::bailing::Geometry;
-using colibri::v2::bailing::LayerCache;
-using colibri::v2::bailing::LayerWeights;
+using flyweight::v2::bailing::Geometry;
+using flyweight::v2::bailing::LayerCache;
+using flyweight::v2::bailing::LayerWeights;
 
 Geometry small_geometry() {
     Geometry g;

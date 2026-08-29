@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from colibri_next.v2 import V2Error, V2Model
+from flyweight.v2 import V2Error, V2Model
 
 from tests.dense_gguf_fixture import build_dense_qwen35_gguf
 
@@ -40,7 +40,7 @@ class CpuBackendSelectionTests(unittest.TestCase):
 class CpuExpertPlacementTests(unittest.TestCase):
     """The default expert mode must not pick a device path on the CPU backend.
 
-    Regression: colibri_cpu_host_register used to return success because there
+    Regression: flyweight_cpu_host_register used to return success because there
     is nothing to pin, the runtime read that as "direct expert paging is
     available", and routed experts moved onto the hybrid path -- which copies
     expert weights out of the GGUF mapping into another host buffer to no
@@ -126,7 +126,7 @@ class CpuCublasFallbackTests(unittest.TestCase):
         cls._directory.cleanup()
 
     def tearDown(self) -> None:
-        os.environ.pop("COLIBRI_CUBLAS_ATTENTION", None)
+        os.environ.pop("FLYWEIGHT_CUBLAS_ATTENTION", None)
         V2Model.select_backend("auto")
 
     def _generate(self, prompt_length: int) -> list[int]:
@@ -144,9 +144,9 @@ class CpuCublasFallbackTests(unittest.TestCase):
         # included so a failure points at the threshold rather than at the model.
         for prompt_length in (100, 140):
             with self.subTest(prompt_length=prompt_length):
-                os.environ["COLIBRI_CUBLAS_ATTENTION"] = "0"
+                os.environ["FLYWEIGHT_CUBLAS_ATTENTION"] = "0"
                 disabled = self._generate(prompt_length)
-                os.environ.pop("COLIBRI_CUBLAS_ATTENTION", None)
+                os.environ.pop("FLYWEIGHT_CUBLAS_ATTENTION", None)
                 enabled = self._generate(prompt_length)
                 self.assertEqual(
                     disabled, enabled,

@@ -1,10 +1,10 @@
-// CPU implementation of the device interface in colibri_gpu_driver.h.
+// CPU implementation of the device interface in flyweight_gpu_driver.h.
 //
 // The runtime's layer loop talks to the device exclusively through this
 // interface and launches compute by kernel *name*, so supplying a second
 // implementation is enough to run the whole model on the host -- v2_runtime.cpp
 // needs no parallel code path. Device pointers become host pointers, streams
-// and events become bookkeeping, and colibri_cpu_launch_named runs the grid
+// and events become bookkeeping, and flyweight_cpu_launch_named runs the grid
 // over the kernels generated from the CUDA corpus (see cpu_kernels.cpp).
 //
 // Ordering: every launch here is synchronous. That trivially satisfies the
@@ -13,11 +13,11 @@
 // the sync and wait entry points have nothing to do. Overlap is a stage-2
 // concern; correctness does not depend on it.
 
-#include <colibri_backend.hpp>
-#include <colibri_cpu_backend.hpp>
-#include <colibri_cpu_kernels_api.hpp>
-#include <colibri_cpu_native.hpp>
-#include <colibri_cpu_shim_geometry.hpp>
+#include <flyweight_backend.hpp>
+#include <flyweight_cpu_backend.hpp>
+#include <flyweight_cpu_kernels_api.hpp>
+#include <flyweight_cpu_native.hpp>
+#include <flyweight_cpu_shim_geometry.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -61,14 +61,14 @@ void* aligned_allocate(std::size_t bytes) {
 #else
     void* memory = std::aligned_alloc(kDeviceAlignment, rounded);
 #endif
-    // COLIBRI_CPU_POISON=1 fills fresh "device" memory with a nonzero pattern.
+    // FLYWEIGHT_CPU_POISON=1 fills fresh "device" memory with a nonzero pattern.
     // A fresh process reads zero pages out of new allocations, so a kernel
     // that consumes memory nothing wrote yet looks correct until the heap has
     // been churned and blocks come back dirty -- the failure then appears
     // suites away from the cause. Poisoning makes the first such read fail in
     // the smallest reproduction.
     static const bool poison = [] {
-        const char* setting = std::getenv("COLIBRI_CPU_POISON");
+        const char* setting = std::getenv("FLYWEIGHT_CPU_POISON");
         return setting != nullptr && setting[0] == '1';
     }();
     if (poison && memory != nullptr) std::memset(memory, 0xAB, rounded);
@@ -97,7 +97,7 @@ struct Stream {
 
 // CUDA until something selects otherwise, so an unmodified GPU deployment
 // behaves exactly as before.
-std::atomic<int> g_backend{kColibriBackendCuda};
+std::atomic<int> g_backend{kFlyweightBackendCuda};
 
 std::mutex g_object_mutex;
 std::unordered_map<std::uint64_t, std::unique_ptr<Stream>> g_streams;
@@ -105,25 +105,25 @@ std::unordered_map<std::uint64_t, std::unique_ptr<Event>> g_events;
 std::atomic<std::uint64_t> g_next_handle{1};
 
 struct Resolved {
-    colibri::cpu::ColibriCpuKernel kernel = nullptr;
-    colibri::cpu::NativeKernel native = nullptr;
+    flyweight::cpu::FlyweightCpuKernel kernel = nullptr;
+    flyweight::cpu::NativeKernel native = nullptr;
     bool cooperative = true;
 };
 
 // Native kernels are registered before main by static initializers, so this map
 // is only written during startup and read-only thereafter.
-std::unordered_map<std::string, colibri::cpu::NativeKernel>& native_registry() {
-    static std::unordered_map<std::string, colibri::cpu::NativeKernel> registry;
+std::unordered_map<std::string, flyweight::cpu::NativeKernel>& native_registry() {
+    static std::unordered_map<std::string, flyweight::cpu::NativeKernel> registry;
     return registry;
 }
 
-// COLIBRI_CPU_FORCE_EMULATION=1 routes every kernel back to the emulated
+// FLYWEIGHT_CPU_FORCE_EMULATION=1 routes every kernel back to the emulated
 // corpus. Slow, but it is the reference implementation, so it is the first
 // thing to try when the CPU backend produces wrong output: if a defect
 // survives it, the defect is not in a hand-written kernel.
 std::atomic<bool> g_force_emulation{
     [] {
-        const char* setting = std::getenv("COLIBRI_CPU_FORCE_EMULATION");
+        const char* setting = std::getenv("FLYWEIGHT_CPU_FORCE_EMULATION");
         return setting != nullptr && setting[0] == '1';
     }()
 };
@@ -133,7 +133,7 @@ std::atomic<bool> g_force_emulation{
 // Which kernels to hand-write next is an empirical question, and the answer is
 // not the same as on the GPU: emulated cooperative kernels cost far more per
 // call than their CUDA versions, so the CPU ordering has to be measured rather
-// than inherited. Off unless COLIBRI_CPU_PROFILE=1, and the check is a single
+// than inherited. Off unless FLYWEIGHT_CPU_PROFILE=1, and the check is a single
 // relaxed load on the launch path.
 struct ProfileEntry {
     std::uint64_t calls = 0;
@@ -143,7 +143,7 @@ struct ProfileEntry {
 
 bool profiling_enabled() {
     static const bool enabled = [] {
-        const char* setting = std::getenv("COLIBRI_CPU_PROFILE");
+        const char* setting = std::getenv("FLYWEIGHT_CPU_PROFILE");
         return setting != nullptr && setting[0] == '1';
     }();
     return enabled;
@@ -181,13 +181,13 @@ std::unordered_map<std::string, Resolved, KernelNameHash, std::equal_to<>>
     g_kernel_cache;
 std::atomic<bool> g_kernel_cache_dirty{false};
 
-// COLIBRI_CPU_EMULATE=name1,name2 forces just those kernels back to the
-// emulated corpus. Bisecting a wrong-output bug with COLIBRI_CPU_FORCE_EMULATION
+// FLYWEIGHT_CPU_EMULATE=name1,name2 forces just those kernels back to the
+// emulated corpus. Bisecting a wrong-output bug with FLYWEIGHT_CPU_FORCE_EMULATION
 // works but costs ~100x, which is impractical for a defect that only appears
 // after a hundred tokens; this narrows the search without that penalty.
 bool emulation_forced_for(const char* name) {
     static const std::string list = [] {
-        const char* setting = std::getenv("COLIBRI_CPU_EMULATE");
+        const char* setting = std::getenv("FLYWEIGHT_CPU_EMULATE");
         return std::string(setting ? setting : "");
     }();
     if (list.empty()) return false;
@@ -210,7 +210,7 @@ Resolved resolve(const char* name) {
         if (found != g_kernel_cache.end()) return found->second;
     }
     Resolved resolved;
-    colibri::cpu::find_kernel_entry(name, &resolved.kernel, &resolved.cooperative);
+    flyweight::cpu::find_kernel_entry(name, &resolved.kernel, &resolved.cooperative);
     const auto& registry = native_registry();
     const auto native = registry.find(name);
     if (native != registry.end() && !emulation_forced_for(name))
@@ -221,7 +221,7 @@ Resolved resolve(const char* name) {
 }
 
 struct LaunchPayload {
-    colibri::cpu::ColibriCpuKernel kernel;
+    flyweight::cpu::FlyweightCpuKernel kernel;
     void** arguments;
 };
 
@@ -231,7 +231,7 @@ void run_thread(void* payload) {
 }
 
 int worker_count() {
-    if (const char* setting = std::getenv("COLIBRI_CPU_THREADS")) {
+    if (const char* setting = std::getenv("FLYWEIGHT_CPU_THREADS")) {
         const int requested = std::atoi(setting);
         if (requested > 0) return requested;
     }
@@ -387,7 +387,7 @@ private:
             // help, and the workers do share cores with the OpenMP MoE team, so
             // spinning longer is not free either.
             static const int kSpins = [] {
-                const char* setting = std::getenv("COLIBRI_CPU_SPINS");
+                const char* setting = std::getenv("FLYWEIGHT_CPU_SPINS");
                 const int requested = setting ? std::atoi(setting) : 0;
                 return requested > 0 || (setting && requested == 0) ? requested
                                                                     : 2000;
@@ -440,21 +440,21 @@ extern "C" {
 
 // --- capability -----------------------------------------------------------
 
-int colibri_cpu_backend_available() { return 1; }
+int flyweight_cpu_backend_available() { return 1; }
 
-int colibri_cpu_backend_kernel_count() {
-    return static_cast<int>(colibri::cpu::kernel_count());
+int flyweight_cpu_backend_kernel_count() {
+    return static_cast<int>(flyweight::cpu::kernel_count());
 }
 
-const char* colibri_cpu_kernel_name(std::uint64_t index) {
-    return colibri::cpu::kernel_name(static_cast<std::size_t>(index));
+const char* flyweight_cpu_kernel_name(std::uint64_t index) {
+    return flyweight::cpu::kernel_name(static_cast<std::size_t>(index));
 }
 
-long long colibri_cpu_kernel_index(const char* name) {
+long long flyweight_cpu_kernel_index(const char* name) {
     if (name == nullptr) return -1;
-    const std::size_t total = colibri::cpu::kernel_count();
+    const std::size_t total = flyweight::cpu::kernel_count();
     for (std::size_t index = 0; index < total; ++index) {
-        const char* candidate = colibri::cpu::kernel_name(index);
+        const char* candidate = flyweight::cpu::kernel_name(index);
         if (candidate != nullptr && std::strcmp(candidate, name) == 0)
             return static_cast<long long>(index);
     }
@@ -463,29 +463,29 @@ long long colibri_cpu_kernel_index(const char* name) {
 
 // --- backend selection ----------------------------------------------------
 
-COLIBRI_BACKEND_API int colibri_backend_select(int backend) {
-    if (backend == kColibriBackendCpu) {
-        g_backend.store(kColibriBackendCpu, std::memory_order_relaxed);
+FLYWEIGHT_BACKEND_API int flyweight_backend_select(int backend) {
+    if (backend == kFlyweightBackendCpu) {
+        g_backend.store(kFlyweightBackendCpu, std::memory_order_relaxed);
         return 0;
     }
-    if (backend == kColibriBackendCuda) {
-        g_backend.store(kColibriBackendCuda, std::memory_order_relaxed);
+    if (backend == kFlyweightBackendCuda) {
+        g_backend.store(kFlyweightBackendCuda, std::memory_order_relaxed);
         return 0;
     }
     return -1;
 }
 
-COLIBRI_BACKEND_API int colibri_backend_active() {
+FLYWEIGHT_BACKEND_API int flyweight_backend_active() {
     return g_backend.load(std::memory_order_relaxed);
 }
 
-COLIBRI_BACKEND_API int colibri_backend_is_cpu() {
-    return g_backend.load(std::memory_order_relaxed) == kColibriBackendCpu;
+FLYWEIGHT_BACKEND_API int flyweight_backend_is_cpu() {
+    return g_backend.load(std::memory_order_relaxed) == kFlyweightBackendCpu;
 }
 
 // --- memory ---------------------------------------------------------------
 
-int colibri_cpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
+int flyweight_cpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
     if (pointer == nullptr) return -1;
     void* memory = aligned_allocate(static_cast<std::size_t>(bytes));
     if (memory == nullptr) return -2;
@@ -493,13 +493,13 @@ int colibri_cpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
     return 0;
 }
 
-int colibri_cpu_free(std::uint64_t pointer) {
+int flyweight_cpu_free(std::uint64_t pointer) {
     if (pointer == 0) return 0;
     aligned_release(reinterpret_cast<void*>(pointer));
     return 0;
 }
 
-int colibri_cpu_host_alloc(std::uint64_t bytes, void** pointer) {
+int flyweight_cpu_host_alloc(std::uint64_t bytes, void** pointer) {
     if (pointer == nullptr) return -1;
     void* memory = aligned_allocate(static_cast<std::size_t>(bytes));
     if (memory == nullptr) return -2;
@@ -507,7 +507,7 @@ int colibri_cpu_host_alloc(std::uint64_t bytes, void** pointer) {
     return 0;
 }
 
-int colibri_cpu_host_free(void* pointer) {
+int flyweight_cpu_host_free(void* pointer) {
     aligned_release(pointer);
     return 0;
 }
@@ -521,10 +521,10 @@ int colibri_cpu_host_free(void* pointer) {
 // into another host buffer and computes nothing faster for it. Measured on a
 // 35B MoE: 0.43 tok/s with registration reported as succeeding, 5.67 tok/s with
 // the CPU MoE path -- a 13x loss from one over-helpful return value.
-int colibri_cpu_host_register(const void*, std::uint64_t) { return -1; }
-int colibri_cpu_host_unregister(const void*) { return 0; }
+int flyweight_cpu_host_register(const void*, std::uint64_t) { return -1; }
+int flyweight_cpu_host_unregister(const void*) { return 0; }
 
-int colibri_cpu_upload(std::uint64_t destination, const void* source,
+int flyweight_cpu_upload(std::uint64_t destination, const void* source,
                        std::uint64_t bytes, std::uint64_t) {
     if (destination == 0 || source == nullptr) return -1;
     std::memcpy(reinterpret_cast<void*>(destination), source,
@@ -532,12 +532,12 @@ int colibri_cpu_upload(std::uint64_t destination, const void* source,
     return 0;
 }
 
-int colibri_cpu_upload_sync(std::uint64_t destination, const void* source,
+int flyweight_cpu_upload_sync(std::uint64_t destination, const void* source,
                             std::uint64_t bytes) {
-    return colibri_cpu_upload(destination, source, bytes, 0);
+    return flyweight_cpu_upload(destination, source, bytes, 0);
 }
 
-int colibri_cpu_download(void* destination, std::uint64_t source,
+int flyweight_cpu_download(void* destination, std::uint64_t source,
                          std::uint64_t bytes, std::uint64_t) {
     if (destination == nullptr || source == 0) return -1;
     std::memcpy(destination, reinterpret_cast<const void*>(source),
@@ -545,7 +545,18 @@ int colibri_cpu_download(void* destination, std::uint64_t source,
     return 0;
 }
 
-int colibri_cpu_memset(std::uint64_t pointer, int value, std::uint64_t bytes,
+int flyweight_cpu_copy_device(std::uint64_t destination, std::uint64_t source,
+                            std::uint64_t bytes, std::uint64_t) {
+    if (destination == 0 || source == 0) return -1;
+    // memcpy, not memmove: the callers copy between two distinct arenas, and a
+    // silent overlap would mean a slot was donating to itself.
+    std::memcpy(reinterpret_cast<void*>(destination),
+                reinterpret_cast<const void*>(source),
+                static_cast<std::size_t>(bytes));
+    return 0;
+}
+
+int flyweight_cpu_memset(std::uint64_t pointer, int value, std::uint64_t bytes,
                        std::uint64_t) {
     if (pointer == 0) return -1;
     std::memset(reinterpret_cast<void*>(pointer), value,
@@ -553,11 +564,11 @@ int colibri_cpu_memset(std::uint64_t pointer, int value, std::uint64_t bytes,
     return 0;
 }
 
-int colibri_cpu_sync() { return 0; }
+int flyweight_cpu_sync() { return 0; }
 
 // --- streams and events ---------------------------------------------------
 
-int colibri_cpu_stream_create(std::uint64_t* stream) {
+int flyweight_cpu_stream_create(std::uint64_t* stream) {
     if (stream == nullptr) return -1;
     const std::uint64_t handle = g_next_handle.fetch_add(1);
     std::lock_guard<std::mutex> lock(g_object_mutex);
@@ -566,15 +577,15 @@ int colibri_cpu_stream_create(std::uint64_t* stream) {
     return 0;
 }
 
-int colibri_cpu_stream_destroy(std::uint64_t stream) {
+int flyweight_cpu_stream_destroy(std::uint64_t stream) {
     std::lock_guard<std::mutex> lock(g_object_mutex);
     g_streams.erase(stream);
     return 0;
 }
 
-int colibri_cpu_stream_sync(std::uint64_t) { return 0; }
+int flyweight_cpu_stream_sync(std::uint64_t) { return 0; }
 
-int colibri_cpu_event_create(std::uint64_t* event) {
+int flyweight_cpu_event_create(std::uint64_t* event) {
     if (event == nullptr) return -1;
     const std::uint64_t handle = g_next_handle.fetch_add(1);
     std::lock_guard<std::mutex> lock(g_object_mutex);
@@ -583,7 +594,7 @@ int colibri_cpu_event_create(std::uint64_t* event) {
     return 0;
 }
 
-int colibri_cpu_timed_event_create(std::uint64_t* event) {
+int flyweight_cpu_timed_event_create(std::uint64_t* event) {
     if (event == nullptr) return -1;
     // Created in one critical section. The old two-lock form published the
     // handle before marking it timed; a destroy racing in between left
@@ -597,7 +608,7 @@ int colibri_cpu_timed_event_create(std::uint64_t* event) {
     return 0;
 }
 
-int colibri_cpu_event_record(std::uint64_t event, std::uint64_t) {
+int flyweight_cpu_event_record(std::uint64_t event, std::uint64_t) {
     std::lock_guard<std::mutex> lock(g_object_mutex);
     const auto found = g_events.find(event);
     if (found == g_events.end()) return -1;
@@ -606,16 +617,16 @@ int colibri_cpu_event_record(std::uint64_t event, std::uint64_t) {
     return 0;
 }
 
-int colibri_cpu_event_sync(std::uint64_t) { return 0; }
-int colibri_cpu_stream_wait_event(std::uint64_t, std::uint64_t) { return 0; }
+int flyweight_cpu_event_sync(std::uint64_t) { return 0; }
+int flyweight_cpu_stream_wait_event(std::uint64_t, std::uint64_t) { return 0; }
 
-int colibri_cpu_event_destroy(std::uint64_t event) {
+int flyweight_cpu_event_destroy(std::uint64_t event) {
     std::lock_guard<std::mutex> lock(g_object_mutex);
     g_events.erase(event);
     return 0;
 }
 
-int colibri_cpu_event_elapsed(std::uint64_t start, std::uint64_t end,
+int flyweight_cpu_event_elapsed(std::uint64_t start, std::uint64_t end,
                               float* milliseconds) {
     if (milliseconds == nullptr) return -1;
     std::lock_guard<std::mutex> lock(g_object_mutex);
@@ -634,14 +645,14 @@ int colibri_cpu_event_elapsed(std::uint64_t start, std::uint64_t end,
 // CUDA graphs exist to amortize launch overhead, which host launches do not
 // have. Capture is refused so the runtime keeps using the eager path; it treats
 // a failed graph_begin as "graphs unavailable" and falls back.
-int colibri_cpu_graph_begin(std::uint64_t) { return -1; }
-int colibri_cpu_graph_end(std::uint64_t, std::uint64_t*) { return -1; }
-int colibri_cpu_graph_launch(std::uint64_t, std::uint64_t) { return -1; }
-int colibri_cpu_graph_destroy(std::uint64_t) { return 0; }
+int flyweight_cpu_graph_begin(std::uint64_t) { return -1; }
+int flyweight_cpu_graph_end(std::uint64_t, std::uint64_t*) { return -1; }
+int flyweight_cpu_graph_launch(std::uint64_t, std::uint64_t) { return -1; }
+int flyweight_cpu_graph_destroy(std::uint64_t) { return 0; }
 
 // --- launch ---------------------------------------------------------------
 
-int colibri_cpu_launch_named(const char* name, std::uint32_t grid_x,
+int flyweight_cpu_launch_named(const char* name, std::uint32_t grid_x,
                              std::uint32_t grid_y, std::uint32_t block_x,
                              std::uint32_t shared_bytes, std::uint64_t stream,
                              void** arguments) {
@@ -672,7 +683,7 @@ int colibri_cpu_launch_named(const char* name, std::uint32_t grid_x,
     // the reference path and is only forced by the parity harness.
     if (resolved.native != nullptr &&
         !g_force_emulation.load(std::memory_order_relaxed)) {
-        const colibri::cpu::Launch launch{grid_x, grid_y, block_x, shared_bytes,
+        const flyweight::cpu::Launch launch{grid_x, grid_y, block_x, shared_bytes,
                                           stream};
         try {
             resolved.native(launch, arguments);
@@ -692,25 +703,25 @@ int colibri_cpu_launch_named(const char* name, std::uint32_t grid_x,
     // fibers avoids the per-block stack working set that otherwise dominates
     // everything: measured ~2ms/block with fibers against ~20us without.
     const auto set_geometry = [&](std::uint64_t block) {
-        colibri::cpu::t_grid_dim = {grid_x, grid_y, 1};
-        colibri::cpu::t_block_dim = {block_x, 1, 1};
-        colibri::cpu::t_block_index = {
+        flyweight::cpu::t_grid_dim = {grid_x, grid_y, 1};
+        flyweight::cpu::t_block_dim = {block_x, 1, 1};
+        flyweight::cpu::t_block_index = {
             static_cast<unsigned int>(block % grid_x),
             static_cast<unsigned int>(block / grid_x), 0};
     };
 
-    const auto run_block = [&](colibri::cpu::BlockScheduler& scheduler,
+    const auto run_block = [&](flyweight::cpu::BlockScheduler& scheduler,
                                std::uint64_t block) {
         set_geometry(block);
         // New block, so any __shared__ it touches must look freshly allocated.
-        ++colibri::cpu::t_block_generation;
+        ++flyweight::cpu::t_block_generation;
         if (resolved.cooperative) {
             scheduler.run(block_x, shared_bytes, &run_thread, &payload);
             return;
         }
         scheduler.prepare_direct(block_x, shared_bytes);
         for (unsigned int thread = 0; thread < block_x; ++thread) {
-            colibri::cpu::t_thread_index = {thread, 0, 0};
+            flyweight::cpu::t_thread_index = {thread, 0, 0};
             resolved.kernel(arguments);
         }
     };
@@ -725,7 +736,7 @@ int colibri_cpu_launch_named(const char* name, std::uint32_t grid_x,
             // One scheduler per worker, reused across blocks and launches: the
             // fiber stacks are the expensive part of a cooperative block and
             // there is no reason to rebuild them.
-            static thread_local colibri::cpu::BlockScheduler scheduler;
+            static thread_local flyweight::cpu::BlockScheduler scheduler;
             (*static_cast<const decltype(run_block)*>(opaque))(scheduler, block);
         },
         const_cast<void*>(static_cast<const void*>(&run_block)), &failure);
@@ -736,7 +747,7 @@ int colibri_cpu_launch_named(const char* name, std::uint32_t grid_x,
 
 }  // extern "C"
 
-namespace colibri::cpu {
+namespace flyweight::cpu {
 
 bool register_native_kernel(const char* name, NativeKernel kernel) {
     if (name == nullptr || kernel == nullptr) return false;
@@ -775,9 +786,9 @@ NativeKernelRegistration::NativeKernelRegistration(const char* name,
     register_native_kernel(name, kernel);
 }
 
-}  // namespace colibri::cpu
+}  // namespace flyweight::cpu
 
-extern "C" COLIBRI_BACKEND_API void colibri_cpu_profile_dump() {
+extern "C" FLYWEIGHT_BACKEND_API void flyweight_cpu_profile_dump() {
     if (!profiling_enabled()) return;
     std::vector<std::pair<std::string, ProfileEntry>> rows;
     {
@@ -792,7 +803,7 @@ extern "C" COLIBRI_BACKEND_API void colibri_cpu_profile_dump() {
     if (total == 0) return;
 
     std::fprintf(stderr,
-        "\n[colibri-cpu] launch profile (%.1f ms total)\n", total / 1e6);
+        "\n[flyweight-cpu] launch profile (%.1f ms total)\n", total / 1e6);
     std::fprintf(stderr, "  %-38s %8s %10s %7s %8s  %s\n",
                  "kernel", "calls", "total ms", "share", "us/call", "impl");
     double cumulative = 0.0;

@@ -19,12 +19,12 @@ import os
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 # Direct expert paging is auto-enabled only when ~31 GiB of host RAM is free,
 # so the SECOND runtime built in a process silently falls back to staged copies
 # and is not comparable to the first. Force it for every runtime here.
-os.environ["COLIBRI_V2_DMA_PAGING"] = "1"
+os.environ["FLYWEIGHT_V2_DMA_PAGING"] = "1"
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 MTP_MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-MTP-BF16.gguf"
@@ -60,9 +60,9 @@ def delta(before: dict, after: dict) -> dict:
 
 def run(model: V2Model, prompt: list[int], drafts: int) -> dict:
     if drafts:
-        os.environ["COLIBRI_MTP_ADAPTIVE"] = "0"
+        os.environ["FLYWEIGHT_MTP_ADAPTIVE"] = "0"
     else:
-        os.environ.pop("COLIBRI_MTP_ADAPTIVE", None)
+        os.environ.pop("FLYWEIGHT_MTP_ADAPTIVE", None)
     with model.native_qwen_runtime(
         context_limit=CONTEXT, gpu_cache_bytes=GPU_CACHE_BYTES,
         moe_device="hybrid", mtp_drafts=drafts,

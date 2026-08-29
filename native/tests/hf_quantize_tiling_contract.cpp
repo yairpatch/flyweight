@@ -16,7 +16,7 @@
 // The other half of this file is the type policy: which target a descriptor
 // gets, which is a per-row question and was not always treated as one.
 
-#include "colibri_v2_hf_quantize.hpp"
+#include "flyweight_v2_hf_quantize.hpp"
 #include "qwen_kquant.h"
 #include "qwen_kquant_pack_api.hpp"
 
@@ -110,7 +110,7 @@ void check(const Packer& packer, std::uint64_t elements, std::uint64_t tile) {
 // perplexity, which no test would have caught.
 //
 // If a deliberate change to the packers lands, re-measure these AND bump
-// kPackerVersion in colibri_v2_hf_cache.hpp. They travel together.
+// kPackerVersion in flyweight_v2_hf_cache.hpp. They travel together.
 struct Golden {
     const char* name;
     void (*pack)(const float*, std::uint64_t, std::uint8_t*);
@@ -260,9 +260,9 @@ void check_round_trip() {
 // spelled out: it takes its own, higher target, and taking it unconditionally
 // packed a 128-wide row across a 256-element super-block, so every row but the
 // first decoded from a predecessor's scales.
-colibri::v2::hf::HfTensor described(const char* name,
+flyweight::v2::hf::HfTensor described(const char* name,
                                     std::vector<std::uint64_t> shape) {
-    colibri::v2::hf::HfTensor tensor;
+    flyweight::v2::hf::HfTensor tensor;
     tensor.name = name;
     tensor.shape = std::move(shape);
     tensor.type = 30;  // bf16
@@ -270,8 +270,8 @@ colibri::v2::hf::HfTensor described(const char* name,
 }
 
 void check_row_policy() {
-    using colibri::v2::hf::Target;
-    colibri::v2::hf::Policy policy;  // Q6_K weights, Q6_K embedding, f32 small
+    using flyweight::v2::hf::Target;
+    flyweight::v2::hf::Policy policy;  // Q6_K weights, Q6_K embedding, f32 small
 
     const auto target = [&](const char* name, std::vector<std::uint64_t> shape) {
         return target_for(described(name, std::move(shape)), policy);

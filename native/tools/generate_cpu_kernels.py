@@ -1,15 +1,15 @@
 """Generate the host-side kernel translation unit and dispatch registry.
 
-The CUDA corpus in colibri_v2_qwen_kernels.hpp and colibri_v2_native_kernels.hpp
+The CUDA corpus in flyweight_v2_qwen_kernels.hpp and flyweight_v2_native_kernels.hpp
 is the single source of truth for the runtime's numerics. The CPU backend
-compiles that same text as C++ (see colibri_cpu_shim.hpp) rather than carrying a
+compiles that same text as C++ (see flyweight_cpu_shim.hpp) rather than carrying a
 hand-written second copy, so the two backends cannot drift.
 
 This script extracts the text, applies the few transforms the host compiler
 needs, and emits:
 
-  colibri_cpu_kernels.inc        the corpus body, host-compilable
-  colibri_cpu_kernel_table.inc   name -> launcher, unpacking void** arguments
+  flyweight_cpu_kernels.inc        the corpus body, host-compilable
+  flyweight_cpu_kernel_table.inc   name -> launcher, unpacking void** arguments
 
 Kernel names cannot be read off the raw source: several families (KV_STORE,
 KV_APPEND, ...) are emitted by function-like macros, so the entry point names
@@ -29,9 +29,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-RAW_SEGMENT = re.compile(r'R"COLIBRI_CUDA\((.*?)\)COLIBRI_CUDA"', re.DOTALL)
+RAW_SEGMENT = re.compile(r'R"FLYWEIGHT_CUDA\((.*?)\)FLYWEIGHT_CUDA"', re.DOTALL)
 
-MARKER = "COLIBRI_CPU_KERNEL_MARKER"
+MARKER = "FLYWEIGHT_CPU_KERNEL_MARKER"
 
 # Device headers the host build supplies itself through the shim.
 DROP_INCLUDES = re.compile(
@@ -74,16 +74,16 @@ def extract(path: Path) -> str:
     text = path.read_text()
     segments = RAW_SEGMENT.findall(text)
     if not segments:
-        raise SystemExit(f"no COLIBRI_CUDA raw segments found in {path}")
+        raise SystemExit(f"no FLYWEIGHT_CUDA raw segments found in {path}")
     for index, segment in enumerate(segments):
         if len(segment.encode()) < MAX_SEGMENT_BYTES:
             continue
         line = text[: text.index(segment)].count("\n") + 1
         raise SystemExit(
-            f"{path}:{line}: COLIBRI_CUDA segment {index} is "
+            f"{path}:{line}: FLYWEIGHT_CUDA segment {index} is "
             f"{len(segment.encode())} bytes, over the {MAX_SEGMENT_BYTES} MSVC "
-            'limit; close it with )COLIBRI_CUDA" and reopen with '
-            'R"COLIBRI_CUDA( at a line boundary'
+            'limit; close it with )FLYWEIGHT_CUDA" and reopen with '
+            'R"FLYWEIGHT_CUDA( at a line boundary'
         )
     return "".join(segments)
 
@@ -92,7 +92,7 @@ def transform(cuda: str) -> str:
     cuda = DROP_INCLUDES.sub("", cuda)
     cuda = EXTERN_SHARED.sub(
         r"\1* \2 = reinterpret_cast<\1*>("
-        r"::colibri::cpu::t_scheduler->dynamic_shared());",
+        r"::flyweight::cpu::t_scheduler->dynamic_shared());",
         cuda,
     )
     # Every __shared__ declaration gets a zeroing call after it. __shared__ maps
@@ -102,7 +102,7 @@ def transform(cuda: str) -> str:
     # block_reduce_sum), which is benign-ish on a GPU and catastrophic against a
     # previous block's real values.
     cuda = SHARED_DECL.sub(
-        r"\g<0> ::colibri::cpu::shared_zero_once(&\g<name>, sizeof(\g<name>));",
+        r"\g<0> ::flyweight::cpu::shared_zero_once(&\g<name>, sizeof(\g<name>));",
         cuda,
     )
     # #pragma unroll is a device-compiler hint with no host spelling; GCC and
@@ -324,7 +324,7 @@ def emit_table(preprocessed: str) -> tuple[str, list[str]]:
         )
         call = ", ".join(parameter_name for _, parameter_name in parameters)
         lines.append(
-            f"static void colibri_cpu_launch_{name}(void** arguments) {{\n"
+            f"static void flyweight_cpu_launch_{name}(void** arguments) {{\n"
             f"{unpack}"
             f"    {name}({call});\n"
             f"}}\n"
@@ -333,10 +333,10 @@ def emit_table(preprocessed: str) -> tuple[str, list[str]]:
 
     cooperative = cooperative_kernels(preprocessed, entries)
 
-    lines.append("static const ColibriCpuKernelEntry kColibriCpuKernels[] = {")
+    lines.append("static const FlyweightCpuKernelEntry kFlyweightCpuKernels[] = {")
     for name in entries:
         flag = "true" if name in cooperative else "false"
-        lines.append(f'    {{"{name}", &colibri_cpu_launch_{name}, {flag}}},')
+        lines.append(f'    {{"{name}", &flyweight_cpu_launch_{name}, {flag}}},')
     lines.append("};")
     lines.append("")
     print(

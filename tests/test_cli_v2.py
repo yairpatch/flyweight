@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from colibri_next.cli import (
+from flyweight.cli import (
     AUTO_PROMPT_CACHE_MIB,
     DEFAULT_QUANT,
     _benchmark_native_generate,
@@ -36,7 +36,7 @@ class NativeV2BenchmarkTests(unittest.TestCase):
                 "model_type": "bailing_hybrid",
                 "architectures": ["BailingMoeV3ForCausalLM"],
             }))
-            with patch("colibri_next.cli.V2Model") as model:
+            with patch("flyweight.cli.V2Model") as model:
                 self.assertEqual(_architecture(path), "bailingmoe3")
             model.assert_not_called()
 
@@ -59,7 +59,7 @@ class NativeV2BenchmarkTests(unittest.TestCase):
         runtime = Runtime()
         config = object()
         with patch(
-            "colibri_next.cli.time.perf_counter",
+            "flyweight.cli.time.perf_counter",
             side_effect=(10.0, 10.1, 10.3, 10.4),
         ):
             generated, arrivals, elapsed = _benchmark_bailing_generate(
@@ -91,7 +91,7 @@ class NativeV2BenchmarkTests(unittest.TestCase):
 
         runtime = Runtime()
         with patch(
-            "colibri_next.cli.time.perf_counter", side_effect=(10.0, 10.25)
+            "flyweight.cli.time.perf_counter", side_effect=(10.0, 10.25)
         ):
             token, elapsed = _benchmark_native_prefill(runtime, [1, 2, 3])
         self.assertEqual(token, 42)
@@ -110,7 +110,7 @@ class NativeV2BenchmarkTests(unittest.TestCase):
 
         runtime = Runtime()
         with patch(
-            "colibri_next.cli.time.perf_counter",
+            "flyweight.cli.time.perf_counter",
             side_effect=(10.0, 10.1, 10.3, 10.4),
         ):
             generated, arrivals, elapsed = _benchmark_native_generate(
@@ -138,16 +138,16 @@ class NativeV2BenchmarkTests(unittest.TestCase):
     def test_cold_cache_advises_and_closes_model(self) -> None:
         dontneed = 4
         with (
-            patch("colibri_next.cli.os.open", return_value=17) as open_file,
+            patch("flyweight.cli.os.open", return_value=17) as open_file,
             patch(
-                "colibri_next.cli.os.posix_fadvise", create=True
+                "flyweight.cli.os.posix_fadvise", create=True
             ) as advise,
             patch(
-                "colibri_next.cli.os.POSIX_FADV_DONTNEED",
+                "flyweight.cli.os.POSIX_FADV_DONTNEED",
                 dontneed,
                 create=True,
             ),
-            patch("colibri_next.cli.os.close") as close_file,
+            patch("flyweight.cli.os.close") as close_file,
         ):
             _drop_file_cache(Path("model.gguf"))
         open_file.assert_called_once_with(Path("model.gguf"), os.O_RDONLY)
@@ -346,9 +346,9 @@ class BackendSelectionTests(unittest.TestCase):
             order.append("load")
             return service
 
-        with patch("colibri_next.cli._architecture", return_value="qwen3"), \
-                patch("colibri_next.cli.V2Model") as model, \
-                patch("colibri_next.v2_server.NativeV2InferenceService", build):
+        with patch("flyweight.cli._architecture", return_value="qwen3"), \
+                patch("flyweight.cli.V2Model") as model, \
+                patch("flyweight.v2_server.NativeV2InferenceService", build):
             model.select_backend.side_effect = select
             _generate(args)
         # Selected first: the service is what opens the model and allocates,
@@ -392,7 +392,7 @@ class ProbeStopTokenTests(unittest.TestCase):
 class QuantPromptTests(unittest.TestCase):
     """Choosing a quantization before a safetensors checkpoint is opened.
 
-    The loader takes its answer from COLIBRI_HF_QUANT, so what these pin is
+    The loader takes its answer from FLYWEIGHT_HF_QUANT, so what these pin is
     which value ends up there -- and, as much, when nothing does: a pipe, a
     service manager and an explicit environment all have to keep loading the
     way they did before the prompt existed.
@@ -400,21 +400,21 @@ class QuantPromptTests(unittest.TestCase):
 
     OPTIONS = [
         {"name": "Q4_K", "arena_bytes": 16 * 1024**3, "cache_bytes": 16 * 1024**3,
-         "cache_path": "/models/m/colibri-1.cache"},
+         "cache_path": "/models/m/flyweight-1.cache"},
         {"name": "Q6_K", "arena_bytes": 22 * 1024**3, "cache_bytes": 0,
-         "cache_path": "/models/m/colibri-2.cache"},
+         "cache_path": "/models/m/flyweight-2.cache"},
         {"name": "F32", "arena_bytes": 109 * 1024**3, "cache_bytes": 0,
-         "cache_path": "/models/m/colibri-3.cache"},
+         "cache_path": "/models/m/flyweight-3.cache"},
     ]
 
     def setUp(self) -> None:
-        self._previous = os.environ.pop("COLIBRI_HF_QUANT", None)
+        self._previous = os.environ.pop("FLYWEIGHT_HF_QUANT", None)
         self.addCleanup(self._restore)
 
     def _restore(self) -> None:
-        os.environ.pop("COLIBRI_HF_QUANT", None)
+        os.environ.pop("FLYWEIGHT_HF_QUANT", None)
         if self._previous is not None:
-            os.environ["COLIBRI_HF_QUANT"] = self._previous
+            os.environ["FLYWEIGHT_HF_QUANT"] = self._previous
 
     def _args(self, directory, quant=None):
         return SimpleNamespace(model=Path(directory), quant=quant)
@@ -438,7 +438,7 @@ class QuantPromptTests(unittest.TestCase):
     def test_choosing_an_unavailable_option_names_its_reason(self) -> None:
         # "not one of the options" against a menu that plainly shows the
         # number reads as a broken prompt; the refusal has to say why.
-        from colibri_next.cli import _unavailable_reason
+        from flyweight.cli import _unavailable_reason
 
         options = [
             {"name": "IQ2_XS", "arena_bytes": 0, "cache_bytes": 0,
@@ -469,28 +469,28 @@ class QuantPromptTests(unittest.TestCase):
 
     def test_an_explicit_choice_needs_no_terminal_and_asks_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch("colibri_next.cli.V2Model") as model:
+            with patch("flyweight.cli.V2Model") as model:
                 _resolve_quant(self._args(directory, "Q4_K"))
             model.hf_quant_options.assert_not_called()
-        self.assertEqual(os.environ["COLIBRI_HF_QUANT"], "Q4_K")
+        self.assertEqual(os.environ["FLYWEIGHT_HF_QUANT"], "Q4_K")
 
     def test_a_pipe_is_left_with_the_loader_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with patch("sys.stdin.isatty", return_value=False), \
-                 patch("colibri_next.cli.V2Model") as model:
+                 patch("flyweight.cli.V2Model") as model:
                 _resolve_quant(self._args(directory))
             model.hf_quant_options.assert_not_called()
-        self.assertNotIn("COLIBRI_HF_QUANT", os.environ)
+        self.assertNotIn("FLYWEIGHT_HF_QUANT", os.environ)
 
     def test_an_exported_variable_wins_over_the_prompt(self) -> None:
-        os.environ["COLIBRI_HF_QUANT"] = "Q8_0"
+        os.environ["FLYWEIGHT_HF_QUANT"] = "Q8_0"
         with tempfile.TemporaryDirectory() as directory:
             with patch("sys.stdin.isatty", return_value=True), \
                  patch("sys.stderr.isatty", return_value=True), \
-                 patch("colibri_next.cli.V2Model") as model:
+                 patch("flyweight.cli.V2Model") as model:
                 _resolve_quant(self._args(directory))
             model.hf_quant_options.assert_not_called()
-        self.assertEqual(os.environ["COLIBRI_HF_QUANT"], "Q8_0")
+        self.assertEqual(os.environ["FLYWEIGHT_HF_QUANT"], "Q8_0")
 
     def test_a_gguf_file_is_never_asked_about(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -498,47 +498,47 @@ class QuantPromptTests(unittest.TestCase):
             model_file.write_bytes(b"GGUF")
             with patch("sys.stdin.isatty", return_value=True), \
                  patch("sys.stderr.isatty", return_value=True), \
-                 patch("colibri_next.cli.V2Model") as model:
+                 patch("flyweight.cli.V2Model") as model:
                 _resolve_quant(SimpleNamespace(model=model_file, quant=None))
             model.hf_quant_options.assert_not_called()
-        self.assertNotIn("COLIBRI_HF_QUANT", os.environ)
+        self.assertNotIn("FLYWEIGHT_HF_QUANT", os.environ)
 
     def test_ask_prompts_and_publishes_the_answer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch("colibri_next.cli.V2Model.hf_quant_options",
+            with patch("flyweight.cli.V2Model.hf_quant_options",
                        return_value=self.OPTIONS), \
                  patch("builtins.input", return_value="1"):
                 _resolve_quant(self._args(directory, "ask"))
-        self.assertEqual(os.environ["COLIBRI_HF_QUANT"], "Q4_K")
+        self.assertEqual(os.environ["FLYWEIGHT_HF_QUANT"], "Q4_K")
 
     def test_a_rejected_answer_is_asked_again(self) -> None:
         answers = iter(("banana", "2"))
         with tempfile.TemporaryDirectory() as directory:
-            with patch("colibri_next.cli.V2Model.hf_quant_options",
+            with patch("flyweight.cli.V2Model.hf_quant_options",
                        return_value=self.OPTIONS), \
                  patch("builtins.input", side_effect=lambda: next(answers)):
                 _resolve_quant(self._args(directory, "ask"))
-        self.assertEqual(os.environ["COLIBRI_HF_QUANT"], "Q6_K")
+        self.assertEqual(os.environ["FLYWEIGHT_HF_QUANT"], "Q6_K")
 
     def test_interrupting_the_question_stops_rather_than_loading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with patch("colibri_next.cli.V2Model.hf_quant_options",
+            with patch("flyweight.cli.V2Model.hf_quant_options",
                        return_value=self.OPTIONS), \
                  patch("builtins.input", side_effect=KeyboardInterrupt):
                 with self.assertRaises(SystemExit) as caught:
                     _resolve_quant(self._args(directory, "ask"))
         self.assertEqual(caught.exception.code, 130)
-        self.assertNotIn("COLIBRI_HF_QUANT", os.environ)
+        self.assertNotIn("FLYWEIGHT_HF_QUANT", os.environ)
 
     def test_a_checkpoint_that_cannot_be_described_is_left_to_the_loader(self) -> None:
-        from colibri_next.v2 import V2Error
+        from flyweight.v2 import V2Error
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("colibri_next.cli.V2Model.hf_quant_options",
+            with patch("flyweight.cli.V2Model.hf_quant_options",
                        side_effect=V2Error("unsupported HF architecture")), \
                  patch("builtins.input", side_effect=AssertionError("must not ask")):
                 _resolve_quant(self._args(directory, "ask"))
-        self.assertNotIn("COLIBRI_HF_QUANT", os.environ)
+        self.assertNotIn("FLYWEIGHT_HF_QUANT", os.environ)
 
     def test_the_flag_is_available_to_every_command_that_takes_a_model(self) -> None:
         for command in ("generate", "serve", "benchmark", "inspect", "probe"):

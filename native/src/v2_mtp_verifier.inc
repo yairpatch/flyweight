@@ -6,40 +6,40 @@
 //     through the regular single-token decode).
 // Neither advances runtime.position/processed_tokens; callers own that.
 
-// Rows per launch of the batched quantized matvec. Must match COLIBRI_Q8_ROWS
-// in native/include/colibri_v2_qwen_kernels.hpp -- the kernel's accumulators
+// Rows per launch of the batched quantized matvec. Must match FLYWEIGHT_Q8_ROWS
+// in native/include/flyweight_v2_qwen_kernels.hpp -- the kernel's accumulators
 // and shared reduction slots are sized by it, and a larger batch would be read
 // past silently.
 static constexpr int kQ8RowBatch=8;
 
 // Tokens per launch of the tiled prefill matmul. Must match
-// COLIBRI_Q8_TILE_TOKENS in native/include/colibri_v2_qwen_kernels.hpp -- the
+// FLYWEIGHT_Q8_TILE_TOKENS in native/include/flyweight_v2_qwen_kernels.hpp -- the
 // kernel's per-warp accumulator slots are sized by it, and a larger batch would
 // drop the excess rows silently.
 static constexpr int kQ8TileTokens=32;
 
-// Output rows per block of the tiled matmul. Must match COLIBRI_Q8_TILE_ROWS.
+// Output rows per block of the tiled matmul. Must match FLYWEIGHT_Q8_TILE_ROWS.
 static constexpr int kQ8TileRows=16;
 
-// The tensor-core matmul's block tile. Must match COLIBRI_MMQ_ROWS and
-// COLIBRI_MMQ_TOKENS in native/include/colibri_v2_qwen_kernels.hpp.
+// The tensor-core matmul's block tile. Must match FLYWEIGHT_MMQ_ROWS and
+// FLYWEIGHT_MMQ_TOKENS in native/include/flyweight_v2_qwen_kernels.hpp.
 static constexpr int kQ8MmqRows=128;
 static constexpr int kQ8MmqTokens=128;
 // The asymmetric K-quants (Q2_K/Q4_K/Q5_K) run the _MIN variant, which stages
 // four more arrays and so cannot afford 64 rows in shared memory. Must match
-// COLIBRI_MMQ_MIN_ROWS.
+// FLYWEIGHT_MMQ_MIN_ROWS.
 static constexpr int kQ8MmqMinRows=32;
-// Must match COLIBRI_MMQ_MIN_TOKENS.
+// Must match FLYWEIGHT_MMQ_MIN_TOKENS.
 static constexpr int kQ8MmqMinTokens=64;
 // Fragments per warp. A warp covers kQ8MmqRowFrags*16 rows by
 // kQ8MmqTokenFrags*8 tokens, so the block tile no longer dictates the thread
-// count. Must match COLIBRI_MMQ_ROW_FRAGS / COLIBRI_MMQ_TOKEN_FRAGS.
+// count. Must match FLYWEIGHT_MMQ_ROW_FRAGS / FLYWEIGHT_MMQ_TOKEN_FRAGS.
 static constexpr int kQ8MmqRowFrags=4;
 static constexpr int kQ8MmqTokenFrags=4;
 // Threads per block: one warp per fragment *grid*.
 static constexpr int kQ8MmqThreads=
     (kQ8MmqRows/16/kQ8MmqRowFrags)*(kQ8MmqTokens/8/kQ8MmqTokenFrags)*32;
-// The wide shape (COLIBRI_MMQ_WIDE, GPU only): same 128x128 tile over 16
+// The wide shape (FLYWEIGHT_MMQ_WIDE, GPU only): same 128x128 tile over 16
 // warps at 2x4 fragments each. The tile and grid math above stay valid --
 // only the block size changes. Must agree with the defines the GPU compile
 // injects (see qwen_mmq_wide in v2_runtime.cpp); a wide launch against a
@@ -49,7 +49,7 @@ static constexpr int kQ8MmqWideThreads=
 // The _MIN variant still runs one fragment per warp.
 static constexpr int kQ8MmqMinThreads=(kQ8MmqMinRows/16)*(kQ8MmqMinTokens/8)*32;
 
-// Launch tally for COLIBRI_PREFILL_LAUNCHES; see the `launch` lambda below.
+// Launch tally for FLYWEIGHT_PREFILL_LAUNCHES; see the `launch` lambda below.
 struct QwenLaunchStat { std::uint64_t calls=0, blocks=0; double milliseconds=0.0; };
 inline std::map<std::string,QwenLaunchStat>& qwen_launch_stats(){
     static std::map<std::string,QwenLaunchStat> stats; return stats;
@@ -58,14 +58,14 @@ inline void qwen_note_launch(const char* name,std::uint32_t gx,std::uint32_t gy)
     auto& e=qwen_launch_stats()[name];
     ++e.calls; e.blocks+=static_cast<std::uint64_t>(gx)*gy;
 }
-// COLIBRI_PREFILL_LAUNCH_TIME=1 adds each kernel's own GPU duration to the tally.
+// FLYWEIGHT_PREFILL_LAUNCH_TIME=1 adds each kernel's own GPU duration to the tally.
 // It brackets every launch with events and syncs, so the WALL time of the run is
 // meaningless -- but a kernel's measured duration is not affected by being
 // serialized, which is the point: it answers "is this kernel slow here?" against
 // the same kernel benchmarked alone.
 inline bool qwen_launch_time_enabled(){
     static const bool on=[]{
-        const char* v=std::getenv("COLIBRI_PREFILL_LAUNCH_TIME");
+        const char* v=std::getenv("FLYWEIGHT_PREFILL_LAUNCH_TIME");
         return v&&v[0]=='1';
     }();
     return on;
@@ -100,11 +100,11 @@ inline void qwen_prefill_launch_report(){
 // instead of computing on the host. The upload is a fixed cost per block per
 // chunk (~6.6 ms for an 86 MiB triple over PCIe) where the host compute scales
 // with rows, so the crossover is low; 16 keeps MTP's small verification batches
-// on the host path where they belong. COLIBRI_HOST_FFN_GPU_ROWS overrides it,
+// on the host path where they belong. FLYWEIGHT_HOST_FFN_GPU_ROWS overrides it,
 // and 0 disables the batch path entirely.
 inline int qwen_host_ffn_batch_threshold(){
     static const int threshold=[]{
-        if(const char* env=std::getenv("COLIBRI_HOST_FFN_GPU_ROWS"))
+        if(const char* env=std::getenv("FLYWEIGHT_HOST_FFN_GPU_ROWS"))
             return static_cast<int>(std::strtol(env,nullptr,10));
         return 16;
     }();
@@ -112,7 +112,7 @@ inline int qwen_host_ffn_batch_threshold(){
 }
 
 void qwen_forward_rows(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
     int total_rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
 ) {
     // Chunk boundary: pick up any layers the background registration finished.
@@ -133,8 +133,8 @@ void qwen_forward_rows(
     const int top_k=static_cast<int>(runtime.model->config.expert_used_count);
     const int intermediate=static_cast<int>(runtime.moe_intermediate);
     const auto expert_phase=output_tokens
-        ?colibri::v2::ExpertExecutionPhase::verification
-        :colibri::v2::ExpertExecutionPhase::prefill;
+        ?flyweight::v2::ExpertExecutionPhase::verification
+        :flyweight::v2::ExpertExecutionPhase::prefill;
     auto expert_policy=qwen_expert_policy(runtime,expert_phase);
     // The flag must imply routed_gpu_execution_allowed()==false, which the
     // policy only derives in hybrid mode. Setting it in streamed-GPU mode let
@@ -143,7 +143,7 @@ void qwen_forward_rows(
     // those experts' contributions vanished from every chunked-prefill token.
     expert_policy.hybrid_prefill_cpu=
         expert_policy.is_hybrid()&&
-        expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
+        expert_phase==flyweight::v2::ExpertExecutionPhase::prefill&&
         runtime.options.hybrid_prefill_cpu!=0;
     // The two-half software pipeline (plans/prefill-pipeline.md): while the
     // engine thread runs one half's routed experts on the CPU, the GPU works
@@ -154,17 +154,17 @@ void qwen_forward_rows(
     // misses_may_be_admitted requires decode). Dense checkpoints and the
     // fully resident streamed-GPU mode keep the one-span driver and pay
     // nothing. The half is kept a multiple of the DeltaNet WY chunk; below
-    // two chunks there is nothing to overlap. COLIBRI_PREFILL_PIPELINE=0
+    // two chunks there is nothing to overlap. FLYWEIGHT_PREFILL_PIPELINE=0
     // restores the serial driver for rollback and A/B.
     static const bool pipeline_enabled=[]{
-        const char*setting=std::getenv("COLIBRI_PREFILL_PIPELINE");
+        const char*setting=std::getenv("FLYWEIGHT_PREFILL_PIPELINE");
         return !setting||setting[0]!='0';
     }();
     const int pipeline_half=
-        total_rows/2/static_cast<int>(colibri::v2::workspace::kDeltaChunk)
-        *static_cast<int>(colibri::v2::workspace::kDeltaChunk);
+        total_rows/2/static_cast<int>(flyweight::v2::workspace::kDeltaChunk)
+        *static_cast<int>(flyweight::v2::workspace::kDeltaChunk);
     const bool pipelined=pipeline_enabled&&pipeline_half>0&&experts>0&&
-        expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
+        expert_phase==flyweight::v2::ExpertExecutionPhase::prefill&&
         !expert_policy.is_streamed_gpu();
     const float epsilon=runtime.model->config.rms_norm_epsilon?runtime.model->config.rms_norm_epsilon:1.0e-6f;
     for(int row=0;row<rows;++row)
@@ -219,31 +219,31 @@ void qwen_forward_rows(
     const auto attention_scores=workspace_layout.attention_scores.address(runtime.workspace);
     const auto mtp_prompt_hidden=
         workspace_layout.mtp_prompt_hidden.address(runtime.workspace);
-    // COLIBRI_PREFILL_LAUNCHES=1 tallies launches and total blocks per kernel
+    // FLYWEIGHT_PREFILL_LAUNCHES=1 tallies launches and total blocks per kernel
     // name over the whole rows forward, dumped by qwen_prefill_launch_report.
     // Launch *count* is the thing the phase trace cannot show: a phase that
     // looks cheap in milliseconds can still be thousands of 4-block grids, and
     // on this path that is the difference between a kernel problem and a
     // batching problem.
-    static const bool trace_launches=std::getenv("COLIBRI_PREFILL_LAUNCHES")!=nullptr;
+    static const bool trace_launches=std::getenv("FLYWEIGHT_PREFILL_LAUNCHES")!=nullptr;
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,std::uint32_t bx,void**args,std::uint32_t shared=0){
         if(trace_launches)qwen_note_launch(name,gx,gy);
         if(qwen_launch_time_enabled()){
             static std::uint64_t start=0,stop=0;
-            if(!start){colibri_gpu_timed_event_create(&start);
-                       colibri_gpu_timed_event_create(&stop);}
-            colibri_gpu_event_record(start,runtime.stream);
-            if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
+            if(!start){flyweight_gpu_timed_event_create(&start);
+                       flyweight_gpu_timed_event_create(&stop);}
+            flyweight_gpu_event_record(start,runtime.stream);
+            if(flyweight_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
                 throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
-            colibri_gpu_event_record(stop,runtime.stream);
-            colibri_gpu_event_sync(stop);
+            flyweight_gpu_event_record(stop,runtime.stream);
+            flyweight_gpu_event_sync(stop);
             float ms=0.0f;
-            if(colibri_gpu_event_elapsed(start,stop,&ms)==0)
+            if(flyweight_gpu_event_elapsed(start,stop,&ms)==0)
                 qwen_note_launch_time(name,ms);
             if(!trace_launches)qwen_note_launch(name,gx,gy);
             return;
         }
-        if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
+        if(flyweight_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen rows forward CUDA kernel failed: ")+name);
     };
     auto rms_rows=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
@@ -299,19 +299,19 @@ void qwen_forward_rows(
         }
         std::uint64_t matrix=staged?staged:runtime.device_tensors[index];
         const auto type=qwen_device_type(runtime,index);
-        const auto*format=colibri::v2::qwen_format(type);
+        const auto*format=flyweight::v2::qwen_format(type);
         // Tensor cores where the format has an MMQ kernel; the dp4a tile
         // kernel is the fallback for the rest. Both are resolved before the
         // gate below, because whether either exists is what decides if a wide
         // MoE batch may enter the block at all. (IQ1_S/IQ1_M land on the
         // symmetric MMQ rather than with the asymmetric _MIN three: their
         // per-group deltas fold into the int8 weights exactly.)
-        // COLIBRI_DENSE_TRACE=1: which kernel each dense projection actually
+        // FLYWEIGHT_DENSE_TRACE=1: which kernel each dense projection actually
         // takes. Reasoning about these gates has been wrong twice (IQ4_NL's
         // missing format row, --hybrid-prefill's silent override), so the
         // dispatch reports itself.
         auto dense_trace=[&](const char* picked){
-            static const bool on=std::getenv("COLIBRI_DENSE_TRACE")!=nullptr;
+            static const bool on=std::getenv("FLYWEIGHT_DENSE_TRACE")!=nullptr;
             if(!on)return;
             static std::set<std::string> seen;
             char key[256];
@@ -345,7 +345,7 @@ void qwen_forward_rows(
             q8_kernel=format->matvec_q8_warp;
         if(q8_kernel){
             // The scale rows sit on a float-sized stride (see rows_q8_scales in
-            // colibri_v2_workspace.hpp) though the kernels write halves.
+            // flyweight_v2_workspace.hpp) though the kernels write halves.
             int scale_stride=(input_size/32)*2;
             if(q8_cached_input!=input||q8_cached_width!=input_size){
                 std::uint64_t all_q8=small_q8,all_scales=small_q8_scales;
@@ -458,7 +458,7 @@ void qwen_forward_rows(
                     static_cast<std::uint64_t>(row)*input_size*sizeof(float);
                 const auto row_output=output+
                     static_cast<std::uint64_t>(row)*output_size*sizeof(float);
-                if(colibri_gpu_q8_matvec_transposed(
+                if(flyweight_gpu_q8_matvec_transposed(
                        matrix,row_input,row_output,input_size,output_size,
                        runtime.stream)!=0)
                     throw std::runtime_error(
@@ -474,7 +474,7 @@ void qwen_forward_rows(
         // prefill "proj" phase before it got its rows kernel.
         if(format&&format->matmul_rows){
             void*args[]={&matrix,&input,&output,&input_size,&output_size,&rows};
-            using Grid=colibri::v2::RowsMatmulGrid;
+            using Grid=flyweight::v2::RowsMatmulGrid;
             switch(format->matmul_rows_grid){
                 case Grid::per_token:
                     launch(format->matmul_rows,output_size,rows,256,args);return;
@@ -633,7 +633,7 @@ void qwen_forward_rows(
                (static_cast<std::uint32_t>(add_count)+255)/256,1,256,add_args);
         q8_cached_input=0;q8_cached_width=0;
     };
-    if(colibri_gpu_upload(token_device,input_tokens,rows*sizeof(std::uint32_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows token upload failed");
+    if(flyweight_gpu_upload(token_device,input_tokens,rows*sizeof(std::uint32_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows token upload failed");
     const auto embedding=qwen_stage_embedding_rows(runtime,input_tokens,rows);
     // Staged rows arrive in chunk order, so they are gathered by the identity
     // permutation rather than by the real token ids in token_device.
@@ -778,23 +778,23 @@ void qwen_forward_rows(
     // The same GPU-event split (core / router / transfer) answers "is
     // route_wait real GPU work or a bubble?" for MTP verification, which is
     // the phase that currently stalls more than decode. Opt in with
-    // COLIBRI_MTP_PROFILE=1; it accumulates into the prefill_gpu_* counters,
+    // FLYWEIGHT_MTP_PROFILE=1; it accumulates into the prefill_gpu_* counters,
     // so a probe must snapshot them between the prefill and decode phases.
     static const bool verify_profile=
-        std::getenv("COLIBRI_MTP_PROFILE")!=nullptr;
+        std::getenv("FLYWEIGHT_MTP_PROFILE")!=nullptr;
     // The event split cannot describe two interleaved halves (each half would
     // re-record the other's start/end markers), so the pipelined driver keeps
     // only the host-side counters and leaves the prefill_gpu_* split at zero.
     const bool profile_prefill=!pipelined&&
         ((runtime.prefill_profile&&expert_policy.records_prefill_frequency())||
          (verify_profile&&
-          expert_phase==colibri::v2::ExpertExecutionPhase::verification));
-    static const bool trace_phases=std::getenv("COLIBRI_PREFILL_TRACE")
-        &&std::getenv("COLIBRI_PREFILL_TRACE")[0]=='2';
+          expert_phase==flyweight::v2::ExpertExecutionPhase::verification));
+    static const bool trace_phases=std::getenv("FLYWEIGHT_PREFILL_TRACE")
+        &&std::getenv("FLYWEIGHT_PREFILL_TRACE")[0]=='2';
     auto phase_clock=std::chrono::steady_clock::now();
     auto phase=[&](std::uint32_t layer_number,const char*name){
         if(!trace_phases)return;
-        colibri_gpu_stream_sync(runtime.stream);
+        flyweight_gpu_stream_sync(runtime.stream);
         const auto now=std::chrono::steady_clock::now();
         std::fprintf(stderr,"[phase] layer %2u %-10s %.1fms\n",layer_number,name,
             std::chrono::duration_cast<std::chrono::nanoseconds>(now-phase_clock).count()/1e6);
@@ -811,7 +811,7 @@ void qwen_forward_rows(
         if(runtime.cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
         auto&layer=runtime.layers[layer_number];
         q8_cached_input=0;q8_cached_width=0;
-        if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)
+        if(profile_prefill&&flyweight_gpu_event_record(runtime.prefill_layer_start_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill layer-start profiling event failed");
         auto tensor=[&](std::size_t role){return runtime.device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size,std::uint64_t staged=0){dense_rows(layer.static_tensors.at(role),input,output,input_size,output_size,staged);};
@@ -860,17 +860,17 @@ void qwen_forward_rows(
             else launch("delta_conv_sequence",channels,1,1,conv_args);
             phase(layer_number,"conv");
             auto recurrent_state=runtime.state+layer.state_second;auto decay=tensor(8),dt=tensor(7),norm=tensor(9);
-            // COLIBRI_DELTA_DUMP=<dir> writes one DeltaNet layer's recurrence
+            // FLYWEIGHT_DELTA_DUMP=<dir> writes one DeltaNet layer's recurrence
             // inputs so alternative kernels can be replayed on real activations
             // instead of synthetic ones. Diagnostic only: it dumps the first
             // such layer once and never alters what runs.
-            if(const char*dump_dir=std::getenv("COLIBRI_DELTA_DUMP")){
-                // COLIBRI_DELTA_DUMP_SKIP skips the first N opportunities. The
+            if(const char*dump_dir=std::getenv("FLYWEIGHT_DELTA_DUMP")){
+                // FLYWEIGHT_DELTA_DUMP_SKIP skips the first N opportunities. The
                 // default first one is layer 0 of the first chunk, whose incoming
                 // recurrent state is still all zeros; skipping past it is what
                 // captures a live state carried in from earlier tokens.
                 static long skip=[]{
-                    const char*value=std::getenv("COLIBRI_DELTA_DUMP_SKIP");
+                    const char*value=std::getenv("FLYWEIGHT_DELTA_DUMP_SKIP");
                     return value?std::strtol(value,nullptr,10):0L;
                 }();
                 static bool dumped=false;
@@ -878,11 +878,11 @@ void qwen_forward_rows(
                     // fall through without dumping
                 }else if(!dumped){
                     dumped=true;
-                    colibri_gpu_stream_sync(runtime.stream);
+                    flyweight_gpu_stream_sync(runtime.stream);
                     auto save=[&](const char*what,std::uint64_t address,std::size_t count){
                         std::vector<float> host(count);
-                        if(colibri_gpu_download(host.data(),address,count*sizeof(float),runtime.stream)!=0
-                           ||colibri_gpu_stream_sync(runtime.stream)!=0)
+                        if(flyweight_gpu_download(host.data(),address,count*sizeof(float),runtime.stream)!=0
+                           ||flyweight_gpu_stream_sync(runtime.stream)!=0)
                             throw std::runtime_error("native Qwen DeltaNet dump readback failed");
                         char path[1024];
                         std::snprintf(path,sizeof(path),"%s/delta_%s.f32",dump_dir,what);
@@ -922,12 +922,12 @@ void qwen_forward_rows(
             // Requires the workspace regions sized at prepare time, so the guard
             // is the same head_dim test that sized them.
             const bool chunked_delta=
-                colibri::v2::workspace::use_chunked_delta(
+                flyweight::v2::workspace::use_chunked_delta(
                     static_cast<std::uint64_t>(rows),
                     static_cast<std::uint64_t>(head_dim),
                     static_cast<std::uint64_t>(value_heads),
                     runtime.delta_value_heads)&&
-                !std::getenv("COLIBRI_DELTA_SEQUENTIAL");
+                !std::getenv("FLYWEIGHT_DELTA_SEQUENTIAL");
             if(chunked_delta){
                 const auto attn=workspace_layout.delta_attn.address(runtime.workspace);
                 const auto pmat=workspace_layout.delta_pmat.address(runtime.workspace);
@@ -943,8 +943,8 @@ void qwen_forward_rows(
                 const auto core=first;
                 const std::uint32_t chunk_count=
                     (static_cast<std::uint32_t>(rows)
-                     +static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaChunk)-1)
-                    /static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaChunk);
+                     +static_cast<std::uint32_t>(flyweight::v2::workspace::kDeltaChunk)-1)
+                    /static_cast<std::uint32_t>(flyweight::v2::workspace::kDeltaChunk);
                 void*score_args[]={const_cast<std::uint64_t*>(&fourth),&beta_logits,
                     const_cast<std::uint64_t*>(&decay_logits),&decay,&dt,
                     const_cast<std::uint64_t*>(&attn),const_cast<std::uint64_t*>(&pmat),
@@ -967,7 +967,7 @@ void qwen_forward_rows(
                     &recurrent_state,const_cast<std::uint64_t*>(&core),
                     &rows,&key_heads,&value_heads};
                 launch("qwen_delta_state_pass",static_cast<std::uint32_t>(value_heads),
-                    static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaDim)/32,
+                    static_cast<std::uint32_t>(flyweight::v2::workspace::kDeltaDim)/32,
                     256,pass_args);
                 void*gate_args[]={const_cast<std::uint64_t*>(&core),
                     const_cast<std::uint64_t*>(&second),&norm,
@@ -975,7 +975,7 @@ void qwen_forward_rows(
                     const_cast<float*>(&epsilon),&gate_sigmoid};
                 launch("qwen_delta_norm_gate",static_cast<std::uint32_t>(rows),
                     static_cast<std::uint32_t>(value_heads),
-                    static_cast<std::uint32_t>(colibri::v2::workspace::kDeltaDim),
+                    static_cast<std::uint32_t>(flyweight::v2::workspace::kDeltaDim),
                     gate_args);
             }else if(head_dim==128)launch("qwen_delta_recurrent_chunk",value_heads,1,128,recurrent_args);
             else launch("qwen_delta_recurrent_rows",value_heads,1,256,recurrent_args);
@@ -1122,7 +1122,7 @@ void qwen_forward_rows(
                     runtime.position+static_cast<std::uint64_t>(span_begin)+rows-1);
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
             const char*cublas_prefill_env=
-                std::getenv("COLIBRI_CUBLAS_PREFILL_ATTENTION");
+                std::getenv("FLYWEIGHT_CUBLAS_PREFILL_ATTENTION");
             const std::uint64_t max_tokens=
                 runtime.position+static_cast<std::uint64_t>(span_begin)+
                 static_cast<std::uint64_t>(rows);
@@ -1175,19 +1175,19 @@ void qwen_forward_rows(
                 runtime.options.cache_type_k==1&&
                 runtime.options.cache_type_v==1&&cublas_tile_rows>0&&
                 cublas_workspace_ok&&
-                colibri_gpu_attention_prefill_f16_cublas(
+                flyweight_gpu_attention_prefill_f16_cublas(
                     queries,gates,cache_keys,cache_values,
                     attention_scores,first,second,
                     attention_scores+packed_query_bytes,flash_state,third,
                     runtime.stream,heads,kv_heads,head_dim,rows,capacity,
                     static_cast<int>(runtime.position)+span_begin,
                     cublas_tile_rows,cublas_block_tokens,scale,1)==0;
-            // COLIBRI_ATTN_PREFILL_TRACE=1: which attention path actually ran,
+            // FLYWEIGHT_ATTN_PREFILL_TRACE=1: which attention path actually ran,
             // printed for the first few layers. The cuBLAS attempt fails
             // silently by design (missing library, kernel, workspace), so a
             // fallback is invisible without this -- and a dormant tensor-core
             // path looks exactly like a slow one.
-            if(std::getenv("COLIBRI_ATTN_PREFILL_TRACE")){
+            if(std::getenv("FLYWEIGHT_ATTN_PREFILL_TRACE")){
                 static int shown=0;
                 if(shown<4){++shown;
                     std::fprintf(stderr,
@@ -1293,7 +1293,7 @@ void qwen_forward_rows(
                 const bool staged_cublas=
                     cublas_prefill_requested&&cublas_tile_rows>0&&
                     cublas_workspace_ok&&
-                    colibri_gpu_attention_prefill_f16_cublas(
+                    flyweight_gpu_attention_prefill_f16_cublas(
                         queries,gates,stage_keys,stage_values,
                         attention_scores,first,second,
                         attention_scores+packed_query_bytes,flash_state,third,
@@ -1336,7 +1336,7 @@ void qwen_forward_rows(
             else add_rows(residual,hidden);
             moe_base=qwen_ffn_base(runtime,layer);
         }
-        if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
+        if(profile_prefill&&flyweight_gpu_event_record(runtime.prefill_core_end_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill core profiling event failed");
         if(runtime.qwen4exp)
             hc_pre_rows(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
@@ -1371,7 +1371,7 @@ void qwen_forward_rows(
                     const auto index=layer.static_tensors[ffn_base+role];
                     const auto&tensor=runtime.model->tensors[index];
                     staged[role]=runtime.host_ffn_stage+offset;
-                    if(colibri_gpu_upload(staged[role],
+                    if(flyweight_gpu_upload(staged[role],
                                           tensor_data(*runtime.model,tensor),
                                           tensor.size,runtime.stream)!=0)
                         throw std::runtime_error(
@@ -1409,11 +1409,11 @@ void qwen_forward_rows(
                 float*host_output=host_input+
                     static_cast<std::size_t>(rows)*hidden_size;
                 const auto host_started=std::chrono::steady_clock::now();
-                if(colibri_gpu_download(host_input,normalized,batch_bytes,runtime.stream)!=0||
-                   colibri_gpu_stream_sync(runtime.stream)!=0)
+                if(flyweight_gpu_download(host_input,normalized,batch_bytes,runtime.stream)!=0||
+                   flyweight_gpu_stream_sync(runtime.stream)!=0)
                     throw std::runtime_error("native dense host FFN rows input transfer failed");
                 qwen_cpu_dense_ffn_rows(runtime,layer,host_input,host_output,rows);
-                if(colibri_gpu_upload(third,host_output,batch_bytes,runtime.stream)!=0)
+                if(flyweight_gpu_upload(third,host_output,batch_bytes,runtime.stream)!=0)
                     throw std::runtime_error("native dense host FFN rows output transfer failed");
                 runtime.dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-host_started).count();
@@ -1450,7 +1450,7 @@ void qwen_forward_rows(
             void*route_args[]={const_cast<std::uint64_t*>(&router_logits),const_cast<std::uint64_t*>(&selected_device),const_cast<std::uint64_t*>(&route_weights),&rows,const_cast<int*>(&experts),const_cast<int*>(&top_k)};
             launch("route_topk_rows",rows,1,256,route_args,experts*sizeof(float));
         }
-        if(profile_prefill&&colibri_gpu_event_record(runtime.prefill_router_end_event,runtime.stream)!=0)
+        if(profile_prefill&&flyweight_gpu_event_record(runtime.prefill_router_end_event,runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill router profiling event failed");
         const auto selected_bytes=
             static_cast<std::uint64_t>(rows)*top_k*sizeof(std::int32_t);
@@ -1458,9 +1458,9 @@ void qwen_forward_rows(
             static_cast<std::uint64_t>(rows)*top_k*sizeof(float);
         const auto input_bytes=
             static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-        if(colibri_gpu_download(selected_host,selected_device,selected_bytes,runtime.stream)!=0||colibri_gpu_download(weights_host,route_weights,weights_bytes,runtime.stream)!=0||colibri_gpu_download(input_host,normalized,input_bytes,runtime.stream)!=0)
+        if(flyweight_gpu_download(selected_host,selected_device,selected_bytes,runtime.stream)!=0||flyweight_gpu_download(weights_host,route_weights,weights_bytes,runtime.stream)!=0||flyweight_gpu_download(input_host,normalized,input_bytes,runtime.stream)!=0)
             throw std::runtime_error("native Qwen rows forward route transfer failed");
-        if(colibri_gpu_event_record(span.route_event,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward route event failed");
+        if(flyweight_gpu_event_record(span.route_event,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward route event failed");
         // Shared expert gate/up as two tiled GEMMs into the halves of the
         // `first` scratch (silu_mul expects gate at [0, n) and up at [n, 2n)
         // of one buffer), then the elementwise swiglu combine.
@@ -1474,12 +1474,12 @@ void qwen_forward_rows(
             auto nvfp4_rows=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size,float scale){
                 std::uint64_t matrix=runtime.device_tensors[layer.static_tensors.at(role)];
                 const char* tensor_core_setting =
-                    std::getenv("COLIBRI_NVFP4_TENSOR_CORES");
+                    std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORES");
                 const bool tensor_cores =
                     (!tensor_core_setting || tensor_core_setting[0] != '0')
                     && rows >= 16;
                 if (tensor_cores &&
-                    colibri_gpu_nvfp4_matmul_cublas(
+                    flyweight_gpu_nvfp4_matmul_cublas(
                         matrix, input, output, runtime.stream, input_size,
                         output_size, rows, scale) == 0)
                     return;
@@ -1519,12 +1519,12 @@ void qwen_forward_rows(
         install_span(span);
         auto&layer=runtime.layers[layer_number];
         const auto route_wait_started=std::chrono::steady_clock::now();
-        if(colibri_gpu_event_sync(span.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
+        if(flyweight_gpu_event_sync(span.route_event)!=0)throw std::runtime_error("native Qwen rows forward route synchronization failed");
         if(profile_prefill){
             float core_ms=0.0f,router_ms=0.0f,transfer_ms=0.0f;
-            if(colibri_gpu_event_elapsed(runtime.prefill_layer_start_event,runtime.prefill_core_end_event,&core_ms)!=0||
-               colibri_gpu_event_elapsed(runtime.prefill_core_end_event,runtime.prefill_router_end_event,&router_ms)!=0||
-               colibri_gpu_event_elapsed(runtime.prefill_router_end_event,runtime.route_event,&transfer_ms)!=0)
+            if(flyweight_gpu_event_elapsed(runtime.prefill_layer_start_event,runtime.prefill_core_end_event,&core_ms)!=0||
+               flyweight_gpu_event_elapsed(runtime.prefill_core_end_event,runtime.prefill_router_end_event,&router_ms)!=0||
+               flyweight_gpu_event_elapsed(runtime.prefill_router_end_event,runtime.route_event,&transfer_ms)!=0)
                 throw std::runtime_error("native Qwen prefill profiling measurement failed");
             ++runtime.prefill_gpu_split_layers;
             runtime.prefill_gpu_core_nanoseconds+=static_cast<std::uint64_t>(core_ms*1.0e6f);
@@ -1535,7 +1535,7 @@ void qwen_forward_rows(
         runtime.route_wait_nanoseconds+=route_wait_elapsed;
         if(expert_policy.records_prefill_frequency())
             runtime.prefill_route_wait_nanoseconds+=route_wait_elapsed;
-        static const bool trace_layers=std::getenv("COLIBRI_PREFILL_TRACE")!=nullptr;
+        static const bool trace_layers=std::getenv("FLYWEIGHT_PREFILL_TRACE")!=nullptr;
         if(trace_layers)std::fprintf(stderr,"[trace] layer %2u %s rows=%d sync=%.1fms\n",layer_number,layer.attention?"attn ":"delta",rows,route_wait_elapsed/1e6);
         span.pager_started=std::chrono::steady_clock::now();
         if(prune_experts){
@@ -1570,17 +1570,17 @@ void qwen_forward_rows(
         // config without the arena) leaves this path untouched.
         const bool stream_experts=span.stream_bytes>0&&
             runtime.dma_paging&&
-            expert_phase==colibri::v2::ExpertExecutionPhase::prefill&&
+            expert_phase==flyweight::v2::ExpertExecutionPhase::prefill&&
             (expert_policy.hybrid_prefill_cpu||
              !expert_policy.routed_gpu_execution_allowed());
-        if(std::getenv("COLIBRI_STREAM_TRACE")){
+        if(std::getenv("FLYWEIGHT_STREAM_TRACE")){
             static int shown=0;
             if(shown<3){++shown;
                 std::fprintf(stderr,
                     "[stream-gate] stream_bytes=%llu dma=%d phase_prefill=%d "
                     "hybrid_prefill_cpu=%d routed_gpu_allowed=%d => %d\n",
                     (unsigned long long)span.stream_bytes,(int)runtime.dma_paging,
-                    (int)(expert_phase==colibri::v2::ExpertExecutionPhase::prefill),
+                    (int)(expert_phase==flyweight::v2::ExpertExecutionPhase::prefill),
                     (int)expert_policy.hybrid_prefill_cpu,
                     (int)expert_policy.routed_gpu_execution_allowed(),
                     (int)stream_experts);}
@@ -1632,7 +1632,7 @@ void qwen_forward_rows(
                     for(int role=0;role<3;++role){
                         const auto&source=runtime.model->tensors[layer.expert_tensors[role]];
                         const auto bytes=source.size/experts;
-                        if(colibri_gpu_upload(
+                        if(flyweight_gpu_upload(
                                admitted_base+admitted_offset,
                                tensor_data(*runtime.model,source)+
                                    static_cast<std::uint64_t>(expert)*bytes,
@@ -1703,9 +1703,9 @@ void qwen_forward_rows(
         const std::uint64_t routed_routes=stream_cap*top_k;
         const std::uint64_t routed_padded=
             routed_routes+static_cast<std::uint64_t>(experts)*
-                (colibri::v2::moe::kMmqBlockSize-1);
+                (flyweight::v2::moe::kMmqBlockSize-1);
         const std::uint64_t routed_blocks=
-            routed_padded/colibri::v2::moe::kMmqBlockSize+1;
+            routed_padded/flyweight::v2::moe::kMmqBlockSize+1;
         std::uint64_t routed_role_ptrs[3];
         for(int role=0;role<3;++role)
             routed_role_ptrs[role]=
@@ -1723,13 +1723,13 @@ void qwen_forward_rows(
             auto stream_role_ok=[&](int role,int in_size){
                 const auto type=
                     runtime.model->tensors[layer.expert_tensors[role]].type;
-                const auto*format=colibri::v2::qwen_format(type);
+                const auto*format=flyweight::v2::qwen_format(type);
                 if(!format)return false;
                 if(format->matmul_q8_mmq&&runtime.int8_tensor_cores&&
                    (in_size&255)==0)return true;
                 return format->matmul_rows!=nullptr&&
                     format->matmul_rows_grid!=
-                        colibri::v2::RowsMatmulGrid::per_token;
+                        flyweight::v2::RowsMatmulGrid::per_token;
             };
             if(stream_role_ok(0,hidden_size)&&stream_role_ok(1,hidden_size)&&
                stream_role_ok(2,intermediate)){
@@ -1761,7 +1761,7 @@ void qwen_forward_rows(
             // small copies with kernels on the compute stream serializes both.
             // The slice was last read by this span's previous layer's GEMMs,
             // so overwriting waits for that consumption first.
-            if(colibri_gpu_stream_wait_event(
+            if(flyweight_gpu_stream_wait_event(
                    runtime.prefetch_stream,span.consumed_event)!=0)
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
@@ -1780,7 +1780,7 @@ void qwen_forward_rows(
                 for(int role=0;role<3;++role){
                     const auto&source=
                         runtime.model->tensors[layer.expert_tensors[role]];
-                    if(colibri_gpu_upload(base+offset,
+                    if(flyweight_gpu_upload(base+offset,
                            tensor_data(*runtime.model,source)+
                                static_cast<std::uint64_t>(expert)*stream_role_bytes[role],
                            stream_role_bytes[role],runtime.prefetch_stream)!=0)
@@ -1796,9 +1796,9 @@ void qwen_forward_rows(
             if(moe_profile_enabled())
                 qwen_moe_profile().stream_upload+=moe_now()-t_upload;
             if(cursor&&
-               (colibri_gpu_event_record(
+               (flyweight_gpu_event_record(
                     span.upload_ready_event,runtime.prefetch_stream)!=0||
-                colibri_gpu_stream_wait_event(
+                flyweight_gpu_stream_wait_event(
                     runtime.stream,span.upload_ready_event)!=0))
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
@@ -1836,9 +1836,9 @@ void qwen_forward_rows(
                 weights_host[route]=0.0f;
             }
             if(stream_total&&
-               (colibri_gpu_upload(stream_idx_dev,stream_tokens.data(),
+               (flyweight_gpu_upload(stream_idx_dev,stream_tokens.data(),
                     stream_total*sizeof(std::int32_t),runtime.stream)!=0||
-                colibri_gpu_upload(stream_wts_dev,stream_route_weights.data(),
+                flyweight_gpu_upload(stream_wts_dev,stream_route_weights.data(),
                     stream_total*sizeof(float),runtime.stream)!=0))
                 throw std::runtime_error(
                     "native Qwen prefill expert stream index upload failed");
@@ -1851,7 +1851,7 @@ void qwen_forward_rows(
         if(gpu_table_path){
             const auto output_bytes=
                 static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-            if(colibri_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward GPU expert reset failed");
+            if(flyweight_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward GPU expert reset failed");
             const auto pointer_bytes=span_entries*sizeof(std::uint64_t);
             const auto scale_bytes=span_entries*sizeof(float);
             const auto table_row=static_cast<std::uint64_t>(span_begin)*top_k;
@@ -1869,13 +1869,13 @@ void qwen_forward_rows(
             std::memcpy(gpu_gate_scale_host,gpu_gate_scales,scale_bytes);
             std::memcpy(gpu_up_scale_host,gpu_up_scales,scale_bytes);
             std::memcpy(gpu_count_host,gpu_counts,rows*sizeof(std::int32_t));
-            if(colibri_gpu_upload(gpu_gate_table,gate_host,pointer_bytes,runtime.stream)!=0||
-               colibri_gpu_upload(gpu_up_table,up_host,pointer_bytes,runtime.stream)!=0||
-               colibri_gpu_upload(gpu_down_table,down_pointer_host,pointer_bytes,runtime.stream)!=0||
-               colibri_gpu_upload(gpu_weight_table,gpu_weight_host,scale_bytes,runtime.stream)!=0||
-               colibri_gpu_upload(gpu_gate_scale_table,gpu_gate_scale_host,scale_bytes,runtime.stream)!=0||
-               colibri_gpu_upload(gpu_up_scale_table,gpu_up_scale_host,scale_bytes,runtime.stream)!=0||
-               colibri_gpu_upload(gpu_count_table,gpu_count_host,rows*sizeof(std::int32_t),runtime.stream)!=0)
+            if(flyweight_gpu_upload(gpu_gate_table,gate_host,pointer_bytes,runtime.stream)!=0||
+               flyweight_gpu_upload(gpu_up_table,up_host,pointer_bytes,runtime.stream)!=0||
+               flyweight_gpu_upload(gpu_down_table,down_pointer_host,pointer_bytes,runtime.stream)!=0||
+               flyweight_gpu_upload(gpu_weight_table,gpu_weight_host,scale_bytes,runtime.stream)!=0||
+               flyweight_gpu_upload(gpu_gate_scale_table,gpu_gate_scale_host,scale_bytes,runtime.stream)!=0||
+               flyweight_gpu_upload(gpu_up_scale_table,gpu_up_scale_host,scale_bytes,runtime.stream)!=0||
+               flyweight_gpu_upload(gpu_count_table,gpu_count_host,rows*sizeof(std::int32_t),runtime.stream)!=0)
                 throw std::runtime_error("native Qwen rows forward pointer upload failed");
             if(any_gpu){
                 void*gate_up_args[]={const_cast<std::uint64_t*>(&gpu_gate_table),const_cast<std::uint64_t*>(&gpu_up_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&gpu_activated),const_cast<int*>(&hidden_size),const_cast<int*>(&intermediate),const_cast<int*>(&top_k),&rows,const_cast<std::uint64_t*>(&gpu_gate_scale_table),const_cast<std::uint64_t*>(&gpu_up_scale_table)};
@@ -1891,14 +1891,14 @@ void qwen_forward_rows(
             if(!gpu_table_path){
                 const auto output_bytes=
                     static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-                if(colibri_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)
+                if(flyweight_gpu_memset(fourth,0,output_bytes,runtime.stream)!=0)
                     throw std::runtime_error("native Qwen rows forward GPU expert reset failed");
             }
             const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
             const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
             const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
             auto stream_needs_q8=[&](std::uint32_t type,int in_size){
-                const auto*format=colibri::v2::qwen_format(type);
+                const auto*format=flyweight::v2::qwen_format(type);
                 return format->matmul_q8_mmq&&runtime.int8_tensor_cores&&
                     (in_size&255)==0;
             };
@@ -1906,7 +1906,7 @@ void qwen_forward_rows(
                                    std::uint64_t f32_input,std::uint64_t q8_input,
                                    std::uint64_t q8_scales,std::uint64_t output,
                                    int in_size,int out_size,int count){
-                const auto*format=colibri::v2::qwen_format(type);
+                const auto*format=flyweight::v2::qwen_format(type);
                 if(stream_needs_q8(type,in_size)){
                     const int mmq_rows=format->mmq_min?kQ8MmqMinRows:kQ8MmqRows;
                     const int mmq_threads=format->mmq_min?kQ8MmqMinThreads
@@ -1928,7 +1928,7 @@ void qwen_forward_rows(
                     return;
                 }
                 void*args[]={&matrix,&f32_input,&output,&in_size,&out_size,&count};
-                if(format->matmul_rows_grid==colibri::v2::RowsMatmulGrid::tiled32){
+                if(format->matmul_rows_grid==flyweight::v2::RowsMatmulGrid::tiled32){
                     launch(format->matmul_rows,(out_size+31)/32,
                            (static_cast<std::uint32_t>(count)+31)/32,256,args);
                     return;
@@ -1955,7 +1955,7 @@ void qwen_forward_rows(
             // The option is the supported switch; the env var stays as an
             // override so the path can be A/B'd against itself without
             // rebuilding a runtime.
-            static const char*routed_env=std::getenv("COLIBRI_ROUTED_MOE");
+            static const char*routed_env=std::getenv("FLYWEIGHT_ROUTED_MOE");
             const bool routed_setting=routed_env
                 ? routed_env[0]=='1'
                 : runtime.options.routed_moe!=0;
@@ -1988,7 +1988,7 @@ void qwen_forward_rows(
                 !routed_gate.empty()&&!routed_up.empty()&&!routed_down.empty()&&
                 !routed_route_weights.empty();
             if(routed_moe){
-                colibri::v2::moe::AlignedRoutes aligned;
+                flyweight::v2::moe::AlignedRoutes aligned;
                 {
                     // Routes the staging claimed, keyed by group rather than by
                     // expert, so the kernel's block table indexes the compact
@@ -1998,10 +1998,10 @@ void qwen_forward_rows(
                     for(int route=0;route<rows*top_k;++route)
                         if(routed_route_weights[route]!=0.0f)
                             route_group[route]=group_of[selected_host[route]];
-                    colibri::v2::moe::align_blocks(
+                    flyweight::v2::moe::align_blocks(
                         route_group.data(),routed_route_weights.data(),
                         rows*top_k,static_cast<int>(stream_groups.size()),
-                        colibri::v2::moe::kMmqBlockSize,aligned);
+                        flyweight::v2::moe::kMmqBlockSize,aligned);
                 }
                 const int blocks=static_cast<int>(aligned.block_experts.size());
                 if(blocks){
@@ -2022,25 +2022,25 @@ void qwen_forward_rows(
                             role_table[role].push_back(
                                 group.matrix+role_offset[role]);
                     for(int role=0;role<3;++role)
-                        if(colibri_gpu_upload(routed_role_ptrs[role],
+                        if(flyweight_gpu_upload(routed_role_ptrs[role],
                                role_table[role].data(),
                                role_table[role].size()*sizeof(std::uint64_t),
                                runtime.stream)!=0)
                             throw std::runtime_error(
                                 "native Qwen routed MoE pointer upload failed");
-                    if(colibri_gpu_upload(routed_block_experts,
+                    if(flyweight_gpu_upload(routed_block_experts,
                            aligned.block_experts.data(),
                            aligned.block_experts.size()*sizeof(std::int32_t),
                            runtime.stream)!=0||
-                       colibri_gpu_upload(routed_sorted,
+                       flyweight_gpu_upload(routed_sorted,
                            aligned.sorted_routes.data(),
                            aligned.sorted_routes.size()*sizeof(std::int32_t),
                            runtime.stream)!=0||
-                       colibri_gpu_upload(routed_slot_of_route,
+                       flyweight_gpu_upload(routed_slot_of_route,
                            slot_of_route.data(),
                            slot_of_route.size()*sizeof(std::int32_t),
                            runtime.stream)!=0||
-                       colibri_gpu_upload(routed_weights,
+                       flyweight_gpu_upload(routed_weights,
                            routed_route_weights.data(),
                            routed_route_weights.size()*sizeof(float),
                            runtime.stream)!=0)
@@ -2051,7 +2051,7 @@ void qwen_forward_rows(
                     // the streaming path needs disappears with it.
                     stream_quantize(normalized,stream_packed_q8,
                                     stream_packed_scales,hidden_size,rows);
-                    const int block_size=colibri::v2::moe::kMmqBlockSize;
+                    const int block_size=flyweight::v2::moe::kMmqBlockSize;
                     // Tiles are sized so every per-slot buffer below is the
                     // scratch the streaming path already owns.
                     const int tile_blocks=
@@ -2199,7 +2199,7 @@ void qwen_forward_rows(
             }
             // The GEMMs above are the last readers of this span's streamed
             // slice; the next layer's uploads wait on this marker.
-            if(colibri_gpu_event_record(span.consumed_event,runtime.stream)!=0)
+            if(flyweight_gpu_event_record(span.consumed_event,runtime.stream)!=0)
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
             span.gpu_experts=true;
@@ -2220,7 +2220,7 @@ void qwen_forward_rows(
         const bool gpu_table_path=span.gpu_experts;
         const auto output_bytes=
             static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float);
-        if(colibri_gpu_upload(first,output_host,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward expert upload failed");
+        if(flyweight_gpu_upload(first,output_host,output_bytes,runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward expert upload failed");
         runtime.expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-span.pager_started).count();
         if(gpu_table_path){add_rows(fourth,first);add_rows(third,fourth);}
         else add_rows(third,first);
@@ -2245,8 +2245,8 @@ void qwen_forward_rows(
         // aligned.
         const std::uint64_t stream_half=
             runtime.prefill_stream_bytes/2
-            /colibri::v2::workspace::kDeviceAlignment
-            *colibri::v2::workspace::kDeviceAlignment;
+            /flyweight::v2::workspace::kDeviceAlignment
+            *flyweight::v2::workspace::kDeviceAlignment;
         RowsSpan front{0,pipeline_half,hidden,residual,
                        runtime.route_event,
                        runtime.prefill_stream_arena,stream_half,
@@ -2309,7 +2309,7 @@ void qwen_forward_rows(
                         runtime.output_hc_down,runtime.output_hc_up,
                         std::numeric_limits<std::uint64_t>::max());
         else rms_rows(hidden,runtime.device_tensors[runtime.final_norm],normalized);
-        if(colibri_gpu_memset(winners,0,rows*sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward argmax reset failed");
+        if(flyweight_gpu_memset(winners,0,rows*sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward argmax reset failed");
         int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];
         if(runtime.lm_head_type==8||runtime.lm_head_type==30){
             void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&winners),const_cast<int*>(&hidden_size),&vocabulary,&rows};
@@ -2325,7 +2325,7 @@ void qwen_forward_rows(
             // launches. Without it an IQ/K-quant checkpoint served with
             // --mtp-draft failed on the first decoded token.
             const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime.lm_head_type);
-            const char*lm_setting=std::getenv("COLIBRI_IQ2_Q8_DECODE");
+            const char*lm_setting=std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
             const bool lm_q8_enabled=!lm_setting||lm_setting[0]!='0';
             if(lm_q8_kernel&&lm_q8_enabled&&(hidden_size&255)==0){
                 // Same trade the decode path makes: quantize the activation to
@@ -2361,28 +2361,37 @@ void qwen_forward_rows(
             }
         }
         auto*packed=reinterpret_cast<std::uint64_t*>(staging);
-        if(colibri_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
+        if(flyweight_gpu_download(packed,winners,rows*sizeof(std::uint64_t),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native Qwen rows forward output transfer failed");
         for(int row=0;row<rows;++row)output_tokens[row]=0xffffffffu-static_cast<std::uint32_t>(packed[row]);
     }
+    // Every MTP hand-over out of the rows path -- the per-row states the
+    // commit replays over, the last row that seeds the next round's draft, and
+    // the pointer the round driver reads -- is in STREAM space on qwen4exp:
+    // its draft block consumes hc_count*hidden, not the collapsed hidden.
+    // See the MTP section of plans/qwen4exp-semantics.md.
+    const std::uint64_t handover_base=runtime.qwen4exp?hc_streams_base:hidden;
+    const int handover_width=
+        runtime.qwen4exp?static_cast<int>(hc_wide_size):hidden_size;
     if(preserve_mtp_prompt_hidden){
         auto destination=mtp_prompt_hidden+
-            static_cast<std::uint64_t>(hidden_size)*sizeof(float);
-        int elements=rows*hidden_size;
-        void*copy_rows_args[]={&hidden,&destination,&elements};
+            static_cast<std::uint64_t>(handover_width)*sizeof(float);
+        int elements=rows*handover_width;
+        void*copy_rows_args[]={const_cast<std::uint64_t*>(&handover_base),
+                               &destination,&elements};
         launch("qwen_copy_vector",(elements+255)/256,1,256,copy_rows_args);
-        auto last_hidden=hidden+
-            static_cast<std::uint64_t>(rows-1)*hidden_size*sizeof(float);
+        auto last_hidden=handover_base+
+            static_cast<std::uint64_t>(rows-1)*handover_width*sizeof(float);
         auto target_hidden=runtime.state+runtime.mtp_target_hidden_offset;
         void*copy_last_args[]={&last_hidden,&target_hidden,
-                              const_cast<int*>(&hidden_size)};
-        launch("qwen_copy_vector",(hidden_size+255)/256,1,256,copy_last_args);
+                              const_cast<int*>(&handover_width)};
+        launch("qwen_copy_vector",(handover_width+255)/256,1,256,copy_last_args);
         runtime.mtp_has_target_hidden=true;
     }
-    if(final_hidden)*final_hidden=hidden;
+    if(final_hidden)*final_hidden=handover_base;
 }
 
 void qwen_verify_target_rows(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* input_tokens,
     int rows, std::uint32_t* output_tokens, std::uint64_t* final_hidden
 ) {
     if(rows>9)throw std::runtime_error("native MTP verifier batch is unsupported");
@@ -2392,7 +2401,7 @@ void qwen_verify_target_rows(
 // Chunked prompt prefill: advance the recurrent/KV state over a whole chunk
 // of prompt tokens without computing logits for any of them.
 void qwen_prefill_rows(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows
 ) {
     // Gemma 4 has its own layer-synchronous chunk driver (and no MTP), with
     // the same bookkeeping contract as the tail below.

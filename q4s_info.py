@@ -1,4 +1,4 @@
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 from pathlib import Path
 
 m = V2Model(Path(r'C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q4_K_S.gguf'))

@@ -1,6 +1,6 @@
 """What limits the BailingMoE3 expert matmuls during prefill?
 
-The routed experts are 35% of a prompt's time (COLIBRI_BAILING_TILED_PROFILE on
+The routed experts are 35% of a prompt's time (FLYWEIGHT_BAILING_TILED_PROFILE on
 an 8192-token prefill: gate 2.84s + down 2.16s + shared 0.37s of 17.1s), and the
 kernels are already grouped per expert -- one block column per expert, walking
 the rows routed to it. So the question is not "should we group" but what the

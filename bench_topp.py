@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 CONTEXT = 8192

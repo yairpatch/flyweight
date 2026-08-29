@@ -17,7 +17,7 @@
 > IQ1_S/IQ4_NL expert kernels), CUDA-graph re-enable for the arch.
 >
 > **STATUS 2026-08-27**: PHASE 3 (QSA indexer) DONE — the sparse selection is
-> live on all three paths but OPT-IN (`COLIBRI_QSA=1`): measured 7-10% slower
+> live on all three paths but OPT-IN (`FLYWEIGHT_QSA=1`): measured 7-10% slower
 > on decode, and its block-key arena costs 384 MiB per sequence slot at the
 > native 262144 context. Six
 > parity tests green (transformers-exact with pruning active, prefill==decode,
@@ -72,7 +72,7 @@ Decisions made with the user:
 
 Arch-gated `hc_pre`/`hc_post`/`hc_head_collapse` helpers replace the `rms`/`add` bookends at the ~8 call sites per path (decode, rows, multi-seq). New `build_qwen4exp_plan()` beside `build_laguna_plan` (dispatch `:11708`), **preserving qwen positional slots** so `qwen_ffn_base()` needs no new case: slot 0 = `hc_attn_norm`, moe_base = `hc_ffn_norm`, MoE slot list unchanged; everything else (`hc_*_down/up/inject`, indexer tensors, `ple_*`, `output_hc_*`, `per_layer_token_embd`) as named `QwenLayerPlan`/runtime fields (the `router_bias` precedent).
 
-Workspace: don't widen `hidden`; add regions (`colibri_v2_workspace.hpp`, both layouts + contract test): `streams` 4×2560, `hc_wide` 10240, `hc_low` 320, `ple_embed` 2560 (+ rows variants). ~92 KB decode — negligible.
+Workspace: don't widen `hidden`; add regions (`flyweight_v2_workspace.hpp`, both layouts + contract test): `streams` 4×2560, `hc_wide` 10240, `hc_low` 320, `ple_embed` 2560 (+ rows variants). ~92 KB decode — negligible.
 
 CUDA graphs **off for qwen4exp at bring-up** (the old residual `add` is inside `enqueue_delta`'s captured region); re-enable later by moving the hooks inside capture (they're position-invariant).
 
@@ -114,12 +114,12 @@ What shipped:
 - **Kernels** (GPU + generated CPU twins): `qsa_key_store` (ring write + block close), `qsa_block_scores`, and `kv_attention_{scores,values}_{f32,f16,bf16,q8}_indexed` — the ring kernels with `(first+token)%capacity` replaced by `slots[token]`. Indexer queries reuse `qwen_attention_key` unchanged (per-head rms + partial rope is exactly its shape).
 - **Selection** is host-side (`qwen_qsa_select`): one score download per selecting layer, `nth_element` on (score desc, block asc) — deterministic, unlike `torch.topk` on exact ties. CUDA graphs are already off for the arch, so the sync costs no capture.
 - **All three paths hooked.** Maintenance runs from token 0 on every path; selection fires per query above the budget. The rows path leaves the batched tiers (cuBLAS flash / fused chunk) as soon as ANY row in the chunk prunes, since those compute dense attention for every row, and falls to a per-row loop that mixes sparse and dense rows by position.
-- **Gates.** `COLIBRI_QSA=1` **enables it — selection is OFF by default** (it shipped on and was reversed the same day; see the STATUS note). A turbo KV cache keeps the dense fallback (announced once) since those codecs rotate rows. Mixed nonzero compress ratios are refused at prepare.
-- **Tests** (`tests/test_v2_qwen4exp_parity.py`, 6 green): dense-fallback parity vs transformers (unchanged), QSA-active parity vs transformers, prefill(rows)==decode across the pruning onset, CUDA==CPU, interleaved==solo under `--parallel 2`, and QSA-on == QSA-off below the budget. The QSA-active classes set `COLIBRI_QSA=1` in `setUpClass` and restore the previous value in teardown, since selection is no longer the default. The fixture's indexer q/k projections share a base component on purpose — iid noise zeroes every head's relu on ~25% of blocks, and blocks tied at exactly 0.0 make the top-k depend on `torch.topk`'s internal tie order, which nothing can replicate. ctest 21/21, pytest 567 + 897 subtests green.
-  Positive control for the switch: forcing `COLIBRI_QSA=0` makes the QSA-active parity test FAIL (dense above the budget disagrees with the sparse reference), which is what proves the gate test is not comparing a configuration against itself.
+- **Gates.** `FLYWEIGHT_QSA=1` **enables it — selection is OFF by default** (it shipped on and was reversed the same day; see the STATUS note). A turbo KV cache keeps the dense fallback (announced once) since those codecs rotate rows. Mixed nonzero compress ratios are refused at prepare.
+- **Tests** (`tests/test_v2_qwen4exp_parity.py`, 6 green): dense-fallback parity vs transformers (unchanged), QSA-active parity vs transformers, prefill(rows)==decode across the pruning onset, CUDA==CPU, interleaved==solo under `--parallel 2`, and QSA-on == QSA-off below the budget. The QSA-active classes set `FLYWEIGHT_QSA=1` in `setUpClass` and restore the previous value in teardown, since selection is no longer the default. The fixture's indexer q/k projections share a base component on purpose — iid noise zeroes every head's relu on ~25% of blocks, and blocks tied at exactly 0.0 make the top-k depend on `torch.topk`'s internal tie order, which nothing can replicate. ctest 21/21, pytest 567 + 897 subtests green.
+  Positive control for the switch: forcing `FLYWEIGHT_QSA=0` makes the QSA-active parity test FAIL (dense above the budget disagrees with the sparse reference), which is what proves the gate test is not comparing a configuration against itself.
 
 **Review fixes applied the same day** (adversarial pass over the diff):
-- `COLIBRI_QSA` was memoized in a function-local `static`, so the second runtime in a process kept the first one's setting — which made the bit-exactness gate test vacuous. Now resolved per runtime at prepare (`ColibriV2QwenRuntime::qsa_enabled`), like `fused_attention`.
+- `FLYWEIGHT_QSA` was memoized in a function-local `static`, so the second runtime in a process kept the first one's setting — which made the bit-exactness gate test vacuous. Now resolved per runtime at prepare (`FlyweightV2QwenRuntime::qsa_enabled`), like `fused_attention`.
 - The block store is indexed linearly (`position/ratio`), unlike every other position-indexed buffer, which wraps modulo capacity. A prompt longer than the configured context reaches the rows path without a position bound and would have written past the reservation into the next layer's KV slab. `qwen_qsa_in_range` now stops the store at `cache_capacity`.
 - `qsa_ratio` is now the single source of truth for "this layer has QSA state", settled at its one assignment (requires all three indexer scalars) — the arena reserve, snapshot size, snapshot copy and host-spill ranges all key off it alone, so they cannot drift. The rows `qsa_keys` region was gated on the head count while activation was gated on key length/top-k; a file with one and not the other would have overrun it.
 - Windowed layers are excluded structurally: QSA selects in position space and hands those positions to the kernels as cache slots, which only coincides when `capacity == context_limit`. No arch ships both today.
@@ -131,10 +131,10 @@ What shipped:
 
 - `native/src/v2_runtime.cpp` — config parse (:1917-2125), plan builders (:2177+, dispatch :11708), runtime create (:11631+), state arena (:12074-12150), decode (:15308-16500), snapshot (:14106), embedding stager (:3921), multi-seq (:18420+)
 - `native/src/v2_mtp_verifier.inc` — `qwen_forward_rows` (:95), same hc/ple hooks
-- `native/include/colibri_v2_native_kernels.hpp` + `native/src/cpu_native_kernels.cpp` — new kernels + CPU twins; `native/src/gpu_driver.cpp` name registration
-- `native/include/colibri_v2_workspace.hpp`, `colibri_v2_config.hpp`, `colibri_v2_format_dispatch.hpp` (additive only)
+- `native/include/flyweight_v2_native_kernels.hpp` + `native/src/cpu_native_kernels.cpp` — new kernels + CPU twins; `native/src/gpu_driver.cpp` name registration
+- `native/include/flyweight_v2_workspace.hpp`, `flyweight_v2_config.hpp`, `flyweight_v2_format_dispatch.hpp` (additive only)
 - `tests/qwen4exp_gguf_fixture.py`, `tests/test_v2_qwen4exp_parity.py`, `native/tests/qwen4exp_{hc,ple}_contract.cpp`, `native/CMakeLists.txt`
-- Templates/prior art: `tests/dense_gguf_fixture.py`, `tests/test_v2_qwen35_parity.py`, `native/tools/kda_reference.py`, `native/include/colibri_v2_deepseek4.hpp:116-274` (hyper-connection structural precedent)
+- Templates/prior art: `tests/dense_gguf_fixture.py`, `tests/test_v2_qwen35_parity.py`, `native/tools/kda_reference.py`, `native/include/flyweight_v2_deepseek4.hpp:116-274` (hyper-connection structural precedent)
 
 ## Risks (ranked, with mitigations)
 

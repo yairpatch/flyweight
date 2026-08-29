@@ -22,17 +22,17 @@ long context, at negligible quality cost.
 ## Status: Phase 1 (f32 + f16) is CODE-COMPLETE but UNVERIFIED
 
 All edits below are already applied to the working tree (uncommitted, on top of
-`cd0b01e`). The C++ **compiles** (`python -m colibri_next.native_build` reached
-`Built target colibri_v2`). It has NOT been run — nvrtc compiles the CUDA kernels
+`cd0b01e`). The C++ **compiles** (`python -m flyweight.native_build` reached
+`Built target flyweight_v2`). It has NOT been run — nvrtc compiles the CUDA kernels
 at runtime, and the f16-vs-f32 correctness A/B could not be executed (environment
 Bash outage). **Do not trust it until the verification below passes.**
 
 ### What Phase 1 changed
 
-- **KV codec + templated kernels** — `native/include/colibri_v2_qwen_kernels.hpp`:
+- **KV codec + templated kernels** — `native/include/flyweight_v2_qwen_kernels.hpp`:
   added `kv_ld`/`kv_st` overloads (float/`__half`); made `kv_attention_scores`
   (K-type), `kv_attention_values` (V-type), `kv_append` (K×V) templated, emitting
-  `*_f16*` variants. `native/include/colibri_v2_native_kernels.hpp`: same for the
+  `*_f16*` variants. `native/include/flyweight_v2_native_kernels.hpp`: same for the
   fused `kv_attention_prefill` (K×V combos).
 - **Kernel registration** — `native/src/gpu_driver.cpp`: added the new `_f16`
   variant names to the soft (non-fatal) `cuModuleGetFunction` lookup list.
@@ -40,22 +40,22 @@ Bash outage). **Do not trust it until the verification below passes.**
   refactored the state arena from an f32-count accumulator to a **byte cursor**
   (`reserve()` lambda, 16-byte aligned regions) so attention KV sizes per type
   (`kv_k`/`kv_v` = 2 or 4 bytes/elem) while DeltaNet state stays f32.
-- **Options + guards** — `native/include/colibri_v2.h`: `cache_type_k`,
-  `cache_type_v` on `ColibriV2QwenRuntimeOptions`. `v2_runtime.cpp` create:
+- **Options + guards** — `native/include/flyweight_v2.h`: `cache_type_k`,
+  `cache_type_v` on `FlyweightV2QwenRuntimeOptions`. `v2_runtime.cpp` create:
   range-check (0/1), and MTP is guarded to f32-only for now.
 - **Kernel selection helpers** — `v2_runtime.cpp`: `kv_append_kernel` /
   `kv_scores_kernel` / `kv_values_kernel` / `kv_prefill_kernel` chosen by the
   configured type; wired at the main-decode launches and the prefill-rows launches
   in `native/src/v2_mtp_verifier.inc`. (MTP-path launches left on f32 kernels,
   matching the guard.)
-- **Python + CLI** — `src/colibri_next/v2.py` (`_QwenRuntimeOptions` ctypes fields +
+- **Python + CLI** — `src/flyweight/v2.py` (`_QwenRuntimeOptions` ctypes fields +
   `native_qwen_runtime` / `V2QwenRuntime` params, string→enum `{f32:0, f16:1}`);
-  `src/colibri_next/v2_server.py` (`NativeV2InferenceService`); `src/colibri_next/cli.py`
+  `src/flyweight/v2_server.py` (`NativeV2InferenceService`); `src/flyweight/cli.py`
   (`serve-v2 --cache-type-k/--cache-type-v`, default `f16`).
 
 ## Verification (run first, before committing Phase 1)
 
-1. `python -m colibri_next.native_build` — reconfirm the build.
+1. `python -m flyweight.native_build` — reconfirm the build.
 2. **nvrtc + correctness A/B** (`/tmp/kvverify.py`, self-contained): build a runtime
    with `cache_type_k/v="f32"` and another with `"f16"` on the same prompt; assert
    (a) both prepare without an nvrtc compile error, (b) f16 `state_bytes` <  f32
@@ -87,10 +87,10 @@ the C `create` range-check per phase.
 
 ## Critical files
 
-- `native/include/colibri_v2_qwen_kernels.hpp` — codec + scores/values/append kernels
-- `native/include/colibri_v2_native_kernels.hpp` — fused prefill kernel
+- `native/include/flyweight_v2_qwen_kernels.hpp` — codec + scores/values/append kernels
+- `native/include/flyweight_v2_native_kernels.hpp` — fused prefill kernel
 - `native/src/v2_runtime.cpp` — state layout, options/validation, decode launches, helpers
 - `native/src/v2_mtp_verifier.inc` — prefill-rows launches
 - `native/src/gpu_driver.cpp` — kernel name registration
-- `native/include/colibri_v2.h` — options struct
-- `src/colibri_next/v2.py`, `v2_server.py`, `cli.py` — Python/CLI plumbing
+- `native/include/flyweight_v2.h` — options struct
+- `src/flyweight/v2.py`, `v2_server.py`, `cli.py` — Python/CLI plumbing

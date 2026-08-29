@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Error, V2Model
+from flyweight.v2 import V2Error, V2Model
 
 from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 from tests.split_gguf_fixture import split_gguf
@@ -31,7 +31,7 @@ def _workspace(case: unittest.TestCase | None = None) -> Path:
     These fixtures are tens of megabytes and /tmp is usually a RAM-backed
     tmpfs, so leaking one per test run adds up quickly.
     """
-    holder = tempfile.TemporaryDirectory(prefix="colibri-deepseek4-")
+    holder = tempfile.TemporaryDirectory(prefix="flyweight-deepseek4-")
     if case is not None:
         case.addCleanup(holder.cleanup)
     else:

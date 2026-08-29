@@ -19,7 +19,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 from tests import qwen35_hf_fixture as fixture
 
 
@@ -123,16 +123,16 @@ class Qwen35HuggingFaceLoaderTest(unittest.TestCase):
         # estimate of it. Q8_0 rather than the default, so this fails if the
         # option list ever stops varying the policy it is asked about.
         index = [str(option["name"]) for option in options].index("Q8_0")
-        previous = os.environ.get("COLIBRI_HF_QUANT")
-        os.environ["COLIBRI_HF_QUANT"] = "Q8_0"
+        previous = os.environ.get("FLYWEIGHT_HF_QUANT")
+        os.environ["FLYWEIGHT_HF_QUANT"] = "Q8_0"
         try:
             with V2Model(self.path) as model:
                 packed = sum(int(tensor["size"]) for tensor in model.tensors())
         finally:
             if previous is None:
-                os.environ.pop("COLIBRI_HF_QUANT", None)
+                os.environ.pop("FLYWEIGHT_HF_QUANT", None)
             else:
-                os.environ["COLIBRI_HF_QUANT"] = previous
+                os.environ["FLYWEIGHT_HF_QUANT"] = previous
         self.assertEqual(packed, sizes[index])
 
     def test_an_option_reports_the_cache_that_would_serve_it(self) -> None:
@@ -144,15 +144,15 @@ class Qwen35HuggingFaceLoaderTest(unittest.TestCase):
             before = {str(o["name"]): int(o["cache_bytes"])
                       for o in V2Model.hf_quant_options(path)}
             self.assertEqual(set(before.values()), {0})
-            previous = os.environ.get("COLIBRI_HF_QUANT")
-            os.environ["COLIBRI_HF_QUANT"] = "Q5_K"
+            previous = os.environ.get("FLYWEIGHT_HF_QUANT")
+            os.environ["FLYWEIGHT_HF_QUANT"] = "Q5_K"
             try:
                 V2Model(path).close()
             finally:
                 if previous is None:
-                    os.environ.pop("COLIBRI_HF_QUANT", None)
+                    os.environ.pop("FLYWEIGHT_HF_QUANT", None)
                 else:
-                    os.environ["COLIBRI_HF_QUANT"] = previous
+                    os.environ["FLYWEIGHT_HF_QUANT"] = previous
             after = {str(o["name"]): int(o["cache_bytes"])
                      for o in V2Model.hf_quant_options(path)}
         self.assertGreater(after.pop("Q5_K"), 0)

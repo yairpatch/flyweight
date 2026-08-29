@@ -12,7 +12,7 @@ The synthetic checkpoint's random draft block disagrees with the target
 constantly, so every generation here is dense with rejections -- exactly what
 the fold path needs exercised. Both checks would have caught a fold that
 drifts: token parity against the replaced path, and the native bitwise state
-comparison (COLIBRI_MTP_FOLD_CHECK) that re-runs the replay after every fold
+comparison (FLYWEIGHT_MTP_FOLD_CHECK) that re-runs the replay after every fold
 and insists on identical state bytes.
 """
 
@@ -24,7 +24,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 from tests import qwen35_hf_fixture as fixture
 
 PROMPT = [3, 9, 17, 4, 21, 33, 8, 12]
@@ -47,8 +47,8 @@ class Qwen35MtpFoldTest(unittest.TestCase):
         # the adaptive gate makes every decode step a draft-and-verify round
         # instead of spending the whole short generation on calibration.
         environment = {
-            "COLIBRI_HF_QUANT": "F32",
-            "COLIBRI_MTP_ADAPTIVE": "0",
+            "FLYWEIGHT_HF_QUANT": "F32",
+            "FLYWEIGHT_MTP_ADAPTIVE": "0",
             **extra_env,
         }
         with mock.patch.dict(os.environ, environment):
@@ -63,8 +63,8 @@ class Qwen35MtpFoldTest(unittest.TestCase):
                     return tokens, runtime.info
 
     def test_fold_matches_full_replay(self) -> None:
-        replayed, replay_info = self._generate({"COLIBRI_MTP_FOLD": "0"})
-        folded, fold_info = self._generate({"COLIBRI_MTP_FOLD": "1"})
+        replayed, replay_info = self._generate({"FLYWEIGHT_MTP_FOLD": "0"})
+        folded, fold_info = self._generate({"FLYWEIGHT_MTP_FOLD": "1"})
         # A run without rejections would compare the fold against nothing.
         self.assertGreater(int(replay_info["mtp_rejected_tokens"]), 0)
         self.assertGreater(int(fold_info["mtp_rejected_tokens"]), 0)
@@ -73,7 +73,7 @@ class Qwen35MtpFoldTest(unittest.TestCase):
     def test_fold_state_is_bitwise_identical(self) -> None:
         # The native check re-runs the full replay after every fold and throws
         # unless the conv and recurrent state match byte for byte.
-        _, info = self._generate({"COLIBRI_MTP_FOLD_CHECK": "1"})
+        _, info = self._generate({"FLYWEIGHT_MTP_FOLD_CHECK": "1"})
         self.assertGreater(int(info["mtp_rejected_tokens"]), 0)
 
     def test_prefill_checkpoints_survive_mtp(self) -> None:
@@ -83,7 +83,7 @@ class Qwen35MtpFoldTest(unittest.TestCase):
         # tokens. The two never actually conflicted. This pins the fix: with
         # MTP on, a second prompt that diverges from the live tail must still
         # reuse a mid-prefill checkpoint of the shared prefix.
-        environment = {"COLIBRI_HF_QUANT": "F32", "COLIBRI_MTP_ADAPTIVE": "0"}
+        environment = {"FLYWEIGHT_HF_QUANT": "F32", "FLYWEIGHT_MTP_ADAPTIVE": "0"}
         with mock.patch.dict(os.environ, environment):
             V2Model.select_backend("cpu")
             with V2Model(str(self.path)) as model:

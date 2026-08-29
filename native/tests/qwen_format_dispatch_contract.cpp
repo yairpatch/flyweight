@@ -4,13 +4,13 @@
 // family's name, a batch kernel listed without the warp kernel that gates it,
 // or an entry whose grid enum disagrees with its kernel set.
 
-#include "colibri_v2_format_dispatch.hpp"
+#include "flyweight_v2_format_dispatch.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
-namespace v2 = colibri::v2;
+namespace v2 = flyweight::v2;
 
 namespace {
 

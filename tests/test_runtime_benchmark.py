@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from colibri_next.runtime_benchmark import (
+from flyweight.runtime_benchmark import (
     _parser,
     _runtime_options,
     _expand_tokens,
@@ -14,7 +14,7 @@ from colibri_next.runtime_benchmark import (
     compare_baselines,
     measure_runtime_sample,
 )
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 
 class _FakeRuntime:
@@ -236,7 +236,7 @@ class NativePromptBoundaryTests(unittest.TestCase):
             raise unittest.SkipTest("native CUDA runtime is unavailable")
         from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
-        holder = tempfile.TemporaryDirectory(prefix="colibri-bench-boundary-")
+        holder = tempfile.TemporaryDirectory(prefix="flyweight-bench-boundary-")
         self.addCleanup(holder.cleanup)
         directory = Path(holder.name)
         path = directory / "dense.gguf"
@@ -257,10 +257,10 @@ class NativePromptBoundaryTests(unittest.TestCase):
             ),
         )
         model = V2Model(path)
-        with patch.dict("os.environ", {"COLIBRI_PREFILL_ROWS": "1"}):
+        with patch.dict("os.environ", {"FLYWEIGHT_PREFILL_ROWS": "1"}):
             serial = model.native_runtime(context_limit=256)
             serial.prepare()
-        with patch.dict("os.environ", {"COLIBRI_PREFILL_ROWS": "64"}):
+        with patch.dict("os.environ", {"FLYWEIGHT_PREFILL_ROWS": "64"}):
             chunked = model.native_runtime(context_limit=256)
             chunked.prepare()
         try:

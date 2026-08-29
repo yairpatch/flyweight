@@ -9,8 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.cli import main as cli_main
-from colibri_next.v2 import V2Error, V2Model
+from flyweight.cli import main as cli_main
+from flyweight.v2 import V2Error, V2Model
 from tests import hf_safetensors_fixture as fixture
 from tests.dense_gguf_fixture import build_dense_qwen35_gguf
 
@@ -50,13 +50,13 @@ class ImatrixPackingTests(unittest.TestCase):
         self.cache.mkdir()
         self._saved = {
             name: os.environ.get(name)
-            for name in ("COLIBRI_HF_QUANT", "COLIBRI_HF_CACHE",
-                         "COLIBRI_HF_IMATRIX")
+            for name in ("FLYWEIGHT_HF_QUANT", "FLYWEIGHT_HF_CACHE",
+                         "FLYWEIGHT_HF_IMATRIX")
         }
         self.addCleanup(self._restore)
-        os.environ["COLIBRI_HF_QUANT"] = "IQ3_XXS"
-        os.environ["COLIBRI_HF_CACHE"] = str(self.cache)
-        os.environ.pop("COLIBRI_HF_IMATRIX", None)
+        os.environ["FLYWEIGHT_HF_QUANT"] = "IQ3_XXS"
+        os.environ["FLYWEIGHT_HF_CACHE"] = str(self.cache)
+        os.environ.pop("FLYWEIGHT_HF_IMATRIX", None)
 
     def _restore(self) -> None:
         for name, value in self._saved.items():
@@ -70,7 +70,7 @@ class ImatrixPackingTests(unittest.TestCase):
             pass
 
     def cache_files(self) -> list[Path]:
-        return sorted(self.cache.glob("colibri-*.cache"))
+        return sorted(self.cache.glob("flyweight-*.cache"))
 
     def spiky_matrix(self) -> dict[str, list[float]]:
         # Strongly nonuniform importance: one hot channel per eight flips the
@@ -100,7 +100,7 @@ class ImatrixPackingTests(unittest.TestCase):
     def test_iq4_xs_reads_the_matrix_too(self) -> None:
         # The second target whose search is importance-weighted; the same
         # spiky matrix must move its bytes the same way.
-        os.environ["COLIBRI_HF_QUANT"] = "IQ4_XS"
+        os.environ["FLYWEIGHT_HF_QUANT"] = "IQ4_XS"
         self.open_once()
         baseline = self.cache_files()
         with V2Model(self.checkpoint) as model:
@@ -117,7 +117,7 @@ class ImatrixPackingTests(unittest.TestCase):
         # The 2.31-bit codebook has nothing to say about which channels can
         # afford to be wrong without calibration data; refusing beats packing
         # a worse-than-Q2_K checkpoint silently. The menu says so too.
-        os.environ["COLIBRI_HF_QUANT"] = "IQ2_XS"
+        os.environ["FLYWEIGHT_HF_QUANT"] = "IQ2_XS"
         with self.assertRaisesRegex(V2Error, "importance matrix"):
             self.open_once()
         options = {
@@ -140,7 +140,7 @@ class ImatrixPackingTests(unittest.TestCase):
     def test_off_restores_the_unweighted_fingerprint(self) -> None:
         self.open_once()
         write_imatrix(self.checkpoint / "imatrix.dat", self.spiky_matrix())
-        os.environ["COLIBRI_HF_IMATRIX"] = "off"
+        os.environ["FLYWEIGHT_HF_IMATRIX"] = "off"
         self.open_once()
         # The second open hit the first cache rather than packing a new one.
         self.assertEqual(len(self.cache_files()), 1)
@@ -158,7 +158,7 @@ class ImatrixPackingTests(unittest.TestCase):
         self.assertEqual(arena(baseline[0]), arena(weighted[0]))
 
     def test_targets_that_read_no_matrix_keep_their_fingerprint(self) -> None:
-        os.environ["COLIBRI_HF_QUANT"] = "Q6_K"
+        os.environ["FLYWEIGHT_HF_QUANT"] = "Q6_K"
         self.open_once()
         write_imatrix(self.checkpoint / "imatrix.dat", self.spiky_matrix())
         self.open_once()
@@ -167,7 +167,7 @@ class ImatrixPackingTests(unittest.TestCase):
         self.assertEqual(len(self.cache_files()), 1)
 
     def test_a_configured_missing_path_is_an_error(self) -> None:
-        os.environ["COLIBRI_HF_IMATRIX"] = str(
+        os.environ["FLYWEIGHT_HF_IMATRIX"] = str(
             Path(self._directory.name) / "absent.dat")
         with self.assertRaises(V2Error):
             self.open_once()
@@ -213,7 +213,7 @@ class ImatrixCollectionTests(unittest.TestCase):
         self.root = Path(self._directory.name)
         self._saved = {
             name: os.environ.get(name)
-            for name in ("COLIBRI_IMATRIX", "COLIBRI_PREFILL_EXPERT_STREAM_MIB")
+            for name in ("FLYWEIGHT_IMATRIX", "FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB")
         }
         self.addCleanup(self._restore)
         V2Model.select_backend("cpu")

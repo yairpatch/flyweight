@@ -211,12 +211,21 @@ def build_qwen4exp_gguf(
     seed: int = 9,
     *,
     mute_mixer: bool = False,
+    mtp: bool = False,
 ) -> Qwen4ExpSpec:
     """Write the fixture.
 
     ``mute_mixer`` zeroes the attention and DeltaNet output projections so each
     block contributes only its feed-forward through the gated residual --
     the same attribution trick the dense fixture uses.
+
+    ``mtp`` appends the nextn draft block at index ``spec.layers`` and reports
+    ``block_count = spec.layers + 1``, matching the release Q4_K_XL layout
+    (the UD-IQ1_S carries no draft block at all). See the MTP section of
+    plans/qwen4exp-semantics.md: the draft block is always FULL ATTENTION
+    regardless of what ``attention_every`` would say for its index, it carries
+    indexer tensors that go unused because the draft runs dense, and it has no
+    PLE.
     """
     spec = spec or Qwen4ExpSpec()
     rng = np.random.default_rng(seed)
@@ -264,11 +273,14 @@ def build_qwen4exp_gguf(
         table.astype(np.float32),
     ))
 
-    for layer in range(spec.layers):
+    for layer in range(spec.layers + (1 if mtp else 0)):
         prefix = f"blk.{layer}."
+        # The draft block sits one past the executed stack and is full
+        # attention whatever the interval pattern says for its index.
+        draft = mtp and layer == spec.layers
         hyper_connection(prefix, "attn")
         hyper_connection(prefix, "ffn")
-        if spec.is_attention(layer):
+        if draft or spec.is_attention(layer):
             projection(prefix + "attn_q.weight", spec.hidden, spec.heads * spec.head_dim * 2)
             projection(prefix + "attn_k.weight", spec.hidden, spec.kv_heads * spec.head_dim)
             projection(prefix + "attn_v.weight", spec.hidden, spec.kv_heads * spec.head_dim)
@@ -309,7 +321,7 @@ def build_qwen4exp_gguf(
                 -np.exp(rng.standard_normal(spec.value_heads) * 0.2).astype(np.float32),
             ))
             vector(prefix + "ssm_norm.weight", spec.ssm_head_dim, value=1.0)
-        if layer in spec.ple_layers:
+        if not draft and layer in spec.ple_layers:
             conv1d(prefix + "ple_conv1d.weight", spec.wide, spec.ple_conv_kernel, scale=0.2)
             projection(prefix + "ple_key.weight", spec.hidden, spec.wide, scale=0.2)
             projection(prefix + "ple_value.weight", spec.hidden, spec.hidden, scale=0.2)
@@ -330,6 +342,13 @@ def build_qwen4exp_gguf(
                 rng.standard_normal((spec.experts, outputs, inputs)) * 0.25
             ).astype(np.float32)
             tensors.append((prefix + name, (inputs, outputs, spec.experts), data))
+        if draft:
+            # hnorm spans the whole stream row (hc*hidden); enorm is one hidden
+            # vector broadcast across the streams; eh_proj is [2*hidden ->
+            # hidden] applied per stream, embedding half first.
+            projection(prefix + "nextn.eh_proj.weight", 2 * spec.hidden, spec.hidden)
+            vector(prefix + "nextn.enorm.weight", spec.hidden, value=1.0)
+            vector(prefix + "nextn.hnorm.weight", spec.wide, value=1.0)
 
     compress = [
         4 if spec.is_attention(layer) else 0 for layer in range(spec.layers)
@@ -337,7 +356,9 @@ def build_qwen4exp_gguf(
     metadata = [
         _kv("general.architecture", GGUF_STRING, _string("qwen4exp")),
         _kv("general.name", GGUF_STRING, _string("qwen4exp-fixture")),
-        _kv("qwen4exp.block_count", GGUF_UINT32, struct.pack("<I", spec.layers)),
+        # Like the release files, block_count INCLUDES the draft block.
+        _kv("qwen4exp.block_count", GGUF_UINT32,
+            struct.pack("<I", spec.layers + (1 if mtp else 0))),
         _kv("qwen4exp.embedding_length", GGUF_UINT32, struct.pack("<I", spec.hidden)),
         _kv("qwen4exp.context_length", GGUF_UINT32, struct.pack("<I", 512)),
         _kv("qwen4exp.attention.head_count", GGUF_UINT32, struct.pack("<I", spec.heads)),
@@ -381,6 +402,13 @@ def build_qwen4exp_gguf(
         _kv("tokenizer.ggml.vocab_size", GGUF_UINT32, struct.pack("<I", spec.vocabulary)),
         _kv("general.alignment", GGUF_UINT32, struct.pack("<I", ALIGNMENT)),
     ]
+    if mtp:
+        # The release MTP files carry this; nothing in the runtime reads it yet
+        # (the draft block is found by tensor name), but the fixture should not
+        # be the only qwen4exp GGUF in the world that omits it.
+        metadata.append(
+            _kv("qwen4exp.nextn_predict_layers", GGUF_UINT32, struct.pack("<I", 1))
+        )
 
     infos = bytearray()
     payloads = bytearray()

@@ -1,7 +1,7 @@
 """Dump real KV caches and score TurboQuant bit widths against them.
 
 Fills the cache with a real prompt, dumps each attention layer's live window
-via ColibriV2QwenRuntime.dump_kv, then runs native/tools/bench_turboquant over
+via FlyweightV2QwenRuntime.dump_kv, then runs native/tools/bench_turboquant over
 each dump. What matters in the output is the K/V norm ratio (which decides
 whether keys need a wider allocation than values) and the score/output error
 per bit width.
@@ -12,14 +12,14 @@ which carry recurrent state and no KV cache at all, so those are skipped.
 Run:
     PYTHONPATH=src python3 bench_kv_dump.py
 Env knobs:
-    COLIBRI_MODEL      GGUF path (default Qwen3.6-35B-A3B-UD-Q5_K_M.gguf)
-    COLIBRI_MOE_DEVICE gpu|cpu|hybrid (default hybrid)
-    COLIBRI_GPU_CACHE_MIB  total GPU budget in MiB (default 8192)
-    COLIBRI_CONTEXT    context window (default 4096)
-    COLIBRI_CACHE_TYPE f32|f16|bf16|q8_0 (default f16, the runtime default)
-    COLIBRI_PROMPT_TOKENS  how much cache to fill (default 1024)
-    COLIBRI_KV_LAYERS  comma list of layers to dump (default: first 3 found)
-    COLIBRI_KV_BENCH   path to the bench_turboquant binary
+    FLYWEIGHT_MODEL      GGUF path (default Qwen3.6-35B-A3B-UD-Q5_K_M.gguf)
+    FLYWEIGHT_MOE_DEVICE gpu|cpu|hybrid (default hybrid)
+    FLYWEIGHT_GPU_CACHE_MIB  total GPU budget in MiB (default 8192)
+    FLYWEIGHT_CONTEXT    context window (default 4096)
+    FLYWEIGHT_CACHE_TYPE f32|f16|bf16|q8_0 (default f16, the runtime default)
+    FLYWEIGHT_PROMPT_TOKENS  how much cache to fill (default 1024)
+    FLYWEIGHT_KV_LAYERS  comma list of layers to dump (default: first 3 found)
+    FLYWEIGHT_KV_BENCH   path to the bench_turboquant binary
 """
 
 from __future__ import annotations
@@ -31,18 +31,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-from colibri_next.v2 import V2Model, V2Error
+from flyweight.v2 import V2Model, V2Error
 
 MODEL = os.environ.get(
-    "COLIBRI_MODEL",
+    "FLYWEIGHT_MODEL",
     "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf",
 )
-MOE_DEVICE = os.environ.get("COLIBRI_MOE_DEVICE", "hybrid")
-GPU_CACHE_MIB = int(os.environ.get("COLIBRI_GPU_CACHE_MIB", "8192"))
-CONTEXT = int(os.environ.get("COLIBRI_CONTEXT", "4096"))
-CACHE_TYPE = os.environ.get("COLIBRI_CACHE_TYPE", "f16")
-PROMPT_TOKENS = int(os.environ.get("COLIBRI_PROMPT_TOKENS", "1024"))
-LAYERS = [int(x) for x in os.environ.get("COLIBRI_KV_LAYERS", "").split(",") if x]
+MOE_DEVICE = os.environ.get("FLYWEIGHT_MOE_DEVICE", "hybrid")
+GPU_CACHE_MIB = int(os.environ.get("FLYWEIGHT_GPU_CACHE_MIB", "8192"))
+CONTEXT = int(os.environ.get("FLYWEIGHT_CONTEXT", "4096"))
+CACHE_TYPE = os.environ.get("FLYWEIGHT_CACHE_TYPE", "f16")
+PROMPT_TOKENS = int(os.environ.get("FLYWEIGHT_PROMPT_TOKENS", "1024"))
+LAYERS = [int(x) for x in os.environ.get("FLYWEIGHT_KV_LAYERS", "").split(",") if x]
 BASELINE_BITS = {"f32": "32", "f16": "16", "bf16": "16", "q8_0": "8.5"}
 
 SENTENCE = (
@@ -52,13 +52,13 @@ SENTENCE = (
 
 
 def find_bench() -> str | None:
-    override = os.environ.get("COLIBRI_KV_BENCH")
+    override = os.environ.get("FLYWEIGHT_KV_BENCH")
     if override:
         return override if Path(override).exists() else None
-    found = shutil.which("colibri_turboquant_bench")
+    found = shutil.which("flyweight_turboquant_bench")
     if found:
         return found
-    for candidate in Path(__file__).parent.rglob("colibri_turboquant_bench"):
+    for candidate in Path(__file__).parent.rglob("flyweight_turboquant_bench"):
         if candidate.is_file():
             return str(candidate)
     return None
@@ -68,9 +68,9 @@ def main() -> int:
     bench = find_bench()
     if bench is None:
         print(
-            "colibri_turboquant_bench not found. Build it with:\n"
+            "flyweight_turboquant_bench not found. Build it with:\n"
             "  cmake -S native -B build/native -DCMAKE_BUILD_TYPE=Release\n"
-            "  cmake --build build/native --target colibri_turboquant_bench",
+            "  cmake --build build/native --target flyweight_turboquant_bench",
             file=sys.stderr,
         )
         return 1
@@ -116,7 +116,7 @@ def main() -> int:
             flush=True,
         )
 
-        with tempfile.TemporaryDirectory(prefix="colibri-kv-") as work:
+        with tempfile.TemporaryDirectory(prefix="flyweight-kv-") as work:
             wanted = LAYERS if LAYERS else list(range(total))
             dumped = 0
             for layer in wanted:

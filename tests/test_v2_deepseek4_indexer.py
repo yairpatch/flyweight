@@ -26,7 +26,7 @@ import unittest
 
 import numpy as np
 
-from colibri_next.deepseek4 import indexer_scores, top_k_select
+from flyweight.deepseek4 import indexer_scores, top_k_select
 
 
 def reference_scores(queries, keys, weights):

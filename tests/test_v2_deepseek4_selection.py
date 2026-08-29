@@ -26,8 +26,8 @@ from pathlib import Path
 
 import numpy as np
 
-from colibri_next.deepseek4 import Deepseek4Runtime
-from colibri_next.v2 import V2Model
+from flyweight.deepseek4 import Deepseek4Runtime
+from flyweight.v2 import V2Model
 from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
@@ -49,7 +49,7 @@ def fixture(directory: str, **spec) -> Path:
 
 class SelectionTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="colibri-ds4sel-")
+        self.directory = tempfile.TemporaryDirectory(prefix="flyweight-ds4sel-")
         self.addCleanup(self.directory.cleanup)
 
     def open(self, **spec) -> V2Model:

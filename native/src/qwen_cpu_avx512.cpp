@@ -1130,7 +1130,7 @@ void q8_dequant(const std::uint8_t* row_data, float* output, int elements) {
 }
 
 // f16 and bf16 rows: sixteen weights per convert, scalar tails so any row
-// length is admissible (simd_dot_granule in colibri_v2_bailing.hpp relies on
+// length is admissible (simd_dot_granule in flyweight_v2_bailing.hpp relies on
 // that). The multi-input variants decode each weight vector once and apply it
 // to all N activations, same as the quantized quad/oct kernels.
 inline __m512 f16_sixteen(const std::uint8_t* pointer) {

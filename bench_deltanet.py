@@ -33,9 +33,9 @@ CHUNK, DIM, TILE = 64, 128, 32
 #   Qwen3.6-35B-A3B  (MoE):   32 value / 16 key / 128
 # head_dim is 128 in both, which is what these kernels require.
 GEOMETRY = {"dense-27b": (16, 48), "moe-35b-a3b": (16, 32)}
-KEY_HEADS, VALUE_HEADS = GEOMETRY[os.environ.get("COLIBRI_GEOMETRY", "dense-27b")]
+KEY_HEADS, VALUE_HEADS = GEOMETRY[os.environ.get("FLYWEIGHT_GEOMETRY", "dense-27b")]
 EPSILON = 1e-6
-# Once the kernels are embedded in colibri_v2_native_kernels.hpp the corpus
+# Once the kernels are embedded in flyweight_v2_native_kernels.hpp the corpus
 # already defines them; appending the prototype again would be a redefinition.
 _PROTOTYPE_PATH = Path(__file__).parent / "native" / "tools" / "deltanet_chunked.cu"
 PROTOTYPE = ("" if "qwen_delta_wy_scores" in kh.source()
@@ -81,7 +81,7 @@ def allocate(rows, value_heads):
             zeros((rows, value_heads, DIM)), zeros((rows, value_heads * DIM)))
 
 
-CHECKPOINT = os.environ.get("COLIBRI_MODEL")
+CHECKPOINT = os.environ.get("FLYWEIGHT_MODEL")
 
 
 def report(rows, seed=7):
@@ -159,7 +159,7 @@ def report(rows, seed=7):
 
 
 def replay(directory):
-    """Re-run both kernels on activations dumped by COLIBRI_DELTA_DUMP.
+    """Re-run both kernels on activations dumped by FLYWEIGHT_DELTA_DUMP.
 
     The synthetic inputs are Gaussian; real projections are not, so this is the
     check that the chunked form holds on the distribution it will actually see.
@@ -216,7 +216,7 @@ def replay(directory):
 
 
 def main() -> int:
-    dump = os.environ.get("COLIBRI_DELTA_DUMP")
+    dump = os.environ.get("FLYWEIGHT_DELTA_DUMP")
     if dump:
         return replay(dump)
     row_counts = [int(a) for a in sys.argv[1:]] or [64, 200, 512, 1024, 2048]

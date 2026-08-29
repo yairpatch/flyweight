@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace colibri::unicode {
+namespace flyweight::unicode {
 
 enum Category : std::uint16_t {
     kUndefined  = 0x0001,
@@ -2327,4 +2327,4 @@ inline bool is_whitespace(std::uint32_t codepoint) {
     return std::binary_search(std::begin(kWhitespace), std::end(kWhitespace), codepoint);
 }
 
-}  // namespace colibri::unicode
+}  // namespace flyweight::unicode

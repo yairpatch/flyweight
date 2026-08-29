@@ -68,7 +68,7 @@ def main(source: str) -> int:
         "#include <algorithm>",
         "#include <cstdint>",
         "",
-        "namespace colibri::unicode {",
+        "namespace flyweight::unicode {",
         "",
         "enum Category : std::uint16_t {",
         "    kUndefined  = 0x0001,",
@@ -117,7 +117,7 @@ def main(source: str) -> int:
             "    return std::binary_search(std::begin(kWhitespace), std::end(kWhitespace), codepoint);",
             "}",
             "",
-            "}  // namespace colibri::unicode",
+            "}  // namespace flyweight::unicode",
             "",
         ]
     )

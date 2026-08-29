@@ -1,9 +1,9 @@
-#include "colibri_v2_workspace.hpp"
+#include "flyweight_v2_workspace.hpp"
 
 #include <array>
 #include <cstdint>
 
-namespace ws = colibri::v2::workspace;
+namespace ws = flyweight::v2::workspace;
 
 template <std::size_t N>
 bool valid_regions(

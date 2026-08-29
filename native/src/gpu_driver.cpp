@@ -5,10 +5,10 @@
 // uses) and launches on the legacy default stream, so device pointers taken
 // from CuPy arrays are valid here and ordering with CuPy-issued work is
 // automatic.
-#include "colibri_gpu_driver.h"
+#include "flyweight_gpu_driver.h"
 
-#include <colibri_backend.hpp>
-#include <colibri_cpu_backend.hpp>
+#include <flyweight_backend.hpp>
+#include <flyweight_cpu_backend.hpp>
 
 #include <cmath>
 #include <chrono>
@@ -86,6 +86,7 @@ struct CudaApi {
     CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
     CUresult (*cuMemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream) = nullptr;
     CUresult (*cuMemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream) = nullptr;
+    CUresult (*cuMemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream) = nullptr;
     CUresult (*cuMemAlloc)(CUdeviceptr*, size_t) = nullptr;
     CUresult (*cuMemFree)(CUdeviceptr) = nullptr;
     CUresult (*cuMemHostAlloc)(void**, size_t, unsigned int) = nullptr;
@@ -337,6 +338,7 @@ bool load_apis() {
     ok &= load_symbol(cuda, "cuMemcpyHtoD_v2", g_api.cuMemcpyHtoD);
     ok &= load_symbol(cuda, "cuMemcpyDtoHAsync_v2", g_api.cuMemcpyDtoHAsync);
     ok &= load_symbol(cuda, "cuMemcpyHtoDAsync_v2", g_api.cuMemcpyHtoDAsync);
+    ok &= load_symbol(cuda, "cuMemcpyDtoDAsync_v2", g_api.cuMemcpyDtoDAsync);
     ok &= load_symbol(cuda, "cuMemAlloc_v2", g_api.cuMemAlloc);
     ok &= load_symbol(cuda, "cuMemFree_v2", g_api.cuMemFree);
     ok &= load_symbol(cuda, "cuMemHostAlloc", g_api.cuMemHostAlloc);
@@ -501,14 +503,14 @@ bool load_cublas_lt() {
     return true;
 }
 
-// Phase profiling under COLIBRI_SEG_DEBUG: 0=start 1=mixer 2=route 3=copies
+// Phase profiling under FLYWEIGHT_SEG_DEBUG: 0=start 1=mixer 2=route 3=copies
 // 4=experts 5=writeback.
 double g_phase_totals[6] = {};
 std::chrono::steady_clock::time_point g_phase_last{};
 
 void phase_mark(int phase) {
     static const bool enabled =
-        std::getenv("COLIBRI_SEG_DEBUG") != nullptr;
+        std::getenv("FLYWEIGHT_SEG_DEBUG") != nullptr;
     if (!enabled) {
         return;
     }
@@ -532,11 +534,11 @@ int launch(
     // Every wrapper in this file bottoms out here, so recognizing a CPU
     // sentinel is all it takes for the host backend to inherit the whole set --
     // including the hand-tuned grid geometry each wrapper computes.
-    if (colibri::is_cpu_function(function)) {
-        const char* name = colibri_cpu_kernel_name(
-            colibri::cpu_function_index(function));
+    if (flyweight::is_cpu_function(function)) {
+        const char* name = flyweight_cpu_kernel_name(
+            flyweight::cpu_function_index(function));
         if (name == nullptr) return -1;
-        return colibri_cpu_launch_named(
+        return flyweight_cpu_launch_named(
             name, grid_x, grid_y, block_x, shared_bytes,
             reinterpret_cast<std::uint64_t>(stream), args);
     }
@@ -552,8 +554,8 @@ int launch(
 // the given stream. Every pointer is static per layer, which is what makes
 // the sequence graph-capturable.
 int enqueue_layer(
-    const ColibriDeltaParams* params,
-    const ColibriDeltaLayer& layer,
+    const FlyweightDeltaParams* params,
+    const FlyweightDeltaLayer& layer,
     CUstream stream
 ) {
     std::int32_t hidden_size = params->hidden_size;
@@ -717,15 +719,15 @@ int enqueue_layer(
 
 }  // namespace
 
-extern "C" int colibri_gpu_available() {
-    if (colibri_backend_is_cpu()) return colibri_cpu_backend_available();
+extern "C" int flyweight_gpu_available() {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_backend_available();
     return load_apis() ? 1 : 0;
 }
 
-extern "C" int colibri_gpu_init(std::int32_t device) {
+extern "C" int flyweight_gpu_init(std::int32_t device) {
     // No driver to load and no context to retain; the host backend is ready as
     // soon as it is selected.
-    if (colibri_backend_is_cpu()) return 0;
+    if (flyweight_backend_is_cpu()) return 0;
     if (!load_apis()) {
         return -1;
     }
@@ -739,7 +741,7 @@ extern "C" int colibri_gpu_init(std::int32_t device) {
     // preserves the same ordering while putting the waiting thread to sleep.
     // Keep an opt-out for latency-sensitive systems with independent cooling.
     constexpr unsigned int kCtxSchedBlockingSync = 0x04;
-    const char* spin_wait = std::getenv("COLIBRI_CUDA_SPIN_WAIT");
+    const char* spin_wait = std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT");
     const bool blocking_sync = !spin_wait || spin_wait[0] != '1';
     if (blocking_sync && g_api.cuDevicePrimaryCtxSetFlags != nullptr) {
         // This can report PRIMARY_CONTEXT_ACTIVE when another CUDA consumer
@@ -800,7 +802,7 @@ const Entry kNamedKernels[] = {
     {"nvfp4_grouped_accumulate_tiled", &g_kernels.nvfp4_grouped_accumulate_tiled},
 };
 
-extern "C" int colibri_gpu_compile(
+extern "C" int flyweight_gpu_compile(
     const char* source,
     const char* const* options,
     std::int32_t option_count,
@@ -811,15 +813,15 @@ extern "C" int colibri_gpu_compile(
     // CPU mode has no source to compile: the host kernels were compiled into
     // this library. Publishing sentinel handles under the same names is what
     // makes every wrapper below work unchanged.
-    if (colibri_backend_is_cpu()) {
+    if (flyweight_backend_is_cpu()) {
         g_functions.clear();
-        const int total = colibri_cpu_backend_kernel_count();
+        const int total = flyweight_cpu_backend_kernel_count();
         for (int index = 0; index < total; ++index) {
-            const char* name = colibri_cpu_kernel_name(
+            const char* name = flyweight_cpu_kernel_name(
                 static_cast<std::uint64_t>(index));
             if (name == nullptr) continue;
             g_functions[name] = reinterpret_cast<CUfunction>(
-                colibri::make_cpu_function(static_cast<std::uint64_t>(index)));
+                flyweight::make_cpu_function(static_cast<std::uint64_t>(index)));
         }
         for (const Entry& entry : kNamedKernels) {
             const auto found = g_functions.find(entry.name);
@@ -906,7 +908,7 @@ extern "C" int colibri_gpu_compile(
     } else {
         nvrtcProgram program = nullptr;
         if (g_api.nvrtcCreateProgram(
-                &program, source, "colibri_kernels.cu", 0, nullptr, nullptr
+                &program, source, "flyweight_kernels.cu", 0, nullptr, nullptr
             ) != 0) {
             return -2;
         }
@@ -1219,7 +1221,7 @@ extern "C" int colibri_gpu_compile(
     return 0;
 }
 
-extern "C" int colibri_gpu_rms_norm(
+extern "C" int flyweight_gpu_rms_norm(
     std::uint64_t input,
     std::uint64_t weights,
     std::uint64_t output,
@@ -1239,7 +1241,7 @@ extern "C" int colibri_gpu_rms_norm(
     return 0;
 }
 
-extern "C" int colibri_gpu_q4_matvec(
+extern "C" int flyweight_gpu_q4_matvec(
     std::uint64_t packed,
     std::uint64_t scales,
     std::uint64_t input,
@@ -1264,7 +1266,7 @@ extern "C" int colibri_gpu_q4_matvec(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_scaled_add(
+extern "C" int flyweight_gpu_scaled_add(
     std::uint64_t target,
     std::uint64_t source,
     float scale,
@@ -1283,7 +1285,7 @@ extern "C" int colibri_gpu_scaled_add(
         == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_attention(
+extern "C" int flyweight_gpu_attention(
     std::uint64_t query,
     std::uint64_t keys,
     std::uint64_t values,
@@ -1310,7 +1312,7 @@ extern "C" int colibri_gpu_attention(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_attention_cache(
+extern "C" int flyweight_gpu_attention_cache(
     std::uint64_t query, std::uint64_t keys, std::uint64_t values,
     std::uint64_t output, std::int32_t heads, std::int32_t kv_heads,
     std::int32_t head_dim, std::int32_t tokens, std::int32_t capacity,
@@ -1326,7 +1328,7 @@ extern "C" int colibri_gpu_attention_cache(
                   kThreadsPerBlock, args) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_kv_append(
+extern "C" int flyweight_gpu_kv_append(
     std::uint64_t current_keys, std::uint64_t current_values,
     std::uint64_t cache_keys, std::uint64_t cache_values,
     std::int32_t kv_heads, std::int32_t head_dim,
@@ -1344,7 +1346,7 @@ extern "C" int colibri_gpu_kv_append(
                   kThreadsPerBlock, args) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_q4_moe(
+extern "C" int flyweight_gpu_q4_moe(
     std::uint64_t gate_up_packed,
     std::uint64_t gate_up_scales,
     std::uint64_t down_packed,
@@ -1394,8 +1396,8 @@ extern "C" int colibri_gpu_q4_moe(
     return 0;
 }
 
-extern "C" int colibri_gpu_sync() {
-    if (colibri_backend_is_cpu()) return colibri_cpu_sync();
+extern "C" int flyweight_gpu_sync() {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_sync();
 
     if (!g_api.loaded) {
         return -1;
@@ -1403,8 +1405,8 @@ extern "C" int colibri_gpu_sync() {
     return g_api.cuStreamSynchronize(nullptr) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_alloc(bytes, pointer);
+extern "C" int flyweight_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_alloc(bytes, pointer);
 
     if (g_context == nullptr || pointer == nullptr || bytes == 0
         || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
@@ -1414,24 +1416,24 @@ extern "C" int colibri_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
     return 0;
 }
 
-extern "C" int colibri_gpu_free(std::uint64_t pointer) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_free(pointer);
+extern "C" int flyweight_gpu_free(std::uint64_t pointer) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_free(pointer);
 
     if (pointer == 0) return 0;
     if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
     return g_api.cuMemFree(static_cast<CUdeviceptr>(pointer)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_host_alloc(std::uint64_t bytes, void** pointer) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_host_alloc(bytes, pointer);
+extern "C" int flyweight_gpu_host_alloc(std::uint64_t bytes, void** pointer) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_host_alloc(bytes, pointer);
 
     if (pointer == nullptr || bytes == 0) return -1;
     return g_api.cuMemHostAlloc(pointer, static_cast<size_t>(bytes), 0) == 0
         ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_host_free(void* pointer) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_host_free(pointer);
+extern "C" int flyweight_gpu_host_free(void* pointer) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_host_free(pointer);
 
     if (pointer == nullptr) return 0;
     return g_api.cuMemFreeHost(pointer) == 0 ? 0 : -1;
@@ -1440,13 +1442,13 @@ extern "C" int colibri_gpu_host_free(void* pointer) {
 // Page-lock an existing host range (e.g. the model mmap) so cuMemcpyHtoDAsync
 // DMAs straight from it with no CPU staging copy. Read-only file mappings need
 // the READ_ONLY flag; fall back to portable/plain for older drivers.
-extern "C" int colibri_gpu_host_register(const void* pointer, std::uint64_t bytes) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_host_register(pointer, bytes);
+extern "C" int flyweight_gpu_host_register(const void* pointer, std::uint64_t bytes) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_host_register(pointer, bytes);
 
     if (pointer == nullptr || bytes == 0) return -1;
     if (g_api.cuMemHostRegister == nullptr) return -3;
     // Bind the primary context like every other entry point here does. Without
-    // this the call works only on the thread that ran colibri_gpu_init, which
+    // this the call works only on the thread that ran flyweight_gpu_init, which
     // made background registration (a worker pinning expert tensors while the
     // main thread decodes) fail with INVALID_CONTEXT.
     if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
@@ -1459,8 +1461,8 @@ extern "C" int colibri_gpu_host_register(const void* pointer, std::uint64_t byte
     return -2;
 }
 
-extern "C" int colibri_gpu_host_unregister(const void* pointer) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_host_unregister(pointer);
+extern "C" int flyweight_gpu_host_unregister(const void* pointer) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_host_unregister(pointer);
 
     if (pointer == nullptr) return 0;
     if (g_api.cuMemHostUnregister == nullptr) return -3;
@@ -1468,11 +1470,11 @@ extern "C" int colibri_gpu_host_unregister(const void* pointer) {
     return g_api.cuMemHostUnregister(const_cast<void*>(pointer)) == 0 ? 0 : -1;
 }
 
-extern "C" int colibri_gpu_upload(
+extern "C" int flyweight_gpu_upload(
     std::uint64_t destination, const void* source, std::uint64_t bytes,
     std::uint64_t stream
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_upload(destination, source, bytes, stream);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_upload(destination, source, bytes, stream);
 
     if (destination == 0 || source == nullptr || bytes == 0) return -1;
     return g_api.cuMemcpyHtoDAsync(
@@ -1481,10 +1483,10 @@ extern "C" int colibri_gpu_upload(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_upload_sync(
+extern "C" int flyweight_gpu_upload_sync(
     std::uint64_t destination, const void* source, std::uint64_t bytes
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_upload_sync(destination, source, bytes);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_upload_sync(destination, source, bytes);
 
     if (destination == 0 || source == nullptr || bytes == 0) return -1;
     return g_api.cuMemcpyHtoD(
@@ -1492,11 +1494,11 @@ extern "C" int colibri_gpu_upload_sync(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_download(
+extern "C" int flyweight_gpu_download(
     void* destination, std::uint64_t source, std::uint64_t bytes,
     std::uint64_t stream
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_download(destination, source, bytes, stream);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_download(destination, source, bytes, stream);
 
     if (destination == nullptr || source == 0 || bytes == 0) return -1;
     return g_api.cuMemcpyDtoHAsync(
@@ -1505,11 +1507,25 @@ extern "C" int colibri_gpu_download(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_memset(
+extern "C" int flyweight_gpu_copy_device(
+    std::uint64_t destination, std::uint64_t source, std::uint64_t bytes,
+    std::uint64_t stream
+) {
+    if (flyweight_backend_is_cpu())
+        return flyweight_cpu_copy_device(destination, source, bytes, stream);
+
+    if (destination == 0 || source == 0 || bytes == 0) return -1;
+    return g_api.cuMemcpyDtoDAsync(
+        static_cast<CUdeviceptr>(destination), static_cast<CUdeviceptr>(source),
+        static_cast<size_t>(bytes), reinterpret_cast<CUstream>(stream)
+    ) == 0 ? 0 : -2;
+}
+
+extern "C" int flyweight_gpu_memset(
     std::uint64_t destination, std::uint8_t value, std::uint64_t bytes,
     std::uint64_t stream
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_memset(destination, value, bytes, stream);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_memset(destination, value, bytes, stream);
 
     if (destination == 0 || bytes == 0) return -1;
     return g_api.cuMemsetD8Async(
@@ -1518,8 +1534,8 @@ extern "C" int colibri_gpu_memset(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_stream_create(std::uint64_t* stream) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_stream_create(stream);
+extern "C" int flyweight_gpu_stream_create(std::uint64_t* stream) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_create(stream);
 
     if (stream == nullptr) return -1;
     CUstream created = nullptr;
@@ -1528,8 +1544,8 @@ extern "C" int colibri_gpu_stream_create(std::uint64_t* stream) {
     return 0;
 }
 
-extern "C" int colibri_gpu_stream_destroy(std::uint64_t stream) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_stream_destroy(stream);
+extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_destroy(stream);
 
     if (stream == 0) return 0;
     const auto cuda_stream = reinterpret_cast<CUstream>(stream);
@@ -1567,15 +1583,15 @@ extern "C" int colibri_gpu_stream_destroy(std::uint64_t stream) {
         ? 0 : -1;
 }
 
-extern "C" int colibri_gpu_stream_sync(std::uint64_t stream) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_stream_sync(stream);
+extern "C" int flyweight_gpu_stream_sync(std::uint64_t stream) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_sync(stream);
 
     return g_api.cuStreamSynchronize(reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -1;
 }
 
-extern "C" int colibri_gpu_graph_begin(std::uint64_t stream) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_graph_begin(stream);
+extern "C" int flyweight_gpu_graph_begin(std::uint64_t stream) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_begin(stream);
 
     if (stream == 0 || g_api.cuStreamBeginCapture == nullptr) return -1;
     return g_api.cuStreamBeginCapture(
@@ -1583,10 +1599,10 @@ extern "C" int colibri_gpu_graph_begin(std::uint64_t stream) {
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_graph_end(
+extern "C" int flyweight_gpu_graph_end(
     std::uint64_t stream, std::uint64_t* handle
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_graph_end(stream, handle);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_end(stream, handle);
 
     if (stream == 0 || handle == nullptr || g_api.cuStreamEndCapture == nullptr)
         return -1;
@@ -1603,10 +1619,10 @@ extern "C" int colibri_gpu_graph_end(
     return 0;
 }
 
-extern "C" int colibri_gpu_graph_launch(
+extern "C" int flyweight_gpu_graph_launch(
     std::uint64_t graph, std::uint64_t stream
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_graph_launch(graph, stream);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_launch(graph, stream);
 
     if (graph == 0 || stream == 0 || g_api.cuGraphLaunch == nullptr) return -1;
     return g_api.cuGraphLaunch(
@@ -1614,16 +1630,16 @@ extern "C" int colibri_gpu_graph_launch(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_graph_destroy(std::uint64_t graph) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_graph_destroy(graph);
+extern "C" int flyweight_gpu_graph_destroy(std::uint64_t graph) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_destroy(graph);
 
     if (graph == 0) return 0;
     if (g_api.cuGraphExecDestroy == nullptr) return -1;
     return g_api.cuGraphExecDestroy(reinterpret_cast<void*>(graph)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_event_create(std::uint64_t* event) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_event_create(event);
+extern "C" int flyweight_gpu_event_create(std::uint64_t* event) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_event_create(event);
 
     if (event == nullptr) return -1;
     CUevent created = nullptr;
@@ -1632,8 +1648,8 @@ extern "C" int colibri_gpu_event_create(std::uint64_t* event) {
     return 0;
 }
 
-extern "C" int colibri_gpu_timed_event_create(std::uint64_t* event) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_timed_event_create(event);
+extern "C" int flyweight_gpu_timed_event_create(std::uint64_t* event) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_timed_event_create(event);
 
     if (event == nullptr) return -1;
     CUevent created = nullptr;
@@ -1642,10 +1658,10 @@ extern "C" int colibri_gpu_timed_event_create(std::uint64_t* event) {
     return 0;
 }
 
-extern "C" int colibri_gpu_event_record(
+extern "C" int flyweight_gpu_event_record(
     std::uint64_t event, std::uint64_t stream
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_event_record(event, stream);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_event_record(event, stream);
 
     if (event == 0) return -1;
     return g_api.cuEventRecord(
@@ -1653,18 +1669,18 @@ extern "C" int colibri_gpu_event_record(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_event_sync(std::uint64_t event) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_event_sync(event);
+extern "C" int flyweight_gpu_event_sync(std::uint64_t event) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_event_sync(event);
 
     if (event == 0) return -1;
     return g_api.cuEventSynchronize(reinterpret_cast<CUevent>(event)) == 0
         ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_stream_wait_event(
+extern "C" int flyweight_gpu_stream_wait_event(
     std::uint64_t stream, std::uint64_t event
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_stream_wait_event(stream, event);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_wait_event(stream, event);
 
     if (event == 0) return -1;
     return g_api.cuStreamWaitEvent(
@@ -1672,18 +1688,18 @@ extern "C" int colibri_gpu_stream_wait_event(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_event_destroy(std::uint64_t event) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_event_destroy(event);
+extern "C" int flyweight_gpu_event_destroy(std::uint64_t event) {
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_event_destroy(event);
 
     if (event == 0) return 0;
     return g_api.cuEventDestroy(reinterpret_cast<CUevent>(event)) == 0
         ? 0 : -1;
 }
 
-extern "C" int colibri_gpu_event_elapsed(
+extern "C" int flyweight_gpu_event_elapsed(
     std::uint64_t start, std::uint64_t end, float* milliseconds
 ) {
-    if (colibri_backend_is_cpu()) return colibri_cpu_event_elapsed(start, end, milliseconds);
+    if (flyweight_backend_is_cpu()) return flyweight_cpu_event_elapsed(start, end, milliseconds);
 
     if (start == 0 || end == 0 || milliseconds == nullptr) return -1;
     return g_api.cuEventElapsedTime(
@@ -1692,7 +1708,7 @@ extern "C" int colibri_gpu_event_elapsed(
     ) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_q8_matvec_transposed(
+extern "C" int flyweight_gpu_q8_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1716,7 +1732,7 @@ extern "C" int colibri_gpu_q8_matvec_transposed(
 // Block per row, one warp per 32-element sub-block, block-reduced at the end,
 // so the launch geometry differs from the warp-per-row kernels. Returns -1 when
 // the kernel is absent, which is what lets the caller fall back.
-extern "C" int colibri_gpu_q4k_matvec_subblock(
+extern "C" int flyweight_gpu_q4k_matvec_subblock(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1732,7 +1748,7 @@ extern "C" int colibri_gpu_q4k_matvec_subblock(
                   args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_q4k_matvec_transposed(
+extern "C" int flyweight_gpu_q4k_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1781,7 +1797,7 @@ int launch_kquant_matvec(
 
 } // namespace
 
-extern "C" int colibri_gpu_q2k_matvec_transposed(
+extern "C" int flyweight_gpu_q2k_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1790,7 +1806,7 @@ extern "C" int colibri_gpu_q2k_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_q3k_matvec_transposed(
+extern "C" int flyweight_gpu_q3k_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1799,7 +1815,7 @@ extern "C" int colibri_gpu_q3k_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_q5k_matvec_transposed(
+extern "C" int flyweight_gpu_q5k_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1808,7 +1824,7 @@ extern "C" int colibri_gpu_q5k_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq2xxs_matvec_transposed(
+extern "C" int flyweight_gpu_iq2xxs_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1817,7 +1833,7 @@ extern "C" int colibri_gpu_iq2xxs_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq1m_matvec_transposed(
+extern "C" int flyweight_gpu_iq1m_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1826,7 +1842,7 @@ extern "C" int colibri_gpu_iq1m_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq1s_matvec_transposed(
+extern "C" int flyweight_gpu_iq1s_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1835,7 +1851,7 @@ extern "C" int colibri_gpu_iq1s_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq3xxs_matvec_transposed(
+extern "C" int flyweight_gpu_iq3xxs_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1844,7 +1860,7 @@ extern "C" int colibri_gpu_iq3xxs_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq2s_matvec_transposed(
+extern "C" int flyweight_gpu_iq2s_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1853,7 +1869,7 @@ extern "C" int colibri_gpu_iq2s_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq3s_matvec_transposed(
+extern "C" int flyweight_gpu_iq3s_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1862,7 +1878,7 @@ extern "C" int colibri_gpu_iq3s_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq2xs_matvec_transposed(
+extern "C" int flyweight_gpu_iq2xs_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1871,7 +1887,7 @@ extern "C" int colibri_gpu_iq2xs_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_iq4xs_matvec_transposed(
+extern "C" int flyweight_gpu_iq4xs_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1880,7 +1896,7 @@ extern "C" int colibri_gpu_iq4xs_matvec_transposed(
         packed, input, output, input_size, output_size, stream);
 }
 
-extern "C" int colibri_gpu_q6k_matvec_transposed(
+extern "C" int flyweight_gpu_q6k_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1901,7 +1917,7 @@ extern "C" int colibri_gpu_q6k_matvec_transposed(
                   args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_bf16_matvec_transposed(
+extern "C" int flyweight_gpu_bf16_matvec_transposed(
     std::uint64_t packed, std::uint64_t input, std::uint64_t output,
     std::int32_t input_size, std::int32_t output_size, std::uint64_t stream
 ) {
@@ -1915,7 +1931,7 @@ extern "C" int colibri_gpu_bf16_matvec_transposed(
                   reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_route_topk(
+extern "C" int flyweight_gpu_route_topk(
     std::uint64_t logits, std::uint64_t selected, std::uint64_t weights,
     std::int32_t experts, std::int32_t top_k, std::uint64_t stream
 ) {
@@ -1927,7 +1943,7 @@ extern "C" int colibri_gpu_route_topk(
                   reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_sampling_topk(
+extern "C" int flyweight_gpu_sampling_topk(
     std::uint64_t logits, std::uint64_t selected,
     std::uint64_t selected_logits, std::uint64_t sort_indices_a,
     std::uint64_t sort_values_a, std::uint64_t sort_indices_b,
@@ -1980,7 +1996,7 @@ extern "C" int colibri_gpu_sampling_topk(
     return 0;
 }
 
-extern "C" int colibri_gpu_q5_grouped_swiglu(
+extern "C" int flyweight_gpu_q5_grouped_swiglu(
     std::uint64_t gate_pointers, std::uint64_t up_pointers,
     std::uint64_t input, std::uint64_t activated,
     std::int32_t input_size, std::int32_t output_size,
@@ -2011,7 +2027,7 @@ int grouped_accumulate(
                   args, 0, reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_q6_grouped_accumulate(
+extern "C" int flyweight_gpu_q6_grouped_accumulate(
     std::uint64_t down_pointers, std::uint64_t activated,
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
@@ -2019,7 +2035,7 @@ extern "C" int colibri_gpu_q6_grouped_accumulate(
 ) { return grouped_accumulate(g_kernels.q6_grouped_accumulate, down_pointers,
     activated, output, weights, input_size, output_size, experts, stream); }
 
-extern "C" int colibri_gpu_q4k_grouped_accumulate(
+extern "C" int flyweight_gpu_q4k_grouped_accumulate(
     std::uint64_t down_pointers, std::uint64_t activated,
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
@@ -2027,7 +2043,7 @@ extern "C" int colibri_gpu_q4k_grouped_accumulate(
 ) { return grouped_accumulate(g_kernels.q4k_grouped_accumulate, down_pointers,
     activated, output, weights, input_size, output_size, experts, stream); }
 
-extern "C" int colibri_gpu_q5k_grouped_accumulate(
+extern "C" int flyweight_gpu_q5k_grouped_accumulate(
     std::uint64_t down_pointers, std::uint64_t activated,
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
@@ -2035,7 +2051,7 @@ extern "C" int colibri_gpu_q5k_grouped_accumulate(
 ) { return grouped_accumulate(g_kernels.q5k_grouped_accumulate, down_pointers,
     activated, output, weights, input_size, output_size, experts, stream); }
 
-extern "C" int colibri_gpu_q8_grouped_accumulate(
+extern "C" int flyweight_gpu_q8_grouped_accumulate(
     std::uint64_t down_pointers, std::uint64_t activated,
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
@@ -2043,13 +2059,13 @@ extern "C" int colibri_gpu_q8_grouped_accumulate(
 ) { return grouped_accumulate(g_kernels.q8_grouped_accumulate, down_pointers,
     activated, output, weights, input_size, output_size, experts, stream); }
 
-extern "C" int colibri_gpu_nvfp4_grouped_swiglu(
+extern "C" int flyweight_gpu_nvfp4_grouped_swiglu(
     std::uint64_t gate_pointers, std::uint64_t up_pointers,
     std::uint64_t input, std::uint64_t activated,
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t experts, std::uint64_t stream
 ) {
-    const char* tiled_env = std::getenv("COLIBRI_NVFP4_TILED");
+    const char* tiled_env = std::getenv("FLYWEIGHT_NVFP4_TILED");
     const bool tiled = tiled_env && tiled_env[0] == '1';
     const auto kernel = tiled ? g_kernels.nvfp4_grouped_swiglu_tiled
                               : g_kernels.nvfp4_grouped_swiglu;
@@ -2065,7 +2081,7 @@ extern "C" int colibri_gpu_nvfp4_grouped_swiglu(
                   reinterpret_cast<CUstream>(stream)) == 0 ? 0 : -2;
 }
 
-extern "C" int colibri_gpu_nvfp4_grouped_accumulate(
+extern "C" int flyweight_gpu_nvfp4_grouped_accumulate(
     std::uint64_t down_pointers, std::uint64_t activated,
     std::uint64_t output, std::uint64_t weights,
     std::int32_t input_size, std::int32_t output_size,
@@ -2076,9 +2092,9 @@ extern "C" int colibri_gpu_nvfp4_grouped_accumulate(
     // so the runtime falls back to the kernel path it already has. Returning
     // success here silently skipped attention entirely for sequences of 128+
     // tokens, which is where cuBLAS attention becomes eligible.
-    if (colibri_backend_is_cpu()) return -1;
+    if (flyweight_backend_is_cpu()) return -1;
 
-    const char* tiled_env = std::getenv("COLIBRI_NVFP4_TILED");
+    const char* tiled_env = std::getenv("FLYWEIGHT_NVFP4_TILED");
     const bool tiled = tiled_env && tiled_env[0] == '1';
     const auto kernel = tiled ? g_kernels.nvfp4_grouped_accumulate_tiled
                               : g_kernels.nvfp4_grouped_accumulate;
@@ -2256,7 +2272,7 @@ static int nvfp4_run_quantized_gemm(
     return status == 0 ? 0 : -4;
 }
 
-extern "C" int colibri_gpu_nvfp4_matmul_cublas(
+extern "C" int flyweight_gpu_nvfp4_matmul_cublas(
     std::uint64_t weights, std::uint64_t input, std::uint64_t output,
     std::uint64_t stream, std::int32_t input_size,
     std::int32_t output_size, std::int32_t rows, float scale
@@ -2266,7 +2282,7 @@ extern "C" int colibri_gpu_nvfp4_matmul_cublas(
     // so the runtime falls back to the kernel path it already has. Returning
     // success here silently skipped attention entirely for sequences of 128+
     // tokens, which is where cuBLAS attention becomes eligible.
-    if (colibri_backend_is_cpu()) return -1;
+    if (flyweight_backend_is_cpu()) return -1;
 
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!weights || !input || !output || input_size <= 0 || output_size <= 0
@@ -2352,7 +2368,7 @@ extern "C" int colibri_gpu_nvfp4_matmul_cublas(
     return status == 0 ? 0 : -8;
 }
 
-extern "C" int colibri_gpu_nvfp4_moe_cublas(
+extern "C" int flyweight_gpu_nvfp4_moe_cublas(
     std::uint64_t gate_pointers, std::uint64_t up_pointers,
     std::uint64_t down_pointers, std::uint64_t input,
     std::uint64_t activated, std::uint64_t output,
@@ -2367,7 +2383,7 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
     // so the runtime falls back to the kernel path it already has. Returning
     // success here silently skipped attention entirely for sequences of 128+
     // tokens, which is where cuBLAS attention becomes eligible.
-    if (colibri_backend_is_cpu()) return -1;
+    if (flyweight_backend_is_cpu()) return -1;
 
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!gate_pointers || !up_pointers || !down_pointers || !input
@@ -2375,7 +2391,7 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
         || intermediate_size <= 0 || experts <= 0 || (hidden_size & 63)
         || (intermediate_size & 63) || !load_cublas_lt()) return -1;
     const bool profile =
-        std::getenv("COLIBRI_NVFP4_TENSOR_CORE_PROFILE") != nullptr;
+        std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_PROFILE") != nullptr;
     if (profile && !g_nvfp4_moe_profile.initialized) {
         bool initialized = true;
         for (auto& event : g_nvfp4_moe_profile.events) {
@@ -2411,7 +2427,7 @@ extern "C" int colibri_gpu_nvfp4_moe_cublas(
         || down_quantize == g_functions.end()
         || add_first == g_functions.end()) return -2;
     const bool validate =
-        std::getenv("COLIBRI_NVFP4_TENSOR_CORE_VALIDATE")
+        std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_VALIDATE")
         && !g_nvfp4_validation_done
         && validate_gate != g_functions.end()
         && validate_down != g_functions.end();
@@ -2615,7 +2631,7 @@ static size_t nvfp4_native_expert_bytes(
     return gate_up_values + gate_up_scales + down_values + down_scales;
 }
 
-extern "C" int colibri_gpu_nvfp4_prepare_expert(
+extern "C" int flyweight_gpu_nvfp4_prepare_expert(
     std::uint64_t gate, std::uint64_t up, std::uint64_t down,
     std::uint64_t native, std::uint64_t stream,
     std::int32_t hidden_size, std::int32_t intermediate_size
@@ -2625,7 +2641,7 @@ extern "C" int colibri_gpu_nvfp4_prepare_expert(
     // so the runtime falls back to the kernel path it already has. Returning
     // success here silently skipped attention entirely for sequences of 128+
     // tokens, which is where cuBLAS attention becomes eligible.
-    if (colibri_backend_is_cpu()) return -1;
+    if (flyweight_backend_is_cpu()) return -1;
 
     if (!gate || !up || !down || !native || hidden_size <= 0
         || intermediate_size <= 0 || (hidden_size & 63)
@@ -2668,7 +2684,7 @@ extern "C" int colibri_gpu_nvfp4_prepare_expert(
         ? 0 : -6;
 }
 
-extern "C" int colibri_gpu_nvfp4_moe_persistent(
+extern "C" int flyweight_gpu_nvfp4_moe_persistent(
     const std::uint64_t* native_experts, std::uint64_t route_weights,
     std::uint64_t gate_scales, std::uint64_t up_scales,
     std::uint64_t down_scales, std::uint64_t input,
@@ -2681,7 +2697,7 @@ extern "C" int colibri_gpu_nvfp4_moe_persistent(
     // so the runtime falls back to the kernel path it already has. Returning
     // success here silently skipped attention entirely for sequences of 128+
     // tokens, which is where cuBLAS attention becomes eligible.
-    if (colibri_backend_is_cpu()) return -1;
+    if (flyweight_backend_is_cpu()) return -1;
 
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!native_experts || !route_weights || !input || !activated || !output
@@ -2705,7 +2721,7 @@ extern "C" int colibri_gpu_nvfp4_moe_persistent(
         swiglu == g_functions.end() || add_first == g_functions.end())
         return -2;
     const char* grouped_env =
-        std::getenv("COLIBRI_NVFP4_PERSISTENT_GROUPED");
+        std::getenv("FLYWEIGHT_NVFP4_PERSISTENT_GROUPED");
     const bool grouped = grouped_env && grouped_env[0] == '1';
     if (grouped && (concat_gate == g_functions.end() ||
                     concat_down == g_functions.end())) return -2;
@@ -2906,7 +2922,7 @@ extern "C" int colibri_gpu_nvfp4_moe_persistent(
         1, 256, add_args, 0, cuda_stream) == 0 ? 0 : -11;
 }
 
-extern "C" int colibri_gpu_launch_named(
+extern "C" int flyweight_gpu_launch_named(
     const char* name, std::uint32_t grid_x, std::uint32_t grid_y,
     std::uint32_t block_x, std::uint32_t shared_bytes,
     std::uint64_t stream, void** arguments
@@ -2920,7 +2936,7 @@ extern "C" int colibri_gpu_launch_named(
         ? 0 : -3;
 }
 
-extern "C" int colibri_gpu_attention_f16_cublas(
+extern "C" int flyweight_gpu_attention_f16_cublas(
     std::uint64_t query, std::uint64_t query_f16,
     std::uint64_t keys, std::uint64_t values,
     std::uint64_t scores_f16, std::uint64_t output,
@@ -2933,7 +2949,7 @@ extern "C" int colibri_gpu_attention_f16_cublas(
     // so the runtime falls back to the kernel path it already has. Returning
     // success here silently skipped attention entirely for sequences of 128+
     // tokens, which is where cuBLAS attention becomes eligible.
-    if (colibri_backend_is_cpu()) return -1;
+    if (flyweight_backend_is_cpu()) return -1;
 
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!query || !query_f16 || !keys || !values || !scores_f16 || !output
@@ -2999,7 +3015,7 @@ extern "C" int colibri_gpu_attention_f16_cublas(
     return 0;
 }
 
-extern "C" int colibri_gpu_attention_prefill_f16_cublas(
+extern "C" int flyweight_gpu_attention_prefill_f16_cublas(
     std::uint64_t queries, std::uint64_t gates,
     std::uint64_t keys, std::uint64_t values,
     std::uint64_t packed_queries, std::uint64_t scores_f32,
@@ -3017,7 +3033,7 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     // so the runtime falls back to the kernel path it already has. Returning
     // success here silently skipped attention entirely for sequences of 128+
     // tokens, which is where cuBLAS attention becomes eligible.
-    if (colibri_backend_is_cpu()) return -1;
+    if (flyweight_backend_is_cpu()) return -1;
 
     std::lock_guard<std::mutex> lock(g_cublas_mutex);
     if (!queries || !gates || !keys || !values || !packed_queries
@@ -3147,9 +3163,9 @@ extern "C" int colibri_gpu_attention_prefill_f16_cublas(
     return 0;
 }
 
-extern "C" int colibri_delta_moe_segment(
-    const ColibriDeltaParams* params,
-    const ColibriDeltaLayer* layers,
+extern "C" int flyweight_delta_moe_segment(
+    const FlyweightDeltaParams* params,
+    const FlyweightDeltaLayer* layers,
     std::int32_t count
 ) {
     if (params == nullptr || layers == nullptr || count <= 0) {
@@ -3180,7 +3196,7 @@ extern "C" int colibri_delta_moe_segment(
     }
     for (std::int32_t index = 0; index < count; ++index) {
         phase_mark(0);
-        const ColibriDeltaLayer& layer = layers[index];
+        const FlyweightDeltaLayer& layer = layers[index];
         if (layer.graph != 0) {
             if (g_api.cuGraphLaunch(
                     reinterpret_cast<void*>(layer.graph), nullptr
@@ -3269,7 +3285,7 @@ extern "C" int colibri_delta_moe_segment(
         down_packed[params->top_k] = layer.shared_down_packed;
         down_scales[params->top_k] = layer.shared_down_scales;
         phase_mark(3);
-        const int moe_status = colibri_q4_moe(
+        const int moe_status = flyweight_q4_moe(
             gate_packed.data(),
             gate_scales.data(),
             down_packed.data(),
@@ -3294,7 +3310,7 @@ extern "C" int colibri_delta_moe_segment(
         }
         phase_mark(5);
     }
-    if (std::getenv("COLIBRI_SEG_DEBUG") != nullptr) {
+    if (std::getenv("FLYWEIGHT_SEG_DEBUG") != nullptr) {
         std::fprintf(
             stderr,
             "[phases ms] gpu=%.3f copy=%.3f topk=%.3f experts=%.3f wb=%.3f\n",
@@ -3306,9 +3322,9 @@ extern "C" int colibri_delta_moe_segment(
     return 0;
 }
 
-extern "C" int colibri_delta_graph_build(
-    const ColibriDeltaParams* params,
-    const ColibriDeltaLayer* layer,
+extern "C" int flyweight_delta_graph_build(
+    const FlyweightDeltaParams* params,
+    const FlyweightDeltaLayer* layer,
     std::uint64_t* handle
 ) {
     if (params == nullptr || layer == nullptr || handle == nullptr) {
@@ -3343,7 +3359,7 @@ extern "C" int colibri_delta_graph_build(
     return 0;
 }
 
-extern "C" int colibri_delta_graph_destroy(std::uint64_t handle) {
+extern "C" int flyweight_delta_graph_destroy(std::uint64_t handle) {
     if (handle == 0 || g_api.cuGraphExecDestroy == nullptr) {
         return -1;
     }

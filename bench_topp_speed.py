@@ -1,7 +1,7 @@
 """Clean interleaved speed: full vs top-p=0.85, to defeat thermal drift."""
 from __future__ import annotations
 import sys, time
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 N = 256

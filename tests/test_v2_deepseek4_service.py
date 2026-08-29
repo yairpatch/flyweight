@@ -30,13 +30,13 @@ from unittest.mock import patch
 
 import numpy as np
 
-from colibri_next.deepseek4_server import (
+from flyweight.deepseek4_server import (
     Deepseek4Engine,
     NativeDeepseek4InferenceService,
     sample_token,
 )
-from colibri_next.sampling import SamplingConfig
-from colibri_next.v2 import V2Model
+from flyweight.sampling import SamplingConfig
+from flyweight.v2 import V2Model
 from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
@@ -53,7 +53,7 @@ class _Fixture:
     @classmethod
     def open(cls) -> V2Model:
         if cls.directory is None:
-            cls.directory = tempfile.TemporaryDirectory(prefix="colibri-ds4svc-")
+            cls.directory = tempfile.TemporaryDirectory(prefix="flyweight-ds4svc-")
             cls.path = Path(cls.directory.name) / "ds4.gguf"
             build_deepseek4_gguf(cls.path, DeepSeek4Spec(layers=6, hash_layers=3))
         return V2Model(cls.path)
@@ -240,7 +240,7 @@ class EngineTests(unittest.TestCase):
         engine = self.engine()
         engine.device = 0
         with patch(
-            "colibri_next.deepseek4.Deepseek4Runtime.attach_gpu",
+            "flyweight.deepseek4.Deepseek4Runtime.attach_gpu",
             side_effect=RuntimeError("attach failed"),
         ):
             _, queue = engine.submit([5, 6], 1, ())
@@ -389,7 +389,7 @@ class ServiceTests(unittest.TestCase):
     def test_a_non_deepseek4_checkpoint_is_refused(self):
         from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
-        with tempfile.TemporaryDirectory(prefix="colibri-ds4svc-") as directory:
+        with tempfile.TemporaryDirectory(prefix="flyweight-ds4svc-") as directory:
             path = Path(directory) / "dense.gguf"
             build_dense_qwen35_gguf(path, DenseQwenSpec(layers=2))
             with self.assertRaises(ValueError):

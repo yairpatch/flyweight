@@ -15,7 +15,7 @@ from ctypes import POINTER, c_int32, c_uint64, c_void_p, byref
 
 import numpy as np
 
-DLL = r"C:\Users\thegr\OneDrive\Documents\colibri-next\src\colibri_next\_native\colibri_v2.dll"
+DLL = r"C:\Users\thegr\OneDrive\Documents\flyweight\src\flyweight\_native\flyweight_v2.dll"
 MODEL = r"C:\Users\thegr\Downloads\Qwen3.6-35B-A3B-UD-Q6_K.gguf"
 
 MIB = 1024 * 1024
@@ -27,14 +27,14 @@ WARM_WINDOW = 8 << 30     # pre-touched region for the random-access test
 
 def load_lib():
     lib = ctypes.CDLL(DLL)
-    lib.colibri_gpu_init.argtypes = [c_int32]
-    lib.colibri_gpu_init.restype = c_int32
-    lib.colibri_gpu_alloc.argtypes = [c_uint64, POINTER(c_uint64)]
-    lib.colibri_gpu_host_alloc.argtypes = [c_uint64, POINTER(c_void_p)]
-    lib.colibri_gpu_host_register.argtypes = [c_void_p, c_uint64]
-    lib.colibri_gpu_upload.argtypes = [c_uint64, c_void_p, c_uint64, c_uint64]
-    lib.colibri_gpu_stream_create.argtypes = [POINTER(c_uint64)]
-    lib.colibri_gpu_stream_sync.argtypes = [c_uint64]
+    lib.flyweight_gpu_init.argtypes = [c_int32]
+    lib.flyweight_gpu_init.restype = c_int32
+    lib.flyweight_gpu_alloc.argtypes = [c_uint64, POINTER(c_uint64)]
+    lib.flyweight_gpu_host_alloc.argtypes = [c_uint64, POINTER(c_void_p)]
+    lib.flyweight_gpu_host_register.argtypes = [c_void_p, c_uint64]
+    lib.flyweight_gpu_upload.argtypes = [c_uint64, c_void_p, c_uint64, c_uint64]
+    lib.flyweight_gpu_stream_create.argtypes = [POINTER(c_uint64)]
+    lib.flyweight_gpu_stream_sync.argtypes = [c_uint64]
     return lib
 
 
@@ -47,29 +47,29 @@ def bandwidth(lib, dst, src_addr, chunk, count, stream, offsets=None, span=None)
     if offsets is None:
         room = max(1, (span or chunk) - chunk + 1)
         offsets = [((i * chunk) % room) & ~4095 for i in range(count)]
-    lib.colibri_gpu_stream_sync(stream)
+    lib.flyweight_gpu_stream_sync(stream)
     started = time.perf_counter()
     for i in range(count):
         off = int(offsets[i])
-        rc = lib.colibri_gpu_upload(dst, c_void_p(src_addr + off), chunk, stream)
+        rc = lib.flyweight_gpu_upload(dst, c_void_p(src_addr + off), chunk, stream)
         if rc != 0:
             raise RuntimeError(f"upload failed rc={rc}")
-    lib.colibri_gpu_stream_sync(stream)
+    lib.flyweight_gpu_stream_sync(stream)
     elapsed = time.perf_counter() - started
     return (chunk * count) / elapsed / 1e9, elapsed
 
 
 def main():
     lib = load_lib()
-    if lib.colibri_gpu_init(0) != 0:
-        sys.exit("colibri_gpu_init failed")
+    if lib.flyweight_gpu_init(0) != 0:
+        sys.exit("flyweight_gpu_init failed")
 
     stream = c_uint64(0)
-    lib.colibri_gpu_stream_create(byref(stream))
+    lib.flyweight_gpu_stream_create(byref(stream))
     stream = stream.value
 
     dev = c_uint64(0)
-    if lib.colibri_gpu_alloc(BULK, byref(dev)) != 0:
+    if lib.flyweight_gpu_alloc(BULK, byref(dev)) != 0:
         sys.exit("device alloc failed")
     dev = dev.value
 
@@ -77,7 +77,7 @@ def main():
 
     # True pinned memory, allocated by CUDA itself.
     pinned = c_void_p(0)
-    if lib.colibri_gpu_host_alloc(BULK, byref(pinned)) == 0:
+    if lib.flyweight_gpu_host_alloc(BULK, byref(pinned)) == 0:
         ctypes.memset(pinned, 1, BULK)
         gbs, _ = bandwidth(lib, dev, pinned.value, BULK, 4, stream, span=BULK)
         print(f"pinned   bulk {BULK//MIB:4d} MiB : {gbs:7.2f} GB/s")
@@ -107,9 +107,9 @@ def main():
     print(f"mapped at 0x{base:x}")
 
     started = time.perf_counter()
-    rc = lib.colibri_gpu_host_register(c_void_p(base), size)
+    rc = lib.flyweight_gpu_host_register(c_void_p(base), size)
     reg_s = time.perf_counter() - started
-    print(f"colibri_gpu_host_register -> rc={rc} in {reg_s*1e3:.3f} ms")
+    print(f"flyweight_gpu_host_register -> rc={rc} in {reg_s*1e3:.3f} ms")
 
     # Which flag actually succeeds? Probe the driver directly.
     try:

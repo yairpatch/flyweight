@@ -2,18 +2,18 @@ import os
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Error, V2Model
+from flyweight.v2 import V2Error, V2Model
 
 
 class QwenV2ReferenceTests(unittest.TestCase):
-    MODEL = os.environ.get("COLIBRI_TEST_MODEL", "")
+    MODEL = os.environ.get("FLYWEIGHT_TEST_MODEL", "")
 
     @classmethod
     def setUpClass(cls) -> None:
         if not cls.MODEL:
-            raise unittest.SkipTest("set COLIBRI_TEST_MODEL to run real-model tests")
+            raise unittest.SkipTest("set FLYWEIGHT_TEST_MODEL to run real-model tests")
         if not Path(cls.MODEL).is_file():
-            raise AssertionError(f"COLIBRI_TEST_MODEL does not exist: {cls.MODEL}")
+            raise AssertionError(f"FLYWEIGHT_TEST_MODEL does not exist: {cls.MODEL}")
 
     def test_native_runtime_catalogs_real_decoder_stack(self):
         model = V2Model(self.MODEL)

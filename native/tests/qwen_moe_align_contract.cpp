@@ -5,7 +5,7 @@
 // because the failure that matters -- a route silently lost or duplicated -- is
 // invisible in a small example and produces fluent-wrong output downstream.
 
-#include "colibri_v2_moe_align.hpp"
+#include "flyweight_v2_moe_align.hpp"
 
 #include <cstdio>
 #include <map>
@@ -28,9 +28,9 @@ void check(bool ok, const char* what) {
 void verify(const std::vector<std::int32_t>& selected,
             const std::vector<float>& weights, int experts, int block_size,
             const char* label) {
-    colibri::v2::moe::AlignedRoutes out;
+    flyweight::v2::moe::AlignedRoutes out;
     const float* w = weights.empty() ? nullptr : weights.data();
-    colibri::v2::moe::align_blocks(selected.data(), w,
+    flyweight::v2::moe::align_blocks(selected.data(), w,
                                    static_cast<int>(selected.size()), experts,
                                    block_size, out);
 
@@ -50,7 +50,7 @@ void verify(const std::vector<std::int32_t>& selected,
         expected.insert(static_cast<std::int32_t>(route));
     }
     for (const auto route : out.sorted_routes)
-        if (route != colibri::v2::moe::kEmpty) seen.insert(route);
+        if (route != flyweight::v2::moe::kEmpty) seen.insert(route);
     check(expected == seen, "every kept route present exactly once");
 
     // A block's routes all belong to the block's expert. This is the property
@@ -61,7 +61,7 @@ void verify(const std::vector<std::int32_t>& selected,
             const auto route =
                 out.sorted_routes[block * static_cast<std::size_t>(block_size) +
                                   static_cast<std::size_t>(slot)];
-            if (route == colibri::v2::moe::kEmpty) continue;
+            if (route == flyweight::v2::moe::kEmpty) continue;
             if (selected[static_cast<std::size_t>(route)] != expert) {
                 check(false, "block routes match block expert");
                 return;
@@ -78,7 +78,7 @@ void verify(const std::vector<std::int32_t>& selected,
             const auto route =
                 out.sorted_routes[block * static_cast<std::size_t>(block_size) +
                                   static_cast<std::size_t>(slot)];
-            if (route == colibri::v2::moe::kEmpty) { tail = true; continue; }
+            if (route == flyweight::v2::moe::kEmpty) { tail = true; continue; }
             if (tail) { check(false, "no gap inside a block"); return; }
         }
         (void)ended;
@@ -96,8 +96,8 @@ void verify(const std::vector<std::int32_t>& selected,
     }
 
     // Deterministic: same input, same buffer.
-    colibri::v2::moe::AlignedRoutes again;
-    colibri::v2::moe::align_blocks(selected.data(), w,
+    flyweight::v2::moe::AlignedRoutes again;
+    flyweight::v2::moe::align_blocks(selected.data(), w,
                                    static_cast<int>(selected.size()), experts,
                                    block_size, again);
     check(again.sorted_routes == out.sorted_routes &&
@@ -113,12 +113,12 @@ int main() {
 
     // Degenerate shapes a caller can legitimately hit.
     {
-        colibri::v2::moe::AlignedRoutes out;
-        colibri::v2::moe::align_blocks(nullptr, nullptr, 0, 8, 16, out);
+        flyweight::v2::moe::AlignedRoutes out;
+        flyweight::v2::moe::align_blocks(nullptr, nullptr, 0, 8, 16, out);
         check(out.padded_total == 0 && out.sorted_routes.empty() &&
                   out.block_experts.empty(), "empty input yields empty output");
         std::vector<std::int32_t> one{3};
-        colibri::v2::moe::align_blocks(one.data(), nullptr, 1, 8, 16, out);
+        flyweight::v2::moe::align_blocks(one.data(), nullptr, 1, 8, 16, out);
         check(out.padded_total == 16 && out.block_experts.size() == 1 &&
                   out.block_experts[0] == 3 && out.sorted_routes[0] == 0,
               "single route takes one block");
@@ -127,8 +127,8 @@ int main() {
     // An exact multiple must not allocate a spare empty block.
     {
         std::vector<std::int32_t> selected(32, 5);
-        colibri::v2::moe::AlignedRoutes out;
-        colibri::v2::moe::align_blocks(selected.data(), nullptr, 32, 8, 16, out);
+        flyweight::v2::moe::AlignedRoutes out;
+        flyweight::v2::moe::align_blocks(selected.data(), nullptr, 32, 8, 16, out);
         check(out.block_experts.size() == 2, "exact multiple takes no spare block");
     }
 

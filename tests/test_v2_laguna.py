@@ -8,8 +8,8 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
-from colibri_next.v2_server import NativeV2Tokenizer
+from flyweight.v2 import V2Model
+from flyweight.v2_server import NativeV2Tokenizer
 
 from tests.laguna_gguf_fixture import LagunaSpec, build_laguna_gguf
 
@@ -32,7 +32,7 @@ def _workspace(prefix: str) -> Path:
 
 
 def _model(**kwargs) -> tuple[V2Model, LagunaSpec]:
-    directory = _workspace("colibri-laguna-")
+    directory = _workspace("flyweight-laguna-")
     path = directory / "laguna.gguf"
     spec = build_laguna_gguf(path, **kwargs)
     return V2Model(path), spec
@@ -81,7 +81,7 @@ class LagunaConfigTests(unittest.TestCase):
         # The per-layer head count is the only independent witness of the
         # implied sliding-window layout, so a contradiction must not be
         # silently accepted.
-        directory = _workspace("colibri-laguna-bad-")
+        directory = _workspace("flyweight-laguna-bad-")
         path = directory / "laguna.gguf"
         spec = LagunaSpec()
         build_laguna_gguf(path, spec)
@@ -216,7 +216,7 @@ class LagunaNativeTests(unittest.TestCase):
         prompt = [7, 11, 3, 29, 5, 17, 23, 2, 13, 19]
         results = {}
         for rows in ("1", "8"):
-            with unittest.mock.patch.dict(os.environ, {"COLIBRI_PREFILL_ROWS": rows}):
+            with unittest.mock.patch.dict(os.environ, {"FLYWEIGHT_PREFILL_ROWS": rows}):
                 model, _ = _model()
                 runtime = _native(model)
                 try:
@@ -244,13 +244,13 @@ class LagunaNativeTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    os.environ.get("COLIBRI_TEST_LAGUNA_MODEL")
-    and Path(os.environ["COLIBRI_TEST_LAGUNA_MODEL"]).is_file(),
-    "set COLIBRI_TEST_LAGUNA_MODEL to a Laguna GGUF checkpoint",
+    os.environ.get("FLYWEIGHT_TEST_LAGUNA_MODEL")
+    and Path(os.environ["FLYWEIGHT_TEST_LAGUNA_MODEL"]).is_file(),
+    "set FLYWEIGHT_TEST_LAGUNA_MODEL to a Laguna GGUF checkpoint",
 )
 class LagunaRealModelTests(unittest.TestCase):
     def test_whole_layer_placement_matches_cpu_experts(self):
-        path = os.environ["COLIBRI_TEST_LAGUNA_MODEL"]
+        path = os.environ["FLYWEIGHT_TEST_LAGUNA_MODEL"]
         with V2Model(path) as model:
             tokens = model.tokenize(
                 "<s><user>What is the capital of France?</user><assistant>"
@@ -267,7 +267,7 @@ class LagunaRealModelTests(unittest.TestCase):
             actual: list[int] = []
             with (
                 unittest.mock.patch.dict(
-                    os.environ, {"COLIBRI_LAGUNA_WHOLE_LAYERS": "auto"}
+                    os.environ, {"FLYWEIGHT_LAGUNA_WHOLE_LAYERS": "auto"}
                 ),
                 model.native_qwen_runtime(
                     context_limit=512,

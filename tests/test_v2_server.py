@@ -8,10 +8,10 @@ import unittest
 from pathlib import Path
 from queue import Empty, Queue
 
-from colibri_next.cli import _parser
-from colibri_next.sampling import SamplingConfig
-from colibri_next.server import InferenceService, _chat_messages
-from colibri_next.v2_server import (
+from flyweight.cli import _parser
+from flyweight.sampling import SamplingConfig
+from flyweight.server import InferenceService, _chat_messages
+from flyweight.v2_server import (
     BailingEngine,
     NativeV2Generator,
     NativeV2InferenceService,
@@ -20,7 +20,7 @@ from colibri_next.v2_server import (
     _generation_config_for_model,
     _merge_generation_defaults,
 )
-from colibri_next.v2 import TASK_EVENT_PREFILL
+from flyweight.v2 import TASK_EVENT_PREFILL
 
 
 class StubV2Model:
@@ -627,7 +627,7 @@ class NativeV2ServerTests(unittest.TestCase):
         # drifted -- `seed` reached only OpenAI requests, the penalties only a
         # flag or an OpenAI request -- so each surface is checked against the
         # table rather than against a second hand-written list.
-        from colibri_next.sampling import SERVER_SETTINGS, SETTINGS
+        from flyweight.sampling import SERVER_SETTINGS, SETTINGS
 
         parser = _parser()
         serve = next(
@@ -654,8 +654,8 @@ class NativeV2ServerTests(unittest.TestCase):
                              f"{setting.name} was dropped by the config loader")
 
         # And a request may set every one of them, including seed.
-        from colibri_next.server import _sampling_from_payload
-        from colibri_next.sampling import defaults as builtin_defaults
+        from flyweight.server import _sampling_from_payload
+        from flyweight.sampling import defaults as builtin_defaults
         payload = dict(values, seed=99)
         sampling = _sampling_from_payload(payload, builtin_defaults())
         for setting in SETTINGS:
@@ -861,12 +861,12 @@ class NativeV2ServerTests(unittest.TestCase):
     def test_bailing_progress_survives_a_library_without_the_entry_point(
         self,
     ) -> None:
-        # colibri_v2_bailing_set_progress shipped in the bindings before any
+        # flyweight_v2_bailing_set_progress shipped in the bindings before any
         # native implementation existed, and the unguarded lookup failed
         # every BailingMoE3 generation with an undefined-symbol stream error.
         # The guard restores the pre-progress behaviour instead: no reports,
         # an uninterruptible prompt, and a working answer.
-        from colibri_next.v2 import BailingRuntime
+        from flyweight.v2 import BailingRuntime
 
         class SymbolFreeLibrary:
             def __getattr__(self, name):
@@ -1443,6 +1443,13 @@ class NativeV2ServerTests(unittest.TestCase):
                 "last_reused_tokens": 0,
                 "last_lcp_live": 0,
                 "last_lcp_snapshot": 0,
+                "kv_reserved_bytes": 0,
+                "kv_peak_live_bytes": 0,
+                "kv_peak_tokens": 0,
+                "kv_peak_tokens_max": 0,
+                "kv_occupancy_samples": 0,
+                "donations": 0,
+                "donated_tokens": 0,
             },
         )
 

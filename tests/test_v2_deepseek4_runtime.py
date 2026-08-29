@@ -22,8 +22,8 @@ from __future__ import annotations
 import os
 import unittest
 
-from colibri_next.deepseek4 import Deepseek4Runtime
-from colibri_next.v2 import V2Error, V2Model
+from flyweight.deepseek4 import Deepseek4Runtime
+from flyweight.v2 import V2Error, V2Model
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
 # A stale path is as good as no path: the variable often outlives the file it
@@ -131,7 +131,7 @@ class Deepseek4RuntimeRejectionTests(unittest.TestCase):
 
         from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
-        with tempfile.TemporaryDirectory(prefix="colibri-ds4rt-") as directory:
+        with tempfile.TemporaryDirectory(prefix="flyweight-ds4rt-") as directory:
             path = Path(directory) / "dense.gguf"
             build_dense_qwen35_gguf(path, DenseQwenSpec(layers=2))
             model = V2Model(path)
@@ -198,7 +198,7 @@ class WeightPlanFixtureTests(unittest.TestCase):
 
         from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 
-        with tempfile.TemporaryDirectory(prefix="colibri-ds4plan-") as directory:
+        with tempfile.TemporaryDirectory(prefix="flyweight-ds4plan-") as directory:
             path = Path(directory) / "ds4.gguf"
             build_deepseek4_gguf(path, DeepSeek4Spec(layers=6, hash_layers=3))
             model = V2Model(path)
@@ -228,7 +228,7 @@ class HalfPrecisionTests(unittest.TestCase):
 
     def test_it_matches_numpy_on_ordinary_values(self):
         import numpy as np
-        from colibri_next.deepseek4 import half_round_trip
+        from flyweight.deepseek4 import half_round_trip
 
         rng = np.random.default_rng(23)
         values = np.concatenate([
@@ -241,7 +241,7 @@ class HalfPrecisionTests(unittest.TestCase):
 
     def test_it_matches_numpy_on_edges(self):
         import numpy as np
-        from colibri_next.deepseek4 import half_round_trip
+        from flyweight.deepseek4 import half_round_trip
 
         edges = [
             0.0, -0.0, 1.0, -1.0, 65504.0, -65504.0,   # largest finite half
@@ -256,7 +256,7 @@ class HalfPrecisionTests(unittest.TestCase):
 
     def test_infinities_and_nan_survive(self):
         import math
-        from colibri_next.deepseek4 import half_round_trip
+        from flyweight.deepseek4 import half_round_trip
 
         self.assertEqual(half_round_trip(math.inf), math.inf)
         self.assertEqual(half_round_trip(-math.inf), -math.inf)
@@ -284,7 +284,7 @@ class NativeForwardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import numpy as np
-        from colibri_next.deepseek4_layer import DeepSeek4Model
+        from flyweight.deepseek4_layer import DeepSeek4Model
 
         cls.model = V2Model(CHECKPOINT)
         cls.tokens = list(cls.model.tokenize(cls.PROMPT))

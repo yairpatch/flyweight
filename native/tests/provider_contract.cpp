@@ -1,10 +1,10 @@
-#include "colibri_v2_provider.hpp"
+#include "flyweight_v2_provider.hpp"
 
 #include <cstring>
 #include <vector>
 
 namespace {
-class SyntheticProvider final : public colibri::v2::WeightProvider {
+class SyntheticProvider final : public flyweight::v2::WeightProvider {
 public:
     SyntheticProvider() : bytes{1, 2, 3, 4} {
         descriptor.name = "synthetic.weight";
@@ -15,7 +15,7 @@ public:
 
     const char* format() const override { return "synthetic"; }
     std::uint64_t tensor_count() const override { return 1; }
-    const colibri::v2::TensorDescriptor* tensor(std::uint64_t index) const override {
+    const flyweight::v2::TensorDescriptor* tensor(std::uint64_t index) const override {
         return index == 0 ? &descriptor : nullptr;
     }
     int read_tensor(std::uint64_t index, void* destination,
@@ -26,7 +26,7 @@ public:
     }
 
 private:
-    colibri::v2::TensorDescriptor descriptor;
+    flyweight::v2::TensorDescriptor descriptor;
     std::vector<unsigned char> bytes;
 };
 }  // namespace

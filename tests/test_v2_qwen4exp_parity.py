@@ -10,7 +10,7 @@ attention, the MoE routing, and the head collapse standing in for a final norm.
 The mapping back to HF inverts the two conversion-side transforms
 (plans/qwen4exp-semantics.md): the +1 baked into every norm weight, and the
 grouped->tiled reorder of DeltaNet value heads (llama.cpp
-`_LinearAttentionVReorderBase`; colibri's kernels index `head % key_heads`,
+`_LinearAttentionVReorderBase`; flyweight's kernels index `head % key_heads`,
 the tiled order).
 
 Skipped without torch and a transformers with the qwen4_exp model (merged
@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 from tests.qwen4exp_gguf_fixture import Qwen4ExpSpec, build_qwen4exp_gguf
 
 # 64 positions, every one greedy-checked; includes the ple eos token (5) so
@@ -308,8 +308,8 @@ class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
     def setUpClass(cls) -> None:
         # QSA is opt-in (it costs 7-10% decode and a per-slot block-key arena),
         # so these tests must ask for it explicitly.
-        cls._qsa_previous = os.environ.get("COLIBRI_QSA")
-        os.environ["COLIBRI_QSA"] = "1"
+        cls._qsa_previous = os.environ.get("FLYWEIGHT_QSA")
+        os.environ["FLYWEIGHT_QSA"] = "1"
         cls.modeling = _load_transformers()
         if cls.modeling is None:
             raise unittest.SkipTest(
@@ -322,9 +322,9 @@ class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
     @classmethod
     def tearDownClass(cls) -> None:
         if cls._qsa_previous is None:
-            os.environ.pop("COLIBRI_QSA", None)
+            os.environ.pop("FLYWEIGHT_QSA", None)
         else:
-            os.environ["COLIBRI_QSA"] = cls._qsa_previous
+            os.environ["FLYWEIGHT_QSA"] = cls._qsa_previous
         super().tearDownClass()
 
     def test_qsa_prefill_matches_decode(self) -> None:
@@ -334,7 +334,7 @@ class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
 
         continuation = 6
         V2Model.select_backend("cpu")
-        os.environ["COLIBRI_PREFILL_ROWS"] = "16"
+        os.environ["FLYWEIGHT_PREFILL_ROWS"] = "16"
         try:
             generated: list[int] = []
             with V2Model(str(self.path)) as model:
@@ -352,7 +352,7 @@ class Qwen4ExpQsaParityTest(Qwen4ExpForwardParityTest):
                     for _ in range(continuation - 1):
                         decoded.append(runtime.decode(decoded[-1]))
         finally:
-            del os.environ["COLIBRI_PREFILL_ROWS"]
+            del os.environ["FLYWEIGHT_PREFILL_ROWS"]
             V2Model.select_backend("auto")
         self.assertEqual(generated, decoded)
 
@@ -369,8 +369,8 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls._qsa_previous = os.environ.get("COLIBRI_QSA")
-        os.environ["COLIBRI_QSA"] = "1"
+        cls._qsa_previous = os.environ.get("FLYWEIGHT_QSA")
+        os.environ["FLYWEIGHT_QSA"] = "1"
         cls._directory = tempfile.TemporaryDirectory()
         cls.path = Path(cls._directory.name) / "qwen4exp_qsa.gguf"
         cls.spec = build_qwen4exp_gguf(
@@ -379,9 +379,9 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         if cls._qsa_previous is None:
-            os.environ.pop("COLIBRI_QSA", None)
+            os.environ.pop("FLYWEIGHT_QSA", None)
         else:
-            os.environ["COLIBRI_QSA"] = cls._qsa_previous
+            os.environ["FLYWEIGHT_QSA"] = cls._qsa_previous
         cls._directory.cleanup()
 
     def _decode(self, backend: str, tokens: list[int]) -> list[int]:
@@ -446,7 +446,7 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
         self.assertEqual(collected[task_b], expected_b, "interleaved task B")
 
     def test_dense_fallback_is_bit_exact_below_the_budget(self) -> None:
-        """The phase-3 gate: with COLIBRI_QSA=0 the runtime must produce the
+        """The phase-3 gate: with FLYWEIGHT_QSA=0 the runtime must produce the
         identical tokens, because below the budget the selection keeps every
         block and the sparse path is mathematically the dense one. Any drift
         here means the indexer perturbed a path it should not touch."""
@@ -454,11 +454,11 @@ class Qwen4ExpQsaPathTest(unittest.TestCase):
 
         short = TOKENS[:11]  # 11 visible tokens: 2 complete blocks, budget 2
         with_qsa = self._decode("cpu", short)
-        os.environ["COLIBRI_QSA"] = "0"
+        os.environ["FLYWEIGHT_QSA"] = "0"
         try:
             without = self._decode("cpu", short)
         finally:
-            del os.environ["COLIBRI_QSA"]
+            del os.environ["FLYWEIGHT_QSA"]
         self.assertEqual(with_qsa, without)
 
 

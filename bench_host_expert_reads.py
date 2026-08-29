@@ -37,23 +37,23 @@ IQ_BLOCK_BYTES = {"iq1s": 50, "iq4nl": 144}
 
 def _load():
     here = Path(__file__).resolve().parent
-    lib = ctypes.CDLL(str(here / "src/colibri_next/_native/colibri_v2.so"))
-    lib.colibri_gpu_init.restype = ctypes.c_int
-    lib.colibri_gpu_init.argtypes = [ctypes.c_int]
+    lib = ctypes.CDLL(str(here / "src/flyweight/_native/flyweight_v2.so"))
+    lib.flyweight_gpu_init.restype = ctypes.c_int
+    lib.flyweight_gpu_init.argtypes = [ctypes.c_int]
     for name, args in (
-        ("colibri_gpu_alloc", [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]),
-        ("colibri_gpu_free", [ctypes.c_uint64]),
-        ("colibri_gpu_host_register", [ctypes.c_void_p, ctypes.c_uint64]),
-        ("colibri_gpu_upload_sync", [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]),
-        ("colibri_gpu_stream_create", [ctypes.POINTER(ctypes.c_uint64)]),
-        ("colibri_gpu_stream_sync", [ctypes.c_uint64]),
-        ("colibri_gpu_event_create", [ctypes.POINTER(ctypes.c_uint64)]),
-        ("colibri_gpu_timed_event_create", [ctypes.POINTER(ctypes.c_uint64)]),
-        ("colibri_gpu_event_record", [ctypes.c_uint64, ctypes.c_uint64]),
-        ("colibri_gpu_event_sync", [ctypes.c_uint64]),
-        ("colibri_gpu_event_elapsed",
+        ("flyweight_gpu_alloc", [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]),
+        ("flyweight_gpu_free", [ctypes.c_uint64]),
+        ("flyweight_gpu_host_register", [ctypes.c_void_p, ctypes.c_uint64]),
+        ("flyweight_gpu_upload_sync", [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]),
+        ("flyweight_gpu_stream_create", [ctypes.POINTER(ctypes.c_uint64)]),
+        ("flyweight_gpu_stream_sync", [ctypes.c_uint64]),
+        ("flyweight_gpu_event_create", [ctypes.POINTER(ctypes.c_uint64)]),
+        ("flyweight_gpu_timed_event_create", [ctypes.POINTER(ctypes.c_uint64)]),
+        ("flyweight_gpu_event_record", [ctypes.c_uint64, ctypes.c_uint64]),
+        ("flyweight_gpu_event_sync", [ctypes.c_uint64]),
+        ("flyweight_gpu_event_elapsed",
          [ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]),
-        ("colibri_gpu_launch_named",
+        ("flyweight_gpu_launch_named",
          [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
           ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]),
     ):
@@ -65,12 +65,12 @@ def _load():
 
 def _compile_kernels():
     """The kernel module is built by NVRTC when a runtime prepares, so borrow a
-    tiny fixture to get it loaded; `colibri_gpu_launch_named` then resolves the
+    tiny fixture to get it loaded; `flyweight_gpu_launch_named` then resolves the
     IQ kernels by name in this same process."""
     import tempfile
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from colibri_next.v2 import V2Model
+    from flyweight.v2 import V2Model
     from tests.qwen4exp_gguf_fixture import build_qwen4exp_gguf
 
     holder = tempfile.TemporaryDirectory()
@@ -86,7 +86,7 @@ def _compile_kernels():
 
 def main() -> int:
     lib = _load()
-    if lib.colibri_gpu_init(0) != 0:
+    if lib.flyweight_gpu_init(0) != 0:
         print("skipped: no CUDA device")
         return 0
     keepalive = _compile_kernels()
@@ -95,22 +95,22 @@ def main() -> int:
         return 0
 
     stream = ctypes.c_uint64()
-    if lib.colibri_gpu_stream_create(ctypes.byref(stream)) != 0:
+    if lib.flyweight_gpu_stream_create(ctypes.byref(stream)) != 0:
         print("stream create failed")
         return 1
     start, stop = ctypes.c_uint64(), ctypes.c_uint64()
-    lib.colibri_gpu_timed_event_create(ctypes.byref(start))
-    lib.colibri_gpu_timed_event_create(ctypes.byref(stop))
+    lib.flyweight_gpu_timed_event_create(ctypes.byref(start))
+    lib.flyweight_gpu_timed_event_create(ctypes.byref(stop))
 
     rng = np.random.default_rng(7)
 
     # Activation vector and the per-expert output, both device-side always.
     vector = np.ascontiguousarray(rng.standard_normal(INPUT_SIZE), dtype=np.float32)
     d_vector = ctypes.c_uint64()
-    lib.colibri_gpu_alloc(vector.nbytes, ctypes.byref(d_vector))
-    lib.colibri_gpu_upload_sync(d_vector, vector.ctypes.data, vector.nbytes)
+    lib.flyweight_gpu_alloc(vector.nbytes, ctypes.byref(d_vector))
+    lib.flyweight_gpu_upload_sync(d_vector, vector.ctypes.data, vector.nbytes)
     d_activated = ctypes.c_uint64()
-    lib.colibri_gpu_alloc(TOP_K * OUTPUT_SIZE * 4, ctypes.byref(d_activated))
+    lib.flyweight_gpu_alloc(TOP_K * OUTPUT_SIZE * 4, ctypes.byref(d_activated))
 
     # One big registered host arena; experts are scattered through it so the
     # reads cannot be served by any cache that a compact layout would enjoy.
@@ -118,7 +118,7 @@ def main() -> int:
     host[:] = rng.integers(0, 256, size=(1 << 20,), dtype=np.uint8)[
         np.arange(HOST_ARENA_BYTES) % (1 << 20)]
     host_addr = host.ctypes.data
-    reg = lib.colibri_gpu_host_register(ctypes.c_void_p(host_addr), HOST_ARENA_BYTES)
+    reg = lib.flyweight_gpu_host_register(ctypes.c_void_p(host_addr), HOST_ARENA_BYTES)
     if reg != 0:
         print(f"host registration of {HOST_ARENA_BYTES>>30} GiB failed ({reg})")
         return 1
@@ -135,9 +135,9 @@ def main() -> int:
 
         # VRAM copy of the same weights.
         d_weights = ctypes.c_uint64()
-        lib.colibri_gpu_alloc(2 * TOP_K * matrix_bytes, ctypes.byref(d_weights))
+        lib.flyweight_gpu_alloc(2 * TOP_K * matrix_bytes, ctypes.byref(d_weights))
         blob = np.frombuffer(host[: 2 * TOP_K * matrix_bytes], dtype=np.uint8)
-        lib.colibri_gpu_upload_sync(d_weights, blob.ctypes.data, blob.nbytes)
+        lib.flyweight_gpu_upload_sync(d_weights, blob.ctypes.data, blob.nbytes)
 
         for label in ("VRAM", "host mmap"):
             if label == "VRAM":
@@ -152,8 +152,8 @@ def main() -> int:
 
             table = np.array(ptrs, dtype=np.uint64)
             d_table = ctypes.c_uint64()
-            lib.colibri_gpu_alloc(table.nbytes, ctypes.byref(d_table))
-            lib.colibri_gpu_upload_sync(d_table, table.ctypes.data, table.nbytes)
+            lib.flyweight_gpu_alloc(table.nbytes, ctypes.byref(d_table))
+            lib.flyweight_gpu_upload_sync(d_table, table.ctypes.data, table.nbytes)
             gate_table = ctypes.c_uint64(d_table.value)
             up_table = ctypes.c_uint64(d_table.value + TOP_K * 8)
 
@@ -172,30 +172,30 @@ def main() -> int:
             name = f"{kernel}_grouped_swiglu".encode()
 
             def launch():
-                return lib.colibri_gpu_launch_named(
+                return lib.flyweight_gpu_launch_named(
                     name, OUTPUT_SIZE, TOP_K, 256, 0, stream, args)
 
             for _ in range(10):
                 if launch() != 0:
                     print(f"  {kernel}: kernel launch failed (name not registered?)")
                     return 1
-            lib.colibri_gpu_stream_sync(stream)
+            lib.flyweight_gpu_stream_sync(stream)
 
-            lib.colibri_gpu_event_record(start, stream)
+            lib.flyweight_gpu_event_record(start, stream)
             for _ in range(ITERATIONS):
                 launch()
-            lib.colibri_gpu_event_record(stop, stream)
-            lib.colibri_gpu_event_sync(stop)
+            lib.flyweight_gpu_event_record(stop, stream)
+            lib.flyweight_gpu_event_sync(stop)
             ms = ctypes.c_float()
-            lib.colibri_gpu_event_elapsed(start, stop, ctypes.byref(ms))
+            lib.flyweight_gpu_event_elapsed(start, stop, ctypes.byref(ms))
             per = ms.value / ITERATIONS
             gbs = traffic / (per / 1000) / 1e9
             results[(kernel, label)] = per
             ratio = (f"{per / results[(kernel, 'VRAM')]:.1f}x"
                      if label != "VRAM" else "-")
             print(f"{kernel:8s} {label:10s} {per:10.3f} {gbs:8.1f} {ratio:>9s}")
-            lib.colibri_gpu_free(d_table)
-        lib.colibri_gpu_free(d_weights)
+            lib.flyweight_gpu_free(d_table)
+        lib.flyweight_gpu_free(d_weights)
         print()
 
     # What the design is competing against: today's CPU expert path measured on

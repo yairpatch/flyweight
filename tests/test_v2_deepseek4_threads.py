@@ -31,8 +31,8 @@ REPO = Path(__file__).resolve().parent.parent
 PROGRAM = """
 import json, sys
 import numpy as np
-from colibri_next.v2 import V2Model
-from colibri_next.deepseek4 import Deepseek4Runtime
+from flyweight.v2 import V2Model
+from flyweight.deepseek4 import Deepseek4Runtime
 
 model = V2Model(sys.argv[1])
 try:
@@ -63,7 +63,7 @@ class ThreadWidthTests(unittest.TestCase):
     def setUpClass(cls):
         from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 
-        cls.directory = tempfile.TemporaryDirectory(prefix="colibri-ds4omp-")
+        cls.directory = tempfile.TemporaryDirectory(prefix="flyweight-ds4omp-")
         cls.path = Path(cls.directory.name) / "ds4.gguf"
         build_deepseek4_gguf(cls.path, DeepSeek4Spec(layers=6, hash_layers=3))
 
@@ -105,7 +105,7 @@ class ThreadWidthTests(unittest.TestCase):
         self.assertGreater(run["attributed"], 0.5 * run["total"])
 
     def test_the_expert_byte_count_matches_the_weights_it_reads(self):
-        from colibri_next.v2 import V2Model
+        from flyweight.v2 import V2Model
 
         run = self.run_with("1")
         model = V2Model(self.path)

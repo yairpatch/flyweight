@@ -6,17 +6,17 @@ bitwise-identical by construction, so every run's token stream must match --
 a stream mismatch fails the diagnostic, not just the timing.
 
 Determinism guards per the Ornith findings: explicit gpu_cache_bytes,
-COLIBRI_EXPERT_HISTORY=0, no prefill cache seed, single runtime for all arms.
+FLYWEIGHT_EXPERT_HISTORY=0, no prefill cache seed, single runtime for all arms.
 """
 from __future__ import annotations
 
 import os
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
-os.environ["COLIBRI_EXPERT_HISTORY"] = "0"
-os.environ["COLIBRI_MTP_ADAPTIVE"] = "0"
+os.environ["FLYWEIGHT_EXPERT_HISTORY"] = "0"
+os.environ["FLYWEIGHT_MTP_ADAPTIVE"] = "0"
 
 MODEL = "/home/yair/Downloads/Ornith-1.5-35B-Q4_K_M.gguf"
 GPU_CACHE_BYTES = 8192 * 1024**2
@@ -39,7 +39,7 @@ FIELDS = (
 
 
 def run_once(runtime, prompt, fold: bool):
-    os.environ["COLIBRI_MTP_FOLD"] = "1" if fold else "0"
+    os.environ["FLYWEIGHT_MTP_FOLD"] = "1" if fold else "0"
     runtime.reset()
     before = {f: runtime.info[f] for f in FIELDS}
     tokens: list[int] = []

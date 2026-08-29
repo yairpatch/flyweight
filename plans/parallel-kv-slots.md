@@ -68,7 +68,7 @@ slot's arena and restore that slot's `position`/`processed_tokens`/`last_output`
 kernel changes.** The existing reuse + KV-safety guard logic runs unchanged against the
 active slot.
 
-Router (in `colibri_v2_qwen_runtime_generate`, before prefill): pick the slot whose
+Router (in `flyweight_v2_qwen_runtime_generate`, before prefill): pick the slot whose
 `processed_tokens` (or a snapshot) is the longest exact prefix of the incoming prompt;
 tie-break by longest match. If none matches, pick the LRU slot and reset it. A prompt
 that matches a slot's prefix stays on that slot (sticky conversation). Optionally bias
@@ -123,7 +123,7 @@ short/no-match prompts toward a designated small scratch slot.
    beyond `position` are never read (attention is position-bounded), so leftover
    victim data there is harmless. Measured: 121.5 MiB packed vs 223.8 full arena
    at position 3000/8192 (~46% saved, scales with position/context). Env-gated
-   `COLIBRI_ROUTE_TRACE=1` prints routing decisions (debug switch, not a tunable).
+   `FLYWEIGHT_ROUTE_TRACE=1` prints routing decisions (debug switch, not a tunable).
    Note: spilled checkpoints (~64 MiB each, up to 4) now dominate a host entry;
    spilling only the end-of-prompt + best mid checkpoint is a future trim.
    Not done: concurrent decode.
@@ -139,7 +139,7 @@ short/no-match prompts toward a designated small scratch slot.
   reprefill, not throughput. True parallel decode (batched multi-seq) is a separate,
   much larger effort.
 - **Interim mitigation (no code)**: point Claude Code's small/side model at a different
-  backend so only the main conversation touches colibri — recovers most of the loss today.
+  backend so only the main conversation touches flyweight — recovers most of the loss today.
 
 ## Instrumentation already in place
 

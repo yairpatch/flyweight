@@ -1,11 +1,11 @@
-#include "colibri_v2_expert_seed.hpp"
+#include "flyweight_v2_expert_seed.hpp"
 
 #include <cassert>
 #include <cstdint>
 #include <limits>
 
 int main() {
-    using namespace colibri::v2::expert_seed;
+    using namespace flyweight::v2::expert_seed;
 
     assert(auto_experts_per_layer(383, 80, 1) == 4);
     assert(auto_experts_per_layer(383, 80, 32) == 4);

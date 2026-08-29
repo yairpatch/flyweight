@@ -16,20 +16,20 @@
 
 // One Q8_0 row (fp16 scale + 32 int8 per 34-byte block) against an f32 vector.
 // `blocks` is elements / 32. `row_packed` points at the row's first block.
-float colibri_q8_row_dot_avx512(const std::uint8_t* row_packed,
+float flyweight_q8_row_dot_avx512(const std::uint8_t* row_packed,
                                 const float* vector, int blocks);
 
-float colibri_q8_row_dot_avx2(const std::uint8_t* row_packed,
+float flyweight_q8_row_dot_avx2(const std::uint8_t* row_packed,
                               const float* vector, int blocks);
 
 // Gate and up rows against the same vector, for the fused SwiGLU. Sharing the
 // activation load across both weight streams is the whole point.
-void colibri_q8_row_dot_pair_avx512(const std::uint8_t* gate_packed,
+void flyweight_q8_row_dot_pair_avx512(const std::uint8_t* gate_packed,
                                     const std::uint8_t* up_packed,
                                     const float* vector, int blocks,
                                     float* gate_out, float* up_out);
 
-void colibri_q8_row_dot_pair_avx2(const std::uint8_t* gate_packed,
+void flyweight_q8_row_dot_pair_avx2(const std::uint8_t* gate_packed,
                                   const std::uint8_t* up_packed,
                                   const float* vector, int blocks,
                                   float* gate_out, float* up_out);

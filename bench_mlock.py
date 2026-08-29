@@ -1,4 +1,4 @@
-"""Measure decode tok/s + per-token latency jitter, for COLIBRI_V2_MLOCK on/off.
+"""Measure decode tok/s + per-token latency jitter, for FLYWEIGHT_V2_MLOCK on/off.
 
 Run in its own process per setting (env read at model open). Reports mean
 tok/s plus per-token latency percentiles — mlock/MAP_POPULATE should shrink
@@ -12,7 +12,7 @@ import statistics
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 CONTEXT = 8192
@@ -25,7 +25,7 @@ PROMPT_TEXT = (
 
 
 def main() -> None:
-    setting = os.environ.get("COLIBRI_V2_MLOCK", "0")
+    setting = os.environ.get("FLYWEIGHT_V2_MLOCK", "0")
     model = V2Model(MODEL)
     try:
         prompt = model.tokenize(PROMPT_TEXT)
@@ -57,7 +57,7 @@ def main() -> None:
         def pct(p: float) -> float:
             return deltas_sorted[min(len(deltas_sorted) - 1, int(p * len(deltas_sorted)))]
 
-        print(f"COLIBRI_V2_MLOCK={setting}  tokens={len(stamps)}  "
+        print(f"FLYWEIGHT_V2_MLOCK={setting}  tokens={len(stamps)}  "
               f"tok/s={len(stamps) / wall:.2f}")
         print(f"  per-token ms: mean={statistics.mean(deltas):.3f}  "
               f"p50={pct(0.50):.3f}  p95={pct(0.95):.3f}  "

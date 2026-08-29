@@ -31,7 +31,7 @@ import unittest
 
 import numpy as np
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
 # A stale path is as good as no path: the variable often outlives the file it
@@ -74,7 +74,7 @@ class DeviceMatvecTests(unittest.TestCase):
         raise unittest.SkipTest(f"this checkpoint stores nothing as type {ggml_type}")
 
     def check(self, name: str, iterations: int = 0):
-        from colibri_next.deepseek4 import gpu_matvec_check
+        from flyweight.deepseek4 import gpu_matvec_check
 
         tensor = self.tensors[name]
         rows, columns = tensor["shape"][0], tensor["shape"][1]
@@ -140,7 +140,7 @@ class ResidentDenseWeightTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from colibri_next.deepseek4 import Deepseek4Runtime
+        from flyweight.deepseek4 import Deepseek4Runtime
 
         cls.model = V2Model(CHECKPOINT)
         cls.tokens = list(cls.model.tokenize("The capital city of France is"))
@@ -210,7 +210,7 @@ class HybridServiceTests(unittest.TestCase):
     """
 
     def test_a_generation_survives_the_scheduler_thread(self):
-        from colibri_next.deepseek4_server import NativeDeepseek4InferenceService
+        from flyweight.deepseek4_server import NativeDeepseek4InferenceService
 
         service = NativeDeepseek4InferenceService(
             CHECKPOINT, context_window=512, max_new_tokens=8, device=0
@@ -227,7 +227,7 @@ class HybridServiceTests(unittest.TestCase):
         self.assertIn("Paris", reply)
 
     def test_multiple_slots_share_one_dense_weight_upload(self):
-        from colibri_next.deepseek4_server import NativeDeepseek4InferenceService
+        from flyweight.deepseek4_server import NativeDeepseek4InferenceService
 
         service = NativeDeepseek4InferenceService(
             CHECKPOINT, context_window=512, device=0, parallel_sequences=2

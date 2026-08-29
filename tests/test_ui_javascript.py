@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 
-APP = Path(__file__).parents[1] / "src" / "colibri_next" / "ui" / "app.js"
+APP = Path(__file__).parents[1] / "src" / "flyweight" / "ui" / "app.js"
 
 
 class UIJavaScriptTests(unittest.TestCase):
@@ -55,7 +55,7 @@ class UIJavaScriptTests(unittest.TestCase):
         self.assertIn('state.settings.reasoningEffort !== "auto"', payload)
         self.assertIn("state.settings.thinking &&", payload)
 
-        index = Path(__file__).parents[1] / "src" / "colibri_next" / "ui" / "index.html"
+        index = Path(__file__).parents[1] / "src" / "flyweight" / "ui" / "index.html"
         markup = index.read_text(encoding="utf-8")
         self.assertIn('id="reasoning-effort"', markup)
         for level in ("auto", "low", "medium", "high"):

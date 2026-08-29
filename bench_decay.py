@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "/home/yair/Downloads/Ling-3.0-tiny-Q6_K.gguf"
 TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 1024

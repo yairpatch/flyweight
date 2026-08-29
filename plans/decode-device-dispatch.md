@@ -10,7 +10,7 @@
 > barely mentioned: the bundle staging memcpy**. Phase 2 is dropped. Phase 1 is the
 > whole plan now. See "Phase 0b results".
 
-## Measured baseline (real UD-IQ1_S, `COLIBRI_TIMING=1`, 109-128 decode calls)
+## Measured baseline (real UD-IQ1_S, `FLYWEIGHT_TIMING=1`, 109-128 decode calls)
 
 | phase | ms/token | share | what it is |
 |---|---|---|---|
@@ -31,8 +31,8 @@ serialization problem, not a bandwidth problem.**
 
 ## Four findings that reframe the work
 
-1. **Routing is ALREADY on the device.** `colibri_gpu_route_topk`
-   (`gpu_driver.cpp:1897`, kernel `colibri_v2_qwen_kernels.hpp:400`) does softmax +
+1. **Routing is ALREADY on the device.** `flyweight_gpu_route_topk`
+   (`gpu_driver.cpp:1897`, kernel `flyweight_v2_qwen_kernels.hpp:400`) does softmax +
    top-k + renormalize in one block and writes `selected_device` / `route_weights`.
    The readback is 40 bytes of expert ids (plus, in hybrid, the weights and the
    full 10 KB activation vector for CPU experts). *Moving routing on-device is not
@@ -56,7 +56,7 @@ serialization problem, not a bandwidth problem.**
    the critical path** — plausibly 5-8 ms of the unexplained 25 ms.
 
 4. **Predictive prefetch has little headroom — measured, not assumed.**
-   `COLIBRI_ROUTE_RECURRENCE=1` (the instrumentation at `:1231`, built for exactly
+   `FLYWEIGHT_ROUTE_RECURRENCE=1` (the instrumentation at `:1231`, built for exactly
    this question and never consulted) over 22560 observations:
    resident 69.9%, **miss-but-in-recent-window 5.3%**, **miss-and-cold 24.7%**.
    Only ~18% of misses were predictable from the last few tokens. A whole-token or
@@ -67,14 +67,14 @@ serialization problem, not a bandwidth problem.**
 
 Two in-tree precedents already do dispatch without a host pointer table:
 
-- **Gemma 4** (`colibri_v2_qwen_kernels.hpp:1306-1356`): `gemma_q4_0_pinned_geglu` /
+- **Gemma 4** (`flyweight_v2_qwen_kernels.hpp:1306-1356`): `gemma_q4_0_pinned_geglu` /
   `_accumulate` take `(layer_base, slot_bytes, const int* selected, ...)` and compute
   the weight address **in the kernel** as `layer_base + selected[rank]*slot_bytes`.
   The comment at `v2_runtime.cpp:15706` is the target state verbatim: *"the routed
   indices never need to visit the host … this layer costs no download and no event
   sync. That also makes the whole dense+router+MoE chain graph-capturable."*
   It works there because Gemma pins **whole layers**, so slot = expert.
-- **Bailing prefill** (`bailing_route_rows`, `colibri_v2_native_kernels.hpp:1878`)
+- **Bailing prefill** (`bailing_route_rows`, `flyweight_v2_native_kernels.hpp:1878`)
   goes further: it builds the inverted dispatch on device with `atomicAdd`, and the
   grouped kernels take `(base, expert_stride, counts, routes)`. Zero readback.
 
@@ -91,7 +91,7 @@ addresses**. The missing piece is exactly one thing: a device-visible
    critical path.
 2. **Pointer-free grouped kernels.** New variants of the IQ grouped family
    (`iq1s`, `iq4nl`, `iq2xxs` — the three this checkpoint uses; macro at
-   `colibri_v2_qwen_kernels.hpp:5795`) taking
+   `flyweight_v2_qwen_kernels.hpp:5795`) taking
    `(cache_base, slot_bytes, role_offsets, const int* slot_of_layer, const int* selected, const float* route_weights)`
    instead of `gate_ptrs/up_ptrs/down_ptrs`. Address is computed in-kernel, Gemma-style.
 3. ~~**Misses without the host.**~~ **KILLED BY PHASE 0.** The idea was that when
@@ -140,13 +140,13 @@ registration covering the expert tensors (or as much of them as a budget allows)
 makes DMA paging available where it is silently off today.
 
 **Note the distinction Phase 0 sharpened**: DMA paging is a *bulk sequential
-`colibri_gpu_upload` from registered memory into a VRAM slot* — it is unaffected by
+`flyweight_gpu_upload` from registered memory into a VRAM slot* — it is unaffected by
 gate 1 and remains the Phase 1 win. What failed is *kernels dereferencing host
 pointers*, which is a different access pattern entirely.
 
 ## Phase 0b results (2026-08-27) — the 25 ms, attributed
 
-`COLIBRI_MOE_PROFILE=1` (added in this commit), real UD-IQ1_S, two windows of the
+`FLYWEIGHT_MOE_PROFILE=1` (added in this commit), real UD-IQ1_S, two windows of the
 same run:
 
 | cause | ms/token (39 tok) | ms/token (89 tok) | share |
@@ -181,7 +181,7 @@ incremented in only some branches), **134-160 admissions/token**, and
    - *Stop copying*: DMA paging uploads straight from the registered mmap with no
      host memcpy (`:17039-17043`). Off here only because the heuristic tests the
      whole 68 GB mapping. This removes the 16-34 ms outright.
-   - *Stop admitting so much*: `COLIBRI_EXPERT_CACHE_STRICT_ADMISSION=1` measures
+   - *Stop admitting so much*: `FLYWEIGHT_EXPERT_CACHE_STRICT_ADMISSION=1` measures
      **27.42 / 27.36 tok/s against a 23.91 / 26.69 baseline** — about +8% and a large
      drop in run-to-run variance, from one environment variable. A miss runs on the
      CPU either way; admitting it is pure speculation about reuse.
@@ -204,7 +204,7 @@ three `qwen_expert_role_scale` mmap touches per expert (`:17010` — these read 
 straight out of the mapping and can minor-fault), `select_expert_cache_slot`'s linear
 victim scan (~40 admissions/token over a ~67-slot band), the six table memcpys, and
 `record_expert_access`'s periodic O(layers x experts) decay sweep (`:1568`).
-Add sub-timers under `COLIBRI_TIMING` and attribute the 25 ms.
+Add sub-timers under `FLYWEIGHT_TIMING` and attribute the 25 ms.
 *Gate: a per-cause ms/token breakdown. This decides whether Phase 1 alone gets most
 of the win, or whether Phase 2 is worth its cost.*
 
@@ -339,8 +339,8 @@ the A/B on a warmed cache before quoting it.
 
 Three things this needed, each a small trap:
 
-- `colibri_gpu_host_register` did not bind the CUDA primary context, unlike
-  `colibri_gpu_alloc` and friends. On a worker thread that fails with
+- `flyweight_gpu_host_register` did not bind the CUDA primary context, unlike
+  `flyweight_gpu_alloc` and friends. On a worker thread that fails with
   `INVALID_CONTEXT`. Fixed in both register and unregister.
 - **Promotion is all-or-nothing, not per layer, and that is forced.** The first
   attempt registered each layer separately, trimming spans inward so neighbouring
@@ -396,11 +396,11 @@ within this box's RAM, which is now Phase 1's real risk and the next thing to te
 
 ## Server validation (2026-08-27) — the win does NOT show up under `serve`
 
-Everything above was measured with `colibri-next benchmark`. The product is the
+Everything above was measured with `flyweight benchmark`. The product is the
 server, which goes through the cooperative engine, the prompt cache and the
 multi-sequence path instead. Measured through the OpenAI streaming API against a
 real `serve` process, 32k context, `--gpu-cache-mib 9000`, decode rate taken from
-the server's own `colibri.decode_elapsed_seconds`:
+the server's own `flyweight.decode_elapsed_seconds`:
 
 | | baseline 5e8fefe | HEAD |
 |---|---|---|
@@ -445,11 +445,11 @@ that is the only reason it is out of scope, not the payoff.
 - `native/src/v2_runtime.cpp` — decode MoE phase (`:16834-17280`), the event sync
   (`:16943`), residency map (`:734`), `select_expert_cache_slot` (`:1587`),
   paging registration (`:13780-13830`), `record_expert_access` (`:1539`)
-- `native/include/colibri_v2_qwen_kernels.hpp` — IQ grouped macro (`:5795`),
+- `native/include/flyweight_v2_qwen_kernels.hpp` — IQ grouped macro (`:5795`),
   Gemma pinned kernels as the template (`:1306-1356`), `route_topk` (`:400`)
-- `native/include/colibri_v2_native_kernels.hpp` — `bailing_route_rows` (`:1878`),
+- `native/include/flyweight_v2_native_kernels.hpp` — `bailing_route_rows` (`:1878`),
   the fully-on-device precedent
-- `native/src/gpu_driver.cpp` — `colibri_gpu_route_topk` (`:1897`), kernel name table
+- `native/src/gpu_driver.cpp` — `flyweight_gpu_route_topk` (`:1897`), kernel name table
 - Prior art: `plans/prefill-pipeline.md` (how the rows path got route_wait <1% — by
   schedule depth, not transfer cleverness), `plans/concurrent-decode.md` (the same
   trick across sequences, 1.46x at N=2)
@@ -459,7 +459,7 @@ that is the only reason it is out of scope, not the payoff.
 # Prefill / TTFT (2026-08-27) — the phase that actually matters
 
 The server measurement above put a ~3k-token request's TTFT at ~33 s against ~30
-tok/s decode. Measured directly on a 4243-token prompt (`COLIBRI_TIMING=1`):
+tok/s decode. Measured directly on a 4243-token prompt (`FLYWEIGHT_TIMING=1`):
 
 | | |
 |---|---|
@@ -505,11 +505,11 @@ hit rate is most of the time.
 ## The override that made `--hybrid-prefill` a no-op (2026-08-27)
 
 Chasing why the prefill expert-GEMM/streaming path never ran
-(`prefill_streamed_bytes = 0` in every arm), a `COLIBRI_STREAM_TRACE` at its gate
+(`prefill_streamed_bytes = 0` in every arm), a `FLYWEIGHT_STREAM_TRACE` at its gate
 showed the gate passing — and, unexpectedly, `hybrid_prefill_cpu=1` and
 `routed_gpu_allowed=0` **even under `--hybrid-prefill split`**.
 
-`src/colibri_next/v2.py`:
+`src/flyweight/v2.py`:
 
 ```python
 effective_hybrid_prefill = ("cpu" if resolved_expert_mode == "auto" else hybrid_prefill)
@@ -581,7 +581,7 @@ a 33 s TTFT by more than 11%.
 
 ### IQ4_NL rows matmul shipped — the path engages, and does not pay here
 
-`iq4nl_matmul_rows` added (`COLIBRI_LOWBIT_MATMUL_ROWS(iq4nl_matmul_rows,
+`iq4nl_matmul_rows` added (`FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq4nl_matmul_rows,
 iq4nl_value)`), format entry wired, registered in the driver name table. Verified
 against the independent host decoder by the IQ kernel contract at 1.3e-08.
 
@@ -637,7 +637,7 @@ genuinely taken.
 
 | | prefill |
 |---|---|
-| `COLIBRI_IQ_AVX512=0` (AVX2) | 58.0 / 58.5 tok/s |
+| `FLYWEIGHT_IQ_AVX512=0` (AVX2) | 58.0 / 58.5 tok/s |
 | AVX-512 | 56.9 / 58.2 tok/s |
 
 **No gain.** Vector width is not the constraint, and the reason points at the
@@ -686,7 +686,7 @@ Three hypotheses about the streaming path were killed by direct test, in order:
    a guessed constant baseline, and it was wrong. It is recorded here because it
    drove two proposals before anyone measured the thing directly.
 
-Direct instrumentation (`COLIBRI_MOE_PROFILE=1` now reports the streaming split,
+Direct instrumentation (`FLYWEIGHT_MOE_PROFILE=1` now reports the streaming split,
 and prints at exit so a short probe still gets it), 4243-token prompt, 2048 MiB
 arena, 55.6 s total:
 
@@ -719,7 +719,7 @@ Second target, unexamined: the ~22 s of non-expert prefill.
 
 ## The non-expert half of prefill (2026-08-27)
 
-`COLIBRI_PREFILL_TRACE=2` with `COLIBRI_PREFILL_PIPELINE=0`, 4243-token prompt.
+`FLYWEIGHT_PREFILL_TRACE=2` with `FLYWEIGHT_PREFILL_PIPELINE=0`, 4243-token prompt.
 **Read the shares, not the totals** — the tracer syncs the stream at every marker.
 
 | phase | seconds | share | layers |
@@ -764,7 +764,7 @@ it is not, or MMQ itself is underperforming here.
 **Next test, and it must come before any code**: a standalone benchmark of
 `q5k_q8_mmq` against `q5k_matmul_rows` at the real shape (1024 x 2560 -> 10240),
 plus a check of which kernel `dense_rows` actually selects. There is no env toggle
-for MMQ today, so the dispatch needs a trace like `COLIBRI_STREAM_TRACE`. That
+for MMQ today, so the dispatch needs a trace like `FLYWEIGHT_STREAM_TRACE`. That
 distinguishes "MMQ is off" (a wiring bug, cheap fix, precedent: IQ4_NL and
 `--hybrid-prefill`) from "MMQ is on and slow" (a kernel problem, expensive).
 
@@ -781,7 +781,7 @@ The tracer is fine for ordering and useless for rates.
 
 **Dead: "the kernel is 20x slower in situ than standalone."** Same cause.
 
-`COLIBRI_PREFILL_LAUNCH_TIME=1` now brackets every rows-path launch with CUDA
+`FLYWEIGHT_PREFILL_LAUNCH_TIME=1` now brackets every rows-path launch with CUDA
 events, so each kernel's own duration is measured. (Wall time under it is
 meaningless -- everything is serialized -- but a kernel's duration is not affected
 by serialization, which is the whole point.) On a 784-token prompt:
@@ -796,7 +796,7 @@ Top GPU kernels: `q5k_q8_mmq` 1.57 s (24.5%, 848 calls = **1.85 ms/call**),
 0.41 s, `quantize_q8_blocks_rows` 0.38 s, `qwen4_group_rms_rows` 0.35 s,
 `iq4nl_matmul_rows` 0.28 s. A standalone benchmark of `q5k_q8_mmq` at
 `[1024x2560]x[2560x10240]` gives **19.06 TFLOP/s** / 2.82 ms, consistent with the
-in-situ per-call figure once shapes are accounted. And `COLIBRI_DENSE_TRACE=1`
+in-situ per-call figure once shapes are accounted. And `FLYWEIGHT_DENSE_TRACE=1`
 confirms every dense projection takes MMQ: `q5k_q8_mmq`, `q6k_q8_mmq`.
 
 **The GPU is not the problem, at all.** Prefill is bound by CPU expert execution,
@@ -824,8 +824,8 @@ Everything in the section below was measured with a **full 2048 MiB staging aren
 which is not the default — expert streaming defaults off. Under the shipped default
 the picture is completely different, and the dispatch count is not the problem.
 
-**Wall-clock phase split, 4158-token prefill, default config** (`COLIBRI_TIMING=1`
-+ `COLIBRI_PREFILL_PROFILE=1`, 8 prefill calls):
+**Wall-clock phase split, 4158-token prefill, default config** (`FLYWEIGHT_TIMING=1`
++ `FLYWEIGHT_PREFILL_PROFILE=1`, 8 prefill calls):
 
 | phase | seconds | share |
 |---|---|---|
@@ -847,13 +847,13 @@ exploit. Decode is the opposite — 480 routes per token with strong recurrence.
 
 **Three hypotheses falsified, in order, each by measurement:**
 1. *Dispatch count* — that is the staging regime, not the default (see split above).
-2. *Direct-quant dots* (`COLIBRI_PREFILL_DIRECT_QUANT=1`, which lifts the Laguna-only
+2. *Direct-quant dots* (`FLYWEIGHT_PREFILL_DIRECT_QUANT=1`, which lifts the Laguna-only
    gate): **2x SLOWER** — 45.8/43.8 tok/s against 89.0/84.6. Identical output. The
    existing dequant-then-GEMM decodes each weight row once and GEMMs it against all
    ~20 tokens routed to that expert; the direct path re-decodes per 8-token tile.
    The gate is correct and should stay.
 3. *Bigger chunks to amortise dequant further* — flat: 89.7 / 90.5 / 89.2 tok/s at
-   `COLIBRI_PREFILL_ROWS` 1024 / 2048 / 4096. Dequant is already amortised as far as
+   `FLYWEIGHT_PREFILL_ROWS` 1024 / 2048 / 4096. Dequant is already amortised as far as
    chunking takes it.
 
 **Lesson: phase split before mechanism.** All three cost a measurement that reading
@@ -863,7 +863,7 @@ the wall-clock split first would have avoided.
 `201`, 2048/4096 -> `248046` = EOS). The prompt was synthetic near-tied garbage and
 [[qwen4exp-support]] already records batch-vs-single CPU-MoE summation drift on this
 quant, so it may be benign — but prefill should not be that chunk-sensitive, and
-this was not run on real text. Check before treating `COLIBRI_PREFILL_ROWS` as a
+this was not run on real text. Check before treating `FLYWEIGHT_PREFILL_ROWS` as a
 tuning knob.
 
 ## RESOLVED (2026-08-28): one weight type had no vectorized row decoder
@@ -926,7 +926,7 @@ is what separated the two, and it should have come first.
 
 **The same omission, two formats over — measured and fixed.** Types 17 (IQ2_XS)
 and 18 (IQ3_XXS) had SIMD dots and q8-K integer dots but no store-form dequant
-either. `colibri_qwen_moe_layer_bench` at the real shape, before and after:
+either. `flyweight_qwen_moe_layer_bench` at the real shape, before and after:
 
 | format | before | after | dequant/gemm |
 |---|---|---|---|
@@ -942,7 +942,7 @@ Not validated end to end: no checkpoint on this box has 17/18 *expert* stacks
 (the local IQ2_XXS/IQ3_XXS models are dense). The exactness is contract-proven
 and the speedup is measured at the real shape, but the first model that runs
 this should be checked. That layout is Laguna's (gate/up 17, down 18), which
-also makes `COLIBRI_PREFILL_DIRECT_QUANT` worth re-measuring there: the gate
+also makes `FLYWEIGHT_PREFILL_DIRECT_QUANT` worth re-measuring there: the gate
 exists because dequant-then-GEMM was the scalar path, and it no longer is.
 
 ### The split after the fix, and why the CPU path is now done
@@ -964,7 +964,7 @@ activate 2.5%. The f32 GEMM is now the top term.
 GMAC/s where the isolated harness reaches 599; that 1.5x is accounted for, not
 a defect:
 
-- **Sustained thermals, -19%.** `colibri_qwen_moe_layer_bench 1024 16 25` holds
+- **Sustained thermals, -19%.** `flyweight_qwen_moe_layer_bench 1024 16 25` holds
   16 cores in AVX-512 for 25 s: 665 GMAC/s on the first pass, ~540 by pass 418.
   A 50 ms benchmark reads the clocks at boost; a prefill does not.
 - **File-backed pages, -9%.** Same bytes, page-cache resident either way,
@@ -996,7 +996,7 @@ do not deliver it — see "STOP: step 3 must not be wired" at the end of this
 document. The prize above stands; the kernel that collects it does not exist
 yet.
 
-## FALSIFIED: colibri's CPU expert path is several times slower than llama.cpp's
+## FALSIFIED: flyweight's CPU expert path is several times slower than llama.cpp's
 
 **This section's conclusion was wrong.** Its measurements were sound and its
 inference was not: it compared configurations end to end and concluded the
@@ -1028,9 +1028,9 @@ The cross-check that localises it. Same GGUF, same box, `llama-bench`:
 |---|---|---|
 | llama.cpp `-ncmoe 48` | **100%** of experts on CPU | **196.5 tok/s** |
 | llama.cpp `-ncmoe 44` | 4 layers GPU, 44 on CPU | 367.9 tok/s |
-| colibri (default) | ~30-35% GPU, 65-70% CPU | ~45 tok/s at 591 tokens |
+| flyweight (default) | ~30-35% GPU, 65-70% CPU | ~45 tok/s at 591 tokens |
 
-llama.cpp doing **more** CPU expert work than colibri is still ~4x faster. So the
+llama.cpp doing **more** CPU expert work than flyweight is still ~4x faster. So the
 gap is not expert placement and not the GPU path — **it is the CPU expert kernel
 itself**, and that is where prefill work should go next.
 
@@ -1038,7 +1038,7 @@ The likely mechanism, and it matches what [[qwen4exp-support]] already flagged
 ("the remaining 98% of prefill is the f32 dot_multi GEMM over decoded rows —
 quantized dot_multi templates for 19/20 are the next lever"):
 
-- colibri decodes IQ1_S/IQ2_XXS/IQ4_NL weight rows to **f32** and runs an f32 GEMM.
+- flyweight decodes IQ1_S/IQ2_XXS/IQ4_NL weight rows to **f32** and runs an f32 GEMM.
   That is a 2-4x byte expansion plus float math, and the measured
   `gate{dequant=446s gemm=119s}` says the decode alone is 3.75x the GEMM it feeds.
 - llama.cpp quantizes the **activations** to Q8_K once per chunk and does **integer
@@ -1050,7 +1050,7 @@ chunk's activations to Q8 once, then int8-dot against the packed expert weights.
 The GPU side of the runtime already does exactly this (`stream_quantize`,
 `iq1s_q8_mmq`); the CPU MoE never got it.
 
-*Before building it*: measure a single CPU expert matmul in isolation, colibri's
+*Before building it*: measure a single CPU expert matmul in isolation, flyweight's
 dequant+GEMM against a q8-activation int-dot prototype, at the real shape
 (2560x640, ~20 tokens). The end-to-end numbers above compare configurations with
 different expert placement, so they bound the opportunity but do not prove the
@@ -1063,7 +1063,7 @@ mechanism. Do not repeat this session's mistake of designing from an inferred ca
 
 ## The prefill bottleneck, established (2026-08-28)
 
-Measured with `COLIBRI_PREFILL_LAUNCH_TIME=1`, 784-token prompt, at the two ends
+Measured with `FLYWEIGHT_PREFILL_LAUNCH_TIME=1`, 784-token prompt, at the two ends
 of the staging range:
 
 | | default arena (48 MiB) | full staging (2048 MiB) |
@@ -1078,7 +1078,7 @@ new limit: `iq1s_q8_mmq` alone is 27,942 calls at **5 blocks per call**. A 5-blo
 kernel cannot fill this GPU; the 66 us the events attribute to each call is
 mostly launch latency, not arithmetic.
 
-Confirmed by a chunk-size test rather than assumed. Doubling `COLIBRI_PREFILL_ROWS`
+Confirmed by a chunk-size test rather than assumed. Doubling `FLYWEIGHT_PREFILL_ROWS`
 1024 -> 2048 at a 2048 MiB arena cuts uploads 184.6 -> 145.6 GiB and groups
 122,333 -> 96,472, both -21%, and moves prefill 66.6 -> 68.2 tok/s: **+2.4%**.
 Reducing dispatches proportionally reduces time proportionally, which is what a
@@ -1111,7 +1111,7 @@ expert. Everything measured this session says that is the last big factor; uploa
 
 ### Step 1 shipped: the block-aligned route layout
 
-`native/include/colibri_v2_moe_align.hpp` — routes grouped by expert and padded to
+`native/include/flyweight_v2_moe_align.hpp` — routes grouped by expert and padded to
 a block multiple, the layout a single fused kernel walks. Host reference and
 production builder in one small header, pinned by
 `native/tests/qwen_moe_align_contract.cpp` (ctest is now 22).
@@ -1181,7 +1181,7 @@ its 4096 launches or its uploads. The residual gap to the streaming path's 0.33M
 is the padding plus the fact that an expert spanning several blocks re-reads its
 row once per block -- 14.4% and ~2.9 blocks per expert at this shape.
 
-`kBlockSize` lives in `colibri_v2_moe_align.hpp` and `COLIBRI_MOE_BLOCK` in the
+`kBlockSize` lives in `flyweight_v2_moe_align.hpp` and `FLYWEIGHT_MOE_BLOCK` in the
 kernel corpus; each names the other, because they size the same accumulator.
 
 **Not yet wired in.** Step 3 is the rows path calling this once per layer instead
@@ -1261,13 +1261,13 @@ actually is. These two kernels are a naive octet decoder wearing the right
 dispatch shape.
 
 Until that kernel exists, wiring step 3 would make prefill slower. The aligned
-layout (`colibri_v2_moe_align.hpp`) survives unchanged and is still the right
+layout (`flyweight_v2_moe_align.hpp`) survives unchanged and is still the right
 input for it; the two `_block_*` kernels are the part to replace.
 
 ### Step 2b: the routed MMQ — the block table over the tensor-core core
 
 `iq1s_q8_mmq_routed` and its four siblings (`iq2xxs`, `iq2xs`, `iq3xxs`,
-`iq4xs`). `COLIBRI_Q8_MMQ_ROUTED` is `COLIBRI_Q8_MMQ` with the staging loop
+`iq4xs`). `FLYWEIGHT_Q8_MMQ_ROUTED` is `FLYWEIGHT_Q8_MMQ` with the staging loop
 changed and nothing else: `blockIdx.y` picks a route-block, its expert comes
 from `block_experts`, and a slot's token is `sorted_routes[slot] / top_k`. The
 ldmatrix pairs, the `m16n8k16` MMAs and the scale folding are the proven core,
@@ -1288,7 +1288,7 @@ holds ~20 routes here, so a 128-token tile would be 84% padding. 32 costs 37.7%
 padding against kBlockSize 8's 14.4%, and buys 2.9x fewer weight decodes --
 the right trade because this kernel is decode-bound, not MMA-bound (it reads
 weights at 46 GB/s of a 391 GB/s bus). `kMmqBlockSize` in the align header and
-`COLIBRI_MOE_MMQ_TOKENS` in the corpus name each other.
+`FLYWEIGHT_MOE_MMQ_TOKENS` in the corpus name each other.
 
 Correctness is pinned by `check_routed_mmq` against a double-precision
 reference over the block table, not against the plain MMQ: a plain-kernel
@@ -1324,7 +1324,7 @@ predicted before the kernel existed.
 
 ### Step 3 SHIPPED: the rows path drives it, opt-in
 
-`COLIBRI_ROUTED_MOE=1` replaces the streaming path's per-expert loop with one
+`FLYWEIGHT_ROUTED_MOE=1` replaces the streaming path's per-expert loop with one
 aligned layout per layer and a handful of launches per tile. Measured at 2048
 tokens, first token identical in every configuration:
 
@@ -1362,11 +1362,11 @@ How it fits the existing path, which is most of why the change is small:
 
 ### Step 4: the K-quants, and what the win actually scales with
 
-The routed treatment applied twice, because `COLIBRI_Q8_MMQ_MIN` is a separate
+The routed treatment applied twice, because `FLYWEIGHT_Q8_MMQ_MIN` is a separate
 macro: Q4_K, Q5_K and Q2_K carry a per-group minimum that has to be cancelled
 against the activation's own sum, which is four extra staged arrays. That is
 what most MoE checkpoints in the wild ship, so leaving them out left the whole
-mechanism applicable to IQ quants only. `COLIBRI_Q8_MMQ_MIN_ROUTED` is 64 rows
+mechanism applicable to IQ quants only. `FLYWEIGHT_Q8_MMQ_MIN_ROUTED` is 64 rows
 x 32 tokens over 16 warps -- 512 threads against the plain form's 256, so the
 launch geometry has to travel with the weight type or a launch reads past its
 staged tile.

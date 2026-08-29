@@ -10,7 +10,7 @@
 // them all at once. Prefill and decode share this kernel, so if that ever
 // breaks, a conversation silently diverges from its own prefill.
 
-#include "colibri_v2_bailing.hpp"
+#include "flyweight_v2_bailing.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -33,7 +33,7 @@ const float expected[] = {0.239543f, -0.261887f, -0.240693f, -0.028916f, 0.21240
 bool matches_the_reference() {
     std::vector<float> state(kHeads * kHeadDim * kHeadDim, 0.0f);
     std::vector<float> output(kRows * kWidth, 0.0f);
-    colibri::v2::bailing::kda_recurrence(
+    flyweight::v2::bailing::kda_recurrence(
         queries, keys, values, gate_raw, beta_logits, a_log, dt_bias,
         kRows, kHeads, kHeadDim, 1e-6f, state.data(), output.data());
     for (std::size_t i = 0; i < kRows * kWidth; ++i)
@@ -45,14 +45,14 @@ bool matches_the_reference() {
 bool decode_matches_prefill() {
     std::vector<float> batched_state(kHeads * kHeadDim * kHeadDim, 0.0f);
     std::vector<float> batched(kRows * kWidth, 0.0f);
-    colibri::v2::bailing::kda_recurrence(
+    flyweight::v2::bailing::kda_recurrence(
         queries, keys, values, gate_raw, beta_logits, a_log, dt_bias,
         kRows, kHeads, kHeadDim, 1e-6f, batched_state.data(), batched.data());
 
     std::vector<float> stepped_state(kHeads * kHeadDim * kHeadDim, 0.0f);
     std::vector<float> stepped(kRows * kWidth, 0.0f);
     for (std::size_t row = 0; row < kRows; ++row)
-        colibri::v2::bailing::kda_recurrence(
+        flyweight::v2::bailing::kda_recurrence(
             queries + row * kWidth, keys + row * kWidth, values + row * kWidth,
             gate_raw + row * kWidth, beta_logits + row * kHeads,
             a_log, dt_bias, 1, kHeads, kHeadDim, 1e-6f,
@@ -84,7 +84,7 @@ bool the_state_decays_rather_than_grows() {
     std::vector<float> output(dim, 0.0f);
     float previous = 0.0f;
     for (int step = 0; step < 256; ++step) {
-        colibri::v2::bailing::kda_recurrence(
+        flyweight::v2::bailing::kda_recurrence(
             q, k, v, gate, beta, coefficient, bias,
             rows, heads, dim, 1e-6f, state.data(), output.data());
         float magnitude = 0.0f;

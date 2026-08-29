@@ -10,7 +10,7 @@ Measured on the real checkpoint with the page cache dropped first: 0.87 -> 1.46
 tok/s, expert time 872 -> 353 ms a token, and disk traffic *halved* (1372 -> 766
 MiB a token), because an explicit range read beats fault-driven readahead at
 guessing what is wanted. Fully resident it costs two to three percent, which is
-the price of the hints themselves; that is the trade, and COLIBRI_DS4_PREFETCH=off
+the price of the hints themselves; that is the trade, and FLYWEIGHT_DS4_PREFETCH=off
 exists so it can be re-measured rather than taken on faith.
 
 A hint cannot change an answer, which is what makes this safe -- the test that
@@ -30,8 +30,8 @@ REPO = Path(__file__).resolve().parent.parent
 
 PROGRAM = """
 import json, sys
-from colibri_next.v2 import V2Model
-from colibri_next.deepseek4 import Deepseek4Runtime
+from flyweight.v2 import V2Model
+from flyweight.deepseek4 import Deepseek4Runtime
 
 model = V2Model(sys.argv[1])
 try:
@@ -56,7 +56,7 @@ class PrefetchTests(unittest.TestCase):
     def setUpClass(cls):
         from tests.deepseek4_gguf_fixture import DeepSeek4Spec, build_deepseek4_gguf
 
-        cls.directory = tempfile.TemporaryDirectory(prefix="colibri-ds4pf-")
+        cls.directory = tempfile.TemporaryDirectory(prefix="flyweight-ds4pf-")
         cls.path = Path(cls.directory.name) / "ds4.gguf"
         build_deepseek4_gguf(cls.path, DeepSeek4Spec(layers=6, hash_layers=3))
 
@@ -70,9 +70,9 @@ class PrefetchTests(unittest.TestCase):
         environment = dict(os.environ)
         environment["PYTHONPATH"] = str(REPO / "src")
         if setting is None:
-            environment.pop("COLIBRI_DS4_PREFETCH", None)
+            environment.pop("FLYWEIGHT_DS4_PREFETCH", None)
         else:
-            environment["COLIBRI_DS4_PREFETCH"] = setting
+            environment["FLYWEIGHT_DS4_PREFETCH"] = setting
         completed = subprocess.run(
             [sys.executable, "-c", PROGRAM, str(self.path)],
             capture_output=True, text=True, env=environment, timeout=600,

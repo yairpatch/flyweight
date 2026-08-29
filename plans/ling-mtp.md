@@ -18,7 +18,7 @@ rejection-heavy work.
 
 ## What exists to build on
 
-- `colibri_v2_bailing_eval_slot` already advances all rows through every layer
+- `flyweight_v2_bailing_eval_slot` already advances all rows through every layer
   (host batched path and device tiled-prefill path both); only the head is
   last-row-only. **Verify = eval + per-row argmax.**
 - Host caches are plain vectors: MLA rollback is `cache.positions` truncation;

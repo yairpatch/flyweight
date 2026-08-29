@@ -23,7 +23,7 @@
 //     (0.119+0.80, 0.525 -> 1.444) beats group 0 (0.269, 0.622 -> 0.891)
 //     despite holding the single worst expert.
 
-#include "colibri_v2_bailing.hpp"
+#include "flyweight_v2_bailing.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -40,7 +40,7 @@ bool selection_follows_the_bias_but_weights_do_not() {
     const float bias[8] = {0.0f, 0.0f, -0.9f, 0.0f, 0.0f, 0.0f, 0.8f, 0.0f};
     std::int32_t chosen[2]{};
     float weights[2]{};
-    colibri::v2::bailing::moe_router(logits, bias, 8, 2, 4, 2, 2.5f, true,
+    flyweight::v2::bailing::moe_router(logits, bias, 8, 2, 4, 2, 2.5f, true,
                                      chosen, weights);
     if (chosen[0] != 6 || chosen[1] != 4) return false;
     // Raw sigmoids 0.119202919 and 0.731058598, normalized then scaled by 2.5.
@@ -57,7 +57,7 @@ bool group_limiting_restricts_the_candidates() {
     const float zero[8] = {};
     std::int32_t chosen[2]{};
     float weights[2]{};
-    colibri::v2::bailing::moe_router(logits, zero, 8, 2, 4, 2, 1.0f, true,
+    flyweight::v2::bailing::moe_router(logits, zero, 8, 2, 4, 2, 1.0f, true,
                                      chosen, weights);
     // Groups by top-2 sum: g0 0.891, g1 1.319, g2 1.410, g3 0.644.
     // Keeping g1 and g2 leaves experts {2,3,4,5}; the best two are 2 and 4.
@@ -74,7 +74,7 @@ bool ungrouped_routing_still_selects() {
     const float zero[8] = {};
     std::int32_t chosen[3]{};
     float weights[3]{};
-    colibri::v2::bailing::moe_router(logits, zero, 8, 3, 1, 1, 1.0f, false,
+    flyweight::v2::bailing::moe_router(logits, zero, 8, 3, 1, 1, 1.0f, false,
                                      chosen, weights);
     if (chosen[0] != 2 || chosen[1] != 4 || chosen[2] != 5) return false;
     // normalize=false leaves the raw sigmoids in place.
@@ -88,7 +88,7 @@ bool single_expert_skips_normalization() {
     const float zero[4] = {};
     std::int32_t chosen[1]{};
     float weights[1]{};
-    colibri::v2::bailing::moe_router(logits, zero, 4, 1, 1, 1, 2.0f, true,
+    flyweight::v2::bailing::moe_router(logits, zero, 4, 1, 1, 1, 2.0f, true,
                                      chosen, weights);
     // sigmoid(3) = 0.952574127, doubled rather than normalized to 1.
     return chosen[0] == 1 && close(weights[0], 2.0f * 0.952574127f);
@@ -120,7 +120,7 @@ bool the_shared_expert_ignores_the_routing_scale() {
 
     const auto run = [&](float scale) {
         std::vector<float> out(hidden);
-        colibri::v2::bailing::moe_block(
+        flyweight::v2::bailing::moe_block(
             hidden_state.data(), router.data(), bias.data(), zeros.data(),
             zeros.data(), zeros.data(), shared_gate.data(), shared_up.data(),
             shared_down.data(), hidden, expert_size, shared_size, experts, 2, 2, 1,
@@ -142,8 +142,8 @@ bool the_swiglu_clamp_bounds_both_halves() {
     const float gate[2] = {50.0f, -50.0f};
     const float up[2] = {50.0f, 50.0f};
     float clamped[2]{}, unclamped[2]{};
-    colibri::v2::bailing::swiglu(gate, up, 2, 1.0f, clamped);
-    colibri::v2::bailing::swiglu(gate, up, 2, 0.0f, unclamped);
+    flyweight::v2::bailing::swiglu(gate, up, 2, 1.0f, clamped);
+    flyweight::v2::bailing::swiglu(gate, up, 2, 0.0f, unclamped);
     // With a limit of 1: silu(1)*1 = 0.7310586, silu(-1)*1 = -0.2689414.
     if (std::fabs(clamped[0] - 0.731058598f) > 1e-6f) return false;
     if (std::fabs(clamped[1] + 0.268941432f) > 1e-6f) return false;

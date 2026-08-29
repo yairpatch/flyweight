@@ -17,7 +17,7 @@ import json
 import statistics
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 
 def _prompt_of_length(model: V2Model, length: int) -> list[int]:

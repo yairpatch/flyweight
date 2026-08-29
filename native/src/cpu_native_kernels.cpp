@@ -10,12 +10,12 @@
 // wants long contiguous runs, few threads, and SIMD over rows. Nothing here
 // should mirror the grid.
 
-#include <colibri_cpu_native.hpp>
-#include <colibri_cpu_shim_geometry.hpp>  // half_bits_to_float
+#include <flyweight_cpu_native.hpp>
+#include <flyweight_cpu_shim_geometry.hpp>  // half_bits_to_float
 
 #include "cpu_q8_dot.h"
 
-extern "C" std::uint32_t colibri_cpu_features();
+extern "C" std::uint32_t flyweight_cpu_features();
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +24,7 @@ extern "C" std::uint32_t colibri_cpu_features();
 #include <cstring>
 #include <vector>
 
-namespace colibri::cpu {
+namespace flyweight::cpu {
 namespace {
 
 // --- rms_norm -------------------------------------------------------------
@@ -203,8 +203,8 @@ void qwen_f32_matmul_rows(const Launch&, void** arguments) {
 constexpr int kQ8BlockBytes = 34;
 constexpr int kQ8BlockValues = 32;
 
-// ISA dispatch, resolved once. colibri_cpu_features() reports what the machine
-// actually supports and honours COLIBRI_CPU_BACKEND for forcing a lower path,
+// ISA dispatch, resolved once. flyweight_cpu_features() reports what the machine
+// actually supports and honours FLYWEIGHT_CPU_BACKEND for forcing a lower path,
 // which is how the parity harness can be run against the scalar reference.
 enum class Q8Path { scalar, avx2, avx512 };
 
@@ -212,7 +212,7 @@ Q8Path q8_path() {
     static const Q8Path path = [] {
         constexpr std::uint32_t kAvx2 = 1u << 0;
         constexpr std::uint32_t kAvx512 = 1u << 1;
-        const std::uint32_t features = colibri_cpu_features();
+        const std::uint32_t features = flyweight_cpu_features();
         if (features & kAvx512) return Q8Path::avx512;
         if (features & kAvx2) return Q8Path::avx2;
         return Q8Path::scalar;
@@ -256,9 +256,9 @@ inline float q8_row_dot(const unsigned char* packed, std::int64_t row,
                          row * blocks * kQ8BlockBytes;
     switch (q8_path()) {
         case Q8Path::avx512:
-            return colibri_q8_row_dot_avx512(cursor, vector, blocks);
+            return flyweight_q8_row_dot_avx512(cursor, vector, blocks);
         case Q8Path::avx2:
-            return colibri_q8_row_dot_avx2(cursor, vector, blocks);
+            return flyweight_q8_row_dot_avx2(cursor, vector, blocks);
         default:
             return q8_row_dot_scalar(cursor, vector, blocks);
     }
@@ -276,11 +276,11 @@ inline void q8_row_dot_pair(const unsigned char* gate_packed,
                             row * blocks * kQ8BlockBytes;
     switch (q8_path()) {
         case Q8Path::avx512:
-            colibri_q8_row_dot_pair_avx512(gate_cursor, up_cursor, vector,
+            flyweight_q8_row_dot_pair_avx512(gate_cursor, up_cursor, vector,
                                            blocks, gate, up);
             return;
         case Q8Path::avx2:
-            colibri_q8_row_dot_pair_avx2(gate_cursor, up_cursor, vector, blocks,
+            flyweight_q8_row_dot_pair_avx2(gate_cursor, up_cursor, vector, blocks,
                                          gate, up);
             return;
         default:
@@ -1158,13 +1158,13 @@ void q8_lm_head_argmax_warp(const Launch&, void** arguments) {
 
 }  // namespace
 
-COLIBRI_CPU_NATIVE_KERNEL("rms_norm_rows", rms_norm_rows);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_shared_scale", qwen_shared_scale);
-COLIBRI_CPU_NATIVE_KERNEL("route_topk", route_topk);
-COLIBRI_CPU_NATIVE_KERNEL("route_topk_rows", route_topk_rows);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_shared_scale_rows", qwen_shared_scale_rows);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_attention_query", qwen_attention_query);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_attention_key", qwen_attention_key);
+FLYWEIGHT_CPU_NATIVE_KERNEL("rms_norm_rows", rms_norm_rows);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_shared_scale", qwen_shared_scale);
+FLYWEIGHT_CPU_NATIVE_KERNEL("route_topk", route_topk);
+FLYWEIGHT_CPU_NATIVE_KERNEL("route_topk_rows", route_topk_rows);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_shared_scale_rows", qwen_shared_scale_rows);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_query", qwen_attention_query);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_attention_key", qwen_attention_key);
 // --- qwen_imatrix_accumulate ----------------------------------------------
 //
 // Corpus signature:
@@ -1186,18 +1186,18 @@ void qwen_imatrix_accumulate(const Launch&, void** arguments) {
     }
 }
 
-COLIBRI_CPU_NATIVE_KERNEL("qwen_imatrix_accumulate", qwen_imatrix_accumulate);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_delta_recurrent_split", qwen_delta_recurrent_split);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_delta_recurrent_chunk", qwen_delta_recurrent_chunk);
-COLIBRI_CPU_NATIVE_KERNEL("q8_swiglu_transposed_warp", q8_swiglu_transposed_warp);
-COLIBRI_CPU_NATIVE_KERNEL("kv_attention_values_f16_ring", kv_attention_values_f16_ring);
-COLIBRI_CPU_NATIVE_KERNEL("kv_attention_values_ring", kv_attention_values_ring);
-COLIBRI_CPU_NATIVE_KERNEL("q8_lm_head_argmax_warp", q8_lm_head_argmax_warp);
-COLIBRI_CPU_NATIVE_KERNEL("q8_matvec_transposed_warp", q8_matvec_transposed_warp);
-COLIBRI_CPU_NATIVE_KERNEL("q8_matmul_tiled", q8_matmul_tiled);
-COLIBRI_CPU_NATIVE_KERNEL("rms_norm", rms_norm);
-COLIBRI_CPU_NATIVE_KERNEL("scaled_add", scaled_add);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_f32_matvec_warp", qwen_f32_matvec_warp);
-COLIBRI_CPU_NATIVE_KERNEL("qwen_f32_matmul_rows", qwen_f32_matmul_rows);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_imatrix_accumulate", qwen_imatrix_accumulate);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_delta_recurrent_split", qwen_delta_recurrent_split);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_delta_recurrent_chunk", qwen_delta_recurrent_chunk);
+FLYWEIGHT_CPU_NATIVE_KERNEL("q8_swiglu_transposed_warp", q8_swiglu_transposed_warp);
+FLYWEIGHT_CPU_NATIVE_KERNEL("kv_attention_values_f16_ring", kv_attention_values_f16_ring);
+FLYWEIGHT_CPU_NATIVE_KERNEL("kv_attention_values_ring", kv_attention_values_ring);
+FLYWEIGHT_CPU_NATIVE_KERNEL("q8_lm_head_argmax_warp", q8_lm_head_argmax_warp);
+FLYWEIGHT_CPU_NATIVE_KERNEL("q8_matvec_transposed_warp", q8_matvec_transposed_warp);
+FLYWEIGHT_CPU_NATIVE_KERNEL("q8_matmul_tiled", q8_matmul_tiled);
+FLYWEIGHT_CPU_NATIVE_KERNEL("rms_norm", rms_norm);
+FLYWEIGHT_CPU_NATIVE_KERNEL("scaled_add", scaled_add);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matvec_warp", qwen_f32_matvec_warp);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matmul_rows", qwen_f32_matmul_rows);
 
-}  // namespace colibri::cpu
+}  // namespace flyweight::cpu

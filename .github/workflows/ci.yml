@@ -22,16 +22,25 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install test tooling
         run: python -m pip install --upgrade pip build mypy pytest ruff wheel
-      - name: Build native runtime
-        run: python -m colibri_next.native_build
-        env:
-          PYTHONPATH: src
+      # The install is what a first-time user runs, so CI runs exactly that and
+      # nothing else to obtain the runtime. It used to build via native_build
+      # with PYTHONPATH=src, which is why `pip install -e .` was free to stop
+      # producing a library without any job noticing.
+      - name: Install (builds the native runtime)
+        run: pip install -e .
+      - name: Check the install reports itself healthy
+        run: flyweight doctor
+      # Adds the contract tests and benchmarks to the same build tree. The
+      # library's compile flags do not change, so this links the extra targets
+      # rather than compiling the runtime a second time.
+      - name: Build development targets
+        run: python -m flyweight.native_build
       - name: Native contract tests
         run: ctest --test-dir build/native --output-on-failure -C Release
       - name: Lint
         run: ruff check src tests setup.py
       - name: Type check
-        run: mypy src/colibri_next
+        run: mypy src/flyweight
       - name: Test
         run: pytest -q
       - name: Build platform wheel
@@ -45,3 +54,16 @@ jobs:
           names = zipfile.ZipFile(wheel).namelist()
           libraries = [name for name in names if name.endswith((".so", ".dll", ".dylib"))]
           assert len(libraries) == 1, libraries
+          # A reused build/lib from before a rename packed a second, stale
+          # package beside the real one -- two libraries in one wheel, and the
+          # count above was the only thing that noticed. Name the cause too.
+          packages = {name.split("/")[0] for name in names}
+          assert packages <= {"flyweight", "flyweight-0.2.0.dist-info"}, packages
+          # Contract tests and benchmarks belong in the build tree, never in
+          # the shipped package.
+          strays = [
+              name for name in names
+              if "_native/" in name
+              and not name.endswith((".so", ".dll", ".dylib", ".gitkeep"))
+          ]
+          assert not strays, strays

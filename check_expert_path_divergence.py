@@ -40,19 +40,19 @@ PROMPT = "Explain how a turbocharger works, step by step."
 
 CHILD = """
 import json, os
-from colibri_next.v2 import V2Model, V2QwenRuntime
+from flyweight.v2 import V2Model, V2QwenRuntime
 
-options = json.loads(os.environ["COLIBRI_DIVERGENCE_OPTIONS"])
-outdir = os.environ["COLIBRI_DIVERGENCE_OUTDIR"]
+options = json.loads(os.environ["FLYWEIGHT_DIVERGENCE_OPTIONS"])
+outdir = os.environ["FLYWEIGHT_DIVERGENCE_OUTDIR"]
 
-model = V2Model(os.environ["COLIBRI_DIVERGENCE_MODEL"])
+model = V2Model(os.environ["FLYWEIGHT_DIVERGENCE_MODEL"])
 runtime = V2QwenRuntime(
     model, cache_type_k="f32", cache_type_v="f32", **options)
 runtime.prepare()
 
-tokens = model.tokenize(os.environ["COLIBRI_DIVERGENCE_PROMPT"])
-forced = json.loads(os.environ["COLIBRI_DIVERGENCE_FORCED"])
-extend = int(os.environ["COLIBRI_DIVERGENCE_EXTEND"])
+tokens = model.tokenize(os.environ["FLYWEIGHT_DIVERGENCE_PROMPT"])
+forced = json.loads(os.environ["FLYWEIGHT_DIVERGENCE_FORCED"])
+extend = int(os.environ["FLYWEIGHT_DIVERGENCE_EXTEND"])
 
 # Teacher forcing: feed the fixed sequence regardless of what is predicted, so
 # both configurations stay on the same context and their argmaxes stay
@@ -73,7 +73,7 @@ else:
         predictions.append(runtime.decode(predictions[-1]))
 
 layers = []
-for index in range(int(os.environ["COLIBRI_DIVERGENCE_MAXLAYERS"])):
+for index in range(int(os.environ["FLYWEIGHT_DIVERGENCE_MAXLAYERS"])):
     path = os.path.join(outdir, f"layer{index:03d}.bin")
     try:
         runtime.dump_kv(index, path)
@@ -96,13 +96,13 @@ def run(model, options, outdir, max_layers, forced=(), extend=0):
     environment = dict(
         os.environ,
         PYTHONPATH="src",
-        COLIBRI_DIVERGENCE_MODEL=model,
-        COLIBRI_DIVERGENCE_PROMPT=PROMPT,
-        COLIBRI_DIVERGENCE_OPTIONS=json.dumps(options),
-        COLIBRI_DIVERGENCE_OUTDIR=outdir,
-        COLIBRI_DIVERGENCE_MAXLAYERS=str(max_layers),
-        COLIBRI_DIVERGENCE_FORCED=json.dumps(list(forced)),
-        COLIBRI_DIVERGENCE_EXTEND=str(extend),
+        FLYWEIGHT_DIVERGENCE_MODEL=model,
+        FLYWEIGHT_DIVERGENCE_PROMPT=PROMPT,
+        FLYWEIGHT_DIVERGENCE_OPTIONS=json.dumps(options),
+        FLYWEIGHT_DIVERGENCE_OUTDIR=outdir,
+        FLYWEIGHT_DIVERGENCE_MAXLAYERS=str(max_layers),
+        FLYWEIGHT_DIVERGENCE_FORCED=json.dumps(list(forced)),
+        FLYWEIGHT_DIVERGENCE_EXTEND=str(extend),
     )
     result = subprocess.run(
         [sys.executable, "-c", CHILD], capture_output=True, text=True,

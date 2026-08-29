@@ -21,8 +21,8 @@ import unittest
 
 import numpy as np
 
-from colibri_next.deepseek4_layer import CompressedState, DeepSeek4Block, LayerCache
-from colibri_next.v2 import V2Model
+from flyweight.deepseek4_layer import CompressedState, DeepSeek4Block, LayerCache
+from flyweight.v2 import V2Model
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
 # A stale path is as good as no path: the variable often outlives the file it
@@ -139,8 +139,8 @@ class NativeVisibilityTests(unittest.TestCase):
     """
 
     def test_native_matches_python_across_shapes(self):
-        from colibri_next.deepseek4 import visible_keys
-        from colibri_next.deepseek4_layer import csa_attention_latents
+        from flyweight.deepseek4 import visible_keys
+        from flyweight.deepseek4_layer import csa_attention_latents
 
         for raw_positions, blocks, ratio, window in (
             (10, 2, 4, 128), (10, 0, 0, 128), (376, 94, 4, 128),
@@ -157,7 +157,7 @@ class NativeVisibilityTests(unittest.TestCase):
                     np.testing.assert_array_equal(actual, expected)
 
     def test_a_zero_ratio_with_blocks_is_rejected(self):
-        from colibri_next.deepseek4 import visible_keys
+        from flyweight.deepseek4 import visible_keys
         with self.assertRaises(Exception):
             visible_keys(0, 4, 2, 0, 128)
 
@@ -189,7 +189,7 @@ class NativeGatherTests(unittest.TestCase):
         return pv, ps
 
     def test_overlapped_gather_matches_python(self):
-        from colibri_next.deepseek4 import gather_block
+        from flyweight.deepseek4 import gather_block
         rng = np.random.default_rng(17)
         head_dim, ratio = 6, 4
         values = rng.standard_normal((16, 2 * head_dim)).astype(np.float32)
@@ -202,7 +202,7 @@ class NativeGatherTests(unittest.TestCase):
                 np.testing.assert_array_equal(gs, ps)
 
     def test_the_first_block_pads_its_predecessor(self):
-        from colibri_next.deepseek4 import gather_block
+        from flyweight.deepseek4 import gather_block
         head_dim, ratio = 5, 4
         values = np.ones((8, 2 * head_dim), dtype=np.float32)
         scores = np.ones((8, 2 * head_dim), dtype=np.float32)
@@ -213,7 +213,7 @@ class NativeGatherTests(unittest.TestCase):
         np.testing.assert_array_equal(gv[ratio:], np.ones((ratio, head_dim), np.float32))
 
     def test_unoverlapped_gather_matches_python(self):
-        from colibri_next.deepseek4 import gather_block
+        from flyweight.deepseek4 import gather_block
         rng = np.random.default_rng(18)
         head_dim, ratio = 7, 8
         values = rng.standard_normal((24, head_dim)).astype(np.float32)
@@ -226,7 +226,7 @@ class NativeGatherTests(unittest.TestCase):
                 np.testing.assert_array_equal(gs, ps)
 
     def test_a_state_width_that_disagrees_with_the_kind_is_rejected(self):
-        from colibri_next.deepseek4 import gather_block
+        from flyweight.deepseek4 import gather_block
         values = np.zeros((8, 6), dtype=np.float32)
         with self.assertRaises(Exception):
             # Six-wide rows cannot be an overlapped layer with head_dim six.

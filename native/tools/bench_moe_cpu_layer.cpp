@@ -9,7 +9,7 @@
 //
 // This harness makes that visible in one line. It reproduces the production
 // loop exactly: the same CSR grouping by expert, the same 4-row task blocks,
-// the same dynamic schedule, the same per-region timers COLIBRI_MOE_PROFILE
+// the same dynamic schedule, the same per-region timers FLYWEIGHT_MOE_PROFILE
 // reports -- but with the weight type on the command line. A format whose
 // dequant/gemm ratio is far above its neighbours' is a format on the scalar
 // path, and the runtime prints a one-time warning naming it (v2_runtime.cpp,
@@ -24,7 +24,7 @@
 // and flatters itself. Comparing the first pass against the last is how you
 // tell a software limit from a thermal one.
 //
-//   colibri_qwen_moe_layer_bench [rows] [threads] [sustain-seconds]
+//   flyweight_qwen_moe_layer_bench [rows] [threads] [sustain-seconds]
 
 #include <qwen_cpu_kernel.h>
 

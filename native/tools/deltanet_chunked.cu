@@ -1,6 +1,6 @@
 // Prototype source for the chunked WY-representation gated DeltaNet.
 // Validated through native/tools/kernel_harness.py, then embedded into
-// colibri_v2_native_kernels.hpp.
+// flyweight_v2_native_kernels.hpp.
 //
 // The sequential kernels (qwen_delta_recurrent{,_split,_rows,_chunk}) walk one
 // token at a time with the state matrix live in registers, so a prefill chunk

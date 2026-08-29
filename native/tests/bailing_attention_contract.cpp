@@ -12,7 +12,7 @@
 // asserting nothing would leave the far more likely bug -- reading the
 // half-split rotation straight out of the reference -- undetected.
 
-#include "colibri_v2_bailing.hpp"
+#include "flyweight_v2_bailing.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -25,8 +25,8 @@ constexpr std::size_t kNope = 128, kRope = 64, kHeadDim = kNope + kRope;
 
 // Score between two rows after rotating each, which is all attention sees.
 float rotated_score(std::vector<float> q, std::vector<float> k, std::int32_t position) {
-    colibri::v2::bailing::partial_rope_norm(q.data(), kHeadDim, kRope, position, 6.0e6f);
-    colibri::v2::bailing::partial_rope_norm(k.data(), kHeadDim, kRope, position, 6.0e6f);
+    flyweight::v2::bailing::partial_rope_norm(q.data(), kHeadDim, kRope, position, 6.0e6f);
+    flyweight::v2::bailing::partial_rope_norm(k.data(), kHeadDim, kRope, position, 6.0e6f);
     float total = 0.0f;
     for (std::size_t i = 0; i < kHeadDim; ++i) total += q[i] * k[i];
     return total;
@@ -57,7 +57,7 @@ bool the_nope_prefix_is_untouched() {
     std::vector<float> row = ramp(1.0f, 0.5f);
     for (std::size_t i = kNope; i < kHeadDim; ++i) row[i] = 0.0f;
     const std::vector<float> before = row;
-    colibri::v2::bailing::partial_rope_norm(row.data(), kHeadDim, kRope, 4321, 6.0e6f);
+    flyweight::v2::bailing::partial_rope_norm(row.data(), kHeadDim, kRope, 4321, 6.0e6f);
     for (std::size_t i = 0; i < kHeadDim; ++i)
         if (row[i] != before[i]) return false;
     return true;
@@ -91,9 +91,9 @@ bool the_score_depends_on_relative_position() {
 
     const auto score_at = [&](std::int32_t query_at, std::int32_t key_at) {
         std::vector<float> rotated_q = q, rotated_k = k;
-        colibri::v2::bailing::partial_rope_norm(
+        flyweight::v2::bailing::partial_rope_norm(
             rotated_q.data(), kHeadDim, kRope, query_at, 6.0e6f);
-        colibri::v2::bailing::partial_rope_norm(
+        flyweight::v2::bailing::partial_rope_norm(
             rotated_k.data(), kHeadDim, kRope, key_at, 6.0e6f);
         float total = 0.0f;
         for (std::size_t i = 0; i < kHeadDim; ++i) total += rotated_q[i] * rotated_k[i];
@@ -113,7 +113,7 @@ bool the_head_gate_scales_each_head_by_its_own_sigmoid() {
     constexpr std::size_t heads = 3, value_dim = 4;
     const float logits[heads] = {0.0f, 2.0f, -2.0f};
     std::vector<float> output(heads * value_dim, 1.0f);
-    colibri::v2::bailing::apply_head_gate(logits, heads, value_dim, output.data());
+    flyweight::v2::bailing::apply_head_gate(logits, heads, value_dim, output.data());
     const float expected[heads] = {0.5f, 0.880797029f, 0.119202919f};
     for (std::size_t head = 0; head < heads; ++head)
         for (std::size_t i = 0; i < value_dim; ++i)
@@ -146,7 +146,7 @@ bool absorbed_matches_decompressed() {
         rope_keys[i] = 0.23f * std::sin(1.3f * static_cast<float>(i) + 0.5f);
 
     std::vector<float> absorbed(heads * value_dim);
-    colibri::v2::bailing::mla_attention_absorbed(
+    flyweight::v2::bailing::mla_attention_absorbed(
         queries_nope.data(), queries_rope.data(), kv_b.data(), latents.data(),
         rope_keys.data(), positions, heads, nope, rope, value_dim, lora,
         absorbed.data());
@@ -154,7 +154,7 @@ bool absorbed_matches_decompressed() {
     std::vector<float> keys(positions * heads * (nope + rope));
     std::vector<float> values(positions * heads * value_dim);
     for (std::size_t position = 0; position < positions; ++position)
-        colibri::v2::bailing::mla_decompress(
+        flyweight::v2::bailing::mla_decompress(
             latents.data() + position * lora, rope_keys.data() + position * rope,
             kv_b.data(), heads, nope, rope, value_dim, lora,
             keys.data() + position * heads * (nope + rope),
@@ -168,7 +168,7 @@ bool absorbed_matches_decompressed() {
             queries[head * (nope + rope) + nope + i] = queries_rope[head * rope + i];
     }
     std::vector<float> decompressed(heads * value_dim);
-    colibri::v2::bailing::mla_attention_decompressed(
+    flyweight::v2::bailing::mla_attention_decompressed(
         queries.data(), keys.data(), values.data(), positions, heads,
         nope + rope, value_dim, decompressed.data());
 
@@ -188,7 +188,7 @@ bool the_rope_key_is_shared_across_heads() {
     std::vector<float> latent(lora, 0.0f);
     const float rope_key[rope] = {1.5f, -2.5f, 3.5f, -4.5f};
     std::vector<float> keys(heads * (nope + rope)), values(heads * value_dim);
-    colibri::v2::bailing::mla_decompress(latent.data(), rope_key, kv_b.data(),
+    flyweight::v2::bailing::mla_decompress(latent.data(), rope_key, kv_b.data(),
                                          heads, nope, rope, value_dim, lora,
                                          keys.data(), values.data());
     for (std::size_t head = 0; head < heads; ++head)

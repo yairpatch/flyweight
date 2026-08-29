@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import sys
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q6_K.gguf"
 POSITIONS = (2048, 16384, 49152)
@@ -27,16 +27,16 @@ FILLER = (
 # name -> environment selecting exactly that kernel
 PATHS = {
     "reference (serial ring)": {
-        "COLIBRI_GQA_ATTENTION": "0", "COLIBRI_CUBLAS_ATTENTION": "0",
-        "COLIBRI_FUSED_ATTENTION": "0",
+        "FLYWEIGHT_GQA_ATTENTION": "0", "FLYWEIGHT_CUBLAS_ATTENTION": "0",
+        "FLYWEIGHT_FUSED_ATTENTION": "0",
     },
     "split-K per head": {
-        "COLIBRI_GQA_ATTENTION": "0", "COLIBRI_CUBLAS_ATTENTION": "0",
-        "COLIBRI_FUSED_ATTENTION": "1",
+        "FLYWEIGHT_GQA_ATTENTION": "0", "FLYWEIGHT_CUBLAS_ATTENTION": "0",
+        "FLYWEIGHT_FUSED_ATTENTION": "1",
     },
     "grouped query": {
-        "COLIBRI_GQA_ATTENTION": "1", "COLIBRI_CUBLAS_ATTENTION": "0",
-        "COLIBRI_FUSED_ATTENTION": "1",
+        "FLYWEIGHT_GQA_ATTENTION": "1", "FLYWEIGHT_CUBLAS_ATTENTION": "0",
+        "FLYWEIGHT_FUSED_ATTENTION": "1",
     },
 }
 

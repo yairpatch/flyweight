@@ -32,7 +32,7 @@
 #include "qwen_kquant_pack.h"
 #include "qwen_cpu_kernel.h"
 
-#include <colibri_cpu_native.hpp>
+#include <flyweight_cpu_native.hpp>
 
 #include <cmath>
 #include <cstdint>
@@ -42,7 +42,7 @@
 #include <vector>
 
 extern "C" {
-int colibri_cpu_launch_named(const char*, std::uint32_t, std::uint32_t,
+int flyweight_cpu_launch_named(const char*, std::uint32_t, std::uint32_t,
                              std::uint32_t, std::uint32_t, std::uint64_t,
                              void**);
 }
@@ -122,7 +122,7 @@ int run_expert() {
         void* arguments[] = {&gate_pointer, &up_pointer, &vector_pointer,
                              &output_pointer, &input_size, &output_size,
                              &experts};
-        if (colibri_cpu_launch_named("q6k_grouped_swiglu", kOutputSize, 1, 256,
+        if (flyweight_cpu_launch_named("q6k_grouped_swiglu", kOutputSize, 1, 256,
                                      0, 0, arguments) != 0) {
             std::printf("FAIL: q6k_grouped_swiglu is not in the corpus\n");
             return 1;
@@ -209,7 +209,7 @@ int run() {
         int elements = kInputSize;
         void* arguments[] = {&input_pointer, &output_pointer, &scale_pointer,
                              &elements};
-        if (colibri_cpu_launch_named("quantize_q8_blocks",
+        if (flyweight_cpu_launch_named("quantize_q8_blocks",
                                      (kInputSize + 31) / 32, 1, 32, 0, 0,
                                      arguments) != 0) {
             std::printf("FAIL: quantize_q8_blocks is not in the corpus\n");
@@ -226,7 +226,7 @@ int run() {
         int input_size = kInputSize, output_size = kOutputSize;
         void* arguments[] = {&packed_pointer, &vector_pointer, &scale_pointer,
                              &output_pointer, &input_size, &output_size};
-        if (colibri_cpu_launch_named("q6k_q8_matvec_transposed_warp",
+        if (flyweight_cpu_launch_named("q6k_q8_matvec_transposed_warp",
                                      kOutputSize, 1, 128, 0, 0,
                                      arguments) != 0) {
             std::printf("FAIL: q6k_q8_matvec_transposed_warp is not in the "
@@ -297,7 +297,7 @@ int run() {
 
 int main() {
     // The CUDA text the GPU compiles, not a host reimplementation of it.
-    colibri::cpu::set_force_emulation(true);
+    flyweight::cpu::set_force_emulation(true);
     const int expert_status = run_expert();
     std::printf("\n== dense matvec (q6k_q8_matvec_transposed_warp) ==\n");
     return run() | expert_status;

@@ -22,7 +22,7 @@ import itertools
 import os
 import unittest
 
-from colibri_next.v2_server import NativeV2Tokenizer
+from flyweight.v2_server import NativeV2Tokenizer
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
 # A stale path is as good as no path: the variable often outlives the file it
@@ -175,7 +175,7 @@ class TemplateEquivalenceTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from colibri_next.v2 import V2Model
+        from flyweight.v2 import V2Model
         cls.model = V2Model(CHECKPOINT)
         cls.tokenizer = NativeV2Tokenizer(cls.model)
 

@@ -11,12 +11,12 @@ the logits differed, so a mismatch localises to arithmetic rather than sampling.
 Each sample is a fresh subprocess, but a fresh process does NOT mean isolated:
 placement reads state that survives the process. Two such inputs are known --
 `<model>.expert-history` next to the checkpoint (disable with
-COLIBRI_EXPERT_HISTORY=off) and free VRAM sampled by the gpu_cache_bytes=0
+FLYWEIGHT_EXPERT_HISTORY=off) and free VRAM sampled by the gpu_cache_bytes=0
 auto-fit (pin with --option gpu_cache_bytes=...). Runs that leave either
 uncontrolled measure the drift of that state, not the runtime.
 
     ./check_greedy_determinism.py MODEL.gguf --runs 3
-    ./check_greedy_determinism.py MODEL.gguf --env COLIBRI_IQ2_Q8_DECODE=0
+    ./check_greedy_determinism.py MODEL.gguf --env FLYWEIGHT_IQ2_Q8_DECODE=0
     ./check_greedy_determinism.py MODEL.gguf --option expert_residency=immutable
 """
 
@@ -43,45 +43,45 @@ COUNTERS = (
     "prefill_cache_seed_auto_skips",
 )
 
-# COLIBRI_DETERMINISM_TRAJECTORY=<path> makes the child dump per-token counter
+# FLYWEIGHT_DETERMINISM_TRAJECTORY=<path> makes the child dump per-token counter
 # rows read from inside the generate() callback, which runs synchronously on
 # the native loop. Diffing two trajectories finds the first token at which
 # *placement* diverged, to compare against the first token at which *routing*
-# diverged (COLIBRI_EXPERT_TRACE) -- whichever moves first is upstream.
+# diverged (FLYWEIGHT_EXPERT_TRACE) -- whichever moves first is upstream.
 
 CHILD = """
 import json, os, sys
-from colibri_next.v2 import V2Model, V2QwenRuntime
+from flyweight.v2 import V2Model, V2QwenRuntime
 
-options = json.loads(os.environ["COLIBRI_DETERMINISM_OPTIONS"])
-prompt = os.environ["COLIBRI_DETERMINISM_PROMPT"]
-count = int(os.environ["COLIBRI_DETERMINISM_TOKENS"])
+options = json.loads(os.environ["FLYWEIGHT_DETERMINISM_OPTIONS"])
+prompt = os.environ["FLYWEIGHT_DETERMINISM_PROMPT"]
+count = int(os.environ["FLYWEIGHT_DETERMINISM_TOKENS"])
 
-model = V2Model(os.environ["COLIBRI_DETERMINISM_MODEL"])
+model = V2Model(os.environ["FLYWEIGHT_DETERMINISM_MODEL"])
 runtime = V2QwenRuntime(model, **options)
 runtime.prepare()
 tokens = []
 trajectory = []
-watched = json.loads(os.environ["COLIBRI_DETERMINISM_COUNTERS"])
+watched = json.loads(os.environ["FLYWEIGHT_DETERMINISM_COUNTERS"])
 
 def receive(token):
     # The callback runs synchronously on the native generate loop, so info
     # read here is the exact counter state after this token's placement
     # decisions -- a per-token trajectory with no rebuild.
     tokens.append(token)
-    if os.environ.get("COLIBRI_DETERMINISM_TRAJECTORY"):
+    if os.environ.get("FLYWEIGHT_DETERMINISM_TRAJECTORY"):
         info = runtime.info
         trajectory.append([int(info.get(k, 0)) for k in watched])
     return True
 
 runtime.generate(model.tokenize(prompt), count, receive)
-if os.environ.get("COLIBRI_DETERMINISM_TRAJECTORY"):
-    with open(os.environ["COLIBRI_DETERMINISM_TRAJECTORY"], "w") as sink:
+if os.environ.get("FLYWEIGHT_DETERMINISM_TRAJECTORY"):
+    with open(os.environ["FLYWEIGHT_DETERMINISM_TRAJECTORY"], "w") as sink:
         json.dump({"counters": watched, "rows": trajectory}, sink)
 info = {}
 try:
     info = {k: v for k, v in runtime.info.items() if k in json.loads(
-        os.environ["COLIBRI_DETERMINISM_COUNTERS"])}
+        os.environ["FLYWEIGHT_DETERMINISM_COUNTERS"])}
 except Exception:
     pass
 print(json.dumps({"tokens": tokens, "info": info}))
@@ -92,11 +92,11 @@ def sample(model, count, options, overrides):
     environment = dict(
         os.environ,
         PYTHONPATH="src",
-        COLIBRI_DETERMINISM_MODEL=model,
-        COLIBRI_DETERMINISM_PROMPT=PROMPT,
-        COLIBRI_DETERMINISM_TOKENS=str(count),
-        COLIBRI_DETERMINISM_OPTIONS=json.dumps(options),
-        COLIBRI_DETERMINISM_COUNTERS=json.dumps(list(COUNTERS)),
+        FLYWEIGHT_DETERMINISM_MODEL=model,
+        FLYWEIGHT_DETERMINISM_PROMPT=PROMPT,
+        FLYWEIGHT_DETERMINISM_TOKENS=str(count),
+        FLYWEIGHT_DETERMINISM_OPTIONS=json.dumps(options),
+        FLYWEIGHT_DETERMINISM_COUNTERS=json.dumps(list(COUNTERS)),
         **overrides,
     )
     result = subprocess.run(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Greedy-token parity for the Q8-activation group-decode matvecs.
 
-COLIBRI_IQ2_Q8_DECODE=0 forces every dense projection back onto the
+FLYWEIGHT_IQ2_Q8_DECODE=0 forces every dense projection back onto the
 per-element reference kernels, so running the same prompt both ways checks the
 DP4A paths against the decode they replace.
 """
@@ -15,7 +15,7 @@ import sys
 def sample(model: str, enabled: str, count: int) -> list[int]:
     source = (
         "import os,sys;"
-        "from colibri_next.v2 import V2Model,V2QwenRuntime;"
+        "from flyweight.v2 import V2Model,V2QwenRuntime;"
         f"m=V2Model({model!r});"
         "r=V2QwenRuntime(m,context_limit=2048);r.prepare();"
         f"p=m.tokenize('Explain how a turbocharger works, step by step.');"
@@ -23,7 +23,7 @@ def sample(model: str, enabled: str, count: int) -> list[int]:
         f"r.generate(p,{count},lambda t: out.append(t) or True);"
         "print(','.join(map(str,out)))"
     )
-    environment = dict(os.environ, COLIBRI_IQ2_Q8_DECODE=enabled, PYTHONPATH="src")
+    environment = dict(os.environ, FLYWEIGHT_IQ2_Q8_DECODE=enabled, PYTHONPATH="src")
     result = subprocess.run(
         [sys.executable, "-c", source], capture_output=True, text=True,
         env=environment, check=True,

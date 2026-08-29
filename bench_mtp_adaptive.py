@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Does the shipped adaptive gate actually turn MTP off?
 
-Every other MTP benchmark here forces COLIBRI_MTP_ADAPTIVE=0. The shipped
+Every other MTP benchmark here forces FLYWEIGHT_MTP_ADAPTIVE=0. The shipped
 default instead calibrates: it times the first kQwenMtpBaselineTokens (16)
 tokens with MTP off, then 4 MTP rounds, and keeps MTP only if it measures under
 kQwenMtpKeepPercent (80%) of the baseline per-token cost. MTP measures 1.16-1.29x
@@ -23,10 +23,10 @@ import os
 import sys
 import time
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
-os.environ["COLIBRI_V2_DMA_PAGING"] = "1"
-os.environ.pop("COLIBRI_MTP_ADAPTIVE", None)  # shipped default
+os.environ["FLYWEIGHT_V2_DMA_PAGING"] = "1"
+os.environ.pop("FLYWEIGHT_MTP_ADAPTIVE", None)  # shipped default
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 MTP_MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-MTP-BF16.gguf"

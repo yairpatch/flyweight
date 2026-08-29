@@ -26,8 +26,8 @@ import unittest
 
 import numpy as np
 
-from colibri_next.deepseek4_layer import DeepSeek4Model
-from colibri_next.v2 import V2Model
+from flyweight.deepseek4_layer import DeepSeek4Model
+from flyweight.v2 import V2Model
 
 _CHECKPOINT_PATH = os.environ.get("DEEPSEEK4_GGUF")
 # A stale path is as good as no path: the variable often outlives the file it

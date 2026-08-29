@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import PropertyMock, patch
 
-from colibri_next.v2 import (
+from flyweight.v2 import (
     V2Model,
     V2Error,
     V2QwenRuntime,
@@ -55,7 +55,7 @@ class V2RuntimeTests(unittest.TestCase):
             def __init__(self):
                 self.options = b""
 
-            def colibri_v2_qwen_runtime_create(self, _model, options, _runtime):
+            def flyweight_v2_qwen_runtime_create(self, _model, options, _runtime):
                 self.options = ctypes.string_at(
                     options, ctypes.sizeof(_QwenRuntimeOptions)
                 )
@@ -101,7 +101,7 @@ class V2RuntimeTests(unittest.TestCase):
             def __init__(self):
                 self.options = b""
 
-            def colibri_v2_qwen_runtime_create(self, _model, options, _runtime):
+            def flyweight_v2_qwen_runtime_create(self, _model, options, _runtime):
                 self.options = ctypes.string_at(
                     options, ctypes.sizeof(_QwenRuntimeOptions)
                 )
@@ -125,7 +125,7 @@ class V2RuntimeTests(unittest.TestCase):
             def __init__(self):
                 self.options = b""
 
-            def colibri_v2_qwen_runtime_create(
+            def flyweight_v2_qwen_runtime_create(
                 self, _model, options, _runtime
             ):
                 self.options = ctypes.string_at(
@@ -191,7 +191,7 @@ class V2RuntimeTests(unittest.TestCase):
 
     def test_hybrid_policies_are_validated_and_forwarded(self):
         model = object.__new__(V2Model)
-        with patch("colibri_next.v2.V2QwenRuntime", return_value="runtime") as create:
+        with patch("flyweight.v2.V2QwenRuntime", return_value="runtime") as create:
             self.assertEqual(
                 model.native_qwen_runtime(
                     hybrid_prefill="cpu", expert_residency="immutable"
@@ -211,7 +211,7 @@ class V2RuntimeTests(unittest.TestCase):
     def test_format_dispatch_table_names_are_registered_kernels(self):
         """Every kernel name in the format table must exist in the driver.
 
-        colibri_gpu_launch_named returns -2 for an unknown name and several
+        flyweight_gpu_launch_named returns -2 for an unknown name and several
         callers treat a nonzero return as "no kernel, use the fallback", so a
         typo or a kernel that was never registered does not fail -- it quietly
         runs the per-element decoder at a fraction of the bandwidth. That is
@@ -219,7 +219,7 @@ class V2RuntimeTests(unittest.TestCase):
         """
         root = Path(__file__).resolve().parents[1]
         table = (
-            root / "native/include/colibri_v2_format_dispatch.hpp"
+            root / "native/include/flyweight_v2_format_dispatch.hpp"
         ).read_text(encoding="utf-8")
         driver = (
             root / "native/src/gpu_driver.cpp"
@@ -254,7 +254,7 @@ class V2RuntimeTests(unittest.TestCase):
     def test_nvfp4_prefill_has_blackwell_tensor_core_dispatch_and_fallback(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
-            root / "native/include/colibri_v2_qwen_kernels.hpp"
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
         ).read_text(encoding="utf-8")
         driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
         verifier = (root / "native/src/v2_mtp_verifier.inc").read_text(encoding="utf-8")
@@ -266,26 +266,26 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("nvfp4_repack_concat_down_cublaslt", kernels)
         self.assertIn("nvfp4_copy_gguf_values_cublaslt", kernels)
         self.assertIn("blockIdx.x * 8 + warp", kernels)
-        self.assertIn("COLIBRI_NVFP4_TILED", runtime)
+        self.assertIn("FLYWEIGHT_NVFP4_TILED", runtime)
         self.assertIn("CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3", kernels)
         self.assertIn("cublasLtMatmulAlgoGetHeuristic", driver)
-        self.assertIn("colibri_gpu_nvfp4_matmul_cublas", driver)
-        self.assertIn("colibri_gpu_nvfp4_moe_cublas", driver)
-        self.assertIn("COLIBRI_NVFP4_TENSOR_CORE_PROFILE", driver)
-        self.assertIn("COLIBRI_NVFP4_PERSISTENT", runtime)
-        self.assertIn("colibri_gpu_nvfp4_moe_persistent", runtime)
-        self.assertIn("COLIBRI_NVFP4_PERSISTENT_GROUPED", driver)
+        self.assertIn("flyweight_gpu_nvfp4_matmul_cublas", driver)
+        self.assertIn("flyweight_gpu_nvfp4_moe_cublas", driver)
+        self.assertIn("FLYWEIGHT_NVFP4_TENSOR_CORE_PROFILE", driver)
+        self.assertIn("FLYWEIGHT_NVFP4_PERSISTENT", runtime)
+        self.assertIn("flyweight_gpu_nvfp4_moe_persistent", runtime)
+        self.assertIn("FLYWEIGHT_NVFP4_PERSISTENT_GROUPED", driver)
         self.assertIn("kPreferenceMaxWorkspace = 1", driver)
         self.assertIn(
-            "COLIBRI_NVFP4_DECODE_TENSOR_CORES\");return s&&s[0]=='1'", runtime
+            "FLYWEIGHT_NVFP4_DECODE_TENSOR_CORES\");return s&&s[0]=='1'", runtime
         )
-        self.assertIn("COLIBRI_NVFP4_TENSOR_CORES", verifier)
+        self.assertIn("FLYWEIGHT_NVFP4_TENSOR_CORES", verifier)
         self.assertIn('launch("nvfp4_matmul_rows"', verifier)
 
     def test_q8_routed_experts_have_explicit_gpu_swiglu_dispatch(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
-            root / "native/include/colibri_v2_qwen_kernels.hpp"
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
         ).read_text(encoding="utf-8")
         driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
@@ -348,13 +348,13 @@ class V2RuntimeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         verifier = (root / "native/src/v2_mtp_verifier.inc").read_text(encoding="utf-8")
         kernels = (
-            root / "native/include/colibri_v2_qwen_kernels.hpp"
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
         ).read_text(encoding="utf-8")
 
         self.assertIn("rows<=8&&type==8", verifier)
         self.assertIn('launch("q8_matvec_transposed_pair"', verifier)
         self.assertIn('launch("q8_matvec_transposed_triple"', verifier)
-        self.assertIn("colibri_gpu_q8_matvec_transposed(", verifier)
+        self.assertIn("flyweight_gpu_q8_matvec_transposed(", verifier)
         self.assertIn("q8_matvec_transposed_pair", kernels)
         self.assertIn("q8_matvec_transposed_triple", kernels)
 
@@ -363,7 +363,7 @@ class V2RuntimeTests(unittest.TestCase):
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
         verifier = (root / "native/src/v2_mtp_verifier.inc").read_text(encoding="utf-8")
         workspace = (
-            root / "native/include/colibri_v2_workspace.hpp"
+            root / "native/include/flyweight_v2_workspace.hpp"
         ).read_text(encoding="utf-8")
 
         self.assertIn("if(runtime->prefill_rows>1&&prompt_count>1", runtime)
@@ -382,7 +382,7 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("cuDevicePrimaryCtxSetFlags", driver)
         self.assertIn("cuCtxSetFlags", driver)
         self.assertIn("kCtxSchedBlockingSync = 0x04", driver)
-        self.assertIn("COLIBRI_CUDA_SPIN_WAIT", driver)
+        self.assertIn("FLYWEIGHT_CUDA_SPIN_WAIT", driver)
         # gpu_info() retains the primary context before runtime initialization,
         # so the probe must set the same scheduling policy first.
         self.assertIn("cuDevicePrimaryCtxSetFlags", runtime)
@@ -391,12 +391,12 @@ class V2RuntimeTests(unittest.TestCase):
     def test_native_tiled_attention_covers_f16_bf16_and_q8(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
-            root / "native/include/colibri_v2_qwen_kernels.hpp"
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
         ).read_text(encoding="utf-8")
         driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
         policy = (
-            root / "native/include/colibri_v2_attention_policy.hpp"
+            root / "native/include/flyweight_v2_attention_policy.hpp"
         ).read_text(encoding="utf-8")
 
         for precision in ("f16", "bf16", "q8"):
@@ -443,29 +443,29 @@ class V2RuntimeTests(unittest.TestCase):
         # else -- silent reinterpretation is what made this look like a model
         # bug rather than a dispatch bug.
         self.assertIn("if(projected!=0)", body)
-        self.assertNotIn("colibri_gpu_q8_matvec_transposed(", body)
+        self.assertNotIn("flyweight_gpu_q8_matvec_transposed(", body)
 
     def test_sampled_topk_stays_on_gpu_until_candidates_are_reduced(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
-            root / "native/include/colibri_v2_qwen_kernels.hpp"
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
         ).read_text(encoding="utf-8")
         driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
         self.assertIn("void sampling_block_topk_logits(", kernels)
         self.assertIn("void sampling_block_topk_pairs(", kernels)
         self.assertIn("cub::BlockRadixSort", kernels)
-        self.assertIn("colibri_gpu_sampling_topk", driver)
+        self.assertIn("flyweight_gpu_sampling_topk", driver)
         self.assertIn("sampling_gpu_topk_bytes", runtime)
         self.assertIn("sampling_nanoseconds", runtime)
-        self.assertIn("COLIBRI_SAMPLING_GPU_TOPK", runtime)
+        self.assertIn("FLYWEIGHT_SAMPLING_GPU_TOPK", runtime)
 
     def test_turbo_cache_types_reach_the_native_options(self):
         class FakeLibrary:
             def __init__(self):
                 self.options = b""
 
-            def colibri_v2_qwen_runtime_create(
+            def flyweight_v2_qwen_runtime_create(
                 self, _model, options, _runtime
             ):
                 self.options = ctypes.string_at(
@@ -521,7 +521,7 @@ class V2RuntimeTests(unittest.TestCase):
             def __init__(self):
                 self.options = b""
 
-            def colibri_v2_qwen_runtime_create(
+            def flyweight_v2_qwen_runtime_create(
                 self, _model, options, _runtime
             ):
                 self.options = ctypes.string_at(
@@ -550,7 +550,7 @@ class V2RuntimeTests(unittest.TestCase):
     def test_native_turbo_kv_path_is_wired_end_to_end(self):
         root = Path(__file__).resolve().parents[1]
         kernels = (
-            root / "native/include/colibri_v2_qwen_kernels.hpp"
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
         ).read_text(encoding="utf-8")
         driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
@@ -810,7 +810,7 @@ class ConstraintSpecificationTests(unittest.TestCase):
     """The wire spec the native sampler parses; both ends must agree on it."""
 
     def test_no_constraints_sends_nothing(self):
-        from colibri_next.v2 import _constraint_specification
+        from flyweight.v2 import _constraint_specification
 
         self.assertIsNone(_constraint_specification(None, None))
         self.assertIsNone(_constraint_specification([], None))
@@ -818,7 +818,7 @@ class ConstraintSpecificationTests(unittest.TestCase):
     def test_tools_alone_keep_the_historical_array_form(self):
         # An older native library parses only the bare array; the object form
         # is reserved for requests that actually need it.
-        from colibri_next.v2 import _constraint_specification
+        from flyweight.v2 import _constraint_specification
 
         import json
 
@@ -828,7 +828,7 @@ class ConstraintSpecificationTests(unittest.TestCase):
         )
 
     def test_response_format_rides_the_object_form(self):
-        from colibri_next.v2 import _constraint_specification
+        from flyweight.v2 import _constraint_specification
 
         import json
 
@@ -849,7 +849,7 @@ class ConstraintSpecificationTests(unittest.TestCase):
         # downstream would parse it, so the sampler must not write it. This is
         # what keeps a compaction/summarize request from storing a phantom
         # <tool_call> block as conversation state.
-        from colibri_next.v2 import _constraint_specification
+        from flyweight.v2 import _constraint_specification
 
         import json
 

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Model
+from flyweight.v2 import V2Model
 
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
@@ -26,7 +26,7 @@ def tearDownModule():
 
 
 def _model(**kwargs) -> tuple[V2Model, DenseQwenSpec, Path]:
-    holder = tempfile.TemporaryDirectory(prefix="colibri-dense-")
+    holder = tempfile.TemporaryDirectory(prefix="flyweight-dense-")
     _WORKSPACES.append(holder)
     directory = Path(holder.name)
     path = directory / "dense.gguf"

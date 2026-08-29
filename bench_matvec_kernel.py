@@ -21,7 +21,7 @@ IQ number here.
 import argparse
 import ctypes
 
-from colibri_next.v2 import V2Model, V2QwenRuntime, _library
+from flyweight.v2 import V2Model, V2QwenRuntime, _library
 
 SUPERBLOCK_BYTES = {10: 84, 11: 110, 12: 144, 13: 176, 14: 210, 16: 66}
 KERNELS = {
@@ -50,28 +50,28 @@ def main() -> int:
     runtime.prepare()
 
     library = _library()
-    library.colibri_gpu_alloc.argtypes = [ctypes.c_uint64,
+    library.flyweight_gpu_alloc.argtypes = [ctypes.c_uint64,
                                           ctypes.POINTER(ctypes.c_uint64)]
-    library.colibri_gpu_launch_named.argtypes = [
+    library.flyweight_gpu_launch_named.argtypes = [
         ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
         ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]
-    library.colibri_gpu_stream_sync.argtypes = [ctypes.c_uint64]
-    library.colibri_gpu_event_record.argtypes = [ctypes.c_uint64,
+    library.flyweight_gpu_stream_sync.argtypes = [ctypes.c_uint64]
+    library.flyweight_gpu_event_record.argtypes = [ctypes.c_uint64,
                                                  ctypes.c_uint64]
 
     rows, columns = arguments.rows, arguments.columns
     stream = ctypes.c_uint64()
-    library.colibri_gpu_stream_create(ctypes.byref(stream))
+    library.flyweight_gpu_stream_create(ctypes.byref(stream))
     start, end = ctypes.c_uint64(), ctypes.c_uint64()
-    library.colibri_gpu_timed_event_create(ctypes.byref(start))
-    library.colibri_gpu_timed_event_create(ctypes.byref(end))
+    library.flyweight_gpu_timed_event_create(ctypes.byref(start))
+    library.flyweight_gpu_timed_event_create(ctypes.byref(end))
 
     for quant in arguments.types or [12]:
         weight_bytes = (columns // 256) * rows * SUPERBLOCK_BYTES[quant]
         pointers = []
         for size in (weight_bytes, columns, (columns // 32) * 2, rows * 4):
             value = ctypes.c_uint64()
-            if library.colibri_gpu_alloc(size, ctypes.byref(value)):
+            if library.flyweight_gpu_alloc(size, ctypes.byref(value)):
                 raise SystemExit("device allocation failed")
             pointers.append(value)
 
@@ -84,26 +84,26 @@ def main() -> int:
 
         def run(count: int) -> None:
             for _ in range(count):
-                if library.colibri_gpu_launch_named(
+                if library.flyweight_gpu_launch_named(
                     name, grid, 1, arguments.block, 0, stream, args
                 ):
                     raise SystemExit(f"launch failed: {name!r}")
 
         run(50)
-        library.colibri_gpu_stream_sync(stream)
-        library.colibri_gpu_event_record(start, stream)
+        library.flyweight_gpu_stream_sync(stream)
+        library.flyweight_gpu_event_record(start, stream)
         run(arguments.iterations)
-        library.colibri_gpu_event_record(end, stream)
-        library.colibri_gpu_stream_sync(stream)
+        library.flyweight_gpu_event_record(end, stream)
+        library.flyweight_gpu_stream_sync(stream)
 
         elapsed = ctypes.c_float()
-        library.colibri_gpu_event_elapsed(start, end, ctypes.byref(elapsed))
+        library.flyweight_gpu_event_elapsed(start, end, ctypes.byref(elapsed))
         per_call = elapsed.value / arguments.iterations
         print(f"{KERNELS[quant]:34s} {weight_bytes / 2**20:7.1f} MiB "
               f"{per_call * 1000:8.1f} us "
               f"{weight_bytes / (per_call / 1000) / 1e9:6.0f} GB/s")
         for value in pointers:
-            library.colibri_gpu_free(value)
+            library.flyweight_gpu_free(value)
     return 0
 
 

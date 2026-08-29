@@ -19,7 +19,7 @@
 //   --dump     read real tensors instead of synthesising them. The file is
 //              headerless little-endian f32: keys[count][dim] then
 //              values[count][dim], preceded by two int32s (count, dim).
-//              ColibriV2QwenRuntime.dump_kv writes exactly this.
+//              FlyweightV2QwenRuntime.dump_kv writes exactly this.
 //   --baseline-bits  what to quote compression against; defaults to 16 for the
 //              runtime's f16 cache default.
 //
@@ -325,7 +325,7 @@ int main(int argc, char** argv) {
 
     const TurboType types[] = {TurboType::Turbo2, TurboType::Turbo3, TurboType::Turbo4};
     // Compression is quoted against whatever the cache runs at today, which
-    // defaults to f16 (cache_type_k/v in ColibriV2QwenRuntimeOptions). Pass
+    // defaults to f16 (cache_type_k/v in FlyweightV2QwenRuntimeOptions). Pass
     // --baseline-bits 32 for f32 or 8.5 for q8_0, whose 34-byte block over 32
     // values costs half a bit of scale on top of the 8-bit payload.
     const float baseline = baseline_bits;

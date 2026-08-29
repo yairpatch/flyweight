@@ -1127,7 +1127,7 @@ bool iq_dot_multi(const std::uint8_t* packed, std::uint32_t type,
 
 // f16 and bf16 rows. No blocks, no scales: convert eight weights at a time
 // and fmadd. The tails are scalar, so any row length is admissible -- the
-// dispatchers rely on that (simd_dot_granule in colibri_v2_bailing.hpp).
+// dispatchers rely on that (simd_dot_granule in flyweight_v2_bailing.hpp).
 float f16_dot(const std::uint8_t* row, const float* input, int elements) {
     __m256 sum = _mm256_setzero_ps();
     int i = 0;

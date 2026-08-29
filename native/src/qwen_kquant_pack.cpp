@@ -56,9 +56,9 @@ bool avx2_usable() {
 // initialization, and the hook is only read inside fit_qk_super_block.
 const bool installed = [] {
 #if defined(__x86_64__) || defined(_M_X64)
-    // COLIBRI_CPU_BACKEND=scalar forces the reference path, which is what makes
+    // FLYWEIGHT_CPU_BACKEND=scalar forces the reference path, which is what makes
     // the two comparable on one machine.
-    const char* backend = std::getenv("COLIBRI_CPU_BACKEND");
+    const char* backend = std::getenv("FLYWEIGHT_CPU_BACKEND");
     const bool forced_scalar = backend && std::strcmp(backend, "scalar") == 0;
     if (!forced_scalar && avx2_usable())
         fit_sub_block_scales_hook = &fit_sub_block_scales_avx2_entry;

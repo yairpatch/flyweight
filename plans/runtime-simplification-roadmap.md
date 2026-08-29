@@ -17,7 +17,7 @@ The target execution policy is:
 7. Reconsider placement only between requests.
 
 This combines llama.cpp-style prepare-time placement with vLLM-style bounded
-prefill scheduling while retaining Colibri's native Qwen kernels.
+prefill scheduling while retaining Flyweight's native Qwen kernels.
 
 ## Rules for every change
 
@@ -126,7 +126,7 @@ Reference commands:
 # Q6, long-context hybrid baseline
 PYTHONPATH=src python bench_runtime.py run \
   /home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q6_K.gguf \
-  --output /tmp/colibri-q6-58k-hybrid.jsonl \
+  --output /tmp/flyweight-q6-58k-hybrid.jsonl \
   --label q6-58k-hybrid \
   --prompt "Explain how expert routing behaves during a long prompt." \
   --prompt-lengths 256,1024,4096,10000 \
@@ -138,7 +138,7 @@ PYTHONPATH=src python bench_runtime.py run \
 # Same placement with routed experts fixed to CPU
 PYTHONPATH=src python bench_runtime.py run \
   /home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q6_K.gguf \
-  --output /tmp/colibri-q6-58k-cpu.jsonl \
+  --output /tmp/flyweight-q6-58k-cpu.jsonl \
   --label q6-58k-cpu \
   --prompt "Explain how expert routing behaves during a long prompt." \
   --prompt-lengths 256,1024,4096,10000 \
@@ -149,7 +149,7 @@ PYTHONPATH=src python bench_runtime.py run \
 
 # Behavior-preserving candidate gate (defaults to 3% latency/throughput limits)
 PYTHONPATH=src python bench_runtime.py compare \
-  /tmp/colibri-before.jsonl /tmp/colibri-after.jsonl
+  /tmp/flyweight-before.jsonl /tmp/flyweight-after.jsonl
 ```
 
 Run the GPU configurations in isolation. A resident server changes the free
@@ -185,7 +185,7 @@ Rollback: revert the layout consumer while retaining its unit tests.
 Implementation result:
 
 - Added typed decode/rows device layouts and matching host-staging layouts in
-  `native/include/colibri_v2_workspace.hpp`.
+  `native/include/flyweight_v2_workspace.hpp`.
 - The runtime builds all four layouts once during prepare. Allocation sizing,
   single decode, rows prefill/MTP verification, and multi-sequence decode now
   consume their stored offsets.
@@ -200,7 +200,7 @@ Implementation result:
   `256`, `1024`, and `4096`.
 - The saved Q6/58K hybrid comparison passed every 3% gate and matched generated
   tokens at `256`, `1024`, `4096`, and `10000`. Candidate JSONL:
-  `/tmp/colibri-q6-58k-hybrid-workspace-candidate.jsonl` (SHA-256
+  `/tmp/flyweight-q6-58k-hybrid-workspace-candidate.jsonl` (SHA-256
   `6100d285a9f632fdb794f8a70416b9db2ddae3b8e515c3017b5393c70c7adf29`).
 
 ### Change 2 — Introduce one explicit expert execution policy ✅ COMPLETE 2026-07-30
@@ -234,7 +234,7 @@ Implementation result:
 
 - Added `ExpertExecutionMode`, `ExpertExecutionPhase`, and
   `ExpertExecutionPolicy` in
-  `native/include/colibri_v2_expert_policy.hpp`.
+  `native/include/flyweight_v2_expert_policy.hpp`.
 - The policy explicitly answers routed CPU/GPU permission, miss admission,
   residency mutation, prefill-frequency recording, and route-pruning
   decisions. Streamed-GPU rows retain their existing CPU fallback for
@@ -560,7 +560,7 @@ Work:
 
 - Remove legacy per-token admission/eviction only after Changes 4-6 have been
   the tested default.
-- Replace overlapping `COLIBRI_*` tuning variables with documented runtime
+- Replace overlapping `FLYWEIGHT_*` tuning variables with documented runtime
   options or one `experimental` configuration group.
 - Remove counters that no longer describe reachable behavior; version the ABI
   change if fields must move.

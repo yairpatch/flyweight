@@ -186,6 +186,52 @@ def ple_forward(hyper: np.ndarray, embeddings: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# MTP (nextn draft block)
+# ---------------------------------------------------------------------------
+
+def mtp_input_fusion(hyper: np.ndarray, embedding: np.ndarray,
+                     enorm: np.ndarray, hnorm: np.ndarray,
+                     eh_proj: np.ndarray, hc: int, hidden: int,
+                     epsilon: float = 1e-6) -> np.ndarray:
+    """The draft block's input fusion: streams + next-token embedding -> streams.
+
+    `hyper` is the TARGET's hyper-connection streams [rows][hc*hidden] (the
+    pre-collapse state, not the collapsed hidden the LM head sees), `embedding`
+    is the raw token embedding [rows][hidden] of the token the target just
+    produced. Returns [rows][hc*hidden] -- stream space in, stream space out,
+    which then runs the ordinary layer bookends (hc_mix/hc_inject) around a
+    DENSE attention and the MoE.
+
+    Two things here are easy to get wrong and are silent when wrong -- a bad
+    fusion only costs acceptance, never text, because verify re-scores every
+    draft with the target:
+
+    - hnorm is hc*hidden wide because the reference RMS-norms the WHOLE stream
+      row as one vector and only then splits it into streams. It is NOT a
+      per-stream (grouped) norm -- deepseek4's MTP is, qwen4exp's is not, and
+      the two differ only in the denominator. Hence `group=hc*hidden` below.
+    - the concat is EMBEDDING FIRST, hidden second, and eh_proj is applied per
+      stream with the embedding term broadcast across all hc of them. The
+      checkpoint's own layout is two separate projections (mtp.fc_embedding,
+      mtp.fc_hidden) that conversion fuses as A*e + B*h == [A|B] @ concat(e, h);
+      that identity is what pins the order.
+
+    ref: llama.cpp qwen4exp graph_mtp (refs/qwen4_exp/llamacpp_qwen4exp.cpp),
+    itself from sglang qwen4_exp_mtp.py. There is no transformers module to
+    check against: upstream drops the weights (`_keys_to_ignore_on_load_
+    unexpected = [r"^mtp.*"]`).
+    """
+    rows = hyper.shape[0]
+    # Whole-row RMS, then split into streams -- not grouped_rms(..., hidden).
+    h_norm = grouped_rms(hyper, hnorm, hc * hidden, epsilon).reshape(rows, hc, hidden)
+    # One embedding term, shared by every stream.
+    e_norm = grouped_rms(embedding, enorm, hidden, epsilon)
+    e_norm = np.repeat(e_norm[:, None, :], hc, axis=1)
+    fused = np.concatenate([e_norm, h_norm], axis=-1) @ eh_proj
+    return fused.reshape(rows, hc * hidden)
+
+
+# ---------------------------------------------------------------------------
 # QSA indexer (full-attention layers)
 # ---------------------------------------------------------------------------
 

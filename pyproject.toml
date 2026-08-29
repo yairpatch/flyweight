@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "wheel>=0.43"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "colibri-next"
+name = "flyweight"
 version = "0.2.0"
 description = "Native GGUF inference runtime for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models"
 readme = "README.md"
@@ -15,13 +15,13 @@ dependencies = ["Jinja2>=3.1"]
 client = ["openai>=2.0"]
 
 [project.scripts]
-colibri-next = "colibri_next.cli:main"
+flyweight = "flyweight.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-colibri_next = [
+flyweight = [
   "ui/*.html",
   "ui/*.css",
   "ui/*.js",

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from colibri_next.v2 import V2Model, V2QwenRuntime, _library
+from flyweight.v2 import V2Model, V2QwenRuntime, _library
 
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 
@@ -53,8 +53,8 @@ NO_Q8_LM_HEAD = {"IQ2_S", "IQ2_XS"}
 COLUMNS = 512      # two 256-value super-blocks per row
 ROWS = 96
 
-# Rows per launch of the *_q8_matvec_transposed_rows kernels; COLIBRI_Q8_ROWS
-# in native/include/colibri_v2_qwen_kernels.hpp.
+# Rows per launch of the *_q8_matvec_transposed_rows kernels; FLYWEIGHT_Q8_ROWS
+# in native/include/flyweight_v2_qwen_kernels.hpp.
 Q8_ROW_BATCH = 8
 
 # Formats with a batched multi-row matvec. Prefill dispatches on these; see the
@@ -86,21 +86,21 @@ class Q8KernelHarness:
         cls._runtime.prepare()
 
         cls._lib = _library()
-        cls._lib.colibri_gpu_alloc.argtypes = [
+        cls._lib.flyweight_gpu_alloc.argtypes = [
             ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
-        cls._lib.colibri_gpu_upload_sync.argtypes = [
+        cls._lib.flyweight_gpu_upload_sync.argtypes = [
             ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]
-        cls._lib.colibri_gpu_download.argtypes = [
+        cls._lib.flyweight_gpu_download.argtypes = [
             ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
-        cls._lib.colibri_gpu_launch_named.argtypes = [
+        cls._lib.flyweight_gpu_launch_named.argtypes = [
             ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]
-        cls._lib.colibri_gpu_stream_sync.argtypes = [ctypes.c_uint64]
+        cls._lib.flyweight_gpu_stream_sync.argtypes = [ctypes.c_uint64]
         # Without this the 64-bit device pointer is marshalled as a C int and
         # the memset lands somewhere else entirely.
-        cls._lib.colibri_gpu_memset.argtypes = [
+        cls._lib.flyweight_gpu_memset.argtypes = [
             ctypes.c_uint64, ctypes.c_int32, ctypes.c_uint64, ctypes.c_uint64]
-        cls._lib.colibri_gpu_free.argtypes = [ctypes.c_uint64]
+        cls._lib.flyweight_gpu_free.argtypes = [ctypes.c_uint64]
 
     @classmethod
     def tearDownClass(cls):
@@ -112,7 +112,7 @@ class Q8KernelHarness:
     def _alloc(self, size: int) -> int:
         pointer = ctypes.c_uint64()
         self.assertEqual(
-            self._lib.colibri_gpu_alloc(size, ctypes.byref(pointer)), 0,
+            self._lib.flyweight_gpu_alloc(size, ctypes.byref(pointer)), 0,
             "device allocation failed")
         return pointer.value
 
@@ -121,18 +121,18 @@ class Q8KernelHarness:
         array = (ctypes.c_void_p * len(args))(
             *[ctypes.addressof(value) for value in args])
         self.assertEqual(
-            self._lib.colibri_gpu_launch_named(
+            self._lib.flyweight_gpu_launch_named(
                 name.encode(), grid, grid_y, block, 0, 0, array),
             0, f"launch failed: {name}")
 
     def _download(self, pointer: int, count: int) -> np.ndarray:
         out = np.zeros(count, dtype=np.float32)
-        self.assertEqual(self._lib.colibri_gpu_stream_sync(0), 0)
+        self.assertEqual(self._lib.flyweight_gpu_stream_sync(0), 0)
         self.assertEqual(
-            self._lib.colibri_gpu_download(
+            self._lib.flyweight_gpu_download(
                 out.ctypes.data_as(ctypes.c_void_p), pointer,
                 out.nbytes, 0), 0)
-        self.assertEqual(self._lib.colibri_gpu_stream_sync(0), 0)
+        self.assertEqual(self._lib.flyweight_gpu_stream_sync(0), 0)
         return out
 
     def _packed_weights(self, label: str, size: int, seed: int) -> np.ndarray:
@@ -178,10 +178,10 @@ class Q8MatvecParityTests(Q8KernelHarness, unittest.TestCase):
         activation = self._exact_q8_activation(seed)
 
         weights = self._alloc(weight_bytes)
-        self.assertEqual(self._lib.colibri_gpu_upload_sync(
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
             weights, packed.ctypes.data_as(ctypes.c_void_p), weight_bytes), 0)
         vector_f32 = self._alloc(COLUMNS * 4)
-        self.assertEqual(self._lib.colibri_gpu_upload_sync(
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
             vector_f32, activation.ctypes.data_as(ctypes.c_void_p),
             COLUMNS * 4), 0)
         quantized = self._alloc(COLUMNS)
@@ -241,10 +241,10 @@ class Q8MatvecParityTests(Q8KernelHarness, unittest.TestCase):
                 activation = self._exact_q8_activation(29 + index)
 
                 weights = self._alloc(weight_bytes)
-                self._lib.colibri_gpu_upload_sync(
+                self._lib.flyweight_gpu_upload_sync(
                     weights, packed.ctypes.data_as(ctypes.c_void_p), weight_bytes)
                 vector_f32 = self._alloc(COLUMNS * 4)
-                self._lib.colibri_gpu_upload_sync(
+                self._lib.flyweight_gpu_upload_sync(
                     vector_f32, activation.ctypes.data_as(ctypes.c_void_p),
                     COLUMNS * 4)
                 quantized = self._alloc(COLUMNS)
@@ -266,16 +266,16 @@ class Q8MatvecParityTests(Q8KernelHarness, unittest.TestCase):
                               ctypes.c_uint64(logits), columns, rows])
                 projected = self._download(logits, ROWS)
 
-                self.assertEqual(self._lib.colibri_gpu_memset(winner, 0, 8, 0), 0)
+                self.assertEqual(self._lib.flyweight_gpu_memset(winner, 0, 8, 0), 0)
                 self._launch(f"{prefix}_q8_lm_head_argmax_warp",
                              (ROWS + 7) // 8, 256,
                              [packed_ptr, q8_ptr, scale_ptr,
                               ctypes.c_uint64(winner), columns, rows])
-                self.assertEqual(self._lib.colibri_gpu_stream_sync(0), 0)
+                self.assertEqual(self._lib.flyweight_gpu_stream_sync(0), 0)
                 packed_winner = ctypes.c_uint64()
-                self.assertEqual(self._lib.colibri_gpu_download(
+                self.assertEqual(self._lib.flyweight_gpu_download(
                     ctypes.byref(packed_winner), winner, 8, 0), 0)
-                self.assertEqual(self._lib.colibri_gpu_stream_sync(0), 0)
+                self.assertEqual(self._lib.flyweight_gpu_stream_sync(0), 0)
                 # The kernels pack ~row in the low word, matching decode's
                 # 0xffffffff - value unpacking.
                 chosen = 0xFFFFFFFF - (packed_winner.value & 0xFFFFFFFF)
@@ -309,7 +309,7 @@ class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
         for row in range(batch):
             vector_f32 = self._alloc(COLUMNS * 4)
             contiguous = np.ascontiguousarray(activations[row])
-            self.assertEqual(self._lib.colibri_gpu_upload_sync(
+            self.assertEqual(self._lib.flyweight_gpu_upload_sync(
                 vector_f32, contiguous.ctypes.data_as(ctypes.c_void_p),
                 COLUMNS * 4), 0)
             quantized = self._alloc(COLUMNS)
@@ -330,7 +330,7 @@ class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
         weight_bytes = (COLUMNS // 256) * ROWS * superblock
         packed = self._packed_weights(label, weight_bytes, seed)
         weights = self._alloc(weight_bytes)
-        self.assertEqual(self._lib.colibri_gpu_upload_sync(
+        self.assertEqual(self._lib.flyweight_gpu_upload_sync(
             weights, packed.ctypes.data_as(ctypes.c_void_p), weight_bytes), 0)
         return ctypes.c_uint64(weights)
 
@@ -354,7 +354,7 @@ class BatchedRowsTests(Q8KernelHarness, unittest.TestCase):
                     scale_stride = (COLUMNS // 32) * 2
                     vectors_f32 = self._alloc(batch * COLUMNS * 4)
                     flat = np.ascontiguousarray(activations.reshape(-1))
-                    self.assertEqual(self._lib.colibri_gpu_upload_sync(
+                    self.assertEqual(self._lib.flyweight_gpu_upload_sync(
                         vectors_f32, flat.ctypes.data_as(ctypes.c_void_p),
                         batch * COLUMNS * 4), 0)
                     quantized = self._alloc(batch * COLUMNS)

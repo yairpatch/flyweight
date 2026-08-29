@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from colibri_next.v2 import V2Error, V2Model
+from flyweight.v2 import V2Error, V2Model
 
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 from tests.split_gguf_fixture import split_gguf
@@ -29,7 +29,7 @@ def tearDownModule():
 
 def _fixture(**kwargs) -> tuple[Path, Path, DenseQwenSpec]:
     """Write the dense fixture once and return it beside a split of itself."""
-    holder = tempfile.TemporaryDirectory(prefix="colibri-split-")
+    holder = tempfile.TemporaryDirectory(prefix="flyweight-split-")
     _WORKSPACES.append(holder)
     directory = Path(holder.name)
     single = directory / "dense.gguf"

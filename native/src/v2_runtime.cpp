@@ -3,33 +3,33 @@
 #define NOMINMAX
 #endif
 
-#include "colibri_v2.h"
-#include "colibri_gpu_driver.h"
-#include <colibri_backend.hpp>
+#include "flyweight_v2.h"
+#include "flyweight_gpu_driver.h"
+#include <flyweight_backend.hpp>
 
 #include <atomic>
-#include "colibri_v2_provider.hpp"
-#include "colibri_v2_config.hpp"
-#include "colibri_v2_attention_policy.hpp"
-#include "colibri_v2_expert_policy.hpp"
-#include "colibri_v2_moe_align.hpp"
-#include "colibri_v2_format_dispatch.hpp"
-#include "colibri_v2_expert_seed.hpp"
-#include "colibri_v2_qwen_kernels.hpp"
-#include "colibri_v2_native_kernels.hpp"
-#include "colibri_v2_deepseek4_kernels.hpp"
-#include "colibri_v2_bailing.hpp"
-#include "colibri_v2_hf_quantize.hpp"
-#include "colibri_v2_hf_cache.hpp"
-#include "colibri_v2_workspace.hpp"
-#include "colibri_v2_tool_grammar.hpp"
-#include "colibri_v2_byte_alphabet.hpp"
+#include "flyweight_v2_provider.hpp"
+#include "flyweight_v2_config.hpp"
+#include "flyweight_v2_attention_policy.hpp"
+#include "flyweight_v2_expert_policy.hpp"
+#include "flyweight_v2_moe_align.hpp"
+#include "flyweight_v2_format_dispatch.hpp"
+#include "flyweight_v2_expert_seed.hpp"
+#include "flyweight_v2_qwen_kernels.hpp"
+#include "flyweight_v2_native_kernels.hpp"
+#include "flyweight_v2_deepseek4_kernels.hpp"
+#include "flyweight_v2_bailing.hpp"
+#include "flyweight_v2_hf_quantize.hpp"
+#include "flyweight_v2_hf_cache.hpp"
+#include "flyweight_v2_workspace.hpp"
+#include "flyweight_v2_tool_grammar.hpp"
+#include "flyweight_v2_byte_alphabet.hpp"
 #include "qwen_cpu_kernel.h"
 #include "qwen_kquant.h"
 #include "qwen_kquant_pack_api.hpp"
 #include "turboquant.h"
 #include "unicode_categories.h"
-#include "colibri_v2_deepseek4.hpp"
+#include "flyweight_v2_deepseek4.hpp"
 
 #include <algorithm>
 #include <array>
@@ -93,10 +93,10 @@ template <class F> int guarded(F&& f) { try { return f(); } catch (const std::ex
 // Guard for the per-layer timing accumulators (route_wait, expert_compute, etc.).
 // On Linux, clock_gettime via vDSO is ~20 ns; on Windows QueryPerformanceCounter
 // is ~150 ns.  Unconditionally calling steady_clock::now() 2-3 times per layer
-// per token added ~50 us/token of pure overhead.  Off unless COLIBRI_TIMING=1.
+// per token added ~50 us/token of pure overhead.  Off unless FLYWEIGHT_TIMING=1.
 bool timing_enabled() {
     static const bool on = [] {
-        const char* s = std::getenv("COLIBRI_TIMING");
+        const char* s = std::getenv("FLYWEIGHT_TIMING");
         return s && s[0] == '1';
     }();
     return on;
@@ -106,8 +106,8 @@ bool timing_enabled() {
 // to the direct-DMA path. Called at token boundaries only: `expert_dma` is then
 // written and read by the same thread, so the per-layer flags need no atomics and
 // a layer can never change execution path mid-token.
-struct ColibriV2QwenRuntime;
-void qwen_absorb_registration(ColibriV2QwenRuntime& runtime);
+struct FlyweightV2QwenRuntime;
+void qwen_absorb_registration(FlyweightV2QwenRuntime& runtime);
 
 // Host RAM left unpinned when expert tensors are registered for direct paging.
 // Registration locks pages, so taking everything would trade the staging memcpy
@@ -118,12 +118,12 @@ constexpr std::uint64_t kRegisterReserveBytes = 8ull * 1024 * 1024 * 1024;
 // would fit.
 constexpr std::uint64_t kRegisterMinimumBytes = 2ull * 1024 * 1024 * 1024;
 
-// COLIBRI_MOE_PROFILE=1 attributes the decode MoE phase's HOST-SERIAL time to its
+// FLYWEIGHT_MOE_PROFILE=1 attributes the decode MoE phase's HOST-SERIAL time to its
 // causes. Phase 0b of plans/decode-device-dispatch.md: `expert_page` measures the
 // whole phase (~32 ms/token on the 125B UD-IQ1_S) and `expert_compute` only the
 // CPU expert dots inside it (~7 ms), leaving ~25 ms/token attributed to nothing.
 // The dispatch rewrite that gap motivates is far too large to build on a guess,
-// so this splits the gap by cause. Separate from COLIBRI_TIMING because these are
+// so this splits the gap by cause. Separate from FLYWEIGHT_TIMING because these are
 // finer-grained clocks inside the per-expert loop, which is exactly where clock
 // overhead would distort what it measures -- read the totals, not the absolute
 // token rate, when this is on.
@@ -145,7 +145,7 @@ struct QwenMoeProfile {
 inline QwenMoeProfile& qwen_moe_profile() { static QwenMoeProfile p; return p; }
 inline bool moe_profile_enabled() {
     static const bool on = [] {
-        const char* s = std::getenv("COLIBRI_MOE_PROFILE");
+        const char* s = std::getenv("FLYWEIGHT_MOE_PROFILE");
         return s && s[0] == '1';
     }();
     return on;
@@ -196,20 +196,20 @@ void qwen_moe_profile_report() {
         p.staged_bytes / t / (1024.0 * 1024.0));
 }
 
-// COLIBRI_EXPERT_TRACE=<path> writes the decode route stream as packed
+// FLYWEIGHT_EXPERT_TRACE=<path> writes the decode route stream as packed
 // (uint32 layer, uint32 expert) pairs so expert-cache policies can be replayed
 // offline against a real trace. Diagnostic only; null unless the var is set.
 std::FILE* expert_trace_file() {
     static std::FILE* const handle = [] () -> std::FILE* {
-        const char* path = std::getenv("COLIBRI_EXPERT_TRACE");
+        const char* path = std::getenv("FLYWEIGHT_EXPERT_TRACE");
         return (path && path[0]) ? std::fopen(path, "wb") : nullptr;
     }();
     return handle;
 }
 
-struct Tensor : colibri::v2::TensorDescriptor {
+struct Tensor : flyweight::v2::TensorDescriptor {
     // Null means the primary model mapping. MTP overlays point into the
-    // sidecar mapping retained by ColibriV2Model::mtp_sidecar.
+    // sidecar mapping retained by FlyweightV2Model::mtp_sidecar.
     const uint8_t* source = nullptr;
 };
 
@@ -234,7 +234,7 @@ struct Reader {
 // Execution consumes this descriptor rather than GGUF internals. GGUF is the
 // first WeightProvider; future providers can populate the same
 // tensor contract without changing CUDA/runtime code.
-struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf", chat_template; colibri::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors; std::unique_ptr<ColibriV2Model> mtp_sidecar;
+struct FlyweightV2Model : flyweight::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf", chat_template; flyweight::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors; std::unique_ptr<FlyweightV2Model> mtp_sidecar;
     // GGUF tokenizer.ggml.pre selects the pre-tokenizer. Control tokens (GGUF
     // token type 3) never come out of BPE and have to be split off ahead of it.
     std::string tokenizer_pre; std::vector<std::uint32_t> token_types;
@@ -246,7 +246,7 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
     // Shards other than the one that was opened. Their descriptors are merged
     // into `tensors` with Tensor::source pointing at the shard mapping, so a
     // split checkpoint is indistinguishable downstream from a single file.
-    std::vector<std::unique_ptr<ColibriV2Model>> shards;
+    std::vector<std::unique_ptr<FlyweightV2Model>> shards;
     // HF checkpoints arrive unquantized and are quantized during open, so their
     // tensor bytes are owned here rather than mapped from a file. Every
     // descriptor then points into this buffer through Tensor::source, which is
@@ -258,7 +258,7 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
 #else
     HANDLE file=nullptr, mapping=nullptr;
 #endif
-    ~ColibriV2Model() {
+    ~FlyweightV2Model() {
 #if !defined(_WIN32)
         if(data&&data!=MAP_FAILED)munmap(const_cast<uint8_t*>(data),size);
         if(fd>=0)::close(fd);
@@ -270,7 +270,7 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
     }
     const char* format() const override { return format_name.c_str(); }
     uint64_t tensor_count() const override { return tensors.size(); }
-    const colibri::v2::TensorDescriptor* tensor(uint64_t index) const override { return index < tensors.size() ? &tensors[index] : nullptr; }
+    const flyweight::v2::TensorDescriptor* tensor(uint64_t index) const override { return index < tensors.size() ? &tensors[index] : nullptr; }
     int read_tensor(uint64_t index, void* destination, uint64_t bytes) const override { if(index >= tensors.size() || !destination || bytes < tensors[index].size) return -1; const auto& tensor=tensors[index];const auto*base=tensor.source?tensor.source:data;std::memcpy(destination, base + tensor.offset, tensor.size); return 0; }
     // Every mapping that can hold tensor bytes, primary file first. Nothing may
     // assume `data`/`size` spans the model: a split checkpoint keeps all of its
@@ -282,10 +282,10 @@ struct ColibriV2Model : colibri::v2::WeightProvider { const uint8_t* data=nullpt
     std::uint64_t mapped_bytes() const { std::uint64_t total=size; for(const auto& shard:shards) if(shard) total+=shard->size; return total; }
 };
 
-const uint8_t* tensor_data(const ColibriV2Model& model, const Tensor& tensor) {
+const uint8_t* tensor_data(const FlyweightV2Model& model, const Tensor& tensor) {
     return (tensor.source ? tensor.source : model.data) + tensor.offset;
 }
-struct ColibriV2KvCache { std::uint64_t keys, values; std::int32_t capacity, kv_heads, head_dim, position=0; };
+struct FlyweightV2KvCache { std::uint64_t keys, values; std::int32_t capacity, kv_heads, head_dim, position=0; };
 
 struct QwenLayerPlan {
     bool attention = false;
@@ -392,6 +392,11 @@ struct QwenLayerPlan {
     std::uint32_t qsa_ratio = 0;
     std::uint64_t snapshot_first = 0;
     std::uint64_t snapshot_second = 0;
+    // qwen4exp: the PLE dilated-conv ring (state_third) is recurrent state just
+    // like the DeltaNet conv, so an MTP rejection has to rewind it too. Without
+    // this the verify pass leaves it `wanted` tokens ahead and the target drifts
+    // -- fluent output, wrong tokens, and only on the PLE layer.
+    std::uint64_t snapshot_third = 0;
     // MTP fold retention (ReplaySSM): during verification the qkv projection
     // and the decay/beta logits -- the only sequence-dependent inputs of the
     // DeltaNet transition -- are written here instead of the shared scratch,
@@ -408,6 +413,10 @@ struct QwenExpertSlot {
     bool valid = false;
     bool native_valid = false;
     bool pinned = false;
+    // Cleared when the slot is handed out, set by the first route that reads
+    // the occupant. An eviction with this still clear is an upload that bought
+    // nothing -- the yield of the admission policy, which hit rate hides.
+    bool used_since_admission = false;
     // One reservation per sequence that predicted this expert for its next
     // layer. A count (rather than a bool) matters under --parallel: two
     // sequences may predict the same resident expert, and the first one to
@@ -470,6 +479,38 @@ struct QwenExpertPrefetchState {
     std::size_t recurrence_stride = 0;
 };
 
+// Where every per-layer region sits inside a slot arena, for one context
+// limit. Slots need not be the same size: agentic side traffic (title/topic
+// detection, quota summaries, short subagent calls) never fills a full-context
+// slot, and a slot reserves its whole context at prepare whether or not a
+// conversation uses it -- on a small card that reservation is expert cache the
+// decode would rather have (plans/paged-kv-cache.md).
+//
+// Everything downstream of the KV slabs shifts with them, so a geometry is the
+// whole offset set, not just the capacities. The active slot's geometry is
+// mirrored onto runtime.layers exactly as its arena is mirrored onto
+// runtime.state, which is what keeps the ~29 kernel dispatch sites (and every
+// `capacity` argument they pass) unaware that slots differ at all.
+struct QwenLayerOffsets {
+    std::uint64_t cache_capacity = 0;
+    std::uint64_t state_first = 0, state_second = 0, state_third = 0;
+    std::uint64_t snapshot_first = 0, snapshot_second = 0, snapshot_third = 0;
+    std::uint64_t qsa_blocks = 0, qsa_ring = 0;
+    std::uint64_t mtp_retain_qkv = 0, mtp_retain_logits = 0;
+};
+
+struct QwenSlotGeometry {
+    std::uint64_t context_limit = 0;
+    std::uint64_t state_bytes = 0;
+    std::vector<QwenLayerOffsets> layers;
+    QwenLayerOffsets mtp_layer;
+    std::uint64_t mtp_target_hidden_offset = 0;
+    std::uint64_t mtp_draft_hidden_offset = 0;
+    std::uint64_t mtp_verified_hidden_offset = 0;
+    std::uint64_t mtp_snapshot_offset = 0;
+    std::uint64_t mtp_snapshot_bytes = 0;
+};
+
 // One decode sequence: its own attention-KV + DeltaNet state arena plus the
 // bookkeeping that pins prefix reuse to it. Agentic clients multiplex several
 // logical conversations (main agent, subagents, title/quota side-calls) onto
@@ -480,6 +521,7 @@ struct QwenExpertPrefetchState {
 // are untouched); qwen_switch_sequence saves/loads them on a slot change.
 struct QwenSequence {
     std::uint64_t state = 0;            // device KV+DeltaNet arena for this slot
+    std::size_t geometry = 0;           // index into runtime.geometries
     std::uint64_t position = 0;
     std::uint32_t last_output_token = 0;
     bool last_output_greedy = true;     // see QwenPrefillSnapshot::last_output_greedy
@@ -520,6 +562,10 @@ struct QwenHostPrompt {
     bool last_output_greedy = true;    // see QwenPrefillSnapshot::last_output_greedy
     std::uint64_t bytes = 0;           // total host bytes held (arena + snapshots)
     std::uint64_t clock = 0;           // LRU stamp within the host cache
+    // The geometry the packed buffer was written under. Restoring into a slot
+    // laid out differently has to re-derive both range lists and check they
+    // still describe the same regions.
+    std::size_t geometry = 0;
 };
 
 // Resumable prompt-processing state shared by the blocking generate path and
@@ -575,21 +621,21 @@ struct QwenSamplingState {
 
     // Constrained decoding for tool calls. Empty unless the caller passed a
     // tool specification, and inert until the model opens a call -- see
-    // colibri_v2_tool_grammar.hpp. It lives here rather than on the task
+    // flyweight_v2_tool_grammar.hpp. It lives here rather than on the task
     // because both decode paths, single-sequence and engine, reach the sampler
     // through this state and both have to be constrained the same way.
-    colibri::v2::tools::Grammar grammar;
+    flyweight::v2::tools::Grammar grammar;
 
     // Constrained decoding for response_format: the visible answer must be one
     // JSON value. Same lifecycle as the tool grammar -- configured per task,
     // disarms once its job is done or the text leaves its language.
-    colibri::v2::tools::ResponseGrammar response_grammar;
+    flyweight::v2::tools::ResponseGrammar response_grammar;
 
     // The inverse constraint, for requests that declared no tools: markup the
     // request cannot accept must not be written. Armed for the whole task,
     // but it costs the fast path one byte comparison per token -- see the
     // ban check beside the fused-argmax early-out in qwen_sample_last_logits.
-    colibri::v2::tools::MarkupBan markup_ban;
+    flyweight::v2::tools::MarkupBan markup_ban;
 
     // The grammars constrain the candidate set, so a request that has one
     // needs candidates even when it would otherwise take the fused greedy
@@ -643,8 +689,8 @@ struct QwenEngineTask {
     bool cancelled = false;
 };
 
-struct ColibriV2QwenRuntime {
-    ColibriV2Model* model = nullptr;
+struct FlyweightV2QwenRuntime {
+    FlyweightV2Model* model = nullptr;
     bool gemma4 = false;
     bool laguna = false;
     bool muse = false;
@@ -662,9 +708,9 @@ struct ColibriV2QwenRuntime {
     // The 320M-row n-gram table. Host-resident always: a token reads 16 rows
     // of 160 elements, so it is served from the mapping like host embeddings.
     std::uint64_t ple_table = std::numeric_limits<std::uint64_t>::max();
-    ColibriV2QwenRuntimeOptions options{};
-    colibri::v2::ExpertExecutionMode expert_mode =
-        colibri::v2::ExpertExecutionMode::streamed_gpu;
+    FlyweightV2QwenRuntimeOptions options{};
+    flyweight::v2::ExpertExecutionMode expert_mode =
+        flyweight::v2::ExpertExecutionMode::streamed_gpu;
     std::vector<QwenLayerPlan> layers;
     QwenLayerPlan mtp_layer_plan;
     std::array<std::uint64_t, 4> mtp_special_tensors{};
@@ -720,13 +766,13 @@ struct ColibriV2QwenRuntime {
     std::uint64_t aliased_tensor_bytes = 0;
     std::uint64_t workspace = 0;
     std::uint64_t workspace_bytes = 0;
-    colibri::v2::workspace::QwenDecodeWorkspaceLayout decode_workspace_layout;
-    colibri::v2::workspace::QwenRowsWorkspaceLayout rows_workspace_layout;
+    flyweight::v2::workspace::QwenDecodeWorkspaceLayout decode_workspace_layout;
+    flyweight::v2::workspace::QwenRowsWorkspaceLayout rows_workspace_layout;
     // Non-zero when the model's DeltaNet layers match the chunked prefill
     // kernels' fixed head_dim, which is what sized the delta_* workspace regions.
     std::uint32_t delta_value_heads = 0;
-    colibri::v2::workspace::QwenDecodeHostLayout decode_host_layout;
-    colibri::v2::workspace::QwenRowsHostLayout rows_host_layout;
+    flyweight::v2::workspace::QwenDecodeHostLayout decode_host_layout;
+    flyweight::v2::workspace::QwenRowsHostLayout rows_host_layout;
     // Pinned scratch for the host-side dense SwiGLU: normalized input, the
     // gate/up activation and the projected output for one token.
     void* dense_host = nullptr;
@@ -771,7 +817,7 @@ struct ColibriV2QwenRuntime {
     // Prefill expert-streaming arena (plans/prefill-expert-stream.md): routed
     // experts staged here per half-layer so the grouped kernels can take a
     // byte-budgeted share of the prefill MoE off the CPU. Sized by
-    // COLIBRI_PREFILL_EXPERT_STREAM_MIB at prepare; zero keeps prefill
+    // FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB at prepare; zero keeps prefill
     // experts wholly on the host, which is today's behavior.
     std::uint64_t prefill_stream_arena = 0;
     std::uint64_t prefill_stream_bytes = 0;
@@ -781,7 +827,7 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefill_stream_scratch = 0;
     std::uint64_t prefill_stream_scratch_bytes = 0;
     std::uint64_t prefill_stream_scratch_span = 0;
-    // Importance-matrix capture (COLIBRI_IMATRIX=1): one f32 accumulator per
+    // Importance-matrix capture (FLYWEIGHT_IMATRIX=1): one f32 accumulator per
     // input channel of every matmul weight, laid out per tensor by
     // `imatrix_offsets` (~0 = untracked). The dense prefill path accumulates
     // on the device via qwen_imatrix_accumulate; the CPU expert path
@@ -842,6 +888,10 @@ struct ColibriV2QwenRuntime {
     std::uint64_t expert_cache_rejections = 0;
     std::uint64_t expert_cache_prompt_bypasses = 0;
     std::uint64_t expert_cache_deferred_admissions = 0;
+    // What first-touch admission costs: an expert uploaded into a slot and
+    // evicted again without a single route reading it. Hit rate cannot show
+    // this -- a wasted upload and a never-attempted one look identical there.
+    std::uint64_t expert_cache_unused_admissions = 0;
     std::uint64_t expert_residency_epochs = 0;
     std::uint64_t prefix_cache_hits = 0;
     std::uint64_t prefix_cache_misses = 0;
@@ -851,6 +901,22 @@ struct ColibriV2QwenRuntime {
     std::uint64_t prefix_cache_last_reused_tokens = 0;
     std::uint64_t prefix_cache_last_lcp_live = 0;
     std::uint64_t prefix_cache_last_lcp_snapshot = 0;
+    // KV occupancy against the reservation (phase 0 of plans/paged-kv-cache.md).
+    // Every slot reserves state_bytes for the full context at prepare, whether
+    // or not a conversation ever fills it; these are the high-water marks of
+    // what the session actually touched, which is what a paged pool would have
+    // had to hold. Sampled at request boundaries: inside a request `position`
+    // only grows, so the boundary is that request's own maximum, and slot
+    // recycling only lowers the sum.
+    std::uint64_t kv_peak_live_bytes = 0;
+    std::uint64_t kv_peak_tokens = 0;      // slot positions summed at that peak
+    std::uint64_t kv_peak_tokens_max = 0;  // largest single-slot position seen
+    std::uint64_t kv_occupancy_samples = 0;
+    // Cross-slot prefix donations: prompts that shared a conversation's opening
+    // without continuing it, and were given a slot seeded from it rather than
+    // taking the slot over. See qwen_donate_prefix.
+    std::uint64_t prefix_donations = 0;
+    std::uint64_t prefix_donated_tokens = 0;
     std::uint64_t mtp_draft_tokens = 0;
     std::uint64_t mtp_accepted_tokens = 0;
     std::uint64_t mtp_rejected_tokens = 0;
@@ -984,7 +1050,7 @@ struct ColibriV2QwenRuntime {
     // parity tests, and any embedder holding more than one model) must be able
     // to disagree, and a latched static made the dense-fallback exactness test
     // compare a configuration against itself.
-    bool qsa_enabled = false;  // opt-in: COLIBRI_QSA=1
+    bool qsa_enabled = false;  // opt-in: FLYWEIGHT_QSA=1
     // Interleaving two distant expert matrices hurts mmap/TLB locality on
     // memory-bound CPU MoE. Keep the experimental kernel opt-in until it can
     // demonstrate a win across representative hardware and expert routing.
@@ -1004,12 +1070,19 @@ struct ColibriV2QwenRuntime {
     std::size_t active_sequence = 0;
     std::uint64_t sequence_clock = 0;
     std::uint32_t parallel_sequences = 1;
+    // Slot geometries, one per distinct slot size; [0] is the full-context one
+    // and every slot references one of these. A single entry means symmetric
+    // slots, which is the legacy layout exactly.
+    std::vector<QwenSlotGeometry> geometries;
+    // What the slots reserve in total. A sum, not slots x state_bytes: slots
+    // need not be the same size, and that difference is the point.
+    std::uint64_t slots_state_bytes = 0;
     // Host-backed prompt cache (see QwenHostPrompt). limit=0 disables it.
     std::vector<QwenHostPrompt> host_prompts;
     std::uint64_t host_cache_limit_bytes = 0;
     std::uint64_t host_cache_used_bytes = 0;
     std::uint64_t host_cache_clock = 0;
-    // Cooperative engine (see colibri_v2_qwen_engine_step). engine_pending /
+    // Cooperative engine (see flyweight_v2_qwen_engine_step). engine_pending /
     // engine_cancel_requests / engine_next_task_id are guarded by engine_mutex
     // (submit/cancel arrive from request threads). engine_tasks elements are
     // touched only by the single engine-stepping thread, but its *size* is
@@ -1069,21 +1142,21 @@ struct ColibriV2QwenRuntime {
     bool model_registered = false; // whether we cuMemHostRegister'd model->data
 };
 
-colibri::v2::ExpertExecutionPolicy qwen_expert_policy(
-    const ColibriV2QwenRuntime& runtime,
-    colibri::v2::ExpertExecutionPhase phase
+flyweight::v2::ExpertExecutionPolicy qwen_expert_policy(
+    const FlyweightV2QwenRuntime& runtime,
+    flyweight::v2::ExpertExecutionPhase phase
 ) {
     return {runtime.expert_mode,phase,runtime.cache_admission_enabled,
             runtime.options.hybrid_prefill_cpu!=0,
             runtime.expert_residency_frozen};
 }
 
-bool qwen_immutable_residency(const ColibriV2QwenRuntime& runtime) {
+bool qwen_immutable_residency(const FlyweightV2QwenRuntime& runtime) {
     return runtime.options.immutable_residency!=0&&
-        runtime.expert_mode==colibri::v2::ExpertExecutionMode::hybrid;
+        runtime.expert_mode==flyweight::v2::ExpertExecutionMode::hybrid;
 }
 
-bool qwen_freeze_expert_residency(ColibriV2QwenRuntime& runtime) {
+bool qwen_freeze_expert_residency(FlyweightV2QwenRuntime& runtime) {
     if(!qwen_immutable_residency(runtime)||runtime.expert_residency_frozen)
         return false;
     runtime.expert_residency_frozen=true;
@@ -1091,21 +1164,21 @@ bool qwen_freeze_expert_residency(ColibriV2QwenRuntime& runtime) {
     return true;
 }
 
-void qwen_unfreeze_expert_residency(ColibriV2QwenRuntime& runtime) {
+void qwen_unfreeze_expert_residency(FlyweightV2QwenRuntime& runtime) {
     runtime.expert_residency_frozen=false;
 }
 
 struct QwenResidencyEpochGuard {
-    ColibriV2QwenRuntime& runtime;
+    FlyweightV2QwenRuntime& runtime;
     bool owned = false;
-    explicit QwenResidencyEpochGuard(ColibriV2QwenRuntime& value)
+    explicit QwenResidencyEpochGuard(FlyweightV2QwenRuntime& value)
         :runtime(value),owned(qwen_freeze_expert_residency(value)){}
     ~QwenResidencyEpochGuard(){
         if(owned)qwen_unfreeze_expert_residency(runtime);
     }
 };
 
-std::size_t qwen_cache_layer_count(const ColibriV2QwenRuntime& runtime) {
+std::size_t qwen_cache_layer_count(const FlyweightV2QwenRuntime& runtime) {
     // The MTP block's routed experts execute directly on the CPU and do
     // not consult expert_residency. Only target layers consume GPU cache slots
     // or persistent routing history.
@@ -1128,6 +1201,57 @@ inline std::uint64_t kv_type_bytes(std::uint64_t elements, int t) {
     return t == 3 ? (elements / 32) * kQ8BlockSize : elements * (t == 0 ? 4 : 2);
 }
 inline bool kv_type_is_turbo(int t) { return t == 4 || t == 5; }
+
+// Point the layer plans at one slot geometry's offsets. This is the same trick
+// runtime.state plays for the arena pointer: the dispatch sites read
+// layer.state_first / layer.cache_capacity and pass them to kernels, so making
+// those describe the ACTIVE slot is what lets slots differ in size without a
+// single kernel or dispatch site learning about it.
+static void qwen_apply_geometry(FlyweightV2QwenRuntime& runtime, std::size_t index) {
+    if (index >= runtime.geometries.size()) return;
+    const auto& g = runtime.geometries[index];
+    auto apply_layer = [](QwenLayerPlan& layer, const QwenLayerOffsets& o) {
+        layer.cache_capacity = o.cache_capacity;
+        layer.state_first = o.state_first;
+        layer.state_second = o.state_second;
+        layer.state_third = o.state_third;
+        layer.snapshot_first = o.snapshot_first;
+        layer.snapshot_second = o.snapshot_second;
+        layer.snapshot_third = o.snapshot_third;
+        layer.qsa_blocks = o.qsa_blocks;
+        layer.qsa_ring = o.qsa_ring;
+        layer.mtp_retain_qkv = o.mtp_retain_qkv;
+        layer.mtp_retain_logits = o.mtp_retain_logits;
+    };
+    for (std::size_t i = 0; i < runtime.layers.size() && i < g.layers.size(); ++i)
+        apply_layer(runtime.layers[i], g.layers[i]);
+    apply_layer(runtime.mtp_layer_plan, g.mtp_layer);
+    runtime.mtp_target_hidden_offset = g.mtp_target_hidden_offset;
+    runtime.mtp_draft_hidden_offset = g.mtp_draft_hidden_offset;
+    runtime.mtp_verified_hidden_offset = g.mtp_verified_hidden_offset;
+    runtime.mtp_snapshot_offset = g.mtp_snapshot_offset;
+    runtime.mtp_snapshot_bytes = g.mtp_snapshot_bytes;
+    runtime.state_bytes = g.state_bytes;
+}
+
+// Slot 0 keeps the full context; the rest take the scratch geometry when there
+// is one. One rule, shared by the reservation estimate and the slots
+// themselves, so the two cannot disagree about what was allocated.
+static std::size_t qwen_slot_geometry_index(
+        const FlyweightV2QwenRuntime& runtime, std::size_t slot) {
+    return slot && runtime.geometries.size() > 1 ? 1 : 0;
+}
+
+// The context this slot can hold. Symmetric runtimes answer with the one limit.
+static std::uint64_t qwen_slot_context(
+        const FlyweightV2QwenRuntime& runtime, std::size_t slot) {
+    if (slot >= runtime.sequences.size() || runtime.geometries.empty())
+        return runtime.options.context_limit;
+    const auto index = runtime.sequences[slot].geometry;
+    return index < runtime.geometries.size()
+        ? runtime.geometries[index].context_limit : runtime.options.context_limit;
+}
+
 
 constexpr std::uint32_t kQ2KBlockSize = kQ2KBlockBytes;   // Q2_K: 84 bytes per 256 elements
 constexpr std::uint32_t kQ3KBlockSize = kQ3KBlockBytes;   // Q3_K: 110 bytes per 256 elements
@@ -1190,7 +1314,7 @@ static std::uint64_t expert_history_hash_bytes(
     return hash;
 }
 
-static std::uint64_t qwen_model_fingerprint(const ColibriV2Model& model) {
+static std::uint64_t qwen_model_fingerprint(const FlyweightV2Model& model) {
     std::uint64_t hash = 1469598103934665603ULL;
     // Total mapped bytes, not the opened file's: a split checkpoint's first
     // shard is a few megabytes of metadata and would not distinguish models.
@@ -1209,8 +1333,8 @@ static std::uint64_t qwen_model_fingerprint(const ColibriV2Model& model) {
     return hash;
 }
 
-static std::string qwen_expert_history_path(const ColibriV2Model& model) {
-    const char* setting = std::getenv("COLIBRI_EXPERT_HISTORY");
+static std::string qwen_expert_history_path(const FlyweightV2Model& model) {
+    const char* setting = std::getenv("FLYWEIGHT_EXPERT_HISTORY");
     if (setting && (!std::strcmp(setting, "0") || !std::strcmp(setting, "off"))) {
         return {};
     }
@@ -1235,7 +1359,7 @@ static bool expert_history_write(std::ofstream& output, const T& value) {
     );
 }
 
-static void qwen_load_expert_history(ColibriV2QwenRuntime& runtime) {
+static void qwen_load_expert_history(FlyweightV2QwenRuntime& runtime) {
     runtime.expert_history_path = qwen_expert_history_path(*runtime.model);
     runtime.expert_history_fingerprint = qwen_model_fingerprint(*runtime.model);
     if (runtime.expert_history_path.empty()) return;
@@ -1259,7 +1383,7 @@ static void qwen_load_expert_history(ColibriV2QwenRuntime& runtime) {
         entries != runtime.expert_history.size()) {
         std::fprintf(
             stderr,
-            "[colibri-v2] ignoring incompatible expert history: %s\n",
+            "[flyweight] ignoring incompatible expert history: %s\n",
             runtime.expert_history_path.c_str()
         );
         return;
@@ -1271,7 +1395,7 @@ static void qwen_load_expert_history(ColibriV2QwenRuntime& runtime) {
             !expert_history_read(input, item.last_used)) {
             std::fprintf(
                 stderr,
-                "[colibri-v2] ignoring truncated expert history: %s\n",
+                "[flyweight] ignoring truncated expert history: %s\n",
                 runtime.expert_history_path.c_str()
             );
             return;
@@ -1285,7 +1409,7 @@ static void qwen_load_expert_history(ColibriV2QwenRuntime& runtime) {
     if (input.peek() != std::ifstream::traits_type::eof()) {
         std::fprintf(
             stderr,
-            "[colibri-v2] ignoring oversized expert history: %s\n",
+            "[flyweight] ignoring oversized expert history: %s\n",
             runtime.expert_history_path.c_str()
         );
         return;
@@ -1295,13 +1419,13 @@ static void qwen_load_expert_history(ColibriV2QwenRuntime& runtime) {
     runtime.expert_history_loaded_entries = loaded_entries;
     std::fprintf(
         stderr,
-        "[colibri-v2] restored %llu learned expert entries from %s\n",
+        "[flyweight] restored %llu learned expert entries from %s\n",
         static_cast<unsigned long long>(loaded_entries),
         runtime.expert_history_path.c_str()
     );
 }
 
-static void qwen_save_expert_history(ColibriV2QwenRuntime& runtime) {
+static void qwen_save_expert_history(FlyweightV2QwenRuntime& runtime) {
     if (runtime.expert_history_path.empty() || runtime.expert_history.empty()) return;
     const std::string temporary = runtime.expert_history_path + ".tmp";
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -1332,21 +1456,21 @@ static void qwen_save_expert_history(ColibriV2QwenRuntime& runtime) {
 }
 
 struct QwenExpertHistorySaveGuard {
-    ColibriV2QwenRuntime& runtime;
+    FlyweightV2QwenRuntime& runtime;
     ~QwenExpertHistorySaveGuard() { qwen_save_expert_history(runtime); }
 };
 
 static std::size_t select_expert_cache_slot(
-    ColibriV2QwenRuntime& runtime, std::uint32_t layer,
+    FlyweightV2QwenRuntime& runtime, std::uint32_t layer,
     std::uint32_t expert, bool allow_rejection, bool record_access = true
 );
 static void qwen_wait_for_prefetch_layer(
-    ColibriV2QwenRuntime& runtime, std::uint32_t layer
+    FlyweightV2QwenRuntime& runtime, std::uint32_t layer
 ) {
     if (!runtime.prefetch_pending ||
         runtime.prefetch_target_layer != layer) return;
     if (runtime.prefetch_event &&
-        colibri_gpu_stream_wait_event(
+        flyweight_gpu_stream_wait_event(
             runtime.stream, runtime.prefetch_event
         ) != 0)
         throw std::runtime_error("native Qwen prefetch wait failed");
@@ -1361,13 +1485,13 @@ static void qwen_wait_for_prefetch_layer(
 // where the transition table only ever sees one layer of runway. Pure
 // measurement -- no caching, prefetch, or execution decision reads these.
 static void qwen_observe_route_recurrence(
-    ColibriV2QwenRuntime& runtime, QwenExpertPrefetchState& state,
+    FlyweightV2QwenRuntime& runtime, QwenExpertPrefetchState& state,
     std::uint32_t layer, const std::int32_t* selected, int selected_count
 ) {
     // Off unless asked for: the distinct-count pass below is O(depth^2 * top_k)
     // per layer, which is measurement overhead nobody serving should pay.
     static const bool enabled = [] {
-        const char* setting = std::getenv("COLIBRI_ROUTE_RECURRENCE");
+        const char* setting = std::getenv("FLYWEIGHT_ROUTE_RECURRENCE");
         return setting && setting[0] != '0';
     }();
     if (!enabled) return;
@@ -1476,14 +1600,14 @@ static void qwen_observe_route_recurrence(
 }
 
 static void qwen_observe_and_prefetch_next_layer(
-    ColibriV2QwenRuntime& runtime, QwenExpertPrefetchState& state,
+    FlyweightV2QwenRuntime& runtime, QwenExpertPrefetchState& state,
     std::uint32_t layer,
     const std::int32_t* selected, int selected_count
 ) {
     const auto budget = runtime.options.next_layer_prefetch;
     const std::uint32_t experts = runtime.model->config.expert_count;
     const auto policy=qwen_expert_policy(
-        runtime,colibri::v2::ExpertExecutionPhase::decode);
+        runtime,flyweight::v2::ExpertExecutionPhase::decode);
     if (!budget || !experts || selected_count <= 0 ||
         runtime.expert_transitions.empty()) {
         return;
@@ -1640,7 +1764,7 @@ static void qwen_observe_and_prefetch_next_layer(
                     runtime.model->tensors[next.expert_tensors[role]];
                 const auto bytes = tensor.size / experts;
                 const auto offset = static_cast<std::uint64_t>(expert) * bytes;
-                if (colibri_gpu_upload(
+                if (flyweight_gpu_upload(
                         slot_base + role_offset,
                         tensor_data(*runtime.model,tensor) + offset,
                         bytes, runtime.prefetch_stream
@@ -1660,7 +1784,7 @@ static void qwen_observe_and_prefetch_next_layer(
         }
     }
     if (queued_gpu_upload) {
-        if (colibri_gpu_event_record(
+        if (flyweight_gpu_event_record(
                 runtime.prefetch_event, runtime.prefetch_stream
             ) != 0)
             throw std::runtime_error("native Qwen prefetch event record failed");
@@ -1670,7 +1794,7 @@ static void qwen_observe_and_prefetch_next_layer(
 }
 
 QwenExpertHistory& record_expert_access(
-    ColibriV2QwenRuntime& runtime, std::uint32_t layer, std::uint32_t expert
+    FlyweightV2QwenRuntime& runtime, std::uint32_t layer, std::uint32_t expert
 ) {
     const auto experts = runtime.model->config.expert_count;
     if (!runtime.cache_admission_enabled &&
@@ -1708,8 +1832,9 @@ QwenExpertHistory& record_expert_access(
 }
 
 static void record_expert_cache_hit(
-        ColibriV2QwenRuntime& runtime, const QwenExpertSlot& slot) {
+        FlyweightV2QwenRuntime& runtime, QwenExpertSlot& slot) {
     ++runtime.expert_cache_hits;
+    slot.used_since_admission = true;
     if (runtime.cache_admission_enabled && slot.pinned) {
         ++runtime.prefill_cache_seed_hits;
         ++runtime.prefill_cache_seed_avoided_misses;
@@ -1717,7 +1842,7 @@ static void record_expert_cache_hit(
 }
 
 std::size_t select_expert_cache_slot(
-    ColibriV2QwenRuntime& runtime, std::uint32_t layer,
+    FlyweightV2QwenRuntime& runtime, std::uint32_t layer,
     std::uint32_t expert, bool allow_rejection, bool record_access
 ) {
     if(runtime.expert_residency_frozen){
@@ -1726,7 +1851,7 @@ std::size_t select_expert_cache_slot(
         return kNoExpertSlot;
     }
     const auto policy=qwen_expert_policy(
-        runtime,colibri::v2::ExpertExecutionPhase::decode);
+        runtime,flyweight::v2::ExpertExecutionPhase::decode);
     if (!policy.misses_may_be_admitted()) {
         // Prompt prefill must not churn the device cache, but its routes are
         // valuable training data for a later bulk seed of the hottest experts.
@@ -1762,9 +1887,12 @@ std::size_t select_expert_cache_slot(
         return !slot.valid;
     });
     if (free_slot != end) {
+        // No gate here: an empty slot displaces nothing, and refusing free
+        // coverage is what made a threshold lose. See expert_admission_allowed.
         // The slot is about to hold a different expert, so any seed pin it
         // still carries describes the previous occupant.
         free_slot->pinned = false;
+        free_slot->used_since_admission = false;
         ++runtime.expert_cache_admissions;
         return static_cast<std::size_t>(free_slot - runtime.expert_slots.begin());
     }
@@ -1797,15 +1925,14 @@ std::size_t select_expert_cache_slot(
     // The legacy policy adapts quickly by admitting an equally frequent but
     // newer candidate. Strict admission avoids replacing a resident until the
     // candidate is demonstrably hotter.
-    if (allow_rejection &&
-        (runtime.strict_cache_admission
-             ? static_cast<std::uint64_t>(candidate.frequency) <=
-                   static_cast<std::uint64_t>(victim_history.frequency)
-             : static_cast<std::uint64_t>(candidate.frequency) <
-                   static_cast<std::uint64_t>(victim_history.frequency))) {
+    if (!flyweight::v2::expert_admission_allowed(
+            candidate.frequency, victim_history.frequency, false,
+            allow_rejection, runtime.strict_cache_admission)) {
         ++runtime.expert_cache_rejections;
         return kNoExpertSlot;
     }
+    if (victim->valid && !victim->used_since_admission)
+        ++runtime.expert_cache_unused_admissions;
     const auto slot = static_cast<std::size_t>(victim - runtime.expert_slots.begin());
     runtime.expert_residency.erase(victim->key);
     victim->native_valid = false;
@@ -1814,17 +1941,18 @@ std::size_t select_expert_cache_slot(
     // inflated the seed hit counters and flattened the eviction preference that
     // is supposed to keep the seeded set resident.
     victim->pinned = false;
+    victim->used_since_admission = false;
     ++runtime.expert_cache_evictions;
     ++runtime.expert_cache_admissions;
     return slot;
 }
 
 std::uint64_t device_align(std::uint64_t bytes) {
-    return colibri::v2::workspace::align(bytes);
+    return flyweight::v2::workspace::align(bytes);
 }
 
 // Definition of the token-boundary promotion declared above.
-void qwen_absorb_registration(ColibriV2QwenRuntime& runtime) {
+void qwen_absorb_registration(FlyweightV2QwenRuntime& runtime) {
     if (runtime.registration_ready.load(std::memory_order_acquire) == 0) return;
     std::lock_guard<std::mutex> guard(runtime.registration_mutex);
     for (const auto layer : runtime.registration_done) {
@@ -1837,7 +1965,7 @@ void qwen_absorb_registration(ColibriV2QwenRuntime& runtime) {
     runtime.registration_ready.store(0, std::memory_order_release);
 }
 
-void release_qwen_device(ColibriV2QwenRuntime& runtime) {
+void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     // Stop the background registration before anything it writes to goes away.
     // It checks the flag between layers, so the wait is bounded by one layer's
     // registration (~0.4s) rather than by the whole checkpoint.
@@ -1846,39 +1974,39 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
         runtime.registration_thread.join();
     }
     qwen_save_expert_history(runtime);
-    if (runtime.stream) colibri_gpu_stream_sync(runtime.stream);
+    if (runtime.stream) flyweight_gpu_stream_sync(runtime.stream);
     // An enqueued expert prefetch DMAs from the model mmap on its own stream,
     // and the main stream only waits for it at the consumption point -- which
     // may never come before teardown. Unregistering the mmap under an
     // in-flight prefetch is a use-after-unregister, so drain it here.
-    if (runtime.prefetch_stream) colibri_gpu_stream_sync(runtime.prefetch_stream);
+    if (runtime.prefetch_stream) flyweight_gpu_stream_sync(runtime.prefetch_stream);
     if (runtime.model_registered && runtime.model) {
         // Unregister exactly the ranges that were registered -- these are expert
         // tensor spans, not whole mappings, so the mapping list is not the
         // inverse of what prepare did.
         for (const auto& [base, bytes] : runtime.registered_ranges) {
             (void)bytes;
-            colibri_gpu_host_unregister(base);
+            flyweight_gpu_host_unregister(base);
         }
         runtime.registered_ranges.clear();
         runtime.model_registered = false;
         runtime.dma_paging = false;
     }
-    colibri_gpu_host_free(runtime.host_staging);
-    colibri_gpu_host_free(runtime.dense_host);
+    flyweight_gpu_host_free(runtime.host_staging);
+    flyweight_gpu_host_free(runtime.dense_host);
     runtime.dense_host = nullptr;
     runtime.dense_host_bytes = 0;
     runtime.host_ffn_stage = 0;
     runtime.host_ffn_stage_bytes = 0;
     runtime.host_ffn_q8.clear();
     runtime.host_ffn_q8_bytes = 0;
-    if (runtime.embedding_event) colibri_gpu_event_destroy(runtime.embedding_event);
-    colibri_gpu_host_free(runtime.embedding_host);
-    colibri_gpu_free(runtime.turbo_kv_stage);
+    if (runtime.embedding_event) flyweight_gpu_event_destroy(runtime.embedding_event);
+    flyweight_gpu_host_free(runtime.embedding_host);
+    flyweight_gpu_free(runtime.turbo_kv_stage);
     runtime.turbo_kv_stage = 0;
     runtime.turbo_kv_stage_bytes = 0;
-    colibri_gpu_free(runtime.embedding_stage);
-    colibri_gpu_free(runtime.embedding_row_index);
+    flyweight_gpu_free(runtime.embedding_stage);
+    flyweight_gpu_free(runtime.embedding_row_index);
     runtime.embedding_event = 0;
     runtime.embedding_host = nullptr;
     runtime.embedding_stage = 0;
@@ -1889,21 +2017,21 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     // inactive slots keep theirs in sequences[i]. Each buffer lives in exactly
     // one of the two, so freeing both frees every buffer once.
     for (auto& snapshot : runtime.prefill_snapshots) {
-        colibri_gpu_free(snapshot.device);
+        flyweight_gpu_free(snapshot.device);
         snapshot = QwenPrefillSnapshot{};
     }
     runtime.prefill_snapshot_bytes = 0;
-    colibri_gpu_free(runtime.expert_cache);
-    colibri_gpu_free(runtime.expert_native_cache);
-    colibri_gpu_free(runtime.expert_staging);
-    colibri_gpu_free(runtime.prefill_stream_arena);
+    flyweight_gpu_free(runtime.expert_cache);
+    flyweight_gpu_free(runtime.expert_native_cache);
+    flyweight_gpu_free(runtime.expert_staging);
+    flyweight_gpu_free(runtime.prefill_stream_arena);
     runtime.prefill_stream_arena = 0;
     runtime.prefill_stream_bytes = 0;
-    colibri_gpu_free(runtime.prefill_stream_scratch);
+    flyweight_gpu_free(runtime.prefill_stream_scratch);
     runtime.prefill_stream_scratch = 0;
     runtime.prefill_stream_scratch_bytes = 0;
     runtime.prefill_stream_scratch_span = 0;
-    colibri_gpu_free(runtime.imatrix_sums);
+    flyweight_gpu_free(runtime.imatrix_sums);
     runtime.imatrix_sums = 0;
     runtime.imatrix_elements = 0;
     runtime.imatrix_offsets.clear();
@@ -1912,8 +2040,8 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     // runtime.state aliases sequences[active].state; free each slot's arena +
     // its checkpoint pool once.
     for (auto& seq : runtime.sequences) {
-        for (auto& snapshot : seq.prefill_snapshots) colibri_gpu_free(snapshot.device);
-        colibri_gpu_free(seq.state);
+        for (auto& snapshot : seq.prefill_snapshots) flyweight_gpu_free(snapshot.device);
+        flyweight_gpu_free(seq.state);
         seq.state = 0;
     }
     runtime.sequences.clear();
@@ -1925,64 +2053,64 @@ void release_qwen_device(ColibriV2QwenRuntime& runtime) {
     runtime.host_prompts.clear();
     runtime.host_cache_used_bytes = 0;
     for (auto& layer : runtime.layers) {
-        colibri_gpu_graph_destroy(layer.shared_graph);
+        flyweight_gpu_graph_destroy(layer.shared_graph);
         layer.shared_graph = 0;
         layer.shared_graph_attempted = false;
-        for (auto& graph : layer.delta_graphs) colibri_gpu_graph_destroy(graph);
+        for (auto& graph : layer.delta_graphs) flyweight_gpu_graph_destroy(graph);
         layer.delta_graphs.clear();
         layer.delta_graph_attempted.clear();
-        colibri_gpu_graph_destroy(layer.dense_ffn_graph);
+        flyweight_gpu_graph_destroy(layer.dense_ffn_graph);
         layer.dense_ffn_graph = 0;
         layer.dense_ffn_graph_attempted = false;
-        colibri_gpu_graph_destroy(layer.gemma_ffn_graph);
+        flyweight_gpu_graph_destroy(layer.gemma_ffn_graph);
         layer.gemma_ffn_graph = 0;
         layer.gemma_ffn_graph_attempted = false;
     }
-    colibri_gpu_free(runtime.workspace);
-    colibri_gpu_free(runtime.static_arena);
-    for (auto& event : runtime.slot_events) colibri_gpu_event_destroy(event);
+    flyweight_gpu_free(runtime.workspace);
+    flyweight_gpu_free(runtime.static_arena);
+    for (auto& event : runtime.slot_events) flyweight_gpu_event_destroy(event);
     runtime.slot_events.clear();
-    colibri_gpu_event_destroy(runtime.staging_event);
+    flyweight_gpu_event_destroy(runtime.staging_event);
     runtime.staging_event = 0;
-    colibri_gpu_event_destroy(runtime.prefetch_event);
+    flyweight_gpu_event_destroy(runtime.prefetch_event);
     runtime.prefetch_event = 0;
-    colibri_gpu_event_destroy(runtime.route_event);
-    colibri_gpu_event_destroy(runtime.route_event_pipeline);
-    colibri_gpu_event_destroy(runtime.stream_upload_event);
-    colibri_gpu_event_destroy(runtime.stream_upload_event_pipeline);
-    colibri_gpu_event_destroy(runtime.stream_consumed_event);
-    colibri_gpu_event_destroy(runtime.stream_consumed_event_pipeline);
+    flyweight_gpu_event_destroy(runtime.route_event);
+    flyweight_gpu_event_destroy(runtime.route_event_pipeline);
+    flyweight_gpu_event_destroy(runtime.stream_upload_event);
+    flyweight_gpu_event_destroy(runtime.stream_upload_event_pipeline);
+    flyweight_gpu_event_destroy(runtime.stream_consumed_event);
+    flyweight_gpu_event_destroy(runtime.stream_consumed_event_pipeline);
     runtime.stream_upload_event=runtime.stream_upload_event_pipeline=0;
     runtime.stream_consumed_event=runtime.stream_consumed_event_pipeline=0;
-    colibri_gpu_event_destroy(runtime.prefill_layer_start_event);
-    colibri_gpu_event_destroy(runtime.prefill_core_end_event);
-    colibri_gpu_event_destroy(runtime.prefill_router_end_event);
+    flyweight_gpu_event_destroy(runtime.prefill_layer_start_event);
+    flyweight_gpu_event_destroy(runtime.prefill_core_end_event);
+    flyweight_gpu_event_destroy(runtime.prefill_router_end_event);
     for(auto&profile:runtime.cuda_layer_profiles){
-        colibri_gpu_event_destroy(profile.pre_start);
-        colibri_gpu_event_destroy(profile.pre_end);
-        colibri_gpu_event_destroy(profile.recurrent_start);
-        colibri_gpu_event_destroy(profile.recurrent_end);
-        colibri_gpu_event_destroy(profile.shared_start);
-        colibri_gpu_event_destroy(profile.shared_end);
-        colibri_gpu_event_destroy(profile.expert_start);
-        colibri_gpu_event_destroy(profile.expert_end);
+        flyweight_gpu_event_destroy(profile.pre_start);
+        flyweight_gpu_event_destroy(profile.pre_end);
+        flyweight_gpu_event_destroy(profile.recurrent_start);
+        flyweight_gpu_event_destroy(profile.recurrent_end);
+        flyweight_gpu_event_destroy(profile.shared_start);
+        flyweight_gpu_event_destroy(profile.shared_end);
+        flyweight_gpu_event_destroy(profile.expert_start);
+        flyweight_gpu_event_destroy(profile.expert_end);
     }
     runtime.cuda_layer_profiles.clear();
-    colibri_gpu_event_destroy(runtime.cuda_tail_start);
-    colibri_gpu_event_destroy(runtime.cuda_lm_start);
-    colibri_gpu_event_destroy(runtime.cuda_lm_end);
-    colibri_gpu_event_destroy(runtime.cuda_tail_end);
+    flyweight_gpu_event_destroy(runtime.cuda_tail_start);
+    flyweight_gpu_event_destroy(runtime.cuda_lm_start);
+    flyweight_gpu_event_destroy(runtime.cuda_lm_end);
+    flyweight_gpu_event_destroy(runtime.cuda_tail_end);
     runtime.cuda_tail_start=runtime.cuda_lm_start=0;
     runtime.cuda_lm_end=runtime.cuda_tail_end=0;
     runtime.cuda_profile=false;
     runtime.cuda_graphs=false;
     runtime.cuda_graph_builds=runtime.cuda_graph_replays=runtime.cuda_graph_fallbacks=0;
     runtime.delta_host_ns=runtime.delta_host_calls=0;
-    colibri_gpu_stream_destroy(runtime.prefetch_stream);
+    flyweight_gpu_stream_destroy(runtime.prefetch_stream);
     runtime.prefetch_stream = 0;
-    colibri_gpu_stream_destroy(runtime.graph_stream);
+    flyweight_gpu_stream_destroy(runtime.graph_stream);
     runtime.graph_stream = 0;
-    colibri_gpu_stream_destroy(runtime.stream);
+    flyweight_gpu_stream_destroy(runtime.stream);
     runtime.device_tensors.clear();
     runtime.host_staging = nullptr;
     runtime.expert_staging = runtime.state = runtime.workspace = 0;
@@ -2042,7 +2170,7 @@ void copy_text(char* dst, size_t cap, const std::string& value) { if (!cap) retu
 // must not be executed before the final norm. Split checkpoints only see their
 // full tensor list once the shards are merged, so this runs again after the
 // merge rather than only at the end of the shard's own parse.
-void detect_mtp_layer(ColibriV2Model& m) {
+void detect_mtp_layer(FlyweightV2Model& m) {
     for (const auto& tensor : m.tensors) {
         const auto marker = tensor.name.find(".nextn.");
         if (marker == std::string::npos || tensor.name.rfind("blk.", 0) != 0) continue;
@@ -2063,7 +2191,7 @@ void detect_mtp_layer(ColibriV2Model& m) {
 // Tokenizer lookup tables, built once per model: rebuilding these ~150k-entry
 // maps per tokenize call dominated short calls. Shared by the GGUF metadata
 // path and the HF tokenizer.json path so the two cannot drift.
-void build_tokenizer_tables(ColibriV2Model& m) {
+void build_tokenizer_tables(FlyweightV2Model& m) {
     m.merge_ranks.clear();
     m.vocabulary_ids.clear();
     m.control_tokens.clear();
@@ -2082,7 +2210,7 @@ void build_tokenizer_tables(ColibriV2Model& m) {
         });
 }
 
-int parse(ColibriV2Model& m) {
+int parse(FlyweightV2Model& m) {
     if (m.size < 24 || std::memcmp(m.data,"GGUF",4)!=0) throw std::runtime_error("not a GGUF file");
     Reader r{m.data+4,m.data+m.size}; m.version=r.get<uint32_t>(); if (m.version<2 || m.version>3) throw std::runtime_error("unsupported GGUF version");
     uint64_t count=r.get<uint64_t>(); m.metadata=r.get<uint64_t>();
@@ -2349,7 +2477,7 @@ int parse(ColibriV2Model& m) {
                     "bailingmoe3 GGUF declares no full-attention layer in "
                     "attention.head_count_kv");
             for(std::size_t layer=0;layer<kv_heads.size();++layer){
-                const bool full=colibri::v2::bailing::layer_is_full_attention(
+                const bool full=flyweight::v2::bailing::layer_is_full_attention(
                     static_cast<std::uint32_t>(layer),
                     static_cast<std::uint32_t>(kv_heads.size()),interval);
                 if((kv_heads[layer]!=0)!=full)
@@ -2366,7 +2494,7 @@ int parse(ColibriV2Model& m) {
             m.config.sliding_window_pattern.assign(m.config.layer_count,0);
             for(std::uint32_t layer=0;layer<m.config.layer_count;++layer)
                 m.config.sliding_window_pattern[layer]=
-                    colibri::v2::bailing::layer_is_full_attention(
+                    flyweight::v2::bailing::layer_is_full_attention(
                         layer,m.config.layer_count,
                         m.config.full_attention_interval)?0:1;
         }
@@ -2412,16 +2540,16 @@ int parse(ColibriV2Model& m) {
     return 0;
 }
 
-std::uint32_t attention_window(const ColibriV2Model& model, std::uint32_t layer) {
+std::uint32_t attention_window(const FlyweightV2Model& model, std::uint32_t layer) {
     if(layer>=model.config.layer_count)throw std::runtime_error("attention layer index is out of range");
     if(!model.config.sliding_window)return 0;
     const auto& pattern=model.config.sliding_window_pattern;
     return pattern.empty()||pattern[layer]?model.config.sliding_window:0;
 }
 
-int fill(const Tensor& t, ColibriV2TensorInfo& out) { std::memset(&out,0,sizeof(out)); out.dimensions=static_cast<uint32_t>(t.shape.size()); std::copy(t.shape.begin(),t.shape.end(),out.shape); out.ggml_type=t.type; out.offset=t.offset; out.size=t.size; copy_text(out.name,sizeof(out.name),t.name); return 0; }
+int fill(const Tensor& t, FlyweightV2TensorInfo& out) { std::memset(&out,0,sizeof(out)); out.dimensions=static_cast<uint32_t>(t.shape.size()); std::copy(t.shape.begin(),t.shape.end(),out.shape); out.ggml_type=t.type; out.offset=t.offset; out.size=t.size; copy_text(out.name,sizeof(out.name),t.name); return 0; }
 
-std::uint64_t tensor_index(const ColibriV2Model& model, const std::string& name) {
+std::uint64_t tensor_index(const FlyweightV2Model& model, const std::string& name) {
     for (std::uint64_t index = 0; index < model.tensors.size(); ++index) {
         if (model.tensors[index].name == name) return index;
     }
@@ -2438,20 +2566,20 @@ std::uint64_t tensor_elements(const Tensor& tensor) {
     return elements;
 }
 
-bool has_tensor(const ColibriV2Model& model, const std::string& name) {
+bool has_tensor(const FlyweightV2Model& model, const std::string& name) {
     for (const auto& tensor : model.tensors) if (tensor.name == name) return true;
     return false;
 }
 
 std::uint64_t first_tensor_index(
-    const ColibriV2Model& model, std::initializer_list<const char*> names
+    const FlyweightV2Model& model, std::initializer_list<const char*> names
 ) {
     for (const char* name : names) if (has_tensor(model, name)) return tensor_index(model, name);
     throw std::runtime_error("required Qwen model tensor is missing");
 }
 
 void add_static_tensor(
-    ColibriV2QwenRuntime& runtime, QwenLayerPlan& layer,
+    FlyweightV2QwenRuntime& runtime, QwenLayerPlan& layer,
     const std::string& name
 ) {
     const auto index = tensor_index(*runtime.model, name);
@@ -2459,7 +2587,7 @@ void add_static_tensor(
     runtime.static_tensor_bytes += runtime.model->tensors[index].size;
 }
 
-void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
+void build_qwen_plan(FlyweightV2QwenRuntime& runtime) {
     auto& model = *runtime.model;
     runtime.token_embeddings = first_tensor_index(
         model, {"token_embd.weight", "model.embed_tokens.weight", "embed_tokens.weight"}
@@ -2662,7 +2790,7 @@ void build_qwen_plan(ColibriV2QwenRuntime& runtime) {
 //
 // Semantics: plans/qwen4exp-semantics.md, pinned by
 // native/tools/qwen4exp_reference_check.py against transformers.
-void build_qwen4exp_plan(ColibriV2QwenRuntime& runtime) {
+void build_qwen4exp_plan(FlyweightV2QwenRuntime& runtime) {
     auto& model = *runtime.model;
     runtime.token_embeddings = tensor_index(model, "token_embd.weight");
     // The head collapse ends in a grouped RMS over the streams, so the model
@@ -2750,7 +2878,7 @@ void build_qwen4exp_plan(ColibriV2QwenRuntime& runtime) {
             // every requirement of the indexer has to be settled HERE or those
             // four sites drift apart. A file that names a ratio but omits any
             // of the three indexer scalars keeps the layer dense.
-            // QSA is OPT-IN (COLIBRI_QSA=1). It is the attention the model was
+            // QSA is OPT-IN (FLYWEIGHT_QSA=1). It is the attention the model was
             // trained with above 2048 tokens, so running dense past that is an
             // approximation -- but it measures 7-10% slower on decode (the
             // selection costs a host round-trip per selecting layer, and decode
@@ -2763,7 +2891,7 @@ void build_qwen4exp_plan(ColibriV2QwenRuntime& runtime) {
             // Settled HERE and not only at the kernel gate, because the arena is
             // reserved from `qsa_ratio` alone -- gating just the execution left
             // the memory allocated for a feature that was switched off.
-            const char* qsa_setting = std::getenv("COLIBRI_QSA");
+            const char* qsa_setting = std::getenv("FLYWEIGHT_QSA");
             if (qsa_setting && qsa_setting[0] == '1'
                 && layer_index < model.config.compress_ratios.size()
                 && model.config.indexer_head_count
@@ -2791,7 +2919,85 @@ void build_qwen4exp_plan(ColibriV2QwenRuntime& runtime) {
         }
         runtime.layers.push_back(std::move(layer));
     }
+    // The nextn draft block, one past the executed stack. Present in the
+    // Q4_K_XL release and in the standalone MTP file, absent from UD-IQ1_S --
+    // so this is keyed off the tensors, never off the architecture.
+    //
+    // The slot order below MIRRORS the ordinary layer above exactly, because
+    // the draft forward indexes a QwenLayerPlan the same way the stack does.
+    // Two deliberate omissions (plans/qwen4exp-semantics.md, MTP section):
+    // the draft has no PLE, and its attention runs DENSE -- the indexer
+    // tensors exist in the checkpoint but llama.cpp loads and ignores them,
+    // so leaving `qsa_ratio` at 0 both matches the reference and spares the
+    // draft a per-sequence block-key store.
+    if (model.mtp_layer != std::numeric_limits<std::uint32_t>::max()) {
+        const std::string prefix = "blk." + std::to_string(model.mtp_layer) + ".";
+        QwenLayerPlan draft;
+        draft.attention = true;
+        auto add_mtp_static = [&](const std::string& name) {
+            const auto index = tensor_index(model, name);
+            draft.static_tensors.push_back(index);
+            runtime.mtp_tensor_bytes += model.tensors[index].size;
+        };
+        auto add_mtp_extra = [&](const std::string& name, std::uint64_t& field) {
+            add_mtp_static(name);
+            field = draft.static_tensors.back();
+        };
+        add_mtp_static(prefix + "hc_attn_norm.weight");           // slot 0
+        for (const char* suffix : {
+                 "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                 "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
+             }) add_mtp_static(prefix + suffix);                  // slots 1-6
+        for (const char* suffix : {
+                 "hc_ffn_norm.weight", "ffn_gate_inp.weight",
+                 "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                 "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight"
+             }) add_mtp_static(prefix + suffix);                  // slots 7-12
+        add_mtp_extra(prefix + "hc_attn_down.weight", draft.hc_attn_down);
+        add_mtp_extra(prefix + "hc_attn_up.weight", draft.hc_attn_up);
+        add_mtp_extra(prefix + "hc_attn_inject.weight", draft.hc_attn_inject);
+        add_mtp_extra(prefix + "hc_ffn_down.weight", draft.hc_ffn_down);
+        add_mtp_extra(prefix + "hc_ffn_up.weight", draft.hc_ffn_up);
+        add_mtp_extra(prefix + "hc_ffn_inject.weight", draft.hc_ffn_inject);
+        draft.attention_heads = model.config.attention_heads;
+        draft.kv_heads = model.config.attention_kv_heads;
+        draft.head_dim = static_cast<std::uint32_t>(
+            model.tensors[draft.static_tensors[2]].shape[1] / draft.kv_heads);
+        draft.rotary_dim = std::min<std::uint32_t>(
+            model.config.rotary_dimension ? model.config.rotary_dimension
+                                          : draft.head_dim, draft.head_dim);
+        draft.rope_theta = model.config.rope_freq_base
+            ? model.config.rope_freq_base : 1000000.0f;
+        const std::array<std::string, 3> draft_experts = {
+            prefix + "ffn_gate_exps.weight", prefix + "ffn_up_exps.weight",
+            prefix + "ffn_down_exps.weight",
+        };
+        for (std::size_t role = 0; role < draft_experts.size(); ++role) {
+            draft.expert_tensors[role] = tensor_index(model, draft_experts[role]);
+            runtime.mtp_tensor_bytes += model.tensors[draft.expert_tensors[role]].size;
+        }
+        const std::array<std::string, 3> special = {
+            prefix + "nextn.eh_proj.weight", prefix + "nextn.enorm.weight",
+            prefix + "nextn.hnorm.weight",
+        };
+        for (std::size_t role = 0; role < special.size(); ++role) {
+            runtime.mtp_special_tensors[role] = tensor_index(model, special[role]);
+            runtime.mtp_tensor_bytes += model.tensors[runtime.mtp_special_tensors[role]].size;
+        }
+        // qwen4exp has no output_norm: the head collapse IS the final norm, and
+        // the draft reuses it (llama.cpp runs build_hc_pre with model.hc_mix_*
+        // on the draft's own output). `final_norm` holds output_hc_norm here.
+        runtime.mtp_special_tensors[3] = has_tensor(model, prefix + "nextn.shared_head_norm.weight")
+            ? tensor_index(model, prefix + "nextn.shared_head_norm.weight")
+            : runtime.final_norm;
+        if (runtime.mtp_special_tensors[3] != runtime.final_norm)
+            runtime.mtp_tensor_bytes +=
+                model.tensors[runtime.mtp_special_tensors[3]].size;
+        runtime.mtp_layer_plan = std::move(draft);
+        runtime.mtp_available = true;
+    }
     for(const auto&layer:runtime.layers)for(auto index:layer.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
+    if(runtime.mtp_available)for(auto index:runtime.mtp_layer_plan.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
     const auto& front = runtime.layers.front();
     const std::size_t ffn_base = front.attention ? 7 : 10;
     const auto& gate = model.tensors[front.static_tensors[ffn_base + 2]];
@@ -2823,7 +3029,7 @@ void qwen_yarn_correction_dims(
 // later feed-forward tensor is addressed relative to. Laguna's attention blocks
 // carry an extra gate projection ahead of it; Qwen's DeltaNet blocks carry the
 // wider recurrent set.
-std::size_t qwen_ffn_base(const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
+std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
     if(runtime.laguna)return 8;
     // Muse Glimmer carries a post-attention norm that the other layouts do not,
     // so its pre-FFN norm sits one slot later and gate/up/down at 10/11/12.
@@ -2835,7 +3041,7 @@ std::size_t qwen_ffn_base(const ColibriV2QwenRuntime& runtime, const QwenLayerPl
 // with a softplus per-head output gate, a single pre-FFN norm (no post-attention
 // or post-FFN norm), a leading run of dense blocks, and sigmoid-routed MoE with
 // a score-correction bias and one always-on ungated shared expert.
-void build_laguna_plan(ColibriV2QwenRuntime& runtime) {
+void build_laguna_plan(FlyweightV2QwenRuntime& runtime) {
     auto& model=*runtime.model;
     runtime.laguna=true;
     runtime.token_embeddings=tensor_index(model,"token_embd.weight");
@@ -2941,7 +3147,7 @@ void build_laguna_plan(ColibriV2QwenRuntime& runtime) {
 // Slots 8 and 13 are the two post-norms that make this architecture different
 // from Laguna: attention output and feed-forward output are each normalized
 // *before* rejoining the residual stream, rather than added raw.
-void build_muse_glimmer_plan(ColibriV2QwenRuntime& runtime) {
+void build_muse_glimmer_plan(FlyweightV2QwenRuntime& runtime) {
     auto& model=*runtime.model;
     runtime.muse=true;
     runtime.token_embeddings=tensor_index(model,"token_embd.weight");
@@ -3001,7 +3207,7 @@ void build_muse_glimmer_plan(ColibriV2QwenRuntime& runtime) {
         runtime.scratch_elements,2u*model.config.dense_intermediate_size);
 }
 
-void build_gemma4_plan(ColibriV2QwenRuntime& runtime) {
+void build_gemma4_plan(FlyweightV2QwenRuntime& runtime) {
     auto& model=*runtime.model;
     runtime.gemma4=true;
     runtime.token_embeddings=tensor_index(model,"token_embd.weight");
@@ -3089,7 +3295,7 @@ using qwen_kpack::pack_q3_k;
 // to bytes 0-3; every sub-block's largest magnitude decodes to exactly 6.0,
 // confirming the grouping.)
 // This layout must stay in lockstep with nvfp4_value() in
-// colibri_v2_qwen_kernels.hpp -- the CPU and GPU expert paths decode the very
+// flyweight_v2_qwen_kernels.hpp -- the CPU and GPU expert paths decode the very
 // same bytes, and the expert-scale folding in the MoE staging path rewrites the
 // four scale bytes of every 36-byte block in place.
 // E2M1 LUT: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives).
@@ -3127,7 +3333,7 @@ float qwen_nvfp4_value(const std::uint8_t*packed,std::uint64_t absolute){
 // the switch cost 10^4-10^5 environ scans per token.
 bool qwen_iq_avx512_enabled(){
     static const bool enabled=[]{
-        const char*setting=std::getenv("COLIBRI_IQ_AVX512");
+        const char*setting=std::getenv("FLYWEIGHT_IQ_AVX512");
         return !setting||setting[0]!='0';
     }();
     return enabled;
@@ -3135,37 +3341,37 @@ bool qwen_iq_avx512_enabled(){
 // Same treatment: the diagnostic gate sat as a raw getenv inside per-layer
 // decode code, costing an environ scan per layer per token when it was off.
 bool qwen_lm_diag_enabled(){
-    static const bool enabled=std::getenv("COLIBRI_LM_DIAG")!=nullptr;
+    static const bool enabled=std::getenv("FLYWEIGHT_LM_DIAG")!=nullptr;
     return enabled;
 }
 float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*input,int elements,std::uint64_t row){
-    if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
-    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0&&
+    if(qwen_simd_quant_type(type)&&(flyweight_cpu_features()&2u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+    if(type==17&&(flyweight_cpu_features()&2u)!=0&&elements%256==0&&
        qwen_iq_avx512_enabled())
         return qwen_quant_dot_avx512(packed,type,input,elements,row);
     // Q4_0's native block is 32 elements, so it takes its own admission: the
     // K-quant super-block gate would exclude Gemma 4's 704-wide expert rows
     // (704 % 256 != 0), which is exactly where this type dominates decode.
-    if(type==2&&(colibri_cpu_features()&2u)!=0&&elements%32==0)
+    if(type==2&&(flyweight_cpu_features()&2u)!=0&&elements%32==0)
         return qwen_quant_dot_avx512(packed,type,input,elements,row);
-    if(type==2&&(colibri_cpu_features()&1u)!=0&&elements%32==0)
+    if(type==2&&(flyweight_cpu_features()&1u)!=0&&elements%32==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
-    if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+    if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
-    if((type==16||type==17||type==18||type==19||type==22||type==23)&&(colibri_cpu_features()&1u)!=0&&elements%256==0)
+    if((type==16||type==17||type==18||type==19||type==22||type==23)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // IQ4_NL's native block is 32 elements (no super-block), so like Q4_0 it
     // takes its own admission: qwen4exp's 640-wide expert down rows fail the
     // 256 gate but are exactly where this type dominates decode. AVX-512 first
     // -- prefill on a low-bit MoE is expert-compute bound, and this type is the
     // down projection of every layer.
-    if(type==20&&(colibri_cpu_features()&2u)!=0&&elements%32==0&&
+    if(type==20&&(flyweight_cpu_features()&2u)!=0&&elements%32==0&&
        qwen_iq_avx512_enabled())
         return qwen_quant_dot_avx512(packed,type,input,elements,row);
-    if(type==20&&(colibri_cpu_features()&1u)!=0&&elements%32==0)
+    if(type==20&&(flyweight_cpu_features()&1u)!=0&&elements%32==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
-    if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+    if(qwen_simd_quant_type(type)&&(flyweight_cpu_features()&1u)!=0&&elements%kBlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     float result=0.0f;
     if(type==2){
         const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/32)*18;
@@ -3273,16 +3479,16 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         }
     }else if(type==30){
         // bf16 experts, as the Qwen3.6 NVFP4 checkpoints ship the nextn (MTP) block.
-        if((colibri_cpu_features()&2u)!=0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
-        if((colibri_cpu_features()&1u)!=0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+        if((flyweight_cpu_features()&2u)!=0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+        if((flyweight_cpu_features()&1u)!=0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
         const auto*row_data=reinterpret_cast<const std::uint16_t*>(packed)
             +row*static_cast<std::uint64_t>(elements);
         for(int index=0;index<elements;++index)
             result+=qwen_bf16_value(row_data[index])*input[index];
     }else if(type==1){
         // f16 rows, as an unquantized GGUF conversion stores every matrix.
-        if((colibri_cpu_features()&2u)!=0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
-        if((colibri_cpu_features()&1u)!=0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
+        if((flyweight_cpu_features()&2u)!=0)return qwen_quant_dot_avx512(packed,type,input,elements,row);
+        if((flyweight_cpu_features()&1u)!=0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
         const auto*row_data=packed+row*static_cast<std::uint64_t>(elements)*2;
         for(int index=0;index<elements;++index){
             std::uint16_t bits=0;std::memcpy(&bits,row_data+index*2,2);
@@ -3293,10 +3499,10 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
         // qwen_f32_dot_multi already has the vectorized single-row case.
         const auto*row_data=reinterpret_cast<const float*>(packed)
             +row*static_cast<std::uint64_t>(elements);
-        if((colibri_cpu_features()&2u)!=0&&elements%32==0){
+        if((flyweight_cpu_features()&2u)!=0&&elements%32==0){
             float value=0.0f;qwen_f32_dot_multi_avx512(row_data,&input,1,elements,&value);return value;
         }
-        if((colibri_cpu_features()&1u)!=0&&elements%16==0){
+        if((flyweight_cpu_features()&1u)!=0&&elements%16==0){
             float value=0.0f;qwen_f32_dot_multi_avx2(row_data,&input,1,elements,&value);return value;
         }
         for(int index=0;index<elements;++index)result+=row_data[index]*input[index];
@@ -3311,7 +3517,7 @@ void qwen_quant_dot_rows(
 ) {
     if (type == 12 && elements % kBlockElements == 0
         && row_count >= 1 && row_count <= 4) {
-        const auto features = colibri_cpu_features();
+        const auto features = flyweight_cpu_features();
         if ((features & 2u) != 0) {
             qwen_quant_dot_rows_avx512(
                 packed, type, input, elements, first_row, row_count, outputs);
@@ -3329,13 +3535,13 @@ void qwen_quant_dot_rows(
 }
 
 void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const float*first,const float*second,int elements,std::uint64_t row,float&first_output,float&second_output){
-    if(type==17&&(colibri_cpu_features()&2u)!=0&&elements%256==0&&
+    if(type==17&&(flyweight_cpu_features()&2u)!=0&&elements%256==0&&
        qwen_iq_avx512_enabled()){
         qwen_quant_dot_pair_avx512(
             packed,type,first,second,elements,row,&first_output,&second_output);
         return;
     }
-    if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_quant_dot_pair_avx512(packed,type,first,second,elements,row,&first_output,&second_output);return;}
+    if(qwen_simd_multi_type(type)&&(flyweight_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_quant_dot_pair_avx512(packed,type,first,second,elements,row,&first_output,&second_output);return;}
     first_output=qwen_quant_dot(packed,type,first,elements,row);second_output=qwen_quant_dot(packed,type,second,elements,row);
 }
 
@@ -3348,7 +3554,7 @@ const char* qwen_iq_kernel_prefix(std::uint32_t type) {
     // Only the formats with a device octet decoder. IQ2_S and IQ3_S pack
     // their signs and grid indices differently and have no grouped kernel,
     // so models using them still route experts to the CPU.
-    const auto* format = colibri::v2::qwen_format(type);
+    const auto* format = flyweight::v2::qwen_format(type);
     return format ? format->iq_expert_prefix : nullptr;
 }
 
@@ -3414,21 +3620,21 @@ int qwen_launch_grouped_accumulate(
     if(!iq.empty()){
         void* args[]={&down_table,&activated,&output,&weights,
                       &intermediate,&hidden_size,&count};
-        return colibri_gpu_launch_named(
+        return flyweight_gpu_launch_named(
             iq.c_str(),static_cast<std::uint32_t>(hidden_size),1,256,0,stream,args);
     }
     switch(down_type){
-        case 8:return colibri_gpu_q8_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
-        case 40:return colibri_gpu_nvfp4_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
-        case 12:return colibri_gpu_q4k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
-        case 13:return colibri_gpu_q5k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
-        case 14:return colibri_gpu_q6_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 8:return flyweight_gpu_q8_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 40:return flyweight_gpu_nvfp4_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 12:return flyweight_gpu_q4k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 13:return flyweight_gpu_q5k_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
+        case 14:return flyweight_gpu_q6_grouped_accumulate(down_table,activated,output,weights,intermediate,hidden_size,count,stream);
         default:throw std::runtime_error(qwen_grouped_expert_unsupported(down_type));
     }
 }
 
 // True when any routed expert tensor uses an IQ codebook format.
-bool qwen_model_has_iq_experts(const ColibriV2QwenRuntime& runtime) {
+bool qwen_model_has_iq_experts(const FlyweightV2QwenRuntime& runtime) {
     for(const auto& layer:runtime.layers){
         if(layer.dense_ffn||!layer.expert_tensors[0])continue;
         for(const auto index:layer.expert_tensors)
@@ -3438,7 +3644,7 @@ bool qwen_model_has_iq_experts(const ColibriV2QwenRuntime& runtime) {
 }
 
 // True when every routed expert tensor in the model can run on the GPU.
-bool qwen_gpu_experts_executable(const ColibriV2QwenRuntime& runtime) {
+bool qwen_gpu_experts_executable(const FlyweightV2QwenRuntime& runtime) {
     // Gemma 4's hybrid decode has its own grouped kernels for the fused Q4_0
     // gate_up bundle and its f32 expert scales; the generic grouped dispatch
     // knows neither, so testing its type list here parked a cache the decode
@@ -3467,7 +3673,7 @@ bool qwen_gpu_experts_executable(const ColibriV2QwenRuntime& runtime) {
 // low-bit MoE checkpoints: their routed experts are IQ2/IQ3/IQ4 even when the
 // dense projections are k-quants.
 bool qwen_cpu_expert_type_supported(std::uint32_t type) {
-    const auto* format = colibri::v2::qwen_format(type);
+    const auto* format = flyweight::v2::qwen_format(type);
     return format && format->cpu_expert;
 }
 
@@ -3499,7 +3705,7 @@ void qwen_quant_dot_two_rows(
     }
     const auto* first_row = first_matrix + row * row_bytes;
     const auto* second_row = second_matrix + row * row_bytes;
-    if ((colibri_cpu_features() & 2u) != 0) {
+    if ((flyweight_cpu_features() & 2u) != 0) {
         const bool supported =
             (type == 8 && elements % 32 == 0)
             || (type == 17 && qwen_iq_avx512_enabled() && elements % 256 == 0)
@@ -3517,7 +3723,7 @@ void qwen_quant_dot_two_rows(
 }
 
 #if defined(_OPENMP)
-int qwen_cpu_thread_count(const ColibriV2QwenRuntime& runtime) {
+int qwen_cpu_thread_count(const FlyweightV2QwenRuntime& runtime) {
     if (runtime.options.cpu_threads)
         return std::min<int>(runtime.options.cpu_threads, omp_get_num_procs());
     int team = omp_get_max_threads();
@@ -3536,8 +3742,8 @@ int qwen_cpu_thread_count(const ColibriV2QwenRuntime& runtime) {
 // this landed).
 bool gemma_q8_activations_enabled(){
     static const bool enabled=[]{
-        const char*setting=std::getenv("COLIBRI_GEMMA_Q8_ACTIVATIONS");
-        return (colibri_cpu_features()&4u)!=0&&(!setting||setting[0]!='0');
+        const char*setting=std::getenv("FLYWEIGHT_GEMMA_Q8_ACTIVATIONS");
+        return (flyweight_cpu_features()&4u)!=0&&(!setting||setting[0]!='0');
     }();
     return enabled;
 }
@@ -3549,13 +3755,13 @@ bool gemma_q8_activations_enabled(){
 // summation order inside a block dot.
 bool gemma_expert_gemm_enabled(){
     static const bool enabled=[]{
-        const char*setting=std::getenv("COLIBRI_GEMMA_EXPERT_GEMM");
-        return setting&&setting[0]=='1'&&(colibri_cpu_features()&8u)!=0;
+        const char*setting=std::getenv("FLYWEIGHT_GEMMA_EXPERT_GEMM");
+        return setting&&setting[0]=='1'&&(flyweight_cpu_features()&8u)!=0;
     }();
     return enabled;
 }
 
-void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
+void gemma_cpu_moe(const FlyweightV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         const std::int32_t*selected,const float*weights,int routed_count,const float*input,
         float*activated,float*output){
     const int experts=runtime.model->config.expert_count;
@@ -3626,7 +3832,7 @@ void gemma_cpu_moe(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
 // rows staging regions; the hot loops re-read only cacheable mirrors because
 // repeated reads against page-locked memory measure ~5x slower (see
 // qwen_cpu_dense_ffn).
-void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&layer,
+void gemma_cpu_moe_rows(const FlyweightV2QwenRuntime&runtime,const QwenLayerPlan&layer,
         int rows,const std::int32_t*selected,const float*weights,
         const float*inputs,float*outputs){
     const int experts=runtime.model->config.expert_count;
@@ -3647,7 +3853,7 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
     std::vector<int> used;
     for(int expert=0;expert<experts;++expert)
         if(!gathered[expert].empty())used.push_back(expert);
-    auto&scratch=const_cast<ColibriV2QwenRuntime&>(runtime).dense_scratch;
+    auto&scratch=const_cast<FlyweightV2QwenRuntime&>(runtime).dense_scratch;
     const std::size_t input_floats=static_cast<std::size_t>(rows)*hidden;
     const std::size_t activated_floats=static_cast<std::size_t>(rows)*top_k*intermediate;
     const std::size_t partial_floats=static_cast<std::size_t>(rows)*top_k*hidden;
@@ -3672,7 +3878,7 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
         // Lazy per-tensor repack: first chunk through a layer pays one pass
         // over the expert bytes, every later chunk reads the repacked copy.
         // This runs on the prefill driver thread, before the parallel region.
-        auto&cache=const_cast<ColibriV2QwenRuntime&>(runtime).q4_gemm_repack;
+        auto&cache=const_cast<FlyweightV2QwenRuntime&>(runtime).q4_gemm_repack;
         auto repack=[&](std::size_t tensor_index,int weight_rows,int weight_elements)
                 ->const std::uint8_t*{
             const auto&tensor=runtime.model->tensors[tensor_index];
@@ -3898,7 +4104,7 @@ void gemma_cpu_moe_rows(const ColibriV2QwenRuntime&runtime,const QwenLayerPlan&l
 // Weights for a spilled block's feed-forward as the host should read them:
 // the Q8_0 re-encoding when prepare made one, otherwise the checkpoint bytes.
 const std::uint8_t* qwen_host_ffn_weights(
-    const ColibriV2QwenRuntime& runtime, std::size_t index, std::uint32_t& type
+    const FlyweightV2QwenRuntime& runtime, std::size_t index, std::uint32_t& type
 ) {
     const auto found = runtime.host_ffn_q8.find(index);
     if (found != runtime.host_ffn_q8.end()) {
@@ -3911,7 +4117,7 @@ const std::uint8_t* qwen_host_ffn_weights(
 }
 
 void qwen_cpu_dense_ffn(
-    ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
+    FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     const float* input, float* output
 ) {
     const int hidden=runtime.model->config.hidden_size;
@@ -3961,7 +4167,7 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
 // drops by the batch size and the arithmetic turns into a GEMM, which the host
 // is far better at than a stream of GEMVs.
 void qwen_cpu_dense_ffn_rows(
-    ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
+    FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     const float* input, float* output, int rows
 ) {
     if(rows<=0)return;
@@ -4009,8 +4215,8 @@ void qwen_cpu_dense_ffn_rows(
     // unbatched path it replaces: this translation unit is built for baseline
     // x86-64, so the saving from decoding once is easily lost to a dot product
     // that is not vectorized.
-    const bool avx512=(colibri_cpu_features()&2u)!=0;
-    const bool avx2=(colibri_cpu_features()&1u)!=0;
+    const bool avx512=(flyweight_cpu_features()&2u)!=0;
+    const bool avx2=(flyweight_cpu_features()&1u)!=0;
     auto dot_multi=[&](const float*row,const float*const*inputs,int count,
                        int elements,float*outputs){
         if(avx512&&elements%32==0){
@@ -4086,8 +4292,8 @@ constexpr std::uint32_t kScalarDequantTypeLimit = 64;
 // routed to the same expert within a batch: the quantized bytes are decoded
 // once per batch instead of once per token.
 void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,std::uint64_t row,float*output){
-    if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx512(packed,type,elements,row,output);return;}
-    if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    if(qwen_simd_quant_type(type)&&(flyweight_cpu_features()&2u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx512(packed,type,elements,row,output);return;}
+    if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     // qwen4exp's expert formats: IQ1_S super-blocks, IQ4_NL 32-wide blocks
     // (the 640-wide expert down rows fail a 256 gate). Chunked prefill decodes
     // every routed expert's rows through here once per chunk, so the scalar
@@ -4099,10 +4305,10 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     // against 623-768 for the formats that had a decoder, which is the expert
     // layout Laguna ships.
     if((type==16||type==17||type==18||type==19)&&
-       (colibri_cpu_features()&1u)!=0&&elements%256==0){
+       (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
-    if(type==20&&(colibri_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
-    if(qwen_simd_quant_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    if(type==20&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    if(qwen_simd_quant_type(type)&&(flyweight_cpu_features()&1u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     // Everything past here re-derives a weight's block, group, scale and grid
     // entry per element. It is correct and roughly 10x slower, and nothing
     // said so: IQ2_XXS sat here for two sessions on 14 of qwen4exp's 48 layers
@@ -4135,8 +4341,8 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
 }
 
 void qwen_f32_dot_multi(const float*row,const float*const*inputs,int count,int elements,float*outputs){
-    if((colibri_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_dot_multi_avx512(row,inputs,count,elements,outputs);return;}
-    if((colibri_cpu_features()&1u)!=0&&elements%16==0){qwen_f32_dot_multi_avx2(row,inputs,count,elements,outputs);return;}
+    if((flyweight_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_dot_multi_avx512(row,inputs,count,elements,outputs);return;}
+    if((flyweight_cpu_features()&1u)!=0&&elements%16==0){qwen_f32_dot_multi_avx2(row,inputs,count,elements,outputs);return;}
     for(int token=0;token<count;++token){
         const float*vector=inputs[token];
         float sum=0.0f;
@@ -4147,8 +4353,8 @@ void qwen_f32_dot_multi(const float*row,const float*const*inputs,int count,int e
 
 // Register-blocked expert GEMM over a block of <=4 weight rows: out[i*count+j].
 void qwen_f32_gemm_rows(const float*weights,int mr,const float*const*inputs,int count,int elements,float*out){
-    if((colibri_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_gemm_rows_avx512(weights,mr,inputs,count,elements,out);return;}
-    if((colibri_cpu_features()&1u)!=0&&elements%16==0){qwen_f32_gemm_rows_avx2(weights,mr,inputs,count,elements,out);return;}
+    if((flyweight_cpu_features()&2u)!=0&&elements%32==0){qwen_f32_gemm_rows_avx512(weights,mr,inputs,count,elements,out);return;}
+    if((flyweight_cpu_features()&1u)!=0&&elements%16==0){qwen_f32_gemm_rows_avx2(weights,mr,inputs,count,elements,out);return;}
     for(int i=0;i<mr;++i){
         const float*row=weights+static_cast<std::size_t>(i)*elements;float*o=out+static_cast<std::size_t>(i)*count;
         for(int j=0;j<count;++j){const float*v=inputs[j];float sum=0.0f;for(int k=0;k<elements;++k)sum+=row[k]*v[k];o[j]=sum;}
@@ -4159,16 +4365,16 @@ void qwen_quant_dot_quad(
     const std::uint8_t*packed,std::uint32_t type,const float*const inputs[4],
     int elements,std::uint64_t row,float outputs[4]
 ){
-    if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&2u)!=0&&elements%256==0){
+    if(qwen_simd_multi_type(type)&&(flyweight_cpu_features()&2u)!=0&&elements%256==0){
         qwen_quant_dot_quad_avx512(packed,type,inputs,elements,row,outputs);return;
     }
-    if(type==40&&(colibri_cpu_features()&1u)!=0&&elements%64==0){
+    if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%64==0){
         qwen_quant_dot_quad_avx2(packed,type,inputs,elements,row,outputs);return;
     }
-    if(qwen_simd_multi_type(type)&&(colibri_cpu_features()&1u)!=0&&elements%256==0){
+    if(qwen_simd_multi_type(type)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_quant_dot_quad_avx2(packed,type,inputs,elements,row,outputs);return;
     }
-    if((colibri_cpu_features()&1u)!=0&&
+    if((flyweight_cpu_features()&1u)!=0&&
        qwen_quant_dot_iq_multi_avx2(packed,type,inputs,4,elements,row,outputs))return;
     qwen_quant_dot_pair(packed,type,inputs[0],inputs[1],elements,row,outputs[0],outputs[1]);
     qwen_quant_dot_pair(packed,type,inputs[2],inputs[3],elements,row,outputs[2],outputs[3]);
@@ -4181,7 +4387,7 @@ void qwen_quant_dot_oct(
     if(!qwen_simd_multi_type(type)){
         // The IQ formats have an eight-token AVX2 kernel; taking it here rather
         // than as two quads halves the codebook decodes.
-        if((colibri_cpu_features()&1u)!=0&&
+        if((flyweight_cpu_features()&1u)!=0&&
            qwen_quant_dot_iq_multi_avx2(packed,type,inputs,8,elements,row,outputs))return;
         // NVFP4 uses two register-blocked AVX2 quads; the formats without an
         // AVX-512 oct kernel fall back through quad to the ordinary pair path,
@@ -4214,46 +4420,46 @@ int qwen_gpu_matvec_by_type(
         // and used to throw on an f32 LM head while greedy worked.
         case 0: {
             void* args[] = {&matrix, &input, &output, &input_size, &output_size};
-            return colibri_gpu_launch_named(
+            return flyweight_gpu_launch_named(
                 "qwen_f32_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
         case 1: {
             void* args[] = {&matrix, &input, &output, &input_size, &output_size};
-            return colibri_gpu_launch_named(
+            return flyweight_gpu_launch_named(
                 "qwen_f16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
         // bf16_matvec_warp declares (rows, columns), so the extents swap.
         case 30: {
             void* args[] = {&matrix, &input, &output, &output_size, &input_size};
-            return colibri_gpu_launch_named(
+            return flyweight_gpu_launch_named(
                 "bf16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
-        case 8: return colibri_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 10: return colibri_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 11: return colibri_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 8: return flyweight_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 10: return flyweight_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 11: return flyweight_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         // Q4_K has two kernels: a sub-block one that unpacks each scale once
         // and the generic per-element one. Prefer the fast path and fall back
         // when it declines (kernel absent, or a row that is not a whole number
         // of sub-blocks) rather than assuming it is always there.
         case 12: {
-            const int fast = colibri_gpu_q4k_matvec_subblock(
+            const int fast = flyweight_gpu_q4k_matvec_subblock(
                 matrix, input, output, input_size, output_size, stream);
             if (fast == 0) return 0;
-            return colibri_gpu_q4k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+            return flyweight_gpu_q4k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         }
-        case 13: return colibri_gpu_q5k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 14: return colibri_gpu_q6k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 16: return colibri_gpu_iq2xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 18: return colibri_gpu_iq3xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 21: return colibri_gpu_iq3s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 17: return colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 22: return colibri_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 23: return colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 19: return colibri_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 29: return colibri_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 13: return flyweight_gpu_q5k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 14: return flyweight_gpu_q6k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 16: return flyweight_gpu_iq2xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 18: return flyweight_gpu_iq3xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 21: return flyweight_gpu_iq3s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 17: return flyweight_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 22: return flyweight_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 23: return flyweight_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 19: return flyweight_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 29: return flyweight_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         default: break;
     }
     return -1;
@@ -4270,6 +4476,20 @@ int qwen_gpu_matvec_by_type(
 // callers can tell "unknown format" from "the launch failed" -- the driver's
 // own failure codes are not distinguishable from any fixed sentinel.
 constexpr int kQwenMatvecUnsupported = -1000000;
+// Types qwen_matvec_driver below can actually launch. Kept adjacent to the
+// switch it mirrors -- the two drift apart silently otherwise, and the symptom
+// is a load-time "type is unsupported" naming a number and nothing else.
+bool qwen_matvec_supported(std::uint32_t type) {
+    switch (type) {
+        case 1: case 8: case 10: case 11: case 12: case 13: case 14:
+        case 16: case 17: case 18: case 19: case 21: case 22: case 23:
+        case 29: case 30:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int qwen_matvec_driver(
     std::uint32_t type, std::uint64_t matrix, std::uint64_t input,
     std::uint64_t output, int input_size, int output_size, std::uint64_t stream
@@ -4277,31 +4497,31 @@ int qwen_matvec_driver(
     switch (type) {
         case 1: {
             void* args[] = {&matrix, &input, &output, &input_size, &output_size};
-            return colibri_gpu_launch_named(
+            return flyweight_gpu_launch_named(
                 "qwen_f16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
         // bf16_matvec_warp declares (rows, columns), so the extents swap.
         case 30: {
             void* args[] = {&matrix, &input, &output, &output_size, &input_size};
-            return colibri_gpu_launch_named(
+            return flyweight_gpu_launch_named(
                 "bf16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
-        case 8: return colibri_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 10: return colibri_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 11: return colibri_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 12: return colibri_gpu_q4k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 13: return colibri_gpu_q5k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 14: return colibri_gpu_q6k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 16: return colibri_gpu_iq2xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 17: return colibri_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 18: return colibri_gpu_iq3xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 19: return colibri_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 21: return colibri_gpu_iq3s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 22: return colibri_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 23: return colibri_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
-        case 29: return colibri_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 8: return flyweight_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 10: return flyweight_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 11: return flyweight_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 12: return flyweight_gpu_q4k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 13: return flyweight_gpu_q5k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 14: return flyweight_gpu_q6k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 16: return flyweight_gpu_iq2xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 17: return flyweight_gpu_iq2xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 18: return flyweight_gpu_iq3xxs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 19: return flyweight_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 21: return flyweight_gpu_iq3s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 22: return flyweight_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 23: return flyweight_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        case 29: return flyweight_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         default: break;
     }
     return kQwenMatvecUnsupported;
@@ -4310,7 +4530,7 @@ int qwen_matvec_driver(
 // Q8-activation group-decode LM head, or null where the type has no such
 // kernel and the per-element fused head has to stand in.
 const char* qwen_q8_lm_head_kernel(std::uint32_t type) {
-    const auto* format = colibri::v2::qwen_format(type);
+    const auto* format = flyweight::v2::qwen_format(type);
     return format ? format->lm_head_argmax_q8 : nullptr;
 }
 
@@ -4319,12 +4539,12 @@ const char* qwen_q8_lm_head_kernel(std::uint32_t type) {
 // returns an argmax, so anything that needs the distribution itself -- the
 // temperature path -- has to project with one of these instead.
 const char* qwen_q8_matvec_kernel(std::uint32_t type) {
-    const auto* format = colibri::v2::qwen_format(type);
+    const auto* format = flyweight::v2::qwen_format(type);
     return format ? format->matvec_q8_warp : nullptr;
 }
 
 const char* qwen_lm_head_argmax_kernel(std::uint32_t type) {
-    const auto* format = colibri::v2::qwen_format(type);
+    const auto* format = flyweight::v2::qwen_format(type);
     if (format && format->lm_head_argmax) return format->lm_head_argmax;
     throw std::runtime_error(
         "native Qwen LM-head type is unsupported: " + std::to_string(type));
@@ -4333,7 +4553,7 @@ const char* qwen_lm_head_argmax_kernel(std::uint32_t type) {
 // Effective device type for a tensor: what actually got uploaded, which is the
 // checkpoint type unless prepare requantized it.
 std::uint32_t qwen_device_type(
-    const ColibriV2QwenRuntime& runtime, std::uint64_t index
+    const FlyweightV2QwenRuntime& runtime, std::uint64_t index
 ) {
     if (index < runtime.device_tensor_types.size())
         return runtime.device_tensor_types[index];
@@ -4342,7 +4562,7 @@ std::uint32_t qwen_device_type(
 
 // Bytes the tensor occupies in the static arena under its effective type.
 std::uint64_t qwen_device_tensor_size(
-    const ColibriV2QwenRuntime& runtime, std::uint64_t index
+    const FlyweightV2QwenRuntime& runtime, std::uint64_t index
 ) {
     const auto& tensor = runtime.model->tensors[index];
     if (qwen_device_type(runtime, index) == 8 && tensor.type != 8) {
@@ -4367,13 +4587,13 @@ std::uint64_t qwen_device_tensor_size(
 // data) or the mapped address is not aligned enough for the 128-bit vector
 // loads the kernels use.
 const std::uint8_t* qwen_alias_static_tensor(
-    const ColibriV2QwenRuntime& runtime, std::uint64_t index
+    const FlyweightV2QwenRuntime& runtime, std::uint64_t index
 ) {
-    if (!colibri_backend_is_cpu()) return nullptr;
+    if (!flyweight_backend_is_cpu()) return nullptr;
     // Escape hatch: forces the copying path so a suspected aliasing problem can
     // be confirmed or ruled out without a rebuild.
     static const bool disabled = [] {
-        const char* setting = std::getenv("COLIBRI_CPU_NO_ALIAS");
+        const char* setting = std::getenv("FLYWEIGHT_CPU_NO_ALIAS");
         return setting != nullptr && setting[0] == '1';
     }();
     if (disabled) return nullptr;
@@ -4389,7 +4609,7 @@ const std::uint8_t* qwen_alias_static_tensor(
 }
 
 const char* qwen_embedding_kernel(std::uint32_t type, bool rows) {
-    const auto* format = colibri::v2::qwen_format(type);
+    const auto* format = flyweight::v2::qwen_format(type);
     if (format && format->embedding)
         return rows ? format->embedding_rows : format->embedding;
     throw std::runtime_error(
@@ -4405,7 +4625,7 @@ const char* qwen_embedding_kernel(std::uint32_t type, bool rows) {
 // Returns the resident table unchanged when the embeddings were kept in VRAM,
 // so every call site is identical in both modes.
 std::uint64_t qwen_stage_embedding_rows(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int count
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens, int count
 ) {
     if (!runtime.embeddings_host_resident)
         return runtime.device_tensors[runtime.token_embeddings];
@@ -4423,7 +4643,7 @@ std::uint64_t qwen_stage_embedding_rows(
             throw std::runtime_error(
                 "native Qwen embedding token is out of range: "
                 + std::to_string(tokens[0]));
-        if (colibri_gpu_upload(
+        if (flyweight_gpu_upload(
                 runtime.embedding_stage,
                 source + static_cast<std::uint64_t>(tokens[0]) * row_bytes,
                 row_bytes, runtime.stream) != 0)
@@ -4433,7 +4653,7 @@ std::uint64_t qwen_stage_embedding_rows(
     // The pinned mirror is refilled every token, so the previous upload has to
     // have drained first. The event is recorded immediately after each upload,
     // so by the time the next token reaches here the wait is already satisfied.
-    if (runtime.embedding_event) colibri_gpu_event_sync(runtime.embedding_event);
+    if (runtime.embedding_event) flyweight_gpu_event_sync(runtime.embedding_event);
     auto* host = static_cast<std::uint8_t*>(runtime.embedding_host);
     for (int row = 0; row < count; ++row) {
         if (tokens[row] >= vocabulary)
@@ -4445,12 +4665,12 @@ std::uint64_t qwen_stage_embedding_rows(
             source + static_cast<std::uint64_t>(tokens[row]) * row_bytes,
             row_bytes);
     }
-    if (colibri_gpu_upload(
+    if (flyweight_gpu_upload(
             runtime.embedding_stage, host,
             static_cast<std::uint64_t>(count) * row_bytes, runtime.stream) != 0)
         throw std::runtime_error("native Qwen embedding row staging failed");
     if (runtime.embedding_event)
-        colibri_gpu_event_record(runtime.embedding_event, runtime.stream);
+        flyweight_gpu_event_record(runtime.embedding_event, runtime.stream);
     return runtime.embedding_stage;
 }
 
@@ -4476,11 +4696,11 @@ std::uint64_t qwen_stage_embedding_rows(
 // prefetch get POSIX_MADV_RANDOM, and MAP_POPULATE is dropped entirely when any
 // exist, because POPULATE cannot be selective). The policy has to be per range,
 // not per file.
-void qwen_advise_access_pattern(const ColibriV2QwenRuntime& runtime) {
+void qwen_advise_access_pattern(const FlyweightV2QwenRuntime& runtime) {
 #if !defined(_WIN32) && defined(MADV_RANDOM)
     // Kill switch: this is a hint whose effect is invisible in correctness and
     // only shows up in I/O, so it needs to be switchable to be measurable.
-    static const char* setting = std::getenv("COLIBRI_ADVISE_RANDOM");
+    static const char* setting = std::getenv("FLYWEIGHT_ADVISE_RANDOM");
     if (setting && setting[0] == '0') return;
     if (runtime.ple_table == std::numeric_limits<std::uint64_t>::max()) return;
     const auto& table = runtime.model->tensors[runtime.ple_table];
@@ -4499,7 +4719,7 @@ void qwen_advise_access_pattern(const ColibriV2QwenRuntime& runtime) {
 }
 
 void qwen4_stage_ple_embed(
-    ColibriV2QwenRuntime& runtime, std::uint32_t token,
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
     const std::vector<std::uint32_t>& history, std::uint64_t destination
 ) {
     const auto& config = runtime.model->config;
@@ -4559,7 +4779,7 @@ void qwen4_stage_ple_embed(
             std::memcpy(destination, row_data, row_width * sizeof(float));
         }
     }
-    if (colibri_gpu_upload(destination, gathered.data(),
+    if (flyweight_gpu_upload(destination, gathered.data(),
             gathered.size() * sizeof(float), runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp PLE staging failed");
 }
@@ -4570,7 +4790,7 @@ void qwen4_stage_ple_embed(
 // chunk (qwen_prefill_rows appends after the forward). Same EOS segmentation
 // as the single-token stager.
 void qwen4_stage_ple_embed_rows(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int count,
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens, int count,
     std::uint64_t destination
 ) {
     const auto& config = runtime.model->config;
@@ -4643,7 +4863,7 @@ void qwen4_stage_ple_embed_rows(
             }
         }
     }
-    if (colibri_gpu_upload(destination, gathered.data(),
+    if (flyweight_gpu_upload(destination, gathered.data(),
             gathered.size() * sizeof(float), runtime.stream) != 0)
         throw std::runtime_error("native qwen4exp PLE rows staging failed");
 }
@@ -4651,7 +4871,7 @@ void qwen4_stage_ple_embed_rows(
 // NVFP4 checkpoints carry an optional per-expert f32 scale tensor alongside each
 // expert role (ffn_{gate,up,down}_exps.scale). Returns 1.0 when the model has none.
 float qwen_expert_role_scale(
-    const ColibriV2QwenRuntime& runtime, std::uint64_t scale_tensor, int expert
+    const FlyweightV2QwenRuntime& runtime, std::uint64_t scale_tensor, int expert
 ) {
     if (scale_tensor == std::numeric_limits<std::uint64_t>::max()) return 1.0f;
     const auto& st = runtime.model->tensors[scale_tensor];
@@ -4667,20 +4887,20 @@ float qwen_expert_role_scale(
 }
 
 // Per-phase MoE timing. The expert path does not go through launch_named, so
-// COLIBRI_CPU_PROFILE cannot see inside it; this is the only view of where the
-// ~43% of decode that lands here actually goes. Off unless COLIBRI_MOE_PROFILE=1.
+// FLYWEIGHT_CPU_PROFILE cannot see inside it; this is the only view of where the
+// ~43% of decode that lands here actually goes. Off unless FLYWEIGHT_MOE_PROFILE=1.
 std::atomic<std::uint64_t> g_moe_gate_up_ns{0}, g_moe_quant_ns{0}, g_moe_down_ns{0};
 std::atomic<std::uint64_t> g_moe_calls{0};
 
 bool moe_profiling() {
     static const bool on = [] {
-        const char* s = std::getenv("COLIBRI_MOE_PROFILE");
+        const char* s = std::getenv("FLYWEIGHT_MOE_PROFILE");
         return s && s[0] == '1';
     }();
     return on;
 }
 
-extern "C" COLIBRI_BACKEND_API void colibri_moe_profile_dump() {
+extern "C" FLYWEIGHT_BACKEND_API void flyweight_moe_profile_dump() {
     if (!moe_profiling()) return;
     const double gate_up = g_moe_gate_up_ns.load() / 1e6;
     const double quant = g_moe_quant_ns.load() / 1e6;
@@ -4688,7 +4908,7 @@ extern "C" COLIBRI_BACKEND_API void colibri_moe_profile_dump() {
     const double total = gate_up + quant + down;
     if (total <= 0.0) return;
     std::fprintf(stderr,
-        "\n[colibri-moe] %llu calls, %.1f ms total\n"
+        "\n[flyweight-moe] %llu calls, %.1f ms total\n"
         "  gate+up+swiglu %8.1f ms  %5.1f%%\n"
         "  activation q8  %8.1f ms  %5.1f%%\n"
         "  down           %8.1f ms  %5.1f%%\n",
@@ -4698,7 +4918,7 @@ extern "C" COLIBRI_BACKEND_API void colibri_moe_profile_dump() {
 }
 
 void qwen_cpu_moe(
-    const ColibriV2QwenRuntime& runtime,
+    const FlyweightV2QwenRuntime& runtime,
     const QwenLayerPlan& layer,
     const std::int32_t* selected,
     const float* weights,
@@ -4732,7 +4952,7 @@ void qwen_cpu_moe(
             // The raw value, in hex, distinguishes the two ways this fires: a
             // routing bug puts a plausible integer here, where a route buffer
             // the router never wrote carries whatever the allocator left --
-            // recognisably 0xabababab under COLIBRI_CPU_POISON.
+            // recognisably 0xabababab under FLYWEIGHT_CPU_POISON.
             throw std::runtime_error(
                 "native CPU MoE selected an invalid expert: rank " +
                 std::to_string(rank) + " of " + std::to_string(routed_count) +
@@ -4759,8 +4979,8 @@ void qwen_cpu_moe(
     const auto gate_type = runtime.model->tensors[layer.expert_tensors[0]].type;
     const auto up_type = runtime.model->tensors[layer.expert_tensors[1]].type;
     const auto down_type = runtime.model->tensors[layer.expert_tensors[2]].type;
-    static const char* q8_setting = std::getenv("COLIBRI_Q8_ACTIVATIONS");
-    const auto cpu_features = colibri_cpu_features();
+    static const char* q8_setting = std::getenv("FLYWEIGHT_Q8_ACTIVATIONS");
+    const auto cpu_features = flyweight_cpu_features();
     // Q8-K activations only pay off, and are only decoded, for these quants.
     // Q4_K, NVFP4 and bf16 are faster on the vectorized f32 path (their small
     // codes do not amortize the activation quantization). IQ2_XS and IQ3_XXS
@@ -4773,13 +4993,13 @@ void qwen_cpu_moe(
         && (!q8_setting || q8_setting[0] != '0');
     // On the CPU backend, default the Q8-K activation path on for any expert
     // quantization q8_activations_ok() accepts. It was previously reachable for
-    // Q8_0 only through COLIBRI_Q8_ACTIVATIONS=1, even though the type is on
+    // Q8_0 only through FLYWEIGHT_Q8_ACTIVATIONS=1, even though the type is on
     // that list -- measured worth ~14% on a 35B Q8_0 MoE (medians 7.53/7.16
     // without against 8.33/8.42 with, two replications, non-overlapping in the
     // second). Scoped to the CPU backend because that is the configuration the
     // measurement covers; a GPU machine running hybrid or cpu expert placement
     // keeps the old behaviour until someone measures it there.
-    const bool q8_default_on = colibri_backend_is_cpu()
+    const bool q8_default_on = flyweight_backend_is_cpu()
         && !(q8_setting && q8_setting[0] == '0');
     const bool use_q8 = (cpu_features & 1u) != 0 && hidden % 256 == 0
         && intermediate % 256 == 0
@@ -4816,10 +5036,10 @@ void qwen_cpu_moe(
             ? qwen_quant_dot_q8_k_avx_vnni(packed,type,input,elements,row)
             : qwen_quant_dot_q8_k_avx2(packed,type,input,elements,row);
     };
-    static const char* fused_gate_up_setting = std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
-    static const char* iq_avx512_setting = std::getenv("COLIBRI_IQ_AVX512");
+    static const char* fused_gate_up_setting = std::getenv("FLYWEIGHT_FUSED_MOE_GATE_UP");
+    static const char* iq_avx512_setting = std::getenv("FLYWEIGHT_IQ_AVX512");
     const bool auto_fused_iq2xs = gate_type == 17
-        && (colibri_cpu_features() & 2u) != 0
+        && (flyweight_cpu_features() & 2u) != 0
         && (!iq_avx512_setting || iq_avx512_setting[0] != '0')
         && (!fused_gate_up_setting || fused_gate_up_setting[0] != '0');
     const auto gate_up_task = [&](int task) {
@@ -4988,7 +5208,7 @@ void qwen_cpu_moe(
             }
         }
     }
-    if (std::getenv("COLIBRI_MOE_DEBUG")) {
+    if (std::getenv("FLYWEIGHT_MOE_DEBUG")) {
         static int calls = 0;
         int n = calls++;
         if (n < 45) {
@@ -5000,10 +5220,10 @@ void qwen_cpu_moe(
 }
 
 bool qwen_prefill_direct_quant_enabled(
-    const ColibriV2QwenRuntime& runtime
+    const FlyweightV2QwenRuntime& runtime
 ) {
-    if ((colibri_cpu_features() & 3u) == 0) return false;
-    if (const char* setting = std::getenv("COLIBRI_PREFILL_DIRECT_QUANT"))
+    if ((flyweight_cpu_features() & 3u) == 0) return false;
+    if (const char* setting = std::getenv("FLYWEIGHT_PREFILL_DIRECT_QUANT"))
         return setting[0] == '1';
     if (!runtime.laguna) return false;
     bool found = false;
@@ -5020,8 +5240,8 @@ bool qwen_prefill_direct_quant_enabled(
 
 // Region timers for the batched CPU MoE. `qwen_cpu_moe` is the largest block of
 // prefill (58% of wall on the 35B-A3B) and ~3.5x off its roofline, but it does
-// not go through `launch_named`, so COLIBRI_CPU_PROFILE never sees it. Enable
-// with COLIBRI_MOE_PROFILE=1; the dump prints once at exit. Off by default --
+// not go through `launch_named`, so FLYWEIGHT_CPU_PROFILE never sees it. Enable
+// with FLYWEIGHT_MOE_PROFILE=1; the dump prints once at exit. Off by default --
 // the clock reads sit inside the OpenMP task loop.
 struct QwenCpuMoeProfile {
     std::atomic<std::uint64_t> setup{0};
@@ -5054,7 +5274,7 @@ struct QwenCpuMoeProfile {
 QwenCpuMoeProfile g_cpu_moe_profile;
 bool qwen_cpu_moe_profile_enabled() {
     static const bool on = [] {
-        const char* v = std::getenv("COLIBRI_MOE_PROFILE");
+        const char* v = std::getenv("FLYWEIGHT_MOE_PROFILE");
         return v && v[0] != '0';
     }();
     return on;
@@ -5070,10 +5290,10 @@ inline std::uint64_t qwen_moe_now() {
 // arena when the matrix is read back. `runtime` arrives const in the callers,
 // but the accumulators are capture state, not model state.
 static void qwen_imatrix_note_expert(
-    const ColibriV2QwenRuntime& runtime, std::uint64_t tensor_index,
+    const FlyweightV2QwenRuntime& runtime, std::uint64_t tensor_index,
     int expert, const float* const* vectors, int count, int width
 ) {
-    auto& capture=const_cast<ColibriV2QwenRuntime&>(runtime);
+    auto& capture=const_cast<FlyweightV2QwenRuntime&>(runtime);
     if(capture.imatrix_offsets.empty())return;
     const auto slot=capture.imatrix_offsets[tensor_index];
     if(slot==~0ull)return;
@@ -5088,7 +5308,7 @@ static void qwen_imatrix_note_expert(
 }
 
 void qwen_cpu_moe_rows(
-    const ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
+    const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     const std::int32_t* selected, const float* weights, int rows,
     int routed_count, const float* input, float* activated,
     float* down_values, float* output
@@ -5097,16 +5317,16 @@ void qwen_cpu_moe_rows(
     const int hidden=runtime.model->config.hidden_size;
     const int intermediate=runtime.moe_intermediate;
     const bool direct_quant=qwen_prefill_direct_quant_enabled(runtime);
-    const bool direct_oct=direct_quant&&(colibri_cpu_features()&2u)!=0;
+    const bool direct_oct=direct_quant&&(flyweight_cpu_features()&2u)!=0;
     if(rows<=0||rows>4096||routed_count<=0||routed_count>256)
         throw std::runtime_error("native CPU batched MoE shape is unsupported");
     const auto gate_type=runtime.model->tensors[layer.expert_tensors[0]].type;
     const auto up_type=runtime.model->tensors[layer.expert_tensors[1]].type;
     const auto down_type=runtime.model->tensors[layer.expert_tensors[2]].type;
-    static const char* fused_gate_up_setting=std::getenv("COLIBRI_FUSED_MOE_GATE_UP");
-    static const char* iq_avx512_setting=std::getenv("COLIBRI_IQ_AVX512");
+    static const char* fused_gate_up_setting=std::getenv("FLYWEIGHT_FUSED_MOE_GATE_UP");
+    static const char* iq_avx512_setting=std::getenv("FLYWEIGHT_IQ_AVX512");
     const bool auto_fused_iq2xs=gate_type==17
-        &&(colibri_cpu_features()&2u)!=0
+        &&(flyweight_cpu_features()&2u)!=0
         &&(!iq_avx512_setting||iq_avx512_setting[0]!='0')
         &&(!fused_gate_up_setting||fused_gate_up_setting[0]!='0');
     for(const auto type:{gate_type,up_type,down_type})
@@ -5377,14 +5597,14 @@ void qwen_cpu_moe_rows(
                 offenders+=std::to_string(type);
             }
             std::fprintf(stderr,
-                "[colibri-v2] expert weight type(s) %s decode a row at a time "
+                "[flyweight] expert weight type(s) %s decode a row at a time "
                 "on this CPU -- no vectorized decoder is admitted for them at "
                 "widths %d/%d, which costs the batched MoE several times its "
                 "speed on the affected layers\n",
                 offenders.c_str(),hidden,intermediate);
         });
     }
-    if (std::getenv("COLIBRI_MOE_DEBUG")) {
+    if (std::getenv("FLYWEIGHT_MOE_DEBUG")) {
         static int rcalls = 0;
         int n = rcalls++;
         if (n < 6) {
@@ -5395,7 +5615,7 @@ void qwen_cpu_moe_rows(
     }
 }
 
-int gpu_probe(ColibriV2GpuInfo& out, int device) {
+int gpu_probe(FlyweightV2GpuInfo& out, int device) {
     std::memset(&out, 0, sizeof(out)); out.device = device;
 #if defined(_WIN32)
     HMODULE lib = LoadLibraryW(L"nvcuda.dll");
@@ -5403,7 +5623,7 @@ int gpu_probe(ColibriV2GpuInfo& out, int device) {
     using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using SetFlags = int (*)(int, unsigned int); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
     auto init=reinterpret_cast<Init>(GetProcAddress(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(GetProcAddress(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(GetProcAddress(lib,"cuCtxSetCurrent")); auto set_flags=reinterpret_cast<SetFlags>(GetProcAddress(lib,"cuDevicePrimaryCtxSetFlags")); auto attr=reinterpret_cast<Attr>(GetProcAddress(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(GetProcAddress(lib,"cuMemGetInfo_v2"));
     if (!init || !retain || !set || !attr || init(0)!=0) { FreeLibrary(lib); return 0; }
-    if(set_flags&&(!std::getenv("COLIBRI_CUDA_SPIN_WAIT")||std::getenv("COLIBRI_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
+    if(set_flags&&(!std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")||std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
     void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { FreeLibrary(lib); return 0; }
     int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { FreeLibrary(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } FreeLibrary(lib); return 0;
 #else
@@ -5411,41 +5631,41 @@ int gpu_probe(ColibriV2GpuInfo& out, int device) {
     using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using SetFlags = int (*)(int, unsigned int); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
     auto init=reinterpret_cast<Init>(dlsym(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(dlsym(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(dlsym(lib,"cuCtxSetCurrent")); auto set_flags=reinterpret_cast<SetFlags>(dlsym(lib,"cuDevicePrimaryCtxSetFlags")); auto attr=reinterpret_cast<Attr>(dlsym(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(dlsym(lib,"cuMemGetInfo_v2"));
     if (!init || !retain || !set || !attr || init(0)!=0) { dlclose(lib); return 0; }
-    if(set_flags&&(!std::getenv("COLIBRI_CUDA_SPIN_WAIT")||std::getenv("COLIBRI_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
+    if(set_flags&&(!std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")||std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
     void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { dlclose(lib); return 0; }
     int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { dlclose(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } dlclose(lib); return 0;
 #endif
 }
 
-int plan_memory(ColibriV2MemoryPlan& out, uint64_t budget, uint64_t static_weights, uint64_t kv_state, uint64_t workspace, uint64_t active, uint64_t staging) {
+int plan_memory(FlyweightV2MemoryPlan& out, uint64_t budget, uint64_t static_weights, uint64_t kv_state, uint64_t workspace, uint64_t active, uint64_t staging) {
     if (static_weights > budget || kv_state > budget-static_weights || workspace > budget-static_weights-kv_state) { fail("persistent v2 GPU allocations exceed budget"); return -1; }
     out={}; out.budget=budget; out.static_weights=static_weights; out.kv_state=kv_state; out.workspace=workspace; uint64_t left=budget-static_weights-kv_state-workspace; out.active_experts=std::min(active,left); left-=out.active_experts; out.staging=std::min(staging,left); out.unused=left-out.staging; return 0;
 }
 
 extern "C" {
-uint32_t colibri_v2_version() { return 5; }
-uint64_t colibri_v2_runtime_options_size() { return sizeof(ColibriV2QwenRuntimeOptions); }
-uint64_t colibri_v2_runtime_info_size() { return sizeof(ColibriV2QwenRuntimeInfo); }
-const char* colibri_v2_last_error() { return error.c_str(); }
-int colibri_v2_gpu_probe(int32_t device, ColibriV2GpuInfo* out) { return guarded([&]{ if(!out||device<0) throw std::runtime_error("invalid GPU probe arguments"); return gpu_probe(*out,device); }); }
-int colibri_v2_memory_plan(uint64_t budget,uint64_t static_weights,uint64_t kv_state,uint64_t workspace,uint64_t active,uint64_t staging,ColibriV2MemoryPlan*out){return guarded([&]{if(!out)throw std::runtime_error("memory plan output is required");return plan_memory(*out,budget,static_weights,kv_state,workspace,active,staging);});}
-int colibri_v2_gpu_available(){return colibri_gpu_available();}
-int colibri_v2_gpu_init(int32_t device){return colibri_gpu_init(device);}
-int colibri_v2_gpu_compile(const char* source,const char*const*options,int32_t count,int32_t device,char*log,int32_t capacity){return colibri_gpu_compile(source,options,count,device,log,capacity);}
-int colibri_v2_gpu_rms_norm(uint64_t input,uint64_t weights,uint64_t output,int32_t size,float epsilon,int32_t one_centered){return colibri_gpu_rms_norm(input,weights,output,size,epsilon,one_centered);}
-int colibri_v2_gpu_q4_matvec(uint64_t packed,uint64_t scales,uint64_t input,uint64_t output,uint64_t stream,int32_t rows,int32_t columns){return colibri_gpu_q4_matvec(packed,scales,input,output,stream,rows,columns);}
-int colibri_v2_gpu_dense_projection(uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t packed,uint64_t scales,uint64_t projection,int32_t rows,int32_t columns,float epsilon,int32_t one_centered){int status=colibri_gpu_rms_norm(input,norm_weights,normalized,columns,epsilon,one_centered);if(status)return status;return colibri_gpu_q4_matvec(packed,scales,normalized,projection,0,rows,columns);}
-int colibri_v2_gpu_dense_residual(uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t packed,uint64_t scales,uint64_t output,int32_t rows,int32_t columns,float epsilon,int32_t one_centered){if(rows!=columns)return -3;int status=colibri_gpu_rms_norm(input,norm_weights,normalized,columns,epsilon,one_centered);if(status)return status;status=colibri_gpu_q4_matvec(packed,scales,normalized,output,0,rows,columns);if(status)return status;return colibri_gpu_scaled_add(output,input,1.0f,rows);}
-int colibri_v2_gpu_attention(uint64_t query,uint64_t keys,uint64_t values,uint64_t output,int32_t heads,int32_t kv_heads,int32_t head_dim,int32_t tokens,float scale){return colibri_gpu_attention(query,keys,values,output,heads,kv_heads,head_dim,tokens,scale);}
-int colibri_v2_gpu_decoder_attention_step(uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t qkv_packed,uint64_t qkv_scales,uint64_t qkv,uint64_t cache_keys,uint64_t cache_values,uint64_t attention_output,uint64_t out_packed,uint64_t out_scales,uint64_t output,int32_t hidden_size,int32_t heads,int32_t kv_heads,int32_t head_dim,int32_t position,int32_t capacity,float epsilon,int32_t one_centered){if(heads<=0||kv_heads<=0||heads%kv_heads!=0||head_dim<=0||position<0||position>=capacity)return -3;int status=colibri_gpu_rms_norm(input,norm_weights,normalized,hidden_size,epsilon,one_centered);if(status)return status;const int q_rows=heads*head_dim;const int kv_rows=kv_heads*head_dim;status=colibri_gpu_q4_matvec(qkv_packed,qkv_scales,normalized,qkv,0,q_rows+2*kv_rows,hidden_size);if(status)return status;status=colibri_gpu_kv_append(qkv+q_rows*sizeof(float),qkv+(q_rows+kv_rows)*sizeof(float),cache_keys,cache_values,kv_heads,head_dim,position,capacity);if(status)return status;status=colibri_gpu_attention_cache(qkv,cache_keys,cache_values,attention_output,heads,kv_heads,head_dim,position+1,capacity,1.0f/sqrtf(static_cast<float>(head_dim)));if(status)return status;status=colibri_gpu_q4_matvec(out_packed,out_scales,attention_output,output,0,hidden_size,heads*head_dim);if(status)return status;return colibri_gpu_scaled_add(output,input,1.0f,hidden_size);}
-int colibri_v2_kv_cache_create(uint64_t keys,uint64_t values,int32_t capacity,int32_t kv_heads,int32_t head_dim,ColibriV2KvCache**out){return guarded([&]{if(!out||!keys||!values||capacity<=0||kv_heads<=0||head_dim<=0)throw std::runtime_error("invalid KV cache arguments");*out=new ColibriV2KvCache{keys,values,capacity,kv_heads,head_dim,0};return 0;});}
-void colibri_v2_kv_cache_destroy(ColibriV2KvCache*cache){try{delete cache;}catch(...){}}
-int colibri_v2_kv_cache_reset(ColibriV2KvCache*cache){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}cache->position=0;return 0;});}
-int colibri_v2_kv_cache_position(const ColibriV2KvCache*cache,int32_t*out){return guarded([&]{if(!cache||!out){fail("invalid KV cache position");return -1;}*out=cache->position;return 0;});}
-int colibri_v2_gpu_decoder_attention_cached(ColibriV2KvCache*cache,uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t qkv_packed,uint64_t qkv_scales,uint64_t qkv,uint64_t attention_output,uint64_t out_packed,uint64_t out_scales,uint64_t output,int32_t hidden_size,int32_t heads,float epsilon,int32_t one_centered){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}int status=colibri_v2_gpu_decoder_attention_step(input,norm_weights,normalized,qkv_packed,qkv_scales,qkv,cache->keys,cache->values,attention_output,out_packed,out_scales,output,hidden_size,heads,cache->kv_heads,cache->head_dim,cache->position,cache->capacity,epsilon,one_centered);if(status)return status;++cache->position;return 0;});}
+uint32_t flyweight_v2_version() { return 5; }
+uint64_t flyweight_v2_runtime_options_size() { return sizeof(FlyweightV2QwenRuntimeOptions); }
+uint64_t flyweight_v2_runtime_info_size() { return sizeof(FlyweightV2QwenRuntimeInfo); }
+const char* flyweight_v2_last_error() { return error.c_str(); }
+int flyweight_v2_gpu_probe(int32_t device, FlyweightV2GpuInfo* out) { return guarded([&]{ if(!out||device<0) throw std::runtime_error("invalid GPU probe arguments"); return gpu_probe(*out,device); }); }
+int flyweight_v2_memory_plan(uint64_t budget,uint64_t static_weights,uint64_t kv_state,uint64_t workspace,uint64_t active,uint64_t staging,FlyweightV2MemoryPlan*out){return guarded([&]{if(!out)throw std::runtime_error("memory plan output is required");return plan_memory(*out,budget,static_weights,kv_state,workspace,active,staging);});}
+int flyweight_v2_gpu_available(){return flyweight_gpu_available();}
+int flyweight_v2_gpu_init(int32_t device){return flyweight_gpu_init(device);}
+int flyweight_v2_gpu_compile(const char* source,const char*const*options,int32_t count,int32_t device,char*log,int32_t capacity){return flyweight_gpu_compile(source,options,count,device,log,capacity);}
+int flyweight_v2_gpu_rms_norm(uint64_t input,uint64_t weights,uint64_t output,int32_t size,float epsilon,int32_t one_centered){return flyweight_gpu_rms_norm(input,weights,output,size,epsilon,one_centered);}
+int flyweight_v2_gpu_q4_matvec(uint64_t packed,uint64_t scales,uint64_t input,uint64_t output,uint64_t stream,int32_t rows,int32_t columns){return flyweight_gpu_q4_matvec(packed,scales,input,output,stream,rows,columns);}
+int flyweight_v2_gpu_dense_projection(uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t packed,uint64_t scales,uint64_t projection,int32_t rows,int32_t columns,float epsilon,int32_t one_centered){int status=flyweight_gpu_rms_norm(input,norm_weights,normalized,columns,epsilon,one_centered);if(status)return status;return flyweight_gpu_q4_matvec(packed,scales,normalized,projection,0,rows,columns);}
+int flyweight_v2_gpu_dense_residual(uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t packed,uint64_t scales,uint64_t output,int32_t rows,int32_t columns,float epsilon,int32_t one_centered){if(rows!=columns)return -3;int status=flyweight_gpu_rms_norm(input,norm_weights,normalized,columns,epsilon,one_centered);if(status)return status;status=flyweight_gpu_q4_matvec(packed,scales,normalized,output,0,rows,columns);if(status)return status;return flyweight_gpu_scaled_add(output,input,1.0f,rows);}
+int flyweight_v2_gpu_attention(uint64_t query,uint64_t keys,uint64_t values,uint64_t output,int32_t heads,int32_t kv_heads,int32_t head_dim,int32_t tokens,float scale){return flyweight_gpu_attention(query,keys,values,output,heads,kv_heads,head_dim,tokens,scale);}
+int flyweight_v2_gpu_decoder_attention_step(uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t qkv_packed,uint64_t qkv_scales,uint64_t qkv,uint64_t cache_keys,uint64_t cache_values,uint64_t attention_output,uint64_t out_packed,uint64_t out_scales,uint64_t output,int32_t hidden_size,int32_t heads,int32_t kv_heads,int32_t head_dim,int32_t position,int32_t capacity,float epsilon,int32_t one_centered){if(heads<=0||kv_heads<=0||heads%kv_heads!=0||head_dim<=0||position<0||position>=capacity)return -3;int status=flyweight_gpu_rms_norm(input,norm_weights,normalized,hidden_size,epsilon,one_centered);if(status)return status;const int q_rows=heads*head_dim;const int kv_rows=kv_heads*head_dim;status=flyweight_gpu_q4_matvec(qkv_packed,qkv_scales,normalized,qkv,0,q_rows+2*kv_rows,hidden_size);if(status)return status;status=flyweight_gpu_kv_append(qkv+q_rows*sizeof(float),qkv+(q_rows+kv_rows)*sizeof(float),cache_keys,cache_values,kv_heads,head_dim,position,capacity);if(status)return status;status=flyweight_gpu_attention_cache(qkv,cache_keys,cache_values,attention_output,heads,kv_heads,head_dim,position+1,capacity,1.0f/sqrtf(static_cast<float>(head_dim)));if(status)return status;status=flyweight_gpu_q4_matvec(out_packed,out_scales,attention_output,output,0,hidden_size,heads*head_dim);if(status)return status;return flyweight_gpu_scaled_add(output,input,1.0f,hidden_size);}
+int flyweight_v2_kv_cache_create(uint64_t keys,uint64_t values,int32_t capacity,int32_t kv_heads,int32_t head_dim,FlyweightV2KvCache**out){return guarded([&]{if(!out||!keys||!values||capacity<=0||kv_heads<=0||head_dim<=0)throw std::runtime_error("invalid KV cache arguments");*out=new FlyweightV2KvCache{keys,values,capacity,kv_heads,head_dim,0};return 0;});}
+void flyweight_v2_kv_cache_destroy(FlyweightV2KvCache*cache){try{delete cache;}catch(...){}}
+int flyweight_v2_kv_cache_reset(FlyweightV2KvCache*cache){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}cache->position=0;return 0;});}
+int flyweight_v2_kv_cache_position(const FlyweightV2KvCache*cache,int32_t*out){return guarded([&]{if(!cache||!out){fail("invalid KV cache position");return -1;}*out=cache->position;return 0;});}
+int flyweight_v2_gpu_decoder_attention_cached(FlyweightV2KvCache*cache,uint64_t input,uint64_t norm_weights,uint64_t normalized,uint64_t qkv_packed,uint64_t qkv_scales,uint64_t qkv,uint64_t attention_output,uint64_t out_packed,uint64_t out_scales,uint64_t output,int32_t hidden_size,int32_t heads,float epsilon,int32_t one_centered){return guarded([&]{if(!cache){fail("invalid KV cache");return -1;}int status=flyweight_v2_gpu_decoder_attention_step(input,norm_weights,normalized,qkv_packed,qkv_scales,qkv,cache->keys,cache->values,attention_output,out_packed,out_scales,output,hidden_size,heads,cache->kv_heads,cache->head_dim,cache->position,cache->capacity,epsilon,one_centered);if(status)return status;++cache->position;return 0;});}
 // Map one file into `model`, without interpreting a byte of it. GGUF shards and
 // safetensors shards both come through here; only the caller knows which.
-void map_file(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&model; m->path=path;
+void map_file(const char* path, FlyweightV2Model& model) { FlyweightV2Model* m=&model; m->path=path;
 #if !defined(_WIN32)
     m->fd=open(path,O_RDONLY); if(m->fd<0) throw std::runtime_error("cannot open GGUF"); struct stat st{}; if(fstat(m->fd,&st)!=0) throw std::runtime_error("cannot stat GGUF"); m->size=static_cast<size_t>(st.st_size);
 #if defined(POSIX_FADV_SEQUENTIAL)
@@ -5456,7 +5676,7 @@ void map_file(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&mode
     // see qwen_advise_access_pattern.
     (void)posix_fadvise(m->fd,0,0,POSIX_FADV_SEQUENTIAL);
 #endif
-    const char* lock_env=std::getenv("COLIBRI_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
+    const char* lock_env=std::getenv("FLYWEIGHT_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
     int map_flags=MAP_PRIVATE;
 #ifdef MAP_POPULATE
     if(lock_model) map_flags|=MAP_POPULATE; // prefault every page so decode never page-faults on a cold expert
@@ -5480,7 +5700,7 @@ void map_file(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&mode
     // FilePmdMapped, and do not attribute a speedup to it on that assumption.
     (void)madvise(const_cast<uint8_t*>(m->data),m->size,MADV_HUGEPAGE);
 #endif
-    if(lock_model&&mlock(m->data,m->size)!=0) std::fprintf(stderr,"colibri_v2: mlock(%zu bytes) failed: %s; continuing without pinning (raise RLIMIT_MEMLOCK to pin)\n",m->size,std::strerror(errno));
+    if(lock_model&&mlock(m->data,m->size)!=0) std::fprintf(stderr,"flyweight_v2: mlock(%zu bytes) failed: %s; continuing without pinning (raise RLIMIT_MEMLOCK to pin)\n",m->size,std::strerror(errno));
 #else
     m->file=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(m->file==INVALID_HANDLE_VALUE){m->file=nullptr;throw std::runtime_error("cannot open GGUF");}
@@ -5494,7 +5714,7 @@ void map_file(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&mode
     if(!m->mapping) throw std::runtime_error("cannot create GGUF mapping");
     m->data=static_cast<const uint8_t*>(MapViewOfFile(m->mapping,FILE_MAP_READ,0,0,0));
     if(!m->data) throw std::runtime_error("cannot map GGUF");
-    const char* lock_env=std::getenv("COLIBRI_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
+    const char* lock_env=std::getenv("FLYWEIGHT_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
     if(lock_model){
         // Touch every page to prefault (MAP_POPULATE equivalent on Windows)
         volatile uint8_t sink=0; const size_t page_size=4096;
@@ -5519,19 +5739,19 @@ void map_file(const char* path, ColibriV2Model& model) { ColibriV2Model* m=&mode
             else break;
         }
         if(locked==0)
-            std::fprintf(stderr,"colibri_v2: VirtualLock failed (error %lu) — pages prefaulted "
+            std::fprintf(stderr,"flyweight_v2: VirtualLock failed (error %lu) — pages prefaulted "
                 "but not pinned; enable SeLockMemoryPrivilege for pinning\n",GetLastError());
         else if(locked<m->size)
-            std::fprintf(stderr,"colibri_v2: pinned %zu/%zu bytes\n",locked,m->size);
+            std::fprintf(stderr,"flyweight_v2: pinned %zu/%zu bytes\n",locked,m->size);
         else
-            std::fprintf(stderr,"colibri_v2: pinned all %zu bytes\n",locked);
+            std::fprintf(stderr,"flyweight_v2: pinned all %zu bytes\n",locked);
     }
 #endif
 }
 
 // Map one GGUF file and parse its header. Shards of a split checkpoint come
 // through here too, which is why it does not attach shards itself.
-void map_and_parse(const char* path, ColibriV2Model& model) {
+void map_and_parse(const char* path, FlyweightV2Model& model) {
     map_file(path,model);
     parse(model);
 }
@@ -5559,7 +5779,7 @@ std::string split_shard_path(const std::string& path, std::uint32_t index, std::
 // Merge the remaining shards of a split checkpoint into `m`. Their descriptors
 // keep pointing at their own mapping through Tensor::source, so downstream code
 // never learns the model arrived in pieces.
-void attach_split_shards(ColibriV2Model& m) {
+void attach_split_shards(FlyweightV2Model& m) {
     if(m.split_count<=1)return;
     if(m.split_no>=m.split_count)
         throw std::runtime_error("split GGUF shard index is outside its own split count");
@@ -5567,7 +5787,7 @@ void attach_split_shards(ColibriV2Model& m) {
     for(std::uint32_t index=0;index<m.split_count;++index){
         if(index==m.split_no)continue;
         const auto path=split_shard_path(m.path,index,m.split_count);
-        auto shard=std::make_unique<ColibriV2Model>();
+        auto shard=std::make_unique<FlyweightV2Model>();
         map_and_parse(path.c_str(),*shard);
         if(shard->split_count!=m.split_count||shard->split_no!=index)
             throw std::runtime_error("split GGUF shard disagrees about its place in the split: "+path);
@@ -5590,8 +5810,8 @@ void attach_split_shards(ColibriV2Model& m) {
 // missing. Runs at open, which is the earliest point a misnamed tensor can be
 // caught: the loader's own gate only proves descriptors point at the right
 // bytes, never that they were given the right meaning.
-void bailing_validate_plan(const ColibriV2Model& m) {
-    namespace bailing = colibri::v2::bailing;
+void bailing_validate_plan(const FlyweightV2Model& m) {
+    namespace bailing = flyweight::v2::bailing;
     const auto& config = m.config;
     if(!config.layer_count)throw std::runtime_error("bailingmoe3 config has no layers");
     std::unordered_set<std::string> present;
@@ -5637,7 +5857,7 @@ void bailing_validate_plan(const ColibriV2Model& m) {
         return count;
     };
     std::fprintf(stderr,
-        "[colibri-v2] bailingmoe3: %u layers (%u MLA, %u KDA), %u experts "
+        "[flyweight] bailingmoe3: %u layers (%u MLA, %u KDA), %u experts "
         "top-%u in %u groups keeping %u, %u shared, query %s, "
         "swiglu clamp on %u routed / %u shared layers\n",
         config.layer_count,full_layers,linear_layers,config.expert_count,
@@ -5659,14 +5879,14 @@ void bailing_validate_plan(const ColibriV2Model& m) {
 // synthesized into `owned_arena`, which the model keeps alive for its lifetime
 // (the same indirection the HF loader and split shards already use):
 //   * ssm_a: the GGUF stores +exp(A_log); the kernels here consume A_log
-//     itself and apply -exp() per step (colibri_v2_bailing.hpp:905 and the
+//     itself and apply -exp() per step (flyweight_v2_bailing.hpp:905 and the
 //     device kernel alike), so the load takes log() -- NOT a negation.
 //   * attn_kv_b.weight: rebuilt from attn_k_b (stored [heads][kv_lora][qk_nope],
 //     i.e. transposed per head for llama.cpp's absorbed matmul) and attn_v_b
 //     ([heads][v_head][kv_lora]), un-transposing the key half so the merged
 //     rows match kv_b_proj byte-for-byte with what the HF path yields.
-void bailing_adapt_gguf(ColibriV2Model& m) {
-    namespace bailing = colibri::v2::bailing;
+void bailing_adapt_gguf(FlyweightV2Model& m) {
+    namespace bailing = flyweight::v2::bailing;
     const auto& config = m.config;
     if(!config.layer_count)return;
 
@@ -5853,10 +6073,10 @@ std::int64_t modified_ns(const struct stat& st) {
 std::vector<std::string> hf_cache_candidates(const std::string& directory,
                                              std::uint64_t print) {
     char name[64];
-    std::snprintf(name,sizeof(name),"colibri-%016llx.cache",
+    std::snprintf(name,sizeof(name),"flyweight-%016llx.cache",
                   static_cast<unsigned long long>(print));
 
-    const char* configured=std::getenv("COLIBRI_HF_CACHE");
+    const char* configured=std::getenv("FLYWEIGHT_HF_CACHE");
     if(configured){
         const std::string value=configured;
         // An explicit off switch matters for benchmarking the packers and for
@@ -5873,7 +6093,7 @@ std::vector<std::string> hf_cache_candidates(const std::string& directory,
     else if(const char* appdata=std::getenv("LOCALAPPDATA");appdata&&appdata[0])base=appdata;
 #endif
     if(!base.empty()){
-        const std::string folder=base+"/colibri-next";
+        const std::string folder=base+"/flyweight";
 #if defined(_WIN32)
         CreateDirectoryA(folder.c_str(),nullptr);
 #else
@@ -5884,7 +6104,7 @@ std::vector<std::string> hf_cache_candidates(const std::string& directory,
     return out;
 }
 
-namespace hf = colibri::v2::hf;
+namespace hf = flyweight::v2::hf;
 
 // The quantization policy a name selects, or false when the name is not one.
 // Shared by the loader and by the pre-load preview, so what a caller is offered
@@ -5925,7 +6145,7 @@ std::string hf_policy_needs_missing_imatrix(const hf::Policy& policy,
     if(policy.weights!=hf::Target::IQ2_XS||imatrix_present)return {};
     return "needs an importance matrix: place imatrix.dat beside the "
            "checkpoint, pass --imatrix, or gather one with "
-           "`colibri-next imatrix`";
+           "`flyweight imatrix`";
 }
 
 // Empty when `policy` can be loaded for this checkpoint, else why it cannot.
@@ -5937,7 +6157,7 @@ std::string hf_policy_needs_missing_imatrix(const hf::Policy& policy,
 // qwen_grouped_expert_type_supported existed, decode as the wrong format --
 // the combination is refused where it is chosen.
 std::string hf_policy_unavailable(const hf::Policy& policy,
-                                  const colibri::v2::ModelConfig& config) {
+                                  const flyweight::v2::ModelConfig& config) {
     const auto type=static_cast<std::uint32_t>(policy.weights);
     if(config.expert_count&&(type==10||type==11))
         return "no GPU routed-expert kernel decodes it, which would leave "
@@ -6002,7 +6222,7 @@ std::vector<hf::cache::SourceFile> hf_cache_sources(
     return sources;
 }
 
-// The importance matrix a quantization would read: COLIBRI_HF_IMATRIX names
+// The importance matrix a quantization would read: FLYWEIGHT_HF_IMATRIX names
 // one (or switches it off), and otherwise an `imatrix.dat` beside the
 // checkpoint is picked up on its own -- that is where the ecosystem publishes
 // them. Returns the path, or empty when there is none. `identity` is filled
@@ -6012,7 +6232,7 @@ std::vector<hf::cache::SourceFile> hf_cache_sources(
 std::string hf_imatrix_path(const std::string& directory,
                             hf::cache::SourceFile& identity) {
     std::string path;
-    if(const char* configured=std::getenv("COLIBRI_HF_IMATRIX")){
+    if(const char* configured=std::getenv("FLYWEIGHT_HF_IMATRIX")){
         const std::string value=configured;
         if(value=="0"||value=="off"||value.empty())return {};
         path=value;
@@ -6024,8 +6244,8 @@ std::string hf_imatrix_path(const std::string& directory,
         // A configured path that does not exist is an error worth raising --
         // the user asked for weighted packing and silence would pack without
         // it. The automatic probe simply found nothing.
-        if(std::getenv("COLIBRI_HF_IMATRIX"))
-            throw std::runtime_error("COLIBRI_HF_IMATRIX points at "+path+
+        if(std::getenv("FLYWEIGHT_HF_IMATRIX"))
+            throw std::runtime_error("FLYWEIGHT_HF_IMATRIX points at "+path+
                                      ", which cannot be read");
         return {};
     }
@@ -6047,23 +6267,23 @@ std::string hf_imatrix_path(const std::string& directory,
 // change, so the arena is written to a sidecar on the way out and mapped on the
 // way back in. A hit skips the shard mappings entirely -- the 15.8 GB of bf16
 // is never opened, let alone read.
-void load_hf(const char* path, ColibriV2Model& m) {
-    namespace hf = colibri::v2::hf;
+void load_hf(const char* path, FlyweightV2Model& m) {
+    namespace hf = flyweight::v2::hf;
     m.path=path;
     m.format_name="safetensors";
 
-    // Phase timings under COLIBRI_HF_PROFILE=1. "Open is slow" has at least
+    // Phase timings under FLYWEIGHT_HF_PROFILE=1. "Open is slow" has at least
     // four candidate causes here -- JSON parsing, packing, disk, page faults --
     // and they take different fixes, so guessing between them is not useful.
     const bool profile=[]{
-        const char* value=std::getenv("COLIBRI_HF_PROFILE");
+        const char* value=std::getenv("FLYWEIGHT_HF_PROFILE");
         return value&&value[0]=='1';
     }();
     auto mark=std::chrono::steady_clock::now();
     const auto phase=[&profile,&mark](const char* name){
         if(!profile)return;
         const auto now=std::chrono::steady_clock::now();
-        std::fprintf(stderr,"[colibri-v2]   %-20s %7.2fs\n",name,
+        std::fprintf(stderr,"[flyweight]   %-20s %7.2fs\n",name,
             std::chrono::duration<double>(now-mark).count());
         mark=now;
     };
@@ -6071,7 +6291,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
     const std::string directory=path;
     const auto config_text=read_text_file(directory+"/config.json");
     if(config_text.empty())throw std::runtime_error("cannot read config.json");
-    m.config=hf::config_from_json(colibri::v2::json::parse(config_text));
+    m.config=hf::config_from_json(flyweight::v2::json::parse(config_text));
     m.architecture=m.config.architecture;
     // The directory name is the closest thing an HF checkpoint has to a model
     // name; config.json carries no equivalent of general.name.
@@ -6086,11 +6306,11 @@ void load_hf(const char* path, ColibriV2Model& m) {
     if(m.chat_template.empty()){
         if(const auto text=read_text_file(directory+"/tokenizer_config.json");
            !text.empty()){
-            const auto parsed=colibri::v2::json::parse(text);
+            const auto parsed=flyweight::v2::json::parse(text);
             const auto& configured=parsed["chat_template"];
-            if(configured.kind==colibri::v2::json::Kind::String)
+            if(configured.kind==flyweight::v2::json::Kind::String)
                 m.chat_template=configured.string;
-            else if(configured.kind==colibri::v2::json::Kind::Array)
+            else if(configured.kind==flyweight::v2::json::Kind::Array)
                 for(const auto& entry:configured.array)
                     if(entry["name"].as_string()=="default"){
                         m.chat_template=entry["template"].as_string();
@@ -6104,7 +6324,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
     if(const auto generation=read_text_file(directory+"/generation_config.json");
        !generation.empty()){
         std::uint32_t eos=0;
-        if(hf::hf_generation_eos(colibri::v2::json::parse(generation),eos))
+        if(hf::hf_generation_eos(flyweight::v2::json::parse(generation),eos))
             m.config.eos_token_id=eos;
     }
     phase("config.json");
@@ -6116,7 +6336,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
         throw std::runtime_error("cannot read tokenizer.json");
     phase("tokenizer.json read");
     auto tokenizer=hf::tokenizer_from_json(
-        colibri::v2::json::parse(tokenizer_text),m.config.vocabulary_size);
+        flyweight::v2::json::parse(tokenizer_text),m.config.vocabulary_size);
     phase("tokenizer.json parse");
     if(tokenizer.pre.empty())
         throw std::runtime_error(
@@ -6132,9 +6352,9 @@ void load_hf(const char* path, ColibriV2Model& m) {
     const auto files=hf_shard_files(directory);
 
     hf::Policy policy;
-    if(const char* requested=std::getenv("COLIBRI_HF_QUANT");
+    if(const char* requested=std::getenv("FLYWEIGHT_HF_QUANT");
        requested&&!hf_policy_for(requested,policy))
-        throw std::runtime_error("COLIBRI_HF_QUANT must be one of "
+        throw std::runtime_error("FLYWEIGHT_HF_QUANT must be one of "
             "IQ2_XS, Q2_K, IQ3_XXS, Q3_K, IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, "
             "F32");
 
@@ -6188,7 +6408,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
     // -- absent, unreadable, stale, truncated -- is a miss, so the loop just
     // moves on rather than distinguishing failures it would treat alike.
     for(const auto& candidate:candidates){
-        auto mapping=std::make_unique<ColibriV2Model>();
+        auto mapping=std::make_unique<FlyweightV2Model>();
         try{
             map_file(candidate.c_str(),*mapping);
         }catch(const std::exception&){
@@ -6201,7 +6421,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
         phase("cache map");
         if(m.architecture=="bailingmoe3")bailing_validate_plan(m);
         std::fprintf(stderr,
-            "[colibri-v2] safetensors: %llu tensors, %llu MiB mapped from %s "
+            "[flyweight] safetensors: %llu tensors, %llu MiB mapped from %s "
             "in %.2fs\n",
             static_cast<unsigned long long>(m.tensors.size()),
             static_cast<unsigned long long>(contents.arena_bytes/(1024ull*1024)),
@@ -6214,9 +6434,9 @@ void load_hf(const char* path, ColibriV2Model& m) {
     std::vector<hf::Shard> parsed;
     parsed.reserve(files.size());
     for(const auto& file:files){
-        auto shard=std::make_unique<ColibriV2Model>();
+        auto shard=std::make_unique<FlyweightV2Model>();
         map_file(file.c_str(),*shard);
-        parsed.push_back({colibri::v2::safetensors::parse_header(shard->data,shard->size),
+        parsed.push_back({flyweight::v2::safetensors::parse_header(shard->data,shard->size),
                           shard->data});
         m.shards.push_back(std::move(shard));
     }
@@ -6230,7 +6450,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
     if(imatrix_applies){
         imatrix=hf::load_imatrix(imatrix_path);
         std::fprintf(stderr,
-            "[colibri-v2] safetensors: weighting the pack with %s "
+            "[flyweight] safetensors: weighting the pack with %s "
             "(%zu tensors)\n",
             imatrix_path.c_str(),imatrix.entries.size());
     }
@@ -6250,7 +6470,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
     phase("cache write");
     if(!candidates.empty()&&cached.empty())
         std::fprintf(stderr,
-            "[colibri-v2] safetensors: could not write the quantized cache to "
+            "[flyweight] safetensors: could not write the quantized cache to "
             "%s; the next open will quantize again\n",candidates.back().c_str());
 
     m.owned_arena=std::move(quantized.arena);
@@ -6262,7 +6482,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
     if(m.architecture=="bailingmoe3")bailing_validate_plan(m);
 
     std::fprintf(stderr,
-        "[colibri-v2] safetensors: %llu tensors, %llu MiB bf16 -> %llu MiB "
+        "[flyweight] safetensors: %llu tensors, %llu MiB bf16 -> %llu MiB "
         "quantized in %.1fs%s%s\n",
         static_cast<unsigned long long>(m.tensors.size()),
         static_cast<unsigned long long>(quantized.source_bytes/(1024ull*1024)),
@@ -6282,7 +6502,7 @@ void load_hf(const char* path, ColibriV2Model& m) {
 // worth building before the decode path proves the wiring.
 //
 // Everything the layer needs already existed: `qwen_gpu_matvec_by_type`
-// dispatches the quantized matvecs, `colibri_gpu_rms_norm` the norms, and the
+// dispatches the quantized matvecs, `flyweight_gpu_rms_norm` the norms, and the
 // two new kernels cover KDA and MLA. What is added here is residency and
 // sequencing, not numerics.
 
@@ -6364,14 +6584,14 @@ struct BailingGpu {
 // is state that PERSISTS between tokens, and nothing else. The scratch every
 // forward pass writes and reads within one token stays shared.
 struct BailingSlot {
-    std::vector<colibri::v2::bailing::LayerCache> caches;
+    std::vector<flyweight::v2::bailing::LayerCache> caches;
     std::uint32_t position = 0;
     // MTP: the draft layer's own cache, the target's pre-norm hidden for the
     // last forwarded token (what the draft block conditions on), and the
     // per-KDA-layer scratch the fold rollback needs -- the state/window
     // snapshot taken before a verify and the retained transition inputs the
     // verify recorded. Persistent per slot so a round allocates nothing.
-    colibri::v2::bailing::LayerCache draft_cache;
+    flyweight::v2::bailing::LayerCache draft_cache;
     std::vector<float> target_hidden;
     bool has_target_hidden = false;
     std::vector<std::vector<float>> mtp_state, mtp_qwin, mtp_kwin, mtp_vwin;
@@ -6389,13 +6609,13 @@ struct BailingSlot {
     bool cache_on_device = false;
 };
 
-struct ColibriV2BailingRuntime {
-    const ColibriV2Model* model = nullptr;
-    colibri::v2::bailing::Geometry geometry;
-    std::vector<colibri::v2::bailing::LayerWeights> layers;
-    colibri::v2::bailing::Matrix embedding_matrix;
+struct FlyweightV2BailingRuntime {
+    const FlyweightV2Model* model = nullptr;
+    flyweight::v2::bailing::Geometry geometry;
+    std::vector<flyweight::v2::bailing::LayerWeights> layers;
+    flyweight::v2::bailing::Matrix embedding_matrix;
     const float* output_norm = nullptr;
-    colibri::v2::bailing::Matrix head;
+    flyweight::v2::bailing::Matrix head;
     std::uint32_t capacity = 0;
     // At least one, always; slot 0 is the sequence a single-sequence caller
     // gets without knowing slots exist.
@@ -6405,14 +6625,14 @@ struct ColibriV2BailingRuntime {
     // The nextn draft block, when the checkpoint carries one: a full MLA+MoE
     // decoder layer of its own plus the enorm/hnorm/eh_proj merge and a
     // dedicated head norm. Loaded host-side; unused unless a caller drives
-    // colibri_v2_bailing_mtp_round.
+    // flyweight_v2_bailing_mtp_round.
     struct {
         bool available = false;
-        colibri::v2::bailing::LayerWeights layer;
+        flyweight::v2::bailing::LayerWeights layer;
         std::vector<float> decoded_kv_b;
         const float* enorm = nullptr;
         const float* hnorm = nullptr;
-        colibri::v2::bailing::Matrix eh_proj;
+        flyweight::v2::bailing::Matrix eh_proj;
         const float* head_norm = nullptr;
     } draft;
     std::uint64_t mtp_drafted = 0, mtp_accepted = 0, mtp_rejected = 0;
@@ -6429,7 +6649,7 @@ struct ColibriV2BailingRuntime {
                 (slots.size() == 1 ? " slot" : " slots"));
         return slots[index];
     }
-    // Optional watcher for long prompts; see colibri_v2_bailing_set_progress.
+    // Optional watcher for long prompts; see flyweight_v2_bailing_set_progress.
     // `reported` and `reporting` are per-eval scratch, not configuration: the
     // internal paths report at whatever granularity is natural for them, and
     // deduplicating here is what makes the sequence the watcher sees strictly
@@ -6452,7 +6672,7 @@ struct ColibriV2BailingRuntime {
 // leaves behind is a sequence advanced by however many tokens completed, which
 // is consistent but not what the caller asked for -- hence the documented
 // requirement to reset.
-void bailing_progress(ColibriV2BailingRuntime& runtime, std::uint32_t processed,
+void bailing_progress(FlyweightV2BailingRuntime& runtime, std::uint32_t processed,
                       std::uint32_t total) {
     if (!runtime.progress) return;
     if (runtime.reporting && processed <= runtime.reported) return;
@@ -6463,7 +6683,7 @@ void bailing_progress(ColibriV2BailingRuntime& runtime, std::uint32_t processed,
 }
 
 // A weight in whatever storage the checkpoint used.
-colibri::v2::bailing::Matrix bailing_matrix(const ColibriV2Model& m,
+flyweight::v2::bailing::Matrix bailing_matrix(const FlyweightV2Model& m,
                                             const std::string& name,
                                             bool required = true) {
     for (const auto& tensor : m.tensors) {
@@ -6476,7 +6696,7 @@ colibri::v2::bailing::Matrix bailing_matrix(const ColibriV2Model& m,
 
 // Small tensors the policy always keeps f32: norms, biases, A_log, dt_bias and
 // the convolution taps, all of which are read as vectors rather than matvecs.
-const float* bailing_f32(const ColibriV2Model& m, const std::string& name,
+const float* bailing_f32(const FlyweightV2Model& m, const std::string& name,
                          bool required = true) {
     for (const auto& tensor : m.tensors) {
         if (tensor.name != name) continue;
@@ -6491,14 +6711,14 @@ const float* bailing_f32(const ColibriV2Model& m, const std::string& name,
 }
 
 // Upload one tensor and remember it for release.
-std::uint64_t bailing_gpu_upload(BailingGpu& gpu, const ColibriV2Model& m,
+std::uint64_t bailing_gpu_upload(BailingGpu& gpu, const FlyweightV2Model& m,
                                  const std::string& name, bool required = true) {
     for (const auto& tensor : m.tensors) {
         if (tensor.name != name) continue;
         std::uint64_t pointer = 0;
-        if (colibri_gpu_alloc(tensor.size, &pointer) != 0)
+        if (flyweight_gpu_alloc(tensor.size, &pointer) != 0)
             throw std::runtime_error("out of device memory uploading " + name);
-        if (colibri_gpu_upload_sync(pointer, tensor_data(m, tensor), tensor.size) != 0)
+        if (flyweight_gpu_upload_sync(pointer, tensor_data(m, tensor), tensor.size) != 0)
             throw std::runtime_error("failed to upload " + name);
         gpu.owned.push_back(pointer);
         return pointer;
@@ -6507,7 +6727,7 @@ std::uint64_t bailing_gpu_upload(BailingGpu& gpu, const ColibriV2Model& m,
     return 0;
 }
 
-BailingGpuMatrix bailing_gpu_matrix(BailingGpu& gpu, const ColibriV2Model& m,
+BailingGpuMatrix bailing_gpu_matrix(BailingGpu& gpu, const FlyweightV2Model& m,
                                     const std::string& name, bool required = true) {
     for (const auto& tensor : m.tensors)
         if (tensor.name == name)
@@ -6518,9 +6738,9 @@ BailingGpuMatrix bailing_gpu_matrix(BailingGpu& gpu, const ColibriV2Model& m,
 
 std::uint64_t bailing_gpu_scratch(BailingGpu& gpu, std::size_t bytes) {
     std::uint64_t pointer = 0;
-    if (colibri_gpu_alloc(bytes, &pointer) != 0)
+    if (flyweight_gpu_alloc(bytes, &pointer) != 0)
         throw std::runtime_error("out of device memory for bailing scratch");
-    colibri_gpu_memset(pointer, 0, bytes, 0);
+    flyweight_gpu_memset(pointer, 0, bytes, 0);
     gpu.owned.push_back(pointer);
     return pointer;
 }
@@ -6531,7 +6751,7 @@ std::uint64_t bailing_gpu_scratch(BailingGpu& gpu, std::size_t bytes) {
 // Computed rather than discovered, because discovering it means allocating
 // until the driver refuses -- which leaves a half-built runtime and an error
 // naming a scratch buffer instead of the decision that caused it.
-std::uint64_t bailing_slot_device_bytes(const ColibriV2BailingRuntime& runtime) {
+std::uint64_t bailing_slot_device_bytes(const FlyweightV2BailingRuntime& runtime) {
     const auto& g = runtime.geometry;
     const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
     const std::uint64_t history = g.conv_width ? g.conv_width - 1 : 0;
@@ -6548,7 +6768,7 @@ std::uint64_t bailing_slot_device_bytes(const ColibriV2BailingRuntime& runtime) 
 // the MTP draft block, and anything else a converter appends. `layer_count` is
 // already trimmed to the executed stack by detect_mtp_layer, so the index is
 // the whole test.
-bool bailing_tensor_is_unexecuted_block(const ColibriV2Model& m,
+bool bailing_tensor_is_unexecuted_block(const FlyweightV2Model& m,
                                         const std::string& name) {
     if (name.rfind("blk.", 0) != 0) return false;
     const auto dot = name.find('.', 4);
@@ -6579,8 +6799,8 @@ bool bailing_gpu_weight_type(std::uint32_t type) {
 
 // Bring the whole model onto the device. Q4_K is 4.4 GB, which fits the 12 GB
 // card with room for the caches and scratch.
-void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
-    namespace bailing = colibri::v2::bailing;
+void bailing_gpu_prepare(FlyweightV2BailingRuntime& runtime) {
+    namespace bailing = flyweight::v2::bailing;
     auto& gpu = *runtime.gpu;
     const auto& m = *runtime.model;
     const auto& c = m.config;
@@ -6605,14 +6825,14 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     // a narrower set than the matvecs.
     for (const auto& tensor : m.tensors)
         if (tensor.name == "token_embd.weight" &&
-            !(colibri::v2::qwen_format(tensor.type) &&
-              colibri::v2::qwen_format(tensor.type)->embedding))
+            !(flyweight::v2::qwen_format(tensor.type) &&
+              flyweight::v2::qwen_format(tensor.type)->embedding))
             throw std::runtime_error(
                 "bailingmoe3 token_embd.weight is stored as type " +
                 std::to_string(tensor.type) +
                 ", which has no GPU embedding kernel; running on the host");
 
-    if (colibri_gpu_init(0) != 0) throw std::runtime_error("failed to initialize CUDA");
+    if (flyweight_gpu_init(0) != 0) throw std::runtime_error("failed to initialize CUDA");
     std::vector<std::string> option_storage;
 #if !defined(_WIN32)
     for (const char* path : {"/opt/cuda/include", "/usr/local/cuda/include", "/usr/include"})
@@ -6625,13 +6845,13 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     std::vector<const char*> options;
     for (const auto& option : option_storage) options.push_back(option.c_str());
     std::array<char, 16384> log{};
-    const std::string source = std::string(colibri::v2::qwen_cuda_source) +
-                               colibri::v2::qwen_native_cuda_source;
-    if (colibri_gpu_compile(source.c_str(), options.data(),
+    const std::string source = std::string(flyweight::v2::qwen_cuda_source) +
+                               flyweight::v2::qwen_native_cuda_source;
+    if (flyweight_gpu_compile(source.c_str(), options.data(),
                             static_cast<std::int32_t>(options.size()), 0,
                             log.data(), log.size()) != 0)
         throw std::runtime_error(std::string("failed to compile CUDA kernels: ") + log.data());
-    if (colibri_gpu_stream_create(&gpu.stream) != 0)
+    if (flyweight_gpu_stream_create(&gpu.stream) != 0)
         throw std::runtime_error("failed to create CUDA stream");
 
     gpu.embedding = bailing_gpu_matrix(gpu, m, "token_embd.weight");
@@ -6662,9 +6882,9 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
             // kv_b goes up already decoded: the absorbed attention walks along
             // its rows, and the host runtime decoded it for the same reason.
             const auto& decoded = runtime.decoded_kv_b[index];
-            if (colibri_gpu_alloc(decoded.size() * 4, &L.kv_b) != 0)
+            if (flyweight_gpu_alloc(decoded.size() * 4, &L.kv_b) != 0)
                 throw std::runtime_error("out of device memory for kv_b");
-            colibri_gpu_upload_sync(L.kv_b, decoded.data(), decoded.size() * 4);
+            flyweight_gpu_upload_sync(L.kv_b, decoded.data(), decoded.size() * 4);
             gpu.owned.push_back(L.kv_b);
         } else {
             L.ssm_q = bailing_gpu_matrix(gpu, m, prefix + "ssm_q.weight");
@@ -6722,7 +6942,7 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     gpu.expert_down_ptrs = gpu.expert_gate_ptrs + g.experts_used * 16;
     gpu.expert_weights = gpu.expert_gate_ptrs + g.experts_used * 24;
     gpu.expert_activated = bailing_gpu_scratch(gpu, g.experts_used * g.expert_size * 4);
-    if (const char* setting = std::getenv("COLIBRI_BAILING_PREFILL_ROWS")) {
+    if (const char* setting = std::getenv("FLYWEIGHT_BAILING_PREFILL_ROWS")) {
         const long requested = std::strtol(setting, nullptr, 10);
         if (requested >= 1 && requested <= 512)
             gpu.prefill_rows = static_cast<std::uint32_t>(requested);
@@ -6738,7 +6958,7 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     gpu.prefill_wide_c = bailing_gpu_scratch(gpu, batch * widest * 4);
     gpu.prefill_wide_d = bailing_gpu_scratch(gpu, batch * widest * 4);
     gpu.prefill_wide_e = bailing_gpu_scratch(gpu, batch * widest * 4);
-    const char* fused_mla_setting = std::getenv("COLIBRI_BAILING_FUSED_MLA");
+    const char* fused_mla_setting = std::getenv("FLYWEIGHT_BAILING_FUSED_MLA");
     if (!fused_mla_setting || fused_mla_setting[0] != '1')
         gpu.prefill_scores = bailing_gpu_scratch(
             gpu, batch * g.heads * runtime.capacity * 4);
@@ -6771,7 +6991,7 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     // "cuMemAlloc failed" from whichever layer happened to be next.
     const std::uint64_t per_slot = bailing_slot_device_bytes(runtime);
     const std::uint64_t wanted = per_slot * runtime.slots.size();
-    ColibriV2GpuInfo memory{};
+    FlyweightV2GpuInfo memory{};
     if (gpu_probe(memory, 0) == 0 && memory.available && memory.free_memory) {
         // A margin, not a rounding error: the driver keeps its own allocations
         // in this pool and a slot that fits with nothing to spare would leave
@@ -6816,7 +7036,7 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
     }
     gpu.ready = true;
     std::fprintf(stderr,
-                 "[colibri-v2] bailingmoe3: %zu tensors resident on device, "
+                 "[flyweight] bailingmoe3: %zu tensors resident on device, "
                  "%zu sequence slot(s) at %llu MiB each\n",
                  gpu.owned.size(), gpu.slots.size(),
                  static_cast<unsigned long long>((per_slot + (1ull << 20) - 1) >> 20));
@@ -6842,7 +7062,7 @@ void bailing_gpu_prepare(ColibriV2BailingRuntime& runtime) {
 void bailing_gpu_bind_thread() {
     static thread_local bool bound = false;
     if (bound) return;
-    if (colibri_gpu_init(0) != 0)
+    if (flyweight_gpu_init(0) != 0)
         throw std::runtime_error("failed to bind CUDA context to this thread");
     bound = true;
 }
@@ -6863,7 +7083,7 @@ void bailing_gpu_bind_thread() {
 // One slot's cache, never all of them: with several sequences live, moving
 // somebody else's cache across would at best waste the bus and at worst
 // overwrite a sequence that is only paused.
-void bailing_cache_transfer(ColibriV2BailingRuntime& runtime,
+void bailing_cache_transfer(FlyweightV2BailingRuntime& runtime,
                             std::uint32_t slot_index, bool to_device) {
     if (!runtime.gpu || !runtime.gpu->ready) return;
     bailing_gpu_bind_thread();
@@ -6878,8 +7098,8 @@ void bailing_cache_transfer(ColibriV2BailingRuntime& runtime,
                     float* host, std::size_t elements) {
         if (!device || !elements) return;
         const std::uint64_t bytes = static_cast<std::uint64_t>(elements) * 4;
-        const int status = to_device ? colibri_gpu_upload(device, host, bytes, 0)
-                                     : colibri_gpu_download(host, device, bytes, 0);
+        const int status = to_device ? flyweight_gpu_upload(device, host, bytes, 0)
+                                     : flyweight_gpu_download(host, device, bytes, 0);
         if (status != 0)
             throw std::runtime_error(
                 std::string("bailing cache ") + (to_device ? "upload" : "download") +
@@ -6907,22 +7127,22 @@ void bailing_cache_transfer(ColibriV2BailingRuntime& runtime,
                  cache.value_window.data(), window);
         }
     }
-    if (colibri_gpu_sync() != 0)
+    if (flyweight_gpu_sync() != 0)
         throw std::runtime_error("bailing cache transfer failed to synchronize");
     slot.cache_on_device = to_device;
 }
 
-void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index,
+void bailing_gpu_step(FlyweightV2BailingRuntime& runtime, std::uint32_t slot_index,
                       std::uint32_t token, float* logits) {
-    namespace bailing = colibri::v2::bailing;
+    namespace bailing = flyweight::v2::bailing;
     bailing_gpu_bind_thread();
     auto& gpu = *runtime.gpu;
     auto& slot = runtime.slot(slot_index);
     auto& device_slot = gpu.slots[slot_index];
     const auto& g = runtime.geometry;
     const auto& c = runtime.model->config;
-    // Everything on the default stream. colibri_gpu_rms_norm and
-    // colibri_gpu_scaled_add take no stream argument and use the default one,
+    // Everything on the default stream. flyweight_gpu_rms_norm and
+    // flyweight_gpu_scaled_add take no stream argument and use the default one,
     // so issuing the matvecs and custom kernels on gpu.stream left the two
     // halves of every layer unordered with respect to each other -- which
     // produced finite but uncorrelated logits, the classic symptom.
@@ -6931,7 +7151,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
     const std::size_t qk = g.qk_nope + g.qk_rope;
     const std::size_t position = slot.position;
     const char* grouped_q6_env =
-        std::getenv("COLIBRI_BAILING_GROUPED_Q6_DECODE");
+        std::getenv("FLYWEIGHT_BAILING_GROUPED_Q6_DECODE");
     const bool grouped_q6 = !grouped_q6_env || grouped_q6_env[0] != '0';
 
     auto matvec = [&](const BailingGpuMatrix& w, std::uint64_t in, std::uint64_t out,
@@ -6947,23 +7167,23 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
     const bool timing = bailing::profiling();
     auto clock_now = []{ return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count(); };
-    double mark = timing ? (colibri_gpu_sync(), clock_now()) : 0.0;
+    double mark = timing ? (flyweight_gpu_sync(), clock_now()) : 0.0;
     auto stop = [&](double& bucket) {
         if (!timing) return;
-        colibri_gpu_sync();
+        flyweight_gpu_sync();
         const double now = clock_now();
         bucket += now - mark;
         mark = now;
     };
     auto launch = [&](const char* name, std::uint32_t grid, std::uint32_t block,
                       void** arguments) {
-        if (colibri_gpu_launch_named(name, grid, 1, block, 0, stream, arguments) != 0)
+        if (flyweight_gpu_launch_named(name, grid, 1, block, 0, stream, arguments) != 0)
             throw std::runtime_error(std::string("bailing GPU launch failed: ") + name);
     };
     auto launch_2d = [&](const char* name, std::uint32_t grid_x,
                          std::uint32_t grid_y, std::uint32_t block,
                          void** arguments) {
-        if (colibri_gpu_launch_named(name, grid_x, grid_y, block, 0, stream,
+        if (flyweight_gpu_launch_named(name, grid_x, grid_y, block, 0, stream,
                                      arguments) != 0)
             throw std::runtime_error(std::string("bailing GPU launch failed: ") + name);
     };
@@ -6982,12 +7202,12 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
         const auto& weights = runtime.layers[index];
         auto& L = gpu.layers[index];
         auto& S = device_slot.layers[index];
-        colibri_gpu_rms_norm(current, L.attn_norm, gpu.normalized,
+        flyweight_gpu_rms_norm(current, L.attn_norm, gpu.normalized,
                              static_cast<int>(g.hidden), g.epsilon, 0);
         if (weights.full_attention) {
             if (g.q_lora) {
                 matvec(L.q_a, gpu.normalized, gpu.wide_a, g.hidden, g.q_lora);
-                colibri_gpu_rms_norm(gpu.wide_a, L.q_a_norm, gpu.wide_b,
+                flyweight_gpu_rms_norm(gpu.wide_a, L.q_a_norm, gpu.wide_b,
                                      static_cast<int>(g.q_lora), g.epsilon, 0);
                 matvec(L.q_b, gpu.wide_b, gpu.wide_c, g.q_lora, g.heads * qk);
             } else {
@@ -6995,7 +7215,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
             }
             matvec(L.kv_a_mqa, gpu.normalized, gpu.wide_d, g.hidden,
                    g.kv_lora + g.qk_rope);
-            colibri_gpu_rms_norm(gpu.wide_d, L.kv_a_norm,
+            flyweight_gpu_rms_norm(gpu.wide_d, L.kv_a_norm,
                                  S.latents + position * g.kv_lora * 4,
                                  static_cast<int>(g.kv_lora), g.epsilon, 0);
             {
@@ -7038,13 +7258,13 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 int nope = static_cast<int>(g.qk_nope), rope = static_cast<int>(g.qk_rope);
                 int value_dim = static_cast<int>(g.v_head_dim);
                 int lora = static_cast<int>(g.kv_lora);
-                const char* tiled_env = std::getenv("COLIBRI_BAILING_MLA_TILED");
+                const char* tiled_env = std::getenv("FLYWEIGHT_BAILING_MLA_TILED");
                 const bool tiled = !tiled_env || tiled_env[0] != '0';
                 // Fused kernels read each latent cache row once for all heads
                 // instead of once per head; the per-head kernels remain the
                 // A/B fallback. "0" disables both, "s" fuses only the score
                 // phase, "a" only the accumulate phase, anything else both.
-                const char* fused_env = std::getenv("COLIBRI_BAILING_MLA_FUSED");
+                const char* fused_env = std::getenv("FLYWEIGHT_BAILING_MLA_FUSED");
                 const bool fused_scores =
                     !fused_env || (fused_env[0] != '0' && fused_env[0] != 'a');
                 const bool fused_accumulate =
@@ -7178,15 +7398,15 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
             matvec(L.ssm_out, gpu.wide_a, gpu.branch, channels, g.hidden);
             stop(bailing::profile().kda);
         }
-        colibri_gpu_scaled_add(gpu.branch, current, 1.0f, static_cast<int>(g.hidden));
-        colibri_gpu_rms_norm(gpu.branch, L.ffn_norm, gpu.normalized,
+        flyweight_gpu_scaled_add(gpu.branch, current, 1.0f, static_cast<int>(g.hidden));
+        flyweight_gpu_rms_norm(gpu.branch, L.ffn_norm, gpu.normalized,
                              static_cast<int>(g.hidden), g.epsilon, 0);
 
         if (weights.routed) {
             matvec(L.router, gpu.normalized, gpu.small, g.hidden, g.experts);
             std::vector<float> router_logits(g.experts);
-            colibri_gpu_sync();
-            colibri_gpu_download(router_logits.data(), gpu.small, g.experts * 4, 0);
+            flyweight_gpu_sync();
+            flyweight_gpu_download(router_logits.data(), gpu.small, g.experts * 4, 0);
             std::vector<std::int32_t> chosen(g.experts_used);
             std::vector<float> expert_weights(g.experts_used);
             bailing::moe_router(router_logits.data(),
@@ -7211,7 +7431,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 L.down_exps.type == expert_type;
             // q4k_grouped_accumulate does `output[row] += partial`, so the
             // target has to start at zero. Both paths need this.
-            colibri_gpu_memset(gpu.wide_d, 0, g.hidden * 4, stream);
+            flyweight_gpu_memset(gpu.wide_d, 0, g.hidden * 4, stream);
             if (grouped) {
                 const bool q6_grouped = expert_type == 14;
                 std::vector<std::uint64_t> gate_ptrs(g.experts_used),
@@ -7222,7 +7442,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                     up_ptrs[slot] = L.up_exps.data + expert * narrow;
                     down_ptrs[slot] = L.down_exps.data + expert * wide;
                 }
-                // One upload, not four. Each colibri_gpu_upload_sync blocks,
+                // One upload, not four. Each flyweight_gpu_upload_sync blocks,
                 // and four per MoE layer is 92 blocking transfers per token --
                 // measured at ~15us each, which was more than the expert
                 // matmuls they were feeding. The three pointer arrays and the
@@ -7236,7 +7456,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                             pointer_bytes);
                 std::memcpy(packed.data() + pointer_bytes * 3, expert_weights.data(),
                             g.experts_used * 4);
-                colibri_gpu_upload_sync(gpu.expert_gate_ptrs, packed.data(),
+                flyweight_gpu_upload_sync(gpu.expert_gate_ptrs, packed.data(),
                                         packed.size());
                 int inputs = static_cast<int>(g.hidden);
                 int outputs = static_cast<int>(g.expert_size);
@@ -7247,7 +7467,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 const char* swiglu_kernel = q6_grouped
                     ? "bailing_q6_grouped_swiglu_warp"
                     : "q4k_grouped_swiglu";
-                if (colibri_gpu_launch_named(swiglu_kernel,
+                if (flyweight_gpu_launch_named(swiglu_kernel,
                         static_cast<std::uint32_t>(q6_grouped
                             ? (g.expert_size + 7) / 8 : g.expert_size),
                         static_cast<std::uint32_t>(g.experts_used),
@@ -7263,7 +7483,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 const char* accumulate_kernel = q6_grouped
                     ? "bailing_q6_grouped_accumulate_warp"
                     : "q4k_grouped_accumulate";
-                if (colibri_gpu_launch_named(accumulate_kernel,
+                if (flyweight_gpu_launch_named(accumulate_kernel,
                         static_cast<std::uint32_t>(q6_grouped
                             ? (g.hidden + 7) / 8 : g.hidden),
                         1, q6_grouped ? 256 : 128, 0, stream,
@@ -7286,7 +7506,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                     launch("bailing_swiglu", 32, 256, arguments);
                 }
                 matvec(ed, gpu.wide_c, gpu.wide_b, g.expert_size, g.hidden);
-                colibri_gpu_scaled_add(gpu.wide_d, gpu.wide_b, expert_weights[slot],
+                flyweight_gpu_scaled_add(gpu.wide_d, gpu.wide_b, expert_weights[slot],
                                        static_cast<int>(g.hidden));
             }
             }
@@ -7298,7 +7518,7 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
                 void* arguments[] = {&gpu.wide_a, &gpu.wide_b, &size, &limit, &gpu.wide_c};
                 launch("bailing_swiglu", 32, 256, arguments);
                 matvec(L.shared_down, gpu.wide_c, gpu.wide_b, g.shared_size, g.hidden);
-                colibri_gpu_scaled_add(gpu.wide_d, gpu.wide_b, 1.0f,
+                flyweight_gpu_scaled_add(gpu.wide_d, gpu.wide_b, 1.0f,
                                        static_cast<int>(g.hidden));
             }
             int count = static_cast<int>(g.hidden);
@@ -7313,22 +7533,22 @@ void bailing_gpu_step(ColibriV2BailingRuntime& runtime, std::uint32_t slot_index
             launch("bailing_swiglu", 32, 256, arguments);
             matvec(L.down_exps, gpu.wide_c, next, g.dense_size, g.hidden);
         }
-        colibri_gpu_scaled_add(next, gpu.branch, 1.0f, static_cast<int>(g.hidden));
+        flyweight_gpu_scaled_add(next, gpu.branch, 1.0f, static_cast<int>(g.hidden));
         stop(bailing::profile().moe);
         std::swap(current, next);
     }
 
-    colibri_gpu_rms_norm(current, gpu.output_norm, gpu.normalized,
+    flyweight_gpu_rms_norm(current, gpu.output_norm, gpu.normalized,
                          static_cast<int>(g.hidden), g.epsilon, 0);
     matvec(gpu.head, gpu.normalized, gpu.logits, g.hidden, c.vocabulary_size);
     stop(bailing::profile().projections);   // reused bucket: the lm head
-    colibri_gpu_sync();
-    colibri_gpu_download(logits, gpu.logits, (std::size_t)c.vocabulary_size * 4, 0);
+    flyweight_gpu_sync();
+    flyweight_gpu_download(logits, gpu.logits, (std::size_t)c.vocabulary_size * 4, 0);
     if (timing) bailing::profile().tokens += 1;
     ++slot.position;
 }
 
-bool bailing_gpu_prefill_tiled_supported(const ColibriV2BailingRuntime& runtime) {
+bool bailing_gpu_prefill_tiled_supported(const FlyweightV2BailingRuntime& runtime) {
     if (!runtime.gpu || !runtime.gpu->ready) return false;
     // The direct expert kernels currently decode Q6_K. Dense row kernels exist
     // for the other formats, but mixing in a host MoE would defeat the purpose
@@ -7344,10 +7564,10 @@ bool bailing_gpu_prefill_tiled_supported(const ColibriV2BailingRuntime& runtime)
 }
 
 void bailing_gpu_prefill_tiled(
-    ColibriV2BailingRuntime& runtime, std::uint32_t slot_index,
+    FlyweightV2BailingRuntime& runtime, std::uint32_t slot_index,
     const std::uint32_t* tokens, std::uint32_t count, float* logits
 ) {
-    namespace bailing = colibri::v2::bailing;
+    namespace bailing = flyweight::v2::bailing;
     bailing_gpu_bind_thread();
     auto& gpu = *runtime.gpu;
     auto& slot = runtime.slot(slot_index);
@@ -7371,7 +7591,7 @@ void bailing_gpu_prefill_tiled(
     const int expert_size = static_cast<int>(g.expert_size);
     const int dense_size = static_cast<int>(g.dense_size);
     const float epsilon = g.epsilon;
-    const bool phase_profile = std::getenv("COLIBRI_BAILING_TILED_PROFILE") != nullptr;
+    const bool phase_profile = std::getenv("FLYWEIGHT_BAILING_TILED_PROFILE") != nullptr;
     double mla_seconds = 0.0, kda_seconds = 0.0;
     double mla_proj_seconds = 0.0, mla_scores_seconds = 0.0,
            mla_softmax_seconds = 0.0, mla_accumulate_seconds = 0.0,
@@ -7384,7 +7604,7 @@ void bailing_gpu_prefill_tiled(
     auto launch = [&](const char* name, std::uint32_t gx, std::uint32_t gy,
                       std::uint32_t block, void** args,
                       std::uint32_t shared = 0) {
-        if (colibri_gpu_launch_named(name, gx, gy, block, shared, stream, args) != 0)
+        if (flyweight_gpu_launch_named(name, gx, gy, block, shared, stream, args) != 0)
             throw std::runtime_error(std::string("bailing tiled prefill kernel failed: ") + name);
     };
     auto rows_kernel = [](std::uint32_t type) -> const char* {
@@ -7406,21 +7626,21 @@ void bailing_gpu_prefill_tiled(
             default: return nullptr;
         }
     };
-    const char* q8_prefill_env = std::getenv("COLIBRI_BAILING_Q8_PREFILL");
+    const char* q8_prefill_env = std::getenv("FLYWEIGHT_BAILING_Q8_PREFILL");
     const bool q8_prefill = !q8_prefill_env || q8_prefill_env[0] != '0';
-    const char* mmq_prefill_env = std::getenv("COLIBRI_BAILING_MMQ_PREFILL");
+    const char* mmq_prefill_env = std::getenv("FLYWEIGHT_BAILING_MMQ_PREFILL");
     const bool mmq_prefill = !mmq_prefill_env || mmq_prefill_env[0] != '0';
-    const char* fused_mla_env = std::getenv("COLIBRI_BAILING_FUSED_MLA");
+    const char* fused_mla_env = std::getenv("FLYWEIGHT_BAILING_FUSED_MLA");
     const bool fused_mla = fused_mla_env && fused_mla_env[0] == '1';
     // Head-fused quadratic phase: each latent row is read once for all heads
     // instead of once per head. Same switch as the decode-side fusion.
-    const char* fused_heads_env = std::getenv("COLIBRI_BAILING_MLA_FUSED");
+    const char* fused_heads_env = std::getenv("FLYWEIGHT_BAILING_MLA_FUSED");
     const bool fused_heads = !fused_heads_env || fused_heads_env[0] != '0';
-    const char* grouped_moe_env = std::getenv("COLIBRI_BAILING_GROUPED_PREFILL");
+    const char* grouped_moe_env = std::getenv("FLYWEIGHT_BAILING_GROUPED_PREFILL");
     const bool grouped_moe = !grouped_moe_env || grouped_moe_env[0] != '0';
-    const char* q8_expert_env = std::getenv("COLIBRI_BAILING_Q8_EXPERT_PREFILL");
+    const char* q8_expert_env = std::getenv("FLYWEIGHT_BAILING_Q8_EXPERT_PREFILL");
     const bool q8_expert_prefill = !q8_expert_env || q8_expert_env[0] != '0';
-    const char* mmq_expert_env = std::getenv("COLIBRI_BAILING_MMQ_EXPERT_PREFILL");
+    const char* mmq_expert_env = std::getenv("FLYWEIGHT_BAILING_MMQ_EXPERT_PREFILL");
     const bool mmq_expert_prefill =
         !mmq_expert_env || mmq_expert_env[0] != '0';
     std::uint64_t q8_cached_input = 0;
@@ -7472,7 +7692,7 @@ void bailing_gpu_prefill_tiled(
         launch("rms_norm_rows", rows, 1, 256, args);
     };
     auto add = [&](std::uint64_t target, std::uint64_t source, int elements) {
-        if (colibri_gpu_scaled_add(target, source, 1.0f, elements) != 0)
+        if (flyweight_gpu_scaled_add(target, source, 1.0f, elements) != 0)
             throw std::runtime_error("bailing tiled prefill residual add failed");
     };
 
@@ -7480,7 +7700,7 @@ void bailing_gpu_prefill_tiled(
         const int rows = static_cast<int>(std::min<std::uint32_t>(
             gpu.prefill_rows, count - offset));
         const int base_position = static_cast<int>(slot.position);
-        if (colibri_gpu_upload_sync(gpu.prefill_tokens, tokens + offset,
+        if (flyweight_gpu_upload_sync(gpu.prefill_tokens, tokens + offset,
                                     rows * sizeof(std::uint32_t)) != 0)
             throw std::runtime_error("bailing tiled prefill token upload failed");
         {
@@ -7534,7 +7754,7 @@ void bailing_gpu_prefill_tiled(
                 auto mla_mark = std::chrono::steady_clock::now();
                 auto mla_lap = [&](double& bucket) {
                     if (!phase_profile) return;
-                    colibri_gpu_sync();
+                    flyweight_gpu_sync();
                     const auto now = std::chrono::steady_clock::now();
                     bucket += std::chrono::duration<double>(now - mla_mark).count();
                     mla_mark = now;
@@ -7641,7 +7861,7 @@ void bailing_gpu_prefill_tiled(
             }
             add(gpu.prefill_branch, current, rows * hidden);
             if (phase_profile) {
-                colibri_gpu_sync();
+                flyweight_gpu_sync();
                 const double seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - attention_start).count();
                 (weights.full_attention ? mla_seconds : kda_seconds) += seconds;
@@ -7655,7 +7875,7 @@ void bailing_gpu_prefill_tiled(
                 matmul(layer.router, gpu.prefill_normalized,
                        gpu.prefill_router_logits, hidden, experts, rows);
                 if (phase_profile) {
-                    colibri_gpu_sync();
+                    flyweight_gpu_sync();
                     const auto now = std::chrono::steady_clock::now();
                     router_projection_seconds +=
                         std::chrono::duration<double>(now - moe_mark).count();
@@ -7663,7 +7883,7 @@ void bailing_gpu_prefill_tiled(
                 }
                 int normalize = g.normalize_weights ? 1 : 0;
                 const int max_routes = rows * top_k;
-                if (colibri_gpu_memset(gpu.prefill_expert_counts, 0,
+                if (flyweight_gpu_memset(gpu.prefill_expert_counts, 0,
                         static_cast<std::size_t>(experts) * sizeof(std::int32_t),
                         stream) != 0)
                     throw std::runtime_error(
@@ -7678,7 +7898,7 @@ void bailing_gpu_prefill_tiled(
                     &normalize, const_cast<float*>(&g.weight_scale)};
                 launch("bailing_route_rows", rows, 1, 256, route_args);
                 if (phase_profile) {
-                    colibri_gpu_sync();
+                    flyweight_gpu_sync();
                     const auto now = std::chrono::steady_clock::now();
                     router_selection_seconds +=
                         std::chrono::duration<double>(now - moe_mark).count();
@@ -7730,13 +7950,13 @@ void bailing_gpu_prefill_tiled(
                                expert_size, experts, 256, gate_args);
                     }
                     if (phase_profile) {
-                        colibri_gpu_sync();
+                        flyweight_gpu_sync();
                         const auto now = std::chrono::steady_clock::now();
                         expert_gate_seconds +=
                             std::chrono::duration<double>(now - moe_mark).count();
                         moe_mark = now;
                     }
-                    if (colibri_gpu_memset(next, 0,
+                    if (flyweight_gpu_memset(next, 0,
                             static_cast<std::size_t>(rows) * hidden * 4,
                             stream) != 0)
                         throw std::runtime_error(
@@ -7757,7 +7977,7 @@ void bailing_gpu_prefill_tiled(
                         launch("bailing_q6_expert_accumulate_grouped_rows",
                                hidden, experts, 256, down_args);
                     if (phase_profile) {
-                        colibri_gpu_sync();
+                        flyweight_gpu_sync();
                         const auto now = std::chrono::steady_clock::now();
                         expert_down_seconds +=
                             std::chrono::duration<double>(now - moe_mark).count();
@@ -7804,7 +8024,7 @@ void bailing_gpu_prefill_tiled(
                            hidden, rows);
                     add(next, gpu.prefill_wide_a, rows * hidden);
                     if (phase_profile) {
-                        colibri_gpu_sync();
+                        flyweight_gpu_sync();
                         const auto now = std::chrono::steady_clock::now();
                         shared_expert_seconds +=
                             std::chrono::duration<double>(now - moe_mark).count();
@@ -7827,7 +8047,7 @@ void bailing_gpu_prefill_tiled(
             }
             add(next, gpu.prefill_branch, rows * hidden);
             if (phase_profile) {
-                colibri_gpu_sync();
+                flyweight_gpu_sync();
                 const double seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - ffn_start).count();
                 (weights.routed ? routed_seconds : dense_seconds) += seconds;
@@ -7838,15 +8058,15 @@ void bailing_gpu_prefill_tiled(
         if (offset + rows == count) {
             std::uint64_t last = current +
                 static_cast<std::uint64_t>(rows - 1) * g.hidden * 4;
-            if (colibri_gpu_rms_norm(last, gpu.output_norm, gpu.normalized,
+            if (flyweight_gpu_rms_norm(last, gpu.output_norm, gpu.normalized,
                                      hidden, epsilon, 0) != 0)
                 throw std::runtime_error("bailing tiled prefill output norm failed");
             if (qwen_gpu_matvec_by_type(gpu.head.type, gpu.head.data,
                     gpu.normalized, gpu.logits, hidden,
                     static_cast<int>(c.vocabulary_size), stream) != 0)
                 throw std::runtime_error("bailing tiled prefill LM head failed");
-            colibri_gpu_sync();
-            if (colibri_gpu_download(logits, gpu.logits,
+            flyweight_gpu_sync();
+            if (flyweight_gpu_download(logits, gpu.logits,
                     static_cast<std::size_t>(c.vocabulary_size) * 4, stream) != 0)
                 throw std::runtime_error("bailing tiled prefill logits download failed");
         }
@@ -7869,16 +8089,16 @@ void bailing_gpu_prefill_tiled(
     slot.cache_on_device = true;
 }
 
-int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capacity,
+int flyweight_v2_bailing_create_slots(const FlyweightV2Model* model, uint32_t capacity,
                                     uint32_t slots,
-                                    ColibriV2BailingRuntime** out) {
+                                    FlyweightV2BailingRuntime** out) {
     return guarded([&]{
     if(!model||!out||!capacity||!slots)throw std::runtime_error("invalid bailing runtime arguments");
     if(model->architecture!="bailingmoe3")
         throw std::runtime_error("model architecture is not bailingmoe3");
-    namespace bailing = colibri::v2::bailing;
+    namespace bailing = flyweight::v2::bailing;
     const auto& c = model->config;
-    auto runtime = std::make_unique<ColibriV2BailingRuntime>();
+    auto runtime = std::make_unique<FlyweightV2BailingRuntime>();
     runtime->model = model;
     runtime->capacity = capacity;
     runtime->slots.resize(slots);
@@ -7955,7 +8175,7 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
                 const auto packed = bailing_matrix(*model, prefix + "attn_kv_b.weight");
                 const std::size_t rows = g.heads * (g.qk_nope + g.v_head_dim);
                 runtime->decoded_kv_b[index].resize(rows * g.kv_lora);
-                colibri::v2::bailing::matrix_decode(
+                flyweight::v2::bailing::matrix_decode(
                     packed, g.kv_lora, rows, runtime->decoded_kv_b[index].data());
                 w.mla.kv_b = runtime->decoded_kv_b[index].data();
             }
@@ -8027,7 +8247,7 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
             const auto packed = bailing_matrix(*model, prefix + "attn_kv_b.weight");
             const std::size_t rows = g.heads * (g.qk_nope + g.v_head_dim);
             d.decoded_kv_b.resize(rows * g.kv_lora);
-            colibri::v2::bailing::matrix_decode(
+            flyweight::v2::bailing::matrix_decode(
                 packed, g.kv_lora, rows, d.decoded_kv_b.data());
             w.mla.kv_b = d.decoded_kv_b.data();
         }
@@ -8067,17 +8287,17 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
     // which cost about half the prefill rate -- so on a long prompt with a
     // short answer the GPU lost overall, and defaulting to it would have been a
     // regression. Now the host keeps its batched prefill and the device only
-    // takes decode (see colibri_v2_bailing_eval), so the device path is no
+    // takes decode (see flyweight_v2_bailing_eval), so the device path is no
     // longer worse at anything: measured 155 vs 158 tok/s prefill, and decode
     // from 44 to 172 tok/s at Q6_K. There is nothing left for the caller to
     // trade off, so there is nothing left to ask them.
     //
-    // `COLIBRI_BAILING_GPU=0` still forces the host path, which is what makes
+    // `FLYWEIGHT_BAILING_GPU=0` still forces the host path, which is what makes
     // the two comparable -- and the host path remains the correctness oracle.
-    const char* want_gpu = std::getenv("COLIBRI_BAILING_GPU");
+    const char* want_gpu = std::getenv("FLYWEIGHT_BAILING_GPU");
     const bool forced_off = want_gpu && want_gpu[0]=='0';
     const bool forced_on = want_gpu && want_gpu[0]=='1';
-    if(!forced_off && (forced_on || colibri_v2_gpu_available()==1)){
+    if(!forced_off && (forced_on || flyweight_v2_gpu_available()==1)){
         // Preparation compiles the kernel corpus and uploads every weight, and
         // it can fail for reasons that are not the caller's problem -- no
         // driver, no nvrtc, not enough VRAM for this model. Falling back to the
@@ -8095,13 +8315,13 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
             // the fallback host runtime share the card with several gigabytes
             // of nothing.
             if(runtime->gpu){
-                for(const auto pointer:runtime->gpu->owned)colibri_gpu_free(pointer);
+                for(const auto pointer:runtime->gpu->owned)flyweight_gpu_free(pointer);
                 runtime->gpu->owned.clear();
             }
             if(forced_on) throw;
             runtime->gpu.reset();
             std::fprintf(stderr,
-                "[colibri-v2] bailingmoe3: staying on the host path (%s)\n",
+                "[flyweight] bailingmoe3: staying on the host path (%s)\n",
                 failure.what());
         }
     }
@@ -8111,39 +8331,39 @@ int colibri_v2_bailing_create_slots(const ColibriV2Model* model, uint32_t capaci
 
 // The single-sequence spelling, which is what every existing caller wants and
 // is exactly one slot.
-int colibri_v2_bailing_create(const ColibriV2Model* model, uint32_t capacity,
-                              ColibriV2BailingRuntime** out) {
-    return colibri_v2_bailing_create_slots(model, capacity, 1, out);
+int flyweight_v2_bailing_create(const FlyweightV2Model* model, uint32_t capacity,
+                              FlyweightV2BailingRuntime** out) {
+    return flyweight_v2_bailing_create_slots(model, capacity, 1, out);
 }
 
-int colibri_v2_bailing_slot_count(ColibriV2BailingRuntime* runtime, uint32_t* out){
+int flyweight_v2_bailing_slot_count(FlyweightV2BailingRuntime* runtime, uint32_t* out){
     return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid bailing slot count arguments");
     *out = static_cast<std::uint32_t>(runtime->slots.size());
     return 0; });
 }
 
-void colibri_v2_bailing_destroy(ColibriV2BailingRuntime* runtime){
+void flyweight_v2_bailing_destroy(FlyweightV2BailingRuntime* runtime){
     try{
-        if(colibri::v2::bailing::profiling())
-            colibri::v2::bailing::profile().report(stderr);
+        if(flyweight::v2::bailing::profiling())
+            flyweight::v2::bailing::profile().report(stderr);
         if(runtime&&runtime->gpu){
-            for(const auto pointer:runtime->gpu->owned)colibri_gpu_free(pointer);
+            for(const auto pointer:runtime->gpu->owned)flyweight_gpu_free(pointer);
             runtime->gpu->owned.clear();
         }
         delete runtime;
     }catch(...){}
 }
 
-int colibri_v2_bailing_reset_slot(ColibriV2BailingRuntime* runtime, uint32_t slot_index){
+int flyweight_v2_bailing_reset_slot(FlyweightV2BailingRuntime* runtime, uint32_t slot_index){
     return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid bailing runtime");
     auto& slot = runtime->slot(slot_index);
     for(std::size_t index=0;index<runtime->layers.size();++index)
-        colibri::v2::bailing::reset_cache(slot.caches[index],
+        flyweight::v2::bailing::reset_cache(slot.caches[index],
             runtime->layers[index], runtime->geometry, runtime->capacity);
     if(runtime->draft.available){
-        colibri::v2::bailing::reset_cache(slot.draft_cache,
+        flyweight::v2::bailing::reset_cache(slot.draft_cache,
             runtime->draft.layer, runtime->geometry, runtime->capacity);
         slot.has_target_hidden = false;
     }
@@ -8167,19 +8387,19 @@ int colibri_v2_bailing_reset_slot(ColibriV2BailingRuntime* runtime, uint32_t slo
         const std::size_t channels = g.heads * g.head_dim;
         for(auto& layer : runtime->gpu->slots[slot_index].layers){
             if(layer.state)
-                colibri_gpu_memset(layer.state, 0,
+                flyweight_gpu_memset(layer.state, 0,
                     channels * g.head_dim * 4, 0);
             if(layer.conv_windows)
-                colibri_gpu_memset(layer.conv_windows, 0,
+                flyweight_gpu_memset(layer.conv_windows, 0,
                     3 * channels * (g.conv_width - 1) * 4, 0);
             if(layer.latents)
-                colibri_gpu_memset(layer.latents, 0,
+                flyweight_gpu_memset(layer.latents, 0,
                     static_cast<std::size_t>(runtime->capacity) * g.kv_lora * 4, 0);
             if(layer.rope_keys)
-                colibri_gpu_memset(layer.rope_keys, 0,
+                flyweight_gpu_memset(layer.rope_keys, 0,
                     static_cast<std::size_t>(runtime->capacity) * g.qk_rope * 4, 0);
         }
-        colibri_gpu_sync();
+        flyweight_gpu_sync();
     }
     // Both copies are now zero, so neither is stale and the host one is as good
     // a starting point as the other. Saying so avoids a pointless transfer on
@@ -8189,11 +8409,11 @@ int colibri_v2_bailing_reset_slot(ColibriV2BailingRuntime* runtime, uint32_t slo
     return 0; });
 }
 
-int colibri_v2_bailing_reset(ColibriV2BailingRuntime* runtime){
-    return colibri_v2_bailing_reset_slot(runtime, 0);
+int flyweight_v2_bailing_reset(FlyweightV2BailingRuntime* runtime){
+    return flyweight_v2_bailing_reset_slot(runtime, 0);
 }
 
-int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot_index,
+int flyweight_v2_bailing_eval_slot(FlyweightV2BailingRuntime* runtime, uint32_t slot_index,
                                  const uint32_t* tokens, uint32_t count,
                                  float* logits){
     return guarded([&]{
@@ -8225,7 +8445,7 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
     // fresh prompts, however; after the tiled device MLA landed, the fully
     // resident token loop wins beyond a conservative 4096-token crossover
     // (measured at 8871: 96.5 vs 56.7 tok/s on Q6_K). Use that automatically.
-    // COLIBRI_BAILING_GPU_PREFILL=0/1 forces either side for reproducible A/B.
+    // FLYWEIGHT_BAILING_GPU_PREFILL=0/1 forces either side for reproducible A/B.
     //
     // The hazard this replaces: the host and device caches are SEPARATE, and an
     // earlier version routed prefill to the host and decode to the device with
@@ -8236,7 +8456,7 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
     // same path; only a server sending a whole prompt at once splits them.
     // Hence `cache_on_device`: the transfer is not optional and not inferred
     // from the call, it is tracked.
-    const char* tiled_prefill_env = std::getenv("COLIBRI_BAILING_TILED_PREFILL");
+    const char* tiled_prefill_env = std::getenv("FLYWEIGHT_BAILING_TILED_PREFILL");
     const bool tiled_prefill = !tiled_prefill_env ||
         tiled_prefill_env[0] != '0';
     if (count > 1 && tiled_prefill &&
@@ -8246,7 +8466,7 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
         if(watched) bailing_progress(*runtime, count, count);
         return 0;
     }
-    const char* gpu_prefill_env = std::getenv("COLIBRI_BAILING_GPU_PREFILL");
+    const char* gpu_prefill_env = std::getenv("FLYWEIGHT_BAILING_GPU_PREFILL");
     const bool gpu_prefill = gpu_prefill_env
         ? gpu_prefill_env[0] == '1'
         : count >= 4096;
@@ -8275,27 +8495,27 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
     // same path and degrades to the single-token one inside.
     std::vector<float> current(static_cast<std::size_t>(count) * g.hidden);
     std::vector<float> next(static_cast<std::size_t>(count) * g.hidden);
-    if(colibri::v2::bailing::profiling())
-        colibri::v2::bailing::profile().positions += count;
+    if(flyweight::v2::bailing::profiling())
+        flyweight::v2::bailing::profile().positions += count;
     {
-    colibri::v2::bailing::ProfileScope gather(
-        colibri::v2::bailing::profile().embedding);
+    flyweight::v2::bailing::ProfileScope gather(
+        flyweight::v2::bailing::profile().embedding);
     for(std::uint32_t index=0;index<count;++index){
         const std::uint32_t token = tokens[index];
         if(token >= c.vocabulary_size)
             throw std::runtime_error("token id is outside the vocabulary");
-        const auto stride = colibri::v2::bailing::row_bytes(
+        const auto stride = flyweight::v2::bailing::row_bytes(
             runtime->embedding_matrix.type, g.hidden);
         const auto* base = reinterpret_cast<const std::uint8_t*>(
             runtime->embedding_matrix.data);
-        colibri::v2::bailing::row_decode(base + static_cast<std::size_t>(token)*stride,
+        flyweight::v2::bailing::row_decode(base + static_cast<std::size_t>(token)*stride,
             runtime->embedding_matrix.type, g.hidden,
             current.data() + static_cast<std::size_t>(index) * g.hidden);
     }
     }
     const std::size_t depth = runtime->layers.size();
     for(std::size_t layer=0;layer<depth;++layer){
-        colibri::v2::bailing::decoder_layer_batch(
+        flyweight::v2::bailing::decoder_layer_batch(
             current.data(), count, runtime->layers[layer], g, slot.position,
             slot.caches[layer], next.data());
         current.swap(next);
@@ -8326,21 +8546,21 @@ int colibri_v2_bailing_eval_slot(ColibriV2BailingRuntime* runtime, uint32_t slot
     // to advance the caches.
     std::vector<float> normalized(g.hidden);
     {
-    colibri::v2::bailing::ProfileScope stage(
-        colibri::v2::bailing::profile().head);
+    flyweight::v2::bailing::ProfileScope stage(
+        flyweight::v2::bailing::profile().head);
     const float* last = current.data() + static_cast<std::size_t>(count - 1) * g.hidden;
-    colibri::v2::bailing::rms_norm(last, runtime->output_norm, g.hidden,
+    flyweight::v2::bailing::rms_norm(last, runtime->output_norm, g.hidden,
                                    g.epsilon, normalized.data());
-    colibri::v2::bailing::matvec(runtime->head, normalized.data(), g.hidden,
+    flyweight::v2::bailing::matvec(runtime->head, normalized.data(), g.hidden,
                                  c.vocabulary_size, logits);
     }
     if(watched) bailing_progress(*runtime, count, count);
     return 0; });
 }
 
-int colibri_v2_bailing_eval(ColibriV2BailingRuntime* runtime, const uint32_t* tokens,
+int flyweight_v2_bailing_eval(FlyweightV2BailingRuntime* runtime, const uint32_t* tokens,
                             uint32_t count, float* logits){
-    return colibri_v2_bailing_eval_slot(runtime, 0, tokens, count, logits);
+    return flyweight_v2_bailing_eval_slot(runtime, 0, tokens, count, logits);
 }
 
 // --- bailingmoe3 MTP (host path) -------------------------------------------
@@ -8364,10 +8584,10 @@ static std::uint32_t bailing_argmax(const float* values, std::size_t count) {
 // -- normalized embedding first, normalized hidden second -- matches the qwen
 // draft and the converter both nextn layouts came from.
 static void bailing_mtp_draft_layer(
-    ColibriV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t token,
+    FlyweightV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t token,
     const float* previous_hidden, float* hidden_out
 ) {
-    namespace bailing = colibri::v2::bailing;
+    namespace bailing = flyweight::v2::bailing;
     const auto& g = runtime.geometry;
     const auto& c = runtime.model->config;
     if (token >= c.vocabulary_size)
@@ -8392,10 +8612,10 @@ static void bailing_mtp_draft_layer(
 }
 
 static std::uint32_t bailing_mtp_draft(
-    ColibriV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t token,
+    FlyweightV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t token,
     const float* previous_hidden, float* hidden_out
 ) {
-    namespace bailing = colibri::v2::bailing;
+    namespace bailing = flyweight::v2::bailing;
     const auto& g = runtime.geometry;
     const auto& c = runtime.model->config;
     bailing_mtp_draft_layer(runtime, slot, token, previous_hidden, hidden_out);
@@ -8413,11 +8633,11 @@ static std::uint32_t bailing_mtp_draft(
 // the caller rolls back on rejection. `hiddens` receives count x hidden
 // pre-norm rows.
 static void bailing_mtp_verify_rows(
-    ColibriV2BailingRuntime& runtime, BailingSlot& slot,
+    FlyweightV2BailingRuntime& runtime, BailingSlot& slot,
     const std::uint32_t* tokens, std::uint32_t count,
     std::uint32_t* winners, float* hiddens
 ) {
-    namespace bailing = colibri::v2::bailing;
+    namespace bailing = flyweight::v2::bailing;
     const auto& g = runtime.geometry;
     const auto& c = runtime.model->config;
     if (slot.position + count > runtime.capacity)
@@ -8481,7 +8701,7 @@ static void bailing_mtp_verify_rows(
 // (restore=true). MLA caches need no copy: their rows are position-indexed,
 // so rollback is truncating `positions`.
 static void bailing_mtp_snapshot(
-    ColibriV2BailingRuntime& runtime, BailingSlot& slot, bool restore
+    FlyweightV2BailingRuntime& runtime, BailingSlot& slot, bool restore
 ) {
     const std::size_t depth = runtime.layers.size();
     if (slot.mtp_state.size() != depth) {
@@ -8509,9 +8729,9 @@ static void bailing_mtp_snapshot(
 // batch's own state after `rows` tokens, bit for bit. The gate and output
 // are not replayed: they never touch state.
 static void bailing_mtp_fold(
-    ColibriV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t rows
+    FlyweightV2BailingRuntime& runtime, BailingSlot& slot, std::uint32_t rows
 ) {
-    namespace bailing = colibri::v2::bailing;
+    namespace bailing = flyweight::v2::bailing;
     const auto& g = runtime.geometry;
     const std::size_t channels = g.heads * g.head_dim;
     std::vector<float> qc(rows * channels), kc(rows * channels),
@@ -8543,14 +8763,14 @@ static void bailing_mtp_fold(
     }
 }
 
-int colibri_v2_bailing_mtp_available(ColibriV2BailingRuntime* runtime, int* out){
+int flyweight_v2_bailing_mtp_available(FlyweightV2BailingRuntime* runtime, int* out){
     return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid bailing MTP arguments");
     *out = runtime->draft.available ? 1 : 0;
     return 0; });
 }
 
-int colibri_v2_bailing_mtp_stats(ColibriV2BailingRuntime* runtime,
+int flyweight_v2_bailing_mtp_stats(FlyweightV2BailingRuntime* runtime,
                                  uint64_t* drafted, uint64_t* accepted,
                                  uint64_t* rejected){
     return guarded([&]{
@@ -8568,7 +8788,7 @@ int colibri_v2_bailing_mtp_stats(ColibriV2BailingRuntime* runtime,
 // one token. The caller feeds the LAST emitted token back as the next round's
 // `next_token`. Host path only: the slot's cache is pulled back from the
 // device if a GPU decode left it there.
-int colibri_v2_bailing_mtp_round(ColibriV2BailingRuntime* runtime,
+int flyweight_v2_bailing_mtp_round(FlyweightV2BailingRuntime* runtime,
                                  uint32_t slot_index, uint32_t next_token,
                                  uint32_t wanted, uint32_t* out_tokens,
                                  uint32_t* out_count){
@@ -8589,7 +8809,7 @@ int colibri_v2_bailing_mtp_round(ColibriV2BailingRuntime* runtime,
     // The draft cache is context-sized and never rewound; recycle it when the
     // round would overflow. The cost is a few poor drafts, not a wrong answer.
     if(slot.draft_cache.positions + wanted + 1 > runtime->capacity)
-        colibri::v2::bailing::reset_cache(slot.draft_cache, runtime->draft.layer,
+        flyweight::v2::bailing::reset_cache(slot.draft_cache, runtime->draft.layer,
                                           g, runtime->capacity);
     const auto draft_base = slot.draft_cache.positions;
     std::array<std::uint32_t, 8> drafts{};
@@ -8648,7 +8868,7 @@ int colibri_v2_bailing_mtp_round(ColibriV2BailingRuntime* runtime,
     return 0; });
 }
 
-int colibri_v2_bailing_uses_gpu(ColibriV2BailingRuntime* runtime, int* out){
+int flyweight_v2_bailing_uses_gpu(FlyweightV2BailingRuntime* runtime, int* out){
     return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid bailing uses-gpu arguments");
     // `gpu` is allocated before preparation and kept afterwards even when
@@ -8658,7 +8878,7 @@ int colibri_v2_bailing_uses_gpu(ColibriV2BailingRuntime* runtime, int* out){
     return 0; });
 }
 
-int colibri_v2_bailing_set_progress(ColibriV2BailingRuntime* runtime,
+int flyweight_v2_bailing_set_progress(FlyweightV2BailingRuntime* runtime,
                                     int (*callback)(void*, uint32_t, uint32_t),
                                     void* user){
     return guarded([&]{
@@ -8702,7 +8922,7 @@ static const std::uint32_t kBailingCacheVersion = 1;
 // How many bytes of cache a sequence of `position` tokens occupies. MLA layers
 // grow with the sequence; KDA layers are a fixed recurrent state and three
 // convolution windows however long the sequence is.
-std::uint64_t bailing_cache_payload_bytes(const ColibriV2BailingRuntime& runtime,
+std::uint64_t bailing_cache_payload_bytes(const FlyweightV2BailingRuntime& runtime,
                                           std::uint64_t position) {
     const auto& g = runtime.geometry;
     const std::uint64_t channels = static_cast<std::uint64_t>(g.heads) * g.head_dim;
@@ -8715,7 +8935,7 @@ std::uint64_t bailing_cache_payload_bytes(const ColibriV2BailingRuntime& runtime
     return bytes;
 }
 
-int colibri_v2_bailing_cache_save_slot(ColibriV2BailingRuntime* runtime,
+int flyweight_v2_bailing_cache_save_slot(FlyweightV2BailingRuntime* runtime,
                                        uint32_t slot_index, void* buffer,
                                        uint64_t capacity, uint64_t* length){
     return guarded([&]{
@@ -8786,12 +9006,12 @@ int colibri_v2_bailing_cache_save_slot(ColibriV2BailingRuntime* runtime,
     return 0; });
 }
 
-int colibri_v2_bailing_cache_save(ColibriV2BailingRuntime* runtime, void* buffer,
+int flyweight_v2_bailing_cache_save(FlyweightV2BailingRuntime* runtime, void* buffer,
                                   uint64_t capacity, uint64_t* length){
-    return colibri_v2_bailing_cache_save_slot(runtime, 0, buffer, capacity, length);
+    return flyweight_v2_bailing_cache_save_slot(runtime, 0, buffer, capacity, length);
 }
 
-int colibri_v2_bailing_cache_load_slot(ColibriV2BailingRuntime* runtime,
+int flyweight_v2_bailing_cache_load_slot(FlyweightV2BailingRuntime* runtime,
                                        uint32_t slot_index, const void* buffer,
                                        uint64_t length){
     return guarded([&]{
@@ -8874,9 +9094,9 @@ int colibri_v2_bailing_cache_load_slot(ColibriV2BailingRuntime* runtime,
     return 0; });
 }
 
-int colibri_v2_bailing_cache_load(ColibriV2BailingRuntime* runtime,
+int flyweight_v2_bailing_cache_load(FlyweightV2BailingRuntime* runtime,
                                   const void* buffer, uint64_t length){
-    return colibri_v2_bailing_cache_load_slot(runtime, 0, buffer, length);
+    return flyweight_v2_bailing_cache_load_slot(runtime, 0, buffer, length);
 }
 
 // The names offered, best-compression first, which is also the order a menu
@@ -8886,10 +9106,10 @@ static const char* const kHfQuantNames[] = {
     "IQ2_XS","Q2_K","IQ3_XXS","Q3_K","IQ4_XS","Q4_K","Q5_K","Q6_K","Q8_0",
     "F32"};
 
-int colibri_v2_hf_quant_options(const char* directory,
-    ColibriV2HfQuantOption* out, std::uint32_t capacity, std::uint32_t* count
+int flyweight_v2_hf_quant_options(const char* directory,
+    FlyweightV2HfQuantOption* out, std::uint32_t capacity, std::uint32_t* count
 ) { return guarded([&]{
-    namespace hf = colibri::v2::hf;
+    namespace hf = flyweight::v2::hf;
     if(!directory||!out||!count)
         throw std::runtime_error("directory, output and count are required");
     const std::size_t options=sizeof(kHfQuantNames)/sizeof(kHfQuantNames[0]);
@@ -8900,20 +9120,20 @@ int colibri_v2_hf_quant_options(const char* directory,
     const std::string folder=directory;
     const auto config_text=read_text_file(folder+"/config.json");
     if(config_text.empty())throw std::runtime_error("cannot read config.json");
-    const auto config=hf::config_from_json(colibri::v2::json::parse(config_text));
+    const auto config=hf::config_from_json(flyweight::v2::json::parse(config_text));
     const auto files=hf_shard_files(folder);
     const auto sources=hf_cache_sources(files);
 
     // Headers only. parse_header touches the JSON at the front of each shard;
     // the weights behind it are mapped but never faulted in, so this stays a
     // metadata read even on a 52 GiB checkpoint.
-    std::vector<std::unique_ptr<ColibriV2Model>> mappings;
+    std::vector<std::unique_ptr<FlyweightV2Model>> mappings;
     std::vector<hf::Shard> parsed;
     parsed.reserve(files.size());
     for(const auto& file:files){
-        auto shard=std::make_unique<ColibriV2Model>();
+        auto shard=std::make_unique<FlyweightV2Model>();
         map_file(file.c_str(),*shard);
-        parsed.push_back({colibri::v2::safetensors::parse_header(shard->data,shard->size),
+        parsed.push_back({flyweight::v2::safetensors::parse_header(shard->data,shard->size),
                           shard->data});
         mappings.push_back(std::move(shard));
     }
@@ -8959,9 +9179,9 @@ int colibri_v2_hf_quant_options(const char* directory,
     *count=static_cast<std::uint32_t>(options);
     return 0; }); }
 
-int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guarded([&]{
+int flyweight_v2_model_open(const char* path, FlyweightV2Model** out) { return guarded([&]{
     if(!path||!out) throw std::runtime_error("path and output are required");
-    auto m=std::make_unique<ColibriV2Model>();
+    auto m=std::make_unique<FlyweightV2Model>();
     if(is_hf_directory(path)){
         load_hf(path,*m);
     }else{
@@ -8975,13 +9195,13 @@ int colibri_v2_model_open(const char* path, ColibriV2Model** out) { return guard
         }
     }
     *out=m.release(); return 0; }); }
-int colibri_v2_model_attach_mtp(ColibriV2Model* m,const char*path){return guarded([&]{
+int flyweight_v2_model_attach_mtp(FlyweightV2Model* m,const char*path){return guarded([&]{
     if(!m||!path||!path[0])throw std::runtime_error("model and MTP sidecar path are required");
     if(m->mtp_sidecar)throw std::runtime_error("an MTP sidecar is already attached");
-    ColibriV2Model*opened=nullptr;
-    if(colibri_v2_model_open(path,&opened)!=0)
+    FlyweightV2Model*opened=nullptr;
+    if(flyweight_v2_model_open(path,&opened)!=0)
         throw std::runtime_error(error.empty()?"failed to open MTP sidecar":error);
-    std::unique_ptr<ColibriV2Model>sidecar(opened);
+    std::unique_ptr<FlyweightV2Model>sidecar(opened);
     if(sidecar->mtp_layer==std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("MTP sidecar has no draft block");
     if(m->mtp_layer!=std::numeric_limits<std::uint32_t>::max()&&
@@ -9028,10 +9248,10 @@ int colibri_v2_model_attach_mtp(ColibriV2Model* m,const char*path){return guarde
     m->mtp_sidecar=std::move(sidecar);
     return 0;
 });}
-void colibri_v2_model_close(ColibriV2Model* m) { try{delete m;}catch(...){} }
-int colibri_v2_model_info(const ColibriV2Model* m, ColibriV2ModelInfo* out) { return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model info handle"); std::memset(out,0,sizeof(*out));out->gguf_version=m->version;out->tensor_count=m->tensor_count();out->metadata_count=m->metadata;out->file_size=m->size;out->alignment=m->alignment;copy_text(out->architecture,sizeof(out->architecture),m->architecture);copy_text(out->name,sizeof(out->name),m->name);copy_text(out->format,sizeof(out->format),m->format());return 0;}); }
-int colibri_v2_model_chat_template(const ColibriV2Model* m,char*out,uint64_t capacity,uint64_t*length){return guarded([&]{if(!m||!length)throw std::runtime_error("invalid model chat-template arguments");*length=static_cast<uint64_t>(m->chat_template.size());if(!out||capacity==0)return 0;if(capacity<=m->chat_template.size())throw std::runtime_error("chat-template output buffer is too small");std::memcpy(out,m->chat_template.data(),m->chat_template.size());out[m->chat_template.size()]=0;return 0;});}
-int colibri_v2_model_config(const ColibriV2Model* m, ColibriV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;out->eos_token_id=m->config.eos_token_id;out->eot_token_id=m->config.eot_token_id;out->bos_token_id=m->config.bos_token_id;
+void flyweight_v2_model_close(FlyweightV2Model* m) { try{delete m;}catch(...){} }
+int flyweight_v2_model_info(const FlyweightV2Model* m, FlyweightV2ModelInfo* out) { return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model info handle"); std::memset(out,0,sizeof(*out));out->gguf_version=m->version;out->tensor_count=m->tensor_count();out->metadata_count=m->metadata;out->file_size=m->size;out->alignment=m->alignment;copy_text(out->architecture,sizeof(out->architecture),m->architecture);copy_text(out->name,sizeof(out->name),m->name);copy_text(out->format,sizeof(out->format),m->format());return 0;}); }
+int flyweight_v2_model_chat_template(const FlyweightV2Model* m,char*out,uint64_t capacity,uint64_t*length){return guarded([&]{if(!m||!length)throw std::runtime_error("invalid model chat-template arguments");*length=static_cast<uint64_t>(m->chat_template.size());if(!out||capacity==0)return 0;if(capacity<=m->chat_template.size())throw std::runtime_error("chat-template output buffer is too small");std::memcpy(out,m->chat_template.data(),m->chat_template.size());out[m->chat_template.size()]=0;return 0;});}
+int flyweight_v2_model_config(const FlyweightV2Model* m, FlyweightV2ModelConfig* out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model config handle");std::memset(out,0,sizeof(*out));copy_text(out->architecture,sizeof(out->architecture),m->config.architecture);out->hidden_size=m->config.hidden_size;out->layer_count=m->config.layer_count;out->attention_heads=m->config.attention_heads;out->attention_kv_heads=m->config.attention_kv_heads;out->context_length=m->config.context_length;out->intermediate_size=m->config.intermediate_size;out->expert_count=m->config.expert_count;out->expert_used_count=m->config.expert_used_count;out->vocabulary_size=m->config.vocabulary_size;out->rotary_dimension=m->config.rotary_dimension;out->full_attention_interval=m->config.full_attention_interval;out->sliding_window=m->config.sliding_window;out->sliding_window_pattern_length=static_cast<uint32_t>(m->config.sliding_window_pattern.size());out->rms_norm_epsilon=m->config.rms_norm_epsilon;out->rope_freq_base=m->config.rope_freq_base;out->eos_token_id=m->config.eos_token_id;out->eot_token_id=m->config.eot_token_id;out->bos_token_id=m->config.bos_token_id;
 out->q_lora_rank=m->config.q_lora_rank;out->kv_lora_rank=m->config.kv_lora_rank;out->output_lora_rank=m->config.output_lora_rank;out->output_group_count=m->config.output_group_count;
 out->indexer_head_count=m->config.indexer_head_count;out->indexer_key_length=m->config.indexer_key_length;out->indexer_top_k=m->config.indexer_top_k;
 out->hyper_connection_count=m->config.hyper_connection_count;out->sinkhorn_iterations=m->config.sinkhorn_iterations;
@@ -9049,8 +9269,8 @@ out->final_logit_softcap=m->config.final_logit_softcap;return 0;});}
 // Multiply a model tensor by a vector, decoding whatever weight type the
 // checkpoint stores it as. GGUF reports a matrix as [inputs, outputs], so
 // `output_size` rows are each a dot product over `input_size` elements.
-int colibri_v2_matvec(
-    const ColibriV2Model* m, const char* name, const float* input,
+int flyweight_v2_matvec(
+    const FlyweightV2Model* m, const char* name, const float* input,
     int32_t input_size, float* output, int32_t output_size
 ){return guarded([&]{
     if(!m||!name||!input||!output)throw std::runtime_error("matvec arguments are required");
@@ -9072,7 +9292,7 @@ int colibri_v2_matvec(
 // RMS normalization over `count` consecutive rows of `size`, optionally scaled
 // by a per-element gain. DeepSeek-V4 uses both forms: the query and KV latents
 // are normalized with a learned gain, while the per-head query norm has none.
-int colibri_v2_deepseek4_rms_norm(
+int flyweight_v2_deepseek4_rms_norm(
     const float* input, const float* weight, int32_t size, int32_t count,
     float epsilon, float* output
 ){return guarded([&]{
@@ -9080,7 +9300,7 @@ int colibri_v2_deepseek4_rms_norm(
         throw std::runtime_error("rms-norm arguments are invalid");
     for(std::int32_t row=0;row<count;++row){
         const auto offset=static_cast<std::size_t>(row)*static_cast<std::size_t>(size);
-        colibri::v2::deepseek4::rms_norm(
+        flyweight::v2::deepseek4::rms_norm(
             input+offset,static_cast<std::size_t>(size),epsilon,output+offset);
         if(weight)
             for(std::int32_t i=0;i<size;++i)output[offset+i]*=weight[i];
@@ -9088,10 +9308,10 @@ int colibri_v2_deepseek4_rms_norm(
     return 0;});}
 
 // Grouped matvec: the input is cut into `groups` chunks and chunk g is
-// multiplied by the g-th slice of the tensor's output rows. `colibri_v2_matvec`
+// multiplied by the g-th slice of the tensor's output rows. `flyweight_v2_matvec`
 // is the groups==1 case; DeepSeek-V4's output projection uses eight.
-int colibri_v2_grouped_matvec(
-    const ColibriV2Model* m, const char* name, const float* input,
+int flyweight_v2_grouped_matvec(
+    const FlyweightV2Model* m, const char* name, const float* input,
     int32_t inputs, float* output, int32_t rank, int32_t groups
 ){return guarded([&]{
     if(!m||!name||!input||!output||inputs<=0||rank<=0||groups<=0)
@@ -9105,7 +9325,7 @@ int colibri_v2_grouped_matvec(
     if(!qwen_cpu_expert_type_supported(found->type))
         throw std::runtime_error("grouped matvec cannot decode this weight type");
     const auto* packed=tensor_data(*m,*found);
-    colibri::v2::deepseek4::grouped_projection(
+    flyweight::v2::deepseek4::grouped_projection(
         input,static_cast<std::size_t>(inputs),static_cast<std::size_t>(rank),
         static_cast<std::size_t>(groups),output,
         [&](const float* source,std::size_t row){
@@ -9116,8 +9336,8 @@ int colibri_v2_grouped_matvec(
 
 // Matvec against one expert of a stacked expert tensor. The experts are laid
 // out back to back, so expert e's rows start at e*outputs.
-int colibri_v2_expert_matvec(
-    const ColibriV2Model* m, const char* name, int32_t expert,
+int flyweight_v2_expert_matvec(
+    const FlyweightV2Model* m, const char* name, int32_t expert,
     const float* input, int32_t inputs, float* output, int32_t outputs
 ){return guarded([&]{
     if(!m||!name||!input||!output||expert<0||inputs<=0||outputs<=0)
@@ -9139,14 +9359,14 @@ int colibri_v2_expert_matvec(
     return 0;});}
 
 // Collapse the streams for the output head, which needs only pre-weights.
-int colibri_v2_deepseek4_head(
+int flyweight_v2_deepseek4_head(
     const float* streams, const float* fn, const float* scale, const float* base,
     int32_t n_embd, int32_t hc, float rms_epsilon, float hc_epsilon,
     float* pre, float* output
 ){return guarded([&]{
     if(!streams||!fn||!scale||!base||!pre||!output||n_embd<=0||hc<=0)
         throw std::runtime_error("head arguments are invalid");
-    colibri::v2::deepseek4::hyper_connection_head(
+    flyweight::v2::deepseek4::hyper_connection_head(
         streams,fn,scale,base,static_cast<std::size_t>(n_embd),
         static_cast<std::size_t>(hc),rms_epsilon,hc_epsilon,pre,output);
     return 0;});}
@@ -9243,8 +9463,8 @@ struct Deepseek4ExpertSlot {
     bool valid = false;
 };
 
-struct ColibriV2Deepseek4Runtime {
-    ColibriV2Model* model = nullptr;
+struct FlyweightV2Deepseek4Runtime {
+    FlyweightV2Model* model = nullptr;
     std::uint32_t context_limit = 0;
     std::vector<Deepseek4LayerState> layers;
     Deepseek4Scratch scratch;
@@ -9272,7 +9492,7 @@ struct ColibriV2Deepseek4Runtime {
     // How much the indexer is actually discarding, which is zero until a
     // sequence is long enough for it to run at all.
     std::uint64_t indexer_selections = 0, indexer_candidates = 0;
-    // Weight prefetch, on unless COLIBRI_DS4_PREFETCH=off, which exists so the
+    // Weight prefetch, on unless FLYWEIGHT_DS4_PREFETCH=off, which exists so the
     // two regimes can be compared rather than assumed.
     bool expert_prefetch = true;
     std::uint64_t expert_prefetch_bytes = 0;
@@ -9294,7 +9514,7 @@ struct ColibriV2Deepseek4Runtime {
     std::vector<Deepseek4ExpertSlot> expert_slots;
     std::unordered_map<std::uint64_t, std::size_t> expert_residency;
     std::unordered_map<std::uint64_t, std::uint32_t> expert_frequency;
-    ColibriV2Deepseek4Runtime* gpu_cache_owner = nullptr;
+    FlyweightV2Deepseek4Runtime* gpu_cache_owner = nullptr;
     std::uint64_t hyper_nanoseconds = 0, matvec_nanoseconds = 0;
     std::uint64_t prefill_calls = 0, prefill_tokens = 0, prefill_nanoseconds = 0;
     std::vector<std::uint32_t> capture_layers;
@@ -9309,13 +9529,13 @@ struct ColibriV2Deepseek4Runtime {
         for (auto& layer : layers) { layer.positions = 0; layer.blocks = 0; }
     }
 };
-struct ColibriV2Deepseek4Snapshot {
+struct FlyweightV2Deepseek4Snapshot {
     std::vector<Deepseek4LayerState> layers;
     std::vector<float> captured;
 };
 
-int colibri_v2_deepseek4_runtime_create(
-    ColibriV2Model* model, uint32_t context_limit, ColibriV2Deepseek4Runtime** out
+int flyweight_v2_deepseek4_runtime_create(
+    FlyweightV2Model* model, uint32_t context_limit, FlyweightV2Deepseek4Runtime** out
 ){return guarded([&]{
     if(!model||!out||!context_limit)
         throw std::runtime_error("model, context limit and output are required");
@@ -9333,7 +9553,7 @@ int colibri_v2_deepseek4_runtime_create(
     by_name.reserve(model->tensors.size()*2);
     for(std::uint64_t index=0;index<model->tensors.size();++index)
         by_name.emplace(model->tensors[index].name,index);
-    auto runtime=std::make_unique<ColibriV2Deepseek4Runtime>();
+    auto runtime=std::make_unique<FlyweightV2Deepseek4Runtime>();
     runtime->model=model;
     runtime->context_limit=context_limit;
     runtime->layers.resize(config.layer_count);
@@ -9440,7 +9660,7 @@ int colibri_v2_deepseek4_runtime_create(
     g.vocabulary=config.vocabulary_size; g.sinkhorn_iterations=config.sinkhorn_iterations;
     g.hash_layers=config.hash_layer_count; g.epsilon=config.rms_norm_epsilon;
     {
-        const char* setting=std::getenv("COLIBRI_DS4_PREFETCH");
+        const char* setting=std::getenv("FLYWEIGHT_DS4_PREFETCH");
         g.expert_prefetch=!(setting&&std::string(setting)=="off");
     }
     g.indexer_heads=config.indexer_head_count; g.indexer_dim=config.indexer_key_length;
@@ -9513,20 +9733,20 @@ int colibri_v2_deepseek4_runtime_create(
     *out=runtime.release();
     return 0;});}
 
-void colibri_v2_deepseek4_runtime_free(ColibriV2Deepseek4Runtime* runtime){
+void flyweight_v2_deepseek4_runtime_free(FlyweightV2Deepseek4Runtime* runtime){
     try{
         if(runtime&&runtime->gpu_owner){
-            for(const auto& entry:runtime->resident)colibri_gpu_free(entry.second);
-            if(runtime->gpu_input)colibri_gpu_free(runtime->gpu_input);
-            if(runtime->gpu_output)colibri_gpu_free(runtime->gpu_output);
-            if(runtime->gpu_batch)colibri_gpu_free(runtime->gpu_batch);
-            if(runtime->expert_cache)colibri_gpu_free(runtime->expert_cache);
+            for(const auto& entry:runtime->resident)flyweight_gpu_free(entry.second);
+            if(runtime->gpu_input)flyweight_gpu_free(runtime->gpu_input);
+            if(runtime->gpu_output)flyweight_gpu_free(runtime->gpu_output);
+            if(runtime->gpu_batch)flyweight_gpu_free(runtime->gpu_batch);
+            if(runtime->expert_cache)flyweight_gpu_free(runtime->expert_cache);
         }
         delete runtime;
     }catch(...){}
 }
 
-int colibri_v2_deepseek4_runtime_reset(ColibriV2Deepseek4Runtime* runtime){return guarded([&]{
+int flyweight_v2_deepseek4_runtime_reset(FlyweightV2Deepseek4Runtime* runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid runtime");
     runtime->reset();
     return 0;});}
@@ -9542,11 +9762,11 @@ namespace {
 // units, and the loop forks about eight hundred times per token, so the wider
 // team costs barrier time as well. deepseek4's pragmas simply never took a
 // `num_threads`.
-int ds4_thread_count() { return colibri::v2::deepseek4::thread_count(); }
+int ds4_thread_count() { return flyweight::v2::deepseek4::thread_count(); }
 
 void ds4_pin_current_thread() {
     static const bool enabled=[] {
-        const char* setting=std::getenv("COLIBRI_DS4_AFFINITY");
+        const char* setting=std::getenv("FLYWEIGHT_DS4_AFFINITY");
         return setting&&std::string(setting)=="on";
     }();
     if(!enabled)return;
@@ -9634,9 +9854,9 @@ void ds4_gpu_compile(std::int32_t device) {
     }
     iq1_grid += "};\n";
     const std::string source =
-        std::string(colibri::v2::qwen_cuda_source) + colibri::v2::qwen_native_cuda_source +
+        std::string(flyweight::v2::qwen_cuda_source) + flyweight::v2::qwen_native_cuda_source +
         iq1_grid + deepseek4_cuda_source;
-    if (colibri_gpu_compile(source.c_str(), options.data(),
+    if (flyweight_gpu_compile(source.c_str(), options.data(),
                             static_cast<std::int32_t>(options.size()), device,
                             log.data(), static_cast<std::int32_t>(log.size())) != 0)
         throw std::runtime_error(std::string("failed to compile CUDA kernels: ") + log.data());
@@ -9653,24 +9873,24 @@ int ds4_gpu_matvec(std::uint32_t type, std::uint64_t weights, std::uint64_t inpu
         case 19: {  // IQ1_S
             void* arguments[] = {&weights, &input, &output, &inputs, &outputs};
             const auto blocks = static_cast<std::uint32_t>((outputs + 7) / 8);
-            return colibri_gpu_launch_named("ds4_iq1s_matvec", blocks, 1, 256, 0,
+            return flyweight_gpu_launch_named("ds4_iq1s_matvec", blocks, 1, 256, 0,
                                             stream, arguments);
         }
         case 8: {  // Q8_0
             // Four blocks in flight per warp against the shared kernel's one.
             void* arguments[] = {&weights, &input, &output, &inputs, &outputs};
             const auto blocks = static_cast<std::uint32_t>((outputs + 7) / 8);
-            return colibri_gpu_launch_named("ds4_q8_matvec", blocks, 1, 256, 0,
+            return flyweight_gpu_launch_named("ds4_q8_matvec", blocks, 1, 256, 0,
                                             stream, arguments);
         }
         case 14: {  // Q6_K
             void* arguments[] = {&weights, &input, &output, &inputs, &outputs};
             const auto blocks = static_cast<std::uint32_t>((outputs + 7) / 8);
-            return colibri_gpu_launch_named("ds4_q6k_matvec", blocks, 1, 256, 0,
+            return flyweight_gpu_launch_named("ds4_q6k_matvec", blocks, 1, 256, 0,
                                             stream, arguments);
         }
         case 30:  // BF16
-            return colibri_gpu_bf16_matvec_transposed(weights, input, output, inputs, outputs, stream);
+            return flyweight_gpu_bf16_matvec_transposed(weights, input, output, inputs, outputs, stream);
         default:
             return qwen_gpu_matvec_by_type(
                 type, weights, input, output, inputs, outputs, stream);
@@ -9715,7 +9935,7 @@ std::uint64_t ds4_now() {
 }
 
 // Multiply a resolved tensor by a vector. The plan holds indices, so this does
-// no lookup -- the difference from colibri_v2_matvec, which searches by name.
+// no lookup -- the difference from flyweight_v2_matvec, which searches by name.
 // Several projections of the same vector, in one round trip.
 //
 // A layer reads its normalized hidden state through six or seven different
@@ -9734,17 +9954,17 @@ struct Ds4Projection {
     bool download = true;
 };
 
-void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
+void ds4_matvec(FlyweightV2Deepseek4Runtime& rt, std::uint64_t index,
                 const float* input, std::int32_t inputs, float* out,
                 std::int32_t outputs);
 
-bool ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
+bool ds4_matvec_batch(FlyweightV2Deepseek4Runtime& rt, const Ds4Projection* batch,
                       std::size_t count, const float* input, std::int32_t inputs) {
     // Off by an environment switch so the two shapes can be compared in one
     // process: the machine's page cache and this laptop's clocks drift enough
     // between runs to swamp the difference otherwise.
     static const bool batching = [] {
-        const char* setting = std::getenv("COLIBRI_DS4_BATCH");
+        const char* setting = std::getenv("FLYWEIGHT_DS4_BATCH");
         return !(setting && std::string(setting) == "off");
     }();
     bool device = rt.gpu && batching;
@@ -9761,7 +9981,7 @@ bool ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
         return false;
     }
     const auto batch_started = ds4_now();
-    int status = colibri_gpu_upload(rt.gpu_input, input, input_bytes, 0);
+    int status = flyweight_gpu_upload(rt.gpu_input, input, input_bytes, 0);
     std::uint64_t offset = 0;
     for (std::size_t item = 0; item < count && status == 0; ++item) {
         const auto& tensor = rt.model->tensors[batch[item].index];
@@ -9773,10 +9993,10 @@ bool ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
     for (std::size_t item = 0; item < count && status == 0; ++item) {
         const auto bytes = static_cast<std::uint64_t>(batch[item].outputs) * sizeof(float);
         if (batch[item].download)
-            status = colibri_gpu_download(batch[item].out, rt.gpu_batch + offset, bytes, 0);
+            status = flyweight_gpu_download(batch[item].out, rt.gpu_batch + offset, bytes, 0);
         offset += bytes;
     }
-    if (status == 0) status = colibri_gpu_sync();
+    if (status == 0) status = flyweight_gpu_sync();
     if (status != 0) throw std::runtime_error("a batched device matvec failed");
     rt.matvec_nanoseconds += ds4_now() - batch_started;
     rt.gpu_matvec_calls += count;
@@ -9785,7 +10005,7 @@ bool ds4_matvec_batch(ColibriV2Deepseek4Runtime& rt, const Ds4Projection* batch,
 }
 
 void ds4_cached_experts(
-    ColibriV2Deepseek4Runtime& rt, std::uint32_t layer_index,
+    FlyweightV2Deepseek4Runtime& rt, std::uint32_t layer_index,
     const Deepseek4LayerPlan& plan, Deepseek4Scratch& sc
 ) {
     std::fill(sc.gpu_experts.begin(),sc.gpu_experts.end(),0);
@@ -9846,7 +10066,7 @@ void ds4_cached_experts(
             for(const auto role:{plan.gate_exps,plan.up_exps,plan.down_exps}){
                 const auto& tensor=model.tensors[role];
                 const auto bytes=tensor.size/rt.experts;
-                if(colibri_gpu_upload(base+offset,tensor_data(model,tensor)+
+                if(flyweight_gpu_upload(base+offset,tensor_data(model,tensor)+
                         static_cast<std::uint64_t>(expert)*bytes,bytes,0)!=0)
                     throw std::runtime_error("DeepSeek expert-cache upload failed");
                 offset+=bytes;
@@ -9887,22 +10107,22 @@ void ds4_cached_experts(
     int intermediate=static_cast<int>(rt.expert_ffn);
     int output_size=static_cast<int>(rt.n_embd);
     int count=static_cast<int>(gpu_count);
-    int status=colibri_gpu_upload(rt.gpu_input,sc.hidden.data(),
+    int status=flyweight_gpu_upload(rt.gpu_input,sc.hidden.data(),
         static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
-    if(status==0)status=colibri_gpu_upload(pointer_buffer,&bundle,sizeof(bundle),0);
-    if(status==0)status=colibri_gpu_memset(
+    if(status==0)status=flyweight_gpu_upload(pointer_buffer,&bundle,sizeof(bundle),0);
+    if(status==0)status=flyweight_gpu_memset(
         aggregate,0,static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
     void* gate_args[]={&gate_device,&up_device,&rt.gpu_input,&rt.gpu_output,
         &input_size,&intermediate,&count,&rt.clamp};
-    if(status==0)status=colibri_gpu_launch_named("ds4_iq1s_grouped_swiglu",
+    if(status==0)status=flyweight_gpu_launch_named("ds4_iq1s_grouped_swiglu",
         rt.expert_ffn,gpu_count,256,0,0,gate_args);
     void* down_args[]={&down_device,&rt.gpu_output,&aggregate,&weights_device,
         &intermediate,&output_size,&count};
-    if(status==0)status=colibri_gpu_launch_named("iq3xxs_grouped_accumulate",
+    if(status==0)status=flyweight_gpu_launch_named("iq3xxs_grouped_accumulate",
         rt.n_embd,1,256,0,0,down_args);
-    if(status==0)status=colibri_gpu_download(sc.expert_out.data(),aggregate,
+    if(status==0)status=flyweight_gpu_download(sc.expert_out.data(),aggregate,
         static_cast<std::uint64_t>(rt.n_embd)*sizeof(float),0);
-    if(status==0)status=colibri_gpu_sync();
+    if(status==0)status=flyweight_gpu_sync();
     if(status!=0)throw std::runtime_error("DeepSeek grouped cached experts failed");
     for(std::uint32_t i=0;i<rt.n_embd;++i)sc.moe[i]+=sc.expert_out[i];
     rt.gpu_matvec_calls+=3*gpu_count;
@@ -9936,7 +10156,7 @@ void ds4_quant_dot_many(
 }
 
 void ds4_cpu_moe_rows(
-    ColibriV2Deepseek4Runtime& rt, std::uint32_t layer_index,
+    FlyweightV2Deepseek4Runtime& rt, std::uint32_t layer_index,
     std::vector<Deepseek4Scratch>& rows
 ) {
     const auto& model=*rt.model;
@@ -10012,7 +10232,7 @@ void ds4_cpu_moe_rows(
     }
 }
 
-void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
+void ds4_matvec(FlyweightV2Deepseek4Runtime& rt, std::uint64_t index,
                 const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
     const auto& model = *rt.model;
     const auto& tensor = model.tensors[index];
@@ -10031,12 +10251,12 @@ void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
                 // at four hundred and seventy calls a token that is the cost
                 // that decides whether crossing per call is affordable at all.
                 const auto call_started = ds4_now();
-                int status = colibri_gpu_upload(rt.gpu_input, input, input_bytes, 0);
+                int status = flyweight_gpu_upload(rt.gpu_input, input, input_bytes, 0);
                 if (status == 0)
                     status = ds4_gpu_matvec(tensor.type, found->second, rt.gpu_input,
                                             rt.gpu_output, inputs, outputs, 0);
-                if (status == 0) status = colibri_gpu_download(out, rt.gpu_output, output_bytes, 0);
-                if (status == 0) status = colibri_gpu_sync();
+                if (status == 0) status = flyweight_gpu_download(out, rt.gpu_output, output_bytes, 0);
+                if (status == 0) status = flyweight_gpu_sync();
                 if (status != 0) throw std::runtime_error("a device matvec failed");
                 ++rt.gpu_matvec_calls;
                 rt.matvec_nanoseconds += ds4_now() - call_started;
@@ -10062,7 +10282,7 @@ void ds4_matvec(ColibriV2Deepseek4Runtime& rt, std::uint64_t index,
                                   static_cast<std::uint64_t>(row));
 }
 
-void ds4_expert_matvec(const ColibriV2Model& model, std::uint64_t index, std::int32_t expert,
+void ds4_expert_matvec(const FlyweightV2Model& model, std::uint64_t index, std::int32_t expert,
                        const float* input, std::int32_t inputs, float* out, std::int32_t outputs) {
     const auto& tensor = model.tensors[index];
     const auto* packed = tensor_data(model, tensor);
@@ -10075,7 +10295,7 @@ void ds4_expert_matvec(const ColibriV2Model& model, std::uint64_t index, std::in
 }
 
 // A resolved f32 tensor's data, for the norms and mixers the loop reads whole.
-const float* ds4_f32(const ColibriV2Model& model, std::uint64_t index) {
+const float* ds4_f32(const FlyweightV2Model& model, std::uint64_t index) {
     return reinterpret_cast<const float*>(tensor_data(model, model.tensors[index]));
 }
 
@@ -10087,12 +10307,12 @@ const float* ds4_f32(const ColibriV2Model& model, std::uint64_t index) {
 // alongside its own, which is why the ring holds twice the ratio and why the
 // halves of a row are read separately: the low half belongs to the block a row
 // was written for, the high half to the one after it.
-void ds4_close_block(const ColibriV2Deepseek4Runtime& rt, Deepseek4LayerState& layer,
+void ds4_close_block(const FlyweightV2Deepseek4Runtime& rt, Deepseek4LayerState& layer,
                      std::uint32_t block, std::uint32_t dim, std::uint32_t width,
                      const std::vector<float>& source_values,
                      const std::vector<float>& source_scores,
                      std::uint64_t norm, std::vector<std::uint16_t>& target) {
-    namespace ds4 = colibri::v2::deepseek4;
+    namespace ds4 = flyweight::v2::deepseek4;
     const auto& model = *rt.model;
     const bool overlapped = layer.ratio == 4;
     const auto rows = layer.state_rows;
@@ -10135,11 +10355,11 @@ void ds4_close_block(const ColibriV2Deepseek4Runtime& rt, Deepseek4LayerState& l
 }
 
 // Run one block over one position, reading and updating its cache.
-void ds4_layer_attention_prepare(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
+void ds4_layer_attention_prepare(FlyweightV2Deepseek4Runtime& rt, std::uint32_t index,
                                  std::uint32_t position, std::uint32_t token,
                                  const float* streams, float* out_streams,
                                  Deepseek4Scratch& sc) {
-    namespace ds4 = colibri::v2::deepseek4;
+    namespace ds4 = flyweight::v2::deepseek4;
     auto& layer = rt.layers[index];
     const auto& plan = layer.plan;
     const auto& model = *rt.model;
@@ -10178,7 +10398,7 @@ void ds4_layer_attention_prepare(ColibriV2Deepseek4Runtime& rt, std::uint32_t in
         Ds4Projection batch[6];
         std::size_t count = 0;
         static const bool query_chain_enabled=[] {
-            const char* setting=std::getenv("COLIBRI_DS4_QUERY_CHAIN");
+            const char* setting=std::getenv("FLYWEIGHT_DS4_QUERY_CHAIN");
             return !(setting&&std::string(setting)=="off");
         }();
         const bool chain_query = query_chain_enabled && rt.gpu &&
@@ -10210,14 +10430,14 @@ void ds4_layer_attention_prepare(ColibriV2Deepseek4Runtime& rt, std::uint32_t in
             // q_a is the first batched output. Keep it resident, normalize it
             // into the input workspace, and feed q_b without a download/upload
             // pair. The final query alone returns to the CPU attention path.
-            int status=colibri_gpu_rms_norm(rt.gpu_batch,rt.resident[plan.q_a_norm],
+            int status=flyweight_gpu_rms_norm(rt.gpu_batch,rt.resident[plan.q_a_norm],
                 rt.gpu_input,static_cast<std::int32_t>(rt.q_lora),rt.epsilon,0);
             const auto& q_b=model.tensors[plan.q_b];
             if(status==0)status=ds4_gpu_matvec(q_b.type,rt.resident[plan.q_b],
                 rt.gpu_input,rt.gpu_output,static_cast<std::int32_t>(rt.q_lora),wide,0);
-            if(status==0)status=colibri_gpu_download(sc.query.data(),rt.gpu_output,
+            if(status==0)status=flyweight_gpu_download(sc.query.data(),rt.gpu_output,
                 static_cast<std::uint64_t>(wide)*sizeof(float),0);
-            if(status==0)status=colibri_gpu_sync();
+            if(status==0)status=flyweight_gpu_sync();
             if(status!=0)throw std::runtime_error("the resident query chain failed");
             ++rt.gpu_matvec_calls;
             query_chained=true;
@@ -10397,13 +10617,13 @@ void ds4_layer_attention_prepare(ColibriV2Deepseek4Runtime& rt, std::uint32_t in
             std::uint64_t in = rt.gpu_input, out_buffer = rt.gpu_output;
             std::int32_t inputs_arg = inputs, rows_arg = rows, group_arg = group_rows;
             void* arguments[] = {&weights, &in, &out_buffer, &inputs_arg, &rows_arg, &group_arg};
-            int status = colibri_gpu_upload(rt.gpu_input, sc.derope.data(), input_bytes, 0);
+            int status = flyweight_gpu_upload(rt.gpu_input, sc.derope.data(), input_bytes, 0);
             if (status == 0)
-                status = colibri_gpu_launch_named("ds4_q8_grouped_matvec",
+                status = flyweight_gpu_launch_named("ds4_q8_grouped_matvec",
                     static_cast<std::uint32_t>((rows + 7) / 8), 1, 256, 0, 0, arguments);
             if (status == 0)
-                status = colibri_gpu_download(sc.grouped.data(), rt.gpu_output, output_bytes, 0);
-            if (status == 0) status = colibri_gpu_sync();
+                status = flyweight_gpu_download(sc.grouped.data(), rt.gpu_output, output_bytes, 0);
+            if (status == 0) status = flyweight_gpu_sync();
             if (status != 0) throw std::runtime_error("the grouped device matvec failed");
             ++rt.gpu_matvec_calls;
             goto grouped_done;
@@ -10461,10 +10681,10 @@ void ds4_layer_attention_prepare(ColibriV2Deepseek4Runtime& rt, std::uint32_t in
 
 }
 
-void ds4_layer_ffn_complete(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
+void ds4_layer_ffn_complete(FlyweightV2Deepseek4Runtime& rt, std::uint32_t index,
                             float* out_streams, Deepseek4Scratch& sc,
                             bool routed_ready=false) {
-    namespace ds4 = colibri::v2::deepseek4;
+    namespace ds4 = flyweight::v2::deepseek4;
     const auto& layer = rt.layers[index];
     const auto& plan = layer.plan;
     const auto& model = *rt.model;
@@ -10495,7 +10715,7 @@ void ds4_layer_ffn_complete(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     const auto experts_started = ds4_now();
     ds4_cached_experts(rt,index,plan,sc);
     static const bool expert_batch_enabled=[] {
-        const char* setting=std::getenv("COLIBRI_DS4_EXPERT_BATCH");
+        const char* setting=std::getenv("FLYWEIGHT_DS4_EXPERT_BATCH");
         return !(setting&&std::string(setting)=="off");
     }();
     // One team spans every selected expert instead of entering OpenMP eighteen
@@ -10587,7 +10807,7 @@ void ds4_layer_ffn_complete(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
     std::copy(sc.after.begin(), sc.after.end(), out_streams);
 }
 
-void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
+void ds4_layer_forward(FlyweightV2Deepseek4Runtime& rt, std::uint32_t index,
                        std::uint32_t position, std::uint32_t token,
                        const float* streams, float* out_streams) {
     auto& sc=rt.scratch;
@@ -10597,8 +10817,8 @@ void ds4_layer_forward(ColibriV2Deepseek4Runtime& rt, std::uint32_t index,
 
 }  // namespace
 
-int colibri_v2_deepseek4_runtime_info(
-    const ColibriV2Deepseek4Runtime* runtime, ColibriV2Deepseek4Info* out
+int flyweight_v2_deepseek4_runtime_info(
+    const FlyweightV2Deepseek4Runtime* runtime, FlyweightV2Deepseek4Info* out
 ){return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid runtime info request");
     std::memset(out,0,sizeof(*out));
@@ -10645,11 +10865,11 @@ int colibri_v2_deepseek4_runtime_info(
 // decoding is the same call again -- prefill and decode share one path, which
 // is what keeps them from disagreeing. `logits` may be null for prompt tokens
 // whose distribution nobody wants.
-int colibri_v2_deepseek4_forward(
-    ColibriV2Deepseek4Runtime* runtime, uint32_t token, float* logits
+int flyweight_v2_deepseek4_forward(
+    FlyweightV2Deepseek4Runtime* runtime, uint32_t token, float* logits
 ){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid runtime");
-    namespace ds4=colibri::v2::deepseek4;
+    namespace ds4=flyweight::v2::deepseek4;
     auto& rt=*runtime;
     const auto& model=*rt.model;
     auto& sc=rt.scratch;
@@ -10661,7 +10881,7 @@ int colibri_v2_deepseek4_forward(
     // Every stream starts as a copy of the embedding.
     {
         const auto& tensor=model.tensors[rt.token_embd];
-        if(colibri_v2_qwen_embedding(&model,token,sc.embedding.data(),
+        if(flyweight_v2_qwen_embedding(&model,token,sc.embedding.data(),
                static_cast<std::int32_t>(rt.n_embd))!=0)
             throw std::runtime_error("cannot read the token embedding");
         for(std::uint32_t stream=0;stream<rt.hc;++stream)
@@ -10717,8 +10937,8 @@ int colibri_v2_deepseek4_forward(
     rt.forward_nanoseconds+=ds4_now()-forward_started;
     return 0;});}
 
-int colibri_v2_deepseek4_capture_layers(
-    ColibriV2Deepseek4Runtime* runtime,const uint32_t* layers,uint32_t count
+int flyweight_v2_deepseek4_capture_layers(
+    FlyweightV2Deepseek4Runtime* runtime,const uint32_t* layers,uint32_t count
 ){return guarded([&]{
     if(!runtime||(!layers&&count))throw std::runtime_error("invalid capture-layer arguments");
     std::vector<std::uint32_t> selected;
@@ -10732,15 +10952,15 @@ int colibri_v2_deepseek4_capture_layers(
     runtime->captured.assign(static_cast<std::size_t>(count)*runtime->n_embd,0.0f);
     return 0;});}
 
-int colibri_v2_deepseek4_captured(
-    const ColibriV2Deepseek4Runtime* runtime,float* output,uint64_t elements
+int flyweight_v2_deepseek4_captured(
+    const FlyweightV2Deepseek4Runtime* runtime,float* output,uint64_t elements
 ){return guarded([&]{
     if(!runtime||(!output&&elements))throw std::runtime_error("invalid captured-feature arguments");
     if(elements<runtime->captured.size())throw std::runtime_error("captured-feature output is too small");
     std::copy(runtime->captured.begin(),runtime->captured.end(),output);
     return static_cast<int>(runtime->capture_layers.size());});}
 
-int colibri_v2_deepseek4_lm_head(ColibriV2Deepseek4Runtime*r,const float*hidden,
+int flyweight_v2_deepseek4_lm_head(FlyweightV2Deepseek4Runtime*r,const float*hidden,
     uint32_t rows,float*logits,uint64_t elements){return guarded([&]{
     if(!r||!hidden||!logits||!rows||r->output==Deepseek4LayerPlan::kAbsent)
         throw std::runtime_error("invalid DeepSeek LM-head arguments");
@@ -10752,7 +10972,7 @@ int colibri_v2_deepseek4_lm_head(ColibriV2Deepseek4Runtime*r,const float*hidden,
     return 0;});}
 
 static int ds4_prefill_impl(
-    ColibriV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count,float* all_logits,
+    FlyweightV2Deepseek4Runtime* runtime,const uint32_t* tokens,uint32_t count,float* all_logits,
     float* all_captures
 ){return guarded([&]{
     if(!runtime||(!tokens&&count))throw std::runtime_error("invalid prefill arguments");
@@ -10760,7 +10980,7 @@ static int ds4_prefill_impl(
     auto& rt=*runtime;
     const auto& model=*rt.model;
     std::uint32_t row_limit=4;
-    if(const char* setting=std::getenv("COLIBRI_DS4_PREFILL_ROWS"))
+    if(const char* setting=std::getenv("FLYWEIGHT_DS4_PREFILL_ROWS"))
         row_limit=std::max(1u,static_cast<std::uint32_t>(std::strtoul(setting,nullptr,10)));
     row_limit=std::min({row_limit,count,8u});
     const auto first_position=rt.layers.empty()?0u:rt.layers.front().positions;
@@ -10775,7 +10995,7 @@ static int ds4_prefill_impl(
         std::vector<Deepseek4Scratch> scratch(rows,rt.scratch);
         for(std::uint32_t row=0;row<rows;++row){
             auto& sc=scratch[row];
-            if(colibri_v2_qwen_embedding(&model,tokens[chunk+row],sc.embedding.data(),
+            if(flyweight_v2_qwen_embedding(&model,tokens[chunk+row],sc.embedding.data(),
                    static_cast<std::int32_t>(rt.n_embd))!=0)
                 throw std::runtime_error("cannot read a prefill token embedding");
             for(std::uint32_t stream=0;stream<rt.hc;++stream)
@@ -10832,7 +11052,7 @@ static int ds4_prefill_impl(
             }
         }
         if(all_logits){
-            namespace ds4=colibri::v2::deepseek4;
+            namespace ds4=flyweight::v2::deepseek4;
             for(std::uint32_t row=0;row<rows;++row){
                 auto&sc=scratch[row];
                 ds4::hyper_connection_head(sc.streams.data(),ds4_f32(model,rt.head_fn),
@@ -10854,17 +11074,17 @@ static int ds4_prefill_impl(
     runtime->forward_nanoseconds+=elapsed;
     return 0;});}
 
-int colibri_v2_deepseek4_prefill(ColibriV2Deepseek4Runtime*r,const uint32_t*t,uint32_t n){
+int flyweight_v2_deepseek4_prefill(FlyweightV2Deepseek4Runtime*r,const uint32_t*t,uint32_t n){
     return ds4_prefill_impl(r,t,n,nullptr,nullptr);
 }
-int colibri_v2_deepseek4_forward_batch(ColibriV2Deepseek4Runtime*r,const uint32_t*t,
+int flyweight_v2_deepseek4_forward_batch(FlyweightV2Deepseek4Runtime*r,const uint32_t*t,
     uint32_t n,float*logits,uint64_t elements){
     if(!r||!logits||elements<static_cast<std::uint64_t>(n)*r->vocabulary){
         error="invalid DeepSeek forward-batch output";return -1;
     }
     return ds4_prefill_impl(r,t,n,logits,nullptr);
 }
-int colibri_v2_deepseek4_forward_batch_capture(ColibriV2Deepseek4Runtime*r,const uint32_t*t,
+int flyweight_v2_deepseek4_forward_batch_capture(FlyweightV2Deepseek4Runtime*r,const uint32_t*t,
     uint32_t n,float*logits,uint64_t logits_elements,float*captures,uint64_t capture_elements){
     if(!r||!logits||!captures||logits_elements<static_cast<std::uint64_t>(n)*r->vocabulary||
        capture_elements<static_cast<std::uint64_t>(n)*r->capture_layers.size()*r->n_embd){
@@ -10872,14 +11092,14 @@ int colibri_v2_deepseek4_forward_batch_capture(ColibriV2Deepseek4Runtime*r,const
     }
     return ds4_prefill_impl(r,t,n,logits,captures);
 }
-int colibri_v2_deepseek4_snapshot(const ColibriV2Deepseek4Runtime*r,ColibriV2Deepseek4Snapshot**out){return guarded([&]{
+int flyweight_v2_deepseek4_snapshot(const FlyweightV2Deepseek4Runtime*r,FlyweightV2Deepseek4Snapshot**out){return guarded([&]{
     if(!r||!out)throw std::runtime_error("invalid DeepSeek snapshot arguments");
-    auto snapshot=std::make_unique<ColibriV2Deepseek4Snapshot>();snapshot->layers=r->layers;
+    auto snapshot=std::make_unique<FlyweightV2Deepseek4Snapshot>();snapshot->layers=r->layers;
     snapshot->captured=r->captured;*out=snapshot.release();return 0;});}
-int colibri_v2_deepseek4_restore(ColibriV2Deepseek4Runtime*r,const ColibriV2Deepseek4Snapshot*s){return guarded([&]{
+int flyweight_v2_deepseek4_restore(FlyweightV2Deepseek4Runtime*r,const FlyweightV2Deepseek4Snapshot*s){return guarded([&]{
     if(!r||!s||s->layers.size()!=r->layers.size())throw std::runtime_error("invalid DeepSeek snapshot");
     r->layers=s->layers;r->captured=s->captured;return 0;});}
-void colibri_v2_deepseek4_snapshot_free(ColibriV2Deepseek4Snapshot*s){try{delete s;}catch(...){}}
+void flyweight_v2_deepseek4_snapshot_free(FlyweightV2Deepseek4Snapshot*s){try{delete s;}catch(...){}}
 
 // Put one checkpoint tensor through the GPU and report how far the answer
 // drifts from the CPU's.
@@ -10901,13 +11121,13 @@ void colibri_v2_deepseek4_snapshot_free(ColibriV2Deepseek4Snapshot*s){try{delete
 //
 // The grouped output projection is left off for now: it does not go through
 // ds4_matvec, so uploading it would spend 1.4 GiB of VRAM on nothing.
-int colibri_v2_deepseek4_runtime_gpu(
-    ColibriV2Deepseek4Runtime* runtime, int32_t device
+int flyweight_v2_deepseek4_runtime_gpu(
+    FlyweightV2Deepseek4Runtime* runtime, int32_t device
 ){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid runtime");
     auto& rt=*runtime;
     if(rt.gpu)return 0;
-    if(colibri_gpu_init(device)!=0)throw std::runtime_error("failed to initialize CUDA");
+    if(flyweight_gpu_init(device)!=0)throw std::runtime_error("failed to initialize CUDA");
     ds4_gpu_compile(device);
     rt.gpu_device=device;
 
@@ -10919,10 +11139,10 @@ int colibri_v2_deepseek4_runtime_gpu(
         const auto& plan=layer.plan;
         // Whether the shared expert belongs on the device is a measurement
         // rather than a deduction, and the first attempt at it was taken on a
-        // 100 W supply shared with a 16-core CPU. COLIBRI_DS4_SHEXP=cpu keeps
+        // 100 W supply shared with a 16-core CPU. FLYWEIGHT_DS4_SHEXP=cpu keeps
         // it off so the two can be compared with everything else held still.
         static const bool shexp_on_device = [] {
-            const char* setting = std::getenv("COLIBRI_DS4_SHEXP");
+            const char* setting = std::getenv("FLYWEIGHT_DS4_SHEXP");
             return !(setting && std::string(setting) == "cpu");
         }();
         for(const auto index:{plan.q_a,plan.q_a_norm,plan.q_b,plan.kv,plan.output_b,plan.comp_kv,
@@ -10946,11 +11166,11 @@ int colibri_v2_deepseek4_runtime_gpu(
     // the complete set is usable so a failed enable neither leaks VRAM nor
     // leaves a half-populated runtime that cannot safely be retried.
     auto release_pending=[&]{
-        for(const auto& entry:resident)colibri_gpu_free(entry.second);
-        if(input_buffer)colibri_gpu_free(input_buffer);
-        if(output_buffer)colibri_gpu_free(output_buffer);
-        if(batch_buffer)colibri_gpu_free(batch_buffer);
-        if(expert_cache)colibri_gpu_free(expert_cache);
+        for(const auto& entry:resident)flyweight_gpu_free(entry.second);
+        if(input_buffer)flyweight_gpu_free(input_buffer);
+        if(output_buffer)flyweight_gpu_free(output_buffer);
+        if(batch_buffer)flyweight_gpu_free(batch_buffer);
+        if(expert_cache)flyweight_gpu_free(expert_cache);
         resident.clear(); input_buffer=output_buffer=batch_buffer=0;
         expert_cache=0;
     };
@@ -10960,12 +11180,12 @@ int colibri_v2_deepseek4_runtime_gpu(
         // CPU rather than being uploaded and never used.
         if(tensor.type!=0&&tensor.type!=8&&tensor.type!=14&&tensor.type!=30)continue;
         std::uint64_t pointer=0;
-        if(colibri_gpu_alloc(tensor.size,&pointer)!=0){
+        if(flyweight_gpu_alloc(tensor.size,&pointer)!=0){
             release_pending();
             throw std::runtime_error("out of device memory for the dense weights");
         }
-        if(colibri_gpu_upload_sync(pointer,tensor_data(*rt.model,tensor),tensor.size)!=0){
-            colibri_gpu_free(pointer);
+        if(flyweight_gpu_upload_sync(pointer,tensor_data(*rt.model,tensor),tensor.size)!=0){
+            flyweight_gpu_free(pointer);
             release_pending();
             throw std::runtime_error("failed to upload a dense weight");
         }
@@ -10986,9 +11206,9 @@ int colibri_v2_deepseek4_runtime_gpu(
     const auto output_capacity=static_cast<std::uint64_t>(widest_output)*sizeof(float);
     // One batch holds every projection of the hidden state a layer makes.
     const auto batch_capacity=8ull*output_capacity;
-    if(colibri_gpu_alloc(input_capacity,&input_buffer)!=0||
-       colibri_gpu_alloc(output_capacity,&output_buffer)!=0||
-       colibri_gpu_alloc(batch_capacity,&batch_buffer)!=0){
+    if(flyweight_gpu_alloc(input_capacity,&input_buffer)!=0||
+       flyweight_gpu_alloc(output_capacity,&output_buffer)!=0||
+       flyweight_gpu_alloc(batch_capacity,&batch_buffer)!=0){
         release_pending();
         throw std::runtime_error("out of device memory for the activation buffers");
     }
@@ -11007,11 +11227,11 @@ int colibri_v2_deepseek4_runtime_gpu(
     // the 16-core IQ path at its measured route recurrence. Larger-memory GPUs
     // can enable it explicitly and inspect the exported hit-rate counters.
     std::uint64_t requested_mib=0;
-    if(const char* setting=std::getenv("COLIBRI_DS4_EXPERT_CACHE_MIB")){
+    if(const char* setting=std::getenv("FLYWEIGHT_DS4_EXPERT_CACHE_MIB")){
         if(std::string(setting)=="off")requested_mib=0;
         else requested_mib=std::strtoull(setting,nullptr,10);
     }
-    ColibriV2GpuInfo gpu_info{};
+    FlyweightV2GpuInfo gpu_info{};
     gpu_probe(gpu_info,device);
     constexpr std::uint64_t reserve=768ull*1024*1024;
     const auto available=gpu_info.free_memory>reserve?gpu_info.free_memory-reserve:0;
@@ -11023,7 +11243,7 @@ int colibri_v2_deepseek4_runtime_gpu(
             rt.layers.size()*expert_slot_bytes;
         if(expert_slots_per_layer<rt.experts_used)expert_cache_bytes=0;
     }
-    if(expert_cache_bytes&&colibri_gpu_alloc(expert_cache_bytes,&expert_cache)!=0){
+    if(expert_cache_bytes&&flyweight_gpu_alloc(expert_cache_bytes,&expert_cache)!=0){
         // Caching is an optimization. Dense placement remains useful when a
         // fragmented or concurrently used device cannot satisfy this request.
         expert_cache=expert_cache_bytes=0;
@@ -11044,8 +11264,8 @@ int colibri_v2_deepseek4_runtime_gpu(
     rt.gpu_owner=true;
     return 0;});}
 
-int colibri_v2_deepseek4_runtime_gpu_share(
-    ColibriV2Deepseek4Runtime* runtime,const ColibriV2Deepseek4Runtime* owner
+int flyweight_v2_deepseek4_runtime_gpu_share(
+    FlyweightV2Deepseek4Runtime* runtime,const FlyweightV2Deepseek4Runtime* owner
 ){return guarded([&]{
     if(!runtime||!owner||!owner->gpu)
         throw std::runtime_error("a GPU-enabled owner runtime is required");
@@ -11065,7 +11285,7 @@ int colibri_v2_deepseek4_runtime_gpu_share(
     runtime->expert_cache_bytes=owner->expert_cache_bytes;
     runtime->expert_slot_bytes=owner->expert_slot_bytes;
     runtime->expert_slots_per_layer=owner->expert_slots_per_layer;
-    runtime->gpu_cache_owner=const_cast<ColibriV2Deepseek4Runtime*>(owner);
+    runtime->gpu_cache_owner=const_cast<FlyweightV2Deepseek4Runtime*>(owner);
     return 0;});}
 
 // Make this thread's CUDA context current.
@@ -11075,16 +11295,16 @@ int colibri_v2_deepseek4_runtime_gpu_share(
 // whichever thread built the runtime, but the scheduler forwards from its own,
 // where nothing was current and every launch failed. Cheap and idempotent, so
 // a worker can simply call it once when it starts.
-int colibri_v2_deepseek4_runtime_gpu_attach(ColibriV2Deepseek4Runtime* runtime
+int flyweight_v2_deepseek4_runtime_gpu_attach(FlyweightV2Deepseek4Runtime* runtime
 ){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid runtime");
     if(!runtime->gpu)return 0;
-    if(colibri_gpu_init(runtime->gpu_device)!=0)
+    if(flyweight_gpu_init(runtime->gpu_device)!=0)
         throw std::runtime_error("cannot attach this thread to the CUDA context");
     return 0;});}
 
-int colibri_v2_deepseek4_gpu_matvec_check(
-    ColibriV2Model* model, const char* name, const float* input, int32_t inputs,
+int flyweight_v2_deepseek4_gpu_matvec_check(
+    FlyweightV2Model* model, const char* name, const float* input, int32_t inputs,
     int32_t outputs, float* out_gpu, float* out_cpu, int32_t device,
     int32_t iterations, double* seconds
 ){return guarded([&]{
@@ -11094,7 +11314,7 @@ int colibri_v2_deepseek4_gpu_matvec_check(
         [&](const Tensor& tensor){return tensor.name==name;});
     if(found==model->tensors.end())
         throw std::runtime_error(std::string("tensor not found: ")+name);
-    if(colibri_gpu_init(device)!=0)
+    if(flyweight_gpu_init(device)!=0)
         throw std::runtime_error("failed to initialize CUDA");
     ds4_gpu_compile(device);
 
@@ -11109,17 +11329,17 @@ int colibri_v2_deepseek4_gpu_matvec_check(
     const std::uint64_t weight_bytes = found->shape.size() == 3
         ? found->size / found->shape[2] : found->size;
     std::uint64_t weights=0,vector=0,result=0;
-    if(colibri_gpu_alloc(weight_bytes,&weights)!=0)
+    if(flyweight_gpu_alloc(weight_bytes,&weights)!=0)
         throw std::runtime_error("cannot allocate device weights");
-    if(colibri_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0)
+    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0)
         throw std::runtime_error("cannot allocate the device input");
-    if(colibri_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0)
+    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0)
         throw std::runtime_error("cannot allocate the device output");
-    int status=colibri_gpu_upload_sync(weights,tensor_data(*model,*found),weight_bytes);
-    if(status==0)status=colibri_gpu_upload_sync(vector,input,
+    int status=flyweight_gpu_upload_sync(weights,tensor_data(*model,*found),weight_bytes);
+    if(status==0)status=flyweight_gpu_upload_sync(vector,input,
         static_cast<std::uint64_t>(inputs)*sizeof(float));
     if(status==0)status=ds4_gpu_matvec(found->type,weights,vector,result,inputs,outputs,0);
-    if(status==0)status=colibri_gpu_sync();
+    if(status==0)status=flyweight_gpu_sync();
     // Repeat the resident matvec for timing. The weights are already on the
     // device, so this measures the kernel against VRAM rather than the upload,
     // which is the number that decides whether moving the dense half is worth
@@ -11129,19 +11349,19 @@ int colibri_v2_deepseek4_gpu_matvec_check(
         const auto started=ds4_now();
         for(std::int32_t i=0;i<iterations&&status==0;++i)
             status=ds4_gpu_matvec(found->type,weights,vector,result,inputs,outputs,0);
-        if(status==0)status=colibri_gpu_sync();
+        if(status==0)status=flyweight_gpu_sync();
         if(seconds)*seconds=static_cast<double>(ds4_now()-started)/1e9;
     }
-    if(status==0)status=colibri_gpu_download(out_gpu,result,
+    if(status==0)status=flyweight_gpu_download(out_gpu,result,
         static_cast<std::uint64_t>(outputs)*sizeof(float),0);
-    if(status==0)status=colibri_gpu_sync();
-    colibri_gpu_free(weights);colibri_gpu_free(vector);colibri_gpu_free(result);
+    if(status==0)status=flyweight_gpu_sync();
+    flyweight_gpu_free(weights);flyweight_gpu_free(vector);flyweight_gpu_free(result);
     if(status!=0)throw std::runtime_error(
         "the device matvec failed with status "+std::to_string(status));
     return 0;});}
 
-int colibri_v2_deepseek4_indexer_key(
-    const ColibriV2Deepseek4Runtime* runtime, uint32_t layer, uint32_t block,
+int flyweight_v2_deepseek4_indexer_key(
+    const FlyweightV2Deepseek4Runtime* runtime, uint32_t layer, uint32_t block,
     float* out, int32_t outputs
 ){return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid indexer key request");
@@ -11154,37 +11374,37 @@ int colibri_v2_deepseek4_indexer_key(
     const std::uint16_t* stored=state.indexer_compressed.data()+
         static_cast<std::size_t>(block)*state.indexer_dim;
     for(std::uint32_t i=0;i<state.indexer_dim;++i)
-        out[i]=colibri::v2::deepseek4::half_value(stored[i]);
+        out[i]=flyweight::v2::deepseek4::half_value(stored[i]);
     return 0;});}
 
-int colibri_v2_deepseek4_indexer_scores(
+int flyweight_v2_deepseek4_indexer_scores(
     const float* queries, const float* keys, const float* weights,
     int32_t heads, int32_t dim, int32_t entries, float* out
 ){return guarded([&]{
     if(!queries||!keys||!weights||!out||heads<=0||dim<=0||entries<0)
         throw std::runtime_error("indexer score arguments are invalid");
-    colibri::v2::deepseek4::indexer_scores(queries,keys,weights,
+    flyweight::v2::deepseek4::indexer_scores(queries,keys,weights,
         static_cast<std::size_t>(heads),static_cast<std::size_t>(dim),
         static_cast<std::size_t>(entries),out);
     return 0;});}
 
-int colibri_v2_deepseek4_top_k(
+int flyweight_v2_deepseek4_top_k(
     const float* scores, int32_t entries, int32_t keep, uint8_t* out
 ){return guarded([&]{
     if(!scores||!out||entries<0||keep<0)
         throw std::runtime_error("top-k arguments are invalid");
-    colibri::v2::deepseek4::top_k_select(scores,static_cast<std::size_t>(entries),
+    flyweight::v2::deepseek4::top_k_select(scores,static_cast<std::size_t>(entries),
         static_cast<std::size_t>(keep),out);
     return 0;});}
 
 // Round-trip a float through half precision, so the storage format the caches
 // use can be checked from outside.
-float colibri_v2_deepseek4_half_round_trip(float value){
-    return colibri::v2::deepseek4::half_value(colibri::v2::deepseek4::half_bits(value));
+float flyweight_v2_deepseek4_half_round_trip(float value){
+    return flyweight::v2::deepseek4::half_value(flyweight::v2::deepseek4::half_bits(value));
 }
 
 // Gather the state rows one compressed block pools.
-int colibri_v2_deepseek4_gather_block(
+int flyweight_v2_deepseek4_gather_block(
     const float* values, const float* scores, int32_t width, int32_t head_dim,
     int32_t ratio, int32_t block, int32_t overlapped,
     float* out_values, float* out_scores, int32_t* rows
@@ -11194,7 +11414,7 @@ int colibri_v2_deepseek4_gather_block(
     const std::int32_t expected=overlapped?2*head_dim:head_dim;
     if(width!=expected)
         throw std::runtime_error("state width does not match the block kind");
-    const auto count=colibri::v2::deepseek4::gather_block(
+    const auto count=flyweight::v2::deepseek4::gather_block(
         values,scores,static_cast<std::size_t>(width),static_cast<std::size_t>(head_dim),
         static_cast<std::size_t>(ratio),static_cast<std::size_t>(block),overlapped!=0,
         out_values,out_scores);
@@ -11202,14 +11422,14 @@ int colibri_v2_deepseek4_gather_block(
     return 0;});}
 
 // Build the attention mask for one query position of a DeepSeek-V4 layer.
-int colibri_v2_deepseek4_visible_keys(
+int flyweight_v2_deepseek4_visible_keys(
     int32_t position, int32_t raw_positions, int32_t blocks, int32_t ratio,
     int32_t window, uint8_t* mask, int32_t* visible
 ){return guarded([&]{
     if(!mask||position<0||raw_positions<0||blocks<0||ratio<0||window<0)
         throw std::runtime_error("visible-key arguments are invalid");
     if(blocks&&!ratio)throw std::runtime_error("compressed blocks need a non-zero ratio");
-    const auto count=colibri::v2::deepseek4::visible_keys(
+    const auto count=flyweight::v2::deepseek4::visible_keys(
         static_cast<std::size_t>(position),static_cast<std::size_t>(raw_positions),
         static_cast<std::size_t>(blocks),static_cast<std::size_t>(ratio),
         static_cast<std::size_t>(window),mask);
@@ -11217,19 +11437,19 @@ int colibri_v2_deepseek4_visible_keys(
     return 0;});}
 
 // Pool one block of positions into a single compressed latent.
-int colibri_v2_deepseek4_compress(
+int flyweight_v2_deepseek4_compress(
     const float* values, const float* scores, int32_t positions, int32_t width,
     float* output
 ){return guarded([&]{
     if(!values||!scores||!output||positions<=0||width<=0)
         throw std::runtime_error("compress arguments are invalid");
-    colibri::v2::deepseek4::compress_block(
+    flyweight::v2::deepseek4::compress_block(
         values,scores,static_cast<std::size_t>(positions),
         static_cast<std::size_t>(width),output);
     return 0;});}
 
 // Expert routing for one token: pick the experts and weight them.
-int colibri_v2_deepseek4_router(
+int flyweight_v2_deepseek4_router(
     const float* logits, const float* bias, int32_t experts, int32_t used,
     float weight_scale, float sum_floor, int32_t select, int32_t* chosen, float* weights
 ){return guarded([&]{
@@ -11239,23 +11459,23 @@ int colibri_v2_deepseek4_router(
         for(std::int32_t slot=0;slot<used;++slot)
             if(chosen[slot]<0||chosen[slot]>=experts)
                 throw std::runtime_error("routed expert id is out of range");
-    colibri::v2::deepseek4::moe_router(
+    flyweight::v2::deepseek4::moe_router(
         logits,bias,static_cast<std::size_t>(experts),static_cast<std::size_t>(used),
         weight_scale,sum_floor,select!=0,chosen,weights);
     return 0;});}
 
 // SwiGLU with both halves clamped, as the per-layer swiglu limits require.
-int colibri_v2_deepseek4_swiglu(
+int flyweight_v2_deepseek4_swiglu(
     const float* gate, const float* up, int32_t size, float limit, float* output
 ){return guarded([&]{
     if(!gate||!up||!output||size<=0)throw std::runtime_error("swiglu arguments are invalid");
-    colibri::v2::deepseek4::clamped_swiglu(
+    flyweight::v2::deepseek4::clamped_swiglu(
         gate,up,static_cast<std::size_t>(size),limit,output);
     return 0;});}
 
 // Rotary embedding over `count` rows, each `stride` wide, rotating the trailing
 // `rope_dim` elements at `position`.
-int colibri_v2_deepseek4_rope(
+int flyweight_v2_deepseek4_rope(
     float* values, int32_t stride, int32_t rope_dim, int32_t count,
     int32_t position, float freq_base, float freq_scale, int32_t inverse,
     float ext_factor, float attn_factor, float beta_fast, float beta_slow,
@@ -11263,24 +11483,24 @@ int colibri_v2_deepseek4_rope(
 ){return guarded([&]{
     if(!values||stride<=0||rope_dim<=0||rope_dim>stride||count<=0)
         throw std::runtime_error("rope arguments are invalid");
-    colibri::v2::deepseek4::YarnParameters yarn{
+    flyweight::v2::deepseek4::YarnParameters yarn{
         ext_factor,attn_factor,beta_fast,beta_slow,
         static_cast<std::uint32_t>(original_context<0?0:original_context)};
     for(std::int32_t row=0;row<count;++row)
-        colibri::v2::deepseek4::rope(
+        flyweight::v2::deepseek4::rope(
             values+static_cast<std::size_t>(row)*stride+(stride-rope_dim),
             static_cast<std::size_t>(rope_dim),position,freq_base,freq_scale,inverse!=0,yarn);
     return 0;});}
 
 // Attention over the shared KV latent with per-head sink logits.
-int colibri_v2_deepseek4_attention(
+int flyweight_v2_deepseek4_attention(
     const float* queries, const float* latents, const float* sinks,
     const uint8_t* mask, int32_t heads, int32_t head_dim, int32_t positions,
     float scale, float* output
 ){return guarded([&]{
     if(!queries||!latents||!output||heads<=0||head_dim<=0||positions<=0)
         throw std::runtime_error("attention arguments are invalid");
-    colibri::v2::deepseek4::attention_with_sinks(
+    flyweight::v2::deepseek4::attention_with_sinks(
         queries,latents,sinks,mask,static_cast<std::size_t>(heads),
         static_cast<std::size_t>(head_dim),static_cast<std::size_t>(positions),
         scale,output);
@@ -11291,7 +11511,7 @@ int colibri_v2_deepseek4_attention(
 // `block` is supplied -- write that block's output back into every stream.
 // Exposed so the pieces can be diffed against the reference implementation one
 // at a time, before there is a whole forward pass to compare.
-int colibri_v2_deepseek4_hyper_connection(
+int flyweight_v2_deepseek4_hyper_connection(
     const float* streams, const float* fn, const float* scale, const float* base,
     int32_t n_embd, int32_t hc, int32_t sinkhorn_iterations,
     float rms_epsilon, float hc_epsilon,
@@ -11303,7 +11523,7 @@ int colibri_v2_deepseek4_hyper_connection(
         throw std::runtime_error("hyper-connection inputs are required");
     if(n_embd<=0||hc<=0||sinkhorn_iterations<=0)
         throw std::runtime_error("hyper-connection geometry is invalid");
-    namespace ds4=colibri::v2::deepseek4;
+    namespace ds4=flyweight::v2::deepseek4;
     ds4::hyper_connection_weights(
         streams,fn,scale,base,static_cast<std::size_t>(n_embd),static_cast<std::size_t>(hc),
         static_cast<std::uint32_t>(sinkhorn_iterations),rms_epsilon,hc_epsilon,
@@ -11319,38 +11539,60 @@ int colibri_v2_deepseek4_hyper_connection(
 // Whether the runtime can decode a GGML weight type at all. This is the CPU
 // path's set, which is the widest one: a type missing here cannot be executed
 // by any backend, so a checkpoint carrying it is unusable rather than slow.
-int colibri_v2_quant_supported(uint32_t type){return qwen_cpu_expert_type_supported(type)?1:0;}
+int flyweight_v2_quant_supported(uint32_t type){return qwen_cpu_expert_type_supported(type)?1:0;}
 
 // Copy the per-layer attention-kind array. Returns the number of entries written.
-int colibri_v2_model_compress_ratios(const ColibriV2Model* m,uint32_t* out,int32_t capacity){return guarded([&]{
+int flyweight_v2_model_compress_ratios(const FlyweightV2Model* m,uint32_t* out,int32_t capacity){return guarded([&]{
     if(!m)throw std::runtime_error("invalid model handle");
     const auto& ratios=m->config.compress_ratios;
     if(!out||capacity<=0)return static_cast<int>(ratios.size());
     const auto written=std::min(static_cast<std::size_t>(capacity),ratios.size());
     std::copy_n(ratios.begin(),written,out);
     return static_cast<int>(written);});}
-int colibri_v2_model_target_layers(const ColibriV2Model* m,uint32_t* out,int32_t capacity){return guarded([&]{
+int flyweight_v2_model_target_layers(const FlyweightV2Model* m,uint32_t* out,int32_t capacity){return guarded([&]{
     if(!m)throw std::runtime_error("invalid model handle");
     const auto& layers=m->config.target_layers;
     if(!out||capacity<=0)return static_cast<int>(layers.size());
     const auto written=std::min(static_cast<std::size_t>(capacity),layers.size());
     std::copy_n(layers.begin(),written,out);
     return static_cast<int>(written);});}
-int colibri_v2_model_attention_window(const ColibriV2Model* m,uint32_t layer,uint32_t*out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model attention-window handle");*out=attention_window(*m,layer);return 0;});}
-int colibri_v2_tensor_info(const ColibriV2Model* m,uint64_t i,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("tensor index out of range");return fill(m->tensors[i],*out);});}
-int colibri_v2_tensor_find(const ColibriV2Model* m,const char* name,ColibriV2TensorInfo* out){return guarded([&]{if(!m||!name||!out)throw std::runtime_error("invalid tensor lookup");for(auto const&t:m->tensors)if(t.name==name)return fill(t,*out);throw std::runtime_error("tensor not found");});}
-int colibri_v2_qwen_validate(const ColibriV2Model*m){return guarded([&]{if(!m)throw std::runtime_error("invalid model handle");if(m->config.architecture.find("qwen")!=0)throw std::runtime_error("model architecture is not Qwen");if(!m->config.hidden_size||!m->config.layer_count||!m->config.attention_heads)throw std::runtime_error("Qwen config is incomplete");return 0;});}
-int colibri_v2_qwen_tensor_role(const ColibriV2Model*m,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen tensor role lookup");std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"final_norm")==0)candidates={"output_norm.weight","model.norm.weight","norm.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight","token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m->tensors)if(t.name==candidate)return fill(t,*out);throw std::runtime_error("Qwen tensor role is missing");});}
-int colibri_v2_qwen_layer_tensor(const ColibriV2Model*m,uint32_t layer,const char*role,ColibriV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen layer tensor lookup");std::string prefix="blk."+std::to_string(layer)+".";std::vector<std::string> suffixes;if(std::strcmp(role,"input_norm")==0)suffixes={"attn_norm.weight"};else if(std::strcmp(role,"qkv")==0)suffixes={"attn_qkv.weight"};else if(std::strcmp(role,"attention_q")==0)suffixes={"attn_q.weight"};else if(std::strcmp(role,"attention_k")==0)suffixes={"attn_k.weight"};else if(std::strcmp(role,"attention_v")==0)suffixes={"attn_v.weight"};else if(std::strcmp(role,"attention_output")==0)suffixes={"attn_output.weight","attn_out.weight"};else if(std::strcmp(role,"attention_gate")==0)suffixes={"attn_gate.weight"};else if(std::strcmp(role,"ssm_output")==0)suffixes={"ssm_out.weight"};else if(std::strcmp(role,"ssm_alpha")==0)suffixes={"ssm_alpha.weight"};else if(std::strcmp(role,"ssm_beta")==0)suffixes={"ssm_beta.weight"};else if(std::strcmp(role,"ssm_conv")==0)suffixes={"ssm_conv1d.weight"};else if(std::strcmp(role,"ssm_dt_bias")==0)suffixes={"ssm_dt.bias"};else if(std::strcmp(role,"ssm_a")==0)suffixes={"ssm_a"};else if(std::strcmp(role,"ssm_norm")==0)suffixes={"ssm_norm.weight"};else if(std::strcmp(role,"post_attention_norm")==0)suffixes={"post_attention_norm.weight"};else if(std::strcmp(role,"router")==0)suffixes={"ffn_gate_inp.weight"};else if(std::strcmp(role,"shared_gate")==0)suffixes={"ffn_gate_shexp.weight"};else throw std::runtime_error("unknown Qwen layer tensor role");for(auto const&suffix:suffixes)for(auto const&t:m->tensors)if(t.name==prefix+suffix)return fill(t,*out);throw std::runtime_error("Qwen layer tensor role is missing");});}
+int flyweight_v2_model_attention_window(const FlyweightV2Model* m,uint32_t layer,uint32_t*out){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid model attention-window handle");*out=attention_window(*m,layer);return 0;});}
+int flyweight_v2_tensor_info(const FlyweightV2Model* m,uint64_t i,FlyweightV2TensorInfo* out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("tensor index out of range");return fill(m->tensors[i],*out);});}
+int flyweight_v2_tensor_find(const FlyweightV2Model* m,const char* name,FlyweightV2TensorInfo* out){return guarded([&]{if(!m||!name||!out)throw std::runtime_error("invalid tensor lookup");for(auto const&t:m->tensors)if(t.name==name)return fill(t,*out);throw std::runtime_error("tensor not found");});}
+int flyweight_v2_qwen_validate(const FlyweightV2Model*m){return guarded([&]{if(!m)throw std::runtime_error("invalid model handle");if(m->config.architecture.find("qwen")!=0)throw std::runtime_error("model architecture is not Qwen");if(!m->config.hidden_size||!m->config.layer_count||!m->config.attention_heads)throw std::runtime_error("Qwen config is incomplete");return 0;});}
+int flyweight_v2_qwen_tensor_role(const FlyweightV2Model*m,const char*role,FlyweightV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen tensor role lookup");std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"final_norm")==0)candidates={"output_norm.weight","model.norm.weight","norm.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight","token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m->tensors)if(t.name==candidate)return fill(t,*out);throw std::runtime_error("Qwen tensor role is missing");});}
+int flyweight_v2_qwen_layer_tensor(const FlyweightV2Model*m,uint32_t layer,const char*role,FlyweightV2TensorInfo*out){return guarded([&]{if(!m||!role||!out)throw std::runtime_error("invalid Qwen layer tensor lookup");std::string prefix="blk."+std::to_string(layer)+".";std::vector<std::string> suffixes;if(std::strcmp(role,"input_norm")==0)suffixes={"attn_norm.weight"};else if(std::strcmp(role,"qkv")==0)suffixes={"attn_qkv.weight"};else if(std::strcmp(role,"attention_q")==0)suffixes={"attn_q.weight"};else if(std::strcmp(role,"attention_k")==0)suffixes={"attn_k.weight"};else if(std::strcmp(role,"attention_v")==0)suffixes={"attn_v.weight"};else if(std::strcmp(role,"attention_output")==0)suffixes={"attn_output.weight","attn_out.weight"};else if(std::strcmp(role,"attention_gate")==0)suffixes={"attn_gate.weight"};else if(std::strcmp(role,"ssm_output")==0)suffixes={"ssm_out.weight"};else if(std::strcmp(role,"ssm_alpha")==0)suffixes={"ssm_alpha.weight"};else if(std::strcmp(role,"ssm_beta")==0)suffixes={"ssm_beta.weight"};else if(std::strcmp(role,"ssm_conv")==0)suffixes={"ssm_conv1d.weight"};else if(std::strcmp(role,"ssm_dt_bias")==0)suffixes={"ssm_dt.bias"};else if(std::strcmp(role,"ssm_a")==0)suffixes={"ssm_a"};else if(std::strcmp(role,"ssm_norm")==0)suffixes={"ssm_norm.weight"};else if(std::strcmp(role,"post_attention_norm")==0)suffixes={"post_attention_norm.weight"};else if(std::strcmp(role,"router")==0)suffixes={"ffn_gate_inp.weight"};else if(std::strcmp(role,"shared_gate")==0)suffixes={"ffn_gate_shexp.weight"};else throw std::runtime_error("unknown Qwen layer tensor role");for(auto const&suffix:suffixes)for(auto const&t:m->tensors)if(t.name==prefix+suffix)return fill(t,*out);throw std::runtime_error("Qwen layer tensor role is missing");});}
 float half_to_float(uint16_t bits){uint32_t sign=(bits&0x8000u)<<16, exponent=(bits>>10)&0x1fu, fraction=bits&0x3ffu;uint32_t result;if(exponent==0){if(!fraction)result=sign;else{exponent=1;while((fraction&0x400u)==0){fraction<<=1;--exponent;}result=sign|((exponent+112)<<23)|((fraction&0x3ffu)<<13);}}else if(exponent==31)result=sign|0x7f800000u|(fraction<<13);else result=sign|((exponent+112)<<23)|(fraction<<13);float value;std::memcpy(&value,&result,sizeof(value));return value;}
-float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==29)return qwen_iq1m_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
-int colibri_v2_dspark_encode(const ColibriV2Model*m,const float*features,uint64_t elements,float*output,uint64_t output_elements){return guarded([&]{
+// Q5_0: 2-byte scale, a 32-bit plane of fifth bits, then 32 nibbles. The two
+// halves of a block are the low and high nibbles, and each takes its fifth bit
+// from bit `within` of the plane -- so the halves read bits 0-15 and 16-31.
+// Only the host side needs this: it exists so a Q5_0 tensor can be repacked to
+// Q8_0 on the way to the device, which is what the MTP draft block does when a
+// companion GGUF is quantized differently from the trunk.
+inline float qwen_q5_0_value(const uint8_t* data, uint64_t index) {
+    constexpr uint64_t kBlock = 22;  // 2 + 4 + 16
+    const uint64_t block = index / 32, within = index % 32;
+    const uint8_t* base = data + block * kBlock;
+    uint16_t scale_bits = 0;
+    std::memcpy(&scale_bits, base, 2);
+    uint32_t plane = 0;
+    std::memcpy(&plane, base + 2, 4);
+    const uint64_t nibble = within % 16;
+    const uint8_t byte = base[6 + nibble];
+    const uint8_t low = (within < 16) ? (byte & 0x0F) : (byte >> 4);
+    const uint8_t fifth = static_cast<uint8_t>((plane >> within) & 1u) << 4;
+    return half_to_float(scale_bits) *
+           (static_cast<float>(low | fifth) - 16.0f);
+}
+
+float tensor_value(const uint8_t*data,uint32_t type,uint64_t index){if(type==6)return qwen_q5_0_value(data,index);if(type==0){float value;std::memcpy(&value,data+index*4,4);return value;}if(type==1){uint16_t value;std::memcpy(&value,data+index*2,2);return half_to_float(value);}if(type==30){uint16_t value;std::memcpy(&value,data+index*2,2);uint32_t bits=static_cast<uint32_t>(value)<<16;float result;std::memcpy(&result,&bits,4);return result;}if(type==8){uint64_t block=index/32,within=index%32;uint16_t scale;std::memcpy(&scale,data+block*kQ8BlockSize,2);int8_t quant;std::memcpy(&quant,data+block*kQ8BlockSize+2+within,1);return half_to_float(scale)*static_cast<float>(quant);}if(type==40)return qwen_nvfp4_value(data,index);if(type==10)return qwen_q2k_value(data,index);if(type==11)return qwen_q3k_value(data,index);if(type==16)return qwen_iq2xxs_value(data,index);if(type==18)return qwen_iq3xxs_value(data,index);if(type==22)return qwen_iq2s_value(data,index);if(type==21)return qwen_iq3s_value(data,index);if(type==17)return qwen_iq2xs_value(data,index);if(type==23)return qwen_iq4xs_value(data,index);if(type==29)return qwen_iq1m_value(data,index);if(type==12)return qwen_q4k_value(data,index);if(type==13)return qwen_q5_value(data,index);if(type==14)return qwen_q6_value(data,index);throw std::runtime_error("unsupported Qwen CPU tensor type");}
+int flyweight_v2_dspark_encode(const FlyweightV2Model*m,const float*features,uint64_t elements,float*output,uint64_t output_elements){return guarded([&]{
     if(!m||!features||!output)throw std::runtime_error("DSpark encoder arguments are required");
     if(m->config.architecture!="dflash")throw std::runtime_error("not a DFlash/DSpark sidecar");
     const auto width=m->config.hidden_size;
     const auto expected=static_cast<std::uint64_t>(m->config.target_layers.size())*width;
     if(!width||elements!=expected||output_elements<width)throw std::runtime_error("DSpark encoder feature shape is invalid");
-    if(colibri_v2_matvec(m,"fc.weight",features,static_cast<int32_t>(elements),output,static_cast<int32_t>(width))!=0)
+    if(flyweight_v2_matvec(m,"fc.weight",features,static_cast<int32_t>(elements),output,static_cast<int32_t>(width))!=0)
         throw std::runtime_error(error.empty()?"DSpark fusion projection failed":error);
     const auto norm=std::find_if(m->tensors.begin(),m->tensors.end(),[](const Tensor&t){return t.name=="enc.output_norm.weight";});
     if(norm==m->tensors.end())throw std::runtime_error("DSpark encoder norm is missing");
@@ -11360,20 +11602,20 @@ int colibri_v2_dspark_encode(const ColibriV2Model*m,const float*features,uint64_
     for(std::uint32_t i=0;i<width;++i)output[i]*=scale*tensor_value(data,norm->type,i);
     return 0;});}
 
-struct ColibriV2DsparkRuntime {
-    ColibriV2Model* model=nullptr;
+struct FlyweightV2DsparkRuntime {
+    FlyweightV2Model* model=nullptr;
     std::uint32_t context_limit=0,position=0,width=0,rope_dim=0,window=0;
     float epsilon=0.0f,freq_base=10000.0f;
     std::vector<std::uint16_t> cache;
     std::vector<float> projected;
-    ColibriV2Deepseek4Runtime* decoder=nullptr;
+    FlyweightV2Deepseek4Runtime* decoder=nullptr;
 };
 
-int colibri_v2_dspark_runtime_create(ColibriV2Model*m,uint32_t context_limit,ColibriV2DsparkRuntime**out){return guarded([&]{
+int flyweight_v2_dspark_runtime_create(FlyweightV2Model*m,uint32_t context_limit,FlyweightV2DsparkRuntime**out){return guarded([&]{
     if(!m||!out||!context_limit)throw std::runtime_error("DSpark model, context and output are required");
     if(m->config.architecture!="dflash")throw std::runtime_error("not a DFlash/DSpark sidecar");
     if(context_limit>m->config.context_length)throw std::runtime_error("DSpark context exceeds checkpoint limit");
-    auto runtime=std::make_unique<ColibriV2DsparkRuntime>();
+    auto runtime=std::make_unique<FlyweightV2DsparkRuntime>();
     runtime->model=m;runtime->context_limit=context_limit;runtime->width=m->config.kv_lora_rank;
     runtime->rope_dim=m->config.rotary_dimension;runtime->window=std::min(context_limit,m->config.sliding_window);
     runtime->epsilon=m->config.rms_norm_epsilon;runtime->freq_base=m->config.rope_freq_base;
@@ -11381,24 +11623,24 @@ int colibri_v2_dspark_runtime_create(ColibriV2Model*m,uint32_t context_limit,Col
         throw std::runtime_error("DSpark KV geometry is incomplete");
     runtime->cache.assign(static_cast<std::size_t>(m->config.layer_count)*runtime->window*runtime->width,0);
     runtime->projected.resize(runtime->width);
-    if(colibri_v2_deepseek4_runtime_create(m,context_limit,&runtime->decoder)!=0)
+    if(flyweight_v2_deepseek4_runtime_create(m,context_limit,&runtime->decoder)!=0)
         throw std::runtime_error(error.empty()?"cannot create DSpark decoder plan":error);
     *out=runtime.release();return 0;});}
-void colibri_v2_dspark_runtime_free(ColibriV2DsparkRuntime*r){try{if(r)colibri_v2_deepseek4_runtime_free(r->decoder);delete r;}catch(...){}}
-int colibri_v2_dspark_runtime_reset(ColibriV2DsparkRuntime*r){return guarded([&]{
+void flyweight_v2_dspark_runtime_free(FlyweightV2DsparkRuntime*r){try{if(r)flyweight_v2_deepseek4_runtime_free(r->decoder);delete r;}catch(...){}}
+int flyweight_v2_dspark_runtime_reset(FlyweightV2DsparkRuntime*r){return guarded([&]{
     if(!r)throw std::runtime_error("invalid DSpark runtime");
     r->position=0;std::fill(r->cache.begin(),r->cache.end(),0);
-    if(colibri_v2_deepseek4_runtime_reset(r->decoder)!=0)
+    if(flyweight_v2_deepseek4_runtime_reset(r->decoder)!=0)
         throw std::runtime_error(error.empty()?"cannot reset DSpark decoder":error);
     return 0;});}
 
-int colibri_v2_dspark_inject(ColibriV2DsparkRuntime*r,const float*fused,uint64_t elements){return guarded([&]{
+int flyweight_v2_dspark_inject(FlyweightV2DsparkRuntime*r,const float*fused,uint64_t elements){return guarded([&]{
     if(!r||!fused||elements!=r->model->config.hidden_size)throw std::runtime_error("invalid DSpark injection");
     if(r->position>=r->context_limit)throw std::runtime_error("DSpark cache is past its context limit");
     auto& m=*r->model;
     for(std::uint32_t layer=0;layer<m.config.layer_count;++layer){
         const auto prefix="blk."+std::to_string(layer)+".";
-        if(colibri_v2_matvec(&m,(prefix+"attn_kv.weight").c_str(),fused,static_cast<int32_t>(elements),r->projected.data(),r->width)!=0)
+        if(flyweight_v2_matvec(&m,(prefix+"attn_kv.weight").c_str(),fused,static_cast<int32_t>(elements),r->projected.data(),r->width)!=0)
             throw std::runtime_error(error.empty()?"DSpark KV projection failed":error);
         const auto norm_name=prefix+"attn_kv_a_norm.weight";
         const auto norm=std::find_if(m.tensors.begin(),m.tensors.end(),[&](const Tensor&t){return t.name==norm_name;});
@@ -11407,24 +11649,24 @@ int colibri_v2_dspark_inject(ColibriV2DsparkRuntime*r,const float*fused,uint64_t
         const float scale=1.0f/std::sqrt(static_cast<float>(square/r->width)+r->epsilon);
         const auto*gain=tensor_data(m,*norm);
         for(std::uint32_t i=0;i<r->width;++i)r->projected[i]*=scale*tensor_value(gain,norm->type,i);
-        colibri::v2::deepseek4::rope(r->projected.data()+r->width-r->rope_dim,r->rope_dim,
+        flyweight::v2::deepseek4::rope(r->projected.data()+r->width-r->rope_dim,r->rope_dim,
             static_cast<std::int32_t>(r->position),r->freq_base,1.0f,false);
         auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+r->position%r->window)*r->width;
         auto*decoder_slot=r->decoder->layers[layer].latents.data()+
             static_cast<std::size_t>(r->position%r->window)*r->width;
-        for(std::uint32_t i=0;i<r->width;++i)slot[i]=decoder_slot[i]=colibri::v2::deepseek4::half_bits(r->projected[i]);
+        for(std::uint32_t i=0;i<r->width;++i)slot[i]=decoder_slot[i]=flyweight::v2::deepseek4::half_bits(r->projected[i]);
         r->decoder->layers[layer].positions=r->position+1;
     }
     ++r->position;return 0;});}
 
-int colibri_v2_dspark_cached(const ColibriV2DsparkRuntime*r,uint32_t layer,uint32_t position,float*output,uint64_t elements){return guarded([&]{
+int flyweight_v2_dspark_cached(const FlyweightV2DsparkRuntime*r,uint32_t layer,uint32_t position,float*output,uint64_t elements){return guarded([&]{
     if(!r||!output||layer>=r->model->config.layer_count||position>=r->position||
        r->position-position>r->window||elements<r->width)throw std::runtime_error("invalid DSpark cache read");
     const auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+position%r->window)*r->width;
-    for(std::uint32_t i=0;i<r->width;++i)output[i]=colibri::v2::deepseek4::half_value(slot[i]);
+    for(std::uint32_t i=0;i<r->width;++i)output[i]=flyweight::v2::deepseek4::half_value(slot[i]);
     return 0;});}
 
-int colibri_v2_dspark_heads(const ColibriV2Model*m,const float*base_logits,const float*hidden,
+int flyweight_v2_dspark_heads(const FlyweightV2Model*m,const float*base_logits,const float*hidden,
     uint32_t rows,uint32_t anchor_token,float*logits,float*confidence,uint32_t*tokens){return guarded([&]{
     if(!m||!base_logits||!hidden||!logits||!confidence||!tokens)
         throw std::runtime_error("DSpark head arguments are required");
@@ -11449,7 +11691,7 @@ int colibri_v2_dspark_heads(const ColibriV2Model*m,const float*base_logits,const
     for(std::uint32_t row=0;row<rows;++row){
         for(std::uint32_t i=0;i<256;++i)
             feature[i]=tensor_value(w1_data,w1.type,static_cast<std::uint64_t>(previous)*256+i);
-        if(colibri_v2_matvec(m,"markov_w2.weight",feature.data(),256,bias.data(),vocab)!=0)
+        if(flyweight_v2_matvec(m,"markov_w2.weight",feature.data(),256,bias.data(),vocab)!=0)
             throw std::runtime_error(error.empty()?"DSpark Markov projection failed":error);
         auto*out=logits+static_cast<std::size_t>(row)*vocab;
         const auto*base=base_logits+static_cast<std::size_t>(row)*vocab;
@@ -11460,12 +11702,12 @@ int colibri_v2_dspark_heads(const ColibriV2Model*m,const float*base_logits,const
         double score=0.0;const auto*state=hidden+static_cast<std::size_t>(row)*width;
         for(std::uint32_t i=0;i<width;++i)score+=static_cast<double>(state[i])*tensor_value(conf_data,conf.type,i);
         for(std::uint32_t i=0;i<256;++i)score+=static_cast<double>(feature[i])*tensor_value(conf_data,conf.type,width+i);
-        confidence[row]=colibri::v2::deepseek4::sigmoid(static_cast<float>(score));
+        confidence[row]=flyweight::v2::deepseek4::sigmoid(static_cast<float>(score));
         tokens[row]=best;previous=best;
     }
     return 0;});}
 
-int colibri_v2_dspark_attention(const ColibriV2DsparkRuntime*r,uint32_t layer,
+int flyweight_v2_dspark_attention(const FlyweightV2DsparkRuntime*r,uint32_t layer,
     const float*queries,const float*noise_kv,uint32_t rows,float*output,uint64_t elements){return guarded([&]{
     if(!r||!queries||!noise_kv||!output||layer>=r->model->config.layer_count||
        !rows||rows>r->model->config.draft_block_size)
@@ -11487,7 +11729,7 @@ int colibri_v2_dspark_attention(const ColibriV2DsparkRuntime*r,uint32_t layer,
         for(std::uint32_t position=first;position<r->position;++position){
             const auto*slot=r->cache.data()+(static_cast<std::size_t>(layer)*r->window+position%r->window)*width;
             auto*target=keys.data()+static_cast<std::size_t>(count++)*width;
-            for(std::uint32_t i=0;i<width;++i)target[i]=colibri::v2::deepseek4::half_value(slot[i]);
+            for(std::uint32_t i=0;i<width;++i)target[i]=flyweight::v2::deepseek4::half_value(slot[i]);
         }
         for(std::uint32_t noise=0;noise<rows;++noise){
             const auto key_position=r->position+noise;
@@ -11495,18 +11737,18 @@ int colibri_v2_dspark_attention(const ColibriV2DsparkRuntime*r,uint32_t layer,
             std::copy_n(noise_kv+static_cast<std::size_t>(noise)*width,width,
                 keys.data()+static_cast<std::size_t>(count++)*width);
         }
-        colibri::v2::deepseek4::attention_with_sinks(
+        flyweight::v2::deepseek4::attention_with_sinks(
             queries+static_cast<std::size_t>(row)*heads*width,keys.data(),sinks.data(),nullptr,
             heads,width,count,scale,output+static_cast<std::size_t>(row)*heads*width);
     }
     return 0;});}
 
-int colibri_v2_dspark_attention_stage(ColibriV2DsparkRuntime*r,uint32_t layer,
+int flyweight_v2_dspark_attention_stage(FlyweightV2DsparkRuntime*r,uint32_t layer,
     const float*streams,uint32_t rows,float*output,uint64_t elements){return guarded([&]{
     if(!r||!streams||!output||layer>=r->decoder->layers.size()||!rows||rows>r->model->config.draft_block_size)
         throw std::runtime_error("invalid DSpark attention stage");
     auto&rt=*r->decoder;const auto&plan=rt.layers[layer].plan;const auto&model=*rt.model;
-    namespace ds4=colibri::v2::deepseek4;
+    namespace ds4=flyweight::v2::deepseek4;
     const auto stream_width=static_cast<std::size_t>(rt.hc)*rt.n_embd;
     if(elements<static_cast<std::uint64_t>(rows)*stream_width)throw std::runtime_error("DSpark stage output is too small");
     const auto wide=static_cast<std::size_t>(rt.heads)*rt.head_dim;
@@ -11542,7 +11784,7 @@ int colibri_v2_dspark_attention_stage(ColibriV2DsparkRuntime*r,uint32_t layer,
         std::copy_n(sc.query.data(),wide,queries.data()+static_cast<std::size_t>(row)*wide);
         std::copy_n(sc.latent.data(),rt.head_dim,latents.data()+static_cast<std::size_t>(row)*rt.head_dim);
     }
-    if(colibri_v2_dspark_attention(r,layer,queries.data(),latents.data(),rows,attended.data(),attended.size())!=0)
+    if(flyweight_v2_dspark_attention(r,layer,queries.data(),latents.data(),rows,attended.data(),attended.size())!=0)
         throw std::runtime_error(error.empty()?"DSpark block attention failed":error);
     for(std::uint32_t row=0;row<rows;++row){
         auto&sc=scratch[row];const auto position=r->position+row;
@@ -11563,12 +11805,12 @@ int colibri_v2_dspark_attention_stage(ColibriV2DsparkRuntime*r,uint32_t layer,
     }
     return 0;});}
 
-int colibri_v2_dspark_ffn_stage(ColibriV2DsparkRuntime*r,uint32_t layer,
+int flyweight_v2_dspark_ffn_stage(FlyweightV2DsparkRuntime*r,uint32_t layer,
     const float*streams,uint32_t rows,float*output,uint64_t elements){return guarded([&]{
     if(!r||!streams||!output||layer>=r->decoder->layers.size()||!rows||rows>r->model->config.draft_block_size)
         throw std::runtime_error("invalid DSpark FFN stage");
     auto&rt=*r->decoder;const auto&plan=rt.layers[layer].plan;const auto&model=*rt.model;
-    namespace ds4=colibri::v2::deepseek4;
+    namespace ds4=flyweight::v2::deepseek4;
     const auto stream_width=static_cast<std::size_t>(rt.hc)*rt.n_embd;
     if(elements<static_cast<std::uint64_t>(rows)*stream_width)throw std::runtime_error("DSpark FFN output is too small");
     for(std::uint32_t row=0;row<rows;++row){
@@ -11591,7 +11833,7 @@ int colibri_v2_dspark_ffn_stage(ColibriV2DsparkRuntime*r,uint32_t layer,
     }
     return 0;});}
 
-int colibri_v2_dspark_decode_hidden(ColibriV2DsparkRuntime*r,const float*embeddings,
+int flyweight_v2_dspark_decode_hidden(FlyweightV2DsparkRuntime*r,const float*embeddings,
     uint32_t rows,float*hidden,float*normalized,uint64_t elements){return guarded([&]{
     if(!r||!embeddings||!hidden||!normalized||!rows||rows>r->model->config.draft_block_size)
         throw std::runtime_error("invalid DSpark decode block");
@@ -11603,12 +11845,12 @@ int colibri_v2_dspark_decode_hidden(ColibriV2DsparkRuntime*r,const float*embeddi
         std::copy_n(embeddings+static_cast<std::size_t>(row)*width,width,
             streams.data()+static_cast<std::size_t>(row)*stream_width+static_cast<std::size_t>(stream)*width);
     for(std::uint32_t layer=0;layer<rt.layers.size();++layer){
-        if(colibri_v2_dspark_attention_stage(r,layer,streams.data(),rows,next.data(),next.size())!=0)
+        if(flyweight_v2_dspark_attention_stage(r,layer,streams.data(),rows,next.data(),next.size())!=0)
             throw std::runtime_error(error.empty()?"DSpark attention stage failed":error);
-        if(colibri_v2_dspark_ffn_stage(r,layer,next.data(),rows,streams.data(),streams.size())!=0)
+        if(flyweight_v2_dspark_ffn_stage(r,layer,next.data(),rows,streams.data(),streams.size())!=0)
             throw std::runtime_error(error.empty()?"DSpark FFN stage failed":error);
     }
-    namespace ds4=colibri::v2::deepseek4;const auto&model=*rt.model;
+    namespace ds4=flyweight::v2::deepseek4;const auto&model=*rt.model;
     for(std::uint32_t row=0;row<rows;++row){
         std::vector<float>pre(rt.hc);
         auto*out=hidden+static_cast<std::size_t>(row)*width;
@@ -11620,17 +11862,17 @@ int colibri_v2_dspark_decode_hidden(ColibriV2DsparkRuntime*r,const float*embeddi
         for(std::uint32_t i=0;i<width;++i)norm[i]*=gain[i];
     }
     return 0;});}
-const Tensor& qwen_role_tensor(const ColibriV2Model&m,const char*role){std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m.tensors)if(t.name==candidate)return t;throw std::runtime_error("Qwen tensor role is missing");}
-int colibri_v2_qwen_embedding(const ColibriV2Model*m,uint32_t token,float*out,uint64_t elements){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid embedding arguments");const Tensor&t=qwen_role_tensor(*m,"token_embeddings");if(t.shape.size()!=2)throw std::runtime_error("embedding shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(token>=vocab||elements<width)throw std::runtime_error("embedding token or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t i=0;i<width;i++)out[i]=tensor_value(data,t.type,static_cast<uint64_t>(token)*width+i);return 0;});}
-int colibri_v2_qwen_lm_head(const ColibriV2Model*m,const float*hidden,float*logits,uint64_t vocabulary,uint64_t elements){return guarded([&]{if(!m||!hidden||!logits)throw std::runtime_error("invalid LM-head arguments");const Tensor&t=qwen_role_tensor(*m,"lm_head");if(t.shape.size()!=2)throw std::runtime_error("LM-head shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(vocabulary<vocab||elements<width)throw std::runtime_error("LM-head shape or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t row=0;row<vocab;row++){float sum=0;for(uint64_t column=0;column<width;column++)sum+=tensor_value(data,t.type,row*width+column)*hidden[column];logits[row]=sum;}return 0;});}
-int colibri_v2_qwen_token_text(const ColibriV2Model*m,uint32_t token,char*out,uint64_t capacity){return guarded([&]{if(!m||!out||capacity==0)throw std::runtime_error("invalid token text arguments");if(token>=m->vocabulary.size())throw std::runtime_error("token is outside the GGUF vocabulary");const std::string&value=m->vocabulary[token];if(capacity<=value.size())throw std::runtime_error("token text buffer is too small");std::memcpy(out,value.data(),value.size());out[value.size()]=0;return 0;});}
-int colibri_v2_token_id(const ColibriV2Model*m,const char*text,uint32_t*token){return guarded([&]{if(!m||!text||!token)throw std::runtime_error("invalid token lookup arguments");const auto it=m->vocabulary_ids.find(text);if(it==m->vocabulary_ids.end())throw std::runtime_error("token text is not in the GGUF vocabulary");*token=it->second;return 0;});}
-std::string gguf_byte_encode(const char*text){return colibri::v2::alphabet::encode(text);}
+const Tensor& qwen_role_tensor(const FlyweightV2Model&m,const char*role){std::vector<std::string> candidates;if(std::strcmp(role,"token_embeddings")==0)candidates={"token_embd.weight","model.embed_tokens.weight","embed_tokens.weight"};else if(std::strcmp(role,"lm_head")==0)candidates={"output.weight","lm_head.weight"};else throw std::runtime_error("unknown Qwen tensor role");for(auto const&candidate:candidates)for(auto const&t:m.tensors)if(t.name==candidate)return t;throw std::runtime_error("Qwen tensor role is missing");}
+int flyweight_v2_qwen_embedding(const FlyweightV2Model*m,uint32_t token,float*out,uint64_t elements){return guarded([&]{if(!m||!out)throw std::runtime_error("invalid embedding arguments");const Tensor&t=qwen_role_tensor(*m,"token_embeddings");if(t.shape.size()!=2)throw std::runtime_error("embedding shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(token>=vocab||elements<width)throw std::runtime_error("embedding token or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t i=0;i<width;i++)out[i]=tensor_value(data,t.type,static_cast<uint64_t>(token)*width+i);return 0;});}
+int flyweight_v2_qwen_lm_head(const FlyweightV2Model*m,const float*hidden,float*logits,uint64_t vocabulary,uint64_t elements){return guarded([&]{if(!m||!hidden||!logits)throw std::runtime_error("invalid LM-head arguments");const Tensor&t=qwen_role_tensor(*m,"lm_head");if(t.shape.size()!=2)throw std::runtime_error("LM-head shape is invalid");uint64_t width=t.shape[0]==m->config.hidden_size?t.shape[0]:t.shape[1],vocab=t.shape[0]==m->config.hidden_size?t.shape[1]:t.shape[0];if(vocabulary<vocab||elements<width)throw std::runtime_error("LM-head shape or buffer is invalid");const auto*data=tensor_data(*m,t);for(uint64_t row=0;row<vocab;row++){float sum=0;for(uint64_t column=0;column<width;column++)sum+=tensor_value(data,t.type,row*width+column)*hidden[column];logits[row]=sum;}return 0;});}
+int flyweight_v2_qwen_token_text(const FlyweightV2Model*m,uint32_t token,char*out,uint64_t capacity){return guarded([&]{if(!m||!out||capacity==0)throw std::runtime_error("invalid token text arguments");if(token>=m->vocabulary.size())throw std::runtime_error("token is outside the GGUF vocabulary");const std::string&value=m->vocabulary[token];if(capacity<=value.size())throw std::runtime_error("token text buffer is too small");std::memcpy(out,value.data(),value.size());out[value.size()]=0;return 0;});}
+int flyweight_v2_token_id(const FlyweightV2Model*m,const char*text,uint32_t*token){return guarded([&]{if(!m||!text||!token)throw std::runtime_error("invalid token lookup arguments");const auto it=m->vocabulary_ids.find(text);if(it==m->vocabulary_ids.end())throw std::runtime_error("token text is not in the GGUF vocabulary");*token=it->second;return 0;});}
+std::string gguf_byte_encode(const char*text){return flyweight::v2::alphabet::encode(text);}
 // One vocabulary piece back to the bytes it stands for; the tool grammar
 // matches literal bytes against candidate tokens and the vocabulary spells
-// them in the byte-level alphabet. See colibri_v2_byte_alphabet.hpp.
+// them in the byte-level alphabet. See flyweight_v2_byte_alphabet.hpp.
 std::string gguf_byte_decode(const std::string&piece){
-    return colibri::v2::alphabet::decode(piece);
+    return flyweight::v2::alphabet::decode(piece);
 }
 std::vector<std::string> gguf_utf8_symbols(const std::string&text){std::vector<std::string> symbols;for(size_t i=0;i<text.size();){unsigned char c=text[i];size_t width=(c<0x80)?1:(c<0xE0?2:(c<0xF0?3:4));if(i+width>text.size())width=1;symbols.emplace_back(text.data()+i,width);i+=width;}return symbols;}
 // One UTF-8 codepoint at `offset`, with its encoded width.
@@ -11838,27 +12080,27 @@ std::vector<std::string> gguf_regex_split(
 // reference tokenizer matters more than agreeing with Unicode.
 bool joyai_is_letter(std::uint32_t c) {
     if(c<128)return (c>='A'&&c<='Z')||(c>='a'&&c<='z');
-    return colibri::unicode::is_letter(c);
+    return flyweight::unicode::is_letter(c);
 }
 bool joyai_is_number(std::uint32_t c) {
     if(c<128)return c>='0'&&c<='9';
-    return colibri::unicode::is_number(c);
+    return flyweight::unicode::is_number(c);
 }
 bool joyai_is_accent_mark(std::uint32_t c) {
     // The collapse lists no sub-128 codepoints for \p{M}.
-    return c<128?false:colibri::unicode::is_accent_mark(c);
+    return c<128?false:flyweight::unicode::is_accent_mark(c);
 }
 bool joyai_is_punctuation(std::uint32_t c) {
     if(c<128)
         return (c>=0x21&&c<=0x23)||(c>=0x25&&c<=0x2A)||(c>=0x2C&&c<=0x2F)||
                (c>=0x3A&&c<=0x3B)||(c>=0x3F&&c<=0x40)||(c>=0x5B&&c<=0x5D)||
                c==0x5F||c==0x7B||c==0x7D;
-    return colibri::unicode::is_punctuation(c);
+    return flyweight::unicode::is_punctuation(c);
 }
 bool joyai_is_symbol(std::uint32_t c) {
     if(c<128)
         return c==0x24||c==0x2B||(c>=0x3C&&c<=0x3E)||c==0x5E||c==0x60||c==0x7C;
-    return colibri::unicode::is_symbol(c);
+    return flyweight::unicode::is_symbol(c);
 }
 
 // "\p{N}{1,3}": digits break into groups of at most three.
@@ -11892,7 +12134,7 @@ std::size_t joyai_match_cjk(const std::vector<std::uint32_t>& code,std::size_t a
 // | \s+(?!\S)
 // | \s+
 std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t at) {
-    namespace unicode=colibri::unicode;
+    namespace unicode=flyweight::unicode;
     const auto size=code.size();
     const auto first=code[at];
     auto letter_or_mark=[](std::uint32_t c){return joyai_is_letter(c)||joyai_is_accent_mark(c);};
@@ -12193,7 +12435,7 @@ std::vector<std::string> deepseek4_pretokenize(const std::string& text) {
 }
 
 // BPE over one pre-tokenized piece, appending its ids to `result`.
-void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
+void gguf_bpe_piece(const FlyweightV2Model& m, const std::string& piece,
                     std::vector<uint32_t>& result) {
     const std::string encoded=gguf_byte_encode(piece.c_str());
     auto symbols=gguf_utf8_symbols(encoded);
@@ -12236,7 +12478,7 @@ void gguf_bpe_piece(const ColibriV2Model& m, const std::string& piece,
 // The pre-tokenizer a checkpoint asks for by name. Anything unlisted keeps the
 // historical behaviour of no pre-tokenization at all, which is what the Qwen
 // checkpoints have always run.
-std::vector<std::string> gguf_pretokenize(const ColibriV2Model& m,
+std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
                                           const std::string& text) {
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
     if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
@@ -12248,7 +12490,7 @@ std::vector<std::string> gguf_pretokenize(const ColibriV2Model& m,
 // patterns without a vocabulary in the way. Writes the byte offset each piece
 // starts at plus a trailing end offset, so `count` is one more than the number
 // of pieces. A null `offsets` asks for the count alone.
-int colibri_v2_pretokenize(const ColibriV2Model*m,const char*text,uint64_t*offsets,uint64_t capacity,uint64_t*count){return guarded([&]{
+int flyweight_v2_pretokenize(const FlyweightV2Model*m,const char*text,uint64_t*offsets,uint64_t capacity,uint64_t*count){return guarded([&]{
     if(!m||!text||!count)throw std::runtime_error("invalid pretokenize arguments");
     const std::string input(text);
     const auto pieces=gguf_pretokenize(*m,input);
@@ -12260,7 +12502,7 @@ int colibri_v2_pretokenize(const ColibriV2Model*m,const char*text,uint64_t*offse
     offsets[index]=at;
     return 0;});}
 
-int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,uint64_t capacity,uint64_t*count){return guarded([&]{
+int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*tokens,uint64_t capacity,uint64_t*count){return guarded([&]{
     if(!m||!text||!count)throw std::runtime_error("invalid tokenize arguments");
     // Muse Glimmer's chat format is built entirely out of control tokens
     // (<|start|>, <|message|>, <|eom|>, <|eot|>), and BPE would happily shred
@@ -12342,10 +12584,10 @@ int colibri_v2_tokenize(const ColibriV2Model*m,const char*text,uint32_t*tokens,u
     std::copy(result.begin(),result.end(),tokens);
     return 0;
 });}
-int colibri_v2_tensor_read(const ColibriV2Model* m,uint64_t i,void* dst,uint64_t bytes){return guarded([&]{if(!m||m->read_tensor(i,dst,bytes)!=0)throw std::runtime_error("invalid tensor read");return 0;});}
-int colibri_v2_tensor_read_slice(const ColibriV2Model*m,uint64_t i,uint64_t offset,void*dst,uint64_t bytes){return guarded([&]{if(!m||!dst||i>=m->tensors.size())throw std::runtime_error("invalid tensor slice read");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor slice is out of bounds");std::memcpy(dst,tensor_data(*m,t)+offset,static_cast<size_t>(bytes));return 0;});}
-int colibri_v2_tensor_view(const ColibriV2Model*m,uint64_t i,uint64_t offset,uint64_t bytes,const void**out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("invalid tensor view");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor view is out of bounds");*out=tensor_data(*m,t)+offset;return 0;});}
-int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOptions*options,ColibriV2QwenRuntime**out){return guarded([&]{
+int flyweight_v2_tensor_read(const FlyweightV2Model* m,uint64_t i,void* dst,uint64_t bytes){return guarded([&]{if(!m||m->read_tensor(i,dst,bytes)!=0)throw std::runtime_error("invalid tensor read");return 0;});}
+int flyweight_v2_tensor_read_slice(const FlyweightV2Model*m,uint64_t i,uint64_t offset,void*dst,uint64_t bytes){return guarded([&]{if(!m||!dst||i>=m->tensors.size())throw std::runtime_error("invalid tensor slice read");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor slice is out of bounds");std::memcpy(dst,tensor_data(*m,t)+offset,static_cast<size_t>(bytes));return 0;});}
+int flyweight_v2_tensor_view(const FlyweightV2Model*m,uint64_t i,uint64_t offset,uint64_t bytes,const void**out){return guarded([&]{if(!m||!out||i>=m->tensors.size())throw std::runtime_error("invalid tensor view");const auto&t=m->tensors[i];if(offset>t.size||bytes>t.size-offset)throw std::runtime_error("tensor view is out of bounds");*out=tensor_data(*m,t)+offset;return 0;});}
+int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRuntimeOptions*options,FlyweightV2QwenRuntime**out){return guarded([&]{
     if(!m||!out)throw std::runtime_error("model and runtime output are required");
     const bool gemma4=m->config.architecture=="gemma4";
     const bool laguna=m->config.architecture=="laguna";
@@ -12362,14 +12604,14 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     const bool dense_ffn=has_tensor(*m,"blk.0.ffn_gate.weight");
     if(!m->config.hidden_size||!m->config.layer_count)throw std::runtime_error("Qwen runtime config is incomplete");
     if(!dense_ffn&&(!m->config.expert_count||!m->config.expert_used_count))throw std::runtime_error("Qwen runtime config is incomplete");
-    auto runtime=std::make_unique<ColibriV2QwenRuntime>();
+    auto runtime=std::make_unique<FlyweightV2QwenRuntime>();
     runtime->model=m;
-    runtime->options=options?*options:ColibriV2QwenRuntimeOptions{};
+    runtime->options=options?*options:FlyweightV2QwenRuntimeOptions{};
     if(runtime->options.device<0)throw std::runtime_error("Qwen runtime device must be non-negative");
-    if(!colibri::v2::valid_expert_execution_mode(runtime->options.moe_device))
+    if(!flyweight::v2::valid_expert_execution_mode(runtime->options.moe_device))
         throw std::runtime_error("Qwen runtime MoE device is invalid");
     runtime->expert_mode=
-        colibri::v2::expert_execution_mode(runtime->options.moe_device);
+        flyweight::v2::expert_execution_mode(runtime->options.moe_device);
     // Every expert placement other than `cpu` exists to divide work between a
     // host and a device. With no device there is nothing to divide, and the
     // resident/hybrid/auto paths degrade into copying expert weights from the
@@ -12377,24 +12619,22 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // slower than running them in place. `auto` in particular is the serving
     // default, so leaving this to the caller means the default configuration is
     // the pathological one.
-    if(colibri_backend_is_cpu()&&
-       runtime->expert_mode!=colibri::v2::ExpertExecutionMode::cpu){
+    if(flyweight_backend_is_cpu()&&
+       runtime->expert_mode!=flyweight::v2::ExpertExecutionMode::cpu){
         std::fprintf(stderr,
-            "[colibri-v2] expert placement forced to CPU: the CPU backend has "
+            "[flyweight] expert placement forced to CPU: the CPU backend has "
             "no device to page experts to\n");
-        runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
+        runtime->expert_mode=flyweight::v2::ExpertExecutionMode::cpu;
         runtime->options.moe_device=
-            colibri::v2::expert_execution_mode_value(runtime->expert_mode);
+            flyweight::v2::expert_execution_mode_value(runtime->expert_mode);
     }
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
-    // qwen4exp: no MTP draft block exists in the released GGUFs, so the MTP
-    // machinery (which also lacks the gated-residual bookends) stays off.
-    if(qwen4exp&&options&&options->mtp_drafts)
-        throw std::runtime_error(
-            "native qwen4exp has no MTP draft block (not present in the GGUF)");
+    // qwen4exp MTP runs in stream space end to end (draft, cache replay,
+    // verify hand-over); see plans/qwen4exp-semantics.md. A checkpoint with no
+    // draft block -- UD-IQ1_S is one -- trips the generic check below.
     if(gemma4&&runtime->options.mtp_drafts)throw std::runtime_error("native Gemma 4 MTP is not implemented");
     if(gemma4&&qwen_expert_policy(
-            *runtime,colibri::v2::ExpertExecutionPhase::prepare
+            *runtime,flyweight::v2::ExpertExecutionPhase::prepare
         ).is_streamed_gpu())
         throw std::runtime_error("native Gemma 4 supports --moe-device cpu or hybrid");
     if(laguna&&runtime->options.mtp_drafts)throw std::runtime_error("native Laguna MTP is not implemented");
@@ -12420,7 +12660,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     if(runtime->options.dense_requant>2)
         throw std::runtime_error("native Qwen dense requant policy is invalid");
     if(runtime->options.strict_resident&&
-       runtime->expert_mode!=colibri::v2::ExpertExecutionMode::streamed_gpu)
+       runtime->expert_mode!=flyweight::v2::ExpertExecutionMode::streamed_gpu)
         throw std::runtime_error(
             "native Qwen strict resident policy requires streamed GPU execution");
      if(gemma4&&runtime->options.next_layer_prefetch)throw std::runtime_error("native Gemma 4 next-layer prefetch is not implemented");
@@ -12440,23 +12680,23 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     runtime->qwen4exp=qwen4exp;
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
-    // colibri::v2::attention so they can be pinned by a contract test.
-    if(runtime->options.cache_type_k==colibri::v2::attention::kCacheTypeAuto||
-       runtime->options.cache_type_v==colibri::v2::attention::kCacheTypeAuto){
+    // flyweight::v2::attention so they can be pinned by a contract test.
+    if(runtime->options.cache_type_k==flyweight::v2::attention::kCacheTypeAuto||
+       runtime->options.cache_type_v==flyweight::v2::attention::kCacheTypeAuto){
         bool head_dim_ok=true;
         for(const auto&layer:runtime->layers){
             if(!layer.attention)continue;
-            if(!colibri::v2::attention::turbo_head_dim_ok(layer.head_dim)){
+            if(!flyweight::v2::attention::turbo_head_dim_ok(layer.head_dim)){
                 head_dim_ok=false;break;
             }
         }
-        const auto resolved=colibri::v2::attention::auto_cache_type(
+        const auto resolved=flyweight::v2::attention::auto_cache_type(
             runtime->options.context_limit,
             runtime->model->config.expert_count>0,
             head_dim_ok);
-        if(runtime->options.cache_type_k==colibri::v2::attention::kCacheTypeAuto)
+        if(runtime->options.cache_type_k==flyweight::v2::attention::kCacheTypeAuto)
             runtime->options.cache_type_k=resolved;
-        if(runtime->options.cache_type_v==colibri::v2::attention::kCacheTypeAuto)
+        if(runtime->options.cache_type_v==flyweight::v2::attention::kCacheTypeAuto)
             runtime->options.cache_type_v=resolved;
     }
     if(runtime->options.next_layer_prefetch&&runtime->layers.size()>1){
@@ -12491,7 +12731,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // sizing every scratch region for a 1024-row dense SwiGLU.
     // Muse Glimmer is dense, so it batches like the other dense checkpoints.
     runtime->prefill_rows=gemma4?256:(laguna?256:(dense_ffn?256:1024));
-    if(const char*env=std::getenv("COLIBRI_PREFILL_ROWS")){
+    if(const char*env=std::getenv("FLYWEIGHT_PREFILL_ROWS")){
         const long value=std::strtol(env,nullptr,10);
         runtime->prefill_rows=static_cast<std::uint32_t>(std::clamp<long>(value,0,4096));
     }
@@ -12511,6 +12751,25 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     // Independent decode slots (llama.cpp --parallel): 0/1 = single-sequence.
     runtime->parallel_sequences=std::clamp<std::uint32_t>(
         runtime->options.parallel_sequences?runtime->options.parallel_sequences:1,1,16);
+    // A scratch size for the slots past the first. Refusing the nonsensical
+    // settings here beats laying out a slot nothing can be routed to: a
+    // scratch slot bigger than the context is the full slot under another
+    // name, and one asked for without a second slot to apply it to is a
+    // request the operator will read as having taken effect.
+    if(runtime->options.scratch_context){
+        if(runtime->options.scratch_context>runtime->options.context_limit)
+            throw std::runtime_error(
+                "native Qwen scratch context ("+std::to_string(runtime->options.scratch_context)
+                +") exceeds the context window ("+std::to_string(runtime->options.context_limit)+")");
+        if(runtime->parallel_sequences<2)
+            throw std::runtime_error(
+                "native Qwen scratch context needs --parallel 2 or more; with a single slot "
+                "there are no side slots to shrink");
+        if(runtime->options.mtp_drafts)
+            throw std::runtime_error(
+                "native Qwen scratch context is unavailable under MTP drafting, which runs "
+                "one slot");
+    }
     // Host RAM budget for the spilled-slot prompt cache. UINT32_MAX selects a
     // conservative automatic budget: one eighth of currently available RAM,
     // capped at llama-server's practical 8 GiB default. This leaves ample
@@ -12527,7 +12786,7 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
             static_cast<std::uint64_t>(runtime->options.prompt_cache_mib)*1024ull*1024;
     }
     if(runtime->host_cache_limit_bytes)
-        std::fprintf(stderr,"[colibri-v2] prompt cache budget %.1f GiB%s\n",
+        std::fprintf(stderr,"[flyweight] prompt cache budget %.1f GiB%s\n",
             runtime->host_cache_limit_bytes/static_cast<double>(1024ull*1024*1024),
             runtime->options.prompt_cache_mib==std::numeric_limits<std::uint32_t>::max()
                 ? " (auto)":"");
@@ -12536,8 +12795,8 @@ int colibri_v2_qwen_runtime_create(ColibriV2Model*m,const ColibriV2QwenRuntimeOp
     *out=runtime.release();
     return 0;
 });}
-void colibri_v2_qwen_runtime_destroy(ColibriV2QwenRuntime*runtime){try{if(runtime)release_qwen_device(*runtime);delete runtime;}catch(...){}}
-int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2QwenRuntimeInfo*out){return guarded([&]{
+void flyweight_v2_qwen_runtime_destroy(FlyweightV2QwenRuntime*runtime){try{if(runtime)release_qwen_device(*runtime);delete runtime;}catch(...){}}
+int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,FlyweightV2QwenRuntimeInfo*out){return guarded([&]{
     if(!runtime||!out)throw std::runtime_error("invalid Qwen runtime info handle");
     std::memset(out,0,sizeof(*out));
     out->layers=static_cast<uint32_t>(runtime->layers.size());
@@ -12560,7 +12819,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->expert_tensor_bytes=runtime->expert_tensor_bytes;
     const std::uint64_t sequence_slots=std::max<std::size_t>(1,runtime->sequences.size());
     out->gpu_allocated_bytes=runtime->static_arena_bytes+runtime->workspace_bytes+
-        sequence_slots*runtime->state_bytes+runtime->expert_staging_bytes+
+        runtime->slots_state_bytes+runtime->expert_staging_bytes+
         runtime->expert_cache_bytes+runtime->expert_native_cache_bytes+
         sequence_slots*runtime->prefill_snapshots.size()*
             runtime->prefill_snapshot_bytes;
@@ -12600,7 +12859,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->position=runtime->position;
     out->device=runtime->options.device;
     out->moe_device=
-        colibri::v2::expert_execution_mode_value(runtime->expert_mode);
+        flyweight::v2::expert_execution_mode_value(runtime->expert_mode);
     out->cuda_ready=runtime->cuda_ready?1:0;
     out->decode_ready=runtime->decode_ready?1:0;
     out->route_expert_sum=runtime->route_expert_sum;
@@ -12625,7 +12884,7 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->prefill_expert_nanoseconds=runtime->prefill_expert_nanoseconds;
     out->prefill_direct_quant=qwen_prefill_direct_quant_enabled(*runtime);
     out->prefill_direct_quant_width=out->prefill_direct_quant?
-        ((colibri_cpu_features()&2u)!=0?8:4):0;
+        ((flyweight_cpu_features()&2u)!=0?8:4):0;
     out->prefill_profile=runtime->prefill_profile?1:0;
     out->prefill_gpu_core_nanoseconds=runtime->prefill_gpu_core_nanoseconds;
     out->prefill_gpu_router_nanoseconds=runtime->prefill_gpu_router_nanoseconds;
@@ -12675,10 +12934,19 @@ int colibri_v2_qwen_runtime_info(const ColibriV2QwenRuntime*runtime,ColibriV2Qwe
     out->multi_decode_batches=runtime->multi_decode_batches;
     out->multi_decode_tokens=runtime->multi_decode_tokens;
     out->prefill_streamed_bytes=runtime->prefill_streamed_bytes;
+    out->kv_slots=sequence_slots;
+    out->kv_reserved_bytes=runtime->slots_state_bytes;
+    out->kv_peak_live_bytes=runtime->kv_peak_live_bytes;
+    out->kv_peak_tokens=runtime->kv_peak_tokens;
+    out->kv_peak_tokens_max=runtime->kv_peak_tokens_max;
+    out->kv_occupancy_samples=runtime->kv_occupancy_samples;
+    out->prefix_donations=runtime->prefix_donations;
+    out->prefix_donated_tokens=runtime->prefix_donated_tokens;
+    out->expert_cache_unused_admissions=runtime->expert_cache_unused_admissions;
     return 0;
 });}
-int colibri_v2_qwen_runtime_reset(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
-int colibri_v2_qwen_runtime_cancel(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");runtime->cancelled=true;return 0;});}
+int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&flyweight_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
+int flyweight_v2_qwen_runtime_cancel(FlyweightV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");runtime->cancelled=true;return 0;});}
 // The wide MMQ shape: the same 128x128 tile spread over 16 warps at 2x4
 // fragments instead of 8 at 4x4, which halves the per-thread accumulator and
 // brings the kernel from 255 registers / 8 resident warps to 128 / 16. The
@@ -12692,9 +12960,9 @@ int colibri_v2_qwen_runtime_cancel(ColibriV2QwenRuntime*runtime){return guarded(
 // On by default: greedy output is bit-identical (same per-element K order,
 // only the warp->fragment assignment moves), and the 27B IQ2_XXS dense
 // checkpoint measured +6% at pp1024 / +9% at pp2048, 6 of 6 interleaved
-// pairs. COLIBRI_MMQ_WIDE=0 restores the 256-thread shape.
+// pairs. FLYWEIGHT_MMQ_WIDE=0 restores the 256-thread shape.
 //
-// Only the env read is cached: colibri_backend_select can flip the backend
+// Only the env read is cached: flyweight_backend_select can flip the backend
 // between runtimes in one process (the test suite does), and a static that
 // froze the backend answer sent 512-thread launches at the CPU shim's
 // 256-shape kernels -- out-of-tile shared writes in emulation, i.e. heap
@@ -12702,18 +12970,18 @@ int colibri_v2_qwen_runtime_cancel(ColibriV2QwenRuntime*runtime){return guarded(
 // later. The backend must be asked every time.
 static bool qwen_mmq_wide(){
     static const bool enabled=[]{
-        const char*setting=std::getenv("COLIBRI_MMQ_WIDE");
+        const char*setting=std::getenv("FLYWEIGHT_MMQ_WIDE");
         return !setting||setting[0]!='0';
     }();
-    return enabled&&!colibri_backend_is_cpu();
+    return enabled&&!flyweight_backend_is_cpu();
 }
-int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded([&]{
+int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return guarded([&]{
     // Before anything reads weights in bulk: the hashed n-gram table is not
     // read the way the rest of the mapping is, and the kernel cannot know that.
     qwen_advise_access_pattern(*runtime);
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     if(runtime->static_arena)return 0;
-    if(colibri_gpu_init(runtime->options.device)!=0)throw std::runtime_error("failed to initialize native CUDA runtime");
+    if(flyweight_gpu_init(runtime->options.device)!=0)throw std::runtime_error("failed to initialize native CUDA runtime");
     std::vector<std::string> option_storage;
 #if !defined(_WIN32)
     for(const char*path:{"/opt/cuda/include","/usr/local/cuda/include","/usr/include"})if(access((std::string(path)+"/cuda_fp16.h").c_str(),R_OK)==0){option_storage.push_back(std::string("-I")+path);if(access((std::string(path)+"/cccl/cub/config.cuh").c_str(),R_OK)==0)option_storage.push_back(std::string("-I")+path+"/cccl");}
@@ -12723,14 +12991,14 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     std::array<char,16384>compile_log{};
     const std::string cuda_source=
         (qwen_mmq_wide()
-             ?std::string("#define COLIBRI_MMQ_ROW_WARPS 4\n"
-                          "#define COLIBRI_MMQ_ROW_FRAGS 2\n")
+             ?std::string("#define FLYWEIGHT_MMQ_ROW_WARPS 4\n"
+                          "#define FLYWEIGHT_MMQ_ROW_FRAGS 2\n")
              :std::string())+
-        std::string(colibri::v2::qwen_cuda_source)+colibri::v2::qwen_native_cuda_source;
-    if(colibri_gpu_compile(cuda_source.c_str(),compile_options.data(),static_cast<int32_t>(compile_options.size()),runtime->options.device,compile_log.data(),compile_log.size())!=0)throw std::runtime_error(std::string("failed to compile native Qwen CUDA kernels: ")+compile_log.data());
+        std::string(flyweight::v2::qwen_cuda_source)+flyweight::v2::qwen_native_cuda_source;
+    if(flyweight_gpu_compile(cuda_source.c_str(),compile_options.data(),static_cast<int32_t>(compile_options.size()),runtime->options.device,compile_log.data(),compile_log.size())!=0)throw std::runtime_error(std::string("failed to compile native Qwen CUDA kernels: ")+compile_log.data());
     runtime->cuda_ready=true;
-    if(colibri_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
-    if(colibri_gpu_stream_create(&runtime->prefetch_stream)!=0){colibri_gpu_stream_destroy(runtime->stream);throw std::runtime_error("failed to create native Qwen prefetch stream");}
+    if(flyweight_gpu_stream_create(&runtime->stream)!=0)throw std::runtime_error("failed to create native CUDA stream");
+    if(flyweight_gpu_stream_create(&runtime->prefetch_stream)!=0){flyweight_gpu_stream_destroy(runtime->stream);throw std::runtime_error("failed to create native Qwen prefetch stream");}
     // On by default. This started off-by-default because the delta capture
     // measured neutral on a MoE checkpoint, where decode waits on ~40 blocking
     // round trips per token for expert routing -- the host already runs ahead,
@@ -12738,53 +13006,53 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
     // routing round trips, which puts host submission back on the critical path:
     // 44.6 -> 41.6 ms/token on Qwen3.8-27B IQ2_XXS, generation byte-identical.
     // Neutral on MoE and a clear win on dense, so the default follows dense.
-    const char*graph_setting=std::getenv("COLIBRI_CUDA_GRAPHS");
+    const char*graph_setting=std::getenv("FLYWEIGHT_CUDA_GRAPHS");
     runtime->cuda_graphs=!graph_setting||graph_setting[0]!='0';
-    if(runtime->cuda_graphs&&colibri_gpu_stream_create(&runtime->graph_stream)!=0)
+    if(runtime->cuda_graphs&&flyweight_gpu_stream_create(&runtime->graph_stream)!=0)
         runtime->cuda_graphs=false;
-    runtime->prefill_profile=std::getenv("COLIBRI_PREFILL_PROFILE")&&
-        std::getenv("COLIBRI_PREFILL_PROFILE")[0]=='1';
-    if(const char*fused=std::getenv("COLIBRI_FUSED_ATTENTION"))
+    runtime->prefill_profile=std::getenv("FLYWEIGHT_PREFILL_PROFILE")&&
+        std::getenv("FLYWEIGHT_PREFILL_PROFILE")[0]=='1';
+    if(const char*fused=std::getenv("FLYWEIGHT_FUSED_ATTENTION"))
         runtime->fused_attention=fused[0]!='0';
-    else if(const char*fused=std::getenv("COLIBRI_FUSED_Q8_ATTENTION"))
+    else if(const char*fused=std::getenv("FLYWEIGHT_FUSED_Q8_ATTENTION"))
         runtime->fused_attention=fused[0]!='0'; // legacy name
-    if(const char*fused=std::getenv("COLIBRI_FUSED_MOE_GATE_UP"))
+    if(const char*fused=std::getenv("FLYWEIGHT_FUSED_MOE_GATE_UP"))
         runtime->fused_moe_gate_up=fused[0]!='0';
     // Opt-in; see the plan-builder gate for why. Both sites must agree, or the
     // arena is reserved for selection that never runs (or vice versa).
-    const char*qsa_setting=std::getenv("COLIBRI_QSA");
+    const char*qsa_setting=std::getenv("FLYWEIGHT_QSA");
     runtime->qsa_enabled=qsa_setting&&qsa_setting[0]=='1';
-    if(const char*strict=std::getenv("COLIBRI_EXPERT_CACHE_STRICT_ADMISSION"))
+    if(const char*strict=std::getenv("FLYWEIGHT_EXPERT_CACHE_STRICT_ADMISSION"))
         runtime->strict_cache_admission=strict[0]!='0';
-    // COLIBRI_MTP_PROFILE reuses the prefill profiling events to split MTP
+    // FLYWEIGHT_MTP_PROFILE reuses the prefill profiling events to split MTP
     // verification into GPU core / router / transfer, so it needs the same
     // timed events -- which only exist when prefill profiling is on.
-    if(std::getenv("COLIBRI_MTP_PROFILE"))runtime->prefill_profile=1;
+    if(std::getenv("FLYWEIGHT_MTP_PROFILE"))runtime->prefill_profile=1;
     const int route_event_status=runtime->prefill_profile
-        ?colibri_gpu_timed_event_create(&runtime->route_event)
-        :colibri_gpu_event_create(&runtime->route_event);
+        ?flyweight_gpu_timed_event_create(&runtime->route_event)
+        :flyweight_gpu_event_create(&runtime->route_event);
     if(route_event_status!=0){release_qwen_device(*runtime);throw std::runtime_error("failed to create native Qwen route event");}
     // The pipeline's second event is never measured, so it is always untimed.
-    if(colibri_gpu_event_create(&runtime->route_event_pipeline)!=0||
-       colibri_gpu_event_create(&runtime->stream_upload_event)!=0||
-       colibri_gpu_event_create(&runtime->stream_upload_event_pipeline)!=0||
-       colibri_gpu_event_create(&runtime->stream_consumed_event)!=0||
-       colibri_gpu_event_create(&runtime->stream_consumed_event_pipeline)!=0){
+    if(flyweight_gpu_event_create(&runtime->route_event_pipeline)!=0||
+       flyweight_gpu_event_create(&runtime->stream_upload_event)!=0||
+       flyweight_gpu_event_create(&runtime->stream_upload_event_pipeline)!=0||
+       flyweight_gpu_event_create(&runtime->stream_consumed_event)!=0||
+       flyweight_gpu_event_create(&runtime->stream_consumed_event_pipeline)!=0){
         release_qwen_device(*runtime);
         throw std::runtime_error("failed to create native Qwen pipeline route event");
     }
     if(runtime->prefill_profile&&(
-       colibri_gpu_timed_event_create(&runtime->prefill_layer_start_event)!=0||
-       colibri_gpu_timed_event_create(&runtime->prefill_core_end_event)!=0||
-       colibri_gpu_timed_event_create(&runtime->prefill_router_end_event)!=0)){
+       flyweight_gpu_timed_event_create(&runtime->prefill_layer_start_event)!=0||
+       flyweight_gpu_timed_event_create(&runtime->prefill_core_end_event)!=0||
+       flyweight_gpu_timed_event_create(&runtime->prefill_router_end_event)!=0)){
         release_qwen_device(*runtime);
         throw std::runtime_error("failed to create native Qwen prefill profiling events");
     }
-    if(const char*profile=std::getenv("COLIBRI_CUDA_PROFILE");profile&&profile[0]&&profile[0]!='0'){
+    if(const char*profile=std::getenv("FLYWEIGHT_CUDA_PROFILE");profile&&profile[0]&&profile[0]!='0'){
         runtime->cuda_profile=true;
         runtime->cuda_layer_profiles.resize(runtime->layers.size());
         auto create_profile_event=[&](std::uint64_t&event){
-            if(colibri_gpu_timed_event_create(&event)!=0){
+            if(flyweight_gpu_timed_event_create(&event)!=0){
                 release_qwen_device(*runtime);
                 throw std::runtime_error("failed to create native Qwen CUDA profiling event");
             }
@@ -12812,6 +13080,13 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         std::uint64_t state_cursor=0;
         auto reserve=[&](std::uint64_t bytes)->std::uint64_t{const auto at=state_cursor;state_cursor=(state_cursor+bytes+15)/16*16;return at;};
         std::uint64_t max_vector=runtime->model->config.vocabulary_size;
+        // The layout below runs once per distinct slot size. It writes into
+        // runtime->layers as it always has -- the geometry is read back out
+        // afterwards -- so the sizing rules stay in one place and a scratch
+        // slot cannot be laid out by a second, drifting copy of them.
+        std::uint64_t geometry_context=runtime->options.context_limit;
+        auto build_geometry=[&]{
+        state_cursor=0;
         for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
             auto&layer=runtime->layers[layer_number];
             for(auto index:layer.static_tensors){const auto&t=runtime->model->tensors[index];if(t.shape.size()==2)max_vector=std::max(max_vector,t.shape[1]);}
@@ -12820,8 +13095,8 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 const auto head_dim=layer.head_dim;
                 const auto batch_room=std::max<std::uint64_t>(runtime->prefill_rows,9);
                 layer.cache_capacity=layer.attention_window&&!runtime->options.swa_full
-                    ?std::min<std::uint64_t>(runtime->options.context_limit,static_cast<std::uint64_t>(layer.attention_window)+batch_room)
-                    :runtime->options.context_limit;
+                    ?std::min<std::uint64_t>(geometry_context,static_cast<std::uint64_t>(layer.attention_window)+batch_room)
+                    :geometry_context;
                 // The TurboQuant rotation is a Walsh-Hadamard butterfly over the
                 // whole head, so head_dim has to be a power of two, and the
                 // rotated row is staged in a fixed shared-memory scratch that
@@ -12872,20 +13147,41 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         }
         if(runtime->options.mtp_drafts){
             auto&layer=runtime->mtp_layer_plan;
-            layer.cache_capacity=runtime->options.context_limit;
+            layer.cache_capacity=geometry_context;
             const auto&key=runtime->model->tensors[layer.static_tensors[2]];
             const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
-            const auto cache_floats=runtime->model->config.attention_kv_heads*runtime->options.context_limit*head_dim;
+            const auto cache_floats=runtime->model->config.attention_kv_heads*geometry_context*head_dim;
             layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
             layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
-            runtime->mtp_target_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
-            runtime->mtp_draft_hidden_offset=reserve(runtime->model->config.hidden_size*sizeof(float));
+            // What the trunk hands the draft. On qwen4exp that is the
+            // hyper-connection STREAMS (hc_count*hidden), not the collapsed
+            // hidden the LM head sees: the draft's hnorm spans the whole
+            // stream row and its eh_proj runs per stream, so reserving one
+            // hidden here would hand over a quarter of the state.
+            // See plans/qwen4exp-semantics.md, MTP section.
+            const std::uint64_t handover_floats=
+                runtime->model->config.architecture=="qwen4exp"
+                    ? static_cast<std::uint64_t>(
+                          runtime->model->config.hyper_connection_count)
+                      *runtime->model->config.hidden_size
+                    : runtime->model->config.hidden_size;
+            runtime->mtp_target_hidden_offset=reserve(handover_floats*sizeof(float));
+            runtime->mtp_draft_hidden_offset=reserve(handover_floats*sizeof(float));
             runtime->mtp_verified_hidden_offset=reserve(
-                8ULL*runtime->model->config.hidden_size*sizeof(float));
+                8ULL*handover_floats*sizeof(float));
             runtime->mtp_snapshot_offset=state_cursor;
             const auto snapshot_start=state_cursor;
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
                 auto&target=runtime->layers[layer_number];
+                // The PLE ring rides the snapshot independently of the layer
+                // kind: its host layer happens to be a DeltaNet one today, but
+                // ple_layers is metadata and nothing pins the two together.
+                if(target.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+                    const auto&ple_conv=runtime->model->tensors[target.ple_conv];
+                    target.snapshot_third=reserve((ple_conv.shape[0]-1)
+                        *std::max<std::uint64_t>(runtime->model->config.ple_ngram_size,1)
+                        *ple_conv.shape[1]*sizeof(float));
+                }
                 if(target.attention)continue;
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
@@ -12908,6 +13204,66 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
         }
         runtime->state_bytes=device_align(state_cursor);
+        };  // build_geometry
+
+        // Read the offsets the layout just wrote back out of the layer plans,
+        // so a geometry is by construction whatever the sizing rules produced.
+        auto capture_geometry=[&]{
+            QwenSlotGeometry g;
+            g.context_limit=geometry_context;
+            g.state_bytes=runtime->state_bytes;
+            auto capture_layer=[](const QwenLayerPlan& layer){
+                QwenLayerOffsets o;
+                o.cache_capacity=layer.cache_capacity;
+                o.state_first=layer.state_first;
+                o.state_second=layer.state_second;
+                o.state_third=layer.state_third;
+                o.snapshot_first=layer.snapshot_first;
+                o.snapshot_second=layer.snapshot_second;
+                o.snapshot_third=layer.snapshot_third;
+                o.qsa_blocks=layer.qsa_blocks;
+                o.qsa_ring=layer.qsa_ring;
+                o.mtp_retain_qkv=layer.mtp_retain_qkv;
+                o.mtp_retain_logits=layer.mtp_retain_logits;
+                return o;
+            };
+            g.layers.reserve(runtime->layers.size());
+            for(const auto&layer:runtime->layers)g.layers.push_back(capture_layer(layer));
+            g.mtp_layer=capture_layer(runtime->mtp_layer_plan);
+            g.mtp_target_hidden_offset=runtime->mtp_target_hidden_offset;
+            g.mtp_draft_hidden_offset=runtime->mtp_draft_hidden_offset;
+            g.mtp_verified_hidden_offset=runtime->mtp_verified_hidden_offset;
+            g.mtp_snapshot_offset=runtime->mtp_snapshot_offset;
+            g.mtp_snapshot_bytes=runtime->mtp_snapshot_bytes;
+            return g;
+        };
+
+        build_geometry();
+        runtime->geometries.clear();
+        runtime->geometries.push_back(capture_geometry());
+        // A scratch size, when asked for and when it is genuinely smaller.
+        // Equal or larger would allocate a second identical layout and buy
+        // nothing, so it collapses back to one.
+        if(runtime->options.scratch_context&&
+           runtime->options.scratch_context<runtime->options.context_limit){
+            geometry_context=runtime->options.scratch_context;
+            build_geometry();
+            runtime->geometries.push_back(capture_geometry());
+            // Leave the layer plans describing the full-context slot: slot 0
+            // holds it, and qwen_apply_geometry re-points them on a switch.
+            geometry_context=runtime->options.context_limit;
+            build_geometry();
+        }
+        runtime->state_bytes=runtime->geometries[0].state_bytes;
+        {   // What every slot will reserve, decided here so the budget
+            // estimates below and the allocation later cannot disagree.
+            const std::size_t planned_slots=runtime->options.mtp_drafts?1:
+                std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+            runtime->slots_state_bytes=0;
+            for(std::size_t i=0;i<planned_slots;++i)
+                runtime->slots_state_bytes+=
+                    runtime->geometries[qwen_slot_geometry_index(*runtime,i)].state_bytes;
+        }
         // QSA scratch geometry: one shape for every selecting layer. Mixed
         // nonzero ratios would need per-layer score buffers; no checkpoint
         // ships them, so refuse instead of sizing for one and overrunning on
@@ -12922,7 +13278,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             qsa_budget=runtime->model->config.indexer_top_k;
             qsa_ratio=layer.qsa_ratio;
         }
-        runtime->decode_workspace_layout=colibri::v2::workspace::qwen_decode(
+        runtime->decode_workspace_layout=flyweight::v2::workspace::qwen_decode(
             runtime->model->config.hidden_size,runtime->scratch_elements,
             runtime->model->config.expert_used_count,runtime->moe_intermediate,
             runtime->model->config.expert_count,
@@ -12947,11 +13303,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(layer.attention)continue;
             const auto heads=runtime->model->tensors[layer.static_tensors[8]].shape[0];
             const auto dim=runtime->model->tensors[layer.static_tensors[9]].shape[0];
-            if(dim==colibri::v2::workspace::kDeltaDim)delta_value_heads=heads;
+            if(dim==flyweight::v2::workspace::kDeltaDim)delta_value_heads=heads;
             break;
         }
         runtime->delta_value_heads=static_cast<std::uint32_t>(delta_value_heads);
-        runtime->rows_workspace_layout=colibri::v2::workspace::qwen_rows(
+        runtime->rows_workspace_layout=flyweight::v2::workspace::qwen_rows(
             rows,hidden,runtime->scratch_elements,top_k,
             runtime->moe_intermediate,runtime->model->config.expert_count,
             runtime->model->config.attention_heads,
@@ -12962,10 +13318,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
             qsa_heads,qsa_key_len,qsa_budget,qsa_ratio);
         runtime->rows_host_layout=
-            colibri::v2::workspace::qwen_rows_host(
+            flyweight::v2::workspace::qwen_rows_host(
                 rows,hidden,top_k,runtime->moe_intermediate);
         runtime->decode_host_layout=
-            colibri::v2::workspace::qwen_decode_host(
+            flyweight::v2::workspace::qwen_decode_host(
                 hidden,top_k,runtime->moe_intermediate);
         // Multi-sequence decode slices one decode workspace per sequence out of
         // the (rows-forward-sized) workspace; capacity is bounded by what fits.
@@ -13003,11 +13359,11 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // tok/s -- a 1.5x that one 5.4 KB row read per token cannot dent. So it
         // defaults on there.
         //
-        // COLIBRI_EMBED_HOST forces it either way.
+        // FLYWEIGHT_EMBED_HOST forces it either way.
         {
             const auto& table=runtime->model->tensors[runtime->token_embeddings];
             const auto vocabulary=runtime->model->config.vocabulary_size;
-            const char* embed_env=std::getenv("COLIBRI_EMBED_HOST");
+            const char* embed_env=std::getenv("FLYWEIGHT_EMBED_HOST");
             runtime->embedding_row_bytes=
                 (vocabulary&&table.size%vocabulary==0)?table.size/vocabulary:0;
             const bool dense_model=runtime->model->config.expert_count==0;
@@ -13040,7 +13396,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
             std::uint64_t budget=runtime->options.gpu_cache_bytes;
             if(!budget){
-                ColibriV2GpuInfo gi{};
+                FlyweightV2GpuInfo gi{};
                 if(gpu_probe(gi,runtime->options.device)==0&&gi.free_memory>0){
                     // Deliberately much tighter than the expert-cache auto-fit
                     // margin: that one reserves room for a cache this model does
@@ -13059,7 +13415,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             // spill exactly at the limit leaves the allocation to fail by a
             // rounding error.
             const std::uint64_t reserved_base=runtime->workspace_bytes
-                +std::max<std::uint32_t>(1u,runtime->parallel_sequences)*runtime->state_bytes
+                +runtime->slots_state_bytes
                 +runtime->expert_staging_bytes
                 +std::max<std::uint64_t>(1024ull*1024,budget/64);
             // Room for the batch staging buffer, but only when something is
@@ -13087,16 +13443,16 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             // turning several IQ3_S/IQ4_XS layers into the decode bottleneck.
             // Two overrides, both for measurement and for pinning residency on a
             // card whose free VRAM moves under you (the auto budget probes it
-            // once at startup). COLIBRI_HOST_FFN_BLOCKS=N spills exactly N
+            // once at startup). FLYWEIGHT_HOST_FFN_BLOCKS=N spills exactly N
             // blocks regardless of budget -- the equivalent of llama.cpp's
-            // --n-cpu-ffn. COLIBRI_HOST_FFN_ORDER=naive takes them sequentially
+            // --n-cpu-ffn. FLYWEIGHT_HOST_FFN_ORDER=naive takes them sequentially
             // from block 0 with no quantization awareness, which is what that
             // flag does, and exists so the ordering can be A/B'd against the
             // default on the same runtime.
-            const char* forced_env=std::getenv("COLIBRI_HOST_FFN_BLOCKS");
+            const char* forced_env=std::getenv("FLYWEIGHT_HOST_FFN_BLOCKS");
             const std::uint32_t forced_blocks=forced_env
                 ?static_cast<std::uint32_t>(std::strtoul(forced_env,nullptr,10)):0;
-            const char* order_env=std::getenv("COLIBRI_HOST_FFN_ORDER");
+            const char* order_env=std::getenv("FLYWEIGHT_HOST_FFN_ORDER");
             const bool naive_order=order_env&&std::strcmp(order_env,"naive")==0;
             auto want_more=[&]{
                 return forced_env?runtime->host_ffn_layers<forced_blocks
@@ -13146,7 +13502,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(runtime->host_ffn_layers)runtime->host_ffn_stage_bytes=ffn_stage;
             // Re-encode the spilled feed-forward as Q8_0 for the host dot; see
             // host_ffn_q8. Bounded because the expansion is ~3.3x and a fully
-            // spilled 27B is ~17 GiB: COLIBRI_HOST_FFN_Q8_MIB caps it (0 turns
+            // spilled 27B is ~17 GiB: FLYWEIGHT_HOST_FFN_Q8_MIB caps it (0 turns
             // the re-encoding off), and blocks past the cap keep the original
             // format, which still works, just slower.
             // Which format to re-encode into is a bandwidth question, not a
@@ -13157,14 +13513,14 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             // 89 ms/token where the codebook path was compute-bound at 60.
             // Q2_K is 1.02x, Q3_K 1.34x, and both have AVX-512 row kernels.
             std::uint32_t q8_format=11;  // Q3_K
-            if(const char*env=std::getenv("COLIBRI_HOST_FFN_FORMAT")){
+            if(const char*env=std::getenv("FLYWEIGHT_HOST_FFN_FORMAT")){
                 if(std::strcmp(env,"q2_k")==0)q8_format=10;
                 else if(std::strcmp(env,"q3_k")==0)q8_format=11;
                 else if(std::strcmp(env,"q8_0")==0)q8_format=8;
                 else if(std::strcmp(env,"off")==0)q8_format=0;
             }
             std::uint64_t q8_budget=8192ull*1024*1024;
-            if(const char*env=std::getenv("COLIBRI_HOST_FFN_Q8_MIB"))
+            if(const char*env=std::getenv("FLYWEIGHT_HOST_FFN_Q8_MIB"))
                 q8_budget=std::strtoull(env,nullptr,10)*1024ull*1024;
             if(!q8_format)q8_budget=0;
             if(runtime->host_ffn_layers&&q8_budget){
@@ -13214,7 +13570,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now()-started).count();
                     std::fprintf(stderr,
-                        "[colibri-v2] spilled feed-forward re-encoded to %s for the host: "
+                        "[flyweight] spilled feed-forward re-encoded to %s for the host: "
                         "%zu tensors, %llu MiB of RAM, %lld ms\n",
                         q8_format==8?"Q8_0":(q8_format==10?"Q2_K":"Q3_K"),
                         runtime->host_ffn_q8.size(),
@@ -13224,7 +13580,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
             if(runtime->host_ffn_layers)
                 std::fprintf(stderr,
-                    "[colibri-v2] dense feed-forward: %u of %zu blocks on CPU (%llu MiB spilled)\n",
+                    "[flyweight] dense feed-forward: %u of %zu blocks on CPU (%llu MiB spilled)\n",
                     runtime->host_ffn_layers,runtime->layers.size(),
                     static_cast<unsigned long long>(runtime->host_ffn_bytes/(1024ull*1024)));
         }
@@ -13269,10 +13625,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // The routed experts are deliberately excluded: they are paged through
         // the expert cache from the mapping, not the static arena, and they are
         // the tensors NVFP4 exists to compress. The public dense_requant policy
-        // controls this; COLIBRI_REQUANT_BF16 remains a legacy override only
+        // controls this; FLYWEIGHT_REQUANT_BF16 remains a legacy override only
         // while the policy is auto.
         {
-            ColibriV2GpuInfo probe{};
+            FlyweightV2GpuInfo probe{};
             if(gpu_probe(probe,runtime->options.device)==0)
                 runtime->int8_tensor_cores=
                     probe.compute_major*10+probe.compute_minor>=75;
@@ -13280,6 +13636,40 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         runtime->device_tensor_types.resize(runtime->model->tensors.size());
         for(std::uint64_t index=0;index<runtime->model->tensors.size();++index)
             runtime->device_tensor_types[index]=runtime->model->tensors[index].type;
+        // A draft block can be quantized differently from the trunk it is
+        // attached to, because it can come from a different file. The released
+        // pair is exactly that: UD-IQ1_S -- the only Qwen3.8-Flash-Next quant
+        // that fits this box -- stores hc_*_up as Q8_0, while the standalone
+        // MTP companion is Q4_K_M and stores it as Q5_0, a type the matvec
+        // driver has no kernel for. Repack those to Q8_0 on the way to the
+        // device, the same flip the IQ1_M head takes below.
+        //
+        // Scoped to the draft block on purpose: it cannot perturb a
+        // configuration that already works, the block is a single layer so the
+        // growth is bounded, and requantizing a DRAFT weight cannot change
+        // output at all -- verify re-scores every drafted token with the
+        // target, so this can only move the acceptance rate.
+        //
+        // Must run AFTER the loop above: that one assigns every entry from the
+        // file type, so a flip written earlier is silently overwritten.
+        if(runtime->mtp_available){
+            auto requant_draft=[&](std::uint64_t index){
+                if(index>=runtime->device_tensor_types.size())return;
+                const auto&draft_tensor=runtime->model->tensors[index];
+                if(draft_tensor.type==0||qwen_matvec_supported(draft_tensor.type))return;
+                std::uint64_t elements=1;
+                for(auto dimension:draft_tensor.shape)elements*=dimension;
+                if(!elements||elements%32)
+                    throw std::runtime_error(
+                        "MTP draft tensor \""+draft_tensor.name+"\" has type "+
+                        std::to_string(draft_tensor.type)+", for which there is no "
+                        "matvec kernel, and is not a whole number of 32-value "
+                        "blocks so it cannot be converted to Q8_0 either");
+                runtime->device_tensor_types[index]=8;
+            };
+            for(auto tensor:runtime->mtp_layer_plan.static_tensors)requant_draft(tensor);
+            for(auto tensor:runtime->mtp_special_tensors)requant_draft(tensor);
+        }
         // IQ1_M reaches the device as itself wherever a kernel can read it, and
         // as Q8_0 where none can.
         //
@@ -13336,7 +13726,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             // nothing pointing back here, so say so up front and let it run.
             if(converted&&growth>persistent_source_bytes/16)
                 std::fprintf(stderr,
-                    "[colibri-v2] warning: this checkpoint stores its head or "
+                    "[flyweight] warning: this checkpoint stores its head or "
                     "embedding table as IQ1_M, whose kernels cannot read that "
                     "type. Converting to Q8_0 adds %llu MiB to %llu MiB of "
                     "static weights (4.86x on those tensors); if the GPU arena "
@@ -13347,7 +13737,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(converted){
                 runtime->static_tensor_bytes+=growth;
                 std::fprintf(stderr,
-                    "[colibri-v2] IQ1_M requant: %llu tensors to Q8_0 "
+                    "[flyweight] IQ1_M requant: %llu tensors to Q8_0 "
                     "(%llu MiB added)\n",
                     static_cast<unsigned long long>(converted),
                     static_cast<unsigned long long>(growth/(1024ull*1024)));
@@ -13356,7 +13746,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         {
             std::uint32_t requant_mode=runtime->options.dense_requant;
             if(requant_mode==0){
-                const char* legacy=std::getenv("COLIBRI_REQUANT_BF16");
+                const char* legacy=std::getenv("FLYWEIGHT_REQUANT_BF16");
                 if(legacy&&legacy[0]=='0')requant_mode=2;
                 else if(legacy&&legacy[0]=='1')requant_mode=1;
             }
@@ -13379,7 +13769,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             }
             std::uint64_t auto_budget=runtime->options.gpu_cache_bytes;
             if(requant_mode==0&&auto_budget==0){
-                ColibriV2GpuInfo gi{};
+                FlyweightV2GpuInfo gi{};
                 if(gpu_probe(gi,runtime->options.device)==0&&gi.free_memory>0){
                     const std::uint64_t margin=std::max<std::uint64_t>(
                         2048ull*1024*1024,gi.total_memory/8);
@@ -13389,9 +13779,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             const std::uint64_t requant_slots=runtime->options.mtp_drafts?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             const std::uint64_t estimated_base=persistent_bytes+
-                runtime->workspace_bytes+requant_slots*runtime->state_bytes;
+                runtime->workspace_bytes+runtime->slots_state_bytes;
             const auto requant_policy=qwen_expert_policy(
-                *runtime,colibri::v2::ExpertExecutionPhase::prepare);
+                *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
             const std::uint64_t useful_expert_cache=
                 requant_policy.routed_gpu_execution_allowed()
                     ?runtime->expert_tensor_bytes:0;
@@ -13418,7 +13808,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 }
             }else if(requant_mode==0&&candidate_count){
                 std::fprintf(stderr,
-                    "[colibri-v2] dense requant auto: kept %llu bf16 tensors "
+                    "[flyweight] dense requant auto: kept %llu bf16 tensors "
                     "(estimated %llu MiB need within %llu MiB GPU budget)\n",
                     static_cast<unsigned long long>(candidate_count),
                     static_cast<unsigned long long>(estimated_need/(1024ull*1024)),
@@ -13431,7 +13821,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         if(runtime->requantized_tensors){
             runtime->static_tensor_bytes-=runtime->requantized_saved_bytes;
             std::fprintf(stderr,
-                "[colibri-v2] dense requant %s: %llu bf16 tensors to Q8_0 "
+                "[flyweight] dense requant %s: %llu bf16 tensors to Q8_0 "
                 "(%llu MiB freed)\n",
                 runtime->options.dense_requant==1?"q8":"auto",
                 static_cast<unsigned long long>(runtime->requantized_tensors),
@@ -13451,7 +13841,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->expert_staging_bytes,
             device_align(runtime->rows_host_layout.bytes));
         auto prepare_policy=qwen_expert_policy(
-            *runtime,colibri::v2::ExpertExecutionPhase::prepare);
+            *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
         runtime->multi_decode_capacity=1;
         const std::uint64_t decode_slots=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
         // Gemma 4 supports independent sequence slots, but its hybrid expert
@@ -13509,12 +13899,16 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // own state inside the arena, so it stays single-slot.
         const std::size_t slot_count=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
         runtime->sequences.assign(slot_count,QwenSequence{});
+        // Which slot is big matters only to the router, which will not send a
+        // prompt to a slot that cannot hold it.
+        for(std::size_t i=0;i<runtime->sequences.size();++i)
+            runtime->sequences[i].geometry=qwen_slot_geometry_index(*runtime,i);
         runtime->slot_owner.assign(slot_count,-1);
         runtime->slot_events.assign(slot_count,0);
         for(auto&event:runtime->slot_events)
-            if(colibri_gpu_event_create(&event)!=0)throw std::runtime_error("failed to create native Qwen slot events");
-        if(colibri_gpu_event_create(&runtime->staging_event)!=0)throw std::runtime_error("failed to create native Qwen staging event");
-        if(colibri_gpu_event_create(&runtime->prefetch_event)!=0){colibri_gpu_event_destroy(runtime->staging_event);throw std::runtime_error("failed to create native Qwen prefetch event");}
+            if(flyweight_gpu_event_create(&event)!=0)throw std::runtime_error("failed to create native Qwen slot events");
+        if(flyweight_gpu_event_create(&runtime->staging_event)!=0)throw std::runtime_error("failed to create native Qwen staging event");
+        if(flyweight_gpu_event_create(&runtime->prefetch_event)!=0){flyweight_gpu_event_destroy(runtime->staging_event);throw std::runtime_error("failed to create native Qwen prefetch event");}
         // Prefill expert-streaming arena, env-budgeted while the plan is in
         // its measured stages (plans/prefill-expert-stream.md). Charged into
         // the base total below like every other arena, so the expert cache
@@ -13531,14 +13925,14 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // carry the arena.
         std::int64_t stream_request=runtime->options.prefill_expert_stream_mib;
         if(const char*stream_setting=
-               std::getenv("COLIBRI_PREFILL_EXPERT_STREAM_MIB"))
+               std::getenv("FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"))
             stream_request=std::strtoll(stream_setting,nullptr,10);
         bool stream_auto=stream_request<0;
         if(stream_auto)stream_request=48;
         if(stream_request>0&&runtime->model->config.expert_count&&
-           !colibri_backend_is_cpu()&&
+           !flyweight_backend_is_cpu()&&
            qwen_expert_policy(*runtime,
-               colibri::v2::ExpertExecutionPhase::prepare)
+               flyweight::v2::ExpertExecutionPhase::prepare)
                    .routed_gpu_execution_allowed())
             runtime->prefill_stream_bytes=
                 static_cast<std::uint64_t>(stream_request)*1024ull*1024;
@@ -13572,9 +13966,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             const std::uint64_t stream_experts=
                 runtime->model->config.expert_count;
             const std::uint64_t stream_padded=stream_routes+
-                stream_experts*(colibri::v2::moe::kMmqBlockSize-1);
+                stream_experts*(flyweight::v2::moe::kMmqBlockSize-1);
             const std::uint64_t stream_blocks=
-                stream_padded/colibri::v2::moe::kMmqBlockSize+1;
+                stream_padded/flyweight::v2::moe::kMmqBlockSize+1;
             for(int role=0;role<3;++role)
                 span+=device_align(stream_experts*sizeof(std::uint64_t));
             span+=device_align(stream_blocks*sizeof(std::int32_t));
@@ -13584,9 +13978,9 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->prefill_stream_scratch_span=span;
             runtime->prefill_stream_scratch_bytes=2*span;
         }
-        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+slot_count*runtime->state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
+        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+runtime->slots_state_bytes+runtime->expert_staging_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
         const char* nvfp4_persistent_env =
-            std::getenv("COLIBRI_NVFP4_PERSISTENT");
+            std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");
         const bool persistent_nvfp4_eligible=
             runtime->model->config.expert_count&&
             std::all_of(runtime->layers.begin(),runtime->layers.end(),
@@ -13613,7 +14007,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         std::uint64_t gpu_budget=runtime->options.gpu_cache_bytes;
         const bool auto_fit=(gpu_budget==0);
         if(auto_fit&&prepare_policy.routed_gpu_execution_allowed()){
-            ColibriV2GpuInfo gi{};
+            FlyweightV2GpuInfo gi{};
             if(gpu_probe(gi,runtime->options.device)==0&&gi.free_memory>0){
                 // Leave headroom for the CUDA context, activations and other
                 // apps. A flat margin starves tight cards (leaving <2 GiB free
@@ -13637,7 +14031,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->prefill_stream_scratch_bytes=0;
             runtime->prefill_stream_scratch_span=0;
             std::fprintf(stderr,
-                "[colibri-v2] prefill expert streaming disabled: the GPU "
+                "[flyweight] prefill expert streaming disabled: the GPU "
                 "budget cannot carry the arena\n");
         }
         if(!runtime->options.strict_resident&&
@@ -13646,10 +14040,15 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             throw std::runtime_error(
                 "native Qwen base CUDA allocations ("+mib(base_total_resolved)+" MiB = static weights "
                 +mib(runtime->static_arena_bytes)+" + workspace "+mib(runtime->workspace_bytes)+" + "
-                +std::to_string(slot_count)+"x KV slot "+mib(runtime->state_bytes)+" ("
-                +mib(slot_count*runtime->state_bytes)+") + staging "+mib(runtime->expert_staging_bytes)
+                +(runtime->geometries.size()>1
+                    ?"1x KV slot "+mib(runtime->geometries[0].state_bytes)+" + "
+                     +std::to_string(slot_count-1)+"x scratch slot "
+                     +mib(runtime->geometries[1].state_bytes)+" ("
+                    :std::to_string(slot_count)+"x KV slot "+mib(runtime->state_bytes)+" (")
+                +mib(runtime->slots_state_bytes)+") + staging "+mib(runtime->expert_staging_bytes)
                 +") exceed the --gpu-cache-mib budget ("+mib(gpu_budget)
-                +" MiB), before any expert cache. Lower --parallel or --context-window, or raise --gpu-cache-mib.");
+                +" MiB), before any expert cache. Lower --parallel or --context-window, "
+                 "shrink the side slots with --scratch-context, or raise --gpu-cache-mib.");
         }
         // expert_slot_bytes is zero for a dense model, which has no expert set
         // to cache and would trap on the slot arithmetic below.
@@ -13667,7 +14066,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 runtime->model->config.expert_count*runtime->expert_slot_bytes;
             if(cache>max_cache)cache=max_cache;
             const char*whole_layer_setting=
-                std::getenv("COLIBRI_LAGUNA_WHOLE_LAYERS");
+                std::getenv("FLYWEIGHT_LAGUNA_WHOLE_LAYERS");
             // Gemma 4 takes the same placement: its expert selection is close
             // to uniform, so per-expert paging replaces a miss with a 3.3 MB
             // PCIe upload every few tokens and eats what the cache saves --
@@ -13705,7 +14104,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 if(!layer_count)
                     runtime->whole_expert_layer_slots.clear();
                 std::fprintf(stderr,
-                    "[colibri-v2] Laguna whole-layer placement selected %zu "
+                    "[flyweight] Laguna whole-layer placement selected %zu "
                     "layers (%zu expert bundles)\n",layer_count,slot);
             }
             runtime->expert_cache_bytes=(cache/runtime->expert_slot_bytes<runtime->model->config.expert_used_count)?0:cache;
@@ -13718,7 +14117,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             auto mib=[](std::uint64_t bytes){
                 return std::to_string((bytes+1024ull*1024-1)/(1024ull*1024));
             };
-            const auto kv_bytes=slot_count*runtime->state_bytes;
+            const auto kv_bytes=runtime->slots_state_bytes;
             const auto snapshot_bytes=slot_count*
                 runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes;
             const auto required=runtime->static_arena_bytes+kv_bytes+
@@ -13743,12 +14142,12 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         }
         // A dense model routes nothing, so the expert staging arena is empty --
         // and a zero-byte CUDA allocation is an error, not a no-op.
-        if(colibri_gpu_alloc(runtime->static_arena_bytes,&runtime->static_arena)!=0||
-           colibri_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
-           (runtime->expert_staging_bytes&&colibri_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0)||
-           (runtime->prefill_stream_bytes&&colibri_gpu_alloc(runtime->prefill_stream_bytes,&runtime->prefill_stream_arena)!=0)||
-           (runtime->prefill_stream_scratch_bytes&&colibri_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
-           (runtime->host_staging_bytes&&colibri_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
+        if(flyweight_gpu_alloc(runtime->static_arena_bytes,&runtime->static_arena)!=0||
+           flyweight_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
+           (runtime->expert_staging_bytes&&flyweight_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0)||
+           (runtime->prefill_stream_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_bytes,&runtime->prefill_stream_arena)!=0)||
+           (runtime->prefill_stream_scratch_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
+           (runtime->host_staging_bytes&&flyweight_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
         // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
         // attention path can run on it, so this only has to hold the widest
         // attention layer's live window (K and V), not the whole cache.
@@ -13763,7 +14162,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             if(widest){
                 runtime->turbo_kv_stage_stride=device_align(widest*sizeof(std::uint16_t));
                 runtime->turbo_kv_stage_bytes=runtime->turbo_kv_stage_stride*2;
-                if(colibri_gpu_alloc(runtime->turbo_kv_stage_bytes,&runtime->turbo_kv_stage)!=0)
+                if(flyweight_gpu_alloc(runtime->turbo_kv_stage_bytes,&runtime->turbo_kv_stage)!=0)
                     throw std::runtime_error("failed to allocate native Qwen turbo KV staging");
             }
         }
@@ -13773,7 +14172,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // skipped on read-back. Allocated only under the switch: the arena is
         // tens of MB on a large checkpoint and calibration is a dedicated run,
         // not a serving mode.
-        if(const char* capture=std::getenv("COLIBRI_IMATRIX");
+        if(const char* capture=std::getenv("FLYWEIGHT_IMATRIX");
            capture&&capture[0]&&std::strcmp(capture,"0")!=0){
             const auto& tensors=runtime->model->tensors;
             runtime->imatrix_offsets.assign(tensors.size(),~0ull);
@@ -13787,10 +14186,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             runtime->imatrix_elements=total;
             runtime->imatrix_host.assign(total,0.0f);
             runtime->imatrix_rows.assign(tensors.size(),0);
-            if(colibri_gpu_alloc(total*sizeof(float),&runtime->imatrix_sums)!=0||
-               colibri_gpu_memset(runtime->imatrix_sums,0,total*sizeof(float),
+            if(flyweight_gpu_alloc(total*sizeof(float),&runtime->imatrix_sums)!=0||
+               flyweight_gpu_memset(runtime->imatrix_sums,0,total*sizeof(float),
                                   runtime->stream)!=0||
-               colibri_gpu_stream_sync(runtime->stream)!=0)
+               flyweight_gpu_stream_sync(runtime->stream)!=0)
                 throw std::runtime_error(
                     "failed to allocate the native Qwen imatrix arena");
         }
@@ -13801,10 +14200,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 std::max<std::uint64_t>(1,runtime->forward_rows_capacity);
             runtime->embedding_stage_bytes=
                 device_align(capacity*runtime->embedding_row_bytes);
-            if(colibri_gpu_alloc(runtime->embedding_stage_bytes,&runtime->embedding_stage)!=0||
-               colibri_gpu_host_alloc(runtime->embedding_stage_bytes,&runtime->embedding_host)!=0||
-               colibri_gpu_alloc(device_align(capacity*sizeof(std::uint32_t)),&runtime->embedding_row_index)!=0||
-               colibri_gpu_event_create(&runtime->embedding_event)!=0)
+            if(flyweight_gpu_alloc(runtime->embedding_stage_bytes,&runtime->embedding_stage)!=0||
+               flyweight_gpu_host_alloc(runtime->embedding_stage_bytes,&runtime->embedding_host)!=0||
+               flyweight_gpu_alloc(device_align(capacity*sizeof(std::uint32_t)),&runtime->embedding_row_index)!=0||
+               flyweight_gpu_event_create(&runtime->embedding_event)!=0)
                 throw std::runtime_error(
                     "failed to allocate native Qwen embedding staging");
             // The rows kernel gathers by token id; the staged copy is already
@@ -13812,7 +14211,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             std::vector<std::uint32_t> identity(capacity);
             for(std::uint64_t row=0;row<capacity;++row)
                 identity[row]=static_cast<std::uint32_t>(row);
-            if(colibri_gpu_upload_sync(runtime->embedding_row_index,identity.data(),
+            if(flyweight_gpu_upload_sync(runtime->embedding_row_index,identity.data(),
                                        capacity*sizeof(std::uint32_t))!=0)
                 throw std::runtime_error(
                     "failed to seed native Qwen embedding row index");
@@ -13831,25 +14230,30 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 std::max<std::uint64_t>(runtime->forward_rows_capacity,1);
             runtime->dense_host_bytes=device_align(
                 2ull*staged_rows*runtime->model->config.hidden_size*sizeof(float));
-            if(colibri_gpu_host_alloc(runtime->dense_host_bytes,&runtime->dense_host)!=0)
+            if(flyweight_gpu_host_alloc(runtime->dense_host_bytes,&runtime->dense_host)!=0)
                 throw std::runtime_error("failed to allocate native Qwen dense host scratch");
             // Device side of the batch path: one block's feed-forward triple,
             // uploaded per block per chunk and consumed by the ordinary device
             // kernels. Reused across blocks, which is safe because the upload
             // and the kernels that read it are ordered on the one stream.
             if(runtime->host_ffn_stage_bytes&&
-               colibri_gpu_alloc(runtime->host_ffn_stage_bytes,
+               flyweight_gpu_alloc(runtime->host_ffn_stage_bytes,
                                  &runtime->host_ffn_stage)!=0)
                 throw std::runtime_error(
                     "failed to allocate native Qwen host feed-forward staging");
         }
-        for(auto&seq:runtime->sequences)if(colibri_gpu_alloc(runtime->state_bytes,&seq.state)!=0)throw std::runtime_error("failed to allocate native Qwen sequence state");
+        for(auto&seq:runtime->sequences){
+            const auto bytes=seq.geometry<runtime->geometries.size()
+                ?runtime->geometries[seq.geometry].state_bytes:runtime->state_bytes;
+            if(flyweight_gpu_alloc(bytes,&seq.state)!=0)throw std::runtime_error("failed to allocate native Qwen sequence state");
+        }
         runtime->state=runtime->sequences[0].state;
         runtime->active_sequence=0;
-        if(runtime->expert_cache_bytes&&colibri_gpu_alloc(runtime->expert_cache_bytes,&runtime->expert_cache)!=0)throw std::runtime_error("failed to allocate native Qwen expert cache");
+        qwen_apply_geometry(*runtime,runtime->sequences[0].geometry);
+        if(runtime->expert_cache_bytes&&flyweight_gpu_alloc(runtime->expert_cache_bytes,&runtime->expert_cache)!=0)throw std::runtime_error("failed to allocate native Qwen expert cache");
         if(runtime->expert_cache_bytes&&persistent_nvfp4_requested){
             runtime->expert_native_cache_bytes=runtime->expert_cache_bytes;
-            if(colibri_gpu_alloc(runtime->expert_native_cache_bytes,
+            if(flyweight_gpu_alloc(runtime->expert_native_cache_bytes,
                                  &runtime->expert_native_cache)!=0)
                 throw std::runtime_error(
                     "failed to allocate persistent NVFP4 expert cache");
@@ -13857,10 +14261,10 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         if(runtime->prefill_snapshot_bytes){
             // Slot 0's checkpoint pool lives in runtime->prefill_snapshots (the
             // active mirror); slots 1..N-1 own theirs in sequences[i].
-            for(auto&snapshot:runtime->prefill_snapshots)if(colibri_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
+            for(auto&snapshot:runtime->prefill_snapshots)if(flyweight_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
             for(std::size_t i=1;i<runtime->sequences.size();++i){
                 runtime->sequences[i].prefill_snapshots.assign(runtime->prefill_snapshots.size(),QwenPrefillSnapshot{});
-                for(auto&snapshot:runtime->sequences[i].prefill_snapshots)if(colibri_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
+                for(auto&snapshot:runtime->sequences[i].prefill_snapshots)if(flyweight_gpu_alloc(runtime->prefill_snapshot_bytes,&snapshot.device)!=0)throw std::runtime_error("failed to allocate native Qwen prefill snapshots");
             }
         }
         if(runtime->expert_slot_bytes)runtime->expert_slots.resize(runtime->expert_cache_bytes/runtime->expert_slot_bytes);
@@ -13873,7 +14277,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         if(!runtime->expert_slots.empty()){
             if(auto_fit)
                 std::fprintf(stderr,
-                    "[colibri-v2] expert cache: %zu slots (%llu MiB) from an "
+                    "[flyweight] expert cache: %zu slots (%llu MiB) from an "
                     "auto-fit %llu MiB GPU budget; free VRAM varies between "
                     "runs, pass --gpu-cache-mib %llu to make expert placement "
                     "reproducible\n",
@@ -13884,7 +14288,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                     static_cast<unsigned long long>(gpu_budget/(1024ull*1024)));
             else
                 std::fprintf(stderr,
-                    "[colibri-v2] expert cache: %zu slots (%llu MiB) within "
+                    "[flyweight] expert cache: %zu slots (%llu MiB) within "
                     "the %llu MiB --gpu-cache-mib budget\n",
                     runtime->expert_slots.size(),
                     static_cast<unsigned long long>(
@@ -13913,30 +14317,30 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
         // CPU and only promotes a hot set at decode, so a prepare-phase test
         // would let IQ experts reach the GPU anyway.
         const bool gpu_at_decode=!qwen_expert_policy(
-            *runtime,colibri::v2::ExpertExecutionPhase::decode).is_cpu();
+            *runtime,flyweight::v2::ExpertExecutionPhase::decode).is_cpu();
         if(gpu_at_decode&&runtime->model->config.expert_count&&
            (!qwen_gpu_experts_executable(*runtime)||
             (qwen_model_has_iq_experts(*runtime)&&!seeded_placement&&
              runtime->whole_expert_layer_slots.empty()))){
-            runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
-            runtime->options.moe_device=colibri::v2::expert_execution_mode_value(
+            runtime->expert_mode=flyweight::v2::ExpertExecutionMode::cpu;
+            runtime->options.moe_device=flyweight::v2::expert_execution_mode_value(
                 runtime->expert_mode);
             prepare_policy=qwen_expert_policy(
-                *runtime,colibri::v2::ExpertExecutionPhase::prepare);
+                *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
             std::fprintf(stderr,
-                "[colibri-v2] routed experts stay on the CPU MoE; set "
-                "--prefill-cache-seed or COLIBRI_LAGUNA_WHOLE_LAYERS to "
+                "[flyweight] routed experts stay on the CPU MoE; set "
+                "--prefill-cache-seed or FLYWEIGHT_LAGUNA_WHOLE_LAYERS to "
                 "place IQ experts on the GPU\n");
         }
         if(prepare_policy.is_hybrid()&&runtime->model->config.expert_count&&
            runtime->expert_slots.empty()){
-            runtime->expert_mode=colibri::v2::ExpertExecutionMode::cpu;
-            runtime->options.moe_device=colibri::v2::expert_execution_mode_value(
+            runtime->expert_mode=flyweight::v2::ExpertExecutionMode::cpu;
+            runtime->options.moe_device=flyweight::v2::expert_execution_mode_value(
                 runtime->expert_mode);
             prepare_policy=qwen_expert_policy(
-                *runtime,colibri::v2::ExpertExecutionPhase::prepare);
+                *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
             std::fprintf(stderr,
-                "[colibri-v2] hybrid expert cache does not fit; falling back to CPU MoE\n");
+                "[flyweight] hybrid expert cache does not fit; falling back to CPU MoE\n");
         }
         runtime->expert_history.resize(
             qwen_cache_layer_count(*runtime) *
@@ -13976,13 +14380,13 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                         widened[i]=tensor_value(source,t.type,i);
                 }
                 pack_q8_0(widened.data(),elements,packed.data());
-                if(colibri_gpu_upload_sync(runtime->device_tensors[index],packed.data(),device_bytes)!=0)throw std::runtime_error("failed to upload requantized native Qwen static tensor");
-            }else if(colibri_gpu_upload_sync(runtime->device_tensors[index],tensor_data(*runtime->model,t),t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
+                if(flyweight_gpu_upload_sync(runtime->device_tensors[index],packed.data(),device_bytes)!=0)throw std::runtime_error("failed to upload requantized native Qwen static tensor");
+            }else if(flyweight_gpu_upload_sync(runtime->device_tensors[index],tensor_data(*runtime->model,t),t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
             cursor+=device_align(device_bytes);
         }
         if(runtime->aliased_tensors)
             std::fprintf(stderr,
-                "[colibri-v2] %llu static tensors (%llu MiB) served from the GGUF "
+                "[flyweight] %llu static tensors (%llu MiB) served from the GGUF "
                 "mapping; device arena is %llu MiB\n",
                 static_cast<unsigned long long>(runtime->aliased_tensors),
                 static_cast<unsigned long long>(runtime->aliased_tensor_bytes/(1024ull*1024)),
@@ -14006,7 +14410,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                         const auto bytes=t.size/experts;
                         const auto source_offset=
                             static_cast<std::uint64_t>(expert)*bytes;
-                        if(colibri_gpu_upload(
+                        if(flyweight_gpu_upload(
                                 slot_base+role_offset,
                                 tensor_data(*runtime->model,t)+source_offset,
                                 bytes,runtime->stream)!=0)
@@ -14024,7 +14428,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 }
             }
             std::fprintf(stderr,
-                "[colibri-v2] resident expert mode prepared %zu experts (%llu MiB)\n",
+                "[flyweight] resident expert mode prepared %zu experts (%llu MiB)\n",
                 runtime->expert_slots.size(),
                 static_cast<unsigned long long>(
                     resident_expert_bytes/(1024ull*1024)));
@@ -14047,7 +14451,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                         const auto bytes=t.size/experts;
                         const auto source_offset=
                             static_cast<std::uint64_t>(expert)*bytes;
-                        if(colibri_gpu_upload(
+                        if(flyweight_gpu_upload(
                                 slot_base+role_offset,
                                 tensor_data(*runtime->model,t)+source_offset,
                                 bytes,runtime->stream)!=0)
@@ -14067,22 +14471,22 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 }
             }
             std::fprintf(stderr,
-                "[colibri-v2] prepared %zu pinned Laguna whole-layer experts "
+                "[flyweight] prepared %zu pinned Laguna whole-layer experts "
                 "(%llu MiB)\n",prepared,
                 static_cast<unsigned long long>(
                     runtime->expert_cache_bytes/(1024ull*1024)));
         }
-        if(colibri_gpu_memset(runtime->workspace,0,runtime->workspace_bytes,runtime->stream)!=0||
-           colibri_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0||
-           colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("failed to initialize native Qwen CUDA arenas");
+        if(flyweight_gpu_memset(runtime->workspace,0,runtime->workspace_bytes,runtime->stream)!=0||
+           flyweight_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0||
+           flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("failed to initialize native Qwen CUDA arenas");
     }catch(...){release_qwen_device(*runtime);throw;}
         const auto paging_policy=qwen_expert_policy(
-            *runtime,colibri::v2::ExpertExecutionPhase::prepare);
+            *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
         if(runtime->options.expert_paging>2)
             throw std::runtime_error("native Qwen expert paging mode is invalid");
         runtime->host_available_bytes=available_host_memory();
         const bool forced_direct=runtime->options.expert_paging==2||
-            std::getenv("COLIBRI_V2_DMA_PAGING");
+            std::getenv("FLYWEIGHT_V2_DMA_PAGING");
         const auto model_bytes=runtime->model->mapped_bytes();
         const auto registration_headroom=std::max<std::uint64_t>(
             4ull*1024*1024*1024,model_bytes/4);
@@ -14167,7 +14571,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
             const auto floor_bytes=kRegisterReserveBytes+host_resident_bytes;
             std::uint64_t budget=runtime->host_available_bytes>floor_bytes
                 ?runtime->host_available_bytes-floor_bytes:0;
-            if(const char* cap=std::getenv("COLIBRI_EXPERT_REGISTER_MIB"))
+            if(const char* cap=std::getenv("FLYWEIGHT_EXPERT_REGISTER_MIB"))
                 budget=std::min<std::uint64_t>(budget,
                     std::strtoull(cap,nullptr,10)*1024ull*1024ull);
             std::uint64_t planned=0;std::uint32_t covered=0;
@@ -14218,7 +14622,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                         "direct expert paging requested, but no expert layer fits the "
                         "registration budget");
                 std::fprintf(stderr,
-                    "[colibri-v2] direct expert paging unavailable; using staged copies\n");
+                    "[flyweight] direct expert paging unavailable; using staged copies\n");
             }else{
                 // Registration is ~2 GiB/s, so pinning 37 GiB costs ~20s -- which
                 // is why this runs on a worker instead of at the front of the
@@ -14228,15 +14632,15 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                 runtime->model_registered=true;
                 runtime->dma_paging=true;
                 std::fprintf(stderr,
-                    "[colibri-v2] direct expert paging: registering %.1f GiB "
+                    "[flyweight] direct expert paging: registering %.1f GiB "
                     "(%u/%zu expert layers%s) in the background\n",
                     planned/1073741824.0,covered,runtime->layers.size(),
                     embedding_fits?" + embeddings":"");
                 if(covered<runtime->layers.size())
                     std::fprintf(stderr,
-                        "[colibri-v2] %zu expert layers exceed the %.1f GiB "
+                        "[flyweight] %zu expert layers exceed the %.1f GiB "
                         "registration budget and keep staged copies; raise host RAM "
-                        "or set COLIBRI_EXPERT_REGISTER_MIB to tune\n",
+                        "or set FLYWEIGHT_EXPERT_REGISTER_MIB to tune\n",
                         runtime->layers.size()-covered,budget/1073741824.0);
                 auto* target=runtime;
                 target->registration_thread=std::thread([target,merged,promoted,
@@ -14248,7 +14652,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                             ok=false;break;
                         }
                         const auto bytes=static_cast<std::uint64_t>(span.end-span.start);
-                        if(colibri_gpu_host_register(span.start,bytes)!=0){ok=false;break;}
+                        if(flyweight_gpu_host_register(span.start,bytes)!=0){ok=false;break;}
                         ranges.emplace_back(span.start,bytes);
                     }
                     std::lock_guard<std::mutex> guard(target->registration_mutex);
@@ -14258,7 +14662,7 @@ int colibri_v2_qwen_runtime_prepare(ColibriV2QwenRuntime*runtime){return guarded
                         // the merged spans are exactly where those edges are. Roll
                         // back and stay staged.
                         for(const auto& [base,bytes]:ranges){
-                            (void)bytes;colibri_gpu_host_unregister(base);
+                            (void)bytes;flyweight_gpu_host_unregister(base);
                         }
                     }else{
                         target->registered_ranges=std::move(ranges);
@@ -14285,20 +14689,20 @@ inline std::uint64_t kv_region_bytes(std::uint64_t elems,int type){return type==
 // The turbo store kernels come in K and V flavours because the two rotate under
 // different sign streams, which is what lets values be accumulated rotated.
 inline const char* kv_store_kernel(int t,bool key){return t==5?(key?"kv_store_turbo4_k":"kv_store_turbo4_v"):t==4?(key?"kv_store_turbo3_k":"kv_store_turbo3_v"):t==3?"kv_store_q8":t==2?"kv_store_bf16":t==1?"kv_store_f16":"kv_store_f32";}
-inline const char* kv_scores_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4":t==4?"kv_attention_scores_turbo3":t==3?"kv_attention_scores_q8":t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";}
-inline const char* kv_values_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4":t==4?"kv_attention_values_turbo3":t==3?"kv_attention_values_q8":t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
-inline const char* kv_scores_ring_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4_ring":t==4?"kv_attention_scores_turbo3_ring":t==3?"kv_attention_scores_q8_ring":t==2?"kv_attention_scores_bf16_ring":t==1?"kv_attention_scores_f16_ring":"kv_attention_scores_ring";}
-inline const char* kv_values_ring_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4_ring":t==4?"kv_attention_values_turbo3_ring":t==3?"kv_attention_values_q8_ring":t==2?"kv_attention_values_bf16_ring":t==1?"kv_attention_values_f16_ring":"kv_attention_values_ring";}
+inline const char* kv_scores_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4":t==4?"kv_attention_scores_turbo3":t==3?"kv_attention_scores_q8":t==2?"kv_attention_scores_bf16":t==1?"kv_attention_scores_f16":"kv_attention_scores";}
+inline const char* kv_values_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4":t==4?"kv_attention_values_turbo3":t==3?"kv_attention_values_q8":t==2?"kv_attention_values_bf16":t==1?"kv_attention_values_f16":"kv_attention_values";}
+inline const char* kv_scores_ring_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==5?"kv_attention_scores_turbo4_ring":t==4?"kv_attention_scores_turbo3_ring":t==3?"kv_attention_scores_q8_ring":t==2?"kv_attention_scores_bf16_ring":t==1?"kv_attention_scores_f16_ring":"kv_attention_scores_ring";}
+inline const char* kv_values_ring_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==5?"kv_attention_values_turbo4_ring":t==4?"kv_attention_values_turbo3_ring":t==3?"kv_attention_values_q8_ring":t==2?"kv_attention_values_bf16_ring":t==1?"kv_attention_values_f16_ring":"kv_attention_values_ring";}
 // The turbo tiles rank below the cuBLAS staging path (see the dispatch) and
 // above the serial per-head kernels; this switch drops them back out of the
 // fallback tier entirely for A/B.
 inline bool qwen_turbo_fused_disabled(){
     static const bool disabled=[]{
-        const char*s=std::getenv("COLIBRI_TURBO_FUSED_ATTENTION");
+        const char*s=std::getenv("FLYWEIGHT_TURBO_FUSED_ATTENTION");
         return s&&s[0]=='0';}();
     return disabled;
 }
-inline const char* kv_fused_tiles_kernel(const ColibriV2QwenRuntime& r){
+inline const char* kv_fused_tiles_kernel(const FlyweightV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
     if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
@@ -14311,7 +14715,7 @@ inline const char* kv_fused_tiles_kernel(const ColibriV2QwenRuntime& r){
 // The 256-dim twin of the above. Kept a separate instantiation rather than
 // widening the 128 one so models with 128-dim heads keep their shared-memory
 // footprint and register count exactly as they were.
-inline const char* kv_fused_tiles_kernel256(const ColibriV2QwenRuntime& r){
+inline const char* kv_fused_tiles_kernel256(const FlyweightV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
     if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
@@ -14322,7 +14726,7 @@ inline const char* kv_fused_tiles_kernel256(const ColibriV2QwenRuntime& r){
            t==5?"kv_attention_fused_turbo4_tiles256":nullptr;
 }
 // The 512-dim triplet, for Gemma 4's global layers.
-inline const char* kv_fused_tiles_kernel512(const ColibriV2QwenRuntime& r){
+inline const char* kv_fused_tiles_kernel512(const FlyweightV2QwenRuntime& r){
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int t=r.options.cache_type_k;
     if((t==4||t==5)&&qwen_turbo_fused_disabled())return nullptr;
@@ -14336,7 +14740,7 @@ inline const char* kv_fused_tiles_kernel512(const ColibriV2QwenRuntime& r){
 // for the turbo pair the combined vector still carries the cache's rotation,
 // which only the turbo merge undoes. Mixing them returns rotated garbage.
 inline const char* kv_fused_merge_kernel_name(
-    const ColibriV2QwenRuntime& r,int width){
+    const FlyweightV2QwenRuntime& r,int width){
     const bool turbo=kv_type_is_turbo(r.options.cache_type_k);
     return width==128
         ?(turbo?"kv_attention_fused_turbo_merge":"kv_attention_fused_merge")
@@ -14349,12 +14753,12 @@ inline int kv_fused_width(int head_dim){
     return head_dim==128?128:head_dim==256?256:head_dim==512?512:0;
 }
 // Grouped-query kernel for `share` query heads per KV head, or nullptr when the
-// shape is not one of the instantiated ones. Opt-out via COLIBRI_GQA_ATTENTION=0.
+// shape is not one of the instantiated ones. Opt-out via FLYWEIGHT_GQA_ATTENTION=0.
 inline const char* kv_gqa_tiles_kernel(
-    const ColibriV2QwenRuntime& r,int head_dim,int heads,int kv_heads
+    const FlyweightV2QwenRuntime& r,int head_dim,int heads,int kv_heads
 ){
     static const bool enabled=[]{
-        const char*env=std::getenv("COLIBRI_GQA_ATTENTION");
+        const char*env=std::getenv("FLYWEIGHT_GQA_ATTENTION");
         return !env||env[0]!='0';
     }();
     if(!enabled||kv_heads<=0||head_dim!=256)return nullptr;
@@ -14391,7 +14795,7 @@ inline int kv_fused_record_stride(int width){return width+2;}
 // then inverse-rotate and gate. Returns false, having touched nothing, when the
 // configuration is not eligible.
 inline bool qwen_turbo_prefill_stage(
-    ColibriV2QwenRuntime& runtime, const QwenLayerPlan& layer,
+    FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     std::uint64_t queries, std::uint64_t cache_keys, std::uint64_t cache_values,
     int heads, int kv_heads, int head_dim, int rows, int base,
     std::uint64_t& stage_keys, std::uint64_t& stage_values
@@ -14401,7 +14805,7 @@ inline bool qwen_turbo_prefill_stage(
     if(!runtime.turbo_kv_stage||rows<=0||heads<=0||kv_heads<=0)return false;
     if(heads%kv_heads!=0||head_dim<32||(head_dim&31)!=0||head_dim>256)return false;
     if(layer.attention_window)return false;  // ring layers keep the per-token path
-    const char*env=std::getenv("COLIBRI_TURBO_CUBLAS");
+    const char*env=std::getenv("FLYWEIGHT_TURBO_CUBLAS");
     if(env&&env[0]=='0')return false;
     const int window=base+rows;
     if(window<=0||static_cast<std::uint64_t>(window)>layer.cache_capacity)return false;
@@ -14410,7 +14814,7 @@ inline bool qwen_turbo_prefill_stage(
     if(needed>runtime.turbo_kv_stage_stride)return false;
 
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,void**args){
-        if(colibri_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)
+        if(flyweight_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen turbo prefill kernel failed: ")+name);
     };
     stage_keys=runtime.turbo_kv_stage;
@@ -14431,28 +14835,28 @@ inline bool qwen_turbo_prefill_stage(
     return true;
 }
 
-inline int kv_fused_tile_tokens(const ColibriV2QwenRuntime&){return 1024;}
-inline int kv_fused_grid_heads(const ColibriV2QwenRuntime&,int heads,int){return heads;}
+inline int kv_fused_tile_tokens(const FlyweightV2QwenRuntime&){return 1024;}
+inline int kv_fused_grid_heads(const FlyweightV2QwenRuntime&,int heads,int){return heads;}
 inline int qwen_cublas_attention_min_tokens(){
     static const int threshold=[]{
-        const char*env=std::getenv("COLIBRI_CUBLAS_ATTENTION_MIN_TOKENS");
+        const char*env=std::getenv("FLYWEIGHT_CUBLAS_ATTENTION_MIN_TOKENS");
         if(!env||!env[0])
-            return colibri::v2::attention::kDefaultCublasMinTokens;
+            return flyweight::v2::attention::kDefaultCublasMinTokens;
         char*end=nullptr;
         const long value=std::strtol(env,&end,10);
         if(end==env||*end!='\0'||value<1||
            value>std::numeric_limits<std::int32_t>::max())
-            return colibri::v2::attention::kDefaultCublasMinTokens;
+            return flyweight::v2::attention::kDefaultCublasMinTokens;
         return static_cast<int>(value);
     }();
     return threshold;
 }
 inline bool qwen_cublas_attention_eligible(
-    const ColibriV2QwenRuntime&runtime,int tokens,int first_slot,int capacity
+    const FlyweightV2QwenRuntime&runtime,int tokens,int first_slot,int capacity
 ){
-    const char*env=std::getenv("COLIBRI_CUBLAS_ATTENTION");
+    const char*env=std::getenv("FLYWEIGHT_CUBLAS_ATTENTION");
     const bool enabled=!env||env[0]!='0';
-    return colibri::v2::attention::cublas_eligible(
+    return flyweight::v2::attention::cublas_eligible(
         runtime.options.cache_type_k,runtime.options.cache_type_v,
         tokens,first_slot,capacity,enabled,
         qwen_cublas_attention_min_tokens());
@@ -14472,13 +14876,13 @@ inline bool qwen_cublas_attention_eligible(
 // after that point throw rather than fall back, because the query has already
 // been rotated in place by then.
 inline bool qwen_turbo_cublas_attention(
-    ColibriV2QwenRuntime& runtime, std::uint64_t queries, std::uint64_t query_f16,
+    FlyweightV2QwenRuntime& runtime, std::uint64_t queries, std::uint64_t query_f16,
     std::uint64_t cache_keys, std::uint64_t cache_values, std::uint64_t scores_f16,
     std::uint64_t attended, int heads, int kv_heads, int head_dim,
     int tokens, int capacity, int first_slot, float scale
 ){
     const int ck=runtime.options.cache_type_k, cv=runtime.options.cache_type_v;
-    const bool diagnose=std::getenv("COLIBRI_TURBO_DIAG")!=nullptr;
+    const bool diagnose=std::getenv("FLYWEIGHT_TURBO_DIAG")!=nullptr;
     auto decline=[&](const char*why)->bool{
         if(diagnose){
             static const char*last=nullptr;
@@ -14492,8 +14896,8 @@ inline bool qwen_turbo_cublas_attention(
     if(heads%kv_heads!=0||head_dim<32||(head_dim&31)!=0)return decline("head geometry");
     if(tokens<qwen_cublas_attention_min_tokens())return decline("below cuBLAS token threshold");
     if(first_slot<0||first_slot>=capacity)return decline("ring slot out of range");
-    const char*env=std::getenv("COLIBRI_TURBO_CUBLAS");
-    if(env&&env[0]=='0')return decline("disabled by COLIBRI_TURBO_CUBLAS=0");
+    const char*env=std::getenv("FLYWEIGHT_TURBO_CUBLAS");
+    if(env&&env[0]=='0')return decline("disabled by FLYWEIGHT_TURBO_CUBLAS=0");
     const std::uint64_t needed=
         static_cast<std::uint64_t>(kv_heads)*tokens*head_dim*sizeof(std::uint16_t);
     if(needed>runtime.turbo_kv_stage_stride)return decline("staging buffer too small");
@@ -14503,7 +14907,7 @@ inline bool qwen_turbo_cublas_attention(
     }
 
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,void**args){
-        if(colibri_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)
+        if(flyweight_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native Qwen turbo attention kernel failed: ")+name);
     };
     std::uint64_t stage_keys=runtime.turbo_kv_stage;
@@ -14519,7 +14923,7 @@ inline bool qwen_turbo_cublas_attention(
     void*rotate_args[]={&queries,&heads,&head_dim,&key_stream};
     launch("turbo_rotate_rows",static_cast<std::uint32_t>(heads),1,rotate_args);
     // The staging copy is already unwrapped, so cuBLAS sees a linear window.
-    if(colibri_gpu_attention_f16_cublas(queries,query_f16,stage_keys,stage_values,
+    if(flyweight_gpu_attention_f16_cublas(queries,query_f16,stage_keys,stage_values,
             scores_f16,attended,runtime.stream,heads,kv_heads,head_dim,tokens,
             tokens,unwrapped,scale)!=0)
         throw std::runtime_error("native Qwen turbo cuBLAS attention failed");
@@ -14529,14 +14933,14 @@ inline bool qwen_turbo_cublas_attention(
 }
 
 void qwen_mtp_dense_projection(
-    ColibriV2QwenRuntime& runtime, std::size_t tensor_index_value,
+    FlyweightV2QwenRuntime& runtime, std::size_t tensor_index_value,
     std::uint64_t input, std::uint64_t output,
     int input_size, int output_size
 ) {
     std::uint64_t matrix = runtime.device_tensors[tensor_index_value];
     const auto type = qwen_device_type(runtime, tensor_index_value);
     auto launch = [&](const char* name, std::uint32_t grid_x, void** args) {
-        if (colibri_gpu_launch_named(
+        if (flyweight_gpu_launch_named(
                 name, grid_x, 1, 256, 0, runtime.stream, args) != 0) {
             throw std::runtime_error(
                 std::string("native MTP dense projection failed: ") + name);
@@ -14571,10 +14975,147 @@ void qwen_mtp_dense_projection(
     throw std::runtime_error("native MTP dense projection failed");
 }
 
-void qwen_mtp_append_pair(
-    ColibriV2QwenRuntime& runtime, std::uint32_t token,
+// qwen4exp twin of qwen_mtp_append_pair: rebuild ONE draft-cache K/V entry from
+// a token and the target's streams. Only the key/value path is needed, so this
+// stops at the attention-boundary block input -- no inject gates, no MoE, no
+// head. Fusion and bookend shapes are the draft forward's; see the comment on
+// qwen4exp_mtp_draft.
+void qwen4exp_mtp_append_pair(
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
     std::uint64_t input_hidden
 ) {
+    const auto& config = runtime.model->config;
+    const int hidden = static_cast<int>(config.hidden_size);
+    const int hc_count = static_cast<int>(config.hyper_connection_count);
+    const int hc_low_rank = static_cast<int>(config.hyper_connection_low_rank);
+    const int hc_wide_size = hc_count * hidden;
+    const int kv_heads = static_cast<int>(config.attention_kv_heads);
+    const auto& layer = runtime.mtp_layer_plan;
+    const int head_dim = static_cast<int>(
+        runtime.model->tensors[layer.static_tensors[2]].shape[1] / kv_heads);
+    const int kv_size = kv_heads * head_dim;
+    const float epsilon = config.rms_norm_epsilon ? config.rms_norm_epsilon : 1.0e-6f;
+    std::uint64_t cursor = runtime.workspace;
+    const auto workspace_end = runtime.workspace + runtime.workspace_bytes;
+    auto take = [&](std::uint64_t bytes) {
+        const auto result = cursor;
+        cursor += device_align(bytes);
+        if (cursor > workspace_end)
+            throw std::runtime_error("native qwen4exp MTP workspace is too small");
+        return result;
+    };
+    const auto embedding = take(hidden * sizeof(float));
+    const auto normalized_embedding = take(hidden * sizeof(float));
+    const auto normalized_hidden = take(hc_wide_size * sizeof(float));
+    const auto concatenated = take(2ULL * hidden * sizeof(float));
+    const auto hc_streams = take(hc_wide_size * sizeof(float));
+    const auto hc_normed = take(hc_wide_size * sizeof(float));
+    const auto hc_wide = take(hc_wide_size * sizeof(float));
+    const auto hc_low = take(hc_low_rank * sizeof(float));
+    const auto normalized = take(hidden * sizeof(float));
+    const auto keys = take(kv_size * sizeof(float));
+    const auto values = take(kv_size * sizeof(float));
+    const auto rotated_keys = take(kv_size * sizeof(float));
+    auto launch = [&](const char* name, std::uint32_t gx, std::uint32_t gy, void** args) {
+        if (flyweight_gpu_launch_named(name, gx, gy, 256, 0, runtime.stream, args) != 0)
+            throw std::runtime_error(
+                std::string("native qwen4exp MTP CUDA kernel failed: ") + name);
+    };
+    const std::uint32_t embedding_token = token;
+    const auto embedding_matrix = qwen_stage_embedding_rows(runtime, &embedding_token, 1);
+    int token_value = runtime.embeddings_host_resident ? 0 : static_cast<int>(token);
+    void* embedding_args[] = {const_cast<std::uint64_t*>(&embedding_matrix),
+                              const_cast<std::uint64_t*>(&embedding), &token_value,
+                              const_cast<int*>(&hidden)};
+    launch(qwen_embedding_kernel(qwen_device_type(runtime, runtime.token_embeddings), false),
+           (hidden + 255) / 256, 1, embedding_args);
+    auto rms_wide = [&](std::uint64_t input, std::uint64_t weight,
+                        std::uint64_t output, int count) {
+        int one_centered = 0;
+        void* args[] = {&input, &weight, &output, &count,
+                        const_cast<float*>(&epsilon), &one_centered};
+        launch("rms_norm", 1, 1, args);
+    };
+    rms_wide(embedding, runtime.device_tensors[runtime.mtp_special_tensors[1]],
+             normalized_embedding, hidden);
+    rms_wide(input_hidden, runtime.device_tensors[runtime.mtp_special_tensors[2]],
+             normalized_hidden, hc_wide_size);
+    for (int stream = 0; stream < hc_count; ++stream) {
+        const auto stream_hidden =
+            normalized_hidden + static_cast<std::uint64_t>(stream) * hidden * sizeof(float);
+        const auto stream_out =
+            hc_streams + static_cast<std::uint64_t>(stream) * hidden * sizeof(float);
+        void* concat_args[] = {const_cast<std::uint64_t*>(&normalized_embedding),
+                               const_cast<std::uint64_t*>(&stream_hidden),
+                               const_cast<std::uint64_t*>(&concatenated),
+                               const_cast<int*>(&hidden)};
+        launch("qwen_concat_pair", (hidden + 255) / 256, 1, concat_args);
+        qwen_mtp_dense_projection(runtime, runtime.mtp_special_tensors[0],
+                                  concatenated, stream_out, hidden * 2, hidden);
+    }
+    // Attention-boundary hc_pre, inject-less: only the block input is wanted.
+    {
+        auto norm_weights = runtime.device_tensors[layer.static_tensors[0]];
+        void* norm_args[] = {const_cast<std::uint64_t*>(&hc_streams), &norm_weights,
+                             const_cast<std::uint64_t*>(&hc_normed),
+                             const_cast<int*>(&hidden), const_cast<float*>(&epsilon)};
+        launch("qwen4_group_rms", hc_count, 1, norm_args);
+        qwen_mtp_dense_projection(runtime, layer.hc_attn_down, hc_normed, hc_low,
+                                  hc_wide_size, hc_low_rank);
+        float divisor = static_cast<float>(hc_count);
+        void* silu_args[] = {const_cast<std::uint64_t*>(&hc_low),
+                             const_cast<int*>(&hc_low_rank), &divisor};
+        launch("qwen4_silu_scale",
+               (static_cast<std::uint32_t>(hc_low_rank) + 255) / 256, 1, silu_args);
+        qwen_mtp_dense_projection(runtime, layer.hc_attn_up, hc_low, hc_wide,
+                                  hc_low_rank, hc_wide_size);
+        void* mix_args[] = {const_cast<std::uint64_t*>(&hc_normed),
+                            const_cast<std::uint64_t*>(&hc_wide),
+                            const_cast<std::uint64_t*>(&normalized),
+                            const_cast<int*>(&hc_count), const_cast<int*>(&hidden)};
+        launch("qwen4_hc_mix", (static_cast<std::uint32_t>(hidden) + 255) / 256, 1, mix_args);
+    }
+    qwen_mtp_dense_projection(runtime, layer.static_tensors[2], normalized,
+                              keys, hidden, kv_size);
+    qwen_mtp_dense_projection(runtime, layer.static_tensors[3], normalized,
+                              values, hidden, kv_size);
+    const int rotary = std::min(
+        static_cast<int>(config.rotary_dimension ? config.rotary_dimension : head_dim),
+        static_cast<int>(head_dim));
+    const int position = static_cast<int>(runtime.mtp_cache_tokens);
+    const float theta = config.rope_freq_base ? config.rope_freq_base : 1000000.0f;
+    const auto key_norm = runtime.device_tensors[layer.static_tensors[6]];
+    void* key_args[] = {const_cast<std::uint64_t*>(&keys),
+                        const_cast<std::uint64_t*>(&key_norm),
+                        const_cast<std::uint64_t*>(&rotated_keys),
+                        const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
+                        const_cast<int*>(&rotary), const_cast<int*>(&position),
+                        const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
+    launch("qwen_attention_key", kv_heads, 1, key_args);
+    auto cache_keys = runtime.state + layer.state_first;
+    auto cache_values = runtime.state + layer.state_second;
+    int capacity = static_cast<int>(runtime.options.context_limit);
+    void* key_store_args[] = {const_cast<std::uint64_t*>(&rotated_keys), &cache_keys,
+                              const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
+                              const_cast<int*>(&position), &capacity};
+    launch(kv_store_kernel(runtime.options.cache_type_k, true), kv_heads, 1, key_store_args);
+    void* value_store_args[] = {const_cast<std::uint64_t*>(&values), &cache_values,
+                                const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
+                                const_cast<int*>(&position), &capacity};
+    launch(kv_store_kernel(runtime.options.cache_type_v, false), kv_heads, 1, value_store_args);
+    ++runtime.mtp_cache_tokens;
+}
+
+void qwen_mtp_append_pair(
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
+    std::uint64_t input_hidden
+) {
+    // Branch here rather than at the call sites: prompt-pair, the true-cache
+    // commit and the rows prefill all reach this one entry point.
+    if (runtime.qwen4exp) {
+        qwen4exp_mtp_append_pair(runtime, token, input_hidden);
+        return;
+    }
     const int hidden = static_cast<int>(runtime.model->config.hidden_size);
     const int kv_heads = static_cast<int>(runtime.model->config.attention_kv_heads);
     const auto& layer = runtime.mtp_layer_plan;
@@ -14602,7 +15143,7 @@ void qwen_mtp_append_pair(
     const auto values = take(kv_size * sizeof(float));
     auto launch = [&](const char* name, std::uint32_t grid_x,
                       std::uint32_t grid_y, void** arguments) {
-        if (colibri_gpu_launch_named(
+        if (flyweight_gpu_launch_named(
                 name, grid_x, grid_y, 256, 0, runtime.stream, arguments
             ) != 0) {
             throw std::runtime_error(std::string("native MTP CUDA kernel failed: ") + name);
@@ -14680,7 +15221,7 @@ void qwen_mtp_append_pair(
 }
 
 void qwen_mtp_append_pair_batch2(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens,
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens,
     std::uint64_t first_hidden, std::uint64_t second_hidden
 ) {
     constexpr int rows=2;
@@ -14710,7 +15251,7 @@ void qwen_mtp_append_pair_batch2(
     const auto token_rows=take(2ULL*sizeof(std::uint32_t));
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,
                     std::uint32_t bx,void**args,std::uint32_t shared=0){
-        if(colibri_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
+        if(flyweight_gpu_launch_named(name,gx,gy,bx,shared,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native MTP batch-commit kernel failed: ")+name);
     };
     auto copy_hidden=[&](std::uint64_t source,int row){
@@ -14721,7 +15262,7 @@ void qwen_mtp_append_pair_batch2(
     copy_hidden(first_hidden,0);copy_hidden(second_hidden,1);
     const auto embedding_matrix=qwen_stage_embedding_rows(runtime,tokens,rows);
     if(!runtime.embeddings_host_resident&&
-       colibri_gpu_upload(token_rows,tokens,2*sizeof(std::uint32_t),runtime.stream)!=0)
+       flyweight_gpu_upload(token_rows,tokens,2*sizeof(std::uint32_t),runtime.stream)!=0)
         throw std::runtime_error("native MTP batch-commit token upload failed");
     const auto embedding_index=runtime.embeddings_host_resident
         ?runtime.embedding_row_index:token_rows;
@@ -14793,7 +15334,7 @@ void qwen_mtp_append_pair_batch2(
 }
 
 void qwen_mtp_append_prompt_pair(
-    ColibriV2QwenRuntime& runtime, std::uint32_t token
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token
 ) {
     if (!runtime.options.mtp_drafts || !runtime.mtp_has_target_hidden) return;
     qwen_mtp_append_pair(
@@ -14801,8 +15342,317 @@ void qwen_mtp_append_prompt_pair(
         runtime.state + runtime.mtp_target_hidden_offset);
 }
 
+// qwen4exp's draft block. Same job as qwen_mtp_draft below -- one token in,
+// one drafted token out, the block's own hidden state left where the next
+// round can read it -- but it runs in STREAM space throughout, because that is
+// what the nextn block consumes and produces on this architecture.
+//
+// The shape differences from the qwen twin, all from the MTP section of
+// plans/qwen4exp-semantics.md (llama.cpp `graph_mtp` is the reference; there
+// is no transformers module to check against):
+//
+//   * `input_hidden` is hc_count*hidden wide -- the target's streams, not the
+//     collapsed hidden the LM head sees.
+//   * hnorm is ONE rms over that whole row, then split into streams. It is not
+//     a per-stream (grouped) norm; deepseek4's MTP is, and the two forms differ
+//     only in the denominator, so getting it wrong is invisible.
+//   * eh_proj is [2*hidden -> hidden] applied PER STREAM, with the one normed
+//     embedding broadcast across all of them and concatenated FIRST.
+//   * the bookends are the gated-residual boundaries (hc_pre/hc_post), not
+//     attn_norm/post_attention_norm, and the output is collapsed by the
+//     ordinary inject-less output_hc_* boundary before the LM head.
+//   * attention runs DENSE. The block carries indexer tensors and the
+//     reference loads and ignores them, so `qsa_ratio` stays 0 and the draft
+//     needs no block-key store of its own.
+//
+// A wrong fusion here costs acceptance rate and NEVER text: the verify pass
+// re-scores every drafted token with the target model.
+std::uint32_t qwen4exp_mtp_draft(
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
+    std::uint64_t input_hidden
+) {
+    const auto& config = runtime.model->config;
+    const int hidden_size = static_cast<int>(config.hidden_size);
+    const int hc_count = static_cast<int>(config.hyper_connection_count);
+    const int hc_low_rank = static_cast<int>(config.hyper_connection_low_rank);
+    const int hc_wide_size = hc_count * hidden_size;
+    const int experts = static_cast<int>(config.expert_count);
+    const int top_k = static_cast<int>(config.expert_used_count);
+    const int intermediate = static_cast<int>(runtime.moe_intermediate);
+    const int heads = static_cast<int>(config.attention_heads);
+    const int kv_heads = static_cast<int>(config.attention_kv_heads);
+    const auto& layer = runtime.mtp_layer_plan;
+    const int head_dim = static_cast<int>(
+        runtime.model->tensors[layer.static_tensors[2]].shape[1] / kv_heads);
+    const int q_size = heads * 2 * head_dim, kv_size = kv_heads * head_dim;
+    const float epsilon = config.rms_norm_epsilon ? config.rms_norm_epsilon : 1.0e-6f;
+    std::uint64_t cursor = runtime.workspace;
+    const auto workspace_end = runtime.workspace + runtime.workspace_bytes;
+    auto take = [&](std::uint64_t bytes) {
+        const auto result = cursor;
+        cursor += device_align(bytes);
+        if (cursor > workspace_end)
+            throw std::runtime_error("native qwen4exp MTP workspace is too small");
+        return result;
+    };
+    const auto embedding = take(hidden_size * sizeof(float));
+    const auto norm_embedding = take(hidden_size * sizeof(float));
+    const auto norm_hidden = take(hc_wide_size * sizeof(float));
+    const auto concatenated = take(2ULL * hidden_size * sizeof(float));
+    const auto hc_streams = take(hc_wide_size * sizeof(float));
+    const auto hc_normed = take(hc_wide_size * sizeof(float));
+    const auto hc_wide = take(hc_wide_size * sizeof(float));
+    const auto hc_low = take(hc_low_rank * sizeof(float));
+    const auto hc_gates = take(hc_count * sizeof(float));
+    const auto normalized = take(hidden_size * sizeof(float));
+    const auto block_output = take(hidden_size * sizeof(float));
+    const auto first = take(runtime.scratch_elements * sizeof(float));
+    const auto second = take(runtime.scratch_elements * sizeof(float));
+    const auto third = take(runtime.scratch_elements * sizeof(float));
+    const auto fourth = take(runtime.scratch_elements * sizeof(float));
+    const auto activated = take(top_k * runtime.moe_intermediate * sizeof(float));
+    (void)activated;
+    const auto router_logits = take(experts * sizeof(float));
+    const auto selected_device = take(top_k * sizeof(std::int32_t));
+    const auto route_weights = take(top_k * sizeof(float));
+    const auto argmax_device = take(sizeof(std::uint64_t));
+    const auto attention_scores = take(
+        static_cast<std::uint64_t>(heads) * runtime.options.context_limit * sizeof(float));
+    auto launch = [&](const char* name, std::uint32_t gx, std::uint32_t gy, void** args) {
+        if (flyweight_gpu_launch_named(name, gx, gy, 256, 0, runtime.stream, args) != 0)
+            throw std::runtime_error(
+                std::string("native qwen4exp MTP CUDA kernel failed: ") + name);
+    };
+    auto dense_index = [&](std::size_t index, std::uint64_t input, std::uint64_t output,
+                           int input_size, int output_size) {
+        qwen_mtp_dense_projection(runtime, index, input, output, input_size, output_size);
+    };
+    auto dense = [&](std::size_t role, std::uint64_t input, std::uint64_t output,
+                     int input_size, int output_size) {
+        dense_index(layer.static_tensors.at(role), input, output, input_size, output_size);
+    };
+    auto tensor = [&](std::size_t role) {
+        return runtime.device_tensors[layer.static_tensors.at(role)];
+    };
+    // Whole-row rms over `count` elements, weight applied directly (baked +1).
+    auto rms_wide = [&](std::uint64_t input, std::uint64_t weight,
+                        std::uint64_t output, int count) {
+        int one_centered = 0;
+        void* args[] = {&input, &weight, &output, &count,
+                        const_cast<float*>(&epsilon), &one_centered};
+        launch("rms_norm", 1, 1, args);
+    };
+    // One gated-residual boundary: streams -> block input, leaving the inject
+    // gates in hc_gates. `inject_index` == max is the inject-less collapse form.
+    auto hc_pre = [&](std::uint64_t norm_weights, std::uint64_t down_index,
+                      std::uint64_t up_index, std::uint64_t inject_index) {
+        void* norm_args[] = {const_cast<std::uint64_t*>(&hc_streams), &norm_weights,
+                             const_cast<std::uint64_t*>(&hc_normed),
+                             const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon)};
+        launch("qwen4_group_rms", hc_count, 1, norm_args);
+        dense_index(down_index, hc_normed, hc_low, hc_wide_size, hc_low_rank);
+        float divisor = static_cast<float>(hc_count);
+        void* silu_args[] = {const_cast<std::uint64_t*>(&hc_low),
+                             const_cast<int*>(&hc_low_rank), &divisor};
+        launch("qwen4_silu_scale",
+               (static_cast<std::uint32_t>(hc_low_rank) + 255) / 256, 1, silu_args);
+        dense_index(up_index, hc_low, hc_wide, hc_low_rank, hc_wide_size);
+        if (inject_index != std::numeric_limits<std::uint64_t>::max())
+            dense_index(inject_index, hc_normed, hc_gates, hc_wide_size, hc_count);
+        void* mix_args[] = {const_cast<std::uint64_t*>(&hc_normed),
+                            const_cast<std::uint64_t*>(&hc_wide),
+                            const_cast<std::uint64_t*>(&normalized),
+                            const_cast<int*>(&hc_count), const_cast<int*>(&hidden_size)};
+        launch("qwen4_hc_mix",
+               (static_cast<std::uint32_t>(hidden_size) + 255) / 256, 1, mix_args);
+    };
+    auto hc_post = [&](std::uint64_t output) {
+        void* inject_args[] = {const_cast<std::uint64_t*>(&hc_streams), &output,
+                               const_cast<std::uint64_t*>(&hc_gates),
+                               const_cast<int*>(&hc_count), const_cast<int*>(&hidden_size)};
+        launch("qwen4_hc_inject",
+               (static_cast<std::uint32_t>(hc_wide_size) + 255) / 256, 1, inject_args);
+    };
+
+    // --- input fusion ------------------------------------------------------
+    const std::uint32_t embedding_token = token;
+    const auto embedding_matrix = qwen_stage_embedding_rows(runtime, &embedding_token, 1);
+    int token_value = runtime.embeddings_host_resident ? 0 : static_cast<int>(token);
+    void* embedding_args[] = {const_cast<std::uint64_t*>(&embedding_matrix),
+                              const_cast<std::uint64_t*>(&embedding), &token_value,
+                              const_cast<int*>(&hidden_size)};
+    launch(qwen_embedding_kernel(qwen_device_type(runtime, runtime.token_embeddings), false),
+           (hidden_size + 255) / 256, 1, embedding_args);
+    rms_wide(embedding, runtime.device_tensors[runtime.mtp_special_tensors[1]],
+             norm_embedding, hidden_size);
+    rms_wide(input_hidden, runtime.device_tensors[runtime.mtp_special_tensors[2]],
+             norm_hidden, hc_wide_size);
+    // eh_proj per stream, embedding half first and shared by every stream.
+    for (int stream = 0; stream < hc_count; ++stream) {
+        const auto stream_hidden =
+            norm_hidden + static_cast<std::uint64_t>(stream) * hidden_size * sizeof(float);
+        const auto stream_out =
+            hc_streams + static_cast<std::uint64_t>(stream) * hidden_size * sizeof(float);
+        void* concat_args[] = {const_cast<std::uint64_t*>(&norm_embedding),
+                               const_cast<std::uint64_t*>(&stream_hidden),
+                               const_cast<std::uint64_t*>(&concatenated),
+                               const_cast<int*>(&hidden_size)};
+        launch("qwen_concat_pair", (hidden_size + 255) / 256, 1, concat_args);
+        dense_index(runtime.mtp_special_tensors[0], concatenated, stream_out,
+                    hidden_size * 2, hidden_size);
+    }
+
+    // --- attention (dense) -------------------------------------------------
+    hc_pre(tensor(0), layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject);
+    dense(1, normalized, first, hidden_size, q_size);
+    dense(2, normalized, second, hidden_size, kv_size);
+    dense(3, normalized, third, hidden_size, kv_size);
+    const int rotary = static_cast<int>(
+        config.rotary_dimension ? config.rotary_dimension : head_dim);
+    const int position = static_cast<int>(runtime.mtp_cache_tokens);
+    const float theta = config.rope_freq_base ? config.rope_freq_base : 1000000.0f;
+    auto qnorm = tensor(5), knorm = tensor(6);
+    std::uint64_t queries = fourth, gates = fourth + q_size / 2 * sizeof(float);
+    void* q_args[] = {const_cast<std::uint64_t*>(&first), &qnorm, &queries, &gates,
+                      const_cast<int*>(&heads), const_cast<int*>(&head_dim),
+                      const_cast<int*>(&rotary), const_cast<int*>(&position),
+                      const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
+    launch("qwen_attention_query", heads, 1, q_args);
+    std::uint64_t keys = first;
+    void* k_args[] = {const_cast<std::uint64_t*>(&second), &knorm, &keys,
+                      const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
+                      const_cast<int*>(&rotary), const_cast<int*>(&position),
+                      const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
+    launch("qwen_attention_key", kv_heads, 1, k_args);
+    auto cache_keys = runtime.state + layer.state_first;
+    auto cache_values = runtime.state + layer.state_second;
+    int capacity = static_cast<int>(runtime.options.context_limit);
+    void* key_store_args[] = {&keys, &cache_keys, const_cast<int*>(&kv_heads),
+                              const_cast<int*>(&head_dim), const_cast<int*>(&position),
+                              &capacity};
+    launch(kv_store_kernel(runtime.options.cache_type_k, true), kv_heads, 1, key_store_args);
+    void* value_store_args[] = {const_cast<std::uint64_t*>(&third), &cache_values,
+                                const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
+                                const_cast<int*>(&position), &capacity};
+    launch(kv_store_kernel(runtime.options.cache_type_v, false), kv_heads, 1, value_store_args);
+    std::uint64_t attended = second;
+    int tokens = position + 1;
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    void* score_args[] = {&queries, &cache_keys, const_cast<std::uint64_t*>(&attention_scores),
+                          const_cast<int*>(&heads), const_cast<int*>(&kv_heads),
+                          const_cast<int*>(&head_dim), &tokens, &capacity, &scale};
+    launch(kv_scores_kernel(runtime), heads, (tokens + 255) / 256, score_args);
+    void* value_args[] = {const_cast<std::uint64_t*>(&attention_scores), &cache_values,
+                          &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads),
+                          const_cast<int*>(&head_dim), &tokens, &capacity};
+    launch(kv_values_kernel(runtime), heads, 1, value_args);
+    std::uint64_t gated = third;
+    int elements = heads * head_dim;
+    void* gate_args[] = {&attended, &gates, &gated, &elements};
+    launch("qwen_attention_gate", (elements + 255) / 256, 1, gate_args);
+    dense(4, gated, block_output, elements, hidden_size);
+    hc_post(block_output);
+
+    // --- MoE ---------------------------------------------------------------
+    hc_pre(tensor(7), layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject);
+    auto* staging = static_cast<std::uint8_t*>(runtime.host_staging);
+    dense(8, normalized, router_logits, hidden_size, experts);
+    if (flyweight_gpu_route_topk(router_logits, selected_device, route_weights,
+                               experts, top_k, runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP routing failed");
+    auto* selected_host = reinterpret_cast<std::int32_t*>(staging);
+    const auto weights_offset = device_align(top_k * sizeof(std::int32_t));
+    const auto input_offset = weights_offset + device_align(top_k * sizeof(float));
+    const auto cpu_activated_offset = input_offset + device_align(hidden_size * sizeof(float));
+    const auto output_offset = cpu_activated_offset
+        + device_align(top_k * runtime.moe_intermediate * sizeof(float));
+    auto* cpu_weights = reinterpret_cast<float*>(staging + weights_offset);
+    auto* cpu_input = reinterpret_cast<float*>(staging + input_offset);
+    auto* cpu_activated = reinterpret_cast<float*>(staging + cpu_activated_offset);
+    auto* cpu_output = reinterpret_cast<float*>(staging + output_offset);
+    if (flyweight_gpu_download(selected_host, selected_device, top_k * sizeof(std::int32_t),
+                             runtime.stream) != 0
+        || flyweight_gpu_download(cpu_weights, route_weights, top_k * sizeof(float),
+                                runtime.stream) != 0
+        || flyweight_gpu_download(cpu_input, normalized, hidden_size * sizeof(float),
+                                runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP route transfer failed");
+    {
+        // Shared expert, then the routed experts on the host -- the same split
+        // the ordinary qwen4exp decode uses.
+        auto up_half = first + static_cast<std::uint64_t>(intermediate) * sizeof(float);
+        dense(9, normalized, first, hidden_size, intermediate);
+        dense(10, normalized, up_half, hidden_size, intermediate);
+        int count = intermediate;
+        void* silu_args[] = {const_cast<std::uint64_t*>(&first),
+                             const_cast<std::uint64_t*>(&second), &count};
+        launch("silu_mul", (static_cast<std::uint32_t>(count) + 255) / 256, 1, silu_args);
+        dense(11, second, third, intermediate, hidden_size);
+    }
+    {
+        auto shared_gate = tensor(12);
+        const auto sg_type = runtime.model->tensors[layer.static_tensors.at(12)].type;
+        void* shared_args[] = {const_cast<std::uint64_t*>(&normalized), &shared_gate,
+                               const_cast<std::uint64_t*>(&third),
+                               const_cast<int*>(&hidden_size)};
+        launch(sg_type == 30 ? "qwen_shared_scale_bf16" : "qwen_shared_scale", 1, 1, shared_args);
+    }
+    if (flyweight_gpu_stream_sync(runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP route synchronization failed");
+    for (int rank = 0; rank < top_k; ++rank) {
+        if (selected_host[rank] < 0 || selected_host[rank] >= experts)
+            throw std::runtime_error("native qwen4exp MTP routing selected an invalid expert");
+        cpu_weights[rank] *=
+            qwen_expert_role_scale(runtime, layer.expert_down_scale, selected_host[rank]);
+    }
+    qwen_cpu_moe(runtime, layer, selected_host, cpu_weights, top_k,
+                 cpu_input, cpu_activated, cpu_output);
+    if (flyweight_gpu_upload(fourth, cpu_output, hidden_size * sizeof(float),
+                           runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP expert upload failed");
+    {
+        float one = 1.0f;
+        int count = hidden_size;
+        void* add_args[] = {const_cast<std::uint64_t*>(&third),
+                            const_cast<std::uint64_t*>(&fourth), &one, &count};
+        launch("scaled_add", (hidden_size + 255) / 256, 1, add_args);
+    }
+    hc_post(third);
+
+    // --- hand-over and head ------------------------------------------------
+    // The streams are what the next round reads back, so the whole row goes to
+    // the draft-hidden slot (which is reserved hc_count*hidden wide on this
+    // arch for exactly this reason).
+    {
+        auto draft_hidden = runtime.state + runtime.mtp_draft_hidden_offset;
+        int count = hc_wide_size;
+        void* copy_args[] = {const_cast<std::uint64_t*>(&hc_streams), &draft_hidden, &count};
+        launch("qwen_copy_vector", (hc_wide_size + 255) / 256, 1, copy_args);
+    }
+    // No final norm on this arch: the inject-less collapse IS it.
+    hc_pre(runtime.device_tensors[runtime.output_hc_norm],
+           runtime.output_hc_down, runtime.output_hc_up,
+           std::numeric_limits<std::uint64_t>::max());
+    if (flyweight_gpu_memset(argmax_device, 0, sizeof(std::uint64_t), runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP argmax reset failed");
+    int vocabulary = static_cast<int>(config.vocabulary_size);
+    auto lm_head = runtime.device_tensors[runtime.lm_head];
+    void* argmax_args[] = {&lm_head, const_cast<std::uint64_t*>(&normalized),
+                           const_cast<std::uint64_t*>(&argmax_device),
+                           const_cast<int*>(&hidden_size), &vocabulary};
+    launch(qwen_lm_head_argmax_kernel(runtime.lm_head_type), (vocabulary + 7) / 8, 1, argmax_args);
+    auto* packed_winner = reinterpret_cast<std::uint64_t*>(staging);
+    if (flyweight_gpu_download(packed_winner, argmax_device, sizeof(*packed_winner),
+                             runtime.stream) != 0
+        || flyweight_gpu_stream_sync(runtime.stream) != 0)
+        throw std::runtime_error("native qwen4exp MTP output synchronization failed");
+    ++runtime.mtp_cache_tokens;
+    ++runtime.mtp_draft_tokens;
+    return 0xffffffffu - static_cast<std::uint32_t>(*packed_winner);
+}
+
 std::uint32_t qwen_mtp_draft(
-    ColibriV2QwenRuntime& runtime, std::uint32_t token,
+    FlyweightV2QwenRuntime& runtime, std::uint32_t token,
     std::uint64_t input_hidden
 ) {
     const int hidden_size=static_cast<int>(runtime.model->config.hidden_size);
@@ -14835,7 +15685,7 @@ std::uint32_t qwen_mtp_draft(
     const auto route_weights=take(top_k*sizeof(float));
     const auto argmax_device=take(sizeof(std::uint64_t));
     const auto attention_scores=take(static_cast<std::uint64_t>(heads)*runtime.options.context_limit*sizeof(float));
-    auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,void**args){if(colibri_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)throw std::runtime_error(std::string("native MTP CUDA kernel failed: ")+name);};
+    auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,void**args){if(flyweight_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)throw std::runtime_error(std::string("native MTP CUDA kernel failed: ")+name);};
     auto dense_index=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         qwen_mtp_dense_projection(
             runtime,index,input,output,input_size,output_size);
@@ -14899,11 +15749,11 @@ std::uint32_t qwen_mtp_draft(
     }else{
     dense(8,normalized,router_logits,hidden_size,experts);
 
-    if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime.stream)!=0)throw std::runtime_error("native MTP routing failed");
+    if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime.stream)!=0)throw std::runtime_error("native MTP routing failed");
     auto*selected_host=reinterpret_cast<std::int32_t*>(staging);
     const auto weights_offset=device_align(top_k*sizeof(std::int32_t));const auto input_offset=weights_offset+device_align(top_k*sizeof(float));const auto cpu_activated_offset=input_offset+device_align(hidden_size*sizeof(float));const auto output_offset=cpu_activated_offset+device_align(top_k*runtime.moe_intermediate*sizeof(float));
     auto*cpu_weights=reinterpret_cast<float*>(staging+weights_offset);auto*cpu_input=reinterpret_cast<float*>(staging+input_offset);auto*cpu_activated=reinterpret_cast<float*>(staging+cpu_activated_offset);auto*cpu_output=reinterpret_cast<float*>(staging+output_offset);
-    if(colibri_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||colibri_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||colibri_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)throw std::runtime_error("native MTP route transfer failed");
+    if(flyweight_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||flyweight_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||flyweight_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)throw std::runtime_error("native MTP route transfer failed");
     auto shared_gate_matrix=tensor(9),shared_up_matrix=tensor(10);
     const auto shexp_type=runtime.model->tensors[layer.static_tensors.at(9)].type;
     if(shexp_type==40){
@@ -14936,7 +15786,7 @@ std::uint32_t qwen_mtp_draft(
         void*shared_args[]={const_cast<std::uint64_t*>(&normalized),&shared_gate,const_cast<std::uint64_t*>(&third),const_cast<int*>(&hidden_size)};
         launch(sg_type==30?"qwen_shared_scale_bf16":"qwen_shared_scale",1,1,shared_args);
     }
-    if(colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP route synchronization failed");
+    if(flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP route synchronization failed");
     // qwen_cpu_moe expects the linear down scale already folded into the routing
     // weights; it applies gate/up itself.
     for(int rank=0;rank<top_k;++rank){
@@ -14945,27 +15795,41 @@ std::uint32_t qwen_mtp_draft(
         cpu_weights[rank]*=qwen_expert_role_scale(runtime,layer.expert_down_scale,selected_host[rank]);
     }
     qwen_cpu_moe(runtime,layer,selected_host,cpu_weights,top_k,cpu_input,cpu_activated,cpu_output);
-    if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)throw std::runtime_error("native MTP expert upload failed");
+    if(flyweight_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)throw std::runtime_error("native MTP expert upload failed");
     add(third,fourth);add(residual,third);std::swap(hidden,residual);
     }
     auto draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;void*copy_args[]={&hidden,&draft_hidden,const_cast<int*>(&hidden_size)};launch("qwen_copy_vector",(hidden_size+255)/256,1,copy_args);
     rms(hidden,runtime.device_tensors[runtime.mtp_special_tensors[3]],normalized);
-    if(colibri_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native MTP argmax reset failed");
+    if(flyweight_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native MTP argmax reset failed");
     int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&argmax_device),const_cast<int*>(&hidden_size),&vocabulary};launch(qwen_lm_head_argmax_kernel(runtime.lm_head_type),(vocabulary+7)/8,1,argmax_args);
-    auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);if(colibri_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP output synchronization failed");
+    auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);if(flyweight_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP output synchronization failed");
     ++runtime.mtp_cache_tokens;++runtime.mtp_draft_tokens;
     return 0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
 }
 
-void qwen_snapshot_delta_state(ColibriV2QwenRuntime& runtime, bool restore) {
+void qwen_snapshot_delta_state(FlyweightV2QwenRuntime& runtime, bool restore) {
     auto launch_copy=[&](std::uint64_t source,std::uint64_t destination,std::uint64_t bytes){
         const int elements=static_cast<int>(bytes/sizeof(float));
         void*args[]={&source,&destination,const_cast<int*>(&elements)};
-        if(colibri_gpu_launch_named("qwen_copy_vector",(elements+255)/256,1,256,0,runtime.stream,args)!=0)
+        if(flyweight_gpu_launch_named("qwen_copy_vector",(elements+255)/256,1,256,0,runtime.stream,args)!=0)
             throw std::runtime_error("native MTP state snapshot failed");
     };
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
         auto&layer=runtime.layers[layer_number];
+        // qwen4exp's PLE conv ring, same treatment as the DeltaNet conv below.
+        // The verify pass advances it by `wanted` tokens; a rejection has to
+        // put it back or the target keeps generating from a state a few tokens
+        // into a future it did not take. Mirrors the prefill checkpoint, which
+        // has always carried this ring.
+        if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+            const auto&ple_conv=runtime.model->tensors[layer.ple_conv];
+            const auto ple_bytes=(ple_conv.shape[0]-1)
+                *std::max<std::uint64_t>(runtime.model->config.ple_ngram_size,1)
+                *ple_conv.shape[1]*sizeof(float);
+            const auto live=runtime.state+layer.state_third;
+            const auto saved=runtime.state+layer.snapshot_third;
+            launch_copy(restore?saved:live,restore?live:saved,ple_bytes);
+        }
         if(layer.attention)continue;
         const auto&conv=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
         const auto&a=runtime.model->tensors[tensor_index(*runtime.model,"blk."+std::to_string(layer_number)+".ssm_a")];
@@ -14991,7 +15855,7 @@ void qwen_snapshot_delta_state(ColibriV2QwenRuntime& runtime, bool restore) {
 // correctly for the accepted prefix. The caller must restore the state
 // snapshot first. The verifier caps at 8 rows, far below the chunked-WY
 // threshold, so mirroring the sequential kernel selection is exhaustive.
-void qwen_mtp_fold_delta_state(ColibriV2QwenRuntime& runtime, int rows) {
+void qwen_mtp_fold_delta_state(FlyweightV2QwenRuntime& runtime, int rows) {
     const auto&layout=runtime.rows_workspace_layout;
     // Scratch: conv output, recurrence output and the gate operand land in the
     // idle rows workspace. Gates only shape the (discarded) output, never the
@@ -15002,7 +15866,7 @@ void qwen_mtp_fold_delta_state(ColibriV2QwenRuntime& runtime, int rows) {
     const float epsilon=runtime.model->config.rms_norm_epsilon
         ?runtime.model->config.rms_norm_epsilon:1.0e-6f;
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t bx,void**args){
-        if(colibri_gpu_launch_named(name,gx,1,bx,0,runtime.stream,args)!=0)
+        if(flyweight_gpu_launch_named(name,gx,1,bx,0,runtime.stream,args)!=0)
             throw std::runtime_error(std::string("native MTP fold kernel failed: ")+name);
     };
     for(std::uint32_t layer_number=0;layer_number<runtime.layers.size();++layer_number){
@@ -15073,12 +15937,12 @@ static int apply_expert_router_policy(std::int32_t* selected, float* weights,
 // Copy every DeltaNet layer's conv+recurrent state between the live state
 // arena and a prefill snapshot buffer (packed sequentially in layer order).
 void qwen_prefill_snapshot_copy(
-    ColibriV2QwenRuntime& runtime, std::uint64_t snapshot, bool restore
+    FlyweightV2QwenRuntime& runtime, std::uint64_t snapshot, bool restore
 ) {
     auto launch_copy=[&](std::uint64_t source,std::uint64_t destination,std::uint64_t bytes){
         const int elements=static_cast<int>(bytes/sizeof(float));
         void*args[]={&source,&destination,const_cast<int*>(&elements)};
-        if(colibri_gpu_launch_named("qwen_copy_vector",(static_cast<std::uint32_t>(elements)+255)/256,1,256,0,runtime.stream,args)!=0)
+        if(flyweight_gpu_launch_named("qwen_copy_vector",(static_cast<std::uint32_t>(elements)+255)/256,1,256,0,runtime.stream,args)!=0)
             throw std::runtime_error("native Qwen prefill snapshot copy failed");
     };
     std::uint64_t cursor=snapshot;
@@ -15129,7 +15993,7 @@ inline AttentionCacheView attention_cache_view(const QwenLayerPlan& layer,std::u
     const auto first_absolute=position+1-visible;
     return {static_cast<int>(position%layer.cache_capacity),static_cast<int>(first_absolute%layer.cache_capacity),static_cast<int>(visible),capacity};
 }
-inline bool swa_snapshot_is_resident(const ColibriV2QwenRuntime& runtime,std::uint64_t snapshot_position,std::uint64_t live_position){
+inline bool swa_snapshot_is_resident(const FlyweightV2QwenRuntime& runtime,std::uint64_t snapshot_position,std::uint64_t live_position){
     if(snapshot_position>live_position)return false;
     for(const auto& layer:runtime.layers)if(layer.attention_window&&layer.cache_capacity<runtime.options.context_limit){
         const auto rollback_room=layer.cache_capacity-layer.attention_window;
@@ -15147,15 +16011,15 @@ inline bool swa_snapshot_is_resident(const ColibriV2QwenRuntime& runtime,std::ui
 // Sparse attention reads the cache through kv_ld like the ring kernels; the
 // turbo codecs rotate rows and keep their own staged path, so a turbo cache
 // stays on the dense fallback (announced once).
-inline const char* kv_scores_indexed_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_scores_q8_indexed":t==2?"kv_attention_scores_bf16_indexed":t==1?"kv_attention_scores_f16_indexed":t==0?"kv_attention_scores_indexed":nullptr;}
-inline const char* kv_values_indexed_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_v;return t==3?"kv_attention_values_q8_indexed":t==2?"kv_attention_values_bf16_indexed":t==1?"kv_attention_values_f16_indexed":t==0?"kv_attention_values_indexed":nullptr;}
+inline const char* kv_scores_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_scores_q8_indexed":t==2?"kv_attention_scores_bf16_indexed":t==1?"kv_attention_scores_f16_indexed":t==0?"kv_attention_scores_indexed":nullptr;}
+inline const char* kv_values_indexed_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_v;return t==3?"kv_attention_values_q8_indexed":t==2?"kv_attention_values_bf16_indexed":t==1?"kv_attention_values_f16_indexed":t==0?"kv_attention_values_indexed":nullptr;}
 // A layer selects when it carries indexer tensors AND a compress ratio. The
 // window exclusion is structural, not incidental: QSA selects in POSITION
 // space and hands the attention kernels those positions as cache slots, which
 // only coincides on a global layer where capacity == context_limit. No arch
 // ships both today; the guard is what keeps the next one from silently
 // addressing the wrong rows.
-inline bool qwen_qsa_layer(const ColibriV2QwenRuntime& r,const QwenLayerPlan& layer){
+inline bool qwen_qsa_layer(const FlyweightV2QwenRuntime& r,const QwenLayerPlan& layer){
     return r.qsa_enabled&&r.qwen4exp&&layer.attention&&layer.qsa_ratio
         &&!layer.attention_window
         &&layer.indexer_q!=std::numeric_limits<std::uint64_t>::max()
@@ -15171,7 +16035,7 @@ inline bool qwen_qsa_layer(const ColibriV2QwenRuntime& r,const QwenLayerPlan& la
 inline bool qwen_qsa_in_range(const QwenLayerPlan& layer,std::uint64_t position){
     return position<layer.cache_capacity;
 }
-inline bool qwen_qsa_selecting(const ColibriV2QwenRuntime& r,const QwenLayerPlan& layer,std::uint64_t position){
+inline bool qwen_qsa_selecting(const FlyweightV2QwenRuntime& r,const QwenLayerPlan& layer,std::uint64_t position){
     const auto ratio=layer.qsa_ratio;
     if(!ratio||!qwen_qsa_in_range(layer,position))return false;
     if((position+1)/ratio<=r.model->config.indexer_top_k/ratio)return false;
@@ -15179,7 +16043,7 @@ inline bool qwen_qsa_selecting(const ColibriV2QwenRuntime& r,const QwenLayerPlan
     static bool announced=false;
     if(!announced){
         announced=true;
-        std::fprintf(stderr,"[colibri] QSA selection needs a f32/f16/bf16/q8 KV cache; "
+        std::fprintf(stderr,"[flyweight] QSA selection needs a f32/f16/bf16/q8 KV cache; "
             "turbo caches keep the dense fallback (approximate past the indexer budget)\n");
     }
     return false;
@@ -15191,7 +16055,7 @@ inline bool qwen_qsa_selecting(const ColibriV2QwenRuntime& r,const QwenLayerPlan
 // the list length. Costs one stream sync per selecting layer; CUDA graphs
 // are already off for the arch.
 inline int qwen_qsa_select(
-    const ColibriV2QwenRuntime& runtime,const QwenLayerPlan& layer,
+    const FlyweightV2QwenRuntime& runtime,const QwenLayerPlan& layer,
     std::uint64_t block_scores_device,std::uint64_t slots_device,
     std::uint64_t position
 ){
@@ -15202,9 +16066,9 @@ inline int qwen_qsa_select(
     static thread_local std::vector<float> scores;
     static thread_local std::vector<std::int32_t> order,slots;
     scores.resize(complete);
-    if(colibri_gpu_download(scores.data(),block_scores_device,
+    if(flyweight_gpu_download(scores.data(),block_scores_device,
             static_cast<std::uint64_t>(complete)*sizeof(float),runtime.stream)!=0
-       ||colibri_gpu_stream_sync(runtime.stream)!=0)
+       ||flyweight_gpu_stream_sync(runtime.stream)!=0)
         throw std::runtime_error("native Qwen QSA score download failed");
     order.resize(complete);
     for(int i=0;i<complete;++i)order[i]=i;
@@ -15223,11 +16087,11 @@ inline int qwen_qsa_select(
     for(int i=0;i<budget_blocks;++i)
         for(int j=0;j<ratio;++j)slots.push_back(order[i]*ratio+j);
     for(int t=complete*ratio;t<visible;++t)slots.push_back(t);
-    if(colibri_gpu_upload(slots_device,slots.data(),
+    if(flyweight_gpu_upload(slots_device,slots.data(),
             slots.size()*sizeof(std::int32_t),runtime.stream)!=0)
         throw std::runtime_error("native Qwen QSA slot upload failed");
-    // COLIBRI_QSA_TRACE=1: proof the selection is live and how hard it prunes.
-    static const bool trace=std::getenv("COLIBRI_QSA_TRACE")!=nullptr;
+    // FLYWEIGHT_QSA_TRACE=1: proof the selection is live and how hard it prunes.
+    static const bool trace=std::getenv("FLYWEIGHT_QSA_TRACE")!=nullptr;
     if(trace){
         static std::uint64_t calls=0,kept=0,candidates=0;
         ++calls;kept+=slots.size();candidates+=visible;
@@ -15242,8 +16106,8 @@ inline int qwen_qsa_select(
 }
 // No fused turbo prefill kernel yet, so a turbo cache falls back to the
 // separate scores+values path, which handles every precision.
-inline bool kv_fused_prefill_ok(const ColibriV2QwenRuntime& r){return r.options.cache_type_k==r.options.cache_type_v&&!kv_type_is_turbo(r.options.cache_type_k);}
-inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_prefill_q8":t==2?"kv_attention_prefill_bf16":t==1?"kv_attention_prefill_f16":"kv_attention_prefill";}
+inline bool kv_fused_prefill_ok(const FlyweightV2QwenRuntime& r){return r.options.cache_type_k==r.options.cache_type_v&&!kv_type_is_turbo(r.options.cache_type_k);}
+inline const char* kv_prefill_kernel(const FlyweightV2QwenRuntime& r){int t=r.options.cache_type_k;return t==3?"kv_attention_prefill_q8":t==2?"kv_attention_prefill_bf16":t==1?"kv_attention_prefill_f16":"kv_attention_prefill";}
 
 // Dump one attention layer's live KV window for the TurboQuant quality harness
 // (native/tools/bench_turboquant.cpp). The file is little-endian and
@@ -15259,7 +16123,7 @@ inline const char* kv_prefill_kernel(const ColibriV2QwenRuntime& r){int t=r.opti
 // The tensors the capture actually saw, in model order. Deterministic, so a
 // caller can enumerate entries by slot across two calls.
 static std::vector<std::size_t> qwen_imatrix_active(
-    const ColibriV2QwenRuntime& runtime
+    const FlyweightV2QwenRuntime& runtime
 ) {
     std::vector<std::size_t> active;
     for(std::size_t i=0;i<runtime.imatrix_rows.size();++i)
@@ -15267,16 +16131,16 @@ static std::vector<std::size_t> qwen_imatrix_active(
     return active;
 }
 
-int colibri_v2_qwen_imatrix_count(
-    ColibriV2QwenRuntime* runtime, uint64_t* count
+int flyweight_v2_qwen_imatrix_count(
+    FlyweightV2QwenRuntime* runtime, uint64_t* count
 ){return guarded([&]{
     if(!runtime||!count)throw std::runtime_error("invalid Qwen imatrix arguments");
     *count=qwen_imatrix_active(*runtime).size();
     return 0;
 });}
 
-int colibri_v2_qwen_imatrix_entry(
-    ColibriV2QwenRuntime* runtime, uint64_t slot, char* name,
+int flyweight_v2_qwen_imatrix_entry(
+    FlyweightV2QwenRuntime* runtime, uint64_t slot, char* name,
     uint64_t name_capacity, float* sums, uint64_t sums_capacity,
     uint64_t* width, uint64_t* rows_seen
 ){return guarded([&]{
@@ -15295,9 +16159,9 @@ int colibri_v2_qwen_imatrix_entry(
     if(sums_capacity<channels)
         throw std::runtime_error("Qwen imatrix entry buffer is too small");
     const auto offset=runtime->imatrix_offsets[index];
-    if(colibri_gpu_download(sums,runtime->imatrix_sums+offset*sizeof(float),
+    if(flyweight_gpu_download(sums,runtime->imatrix_sums+offset*sizeof(float),
                             channels*sizeof(float),runtime->stream)!=0||
-       colibri_gpu_stream_sync(runtime->stream)!=0)
+       flyweight_gpu_stream_sync(runtime->stream)!=0)
         throw std::runtime_error("failed to download the Qwen imatrix arena");
     // The CPU expert path accumulated beside the device, not into it.
     const float* host=runtime->imatrix_host.data()+offset;
@@ -15305,8 +16169,8 @@ int colibri_v2_qwen_imatrix_entry(
     return 0;
 });}
 
-int colibri_v2_qwen_runtime_dump_kv(
-    ColibriV2QwenRuntime* runtime, uint32_t layer_index, const char* path
+int flyweight_v2_qwen_runtime_dump_kv(
+    FlyweightV2QwenRuntime* runtime, uint32_t layer_index, const char* path
 ){return guarded([&]{
     if(!runtime||!path)throw std::runtime_error("invalid Qwen KV dump arguments");
     if(!runtime->state)throw std::runtime_error("native Qwen runtime is not prepared");
@@ -15327,10 +16191,10 @@ int colibri_v2_qwen_runtime_dump_kv(
     auto region_bytes=[&](int type){return kv_type_bytes(elements,type);};
 
     std::vector<std::uint8_t> raw_keys(region_bytes(ck)),raw_values(region_bytes(cv));
-    if(colibri_gpu_download(raw_keys.data(),runtime->state+layer.state_first,raw_keys.size(),runtime->stream)!=0
-       ||colibri_gpu_download(raw_values.data(),runtime->state+layer.state_second,raw_values.size(),runtime->stream)!=0)
+    if(flyweight_gpu_download(raw_keys.data(),runtime->state+layer.state_first,raw_keys.size(),runtime->stream)!=0
+       ||flyweight_gpu_download(raw_values.data(),runtime->state+layer.state_second,raw_values.size(),runtime->stream)!=0)
         throw std::runtime_error("failed to download native Qwen KV cache");
-    if(colibri_gpu_stream_sync(runtime->stream)!=0)
+    if(flyweight_gpu_stream_sync(runtime->stream)!=0)
         throw std::runtime_error("failed to synchronize native Qwen KV dump");
 
     auto element=[&](const std::uint8_t* raw,int type,std::uint64_t row,int d)->float{
@@ -15386,7 +16250,7 @@ int colibri_v2_qwen_runtime_dump_kv(
 // Defined below gemma4_decode; the rows driver in v2_mtp_verifier.inc
 // dispatches here for Gemma 4 chunks.
 void gemma4_prefill_rows(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows);
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows);
 
 #include "v2_mtp_verifier.inc"
 
@@ -15398,7 +16262,7 @@ void gemma4_prefill_rows(
 // No logits and no argmax: the caller keeps the prompt tail on the one-token
 // path, exactly like the Qwen rows forward.
 void gemma4_prefill_rows(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows) {
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows) {
     const auto started=std::chrono::steady_clock::now();
     if(rows<1||rows>static_cast<int>(runtime.forward_rows_capacity))
         throw std::runtime_error("native Gemma 4 prefill chunk exceeds the rows capacity");
@@ -15429,12 +16293,12 @@ void gemma4_prefill_rows(
     auto*host_weights=reinterpret_cast<float*>(staging+host_layout.weights.offset);
     auto*host_input=reinterpret_cast<float*>(staging+host_layout.input.offset);
     auto*host_output=reinterpret_cast<float*>(staging+host_layout.output.offset);
-    // COLIBRI_KERNEL_PROFILE=1 brackets every rows launch with CUDA events,
+    // FLYWEIGHT_KERNEL_PROFILE=1 brackets every rows launch with CUDA events,
     // same mechanism as the Qwen decode profiler: relative split only, since
     // the events serialize the stream. Reported once per chunk.
     static const bool kernel_profile=
-        std::getenv("COLIBRI_KERNEL_PROFILE")&&
-        std::getenv("COLIBRI_KERNEL_PROFILE")[0]=='1';
+        std::getenv("FLYWEIGHT_KERNEL_PROFILE")&&
+        std::getenv("FLYWEIGHT_KERNEL_PROFILE")[0]=='1';
     struct RowsProfileEntry{double milliseconds=0.0;std::uint64_t calls=0;};
     static std::map<std::string,RowsProfileEntry> rows_profile_totals;
     static constexpr std::size_t kRowsProfileCapacity=49152;
@@ -15445,17 +16309,17 @@ void gemma4_prefill_rows(
         rows_profile_events.resize(2*kRowsProfileCapacity);
         rows_profile_labels.resize(kRowsProfileCapacity);
         for(auto&event:rows_profile_events)
-            colibri_gpu_timed_event_create(&event);
+            flyweight_gpu_timed_event_create(&event);
     }
     auto launch=[&](const char* name,std::uint32_t grid_x,std::uint32_t grid_y,
                     std::uint32_t block_x,void** arguments,std::uint32_t shared=0){
         const bool traced=kernel_profile&&rows_profile_used<kRowsProfileCapacity;
         const std::size_t slot=rows_profile_used;
-        if(traced)colibri_gpu_event_record(rows_profile_events[2*slot],runtime.stream);
-        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,runtime.stream,arguments)!=0)
+        if(traced)flyweight_gpu_event_record(rows_profile_events[2*slot],runtime.stream);
+        if(flyweight_gpu_launch_named(name,grid_x,grid_y,block_x,shared,runtime.stream,arguments)!=0)
             throw std::runtime_error(std::string("native Gemma 4 CUDA kernel failed: ")+name);
         if(traced){
-            colibri_gpu_event_record(rows_profile_events[2*slot+1],runtime.stream);
+            flyweight_gpu_event_record(rows_profile_events[2*slot+1],runtime.stream);
             rows_profile_labels[slot]=name;
             ++rows_profile_used;
         }
@@ -15501,7 +16365,7 @@ void gemma4_prefill_rows(
     // ~16 per-layer ones (the attention core stays per-row: a row's scores
     // must see exactly the stores of earlier rows). Off-switch for A/B.
     static const bool env_rows_kernels=[]{
-        const char*s=std::getenv("COLIBRI_GEMMA_ROWS_KERNELS");return !s||s[0]!='0';}();
+        const char*s=std::getenv("FLYWEIGHT_GEMMA_ROWS_KERNELS");return !s||s[0]!='0';}();
     const long long h_elems=hidden_size;
     const long long s_elems=static_cast<long long>(runtime.scratch_elements);
     const std::uint64_t fourth_rows=rows_layout.fourth.address(runtime.workspace);
@@ -15529,7 +16393,7 @@ void gemma4_prefill_rows(
     // quantize to int8, like llama.cpp's default MMQ prefill), hence its own
     // off-switch. Requires the scratch regions to carry the widest GEMM input.
     static const bool env_mmq=[]{
-        const char*s=std::getenv("COLIBRI_GEMMA_MMQ");return !s||s[0]!='0';}();
+        const char*s=std::getenv("FLYWEIGHT_GEMMA_MMQ");return !s||s[0]!='0';}();
     const std::uint64_t q8_rows_base=rows_layout.rows_q8.address(runtime.workspace);
     const std::uint64_t q8_scales_base=rows_layout.rows_q8_scales.address(runtime.workspace);
     const bool use_mmq=env_rows_kernels&&env_mmq&&hidden_size%32==0&&
@@ -15587,7 +16451,7 @@ void gemma4_prefill_rows(
             // per-row scores/values pairs. Window layers keep the per-row ring
             // path, whose cost the window bounds.
             static const bool env_prefill_attention=[]{
-                const char*s=std::getenv("COLIBRI_GEMMA_PREFILL_ATTENTION");
+                const char*s=std::getenv("FLYWEIGHT_GEMMA_PREFILL_ATTENTION");
                 return !s||s[0]!='0';}();
             // Gemma 4 global layers run head_dim 512, past the shared fused
             // kernel's register budget; the wide twin covers them when the
@@ -15745,13 +16609,13 @@ void gemma4_prefill_rows(
             launch("route_topk_rows",rows,1,256,topk_args,
                    static_cast<std::uint32_t>(experts*sizeof(float)));
             rms_rows(hidden_rows,tensor(15),normalized_rows,h_elems,h_elems);
-            if(colibri_gpu_download(host_selected,selected_rows,
+            if(flyweight_gpu_download(host_selected,selected_rows,
                                     static_cast<std::uint64_t>(rows)*top_k*sizeof(std::int32_t),
                                     runtime.stream)!=0||
-               colibri_gpu_download(host_weights,weight_rows,
+               flyweight_gpu_download(host_weights,weight_rows,
                                     static_cast<std::uint64_t>(rows)*top_k*sizeof(float),
                                     runtime.stream)!=0||
-               colibri_gpu_download(host_input,normalized_rows,
+               flyweight_gpu_download(host_input,normalized_rows,
                                     static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float),
                                     runtime.stream)!=0)
                 throw std::runtime_error("native Gemma 4 rows MoE input transfer failed");
@@ -15831,22 +16695,22 @@ void gemma4_prefill_rows(
             const std::uint64_t selected_r=selected_rows+static_cast<std::uint64_t>(row)*top_k*sizeof(std::int32_t);
             const std::uint64_t weights_r=weight_rows+static_cast<std::uint64_t>(row)*top_k*sizeof(float);
             f32(tensor(14),normalized_r,router_r,hidden_size,experts);
-            if(colibri_gpu_route_topk(router_r,selected_r,weights_r,
+            if(flyweight_gpu_route_topk(router_r,selected_r,weights_r,
                                      experts,top_k,runtime.stream)!=0)
                 throw std::runtime_error("native Gemma 4 routing failed");
             rms(hidden_r,tensor(15),normalized_r);
-            if(colibri_gpu_download(host_selected+static_cast<std::size_t>(row)*top_k,
+            if(flyweight_gpu_download(host_selected+static_cast<std::size_t>(row)*top_k,
                                     selected_r,top_k*sizeof(std::int32_t),runtime.stream)!=0||
-               colibri_gpu_download(host_weights+static_cast<std::size_t>(row)*top_k,
+               flyweight_gpu_download(host_weights+static_cast<std::size_t>(row)*top_k,
                                     weights_r,top_k*sizeof(float),runtime.stream)!=0||
-               colibri_gpu_download(host_input+static_cast<std::size_t>(row)*hidden_size,
+               flyweight_gpu_download(host_input+static_cast<std::size_t>(row)*hidden_size,
                                     normalized_r,hidden_size*sizeof(float),runtime.stream)!=0)
                 throw std::runtime_error("native Gemma 4 rows MoE input transfer failed");
         }
         }
         const auto wait_started=std::chrono::steady_clock::now();
-        if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0||
-           colibri_gpu_event_sync(runtime.route_event)!=0)
+        if(flyweight_gpu_event_record(runtime.route_event,runtime.stream)!=0||
+           flyweight_gpu_event_sync(runtime.route_event)!=0)
             throw std::runtime_error("native Gemma 4 rows route synchronization failed");
         runtime.route_wait_nanoseconds+=std::chrono::duration_cast<
             std::chrono::nanoseconds>(std::chrono::steady_clock::now()-wait_started).count();
@@ -15858,7 +16722,7 @@ void gemma4_prefill_rows(
             std::chrono::nanoseconds>(std::chrono::steady_clock::now()-expert_started).count();
         // One contiguous upload for the whole chunk; residual is free until
         // the combine below rewrites it row by row.
-        if(colibri_gpu_upload(residual_rows,host_output,
+        if(flyweight_gpu_upload(residual_rows,host_output,
                               static_cast<std::uint64_t>(rows)*hidden_size*sizeof(float),
                               runtime.stream)!=0)
             throw std::runtime_error("native Gemma 4 rows MoE output upload failed");
@@ -15888,12 +16752,12 @@ void gemma4_prefill_rows(
             launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
         }
     }
-    if(colibri_gpu_stream_sync(runtime.stream)!=0)
+    if(flyweight_gpu_stream_sync(runtime.stream)!=0)
         throw std::runtime_error("native Gemma 4 rows synchronization failed");
     if(kernel_profile){
         for(std::size_t slot=0;slot<rows_profile_used;++slot){
             float milliseconds=0.0f;
-            if(colibri_gpu_event_elapsed(rows_profile_events[2*slot],
+            if(flyweight_gpu_event_elapsed(rows_profile_events[2*slot],
                                          rows_profile_events[2*slot+1],
                                          &milliseconds)!=0)continue;
             auto&entry=rows_profile_totals[rows_profile_labels[slot]];
@@ -15931,11 +16795,11 @@ void gemma4_prefill_rows(
         std::chrono::steady_clock::now()-started).count();
 }
 
-static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_token,
+static int gemma4_decode(FlyweightV2QwenRuntime& runtime, std::uint32_t input_token,
                          std::uint32_t& output_token) {
     const auto decode_started=std::chrono::steady_clock::now();
     const auto expert_policy=qwen_expert_policy(
-        runtime,colibri::v2::ExpertExecutionPhase::decode);
+        runtime,flyweight::v2::ExpertExecutionPhase::decode);
     const int hidden_size=static_cast<int>(runtime.model->config.hidden_size);
     const int experts=static_cast<int>(runtime.model->config.expert_count);
     const int top_k=static_cast<int>(runtime.model->config.expert_used_count);
@@ -15985,11 +16849,11 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
     // layers. Kept for WDDM, where per-launch submission costs several times
     // more and the delta-block graphs measurably pay.
     static const bool env_graph_gemma=[]{
-        const char*s=std::getenv("COLIBRI_CUDA_GRAPH_GEMMA");return s&&s[0]=='1';}();
+        const char*s=std::getenv("FLYWEIGHT_CUDA_GRAPH_GEMMA");return s&&s[0]=='1';}();
     const bool gemma_graph_eligible=runtime.cuda_graphs&&env_graph_gemma;
     auto launch=[&](const char* name,std::uint32_t grid_x,std::uint32_t grid_y,
                     std::uint32_t block_x,void** arguments,std::uint32_t shared=0){
-        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)
+        if(flyweight_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)
             throw std::runtime_error(std::string("native Gemma 4 CUDA kernel failed: ")+name);
     };
     auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
@@ -16077,7 +16941,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
         // 13k for the same reason, and decode pays it once per token. The 512
         // instantiation covers the five global layers.
         static const bool env_fused_decode=[]{
-            const char*s=std::getenv("COLIBRI_GEMMA_FUSED_ATTENTION");
+            const char*s=std::getenv("FLYWEIGHT_GEMMA_FUSED_ATTENTION");
             return !s||s[0]!='0';}();
         const int fused_width=kv_fused_width(head_dim);
         const char* fused_tiles_name=!env_fused_decode||!fused_width?nullptr
@@ -16140,7 +17004,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                                        const_cast<float*>(&epsilon)};
             launch("gemma_router_input",1,1,256,router_input_args);
             f32(tensor(14),normalized,router_logits,hidden_size,experts);
-            if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,
+            if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,
                                      experts,top_k,launch_stream)!=0)
                 throw std::runtime_error("native Gemma 4 routing failed");
             rms(hidden,tensor(15),normalized);
@@ -16167,7 +17031,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
             const std::uint64_t scale_offset=down_offset+down_tensor.size/experts;
             const int intermediate=static_cast<int>(runtime.moe_intermediate);
             auto enqueue_pinned_moe=[&]{
-                if(colibri_gpu_memset(fourth,0,hidden_size*sizeof(float),launch_stream)!=0)
+                if(flyweight_gpu_memset(fourth,0,hidden_size*sizeof(float),launch_stream)!=0)
                     throw std::runtime_error("native Gemma 4 pinned output reset failed");
                 void* gate_args[]={const_cast<std::uint64_t*>(&layer_base),
                                    const_cast<std::uint64_t*>(&runtime.expert_slot_bytes),
@@ -16200,10 +17064,10 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
             };
             bool ffn_launched=false;
             if(gemma_graph_eligible&&layer.gemma_ffn_graph){
-                if(colibri_gpu_graph_launch(layer.gemma_ffn_graph,runtime.stream)==0){
+                if(flyweight_gpu_graph_launch(layer.gemma_ffn_graph,runtime.stream)==0){
                     ++runtime.cuda_graph_replays;ffn_launched=true;
                 }else{
-                    colibri_gpu_graph_destroy(layer.gemma_ffn_graph);
+                    flyweight_gpu_graph_destroy(layer.gemma_ffn_graph);
                     layer.gemma_ffn_graph=0;++runtime.cuda_graph_fallbacks;
                 }
             }
@@ -16212,32 +17076,32 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                 // only execution this token, keeping it ordered on
                 // runtime.stream behind the eager attention above.
                 layer.gemma_ffn_graph_attempted=true;
-                if(colibri_gpu_graph_begin(runtime.graph_stream)==0){
+                if(flyweight_gpu_graph_begin(runtime.graph_stream)==0){
                     bool capture_enqueued=true;
                     launch_stream=runtime.graph_stream;
                     try{enqueue_ffn_router();enqueue_pinned_moe();}
                     catch(...){capture_enqueued=false;}
                     launch_stream=runtime.stream;
                     std::uint64_t captured_graph=0;
-                    const int capture_status=colibri_gpu_graph_end(
+                    const int capture_status=flyweight_gpu_graph_end(
                         runtime.graph_stream,&captured_graph);
                     if(capture_enqueued&&capture_status==0){
                         layer.gemma_ffn_graph=captured_graph;++runtime.cuda_graph_builds;
-                        if(std::getenv("COLIBRI_CUDA_GRAPH_TRACE"))
+                        if(std::getenv("FLYWEIGHT_CUDA_GRAPH_TRACE"))
                             std::fprintf(stderr,
                                 "[cuda-graphs] gemma layer %u FFN captured\n",
                                 layer_number);
-                        if(colibri_gpu_graph_launch(layer.gemma_ffn_graph,runtime.stream)==0){
+                        if(flyweight_gpu_graph_launch(layer.gemma_ffn_graph,runtime.stream)==0){
                             ++runtime.cuda_graph_replays;ffn_launched=true;
                         }else{
-                            colibri_gpu_graph_destroy(layer.gemma_ffn_graph);
+                            flyweight_gpu_graph_destroy(layer.gemma_ffn_graph);
                             layer.gemma_ffn_graph=0;++runtime.cuda_graph_fallbacks;
                         }
                     }else{
                         if(capture_status==0&&captured_graph)
-                            colibri_gpu_graph_destroy(captured_graph);
+                            flyweight_gpu_graph_destroy(captured_graph);
                         ++runtime.cuda_graph_fallbacks;
-                        if(std::getenv("COLIBRI_CUDA_GRAPH_TRACE"))
+                        if(std::getenv("FLYWEIGHT_CUDA_GRAPH_TRACE"))
                             std::fprintf(stderr,
                                 "[cuda-graphs] gemma layer %u FFN capture failed "
                                 "(enqueued=%d status=%d)\n",
@@ -16249,12 +17113,12 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
             continue;
         }
         enqueue_ffn_router();
-        if(colibri_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||
-           colibri_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||
-           colibri_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)
+        if(flyweight_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||
+           flyweight_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||
+           flyweight_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)
             throw std::runtime_error("native Gemma 4 CPU MoE input transfer failed");
-        if(colibri_gpu_event_record(runtime.route_event,runtime.stream)!=0||
-           colibri_gpu_event_sync(runtime.route_event)!=0)
+        if(flyweight_gpu_event_record(runtime.route_event,runtime.stream)!=0||
+           flyweight_gpu_event_sync(runtime.route_event)!=0)
             throw std::runtime_error("native Gemma 4 route synchronization failed");
         runtime.route_expert_sum+=top_k;
         if(expert_policy.is_cpu()){
@@ -16263,7 +17127,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                           cpu_activated,cpu_output);
             runtime.expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now()-compute_started).count();
-            if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
+            if(flyweight_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
                 throw std::runtime_error("native Gemma 4 CPU MoE output upload failed");
         }else{
             const auto pager_started=std::chrono::steady_clock::now();
@@ -16315,11 +17179,11 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                 std::memcpy(staging+paging_cursor+gate_up_bytes,tensor_data(*runtime.model,down_tensor)+static_cast<std::uint64_t>(expert)*down_bytes,down_bytes);
                 std::memcpy(staging+paging_cursor+gate_up_bytes+down_bytes,tensor_data(*runtime.model,scale_tensor)+static_cast<std::uint64_t>(expert)*scale_bytes,scale_bytes);
                 const auto base=runtime.expert_cache+slot_index*runtime.expert_slot_bytes;
-                if(colibri_gpu_upload(base,staging+paging_cursor,bundle_bytes,runtime.stream)!=0)
+                if(flyweight_gpu_upload(base,staging+paging_cursor,bundle_bytes,runtime.stream)!=0)
                     throw std::runtime_error("native Gemma 4 hybrid expert upload failed");
                 paging_cursor+=device_align(bundle_bytes);
             }
-            if(colibri_gpu_memset(fourth,0,hidden_size*sizeof(float),runtime.stream)!=0)
+            if(flyweight_gpu_memset(fourth,0,hidden_size*sizeof(float),runtime.stream)!=0)
                 throw std::runtime_error("native Gemma 4 hybrid output reset failed");
             if(gpu_count){
                 const auto table_bytes=device_align(static_cast<std::uint64_t>(gpu_count)*(
@@ -16331,7 +17195,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                 std::memcpy(staging+table_host+gpu_count*sizeof(std::uint64_t),down_pointers.data(),gpu_count*sizeof(std::uint64_t));
                 std::memcpy(staging+table_host+2*gpu_count*sizeof(std::uint64_t),gpu_compact_weights.data(),gpu_count*sizeof(float));
                 const auto table_device=runtime.expert_staging+runtime.expert_staging_bytes-table_bytes;
-                if(colibri_gpu_upload(table_device,staging+table_host,table_bytes,runtime.stream)!=0)
+                if(flyweight_gpu_upload(table_device,staging+table_host,table_bytes,runtime.stream)!=0)
                     throw std::runtime_error("native Gemma 4 hybrid pointer upload failed");
                 const auto gate_table=table_device;
                 const auto down_table=gate_table+gpu_count*sizeof(std::uint64_t);
@@ -16355,7 +17219,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                               cpu_count,cpu_input,cpu_activated,cpu_output);
                 runtime.expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-compute_started).count();
-                if(colibri_gpu_upload(first,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
+                if(flyweight_gpu_upload(first,cpu_output,hidden_size*sizeof(float),runtime.stream)!=0)
                     throw std::runtime_error("native Gemma 4 hybrid CPU output upload failed");
                 add(fourth,first);
             }
@@ -16377,7 +17241,7 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
     runtime.last_sampling_normalized=normalized;
     runtime.last_sampling_logits=workspace_layout.logits.address(runtime.workspace);
     const int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);
-    if(colibri_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)
+    if(flyweight_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)
         throw std::runtime_error("native Gemma 4 argmax reset failed");
     auto lm_head=runtime.device_tensors[runtime.lm_head];
     void* argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),
@@ -16385,8 +17249,8 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
                          const_cast<int*>(&hidden_size),const_cast<int*>(&vocabulary)};
     launch("gemma_q4_0_lm_argmax",(vocabulary+7)/8,1,256,argmax_args);
     auto* packed_winner=reinterpret_cast<std::uint64_t*>(staging);
-    if(colibri_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime.stream)!=0||
-       colibri_gpu_stream_sync(runtime.stream)!=0)
+    if(flyweight_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime.stream)!=0||
+       flyweight_gpu_stream_sync(runtime.stream)!=0)
         throw std::runtime_error("native Gemma 4 output synchronization failed");
     output_token=0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
     runtime.last_output_token=output_token;
@@ -16399,8 +17263,8 @@ static int gemma4_decode(ColibriV2QwenRuntime& runtime, std::uint32_t input_toke
     return 0;
 }
 
-int colibri_v2_qwen_runtime_synchronize(ColibriV2QwenRuntime*runtime){return guarded([&]{if(!runtime||!runtime->stream)throw std::runtime_error("native Qwen runtime is not prepared");if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA synchronization failed");return 0;});}
-int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_token,uint32_t*output_token){return guarded([&]{
+int flyweight_v2_qwen_runtime_synchronize(FlyweightV2QwenRuntime*runtime){return guarded([&]{if(!runtime||!runtime->stream)throw std::runtime_error("native Qwen runtime is not prepared");if(flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA synchronization failed");return 0;});}
+int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t input_token,uint32_t*output_token){return guarded([&]{
     if(!runtime||!output_token)throw std::runtime_error("invalid native Qwen decode arguments");
     if(!runtime->decode_ready)throw std::runtime_error("native Qwen runtime is not prepared for decode");
     if(runtime->cancelled)throw std::runtime_error("native Qwen runtime is cancelled");
@@ -16411,8 +17275,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     qwen_absorb_registration(*runtime);
     if(runtime->gemma4)return gemma4_decode(*runtime,input_token,*output_token);
     const auto expert_phase=runtime->cache_admission_enabled
-        ?colibri::v2::ExpertExecutionPhase::decode
-        :colibri::v2::ExpertExecutionPhase::prefill;
+        ?flyweight::v2::ExpertExecutionPhase::decode
+        :flyweight::v2::ExpertExecutionPhase::prefill;
     const auto expert_policy=qwen_expert_policy(*runtime,expert_phase);
     qwen_mtp_append_prompt_pair(*runtime,input_token);
     const auto decode_started=std::chrono::steady_clock::now();
@@ -16456,14 +17320,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     auto*staging=static_cast<std::uint8_t*>(runtime->host_staging);
     auto*selected_host=reinterpret_cast<std::int32_t*>(staging);
     std::uint64_t launch_stream=runtime->stream;
-    // COLIBRI_KERNEL_PROFILE=1 brackets every decode launch with CUDA events and
+    // FLYWEIGHT_KERNEL_PROFILE=1 brackets every decode launch with CUDA events and
     // accumulates GPU time per kernel name. The events serialize the stream, so
     // the absolute total runs high; the point is the relative split, which is
     // what says whether a token is spent reading weights or somewhere else.
-    static const bool lm_diagnostics=std::getenv("COLIBRI_LM_DIAG")!=nullptr;
+    static const bool lm_diagnostics=std::getenv("FLYWEIGHT_LM_DIAG")!=nullptr;
     static const bool kernel_profile=
-        std::getenv("COLIBRI_KERNEL_PROFILE")&&
-        std::getenv("COLIBRI_KERNEL_PROFILE")[0]=='1';
+        std::getenv("FLYWEIGHT_KERNEL_PROFILE")&&
+        std::getenv("FLYWEIGHT_KERNEL_PROFILE")[0]=='1';
     struct KernelProfileEntry{double milliseconds=0.0;std::uint64_t calls=0;};
     static std::map<std::string,KernelProfileEntry> kernel_profile_totals;
     // Events are recorded on the stream and only read back once the token is
@@ -16480,15 +17344,15 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         kernel_profile_events.resize(2*kKernelProfileCapacity);
         kernel_profile_labels.resize(kKernelProfileCapacity);
         for(auto&event:kernel_profile_events)
-            colibri_gpu_timed_event_create(&event);
+            flyweight_gpu_timed_event_create(&event);
     }
     auto launch_named=[&](const char*name,std::uint32_t grid_x,std::uint32_t grid_y,std::uint32_t block_x,void**arguments,std::uint32_t shared=0){
         const bool traced=kernel_profile&&kernel_profile_used<kKernelProfileCapacity;
         const std::size_t slot=kernel_profile_used;
-        if(traced)colibri_gpu_event_record(kernel_profile_events[2*slot],launch_stream);
-        if(colibri_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ")+name);
+        if(traced)flyweight_gpu_event_record(kernel_profile_events[2*slot],launch_stream);
+        if(flyweight_gpu_launch_named(name,grid_x,grid_y,block_x,shared,launch_stream,arguments)!=0)throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ")+name);
         if(traced){
-            colibri_gpu_event_record(kernel_profile_events[2*slot+1],launch_stream);
+            flyweight_gpu_event_record(kernel_profile_events[2*slot+1],launch_stream);
             char key[192];
             std::snprintf(key,sizeof(key),"%s grid=%u",name,grid_x);
             kernel_profile_labels[slot]=key;
@@ -16499,7 +17363,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(!kernel_profile)return;
         for(std::size_t slot=0;slot<kernel_profile_used;++slot){
             float milliseconds=0.0f;
-            if(colibri_gpu_event_elapsed(kernel_profile_events[2*slot],
+            if(flyweight_gpu_event_elapsed(kernel_profile_events[2*slot],
                                          kernel_profile_events[2*slot+1],
                                          &milliseconds)!=0)continue;
             auto&entry=kernel_profile_totals[kernel_profile_labels[slot]];
@@ -16548,9 +17412,9 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                      const_cast<float*>(&post_norm_epsilon),&one_centered};
         launch_named("rms_norm",1,1,1024,args);
     };
-    auto q8=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){if(colibri_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)!=0)throw std::runtime_error("native Qwen Q8 projection failed");};
+    auto q8=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){if(flyweight_gpu_q8_matvec_transposed(matrix,input,output,input_size,output_size,launch_stream)!=0)throw std::runtime_error("native Qwen Q8 projection failed");};
     auto f32=[&](std::uint64_t matrix,std::uint64_t input,std::uint64_t output,int input_size,int output_size){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);};
-    const char*iq2_q8_setting=std::getenv("COLIBRI_IQ2_Q8_DECODE");
+    const char*iq2_q8_setting=std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
     const bool iq2_q8_enabled=
         !iq2_q8_setting||iq2_q8_setting[0]!='0';
     // Quantize the activation to 32-value Q8 blocks once, then run a group-wise
@@ -16585,7 +17449,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(type==0){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);return;}
         // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
         if(type==30){void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
-        const auto*format=colibri::v2::qwen_format(type);
+        const auto*format=flyweight::v2::qwen_format(type);
         if(format&&format->matvec_q8_warp&&
            q8_decode(format->matvec_q8_warp,matrix,input,output,input_size,output_size))return;
         const int status=qwen_matvec_driver(type,matrix,input,output,input_size,output_size,launch_stream);
@@ -16687,7 +17551,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             (static_cast<std::uint32_t>(hc_wide_size)+255)/256,1,256,ple_add_args);
         q8_cached_input=0;
     };
-    auto profile_record=[&](std::uint64_t event){if(runtime->cuda_profile&&colibri_gpu_event_record(event,runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA profiling event failed");};
+    auto profile_record=[&](std::uint64_t event){if(runtime->cuda_profile&&flyweight_gpu_event_record(event,runtime->stream)!=0)throw std::runtime_error("native Qwen CUDA profiling event failed");};
     {
         const std::uint32_t embedding_token=input_token;
         const auto embedding=qwen_stage_embedding_rows(*runtime,&embedding_token,1);
@@ -16724,24 +17588,24 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     }
     if(qwen_lm_diag_enabled()){
         static int ec=0;
-        if(ec<2){++ec;float v[8]={};if(colibri_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+        if(ec<2){++ec;float v[8]={};if(flyweight_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
             std::fprintf(stderr,"[diag] after_embed hidden[0..7]=% .6e % .6e % .6e % .6e % .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);}
     }
     // Cache per-layer env vars once; std::getenv on Windows crosses the kernel
     // boundary (~1-3 us) vs Linux vDSO (~20 ns).  With ~40 calls across 30
     // layers this was ~120 us/token of pure overhead.
-    static const bool env_delta_serial=[]{const char*s=std::getenv("COLIBRI_DELTA_SERIAL");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_persistent=[]{const char*s=std::getenv("COLIBRI_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_tc=[]{const char*s=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_tc_trace=std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
-    static const bool env_nvfp4_tiled=[]{const char*s=std::getenv("COLIBRI_NVFP4_TILED");return s&&s[0]=='1';}();
-    static const bool env_lm_diag=std::getenv("COLIBRI_LM_DIAG")!=nullptr;
-    static const bool env_graph_trace=std::getenv("COLIBRI_CUDA_GRAPH_TRACE")!=nullptr;
+    static const bool env_delta_serial=[]{const char*s=std::getenv("FLYWEIGHT_DELTA_SERIAL");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_persistent=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc_trace=std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
+    static const bool env_nvfp4_tiled=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_TILED");return s&&s[0]=='1';}();
+    static const bool env_lm_diag=std::getenv("FLYWEIGHT_LM_DIAG")!=nullptr;
+    static const bool env_graph_trace=std::getenv("FLYWEIGHT_CUDA_GRAPH_TRACE")!=nullptr;
     // Lets the delta-block capture be A/B'd on its own, with the shared-expert
     // graphs left enabled either way.
-    static const bool env_graph_delta=[]{const char*s=std::getenv("COLIBRI_CUDA_GRAPH_DELTA");return !s||s[0]!='0';}();
+    static const bool env_graph_delta=[]{const char*s=std::getenv("FLYWEIGHT_CUDA_GRAPH_DELTA");return !s||s[0]!='0';}();
     // Same, for the dense SwiGLU capture.
-    static const bool env_graph_ffn=[]{const char*s=std::getenv("COLIBRI_CUDA_GRAPH_FFN");return !s||s[0]!='0';}();
+    static const bool env_graph_ffn=[]{const char*s=std::getenv("FLYWEIGHT_CUDA_GRAPH_FFN");return !s||s[0]!='0';}();
     for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
         auto&layer=runtime->layers[layer_number];
         auto*profile=runtime->cuda_profile?&runtime->cuda_layer_profiles[layer_number]:nullptr;
@@ -16783,10 +17647,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             dense(4,normalized,third,hidden_size,value_heads);
             dense(5,normalized,third+value_heads*sizeof(float),hidden_size,value_heads);
             if(qwen_lm_diag_enabled()&&layer_number==0){
-                float v[4]={};colibri_gpu_stream_sync(runtime->stream);
-                if(colibri_gpu_download(v,first,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+                float v[4]={};flyweight_gpu_stream_sync(runtime->stream);
+                if(flyweight_gpu_download(v,first,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_qkv first[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
-                if(colibri_gpu_download(v,second,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+                if(flyweight_gpu_download(v,second,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_gate second[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
             }
             int kernel_size=static_cast<int>(runtime->model->tensors[layer.static_tensors[6]].shape[0]);
@@ -16803,7 +17667,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             // groups is the most a 1024-thread block allows at head_dim 128, which
             // is what every Qwen3.6 checkpoint uses; wider heads get fewer, and
             // anything past a 1024-thread block falls back to the serial kernel.
-            // COLIBRI_DELTA_SERIAL forces that fallback for A/B measurement --
+            // FLYWEIGHT_DELTA_SERIAL forces that fallback for A/B measurement --
             // the split form is 2.9x here (1.92 -> 0.67 ms/token over 30 layers).
             if(profile)profile_record(profile->recurrent_start);
             int recurrent_slices=head_dim>0?1024/head_dim:0;
@@ -16818,22 +17682,22 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             }
             if(profile)profile_record(profile->recurrent_end);
             if(qwen_lm_diag_enabled()&&layer_number==0){
-                float v[4]={};colibri_gpu_stream_sync(runtime->stream);
-                if(colibri_gpu_download(v,fourth,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+                float v[4]={};flyweight_gpu_stream_sync(runtime->stream);
+                if(flyweight_gpu_download(v,fourth,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_recur fourth[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
-                if(colibri_gpu_download(v,first,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+                if(flyweight_gpu_download(v,first,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_recur first[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
             }
             dense(3,first,residual,value_dim,hidden_size);
             if(qwen_lm_diag_enabled()&&layer_number==0){
-                float v[4]={};colibri_gpu_stream_sync(runtime->stream);
-                if(colibri_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+                float v[4]={};flyweight_gpu_stream_sync(runtime->stream);
+                if(flyweight_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                     std::fprintf(stderr,"[diag] L0 after_ssm_out residual[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
                 fprintf(stderr,"[diag] L0 value_dim=%d hidden_size=%d\n",value_dim,hidden_size);
                 // Also download first bytes of ssm_out tensor to verify data
                 auto ssm_out_gpu=tensor(3);
                 unsigned char buf[34]={};
-                if(colibri_gpu_download(buf,ssm_out_gpu,sizeof(buf),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0){
+                if(flyweight_gpu_download(buf,ssm_out_gpu,sizeof(buf),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0){
                     fprintf(stderr,"[diag] L0 ssm_out bytes[0..33]: %02x %02x %02x %02x %02x %02x\n",buf[0],buf[1],buf[2],buf[3],buf[4],buf[5]);
                 }
             }
@@ -16855,32 +17719,32 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 layer.delta_graph_attempted.resize(runtime->sequences.size(),0);
             }
             if(graph_eligible&&layer.delta_graphs[graph_slot]){
-                if(colibri_gpu_graph_launch(layer.delta_graphs[graph_slot],runtime->stream)==0){
+                if(flyweight_gpu_graph_launch(layer.delta_graphs[graph_slot],runtime->stream)==0){
                     ++runtime->cuda_graph_replays;delta_launched=true;
                 }else{
-                    colibri_gpu_graph_destroy(layer.delta_graphs[graph_slot]);
+                    flyweight_gpu_graph_destroy(layer.delta_graphs[graph_slot]);
                     layer.delta_graphs[graph_slot]=0;++runtime->cuda_graph_fallbacks;
                 }
             }
             if(graph_eligible&&!delta_launched&&!layer.delta_graph_attempted[graph_slot]){
                 layer.delta_graph_attempted[graph_slot]=1;
-                if(colibri_gpu_graph_begin(runtime->graph_stream)==0){
+                if(flyweight_gpu_graph_begin(runtime->graph_stream)==0){
                     bool capture_enqueued=true;
                     launch_stream=runtime->graph_stream;
                     try{enqueue_delta();}catch(...){capture_enqueued=false;}
                     launch_stream=runtime->stream;
                     std::uint64_t captured_graph=0;
-                    const int capture_status=colibri_gpu_graph_end(runtime->graph_stream,&captured_graph);
+                    const int capture_status=flyweight_gpu_graph_end(runtime->graph_stream,&captured_graph);
                     if(capture_enqueued&&capture_status==0){
                         layer.delta_graphs[graph_slot]=captured_graph;++runtime->cuda_graph_builds;
-                        if(colibri_gpu_graph_launch(layer.delta_graphs[graph_slot],runtime->stream)==0){
+                        if(flyweight_gpu_graph_launch(layer.delta_graphs[graph_slot],runtime->stream)==0){
                             ++runtime->cuda_graph_replays;delta_launched=true;
                         }else{
-                            colibri_gpu_graph_destroy(layer.delta_graphs[graph_slot]);
+                            flyweight_gpu_graph_destroy(layer.delta_graphs[graph_slot]);
                             layer.delta_graphs[graph_slot]=0;++runtime->cuda_graph_fallbacks;
                         }
                     }else{
-                        if(capture_status==0&&captured_graph)colibri_gpu_graph_destroy(captured_graph);
+                        if(capture_status==0&&captured_graph)flyweight_gpu_graph_destroy(captured_graph);
                         ++runtime->cuda_graph_fallbacks;
                     }
                 }
@@ -17116,7 +17980,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     capacity,first_slot,scale)||
                 (qwen_cublas_attention_eligible(
                     *runtime,tokens,first_slot,capacity)&&
-                colibri_gpu_attention_f16_cublas(
+                flyweight_gpu_attention_f16_cublas(
                     queries,first,cache_keys,cache_values,attention_scores,
                     attended,runtime->stream,heads,kv_heads,head_dim,tokens,
                     capacity,first_slot,scale)==0);
@@ -17198,10 +18062,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                    layer.hc_ffn_inject);
         else rms(residual,tensor(moe_base),normalized);
         if(qwen_lm_diag_enabled()&&layer_number==0){
-            float v[4]={};colibri_gpu_stream_sync(runtime->stream);
-            if(colibri_gpu_download(v,normalized,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+            float v[4]={};flyweight_gpu_stream_sync(runtime->stream);
+            if(flyweight_gpu_download(v,normalized,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] L0 after_rms normalized[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
-            if(colibri_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+            if(flyweight_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] L0 after_rms residual[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
         }
         if(layer.dense_ffn){
@@ -17216,12 +18080,12 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 auto*scratch=static_cast<float*>(runtime->dense_host);
                 float*host_input=scratch;
                 float*host_output=host_input+hidden_size;
-                if(colibri_gpu_download(host_input,normalized,hidden_size*sizeof(float),runtime->stream)!=0||
-                   colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native dense host FFN input transfer failed");
+                if(flyweight_gpu_download(host_input,normalized,hidden_size*sizeof(float),runtime->stream)!=0||
+                   flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native dense host FFN input transfer failed");
                 const auto host_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 qwen_cpu_dense_ffn(*runtime,layer,host_input,host_output);
                 if(timing_enabled())runtime->dense_host_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-host_started).count();
-                if(colibri_gpu_upload(third,host_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native dense host FFN output transfer failed");
+                if(flyweight_gpu_upload(third,host_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native dense host FFN output transfer failed");
             }else{
             auto enqueue_dense_ffn=[&]{
                 const auto up_half=first+static_cast<std::uint64_t>(dense_intermediate)*sizeof(float);
@@ -17239,32 +18103,32 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             // delta and shared-expert graphs above never cover it.
             bool dense_ffn_launched=false;
             if(ffn_graph_eligible&&layer.dense_ffn_graph){
-                if(colibri_gpu_graph_launch(layer.dense_ffn_graph,runtime->stream)==0){
+                if(flyweight_gpu_graph_launch(layer.dense_ffn_graph,runtime->stream)==0){
                     ++runtime->cuda_graph_replays;dense_ffn_launched=true;
                 }else{
-                    colibri_gpu_graph_destroy(layer.dense_ffn_graph);
+                    flyweight_gpu_graph_destroy(layer.dense_ffn_graph);
                     layer.dense_ffn_graph=0;++runtime->cuda_graph_fallbacks;
                 }
             }
             if(ffn_graph_eligible&&!dense_ffn_launched&&!layer.dense_ffn_graph_attempted){
                 layer.dense_ffn_graph_attempted=true;
-                if(colibri_gpu_graph_begin(runtime->graph_stream)==0){
+                if(flyweight_gpu_graph_begin(runtime->graph_stream)==0){
                     bool capture_enqueued=true;
                     launch_stream=runtime->graph_stream;
                     try{enqueue_dense_ffn();}catch(...){capture_enqueued=false;}
                     launch_stream=runtime->stream;
                     std::uint64_t captured_graph=0;
-                    const int capture_status=colibri_gpu_graph_end(runtime->graph_stream,&captured_graph);
+                    const int capture_status=flyweight_gpu_graph_end(runtime->graph_stream,&captured_graph);
                     if(capture_enqueued&&capture_status==0){
                         layer.dense_ffn_graph=captured_graph;++runtime->cuda_graph_builds;
-                        if(colibri_gpu_graph_launch(layer.dense_ffn_graph,runtime->stream)==0){
+                        if(flyweight_gpu_graph_launch(layer.dense_ffn_graph,runtime->stream)==0){
                             ++runtime->cuda_graph_replays;dense_ffn_launched=true;
                         }else{
-                            colibri_gpu_graph_destroy(layer.dense_ffn_graph);
+                            flyweight_gpu_graph_destroy(layer.dense_ffn_graph);
                             layer.dense_ffn_graph=0;++runtime->cuda_graph_fallbacks;
                         }
                     }else{
-                        if(capture_status==0&&captured_graph)colibri_gpu_graph_destroy(captured_graph);
+                        if(capture_status==0&&captured_graph)flyweight_gpu_graph_destroy(captured_graph);
                         ++runtime->cuda_graph_fallbacks;
                     }
                 }else{
@@ -17289,18 +18153,18 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                                &normalize,&weight_scale};
             launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
                          static_cast<std::uint32_t>(2*experts*sizeof(float)));
-        }else if(colibri_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime->stream)!=0)throw std::runtime_error("native Qwen routing failed");
+        }else if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime->stream)!=0)throw std::runtime_error("native Qwen routing failed");
         const auto cpu_weights_offset=device_align(top_k*sizeof(std::int32_t));
         const auto cpu_input_offset=cpu_weights_offset+device_align(top_k*sizeof(float));
         const auto cpu_activated_offset=cpu_input_offset+device_align(hidden_size*sizeof(float));
         const auto cpu_output_offset=cpu_activated_offset+device_align(top_k*runtime->moe_intermediate*sizeof(float));
         auto*cpu_weights=reinterpret_cast<float*>(staging+cpu_weights_offset);auto*cpu_input=reinterpret_cast<float*>(staging+cpu_input_offset);auto*cpu_activated=reinterpret_cast<float*>(staging+cpu_activated_offset);auto*cpu_output=reinterpret_cast<float*>(staging+cpu_output_offset);
-        if(colibri_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime->stream)!=0)throw std::runtime_error("native Qwen route transfer failed");
+        if(flyweight_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime->stream)!=0)throw std::runtime_error("native Qwen route transfer failed");
         if(expert_policy.routed_cpu_execution_allowed()&&
-           (colibri_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime->stream)!=0||
-            colibri_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime->stream)!=0))
+           (flyweight_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime->stream)!=0||
+            flyweight_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime->stream)!=0))
             throw std::runtime_error("native Qwen CPU MoE input transfer failed");
-        if(colibri_gpu_event_record(runtime->route_event,runtime->stream)!=0)throw std::runtime_error("native Qwen route event failed");
+        if(flyweight_gpu_event_record(runtime->route_event,runtime->stream)!=0)throw std::runtime_error("native Qwen route event failed");
         if(profile){profile_record(profile->pre_end);profile_record(profile->shared_start);}
         const int intermediate=static_cast<int>(runtime->moe_intermediate);
         auto enqueue_shared=[&]{
@@ -17344,37 +18208,37 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         };
         bool shared_launched=false;
         if(runtime->cuda_graphs&&layer.shared_graph){
-            if(colibri_gpu_graph_launch(layer.shared_graph,runtime->stream)==0){
+            if(flyweight_gpu_graph_launch(layer.shared_graph,runtime->stream)==0){
                 ++runtime->cuda_graph_replays;
                 shared_launched=true;
             }else{
-                colibri_gpu_graph_destroy(layer.shared_graph);
+                flyweight_gpu_graph_destroy(layer.shared_graph);
                 layer.shared_graph=0;
                 ++runtime->cuda_graph_fallbacks;
             }
         }
         if(runtime->cuda_graphs&&!shared_launched&&!layer.shared_graph_attempted){
             layer.shared_graph_attempted=true;
-            if(colibri_gpu_graph_begin(runtime->graph_stream)==0){
+            if(flyweight_gpu_graph_begin(runtime->graph_stream)==0){
                 bool capture_enqueued=true;
                 launch_stream=runtime->graph_stream;
                 try{enqueue_shared();}catch(...){capture_enqueued=false;}
                 launch_stream=runtime->stream;
                 std::uint64_t captured_graph=0;
-                const int capture_status=colibri_gpu_graph_end(runtime->graph_stream,&captured_graph);
+                const int capture_status=flyweight_gpu_graph_end(runtime->graph_stream,&captured_graph);
                 if(capture_enqueued&&capture_status==0){
                     layer.shared_graph=captured_graph;
                     ++runtime->cuda_graph_builds;
-                    if(colibri_gpu_graph_launch(layer.shared_graph,runtime->stream)==0){
+                    if(flyweight_gpu_graph_launch(layer.shared_graph,runtime->stream)==0){
                         ++runtime->cuda_graph_replays;
                         shared_launched=true;
                     }else{
-                        colibri_gpu_graph_destroy(layer.shared_graph);
+                        flyweight_gpu_graph_destroy(layer.shared_graph);
                         layer.shared_graph=0;
                         ++runtime->cuda_graph_fallbacks;
                     }
                 }else{
-                    colibri_gpu_graph_destroy(captured_graph);
+                    flyweight_gpu_graph_destroy(captured_graph);
                     ++runtime->cuda_graph_fallbacks;
                 }
             }else{
@@ -17384,7 +18248,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(!shared_launched)enqueue_shared();
         if(profile)profile_record(profile->shared_end);
         const auto route_wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-        if(colibri_gpu_event_sync(runtime->route_event)!=0)throw std::runtime_error("native Qwen route event failed");
+        if(flyweight_gpu_event_sync(runtime->route_event)!=0)throw std::runtime_error("native Qwen route event failed");
         if(timing_enabled())runtime->route_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-route_wait_started).count();
         if(profile)profile_record(profile->expert_start);
         // Optional adaptive expert pruning (top-p / hard top-k). Runs only for
@@ -17423,7 +18287,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             qwen_cpu_moe(*runtime,layer,selected_host,cpu_weights,route_count,cpu_input,cpu_activated,cpu_output);
             if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
-            if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");
+            if(flyweight_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");
             add(third,fourth);
         }else if(expert_policy.is_hybrid()){
             if(runtime->expert_slots.empty())throw std::runtime_error("native hybrid MoE requires an expert cache budget");
@@ -17493,13 +18357,13 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     // DMA each role straight from the registered mmap into the cache slot;
                     // no CPU staging memcpy (the 4.4 ms/token page-in cost we are attacking).
                     std::uint64_t role_offset=0;
-                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(slot_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE DMA cache upload failed");role_offset+=bytes;}
+                    for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(flyweight_gpu_upload(slot_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE DMA cache upload failed");role_offset+=bytes;}
                     if(runtime->expert_native_cache){
                         const auto gate_bytes=runtime->model->tensors[
                             layer.expert_tensors[0]].size/experts;
                         const auto up_bytes=runtime->model->tensors[
                             layer.expert_tensors[1]].size/experts;
-                        const int status=colibri_gpu_nvfp4_prepare_expert(
+                        const int status=flyweight_gpu_nvfp4_prepare_expert(
                             slot_base,slot_base+gate_bytes,
                             slot_base+gate_bytes+up_bytes,
                             runtime->expert_native_cache+
@@ -17530,7 +18394,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 std::memcpy(staging+table_host+3*gpu_count*sizeof(std::uint64_t)+gpu_count*sizeof(float),gpu_gate_scales.data(),gpu_count*sizeof(float));
                 std::memcpy(staging+table_host+3*gpu_count*sizeof(std::uint64_t)+2*gpu_count*sizeof(float),gpu_up_scales.data(),gpu_count*sizeof(float));
                 std::memcpy(staging+table_host+3*gpu_count*sizeof(std::uint64_t)+3*gpu_count*sizeof(float),gpu_down_scales.data(),gpu_count*sizeof(float));
-                if(colibri_gpu_upload(table_device,staging+table_host,table_bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE table upload failed");
+                if(flyweight_gpu_upload(table_device,staging+table_host,table_bytes,runtime->stream)!=0)throw std::runtime_error("native hybrid MoE table upload failed");
                 const auto gate_table=table_device,up_table=gate_table+gpu_count*sizeof(std::uint64_t),down_table=up_table+gpu_count*sizeof(std::uint64_t),weight_table=down_table+gpu_count*sizeof(std::uint64_t);
                 const auto gate_scale_table=weight_table+gpu_count*sizeof(float),up_scale_table=gate_scale_table+gpu_count*sizeof(float),down_scale_table=up_scale_table+gpu_count*sizeof(float);
                 if(moe_profile_enabled())moe_prof.table+=moe_now()-t_table;
@@ -17552,7 +18416,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 const bool tc_enabled=env_nvfp4_tc;
                 bool tc_done=false;
                 if(persistent_enabled&&gate_type==40&&down_type==40){
-                    const int tc_status=colibri_gpu_nvfp4_moe_persistent(
+                    const int tc_status=flyweight_gpu_nvfp4_moe_persistent(
                         native_pointers.data(),weight_table,
                         gate_scale_table,up_scale_table,down_scale_table,
                         normalized,activated,third,runtime->stream,
@@ -17566,7 +18430,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                     }
                 }
                 if(!tc_done&&tc_enabled&&gate_type==40&&down_type==40){
-                    const int tc_status=colibri_gpu_nvfp4_moe_cublas(
+                    const int tc_status=flyweight_gpu_nvfp4_moe_cublas(
                         gate_table,up_table,down_table,normalized,activated,third,
                         weight_table,gate_scale_table,up_scale_table,down_scale_table,runtime->stream,
                         hidden_size,intermediate,gpu_count);
@@ -17591,7 +18455,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             const double t_queue=moe_now();
             for(int index=0;index<pending_count;++index){
                 const auto&upload=pending[index];
-                if(colibri_gpu_upload(upload.device,
+                if(flyweight_gpu_upload(upload.device,
                         staging+upload.host_offset,upload.bytes,
                         runtime->stream)!=0)
                     throw std::runtime_error(
@@ -17601,7 +18465,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                         layer.expert_tensors[0]].size/experts;
                     const auto up_bytes=runtime->model->tensors[
                         layer.expert_tensors[1]].size/experts;
-                    const int status=colibri_gpu_nvfp4_prepare_expert(
+                    const int status=flyweight_gpu_nvfp4_prepare_expert(
                         upload.device,upload.device+gate_bytes,
                         upload.device+gate_bytes+up_bytes,
                         runtime->expert_native_cache+
@@ -17618,7 +18482,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                 const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 qwen_cpu_moe(*runtime,layer,cpu_selected.data(),cpu_compact_weights.data(),cpu_count,cpu_input,cpu_activated,cpu_output);
                 if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
-                if(colibri_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native hybrid MoE output upload failed");
+                if(flyweight_gpu_upload(fourth,cpu_output,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native hybrid MoE output upload failed");
                 add(third,fourth);
             }
         }else{
@@ -17661,7 +18525,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                             // memcpy from the critical path -- the CPU has already synced on
                             // route_event by here, so every byte it copies is GPU idle time.
                             std::uint64_t role_offset=0;
-                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(colibri_gpu_upload(device_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert DMA upload failed");role_offset+=bytes;}
+                            for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;if(flyweight_gpu_upload(device_base+role_offset,tensor_data(*runtime->model,t)+offset,bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert DMA upload failed");role_offset+=bytes;}
                         }else{
                             // Size and bound-check the bundle BEFORE copying:
                             // the check used to run after the memcpys, so the
@@ -17672,7 +18536,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
                             if(staging_cursor+bundle_bytes>runtime->expert_staging_bytes)throw std::runtime_error("native Qwen expert staging overflow");
                             std::uint64_t copied=0;
                             for(int role=0;role<3;++role){const auto&t=runtime->model->tensors[layer.expert_tensors[role]];const auto bytes=t.size/experts;const auto offset=static_cast<std::uint64_t>(expert)*bytes;std::memcpy(staging+staging_cursor+copied,tensor_data(*runtime->model,t)+offset,bytes);copied+=bytes;}
-                            if(colibri_gpu_upload(device_base,staging+staging_cursor,bundle_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert upload failed");
+                            if(flyweight_gpu_upload(device_base,staging+staging_cursor,bundle_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen cached expert upload failed");
                             staging_cursor+=bundle_bytes;
                         }
                         std::uint64_t role_offset=0;
@@ -17694,8 +18558,8 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         std::memcpy(staging+table_host+3*top_k*sizeof(std::uint64_t)+top_k*sizeof(float),route_up_scales.data(),top_k*sizeof(float));
         std::memcpy(staging+table_host+3*top_k*sizeof(std::uint64_t)+2*top_k*sizeof(float),route_down_scales.data(),top_k*sizeof(float));
         if(table_host+table_bytes>runtime->expert_staging_bytes)throw std::runtime_error("native Qwen expert staging overflow");
-        if(has_uncached_expert&&staging_cursor&&colibri_gpu_upload(runtime->expert_staging,staging,staging_cursor,runtime->stream)!=0)throw std::runtime_error("native Qwen expert upload failed");
-        if(colibri_gpu_upload(table_device,staging+table_host,table_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen expert pointer upload failed");
+        if(has_uncached_expert&&staging_cursor&&flyweight_gpu_upload(runtime->expert_staging,staging,staging_cursor,runtime->stream)!=0)throw std::runtime_error("native Qwen expert upload failed");
+        if(flyweight_gpu_upload(table_device,staging+table_host,table_bytes,runtime->stream)!=0)throw std::runtime_error("native Qwen expert pointer upload failed");
         const auto gate_type=runtime->model->tensors[layer.expert_tensors[0]].type;
         const auto down_type=runtime->model->tensors[layer.expert_tensors[2]].type;
         // The grouped dispatch below ends in a k-quant fallback, so an
@@ -17710,7 +18574,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         const bool tc_enabled=env_nvfp4_tc;
         bool tc_done=false;
         if(tc_enabled&&gate_type==40&&down_type==40){
-            const int tc_status=colibri_gpu_nvfp4_moe_cublas(
+            const int tc_status=flyweight_gpu_nvfp4_moe_cublas(
                 gate_table,up_table,down_table,normalized,activated,third,
                 route_weights,gate_scale_table,up_scale_table,down_scale_table,runtime->stream,
                 hidden_size,intermediate,top_k);
@@ -17731,10 +18595,10 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         }
         }
         if(qwen_lm_diag_enabled()&&layer_number==0){
-            float v[4]={};colibri_gpu_stream_sync(runtime->stream);
-            if(colibri_gpu_download(v,third,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+            float v[4]={};flyweight_gpu_stream_sync(runtime->stream);
+            if(flyweight_gpu_download(v,third,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] L0 before_final_add third[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
-            if(colibri_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+            if(flyweight_gpu_download(v,residual,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] L0 before_final_add residual[0..3]=% .6e % .6e % .6e % .6e\n",v[0],v[1],v[2],v[3]);
         }
         if(timing_enabled())runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pager_started).count();
@@ -17748,15 +18612,21 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         std::swap(hidden,residual);
         if(qwen_lm_diag_enabled()&&(layer_number==0||layer_number==3||layer_number==33||layer_number==39)){
             static int lc=0;
-            if(lc<8){++lc;float v[4]={};if(colibri_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0)
+            if(lc<8){++lc;float v[4]={};if(flyweight_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] after_layer_%u hidden[0..3]=% .6e % .6e % .6e % .6e\n",layer_number,v[0],v[1],v[2],v[3]);}
         }
     }
     if(runtime->cuda_profile)profile_record(runtime->cuda_tail_start);
     if(runtime->options.mtp_drafts){
         auto target_hidden=runtime->state+runtime->mtp_target_hidden_offset;
-        void*copy_args[]={const_cast<std::uint64_t*>(&hidden),&target_hidden,const_cast<int*>(&hidden_size)};
-        launch_named("qwen_copy_vector",(hidden_size+255)/256,1,256,copy_args);
+        // qwen4exp's draft block consumes the hyper-connection STREAMS, so the
+        // hand-over is captured here -- before the inject-less collapse below
+        // reduces them to the LM head's input. Handing over the collapsed
+        // vector would be both the wrong width and the wrong quantity.
+        const std::uint64_t source=runtime->qwen4exp?hc_streams:hidden;
+        int count=runtime->qwen4exp?hc_count*hidden_size:hidden_size;
+        void*copy_args[]={const_cast<std::uint64_t*>(&source),&target_hidden,&count};
+        launch_named("qwen_copy_vector",(count+255)/256,1,256,copy_args);
         runtime->mtp_has_target_hidden=true;
     }
     // qwen4exp carries no final norm: the head collapse (the inject-less
@@ -17775,14 +18645,14 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
         if(diag_count<2){
             ++diag_count;
             float nvec[8]={};
-            if(colibri_gpu_download(nvec,normalized,sizeof(nvec),runtime->stream)==0&&colibri_gpu_stream_sync(runtime->stream)==0){
+            if(flyweight_gpu_download(nvec,normalized,sizeof(nvec),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0){
                 std::fprintf(stderr,"[lm-diag] normalized[0..7]=% .6e % .6e % .6e % .6e % .6e % .6e % .6e % .6e\n",nvec[0],nvec[1],nvec[2],nvec[3],nvec[4],nvec[5],nvec[6],nvec[7]);
             }
             std::fprintf(stderr,"[lm-diag] lm_head_type=%u lm_head_tensor=%zu hidden_size=%d\n",runtime->lm_head_type,runtime->lm_head,hidden_size);
         }
     }
     int vocabulary=static_cast<int>(runtime->model->config.vocabulary_size);
-    if(colibri_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime->stream)!=0)throw std::runtime_error("native Qwen argmax reset failed");
+    if(flyweight_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime->stream)!=0)throw std::runtime_error("native Qwen argmax reset failed");
     auto lm_head=runtime->device_tensors[runtime->lm_head];
     // The LM head is the largest single tensor read per token. Where the type
     // has a group-decode kernel, quantize the activation once and use it; the
@@ -17808,17 +18678,17 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     }
     if(runtime->cuda_profile)profile_record(runtime->cuda_lm_end);
     auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);
-    if(colibri_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime->stream)!=0)throw std::runtime_error("native Qwen output transfer failed");
+    if(flyweight_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime->stream)!=0)throw std::runtime_error("native Qwen output transfer failed");
     if(runtime->cuda_profile)profile_record(runtime->cuda_tail_end);
     const auto tail_wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-    if(colibri_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
+    if(flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("native Qwen output synchronization failed");
     if(timing_enabled())runtime->tail_wait_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tail_wait_started).count();
     kernel_profile_collect();
     if(kernel_profile)++kernel_profile_decodes;
     if(runtime->cuda_profile){
         float delta_ms=0.0f,attention_ms=0.0f,shared_ms=0.0f,expert_ms=0.0f,tail_ms=0.0f,lm_ms=0.0f,recurrent_ms=0.0f,attention_core_ms=0.0f;
         std::uint32_t delta_layers=0,attention_layers=0;
-        auto elapsed=[](std::uint64_t start,std::uint64_t end){float value=0.0f;if(colibri_gpu_event_elapsed(start,end,&value)!=0)throw std::runtime_error("native Qwen CUDA profiling measurement failed");return value;};
+        auto elapsed=[](std::uint64_t start,std::uint64_t end){float value=0.0f;if(flyweight_gpu_event_elapsed(start,end,&value)!=0)throw std::runtime_error("native Qwen CUDA profiling measurement failed");return value;};
         for(std::size_t index=0;index<runtime->layers.size();++index){
             const auto&events=runtime->cuda_layer_profiles[index];
             const float pre=elapsed(events.pre_start,events.pre_end);
@@ -17833,7 +18703,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
             shared_ms,expert_ms,tail_ms,lm_ms,delta_ms+attention_ms+shared_ms+expert_ms+tail_ms);
     }
     *output_token=0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
-    if(std::getenv("COLIBRI_TOK_DEBUG")){
+    if(std::getenv("FLYWEIGHT_TOK_DEBUG")){
         static int tc=0; if(tc++<60)
             std::fprintf(stderr,"[tok-dbg] step=%d in=%u -> out=%u\n",tc,input_token,*output_token);
     }
@@ -17843,7 +18713,7 @@ int colibri_v2_qwen_runtime_decode(ColibriV2QwenRuntime*runtime,uint32_t input_t
     ++runtime->position;
     // Reported periodically rather than once: the first token pays for capture,
     // so only the steady state says whether replay is actually cheaper.
-    if(std::getenv("COLIBRI_CUDA_GRAPH_TRACE")&&runtime->decode_calls%500==0)
+    if(std::getenv("FLYWEIGHT_CUDA_GRAPH_TRACE")&&runtime->decode_calls%500==0)
     {
         const double per_token=runtime->delta_host_calls
             ?static_cast<double>(runtime->delta_host_ns)/1e6
@@ -17882,13 +18752,13 @@ static double qwen_sampling_uniform(QwenSamplingState& sampling) {
 // vocabulary holds the GGUF byte-level spelling, so this is the same decode the
 // Python side does when it turns generated tokens back into text.
 static std::string qwen_token_bytes(
-        const ColibriV2QwenRuntime& runtime,std::uint32_t token) {
+        const FlyweightV2QwenRuntime& runtime,std::uint32_t token) {
     if(!runtime.model||token>=runtime.model->vocabulary.size())return std::string();
     return gguf_byte_decode(runtime.model->vocabulary[token]);
 }
 
 static std::uint32_t qwen_sample_last_logits(
-        ColibriV2QwenRuntime& runtime,QwenSamplingState& sampling,
+        FlyweightV2QwenRuntime& runtime,QwenSamplingState& sampling,
         std::uint32_t greedy_token) {
     // Every exit runs through this: the penalty window and the tool grammar
     // both track what was actually emitted, and a path that returns a token
@@ -17939,7 +18809,7 @@ static std::uint32_t qwen_sample_last_logits(
                              ban_trips)
         ?std::min<std::size_t>(
             std::max<std::size_t>(
-                requested,colibri::v2::workspace::kSamplingConstrainedMinimum),
+                requested,flyweight::v2::workspace::kSamplingConstrainedMinimum),
             vocabulary)
         :requested;
     // Sampling from a single candidate is identical to greedy decode. Avoid
@@ -17964,7 +18834,7 @@ static std::uint32_t qwen_sample_last_logits(
     // argmax that never writes the logits this path needs.
     const int hidden=static_cast<int>(runtime.model->config.hidden_size);
     static const bool q8_head_enabled=[]{
-        const char*setting=std::getenv("COLIBRI_IQ2_Q8_DECODE");
+        const char*setting=std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
         return !setting||setting[0]!='0';
     }();
     const char*q8_kernel=q8_head_enabled?
@@ -17983,7 +18853,7 @@ static std::uint32_t qwen_sample_last_logits(
             &runtime.last_sampling_normalized,
             &runtime.last_sampling_logits,
             const_cast<int*>(&hidden),&vocabulary_rows};
-        projected=colibri_gpu_launch_named("gemma_q4_0_matvec",
+        projected=flyweight_gpu_launch_named("gemma_q4_0_matvec",
                 (vocabulary_rows+7)/8,1,256,0,runtime.stream,matvec_args);
         if(projected!=0)
             throw std::runtime_error(
@@ -17999,15 +18869,15 @@ static std::uint32_t qwen_sample_last_logits(
             const_cast<std::uint64_t*>(&q8_scales),
             const_cast<std::uint64_t*>(&runtime.last_sampling_logits),
             const_cast<int*>(&hidden),&vocabulary_rows};
-        projected=colibri_gpu_launch_named("quantize_q8_blocks",
+        projected=flyweight_gpu_launch_named("quantize_q8_blocks",
                 (hidden+31)/32,1,32,0,runtime.stream,quantize_args);
         if(projected==0)
-            projected=colibri_gpu_launch_named(q8_kernel,
+            projected=flyweight_gpu_launch_named(q8_kernel,
                     vocabulary_rows,1,128,0,runtime.stream,matvec_args);
     }
     if(projected!=0)
         projected=runtime.lm_head_type==30?
-            colibri_gpu_bf16_matvec_transposed(
+            flyweight_gpu_bf16_matvec_transposed(
                 lm_head,runtime.last_sampling_normalized,runtime.last_sampling_logits,
                 hidden,static_cast<std::int32_t>(vocabulary),runtime.stream):
             qwen_gpu_matvec_by_type(
@@ -18033,7 +18903,7 @@ static std::uint32_t qwen_sample_last_logits(
         void*args[]={const_cast<std::uint64_t*>(&runtime.last_sampling_logits),
                      &vocabulary_count,const_cast<float*>(&scale),
                      const_cast<float*>(&softcap)};
-        if(colibri_gpu_launch_named("muse_logit_softcap",
+        if(flyweight_gpu_launch_named("muse_logit_softcap",
                 (vocabulary_count+255)/256,1,256,0,runtime.stream,args)!=0)
             throw std::runtime_error("native Muse Glimmer logit softcap failed");
     }
@@ -18047,13 +18917,13 @@ static std::uint32_t qwen_sample_last_logits(
     candidates.clear();
     candidate_logits.clear();
     static const bool gpu_topk_enabled=[]{
-        const char*setting=std::getenv("COLIBRI_SAMPLING_GPU_TOPK");
+        const char*setting=std::getenv("FLYWEIGHT_SAMPLING_GPU_TOPK");
         return !setting||setting[0]!='0';
     }();
     if(gpu_topk_enabled&&sampling.top_k&&
-       count<=colibri::v2::workspace::kSamplingTopKCapacity&&
-       vocabulary<=colibri::v2::workspace::kSamplingSortItemsPerBlock*
-                   colibri::v2::workspace::kSamplingSortBlockCapacity){
+       count<=flyweight::v2::workspace::kSamplingTopKCapacity&&
+       vocabulary<=flyweight::v2::workspace::kSamplingSortItemsPerBlock*
+                   flyweight::v2::workspace::kSamplingSortBlockCapacity){
         const auto selected_device=runtime.decode_workspace_layout.
             sampling_selected.address(runtime.workspace);
         const auto values_device=runtime.decode_workspace_layout.
@@ -18066,7 +18936,7 @@ static std::uint32_t qwen_sample_last_logits(
             sampling_sort_indices_b.address(runtime.workspace);
         const auto sort_values_b=runtime.decode_workspace_layout.
             sampling_sort_values_b.address(runtime.workspace);
-        if(colibri_gpu_sampling_topk(
+        if(flyweight_gpu_sampling_topk(
                 runtime.last_sampling_logits,selected_device,values_device,
                 sort_indices_a,sort_values_a,sort_indices_b,sort_values_b,
                 static_cast<std::int32_t>(vocabulary),
@@ -18080,11 +18950,11 @@ static std::uint32_t qwen_sample_last_logits(
         auto*selected_host=static_cast<std::uint32_t*>(runtime.host_staging);
         auto*values_host=reinterpret_cast<float*>(
             static_cast<std::uint8_t*>(runtime.host_staging)+value_offset);
-        if(colibri_gpu_download(
+        if(flyweight_gpu_download(
                 selected_host,selected_device,candidate_bytes,runtime.stream)!=0||
-           colibri_gpu_download(
+           flyweight_gpu_download(
                 values_host,values_device,value_bytes,runtime.stream)!=0||
-           colibri_gpu_stream_sync(runtime.stream)!=0)
+           flyweight_gpu_stream_sync(runtime.stream)!=0)
             throw std::runtime_error("native Qwen sampling candidate transfer failed");
         candidates.assign(selected_host,selected_host+count);
         candidate_logits.assign(values_host,values_host+count);
@@ -18096,9 +18966,9 @@ static std::uint32_t qwen_sample_last_logits(
         if(bytes>runtime.host_staging_bytes)
             throw std::runtime_error("native Qwen sampling workspace is too small");
         auto*logits=static_cast<float*>(runtime.host_staging);
-        if(colibri_gpu_download(
+        if(flyweight_gpu_download(
                 logits,runtime.last_sampling_logits,bytes,runtime.stream)!=0||
-           colibri_gpu_stream_sync(runtime.stream)!=0)
+           flyweight_gpu_stream_sync(runtime.stream)!=0)
             throw std::runtime_error("native Qwen sampling logits transfer failed");
         runtime.sampling_full_download_bytes+=bytes;
         candidates.resize(vocabulary);
@@ -18262,20 +19132,54 @@ static std::uint64_t qwen_sequence_match(
     return i;
 }
 
+// How many tokens make a shared prefix substantial in absolute terms. The
+// synthetic fixtures run 256-token contexts, so the real bar would make every
+// prefix-routing path unreachable in a test; the override exists for them.
+// Read per call, never latched in a static -- a cached first read is what once
+// made a kill-switch test vacuous.
+static std::uint64_t qwen_prefix_bar() {
+    if (const char* setting = std::getenv("FLYWEIGHT_PREFIX_BAR")) {
+        const auto value = std::strtoull(setting, nullptr, 10);
+        if (value) return value;
+    }
+    return 2048;
+}
+
 // A large absolute shared prefix is worth restoring even when it is less than
 // half of a very long previous conversation. The fractional rule alone caused
 // 15-30k reusable agent prefixes to be discarded after a long side branch.
 static bool qwen_cache_match_useful(
         std::uint64_t match, std::size_t cached_tokens) {
     return match != 0 &&
-        (match >= 2048 || match >= (cached_tokens + 1) / 2);
+        (match >= qwen_prefix_bar() || match >= (cached_tokens + 1) / 2);
+}
+
+// Whether handing this slot to a prompt that shares `match` of its tokens is
+// worth avoiding. Taking a slot overwrites everything it holds PAST the shared
+// prefix, so that residual -- not the fraction matched -- is the work at risk,
+// and it is what a donation preserves.
+//
+// The fraction is the wrong question, and a real 35B measurement is what said
+// so: a side-request under a 2352-token system prompt covered 97% of a
+// 2417-token conversation, so a "matched more than half, must be a
+// continuation" rule declined to donate. Read the other way round, only 65
+// tokens were at risk and declining was right -- but the same rule declines
+// just as firmly when the conversation is 30k and 28k of it would be lost.
+//
+// Residual zero means the prompt extends the conversation and there is nothing
+// to preserve; a few hundred means a client re-rendered its last reply, not
+// worth moving a conversation for; thousands means something branched off it.
+static bool qwen_donation_is_worthwhile(
+        std::uint64_t match, std::size_t cached_tokens) {
+    return cached_tokens > match &&
+        cached_tokens - match >= qwen_prefix_bar();
 }
 
 // Save the live (active) working set into its slot and load `target`'s. The KV
 // arena is per-slot, so only the pointer + host bookkeeping move -- no device
 // copy. Snapshots stay global; the reuse KV-safety guard keeps them correct
 // across slots by tying reuse to the (per-slot) processed_tokens.
-static void qwen_switch_sequence(ColibriV2QwenRuntime& runtime, std::size_t target) {
+static void qwen_switch_sequence(FlyweightV2QwenRuntime& runtime, std::size_t target) {
     if (target == runtime.active_sequence) return;
     QwenSequence& cur = runtime.sequences[runtime.active_sequence];
     cur.position = runtime.position;
@@ -18286,6 +19190,7 @@ static void qwen_switch_sequence(ColibriV2QwenRuntime& runtime, std::size_t targ
     cur.prefill_snapshot_clock = runtime.prefill_snapshot_clock;
     QwenSequence& next = runtime.sequences[target];
     runtime.state = next.state;
+    qwen_apply_geometry(runtime, next.geometry);
     runtime.position = next.position;
     runtime.last_output_token = next.last_output_token;
     runtime.last_output_greedy = next.last_output_greedy;
@@ -18309,9 +19214,18 @@ static std::uint64_t qwen_kv_region_bytes(std::uint64_t elems, int type) {
 // state. Bytes beyond `position` in the KV slabs are never read (attention is
 // position-bounded), so spill/restore can skip them: a spill copies
 // position/capacity of the KV instead of the whole arena.
+//
+// `position_indexed_only` drops the ranges that are NOT a function of position
+// -- the DeltaNet conv/recurrent state, the PLE ring, the QSA raw-key ring --
+// leaving exactly the regions whose contents at `position` depend only on
+// tokens below it. Those are the ranges one slot may donate to another; the
+// recurrent remainder has to come from a checkpoint taken at that same
+// position, which is what qwen_prefill_snapshot_copy carries. The split is a
+// parameter rather than a second function so the layout stays defined once.
 extern "C++" {
 static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_ranges(
-        const ColibriV2QwenRuntime& runtime, std::uint64_t position) {
+        const FlyweightV2QwenRuntime& runtime, std::uint64_t position,
+        bool position_indexed_only = false) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     const int ck = runtime.options.cache_type_k, cv = runtime.options.cache_type_v;
     for (std::uint32_t layer_number = 0; layer_number < runtime.layers.size(); ++layer_number) {
@@ -18338,18 +19252,20 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
                     std::min<std::uint64_t>(position, layer.cache_capacity) / layer.qsa_ratio;
                 if (used_blocks)
                     ranges.emplace_back(layer.qsa_blocks, used_blocks * key_len * sizeof(float));
-                ranges.emplace_back(
-                    layer.qsa_ring,
-                    static_cast<std::uint64_t>(layer.qsa_ratio) * key_len * sizeof(float));
+                if (!position_indexed_only)
+                    ranges.emplace_back(
+                        layer.qsa_ring,
+                        static_cast<std::uint64_t>(layer.qsa_ratio) * key_len * sizeof(float));
             }
-        } else {
+        } else if (!position_indexed_only) {
             const auto& conv = runtime.model->tensors[layer.static_tensors[6]];
             const auto& a = runtime.model->tensors[layer.static_tensors[8]];
             const auto& norm = runtime.model->tensors[layer.static_tensors[9]];
             ranges.emplace_back(layer.state_first, tensor_elements(conv) * sizeof(float));
             ranges.emplace_back(layer.state_second, a.shape[0] * norm.shape[0] * norm.shape[0] * sizeof(float));
         }
-        if (layer.ple_conv != std::numeric_limits<std::uint64_t>::max()) {
+        if (!position_indexed_only &&
+            layer.ple_conv != std::numeric_limits<std::uint64_t>::max()) {
             const auto& ple_conv = runtime.model->tensors[layer.ple_conv];
             ranges.emplace_back(
                 layer.state_third,
@@ -18361,9 +19277,84 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
     }
     return ranges;
 }
+
+// How much of the reservation a session has actually touched. Each slot
+// reserves state_bytes for the full context up front; the live set at a given
+// position is what a paged pool would have had to hold instead, so the gap
+// between them is the VRAM phase 2 of plans/paged-kv-cache.md would reclaim
+// (and hand to the expert cache, which is where decode spends it).
+//
+// Idle slots are counted, not skipped: at position 0 the used ranges are
+// exactly the non-pageable floor (DeltaNet conv+recurrent, the PLE ring, the
+// QSA raw-key ring), which a pool still has to allocate per slot.
+static void qwen_note_kv_occupancy(FlyweightV2QwenRuntime& runtime) {
+    if (runtime.sequences.empty() || !runtime.state_bytes) return;
+    std::uint64_t tokens = 0, live = 0;
+    for (std::size_t slot = 0; slot < runtime.sequences.size(); ++slot) {
+        // The active slot's position lives in the runtime mirror, the rest in
+        // sequences[] -- the same convention qwen_spill_slot_to_host reads by.
+        // Both engine call sites are outside a qwen_park_active window, so the
+        // mirror is authoritative here rather than stale.
+        const auto position = slot == runtime.active_sequence
+            ? runtime.position : runtime.sequences[slot].position;
+        tokens += position;
+        runtime.kv_peak_tokens_max =
+            std::max(runtime.kv_peak_tokens_max, position);
+        for (const auto& range : qwen_used_state_ranges(runtime, position))
+            live += range.second;
+    }
+    ++runtime.kv_occupancy_samples;
+    // One sample, both figures: reporting the largest token count and the
+    // largest byte count from different moments would describe a state the
+    // runtime was never in.
+    if (live > runtime.kv_peak_live_bytes) {
+        runtime.kv_peak_live_bytes = live;
+        runtime.kv_peak_tokens = tokens;
+    }
+}
+
+// Sample on the way out of a request however it ends. A generate that the
+// callback aborts, or that cancellation cuts short, still grew the KV it grew;
+// sampling only on the clean return would under-report exactly the interleaved
+// traffic this is meant to characterize.
+// The live ranges of a slot under ITS OWN geometry rather than the active
+// one. Slots may be laid out differently, so anything that reads or writes an
+// inactive slot's arena -- spill, restore, donation -- has to ask with that
+// slot's offsets. Borrowing the geometry and putting it back is what keeps one
+// definition of the layout instead of a second, drifting copy.
+static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_slot_state_ranges(
+        FlyweightV2QwenRuntime& runtime, std::size_t geometry,
+        std::uint64_t position, bool position_indexed_only = false) {
+    const std::size_t active = runtime.sequences.empty()
+        ? 0 : runtime.sequences[runtime.active_sequence].geometry;
+    if (geometry != active) qwen_apply_geometry(runtime, geometry);
+    auto ranges = qwen_used_state_ranges(runtime, position, position_indexed_only);
+    if (geometry != active) qwen_apply_geometry(runtime, active);
+    return ranges;
+}
+
+// Two range lists describe the same state in different layouts only if they
+// agree region for region. Capacities that differ enough to change a region's
+// length (a sliding window that fits one slot's context and not the other's)
+// make the copy meaningless, so refuse rather than transfer a truncated one.
+static bool qwen_ranges_are_compatible(
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>>& a,
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (a[i].second != b[i].second) return false;
+    return true;
+}
+
+struct QwenKvOccupancyGuard {
+    FlyweightV2QwenRuntime& runtime;
+    ~QwenKvOccupancyGuard() {
+        try { qwen_note_kv_occupancy(runtime); } catch (...) {}
+    }
+};
 }  // extern "C++"
 
-static void qwen_free_host_prompt(ColibriV2QwenRuntime& runtime, std::size_t idx) {
+static void qwen_free_host_prompt(FlyweightV2QwenRuntime& runtime, std::size_t idx) {
     QwenHostPrompt& e = runtime.host_prompts[idx];
     std::free(e.state);
     for (auto& s : e.snapshots) std::free(s.state);
@@ -18371,7 +19362,7 @@ static void qwen_free_host_prompt(ColibriV2QwenRuntime& runtime, std::size_t idx
     runtime.host_prompts.erase(runtime.host_prompts.begin() + idx);
 }
 
-static void qwen_evict_host_lru(ColibriV2QwenRuntime& runtime) {
+static void qwen_evict_host_lru(FlyweightV2QwenRuntime& runtime) {
     if (runtime.host_prompts.empty()) return;
     std::size_t lru = 0;
     for (std::size_t i = 1; i < runtime.host_prompts.size(); ++i)
@@ -18383,7 +19374,7 @@ static void qwen_evict_host_lru(ColibriV2QwenRuntime& runtime) {
 // checkpoints to host RAM, so a later request that continues this conversation
 // restores from RAM instead of reprefilling ~30k tokens cold. Only substantial
 // conversations are worth caching; short side-requests are skipped.
-static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t slot) {
+static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t slot) {
     if (!runtime.host_cache_limit_bytes || !runtime.state_bytes) return;
     const QwenSequence& seq = runtime.sequences[slot];
     const bool active = slot == runtime.active_sequence;
@@ -18400,7 +19391,8 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
         if (e.tokens == tokens) { e.clock = ++runtime.host_cache_clock; return; }
     // Pack only the live ranges (used KV prefixes + DeltaNet state) instead of
     // the whole arena: at small positions the spill is a fraction of state_bytes.
-    const auto ranges = qwen_used_state_ranges(runtime, position);
+    // Under this slot's own geometry -- it need not be the active slot's.
+    const auto ranges = qwen_slot_state_ranges(runtime, seq.geometry, position);
     std::uint64_t packed_bytes = 0;
     for (const auto& r : ranges) packed_bytes += r.second;
     if (packed_bytes > runtime.host_cache_limit_bytes) return;
@@ -18421,11 +19413,11 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
     std::uint64_t cursor = 0;
     bool copy_failed = false;
     for (const auto& r : ranges) {
-        if (colibri_gpu_download(static_cast<char*>(buf) + cursor,
+        if (flyweight_gpu_download(static_cast<char*>(buf) + cursor,
                 seq.state + r.first, r.second, runtime.stream) != 0) { copy_failed = true; break; }
         cursor += r.second;
     }
-    if (copy_failed || colibri_gpu_stream_sync(runtime.stream) != 0) { std::free(buf); return; }
+    if (copy_failed || flyweight_gpu_stream_sync(runtime.stream) != 0) { std::free(buf); return; }
     QwenHostPrompt e;
     e.tokens = tokens;
     e.state = buf;
@@ -18433,13 +19425,14 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
     e.last_output_token = last_output;
     e.last_output_greedy = last_output_greedy;
     e.bytes = packed_bytes;
+    e.geometry = seq.geometry;
     std::uint64_t copied_snapshots=0;
     for (const auto& s : snapshots) {
         if (!s.valid || s.tokens.empty() || copied_snapshots>=snapshots_to_copy) continue;
         void* sbuf = std::malloc(runtime.prefill_snapshot_bytes);
         if (!sbuf) break;  // partial checkpoint set is fine; arena reuse still works
-        if (colibri_gpu_download(sbuf, s.device, runtime.prefill_snapshot_bytes, runtime.stream) != 0
-            || colibri_gpu_stream_sync(runtime.stream) != 0) { std::free(sbuf); break; }
+        if (flyweight_gpu_download(sbuf, s.device, runtime.prefill_snapshot_bytes, runtime.stream) != 0
+            || flyweight_gpu_stream_sync(runtime.stream) != 0) { std::free(sbuf); break; }
         e.snapshots.push_back({s.tokens, sbuf, s.last_output, s.last_output_greedy});
         e.bytes += runtime.prefill_snapshot_bytes;
         ++copied_snapshots;
@@ -18452,7 +19445,7 @@ static void qwen_spill_slot_to_host(ColibriV2QwenRuntime& runtime, std::size_t s
 // Restore a host-cached conversation into an (inactive) victim slot: HtoD the
 // saved arena, its checkpoints, and bookkeeping. Any leftover victim checkpoints
 // beyond the restored set are invalidated.
-static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
+static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
         std::size_t entry_idx, std::size_t victim) {
     QwenHostPrompt& e = runtime.host_prompts[entry_idx];
     QwenSequence& seq = runtime.sequences[victim];
@@ -18461,17 +19454,24 @@ static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
     auto& snapshots = active ? runtime.prefill_snapshots : seq.prefill_snapshots;
     auto& snapshot_clock = active
         ? runtime.prefill_snapshot_clock : seq.prefill_snapshot_clock;
-    // The packed layout is a pure function of (runtime config, position), so the
-    // ranges recomputed here match the spill order exactly.
-    const auto ranges = qwen_used_state_ranges(runtime, e.position);
+    // A conversation longer than this slot can hold has nowhere to go: the
+    // caller falls back to prefilling it on a slot that fits.
+    if (e.position > qwen_slot_context(runtime, victim)) return false;
+    // The packed layout is a pure function of (geometry, position), so the
+    // ranges recomputed here match the spill order exactly -- but the spill's
+    // geometry and the victim's need not be the same one, and the buffer was
+    // written under the former while it lands under the latter.
+    const auto source = qwen_slot_state_ranges(runtime, e.geometry, e.position);
+    const auto ranges = qwen_slot_state_ranges(runtime, seq.geometry, e.position);
+    if (!qwen_ranges_are_compatible(source, ranges)) return false;
     std::uint64_t cursor = 0;
     for (const auto& r : ranges) {
-        if (colibri_gpu_upload(seq.state + r.first,
+        if (flyweight_gpu_upload(seq.state + r.first,
                 static_cast<const char*>(e.state) + cursor, r.second, runtime.stream) != 0)
             return false;
         cursor += r.second;
     }
-    if (colibri_gpu_stream_sync(runtime.stream) != 0) return false;
+    if (flyweight_gpu_stream_sync(runtime.stream) != 0) return false;
     tokens = std::move(e.tokens);
     if (active) {
         runtime.position = e.position;
@@ -18486,8 +19486,8 @@ static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
     for (auto& hs : e.snapshots) {
         if (slot_i >= snapshots.size()) break;
         auto& dst = snapshots[slot_i++];
-        if (colibri_gpu_upload(dst.device, hs.state, runtime.prefill_snapshot_bytes, runtime.stream) != 0
-            || colibri_gpu_stream_sync(runtime.stream) != 0)
+        if (flyweight_gpu_upload(dst.device, hs.state, runtime.prefill_snapshot_bytes, runtime.stream) != 0
+            || flyweight_gpu_stream_sync(runtime.stream) != 0)
             break;
         dst.tokens = std::move(hs.tokens);
         dst.last_output = hs.last_output;
@@ -18501,18 +19501,195 @@ static bool qwen_restore_host_to_slot(ColibriV2QwenRuntime& runtime,
     return true;
 }
 
+// Copy a cached prefix from one slot into another, so a prompt that merely
+// SHARES a conversation's opening does not have to take over the slot holding
+// it (plans/paged-kv-cache.md, phase 1).
+//
+// A subagent or a side-request under the main agent's system prompt matches
+// that slot on 15-30k tokens while continuing nothing. Routing it there reuses
+// the prefix and then overwrites everything past it, so the main conversation's
+// next turn reprefills -- or, with a host cache, pays a full spill and restore.
+// Donation gives the newcomer its own slot seeded with the shared prefix and
+// leaves the donor untouched.
+//
+// What may be copied is exactly the position-indexed state, whose contents at
+// [0, p) depend only on tokens below p. The recurrent remainder cannot be
+// sliced, so p must be a position where the donor holds a checkpoint -- except
+// on attention-only architectures, which have no recurrent state and can be cut
+// anywhere, the same property that lets gemma4 rewind in qwen_prompt_begin.
+//
+// Returns true with `target` active, seeded, and ready for qwen_prompt_begin to
+// reuse through its ordinary live-prefix path.
+static bool qwen_donate_prefix(FlyweightV2QwenRuntime& runtime,
+        std::size_t donor, std::size_t target,
+        const std::uint32_t* prompt, std::uint64_t prompt_count) {
+    if (donor == target || donor >= runtime.sequences.size() ||
+        target >= runtime.sequences.size() || prompt_count < 2)
+        return false;
+    // A kill switch for a routing change that moves conversations between
+    // slots: =0 restores the take-the-slot behaviour without a rebuild. Read
+    // per call, never latched (see qwen_prefix_bar).
+    if (const char* setting = std::getenv("FLYWEIGHT_PREFIX_DONATE");
+        setting && setting[0] == '0')
+        return false;
+    const bool donor_active = donor == runtime.active_sequence;
+    const auto& donor_tokens = donor_active
+        ? runtime.processed_tokens : runtime.sequences[donor].processed_tokens;
+    const auto donor_position = donor_active
+        ? runtime.position : runtime.sequences[donor].position;
+    if (!donor_position || donor_tokens.empty()) return false;
+
+    // Everything the donation needs is copied out before the switch below moves
+    // the donor's bookkeeping into sequences[donor].
+    std::uint64_t donated = 0, snapshot_device = 0;
+    std::uint32_t last_output = 0;
+    bool last_output_greedy = false;
+    if (runtime.prefill_snapshot_bytes) {
+        const auto& snapshots = donor_active
+            ? runtime.prefill_snapshots
+            : runtime.sequences[donor].prefill_snapshots;
+        for (const auto& candidate : snapshots) {
+            if (!candidate.valid || candidate.tokens.empty()) continue;
+            const std::uint64_t count = candidate.tokens.size();
+            if (count <= donated) continue;
+            // A strict prefix, deliberately: donating the whole prompt would
+            // raise the same last-logits question qwen_prompt_begin answers for
+            // a full hit, and one prefilled token regenerates real logits.
+            if (count >= prompt_count || count > donor_tokens.size()) continue;
+            if (!std::equal(candidate.tokens.begin(), candidate.tokens.end(), prompt))
+                continue;
+            // The KV-safety guard, donor side: a checkpoint the donor has since
+            // diverged from describes attention KV the donor no longer holds.
+            if (!std::equal(candidate.tokens.begin(), candidate.tokens.end(),
+                            donor_tokens.begin()))
+                continue;
+            if (!swa_snapshot_is_resident(runtime, count, donor_position)) continue;
+            donated = count;
+            snapshot_device = candidate.device;
+            last_output = candidate.last_output;
+            last_output_greedy = candidate.last_output_greedy;
+        }
+    } else {
+        // No recurrent state anywhere in the stack, so no checkpoint is needed
+        // and the cut can land on the exact divergence point.
+        const auto limit = std::min<std::uint64_t>(
+            donor_tokens.size(), prompt_count - 1);
+        std::uint64_t match = 0;
+        while (match < limit && donor_tokens[match] == prompt[match]) ++match;
+        if (match && swa_snapshot_is_resident(runtime, match, donor_position))
+            donated = match;
+    }
+    // Any checkpoint at all is enough, and the bar that guards the caller does
+    // not belong here: taking the donor's slot would have reused from these
+    // same checkpoints, so a donation of `donated` tokens buys the newcomer
+    // exactly what stealing the slot would have, and leaves the donor standing.
+    // Measured on the 35B: the best checkpoint below a 2352-token shared
+    // opening sat at 1572, and a 2048 bar here declined a donation that was
+    // free. Zero is the real floor -- with nothing to seed, relocating would
+    // trade the newcomer's reuse for the donor's, which is a different bet.
+    if (!donated) return false;
+    // The target may be a smaller slot than the donor; it cannot take more
+    // prefix than it has room for.
+    if (donated > qwen_slot_context(runtime, target)) return false;
+
+    // Source and destination offsets coincide only when the two slots share a
+    // geometry, so both lists are derived and checked rather than assumed.
+    const auto source = qwen_slot_state_ranges(
+        runtime, runtime.sequences[donor].geometry, donated, true);
+    const auto destination = qwen_slot_state_ranges(
+        runtime, runtime.sequences[target].geometry, donated, true);
+    if (!qwen_ranges_are_compatible(source, destination)) return false;
+
+    // Committed now, so the target's own conversation is about to be lost --
+    // preserve it exactly as the recycle path would. Done here rather than in
+    // the caller so an ineligible donation costs no spill.
+    if (runtime.host_cache_limit_bytes) qwen_spill_slot_to_host(runtime, target);
+    const auto donor_state = runtime.sequences[donor].state;
+    qwen_switch_sequence(runtime, target);
+    bool ok = true;
+    for (std::size_t i = 0; i < destination.size(); ++i)
+        if (flyweight_gpu_copy_device(runtime.state + destination[i].first,
+                donor_state + source[i].first, destination[i].second,
+                runtime.stream) != 0) {
+            ok = false;
+            break;
+        }
+    if (ok && snapshot_device)
+        try { qwen_prefill_snapshot_copy(runtime, snapshot_device, true); }
+        catch (const std::exception&) { ok = false; }
+    if (ok && flyweight_gpu_stream_sync(runtime.stream) != 0) ok = false;
+    if (!ok) {
+        // A partial copy leaves the target holding two conversations spliced
+        // together, which is worse than a cold start. Reset covers the arena
+        // and the bookkeeping; the caller proceeds as if nothing was donated.
+        flyweight_v2_qwen_runtime_reset(&runtime);
+        return false;
+    }
+
+    // Seed the target so qwen_prompt_begin's live-prefix path reuses it. Tokens
+    // come from `prompt`, not the donor's checkpoint: they are equal by the
+    // check above, and the switch has since swapped the snapshot vectors.
+    runtime.processed_tokens.assign(prompt, prompt + donated);
+    runtime.position = donated;
+    runtime.last_output_token = last_output;
+    // Only a checkpoint knows whether its token was the unadjusted argmax, and
+    // a donation always leaves at least one token to prefill, so the value is
+    // never read as a full-hit seed. False is the safe reading either way.
+    runtime.last_output_greedy = snapshot_device ? last_output_greedy : false;
+    // Draft-block state describes the conversation this slot held a moment ago.
+    // It is acceptance-only -- the verifier guards the text -- but stale entries
+    // draft from a history the target no longer has.
+    runtime.mtp_cache_tokens = 0;
+    runtime.mtp_has_target_hidden = false;
+
+    // The target's own checkpoints described the conversation just overwritten.
+    // Install the donated one in their place so a later divergence on this slot
+    // still has something to fall back to.
+    for (auto& s : runtime.prefill_snapshots) s.valid = false;
+    if (snapshot_device && !runtime.prefill_snapshots.empty()) {
+        auto& dst = runtime.prefill_snapshots.front();
+        if (flyweight_gpu_copy_device(dst.device, snapshot_device,
+                runtime.prefill_snapshot_bytes, runtime.stream) == 0 &&
+            flyweight_gpu_stream_sync(runtime.stream) == 0) {
+            dst.tokens.assign(prompt, prompt + donated);
+            dst.last_output = last_output;
+            dst.last_output_greedy = last_output_greedy;
+            dst.valid = true;
+            dst.clock = ++runtime.prefill_snapshot_clock;
+        }
+    }
+
+    ++runtime.prefix_donations;
+    runtime.prefix_donated_tokens += donated;
+    if (std::getenv("FLYWEIGHT_ROUTE_TRACE"))
+        std::fprintf(stderr, "[route] donated %llu tokens from slot %zu to %zu\n",
+            static_cast<unsigned long long>(donated), donor, target);
+    return true;
+}
+
 // Route a prompt to the slot/host entry it continues; recycle the LRU slot
 // otherwise. A slot/entry owns the prompt when it covers most of its committed
 // tokens or provides a substantial absolute prefix. Before a divergent request
 // overwrites that slot, the host cache preserves it even in one-slot mode.
-static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
-        const std::uint32_t* prompt, std::uint64_t prompt_count) {
+static void qwen_route_sequence(FlyweightV2QwenRuntime& runtime,
+        const std::uint32_t* prompt, std::uint64_t prompt_count,
+        std::uint64_t required = 0) {
     const bool host_cache = runtime.host_cache_limit_bytes != 0;
     if (runtime.sequences.size() <= 1 && !host_cache) return;
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
+    // Slots need not be the same size, so "can this slot hold the request"
+    // comes before every other consideration -- a scratch slot that matched a
+    // long prompt's opening is still the wrong home for it. `required` counts
+    // the tokens the request will occupy (prompt plus what it may generate);
+    // zero means the caller could not say, and only the prompt is checked.
+    const std::uint64_t need = std::max<std::uint64_t>(required, prompt_count);
+    auto fits = [&](std::size_t slot) {
+        return qwen_slot_context(runtime, slot) >= need;
+    };
     std::size_t best = kNone;
     std::uint64_t best_match = 0;
     auto consider = [&](std::size_t i, const std::vector<std::uint32_t>& tokens) {
+        if (!fits(i)) return;
         const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
         if (m > best_match && qwen_cache_match_useful(m,tokens.size())) {
             best_match = m; best = i;
@@ -18531,13 +19708,26 @@ static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
                 best_host_match = m; best_host = i;
             }
         }
+    // The slot to recycle: the smallest one that can hold the request, so a
+    // short side-request lands on scratch and leaves the full-context slot for
+    // the conversation that needs it; LRU breaks ties. Under symmetric slots
+    // every capacity is equal and this is the plain LRU it always was, which
+    // never picks the active slot (that one is the most-recently-stamped).
     auto lru_slot = [&]() {
         std::size_t v = 0;
-        for (std::size_t i = 1; i < runtime.sequences.size(); ++i)
-            if (runtime.sequences[i].clock < runtime.sequences[v].clock) v = i;
-        return v;  // != active: the active slot is the most-recently-stamped
+        bool found = false;
+        for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
+            if (!fits(i)) continue;
+            if (!found) { v = i; found = true; continue; }
+            const auto here = qwen_slot_context(runtime, i);
+            const auto there = qwen_slot_context(runtime, v);
+            if (here != there ? here < there
+                              : runtime.sequences[i].clock < runtime.sequences[v].clock)
+                v = i;
+        }
+        return v;  // slot 0 spans the whole context, so something always fits
     };
-    if (std::getenv("COLIBRI_ROUTE_TRACE"))
+    if (std::getenv("FLYWEIGHT_ROUTE_TRACE"))
         std::fprintf(stderr, "[route] active=%zu best=%lld match=%llu host_best=%lld host_match=%llu entries=%zu\n",
             runtime.active_sequence, best==kNone?-1LL:(long long)best, (unsigned long long)best_match,
             best_host==kNone?-1LL:(long long)best_host, (unsigned long long)best_host_match,
@@ -18545,6 +19735,20 @@ static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
     if (best != kNone && best_match >= best_host_match) {
         const auto& best_tokens = best == runtime.active_sequence
             ? runtime.processed_tokens : runtime.sequences[best].processed_tokens;
+        // A prompt that extends this conversation belongs on its slot. One that
+        // only shares its opening does not: taking the slot would reuse the
+        // prefix and overwrite the conversation behind it. Give it a slot of
+        // its own with the prefix copied in, when there is one to spare and
+        // enough of the donor would otherwise be lost to justify the copy.
+        if (qwen_donation_is_worthwhile(best_match, best_tokens.size())) {
+            const std::size_t victim = lru_slot();
+            if (victim != best &&
+                qwen_donate_prefix(runtime, best, victim, prompt, prompt_count)) {
+                runtime.sequences[runtime.active_sequence].clock =
+                    ++runtime.sequence_clock;
+                return;
+            }
+        }
         if (host_cache && best_match < best_tokens.size())
             qwen_spill_slot_to_host(runtime, best);
         if (best != runtime.active_sequence) qwen_switch_sequence(runtime, best);
@@ -18568,7 +19772,7 @@ static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
         const std::size_t victim = lru_slot();
         if (host_cache) qwen_spill_slot_to_host(runtime, victim);
         if (victim != runtime.active_sequence) qwen_switch_sequence(runtime, victim);
-        if (std::getenv("COLIBRI_ROUTE_TRACE"))
+        if (std::getenv("FLYWEIGHT_ROUTE_TRACE"))
             std::fprintf(stderr, "[route] victim=%zu spilled_entries=%zu\n", victim, runtime.host_prompts.size());
     }
     runtime.sequences[runtime.active_sequence].clock = ++runtime.sequence_clock;
@@ -18579,7 +19783,7 @@ static void qwen_route_sequence(ColibriV2QwenRuntime& runtime,
 // targets. Shared verbatim by the blocking generate path and the engine so the
 // two cannot drift. Disables expert-cache admission (prompt tokens must not
 // pollute it); callers re-enable it when prefill completes.
-static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
+static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, QwenPromptPlan& plan,
         bool require_last_logits=false) {
     // Prefix-reuse diagnostics (computed before any state mutation below). The
@@ -18651,7 +19855,7 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
             runtime->cancelled=false;
         }else{
             ++runtime->prefix_cache_misses;
-            const int status=colibri_v2_qwen_runtime_reset(runtime);if(status)return status;
+            const int status=flyweight_v2_qwen_runtime_reset(runtime);if(status)return status;
         }
     }else{
         // The live state diverged (typically: the client re-encoded the
@@ -18696,12 +19900,12 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
             runtime->mtp_has_target_hidden=false;
         }else{
             ++runtime->prefix_cache_misses;
-            const int status=colibri_v2_qwen_runtime_reset(runtime);if(status)return status;
+            const int status=flyweight_v2_qwen_runtime_reset(runtime);if(status)return status;
         }
     }
     runtime->prefix_cache_last_reused_tokens=prompt_start;
     runtime->prefix_cache_reprefilled_tokens+=prompt_count-prompt_start;
-    if(std::getenv("COLIBRI_PREFIX_TRACE"))
+    if(std::getenv("FLYWEIGHT_PREFIX_TRACE"))
         std::fprintf(stderr,
             "[prefix] prompt=%llu reused=%llu reprefill=%llu lcp_live=%llu lcp_snapshot=%llu\n",
             static_cast<unsigned long long>(prompt_count),
@@ -18750,7 +19954,7 @@ static int qwen_prompt_begin(ColibriV2QwenRuntime* runtime,
 }
 
 // Save every checkpoint target the prefill has reached.
-static void qwen_prompt_checkpoints(ColibriV2QwenRuntime* runtime,
+static void qwen_prompt_checkpoints(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, QwenPromptPlan& plan) {
     while(plan.next_target<plan.targets.size()&&runtime->position>=plan.targets[plan.next_target]){
         auto&slot=runtime->prefill_snapshots[plan.next_target];
@@ -18772,7 +19976,7 @@ static void qwen_prompt_checkpoints(ColibriV2QwenRuntime* runtime,
 // reads amortize across the chunk; the final prompt token still runs through
 // single-token decode to produce next_token. MTP needs per-token prompt pairs
 // from decode, so it keeps the one-token path.
-static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prompt,
+static int qwen_prefill_unit(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt,
         uint64_t prompt_count, QwenPromptPlan& plan, uint64_t& index,
         uint32_t& next_token, bool& done,QwenSamplingState* sampling=nullptr) {
     done=false;
@@ -18790,14 +19994,14 @@ static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prom
             if(target>index&&target-index<rows)rows=target-index;
         }
         qwen_prefill_rows(*runtime,prompt+index,static_cast<int>(rows));
-        if(std::getenv("COLIBRI_PREFILL_LAUNCHES"))qwen_prefill_launch_report();
+        if(std::getenv("FLYWEIGHT_PREFILL_LAUNCHES"))qwen_prefill_launch_report();
         index+=rows;
         qwen_prompt_checkpoints(runtime,prompt,plan);
         if(index+3<=prompt_count&&!runtime->cancelled)return 0; // more chunks pending
     }
     uint64_t budget=64; // bounds the one-token path when chunking is off
     for(;index<prompt_count&&budget;--budget,index++){
-        const int status=colibri_v2_qwen_runtime_decode(runtime,prompt[index],&next_token);
+        const int status=flyweight_v2_qwen_runtime_decode(runtime,prompt[index],&next_token);
         if(status)return status;
         if(sampling&&sampling->active()&&index+1==prompt_count)
             next_token=qwen_sample_last_logits(*runtime,*sampling,next_token);
@@ -18813,9 +20017,9 @@ static int qwen_prefill_unit(ColibriV2QwenRuntime* runtime, const uint32_t* prom
 // bounded by cache capacity and wall time. A low-value prompt leaves the
 // previous pinned set untouched, which is important for short side requests.
 static void qwen_seed_prefill_experts(
-        ColibriV2QwenRuntime& runtime,
+        FlyweightV2QwenRuntime& runtime,
         std::uint64_t requested_generation_tokens) {
-    const char* setting=std::getenv("COLIBRI_PREFILL_CACHE_SEED");
+    const char* setting=std::getenv("FLYWEIGHT_PREFILL_CACHE_SEED");
     long requested=static_cast<long>(runtime.options.prefill_cache_seed);
     bool automatic=runtime.options.prefill_cache_seed_auto!=0;
     if(setting){
@@ -18828,7 +20032,7 @@ static void qwen_seed_prefill_experts(
         }
     }
     const auto expert_policy=qwen_expert_policy(
-        runtime,colibri::v2::ExpertExecutionPhase::prepare);
+        runtime,flyweight::v2::ExpertExecutionPhase::prepare);
     if(runtime.gemma4||
        !expert_policy.is_hybrid()||runtime.expert_slots.empty())return;
     // Auto placement warms the cache whether or not residency is frozen after
@@ -18847,11 +20051,11 @@ static void qwen_seed_prefill_experts(
     std::uint32_t max_history_frequency=0;
     for(const auto frequency:sequence.prompt_expert_history)
         max_history_frequency=std::max(max_history_frequency,frequency);
-    const bool useful_prompt=colibri::v2::expert_seed::has_useful_prompt(
+    const bool useful_prompt=flyweight::v2::expert_seed::has_useful_prompt(
         sequence.prompt_expert_observations,
         static_cast<std::uint32_t>(runtime.layers.size()),
         runtime.model->config.expert_used_count);
-    if(automatic&&!colibri::v2::expert_seed::should_seed(
+    if(automatic&&!flyweight::v2::expert_seed::should_seed(
             sequence.prompt_expert_observations,
             static_cast<std::uint32_t>(runtime.layers.size()),
             runtime.model->config.expert_used_count,
@@ -18866,7 +20070,7 @@ static void qwen_seed_prefill_experts(
         return;
     }
     const std::size_t per_layer=automatic
-        ? colibri::v2::expert_seed::auto_experts_per_layer(
+        ? flyweight::v2::expert_seed::auto_experts_per_layer(
             runtime.expert_slots.size(),cache_layers,
             requested_generation_tokens)
         : static_cast<std::size_t>(std::clamp<long>(requested,1,256));
@@ -18911,8 +20115,8 @@ static void qwen_seed_prefill_experts(
                 ? sequence.prompt_expert_history[right_index]:0;
             const auto& a=runtime.expert_history[left_index];
             const auto& b=runtime.expert_history[right_index];
-            const auto a_score=colibri::v2::expert_seed::score(left_prompt,left_history);
-            const auto b_score=colibri::v2::expert_seed::score(right_prompt,right_history);
+            const auto a_score=flyweight::v2::expert_seed::score(left_prompt,left_history);
+            const auto b_score=flyweight::v2::expert_seed::score(right_prompt,right_history);
             return a_score!=b_score?a_score>b_score:
                 (a.last_used!=b.last_used?a.last_used>b.last_used:left<right);
         });
@@ -18939,10 +20143,10 @@ static void qwen_seed_prefill_experts(
     std::uint64_t cursor=0;
     auto flush=[&](){
         for(const auto& upload:pending)
-            if(colibri_gpu_upload(upload.device,staging+upload.host_offset,
+            if(flyweight_gpu_upload(upload.device,staging+upload.host_offset,
                                   upload.bytes,runtime.stream)!=0)
                 throw std::runtime_error("native Qwen prefill cache seed upload failed");
-        if(!pending.empty()&&colibri_gpu_stream_sync(runtime.stream)!=0)
+        if(!pending.empty()&&flyweight_gpu_stream_sync(runtime.stream)!=0)
             throw std::runtime_error("native Qwen prefill cache seed synchronization failed");
         pending.clear();cursor=0;
     };
@@ -18952,7 +20156,7 @@ static void qwen_seed_prefill_experts(
         // of the selection list. The wall-clock bound this replaces made the
         // pinned set -- and therefore greedy output -- vary with upload speed.
         if(automatic&&
-           uploaded_bytes>=colibri::v2::expert_seed::kAutoMaxUploadBytes){
+           uploaded_bytes>=flyweight::v2::expert_seed::kAutoMaxUploadBytes){
             ++runtime.prefill_cache_seed_budget_stops;break;
         }
         const auto layer=selection.layer,expert=selection.expert;
@@ -19006,10 +20210,10 @@ static void qwen_seed_prefill_experts(
 // runs once per token, so allowing one layer to consume the entire byte budget
 // would make a poor first-token working set. The pages remain ordinary,
 // reclaimable OS cache; no second copy of the model is allocated.
-static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
+static void qwen_prefetch_cpu_experts(FlyweightV2QwenRuntime& runtime) {
     const bool automatic=runtime.options.cpu_prefetch_auto!=0;
     const auto expert_policy=qwen_expert_policy(
-        runtime,colibri::v2::ExpertExecutionPhase::decode);
+        runtime,flyweight::v2::ExpertExecutionPhase::decode);
     if(runtime.gemma4||
        !expert_policy.routed_cpu_execution_allowed()||
        (!runtime.options.cpu_prefetch_mib&&!automatic))return;
@@ -19150,7 +20354,7 @@ static void qwen_prefetch_cpu_experts(ColibriV2QwenRuntime& runtime) {
 
 // Save this prompt's end-of-prefill state so the next turn only prefills its
 // suffix, and re-enable expert-cache admission for decode.
-static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
+static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token,
         uint64_t requested_generation_tokens) {
     runtime->cache_admission_enabled=true;
@@ -19187,7 +20391,7 @@ static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
 // the target model's true hidden states. Keeping the recursive draft entries
 // makes the cache drift farther from training semantics after every round and
 // rapidly destroys acceptance.
-// COLIBRI_MTP_FOLD_CHECK=1: after a fold rebuilt the DeltaNet state, prove it
+// FLYWEIGHT_MTP_FOLD_CHECK=1: after a fold rebuilt the DeltaNet state, prove it
 // bit-identical to the full replay forward it replaced. Downloads the folded
 // conv/recurrent state, restores the snapshot a second time, runs the old
 // replay path, downloads again and compares every byte. Replay is idempotent
@@ -19207,7 +20411,7 @@ static void qwen_prompt_finish(ColibriV2QwenRuntime* runtime,
 // check for the CPU parity suite and for reading the printed max_diff -- a
 // large value still means a real bug, ulps mean the kernel-selection seam.
 static void qwen_mtp_fold_check(
-    ColibriV2QwenRuntime& runtime, const std::uint32_t* inputs,
+    FlyweightV2QwenRuntime& runtime, const std::uint32_t* inputs,
     std::uint32_t valid
 ) {
     struct Saved { std::vector<float> conv, recurrent; };
@@ -19222,12 +20426,12 @@ static void qwen_mtp_fold_check(
             Saved saved;
             saved.conv.resize(conv.shape[0]*conv.shape[1]);
             saved.recurrent.resize(a.shape[0]*norm.shape[0]*norm.shape[0]);
-            if(colibri_gpu_download(saved.conv.data(),runtime.state+layer.state_first,saved.conv.size()*sizeof(float),runtime.stream)!=0
-               ||colibri_gpu_download(saved.recurrent.data(),runtime.state+layer.state_second,saved.recurrent.size()*sizeof(float),runtime.stream)!=0)
+            if(flyweight_gpu_download(saved.conv.data(),runtime.state+layer.state_first,saved.conv.size()*sizeof(float),runtime.stream)!=0
+               ||flyweight_gpu_download(saved.recurrent.data(),runtime.state+layer.state_second,saved.recurrent.size()*sizeof(float),runtime.stream)!=0)
                 throw std::runtime_error("native MTP fold check download failed");
             stash.push_back(std::move(saved));
         }
-        if(colibri_gpu_stream_sync(runtime.stream)!=0)
+        if(flyweight_gpu_stream_sync(runtime.stream)!=0)
             throw std::runtime_error("native MTP fold check sync failed");
     };
     std::vector<Saved> folded;
@@ -19255,12 +20459,17 @@ static void qwen_mtp_fold_check(
 }
 
 static void qwen_mtp_commit_true_cache(
-    ColibriV2QwenRuntime& runtime, std::uint64_t base_cache_tokens,
+    FlyweightV2QwenRuntime& runtime, std::uint64_t base_cache_tokens,
     const std::uint32_t* inputs, std::uint32_t count,
     std::uint64_t verified_hidden
 ) {
     if (!count) return;
-    const int hidden = static_cast<int>(runtime.model->config.hidden_size);
+    // The hand-over width, not the model's hidden width: on qwen4exp every one
+    // of these vectors is a hyper-connection stream row (hc_count*hidden).
+    const int hidden = runtime.qwen4exp
+        ? static_cast<int>(runtime.model->config.hyper_connection_count
+                           * runtime.model->config.hidden_size)
+        : static_cast<int>(runtime.model->config.hidden_size);
     const int hidden_elements = static_cast<int>(count) * hidden;
     const auto stable_hidden =
         runtime.state + runtime.mtp_verified_hidden_offset;
@@ -19268,7 +20477,7 @@ static void qwen_mtp_commit_true_cache(
         &verified_hidden, const_cast<std::uint64_t*>(&stable_hidden),
         const_cast<int*>(&hidden_elements),
     };
-    if (colibri_gpu_launch_named(
+    if (flyweight_gpu_launch_named(
             "qwen_copy_vector", (hidden_elements + 255) / 256, 1, 256, 0,
             runtime.stream, batch_copy_args) != 0) {
         throw std::runtime_error("native MTP verified-hidden snapshot failed");
@@ -19280,7 +20489,9 @@ static void qwen_mtp_commit_true_cache(
     runtime.mtp_cache_tokens = base_cache_tokens + 1;
     const auto initial_hidden =
         runtime.state + runtime.mtp_target_hidden_offset;
-    if(count==3){
+    // The batch2 shortcut is the qwen-shaped fusion; qwen4exp takes the plain
+    // per-pair path instead (correct, one extra launch set at count==3).
+    if(count==3&&!runtime.qwen4exp){
         qwen_mtp_append_pair_batch2(
             runtime,inputs+1,stable_hidden,
             stable_hidden+static_cast<std::uint64_t>(hidden)*sizeof(float));
@@ -19297,10 +20508,10 @@ static void qwen_mtp_commit_true_cache(
     void* final_copy_args[] = {
         &final_source, &final_target, const_cast<int*>(&hidden),
     };
-    if (colibri_gpu_launch_named(
+    if (flyweight_gpu_launch_named(
             "qwen_copy_vector", (hidden + 255) / 256, 1, 256, 0,
             runtime.stream, final_copy_args) != 0 ||
-        colibri_gpu_stream_sync(runtime.stream) != 0) {
+        flyweight_gpu_stream_sync(runtime.stream) != 0) {
         throw std::runtime_error("native MTP true-cache commit failed");
     }
 }
@@ -19312,7 +20523,7 @@ static void qwen_mtp_commit_true_cache(
 // always at least one, because the verifier's own token is committed even when
 // every draft is rejected. The returned tokens are target outputs, so drafting
 // quality only moves the acceptance rate, never the text.
-static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out){
+static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out){
     if(wanted>8)wanted=8;
     if(!wanted)wanted=1;
     // The draft block's KV cache is sized for the context limit and, unlike the
@@ -19326,7 +20537,9 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
     std::uint64_t draft_hidden=runtime.state+runtime.mtp_target_hidden_offset;
     const auto draft_started=std::chrono::steady_clock::now();
     for(uint32_t index=0;index<wanted;++index){
-        drafts[index]=qwen_mtp_draft(runtime,draft_input,draft_hidden);
+        drafts[index]=runtime.qwen4exp
+            ?qwen4exp_mtp_draft(runtime,draft_input,draft_hidden)
+            :qwen_mtp_draft(runtime,draft_input,draft_hidden);
         draft_input=drafts[index];
         draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;
     }
@@ -19336,12 +20549,22 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
     for(uint32_t index=1;index<wanted;++index)inputs[index]=drafts[index-1];
     // Arm the fold: the verify pass records each DeltaNet layer's transition
     // inputs in its retention arena so a rejection can rebuild the state
-    // without re-running the forward. COLIBRI_MTP_FOLD=0 restores the full
+    // without re-running the forward. FLYWEIGHT_MTP_FOLD=0 restores the full
     // replay path.
-    const char*fold_env=std::getenv("COLIBRI_MTP_FOLD");
+    const char*fold_env=std::getenv("FLYWEIGHT_MTP_FOLD");
     const bool fold_enabled=!(fold_env&&fold_env[0]=='0');
-    runtime.mtp_fold_capture=fold_enabled&&runtime.mtp_delta_layers;
-    runtime.mtp_fold_valid=fold_enabled;
+    // The fold rebuilds DeltaNet state and nothing else. qwen4exp's PLE layer
+    // carries a SECOND recurrent ring -- the dilated conv -- and the fold has
+    // no retention for its inputs, so a rejection would restore that ring to
+    // the pre-round state and never replay the accepted token into it. The
+    // ring then runs one token behind per round, which does not show up as an
+    // immediate wrong token: the conv taps at 0, dilation, 2*dilation back, so
+    // the drift only reaches the output a few steps later (measured: token 3
+    // on a dilation-3 fixture). A checkpoint with a PLE layer therefore takes
+    // the full-replay rollback until the ring joins the retention arena.
+    const bool ple_blocks_fold=!runtime.model->config.ple_layers.empty();
+    runtime.mtp_fold_capture=fold_enabled&&runtime.mtp_delta_layers&&!ple_blocks_fold;
+    runtime.mtp_fold_valid=fold_enabled&&!ple_blocks_fold;
     runtime.mtp_fold_rows=wanted;
     qwen_snapshot_delta_state(runtime,false);
     const auto batch_started=std::chrono::steady_clock::now();
@@ -19362,7 +20585,7 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
         const auto rollback_started=std::chrono::steady_clock::now();
         qwen_snapshot_delta_state(runtime,true);
         qwen_mtp_fold_delta_state(runtime,static_cast<int>(valid));
-        if(std::getenv("COLIBRI_MTP_FOLD_CHECK"))
+        if(std::getenv("FLYWEIGHT_MTP_FOLD_CHECK"))
             qwen_mtp_fold_check(runtime,inputs.data(),valid);
         qwen_mtp_commit_true_cache(
             runtime,base_cache_tokens,inputs.data(),valid,batch_hidden);
@@ -19380,12 +20603,12 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
         const auto rollback_started=std::chrono::steady_clock::now();
         const auto batch_rejected_token=verified[valid-1];
         std::vector<float>batch_trace;
-        const bool trace=std::getenv("COLIBRI_MTP_TRACE")!=nullptr;
+        const bool trace=std::getenv("FLYWEIGHT_MTP_TRACE")!=nullptr;
         const int trace_hidden=static_cast<int>(runtime.model->config.hidden_size);
         if(trace){
             batch_trace.resize(trace_hidden);
             const auto trace_source=batch_hidden+static_cast<std::uint64_t>(valid-1)*trace_hidden*sizeof(float);
-            if(colibri_gpu_download(batch_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP trace download failed");
+            if(flyweight_gpu_download(batch_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP trace download failed");
         }
         qwen_snapshot_delta_state(runtime,true);
         std::uint64_t replay_hidden=0;
@@ -19402,7 +20625,7 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
         if(trace){
             std::vector<float>replay_trace(trace_hidden);
             const auto trace_source=runtime.state+runtime.mtp_target_hidden_offset;
-            if(colibri_gpu_download(replay_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||colibri_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP replay trace download failed");
+            if(flyweight_gpu_download(replay_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP replay trace download failed");
             float maximum=0.0f;
             for(int index=0;index<trace_hidden;++index)maximum=std::max(maximum,std::fabs(batch_trace[index]-replay_trace[index]));
             std::fprintf(stderr,"mtp reject position=%llu row=%u draft=%u batch=%u replay=%u hidden_max_diff=%g\n",static_cast<unsigned long long>(runtime.position-valid),valid-1,drafts[valid-1],batch_rejected_token,verified[valid-1],maximum);
@@ -19428,7 +20651,7 @@ static uint32_t qwen_mtp_round(ColibriV2QwenRuntime&runtime,uint32_t next_token,
 }
 
 static bool qwen_mtp_adaptive_enabled(){
-    const char*setting=std::getenv("COLIBRI_MTP_ADAPTIVE");
+    const char*setting=std::getenv("FLYWEIGHT_MTP_ADAPTIVE");
     return !setting||setting[0]!='0';
 }
 
@@ -19442,7 +20665,7 @@ static constexpr std::uint32_t kQwenMtpTrialRounds=4;
 static constexpr std::uint32_t kQwenMtpWarmupTokens=8;
 static constexpr std::uint64_t kQwenMtpKeepPercent=80;
 
-static bool qwen_mtp_should_draft(const ColibriV2QwenRuntime&runtime){
+static bool qwen_mtp_should_draft(const FlyweightV2QwenRuntime&runtime){
     if(!qwen_mtp_adaptive_enabled())return runtime.options.mtp_drafts!=0;
     if(runtime.options.mtp_drafts<2||runtime.mtp_adaptive_disabled)return false;
     if(runtime.mtp_calibration_done)return true;
@@ -19460,10 +20683,10 @@ static bool qwen_mtp_should_draft(const ColibriV2QwenRuntime&runtime){
     return need_rounds;
 }
 
-static void qwen_mtp_finish_calibration(ColibriV2QwenRuntime&runtime);
+static void qwen_mtp_finish_calibration(FlyweightV2QwenRuntime&runtime);
 
 static void qwen_mtp_record_decode(
-    ColibriV2QwenRuntime&runtime,std::uint64_t nanoseconds
+    FlyweightV2QwenRuntime&runtime,std::uint64_t nanoseconds
 ){
     if(!qwen_mtp_adaptive_enabled()||runtime.mtp_adaptive_disabled||
        runtime.mtp_calibration_done)return;
@@ -19483,7 +20706,7 @@ static void qwen_mtp_record_decode(
 // call completes the pair: the sequential arm can be the last to fill, and
 // deciding only inside record_round left should_draft returning false forever
 // with the verdict never reached -- MTP off by accident rather than by verdict.
-static void qwen_mtp_finish_calibration(ColibriV2QwenRuntime&runtime){
+static void qwen_mtp_finish_calibration(FlyweightV2QwenRuntime&runtime){
     if(runtime.mtp_calibration_done||
        runtime.mtp_calibration_rounds<kQwenMtpTrialRounds||
        runtime.mtp_calibration_decode_tokens<kQwenMtpBaselineTokens||
@@ -19507,7 +20730,7 @@ static void qwen_mtp_finish_calibration(ColibriV2QwenRuntime&runtime){
     // completely silent.
     if(!runtime.mtp_adaptive_reported){
         std::fprintf(stderr,
-            "[colibri-v2] MTP calibration: %llu us/token speculative vs "
+            "[flyweight] MTP calibration: %llu us/token speculative vs "
             "%llu us/token ordinary decode -- %s\n",
             static_cast<unsigned long long>(mtp_per_token/1000),
             static_cast<unsigned long long>(baseline_per_token/1000),
@@ -19517,7 +20740,7 @@ static void qwen_mtp_finish_calibration(ColibriV2QwenRuntime&runtime){
 }
 
 static void qwen_mtp_record_round(
-    ColibriV2QwenRuntime&runtime,std::uint64_t nanoseconds,
+    FlyweightV2QwenRuntime&runtime,std::uint64_t nanoseconds,
     std::uint32_t committed
 ){
     if(!qwen_mtp_adaptive_enabled()||runtime.mtp_adaptive_disabled||
@@ -19529,7 +20752,7 @@ static void qwen_mtp_record_round(
     qwen_mtp_finish_calibration(runtime);
 }
 
-int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,ColibriV2TokenCallback callback,void*user){return guarded([&]{
+int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,FlyweightV2TokenCallback callback,void*user){return guarded([&]{
     if(!runtime||!prompt||!prompt_count||!max_tokens||!callback)throw std::runtime_error("invalid native Qwen generation arguments");
     if(prompt_count>runtime->options.context_limit||
        max_tokens>runtime->options.context_limit-prompt_count)
@@ -19537,8 +20760,11 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
     if(!runtime->engine_tasks.empty()||!runtime->engine_pending.empty())throw std::runtime_error("the cooperative engine is active; blocking generate is unavailable");
     qwen_unfreeze_expert_residency(*runtime);
     QwenExpertHistorySaveGuard history_save{*runtime};
+    QwenKvOccupancyGuard kv_occupancy{*runtime};
     // Pick the decode slot for this prompt before any reuse/diagnostics run.
-    qwen_route_sequence(*runtime, prompt, prompt_count);
+    // Slots may differ in size, so the router is told what the whole request
+    // will occupy, not just the prompt.
+    qwen_route_sequence(*runtime, prompt, prompt_count, prompt_count + max_tokens);
     QwenPromptPlan plan;
     int status=qwen_prompt_begin(runtime,prompt,prompt_count,plan);if(status)return status;
     uint64_t index=plan.prompt_start;
@@ -19557,7 +20783,7 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
         while(emitted<max_tokens&&!runtime->cancelled){
             if(!qwen_mtp_should_draft(*runtime)){
                 const auto decode_started=std::chrono::steady_clock::now();
-                status=colibri_v2_qwen_runtime_decode(
+                status=flyweight_v2_qwen_runtime_decode(
                     runtime,next_token,&next_token);
                 if(status)return status;
                 qwen_mtp_record_decode(
@@ -19589,12 +20815,12 @@ int colibri_v2_qwen_runtime_generate(ColibriV2QwenRuntime*runtime,const uint32_t
     }
     for(uint64_t index=0;index<max_tokens&&!runtime->cancelled;index++){
         if(callback(next_token,user)!=0)break;
-        if(index+1<max_tokens){status=colibri_v2_qwen_runtime_decode(runtime,next_token,&next_token);if(status)return status;}
+        if(index+1<max_tokens){status=flyweight_v2_qwen_runtime_decode(runtime,next_token,&next_token);if(status)return status;}
     }
     return 0;
 });}
 
-static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
+static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
         const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,
         const uint32_t*stop_tokens,uint64_t stop_count,float temperature,
         uint32_t top_k,float top_p,float repetition_penalty,
@@ -19640,13 +20866,13 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
     // emits, this restores the previous behaviour without a rebuild, and the
     // tolerant parser in the server catches what it used to catch.
     static const bool grammar_enabled=[]{
-        const char*setting=std::getenv("COLIBRI_TOOL_GRAMMAR");
+        const char*setting=std::getenv("FLYWEIGHT_TOOL_GRAMMAR");
         return !setting||setting[0]!='0';
     }();
     // The same hatch for the response constraint, separately: one can be
     // switched off without giving up the other.
     static const bool response_grammar_enabled=[]{
-        const char*setting=std::getenv("COLIBRI_RESPONSE_GRAMMAR");
+        const char*setting=std::getenv("FLYWEIGHT_RESPONSE_GRAMMAR");
         return !setting||setting[0]!='0';
     }();
     // A specification the caller could not parse is worth failing on: silently
@@ -19654,17 +20880,17 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
     if(tool_specification&&*tool_specification){
         try{
             const auto constraints=
-                colibri::v2::tools::parse_constraints(tool_specification);
+                flyweight::v2::tools::parse_constraints(tool_specification);
             if(grammar_enabled&&!constraints.tools.empty())
                 task.sampling.grammar=
-                    colibri::v2::tools::Grammar(constraints.tools);
-            // Same escape hatch as the grammar: COLIBRI_TOOL_GRAMMAR=0
+                    flyweight::v2::tools::Grammar(constraints.tools);
+            // Same escape hatch as the grammar: FLYWEIGHT_TOOL_GRAMMAR=0
             // restores the previous (unconstrained) behaviour for both.
             if(grammar_enabled&&constraints.tool_calls_forbidden)
                 task.sampling.markup_ban.enable();
             if(response_grammar_enabled&&constraints.response_enabled)
                 task.sampling.response_grammar=
-                    colibri::v2::tools::ResponseGrammar(
+                    flyweight::v2::tools::ResponseGrammar(
                         constraints.response_shape,constraints.thinking_open);
         }catch(const std::exception&error){
             throw std::runtime_error(
@@ -19686,13 +20912,13 @@ static void qwen_task_submit_impl(ColibriV2QwenRuntime*runtime,
     runtime->engine_pending.push_back(std::move(task));
 }
 
-int colibri_v2_qwen_task_submit(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,uint64_t*task_id){return guarded([&]{
+int flyweight_v2_qwen_task_submit(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
         stop_count,0.0f,20,0.95f,1.0f,0.0f,0.0f,64,0,false,task_id);
     return 0;
 });}
 
-int colibri_v2_qwen_task_submit_penalties(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
+int flyweight_v2_qwen_task_submit_penalties(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
         stop_count,temperature,top_k,top_p,repetition_penalty,presence_penalty,
         frequency_penalty,penalty_window,seed,has_seed!=0,task_id);
@@ -19702,7 +20928,7 @@ int colibri_v2_qwen_task_submit_penalties(ColibriV2QwenRuntime*runtime,const uin
 // The penalties entry point plus the tool specification the sampler constrains
 // tool calls to. Null or empty leaves the sampler unconstrained, which is what
 // every request without tools wants.
-int colibri_v2_qwen_task_submit_grammar(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,const char*tool_specification,uint64_t*task_id){return guarded([&]{
+int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,const char*tool_specification,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
         stop_count,temperature,top_k,top_p,repetition_penalty,presence_penalty,
         frequency_penalty,penalty_window,seed,has_seed!=0,task_id,
@@ -19710,14 +20936,14 @@ int colibri_v2_qwen_task_submit_grammar(ColibriV2QwenRuntime*runtime,const uint3
     return 0;
 });}
 
-int colibri_v2_qwen_task_submit_sampling(ColibriV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
+int flyweight_v2_qwen_task_submit_sampling(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
         stop_count,temperature,top_k,top_p,1.0f,0.0f,0.0f,64,
         seed,has_seed!=0,task_id);
     return 0;
 });}
 
-int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime*runtime,uint64_t task_id){return guarded([&]{
+int flyweight_v2_qwen_task_cancel(FlyweightV2QwenRuntime*runtime,uint64_t task_id){return guarded([&]{
     if(!runtime||!task_id)throw std::runtime_error("invalid native Qwen task handle");
     std::lock_guard<std::mutex> lock(runtime->engine_mutex);
     runtime->engine_cancel_requests.push_back(task_id);
@@ -19727,7 +20953,7 @@ int colibri_v2_qwen_task_cancel(ColibriV2QwenRuntime*runtime,uint64_t task_id){r
 // Move the active slot's mirrored bookkeeping (position/last_output/processed
 // tokens) back into sequences[active] (park) or out again (unpark), so code can
 // address every slot uniformly through sequences[] without switching.
-static void qwen_park_active(ColibriV2QwenRuntime& rt, bool park) {
+static void qwen_park_active(FlyweightV2QwenRuntime& rt, bool park) {
     QwenSequence& a = rt.sequences[rt.active_sequence];
     if (park) {
         a.position = rt.position;
@@ -19753,12 +20979,12 @@ static void qwen_park_active(ColibriV2QwenRuntime& rt, bool park) {
 // expert-paging staging area is fenced with staging_event against its async
 // stream-queued consumers. Requires the caller to have parked the active
 // mirror; requires a decode policy with CPU expert execution and no MTP.
-static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
+static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
         const std::size_t* slots, const std::uint32_t* inputs, std::uint32_t* outputs) {
     qwen_absorb_registration(*runtime);
     const auto decode_started = std::chrono::steady_clock::now();
     const auto expert_policy=qwen_expert_policy(
-        *runtime,colibri::v2::ExpertExecutionPhase::decode);
+        *runtime,flyweight::v2::ExpertExecutionPhase::decode);
     const int hidden_size = static_cast<int>(runtime->model->config.hidden_size);
     const int experts = static_cast<int>(runtime->model->config.expert_count);
     const int configured_top_k = static_cast<int>(runtime->model->config.expert_used_count);
@@ -19831,12 +21057,12 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         s.winner_host = reinterpret_cast<std::uint64_t*>(
             block+host_layout.winner.offset);
     }
-    auto launch_named = [&](const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t bx, void** args, std::uint32_t shared = 0) { if (colibri_gpu_launch_named(name, gx, gy, bx, shared, runtime->stream, args) != 0) throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ") + name); };
+    auto launch_named = [&](const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t bx, void** args, std::uint32_t shared = 0) { if (flyweight_gpu_launch_named(name, gx, gy, bx, shared, runtime->stream, args) != 0) throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ") + name); };
     std::uint64_t q8_cached_input = 0, q8_cached_normalized = 0;
     auto rms = [&](std::uint64_t input, std::uint64_t weights, std::uint64_t output) { int one_centered = 0; q8_cached_input = 0; void* args[] = {&input, &weights, &output, const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon), &one_centered}; launch_named("rms_norm", 1, 1, 1024, args); };
-    auto q8 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { if (colibri_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) != 0) throw std::runtime_error("native Qwen Q8 projection failed"); };
+    auto q8 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { if (flyweight_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) != 0) throw std::runtime_error("native Qwen Q8 projection failed"); };
     auto f32 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { void* args[] = {&matrix, &input, &output, &in_size, &out_size}; launch_named("qwen_f32_matvec_warp", (out_size + 7) / 8, 1, 256, args); };
-    const char* iq2_q8_setting = std::getenv("COLIBRI_IQ2_Q8_DECODE");
+    const char* iq2_q8_setting = std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
     const bool iq2_q8_enabled =
         !iq2_q8_setting || iq2_q8_setting[0] != '0';
     std::uint64_t active_dense_q8 = 0, active_dense_q8_scales = 0;
@@ -19866,7 +21092,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         if (type == 0) { void* args[] = {&matrix, &input, &output, &in_size, &out_size}; launch_named("qwen_f32_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
         // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
         if (type == 30) { void* args[] = {&matrix, &input, &output, &out_size, &in_size}; launch_named("bf16_matvec_warp", (out_size + 7) / 8, 1, 256, args); return; }
-        const auto* format = colibri::v2::qwen_format(type);
+        const auto* format = flyweight::v2::qwen_format(type);
         if (format && format->matvec_q8_warp &&
             q8_decode(format->matvec_q8_warp, matrix, input, output, in_size, out_size)) return;
         const int status = qwen_matvec_driver(
@@ -19986,10 +21212,10 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     runtime->sequences[s.slot].processed_tokens, s.ple_embed);
         }
     }
-    static const bool env_nvfp4_persistent_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_tc_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
-    static const bool env_nvfp4_tc_trace_b=std::getenv("COLIBRI_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
-    static const bool env_nvfp4_tiled_b=[]{const char*s=std::getenv("COLIBRI_NVFP4_TILED");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_persistent_b=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc_b=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_DECODE_TENSOR_CORES");return s&&s[0]=='1';}();
+    static const bool env_nvfp4_tc_trace_b=std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
+    static const bool env_nvfp4_tiled_b=[]{const char*s=std::getenv("FLYWEIGHT_NVFP4_TILED");return s&&s[0]=='1';}();
     for (std::uint32_t layer_number = 0; layer_number < runtime->layers.size(); ++layer_number) {
         auto& layer = runtime->layers[layer_number];
         auto tensor = [&](std::size_t role) { return runtime->device_tensors[layer.static_tensors.at(role)]; };
@@ -20036,7 +21262,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 // driver that picked differently would let a batched token
                 // diverge from the identical solo decode.
                 static const bool multi_delta_serial =
-                    std::getenv("COLIBRI_DELTA_SERIAL") != nullptr;
+                    std::getenv("FLYWEIGHT_DELTA_SERIAL") != nullptr;
                 int recurrent_slices = head_dim > 0 ? 1024 / head_dim : 0;
                 if (recurrent_slices > 4) recurrent_slices = 4;
                 if (recurrent_slices >= 1 && !multi_delta_serial) {
@@ -20138,7 +21364,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                         tokens,capacity,first_slot,scale)||
                     (qwen_cublas_attention_eligible(
                         *runtime,tokens,first_slot,capacity)&&
-                    colibri_gpu_attention_f16_cublas(
+                    flyweight_gpu_attention_f16_cublas(
                         queries,s.first,cache_keys,cache_values,
                         s.attention_scores,attended,runtime->stream,
                         heads,kv_heads,head_dim,tokens,capacity,first_slot,
@@ -20193,12 +21419,12 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     // dense_host owns exactly two hidden-sized DMA endpoints;
                     // qwen_cpu_dense_ffn keeps its activation in dense_scratch.
                     float* host_output = host_input + hidden_size;
-                    if (colibri_gpu_download(host_input, s.normalized, hidden_size * sizeof(float), runtime->stream) != 0 ||
-                        colibri_gpu_stream_sync(runtime->stream) != 0) throw std::runtime_error("native dense host FFN input transfer failed");
+                    if (flyweight_gpu_download(host_input, s.normalized, hidden_size * sizeof(float), runtime->stream) != 0 ||
+                        flyweight_gpu_stream_sync(runtime->stream) != 0) throw std::runtime_error("native dense host FFN input transfer failed");
                     const auto host_started = std::chrono::steady_clock::now();
                     qwen_cpu_dense_ffn(*runtime, layer, host_input, host_output);
                     runtime->dense_host_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - host_started).count();
-                    if (colibri_gpu_upload(s.third, host_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native dense host FFN output transfer failed");
+                    if (flyweight_gpu_upload(s.third, host_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native dense host FFN output transfer failed");
                 } else {
                 const auto up_half = s.first + static_cast<std::uint64_t>(dense_intermediate) * sizeof(float);
                 dense(moe_base + 1, s.normalized, s.first, hidden_size, dense_intermediate);
@@ -20210,11 +21436,11 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 }
             } else {
             dense(moe_base + 1, s.normalized, s.router_logits, hidden_size, experts);
-            if (colibri_gpu_route_topk(s.router_logits, s.selected_device, s.route_weights, experts, top_k, runtime->stream) != 0) throw std::runtime_error("native Qwen routing failed");
-            if (colibri_gpu_download(s.selected_host, s.selected_device, top_k * sizeof(std::int32_t), runtime->stream) != 0 ||
-                colibri_gpu_download(s.cpu_weights, s.route_weights, top_k * sizeof(float), runtime->stream) != 0 ||
-                colibri_gpu_download(s.cpu_input, s.normalized, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native Qwen route transfer failed");
-            if (colibri_gpu_event_record(runtime->slot_events[s.slot], runtime->stream) != 0) throw std::runtime_error("native Qwen route event failed");
+            if (flyweight_gpu_route_topk(s.router_logits, s.selected_device, s.route_weights, experts, top_k, runtime->stream) != 0) throw std::runtime_error("native Qwen routing failed");
+            if (flyweight_gpu_download(s.selected_host, s.selected_device, top_k * sizeof(std::int32_t), runtime->stream) != 0 ||
+                flyweight_gpu_download(s.cpu_weights, s.route_weights, top_k * sizeof(float), runtime->stream) != 0 ||
+                flyweight_gpu_download(s.cpu_input, s.normalized, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native Qwen route transfer failed");
+            if (flyweight_gpu_event_record(runtime->slot_events[s.slot], runtime->stream) != 0) throw std::runtime_error("native Qwen route event failed");
             auto shared_gate_matrix = tensor(moe_base + 2), shared_up_matrix = tensor(moe_base + 3);
             // The device type, not the stored one, exactly as single decode
             // dispatches: bf16 shared experts are requantized to Q8_0 on
@@ -20265,8 +21491,8 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         // is in flight changes this one's greedy output. That is the ornith
         // failure class, so determinism is the default and the fused path is
         // explicit opt-in until a measured decision promotes it.
-        static const char*batch_cpu_moe=std::getenv("COLIBRI_BATCHED_CPU_MOE");
-        const bool batch_cpu_supported=(colibri_cpu_features()&2u)!=0;
+        static const char*batch_cpu_moe=std::getenv("FLYWEIGHT_BATCHED_CPU_MOE");
+        const bool batch_cpu_supported=(flyweight_cpu_features()&2u)!=0;
         if(expert_policy.is_cpu()&&n==2&&batch_cpu_supported&&
            batch_cpu_moe&&batch_cpu_moe[0]=='1'){
             const auto expert_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
@@ -20278,7 +21504,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             for(std::size_t index=0;index<n;++index){
                 auto&s=seqs[index];
                 const auto wait_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-                if(colibri_gpu_event_sync(runtime->slot_events[s.slot])!=0)
+                if(flyweight_gpu_event_sync(runtime->slot_events[s.slot])!=0)
                     throw std::runtime_error("native Qwen route event failed");
                 if(timing_enabled())runtime->route_wait_nanoseconds+=
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -20316,7 +21542,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
             const auto compute_started=timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             qwen_cpu_moe_rows(*runtime,layer,batch_selected.data(),batch_weights.data(),static_cast<int>(n),top_k,batch_inputs.data(),batch_activated.data(),batch_down.data(),batch_outputs.data());
             if(timing_enabled())runtime->expert_compute_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_started).count();
-            for(std::size_t index=0;index<n;++index){auto&s=seqs[index];if(colibri_gpu_upload(s.fourth,batch_outputs.data()+index*hidden_size,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");add(s.third,s.fourth);if(runtime->qwen4exp)hc_post_multi(s,s.third);else add(s.residual,s.third);std::swap(s.hidden,s.residual);}
+            for(std::size_t index=0;index<n;++index){auto&s=seqs[index];if(flyweight_gpu_upload(s.fourth,batch_outputs.data()+index*hidden_size,hidden_size*sizeof(float),runtime->stream)!=0)throw std::runtime_error("native CPU MoE output upload failed");add(s.third,s.fourth);if(runtime->qwen4exp)hc_post_multi(s,s.third);else add(s.residual,s.third);std::swap(s.hidden,s.residual);}
             if(timing_enabled())runtime->expert_page_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-expert_started).count();
             continue;
         }
@@ -20324,7 +21550,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
         // the GPU is still executing the queued pass-A work of the later ones.
         for (auto& s : seqs) {
             const auto route_wait_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-            if (colibri_gpu_event_sync(runtime->slot_events[s.slot]) != 0) throw std::runtime_error("native Qwen route event failed");
+            if (flyweight_gpu_event_sync(runtime->slot_events[s.slot]) != 0) throw std::runtime_error("native Qwen route event failed");
             if(timing_enabled())runtime->route_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - route_wait_started).count();
             int route_count = top_k;
             if (runtime->options.expert_top_k > 0 || (runtime->options.expert_top_p > 0.0f && runtime->options.expert_top_p < 1.0f))
@@ -20340,13 +21566,13 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 const auto compute_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                 qwen_cpu_moe(*runtime, layer, s.selected_host, s.cpu_weights, route_count, s.cpu_input, s.cpu_activated, s.cpu_output);
                 if(timing_enabled())runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
-                if (colibri_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native CPU MoE output upload failed");
+                if (flyweight_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native CPU MoE output upload failed");
                 add(s.third, s.fourth);
             } else {
                 if (runtime->expert_slots.empty()) throw std::runtime_error("native hybrid MoE requires an expert cache budget");
                 // The shared paging area's previous contents may still be
                 // consumed by stream-queued uploads; fence before rewriting.
-                if (colibri_gpu_event_sync(runtime->staging_event) != 0) throw std::runtime_error("native Qwen staging event failed");
+                if (flyweight_gpu_event_sync(runtime->staging_event) != 0) throw std::runtime_error("native Qwen staging event failed");
                 auto* pag = staging + shared_base;
                 std::array<std::int32_t, 256> cpu_selected{};
                 std::array<float, 256> cpu_compact_weights{}, gpu_compact_weights{};
@@ -20401,13 +21627,13 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     const auto slot_base = runtime->expert_cache + slot_index * runtime->expert_slot_bytes;
                     if (layer.expert_dma) {
                         std::uint64_t role_offset = 0;
-                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (colibri_gpu_upload(slot_base + role_offset, tensor_data(*runtime->model,t) + offset, bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE DMA cache upload failed"); role_offset += bytes; }
+                        for (int role = 0; role < 3; ++role) { const auto& t = runtime->model->tensors[layer.expert_tensors[role]]; const auto bytes = t.size / experts; const auto offset = static_cast<std::uint64_t>(expert) * bytes; if (flyweight_gpu_upload(slot_base + role_offset, tensor_data(*runtime->model,t) + offset, bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE DMA cache upload failed"); role_offset += bytes; }
                         if(runtime->expert_native_cache){
                             const auto gate_bytes=runtime->model->tensors[
                                 layer.expert_tensors[0]].size/experts;
                             const auto up_bytes=runtime->model->tensors[
                                 layer.expert_tensors[1]].size/experts;
-                            const int status=colibri_gpu_nvfp4_prepare_expert(
+                            const int status=flyweight_gpu_nvfp4_prepare_expert(
                                 slot_base,slot_base+gate_bytes,
                                 slot_base+gate_bytes+up_bytes,
                                 runtime->expert_native_cache+
@@ -20436,7 +21662,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t) + gpu_count * sizeof(float), gpu_gate_scales.data(), gpu_count * sizeof(float));
                     std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t) + 2 * gpu_count * sizeof(float), gpu_up_scales.data(), gpu_count * sizeof(float));
                     std::memcpy(pag + table_host + 3 * gpu_count * sizeof(std::uint64_t) + 3 * gpu_count * sizeof(float), gpu_down_scales.data(), gpu_count * sizeof(float));
-                    if (colibri_gpu_upload(table_device, pag + table_host, table_bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE table upload failed");
+                    if (flyweight_gpu_upload(table_device, pag + table_host, table_bytes, runtime->stream) != 0) throw std::runtime_error("native hybrid MoE table upload failed");
                     const auto gate_table = table_device, up_table = gate_table + gpu_count * sizeof(std::uint64_t), down_table = up_table + gpu_count * sizeof(std::uint64_t), weight_table = down_table + gpu_count * sizeof(std::uint64_t);
                     const auto gate_scale_table = weight_table + gpu_count * sizeof(float), up_scale_table = gate_scale_table + gpu_count * sizeof(float), down_scale_table = up_scale_table + gpu_count * sizeof(float);
                     const auto gate_type = runtime->model->tensors[layer.expert_tensors[0]].type;
@@ -20462,7 +21688,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                     if (persistent_enabled && gate_type == 40 &&
                         down_type == 40) {
                         const int tc_status =
-                            colibri_gpu_nvfp4_moe_persistent(
+                            flyweight_gpu_nvfp4_moe_persistent(
                                 native_pointers.data(),weight_table,gate_scale_table,
                                 up_scale_table,down_scale_table,s.normalized,
                                 s.activated,s.third,runtime->stream,
@@ -20483,7 +21709,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                         }
                     }
                     if (!tc_done && tc_enabled && gate_type == 40 && down_type == 40) {
-                        const int tc_status = colibri_gpu_nvfp4_moe_cublas(
+                        const int tc_status = flyweight_gpu_nvfp4_moe_cublas(
                             gate_table, up_table, down_table, s.normalized,
                             s.activated, s.third, weight_table, gate_scale_table,
                             up_scale_table, down_scale_table, runtime->stream, hidden_size,
@@ -20509,7 +21735,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                 }
                 for (int index = 0; index < pending_count; ++index) {
                     const auto& upload=pending[index];
-                    if (colibri_gpu_upload(
+                    if (flyweight_gpu_upload(
                             upload.device,pag+upload.host_offset,upload.bytes,
                             runtime->stream)!=0)
                         throw std::runtime_error(
@@ -20519,7 +21745,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                             layer.expert_tensors[0]].size/experts;
                         const auto up_bytes=runtime->model->tensors[
                             layer.expert_tensors[1]].size/experts;
-                        const int status=colibri_gpu_nvfp4_prepare_expert(
+                        const int status=flyweight_gpu_nvfp4_prepare_expert(
                             upload.device,upload.device+gate_bytes,
                             upload.device+gate_bytes+up_bytes,
                             runtime->expert_native_cache+
@@ -20531,12 +21757,12 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                             upload.slot_index].native_valid=true;
                     }
                 }
-                if (colibri_gpu_event_record(runtime->staging_event, runtime->stream) != 0) throw std::runtime_error("native Qwen staging event failed");
+                if (flyweight_gpu_event_record(runtime->staging_event, runtime->stream) != 0) throw std::runtime_error("native Qwen staging event failed");
                 if (cpu_count) {
                     const auto compute_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
                     qwen_cpu_moe(*runtime, layer, cpu_selected.data(), cpu_compact_weights.data(), cpu_count, s.cpu_input, s.cpu_activated, s.cpu_output);
                     if(timing_enabled())runtime->expert_compute_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compute_started).count();
-                    if (colibri_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native hybrid MoE output upload failed");
+                    if (flyweight_gpu_upload(s.fourth, s.cpu_output, hidden_size * sizeof(float), runtime->stream) != 0) throw std::runtime_error("native hybrid MoE output upload failed");
                     add(s.third, s.fourth);
                 }
             }
@@ -20553,14 +21779,14 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
                          std::numeric_limits<std::uint64_t>::max());
         else rms(s.hidden, runtime->device_tensors[runtime->final_norm], s.normalized);
         int vocabulary = static_cast<int>(runtime->model->config.vocabulary_size);
-        if (colibri_gpu_memset(s.argmax_device, 0, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen argmax reset failed");
+        if (flyweight_gpu_memset(s.argmax_device, 0, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen argmax reset failed");
         auto lm_head = runtime->device_tensors[runtime->lm_head];
         void* argmax_args[] = {&lm_head, const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.argmax_device), const_cast<int*>(&hidden_size), &vocabulary};
         launch_named(qwen_lm_head_argmax_kernel(runtime->lm_head_type), (vocabulary + 7) / 8, 1, 256, argmax_args);
-        if (colibri_gpu_download(s.winner_host, s.argmax_device, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen output transfer failed");
+        if (flyweight_gpu_download(s.winner_host, s.argmax_device, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen output transfer failed");
     }
     const auto tail_wait_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-    if (colibri_gpu_stream_sync(runtime->stream) != 0) throw std::runtime_error("native Qwen output synchronization failed");
+    if (flyweight_gpu_stream_sync(runtime->stream) != 0) throw std::runtime_error("native Qwen output synchronization failed");
     if(timing_enabled())runtime->tail_wait_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tail_wait_started).count();
     for (std::size_t i = 0; i < n; ++i) {
         outputs[i] = 0xffffffffu - static_cast<std::uint32_t>(*seqs[i].winner_host);
@@ -20580,7 +21806,7 @@ static void qwen_decode_multi(ColibriV2QwenRuntime* runtime, std::size_t n,
 // slot ownership: a slot owned by another running task is untouchable, and if
 // the busiest match for this prompt IS an owned slot (same conversation already
 // generating), the task waits instead of duplicating the conversation elsewhere.
-static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask& task) {
+static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTask& task) {
     const auto* prompt = task.prompt.data();
     const std::uint64_t prompt_count = task.prompt.size();
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
@@ -20589,20 +21815,33 @@ static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask&
                                             : runtime.sequences[i].processed_tokens;
     };
     auto owned = [&](std::size_t i) { return runtime.slot_owner[i] >= 0; };
+    // Slots may differ in size; one too small for this request is not a
+    // candidate however well it matches. See qwen_route_sequence.
+    const std::uint64_t need = prompt_count + task.max_tokens;
+    auto fits = [&](std::size_t i) { return qwen_slot_context(runtime, i) >= need; };
     std::size_t best = kNone;
     std::uint64_t best_match = 0, busy_match = 0;
     for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
+        if (!fits(i)) continue;
         const auto& tokens = tokens_of(i);
         const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
         if (!qwen_cache_match_useful(m,tokens.size())) continue;
         if (owned(i)) busy_match = std::max(busy_match, m);
         else if (m > best_match) { best_match = m; best = i; }
     }
+    // Smallest fitting free slot first, LRU within a size -- so a short task
+    // takes scratch and leaves the full-context slot free.
     std::size_t free_lru = kNone;
-    for (std::size_t i = 0; i < runtime.sequences.size(); ++i)
-        if (!owned(i) && (free_lru == kNone ||
-            runtime.sequences[i].clock < runtime.sequences[free_lru].clock)) free_lru = i;
-    if (free_lru == kNone) return false;  // every slot busy: wait
+    for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
+        if (owned(i) || !fits(i)) continue;
+        if (free_lru == kNone) { free_lru = i; continue; }
+        const auto here = qwen_slot_context(runtime, i);
+        const auto there = qwen_slot_context(runtime, free_lru);
+        if (here != there ? here < there
+                          : runtime.sequences[i].clock < runtime.sequences[free_lru].clock)
+            free_lru = i;
+    }
+    if (free_lru == kNone) return false;  // no free slot big enough: wait
     const bool host_cache = runtime.host_cache_limit_bytes != 0;
     std::size_t best_host = kNone;
     std::uint64_t best_host_match = 0;
@@ -20662,7 +21901,7 @@ static bool qwen_engine_try_start(ColibriV2QwenRuntime& runtime, QwenEngineTask&
     return true;
 }
 
-int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEvent*events,uint64_t capacity,uint64_t*count){return guarded([&]{
+int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2QwenTaskEvent*events,uint64_t capacity,uint64_t*count){return guarded([&]{
     if(!runtime||!events||!capacity||!count)throw std::runtime_error("invalid native Qwen engine arguments");
     if(!runtime->decode_ready)throw std::runtime_error("native Qwen runtime is not prepared for decode");
     *count=0;
@@ -20683,11 +21922,11 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
         // produce, so a full buffer here is a scheduling bug -- but it must
         // never become a write past the caller's (Python-owned) array.
         if(*count>=capacity){
-            std::fprintf(stderr,"[colibri-v2] engine event buffer full; dropped event (task %llu kind %u)\n",
+            std::fprintf(stderr,"[flyweight] engine event buffer full; dropped event (task %llu kind %u)\n",
                 static_cast<unsigned long long>(id),static_cast<unsigned>(kind));
             return;
         }
-        events[*count]=ColibriV2QwenTaskEvent{id,token,kind};++*count;
+        events[*count]=FlyweightV2QwenTaskEvent{id,token,kind};++*count;
     };
     std::vector<std::uint64_t> finished;
     std::vector<QwenEngineTask*> pending_decode;
@@ -20745,7 +21984,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
             pending_decode.push_back(&task);
         }catch(const std::exception&error){
             // Isolate the failure: this task dies, the others keep running.
-            std::fprintf(stderr,"[colibri-v2] engine task %llu failed: %s\n",
+            std::fprintf(stderr,"[flyweight] engine task %llu failed: %s\n",
                 static_cast<unsigned long long>(task.id),error.what());
             finished.push_back(task.id);emit(task.id,0,2);
         }
@@ -20757,7 +21996,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
         runtime->cache_admission_enabled=true;
         std::size_t batched=0;
         const auto expert_policy=qwen_expert_policy(
-            *runtime,colibri::v2::ExpertExecutionPhase::decode);
+            *runtime,flyweight::v2::ExpertExecutionPhase::decode);
         if(pending_decode.size()>=2&&
            runtime->multi_decode_capacity>=2&&
            !runtime->expert_residency_frozen&&
@@ -20776,7 +22015,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
             }catch(const std::exception&error){
                 qwen_park_active(*runtime,false);
                 // The whole batch shares one stream of work; fail all of it.
-                std::fprintf(stderr,"[colibri-v2] engine decode batch failed: %s\n",error.what());
+                std::fprintf(stderr,"[flyweight] engine decode batch failed: %s\n",error.what());
                 for(std::size_t i=0;i<batched;++i){finished.push_back(pending_decode[i]->id);emit(pending_decode[i]->id,0,2);}
             }
             // A sampled task in the batch draws from its row's logits: the
@@ -20802,7 +22041,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                         *runtime,task->sampling,task->next_token);
                 }catch(const std::exception&error){
                     std::fprintf(stderr,
-                        "[colibri-v2] engine task %llu sampling failed: %s\n",
+                        "[flyweight] engine task %llu sampling failed: %s\n",
                         static_cast<unsigned long long>(task->id),error.what());
                     finished.push_back(task->id);emit(task->id,0,2);
                 }
@@ -20835,7 +22074,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                     for(uint32_t index=1;index<valid;++index)task->drafted.push_back(produced[index]);
                 }else{
                     const auto decode_started=std::chrono::steady_clock::now();
-                    const int status=colibri_v2_qwen_runtime_decode(runtime,task->next_token,&task->next_token);
+                    const int status=flyweight_v2_qwen_runtime_decode(runtime,task->next_token,&task->next_token);
                     if(status)throw std::runtime_error("native Qwen decode failed");
                     if(runtime->options.mtp_drafts&&!task->sampling.active())
                         qwen_mtp_record_decode(
@@ -20846,7 +22085,7 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                         task->next_token=qwen_sample_last_logits(*runtime,task->sampling,task->next_token);
                 }
             }catch(const std::exception&error){
-                std::fprintf(stderr,"[colibri-v2] engine task %llu decode failed: %s\n",
+                std::fprintf(stderr,"[flyweight] engine task %llu decode failed: %s\n",
                     static_cast<unsigned long long>(task->id),error.what());
                 finished.push_back(task->id);emit(task->id,0,2);
             }
@@ -20865,7 +22104,11 @@ int colibri_v2_qwen_engine_step(ColibriV2QwenRuntime*runtime,ColibriV2QwenTaskEv
                 runtime->engine_tasks.end());
         }
     }
-    if(!finished.empty())qwen_save_expert_history(*runtime);
+    if(!finished.empty()){
+        qwen_save_expert_history(*runtime);
+        // The engine's request boundary, matching the blocking path's guard.
+        qwen_note_kv_occupancy(*runtime);
+    }
     if(runtime->engine_tasks.empty())
         qwen_unfreeze_expert_residency(*runtime);
     return 0;

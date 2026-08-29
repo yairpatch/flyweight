@@ -20,7 +20,7 @@ import argparse
 import ctypes
 import time
 
-from colibri_next.v2 import V2Model, V2QwenRuntime, _library
+from flyweight.v2 import V2Model, V2QwenRuntime, _library
 
 HEAD_DIM = 256
 TOKENS_PER_TILE = 1024
@@ -39,18 +39,18 @@ def main() -> int:
     runtime.prepare()
 
     library = _library()
-    library.colibri_gpu_alloc.argtypes = [ctypes.c_uint64,
+    library.flyweight_gpu_alloc.argtypes = [ctypes.c_uint64,
                                           ctypes.POINTER(ctypes.c_uint64)]
-    library.colibri_gpu_launch_named.argtypes = [
+    library.flyweight_gpu_launch_named.argtypes = [
         ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
         ctypes.c_uint32, ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]
-    library.colibri_gpu_stream_sync.argtypes = [ctypes.c_uint64]
+    library.flyweight_gpu_stream_sync.argtypes = [ctypes.c_uint64]
 
     stream = ctypes.c_uint64()
-    library.colibri_gpu_stream_create(ctypes.byref(stream))
+    library.flyweight_gpu_stream_create(ctypes.byref(stream))
     start, end = ctypes.c_uint64(), ctypes.c_uint64()
-    library.colibri_gpu_timed_event_create(ctypes.byref(start))
-    library.colibri_gpu_timed_event_create(ctypes.byref(end))
+    library.flyweight_gpu_timed_event_create(ctypes.byref(start))
+    library.flyweight_gpu_timed_event_create(ctypes.byref(end))
 
     tokens = arguments.tokens
     kv_heads = arguments.kv_heads
@@ -73,7 +73,7 @@ def main() -> int:
             heads * tile_count * (HEAD_DIM + 2) * 4,           # partial
         ):
             value = ctypes.c_uint64()
-            if library.colibri_gpu_alloc(size, ctypes.byref(value)):
+            if library.flyweight_gpu_alloc(size, ctypes.byref(value)):
                 raise SystemExit("device allocation failed")
             pointers.append(value)
 
@@ -94,7 +94,7 @@ def main() -> int:
 
         def run(count: int) -> None:
             for _ in range(count):
-                if library.colibri_gpu_launch_named(
+                if library.flyweight_gpu_launch_named(
                     name, heads, tile_count, 256, 0, stream, args
                 ):
                     raise SystemExit(f"launch failed: {name!r}")
@@ -105,14 +105,14 @@ def main() -> int:
         settle = time.perf_counter()
         while time.perf_counter() - settle < 3.0:
             run(20)
-            library.colibri_gpu_stream_sync(stream)
-        library.colibri_gpu_stream_sync(stream)
-        library.colibri_gpu_event_record(start, stream)
+            library.flyweight_gpu_stream_sync(stream)
+        library.flyweight_gpu_stream_sync(stream)
+        library.flyweight_gpu_event_record(start, stream)
         run(arguments.iterations)
-        library.colibri_gpu_event_record(end, stream)
-        library.colibri_gpu_stream_sync(stream)
+        library.flyweight_gpu_event_record(end, stream)
+        library.flyweight_gpu_stream_sync(stream)
         elapsed = ctypes.c_float()
-        library.colibri_gpu_event_elapsed(start, end, ctypes.byref(elapsed))
+        library.flyweight_gpu_event_elapsed(start, end, ctypes.byref(elapsed))
         per_call_us = elapsed.value / arguments.iterations * 1000
 
         useful = 2 * kv_bytes  # K and V each read once, if sharing is free
@@ -120,7 +120,7 @@ def main() -> int:
               f"{useful / (per_call_us / 1e6) / 1e9:12.0f} "
               f"{per_call_us / heads:14.2f}")
         for value in pointers:
-            library.colibri_gpu_free(value)
+            library.flyweight_gpu_free(value)
     return 0
 
 
