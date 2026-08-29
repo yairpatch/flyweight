@@ -13238,32 +13238,38 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             return g;
         };
 
-        build_geometry();
-        runtime->geometries.clear();
-        runtime->geometries.push_back(capture_geometry());
-        // A scratch size, when asked for and when it is genuinely smaller.
-        // Equal or larger would allocate a second identical layout and buy
-        // nothing, so it collapses back to one.
-        if(runtime->options.scratch_context&&
-           runtime->options.scratch_context<runtime->options.context_limit){
-            geometry_context=runtime->options.scratch_context;
+        // Every slot layout for one context, plus what the slots will reserve
+        // -- decided here so the budget estimate and the allocation later
+        // cannot disagree. Callable more than once so the budget check can
+        // search for a context that fits instead of refusing the request.
+        auto plan_slots=[&](std::uint64_t context){
+            runtime->options.context_limit=context;
+            geometry_context=context;
             build_geometry();
+            runtime->geometries.clear();
             runtime->geometries.push_back(capture_geometry());
-            // Leave the layer plans describing the full-context slot: slot 0
-            // holds it, and qwen_apply_geometry re-points them on a switch.
-            geometry_context=runtime->options.context_limit;
-            build_geometry();
-        }
-        runtime->state_bytes=runtime->geometries[0].state_bytes;
-        {   // What every slot will reserve, decided here so the budget
-            // estimates below and the allocation later cannot disagree.
+            // A scratch size, when asked for and when it is genuinely smaller.
+            // Equal or larger would allocate a second identical layout and buy
+            // nothing, so it collapses back to one.
+            if(runtime->options.scratch_context&&
+               runtime->options.scratch_context<context){
+                geometry_context=runtime->options.scratch_context;
+                build_geometry();
+                runtime->geometries.push_back(capture_geometry());
+                // Leave the layer plans describing the full-context slot: slot
+                // 0 holds it, and qwen_apply_geometry re-points them on a switch.
+                geometry_context=context;
+                build_geometry();
+            }
+            runtime->state_bytes=runtime->geometries[0].state_bytes;
             const std::size_t planned_slots=runtime->options.mtp_drafts?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             runtime->slots_state_bytes=0;
             for(std::size_t i=0;i<planned_slots;++i)
                 runtime->slots_state_bytes+=
                     runtime->geometries[qwen_slot_geometry_index(*runtime,i)].state_bytes;
-        }
+        };
+        plan_slots(runtime->options.context_limit);
         // QSA scratch geometry: one shape for every selecting layer. Mixed
         // nonzero ratios would need per-layer score buffers; no checkpoint
         // ships them, so refuse instead of sizing for one and overrunning on
@@ -14069,6 +14075,55 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 m(runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes),
                 m(base_total_resolved),m(gpu_budget),auto_fit?"auto":"explicit",
                 m(now.free_memory));
+        }
+        // Auto-fit shrinks the context to what the card can hold rather than
+        // refusing the request. The context is the one term here nobody
+        // usually chose -- it defaults to the checkpoint's maximum, which on a
+        // 262144-token model reserves 16 GiB for a single slot -- whereas
+        // --parallel is always typed on purpose. So the context yields first
+        // and the slot count is left alone; a run that still does not fit
+        // falls through to the refusal below, which names both.
+        //
+        // Only under auto-fit: an explicit --gpu-cache-mib is a statement about
+        // the budget, and silently serving a shorter context than asked for
+        // would answer a question the caller had already answered.
+        if(auto_fit&&!runtime->options.strict_resident&&gpu_budget&&
+           base_total_resolved>gpu_budget&&runtime->slots_state_bytes){
+            const auto fixed=base_total_resolved-runtime->slots_state_bytes;
+            const std::uint64_t requested=runtime->options.context_limit;
+            // Below this a server is not worth starting, and the refusal says
+            // more than a context nothing fits in.
+            constexpr std::uint64_t kContextFloor=2048;
+            if(gpu_budget>fixed&&requested>kContextFloor){
+                const auto room=gpu_budget-fixed;
+                std::uint64_t low=kContextFloor,high=requested,best=0;
+                while(low<=high){
+                    const auto middle=low+(high-low)/2;
+                    plan_slots(middle);
+                    if(runtime->slots_state_bytes<=room){
+                        best=middle;
+                        low=middle+1;
+                    }else{
+                        if(middle==kContextFloor)break;
+                        high=middle-1;
+                    }
+                }
+                plan_slots(best?best:requested);
+                if(best){
+                    base_total_resolved=fixed+runtime->slots_state_bytes;
+                    std::fprintf(stderr,
+                        "[flyweight] context %llu -> %llu tokens: %llu slot%s "
+                        "of the requested context need %llu MiB more than this "
+                        "device has free. Pass --context-window to choose the "
+                        "trade yourself.\n",
+                        static_cast<unsigned long long>(requested),
+                        static_cast<unsigned long long>(best),
+                        static_cast<unsigned long long>(slot_count),
+                        slot_count==1?"":"s",
+                        static_cast<unsigned long long>(
+                            (base_total-gpu_budget)/(1024ull*1024)));
+                }
+            }
         }
         if(!runtime->options.strict_resident&&
            gpu_budget&&base_total_resolved>gpu_budget){
