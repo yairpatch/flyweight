@@ -13410,6 +13410,16 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     // an alignment headroom are all subtracted explicitly below.
                     // Every 96 MiB left unused here is another block whose
                     // feed-forward has to be re-read from RAM on every token.
+                    // Deliberately tighter than the auto-fit check's
+                    // max(2 GiB, VRAM/8), and it stays that way: raising it to
+                    // match was measured twice and reverted both times. The two
+                    // margins encode different policies -- keep weights on the
+                    // GPU for speed here, leave the desktop its headroom there
+                    // -- and forcing this one up spills so much that host and
+                    // device arithmetic diverge: 11 contract tests, MTP fold
+                    // bitwise-identity and transformers parity among them,
+                    // changed their tokens. The residual disagreement is what
+                    // the context clamp below absorbs.
                     const std::uint64_t margin=std::max<std::uint64_t>(384ull*1024*1024,gi.total_memory/32);
                     budget=gi.free_memory>margin?gi.free_memory-margin:0;
                 }
@@ -13420,9 +13430,57 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // and the snapshot pool land on the same budget, and stopping the
             // spill exactly at the limit leaves the allocation to fail by a
             // rounding error.
+            // The snapshot pool is one allocation per checkpoint slot per
+            // decode slot and reached 1212 MiB on a 2-slot 27B -- an order more
+            // than the alignment headroom that was standing in for it, and
+            // exactly the shortfall that killed prepare after the spill had
+            // already decided it was done.
+            // Auto-fit only. Under an explicit --gpu-cache-mib the later check
+            // has always run and refuses with the same arithmetic spelled out,
+            // so nothing there was ever silently wrong; widening this changes
+            // how many blocks such a run spills, and a feed-forward moved to
+            // the host is different arithmetic, so it moves that run's tokens.
+            // Measured: it re-spills the dense contract fixture entirely and
+            // the host and resident paths stop agreeing.
+            const std::size_t snapshot_slots=runtime->options.mtp_drafts?1:
+                std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+            // Estimated here rather than read from prefill_snapshot_bytes,
+            // which is not sized until after this point. Moving that sizing
+            // earlier was tried and reverted: it changes what prefix donation
+            // copies between slots and the donated turn decodes garbage, so
+            // the authoritative value stays where the rest of prepare expects
+            // it and this is a same-formula estimate for the budget only.
+            std::uint64_t snapshot_estimate=0;
+            for(const auto&layer:runtime->layers){
+                if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max()){
+                    const auto&ple=runtime->model->tensors[layer.ple_conv];
+                    snapshot_estimate+=(ple.shape[0]-1)*std::max<std::uint64_t>(
+                        runtime->model->config.ple_ngram_size,1)*ple.shape[1];
+                }
+                if(layer.attention){
+                    if(layer.qsa_ratio&&layer.indexer_q!=
+                            std::numeric_limits<std::uint64_t>::max())
+                        snapshot_estimate+=static_cast<std::uint64_t>(layer.qsa_ratio)
+                            *runtime->model->config.indexer_key_length;
+                    continue;
+                }
+                const auto&conv=runtime->model->tensors[layer.static_tensors[6]];
+                const auto&a=runtime->model->tensors[layer.static_tensors[8]];
+                const auto&norm=runtime->model->tensors[layer.static_tensors[9]];
+                snapshot_estimate+=conv.shape[0]*conv.shape[1]
+                    +a.shape[0]*norm.shape[0]*norm.shape[0];
+            }
+            // Auto-fit only: under an explicit --gpu-cache-mib the later check
+            // has always refused with this arithmetic spelled out, and widening
+            // the reservation there re-spills the dense contract fixture, whose
+            // host and resident paths then stop agreeing.
+            const std::uint64_t snapshot_pool=runtime->options.gpu_cache_bytes?0:
+                snapshot_slots*runtime->prefill_snapshots.size()*
+                    device_align(snapshot_estimate*sizeof(float));
             const std::uint64_t reserved_base=runtime->workspace_bytes
                 +runtime->slots_state_bytes
                 +runtime->expert_staging_bytes
+                +snapshot_pool
                 +std::max<std::uint64_t>(1024ull*1024,budget/64);
             // Room for the batch staging buffer, but only when something is
             // going to spill -- a model that fits entirely never allocates it.
