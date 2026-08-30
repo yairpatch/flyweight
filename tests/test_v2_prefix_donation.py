@@ -103,8 +103,13 @@ class PrefixDonationTests(unittest.TestCase):
                 # live slot rather than reprefilling anything.
                 again = self._generate(runtime, MAIN)
                 self.assertEqual(again, expected_main)
-                self.assertEqual(
-                    runtime.info["prefix_cache_last_reused_tokens"], len(MAIN),
+                # len-1, not len: the reserved checkpoint is taken one token
+                # short of the prompt's end on purpose (a stripped-reasoning
+                # replay diverges at exactly that token), so an exact re-send
+                # re-evaluates at most the final token.
+                self.assertGreaterEqual(
+                    runtime.info["prefix_cache_last_reused_tokens"],
+                    len(MAIN) - 1,
                     "the donor slot was not preserved")
                 self.assertEqual(runtime.info["prefix_donations"], 1,
                                  "continuing the donor should not donate again")

@@ -127,6 +127,35 @@ class DenseNativeTests(unittest.TestCase):
             model.close()
             V2Model.select_backend("auto")
 
+    def test_tail_checkpoint_survives_a_last_token_divergence(self):
+        # A stripped-reasoning replay re-tokenizes the newline after the
+        # forced "<think>" opener, so the next turn agrees with the previous
+        # prompt up to exactly its LAST token. The reserved snapshot is taken
+        # one token short of the end (qwen_prompt_begin's tail target) so that
+        # turn restores everything but that token, instead of falling back to
+        # a mid checkpoint a quarter of the prompt behind.
+        V2Model.select_backend("cpu")
+        model, _, _ = _model()
+        runtime = model.native_runtime(
+            context_limit=512,
+            mtp_drafts=0,
+            parallel_sequences=1,
+        )
+        runtime.prepare()
+        first = [5] * 300
+        try:
+            _run_task(runtime, first)
+
+            _run_task(runtime, [*first[:-1], 7, 8])
+
+            self.assertEqual(
+                runtime.info["prefix_cache_last_reused_tokens"], len(first) - 1
+            )
+        finally:
+            runtime.close()
+            model.close()
+            V2Model.select_backend("auto")
+
     def test_host_spilled_feed_forward_matches_the_resident_one(self):
         model, _, _ = _model()
         resident = _native(model)

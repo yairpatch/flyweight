@@ -576,6 +576,10 @@ struct QwenPromptPlan {
     std::uint32_t next_token = 0;
     std::vector<std::uint64_t> targets;
     std::size_t next_target = 0;
+    // Position of the tail checkpoint, one token SHORT of the prompt's end,
+    // saved into the reserved snapshot slot as the prefill passes it. 0 when
+    // none is due (no reserved slot, or reuse already covered it).
+    std::uint64_t tail_target = 0;
 };
 
 struct QwenSamplingState {
@@ -20244,6 +20248,19 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
     }
     plan.next_target=0;
     while(plan.next_target<plan.targets.size()&&plan.targets[plan.next_target]<=prompt_start)++plan.next_target;
+    // The reserved slot's checkpoint is taken one token SHORT of the end, not
+    // at it. A prompt ends with the assistant header's forced "<think>" opener
+    // plus a newline, and the next turn re-renders that reply with the
+    // reasoning stripped -- where the newline re-tokenizes into a different
+    // merge ("\n\n" as one token). Measured on the real template, the next
+    // prompt agrees with this one up to exactly len-1: a snapshot AT the end
+    // never matches again, while one token short serves the re-send (one
+    // token to re-evaluate) and every continuation equally.
+    plan.tail_target=0;
+    if(runtime->prefill_snapshot_bytes&&
+       runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1&&
+       prompt_count>=2&&prompt_start<prompt_count-1)
+        plan.tail_target=prompt_count-1;
     plan.prompt_start=prompt_start;
     plan.next_token=next_token;
     return 0;
@@ -20261,6 +20278,20 @@ static void qwen_prompt_checkpoints(FlyweightV2QwenRuntime* runtime,
         slot.valid=true;
         slot.clock=++runtime->prefill_snapshot_clock;
         ++plan.next_target;
+    }
+    // The tail checkpoint (see qwen_prompt_begin). Rows chunks stop at len-1
+    // and the single-token tail advances position one at a time, so an exact
+    // match is guaranteed on the way to the end of every prompt this is due
+    // for.
+    if(plan.tail_target&&runtime->position==plan.tail_target){
+        auto&slot=runtime->prefill_snapshots.back();
+        qwen_prefill_snapshot_copy(*runtime,slot.device,false);
+        slot.tokens.assign(prompt,prompt+runtime->position);
+        slot.last_output=0; // a restore always leaves the final token to evaluate
+        slot.last_output_greedy=false;
+        slot.valid=true;
+        slot.clock=++runtime->prefill_snapshot_clock;
+        plan.tail_target=0;
     }
 }
 
@@ -20661,9 +20692,18 @@ static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
     // tracking this conversation, else a free slot, else the LRU.
     QwenPrefillSnapshot*slot=nullptr;
     if(runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1){
-        // Mid-prefill checkpoints own slots [0,size-1); the exact end-of-prompt
+        // Mid-prefill checkpoints own slots [0,size-1); the end-of-prompt
         // snapshot has the reserved last slot so it never evicts a mid.
         slot=&runtime->prefill_snapshots.back();
+        // When the prefill just wrote its tail checkpoint here (one token
+        // short of this prompt -- see qwen_prompt_begin), keep it. Replacing
+        // it with the exact end state traded the one snapshot the next turn
+        // can restore for one it never matches.
+        if(slot->valid&&slot->tokens.size()+1==prompt_count&&
+           std::equal(slot->tokens.begin(),slot->tokens.end(),prompt)){
+            slot->clock=++runtime->prefill_snapshot_clock;
+            return;
+        }
     }
     if(!slot)for(auto&candidate:runtime->prefill_snapshots)
         if(candidate.valid&&candidate.tokens.size()<=prompt_count&&std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt)){slot=&candidate;break;}
