@@ -169,6 +169,47 @@ class PrefixDonationTests(unittest.TestCase):
                 self._generate(runtime, SIDE)
                 self.assertEqual(runtime.info["prefix_donations"], 0)
 
+    def _engine_generate(self, runtime, prompt: list[int]) -> list[int]:
+        tokens: list[int] = []
+        task = runtime.task_submit(prompt, CONTINUATION)
+        for _ in range(64 + 32 * CONTINUATION):
+            for identifier, token, kind in runtime.engine_step():
+                if kind == 2:
+                    raise AssertionError("engine task failed")
+                if identifier != task:
+                    continue
+                if kind == 0:
+                    tokens.append(token)
+                if kind == 1:
+                    return tokens
+        raise AssertionError("engine task did not finish")
+
+    def test_the_engine_router_donates_too(self) -> None:
+        """The serving path routes through qwen_engine_try_start, not
+        qwen_route_sequence -- donation shipped on the latter and was dead
+        code in production until the engine router learned the same rule.
+        Same traffic as the blocking test, driven through the engine."""
+        expected_side = self._solo(SIDE)
+        expected_main = self._solo(MAIN)
+        with V2Model(str(self.path)) as model:
+            with model.native_qwen_runtime(
+                    context_limit=CONTEXT, parallel_sequences=2,
+                    prefill_checkpoint_interval=8) as runtime:
+                runtime.prepare()
+                self._engine_generate(runtime, MAIN)
+                side = self._engine_generate(runtime, SIDE)
+                info = runtime.info
+                self.assertEqual(info["prefix_donations"], 1,
+                                 "the engine router did not donate")
+                self.assertEqual(side, expected_side)
+                again = self._engine_generate(runtime, MAIN)
+                self.assertEqual(again, expected_main)
+                self.assertGreaterEqual(
+                    runtime.info["prefix_cache_last_reused_tokens"],
+                    len(MAIN) - 1,
+                    "the donor slot was not preserved")
+                self.assertEqual(runtime.info["prefix_donations"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

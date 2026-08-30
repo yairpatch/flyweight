@@ -22290,16 +22290,20 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
     }
     // Smallest fitting free slot first, LRU within a size -- so a short task
     // takes scratch and leaves the full-context slot free.
-    std::size_t free_lru = kNone;
-    for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
-        if (owned(i) || !fits(i)) continue;
-        if (free_lru == kNone) { free_lru = i; continue; }
-        const auto here = qwen_slot_context(runtime, i);
-        const auto there = qwen_slot_context(runtime, free_lru);
-        if (here != there ? here < there
-                          : runtime.sequences[i].clock < runtime.sequences[free_lru].clock)
-            free_lru = i;
-    }
+    auto smallest_free = [&](std::size_t exclude) {
+        std::size_t v = kNone;
+        for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
+            if (i == exclude || owned(i) || !fits(i)) continue;
+            if (v == kNone) { v = i; continue; }
+            const auto here = qwen_slot_context(runtime, i);
+            const auto there = qwen_slot_context(runtime, v);
+            if (here != there ? here < there
+                              : runtime.sequences[i].clock < runtime.sequences[v].clock)
+                v = i;
+        }
+        return v;
+    };
+    const std::size_t free_lru = smallest_free(kNone);
     if (free_lru == kNone) return false;  // no free slot big enough: wait
     const bool host_cache = runtime.host_cache_limit_bytes != 0;
     std::size_t best_host = kNone;
@@ -22318,8 +22322,23 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
     std::size_t chosen;
     if (best != kNone && best_match >= best_host_match) {
         chosen = best;
-        const auto& tokens = tokens_of(chosen);
-        if (host_cache && best_match < tokens.size())
+        // Sized before any donation: qwen_donate_prefix switches sequences,
+        // which swaps the vector a tokens_of reference would keep pointing at.
+        const std::uint64_t cached = tokens_of(best).size();
+        // Same rule as qwen_route_sequence, which the blocking path has had
+        // since phase 1 and this router silently lacked: a prompt that merely
+        // shares this conversation's opening gets a different free slot
+        // seeded with the shared prefix, and the conversation is left
+        // standing -- taking the slot would displace it (a full spill and
+        // restore, or a cold reprefill) for the exact side-request traffic
+        // slots exist to absorb.
+        if (qwen_donation_is_worthwhile(best_match, cached)) {
+            const std::size_t target = smallest_free(best);
+            if (target != kNone &&
+                qwen_donate_prefix(runtime, best, target, prompt, prompt_count))
+                chosen = target;
+        }
+        if (chosen == best && host_cache && best_match < cached)
             qwen_spill_slot_to_host(runtime, chosen);
     } else if (best_host != kNone) {
         qwen_spill_slot_to_host(runtime, free_lru);
