@@ -434,6 +434,14 @@ def _truncate_at_stop(
     return text[:earliest], matched
 
 
+# What the live [gen] status line appends for the phase a stream is in, so
+# a long silent stretch names itself instead of reading as a stall.
+_PHASE_LABELS = {
+    "tool_call": " [building tool call]",
+    "thinking": " [thinking]",
+}
+
+
 def _metrics_payload(metrics: _Metrics) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "generated_tokens": metrics.tokens,
@@ -929,8 +937,18 @@ class InferenceService:
                     if decode_started is None:
                         decode_started = now
                     metrics = _Metrics(len(step.generated_ids), now - decode_started)
+                    # While the think block is still open, events ride out
+                    # tagged "thinking" so the server log (and any UI reading
+                    # the metrics) can say what the silence is instead of
+                    # showing a stream that produces nothing visible.
+                    in_think = (
+                        _Metrics(metrics.tokens, metrics.elapsed, "thinking")
+                        if channels is not None
+                        and not getattr(channels, "_closed", True)
+                        else None
+                    )
                     if not step.text_delta:
-                        yield _ProgressDelta(metrics)
+                        yield _ProgressDelta(in_think or metrics)
                         continue
                     text_parts.append(step.text_delta)
                     if channels is None:
@@ -940,13 +958,17 @@ class InferenceService:
                     if scanner is not None and visible:
                         visible = scanner.feed(visible)
                     if reasoning:
-                        yield _ReasoningDelta(reasoning, metrics)
+                        yield _ReasoningDelta(
+                            reasoning,
+                            in_think
+                            or _Metrics(metrics.tokens, metrics.elapsed, "thinking"),
+                        )
                     if visible:
                         yield _TextDelta(visible, metrics)
                     if not reasoning and not visible:
                         # The channel filter is withholding a possible marker;
                         # keep the liveness signal the raw token used to carry.
-                        yield _ProgressDelta(metrics)
+                        yield _ProgressDelta(in_think or metrics)
                     if scanner is not None and scanner.matched is not None:
                         break
             finally:
@@ -1076,7 +1098,17 @@ class InferenceService:
                             delta_text
                         )
                         if channel_reasoning:
-                            yield _ReasoningDelta(channel_reasoning)
+                            # With no metrics these deltas were invisible to
+                            # the server log: a tool-enabled request looked
+                            # stalled for its whole thinking stretch.
+                            yield _ReasoningDelta(
+                                channel_reasoning,
+                                _Metrics(
+                                    len(step.generated_ids),
+                                    now - decode_started,
+                                    "thinking",
+                                ),
+                            )
                     marker_window = ""
                     if tool_start is None:
                         # Stream clean text, but stop at (and never leak) the
@@ -3143,8 +3175,12 @@ def create_handler(
                             if isinstance(tokens, int) and isinstance(elapsed, float):
                                 decode_tokens = tokens
                                 decode_elapsed = elapsed
-                                if isinstance(phase, str):
-                                    decode_phase = phase
+                                # Absent means the phase ENDED, not "same as
+                                # before": a latched "[thinking]" would outlive
+                                # the think block and label the visible answer.
+                                decode_phase = (
+                                    phase if isinstance(phase, str) else None
+                                )
                                 now = time.perf_counter()
                                 if now - last_stat >= 1.0:
                                     last_stat = now
@@ -3157,11 +3193,7 @@ def create_handler(
                                     sys.stderr.write(
                                         f"\r[gen ] {tokens} tokens "
                                         f"{rate:6.1f} tok/s {elapsed:5.1f}s"
-                                        + (
-                                            " [building tool call]"
-                                            if decode_phase == "tool_call"
-                                            else ""
-                                        )
+                                        + _PHASE_LABELS.get(decode_phase or "", "")
                                     )
                                     sys.stderr.flush()
                     self._write_sse_event(
@@ -3183,6 +3215,8 @@ def create_handler(
                         + (
                             " [tool call ready]"
                             if decode_phase == "tool_call"
+                            else " [ended while thinking]"
+                            if decode_phase == "thinking"
                             else ""
                         )
                         + "\n"

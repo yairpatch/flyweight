@@ -118,6 +118,36 @@ class LengthStubGenerator(StubGenerator):
             yield replace(step, stopped_on_eos=False)
 
 
+class ThinkingStubGenerator(StubGenerator):
+    """Streams a turn that begins inside a prompt-opened think block."""
+
+    def stream_messages(self, messages, **options):
+        self.calls.append((messages, options))
+        generated: list[int] = []
+        for token, delta in ((4, "mulling"), (5, "</think>"), (6, "Hi!")):
+            generated.append(token)
+            yield GenerationStep(
+                token_id=token,
+                text_delta=delta,
+                prompt_ids=(1, 2, 3),
+                generated_ids=tuple(generated),
+                text="",
+                stopped_on_eos=False,
+                finished=False,
+                state_tokens=3 + len(generated),
+            )
+        yield GenerationStep(
+            token_id=None,
+            text_delta="",
+            prompt_ids=(1, 2, 3),
+            generated_ids=tuple(generated),
+            text="mulling</think>Hi!",
+            stopped_on_eos=True,
+            finished=True,
+            state_tokens=6,
+        )
+
+
 class ToolStubGenerator(StubGenerator):
     TOOL_TEXT = (
         "<tool_call>\n<function=get_weather>\n"
@@ -1190,6 +1220,44 @@ class InferenceServiceTests(unittest.TestCase):
         # as a fatal API error and the session dead-ends.
         with self.assertRaisesRegex(APIError, "prompt is too long"):
             service.completion({"prompt": "12345", "max_tokens": 1})
+
+    def test_thinking_stream_tags_its_metrics_with_the_phase(self) -> None:
+        # The [gen] status line (and any UI reading the metrics) names the
+        # phase; without the tag a thinking stretch read as a stall. The tag
+        # must also END with the block, or it would label the answer too.
+        service = InferenceService(
+            "qwen-local", ThinkingStubGenerator(), max_new_tokens=32
+        )
+        events = list(
+            service.stream_chat_completion(
+                {
+                    # The stub tokenizer round-trips characters, so a prompt
+                    # ending with the marker reports thinking_open.
+                    "messages": [{"role": "user", "content": "Hi<think>"}],
+                    "stream": True,
+                }
+            )
+        )
+        reasoning = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("choices")
+            and event["choices"][0]["delta"].get("reasoning_content")
+        ]
+        self.assertTrue(reasoning)
+        for event in reasoning:
+            self.assertEqual(event["flyweight"]["phase"], "thinking")
+        visible = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("choices")
+            and event["choices"][0]["delta"].get("content")
+        ]
+        self.assertTrue(visible)
+        for event in visible:
+            self.assertNotIn("phase", event.get("flyweight", {}))
 
     def test_chat_stream_emits_deltas_usage_and_done(self) -> None:
         events = list(
