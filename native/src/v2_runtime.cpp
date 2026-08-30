@@ -14936,7 +14936,7 @@ inline int kv_fused_width(int head_dim){
 // Grouped-query kernel for `share` query heads per KV head, or nullptr when the
 // shape is not one of the instantiated ones. Opt-out via FLYWEIGHT_GQA_ATTENTION=0.
 inline const char* kv_gqa_tiles_kernel(
-    const FlyweightV2QwenRuntime& r,int head_dim,int heads,int kv_heads
+    const FlyweightV2QwenRuntime& r,int head_dim,int heads,int kv_heads,int tile
 ){
     static const bool enabled=[]{
         const char*env=std::getenv("FLYWEIGHT_GQA_ATTENTION");
@@ -14946,22 +14946,48 @@ inline const char* kv_gqa_tiles_kernel(
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
     const int share=heads/kv_heads;
     if(heads!=kv_heads*share||(share!=8&&share!=4))return nullptr;
+    if(tile!=256&&tile!=512)return nullptr;
     const int t=r.options.cache_type_k;
+    const bool narrow=tile==256;
     if(share==8)
-        return t==3?"kv_attention_gqa_q8_256_s8":
-               t==2?"kv_attention_gqa_bf16_256_s8":
-               t==1?"kv_attention_gqa_f16_256_s8":nullptr;
-    return t==3?"kv_attention_gqa_q8_256_s4":
-           t==2?"kv_attention_gqa_bf16_256_s4":
-           t==1?"kv_attention_gqa_f16_256_s4":nullptr;
+        return t==3?(narrow?"kv_attention_gqa_rows_q8_256_s8_t256"
+                           :"kv_attention_gqa_rows_q8_256_s8_t512"):
+               t==2?(narrow?"kv_attention_gqa_rows_bf16_256_s8_t256"
+                           :"kv_attention_gqa_rows_bf16_256_s8_t512"):
+               t==1?(narrow?"kv_attention_gqa_rows_f16_256_s8_t256"
+                           :"kv_attention_gqa_rows_f16_256_s8_t512"):nullptr;
+    return t==3?(narrow?"kv_attention_gqa_rows_q8_256_s4_t256"
+                       :"kv_attention_gqa_rows_q8_256_s4_t512"):
+           t==2?(narrow?"kv_attention_gqa_rows_bf16_256_s4_t256"
+                       :"kv_attention_gqa_rows_bf16_256_s4_t512"):
+           t==1?(narrow?"kv_attention_gqa_rows_f16_256_s4_t256"
+                       :"kv_attention_gqa_rows_f16_256_s4_t512"):nullptr;
 }
-// The grouped kernel uses a smaller tile than the per-head one: its grid is
-// keyed on KV heads, so with only two of them a 1024-token tile left far too
-// few blocks to fill the SMs.
-inline int kv_gqa_tile_tokens(){return 512;}
 // Floats per (head, tile) partial record: the head dimension plus the running
 // maximum and denominator. Must match the kernel width that wrote it.
 inline int kv_fused_record_stride(int width){return width+2;}
+// The narrowest instantiated tile whose records both fit the merge's ceiling and
+// fit the partial buffer, or 0 when neither does and the caller must use another
+// path. The buffer holds `heads * context_limit` floats and a record is
+// head_dim + 2 of them, so a 256-token tile overruns a *full* context by a
+// fraction of a percent -- which is exactly when the 512 twin is picked.
+inline int kv_gqa_rows_tile_tokens(
+    const FlyweightV2QwenRuntime& r,int tokens
+){
+    // Narrowest first: the narrow tile is faster at every measured context
+    // because it fills the device, where a wide tile on two KV heads is a
+    // handful of blocks. The wide twin exists for the case the narrow one
+    // cannot serve rather than because it is ever preferred.
+    for(const int tile:{256,512}){
+        const std::uint64_t records=
+            (static_cast<std::uint64_t>(tokens)+tile-1)/tile;
+        if(records==0||records>512)continue;
+        if(records*kv_fused_record_stride(256)>
+           static_cast<std::uint64_t>(r.options.context_limit))continue;
+        return tile;
+    }
+    return 0;
+}
 // Prefill counterpart of qwen_turbo_cublas_attention: stage the whole causal
 // window as f16 once for the chunk, then run the fused f16 prefill kernel over
 // it instead of walking the cache once per row.
@@ -18183,22 +18209,41 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     queries,first,cache_keys,cache_values,attention_scores,
                     attended,runtime->stream,heads,kv_heads,head_dim,tokens,
                     capacity,first_slot,scale)==0);
-            const char* gqa_tiles=(!cublas_done&&runtime->fused_attention)
-                ? kv_gqa_tiles_kernel(*runtime,head_dim,heads,kv_heads)
+            const int gqa_tile_tokens=(!cublas_done&&runtime->fused_attention)
+                ? kv_gqa_rows_tile_tokens(*runtime,tokens) : 0;
+            const char* gqa_tiles=gqa_tile_tokens
+                ? kv_gqa_tiles_kernel(
+                      *runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
                 : nullptr;
             const int gqa_tile_count=gqa_tiles
-                ? (tokens+kv_gqa_tile_tokens()-1)/kv_gqa_tile_tokens() : 0;
-            // Ranked below cuBLAS by measurement, not by principle: reading the
-            // cache once per block instead of once per query head does cut the
-            // traffic, but each warp then walks the whole tile alone, and the
-            // longer reduction chain costs more than the traffic saves. On f16
-            // at 49k that is 40.0 tok/s against cuBLAS' 44.4. Where cuBLAS
-            // cannot go -- any cache but f16, a wrapped ring -- it is the best
-            // of the remaining options: q8 at 49k measures 39.8 against 36.1
-            // for the per-head kernel and 8.3 for the serial fallback.
-            const bool gqa_done=gqa_tiles&&gqa_tile_count<=512&&
-                static_cast<std::uint64_t>(gqa_tile_count)*
-                    kv_fused_record_stride(256)<=runtime->options.context_limit;
+                ? (tokens+gqa_tile_tokens-1)/gqa_tile_tokens : 0;
+            // Ranked below cuBLAS by measurement, not by principle: at 49k on
+            // an f16 cache cuBLAS is 320 us against this kernel's 563. Where
+            // cuBLAS cannot go -- any cache but f16, a wrapped ring, a window it
+            // declines -- this is the best of what is left, by a wide margin on
+            // a quantized cache: q8 at 49k is 528 us against 909 for the
+            // per-head kernel, which decodes every row once per query head.
+            //
+            // End to end that is smaller than it sounds, and worth knowing
+            // before reading a disappointing A/B as a broken kernel: Ornith runs
+            // full attention on 10 of 40 layers and the rest of the token is
+            // MoE, so 17k q8 decode moves 35.4 -> 37.3 tok/s (+5.5%), token
+            // identical, one process per setting.
+            const bool gqa_done=gqa_tiles!=nullptr;
+            // Which of the four decode paths ran, announced once. Every one of
+            // them is correct and they differ only in speed, so a silent
+            // fallback looks exactly like a fast path that is not engaged --
+            // which is what an A/B measures instead of what it meant to.
+            if(std::getenv("FLYWEIGHT_ATTENTION_DIAG")){
+                static const char*announced=nullptr;
+                const char*chosen=cublas_done?"cublas"
+                    :gqa_done?gqa_tiles
+                    :runtime->fused_attention?"fused per-head tiles":"serial ring";
+                if(announced!=chosen){
+                    announced=chosen;
+                    std::fprintf(stderr,"[attention] decode path: %s\n",chosen);
+                }
+            }
             if(cublas_done){
                 // Turbo or tensor-core attention already wrote `attended`.
             }else if(gqa_done){
@@ -18206,8 +18251,9 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     const_cast<std::uint64_t*>(&attention_scores),
                     const_cast<int*>(&heads),const_cast<int*>(&kv_heads),
                     const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-                launch_named(gqa_tiles,kv_heads,gqa_tile_count,
-                             32*(heads/kv_heads),gqa_args);
+                // Always eight warps: the block's warps split the tile's tokens,
+                // and each of them carries the whole group's queries.
+                launch_named(gqa_tiles,kv_heads,gqa_tile_count,256,gqa_args);
                 void*merge_args[]={const_cast<std::uint64_t*>(&attention_scores),
                     &attended,const_cast<int*>(&heads),
                     const_cast<int*>(&head_dim),

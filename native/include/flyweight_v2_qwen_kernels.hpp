@@ -10297,23 +10297,58 @@ extern "C" __global__ void kv_attention_fused_turbo_merge512(
 }
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
-// Grouped-query attention that reads each cached byte once per block instead of
-// once per query head.
+// One token's cache row, decoded into `parts` registers -- the unit the kernel
+// below shares across a whole GQA group.
+template<typename T, int parts>
+__device__ __forceinline__ void kv_fused_load_row(
+    const T* cache, long long row, int head_dim, int lane, float* out
+) {
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int dimension = lane + part * 32;
+        out[part] = dimension < head_dim
+            ? kv_fused_load(cache, row, dimension, head_dim) : 0.0f;
+    }
+}
+
+// Grouped-query attention that keeps the *token* parallelism of the per-head
+// kernel and still reads each cached row once.
 //
-// The per-head kernel above keys its grid on query heads, so with GQA 8:1 the
-// eight heads sharing a KV head each re-read and re-reduce the same bytes.
-// Measured on this card at 49k tokens: 235 us at a sharing factor of 2 (428
-// GB/s, memory-bound) against 675 us at 8 (149 GB/s) for *identical* KV -- the
-// loss is entirely the redundancy, not DRAM.
+// A kernel that shared the same bytes through shared memory -- one block per KV
+// head, one warp per query head -- used to sit here, and it lost. Sharing that
+// way costs the thing the per-head kernel had, eight warps walking a tile
+// together, because each warp then walks the whole tile alone: at 49k it
+// measured 705 us against the per-head kernel's 680 in the same run. It read an
+// eighth of the bytes and came out behind.
 //
-// So key the grid on KV heads, stage a chunk of K and V in shared once, and give
-// each warp one query head. Two consequences beyond the saved traffic: the eight
-// reduction chains become independent, and because a warp owns its query head
-// outright there is no cross-warp merge and no partial_output array -- which is
-// what makes 256-dim heads fit, since eight warps' worth of 256 floats each
-// would have been 64 KB of shared memory.
-template<typename KT, typename VT, int maximum_head_dim, int share>
-__device__ void kv_attention_gqa_tiles_impl(
+// So share inside the warp instead. A warp still owns a token, as in the
+// per-head kernel, but it loads and dequantizes that token's K and V rows into
+// registers once and runs the whole group against them: one decode, `share` dot
+// products, `share` online-softmax states. Same 8x traffic cut, no shared-memory
+// round trip, and the block's warps stay on separate tokens.
+//
+// Measured at 49k on 2 KV heads of 8 query heads each, tiles plus merge,
+// interleaved A/B, best of seven rounds (bench_attention_variants.py):
+//
+//     f16   per-head 739 us    rows 563 us    cuBLAS 320 us
+//     q8    per-head 909 us    rows 528 us    (cuBLAS cannot read the cache)
+//
+// It therefore does not replace cuBLAS on an f16 cache: that path reads the
+// same rows once through the tensor cores and stays first wherever it is
+// eligible. This is what the runtime falls to otherwise -- a quantized cache, a
+// wrapped ring, a window cuBLAS declines. Note which column moves most: q8 is
+// where a row costs the most to decode, so it is where decoding it once for the
+// group rather than once per query head is worth the most.
+//
+// What it costs is registers -- share*parts each for the queries and the
+// accumulators, 216 at share 8 -- which caps an SM at eight warps. Two things
+// that should have followed from that do not, and both were measured rather
+// than reasoned: prefetching the next token's rows (2 and 4 deep) is inside the
+// noise, and so is splitting the group across two warps to halve the registers.
+// The kernel is therefore the simple form.
+template<typename KT, typename VT, int maximum_head_dim, int share,
+         int tokens_per_tile>
+__device__ void kv_attention_gqa_rows_impl(
     const float* query,
     const KT* keys,
     const VT* values,
@@ -10326,12 +10361,8 @@ __device__ void kv_attention_gqa_tiles_impl(
     const int first,
     const float scale
 ) {
+    constexpr int warp_count = 8;
     constexpr int parts = maximum_head_dim / 32;
-    constexpr int tokens_per_tile = 512;
-    // Tokens staged per round. 16 costs 32 KB of shared for K and V together,
-    // which still leaves room for more than one block per SM.
-    constexpr int chunk = 16;
-
     const int kv_head = blockIdx.x;
     const int tile = blockIdx.y;
     const int lane = threadIdx.x & 31;
@@ -10342,112 +10373,169 @@ __device__ void kv_attention_gqa_tiles_impl(
 
     const int tile_begin = tile * tokens_per_tile;
     const int tile_end = min(tokens, tile_begin + tokens_per_tile);
-    if (tile_begin >= tile_end) return;
+    const int head_base = kv_head * share;
 
-    const int head = kv_head * share + warp;
-    const float* q = query + (long long)head * head_dim;
-    float query_registers[parts];
+    float query_registers[share][parts];
+    float accumulator[share][parts];
+    float maximum[share];
+    float denominator[share];
     #pragma unroll
-    for (int part = 0; part < parts; ++part) {
-        const int dimension = lane + part * 32;
-        query_registers[part] = dimension < head_dim ? q[dimension] : 0.0f;
+    for (int index = 0; index < share; ++index) {
+        const float* row = query + (long long)(head_base + index) * head_dim;
+        #pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const int dimension = lane + part * 32;
+            query_registers[index][part] =
+                dimension < head_dim ? row[dimension] : 0.0f;
+            accumulator[index][part] = 0.0f;
+        }
+        maximum[index] = -3.402823466e+38F;
+        denominator[index] = 0.0f;
     }
 
-    __shared__ float key_stage[chunk][maximum_head_dim];
-    __shared__ float value_stage[chunk][maximum_head_dim];
-
-    float accumulator[parts];
-    #pragma unroll
-    for (int part = 0; part < parts; ++part) accumulator[part] = 0.0f;
-    float maximum = -3.402823466e+38F;
-    float denominator = 0.0f;
-
-    for (int base = tile_begin; base < tile_end; base += chunk) {
-        const int count = min(chunk, tile_end - base);
-        for (int index = threadIdx.x;
-             index < count * head_dim;
-             index += blockDim.x) {
-            const int token = index / head_dim;
-            const int dimension = index - token * head_dim;
-            int slot = first + base + token;
-            if (slot >= capacity) slot -= capacity;
-            const long long row = (long long)kv_head * capacity + slot;
-            key_stage[token][dimension] =
-                kv_fused_load(keys, row, dimension, head_dim);
-            value_stage[token][dimension] =
-                kv_fused_load(values, row, dimension, head_dim);
-        }
-        __syncthreads();
-)FLYWEIGHT_CUDA"
-R"FLYWEIGHT_CUDA(
-        for (int token = 0; token < count; ++token) {
+    for (int token = tile_begin + warp;
+         token < tile_end;
+         token += warp_count) {
+        int slot = first + token;
+        if (slot >= capacity) slot -= capacity;
+        const long long row = (long long)kv_head * capacity + slot;
+        float key_row[parts];
+        float value_row[parts];
+        kv_fused_load_row<KT, parts>(keys, row, head_dim, lane, key_row);
+        kv_fused_load_row<VT, parts>(values, row, head_dim, lane, value_row);
+        #pragma unroll
+        for (int index = 0; index < share; ++index) {
             float dot = 0.0f;
             #pragma unroll
-            for (int part = 0; part < parts; ++part) {
-                const int dimension = lane + part * 32;
-                if (dimension < head_dim)
-                    dot += query_registers[part] * key_stage[token][dimension];
-            }
+            for (int part = 0; part < parts; ++part)
+                dot += query_registers[index][part] * key_row[part];
             for (int offset = 16; offset > 0; offset >>= 1)
                 dot += __shfl_down_sync(0xffffffff, dot, offset);
             const float score = __shfl_sync(0xffffffff, dot, 0) * scale;
-            const float next_maximum = fmaxf(maximum, score);
-            const float old_scale = maximum == -3.402823466e+38F
-                ? 0.0f : __expf(maximum - next_maximum);
-            const float token_scale = __expf(score - next_maximum);
-            denominator = denominator * old_scale + token_scale;
-            #pragma unroll
-            for (int part = 0; part < parts; ++part) {
-                const int dimension = lane + part * 32;
-                if (dimension < head_dim)
-                    accumulator[part] = accumulator[part] * old_scale
-                        + token_scale * value_stage[token][dimension];
+            // Rescaling the running sums is only needed when this token raises
+            // the maximum, which over a tile happens a handful of times. The
+            // score is warp-uniform, so the branch is too, and skipping it
+            // takes share*parts multiplies out of the common token.
+            if (score > maximum[index]) {
+                const float shrink = maximum[index] == -3.402823466e+38F
+                    ? 0.0f : __expf(maximum[index] - score);
+                denominator[index] *= shrink;
+                #pragma unroll
+                for (int part = 0; part < parts; ++part)
+                    accumulator[index][part] *= shrink;
+                maximum[index] = score;
             }
-            maximum = next_maximum;
+            const float token_scale = __expf(score - maximum[index]);
+            denominator[index] += token_scale;
+            #pragma unroll
+            for (int part = 0; part < parts; ++part)
+                accumulator[index][part] += token_scale * value_row[part];
         }
-        __syncthreads();
     }
 
-    // Same record layout as the per-head kernel, so kv_attention_fused_merge*
-    // combines these tiles unchanged.
+    // The eight warps hold disjoint token sets of the same tile, so the block
+    // combines their online-softmax states before publishing -- one record per
+    // (head, tile), exactly the layout the per-head kernel writes.
+    //
+    // Publishing a record per warp instead would be the same arithmetic and no
+    // shared memory, but eight times the records, and the partial buffer is
+    // sized `heads * context` floats: at a full context that overruns it by 2x.
+    // Merging one head at a time keeps the staging buffer at 8 KB rather than
+    // the 64 KB all eight heads at once would take, and the barriers are paid
+    // once per block, not once per token.
+    __shared__ float warp_maximum[warp_count];
+    __shared__ float warp_denominator[warp_count];
+    __shared__ float warp_scale[warp_count];
+    __shared__ float merged_maximum;
+    __shared__ float merged_denominator;
+    __shared__ float partial_output[warp_count][maximum_head_dim];
     const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
-    float* record = partial
-        + ((long long)head * tile_count + tile) * (maximum_head_dim + 2);
-    if (lane == 0) {
-        record[0] = maximum;
-        record[1] = denominator;
-    }
     #pragma unroll
-    for (int part = 0; part < parts; ++part) {
-        const int dimension = lane + part * 32;
-        if (dimension < head_dim)
-            record[dimension + 2] = accumulator[part];
+    for (int index = 0; index < share; ++index) {
+        __syncthreads();
+        if (lane == 0) {
+            warp_maximum[warp] = maximum[index];
+            warp_denominator[warp] = denominator[index];
+        }
+        #pragma unroll
+        for (int part = 0; part < parts; ++part) {
+            const int dimension = lane + part * 32;
+            if (dimension < head_dim)
+                partial_output[warp][dimension] = accumulator[index][part];
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float tile_maximum = warp_maximum[0];
+            #pragma unroll
+            for (int other = 1; other < warp_count; ++other)
+                tile_maximum = fmaxf(tile_maximum, warp_maximum[other]);
+            float tile_denominator = 0.0f;
+            #pragma unroll
+            for (int other = 0; other < warp_count; ++other) {
+                const float factor = warp_denominator[other] == 0.0f
+                    ? 0.0f : __expf(warp_maximum[other] - tile_maximum);
+                warp_scale[other] = factor;
+                tile_denominator += warp_denominator[other] * factor;
+            }
+            merged_maximum = tile_maximum;
+            merged_denominator = tile_denominator;
+        }
+        __syncthreads();
+        float* record = partial
+            + ((long long)(head_base + index) * tile_count + tile)
+                * (maximum_head_dim + 2);
+        if (threadIdx.x == 0) {
+            record[0] = merged_maximum;
+            record[1] = merged_denominator;
+        }
+        for (int dimension = threadIdx.x;
+             dimension < head_dim;
+             dimension += blockDim.x) {
+            float result = 0.0f;
+            #pragma unroll
+            for (int other = 0; other < warp_count; ++other)
+                result += partial_output[other][dimension] * warp_scale[other];
+            record[dimension + 2] = result;
+        }
     }
 }
 
-#define KV_ATTENTION_GQA_TILES(name, KT, VT, WIDTH, SHARE) \
-extern "C" __global__ void name( \
+// Two tile widths per shape, and the host picks between them by arithmetic, not
+// by preference. A block covers one (KV head, tile), so with two KV heads a
+// 1024-token tile is eight blocks at 8k and cannot fill the device: measured,
+// that shape is flat at ~170 us from 4k to 16k because it is one wave either
+// way, and the 256-token tile runs 138 us where it runs 168. The wide twin
+// exists for the one case the narrow one cannot serve: a tile costs a record of
+// `head_dim + 2` floats and the partial buffer holds `heads * context`, so at a
+// full context 256-token tiles overrun it by 0.8% and 512 is what fits.
+#define KV_ATTENTION_GQA_ROWS(name, KT, VT, DIM, SHARE, TILE) \
+extern "C" __global__ __launch_bounds__(256, 1) void name( \
     const float* query, const KT* keys, const VT* values, float* partial, \
     const int heads, const int kv_heads, const int head_dim, const int tokens, \
     const int capacity, const int first, const float scale \
 ) { \
-    kv_attention_gqa_tiles_impl<KT, VT, WIDTH, SHARE>( \
+    kv_attention_gqa_rows_impl<KT, VT, DIM, SHARE, TILE>( \
         query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
         capacity, first, scale \
     ); \
 }
-KV_ATTENTION_GQA_TILES(kv_attention_gqa_f16_256_s8, __half, __half, 256, 8)
-KV_ATTENTION_GQA_TILES(kv_attention_gqa_f16_256_s4, __half, __half, 256, 4)
-KV_ATTENTION_GQA_TILES(
-    kv_attention_gqa_bf16_256_s8, __nv_bfloat16, __nv_bfloat16, 256, 8)
-KV_ATTENTION_GQA_TILES(
-    kv_attention_gqa_bf16_256_s4, __nv_bfloat16, __nv_bfloat16, 256, 4)
-KV_ATTENTION_GQA_TILES(
-    kv_attention_gqa_q8_256_s8, unsigned char, unsigned char, 256, 8)
-KV_ATTENTION_GQA_TILES(
-    kv_attention_gqa_q8_256_s4, unsigned char, unsigned char, 256, 4)
-#undef KV_ATTENTION_GQA_TILES
-
+#define KV_ATTENTION_GQA_ROWS_TYPE(suffix, KT, VT) \
+    KV_ATTENTION_GQA_ROWS( \
+        kv_attention_gqa_rows_##suffix##_256_s8_t256, KT, VT, 256, 8, 256) \
+    KV_ATTENTION_GQA_ROWS( \
+        kv_attention_gqa_rows_##suffix##_256_s8_t512, KT, VT, 256, 8, 512) \
+    KV_ATTENTION_GQA_ROWS( \
+        kv_attention_gqa_rows_##suffix##_256_s4_t256, KT, VT, 256, 4, 256) \
+    KV_ATTENTION_GQA_ROWS( \
+        kv_attention_gqa_rows_##suffix##_256_s4_t512, KT, VT, 256, 4, 512)
+KV_ATTENTION_GQA_ROWS_TYPE(f16, __half, __half)
+KV_ATTENTION_GQA_ROWS_TYPE(bf16, __nv_bfloat16, __nv_bfloat16)
+KV_ATTENTION_GQA_ROWS_TYPE(q8, unsigned char, unsigned char)
+#undef KV_ATTENTION_GQA_ROWS_TYPE
+#undef KV_ATTENTION_GQA_ROWS
+#undef KV_ATTENTION_GQA_MMA
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
 template<int maximum_head_dim>
 __device__ void kv_attention_fused_merge_impl(
     const float* partial,

@@ -1148,11 +1148,15 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_fused_turbo3_tiles512", "kv_attention_fused_turbo4_tiles512",
              "kv_attention_fused_turbo_merge", "kv_attention_fused_turbo_merge256",
              "kv_attention_fused_turbo_merge512",
-             // Grouped-query variants: one block per KV head, one warp per
-             // query head, KV staged through shared memory.
-             "kv_attention_gqa_f16_256_s8", "kv_attention_gqa_f16_256_s4",
-             "kv_attention_gqa_bf16_256_s8", "kv_attention_gqa_bf16_256_s4",
-             "kv_attention_gqa_q8_256_s8", "kv_attention_gqa_q8_256_s4",
+             // Grouped-query decode: one block per (KV head, tile), one warp
+             // per token, the row decoded once into registers for the whole
+             // group. Two tile widths; the runtime picks by record count.
+             "kv_attention_gqa_rows_f16_256_s8_t256", "kv_attention_gqa_rows_f16_256_s8_t512",
+             "kv_attention_gqa_rows_f16_256_s4_t256", "kv_attention_gqa_rows_f16_256_s4_t512",
+             "kv_attention_gqa_rows_bf16_256_s8_t256", "kv_attention_gqa_rows_bf16_256_s8_t512",
+             "kv_attention_gqa_rows_bf16_256_s4_t256", "kv_attention_gqa_rows_bf16_256_s4_t512",
+             "kv_attention_gqa_rows_q8_256_s8_t256", "kv_attention_gqa_rows_q8_256_s8_t512",
+             "kv_attention_gqa_rows_q8_256_s4_t256", "kv_attention_gqa_rows_q8_256_s4_t512",
              "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8",
              "gemma_q4_0_matvec", "gemma_q4_0_embedding", "gemma_q4_0_geglu",
              "gemma_q4_0_grouped_geglu", "gemma_q4_0_grouped_accumulate",

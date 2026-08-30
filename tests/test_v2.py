@@ -412,6 +412,78 @@ class V2RuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("tokens>=4096", runtime)
 
+    def test_grouped_attention_shares_each_row_across_the_query_group(self):
+        """The GQA decode kernel decodes a row once per (token, KV head).
+
+        The shape that makes this worth having is 8 query heads per KV head at
+        head_dim 256: the per-head kernel re-reads and re-dequantizes the same
+        row eight times, which on q8 at 49k measured 896 us against this
+        kernel's 511. The parts that are easy to break silently, because every
+        variant still produces correct tokens, are all asserted here.
+        """
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
+
+        # Both tile widths, every cache type, every instantiated group size.
+        # The corpus pastes the type into the name, so it is the instantiation
+        # that is checked there; the driver and the runtime name them in full --
+        # and the driver resolves kernels from a fixed list, so one missing from
+        # it is simply never found at launch, silently, as a fallback.
+        for share in (8, 4):
+            for tile in (256, 512):
+                self.assertIn(
+                    f"kv_attention_gqa_rows_##suffix##_256_s{share}_t{tile}",
+                    kernels)
+        for precision, types in (("f16", "__half, __half"),
+                                 ("bf16", "__nv_bfloat16, __nv_bfloat16"),
+                                 ("q8", "unsigned char, unsigned char")):
+            self.assertIn(
+                f"KV_ATTENTION_GQA_ROWS_TYPE({precision}, {types})", kernels)
+            for share in (8, 4):
+                for tile in (256, 512):
+                    symbol = (f"kv_attention_gqa_rows_{precision}_256"
+                              f"_s{share}_t{tile}")
+                    self.assertIn(symbol, driver)
+                    self.assertIn(symbol, runtime)
+        # The sharing itself: one decode of the row, `share` dot products
+        # against it, and the queries held per group rather than per head.
+        self.assertIn("kv_fused_load_row<KT, parts>(keys", kernels)
+        self.assertIn("kv_fused_load_row<VT, parts>(values", kernels)
+        self.assertIn("float query_registers[share][parts];", kernels)
+        # A block's warps split the tile's tokens, so it always launches 256
+        # threads and merges them itself into one record per (head, tile).
+        self.assertIn("launch_named(gqa_tiles,kv_heads,gqa_tile_count,256,", runtime)
+        self.assertIn(
+            "const int tile_count = (tokens + tokens_per_tile - 1) "
+            "/ tokens_per_tile;", kernels)
+        # cuBLAS keeps its place ahead of it on an f16 cache.
+        self.assertIn("!cublas_done&&runtime->fused_attention", runtime)
+        # The tile is chosen by what fits, not by preference.
+        self.assertIn("kv_gqa_rows_tile_tokens(*runtime,tokens)", runtime)
+        self.assertIn("records*kv_fused_record_stride(256)", runtime)
+        # The superseded staged variant is gone rather than left unreachable.
+        self.assertNotIn("kv_attention_gqa_f16_256_s8", kernels)
+        self.assertNotIn("kv_attention_gqa_f16_256_s8", driver)
+
+    def test_attention_path_can_say_which_kernel_it_chose(self):
+        """Every decode path is correct, so a fallback is invisible without this.
+
+        FLYWEIGHT_GQA_ATTENTION is latched into a function-local static on first
+        use, which means two settings inside one process run the same kernel
+        twice -- an A/B that compares a kernel with itself and reports no
+        difference. The announcement is what catches that.
+        """
+        root = Path(__file__).resolve().parents[1]
+        runtime = (
+            root / "native/src/v2_runtime.cpp"
+        ).read_text(encoding="utf-8")
+        self.assertIn("FLYWEIGHT_ATTENTION_DIAG", runtime)
+        self.assertIn("[attention] decode path: %s", runtime)
+
     def test_sampling_lm_head_dispatches_on_tensor_type(self):
         """Temperature sampling must pick the head kernel by tensor type.
 
