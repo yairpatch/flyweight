@@ -1598,12 +1598,27 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertEqual(
             self.generator.calls[-1][1]["reasoning_budget_tokens"], 2048
         )
-        # Adaptive carries no budget even if a client sends one: the field is
-        # only defined alongside "enabled".
+        # Adaptive carries no budget_tokens (the field is only defined
+        # alongside "enabled"), so the server arms its own default: half the
+        # completion budget. Uncapped, a long think consumed the whole turn
+        # and returned no visible text -- Claude Code's compaction request
+        # was the worst case, ending "[ended while thinking]" with no summary
+        # for the client to install, so compaction never completed.
         self.service.anthropic_message(
             {
                 "messages": [{"role": "user", "content": "Think"}],
                 "thinking": {"type": "adaptive", "budget_tokens": 2048},
+                "max_tokens": 4,
+            }
+        )
+        self.assertEqual(
+            self.generator.calls[-1][1]["reasoning_budget_tokens"], 2
+        )
+        # Disabled thinking never arms the meter.
+        self.service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "thinking": {"type": "disabled"},
                 "max_tokens": 4,
             }
         )

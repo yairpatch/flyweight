@@ -2259,6 +2259,20 @@ class InferenceService:
         # never set. Only the tail can carry the marker.
         thinking_open = self._prompt_opens_thinking(prompt_ids)
         format_shape = _response_format_shape(payload.get("response_format"))
+        reasoning_budget = _reasoning_budget(payload)
+        if reasoning_budget is None and enable_thinking is not False:
+            # A model that thinks with no ceiling can spend the whole
+            # completion budget inside <think> and end the turn with no
+            # visible text at all ("[ended while thinking]"). Claude Code's
+            # compaction is the worst case: the summary request arrives with
+            # thinking "adaptive" (which carries no budget_tokens) and a
+            # modest max_tokens, the model deliberates past the cap, the
+            # client receives no summary, and the session rolls on with a
+            # full context. Half the completion budget is the ceiling --
+            # thinking may be most of a turn but never all of it. An explicit
+            # reasoning_budget_tokens still overrides, and thinking:
+            # {"type": "disabled"} never arms the meter.
+            reasoning_budget = max(1, max_new_tokens // 2)
         return _GenerationRequest(
             messages,
             prompt_ids,
@@ -2279,7 +2293,7 @@ class InferenceService:
                 if format_shape is not None
                 else None
             ),
-            reasoning_budget_tokens=_reasoning_budget(payload),
+            reasoning_budget_tokens=reasoning_budget,
         )
 
     def _record_transcript(
