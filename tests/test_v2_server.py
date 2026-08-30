@@ -1443,6 +1443,7 @@ class NativeV2ServerTests(unittest.TestCase):
                 "last_reused_tokens": 0,
                 "last_lcp_live": 0,
                 "last_lcp_snapshot": 0,
+                "last_slot": 0,
                 "kv_reserved_bytes": 0,
                 "kv_peak_live_bytes": 0,
                 "kv_peak_tokens": 0,

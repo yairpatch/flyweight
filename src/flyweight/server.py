@@ -3020,10 +3020,48 @@ def create_handler(
                     reused = min(max(0, processed), total)
                     remaining = max(0, total - reused)
                     cached = f", {reused} cached/reused" if reused else ""
+                    detail = None
+                    diagnostics = getattr(
+                        getattr(service, "generator", None),
+                        "prefix_diagnostics",
+                        None,
+                    )
+                    if diagnostics is not None:
+                        try:
+                            detail = diagnostics()
+                        except Exception:
+                            detail = None
+                    # The runtime records only the LAST admission; under the
+                    # engine another request can admit between ours and this
+                    # read, so only trust a record describing this prompt.
+                    if detail is not None and detail["prompt_tokens"] != total:
+                        detail = None
+                    slot = f" [slot {detail['slot']}]" if detail is not None else ""
                     sys.stderr.write(
                         f"{label}: starting {total} prompt tokens"
-                        f"{cached}, {remaining} to evaluate\n"
+                        f"{cached}, {remaining} to evaluate{slot}\n"
                     )
+                    if detail is not None and 0 < detail["divergence"] < detail[
+                        "cached_tokens"
+                    ]:
+
+                        def clip(text: str) -> str:
+                            text = str(text).replace("\n", "\\n")
+                            return text[:80] + ("…" if len(text) > 80 else "")
+
+                        snapped = (
+                            f", reuse snapped back to {detail['reused_tokens']}"
+                            f" (nearest checkpoint)"
+                            if detail["reused_tokens"] < detail["divergence"]
+                            else ""
+                        )
+                        sys.stderr.write(
+                            f"{label}: history rewritten at token"
+                            f" {detail['divergence']} of"
+                            f" {detail['cached_tokens']} cached{snapped}\n"
+                            f"{label}:   cached: {clip(detail['old_text'])}\n"
+                            f"{label}:   prompt: {clip(detail['new_text'])}\n"
+                        )
                     sys.stderr.flush()
                     # The clock is NOT restarted here, and that is deliberate.
                     #

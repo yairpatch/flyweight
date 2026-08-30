@@ -1676,6 +1676,7 @@ class NativeV2Generator(ChatGenerator):
             "last_lcp_snapshot": int(
                 info.get("prefix_cache_last_lcp_snapshot", 0)
             ),
+            "last_slot": int(info.get("prefix_cache_last_slot", 0)),
             # What the slots reserve against what they were ever asked to hold.
             # Slots are sized for the full context at load, so on a small card
             # the difference is expert cache that decode would rather have --
@@ -1690,6 +1691,37 @@ class NativeV2Generator(ChatGenerator):
             # continuing it, and were given their own slot seeded from it.
             "donations": int(info.get("prefix_donations", 0)),
             "donated_tokens": int(info.get("prefix_donated_tokens", 0)),
+        }
+
+    def prefix_diagnostics(self) -> dict[str, object] | None:
+        """Where the last admitted prompt split from its slot's history.
+
+        Decoded from the token snippets the runtime captures at admission,
+        so the prefill log can show WHAT the client rewrote rather than only
+        how much the rewrite cost. None until a prompt has been admitted.
+        Special tokens are kept: a divergence at a turn boundary IS the
+        interesting case, and hiding <|im_end|> would hide it.
+        """
+        info = self.runtime.info
+        prompt_tokens = int(info.get("prefix_cache_last_prompt_tokens", 0))
+        if not prompt_tokens:
+            return None
+        old_count = int(info.get("prefix_cache_last_old_count", 0))
+        new_count = int(info.get("prefix_cache_last_new_count", 0))
+        old_ids = [int(t) for t in info.get("prefix_cache_last_old_tokens", [])]
+        new_ids = [int(t) for t in info.get("prefix_cache_last_new_tokens", [])]
+        return {
+            "slot": int(info.get("prefix_cache_last_slot", 0)),
+            "cached_tokens": int(info.get("prefix_cache_last_cached_tokens", 0)),
+            "prompt_tokens": prompt_tokens,
+            "reused_tokens": int(info.get("prefix_cache_last_reused_tokens", 0)),
+            "divergence": int(info.get("prefix_cache_last_lcp_live", 0)),
+            "old_text": self.tokenizer.decode(
+                old_ids[:old_count], skip_special_tokens=False
+            ),
+            "new_text": self.tokenizer.decode(
+                new_ids[:new_count], skip_special_tokens=False
+            ),
         }
 
 

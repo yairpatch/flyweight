@@ -403,6 +403,15 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefix_donations", ctypes.c_uint64),
         ("prefix_donated_tokens", ctypes.c_uint64),
         ("expert_cache_unused_admissions", ctypes.c_uint64),
+        # Last-admission divergence capture: the routed slot, what it held,
+        # and up to 32 token ids from each side of the point where the new
+        # prompt stopped matching the cached history.
+        ("prefix_cache_last_slot", ctypes.c_uint64),
+        ("prefix_cache_last_cached_tokens", ctypes.c_uint64),
+        ("prefix_cache_last_old_tokens", ctypes.c_uint32 * 32),
+        ("prefix_cache_last_old_count", ctypes.c_uint64),
+        ("prefix_cache_last_new_tokens", ctypes.c_uint32 * 32),
+        ("prefix_cache_last_new_count", ctypes.c_uint64),
     ]
 
 
@@ -2705,9 +2714,15 @@ class V2QwenRuntime:
             self._lib.flyweight_v2_qwen_runtime_info(self._handle, ctypes.byref(value))
         )
         boolean_fields = {"cuda_ready", "decode_ready"}
+        array_fields = {
+            "prefix_cache_last_old_tokens",
+            "prefix_cache_last_new_tokens",
+        }
         result: dict[str, object] = {
             field: bool(getattr(value, field))
             if field in boolean_fields
+            else list(getattr(value, field))
+            if field in array_fields
             else int(getattr(value, field))
             for field, _ in _QwenRuntimeInfo._fields_
         }

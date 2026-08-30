@@ -905,6 +905,16 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t prefix_cache_last_reused_tokens = 0;
     std::uint64_t prefix_cache_last_lcp_live = 0;
     std::uint64_t prefix_cache_last_lcp_snapshot = 0;
+    // Divergence capture for the last admission: which slot the prompt was
+    // routed to, what that slot held, and a short window of token ids from
+    // each side of the split -- taken before reuse truncates the history,
+    // which is the only moment the old side still exists.
+    std::uint64_t prefix_cache_last_slot = 0;
+    std::uint64_t prefix_cache_last_cached_tokens = 0;
+    std::uint32_t prefix_cache_last_old_tokens[32] = {};
+    std::uint64_t prefix_cache_last_old_count = 0;
+    std::uint32_t prefix_cache_last_new_tokens[32] = {};
+    std::uint64_t prefix_cache_last_new_count = 0;
     // KV occupancy against the reservation (phase 0 of plans/paged-kv-cache.md).
     // Every slot reserves state_bytes for the full context at prepare, whether
     // or not a conversation ever fills it; these are the high-water marks of
@@ -12947,6 +12957,14 @@ int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->prefix_donations=runtime->prefix_donations;
     out->prefix_donated_tokens=runtime->prefix_donated_tokens;
     out->expert_cache_unused_admissions=runtime->expert_cache_unused_admissions;
+    out->prefix_cache_last_slot=runtime->prefix_cache_last_slot;
+    out->prefix_cache_last_cached_tokens=runtime->prefix_cache_last_cached_tokens;
+    std::memcpy(out->prefix_cache_last_old_tokens,runtime->prefix_cache_last_old_tokens,
+        sizeof(out->prefix_cache_last_old_tokens));
+    out->prefix_cache_last_old_count=runtime->prefix_cache_last_old_count;
+    std::memcpy(out->prefix_cache_last_new_tokens,runtime->prefix_cache_last_new_tokens,
+        sizeof(out->prefix_cache_last_new_tokens));
+    out->prefix_cache_last_new_count=runtime->prefix_cache_last_new_count;
     return 0;
 });}
 int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&flyweight_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
@@ -20107,6 +20125,23 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         best_snapshot_lcp=std::max(best_snapshot_lcp,lcp_with(candidate.tokens.data(),candidate.tokens.size()));
     }
     runtime->prefix_cache_last_lcp_snapshot=best_snapshot_lcp;
+    {
+        // Capture both sides of the divergence NOW: reuse below truncates
+        // processed_tokens, and with it the only copy of what the client
+        // rewrote. 32 tokens is a log snippet, not a transcript.
+        runtime->prefix_cache_last_slot=runtime->active_sequence;
+        runtime->prefix_cache_last_cached_tokens=runtime->processed_tokens.size();
+        const std::uint64_t split=runtime->prefix_cache_last_lcp_live;
+        constexpr std::uint64_t kSnippet=32;
+        std::uint64_t taken=0;
+        for(std::uint64_t i=split;i<runtime->processed_tokens.size()&&taken<kSnippet;++i)
+            runtime->prefix_cache_last_old_tokens[taken++]=runtime->processed_tokens[i];
+        runtime->prefix_cache_last_old_count=taken;
+        taken=0;
+        for(std::uint64_t i=split;i<prompt_count&&taken<kSnippet;++i)
+            runtime->prefix_cache_last_new_tokens[taken++]=prompt[i];
+        runtime->prefix_cache_last_new_count=taken;
+    }
     std::uint64_t prompt_start=0;
     bool reusable=!runtime->processed_tokens.empty()&&
         runtime->processed_tokens.size()<=prompt_count;

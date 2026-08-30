@@ -306,6 +306,16 @@ typedef struct FlyweightV2QwenRuntimeInfo {
        and is slower (see expert_admission_allowed), so this is a watch on the
        upload share, not a defect count. */
     uint64_t expert_cache_unused_admissions;
+    /* Where the last prompt parted ways with the routed slot's cached history,
+       captured at admission BEFORE reuse truncates that history: the slot it
+       landed on, how many tokens the slot held, and up to 32 token ids from
+       each side of the divergence so a server can log the rewrite as text. */
+    uint64_t prefix_cache_last_slot;
+    uint64_t prefix_cache_last_cached_tokens;
+    uint32_t prefix_cache_last_old_tokens[32];
+    uint64_t prefix_cache_last_old_count;
+    uint32_t prefix_cache_last_new_tokens[32];
+    uint64_t prefix_cache_last_new_count;
 } FlyweightV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
