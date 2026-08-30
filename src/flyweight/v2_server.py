@@ -21,7 +21,7 @@ from .sampling import (
     SamplingConfig,
     coerce as sampling_coerce,
 )
-from .server import InferenceService, _parse_tool_calls
+from .server import InferenceService, _parse_tool_calls, _split_reasoning_content
 from .v2 import (
     AUTO_PROMPT_CACHE_MIB,
     TASK_EVENT_DONE,
@@ -1365,7 +1365,15 @@ class ChatGenerator:
         raw = (self._chat_text if raw_text is None else raw_text).strip()
         if candidate == raw:
             return True
-        raw_content, raw_calls = _parse_tool_calls(raw)
+        # The client replays what it was served, and the response path splits
+        # the leading reasoning out of `content` (_split_reasoning_content)
+        # while `raw` still carries it -- so a thinking model's every plain
+        # answer failed this check and the turn re-rendered cold. Compare
+        # against the same visible reading the client received.
+        visible = _split_reasoning_content(raw)[0].strip()
+        if candidate == visible:
+            return True
+        raw_content, raw_calls = _parse_tool_calls(visible)
         candidate_content, candidate_calls = _parse_tool_calls(candidate)
         if not raw_calls or not candidate_calls or len(raw_calls) != len(candidate_calls):
             return False

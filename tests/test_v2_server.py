@@ -1575,6 +1575,59 @@ class NativeV2ServerTests(unittest.TestCase):
 
         self.assertEqual(continued, [7, 8, 20, 30, 1, 2, 1, 2])
 
+    def test_thinking_answer_round_trip_preserves_generated_token_ids(self) -> None:
+        # The response path serves `content` with the leading reasoning split
+        # off, and that is what the client replays -- while _chat_text keeps
+        # the raw generation. A thinking model's every plain answer used to
+        # fail the exact compare here and re-render the whole turn cold.
+        generator, _ = self.make_generator([10])
+        generator._chat_messages = (("user", "Hi", ""),)
+        generator._chat_prompt_ids = (7, 8)
+        generator._chat_generated_ids = (20, 30)
+        # The prompt ends inside a forced-open think block, so the generation
+        # carries only the CLOSING tag -- the shape _split_reasoning_content
+        # documents.
+        generator._chat_text = "Some mulling.\n</think>\n\nHello world"
+        generator._chat_thinking = None
+
+        continued = generator._continued_chat_prompt(
+            (
+                ("user", "Hi", ""),
+                ("assistant", "Hello world", "Some mulling."),
+                ("user", "Again", ""),
+            ),
+            None,
+        )
+
+        self.assertEqual(continued, [7, 8, 20, 30, 1, 2, 1, 2])
+
+    def test_thinking_tool_call_round_trip_preserves_generated_token_ids(self) -> None:
+        # Same split, with a structured tool call after the reasoning: the
+        # call comparison must read the visible text, not the raw generation,
+        # or the reasoning lands in raw_content and never matches.
+        generator, _ = self.make_generator([10])
+        call = (
+            "<tool_call>\n<function=write_file>\n"
+            "<parameter=path>\n/tmp/example\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        generator._chat_messages = (("user", "Write it", ""),)
+        generator._chat_prompt_ids = (7, 8)
+        generator._chat_generated_ids = (20, 30)
+        generator._chat_text = f"<think>\nPlanning the write.\n</think>\n\n{call}"
+        generator._chat_thinking = None
+
+        continued = generator._continued_chat_prompt(
+            (
+                ("user", "Write it", ""),
+                ("assistant", call, ""),
+                ("user", "<tool_response>\ndone\n</tool_response>", ""),
+            ),
+            None,
+        )
+
+        self.assertEqual(continued, [7, 8, 20, 30, 1, 2, 1, 2])
+
     def test_concurrent_side_chat_does_not_evict_main_continuation(self) -> None:
         generator, _ = self.make_generator([10])
         main = (("user", "Long main conversation", ""),)
