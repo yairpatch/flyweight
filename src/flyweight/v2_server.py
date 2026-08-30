@@ -1573,7 +1573,13 @@ class ChatGenerator:
                     # closed and resume the answer on a fresh task whose
                     # prompt is everything decoded so far plus the close. The
                     # engine treats that prompt like any other, so a prefix
-                    # cache absorbs the restage where one exists.
+                    # cache absorbs the restage where one exists. Named in
+                    # the log because from outside, a capped think and a hung
+                    # one look identical until the answer arrives.
+                    sys.stderr.write(
+                        f"[gen ] thinking budget of {meter.budget} tokens "
+                        f"spent; closing the block and resuming the answer\n"
+                    )
                     self.engine.cancel(task_id)
                     self.engine.forget(task_id)
                     meter.close()

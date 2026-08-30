@@ -480,6 +480,14 @@ class InferenceService:
         # one parameter, and a cap that fits a "normal" call would truncate it.
         # Set it where a model is known to loop inside <tool_call>.
         max_tool_call_tokens: int = 0,
+        # The thinking cap for requests that ask for thinking but name no
+        # budget of their own (Claude Code's "adaptive" on every request).
+        # Proportional-only ("half of max_tokens") proved useless locally: a
+        # 32k-token completion budget arms a 16k thinking cap, which at 40
+        # tok/s is six minutes of deliberation -- indistinguishable from a
+        # hang, and Claude Code's compaction sat behind exactly that. Tokens;
+        # 0 disables the default (explicit budgets always apply).
+        default_thinking_budget: int = 2048,
         reasoning_effort: str | None = None,
         generation_defaults: Mapping[str, int | float] | None = None,
     ):
@@ -497,6 +505,8 @@ class InferenceService:
             raise ValueError("sse_keepalive_seconds must be positive")
         if max_tool_call_tokens < 0:
             raise ValueError("max_tool_call_tokens must be non-negative")
+        if default_thinking_budget < 0:
+            raise ValueError("default_thinking_budget must be non-negative")
         self.model_name = model_name
         self.generator = generator
         self.max_new_tokens = max_new_tokens
@@ -509,6 +519,7 @@ class InferenceService:
         self.keepalive_timeout_seconds = keepalive_timeout_seconds
         self.sse_keepalive_seconds = sse_keepalive_seconds
         self.max_tool_call_tokens = max_tool_call_tokens
+        self.default_thinking_budget = default_thinking_budget
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(
                 "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS))
@@ -2260,19 +2271,27 @@ class InferenceService:
         thinking_open = self._prompt_opens_thinking(prompt_ids)
         format_shape = _response_format_shape(payload.get("response_format"))
         reasoning_budget = _reasoning_budget(payload)
-        if reasoning_budget is None and enable_thinking is not False:
+        if (
+            reasoning_budget is None
+            and enable_thinking is not False
+            and self.default_thinking_budget
+        ):
             # A model that thinks with no ceiling can spend the whole
             # completion budget inside <think> and end the turn with no
             # visible text at all ("[ended while thinking]"). Claude Code's
             # compaction is the worst case: the summary request arrives with
-            # thinking "adaptive" (which carries no budget_tokens) and a
-            # modest max_tokens, the model deliberates past the cap, the
-            # client receives no summary, and the session rolls on with a
-            # full context. Half the completion budget is the ceiling --
-            # thinking may be most of a turn but never all of it. An explicit
+            # thinking "adaptive" (which carries no budget_tokens), the model
+            # deliberates past the cap, the client receives no summary, and
+            # the session rolls on with a full context. Two ceilings, both
+            # needed: half the completion budget so thinking can never starve
+            # the visible answer, and the server's absolute default so a
+            # 32k-token max_tokens does not translate to six minutes of
+            # deliberation at local decode speeds. An explicit
             # reasoning_budget_tokens still overrides, and thinking:
             # {"type": "disabled"} never arms the meter.
-            reasoning_budget = max(1, max_new_tokens // 2)
+            reasoning_budget = min(
+                max(1, max_new_tokens // 2), self.default_thinking_budget
+            )
         return _GenerationRequest(
             messages,
             prompt_ids,

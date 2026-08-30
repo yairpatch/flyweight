@@ -784,6 +784,14 @@ checkpoint's generation_config.json says.\
              "0 leaves it bounded only by --max-tokens, since a legitimate "
              "call can be as large as the file it writes",
     )
+    limits.add_argument(
+        "--thinking-budget", type=int, default=2048, metavar="N",
+        help="thinking-token cap for requests that enable thinking without "
+             "naming a budget (Claude Code sends exactly that on every "
+             "request); the block is closed at the cap and the answer "
+             "resumes. An explicit reasoning_budget_tokens overrides; "
+             "0 disables the default and lets a think run to max-tokens",
+    )
     _add_backend_option(
         serve.add_argument_group(
             "backend", "Which processor runs the model.",
@@ -1136,6 +1144,8 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         raise SystemExit("--sse-keepalive-seconds must be positive")
     if getattr(args, "max_tool_call_tokens", 0) < 0:
         raise SystemExit("--max-tool-call-tokens must be non-negative")
+    if getattr(args, "thinking_budget", 0) < 0:
+        raise SystemExit("--thinking-budget must be non-negative")
     if args.cpu_prefetch_mib and args.cpu_prefetch_auto:
         raise SystemExit("use either --cpu-prefetch-mib or --cpu-prefetch-auto")
     if not 0 <= args.next_layer_prefetch <= 64:
@@ -1419,6 +1429,7 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
         request_timeout_seconds=getattr(args, "request_timeout_seconds", 30.0),
         sse_keepalive_seconds=getattr(args, "sse_keepalive_seconds", 10.0),
         max_tool_call_tokens=getattr(args, "max_tool_call_tokens", 0),
+        default_thinking_budget=getattr(args, "thinking_budget", 2048),
     )
 
 
@@ -1530,6 +1541,7 @@ def _serve(args: argparse.Namespace) -> int:
         request_timeout_seconds=args.request_timeout_seconds,
         sse_keepalive_seconds=args.sse_keepalive_seconds,
         max_tool_call_tokens=args.max_tool_call_tokens,
+        default_thinking_budget=getattr(args, "thinking_budget", 2048),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         generation_defaults=_sampling_overrides(args),
     )

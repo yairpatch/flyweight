@@ -1625,6 +1625,42 @@ class InferenceServiceTests(unittest.TestCase):
         self.assertIsNone(
             self.generator.calls[-1][1]["reasoning_budget_tokens"]
         )
+        # The proportional half is itself capped by the server's absolute
+        # default: half of a 32k completion budget is six minutes of local
+        # decode, which reads as a hang -- Claude Code's compaction sat
+        # behind exactly that.
+        generator = StubGenerator()
+        service = InferenceService(
+            "qwen-local", generator, max_new_tokens=32000,
+            context_window=131072,
+        )
+        service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "thinking": {"type": "adaptive"},
+                "max_tokens": 32000,
+            }
+        )
+        self.assertEqual(
+            generator.calls[-1][1]["reasoning_budget_tokens"], 2048
+        )
+        # And 0 disables the default entirely: the old uncapped behaviour,
+        # by explicit operator choice.
+        generator = StubGenerator()
+        service = InferenceService(
+            "qwen-local", generator, max_new_tokens=32000,
+            context_window=131072, default_thinking_budget=0,
+        )
+        service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "thinking": {"type": "adaptive"},
+                "max_tokens": 32000,
+            }
+        )
+        self.assertIsNone(
+            generator.calls[-1][1]["reasoning_budget_tokens"]
+        )
         with self.assertRaisesRegex(APIError, "reasoning_budget_tokens"):
             self.service.chat_completion(
                 {
