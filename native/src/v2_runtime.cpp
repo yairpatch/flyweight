@@ -1088,6 +1088,11 @@ struct FlyweightV2QwenRuntime {
     // and every slot references one of these. A single entry means symmetric
     // slots, which is the legacy layout exactly.
     std::vector<QwenSlotGeometry> geometries;
+    // Which geometry the layer table currently mirrors. Kernel dispatch reads
+    // offsets and ring capacities from that one table, so any code addressing
+    // a slot's arena must first ensure this matches the slot's geometry --
+    // qwen_decode_multi enforces it per batched slot.
+    std::size_t mirrored_geometry = 0;
     // What the slots reserve in total. A sum, not slots x state_bytes: slots
     // need not be the same size, and that difference is the point.
     std::uint64_t slots_state_bytes = 0;
@@ -1239,6 +1244,7 @@ static void qwen_apply_geometry(FlyweightV2QwenRuntime& runtime, std::size_t ind
     };
     for (std::size_t i = 0; i < runtime.layers.size() && i < g.layers.size(); ++i)
         apply_layer(runtime.layers[i], g.layers[i]);
+    runtime.mirrored_geometry = index;
     apply_layer(runtime.mtp_layer_plan, g.mtp_layer);
     runtime.mtp_target_hidden_offset = g.mtp_target_hidden_offset;
     runtime.mtp_draft_hidden_offset = g.mtp_draft_hidden_offset;
@@ -21389,7 +21395,15 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
         s.slot = slots[i]; s.input = inputs[i];
         s.state = runtime->sequences[s.slot].state;
         s.position = runtime->sequences[s.slot].position;
-        if (s.position >= runtime->options.context_limit) throw std::runtime_error("native Qwen context limit exceeded");
+        // Every layer offset and ring capacity below comes from the ONE
+        // mirrored layer table, so a slot with a different geometry would be
+        // addressed with another slot's layout -- cross-region corruption
+        // inside its arena, or writes past the end of a smaller one. The
+        // caller batches same-geometry slots; this is the backstop.
+        if (runtime->sequences[s.slot].geometry != runtime->mirrored_geometry)
+            throw std::runtime_error(
+                "native Qwen multi-decode geometry mismatch");
+        if (s.position >= qwen_slot_context(*runtime, s.slot)) throw std::runtime_error("native Qwen context limit exceeded");
         if (s.input >= runtime->model->config.vocabulary_size) throw std::runtime_error("native Qwen input token is out of range");
         const auto base=runtime->workspace+i*workspace_layout.bytes;
         s.hidden = workspace_layout.hidden.address(base);
@@ -22373,19 +22387,42 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
            runtime->multi_decode_capacity>=2&&
            !runtime->expert_residency_frozen&&
            expert_policy.routed_cpu_execution_allowed()){
-            batched=std::min<std::size_t>(pending_decode.size(),runtime->multi_decode_capacity);
+            // The multi driver reads every layer offset and ring capacity from
+            // the one mirrored layer table, so a batch must share a geometry:
+            // group the front of the queue by the first task's geometry and
+            // leave the rest (different geometry, or overflow) to the serial
+            // loop below, which switches geometry per slot -- every pending
+            // task still decodes its token this step, batched or not.
+            const auto batch_geometry=
+                runtime->sequences[pending_decode[0]->slot].geometry;
+            std::stable_partition(pending_decode.begin(),pending_decode.end(),
+                [&](const QwenEngineTask*task){
+                    return runtime->sequences[task->slot].geometry
+                        ==batch_geometry;});
+            std::size_t same_geometry=0;
+            while(same_geometry<pending_decode.size()&&
+                  runtime->sequences[pending_decode[same_geometry]->slot]
+                      .geometry==batch_geometry)++same_geometry;
+            batched=std::min<std::size_t>(
+                same_geometry,runtime->multi_decode_capacity);
             std::vector<std::size_t> slots(batched);
             std::vector<std::uint32_t> batch_inputs(batched),batch_outputs(batched);
             for(std::size_t i=0;i<batched;++i){slots[i]=pending_decode[i]->slot;batch_inputs[i]=pending_decode[i]->next_token;}
             qwen_park_active(*runtime,true);
+            qwen_apply_geometry(*runtime,batch_geometry);
+            const auto restore_geometry=[&]{
+                qwen_apply_geometry(*runtime,
+                    runtime->sequences[runtime->active_sequence].geometry);
+                qwen_park_active(*runtime,false);
+            };
             bool batch_ok=false;
             try{
                 qwen_decode_multi(runtime,batched,slots.data(),batch_inputs.data(),batch_outputs.data());
-                qwen_park_active(*runtime,false);
+                restore_geometry();
                 for(std::size_t i=0;i<batched;++i)pending_decode[i]->next_token=batch_outputs[i];
                 batch_ok=true;
             }catch(const std::exception&error){
-                qwen_park_active(*runtime,false);
+                restore_geometry();
                 // The whole batch shares one stream of work; fail all of it.
                 std::fprintf(stderr,"[flyweight] engine decode batch failed: %s\n",error.what());
                 for(std::size_t i=0;i<batched;++i){finished.push_back(pending_decode[i]->id);emit(pending_decode[i]->id,0,2);}
