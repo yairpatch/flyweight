@@ -2016,6 +2016,10 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_host_free(runtime.dense_host);
     runtime.dense_host = nullptr;
     runtime.dense_host_bytes = 0;
+    // A device arena, unlike its host-side neighbours: zeroing the handle
+    // without freeing leaked the widest gate/up/down staging triple per
+    // reload, and the next prepare's auto-fit probed that much less VRAM.
+    flyweight_gpu_free(runtime.host_ffn_stage);
     runtime.host_ffn_stage = 0;
     runtime.host_ffn_stage_bytes = 0;
     runtime.host_ffn_q8.clear();
@@ -16284,10 +16288,28 @@ inline AttentionCacheView attention_cache_view(const QwenLayerPlan& layer,std::u
     const auto first_absolute=position+1-visible;
     return {static_cast<int>(position%layer.cache_capacity),static_cast<int>(first_absolute%layer.cache_capacity),static_cast<int>(visible),capacity};
 }
-inline bool swa_snapshot_is_resident(const FlyweightV2QwenRuntime& runtime,std::uint64_t snapshot_position,std::uint64_t live_position){
+// Whether rewinding a slot from live_position back to snapshot_position stays
+// inside every sliding-window ring's rollback room. Judged under the SLOT'S
+// OWN geometry, passed explicitly: the mirrored layer table describes the
+// active slot, and the donation path asks this about a donor that is usually
+// not active -- under heterogeneous slots the two disagree about capacity.
+inline bool swa_snapshot_is_resident(const FlyweightV2QwenRuntime& runtime,
+        std::size_t geometry,
+        std::uint64_t snapshot_position,std::uint64_t live_position){
     if(snapshot_position>live_position)return false;
-    for(const auto& layer:runtime.layers)if(layer.attention_window&&layer.cache_capacity<runtime.options.context_limit){
-        const auto rollback_room=layer.cache_capacity-layer.attention_window;
+    const auto*g=geometry<runtime.geometries.size()
+        ?&runtime.geometries[geometry]:nullptr;
+    const auto slot_context=g?g->context_limit:runtime.options.context_limit;
+    for(std::size_t i=0;i<runtime.layers.size();++i){
+        const auto&layer=runtime.layers[i];
+        if(!layer.attention_window)continue;
+        const auto capacity=g&&i<g->layers.size()
+            ?g->layers[i].cache_capacity:layer.cache_capacity;
+        if(capacity>=slot_context)continue; // never wraps within this slot
+        // capacity is uint64 and the window uint32: a ring no larger than its
+        // window has zero rollback room, not ~2^64 of it.
+        const auto rollback_room=capacity>layer.attention_window
+            ?capacity-layer.attention_window:0;
         if(live_position-snapshot_position>rollback_room)return false;
     }
     return true;
@@ -19501,8 +19523,8 @@ static bool qwen_donation_is_worthwhile(
 
 // Save the live (active) working set into its slot and load `target`'s. The KV
 // arena is per-slot, so only the pointer + host bookkeeping move -- no device
-// copy. Snapshots stay global; the reuse KV-safety guard keeps them correct
-// across slots by tying reuse to the (per-slot) processed_tokens.
+// copy. Checkpoints are per-slot too (swapped below); the reuse KV-safety
+// guard additionally ties any checkpoint reuse to the slot's processed_tokens.
 static void qwen_switch_sequence(FlyweightV2QwenRuntime& runtime, std::size_t target) {
     if (target == runtime.active_sequence) return;
     QwenSequence& cur = runtime.sequences[runtime.active_sequence];
@@ -19521,6 +19543,13 @@ static void qwen_switch_sequence(FlyweightV2QwenRuntime& runtime, std::size_t ta
     runtime.processed_tokens.swap(next.processed_tokens);
     runtime.prefill_snapshots.swap(next.prefill_snapshots);
     runtime.prefill_snapshot_clock = next.prefill_snapshot_clock;
+    // The MTP draft cache is per-slot but its fill counter and the
+    // conditioning-hidden flag are runtime globals: carried across a switch
+    // they describe another slot's cache, and drafting from it wastes rounds
+    // until the clamp happens to zero it. Acceptance-only state -- the
+    // verifier guards the text -- so starting over costs only draft work.
+    runtime.mtp_cache_tokens = 0;
+    runtime.mtp_has_target_hidden = false;
     runtime.active_sequence = target;
 }
 
@@ -19602,6 +19631,22 @@ static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_used_state_rang
     return ranges;
 }
 
+// The live ranges of a slot under ITS OWN geometry rather than the active
+// one. Slots may be laid out differently, so anything that reads or writes an
+// inactive slot's arena -- spill, restore, donation -- has to ask with that
+// slot's offsets. Borrowing the geometry and putting it back is what keeps one
+// definition of the layout instead of a second, drifting copy.
+static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_slot_state_ranges(
+        FlyweightV2QwenRuntime& runtime, std::size_t geometry,
+        std::uint64_t position, bool position_indexed_only = false) {
+    const std::size_t active = runtime.sequences.empty()
+        ? 0 : runtime.sequences[runtime.active_sequence].geometry;
+    if (geometry != active) qwen_apply_geometry(runtime, geometry);
+    auto ranges = qwen_used_state_ranges(runtime, position, position_indexed_only);
+    if (geometry != active) qwen_apply_geometry(runtime, active);
+    return ranges;
+}
+
 // How much of the reservation a session has actually touched. Each slot
 // reserves state_bytes for the full context up front; the live set at a given
 // position is what a paged pool would have had to hold instead, so the gap
@@ -19624,7 +19669,11 @@ static void qwen_note_kv_occupancy(FlyweightV2QwenRuntime& runtime) {
         tokens += position;
         runtime.kv_peak_tokens_max =
             std::max(runtime.kv_peak_tokens_max, position);
-        for (const auto& range : qwen_used_state_ranges(runtime, position))
+        // Under the slot's own geometry: measuring a full slot with a scratch
+        // slot's capacities clamps its live bytes to the scratch size, and
+        // this peak is the sizing input for the paged pool.
+        for (const auto& range : qwen_slot_state_ranges(
+                 runtime, runtime.sequences[slot].geometry, position))
             live += range.second;
     }
     ++runtime.kv_occupancy_samples;
@@ -19635,26 +19684,6 @@ static void qwen_note_kv_occupancy(FlyweightV2QwenRuntime& runtime) {
         runtime.kv_peak_live_bytes = live;
         runtime.kv_peak_tokens = tokens;
     }
-}
-
-// Sample on the way out of a request however it ends. A generate that the
-// callback aborts, or that cancellation cuts short, still grew the KV it grew;
-// sampling only on the clean return would under-report exactly the interleaved
-// traffic this is meant to characterize.
-// The live ranges of a slot under ITS OWN geometry rather than the active
-// one. Slots may be laid out differently, so anything that reads or writes an
-// inactive slot's arena -- spill, restore, donation -- has to ask with that
-// slot's offsets. Borrowing the geometry and putting it back is what keeps one
-// definition of the layout instead of a second, drifting copy.
-static std::vector<std::pair<std::uint64_t, std::uint64_t>> qwen_slot_state_ranges(
-        FlyweightV2QwenRuntime& runtime, std::size_t geometry,
-        std::uint64_t position, bool position_indexed_only = false) {
-    const std::size_t active = runtime.sequences.empty()
-        ? 0 : runtime.sequences[runtime.active_sequence].geometry;
-    if (geometry != active) qwen_apply_geometry(runtime, geometry);
-    auto ranges = qwen_used_state_ranges(runtime, position, position_indexed_only);
-    if (geometry != active) qwen_apply_geometry(runtime, active);
-    return ranges;
 }
 
 // Two range lists describe the same state in different layouts only if they
@@ -19670,6 +19699,10 @@ static bool qwen_ranges_are_compatible(
     return true;
 }
 
+// Sample on the way out of a request however it ends. A generate that the
+// callback aborts, or that cancellation cuts short, still grew the KV it grew;
+// sampling only on the clean return would under-report exactly the interleaved
+// traffic this is meant to characterize.
 struct QwenKvOccupancyGuard {
     FlyweightV2QwenRuntime& runtime;
     ~QwenKvOccupancyGuard() {
@@ -19788,19 +19821,47 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
     const auto source = qwen_slot_state_ranges(runtime, e.geometry, e.position);
     const auto ranges = qwen_slot_state_ranges(runtime, seq.geometry, e.position);
     if (!qwen_ranges_are_compatible(source, ranges)) return false;
+    // Once the first upload is issued the victim's arena is a splice of two
+    // conversations, while its bookkeeping still claims the old one -- and a
+    // prompt continuing that old conversation would reuse the spliced state.
+    // A refusal above leaves the victim intact; a failure below must not.
+    const auto poison_victim = [&] {
+        tokens.clear();
+        if (active) {
+            runtime.position = 0;
+            runtime.last_output_token = 0;
+            runtime.last_output_greedy = true;
+        } else {
+            seq.position = 0;
+            seq.last_output_token = 0;
+            seq.last_output_greedy = true;
+        }
+        for (auto& s : snapshots) s.valid = false;
+    };
     std::uint64_t cursor = 0;
     for (const auto& r : ranges) {
         if (flyweight_gpu_upload(seq.state + r.first,
-                static_cast<const char*>(e.state) + cursor, r.second, runtime.stream) != 0)
+                static_cast<const char*>(e.state) + cursor, r.second, runtime.stream) != 0) {
+            poison_victim();
             return false;
+        }
         cursor += r.second;
     }
-    if (flyweight_gpu_stream_sync(runtime.stream) != 0) return false;
+    if (flyweight_gpu_stream_sync(runtime.stream) != 0) {
+        poison_victim();
+        return false;
+    }
     tokens = std::move(e.tokens);
     if (active) {
         runtime.position = e.position;
         runtime.last_output_token = e.last_output_token;
         runtime.last_output_greedy = e.last_output_greedy;
+        // The restore displaced the live conversation without a slot switch
+        // (the one-slot case), so the switch-time MTP invalidation never
+        // runs; drafts would otherwise continue from the displaced
+        // conversation's cache.
+        runtime.mtp_cache_tokens = 0;
+        runtime.mtp_has_target_hidden = false;
     } else {
         seq.position = e.position;
         seq.last_output_token = e.last_output_token;
@@ -19811,8 +19872,13 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
         if (slot_i >= snapshots.size()) break;
         auto& dst = snapshots[slot_i++];
         if (flyweight_gpu_upload(dst.device, hs.state, runtime.prefill_snapshot_bytes, runtime.stream) != 0
-            || flyweight_gpu_stream_sync(runtime.stream) != 0)
+            || flyweight_gpu_stream_sync(runtime.stream) != 0) {
+            // slot_i already moved past dst: invalidate the half-written
+            // checkpoint itself, not just the ones after it, or it keeps its
+            // old tokens over a device buffer in an unknown state.
+            dst.valid = false;
             break;
+        }
         dst.tokens = std::move(hs.tokens);
         dst.last_output = hs.last_output;
         dst.last_output_greedy = hs.last_output_greedy;
@@ -19861,6 +19927,7 @@ static bool qwen_donate_prefix(FlyweightV2QwenRuntime& runtime,
         ? runtime.processed_tokens : runtime.sequences[donor].processed_tokens;
     const auto donor_position = donor_active
         ? runtime.position : runtime.sequences[donor].position;
+    const auto donor_geometry = runtime.sequences[donor].geometry;
     if (!donor_position || donor_tokens.empty()) return false;
 
     // Everything the donation needs is copied out before the switch below moves
@@ -19887,7 +19954,8 @@ static bool qwen_donate_prefix(FlyweightV2QwenRuntime& runtime,
             if (!std::equal(candidate.tokens.begin(), candidate.tokens.end(),
                             donor_tokens.begin()))
                 continue;
-            if (!swa_snapshot_is_resident(runtime, count, donor_position)) continue;
+            if (!swa_snapshot_is_resident(runtime, donor_geometry, count,
+                                          donor_position)) continue;
             donated = count;
             snapshot_device = candidate.device;
             last_output = candidate.last_output;
@@ -19900,7 +19968,8 @@ static bool qwen_donate_prefix(FlyweightV2QwenRuntime& runtime,
             donor_tokens.size(), prompt_count - 1);
         std::uint64_t match = 0;
         while (match < limit && donor_tokens[match] == prompt[match]) ++match;
-        if (match && swa_snapshot_is_resident(runtime, match, donor_position))
+        if (match && swa_snapshot_is_resident(runtime, donor_geometry, match,
+                                              donor_position))
             donated = match;
     }
     // Any checkpoint at all is enough, and the bar that guards the caller does
@@ -20187,7 +20256,9 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         // reprefilling it cold.
         const std::uint64_t cut=std::min<std::uint64_t>(
             runtime->prefix_cache_last_lcp_live,prompt_count-1);
-        if(cut&&swa_snapshot_is_resident(*runtime,cut,runtime->position)){
+        if(cut&&swa_snapshot_is_resident(*runtime,
+               runtime->sequences[runtime->active_sequence].geometry,
+               cut,runtime->position)){
             runtime->processed_tokens.resize(cut);
             runtime->position=cut;
             prompt_start=cut;
@@ -20213,7 +20284,9 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
             if(!candidate.valid||candidate.tokens.empty()||candidate.tokens.size()>prompt_count)continue;
             if(candidate.tokens.size()==prompt_count&&
                (require_last_logits||!candidate.last_output_greedy))continue;
-            if(!swa_snapshot_is_resident(*runtime,candidate.tokens.size(),runtime->position))continue;
+            if(!swa_snapshot_is_resident(*runtime,
+                   runtime->sequences[runtime->active_sequence].geometry,
+                   candidate.tokens.size(),runtime->position))continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt))continue;
             if(candidate.tokens.size()>runtime->processed_tokens.size())continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),runtime->processed_tokens.begin()))continue;
