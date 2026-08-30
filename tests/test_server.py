@@ -3080,6 +3080,18 @@ WRITE_FILE_TOOL = {
 }
 
 
+class TrailingSeparatorToolStubGenerator(ToolStubGenerator):
+    """Content, then the model's own separator newlines, then the call."""
+
+    TOOL_TEXT = (
+        "Writing the file now.\n\n"
+        "<tool_call>\n<function=write_file>\n"
+        "<parameter=path>\n/tmp/a\n</parameter>\n"
+        "<parameter=content>\nhello\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+
 class ToolCallStreamingTests(unittest.TestCase):
     """A tool call must reach the client while it is still being written.
 
@@ -3155,6 +3167,30 @@ class ToolCallStreamingTests(unittest.TestCase):
         events = self._anthropic_events(SlowToolStubGenerator())
         deltas = [e for e in events if e["type"] == "message_delta"]
         self.assertEqual(deltas[-1]["delta"]["stop_reason"], "tool_use")
+
+    def test_streamed_content_before_a_call_matches_the_parsed_content(self) -> None:
+        # The chat template re-renders a replayed call as content +
+        # '\n\n<tool_call>', so streamed content must not keep the model's own
+        # separator: stored by the client, it comes back two newlines wider on
+        # every round trip, the model mimics the widened gap, and the KV
+        # prefix breaks at the seam of every turn (observed live 2026-08-30,
+        # escalating 2 -> 10 newlines over a session). The invariant is the
+        # same one the argument streamer holds: streaming must deliver exactly
+        # what the non-streaming parse of the same text produces.
+        generator = TrailingSeparatorToolStubGenerator()
+        events = self._anthropic_events(generator)
+        streamed = "".join(
+            event["delta"]["text"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "text_delta"
+        )
+        parsed_content, calls = _parse_tool_calls(
+            generator.TOOL_TEXT, tools=[WRITE_FILE_TOOL]
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(streamed, parsed_content)
+        self.assertEqual(streamed, "Writing the file now.")
 
     def test_openai_stream_reports_tool_calls_finish_reason(self) -> None:
         service = InferenceService(

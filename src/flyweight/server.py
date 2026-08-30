@@ -1117,7 +1117,14 @@ class InferenceService:
                         pending += delta_text
                         found = pending.find(marker)
                         if found != -1:
-                            delta = pending[:found]
+                            # Strip the separator run in front of the marker,
+                            # like the non-streaming parser strips content.
+                            # Streamed through, it becomes stored assistant
+                            # content, the chat template adds its own
+                            # '\n\n<tool_call>' on replay, and the model then
+                            # mimics the widened gap -- +2 newlines per round
+                            # trip, breaking the KV prefix at every turn.
+                            delta = pending[:found].rstrip()
                             pending = pending[found:]
                             tool_start = 0
                             tool_start_tokens = len(step.generated_ids)
@@ -1127,8 +1134,15 @@ class InferenceService:
                                 -len(TOOL_CALL_END_MARKER) :
                             ]
                         else:
-                            # Hold back a possible partial marker at the tail.
+                            # Hold back a possible partial marker at the tail,
+                            # and any whitespace before it: it may be the
+                            # separator of a marker that has not arrived yet,
+                            # and once flushed it cannot be unstreamed. More
+                            # text releases it; the tail flush emits it when
+                            # the turn ends without a call.
                             safe = max(0, len(pending) - holdback)
+                            while safe and pending[safe - 1].isspace():
+                                safe -= 1
                             delta = pending[:safe]
                             pending = pending[safe:]
                         if delta and scanner is not None:
