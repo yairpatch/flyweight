@@ -9361,28 +9361,68 @@ __device__ __forceinline__ float kv_fused_load(
     );
 }
 
-extern "C" __global__ void qwen_attention_query_f16(
-    const float* input, __half* output, const int elements
+// Query and score staging for the cuBLAS decode path. Both are templated on the
+// cache's element type rather than fixed at f16: the GEMM reads the cache in
+// place, so its operands have to be whatever the cache holds, and a bf16 cache
+// needs the query converted and the scores normalized in bf16 to match.
+template<typename T>
+__device__ __forceinline__ float kv_cublas_to_float(T value);
+template<>
+__device__ __forceinline__ float kv_cublas_to_float<__half>(__half value) {
+    return __half2float(value);
+}
+template<>
+__device__ __forceinline__ float kv_cublas_to_float<__nv_bfloat16>(
+    __nv_bfloat16 value
+) {
+    return __bfloat162float(value);
+}
+template<typename T>
+__device__ __forceinline__ T kv_cublas_from_float(float value);
+template<>
+__device__ __forceinline__ __half kv_cublas_from_float<__half>(float value) {
+    return __float2half(value);
+}
+template<>
+__device__ __forceinline__ __nv_bfloat16
+kv_cublas_from_float<__nv_bfloat16>(float value) {
+    return __float2bfloat16(value);
+}
+
+template<typename T>
+__device__ void qwen_attention_query_impl(
+    const float* input, T* output, const int elements
 ) {
     for (int index = blockIdx.x * blockDim.x + threadIdx.x;
          index < elements;
          index += blockDim.x * gridDim.x)
-        output[index] = __float2half(input[index]);
+        output[index] = kv_cublas_from_float<T>(input[index]);
+}
+extern "C" __global__ void qwen_attention_query_f16(
+    const float* input, __half* output, const int elements
+) {
+    qwen_attention_query_impl<__half>(input, output, elements);
+}
+extern "C" __global__ void qwen_attention_query_bf16(
+    const float* input, __nv_bfloat16* output, const int elements
+) {
+    qwen_attention_query_impl<__nv_bfloat16>(input, output, elements);
 }
 
-// The cuBLAS attention path materializes one FP16 score/probability matrix per
-// GQA group. Keeping it FP16 lets both QK^T and PV use tensor cores and halves
+// The cuBLAS attention path materializes one 16-bit score/probability matrix per
+// GQA group. Keeping it 16-bit lets both QK^T and PV use tensor cores and halves
 // score traffic. One block normalizes one query head.
-extern "C" __global__ void kv_attention_softmax_f16(
-    __half* scores, const int heads, const int tokens
+template<typename T>
+__device__ void kv_attention_softmax_impl(
+    T* scores, const int heads, const int tokens
 ) {
     const int head = blockIdx.x;
     if (head >= heads || tokens <= 0) return;
     __shared__ float reduction[256];
-    __half* row = scores + (long long)head * tokens;
+    T* row = scores + (long long)head * tokens;
     float maximum = -3.402823466e+38F;
     for (int token = threadIdx.x; token < tokens; token += blockDim.x)
-        maximum = fmaxf(maximum, __half2float(row[token]));
+        maximum = fmaxf(maximum, kv_cublas_to_float<T>(row[token]));
     reduction[threadIdx.x] = maximum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -9394,8 +9434,9 @@ extern "C" __global__ void kv_attention_softmax_f16(
     maximum = reduction[0];
     float denominator = 0.0f;
     for (int token = threadIdx.x; token < tokens; token += blockDim.x) {
-        const float probability = __expf(__half2float(row[token]) - maximum);
-        row[token] = __float2half(probability);
+        const float probability =
+            __expf(kv_cublas_to_float<T>(row[token]) - maximum);
+        row[token] = kv_cublas_from_float<T>(probability);
         denominator += probability;
     }
     reduction[threadIdx.x] = denominator;
@@ -9407,7 +9448,18 @@ extern "C" __global__ void kv_attention_softmax_f16(
     }
     const float inverse = 1.0f / reduction[0];
     for (int token = threadIdx.x; token < tokens; token += blockDim.x)
-        row[token] = __float2half(__half2float(row[token]) * inverse);
+        row[token] = kv_cublas_from_float<T>(
+            kv_cublas_to_float<T>(row[token]) * inverse);
+}
+extern "C" __global__ void kv_attention_softmax_f16(
+    __half* scores, const int heads, const int tokens
+) {
+    kv_attention_softmax_impl<__half>(scores, heads, tokens);
+}
+extern "C" __global__ void kv_attention_softmax_bf16(
+    __nv_bfloat16* scores, const int heads, const int tokens
+) {
+    kv_attention_softmax_impl<__nv_bfloat16>(scores, heads, tokens);
 }
 
 // Tensor-core prefill attention packs a small query-row tile so every KV head

@@ -68,8 +68,9 @@ class Gpu:
         library.flyweight_gpu_compile.argtypes = [
             ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int32,
             ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32]
-        library.flyweight_gpu_attention_f16_cublas.argtypes = (
-            [ctypes.c_uint64] * 7 + [ctypes.c_int32] * 6 + [ctypes.c_float])
+        library.flyweight_gpu_attention_16bit_cublas.argtypes = (
+            [ctypes.c_int32] + [ctypes.c_uint64] * 7 + [ctypes.c_int32] * 6
+            + [ctypes.c_float])
         source = ("#define FLYWEIGHT_MMQ_ROW_WARPS 4\n"
                   "#define FLYWEIGHT_MMQ_ROW_FRAGS 2\n"
                   + corpus(ROOT / "native/include/flyweight_v2_qwen_kernels.hpp")
@@ -288,14 +289,17 @@ def main() -> int:
                     raise SystemExit("merge launch failed")
         plans.append([name, run, held, []])
 
-    if arguments.kv_type == "f16":
+    if arguments.kv_type in ("f16", "bf16"):
+        # The cache is read in place, so cuBLAS is told which 16-bit float it
+        # holds rather than being handed a staged f16 copy of it.
+        kv_type = 1 if arguments.kv_type == "f16" else 2
         query_staged = gpu.alloc(heads * HEAD_DIM * 2)
         scores_staged = gpu.alloc(heads * tokens * 2 + 4096)
 
         def run_cublas(count):
             for _ in range(count):
-                if gpu.library.flyweight_gpu_attention_f16_cublas(
-                    device_query, query_staged, device_keys,
+                if gpu.library.flyweight_gpu_attention_16bit_cublas(
+                    kv_type, device_query, query_staged, device_keys,
                     device_values, scores_staged, device_output, gpu.stream,
                     heads, kv_heads, HEAD_DIM, tokens, capacity,
                     arguments.first, scale

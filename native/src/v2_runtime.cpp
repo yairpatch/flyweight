@@ -18205,7 +18205,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     capacity,first_slot,scale)||
                 (qwen_cublas_attention_eligible(
                     *runtime,tokens,first_slot,capacity)&&
-                flyweight_gpu_attention_f16_cublas(
+                flyweight_gpu_attention_16bit_cublas(
+                    runtime->options.cache_type_k,
                     queries,first,cache_keys,cache_values,attention_scores,
                     attended,runtime->stream,heads,kv_heads,head_dim,tokens,
                     capacity,first_slot,scale)==0);
@@ -21609,7 +21610,8 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                         tokens,capacity,first_slot,scale)||
                     (qwen_cublas_attention_eligible(
                         *runtime,tokens,first_slot,capacity)&&
-                    flyweight_gpu_attention_f16_cublas(
+                    flyweight_gpu_attention_16bit_cublas(
+                        runtime->options.cache_type_k,
                         queries,s.first,cache_keys,cache_values,
                         s.attention_scores,attended,runtime->stream,
                         heads,kv_heads,head_dim,tokens,capacity,first_slot,

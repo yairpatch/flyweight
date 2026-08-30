@@ -18,9 +18,15 @@ constexpr bool cublas_eligible(
     bool enabled,
     std::int32_t minimum_tokens
 ) {
+    // f16 and bf16 both: the GEMM reads the cache in place and takes its
+    // element type as an argument, so a 16-bit float cache of either kind needs
+    // no staging copy to reach the tensor cores. A quantized cache would, and
+    // that copy costs more than reading the quantized rows directly -- measured
+    // on q8 at 49k, 547 us staged against 511 us direct, plus 96 MiB of
+    // scratch -- so those cache types stay on the grouped-rows kernel.
     return enabled &&
-        cache_type_k == 1 &&
-        cache_type_v == 1 &&
+        (cache_type_k == 1 || cache_type_k == 2) &&
+        cache_type_v == cache_type_k &&
         tokens >= minimum_tokens &&
         first_slot >= 0 &&
         first_slot + tokens <= capacity;

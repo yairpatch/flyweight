@@ -469,6 +469,46 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertNotIn("kv_attention_gqa_f16_256_s8", kernels)
         self.assertNotIn("kv_attention_gqa_f16_256_s8", driver)
 
+    def test_bf16_cache_reaches_cublas_without_a_staging_copy(self):
+        """A bf16 cache is a dense 16-bit matrix, so it needs no f16 copy.
+
+        The GEMM takes its element type as an argument and reads the cache in
+        place; only the type code and the two kernels that stage the query and
+        normalize the scores differ. This was f16-only for no reason other than
+        a hard-coded CUDA_R_16F, which cost bf16 caches 563 us against cuBLAS'
+        320 at 49k.
+        """
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
+        policy = (
+            root / "native/include/flyweight_v2_attention_policy.hpp"
+        ).read_text(encoding="utf-8")
+
+        # Scores are held in the cache's own type, because the second GEMM
+        # multiplies them by the values and both operands must match.
+        for symbol in ("qwen_attention_query_bf16", "kv_attention_softmax_bf16"):
+            self.assertIn(symbol, kernels)
+            self.assertIn(symbol, driver)
+        self.assertIn("kCudaR16BF = 14", driver)
+        self.assertIn("flyweight_gpu_attention_16bit_cublas", driver)
+        self.assertIn("flyweight_gpu_attention_16bit_cublas", runtime)
+        # Both decode call sites pass the cache type rather than assuming f16.
+        self.assertEqual(
+            runtime.count("flyweight_gpu_attention_16bit_cublas(\n"
+                          "                    runtime->options.cache_type_k,")
+            + runtime.count("flyweight_gpu_attention_16bit_cublas(\n"
+                            "                        runtime->options.cache_type_k,"),
+            2)
+        # The turbo path stages to f16 itself, so it keeps the f16 entry point.
+        self.assertIn("flyweight_gpu_attention_f16_cublas(queries,query_f16,"
+                      "stage_keys,stage_values", runtime)
+        self.assertIn("cache_type_k == 1 || cache_type_k == 2", policy)
+        self.assertIn("cache_type_v == cache_type_k", policy)
+
     def test_attention_path_can_say_which_kernel_it_chose(self):
         """Every decode path is correct, so a fallback is invisible without this.
 

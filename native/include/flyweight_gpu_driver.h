@@ -124,6 +124,25 @@ FLYWEIGHT_API int flyweight_gpu_attention_cache(
     std::int32_t capacity,
     float scale
 );
+// Tensor-core decode attention over a 16-bit float cache, read in place.
+// kv_type is the cache precision code: 1 = f16, 2 = bf16.
+FLYWEIGHT_API int flyweight_gpu_attention_16bit_cublas(
+    std::int32_t kv_type,
+    std::uint64_t query,
+    std::uint64_t query_f16,
+    std::uint64_t keys,
+    std::uint64_t values,
+    std::uint64_t scores_f16,
+    std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t heads,
+    std::int32_t kv_heads,
+    std::int32_t head_dim,
+    std::int32_t tokens,
+    std::int32_t capacity,
+    std::int32_t first,
+    float scale
+);
 FLYWEIGHT_API int flyweight_gpu_attention_f16_cublas(
     std::uint64_t query,
     std::uint64_t query_f16,

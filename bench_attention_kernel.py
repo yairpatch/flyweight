@@ -32,6 +32,8 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=49152)
     parser.add_argument("--kv-heads", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--kv-type", choices=("f16", "q8_0"), default="f16",
+                        help="which fused variant to launch; q8_0 reads a\n                             34-byte-blocked cache and dequantizes inline")
     arguments = parser.parse_args()
 
     model = V2Model(arguments.model)
@@ -56,8 +58,12 @@ def main() -> int:
     kv_heads = arguments.kv_heads
     capacity = tokens
     tile_count = (tokens + TOKENS_PER_TILE - 1) // TOKENS_PER_TILE
-    # K and V, f16, laid out [kv_head][capacity][head_dim].
-    kv_bytes = kv_heads * capacity * HEAD_DIM * 2
+    # K and V laid out [kv_head][capacity][head_dim]. q8_0 stores 32 elements
+    # as [f16 scale | 32 int8] = 34 bytes, so a row is (head_dim/32)*34 rather
+    # than head_dim*2 -- 53% of the bytes for the same tokens.
+    quantized = arguments.kv_type == "q8_0"
+    row_bytes = (HEAD_DIM // 32) * 34 if quantized else HEAD_DIM * 2
+    kv_bytes = kv_heads * capacity * row_bytes
     print(f"tokens={tokens}  kv_heads={kv_heads}  tiles={tile_count}  "
           f"KV={2 * kv_bytes / 2**20:.0f} MiB (K+V)")
     print(f"{'query_heads':>12} {'share':>6} {'us':>9} {'useful GB/s':>12} "
@@ -90,7 +96,8 @@ def main() -> int:
             ctypes.addressof(c_dim), ctypes.addressof(c_tokens),
             ctypes.addressof(c_capacity), ctypes.addressof(c_first),
             ctypes.addressof(c_scale))
-        name = b"kv_attention_fused_f16_tiles256"
+        name = (b"kv_attention_fused_q8_tiles256" if quantized
+                else b"kv_attention_fused_f16_tiles256")
 
         def run(count: int) -> None:
             for _ in range(count):

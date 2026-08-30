@@ -18,6 +18,20 @@ int main() {
     if (!attention::cublas_eligible(1, 1, 1024, 0, 8192, true, 1024))
         return 6;
 
+    // bf16 reads in place through the tensor cores exactly as f16 does -- the
+    // GEMM takes the element type as an argument -- so it is eligible too.
+    if (!attention::cublas_eligible(2, 2, threshold, 0, 8192, true, threshold))
+        return 13;
+    // A quantized cache is not: cuBLAS cannot address it, and staging it to f16
+    // first measured slower than reading the quantized rows directly (q8 at
+    // 49k: 547 us staged against 511 us) as well as costing scratch VRAM.
+    if (attention::cublas_eligible(3, 3, threshold, 0, 8192, true, threshold))
+        return 14;
+    // A mismatched pair has no single element type to hand the GEMM.
+    if (attention::cublas_eligible(2, 1, threshold, 0, 8192, true, threshold) ||
+        attention::cublas_eligible(1, 2, threshold, 0, 8192, true, threshold))
+        return 15;
+
     // Cache-type `auto` resolution. Each guard below corresponds to a measured
     // failure mode, not a style preference -- see the header for the numbers.
     constexpr auto ctx = attention::kTurboAutoContextThreshold;

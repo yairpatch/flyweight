@@ -1048,6 +1048,7 @@ extern "C" int flyweight_gpu_compile(
              "iq2xxs_grouped_swiglu", "iq2xxs_grouped_swiglu_rows",
              "iq2xxs_grouped_accumulate", "iq2xxs_grouped_accumulate_rows",
              "qwen_attention_query_f16", "kv_attention_softmax_f16",
+             "qwen_attention_query_bf16", "kv_attention_softmax_bf16",
              "qwen_attention_prefill_pack_f16",
              "kv_attention_prefill_softmax_f16",
              "kv_attention_prefill_block_softmax_f16",
@@ -2943,7 +2944,8 @@ extern "C" int flyweight_gpu_launch_named(
         ? 0 : -3;
 }
 
-extern "C" int flyweight_gpu_attention_f16_cublas(
+extern "C" int flyweight_gpu_attention_16bit_cublas(
+    std::int32_t kv_type,
     std::uint64_t query, std::uint64_t query_f16,
     std::uint64_t keys, std::uint64_t values,
     std::uint64_t scores_f16, std::uint64_t output,
@@ -2951,6 +2953,27 @@ extern "C" int flyweight_gpu_attention_f16_cublas(
     std::int32_t head_dim, std::int32_t tokens, std::int32_t capacity,
     std::int32_t first, float scale
 ) {
+    // The GEMM reads the KV cache in place, so its element type is the cache's,
+    // and the staged query and the score matrix must match it. Both types are
+    // 16 bit, so every stride and offset below is unchanged -- only the type
+    // code and the two kernels that write those buffers differ. Same shape as
+    // flyweight_gpu_attention_prefill_cublas, which has taken a cache type
+    // since bf16 reached the tensor-core prefill path.
+    constexpr int kCudaR16BF = 14;
+    const bool bf16 = kv_type == 2;
+    if (kv_type != 1 && kv_type != 2) return -1;
+    const int element_type = bf16 ? kCudaR16BF : 2 /* kCudaR16F */;
+    const char* conversion_name = bf16 ? "qwen_attention_query_bf16"
+                                       : "qwen_attention_query_f16";
+    const char* softmax_name = bf16 ? "kv_attention_softmax_bf16"
+                                    : "kv_attention_softmax_f16";
+    // The scores are the second GEMM's B operand and the values are its A, so
+    // the score matrix has to carry the cache's type -- which on bf16 means an
+    // 8-bit mantissa for the probabilities where f16 has 11. Against a float64
+    // reference that is 4.5e-4 of error rather than 9e-5, enough to flip a
+    // greedy token at a near-tie. The accumulator stays f32 either way, and
+    // this is the same trade the tensor-core prefill path already makes for a
+    // bf16 cache.
     // Not reachable through launch(), so the CPU backend cannot substitute a
     // host kernel for it: this bottoms out in cuBLAS directly. Report failure
     // so the runtime falls back to the kernel path it already has. Returning
@@ -2968,8 +2991,8 @@ extern "C" int flyweight_gpu_attention_f16_cublas(
     if (g_cublas.set_stream(g_cublas_handle, cuda_stream) != 0) return -2;
     const int group = heads / kv_heads;
     const int query_elements = heads * head_dim;
-    auto conversion = g_functions.find("qwen_attention_query_f16");
-    auto softmax = g_functions.find("kv_attention_softmax_f16");
+    auto conversion = g_functions.find(conversion_name);
+    auto softmax = g_functions.find(softmax_name);
     if (conversion == g_functions.end() || softmax == g_functions.end())
         return -3;
     void* conversion_args[] = {&query, &query_f16,
@@ -2978,7 +3001,6 @@ extern "C" int flyweight_gpu_attention_f16_cublas(
                conversion_args, 0, cuda_stream) != 0)
         return -4;
 
-    constexpr int kCudaR16F = 2;
     constexpr int kCudaR32F = 0;
     constexpr int kCublasOpN = 0;
     constexpr int kCublasOpT = 1;
@@ -2995,10 +3017,10 @@ extern "C" int flyweight_gpu_attention_f16_cublas(
     if (g_cublas.gemm_strided_batched_ex(
             g_cublas_handle, kCublasOpT, kCublasOpN,
             tokens, group, head_dim, &scale,
-            key_base, kCudaR16F, head_dim, cache_stride,
-            reinterpret_cast<const void*>(query_f16), kCudaR16F, head_dim,
+            key_base, element_type, head_dim, cache_stride,
+            reinterpret_cast<const void*>(query_f16), element_type, head_dim,
             query_stride, &zero, reinterpret_cast<void*>(scores_f16),
-            kCudaR16F, tokens, score_stride, kv_heads,
+            element_type, tokens, score_stride, kv_heads,
             kCompute32F, kTensorOp) != 0)
         return -5;
     void* softmax_args[] = {&scores_f16, &heads, &tokens};
@@ -3013,13 +3035,29 @@ extern "C" int flyweight_gpu_attention_f16_cublas(
     if (g_cublas.gemm_strided_batched_ex(
             g_cublas_handle, kCublasOpN, kCublasOpN,
             head_dim, group, tokens, &one,
-            value_base, kCudaR16F, head_dim, cache_stride,
-            reinterpret_cast<const void*>(scores_f16), kCudaR16F, tokens,
+            value_base, element_type, head_dim, cache_stride,
+            reinterpret_cast<const void*>(scores_f16), element_type, tokens,
             score_stride, &zero, reinterpret_cast<void*>(output),
             kCudaR32F, head_dim, query_stride, kv_heads,
             kCompute32F, kTensorOp) != 0)
         return -7;
     return 0;
+}
+
+
+// The name the f16-only path had, kept so callers that cannot be quantized
+// still read plainly.
+extern "C" int flyweight_gpu_attention_f16_cublas(
+    std::uint64_t query, std::uint64_t query_f16,
+    std::uint64_t keys, std::uint64_t values,
+    std::uint64_t scores_f16, std::uint64_t output,
+    std::uint64_t stream, std::int32_t heads, std::int32_t kv_heads,
+    std::int32_t head_dim, std::int32_t tokens, std::int32_t capacity,
+    std::int32_t first, float scale
+) {
+    return flyweight_gpu_attention_16bit_cublas(
+        1, query, query_f16, keys, values, scores_f16, output, stream, heads,
+        kv_heads, head_dim, tokens, capacity, first, scale);
 }
 
 extern "C" int flyweight_gpu_attention_prefill_cublas(
