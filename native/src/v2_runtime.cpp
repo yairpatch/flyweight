@@ -20452,21 +20452,34 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
     // Mid-prefill checkpoint targets, spread EVENLY across this prompt (like
     // llama.cpp's spread context checkpoints) so a mid-conversation divergence
     // always finds a checkpoint within one spacing of the divergence point.
-    // Spacing adapts to the prompt: max(interval, prompt/(mids+1)), so short
-    // prompts keep dense early coverage while a 30k prompt spreads its slots
-    // over the whole range instead of clustering at 256/512/1024 (measured live:
-    // geometric placement reused only 1024 of a 13313-token shared prefix). The
-    // last slot is reserved for the exact end-of-prompt snapshot saved below.
-    // Targets already covered by the reused prefix are skipped.
+    // One checkpoint is pinned at the interval; the rest adapt to the prompt,
+    // max(interval, prompt/mids), so short prompts keep dense early coverage
+    // while a 30k prompt spreads its slots over the whole range instead of
+    // clustering at 256/512/1024 (measured live: geometric placement reused
+    // only 1024 of a 13313-token shared prefix -- but NO early checkpoint
+    // meant a compacted conversation reused nothing at all, hence the pin).
+    // The last slot is reserved for the exact end-of-prompt snapshot saved
+    // below. Targets already covered by the reused prefix are skipped.
     plan.targets.clear();
     if(runtime->prefill_snapshot_bytes&&
        runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1){
         const std::size_t mid_slots=runtime->prefill_snapshots.size()-1;
+        const std::uint64_t interval=runtime->prefill_checkpoint_interval;
+        // The FIRST checkpoint sits at the interval, which is what the option
+        // has always documented. Folded into the uniform spacing it landed at
+        // prompt/4 -- after a long session, tens of thousands of tokens past
+        // the system prefix -- so a prompt sharing only the conversation's
+        // opening (a compacted history, a side request under the same system
+        // prompt) reused nothing on a recurrent arch and reprefilled from
+        // zero. The pin is that traffic's reuse floor; the remaining slots
+        // still spread over the whole prompt for mid-history rewrites.
+        if(interval<prompt_count)plan.targets.push_back(interval);
         const std::uint64_t spacing=std::max<std::uint64_t>(
-            runtime->prefill_checkpoint_interval,prompt_count/(mid_slots+1));
+            interval,prompt_count/std::max<std::size_t>(mid_slots,std::size_t{1}));
         for(std::uint64_t pos=spacing;
             pos<prompt_count&&plan.targets.size()<mid_slots;pos+=spacing)
-            plan.targets.push_back(pos);
+            if(plan.targets.empty()||pos>plan.targets.back())
+                plan.targets.push_back(pos);
     }
     plan.next_target=0;
     while(plan.next_target<plan.targets.size()&&plan.targets[plan.next_target]<=prompt_start)++plan.next_target;
