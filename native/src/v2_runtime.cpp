@@ -12977,7 +12977,59 @@ int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->prefix_cache_last_new_count=runtime->prefix_cache_last_new_count;
     return 0;
 });}
-int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");if(runtime->state&&flyweight_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0)throw std::runtime_error("failed to reset native Qwen state");runtime->position=0;runtime->last_output_token=0;runtime->last_output_greedy=true;runtime->processed_tokens.clear();runtime->mtp_cache_tokens=0;runtime->mtp_has_target_hidden=false;runtime->cancelled=false;runtime->cache_admission_enabled=true;qwen_unfreeze_expert_residency(*runtime);return 0;});}
+// Reset ONLY the active slot's conversation: arena zeroed, bookkeeping
+// cleared. Checkpoints are left alone on purpose -- a checkpoint is a pure
+// function of its token prefix, so one matching a later prompt's opening is
+// correct to reuse even across this recycle, and the double prefix guard in
+// qwen_prompt_begin screens the rest. This is what the internal recycle
+// paths mean by "reset"; the public entry point below means the runtime.
+static void qwen_reset_active_slot(FlyweightV2QwenRuntime& runtime) {
+    if (runtime.state && flyweight_gpu_memset(runtime.state, 0,
+            runtime.state_bytes, runtime.stream) != 0)
+        throw std::runtime_error("failed to reset native Qwen state");
+    runtime.position = 0;
+    runtime.last_output_token = 0;
+    runtime.last_output_greedy = true;
+    runtime.processed_tokens.clear();
+    runtime.mtp_cache_tokens = 0;
+    runtime.mtp_has_target_hidden = false;
+    runtime.cancelled = false;
+    runtime.cache_admission_enabled = true;
+    qwen_unfreeze_expert_residency(runtime);
+}
+int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime*runtime){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
+    // The public name promises the runtime, not a slot: under --parallel the
+    // router would otherwise route a post-reset prompt back onto a sibling
+    // slot's surviving conversation (or recall one from the host cache),
+    // bleeding state across what the client meant as a clean boundary.
+    qwen_reset_active_slot(*runtime);
+    for(std::size_t slot=0;slot<runtime->sequences.size();++slot){
+        auto&seq=runtime->sequences[slot];
+        const bool active=slot==runtime->active_sequence;
+        if(!active){
+            if(seq.state){
+                const auto bytes=seq.geometry<runtime->geometries.size()
+                    ?runtime->geometries[seq.geometry].state_bytes
+                    :runtime->state_bytes;
+                if(flyweight_gpu_memset(seq.state,0,bytes,runtime->stream)!=0)
+                    throw std::runtime_error("failed to reset native Qwen state");
+            }
+            seq.position=0;seq.last_output_token=0;seq.last_output_greedy=true;
+            seq.processed_tokens.clear();
+        }
+        auto&snapshots=active?runtime->prefill_snapshots:seq.prefill_snapshots;
+        for(auto&s:snapshots){s.valid=false;s.tokens.clear();}
+    }
+    // qwen_free_host_prompt lives further down the file; the freeing is three
+    // lines, so inline it rather than forward-declare for one caller.
+    for(auto&e:runtime->host_prompts){
+        std::free(e.state);
+        for(auto&s:e.snapshots)std::free(s.state);
+    }
+    runtime->host_prompts.clear();
+    runtime->host_cache_used_bytes=0;
+    return 0;});}
 int flyweight_v2_qwen_runtime_cancel(FlyweightV2QwenRuntime*runtime){return guarded([&]{if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");runtime->cancelled=true;return 0;});}
 // The wide MMQ shape: the same 128x128 tile spread over 16 warps at 2x4
 // fragments instead of 8 at 4x4, which halves the per-thread accumulator and
@@ -13008,10 +13060,10 @@ static bool qwen_mmq_wide(){
     return enabled&&!flyweight_backend_is_cpu();
 }
 int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return guarded([&]{
+    if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     // Before anything reads weights in bulk: the hashed n-gram table is not
     // read the way the rest of the mapping is, and the kernel cannot know that.
     qwen_advise_access_pattern(*runtime);
-    if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
     if(runtime->static_arena)return 0;
     if(flyweight_gpu_init(runtime->options.device)!=0)throw std::runtime_error("failed to initialize native CUDA runtime");
     std::vector<std::string> option_storage;
@@ -13140,6 +13192,16 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                         "native Qwen turbo3/turbo4 KV cache needs a head_dim that is a power of two "
                         "between 32 and 512, but layer "+std::to_string(layer_number)+" has "
                         +std::to_string(head_dim));
+                // q8_0 rows are 34-byte blocks of 32 values. A head_dim off
+                // that grid would silently drop its tail channels in the store
+                // kernel while the score kernel reads into the next row --
+                // and the sizing here, the kernels, and the spill ranges each
+                // round differently. No shipped arch trips this; the refusal
+                // is for the first one that would.
+                if((ck_type==3||cv_type==3)&&head_dim%32!=0)
+                    throw std::runtime_error(
+                        "native Qwen q8_0 KV cache needs head_dim divisible by 32, but layer "
+                        +std::to_string(layer_number)+" has "+std::to_string(head_dim));
                 const auto cache_floats=layer.kv_heads*layer.cache_capacity*head_dim;
                 layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
                 layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
@@ -13994,6 +14056,13 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // One KV+DeltaNet state arena per parallel decode slot. MTP manages its
         // own state inside the arena, so it stays single-slot.
         const std::size_t slot_count=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+        // --parallel is always typed on purpose; degrading it silently under
+        // --mtp-draft contradicted that (scratch+MTP already refuses loudly).
+        if(runtime->options.mtp_drafts&&runtime->parallel_sequences>1)
+            std::fprintf(stderr,
+                "[flyweight] --mtp-draft keeps a single sequence slot; "
+                "--parallel %u is reduced to 1\n",
+                static_cast<unsigned>(runtime->parallel_sequences));
         runtime->sequences.assign(slot_count,QwenSequence{});
         // Which slot is big matters only to the router, which will not send a
         // prompt to a slot that cannot hold it.
@@ -19744,8 +19813,21 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
     // Ignore tiny utility prompts, but retain ordinary conversations before a
     // title/quota/subagent request displaces the sole GPU slot.
     if (tokens.size() < 256) return;
-    for (auto& e : runtime.host_prompts)
+    for (std::size_t i = 0; i < runtime.host_prompts.size();) {
+        auto& e = runtime.host_prompts[i];
         if (e.tokens == tokens) { e.clock = ++runtime.host_cache_clock; return; }
+        // An earlier spill of this same conversation -- its tokens a strict
+        // prefix of ours -- is dominated: restoring the longer entry buys
+        // everything the shorter one held. Keeping both wastes budget, and
+        // under pressure the eviction loop may push a DIFFERENT conversation
+        // out to make room beside a stale twin.
+        if (e.tokens.size() < tokens.size()
+            && std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) {
+            qwen_free_host_prompt(runtime, i);
+            continue;
+        }
+        ++i;
+    }
     // Pack only the live ranges (used KV prefixes + DeltaNet state) instead of
     // the whole arena: at small positions the spill is a fraction of state_bytes.
     // Under this slot's own geometry -- it need not be the active slot's.
@@ -19784,7 +19866,16 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
     e.bytes = packed_bytes;
     e.geometry = seq.geometry;
     std::uint64_t copied_snapshots=0;
-    for (const auto& s : snapshots) {
+    // Tail checkpoint first: under budget pressure snapshots_to_copy truncates
+    // this loop, and the end-of-prompt checkpoint in the reserved last slot is
+    // what lets the recalled turn reuse past the prompt boundary. Dropping
+    // early mids instead loses only mid-conversation fallbacks.
+    std::vector<std::size_t> spill_order;
+    spill_order.reserve(snapshots.size());
+    if (!snapshots.empty()) spill_order.push_back(snapshots.size() - 1);
+    for (std::size_t i = 0; i + 1 < snapshots.size(); ++i) spill_order.push_back(i);
+    for (const auto snapshot_index : spill_order) {
+        const auto& s = snapshots[snapshot_index];
         if (!s.valid || s.tokens.empty() || copied_snapshots>=snapshots_to_copy) continue;
         void* sbuf = std::malloc(runtime.prefill_snapshot_bytes);
         if (!sbuf) break;  // partial checkpoint set is fine; arena reuse still works
@@ -19887,6 +19978,23 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
     }
     for (std::size_t i = slot_i; i < snapshots.size(); ++i)
         snapshots[i].valid = false;
+    // The repack above filled indices 0.. in spill order, which starts with
+    // the tail checkpoint -- but the reserved LAST slot is what the
+    // mid-checkpoint writer avoids (it targets [0, size-1) by index) and what
+    // qwen_prompt_finish refreshes. Swap the longest restored checkpoint back
+    // into .back() so its identity survives the round trip; the structs carry
+    // their device buffers with them, so the pairing stays intact.
+    if (!snapshots.empty()) {
+        std::size_t longest = snapshots.size();
+        for (std::size_t i = 0; i < snapshots.size(); ++i) {
+            if (!snapshots[i].valid) continue;
+            if (longest == snapshots.size()
+                || snapshots[i].tokens.size() > snapshots[longest].tokens.size())
+                longest = i;
+        }
+        if (longest < snapshots.size() && longest != snapshots.size() - 1)
+            std::swap(snapshots[longest], snapshots.back());
+    }
     qwen_free_host_prompt(runtime, entry_idx);
     return true;
 }
@@ -20015,7 +20123,7 @@ static bool qwen_donate_prefix(FlyweightV2QwenRuntime& runtime,
         // A partial copy leaves the target holding two conversations spliced
         // together, which is worse than a cold start. Reset covers the arena
         // and the bookkeeping; the caller proceeds as if nothing was donated.
-        flyweight_v2_qwen_runtime_reset(&runtime);
+        qwen_reset_active_slot(runtime);
         return false;
     }
 
@@ -20267,7 +20375,7 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
             runtime->cancelled=false;
         }else{
             ++runtime->prefix_cache_misses;
-            const int status=flyweight_v2_qwen_runtime_reset(runtime);if(status)return status;
+            qwen_reset_active_slot(*runtime);
         }
     }else{
         // The live state diverged (typically: the client re-encoded the
@@ -20314,7 +20422,7 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
             runtime->mtp_has_target_hidden=false;
         }else{
             ++runtime->prefix_cache_misses;
-            const int status=flyweight_v2_qwen_runtime_reset(runtime);if(status)return status;
+            qwen_reset_active_slot(*runtime);
         }
     }
     runtime->prefix_cache_last_reused_tokens=prompt_start;
@@ -22261,6 +22369,34 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
     runtime->decode_nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - decode_started).count();
 }
 
+// Forget a slot's conversation after a mid-forward failure. The recurrent
+// updates run early in the layer loop while position advances only on
+// completion, so a failed step leaves DeltaNet state partially advanced under
+// bookkeeping that looks clean -- a retry that matched it would re-run the
+// same tokens into the half-stepped state and silently diverge (attention-only
+// archs self-heal; recurrent state cannot). Cold is recoverable, corrupt is
+// not, and the failure is rare enough that the lost reuse does not matter.
+// The bailing engine has done this from the start (_forget_slot).
+static void qwen_poison_slot(FlyweightV2QwenRuntime& runtime, std::size_t slot) {
+    if (slot >= runtime.sequences.size()) return;
+    const bool active = slot == runtime.active_sequence;
+    QwenSequence& seq = runtime.sequences[slot];
+    (active ? runtime.processed_tokens : seq.processed_tokens).clear();
+    for (auto& s : active ? runtime.prefill_snapshots : seq.prefill_snapshots)
+        s.valid = false;
+    if (active) {
+        runtime.position = 0;
+        runtime.last_output_token = 0;
+        runtime.last_output_greedy = true;
+        runtime.mtp_cache_tokens = 0;
+        runtime.mtp_has_target_hidden = false;
+    } else {
+        seq.position = 0;
+        seq.last_output_token = 0;
+        seq.last_output_greedy = true;
+    }
+}
+
 // Route a pending task to a slot the way qwen_route_sequence does, but aware of
 // slot ownership: a slot owned by another running task is untouchable, and if
 // the busiest match for this prompt IS an owned slot (same conversation already
@@ -22461,9 +22597,12 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
             }
             pending_decode.push_back(&task);
         }catch(const std::exception&error){
-            // Isolate the failure: this task dies, the others keep running.
+            // Isolate the failure: this task dies, the others keep running --
+            // but its slot's conversation cannot be trusted after a throw
+            // mid-forward, so it is forgotten rather than left reusable.
             std::fprintf(stderr,"[flyweight] engine task %llu failed: %s\n",
                 static_cast<unsigned long long>(task.id),error.what());
+            if(task.phase!=0)qwen_poison_slot(*runtime,task.slot);
             finished.push_back(task.id);emit(task.id,0,2);
         }
     }
@@ -22515,9 +22654,14 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                 batch_ok=true;
             }catch(const std::exception&error){
                 restore_geometry();
-                // The whole batch shares one stream of work; fail all of it.
+                // The whole batch shares one stream of work; fail all of it,
+                // and forget every batched slot -- the failure point within
+                // the interleaved layer walk is unknowable from here.
                 std::fprintf(stderr,"[flyweight] engine decode batch failed: %s\n",error.what());
-                for(std::size_t i=0;i<batched;++i){finished.push_back(pending_decode[i]->id);emit(pending_decode[i]->id,0,2);}
+                for(std::size_t i=0;i<batched;++i){
+                    qwen_poison_slot(*runtime,pending_decode[i]->slot);
+                    finished.push_back(pending_decode[i]->id);emit(pending_decode[i]->id,0,2);
+                }
             }
             // A sampled task in the batch draws from its row's logits: the
             // multi driver leaves each row's final normalized hidden in its

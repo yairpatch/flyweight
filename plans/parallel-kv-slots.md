@@ -111,7 +111,7 @@ short/no-match prompts toward a designated small scratch slot.
    `qwen_restore_host_to_slot` (arena **and** checkpoints spilled/restored — the
    end-of-prompt checkpoint is what lets the recalled turn reuse past the prompt
    boundary), per-entry byte accounting + LRU eviction, `--prompt-cache-mib` (needs
-   `--parallel >= 2`; min 2048-token conversations spilled). Validated live 35B:
+   `--parallel >= 2`; min 256-token conversations spilled -- the doc said 2048 while the code always gated at 256. Validated live 35B:
    evict-then-continue goes `reused 0 → 1024` (all checkpoints recalled) with
    bit-identical output vs cold.
 6. **Packed `[0,position)` spill.** ✅ SHIPPED 2026-07-22. `qwen_used_state_ranges`
