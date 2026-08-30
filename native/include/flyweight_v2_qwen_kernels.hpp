@@ -10385,12 +10385,13 @@ __device__ __forceinline__ void kv_fused_load_row(
 //     f16   per-head 739 us    rows 563 us    cuBLAS 320 us
 //     q8    per-head 909 us    rows 528 us    (cuBLAS cannot read the cache)
 //
-// It therefore does not replace cuBLAS on an f16 cache: that path reads the
-// same rows once through the tensor cores and stays first wherever it is
-// eligible. This is what the runtime falls to otherwise -- a quantized cache, a
-// wrapped ring, a window cuBLAS declines. Note which column moves most: q8 is
-// where a row costs the most to decode, so it is where decoding it once for the
-// group rather than once per query head is worth the most.
+// Both columns were later beaten by the fused tensor-core kernel further down,
+// which shares rows the same way but hands the products to the mma units: 279
+// and 309 us. This kernel is what serves the shapes that one does not -- a
+// group that is not 8 wide, or a device below sm_75 -- and it stays the most
+// accurate of the three, since it never rounds a probability to 16 bits at all.
+// Note which column moved most: q8 is where a row costs the most to decode, so
+// it is where decoding it once for the group is worth the most.
 //
 // What it costs is registers -- share*parts each for the queries and the
 // accumulators, 216 at share 8 -- which caps an SM at eight warps. Two things
@@ -10585,6 +10586,473 @@ KV_ATTENTION_GQA_ROWS_TYPE(bf16, __nv_bfloat16, __nv_bfloat16)
 KV_ATTENTION_GQA_ROWS_TYPE(q8, unsigned char, unsigned char)
 #undef KV_ATTENTION_GQA_ROWS_TYPE
 #undef KV_ATTENTION_GQA_ROWS
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// ---- Fused tensor-core decode attention -------------------------------------
+//
+// The grouped-rows kernel above shares each cached row across the query group
+// and keeps the softmax in f32 registers, but it does the arithmetic with
+// scalar FMAs and reaches 179 GB/s of a measured 483 GB/s wall. cuBLAS reaches
+// 315, and pays for it by materializing the [heads x tokens] score matrix in
+// memory as 16-bit -- which is where a bf16 cache loses 4.5e-4 of accuracy.
+// Neither has to be given up: the products go through the tensor cores while
+// the running max, denominator and output accumulator stay in f32 registers,
+// and the score matrix never leaves them.
+//
+// The shape is what makes it fit. `mma.sync.m16n8k16` computes D[16x8] and the
+// GQA group is exactly 8 wide, so the group fills the n dimension with nothing
+// wasted:
+//
+//   scores  D[16 keys  x 8 queries] = K[16 keys x 16 dims] . Q[8 queries x dims]
+//   output  D[16 dims  x 8 queries] = V^T[16 dims x 16 keys] . P[16 keys x 8 q]
+//
+// Three layout facts carry the whole kernel:
+//
+//  * V has to be transposed for the second product -- a cache row is contiguous
+//    in dims, and the contraction is over keys. `ldmatrix.trans` does it for
+//    free on the way out of shared memory, which is why V is staged there.
+//  * The score fragment and the operand the second mma wants are the same
+//    matrix under different thread mappings. `movmatrix` converts one to the
+//    other in two instructions, with no round trip through memory.
+//  * A thread's four score elements are (keys gid, gid+8) x (queries 2*tig,
+//    2*tig+1), so a query's 16 keys live in the 8 lanes sharing its `tig`, and
+//    the softmax reduction is a three-step butterfly over lanes 4/8/16 apart.
+//
+// The cache type only reaches the staging loop: K and V are widened to f16 on
+// the way into shared, so f16, bf16 and q8_0 all run the same mma path, and a
+// quantized row is still decoded exactly once per (token, KV head).
+__device__ __forceinline__ unsigned int kv_mma_shared_address(const void* source) {
+    unsigned int address;
+    asm("{ .reg .u64 wide;\n"
+        "  cvta.to.shared.u64 wide, %1;\n"
+        "  cvt.u32.u64 %0, wide; }"
+        : "=r"(address) : "l"(source));
+    return address;
+}
+__device__ __forceinline__ void kv_mma_ldmatrix(
+    unsigned int* d, const void* source
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    const unsigned int address = kv_mma_shared_address(source);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(address));
+#else
+    d[0] = d[1] = d[2] = d[3] = 0u;
+#endif
+}
+// The same load with the four 8x8 blocks transposed on the way into the
+// registers, which is how V arrives as V^T without ever being transposed in
+// memory.
+__device__ __forceinline__ void kv_mma_ldmatrix_trans(
+    unsigned int* d, const void* source
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    const unsigned int address = kv_mma_shared_address(source);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(address));
+#else
+    d[0] = d[1] = d[2] = d[3] = 0u;
+#endif
+}
+__device__ __forceinline__ unsigned int kv_mma_movmatrix(unsigned int source) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    unsigned int result;
+    asm("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;"
+        : "=r"(result) : "r"(source));
+    return result;
+#else
+    return source;
+#endif
+}
+// The operand type is the cache's own: a bf16 cache never passes through f16,
+// which has a quarter of its exponent range. The accumulator is f32 either way.
+__device__ __forceinline__ void kv_mma_m16n8k16(
+    float* d, const unsigned int* a, const unsigned int* b, const __half*
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+#endif
+}
+__device__ __forceinline__ void kv_mma_m16n8k16(
+    float* d, const unsigned int* a, const unsigned int* b, const __nv_bfloat16*
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+#endif
+}
+// Two halves in one 32-bit register, low element first, without
+// __floats2half2_rn: the same corpus is compiled as host code for the CPU
+// backend, where the half2 intrinsics do not exist.
+template<typename Operand>
+__device__ __forceinline__ unsigned int kv_mma_pack(float low, float high);
+template<>
+__device__ __forceinline__ unsigned int kv_mma_pack<__half>(float low, float high) {
+    const __half first = __float2half(low);
+    const __half second = __float2half(high);
+    unsigned short bits[2];
+    memcpy(&bits[0], &first, sizeof(unsigned short));
+    memcpy(&bits[1], &second, sizeof(unsigned short));
+    return (unsigned int)bits[0] | ((unsigned int)bits[1] << 16);
+}
+template<>
+__device__ __forceinline__ unsigned int kv_mma_pack<__nv_bfloat16>(
+    float low, float high
+) {
+    const __nv_bfloat16 first = __float2bfloat16(low);
+    const __nv_bfloat16 second = __float2bfloat16(high);
+    unsigned short bits[2];
+    memcpy(&bits[0], &first, sizeof(unsigned short));
+    memcpy(&bits[1], &second, sizeof(unsigned short));
+    return (unsigned int)bits[0] | ((unsigned int)bits[1] << 16);
+}
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// Eight cache elements into eight halves. An f16 cache is already the mma's
+// type, so that case is one 16-byte move and no conversion at all; the others
+// widen on the way past. Overloads rather than a branch: the cache type is a
+// template parameter of the caller, so the right one is picked at compile time.
+__device__ __forceinline__ void kv_mma_load8(
+    const __half* cache, long long row, int dimension, int head_dim, __half* out
+) {
+    *reinterpret_cast<uint4*>(out) =
+        *reinterpret_cast<const uint4*>(cache + row * head_dim + dimension);
+}
+__device__ __forceinline__ void kv_mma_load8(
+    const __nv_bfloat16* cache, long long row, int dimension, int head_dim,
+    __nv_bfloat16* out
+) {
+    *reinterpret_cast<uint4*>(out) =
+        *reinterpret_cast<const uint4*>(cache + row * head_dim + dimension);
+}
+__device__ __forceinline__ void kv_mma_load8(
+    const unsigned char* cache, long long row, int dimension, int head_dim,
+    __half* out
+) {
+    // One q8_0 block covers 32 elements, so eight of them share a scale: read
+    // it once rather than once per element, which is the whole point of
+    // decoding a row for the group instead of per query head.
+    const unsigned char* block =
+        cache + row * (head_dim / 32) * 34 + (dimension >> 5) * 34;
+    const float factor = __half2float(*(const __half*)block);
+    const signed char* quantized = (const signed char*)(block + 2) + (dimension & 31);
+    #pragma unroll
+    for (int step = 0; step < 8; ++step)
+        out[step] = __float2half(factor * (float)quantized[step]);
+}
+
+// One warp's 16-key window of the cache, widened into shared memory as f16.
+// The row stride is padded so the eight rows an `ldmatrix` reads at once land
+// in different banks; without it the load serializes eight ways.
+template<typename T, typename Operand, int chunk_dims, int stride>
+__device__ __forceinline__ void kv_mma_stage(
+    const T* cache, Operand* destination, const int kv_head, const int capacity,
+    const int first, const int base, const int live, const int dimension,
+    const int head_dim, const int lane
+) {
+    constexpr int rows = 16;
+    constexpr int groups = chunk_dims / 8;
+    #pragma unroll
+    for (int index = lane; index < rows * groups; index += 32) {
+        const int row = index / groups;
+        const int column = (index - row * groups) * 8;
+        Operand* out = destination + row * stride + column;
+        if (row >= live) {
+            const uint4 zero = {0u, 0u, 0u, 0u};
+            *reinterpret_cast<uint4*>(out) = zero;
+            continue;
+        }
+        int slot = first + base + row;
+        if (slot >= capacity) slot -= capacity;
+        kv_mma_load8(cache, (long long)kv_head * capacity + slot,
+                     dimension + column, head_dim, out);
+    }
+}
+
+template<typename KT, typename VT, typename Operand, int maximum_head_dim,
+         int share, int tokens_per_tile>
+__device__ void kv_attention_gqa_mma_impl(
+    const float* query,
+    const KT* keys,
+    const VT* values,
+    float* partial,
+    const int heads,
+    const int kv_heads,
+    const int head_dim,
+    const int tokens,
+    const int capacity,
+    const int first,
+    const float scale
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    constexpr int warp_count = 8;
+    constexpr int keys_per_step = 16;
+    constexpr int chunk_dims = 64;
+    constexpr int chunks = maximum_head_dim / chunk_dims;
+    constexpr int fragments = maximum_head_dim / 16;
+    constexpr int stride = chunk_dims + 8;
+    constexpr float negative = -3.402823466e+38F / 2.0f;
+
+    const int kv_head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int group = lane >> 2;
+    const int quad = lane & 3;
+    const int block = lane >> 3;
+    if (kv_head >= kv_heads || head_dim != maximum_head_dim ||
+        heads != kv_heads * share)
+        return;
+
+    __shared__ Operand staged[warp_count][keys_per_step * stride];
+    __shared__ float merged[warp_count][maximum_head_dim];
+    __shared__ float warp_maximum[warp_count];
+    __shared__ float warp_denominator[warp_count];
+    __shared__ float warp_scale[warp_count];
+    __shared__ float tile_maximum;
+    __shared__ float tile_denominator;
+    Operand* stage = staged[warp];
+
+    const int tile_begin = tile * tokens_per_tile;
+    const int tile_end = min(tokens, tile_begin + tokens_per_tile);
+    const int head_base = kv_head * share;
+
+    // Q as the second operand, once, scaled on the way in: lane `l` carries
+    // query head `group` at dims 2*quad, +1, +8, +9 of every 16-dim step.
+    unsigned int query_operand[fragments][2];
+    {
+        const float* row = query + (long long)(head_base + group) * head_dim;
+        #pragma unroll
+        for (int fragment = 0; fragment < fragments; ++fragment) {
+            const int start = fragment * 16 + 2 * quad;
+            query_operand[fragment][0] = kv_mma_pack<Operand>(
+                row[start] * scale, row[start + 1] * scale);
+            query_operand[fragment][1] = kv_mma_pack<Operand>(
+                row[start + 8] * scale, row[start + 9] * scale);
+        }
+    }
+
+    float output[fragments][4];
+    #pragma unroll
+    for (int fragment = 0; fragment < fragments; ++fragment) {
+        #pragma unroll
+        for (int element = 0; element < 4; ++element)
+            output[fragment][element] = 0.0f;
+    }
+    float running_maximum[2] = {negative, negative};
+    float running_denominator[2] = {0.0f, 0.0f};
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+    for (int base = tile_begin + warp * keys_per_step;
+         base < tile_end;
+         base += warp_count * keys_per_step) {
+        const int live = min(keys_per_step, tile_end - base);
+        float score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            kv_mma_stage<KT, Operand, chunk_dims, stride>(
+                keys, stage, kv_head, capacity, first, base, live,
+                chunk * chunk_dims, head_dim, lane);
+            __syncwarp();
+            #pragma unroll
+            for (int step = 0; step < chunk_dims / 16; ++step) {
+                unsigned int operand[4];
+                kv_mma_ldmatrix(
+                    operand,
+                    stage + ((block & 1) * 8 + (lane & 7)) * stride
+                          + step * 16 + (block >> 1) * 8);
+                kv_mma_m16n8k16(
+                    score, operand,
+                    query_operand[chunk * (chunk_dims / 16) + step],
+                    (const Operand*)nullptr);
+            }
+            __syncwarp();
+        }
+
+        // Element `l` is key base + 8*(l/2) + group, query 2*quad + (l%2).
+        #pragma unroll
+        for (int element = 0; element < 4; ++element) {
+            if (8 * (element / 2) + group >= live) score[element] = negative;
+        }
+        float updated[2] = {fmaxf(score[0], score[2]), fmaxf(score[1], score[3])};
+        // A query's keys are the eight lanes sharing this lane's `quad`.
+        #pragma unroll
+        for (int offset = 4; offset <= 16; offset <<= 1) {
+            updated[0] = fmaxf(updated[0],
+                __shfl_xor_sync(0xffffffff, updated[0], offset));
+            updated[1] = fmaxf(updated[1],
+                __shfl_xor_sync(0xffffffff, updated[1], offset));
+        }
+        float rescale[2];
+        #pragma unroll
+        for (int column = 0; column < 2; ++column) {
+            updated[column] = fmaxf(running_maximum[column], updated[column]);
+            rescale[column] = __expf(running_maximum[column] - updated[column]);
+            running_maximum[column] = updated[column];
+            running_denominator[column] *= rescale[column];
+        }
+        #pragma unroll
+        for (int fragment = 0; fragment < fragments; ++fragment) {
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                output[fragment][element] *= rescale[element & 1];
+        }
+        float probability[4];
+        #pragma unroll
+        for (int element = 0; element < 4; ++element)
+            probability[element] =
+                __expf(score[element] - running_maximum[element & 1]);
+        float sum[2] = {probability[0] + probability[2],
+                        probability[1] + probability[3]};
+        #pragma unroll
+        for (int offset = 4; offset <= 16; offset <<= 1) {
+            sum[0] += __shfl_xor_sync(0xffffffff, sum[0], offset);
+            sum[1] += __shfl_xor_sync(0xffffffff, sum[1], offset);
+        }
+        running_denominator[0] += sum[0];
+        running_denominator[1] += sum[1];
+
+        // Same matrix, other thread mapping: scores are (key, query) per lane,
+        // the second mma wants (query, key).
+        unsigned int probability_operand[2];
+        probability_operand[0] = kv_mma_movmatrix(
+            kv_mma_pack<Operand>(probability[0], probability[1]));
+        probability_operand[1] = kv_mma_movmatrix(
+            kv_mma_pack<Operand>(probability[2], probability[3]));
+
+        #pragma unroll
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            kv_mma_stage<VT, Operand, chunk_dims, stride>(
+                values, stage, kv_head, capacity, first, base, live,
+                chunk * chunk_dims, head_dim, lane);
+            __syncwarp();
+            #pragma unroll
+            for (int step = 0; step < chunk_dims / 16; ++step) {
+                unsigned int operand[4];
+                kv_mma_ldmatrix_trans(
+                    operand,
+                    stage + ((block >> 1) * 8 + (lane & 7)) * stride
+                          + step * 16 + (block & 1) * 8);
+                kv_mma_m16n8k16(
+                    output[chunk * (chunk_dims / 16) + step], operand,
+                    probability_operand, (const Operand*)nullptr);
+            }
+            __syncwarp();
+        }
+    }
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+    // One query head at a time, so the cross-warp merge needs one 256-float
+    // staging row per warp rather than eight. A query's output lives in the
+    // lanes whose `quad` is its column pair; dims are 16*fragment + group and
+    // + 8 + group.
+    const int tile_count = (tokens + tokens_per_tile - 1) / tokens_per_tile;
+    #pragma unroll
+    for (int index = 0; index < share; ++index) {
+        __syncthreads();
+        if (quad == index / 2) {
+            if (group == 0) {
+                warp_maximum[warp] = running_maximum[index & 1];
+                warp_denominator[warp] = running_denominator[index & 1];
+            }
+            #pragma unroll
+            for (int fragment = 0; fragment < fragments; ++fragment) {
+                merged[warp][fragment * 16 + group] =
+                    output[fragment][index & 1];
+                merged[warp][fragment * 16 + 8 + group] =
+                    output[fragment][2 + (index & 1)];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float maximum = warp_maximum[0];
+            #pragma unroll
+            for (int other = 1; other < warp_count; ++other)
+                maximum = fmaxf(maximum, warp_maximum[other]);
+            float denominator = 0.0f;
+            #pragma unroll
+            for (int other = 0; other < warp_count; ++other) {
+                const float factor = warp_denominator[other] == 0.0f
+                    ? 0.0f : __expf(warp_maximum[other] - maximum);
+                warp_scale[other] = factor;
+                denominator += warp_denominator[other] * factor;
+            }
+            tile_maximum = maximum;
+            tile_denominator = denominator;
+        }
+        __syncthreads();
+        float* record = partial
+            + ((long long)(head_base + index) * tile_count + tile)
+                * (maximum_head_dim + 2);
+        if (threadIdx.x == 0) {
+            record[0] = tile_maximum;
+            record[1] = tile_denominator;
+        }
+        for (int dimension = threadIdx.x;
+             dimension < head_dim;
+             dimension += blockDim.x) {
+            float result = 0.0f;
+            #pragma unroll
+            for (int other = 0; other < warp_count; ++other)
+                result += merged[other][dimension] * warp_scale[other];
+            record[dimension + 2] = result;
+        }
+    }
+#else
+    // No tensor cores to run this on. The host checks the same floor before it
+    // selects the kernel, so reaching here means the check was skipped.
+    (void)query; (void)keys; (void)values; (void)partial; (void)heads;
+    (void)kv_heads; (void)head_dim; (void)tokens; (void)capacity; (void)first;
+    (void)scale;
+#endif
+}
+
+#define KV_ATTENTION_GQA_MMA(name, KT, VT, OPERAND, DIM, SHARE, TILE) \
+extern "C" __global__ __launch_bounds__(256, 1) void name( \
+    const float* query, const KT* keys, const VT* values, float* partial, \
+    const int heads, const int kv_heads, const int head_dim, const int tokens, \
+    const int capacity, const int first, const float scale \
+) { \
+    kv_attention_gqa_mma_impl<KT, VT, OPERAND, DIM, SHARE, TILE>( \
+        query, keys, values, partial, heads, kv_heads, head_dim, tokens, \
+        capacity, first, scale \
+    ); \
+}
+// Defined only where the instructions exist, so a device below the floor
+// simply does not have the kernel and the host falls back by name lookup
+// rather than by an architecture test it could get wrong.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_f16_256_s8_t512, __half, __half, __half, 256, 8, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_f16_256_s8_t256, __half, __half, __half, 256, 8, 256)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_q8_256_s8_t512, unsigned char, unsigned char, __half,
+    256, 8, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_q8_256_s8_t256, unsigned char, unsigned char, __half,
+    256, 8, 256)
+#endif
+// bf16 operands are one step later than f16 ones.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_bf16_256_s8_t512, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 256, 8, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_bf16_256_s8_t256, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 256, 8, 256)
+#endif
 #undef KV_ATTENTION_GQA_MMA
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(

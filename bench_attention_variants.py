@@ -245,6 +245,10 @@ def main() -> int:
         candidates.append((
             f"kv_attention_gqa_rows_{arguments.kv_type}_256"
             f"_s{share}_t{arguments.tile}", arguments.tile, kv_heads))
+    if share == 8:
+        candidates.append((
+            f"kv_attention_gqa_mma_{arguments.kv_type}_256"
+            f"_s{share}_t{arguments.tile}", arguments.tile, kv_heads))
 
     print(f"tokens={tokens} kv_heads={kv_heads} share={share} "
           f"kv_type={arguments.kv_type} KV={2 * kv_bytes / 2**20:.0f} MiB "

@@ -460,14 +460,62 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn(
             "const int tile_count = (tokens + tokens_per_tile - 1) "
             "/ tokens_per_tile;", kernels)
-        # cuBLAS keeps its place ahead of it on an f16 cache.
-        self.assertIn("!cublas_done&&runtime->fused_attention", runtime)
+        # It is now the second choice for its own shapes -- the fused
+        # tensor-core kernel outranks it -- and is reached only when that one
+        # is absent and cuBLAS did not run.
+        self.assertIn(": (!cublas_done&&gqa_tile_tokens)", runtime)
         # The tile is chosen by what fits, not by preference.
         self.assertIn("kv_gqa_rows_tile_tokens(*runtime,tokens)", runtime)
         self.assertIn("records*kv_fused_record_stride(256)", runtime)
         # The superseded staged variant is gone rather than left unreachable.
         self.assertNotIn("kv_attention_gqa_f16_256_s8", kernels)
         self.assertNotIn("kv_attention_gqa_f16_256_s8", driver)
+
+    def test_fused_tensor_core_attention_outranks_cublas(self):
+        """The mma decode kernel: tensor cores without giving up f32 softmax.
+
+        It is the first path that takes both halves -- cuBLAS is fast because it
+        hands the products to the tensor cores, and inaccurate because it has to
+        materialize the score matrix as 16-bit to do so. Measured at the
+        runtime's own shape (17k tokens, 2 KV heads of 8): 44.6 us at 1.3e-05
+        against cuBLAS' 72.0 us at 3.37e-05. So it is ranked first, and the
+        things that make that safe are asserted here.
+        """
+        root = Path(__file__).resolve().parents[1]
+        kernels = (
+            root / "native/include/flyweight_v2_qwen_kernels.hpp"
+        ).read_text(encoding="utf-8")
+        driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
+        runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
+
+        # The three instructions the kernel is built on. `movmatrix` is what
+        # turns the score fragment into the second product's operand without a
+        # round trip, and `.trans` is what transposes V on the way out of shared
+        # memory -- a cache row is contiguous in dims, the contraction is over
+        # keys, and nothing else reconciles those.
+        self.assertIn("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32", kernels)
+        self.assertIn("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32", kernels)
+        self.assertIn("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16", kernels)
+        self.assertIn("movmatrix.sync.aligned.m8n8.trans.b16", kernels)
+        # A bf16 cache keeps its own element type into the tensor cores rather
+        # than passing through f16, which has a quarter of its exponent range.
+        self.assertIn("__CUDA_ARCH__ >= 800", kernels)
+        for precision in ("f16", "bf16", "q8"):
+            for tile in (256, 512):
+                symbol = f"kv_attention_gqa_mma_{precision}_256_s8_t{tile}"
+                self.assertIn(symbol, kernels)
+                self.assertIn(symbol, driver)
+                self.assertIn(symbol, runtime)
+        # Below the instruction floor the kernels are not defined at all, and
+        # the host asks the module rather than re-deriving the rule.
+        self.assertIn("flyweight_gpu_kernel_available", driver)
+        self.assertIn("flyweight_gpu_kernel_available(name)?name:nullptr", runtime)
+        # Ranked ahead of cuBLAS, and asked *before* it, because cuBLAS writes
+        # its output on the way through and turbo staging rotates the query in
+        # place -- neither is worth undoing once started.
+        self.assertIn("const bool cublas_done=mma_tiles==nullptr&&", runtime)
+        # It reuses the grouped-rows record layout, so the merge is unchanged.
+        self.assertIn("const char* gqa_tiles=mma_tiles ? mma_tiles", runtime)
 
     def test_bf16_cache_reaches_cublas_without_a_staging_copy(self):
         """A bf16 cache is a dense 16-bit matrix, so it needs no f16 copy.

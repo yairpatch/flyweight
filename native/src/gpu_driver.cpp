@@ -1158,6 +1158,10 @@ extern "C" int flyweight_gpu_compile(
              "kv_attention_gqa_rows_bf16_256_s4_t256", "kv_attention_gqa_rows_bf16_256_s4_t512",
              "kv_attention_gqa_rows_q8_256_s8_t256", "kv_attention_gqa_rows_q8_256_s8_t512",
              "kv_attention_gqa_rows_q8_256_s4_t256", "kv_attention_gqa_rows_q8_256_s4_t512",
+             // Fused tensor-core decode: same sharing, mma products.
+             "kv_attention_gqa_mma_f16_256_s8_t256", "kv_attention_gqa_mma_f16_256_s8_t512",
+             "kv_attention_gqa_mma_bf16_256_s8_t256", "kv_attention_gqa_mma_bf16_256_s8_t512",
+             "kv_attention_gqa_mma_q8_256_s8_t256", "kv_attention_gqa_mma_q8_256_s8_t512",
              "kv_attention_prefill_f16", "kv_attention_prefill_bf16", "kv_attention_prefill_q8",
              "gemma_q4_0_matvec", "gemma_q4_0_embedding", "gemma_q4_0_geglu",
              "gemma_q4_0_grouped_geglu", "gemma_q4_0_grouped_accumulate",
@@ -2942,6 +2946,15 @@ extern "C" int flyweight_gpu_launch_named(
     return launch(found->second, grid_x, grid_y, block_x, arguments,
                   shared_bytes, reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -3;
+}
+
+// Whether the compiled module actually defines a kernel. The corpus guards its
+// tensor-core kernels on __CUDA_ARCH__, so on a device below the floor they are
+// simply absent -- asking the module is exact, where a compute-capability test
+// on this side would be a second copy of the same rule, free to drift from it.
+extern "C" int flyweight_gpu_kernel_available(const char* name) {
+    if (name == nullptr) return 0;
+    return g_functions.find(name) != g_functions.end() ? 1 : 0;
 }
 
 extern "C" int flyweight_gpu_attention_16bit_cublas(

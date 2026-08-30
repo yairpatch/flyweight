@@ -14963,6 +14963,44 @@ inline const char* kv_gqa_tiles_kernel(
            t==1?(narrow?"kv_attention_gqa_rows_f16_256_s4_t256"
                        :"kv_attention_gqa_rows_f16_256_s4_t512"):nullptr;
 }
+// Fused tensor-core decode attention: the products go through the mma units
+// while the softmax and the output accumulator stay in f32 registers, so it is
+// both the fastest of these paths and the most accurate. At 49k on 2 KV heads
+// of 8 query heads (tiles + merge, interleaved, best of seven): 279 us against
+// cuBLAS' 318 and the grouped-rows kernel's 580 on f16, and 309 against 572 on
+// q8, where cuBLAS cannot go at all.
+//
+// Availability is asked of the compiled module rather than computed here: the
+// corpus defines these kernels only for sm_75 and up (sm_80 for bf16 operands),
+// so on an older device the name is simply absent. Opt out with
+// FLYWEIGHT_MMA_ATTENTION=0 -- note the latch, which is why an A/B of this
+// switch needs one process per setting (FLYWEIGHT_ATTENTION_DIAG=1 confirms
+// which path actually ran).
+inline const char* kv_gqa_mma_kernel(
+    const FlyweightV2QwenRuntime& r,int head_dim,int heads,int kv_heads,int tile
+){
+    static const bool enabled=[]{
+        const char*env=std::getenv("FLYWEIGHT_MMA_ATTENTION");
+        return !env||env[0]!='0';
+    }();
+    if(!enabled||kv_heads<=0||head_dim!=256)return nullptr;
+    if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
+    // The mma tile is 8 wide and the group fills it exactly; other ratios would
+    // leave that dimension half empty, which the grouped-rows kernel serves
+    // without waste.
+    if(heads!=kv_heads*8)return nullptr;
+    if(tile!=256&&tile!=512)return nullptr;
+    const bool narrow=tile==256;
+    const int t=r.options.cache_type_k;
+    const char* name=
+        t==3?(narrow?"kv_attention_gqa_mma_q8_256_s8_t256"
+                    :"kv_attention_gqa_mma_q8_256_s8_t512"):
+        t==2?(narrow?"kv_attention_gqa_mma_bf16_256_s8_t256"
+                    :"kv_attention_gqa_mma_bf16_256_s8_t512"):
+        t==1?(narrow?"kv_attention_gqa_mma_f16_256_s8_t256"
+                    :"kv_attention_gqa_mma_f16_256_s8_t512"):nullptr;
+    return name&&flyweight_gpu_kernel_available(name)?name:nullptr;
+}
 // Floats per (head, tile) partial record: the head dimension plus the running
 // maximum and denominator. Must match the kernel width that wrote it.
 inline int kv_fused_record_stride(int width){return width+2;}
@@ -18198,8 +18236,18 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             // The tiles take over where cuBLAS declines (window past the
             // staging buffer, short windows), which used to fall all the way
             // to the serial per-head kernels.
-            const bool cublas_done=
-                qwen_turbo_cublas_attention(
+            // The fused tensor-core kernel outranks cuBLAS where it exists, so
+            // it is resolved before anything is staged or launched: cuBLAS
+            // mutates `attended` on the way through and turbo staging rotates
+            // the query in place, neither of which is worth undoing.
+            const int gqa_tile_tokens=runtime->fused_attention
+                ? kv_gqa_rows_tile_tokens(*runtime,tokens) : 0;
+            const char* mma_tiles=gqa_tile_tokens
+                ? kv_gqa_mma_kernel(
+                      *runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
+                : nullptr;
+            const bool cublas_done=mma_tiles==nullptr&&
+                (qwen_turbo_cublas_attention(
                     *runtime,queries,first,cache_keys,cache_values,
                     attention_scores,attended,heads,kv_heads,head_dim,tokens,
                     capacity,first_slot,scale)||
@@ -18209,27 +18257,29 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     runtime->options.cache_type_k,
                     queries,first,cache_keys,cache_values,attention_scores,
                     attended,runtime->stream,heads,kv_heads,head_dim,tokens,
-                    capacity,first_slot,scale)==0);
-            const int gqa_tile_tokens=(!cublas_done&&runtime->fused_attention)
-                ? kv_gqa_rows_tile_tokens(*runtime,tokens) : 0;
-            const char* gqa_tiles=gqa_tile_tokens
+                    capacity,first_slot,scale)==0));
+            // Same tile rule and the same one-record-per-(head, tile) layout,
+            // so the two are interchangeable and the merge is unchanged.
+            const char* gqa_tiles=mma_tiles ? mma_tiles
+                : (!cublas_done&&gqa_tile_tokens)
                 ? kv_gqa_tiles_kernel(
                       *runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
                 : nullptr;
             const int gqa_tile_count=gqa_tiles
                 ? (tokens+gqa_tile_tokens-1)/gqa_tile_tokens : 0;
-            // Ranked below cuBLAS by measurement, not by principle: at 49k on
-            // an f16 cache cuBLAS is 320 us against this kernel's 563. Where
-            // cuBLAS cannot go -- any cache but f16, a wrapped ring, a window it
-            // declines -- this is the best of what is left, by a wide margin on
-            // a quantized cache: q8 at 49k is 528 us against 909 for the
-            // per-head kernel, which decodes every row once per query head.
+            // Either the fused tensor-core kernel or, for the shapes it does
+            // not cover, the grouped-rows one. Measured at the runtime's own
+            // shape (17k tokens, 2 KV heads of 8, tiles + merge, interleaved):
+            //
+            //     f16   mma 44.6 us    cuBLAS 72.0 us    rows 141.3 us
+            //     q8    mma 78.6 us    (no cuBLAS)       rows 144.1 us
             //
             // End to end that is smaller than it sounds, and worth knowing
-            // before reading a disappointing A/B as a broken kernel: Ornith runs
-            // full attention on 10 of 40 layers and the rest of the token is
-            // MoE, so 17k q8 decode moves 35.4 -> 37.3 tok/s (+5.5%), token
-            // identical, one process per setting.
+            // before reading a modest A/B as a broken kernel: Ornith runs full
+            // attention on 10 of 40 layers and the rest of the token is MoE, so
+            // 17k q8 decode moves 52.4 -> 58.8 tok/s (+12%) against what this
+            // path used before, and f16 +0.4% against cuBLAS, which was already
+            // most of the way there.
             const bool gqa_done=gqa_tiles!=nullptr;
             // Which of the four decode paths ran, announced once. Every one of
             // them is correct and they differ only in speed, so a silent
