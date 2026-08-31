@@ -78,6 +78,10 @@ FLYWEIGHT_KQUANT_EMBEDDING(qwen_iq2s_embedding, iq2s_value)
 FLYWEIGHT_KQUANT_EMBEDDING(qwen_iq3s_embedding, iq3s_value)
 FLYWEIGHT_KQUANT_EMBEDDING(qwen_iq2xs_embedding, iq2xs_value)
 FLYWEIGHT_KQUANT_EMBEDDING(qwen_iq4xs_embedding, iq4xs_value)
+// All-NVFP4 checkpoints store token_embd as type 40; the gather is the same
+// indexed decode, with weight_scale_2 folded into the E4M3 block scales (see
+// nvfp4_matmul_tiled).
+FLYWEIGHT_KQUANT_EMBEDDING(qwen_nvfp4_embedding, nvfp4_value)
 
 #undef FLYWEIGHT_KQUANT_EMBEDDING
 

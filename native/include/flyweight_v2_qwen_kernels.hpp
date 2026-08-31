@@ -8336,6 +8336,69 @@ void nvfp4_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial * scale;
 }
 
+// Warp per row, eight rows per block -- the shape every dense matvec here
+// uses. The block-per-row form above keeps the shared-expert launch sites
+// working; this one serves the dense projections of an all-NVFP4 checkpoint,
+// where a 256-thread block reduction per row was measured 17% off the whole
+// decode. nvfp4_value's shuffle broadcasts want contiguous lanes on
+// contiguous elements, which the lane-strided walk provides.
+extern "C" __global__
+void nvfp4_matvec_transposed_warp(
+    const unsigned char* packed, const float* vector, float* output,
+    const int input_size, const int output_size, const float scale
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 8 + warp;
+    if (row >= output_size) return;
+    // One whole 16-element sub-block per lane per step: the scale is decoded
+    // once per 16 values instead of once per value, and no cross-lane
+    // broadcast is needed at all. nvfp4_value's shuffle form costs two
+    // __shfl_sync per element, which made the naive walk ALU-bound -- dense
+    // NVFP4 measured slower than the 1.89x-larger Q8_0 copy it replaced.
+    const int subblocks = input_size >> 4;
+    const long long row_blocks = (long long)row * (input_size >> 6);
+    float partial = 0.0f;
+    for (int sb = lane; sb < subblocks; sb += 32) {
+        const unsigned char* base = packed + (row_blocks + (sb >> 2)) * 36;
+        const int sub = sb & 3;
+        const float block_scale = ue4m3_to_float(base[sub]);
+        const float* v = vector + sb * 16;
+        // A 36-byte block keeps its nibble bytes 4-aligned (36 = 4 mod 8, and
+        // the arena base is 16-aligned), so the eight data bytes are two u32
+        // loads; the 16 vector floats are four float4 loads.
+        const unsigned int lo =
+            *(const unsigned int*)(base + 4 + sub * 8);
+        const unsigned int hi =
+            *(const unsigned int*)(base + 8 + sub * 8);
+        const float4 v0 = *(const float4*)(v);
+        const float4 v1 = *(const float4*)(v + 4);
+        const float4 v2 = *(const float4*)(v + 8);
+        const float4 v3 = *(const float4*)(v + 12);
+        float acc = 0.0f;
+        acc += fp4_e2m1_to_float((int)(lo       ) & 15) * v0.x;
+        acc += fp4_e2m1_to_float((int)(lo >>  8 ) & 15) * v0.y;
+        acc += fp4_e2m1_to_float((int)(lo >> 16 ) & 15) * v0.z;
+        acc += fp4_e2m1_to_float((int)(lo >> 24 ) & 15) * v0.w;
+        acc += fp4_e2m1_to_float((int)(hi       ) & 15) * v1.x;
+        acc += fp4_e2m1_to_float((int)(hi >>  8 ) & 15) * v1.y;
+        acc += fp4_e2m1_to_float((int)(hi >> 16 ) & 15) * v1.z;
+        acc += fp4_e2m1_to_float((int)(hi >> 24 ) & 15) * v1.w;
+        acc += fp4_e2m1_to_float((int)(lo >>  4 ) & 15) * v2.x;
+        acc += fp4_e2m1_to_float((int)(lo >> 12 ) & 15) * v2.y;
+        acc += fp4_e2m1_to_float((int)(lo >> 20 ) & 15) * v2.z;
+        acc += fp4_e2m1_to_float((int)(lo >> 28 ) & 15) * v2.w;
+        acc += fp4_e2m1_to_float((int)(hi >>  4 ) & 15) * v3.x;
+        acc += fp4_e2m1_to_float((int)(hi >> 12 ) & 15) * v3.y;
+        acc += fp4_e2m1_to_float((int)(hi >> 20 ) & 15) * v3.z;
+        acc += fp4_e2m1_to_float((int)(hi >> 28 ) & 15) * v3.w;
+        partial += block_scale * acc;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    if (lane == 0) output[row] = partial * scale;
+}
+
 extern "C" __global__
 void nvfp4_swiglu_transposed(
     const unsigned char* gate_packed,
@@ -8390,6 +8453,70 @@ void nvfp4_matmul_rows(
     if (threadIdx.x == 0)
         output[(long long)token * (long long)output_size + output_row] =
             partial * scale;
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// Shared-tile GEMM for the dense projections of an all-NVFP4 checkpoint,
+// mirroring q8_matmul_tiled: a 32-row x 32-token block decodes each weight
+// tile once into shared memory and reuses it across all 32 tokens. The
+// per-token rows kernel re-read the whole matrix per token and measured
+// prefill at half the Q8 build's speed; this shape restores the reuse.
+// weight_scale_2 is folded into the E4M3 block scales for dense tensors
+// (both known all-NVFP4 quantizers ship no `.scale` tensors for them), so
+// no scale argument -- which is also what lets the generic six-argument
+// format-table launch name this kernel. The decode avoids nvfp4_value on
+// purpose: its __shfl_sync broadcasts assume contiguous lanes on contiguous
+// elements of one row, and the tile fill walks (row, column) pairs instead.
+extern "C" __global__
+void nvfp4_matmul_tiled(
+    const unsigned char* packed, const float* input, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    __shared__ float weight_tile[32][33];
+    __shared__ float input_tile[32][33];
+    const int row_base = blockIdx.x * 32;
+    const int token_base = blockIdx.y * 32;
+    const int lane_token = threadIdx.x & 31;
+    const int row_group = threadIdx.x >> 5;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k0 = 0; k0 < input_size; k0 += 32) {
+        for (int index = threadIdx.x; index < 32 * 32; index += 256) {
+            const int local = index >> 5, k = index & 31;
+            const int token = token_base + local;
+            input_tile[local][k] = token < rows
+                ? input[(long long)token * input_size + k0 + k] : 0.0f;
+            const int row = row_base + local;
+            if (row < output_size) {
+                const long long absolute = (long long)row * input_size + k0 + k;
+                const unsigned char* base = packed + (absolute >> 6) * 36;
+                const int offset = (int)(absolute & 63);
+                const int sub = offset >> 4;
+                const int within = offset & 15;
+                const int byte = base[4 + sub * 8 + (within & 7)];
+                const int val = within < 8 ? (byte & 0x0F) : (byte >> 4);
+                weight_tile[local][k] =
+                    ue4m3_to_float(base[sub]) * fp4_e2m1_to_float(val);
+            } else weight_tile[local][k] = 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const float value = input_tile[lane_token][k];
+            acc[0] += weight_tile[row_group * 4 + 0][k] * value;
+            acc[1] += weight_tile[row_group * 4 + 1][k] * value;
+            acc[2] += weight_tile[row_group * 4 + 2][k] * value;
+            acc[3] += weight_tile[row_group * 4 + 3][k] * value;
+        }
+        __syncthreads();
+    }
+    const int token = token_base + lane_token;
+    if (token >= rows) return;
+    for (int r = 0; r < 4; ++r) {
+        const int row = row_base + row_group * 4 + r;
+        if (row < output_size)
+            output[(long long)token * output_size + row] = acc[r];
+    }
 }
 
 extern "C" __global__

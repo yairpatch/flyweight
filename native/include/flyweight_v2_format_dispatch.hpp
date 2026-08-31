@@ -243,10 +243,23 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .embedding = "qwen_bf16_embedding",
      .embedding_rows = "qwen_bf16_embedding_rows",
      .cpu_expert = true},
-    // MXFP4 and NVFP4 run through dedicated paths (grouped/cuBLASLt); only
-    // their CPU expert support is recorded here.
+    // MXFP4 experts run through dedicated paths (grouped/cuBLASLt); only the
+    // CPU expert support is recorded here.
     {.type = 39, .family = "mxfp4", .cpu_expert = true},
-    {.type = 40, .family = "nvfp4", .cpu_expert = true},
+    // NVFP4 experts likewise run the dedicated grouped/cuBLASLt paths (the
+    // expert stream short-circuits on type 40 before consulting this table,
+    // because the expert kernels carry weight_scale_2). The entries below are
+    // for the DENSE tensors of an all-NVFP4 checkpoint -- embedding table,
+    // attention/DeltaNet projections -- whose scales are folded into the E4M3
+    // blocks. The decode matvec lives in qwen_matvec_driver (its trailing
+    // scale argument does not fit the generic table launch); no LM-head
+    // argmax, so an NVFP4 head still converts to Q8_0 at prepare.
+    {.type = 40, .family = "nvfp4",
+     .matmul_rows = "nvfp4_matmul_tiled",
+     .matmul_rows_grid = RowsMatmulGrid::tiled32,
+     .embedding = "qwen_nvfp4_embedding",
+     .embedding_rows = "qwen_nvfp4_embedding_rows",
+     .cpu_expert = true},
 };
 
 inline constexpr const QwenFormatKernels* qwen_format(std::uint32_t type) {

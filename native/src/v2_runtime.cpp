@@ -4497,6 +4497,17 @@ int qwen_gpu_matvec_by_type(
         case 23: return flyweight_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 19: return flyweight_gpu_iq1s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 29: return flyweight_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        // Dense NVFP4 (all-NVFP4 checkpoints): weight_scale_2 is folded into
+        // the E4M3 block scales for these tensors, so the kernel's trailing
+        // scale argument is fixed at 1. The expert paths never come through
+        // here -- they pass the real per-expert scales themselves.
+        case 40: {
+            float scale = 1.0f;
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size, &scale};
+            return flyweight_gpu_launch_named(
+                "nvfp4_matvec_transposed_warp", (output_size + 7) / 8, 1, 256,
+                0, stream, args);
+        }
         default: break;
     }
     return -1;
@@ -4520,7 +4531,7 @@ bool qwen_matvec_supported(std::uint32_t type) {
     switch (type) {
         case 1: case 8: case 10: case 11: case 12: case 13: case 14:
         case 16: case 17: case 18: case 19: case 21: case 22: case 23:
-        case 29: case 30:
+        case 29: case 30: case 40:
             return true;
         default:
             return false;
@@ -4559,6 +4570,14 @@ int qwen_matvec_driver(
         case 22: return flyweight_gpu_iq2s_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 23: return flyweight_gpu_iq4xs_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 29: return flyweight_gpu_iq1m_matvec_transposed(matrix, input, output, input_size, output_size, stream);
+        // Dense NVFP4, scale folded into the blocks -- see qwen_gpu_matvec_by_type.
+        case 40: {
+            float scale = 1.0f;
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size, &scale};
+            return flyweight_gpu_launch_named(
+                "nvfp4_matvec_transposed_warp", (output_size + 7) / 8, 1, 256,
+                0, stream, args);
+        }
         default: break;
     }
     return kQwenMatvecUnsupported;
@@ -13940,45 +13959,24 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         }
         // All-NVFP4 checkpoints (llama.cpp file_type 39) quantize the dense
         // projections, the embedding table, and sometimes the head to type 40
-        // as well, not just the expert stacks. NVFP4 has device kernels only
-        // where its bytes are re-read enough to matter: the routed experts
-        // (paged through the expert cache) and the fused shared expert. The
-        // matvec dispatch, the embedding gather, and the LM head have no
-        // type-40 entry, so every other persistent NVFP4 tensor reaches the
-        // device as Q8_0, exactly like the IQ1_M head above. Q8_0 holds each
+        // as well, not just the expert stacks. The dense tensors now run from
+        // their packed bytes -- qwen_matvec_driver, the format table's rows
+        // matmul, and the embedding kernels all carry a type-40 entry with
+        // weight_scale_2 folded into the blocks. The one consumer without a
+        // kernel is the fused LM-head argmax, so an NVFP4 head converts to
+        // Q8_0 here, exactly like the IQ1_M head above. Q8_0 holds each
         // block's decoded values exactly (an fp16 scale per 32 values against
         // NVFP4's e4m3 per 16, but int8 mantissas cover E2M1's 3 magnitude
-        // bits), so the conversion is value-preserving; the cost is bytes,
-        // 1.89x the packed form on the converted tensors.
-        //
-        // Unconditional on purpose, like the IQ1_M flip and unlike the bf16
-        // policy below: there is no kernel that could read these tensors in
-        // their file form, so "keeping" them is not an option the policy
-        // could express.
+        // bits), so the conversion is value-preserving. A tied checkpoint
+        // (token_embd doubling as the head) converts the shared tensor once,
+        // and the embedding gather follows the device type to Q8_0 with it.
         {
-            // The shared-expert gate/up/down stay packed: enqueue_shared
-            // dispatches on the device type and owns fused NVFP4 kernels for
-            // exactly these three (with weight_scale_2 passed alongside,
-            // which a byte conversion here would silently drop).
-            auto shexp_fused=[](const std::string&name){
-                for(const char*suffix:{"ffn_gate_shexp.weight",
-                                       "ffn_up_shexp.weight",
-                                       "ffn_down_shexp.weight"}){
-                    const auto length=std::strlen(suffix);
-                    if(name.size()>=length&&
-                       name.compare(name.size()-length,length,suffix)==0)
-                        return true;
-                }
-                return false;
-            };
             std::uint64_t converted=0,growth=0;
             for(std::uint64_t index=0;index<persistent.size();++index){
                 if(!persistent[index])continue;
-                // The device type, not the file type: the draft-block loop
-                // above may have flipped an NVFP4 draft tensor already.
+                if(index!=runtime->lm_head)continue;
                 if(runtime->device_tensor_types[index]!=40)continue;
                 const auto&tensor=runtime->model->tensors[index];
-                if(shexp_fused(tensor.name))continue;
                 std::uint64_t elements=1;
                 for(auto dimension:tensor.shape)elements*=dimension;
                 // NVFP4 blocks are 64 elements, so a whole-block tensor is
@@ -13996,7 +13994,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             if(converted){
                 runtime->static_tensor_bytes+=growth;
                 std::fprintf(stderr,
-                    "[flyweight] NVFP4 dense requant: %llu tensors to Q8_0 "
+                    "[flyweight] NVFP4 head requant: %llu tensor to Q8_0 "
                     "(%llu MiB added)\n",
                     static_cast<unsigned long long>(converted),
                     static_cast<unsigned long long>(growth/(1024ull*1024)));
