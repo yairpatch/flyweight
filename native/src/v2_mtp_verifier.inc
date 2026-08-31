@@ -1499,7 +1499,10 @@ void qwen_forward_rows(
         // `first` scratch (silu_mul expects gate at [0, n) and up at [n, 2n)
         // of one buffer), then the elementwise swiglu combine.
         const auto swiglu_elements=static_cast<std::uint64_t>(rows)*intermediate;
-        const auto shexp_type=runtime.model->tensors[layer.static_tensors.at(moe_base+2)].type;
+        // The device type, not the stored one: requant may have flipped an
+        // all-NVFP4 draft block's shexp to Q8_0, and the packed-NVFP4 branch
+        // must not run on converted bytes.
+        const auto shexp_type=qwen_device_type(runtime,layer.static_tensors.at(moe_base+2));
         if(shexp_type==40){
             // NVFP4 shared expert. weight_scale_2 rides in f32 (it is far below
             // E4M3's smallest subnormal) and gate/up must be scaled before the

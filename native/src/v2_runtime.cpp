@@ -16220,7 +16220,12 @@ std::uint32_t qwen_mtp_draft(
     auto*cpu_weights=reinterpret_cast<float*>(staging+weights_offset);auto*cpu_input=reinterpret_cast<float*>(staging+input_offset);auto*cpu_activated=reinterpret_cast<float*>(staging+cpu_activated_offset);auto*cpu_output=reinterpret_cast<float*>(staging+output_offset);
     if(flyweight_gpu_download(selected_host,selected_device,top_k*sizeof(std::int32_t),runtime.stream)!=0||flyweight_gpu_download(cpu_weights,route_weights,top_k*sizeof(float),runtime.stream)!=0||flyweight_gpu_download(cpu_input,normalized,hidden_size*sizeof(float),runtime.stream)!=0)throw std::runtime_error("native MTP route transfer failed");
     auto shared_gate_matrix=tensor(9),shared_up_matrix=tensor(10);
-    const auto shexp_type=runtime.model->tensors[layer.static_tensors.at(9)].type;
+    // The device type, not the stored one: on an all-NVFP4 checkpoint the
+    // draft block's shexp is type 40 in the file but requant_draft flipped
+    // it to Q8_0, and dispatching on the file type here launched the NVFP4
+    // fused kernels on Q8_0 bytes -- every draft came out garbage, and the
+    // acceptance rate pinned to zero while verify quietly ate the cost.
+    const auto shexp_type=qwen_device_type(runtime,layer.static_tensors.at(9));
     if(shexp_type==40){
         // NVFP4 shared expert: gate/up scales before the non-linear SiLU, the
         // linear down scale on the down projection itself.
