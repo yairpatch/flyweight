@@ -16,6 +16,10 @@
 
 #include <qwen_cpu_kernel.h>
 
+// The same <cmath>/<algorithm> spelling as the reference quantizer this is
+// bit-identical to. The GCC __builtin_ forms are not declared by MSVC.
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <immintrin.h>
 
@@ -53,14 +57,13 @@ void qwen_quantize_q8_gemm(
         const float* source = input + block * 32;
         float amax = 0.0f;
         for (int i = 0; i < 32; ++i)
-            amax = amax > __builtin_fabsf(source[i]) ? amax
-                                                     : __builtin_fabsf(source[i]);
+            amax = std::max(amax, std::fabs(source[i]));
         const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
         scales[block] = amax / 127.0f;
         std::int32_t sum = 0;
         for (int i = 0; i < 32; ++i) {
             const std::int8_t q =
-                static_cast<std::int8_t>(__builtin_lrintf(source[i] * inverse));
+                static_cast<std::int8_t>(std::lrintf(source[i] * inverse));
             values[block * 32 + i] = q;
             sum += q;
         }

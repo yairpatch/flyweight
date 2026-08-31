@@ -45,8 +45,15 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <sys/stat.h>
+// The POSIX st_mode predicates are macros the MSVC CRT does not define, only
+// the _S_IF* constants they are built from. S_ISDIR was shimmed when the first
+// caller appeared and S_ISREG was not, so every later "is this a file" check
+// compiled everywhere except Windows.
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
 #endif
 #else
 #include <dirent.h>
@@ -3964,9 +3971,15 @@ void gemma_cpu_moe_rows(const FlyweightV2QwenRuntime&runtime,const QwenLayerPlan
         }
         // Experts carry work proportional to how many rows routed to them, so
         // this one stays dynamic; the uniform reduction below is static.
+        //
+        // Signed index: MSVC implements OpenMP 2.0, whose canonical loop form
+        // admits only a signed integral variable, so the std::size_t this used
+        // to be was a hard error there and compiled everywhere else. The count
+        // is the routed expert set, which cannot approach INT_MAX.
+        const int used_count=static_cast<int>(used.size());
         #pragma omp for schedule(dynamic,1)
-        for(std::size_t index=0;index<used.size();++index){
-            const int expert=used[index];
+        for(int index=0;index<used_count;++index){
+            const int expert=used[static_cast<std::size_t>(index)];
             const auto*gate_up=tensor_data(*runtime.model,gate_up_tensor)+
                 static_cast<std::uint64_t>(expert)*gate_up_bytes;
             const auto*down=tensor_data(*runtime.model,down_tensor)+

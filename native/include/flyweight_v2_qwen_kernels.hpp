@@ -10621,13 +10621,24 @@ R"FLYWEIGHT_CUDA(
 // The cache type only reaches the staging loop: K and V are widened to f16 on
 // the way into shared, so f16, bf16 and q8_0 all run the same mma path, and a
 // quantized row is still decoded exactly once per (token, KV head).
+//
+// Guarded like every one of its callers below, and for the same reason they
+// are: this corpus is also compiled as host C++ for the CPU backend. GCC
+// tolerated an unguarded body because nothing on the host path calls it, so the
+// PTX string is never assembled -- but MSVC rejects GNU extended asm at parse
+// time, which broke the whole Windows build on a function no host code runs.
 __device__ __forceinline__ unsigned int kv_mma_shared_address(const void* source) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
     unsigned int address;
     asm("{ .reg .u64 wide;\n"
         "  cvta.to.shared.u64 wide, %1;\n"
         "  cvt.u32.u64 %0, wide; }"
         : "=r"(address) : "l"(source));
     return address;
+#else
+    (void)source;
+    return 0u;
+#endif
 }
 __device__ __forceinline__ void kv_mma_ldmatrix(
     unsigned int* d, const void* source

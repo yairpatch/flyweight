@@ -41,6 +41,33 @@
 #include <random>
 #include <vector>
 
+// The same split the other contracts use: __builtin_cpu_supports is a GCC
+// extension, and MSVC answers the question through cpuid in <intrin.h>.
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+
+namespace {
+
+bool cpu_has_avx512() {
+#if defined(_MSC_VER)
+    int registers[4]{};
+    __cpuid(registers, 1);
+    // OSXSAVE, then the OS actually preserving the ZMM/YMM state, before the
+    // AVX-512 feature bits mean anything.
+    if ((registers[2] & (1 << 27)) == 0) return false;
+    if ((_xgetbv(0) & 0xe6) != 0xe6) return false;
+    __cpuidex(registers, 7, 0);
+    return (registers[1] & (1 << 16)) != 0;
+#else
+    return __builtin_cpu_supports("avx512f") != 0;
+#endif
+}
+
+} // namespace
+
 extern "C" {
 int flyweight_cpu_launch_named(const char*, std::uint32_t, std::uint32_t,
                              std::uint32_t, std::uint32_t, std::uint64_t,
@@ -138,7 +165,7 @@ int run_expert() {
     // is in qwen_simd_quant_type, so with AVX-512 present qwen_quant_dot
     // dispatches to qwen_quant_dot_avx512. Comparing the kernel against the
     // scalar reference alone therefore tests a path the runtime never takes.
-    const bool has_avx512 = __builtin_cpu_supports("avx512f");
+    const bool has_avx512 = cpu_has_avx512();
 
     std::vector<double> exact(kOutputSize), cpu(kOutputSize), gpu(kOutputSize),
         simd(kOutputSize);
