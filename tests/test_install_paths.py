@@ -9,12 +9,19 @@ cannot work from an installed copy, because there is no `native/` beside it.
 
 from __future__ import annotations
 
+import os
+import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from flyweight import native_build
 from flyweight.cli import main
+
+# Bound before any patch replaces it. The doctor calls which() for cmake and the
+# compiler too, so the tests below have to answer for "flyweight" and defer the
+# rest -- deferring to the patched name instead recurses until the stack ends.
+real_which = shutil.which
 
 
 class NativeBuildTests(unittest.TestCase):
@@ -34,6 +41,62 @@ class NativeBuildTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("no native sources", message)
         self.assertIn("wheel", message)
+
+
+@unittest.skipUnless(os.name == "nt", "the Windows toolchain lookup")
+class WindowsToolchainTests(unittest.TestCase):
+    """Finding MSVC the way Visual Studio says to, not by guessing paths.
+
+    The old lookup tried three hardcoded Community/BuildTools directories, so a
+    machine with Professional, Enterprise, a Preview channel, or a non-C: drive
+    was told to install a compiler it already had -- by the build as an error,
+    and by `flyweight doctor` as a blocking failure.
+    """
+
+    def test_the_toolchain_is_found_on_a_machine_that_can_build(self) -> None:
+        vcvars = native_build.find_msvc()
+        if vcvars is None:
+            self.skipTest("no Visual Studio C++ tools on this machine")
+        self.assertTrue(vcvars.is_file())
+        self.assertEqual(vcvars.name, "vcvars64.bat")
+
+    def test_a_professional_install_is_found_through_vswhere(self) -> None:
+        # vswhere reports an installation root; everything else is derived. The
+        # edition and the drive are exactly what a hardcoded list cannot cover.
+        install = Path(r"D:\VS\2022\Professional")
+        with (
+            patch.object(native_build, "_vswhere", return_value=[install]),
+            patch.object(Path, "is_file", lambda self: True),
+        ):
+            found = native_build.find_msvc()
+        self.assertEqual(
+            found, install / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        )
+
+    def test_no_toolchain_yields_an_instruction_rather_than_a_cmake_crash(self) -> None:
+        with (
+            patch.object(native_build, "find_msvc", return_value=None),
+            patch.object(native_build.shutil, "which", return_value=None),
+        ):
+            with self.assertRaises(FileNotFoundError) as raised:
+                native_build._build_environment()
+        # The fix has to be runnable, not a description of a checkbox.
+        self.assertIn("winget install", str(raised.exception))
+
+    def test_ninja_is_preferred_so_the_build_is_not_serial(self) -> None:
+        # NMake Makefiles ignores --parallel entirely, which is the difference
+        # between one core and all of them over a few dozen AVX-512 units.
+        with patch.object(native_build, "find_ninja", return_value=Path("ninja.exe")):
+            environment = {"PATH": "C:\\existing"}
+            self.assertEqual(native_build._generator(environment), "Ninja")
+            self.assertTrue(environment["PATH"].startswith("."))
+        with patch.object(native_build, "find_ninja", return_value=None):
+            self.assertEqual(native_build._generator({}), "NMake Makefiles")
+
+    def test_switching_generator_does_not_strand_an_existing_build_tree(self) -> None:
+        # cmake refuses to reconfigure under a new generator. A checkout built
+        # before Ninja must not have its next build turn into that error.
+        self.assertIsNone(native_build._cached_generator(Path("/nonexistent")))
 
 
 class DoctorTests(unittest.TestCase):
@@ -73,8 +136,58 @@ class DoctorTests(unittest.TestCase):
             return_value=Path("/elsewhere/flyweight/_native"),
         ):
             _, output = self._run()
-        self.assertIn("not /", output)
+        # Named, not spelled "not /": the checkout is reported as an absolute
+        # path, which on Windows starts with a drive letter and failed here.
+        self.assertIn(f"not {Path(__file__).resolve().parents[1]}", output)
         self.assertIn("shadowing the checkout", output)
+
+    def test_a_console_script_off_path_is_a_warning_naming_the_module_form(self) -> None:
+        # The exact end state of a successful Microsoft Store `pip install`:
+        # flyweight.exe is written, pip warns that its directory is not on
+        # PATH, and the shell then says the command does not exist. Not a
+        # failure -- `python -m flyweight` is a complete answer -- but it has
+        # to be *said*, because nothing else in the install does.
+        script = Path("/scripts-off-path") / (
+            "flyweight.exe" if os.name == "nt" else "flyweight")
+        with (
+            patch("flyweight.cli._console_script", return_value=script),
+            patch("shutil.which", lambda name, **k: None if name == "flyweight"
+                  else real_which(name, **k)),
+        ):
+            code, output = self._run()
+        self.assertEqual(code, 0, output)
+        self.assertIn("not on PATH", output)
+        self.assertIn("python -m flyweight", output)
+
+    def test_a_console_script_from_another_install_is_reported_as_shadowing(self) -> None:
+        ours = Path("/ours") / "flyweight"
+        with (
+            patch("flyweight.cli._console_script", return_value=ours),
+            patch("shutil.which", lambda name, **k: "/somewhere/else/flyweight"
+                  if name == "flyweight" else real_which(name, **k)),
+        ):
+            _, output = self._run()
+        self.assertIn("shadows this one on PATH", output)
+
+    def test_the_user_scheme_scripts_directory_is_searched(self) -> None:
+        # A Store Python's default scripts path is under Program
+        # Files\WindowsApps, which pip cannot write to, so every console script
+        # it installs goes to the nt_user scheme instead. Looking only at the
+        # default reported a correctly installed command as missing.
+        import sysconfig
+
+        user_scheme = sysconfig.get_preferred_scheme("user")
+        user_directory = Path(sysconfig.get_path("scripts", user_scheme))
+        name = "flyweight.exe" if os.name == "nt" else "flyweight"
+        real_is_file = Path.is_file
+
+        def only_the_user_copy(self: Path) -> bool:
+            return self == user_directory / name or real_is_file(self)
+
+        with patch.object(Path, "is_file", only_the_user_copy):
+            from flyweight.cli import _console_script
+
+            self.assertEqual(_console_script(), user_directory / name)
 
     def test_a_healthy_checkout_reports_that_it_can_serve(self) -> None:
         if not any(

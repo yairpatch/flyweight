@@ -50,42 +50,154 @@ loads from GGUF, including multi-file `-00001-of-0000N` splits.
 
 ## Requirements
 
-- Python 3.11+
-- CMake 3.24+
-- A C++20 compiler
-- An NVIDIA driver for GPU execution (`--backend cpu` serves without one)
-- Optional CuPy only for low-level CUDA development checks
+There is no published wheel: Flyweight compiles its native runtime from source
+as part of the install, so a C++ toolchain is needed once, at install time.
 
-Windows requires Visual Studio 2022 Build Tools with the **Desktop development
-with C++** workload. Linux requires a recent GCC or Clang toolchain.
+| | Needed |
+| --- | --- |
+| Python | 3.11 or newer, 64-bit |
+| CMake | 3.24 or newer |
+| Compiler | MSVC v143 (Windows) or GCC 13+ / Clang 16+ (Linux) |
+| GPU | Any current NVIDIA driver — **no CUDA toolkit**. `--backend cpu` serves without a GPU at all |
+| Disk | ~100 MB for the build tree, plus whatever the model weighs |
+
+CUDA kernels are compiled at runtime through the NVIDIA driver API, which is
+why the driver alone is enough and `nvcc` is never invoked. CuPy appears
+nowhere in this list — it is used only by low-level development checks, never
+by the runtime.
 
 ## Installation
 
-~~~bash
+Pick your platform below. Both end at `flyweight doctor`, which reports whether
+the machine can serve and names the fix for anything missing.
+
+Expect the install to take a few minutes: the runtime is a few dozen large
+AVX-512 and kernel translation units, and they are compiled, not downloaded.
+
+### Windows
+
+Run this in PowerShell. Nothing here needs a Developer Command Prompt — the
+build locates the x64 MSVC toolchain itself, through the same `vswhere` lookup
+`flyweight doctor` reports.
+
+~~~powershell
+# One-time prerequisites.
+winget install Kitware.CMake
+winget install Ninja-build.Ninja
+winget install --id Microsoft.VisualStudio.2022.BuildTools --override `
+  "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+
+# Close and reopen PowerShell so the new tools are on PATH, then:
+git clone https://github.com/yairpatch/flyweight
+cd flyweight
 python -m venv .venv
-source .venv/bin/activate
+.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -e .
+pip install .
 flyweight doctor
 ~~~
 
-`pip install -e .` compiles the native runtime as part of the install; there is
-no second build step. `flyweight doctor` then reports whether this machine can
-serve and names the fix for anything missing — run it first whenever something
-fails to start.
+Notes specific to Windows:
 
-On Windows, activate with `.venv\Scripts\Activate.ps1` and run the same
-commands. CUDA kernels are compiled at runtime through the NVIDIA driver API;
-the project does not require a separately installed CUDA toolkit for serving.
+- **Any Visual Studio edition works** — Community, Professional, Enterprise, or
+  the standalone Build Tools, including installs on a non-system drive. Only
+  the x64 C++ compiler component matters, so an existing Visual Studio with
+  **Desktop development with C++** already ticked needs no `winget` line.
+- **Ninja is optional but worth installing.** Without it the build falls back to
+  NMake, which compiles one file at a time regardless of `--parallel`. Visual
+  Studio ships its own `ninja.exe` and that copy is found automatically, so the
+  `winget install Ninja-build.Ninja` line only matters if it is absent.
+- **Use 64-bit Python.** The runtime library is x64; a 32-bit interpreter fails
+  to load it with `WinError 193`.
+- **If the build says the C++ tools were not found**, run `flyweight doctor`. It
+  names which of CMake, MSVC, and the build tool it can and cannot see, instead
+  of stopping at the first one.
 
-Working on the runtime itself needs the contract tests and benchmarks, which an
-install does not build:
+### Linux
 
 ~~~bash
+# Debian / Ubuntu -- one-time prerequisites.
+sudo apt install git python3-venv python3-pip build-essential cmake ninja-build
+# Fedora / RHEL:  sudo dnf install git python3-devel gcc-c++ cmake ninja-build
+# Arch:           sudo pacman -S git python gcc cmake ninja
+
+git clone https://github.com/yairpatch/flyweight
+cd flyweight
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install .
+flyweight doctor
+~~~
+
+Notes specific to Linux:
+
+- **Check the compiler version if the build fails on unknown syntax.** The
+  runtime is C++20 and needs GCC 13+ or Clang 16+; `g++ --version` settles it.
+  Older LTS releases ship GCC 11 or 12, where `sudo apt install g++-13` and
+  `export CXX=g++-13` before `pip install .` is the smallest fix.
+- **CMake older than 3.24** is the other common blocker on long-term releases.
+  `pip install cmake` inside the activated venv puts a current one on PATH
+  without touching the system package.
+- **A GPU needs only the proprietary NVIDIA driver.** `nvidia-smi` reporting a
+  device is the whole check; the `cuda-toolkit` package is not used. Without
+  one, serve with `--backend cpu`.
+
+### Verifying the install
+
+~~~
+$ flyweight doctor
+[ok  ] python: 3.12.10
+[ok  ] package: .../.venv/lib/python3.12/site-packages/flyweight
+[ok  ] command: .../.venv/bin/flyweight
+[ok  ] native runtime: flyweight_v2.so, built 2026-08-31 14:04
+[warn] sources: no checkout beside this install
+       -> fine for a wheel; you cannot rebuild the runtime here
+[ok  ] nvidia gpu: device 0, compute 12.0, 10.8/11.9 GiB free
+
+this install can serve
+~~~
+
+Read the last line first. Only `FAIL` lines stop the runtime, and each one
+prints the command that fixes it; `warn` lines are notes. The `sources` warning
+above is the normal state of an installed copy — it means the runtime cannot be
+rebuilt from there, which only matters if you intend to change it. Run
+`flyweight doctor` first whenever something refuses to start.
+
+### If `flyweight` is "not recognized" or "command not found"
+
+The install succeeded and the console script simply is not on PATH. Run it as a
+module instead — identical arguments, no PATH entry required:
+
+~~~
+python -m flyweight doctor
+python -m flyweight serve model.gguf
+~~~
+
+Activating the virtual environment as shown above normally prevents this,
+because activation puts the environment's script directory on PATH. It comes up
+without one on a Microsoft Store Python, whose per-user
+`...\LocalCache\local-packages\Python312\Scripts` is never added to PATH, and
+after any `pip install --user`. Both cases make pip print a warning and install
+anyway. `flyweight doctor` reports the exact directory to add if you would
+rather fix PATH permanently.
+
+### Developing on Flyweight itself
+
+Use an editable install, so edits to `src/flyweight` take effect without
+reinstalling, and build the contract tests and benchmarks that a plain install
+skips:
+
+~~~bash
+pip install -e .
 python -m flyweight.native_build     # same build tree, plus the test binaries
 ctest --test-dir build/native --output-on-failure
 pytest -q
 ~~~
+
+Do not keep an editable and a regular install in the same environment. The
+regular one wins every import, edits appear to do nothing, and `flyweight
+doctor` reports the shadowing on its `package` line.
 
 ## Commands
 

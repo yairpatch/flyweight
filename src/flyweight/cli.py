@@ -9,6 +9,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import sysconfig
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1358,7 +1359,12 @@ def _architecture(model_path: Path) -> str | None:
     # the 12 MB tokenizer, only to close both and repeat the work in the service.
     if model_path.is_dir():
         try:
-            config = json.loads((model_path / "config.json").read_text())
+            # JSON is UTF-8; without saying so this decodes as cp1252 on
+            # Windows and a checkpoint with any non-ASCII byte in its config
+            # falls into the slow path below instead of being recognized.
+            config = json.loads(
+                (model_path / "config.json").read_text(encoding="utf-8")
+            )
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         model_type = config.get("model_type")
@@ -1651,6 +1657,32 @@ def _transcript_audit(args: argparse.Namespace) -> int:
     return 1 if report.by_verdict("runtime-dropped") else 0
 
 
+def _console_script() -> Path | None:
+    """The `flyweight` entry point pip wrote for this interpreter, if any.
+
+    Both schemes are searched, and the user one is not a fallback. A Microsoft
+    Store Python reports its scripts directory inside `C:\\Program
+    Files\\WindowsApps`, which is read-only to everyone including pip, so every
+    console script it installs goes to the `nt_user` scheme instead -- looking
+    only at the default would report a perfectly installed command as missing.
+    """
+    name = "flyweight.exe" if os.name == "nt" else "flyweight"
+    schemes = (None, sysconfig.get_preferred_scheme("user"))
+    seen: list[Path] = []
+    for scheme in schemes:
+        directory = sysconfig.get_path("scripts") if scheme is None \
+            else sysconfig.get_path("scripts", scheme)
+        if not directory:
+            continue
+        candidate = Path(directory) / name
+        if candidate in seen:
+            continue
+        seen.append(candidate)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _doctor() -> int:
     """Say what this install can do, and name the fix for what it cannot.
 
@@ -1705,6 +1737,34 @@ def _doctor() -> int:
     else:
         report("package", True, str(package))
 
+    # An install that succeeded and a command that cannot be found are the same
+    # event on Windows: pip puts `flyweight.exe` in the interpreter's Scripts
+    # directory, and that directory is not on PATH for a Microsoft Store Python
+    # (its per-user LocalCache one never is) or for any non-venv
+    # `pip install --user`. pip warns and installs anyway, so the last thing the
+    # installer prints is success and the first thing the shell says is "not
+    # recognized". Reported as a warning, not a failure: `python -m flyweight`
+    # is a complete answer and is how this check was reached.
+    console = _console_script()
+    found = shutil.which("flyweight")
+    if found and console is not None and Path(found).resolve() == console.resolve():
+        report("command", True, found)
+    elif found:
+        # A different one wins the PATH lookup; naming both is the only way to
+        # explain why edits here do not change what `flyweight` does.
+        report("command", None,
+               f"`flyweight` resolves to {found}"
+               + (f", not {console}" if console else ""),
+               "an install from elsewhere shadows this one on PATH")
+    elif console is not None:
+        report("command", None, f"{console} exists but its directory is not on PATH",
+               "run it as `python -m flyweight ...`, which needs no PATH entry, "
+               f"or add {console.parent} to PATH")
+    else:
+        report("command", None, "no `flyweight` console script",
+               "running from a checkout without an install; use "
+               "`python -m flyweight ...`")
+
     library = None
     for suffix in (".so", ".dylib", ".dll"):
         candidate = native_build.default_output() / f"{native_build.LIBRARY_STEM}{suffix}"
@@ -1748,10 +1808,25 @@ def _doctor() -> int:
         else:
             report("cmake", False, "not on PATH", "install CMake 3.24+")
         if os.name == "nt":
-            compiler = shutil.which("cl")
-            report("c++ compiler", bool(compiler), compiler or "cl not on PATH",
-                   "" if compiler else "install VS 2022 Build Tools "
-                                       "(Desktop development with C++)")
+            # NOT `which("cl")`. The build configures its own x64 toolchain from
+            # vcvars64, so cl is not expected on PATH and never is in a plain
+            # PowerShell -- this check used to fail on machines that build
+            # perfectly, and sent them to install a compiler they already had.
+            vcvars = native_build.find_msvc()
+            if vcvars is not None:
+                report("c++ compiler", True, f"MSVC at {vcvars.parents[3]}")
+            elif shutil.which("cl"):
+                report("c++ compiler", True, f"{shutil.which('cl')} (already on PATH)")
+            else:
+                report("c++ compiler", False, "no Visual Studio C++ tools",
+                       native_build.MSVC_MISSING.replace("\n", "\n       "))
+            # Not a failure, only the difference between a build that uses every
+            # core and one that uses a single one.
+            ninja = native_build.find_ninja()
+            report("build tool", True if ninja else None,
+                   str(ninja) if ninja else "NMake Makefiles (serial build)",
+                   "" if ninja else "install Ninja for a parallel build: "
+                                    "winget install Ninja-build.Ninja")
         else:
             compiler = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
             report("c++ compiler", bool(compiler), compiler or "none found",
