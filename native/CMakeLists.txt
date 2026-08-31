@@ -21,6 +21,13 @@ if(MSVC)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# MSVC's default OpenMP runtime is the 2.0-era vcomp; the LLVM runtime gets
+# modern scheduling for the CPU-expert layers on decode's serial path. The
+# variable is honored by CMake >= 3.30 and harmlessly ignored before that.
+# Found here, above every target that checks OpenMP_CXX_FOUND.
+set(OpenMP_RUNTIME_MSVC "llvm")
+find_package(OpenMP)
+
 # The CPU backend compiles the CUDA corpus as host C++ rather than carrying a
 # hand-written second copy of the numerics; these two artifacts are that corpus
 # plus its name -> launcher table. Regenerated whenever a kernel header changes.
@@ -537,7 +544,6 @@ if(NOT WIN32)
     set_source_files_properties(src/cpu_q8_dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mfma;-mf16c")
 endif()
 
-find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(flyweight_v2 PRIVATE OpenMP::OpenMP_CXX)
 endif()
