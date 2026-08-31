@@ -5657,18 +5657,16 @@ int gpu_probe(FlyweightV2GpuInfo& out, int device) {
 #if defined(_WIN32)
     HMODULE lib = LoadLibraryW(L"nvcuda.dll");
     if (!lib) return 0;
-    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using SetFlags = int (*)(int, unsigned int); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
-    auto init=reinterpret_cast<Init>(GetProcAddress(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(GetProcAddress(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(GetProcAddress(lib,"cuCtxSetCurrent")); auto set_flags=reinterpret_cast<SetFlags>(GetProcAddress(lib,"cuDevicePrimaryCtxSetFlags")); auto attr=reinterpret_cast<Attr>(GetProcAddress(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(GetProcAddress(lib,"cuMemGetInfo_v2"));
+    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
+    auto init=reinterpret_cast<Init>(GetProcAddress(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(GetProcAddress(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(GetProcAddress(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(GetProcAddress(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(GetProcAddress(lib,"cuMemGetInfo_v2"));
     if (!init || !retain || !set || !attr || init(0)!=0) { FreeLibrary(lib); return 0; }
-    if(set_flags&&(!std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")||std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
     void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { FreeLibrary(lib); return 0; }
     int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { FreeLibrary(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } FreeLibrary(lib); return 0;
 #else
     void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL); if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_LOCAL); if (!lib) return 0;
-    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using SetFlags = int (*)(int, unsigned int); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
-    auto init=reinterpret_cast<Init>(dlsym(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(dlsym(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(dlsym(lib,"cuCtxSetCurrent")); auto set_flags=reinterpret_cast<SetFlags>(dlsym(lib,"cuDevicePrimaryCtxSetFlags")); auto attr=reinterpret_cast<Attr>(dlsym(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(dlsym(lib,"cuMemGetInfo_v2"));
+    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
+    auto init=reinterpret_cast<Init>(dlsym(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(dlsym(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(dlsym(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(dlsym(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(dlsym(lib,"cuMemGetInfo_v2"));
     if (!init || !retain || !set || !attr || init(0)!=0) { dlclose(lib); return 0; }
-    if(set_flags&&(!std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")||std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT")[0]!='1'))(void)set_flags(device,0x04);
     void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { dlclose(lib); return 0; }
     int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { dlclose(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } dlclose(lib); return 0;
 #endif
@@ -5753,6 +5751,24 @@ void map_file(const char* path, FlyweightV2Model& model) { FlyweightV2Model* m=&
     if(!m->data) throw std::runtime_error("cannot map GGUF");
     const char* lock_env=std::getenv("FLYWEIGHT_V2_MLOCK"); const bool lock_model=lock_env&&lock_env[0]=='1';
     if(lock_model){
+        // VirtualLock is capped by the process *minimum working set* (a few MB
+        // by default), not by SeLockMemoryPrivilege, so grow the quota by this
+        // mapping's size first. Shards each pass through here and extend it
+        // again. Min is hard (locked pages cannot be trimmed anyway), max soft
+        // so the rest of the process can still grow past it.
+        {
+            SIZE_T ws_min=0,ws_max=0;
+            if(GetProcessWorkingSetSize(GetCurrentProcess(),&ws_min,&ws_max)){
+                const SIZE_T slack=64ULL*1024ULL*1024ULL;
+                SIZE_T want_min=ws_min+m->size+slack;
+                SIZE_T want_max=ws_max>want_min?ws_max:want_min+slack;
+                if(!SetProcessWorkingSetSizeEx(GetCurrentProcess(),want_min,want_max,
+                        QUOTA_LIMITS_HARDWS_MIN_ENABLE|QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+                    std::fprintf(stderr,"flyweight_v2: SetProcessWorkingSetSizeEx(%zu) failed "
+                        "(error %lu); VirtualLock will likely cap out\n",
+                        static_cast<size_t>(want_min),GetLastError());
+            }
+        }
         // Touch every page to prefault (MAP_POPULATE equivalent on Windows)
         volatile uint8_t sink=0; const size_t page_size=4096;
         for(size_t offset=0;offset<m->size;offset+=page_size) sink^=m->data[offset];
@@ -17238,13 +17254,16 @@ static int gemma4_decode(FlyweightV2QwenRuntime& runtime, std::uint32_t input_to
     // the same lambdas onto the capture stream; outside capture it is always
     // runtime.stream.
     std::uint64_t launch_stream=runtime.stream;
-    // Opt-in: capturing the pinned FFN chain measured 2% SLOWER than eager
-    // launches on Linux (56.3 vs 57.6 tok/s, 3x interleaved A/B) -- decode
-    // submission overhead is already hidden behind the serial CPU-expert
-    // layers. Kept for WDDM, where per-launch submission costs several times
-    // more and the delta-block graphs measurably pay.
+    // Capturing the pinned FFN chain measured 2% SLOWER than eager launches
+    // on Linux (56.3 vs 57.6 tok/s, 3x interleaved A/B) -- decode submission
+    // overhead is already hidden behind the serial CPU-expert layers. Under
+    // WDDM per-launch submission costs several times more and the delta-block
+    // graphs measurably pay, so the default follows the driver model; the env
+    // still forces either way ('1' on, '0' off).
     static const bool env_graph_gemma=[]{
-        const char*s=std::getenv("FLYWEIGHT_CUDA_GRAPH_GEMMA");return s&&s[0]=='1';}();
+        const char*s=std::getenv("FLYWEIGHT_CUDA_GRAPH_GEMMA");
+        if(s)return s[0]=='1';
+        return flyweight_gpu_wddm()!=0;}();
     const bool gemma_graph_eligible=runtime.cuda_graphs&&env_graph_gemma;
     auto launch=[&](const char* name,std::uint32_t grid_x,std::uint32_t grid_y,
                     std::uint32_t block_x,void** arguments,std::uint32_t shared=0){
@@ -17628,6 +17647,12 @@ static int gemma4_decode(FlyweightV2QwenRuntime& runtime, std::uint32_t input_to
         auto layer_scale=tensor(18);
         void* scale_args[]={&hidden,&layer_scale,const_cast<int*>(&hidden_size)};
         launch("gemma_scale_vector",(hidden_size+255)/256,1,256,scale_args);
+        // Force WDDM to submit the queued layer instead of batching it with
+        // the next; opt-in for the same reason as the Qwen decode loop.
+        static const bool env_wddm_flush=[]{
+            const char*s=std::getenv("FLYWEIGHT_WDDM_FLUSH");return s&&s[0]=='1';}();
+        if(env_wddm_flush&&flyweight_gpu_wddm())
+            (void)flyweight_gpu_stream_query(runtime.stream);
     }
     rms(hidden,runtime.device_tensors[runtime.final_norm],normalized);
     // A sampled or penalized step re-projects the head from this normalized
@@ -19043,6 +19068,17 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             if(lc<8){++lc;float v[4]={};if(flyweight_gpu_download(v,hidden,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
                 std::fprintf(stderr,"[diag] after_layer_%u hidden[0..3]=% .6e % .6e % .6e % .6e\n",layer_number,v[0],v[1],v[2],v[3]);}
         }
+        // WDDM batches launches into a command buffer that only reaches the
+        // GPU when it fills or something synchronizes; querying the stream
+        // forces submission of what is queued so far. Opt-in: decode already
+        // crosses the host/device boundary every routed-MoE layer, which
+        // flushes the buffer anyway -- measured a wash on the NVFP4 35B
+        // (34.9 vs 35.0 tok/s median, 2x2 interleaved pairs, 2026-08-31).
+        // Kept for A/B on dense models, whose layers enqueue without a sync.
+        static const bool env_wddm_flush=[]{
+            const char*s=std::getenv("FLYWEIGHT_WDDM_FLUSH");return s&&s[0]=='1';}();
+        if(env_wddm_flush&&flyweight_gpu_wddm())
+            (void)flyweight_gpu_stream_query(runtime->stream);
     }
     if(runtime->cuda_profile)profile_record(runtime->cuda_tail_start);
     if(runtime->options.mtp_drafts){

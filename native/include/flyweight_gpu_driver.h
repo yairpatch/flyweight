@@ -70,6 +70,9 @@ FLYWEIGHT_API int flyweight_q4_moe_grouped(
 // context and the legacy default stream with CuPy.
 FLYWEIGHT_API int flyweight_gpu_available();
 FLYWEIGHT_API int flyweight_gpu_init(std::int32_t device);
+// 1 when the initialized device runs under Windows' WDDM driver model (per-
+// launch OS submission overhead); 0 on Linux, TCC, or the CPU backend.
+FLYWEIGHT_API int flyweight_gpu_wddm();
 FLYWEIGHT_API int flyweight_gpu_compile(
     const char* source,
     const char* const* options,
@@ -252,6 +255,11 @@ FLYWEIGHT_API int flyweight_gpu_memset(
 FLYWEIGHT_API int flyweight_gpu_stream_create(std::uint64_t* stream);
 FLYWEIGHT_API int flyweight_gpu_stream_destroy(std::uint64_t stream);
 FLYWEIGHT_API int flyweight_gpu_stream_sync(std::uint64_t stream);
+// Non-blocking completion probe. On WDDM the query's side effect — flushing
+// the driver's batched command buffer to the GPU — is the point; callers on
+// the decode path invoke it after enqueueing a layer and ignore the result.
+// Returns 0 when the stream is idle, 1 when work is pending, -1 on error.
+FLYWEIGHT_API int flyweight_gpu_stream_query(std::uint64_t stream);
 FLYWEIGHT_API int flyweight_gpu_graph_begin(std::uint64_t stream);
 FLYWEIGHT_API int flyweight_gpu_graph_end(
     std::uint64_t stream, std::uint64_t* graph

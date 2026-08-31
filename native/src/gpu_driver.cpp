@@ -66,9 +66,7 @@ struct CublasLtHeuristicResult {
 struct CudaApi {
     CUresult (*cuInit)(unsigned int) = nullptr;
     CUresult (*cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice) = nullptr;
-    CUresult (*cuDevicePrimaryCtxSetFlags)(CUdevice, unsigned int) = nullptr;
     CUresult (*cuCtxSetCurrent)(CUcontext) = nullptr;
-    CUresult (*cuCtxSetFlags)(unsigned int) = nullptr;
     CUresult (*cuDeviceGetAttribute)(int*, int, CUdevice) = nullptr;
     CUresult (*cuModuleLoadDataEx)(
         CUmodule*, const void*, unsigned int, int*, void**
@@ -95,6 +93,7 @@ struct CudaApi {
     CUresult (*cuMemHostUnregister)(void*) = nullptr;
     CUresult (*cuMemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream) = nullptr;
     CUresult (*cuStreamSynchronize)(CUstream) = nullptr;
+    CUresult (*cuStreamQuery)(CUstream) = nullptr;
     CUresult (*cuStreamCreate)(CUstream*, unsigned int) = nullptr;
     CUresult (*cuStreamDestroy)(CUstream) = nullptr;
     CUresult (*cuEventCreate)(CUevent*, unsigned int) = nullptr;
@@ -212,7 +211,13 @@ CUstream g_stream = nullptr;
 
 constexpr int kAttributeComputeMajor = 75;
 constexpr int kAttributeComputeMinor = 76;
+constexpr int kAttributeTccDriver = 35;
 constexpr unsigned int kThreadsPerBlock = 256;
+
+// 1 when the device runs under Windows' WDDM driver model, where every kernel
+// launch pays an OS-scheduler submission. Decode-path code keys graph capture
+// and command-buffer flush heuristics off this. Cached by flyweight_gpu_init.
+int g_wddm = 0;
 
 struct Kernels {
     CUfunction rms_norm = nullptr;
@@ -323,11 +328,7 @@ bool load_apis() {
     ok &= load_symbol(
         cuda, "cuDevicePrimaryCtxRetain", g_api.cuDevicePrimaryCtxRetain
     );
-    load_symbol(
-        cuda, "cuDevicePrimaryCtxSetFlags", g_api.cuDevicePrimaryCtxSetFlags
-    );
     ok &= load_symbol(cuda, "cuCtxSetCurrent", g_api.cuCtxSetCurrent);
-    load_symbol(cuda, "cuCtxSetFlags", g_api.cuCtxSetFlags);
     ok &= load_symbol(
         cuda, "cuDeviceGetAttribute", g_api.cuDeviceGetAttribute
     );
@@ -348,6 +349,8 @@ bool load_apis() {
     load_symbol(cuda, "cuMemHostUnregister", g_api.cuMemHostUnregister);
     ok &= load_symbol(cuda, "cuMemsetD8Async", g_api.cuMemsetD8Async);
     ok &= load_symbol(cuda, "cuStreamSynchronize", g_api.cuStreamSynchronize);
+    // Optional: WDDM command-buffer nudge (not fatal if absent).
+    load_symbol(cuda, "cuStreamQuery", g_api.cuStreamQuery);
     ok &= load_symbol(cuda, "cuStreamCreate", g_api.cuStreamCreate);
     ok &= load_symbol(cuda, "cuStreamDestroy_v2", g_api.cuStreamDestroy);
     ok &= load_symbol(cuda, "cuEventCreate", g_api.cuEventCreate);
@@ -734,23 +737,6 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
     if (g_api.cuInit(0) != 0) {
         return -2;
     }
-    // CUDA's default AUTO scheduling actively spins a host core while a stream
-    // is synchronized. Decode has a host/device boundary at every routed MoE
-    // layer, so that spin can heat a shared-power laptop enough to force the
-    // GPU into a much lower firmware power state. Blocking synchronization
-    // preserves the same ordering while putting the waiting thread to sleep.
-    // Keep an opt-out for latency-sensitive systems with independent cooling.
-    constexpr unsigned int kCtxSchedBlockingSync = 0x04;
-    const char* spin_wait = std::getenv("FLYWEIGHT_CUDA_SPIN_WAIT");
-    const bool blocking_sync = !spin_wait || spin_wait[0] != '1';
-    if (blocking_sync && g_api.cuDevicePrimaryCtxSetFlags != nullptr) {
-        // This can report PRIMARY_CONTEXT_ACTIVE when another CUDA consumer
-        // initialized first. cuCtxSetFlags below handles that case on drivers
-        // which expose the current-context API.
-        (void)g_api.cuDevicePrimaryCtxSetFlags(
-            device, kCtxSchedBlockingSync
-        );
-    }
     if (g_context == nullptr) {
         // Retain exactly once per process. Every runtime prepare comes through
         // here, and an unbalanced retain per open kept the primary context
@@ -762,9 +748,19 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
     if (g_api.cuCtxSetCurrent(g_context) != 0) {
         return -4;
     }
-    if (blocking_sync && g_api.cuCtxSetFlags != nullptr)
-        (void)g_api.cuCtxSetFlags(kCtxSchedBlockingSync);
+#if defined(_WIN32)
+    if (g_api.cuDeviceGetAttribute != nullptr) {
+        int tcc = 0;
+        if (g_api.cuDeviceGetAttribute(&tcc, kAttributeTccDriver, device) == 0)
+            g_wddm = tcc == 0 ? 1 : 0;
+    }
+#endif
     return 0;
+}
+
+extern "C" int flyweight_gpu_wddm() {
+    if (flyweight_backend_is_cpu()) return 0;
+    return g_wddm;
 }
 
 struct Entry {
@@ -1600,6 +1596,18 @@ extern "C" int flyweight_gpu_stream_sync(std::uint64_t stream) {
 
     return g_api.cuStreamSynchronize(reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -1;
+}
+
+extern "C" int flyweight_gpu_stream_query(std::uint64_t stream) {
+    if (flyweight_backend_is_cpu()) return 0;
+
+    if (g_api.cuStreamQuery == nullptr) return -1;
+    // Queried purely for its side effect on WDDM: submission of the batched
+    // command buffer. 0 = idle, 1 = work still pending, -1 = error.
+    const CUresult result =
+        g_api.cuStreamQuery(reinterpret_cast<CUstream>(stream));
+    if (result == 0) return 0;
+    return result == 600 /* CUDA_ERROR_NOT_READY */ ? 1 : -1;
 }
 
 extern "C" int flyweight_gpu_graph_begin(std::uint64_t stream) {
