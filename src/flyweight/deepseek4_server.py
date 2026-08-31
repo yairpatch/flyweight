@@ -590,6 +590,7 @@ class NativeDeepseek4InferenceService(InferenceService):
         max_concurrent_requests: int = 64,
         request_timeout_seconds: float = 30.0,
         sse_keepalive_seconds: float = 10.0,
+        default_thinking_budget: int = 2048,
         **unsupported: object,
     ):
         _reject_unsupported(unsupported)
@@ -630,6 +631,7 @@ class NativeDeepseek4InferenceService(InferenceService):
             max_concurrent_requests=max_concurrent_requests,
             request_timeout_seconds=request_timeout_seconds,
             sse_keepalive_seconds=sse_keepalive_seconds,
+            default_thinking_budget=default_thinking_budget,
             generation_defaults=generation_defaults,
         )
         self.generation_defaults_source = generation_defaults_source
