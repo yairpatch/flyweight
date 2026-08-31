@@ -13497,10 +13497,18 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 (vocabulary&&table.size%vocabulary==0)?table.size/vocabulary:0;
             const bool dense_model=runtime->model->config.expert_count==0;
             const bool wanted=embed_env?embed_env[0]=='1':dense_model;
+            // Host residency stages raw file rows and decodes them with the
+            // kernel for the FILE type, while every launch site dispatches on
+            // the device type. The two only agree when the file type has an
+            // embedding kernel of its own; a table the requant loops below
+            // must convert (NVFP4, IQ1_M) has to stay in the arena, where the
+            // staged bytes and the dispatched kernel are both Q8_0.
+            const auto* table_format=flyweight::v2::qwen_format(table.type);
             runtime->embeddings_host_resident=
                 runtime->embedding_row_bytes!=0&&
                 runtime->lm_head!=runtime->token_embeddings&&
                 !runtime->gemma4&&
+                table_format&&table_format->embedding&&
                 wanted;
             if(runtime->embeddings_host_resident)
                 runtime->static_tensor_bytes-=table.size;
@@ -13925,6 +13933,70 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 runtime->static_tensor_bytes+=growth;
                 std::fprintf(stderr,
                     "[flyweight] IQ1_M requant: %llu tensors to Q8_0 "
+                    "(%llu MiB added)\n",
+                    static_cast<unsigned long long>(converted),
+                    static_cast<unsigned long long>(growth/(1024ull*1024)));
+            }
+        }
+        // All-NVFP4 checkpoints (llama.cpp file_type 39) quantize the dense
+        // projections, the embedding table, and sometimes the head to type 40
+        // as well, not just the expert stacks. NVFP4 has device kernels only
+        // where its bytes are re-read enough to matter: the routed experts
+        // (paged through the expert cache) and the fused shared expert. The
+        // matvec dispatch, the embedding gather, and the LM head have no
+        // type-40 entry, so every other persistent NVFP4 tensor reaches the
+        // device as Q8_0, exactly like the IQ1_M head above. Q8_0 holds each
+        // block's decoded values exactly (an fp16 scale per 32 values against
+        // NVFP4's e4m3 per 16, but int8 mantissas cover E2M1's 3 magnitude
+        // bits), so the conversion is value-preserving; the cost is bytes,
+        // 1.89x the packed form on the converted tensors.
+        //
+        // Unconditional on purpose, like the IQ1_M flip and unlike the bf16
+        // policy below: there is no kernel that could read these tensors in
+        // their file form, so "keeping" them is not an option the policy
+        // could express.
+        {
+            // The shared-expert gate/up/down stay packed: enqueue_shared
+            // dispatches on the device type and owns fused NVFP4 kernels for
+            // exactly these three (with weight_scale_2 passed alongside,
+            // which a byte conversion here would silently drop).
+            auto shexp_fused=[](const std::string&name){
+                for(const char*suffix:{"ffn_gate_shexp.weight",
+                                       "ffn_up_shexp.weight",
+                                       "ffn_down_shexp.weight"}){
+                    const auto length=std::strlen(suffix);
+                    if(name.size()>=length&&
+                       name.compare(name.size()-length,length,suffix)==0)
+                        return true;
+                }
+                return false;
+            };
+            std::uint64_t converted=0,growth=0;
+            for(std::uint64_t index=0;index<persistent.size();++index){
+                if(!persistent[index])continue;
+                // The device type, not the file type: the draft-block loop
+                // above may have flipped an NVFP4 draft tensor already.
+                if(runtime->device_tensor_types[index]!=40)continue;
+                const auto&tensor=runtime->model->tensors[index];
+                if(shexp_fused(tensor.name))continue;
+                std::uint64_t elements=1;
+                for(auto dimension:tensor.shape)elements*=dimension;
+                // NVFP4 blocks are 64 elements, so a whole-block tensor is
+                // always a whole number of Q8_0's 32-value blocks too; a
+                // partial trailing block cannot have come from the packer.
+                if(elements==0||elements%64)
+                    throw std::runtime_error(
+                        "NVFP4 tensor \""+tensor.name+"\" is not a whole "
+                        "number of 64-value blocks and cannot be converted to "
+                        "Q8_0, which is the only form its consumer can read");
+                runtime->device_tensor_types[index]=8;
+                ++converted;
+                growth+=(elements/32)*kQ8BlockSize-tensor.size;
+            }
+            if(converted){
+                runtime->static_tensor_bytes+=growth;
+                std::fprintf(stderr,
+                    "[flyweight] NVFP4 dense requant: %llu tensors to Q8_0 "
                     "(%llu MiB added)\n",
                     static_cast<unsigned long long>(converted),
                     static_cast<unsigned long long>(growth/(1024ull*1024)));
