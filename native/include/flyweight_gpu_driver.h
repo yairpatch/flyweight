@@ -411,6 +411,16 @@ FLYWEIGHT_API int flyweight_gpu_nvfp4_matmul_cublas(
     std::int32_t input_size, std::int32_t output_size,
     std::int32_t rows, float scale
 );
+// Same GEMM with the weight repack cached per device address: for the dense
+// projections, whose matrices live at fixed arena addresses. Never pass a
+// reused staging buffer here -- the cache would serve the first occupant's
+// bytes forever.
+FLYWEIGHT_API int flyweight_gpu_nvfp4_matmul_cublas_cached(
+    std::uint64_t weights, std::uint64_t input, std::uint64_t output,
+    std::uint64_t stream,
+    std::int32_t input_size, std::int32_t output_size,
+    std::int32_t rows, float scale
+);
 // Native FP4 routed-MoE decode: one stacked gate/up GEMM followed by one
 // concatenated down GEMM. Pointer and scale arrays live on the device.
 FLYWEIGHT_API int flyweight_gpu_nvfp4_moe_cublas(

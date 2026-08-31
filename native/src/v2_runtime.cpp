@@ -765,6 +765,10 @@ struct FlyweightV2QwenRuntime {
     // (the instruction is guarded) but fall back to a shuffle emulation that is
     // far slower than the dp4a tile kernel, so the host must not pick them.
     bool int8_tensor_cores=false;
+    // Blackwell block-scaled FP4 MMA (compute 10.0+), which is what the
+    // cuBLASLt NVFP4 prefill GEMMs need. Decides the prefill tensor-core
+    // default; FLYWEIGHT_NVFP4_PREFILL_TC overrides either way.
+    bool fp4_tensor_cores=false;
     std::uint64_t requantized_tensors = 0;
     std::uint64_t requantized_saved_bytes = 0;
     std::uint64_t static_arena = 0;
@@ -13843,9 +13847,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // while the policy is auto.
         {
             FlyweightV2GpuInfo probe{};
-            if(gpu_probe(probe,runtime->options.device)==0)
+            if(gpu_probe(probe,runtime->options.device)==0){
                 runtime->int8_tensor_cores=
                     probe.compute_major*10+probe.compute_minor>=75;
+                runtime->fp4_tensor_cores=probe.compute_major>=10;
+            }
         }
         runtime->device_tensor_types.resize(runtime->model->tensors.size());
         for(std::uint64_t index=0;index<runtime->model->tensors.size();++index)
@@ -16737,6 +16743,30 @@ int flyweight_v2_qwen_runtime_dump_kv(
 // dispatches here for Gemma 4 chunks.
 void gemma4_prefill_rows(
     FlyweightV2QwenRuntime& runtime, const std::uint32_t* tokens, int rows);
+
+// Minimum row count before a prefill NVFP4 GEMM takes the Blackwell
+// block-scaled FP4 tensor-core path, shared by the streamed experts and the
+// dense projections. The repack and activation quantization amortize with
+// rows, so below the threshold the CUDA-core kernels win. Default: 16 on
+// hardware that has the block-scaled MMA at all (compute 10.0+), off
+// elsewhere. FLYWEIGHT_NVFP4_PREFILL_TC overrides in either direction; 0
+// restores the bit-stable CUDA-core prefill.
+//
+// This default is a deliberate exception to the numerics-changes-stay-opt-in
+// convention, made by the project owner with the measurement in hand:
+// FP4-quantizing the prefill activations flips occasional greedy tokens on
+// long prompts (a 1k-token A/B first diverged at word 27; short prompts held
+// byte-identical), with both outputs equally coherent -- and it buys 2.2x
+// prefill (117 -> 263 tok/s at 1024 on the SM120 laptop), which is the
+// headline number for the serving workloads this checkpoint family targets.
+int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
+    static const int override_rows = [] {
+        const char* setting = std::getenv("FLYWEIGHT_NVFP4_PREFILL_TC");
+        return setting && setting[0] ? std::atoi(setting) : -1;
+    }();
+    if (override_rows >= 0) return override_rows;
+    return runtime.fp4_tensor_cores ? 16 : 0;
+}
 
 #include "v2_mtp_verifier.inc"
 

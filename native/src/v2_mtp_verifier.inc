@@ -466,6 +466,26 @@ void qwen_forward_rows(
             }
             return;
         }
+        // Dense NVFP4 through the Blackwell FP4 tensor cores, same path and
+        // threshold as the streamed experts (scale is 1: dense tensors fold
+        // weight_scale_2 into their E4M3 block scales). Declines -- pre-FP4
+        // hardware, or a chunk below the threshold -- fall through to the
+        // shared-tile kernel the format table names.
+        // The cached variant, never the plain one: dense matrices sit at
+        // fixed arena addresses, so their cuBLASLt repack is done once and
+        // every later chunk skips straight to the GEMM. `staged` weights are
+        // excluded -- a staging buffer's address does not identify its
+        // contents, which is exactly the aliasing the cache must never see.
+        if(type==40&&!staged){
+            const int tc_min_rows=qwen_nvfp4_prefill_tc_rows(runtime);
+            if(tc_min_rows>0&&rows>=tc_min_rows&&
+               flyweight_gpu_nvfp4_matmul_cublas_cached(
+                   matrix,input,output,runtime.stream,
+                   input_size,output_size,rows,1.0f)==0){
+                dense_trace("nvfp4_matmul_cublas");
+                return;
+            }
+        }
         // The reconstruct-in-float batch matmul, one launch for the whole
         // chunk. A format without one (a *future* format: every current type
         // has an entry) pays the per-token fallback below -- 64 launches of a
@@ -1960,15 +1980,12 @@ void qwen_forward_rows(
                     // Blackwell FP4 tensor cores for the per-expert GEMMs: the
                     // driver repacks the streamed GGUF matrix and quantizes
                     // the gathered f32 rows into cuBLASLt's NVFP4 layout.
-                    // Quantizing the activations changes numerics, so like
-                    // the routed MMQ this is opt-in: the env value is the
-                    // minimum row count (repack + quantize amortize with
-                    // rows), 0/unset stays on the CUDA-core kernel. The
+                    // The threshold and default (on where the hardware has
+                    // block-scaled MMA) live in qwen_nvfp4_prefill_tc_rows;
+                    // FLYWEIGHT_NVFP4_PREFILL_TC overrides, 0 disables. The
                     // expert's weight_scale_2 rides alpha. Declines fall
                     // through to the rows kernel.
-                    static const int tc_min_rows=[]{
-                        const char*s=std::getenv("FLYWEIGHT_NVFP4_PREFILL_TC");
-                        return s&&s[0]?std::atoi(s):0;}();
+                    const int tc_min_rows=qwen_nvfp4_prefill_tc_rows(runtime);
                     if(tc_min_rows>0&&count>=tc_min_rows){
                         static const bool tc_trace=
                             std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_TRACE")!=nullptr;

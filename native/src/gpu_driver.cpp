@@ -196,6 +196,13 @@ struct Nvfp4LtPlan {
     CublasLtMatmulAlgo algo{};
 };
 std::unordered_map<std::uint64_t, Nvfp4LtPlan> g_nvfp4_plans;
+// Dense weight matrices repacked into cuBLASLt's NVFP4 layout, keyed by their
+// (stable) arena address; see flyweight_gpu_nvfp4_matmul_cublas_cached.
+struct Nvfp4DenseRepack {
+    CUdeviceptr values = 0;
+    CUdeviceptr scales = 0;
+};
+std::unordered_map<std::uint64_t, Nvfp4DenseRepack> g_nvfp4_dense_repacks;
 bool g_nvfp4_validation_done = false;
 struct Nvfp4MoeProfile {
     CUevent events[9]{};
@@ -1581,6 +1588,14 @@ extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
                 release(g_nvfp4_scratch.input_scales);
                 release(g_nvfp4_scratch.projected);
                 release(g_nvfp4_scratch.expert_pointers);
+                // The dense repack cache is keyed by arena addresses that die
+                // with the runtime this stream served; a reload would other-
+                // wise hit stale entries at recycled addresses.
+                for (const auto& entry : g_nvfp4_dense_repacks) {
+                    release(entry.second.values);
+                    release(entry.second.scales);
+                }
+                g_nvfp4_dense_repacks.clear();
             }
             const CUevent handoff = g_nvfp4_scratch.handoff;
             g_nvfp4_scratch = Nvfp4Scratch{};
@@ -2387,6 +2402,110 @@ extern "C" int flyweight_gpu_nvfp4_matmul_cublas(
     const int status = nvfp4_run_quantized_gemm(
         input_size, output_size, rows, scale, 0.0f, output, cuda_stream,
         weight_values, weight_scales, input_values, input_scales);
+    return status == 0 ? 0 : -8;
+}
+
+// The dense-projection sibling of flyweight_gpu_nvfp4_matmul_cublas. The
+// uncached function repacks the weight matrix into cuBLASLt's layout on every
+// call, which is inherent for the streamed experts (the scratch holds a
+// different expert each time) but pathological for dense tensors: the same
+// ~190 matrices live at fixed arena addresses for the life of the runtime,
+// and repacking them per 64-row prefill chunk moved more bytes than the GEMMs
+// computed -- measured prefill HALVED against the CUDA-core tile kernel.
+// Repack each matrix once, keyed by its device address, and serve every later
+// chunk from the cached copy (~1.06x the packed bytes, values + tiled
+// scales). An allocation or repack failure falls back to the tile kernel via
+// the error return, exactly like the uncached path.
+extern "C" int flyweight_gpu_nvfp4_matmul_cublas_cached(
+    std::uint64_t weights, std::uint64_t input, std::uint64_t output,
+    std::uint64_t stream, std::int32_t input_size,
+    std::int32_t output_size, std::int32_t rows, float scale
+) {
+    if (flyweight_backend_is_cpu()) return -1;
+
+    std::lock_guard<std::mutex> lock(g_cublas_mutex);
+    if (!weights || !input || !output || input_size <= 0 || output_size <= 0
+        || rows <= 0 || (input_size & 63) || (output_size & 15)
+        || !load_cublas_lt()) return -1;
+    const auto repack = g_functions.find("nvfp4_repack_cublaslt");
+    const auto quantize = g_functions.find("nvfp4_quantize_cublaslt");
+    if (repack == g_functions.end() || quantize == g_functions.end()) return -2;
+    const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+    if (nvfp4_scratch_switch_stream(cuda_stream) != 0) return -3;
+
+    const auto scale_bytes = [](std::int32_t outer, std::int32_t inner) {
+        const size_t outer_tiles = (static_cast<size_t>(outer) + 127) / 128;
+        const size_t inner_tiles =
+            ((static_cast<size_t>(inner) + 15) / 16 + 3) / 4;
+        return outer_tiles * inner_tiles * 512;
+    };
+    auto found = g_nvfp4_dense_repacks.find(weights);
+    if (found == g_nvfp4_dense_repacks.end()) {
+        Nvfp4DenseRepack entry;
+        const size_t value_bytes =
+            static_cast<size_t>(output_size) * input_size / 2;
+        if (g_api.cuMemAlloc(&entry.values, value_bytes) != 0) return -5;
+        if (g_api.cuMemAlloc(&entry.scales,
+                             scale_bytes(output_size, input_size)) != 0) {
+            g_api.cuMemFree(entry.values);
+            return -5;
+        }
+        std::uint64_t values = entry.values, scales = entry.scales;
+        void* repack_args[] = {
+            &weights, &values, &scales, &output_size, &input_size};
+        const unsigned int blocks = static_cast<unsigned int>(
+            (static_cast<std::uint64_t>(output_size) * input_size / 64 + 255)
+            / 256);
+        if (launch(repack->second, blocks, 1, 256, repack_args, 0,
+                   cuda_stream) != 0) {
+            g_api.cuMemFree(entry.values);
+            g_api.cuMemFree(entry.scales);
+            return -6;
+        }
+        found = g_nvfp4_dense_repacks.emplace(weights, entry).first;
+    }
+
+    // Only the activation side of the scratch is needed; the weight side
+    // stays whatever the expert stream last left there.
+    const size_t input_value_bytes =
+        static_cast<size_t>(rows) * input_size / 2;
+    const size_t input_scale_bytes = scale_bytes(rows, input_size);
+    bool grow =
+        input_value_bytes > g_nvfp4_scratch.input_values_bytes ||
+        input_scale_bytes > g_nvfp4_scratch.input_scales_bytes;
+    if (grow && g_nvfp4_scratch.stream != nullptr
+        && g_api.cuStreamSynchronize(g_nvfp4_scratch.stream) != 0) return -4;
+    if (grow) nvfp4_clear_cublas_plans();
+    auto reserve = [&](CUdeviceptr& pointer, size_t& capacity, size_t bytes) {
+        if (bytes <= capacity) return true;
+        if (pointer && g_api.cuMemFree(pointer) != 0) return false;
+        pointer = 0;
+        capacity = 0;
+        if (g_api.cuMemAlloc(&pointer, bytes) != 0) return false;
+        capacity = bytes;
+        return true;
+    };
+    if (!reserve(g_nvfp4_scratch.input_values,
+                 g_nvfp4_scratch.input_values_bytes, input_value_bytes) ||
+        !reserve(g_nvfp4_scratch.input_scales,
+                 g_nvfp4_scratch.input_scales_bytes, input_scale_bytes))
+        return -5;
+    g_nvfp4_scratch.stream = cuda_stream;
+
+    std::uint64_t input_values = g_nvfp4_scratch.input_values;
+    std::uint64_t input_scales = g_nvfp4_scratch.input_scales;
+    void* quantize_args[] = {
+        &input, &input_values, &input_scales, &rows, &input_size};
+    const unsigned int input_blocks =
+        static_cast<unsigned int>(
+            static_cast<std::uint64_t>(rows) * input_size / 16);
+    if (launch(quantize->second, input_blocks, 1, 32, quantize_args, 0,
+               cuda_stream) != 0) return -7;
+
+    const int status = nvfp4_run_quantized_gemm(
+        input_size, output_size, rows, scale, 0.0f, output, cuda_stream,
+        found->second.values, found->second.scales,
+        input_values, input_scales);
     return status == 0 ? 0 : -8;
 }
 
