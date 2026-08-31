@@ -1757,6 +1757,11 @@ void qwen_forward_rows(
             auto stream_role_ok=[&](int role,int in_size){
                 const auto type=
                     runtime.model->tensors[layer.expert_tensors[role]].type;
+                // NVFP4's rows matmul is not in the format table because its
+                // signature carries the expert's weight_scale_2; the branch in
+                // expert_matmul below launches it directly.
+                if(type==40)
+                    return flyweight_gpu_kernel_available("nvfp4_matmul_rows")!=0;
                 const auto*format=flyweight::v2::qwen_format(type);
                 if(!format)return false;
                 if(format->matmul_q8_mmq&&runtime.int8_tensor_cores&&
@@ -1800,14 +1805,21 @@ void qwen_forward_rows(
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
             const double t_upload=moe_now();
+            // All three roles NVFP4: the expert_matmul branch below carries
+            // weight_scale_2 (gate on the gate GEMM, up*down folded onto the
+            // up GEMM exactly like the table path), so scaled experts stream.
+            const bool stream_scales_ok=
+                runtime.model->tensors[layer.expert_tensors[0]].type==40&&
+                runtime.model->tensors[layer.expert_tensors[1]].type==40&&
+                runtime.model->tensors[layer.expert_tensors[2]].type==40;
             for(const int expert:order){
                 if(cursor+stride>span.stream_bytes)break;
-                // NVFP4-style per-expert scales fold into the kernels the
-                // grouped path runs; the GEMM path has no seam for them, so
-                // scaled experts stay on the CPU.
-                if(qwen_expert_role_scale(runtime,layer.expert_gate_scale,expert)!=1.0f||
-                   qwen_expert_role_scale(runtime,layer.expert_up_scale,expert)!=1.0f||
-                   qwen_expert_role_scale(runtime,layer.expert_down_scale,expert)!=1.0f)
+                // Other formats' GEMM kernels have no seam for a per-expert
+                // scale, so their scaled experts stay on the CPU.
+                if(!stream_scales_ok&&
+                   (qwen_expert_role_scale(runtime,layer.expert_gate_scale,expert)!=1.0f||
+                    qwen_expert_role_scale(runtime,layer.expert_up_scale,expert)!=1.0f||
+                    qwen_expert_role_scale(runtime,layer.expert_down_scale,expert)!=1.0f))
                     continue;
                 const auto base=span.stream_base+cursor;
                 std::uint64_t offset=0;
@@ -1939,7 +1951,41 @@ void qwen_forward_rows(
             auto expert_matmul=[&](std::uint32_t type,std::uint64_t matrix,
                                    std::uint64_t f32_input,std::uint64_t q8_input,
                                    std::uint64_t q8_scales,std::uint64_t output,
-                                   int in_size,int out_size,int count){
+                                   int in_size,int out_size,int count,
+                                   float scale){
+                if(type==40){
+                    // Blackwell FP4 tensor cores for the per-expert GEMMs: the
+                    // driver repacks the streamed GGUF matrix and quantizes
+                    // the gathered f32 rows into cuBLASLt's NVFP4 layout.
+                    // Quantizing the activations changes numerics, so like
+                    // the routed MMQ this is opt-in: the env value is the
+                    // minimum row count (repack + quantize amortize with
+                    // rows), 0/unset stays on the CUDA-core kernel. The
+                    // expert's weight_scale_2 rides alpha. Declines fall
+                    // through to the rows kernel.
+                    static const int tc_min_rows=[]{
+                        const char*s=std::getenv("FLYWEIGHT_NVFP4_PREFILL_TC");
+                        return s&&s[0]?std::atoi(s):0;}();
+                    if(tc_min_rows>0&&count>=tc_min_rows){
+                        static const bool tc_trace=
+                            std::getenv("FLYWEIGHT_NVFP4_TENSOR_CORE_TRACE")!=nullptr;
+                        const int tc_status=flyweight_gpu_nvfp4_matmul_cublas(
+                            matrix,f32_input,output,runtime.stream,
+                            in_size,out_size,count,scale);
+                        if(tc_trace)
+                            std::fprintf(stderr,"[nvfp4-prefill-tc] %dx%d rows=%d status=%d\n",
+                                         in_size,out_size,count,tc_status);
+                        if(tc_status==0)return;
+                    }
+                    // Not in the format table: the trailing weight_scale_2
+                    // argument and the one-token-per-block-row grid do not
+                    // fit the generic launch below.
+                    void*args[]={&matrix,&f32_input,&output,&in_size,&out_size,
+                        &count,&scale};
+                    launch("nvfp4_matmul_rows",out_size,
+                           static_cast<std::uint32_t>(count),256,args);
+                    return;
+                }
                 const auto*format=flyweight::v2::qwen_format(type);
                 if(stream_needs_q8(type,in_size)){
                     const int mmq_rows=format->mmq_min?kQ8MmqMinRows:kQ8MmqRows;
@@ -2197,12 +2243,17 @@ void qwen_forward_rows(
                                     stream_packed_scales,hidden_size,count);
                 const auto up_half=stream_act+
                     static_cast<std::uint64_t>(count)*intermediate*sizeof(float);
+                // weight_scale_2 handling mirrors the table path: gate's scale
+                // must land before SiLU, down's is linear so it folds onto up.
                 expert_matmul(gate_type,group.matrix,
                     stream_packed,stream_packed_q8,stream_packed_scales,
-                    stream_act,hidden_size,intermediate,count);
+                    stream_act,hidden_size,intermediate,count,
+                    qwen_expert_role_scale(runtime,layer.expert_gate_scale,group.expert));
                 expert_matmul(up_type,group.matrix+stream_role_bytes[0],
                     stream_packed,stream_packed_q8,stream_packed_scales,
-                    up_half,hidden_size,intermediate,count);
+                    up_half,hidden_size,intermediate,count,
+                    qwen_expert_role_scale(runtime,layer.expert_up_scale,group.expert)*
+                        qwen_expert_role_scale(runtime,layer.expert_down_scale,group.expert));
                 int silu_count=count*intermediate;
                 void*silu_args[]={const_cast<std::uint64_t*>(&stream_act),
                     const_cast<std::uint64_t*>(&stream_silu),&silu_count};
@@ -2215,7 +2266,7 @@ void qwen_forward_rows(
                 expert_matmul(down_type,
                     group.matrix+stream_role_bytes[0]+stream_role_bytes[1],
                     stream_silu,stream_act_q8,stream_act_scales,
-                    stream_down,intermediate,hidden_size,count);
+                    stream_down,intermediate,hidden_size,count,1.0f);
                 void*scatter_args[]={const_cast<std::uint64_t*>(&stream_down),
                     const_cast<std::uint64_t*>(&indices),
                     const_cast<std::uint64_t*>(&route_weights),
