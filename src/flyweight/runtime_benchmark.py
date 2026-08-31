@@ -10,7 +10,6 @@ import json
 import math
 import os
 import platform
-import resource
 import statistics
 import subprocess
 import sys
@@ -18,6 +17,14 @@ import time
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
+
+# `resource` is POSIX-only, and importing it at module scope made the whole
+# benchmark harness -- and the `flyweight benchmark` command that imports it --
+# fail on Windows with ModuleNotFoundError before running anything.
+if os.name == "nt":
+    resource = None
+else:
+    import resource  # type: ignore[no-redef]
 
 from .v2 import V2Model
 
@@ -210,6 +217,8 @@ def measure_runtime_sample(
 
 
 def _process_memory() -> dict[str, int]:
+    if resource is None:
+        return _windows_process_memory()
     rss_bytes = 0
     try:
         fields = Path("/proc/self/statm").read_text(encoding="ascii").split()
@@ -219,6 +228,55 @@ def _process_memory() -> dict[str, int]:
     maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     maximum_bytes = int(maximum if sys.platform == "darwin" else maximum * 1024)
     return {"rss_bytes": rss_bytes, "maximum_rss_bytes": maximum_bytes}
+
+
+def _windows_process_memory() -> dict[str, int]:
+    """The same two numbers from psapi: working set, current and peak.
+
+    Reporting zeros instead would be a benchmark that silently stops measuring
+    memory on one platform, which is worse than not running there at all -- an
+    expert-offload regression shows up in exactly this field.
+    """
+    import ctypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_uint32),
+            ("PageFaultCount", ctypes.c_uint32),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = Counters()
+    counters.cb = ctypes.sizeof(Counters)
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        psapi = ctypes.windll.psapi  # type: ignore[attr-defined]
+        # The prototypes are not optional. GetCurrentProcess returns the
+        # pseudo-handle (HANDLE)-1, which ctypes truncates to 32 bits without a
+        # declared restype -- the call then fails and reports zero memory.
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(Counters), ctypes.c_uint32
+        ]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        ok = psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        )
+    except (AttributeError, OSError):
+        ok = 0
+    if not ok:
+        return {"rss_bytes": 0, "maximum_rss_bytes": 0}
+    return {
+        "rss_bytes": int(counters.WorkingSetSize),
+        "maximum_rss_bytes": int(counters.PeakWorkingSetSize),
+    }
 
 
 def _source_state(root: Path) -> dict[str, Any]:

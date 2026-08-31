@@ -64,12 +64,16 @@ class CpuExpertPlacementTests(unittest.TestCase):
         V2Model.select_backend("auto")
 
     def _prepared_runtime_mode(self, expert_mode: str) -> str:
-        model = V2Model(self.model_path)
-        runtime = model.native_qwen_runtime(
-            context_limit=64, expert_mode=expert_mode
-        )
-        runtime.prepare()
-        return str(runtime.info["expert_mode"])
+        # Closed, not leaked: the model holds a mapping of the GGUF, and
+        # Windows refuses to delete a mapped file -- so leaking one per call
+        # turned tearDownClass into a PermissionError there while passing on
+        # Linux, where unlinking an open file is legal.
+        with V2Model(self.model_path) as model:
+            with model.native_qwen_runtime(
+                context_limit=64, expert_mode=expert_mode
+            ) as runtime:
+                runtime.prepare()
+                return str(runtime.info["expert_mode"])
 
     def test_every_expert_mode_lands_on_cpu(self):
         V2Model.select_backend("cpu")
@@ -130,13 +134,18 @@ class CpuCublasFallbackTests(unittest.TestCase):
         V2Model.select_backend("auto")
 
     def _generate(self, prompt_length: int) -> list[int]:
-        model = V2Model(self.model_path)
-        runtime = model.native_qwen_runtime(context_limit=512, expert_mode="cpu")
-        runtime.prepare()
-        prompt = [(index * 7 + 3) % 64 for index in range(prompt_length)]
-        produced: list[int] = []
-        runtime.generate(prompt, 8, produced.append)
-        return produced
+        # Closed for the same reason as CpuExpertPlacementTests above: an open
+        # mapping of the fixture makes the temporary directory undeletable on
+        # Windows.
+        with V2Model(self.model_path) as model:
+            with model.native_qwen_runtime(
+                context_limit=512, expert_mode="cpu"
+            ) as runtime:
+                runtime.prepare()
+                prompt = [(index * 7 + 3) % 64 for index in range(prompt_length)]
+                produced: list[int] = []
+                runtime.generate(prompt, 8, produced.append)
+                return produced
 
     def test_cublas_attention_toggle_does_not_change_cpu_output(self):
         V2Model.select_backend("cpu")

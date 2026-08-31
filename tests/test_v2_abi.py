@@ -28,7 +28,11 @@ SOURCE = Path(v2.__file__)
 
 class NativeAbiTests(unittest.TestCase):
     def test_every_referenced_entry_point_is_defined(self) -> None:
-        names = sorted(set(re.findall(r"flyweight_v2_\w+", SOURCE.read_text())))
+        # Explicit UTF-8: Python falls back to the locale codec, which is
+        # cp1252 on Windows, and the non-ASCII characters in this source made
+        # the whole ABI check fail there with a decode error.
+        source = SOURCE.read_text(encoding="utf-8")
+        names = sorted(set(re.findall(r"flyweight_v2_\w+", source)))
         # A guard that guards nothing would pass just as quietly.
         self.assertGreater(len(names), 20)
 
