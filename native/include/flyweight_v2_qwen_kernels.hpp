@@ -4847,6 +4847,42 @@ void iq3s_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+// Batched decode for IQ3_S: a 32-value group is eight 4-value grid entries,
+// each negated bytewise by its half of a sign byte. Unlike IQ2_S the 4-bit odd
+// scale covers the whole group, so both returned halves carry the same value;
+// the grid magnitudes top out at 15, so the negation stays inside int8.
+__device__ __forceinline__ void iq3s_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 110;
+    const unsigned char* quants = base + 2;
+    const unsigned char* high = base + 66;
+    const unsigned char* signs = base + 74;
+    const unsigned char* scales = base + 106;
+    const unsigned int qh_byte = high[group];
+    const int first_index = group * 8;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        const int index = first_index + step;
+        const int entry = quants[index] | (int)(((qh_byte >> step) & 1u) << 8);
+        const unsigned int sign_word =
+            (unsigned int)signs[group * 4 + (step >> 1)] * 0x01010101u;
+        const int masks = __vcmpne4(
+            sign_word & ((step & 1) ? 0x80402010u : 0x08040201u), 0);
+        words[step] = __vsub4((int)kIq3sGrid[entry] ^ masks, masks);
+    }
+    const float scale = __half2float(*((const __half*)base))
+        * (float)(1 + 2 * ((scales[group >> 1] >> (4 * (group & 1))) & 15));
+    *scale_low = scale;
+    *scale_high = scale;
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+FLYWEIGHT_Q8_MMQ_ROUTED(iq3s_q8_mmq_routed, iq3s_q8_decode, 110, 8, 3)
+
 __device__ const unsigned long long kIq2xsGrid[512] = {
     578721382704613384ULL, 578721382704613419ULL, 578721382704617753ULL, 578721382704622344ULL,
     578721382704622379ULL, 578721382705727513ULL, 578721382705731848ULL, 578721382705731883ULL,
@@ -6263,6 +6299,36 @@ __device__ __forceinline__ void iq4xs_octet(
     }
 }
 
+// IQ3_S: two 4-value grid entries per octet, and one sign byte covers exactly
+// one octet (signs[group * 4 + quad] with group = octet / 4, quad = octet % 4
+// collapses to signs[octet]). The 4-bit odd scale spans a 32-value group, so
+// all eight values here share it.
+__device__ __forceinline__ void iq3s_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const unsigned char* base = packed + block * 110;
+    const float d = __half2float(*((const __half*)base));
+    const unsigned char* quants = base + 2;
+    const unsigned char* high = base + 66;
+    const unsigned char* signs = base + 74;
+    const unsigned char* scales = base + 106;
+    const int group = octet >> 2;
+    const int scale = (scales[group >> 1] >> (4 * (group & 1))) & 15;
+    const float db = d * (float)(1 + 2 * scale);
+    const unsigned int sign_byte = signs[octet];
+    for (int half = 0; half < 2; ++half) {
+        const int index = octet * 2 + half;
+        const int entry = quants[index] |
+            (((high[index >> 3] >> (index & 7)) & 1) << 8);
+        const unsigned int pattern = kIq3sGrid[entry];
+        for (int k = 0; k < 4; ++k) {
+            const float value = (float)((pattern >> (8 * k)) & 0xffu);
+            const int lane = half * 4 + k;
+            out[lane] = ((sign_byte >> lane) & 1) ? -db * value : db * value;
+        }
+    }
+}
+
 #define FLYWEIGHT_IQ_GROUPED(prefix, octet_at)                                    \
 extern "C" __global__                                                           \
 void prefix##_grouped_swiglu(                                                   \
@@ -6391,6 +6457,7 @@ void prefix##_grouped_accumulate_rows(                                          
 
 FLYWEIGHT_IQ_GROUPED(iq2xs, iq2xs_octet)
 FLYWEIGHT_IQ_GROUPED(iq3xxs, iq3xxs_octet)
+FLYWEIGHT_IQ_GROUPED(iq3s, iq3s_octet)
 FLYWEIGHT_IQ_GROUPED(iq4xs, iq4xs_octet)
 FLYWEIGHT_IQ_GROUPED(iq1s, iq1s_octet)
 FLYWEIGHT_IQ_GROUPED(iq4nl, iq4nl_octet)

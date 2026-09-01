@@ -193,7 +193,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax = "iq3s_lm_head_argmax_warp",
      .embedding = "qwen_iq3s_embedding",
      .embedding_rows = "qwen_iq3s_embedding_rows",
-     .cpu_expert = true},
+     .iq_expert_prefix = "iq3s", .cpu_expert = true},
     {.type = 22, .family = "iq2s",
      .matvec_q8_warp = "iq2s_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq2s_q8_matvec_transposed_rows",

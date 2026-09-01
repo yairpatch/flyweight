@@ -128,6 +128,8 @@ const Format kIq2xs{
     kIq2xsBlockBytes, fill_leading_scale<kIq2xsBlockBytes>, qwen_iq2xs_value};
 const Format kIq3xxs{
     kIq3xxsBlockBytes, fill_leading_scale<kIq3xxsBlockBytes>, qwen_iq3xxs_value};
+const Format kIq3s{
+    kIq3sBlockBytes, fill_leading_scale<kIq3sBlockBytes>, qwen_iq3s_value};
 const Format kIq4xs{
     kIq4xsBlockBytes, fill_leading_scale<kIq4xsBlockBytes>, qwen_iq4xs_value};
 
@@ -829,6 +831,200 @@ int check_block_accumulate(const char* block_kernel, const char* rows_kernel,
     return report(block_kernel, worst);
 }
 
+// The grouped routed-expert kernels against the CPU decoder in double. The
+// block-major checks above pin iq1s/iq2xxs octet decoders transitively (block
+// vs rows form, both on the corpus); IQ3_S has no block-major twin, so its
+// octet decoder gets the direct comparison, decode form and rows form both.
+//
+// The SwiGLU error bound folds the two dot products' condition numbers: an
+// f32-accumulated gate perturbs the output through sigma(g) + g*sigma'(g),
+// which is bounded by ~1.1, so |up|*sum|g_i v_i| + |silu(g)|*sum|u_i v_i|
+// conditions the product the way sum|w_i v_i| conditions a plain dot.
+int check_grouped_swiglu(const char* kernel, const Format& format,
+                         bool rows_form) {
+    std::mt19937 rng(20260901);
+    std::uniform_real_distribution<float> real(-1.0f, 1.0f);
+    const int input_size = 512, output_size = 9;
+    const int rows = 7, top_k = 3, experts = 4;
+    const int routes = rows * top_k;
+    const std::size_t matrix_bytes =
+        static_cast<std::size_t>(input_size) / format.block_elements *
+        output_size * format.block_bytes;
+
+    std::vector<std::uint8_t> gate(matrix_bytes * experts);
+    std::vector<std::uint8_t> up(matrix_bytes * experts);
+    format.fill(rng, gate);
+    format.fill(rng, up);
+    const int vector_count = rows_form ? rows : 1;
+    std::vector<float> vectors(
+        static_cast<std::size_t>(vector_count) * input_size);
+    for (auto& value : vectors) value = real(rng);
+
+    const int slots = rows_form ? routes : experts;
+    std::vector<std::int32_t> selected(static_cast<std::size_t>(slots));
+    std::uniform_int_distribution<int> pick(0, experts - 1);
+    for (auto& value : selected) value = pick(rng);
+    std::vector<unsigned long long> gate_ptrs(slots), up_ptrs(slots);
+    for (int slot = 0; slot < slots; ++slot) {
+        gate_ptrs[slot] = reinterpret_cast<unsigned long long>(
+            gate.data() + static_cast<std::size_t>(selected[slot]) * matrix_bytes);
+        up_ptrs[slot] = reinterpret_cast<unsigned long long>(
+            up.data() + static_cast<std::size_t>(selected[slot]) * matrix_bytes);
+    }
+    std::vector<int> counts(static_cast<std::size_t>(rows), top_k);
+
+    std::vector<float> output(
+        static_cast<std::size_t>(slots) * output_size, 0.0f);
+    {
+        const unsigned long long* g = gate_ptrs.data();
+        const unsigned long long* u = up_ptrs.data();
+        const int* c = counts.data();
+        const float* v = vectors.data();
+        float* out = output.data();
+        int in = input_size, on = output_size, tk = top_k, rw = rows;
+        int ex = experts;
+        if (rows_form) {
+            void* args[] = {&g, &u, &c, &v, &out, &in, &on, &tk, &rw};
+            flyweight_cpu_launch_named(
+                kernel, static_cast<std::uint32_t>(output_size),
+                static_cast<std::uint32_t>(routes), 256, 0, 0, args);
+        } else {
+            void* args[] = {&g, &u, &v, &out, &in, &on, &ex};
+            flyweight_cpu_launch_named(
+                kernel, static_cast<std::uint32_t>(output_size),
+                static_cast<std::uint32_t>(experts), 256, 0, 0, args);
+        }
+    }
+
+    float worst = 0.0f;
+    for (int slot = 0; slot < slots; ++slot) {
+        const float* vector =
+            vectors.data() +
+            static_cast<std::size_t>(rows_form ? slot / top_k : 0) * input_size;
+        const std::size_t expert_at =
+            static_cast<std::size_t>(selected[slot]) * matrix_bytes;
+        for (int row = 0; row < output_size; ++row) {
+            const std::size_t row_at =
+                static_cast<std::size_t>(row) *
+                (input_size / format.block_elements) * format.block_bytes;
+            double gate_dot = 0.0, up_dot = 0.0;
+            double gate_mag = 0.0, up_mag = 0.0;
+            for (int index = 0; index < input_size; ++index) {
+                const double gv = static_cast<double>(format.value_at(
+                    gate.data() + expert_at + row_at, index)) * vector[index];
+                const double uv = static_cast<double>(format.value_at(
+                    up.data() + expert_at + row_at, index)) * vector[index];
+                gate_dot += gv;
+                gate_mag += std::fabs(gv);
+                up_dot += uv;
+                up_mag += std::fabs(uv);
+            }
+            const double silu = gate_dot / (1.0 + std::exp(-gate_dot));
+            const double expected = silu * up_dot;
+            const double got =
+                output[static_cast<std::size_t>(slot) * output_size + row];
+            worst = std::fmax(
+                worst,
+                static_cast<float>(
+                    std::fabs(expected - got) /
+                    std::fmax(1.0, gate_mag * std::fabs(up_dot) +
+                                       std::fabs(silu) * up_mag)));
+        }
+    }
+    return report(kernel, worst);
+}
+
+// The grouped down projection, decode form (experts looped inside one block
+// per row, += into the token's vector) and rows form (one token per grid row,
+// += per token). Reference is the CPU decoder in double, normalized by the
+// accumulated magnitude exactly as worst_error does for a plain dot.
+int check_grouped_accumulate(const char* kernel, const Format& format,
+                             bool rows_form) {
+    std::mt19937 rng(20260901);
+    std::uniform_real_distribution<float> real(-1.0f, 1.0f);
+    const int input_size = 512, output_size = 9;
+    const int rows = 7, top_k = 3, experts = 4;
+    const int routes = rows * top_k;
+    const std::size_t matrix_bytes =
+        static_cast<std::size_t>(input_size) / format.block_elements *
+        output_size * format.block_bytes;
+
+    std::vector<std::uint8_t> down(matrix_bytes * experts);
+    format.fill(rng, down);
+    const int slots = rows_form ? routes : experts;
+    std::vector<std::int32_t> selected(static_cast<std::size_t>(slots));
+    std::uniform_int_distribution<int> pick(0, experts - 1);
+    for (auto& value : selected) value = pick(rng);
+    std::vector<unsigned long long> down_ptrs(slots);
+    for (int slot = 0; slot < slots; ++slot)
+        down_ptrs[slot] = reinterpret_cast<unsigned long long>(
+            down.data() + static_cast<std::size_t>(selected[slot]) * matrix_bytes);
+    std::vector<float> weights(static_cast<std::size_t>(slots));
+    for (auto& value : weights) value = real(rng);
+    std::vector<float> activated(
+        static_cast<std::size_t>(slots) * input_size);
+    for (auto& value : activated) value = real(rng);
+    std::vector<int> counts(static_cast<std::size_t>(rows), top_k);
+
+    const int tokens = rows_form ? rows : 1;
+    std::vector<float> output(
+        static_cast<std::size_t>(tokens) * output_size, 0.0f);
+    {
+        const unsigned long long* d = down_ptrs.data();
+        const float* a = activated.data();
+        float* out = output.data();
+        const float* w = weights.data();
+        const int* c = counts.data();
+        int in = input_size, on = output_size, tk = top_k, rw = rows;
+        int ex = experts;
+        if (rows_form) {
+            void* args[] = {&d, &a, &out, &w, &c, &in, &on, &tk, &rw};
+            flyweight_cpu_launch_named(
+                kernel, static_cast<std::uint32_t>(output_size),
+                static_cast<std::uint32_t>(rows), 256, 0, 0, args);
+        } else {
+            void* args[] = {&d, &a, &out, &w, &in, &on, &ex};
+            flyweight_cpu_launch_named(
+                kernel, static_cast<std::uint32_t>(output_size), 1, 256, 0, 0,
+                args);
+        }
+    }
+
+    float worst = 0.0f;
+    for (int token = 0; token < tokens; ++token) {
+        const int base = rows_form ? token * top_k : 0;
+        const int count = rows_form ? top_k : experts;
+        for (int row = 0; row < output_size; ++row) {
+            const std::size_t row_at =
+                static_cast<std::size_t>(row) *
+                (input_size / format.block_elements) * format.block_bytes;
+            double expected = 0.0, magnitude = 0.0;
+            for (int rank = 0; rank < count; ++rank) {
+                const int slot = base + rank;
+                const std::uint8_t* row_data =
+                    down.data() +
+                    static_cast<std::size_t>(selected[slot]) * matrix_bytes +
+                    row_at;
+                for (int index = 0; index < input_size; ++index) {
+                    const double term =
+                        static_cast<double>(weights[slot]) *
+                        static_cast<double>(format.value_at(row_data, index)) *
+                        activated[static_cast<std::size_t>(slot) * input_size +
+                                  index];
+                    expected += term;
+                    magnitude += std::fabs(term);
+                }
+            }
+            const double got =
+                output[static_cast<std::size_t>(token) * output_size + row];
+            worst = std::fmax(worst,
+                              static_cast<float>(std::fabs(expected - got) /
+                                                 std::fmax(1.0, magnitude)));
+        }
+    }
+    return report(kernel, worst);
+}
+
 int main() {
     std::printf("IQ kernel contract (corpus CUDA vs CPU reference)\n");
     int failures = 0;
@@ -881,6 +1077,18 @@ int main() {
     // The same core driven by a block table. Its thread count is fixed by
     // FLYWEIGHT_MOE_MMQ_ROW_WARPS * FLYWEIGHT_MOE_MMQ_TOKEN_WARPS * 32, which is
     // the same 256 -- a different split of the warps, not a different budget.
+    // IQ3_S, new with the qwen4exp UD checkpoints whose gate/up expert stacks
+    // ship in it. No block-major twin yet, so the grouped kernels compare to
+    // the CPU decoder directly, and the per-element kernels pin iq3s_value
+    // itself (nothing else in the suite did).
+    failures += check("iq3s_matvec_transposed", kIq3s, false, 256);
+    failures += check_rows("iq3s_matmul_rows", kIq3s);
+    failures += check_grouped_swiglu("iq3s_grouped_swiglu", kIq3s, false);
+    failures += check_grouped_swiglu("iq3s_grouped_swiglu_rows", kIq3s, true);
+    failures += check_grouped_accumulate("iq3s_grouped_accumulate", kIq3s, false);
+    failures += check_grouped_accumulate("iq3s_grouped_accumulate_rows", kIq3s,
+                                         true);
+    failures += check_routed_mmq("iq3s_q8_mmq_routed", kIq3s, kMmqThreads);
     failures += check_routed_mmq("iq1s_q8_mmq_routed", kIq1s, kMmqThreads);
     failures += check_routed_mmq("iq2xxs_q8_mmq_routed", kIq2xxs, kMmqThreads);
     failures += check_routed_mmq("iq2xs_q8_mmq_routed", kIq2xs, kMmqThreads);
