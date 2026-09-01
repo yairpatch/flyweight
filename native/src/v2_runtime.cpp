@@ -3394,7 +3394,7 @@ float qwen_quant_dot(const std::uint8_t*packed,std::uint32_t type,const float*in
     if(type==40&&(flyweight_cpu_features()&1u)!=0&&elements%kNvfp4BlockElements==0)return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // The IQ codebook formats decode a branch per weight in scalar form, which
     // is what made low-bit MoE decode compute-bound rather than bandwidth-bound.
-    if((type==16||type==17||type==18||type==19||type==22||type==23)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
+    if((type==16||type==17||type==18||type==19||type==21||type==22||type==23)&&(flyweight_cpu_features()&1u)!=0&&elements%256==0)
         return qwen_quant_dot_avx2(packed,type,input,elements,row);
     // IQ4_NL's native block is 32 elements (no super-block), so like Q4_0 it
     // takes its own admission: qwen4exp's 640-wide expert down rows fail the
@@ -4345,10 +4345,17 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     // 17 and 18 were the same omission one model over: measured 44 GMAC/s
     // against 623-768 for the formats that had a decoder, which is the expert
     // layout Laguna ships.
-    if((type==16||type==17||type==18||type==19)&&
+    // 21 and 23 were the qwen4exp repeat of the same story: the UD-IQ4_XS mix
+    // ships most gate/up expert stacks as IQ3_S with a few promoted to
+    // IQ4_XS, and the tripwire below caught both on the scalar path.
+    if((type==16||type==17||type==18||type==19||type==21||type==23)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(type==20&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
+    // Q8_0's native block is 32, so a 640-wide expert down row fails the
+    // super-block gate above and sat scalar for exactly the widths the UD mix
+    // promotes to Q8_0.
+    if(type==8&&(flyweight_cpu_features()&1u)!=0&&elements%32==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     if(qwen_simd_quant_type(type)&&(flyweight_cpu_features()&1u)!=0&&elements%kBlockElements==0){qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
     // Everything past here re-derives a weight's block, group, scale and grid
     // entry per element. It is correct and roughly 10x slower, and nothing

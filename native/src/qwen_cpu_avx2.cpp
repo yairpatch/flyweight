@@ -806,6 +806,49 @@ float iq2s_dot(const std::uint8_t* row_data, const float* input, int elements) {
     return result;
 }
 
+// IQ3_S: 110 bytes per 256 values -> d(2) qs[64] qh[8] signs[32] scales[4].
+// The same literal sign bytes as IQ2_S and the same two-entries-per-octet
+// grid as IQ3_XXS: entry j takes its ninth index bit from qh, and the 4-bit
+// group scale is the odd multiplier 1 + 2*s rather than an offset-and-scale
+// pair. The block scale factors out of the whole accumulation.
+float iq3s_dot(const std::uint8_t* row_data, const float* input, int elements) {
+    float result = 0.0f;
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq3sBlockBytes;
+        const auto* quants = base + 2;
+        const auto* high = base + 66;
+        const auto* signs = base + 74;
+        const auto* scales = base + 106;
+        const float* vector = input + block * 256;
+        __m256 accumulator = _mm256_setzero_ps();
+        for (int group = 0; group < 8; ++group) {
+            const int scale = (scales[group >> 1] >> (4 * (group & 1))) & 15;
+            const __m256 weight =
+                _mm256_set1_ps(static_cast<float>(1 + 2 * scale));
+            const unsigned int qh_byte = high[group];
+            for (int quad = 0; quad < 4; ++quad) {
+                const int index = group * 8 + quad * 2;
+                const std::uint64_t grid =
+                    static_cast<std::uint64_t>(
+                        kIq3sGrid[quants[index] |
+                                  (((qh_byte >> (quad * 2)) & 1) << 8)]) |
+                    (static_cast<std::uint64_t>(
+                         kIq3sGrid[quants[index + 1] |
+                                   (((qh_byte >> (quad * 2 + 1)) & 1) << 8)])
+                     << 32);
+                const __m256 magnitudes =
+                    iq_signed_octet(grid, signs[group * 4 + quad]);
+                accumulator = _mm256_fmadd_ps(
+                    _mm256_mul_ps(magnitudes, weight),
+                    _mm256_loadu_ps(vector + group * 32 + quad * 8),
+                    accumulator);
+            }
+        }
+        result += half_value(base) * horizontal_sum(accumulator);
+    }
+    return result;
+}
+
 // IQ3_XXS: d(2), 64 index bytes, then eight 32-bit auxiliaries. Each auxiliary
 // carries a 4-bit group scale in its top nibble and four 7-bit sign indices.
 // Two 32-bit grid entries supply the eight magnitudes one sign index covers.
@@ -1058,6 +1101,47 @@ void iq3xxs_dot_multi(const std::uint8_t* row_data, const float* const inputs[kT
 }
 
 template <int kTokens>
+void iq3s_dot_multi(const std::uint8_t* row_data, const float* const inputs[kTokens],
+                    int elements, float outputs[kTokens]) {
+    __m256 sums[kTokens];
+    for (auto& sum : sums) sum = _mm256_setzero_ps();
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq3sBlockBytes;
+        const auto* quants = base + 2;
+        const auto* high = base + 66;
+        const auto* signs = base + 74;
+        const auto* scales = base + 106;
+        const float d = half_value(base);
+        for (int group = 0; group < 8; ++group) {
+            const int scale = (scales[group >> 1] >> (4 * (group & 1))) & 15;
+            const __m256 weight =
+                _mm256_set1_ps(d * static_cast<float>(1 + 2 * scale));
+            const unsigned int qh_byte = high[group];
+            for (int quad = 0; quad < 4; ++quad) {
+                const int entry_at = group * 8 + quad * 2;
+                const std::uint64_t grid =
+                    static_cast<std::uint64_t>(
+                        kIq3sGrid[quants[entry_at] |
+                                  (((qh_byte >> (quad * 2)) & 1) << 8)]) |
+                    (static_cast<std::uint64_t>(
+                         kIq3sGrid[quants[entry_at + 1] |
+                                   (((qh_byte >> (quad * 2 + 1)) & 1) << 8)])
+                     << 32);
+                const __m256 magnitudes = _mm256_mul_ps(
+                    iq_signed_octet(grid, signs[group * 4 + quad]), weight);
+                const int index = block * 256 + group * 32 + quad * 8;
+                for (int token = 0; token < kTokens; ++token)
+                    sums[token] = _mm256_fmadd_ps(
+                        magnitudes, _mm256_loadu_ps(inputs[token] + index),
+                        sums[token]);
+            }
+        }
+    }
+    for (int token = 0; token < kTokens; ++token)
+        outputs[token] = horizontal_sum(sums[token]);
+}
+
+template <int kTokens>
 void iq4xs_dot_multi(const std::uint8_t* row_data, const float* const inputs[kTokens],
                      int elements, float outputs[kTokens]) {
     const __m128i levels =
@@ -1115,6 +1199,10 @@ bool iq_dot_multi(const std::uint8_t* packed, std::uint32_t type,
         case 18:
             iq3xxs_dot_multi<kTokens>(
                 packed + row * blocks * kIq3xxsBlockBytes, inputs, elements, outputs);
+            return true;
+        case 21:
+            iq3s_dot_multi<kTokens>(
+                packed + row * blocks * kIq3sBlockBytes, inputs, elements, outputs);
             return true;
         case 23:
             iq4xs_dot_multi<kTokens>(
@@ -1217,6 +1305,7 @@ float qwen_quant_dot_avx2(const std::uint8_t* packed,std::uint32_t type,const fl
     if(type==16)return iq2xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,input,elements);
     if(type==17)return iq2xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,input,elements);
     if(type==18)return iq3xxs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,input,elements);
+    if(type==21)return iq3s_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3sBlockBytes,input,elements);
     if(type==22)return iq2s_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2sBlockBytes,input,elements);
     if(type==23)return iq4xs_dot(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,input,elements);
     if(type==20)return iq4nl_dot(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,input,elements);
@@ -1520,6 +1609,82 @@ void iq3xxs_dequant(const std::uint8_t* row_data, float* output, int elements) {
     }
 }
 
+// The store form of iq3s_dot above, for the same reason as its neighbors: the
+// qwen4exp UD mix ships most gate/up expert stacks in IQ3_S, and without this
+// the chunked prefill re-derived the group scale, sign byte and both grid
+// entries for every individual weight of every routed row.
+void iq3s_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq3sBlockBytes;
+        const auto* quants = base + 2;
+        const auto* high = base + 66;
+        const auto* signs = base + 74;
+        const auto* scales = base + 106;
+        const float d = half_value(base);
+        float* out = output + block * 256;
+        for (int group = 0; group < 8; ++group) {
+            const int scale = (scales[group >> 1] >> (4 * (group & 1))) & 15;
+            const __m256 weight =
+                _mm256_set1_ps(d * static_cast<float>(1 + 2 * scale));
+            const unsigned int qh_byte = high[group];
+            for (int quad = 0; quad < 4; ++quad) {
+                const int entry_at = group * 8 + quad * 2;
+                const std::uint64_t grid =
+                    static_cast<std::uint64_t>(
+                        kIq3sGrid[quants[entry_at] |
+                                  (((qh_byte >> (quad * 2)) & 1) << 8)]) |
+                    (static_cast<std::uint64_t>(
+                         kIq3sGrid[quants[entry_at + 1] |
+                                   (((qh_byte >> (quad * 2 + 1)) & 1) << 8)])
+                     << 32);
+                const __m256 magnitudes = iq_signed_octet(
+                    grid, signs[group * 4 + quad]);
+                _mm256_storeu_ps(out + group * 32 + quad * 8,
+                                 _mm256_mul_ps(magnitudes, weight));
+            }
+        }
+    }
+}
+
+// IQ4_XS, the store form of iq4xs_dot: a byte shuffle decodes sixteen codes at
+// a time and the 6-bit sub-block scale folds into one float. The qwen4exp UD
+// mix promotes a few gate/up expert stacks to it, and those layers sat on the
+// per-element path the tripwire announces.
+void iq4xs_dequant(const std::uint8_t* row_data, float* output, int elements) {
+    const __m128i levels =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(kIq4nlValues));
+    const __m128i low_nibble = _mm_set1_epi8(15);
+    for (int block = 0; block < elements / 256; ++block) {
+        const auto* base = row_data + block * kIq4xsBlockBytes;
+        std::uint16_t scales_high = 0;
+        std::memcpy(&scales_high, base + 2, 2);
+        const float d = half_value(base);
+        float* out = output + block * 256;
+        for (int sub = 0; sub < 8; ++sub) {
+            const int low = (base[4 + (sub >> 1)] >> (4 * (sub & 1))) & 15;
+            const int scale = (low | (((scales_high >> (2 * sub)) & 3) << 4)) - 32;
+            const __m256 weight = _mm256_set1_ps(d * scale);
+            const __m128i quants = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(base + 8 + sub * 16));
+            const __m128i first =
+                _mm_shuffle_epi8(levels, _mm_and_si128(quants, low_nibble));
+            const __m128i second = _mm_shuffle_epi8(
+                levels, _mm_and_si128(_mm_srli_epi16(quants, 4), low_nibble));
+            float* values = out + sub * 32;
+            _mm256_storeu_ps(values, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(first)), weight));
+            _mm256_storeu_ps(values + 8, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(first, 8))), weight));
+            _mm256_storeu_ps(values + 16, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(second)), weight));
+            _mm256_storeu_ps(values + 24, _mm256_mul_ps(
+                _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(second, 8))), weight));
+        }
+    }
+}
+
 void iq1s_dequant(const std::uint8_t* row_data, float* output, int elements) {
     for (int block = 0; block < elements / 256; ++block) {
         const auto* base = row_data + block * kIq1sBlockBytes;
@@ -1558,6 +1723,8 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==16)iq2xxs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xxsBlockBytes,output,elements);
     else if(type==17)iq2xs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq2xsBlockBytes,output,elements);
     else if(type==18)iq3xxs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3xxsBlockBytes,output,elements);
+    else if(type==21)iq3s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq3sBlockBytes,output,elements);
+    else if(type==23)iq4xs_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq4xsBlockBytes,output,elements);
     else if(type==19)iq1s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,output,elements);
     else if(type==20)iq4nl_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,output,elements);
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);

@@ -166,6 +166,7 @@ int main() {
     check("iq2xs", 17, kIq2xsBlockBytes, qwen_iq2xs_dot_row);
     check("iq3xxs", 18, kIq3xxsBlockBytes, qwen_iq3xxs_dot_row);
     check("iq2s", 22, kIq2sBlockBytes, qwen_iq2s_dot_row);
+    check("iq3s", 21, kIq3sBlockBytes, qwen_iq3s_dot_row);
     check("iq4xs", 23, kIq4xsBlockBytes, qwen_iq4xs_dot_row);
     check("iq1s", 19, kIq1sBlockBytes, qwen_iq1s_dot_row);
     // The vectorized row decoders feed the chunked-prefill GEMM; pin them
@@ -202,10 +203,58 @@ int main() {
         dequant_check("iq2xxs", 16, kIq2xxsBlockBytes, 256, qwen_iq2xxs_value);
         dequant_check("iq2xs", 17, kIq2xsBlockBytes, 256, qwen_iq2xs_value);
         dequant_check("iq3xxs", 18, kIq3xxsBlockBytes, 256, qwen_iq3xxs_value);
+        dequant_check("iq3s", 21, kIq3sBlockBytes, 256, qwen_iq3s_value);
+        dequant_check("iq4xs", 23, kIq4xsBlockBytes, 256, qwen_iq4xs_value);
+        // Q8_0's admission is %32, for the 640-wide expert down rows.
+        dequant_check("q8", 8, 34, 32, qwen_q8_value);
     }
     // 32-element native blocks, and 640-wide rows in the wild: the
     // admission gates on %32, so the contract runs the same width.
     check("iq4nl", 20, kIq4nlBlockBytes, qwen_iq4nl_dot_row, 32);
+    // The multi-token entry the quad/oct expert dots take. IQ3_S is pinned
+    // here because nothing else covers qwen_quant_dot_iq_multi_avx2 directly;
+    // the second packed row and row=1 exercise the row-offset addressing.
+    {
+        std::mt19937 generator(9876u);
+        std::uniform_int_distribution<int> byte(0, 255);
+        std::normal_distribution<float> activation(0.0f, 1.0f);
+        const int elements = 2560;
+        const std::size_t blocks = elements / 256;
+        std::vector<std::uint8_t> packed(blocks * kIq3sBlockBytes * 2);
+        for (auto& value : packed)
+            value = static_cast<std::uint8_t>(byte(generator));
+        const std::uint16_t block_scale = 0x2E66;
+        for (std::size_t block = 0; block * kIq3sBlockBytes < packed.size();
+             ++block)
+            std::memcpy(packed.data() + block * kIq3sBlockBytes, &block_scale, 2);
+        std::vector<float> vectors(8 * elements);
+        for (auto& value : vectors) value = activation(generator);
+        const float* inputs[8];
+        for (int token = 0; token < 8; ++token)
+            inputs[token] = vectors.data() + token * elements;
+        for (const int tokens : {4, 8}) {
+            float outputs[8]{};
+            if (!qwen_quant_dot_iq_multi_avx2(packed.data(), 21, inputs, tokens,
+                                              elements, 1, outputs)) {
+                std::fprintf(stderr,
+                             "iq3s multi %d-token kernel not admitted\n", tokens);
+                ++failures;
+                continue;
+            }
+            for (int token = 0; token < tokens; ++token) {
+                const float expected = qwen_iq3s_dot_row(
+                    packed.data(), inputs[token], elements, 1);
+                float scale = 0.0f;
+                for (int i = 0; i < elements; ++i)
+                    scale += std::fabs(inputs[token][i]);
+                scale *= 0.1f * 256.0f * 8.0f;
+                char name[64];
+                std::snprintf(name, sizeof(name), "iq3s multi %d token %d",
+                              tokens, token);
+                expect_close(name, outputs[token], expected, scale);
+            }
+        }
+    }
     if (failures) {
         std::fprintf(stderr, "%d IQ SIMD mismatches\n", failures);
         return 1;
