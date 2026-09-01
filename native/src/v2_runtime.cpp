@@ -20445,6 +20445,83 @@ static void qwen_route_sequence(FlyweightV2QwenRuntime& runtime,
 // targets. Shared verbatim by the blocking generate path and the engine so the
 // two cannot drift. Disables expert-cache admission (prompt tokens must not
 // pollute it); callers re-enable it when prefill completes.
+// A sweep-shaped prefill on a host whose page cache cannot hold the routed
+// expert set runs against its own eviction churn: every chunk touches most of
+// a layer's experts, so once memory fills, each faulted page costs a reclaim
+// decision over everything resident -- and the sweep still re-reads whatever
+// the previous chunks evicted. Dropping the expert regions once up front
+// converts the whole prefill into clean reads into free memory. Measured on a
+// qwen4exp UD checkpoint whose 59 GiB of routed experts share a 63 GiB host
+// with the OS: 34s against 79s for an 1871-token prompt, identical output.
+// The decode-hot experts re-fault afterwards, which the post-prompt
+// qwen_prefetch_cpu_experts pass already exists to accelerate. Per-chunk
+// MADV_COLD on the cold tail was tried first and measured strictly worse
+// (56s, and slower decode after): chunks reuse each other's experts, so
+// demoting pages mid-sweep forces re-reads that plain LRU would have dodged.
+//
+// The madvise drops our own PTEs (a private clean mapping otherwise keeps the
+// cache pages referenced and fadvise skips them); the fadvise then frees the
+// cache copies. Both advisory, both correctness-free: dropped pages re-fault
+// from the file.
+void qwen_drop_expert_pages_for_sweep(
+    FlyweightV2QwenRuntime& runtime, std::uint64_t prefill_tokens
+) {
+#if !defined(_WIN32)
+    // Kill switch, same switchability rationale as FLYWEIGHT_ADVISE_RANDOM:
+    // the effect is invisible in correctness and only shows up in I/O.
+    static const char* setting = std::getenv("FLYWEIGHT_PREFILL_DROP");
+    if (setting && setting[0] == '0') return;
+    const auto& config = runtime.model->config;
+    const std::uint64_t experts = config.expert_count;
+    const std::uint64_t top_k = config.expert_used_count;
+    if (!experts || !top_k || !runtime.expert_tensor_bytes) return;
+    // Sweep-shaped: enough routes to touch most of a layer's experts, and
+    // enough chunks that churn dominates whatever the cache held going in. A
+    // ~5-chunk prompt measured *faster* on a warm cache without the drop
+    // (5.8s against ~19s with it), while at 15 chunks the drop won from every
+    // starting state -- so the bar sits at 8 chunks, above every observed
+    // keep-the-cache win and below every observed churn loss.
+    if (prefill_tokens * top_k < 2 * experts) return;
+    if (prefill_tokens < 8 * static_cast<std::uint64_t>(runtime.prefill_rows))
+        return;
+    if (runtime.expert_tensor_bytes <= available_host_memory()) return;
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    for (const auto& layer : runtime.layers) {
+        if (layer.dense_ffn || !layer.expert_tensors[0]) continue;
+        for (int role = 0; role < 3; ++role) {
+            const auto& tensor =
+                runtime.model->tensors[layer.expert_tensors[role]];
+            const auto* address = tensor_data(*runtime.model, tensor);
+            if (!address || !tensor.size) continue;
+            const auto begin =
+                reinterpret_cast<std::uintptr_t>(address) & ~(page - 1);
+            const auto end = (reinterpret_cast<std::uintptr_t>(address) +
+                              tensor.size + page - 1) & ~(page - 1);
+            (void)madvise(reinterpret_cast<void*>(begin),
+                          static_cast<std::size_t>(end - begin), MADV_DONTNEED);
+            // The owning fd: a split checkpoint's tensors point into a shard
+            // mapping through Tensor::source, and tensor.offset is relative
+            // to that shard's file.
+            int fd = runtime.model->fd;
+            if (tensor.source) {
+                fd = -1;
+                for (const auto& shard : runtime.model->shards)
+                    if (shard && shard->data == tensor.source) {
+                        fd = shard->fd;
+                        break;
+                    }
+            }
+            if (fd >= 0)
+                (void)posix_fadvise(fd, static_cast<off_t>(tensor.offset),
+                                    static_cast<off_t>(tensor.size),
+                                    POSIX_FADV_DONTNEED);
+        }
+    }
+#else
+    (void)runtime; (void)prefill_tokens;
+#endif
+}
+
 static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, QwenPromptPlan& plan,
         bool require_last_logits=false) {
@@ -20588,6 +20665,7 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
     }
     runtime->prefix_cache_last_reused_tokens=prompt_start;
     runtime->prefix_cache_reprefilled_tokens+=prompt_count-prompt_start;
+    qwen_drop_expert_pages_for_sweep(*runtime,prompt_count-prompt_start);
     if(std::getenv("FLYWEIGHT_PREFIX_TRACE"))
         std::fprintf(stderr,
             "[prefix] prompt=%llu reused=%llu reprefill=%llu lcp_live=%llu lcp_snapshot=%llu\n",
