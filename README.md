@@ -418,8 +418,10 @@ are accepted everywhere:
 - `--gpu-cache-mib 0`: size allocations from currently free VRAM
 - `--cache-type-k` / `--cache-type-v` `auto|f32|f16|bf16|q8_0|turbo3|turbo4`:
   KV precision (default `f16`)
-- `--mtp-drafts N`: multi-token prediction for Qwen checkpoints;
-  `--mtp-model` supplies a draft GGUF overlay (DSpark for DeepSeek-V4-Flash)
+- `--mtp-drafts N`: multi-token prediction for Qwen checkpoints; a round
+  drafts N tokens and can commit N+1 (the drafts plus the token that verifies
+  the last one). `--mtp-model` supplies a draft GGUF overlay (DSpark for
+  DeepSeek-V4-Flash)
 - `--dense-requant auto|q8|off`: control temporary BF16 dense-weight Q8 upload
 - `--parallel N`: independent sequence slots
 - `--cache auto|off|MIB`: host cache for displaced conversation state
@@ -479,6 +481,14 @@ but not little enough to ignore. On a 12 GB card the 27B above spills 51 of
 64 dense blocks at `Q6_K` and none at `Q2_K`, which is the difference between
 4 and 36 tokens/s of decode. Pick the largest target that still fits, not the
 largest you can pack.
+
+Two things to know about spilled blocks. Which blocks spill is decided from
+the VRAM free at startup, so on a card shared with a desktop the split can
+differ from one launch to the next; pass `--gpu-cache-mib` to pin it. And a
+spilled block whose weights are in a codebook format (IQ2/IQ3) is re-encoded
+to Q3_K for the host kernels, which is lossy: `FLYWEIGHT_HOST_FFN_FORMAT`
+picks `q2_k`, `q3_k` (default), `q8_0` or `off`, and
+`FLYWEIGHT_HOST_FFN_Q8_MIB` caps the re-encoded bytes (default 8192).
 
 `Q2_K` and `Q3_K` are dense-only: no GPU routed-expert kernel decodes either,
 so a mixture-of-experts checkpoint packed to one would run every routed layer

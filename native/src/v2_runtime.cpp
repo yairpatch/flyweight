@@ -266,13 +266,29 @@ struct Reader {
     template <class T> T get() { if (end-p < static_cast<ptrdiff_t>(sizeof(T))) throw std::runtime_error("truncated GGUF"); T v; std::memcpy(&v,p,sizeof(v)); p += sizeof(v); return v; }
     std::string str() { auto n=get<uint64_t>(); if (n > static_cast<uint64_t>(end-p)) throw std::runtime_error("invalid GGUF string"); std::string s(reinterpret_cast<const char*>(p), static_cast<size_t>(n)); p+=n; return s; }
     void skip(size_t n) { if (n > static_cast<size_t>(end-p)) throw std::runtime_error("truncated GGUF value"); p+=n; }
-    void value(uint32_t type) {
+    std::size_t remaining() const { return static_cast<std::size_t>(end-p); }
+    // Bound a `reserve` fed an untrusted element count by what the bytes
+    // left in the file could possibly hold: a header claiming 2^40 entries
+    // used to be a 2^40-element allocation before the first read failed.
+    std::size_t plausible(uint64_t count, std::size_t element_bytes) const {
+        const std::size_t limit=remaining()/(element_bytes?element_bytes:1);
+        return static_cast<std::size_t>(std::min<uint64_t>(count,limit));
+    }
+    void value(uint32_t type, unsigned depth=0) {
         switch(type) {
         case 0: case 1: case 7: skip(1); break;
         case 2: case 3: skip(2); break;
         case 4: case 5: case 6: skip(4); break;
         case 8: str(); break;
-        case 9: { auto element_type=get<uint32_t>(); auto n=get<uint64_t>(); for(uint64_t i=0;i<n;i++) value(element_type); break; }
+        case 9: {
+            // GGUF never nests arrays; a file that does is hostile, and each
+            // level cost a stack frame -- 12 bytes of file per frame was a
+            // stack overflow, which no catch block sees.
+            if (depth>=4) throw std::runtime_error("GGUF metadata nests too deeply");
+            auto element_type=get<uint32_t>(); auto n=get<uint64_t>();
+            for(uint64_t i=0;i<n;i++) value(element_type, depth+1);
+            break;
+        }
         case 10: case 11: case 12: skip(8); break;
         default: throw std::runtime_error("unsupported GGUF metadata type");
         }
@@ -2330,7 +2346,7 @@ int parse(FlyweightV2Model& m) {
         const auto element_type=r.get<uint32_t>();const auto count=r.get<uint64_t>();
         if(element_type!=4&&element_type!=5&&element_type!=10&&element_type!=11)
             throw std::runtime_error("GGUF architecture array is not integer");
-        std::vector<std::uint32_t> values;values.reserve(static_cast<std::size_t>(count));
+        std::vector<std::uint32_t> values;values.reserve(r.plausible(count,4));
         for(std::uint64_t i=0;i<count;++i){
             std::int64_t value=0;
             if(element_type==4)value=r.get<std::uint32_t>();
@@ -2351,7 +2367,7 @@ int parse(FlyweightV2Model& m) {
         const auto element_type=r.get<uint32_t>();const auto count=r.get<uint64_t>();
         if(element_type!=10&&element_type!=11&&element_type!=4&&element_type!=5)
             throw std::runtime_error("GGUF architecture array is not integer");
-        std::vector<std::uint64_t> values;values.reserve(static_cast<std::size_t>(count));
+        std::vector<std::uint64_t> values;values.reserve(r.plausible(count,4));
         for(std::uint64_t i=0;i<count;++i){
             if(element_type==10)values.push_back(r.get<std::uint64_t>());
             else if(element_type==4)values.push_back(r.get<std::uint32_t>());
@@ -2371,7 +2387,7 @@ int parse(FlyweightV2Model& m) {
         const auto element_type=r.get<uint32_t>();const auto count=r.get<uint64_t>();
         if(element_type!=6&&element_type!=12)
             throw std::runtime_error("GGUF architecture array is not float");
-        std::vector<float> values;values.reserve(static_cast<std::size_t>(count));
+        std::vector<float> values;values.reserve(r.plausible(count,4));
         for(std::uint64_t i=0;i<count;++i)
             values.push_back(element_type==6?r.get<float>():static_cast<float>(r.get<double>()));
         return values;
@@ -2442,14 +2458,14 @@ int parse(FlyweightV2Model& m) {
         else if (key=="split.count" && is_integer(type)) m.split_count=static_cast<uint32_t>(read_any_uint(type));
         else if (key=="split.tensors.count" && is_integer(type)) m.split_tensors=read_any_uint(type);
         else if (key=="tokenizer.chat_template" && type==8) m.chat_template=r.str();
-        else if (key=="tokenizer.ggml.tokens" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_tokens=r.get<uint64_t>();m.config.vocabulary_size=static_cast<uint32_t>(count_tokens);m.vocabulary.reserve(static_cast<size_t>(count_tokens));for(uint64_t token_index=0;token_index<count_tokens;token_index++){if(element_type==8)m.vocabulary.push_back(r.str());else r.value(element_type);}}
+        else if (key=="tokenizer.ggml.tokens" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_tokens=r.get<uint64_t>();m.config.vocabulary_size=static_cast<uint32_t>(count_tokens);m.vocabulary.reserve(r.plausible(count_tokens,8));for(uint64_t token_index=0;token_index<count_tokens;token_index++){if(element_type==8)m.vocabulary.push_back(r.str());else r.value(element_type);}}
         else if (key=="tokenizer.ggml.pre" && type==8) m.tokenizer_pre=r.str();
         else if (key=="tokenizer.ggml.eos_token_id" && (type==4||type==10)) m.config.eos_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.eot_token_id" && (type==4||type==10)) m.config.eot_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.bos_token_id" && (type==4||type==10)) m.config.bos_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.mask_token_id" && is_integer(type)) m.config.mask_token_id=static_cast<uint32_t>(read_any_uint(type));
         else if (key=="tokenizer.ggml.token_type" && type==9) m.token_types=read_uint_array(type);
-        else if (key=="tokenizer.ggml.merges" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_merges=r.get<uint64_t>();m.merges.reserve(static_cast<size_t>(count_merges));for(uint64_t merge_index=0;merge_index<count_merges;merge_index++){if(element_type==8)m.merges.push_back(r.str());else r.value(element_type);}}
+        else if (key=="tokenizer.ggml.merges" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_merges=r.get<uint64_t>();m.merges.reserve(r.plausible(count_merges,8));for(uint64_t merge_index=0;merge_index<count_merges;merge_index++){if(element_type==8)m.merges.push_back(r.str());else r.value(element_type);}}
         else if (key.size()>=21 && key.compare(key.size()-21,21,".rope.dimension_count")==0 && (type==4 || type==10)) m.config.rotary_dimension=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=24 && key.compare(key.size()-24,24,".full_attention_interval")==0 && (type==4 || type==10)) m.config.full_attention_interval=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=24 && key.compare(key.size()-24,24,".attention.head_count_kv")==0 && type==9) m.config.attention_kv_heads_by_layer=read_uint_array(type);
@@ -2459,7 +2475,7 @@ int parse(FlyweightV2Model& m) {
             const auto element_type=r.get<uint32_t>();
             const auto elements=r.get<uint64_t>();
             if(element_type!=7)throw std::runtime_error("GGUF sliding-window pattern must be boolean");
-            m.config.sliding_window_pattern.reserve(static_cast<std::size_t>(elements));
+            m.config.sliding_window_pattern.reserve(r.plausible(elements,1));
             for(std::uint64_t element=0;element<elements;++element)m.config.sliding_window_pattern.push_back(r.get<std::uint8_t>()?1:0);
         }
         // Muse Glimmer writes the same key as a scalar period instead of a
@@ -2498,7 +2514,7 @@ int parse(FlyweightV2Model& m) {
         else if (set_config(key,type)) {}
         else r.value(type);
     }
-    m.tensors.reserve(static_cast<size_t>(count));
+    m.tensors.reserve(r.plausible(count,24));  // name length + dims + type + offset
     for(uint64_t i=0;i<count;i++) { Tensor t; t.name=r.str(); auto dims=r.get<uint32_t>(); if(dims>4) throw std::runtime_error("GGUF rank exceeds v2 ABI"); for(uint32_t d=0;d<dims;d++) t.shape.push_back(r.get<uint64_t>()); t.type=r.get<uint32_t>(); t.offset=r.get<uint64_t>(); m.tensors.push_back(std::move(t)); }
     detect_mtp_layer(m);
     // An array-valued head count leaves the scalar unset. Workspaces and score
@@ -2610,6 +2626,11 @@ int parse(FlyweightV2Model& m) {
                 throw std::runtime_error(
                     "qwen4exp ple head offset/vocab arrays are shorter than the "
                     "head count");
+            for(std::size_t head=0;head<heads;++head)
+                if(!m.config.ple_head_vocab_sizes[head])
+                    throw std::runtime_error(
+                        "qwen4exp ple.head_vocab_sizes has a zero entry (the "
+                        "n-gram hash takes it modulo)");
             if(m.config.ple_eos_token_id==0xffffffffu)
                 throw std::runtime_error("qwen4exp ple.eos_token_id is missing");
             if(!m.config.per_layer_embedding_size)
@@ -2743,6 +2764,8 @@ void build_qwen_plan(FlyweightV2QwenRuntime& runtime) {
                  }) add_static_tensor(runtime, layer, prefix + suffix);
             layer.attention_heads=model.config.attention_heads;
             layer.kv_heads=model.config.attention_kv_heads;
+            if(!layer.kv_heads||model.tensors[layer.static_tensors[2]].shape.size()<2)
+                throw std::runtime_error("GGUF attention geometry is incomplete: attention.head_count_kv is zero or attn_k is not a matrix");
             layer.head_dim=static_cast<std::uint32_t>(model.tensors[layer.static_tensors[2]].shape[1]/layer.kv_heads);
             // Clamped: rope.dimension_count comes straight from GGUF metadata,
             // and the RoPE kernels stage a head_dim-sized buffer that a wider
@@ -2880,6 +2903,8 @@ void build_qwen_plan(FlyweightV2QwenRuntime& runtime) {
     // The feed-forward width comes from the gate projection: the shared expert's
     // for MoE checkpoints, the block's own for dense ones. Both sit one slot
     // past post_attention_norm plus the router that only MoE layers carry.
+    if(runtime.layers.empty())
+        throw std::runtime_error("GGUF block_count is zero: the checkpoint has no layers to plan");
     const auto& front = runtime.layers.front();
     const std::size_t ffn_base = front.attention ? 7 : 10;
     const auto& gate = model.tensors[front.static_tensors[ffn_base + (front.dense_ffn ? 1 : 2)]];
@@ -2954,6 +2979,8 @@ void build_qwen4exp_plan(FlyweightV2QwenRuntime& runtime) {
                  }) add_static_tensor(runtime, layer, prefix + suffix);
             layer.attention_heads=model.config.attention_heads;
             layer.kv_heads=model.config.attention_kv_heads;
+            if(!layer.kv_heads||model.tensors[layer.static_tensors[2]].shape.size()<2)
+                throw std::runtime_error("GGUF attention geometry is incomplete: attention.head_count_kv is zero or attn_k is not a matrix");
             layer.head_dim=static_cast<std::uint32_t>(model.tensors[layer.static_tensors[2]].shape[1]/layer.kv_heads);
             layer.rotary_dim=std::min<std::uint32_t>(model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim,layer.head_dim);
             layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:1000000.0f;
@@ -3119,6 +3146,8 @@ void build_qwen4exp_plan(FlyweightV2QwenRuntime& runtime) {
     }
     for(const auto&layer:runtime.layers)for(auto index:layer.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
     if(runtime.mtp_available)for(auto index:runtime.mtp_layer_plan.static_tensors){const auto&t=model.tensors[index];if(t.shape.size()==2)runtime.scratch_elements=std::max(runtime.scratch_elements,static_cast<std::uint32_t>(t.shape[1]));}
+    if(runtime.layers.empty())
+        throw std::runtime_error("GGUF block_count is zero: the checkpoint has no layers to plan");
     const auto& front = runtime.layers.front();
     const std::size_t ffn_base = front.attention ? 7 : 10;
     const auto& gate = model.tensors[front.static_tensors[ffn_base + 2]];
@@ -13517,8 +13546,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     : runtime->model->config.hidden_size;
             runtime->mtp_target_hidden_offset=reserve(handover_floats*sizeof(float));
             runtime->mtp_draft_hidden_offset=reserve(handover_floats*sizeof(float));
+            // 9 rows: the 8-draft maximum plus the row that verifies the
+            // last draft (see qwen_mtp_round).
             runtime->mtp_verified_hidden_offset=reserve(
-                8ULL*handover_floats*sizeof(float));
+                9ULL*handover_floats*sizeof(float));
             runtime->mtp_snapshot_offset=state_cursor;
             const auto snapshot_start=state_cursor;
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
@@ -13541,15 +13572,16 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             }
             runtime->mtp_snapshot_bytes=state_cursor-snapshot_start;
             // Fold retention: per DeltaNet layer, room for the verifier's
-            // 8-row maximum of qkv projections (conv.shape[1] channels) and
+            // 9-row maximum (8 drafts plus the row that verifies the last
+            // one) of qkv projections (conv.shape[1] channels) and
             // decay+beta logits (2 * value_heads each row). See QwenLayerPlan.
             for(std::uint32_t layer_number=0;layer_number<runtime->layers.size();++layer_number){
                 auto&target=runtime->layers[layer_number];
                 if(target.attention)continue;
                 const auto&conv=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_conv1d.weight")];
                 const auto&a=runtime->model->tensors[tensor_index(*runtime->model,"blk."+std::to_string(layer_number)+".ssm_a")];
-                target.mtp_retain_qkv=reserve(8ULL*conv.shape[1]*sizeof(float));
-                target.mtp_retain_logits=reserve(16ULL*a.shape[0]*sizeof(float));
+                target.mtp_retain_qkv=reserve(9ULL*conv.shape[1]*sizeof(float));
+                target.mtp_retain_logits=reserve(18ULL*a.shape[0]*sizeof(float));
                 runtime->mtp_delta_layers=true;
             }
         }
@@ -21564,11 +21596,17 @@ static void qwen_mtp_commit_true_cache(
 static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr){
     if(wanted>8)wanted=8;
     if(!wanted)wanted=1;
+    // One row per draft plus one more: the verify batch's row k answers "what
+    // follows inputs[k]", so the last draft only gets checked -- and only
+    // gets to count -- if it is fed as an input too. Verifying `wanted` rows
+    // for `wanted` drafts computed the last draft for nothing every round and
+    // capped a round at `wanted` tokens where `wanted+1` were earned.
+    const uint32_t rows=wanted+1;
     // The draft block's KV cache is sized for the context limit and, unlike the
     // target caches, is never rewound by a new request. Recycling it when it
     // would overflow keeps a long-running server in bounds; the cost is a few
     // poor drafts, not a wrong answer.
-    if(runtime.mtp_cache_tokens+wanted+1>runtime.options.context_limit)runtime.mtp_cache_tokens=0;
+    if(runtime.mtp_cache_tokens+rows+1>runtime.options.context_limit)runtime.mtp_cache_tokens=0;
     const auto base_cache_tokens=runtime.mtp_cache_tokens;
     std::array<uint32_t,8>drafts{};
     uint32_t draft_input=next_token;
@@ -21582,9 +21620,9 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;
     }
     runtime.mtp_draft_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-draft_started).count();
-    std::array<uint32_t,8>inputs{},verified{};
+    std::array<uint32_t,9>inputs{},verified{};
     inputs[0]=next_token;
-    for(uint32_t index=1;index<wanted;++index)inputs[index]=drafts[index-1];
+    for(uint32_t index=1;index<rows;++index)inputs[index]=drafts[index-1];
     // Arm the fold: the verify pass records each DeltaNet layer's transition
     // inputs in its retention arena so a rejection can rebuild the state
     // without re-running the forward. FLYWEIGHT_MTP_FOLD=0 restores the full
@@ -21603,11 +21641,11 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     const bool ple_blocks_fold=!runtime.model->config.ple_layers.empty();
     runtime.mtp_fold_capture=fold_enabled&&runtime.mtp_delta_layers&&!ple_blocks_fold;
     runtime.mtp_fold_valid=fold_enabled&&!ple_blocks_fold;
-    runtime.mtp_fold_rows=wanted;
+    runtime.mtp_fold_rows=rows;
     qwen_snapshot_delta_state(runtime,false);
     const auto batch_started=std::chrono::steady_clock::now();
     std::uint64_t batch_hidden=0;
-    qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(wanted),verified.data(),&batch_hidden);
+    qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(rows),verified.data(),&batch_hidden);
     runtime.mtp_fold_capture=false;
     runtime.mtp_verify_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-batch_started).count();
     bool last_greedy=true;
@@ -21615,7 +21653,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         const int hidden=static_cast<int>(runtime.model->config.hidden_size);
         const auto row_bytes=static_cast<std::uint64_t>(hidden)*sizeof(float);
         if(!runtime.mtp_sampling_rows&&
-           flyweight_gpu_alloc(8*row_bytes,&runtime.mtp_sampling_rows)!=0)
+           flyweight_gpu_alloc(9*row_bytes,&runtime.mtp_sampling_rows)!=0)
             throw std::runtime_error("native MTP sampling rows allocation failed");
         // Two things the sampler's scratch could trample, taken out of the
         // rows workspace first: the normalized rows it will read, and the
@@ -21624,18 +21662,18 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         // becomes a self-copy.
         const auto normalized=runtime.rows_workspace_layout.normalized.address(runtime.workspace);
         if(flyweight_gpu_copy_device(runtime.mtp_sampling_rows,normalized,
-               static_cast<std::uint64_t>(wanted)*row_bytes,runtime.stream)!=0)
+               static_cast<std::uint64_t>(rows)*row_bytes,runtime.stream)!=0)
             throw std::runtime_error("native MTP sampling rows copy failed");
         const int handover=runtime.qwen4exp
             ?static_cast<int>(runtime.model->config.hyper_connection_count*runtime.model->config.hidden_size)
             :hidden;
         const auto stable_hidden=runtime.state+runtime.mtp_verified_hidden_offset;
         if(flyweight_gpu_copy_device(stable_hidden,batch_hidden,
-               static_cast<std::uint64_t>(wanted)*handover*sizeof(float),runtime.stream)!=0)
+               static_cast<std::uint64_t>(rows)*handover*sizeof(float),runtime.stream)!=0)
             throw std::runtime_error("native MTP hand-over rows copy failed");
         batch_hidden=stable_hidden;
         const auto logits=runtime.decode_workspace_layout.logits.address(runtime.workspace);
-        for(uint32_t row=0;row<wanted;++row){
+        for(uint32_t row=0;row<rows;++row){
             runtime.last_sampling_normalized=runtime.mtp_sampling_rows+row*row_bytes;
             runtime.last_sampling_logits=logits;
             runtime.last_output_token=verified[row];
@@ -21643,15 +21681,19 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
             const auto chosen=qwen_sample_last_logits(runtime,*sampling,verified[row]);
             verified[row]=chosen;
             // Rows past a disagreement were computed on the draft's prefix,
-            // not this token's; they are neither sampled nor committed.
-            if(chosen!=drafts[row])break;
+            // not this token's; they are neither sampled nor committed. The
+            // final row has no draft to agree with: it is the round's own
+            // last token.
+            if(row>=wanted||chosen!=drafts[row])break;
         }
         last_greedy=runtime.last_output_greedy;
     }
     uint32_t valid=0;
     bool rejected=false;
     for(;valid<wanted;++valid)if(verified[valid]!=drafts[valid]){++valid;rejected=true;break;}
-    if(rejected&&valid<wanted&&runtime.mtp_fold_valid){
+    // Every draft held: the final row's own token comes with them.
+    if(!rejected)valid=rows;
+    if(rejected&&runtime.mtp_fold_valid){
         // Fold rollback: the batch verify already produced correct KV rows,
         // hidden states and verified tokens for the accepted prefix -- only
         // the DeltaNet conv/recurrent state ran ahead through the rejected
@@ -21675,7 +21717,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         runtime.mtp_accepted_tokens+=valid-1;
         ++runtime.mtp_rejected_tokens;
         runtime.mtp_rollback_nanoseconds+=rollback_elapsed;
-    }else if(rejected&&valid<wanted){
+    }else if(rejected){
         const auto rollback_started=std::chrono::steady_clock::now();
         const auto batch_rejected_token=verified[valid-1];
         std::vector<float>batch_trace;
@@ -21711,16 +21753,15 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         runtime.mtp_rollback_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-rollback_started).count();
     }else{
         qwen_mtp_commit_true_cache(
-            runtime,base_cache_tokens,inputs.data(),wanted,batch_hidden);
-        runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+wanted);
-        runtime.position+=wanted;
-        runtime.last_output_token=verified[wanted-1];
+            runtime,base_cache_tokens,inputs.data(),rows,batch_hidden);
+        runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+rows);
+        runtime.position+=rows;
+        runtime.last_output_token=verified[rows-1];
         runtime.last_output_greedy=last_greedy;
-        runtime.decode_calls+=wanted;
+        runtime.decode_calls+=rows;
         runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-batch_started).count();
-        runtime.mtp_accepted_tokens+=rejected?wanted-1:wanted;
-        if(rejected)++runtime.mtp_rejected_tokens;
-        valid=wanted;
+        runtime.mtp_accepted_tokens+=wanted;
+        valid=rows;
     }
     for(uint32_t index=0;index<valid;++index)out[index]=verified[index];
     return valid;
@@ -21857,7 +21898,9 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
         if(callback(next_token,user)!=0)return 0;
         ++emitted;
         while(emitted<max_tokens&&!runtime->cancelled){
-            if(!qwen_mtp_should_draft(*runtime)){
+            // A round commits up to wanted+1 tokens; with one token of room
+            // left it would advance the sequence past what gets emitted.
+            if(!qwen_mtp_should_draft(*runtime)||max_tokens-emitted<2){
                 const auto decode_started=std::chrono::steady_clock::now();
                 status=flyweight_v2_qwen_runtime_decode(
                     runtime,next_token,&next_token);
@@ -21871,9 +21914,9 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
                 continue;
             }
             const auto wanted=static_cast<uint32_t>(std::min<uint64_t>(
-                runtime->options.mtp_drafts,max_tokens-emitted
+                runtime->options.mtp_drafts,max_tokens-emitted-1
             ));
-            std::array<uint32_t,8>produced{};
+            std::array<uint32_t,9>produced{};
             const auto round_started=std::chrono::steady_clock::now();
             const auto valid=qwen_mtp_round(*runtime,next_token,wanted,produced.data());
             qwen_mtp_record_round(
@@ -23241,11 +23284,15 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                 // to the one-token path. Before that, only a task with no
                 // sampler features could draft -- and every served request
                 // has some, so --mtp-drafts never engaged under serve.
-                if(runtime->options.mtp_drafts&&qwen_mtp_should_draft(*runtime)){
+                if(runtime->options.mtp_drafts&&qwen_mtp_should_draft(*runtime)&&
+                   task->max_tokens-task->emitted>=2){
+                    // A round commits up to wanted+1 tokens (the drafts plus
+                    // the row that verifies the last one), so it needs that
+                    // much room under max_tokens.
                     const auto wanted=static_cast<uint32_t>(std::min<std::uint64_t>(
-                        runtime->options.mtp_drafts,task->max_tokens-task->emitted
+                        runtime->options.mtp_drafts,task->max_tokens-task->emitted-1
                     ));
-                    std::array<uint32_t,8>produced{};
+                    std::array<uint32_t,9>produced{};
                     const auto round_started=std::chrono::steady_clock::now();
                     const auto valid=qwen_mtp_round(*runtime,task->next_token,wanted,produced.data(),&task->sampling);
                     qwen_mtp_record_round(
