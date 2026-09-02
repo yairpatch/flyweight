@@ -420,7 +420,12 @@ are accepted everywhere:
   KV precision (default `f16`)
 - `--mtp-drafts N`: multi-token prediction for Qwen checkpoints; a round
   drafts N tokens and can commit N+1 (the drafts plus the token that verifies
-  the last one). `--mtp-model` supplies a draft GGUF overlay (DSpark for
+  the last one). The runtime times a short trial of drafting against
+  ordinary decode and keeps drafting only when it wins; the verdict expires
+  after `FLYWEIGHT_MTP_RECALIBRATE_TOKENS` decoded tokens (default 2048, 0
+  keeps the first verdict) so a reading taken under a load spike does not
+  last the whole process, and `FLYWEIGHT_MTP_ADAPTIVE=0` drafts
+  unconditionally. `--mtp-model` supplies a draft GGUF overlay (DSpark for
   DeepSeek-V4-Flash)
 - `--dense-requant auto|q8|off`: control temporary BF16 dense-weight Q8 upload
 - `--parallel N`: independent sequence slots

@@ -1018,6 +1018,11 @@ struct FlyweightV2QwenRuntime {
     bool mtp_calibration_done = false;
     bool mtp_adaptive_disabled = false;
     bool mtp_adaptive_reported = false;
+    // Tokens decoded since the verdict, and what it was: a verdict taken in
+    // a load spike (or a quiet moment) expires after enough tokens so the
+    // next request re-measures rather than living with it for the process.
+    std::uint64_t mtp_verdict_tokens = 0;
+    bool mtp_adaptive_last_keep = false;
     std::uint64_t mtp_target_hidden_offset = 0;
     std::uint64_t mtp_draft_hidden_offset = 0;
     std::uint64_t mtp_verified_hidden_offset = 0;
@@ -21452,10 +21457,12 @@ static void qwen_prefetch_cpu_experts(FlyweightV2QwenRuntime& runtime) {
 
 // Save this prompt's end-of-prefill state so the next turn only prefills its
 // suffix, and re-enable expert-cache admission for decode.
+static void qwen_mtp_expire_calibration(FlyweightV2QwenRuntime&runtime);
 static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token,
         uint64_t requested_generation_tokens) {
     runtime->cache_admission_enabled=true;
+    if(runtime->options.mtp_drafts)qwen_mtp_expire_calibration(*runtime);
     qwen_prefetch_cpu_experts(*runtime);
     qwen_seed_prefill_experts(*runtime,requested_generation_tokens);
     if(!runtime->prefill_snapshot_bytes)return;
@@ -21818,6 +21825,35 @@ static bool qwen_mtp_adaptive_enabled(){
     return !setting||setting[0]!='0';
 }
 
+// How many decoded tokens a calibration verdict lives before the next request
+// boundary re-runs the trial. FLYWEIGHT_MTP_RECALIBRATE_TOKENS overrides; 0
+// makes the first verdict permanent, which is what it always was.
+static std::uint64_t qwen_mtp_recalibrate_tokens(){
+    static const std::uint64_t tokens=[]{
+        const char*setting=std::getenv("FLYWEIGHT_MTP_RECALIBRATE_TOKENS");
+        return setting?std::strtoull(setting,nullptr,10):std::uint64_t{2048};
+    }();
+    return tokens;
+}
+
+// At a request boundary: forget an expired verdict so the trial runs again.
+// Only between requests -- a trial mid-request would interleave its arms
+// with a conversation's own decode, which is exactly the noise it measures.
+static void qwen_mtp_expire_calibration(FlyweightV2QwenRuntime&runtime){
+    const auto lifetime=qwen_mtp_recalibrate_tokens();
+    if(!runtime.mtp_calibration_done||!lifetime||runtime.mtp_verdict_tokens<lifetime)return;
+    runtime.mtp_calibration_done=false;
+    runtime.mtp_adaptive_disabled=false;
+    runtime.mtp_calibration_decode_nanoseconds=0;
+    runtime.mtp_calibration_round_nanoseconds=0;
+    runtime.mtp_calibration_round_tokens=0;
+    runtime.mtp_calibration_decode_tokens=0;
+    runtime.mtp_calibration_rounds=0;
+    runtime.mtp_calibration_warmup_tokens=0;
+    runtime.mtp_calibration_draft_turn=false;
+    runtime.mtp_verdict_tokens=0;
+}
+
 static constexpr std::uint32_t kQwenMtpBaselineTokens=8;
 static constexpr std::uint32_t kQwenMtpTrialRounds=4;
 // Tokens discarded before calibration starts. The first tokens after prefill
@@ -21851,8 +21887,11 @@ static void qwen_mtp_finish_calibration(FlyweightV2QwenRuntime&runtime);
 static void qwen_mtp_record_decode(
     FlyweightV2QwenRuntime&runtime,std::uint64_t nanoseconds
 ){
-    if(!qwen_mtp_adaptive_enabled()||runtime.mtp_adaptive_disabled||
-       runtime.mtp_calibration_done)return;
+    if(!qwen_mtp_adaptive_enabled())return;
+    if(runtime.mtp_adaptive_disabled||runtime.mtp_calibration_done){
+        ++runtime.mtp_verdict_tokens;
+        return;
+    }
     if(runtime.mtp_calibration_warmup_tokens<kQwenMtpWarmupTokens){
         ++runtime.mtp_calibration_warmup_tokens;
         return;
@@ -21888,10 +21927,14 @@ static void qwen_mtp_finish_calibration(FlyweightV2QwenRuntime&runtime){
     const bool keep=
         mtp_per_token*100<baseline_per_token*kQwenMtpKeepPercent;
     if(!keep)runtime.mtp_adaptive_disabled=true;
+    runtime.mtp_verdict_tokens=0;
     // Report both verdicts. Only the fallback used to be logged, so a gate that
     // wrongly kept MTP -- the case that costs the user throughput -- was
-    // completely silent.
-    if(!runtime.mtp_adaptive_reported){
+    // completely silent. A re-calibration reports only when the verdict
+    // changed, so a stable server does not narrate every few thousand tokens.
+    const bool changed=runtime.mtp_adaptive_reported&&keep!=runtime.mtp_adaptive_last_keep;
+    runtime.mtp_adaptive_last_keep=keep;
+    if(!runtime.mtp_adaptive_reported||changed){
         std::fprintf(stderr,
             "[flyweight] MTP calibration: %llu us/token speculative vs "
             "%llu us/token ordinary decode -- %s\n",
@@ -21906,8 +21949,11 @@ static void qwen_mtp_record_round(
     FlyweightV2QwenRuntime&runtime,std::uint64_t nanoseconds,
     std::uint32_t committed
 ){
-    if(!qwen_mtp_adaptive_enabled()||runtime.mtp_adaptive_disabled||
-       runtime.mtp_calibration_done)return;
+    if(!qwen_mtp_adaptive_enabled())return;
+    if(runtime.mtp_adaptive_disabled||runtime.mtp_calibration_done){
+        runtime.mtp_verdict_tokens+=committed;
+        return;
+    }
     runtime.mtp_calibration_draft_turn=false;
     runtime.mtp_calibration_round_nanoseconds+=nanoseconds;
     runtime.mtp_calibration_round_tokens+=committed;
