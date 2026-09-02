@@ -374,19 +374,18 @@ class V2RuntimeTests(unittest.TestCase):
         self.assertIn("preserve_mtp_prompt_hidden", verifier)
         self.assertIn("qwen_mtp_append_pair(", verifier)
 
-    def test_cuda_waits_default_to_blocking_context_scheduling(self):
+    def test_cuda_waits_use_stock_context_scheduling(self):
+        # The blocking-sync context flag (and its FLYWEIGHT_CUDA_SPIN_WAIT
+        # opt-out) measured neutral and was removed; neither the driver nor
+        # the probe may quietly reintroduce a scheduling override.
         root = Path(__file__).resolve().parents[1]
         driver = (root / "native/src/gpu_driver.cpp").read_text(encoding="utf-8")
         runtime = (root / "native/src/v2_runtime.cpp").read_text(encoding="utf-8")
 
-        self.assertIn("cuDevicePrimaryCtxSetFlags", driver)
-        self.assertIn("cuCtxSetFlags", driver)
-        self.assertIn("kCtxSchedBlockingSync = 0x04", driver)
-        self.assertIn("FLYWEIGHT_CUDA_SPIN_WAIT", driver)
-        # gpu_info() retains the primary context before runtime initialization,
-        # so the probe must set the same scheduling policy first.
-        self.assertIn("cuDevicePrimaryCtxSetFlags", runtime)
-        self.assertIn("set_flags(device,0x04)", runtime)
+        for source in (driver, runtime):
+            self.assertNotIn("cuDevicePrimaryCtxSetFlags", source)
+            self.assertNotIn("cuCtxSetFlags", source)
+            self.assertNotIn("FLYWEIGHT_CUDA_SPIN_WAIT", source)
 
     def test_native_tiled_attention_covers_f16_bf16_and_q8(self):
         root = Path(__file__).resolve().parents[1]
@@ -817,7 +816,10 @@ class V2RuntimeTests(unittest.TestCase):
                 + bytes(sliding_pattern),
             ))
         metadata = b"".join(metadata_items)
-        tensor = gguf_string("token_embd.weight") + struct.pack("<IQQIQ", 2, 2, 2, 0, 0)
+        # One f32 element, matching the four payload bytes below: the parser
+        # now checks that a tensor's bytes back its shape, so a 2x2 f32 over
+        # a 4-byte payload is (correctly) refused as truncated.
+        tensor = gguf_string("token_embd.weight") + struct.pack("<IQQIQ", 2, 1, 1, 0, 0)
         header = b"GGUF" + struct.pack("<IQQ", 3, 1, len(metadata_items))
         body = header + metadata + tensor
         body += b"\0" * ((32 - len(body) % 32) % 32)

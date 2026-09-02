@@ -296,8 +296,12 @@ public:
         remaining_.store(workers, std::memory_order_relaxed);
 
         // Publishing the generation releases the job fields above to workers.
-        generation_.fetch_add(1, std::memory_order_release);
-        if (sleepers_.load(std::memory_order_acquire) > 0) {
+        // Sequentially consistent, paired with the worker's seq_cst
+        // sleepers_ increment: each side stores then loads the other's flag
+        // (Dekker), and with weaker orders both could read stale values --
+        // the launcher skipping the notify while the worker parks for good.
+        generation_.fetch_add(1, std::memory_order_seq_cst);
+        if (sleepers_.load(std::memory_order_seq_cst) > 0) {
             std::lock_guard<std::mutex> lock(sleep_mutex_);
             sleep_signal_.notify_all();
         }
@@ -346,6 +350,10 @@ private:
             } catch (const std::exception& error) {
                 if (failure != nullptr && failure->empty()) *failure = error.what();
                 return;
+            } catch (...) {
+                if (failure != nullptr && failure->empty())
+                    *failure = "non-standard exception in a CPU kernel block";
+                return;
             }
         }
     }
@@ -363,6 +371,10 @@ private:
             } catch (const std::exception& error) {
                 record_failure(error.what());
                 // Drain the grid so the launch still terminates.
+                next_block_.store(blocks_, std::memory_order_relaxed);
+                return;
+            } catch (...) {
+                record_failure("non-standard exception in a CPU kernel block");
                 next_block_.store(blocks_, std::memory_order_relaxed);
                 return;
             }
@@ -400,9 +412,25 @@ private:
                     std::this_thread::yield();
                 } else {
                     std::unique_lock<std::mutex> lock(sleep_mutex_);
-                    sleepers_.fetch_add(1, std::memory_order_release);
-                    sleep_signal_.wait_for(lock, std::chrono::milliseconds(2));
-                    sleepers_.fetch_sub(1, std::memory_order_release);
+                    sleepers_.fetch_add(1, std::memory_order_seq_cst);
+                    // Re-check after registering as a sleeper: a launch that
+                    // bumped the generation between the load above and this
+                    // increment saw sleepers_ == 0 and did not notify. The
+                    // old 2 ms timed wait papered over that race at the cost
+                    // of a 2 ms stall per hit and, once the spin budget was
+                    // spent, a wakeup per worker every 2 ms for as long as
+                    // the process idled. With the re-check the wait needs no
+                    // timeout: run() and shutdown() both notify under the
+                    // mutex after publishing their flag.
+                    if (generation_.load(std::memory_order_seq_cst) == seen
+                        && !stopping_.load(std::memory_order_acquire)) {
+                        sleep_signal_.wait(lock, [&] {
+                            return generation_.load(std::memory_order_acquire)
+                                       != seen
+                                || stopping_.load(std::memory_order_acquire);
+                        });
+                    }
+                    sleepers_.fetch_sub(1, std::memory_order_seq_cst);
                 }
                 current = generation_.load(std::memory_order_acquire);
             }

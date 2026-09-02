@@ -225,6 +225,24 @@ constexpr unsigned int kThreadsPerBlock = 256;
 // launch pays an OS-scheduler submission. Decode-path code keys graph capture
 // and command-buffer flush heuristics off this. Cached by flyweight_gpu_init.
 int g_wddm = 0;
+// Device whose primary context g_context holds; -1 until flyweight_gpu_init.
+int g_device = -1;
+
+// The driver API's current context is per thread. Every entry point that
+// touches the driver binds it here, once per thread, so a call from a thread
+// that never ran flyweight_gpu_init (the engine thread, a background
+// registration worker) does not fail with CUDA_ERROR_INVALID_CONTEXT -- and
+// so a call before the driver was loaded returns an error instead of jumping
+// through a null API pointer.
+bool driver_ready() {
+    if (!g_api.loaded || g_context == nullptr) return false;
+    static thread_local CUcontext bound = nullptr;
+    if (bound != g_context) {
+        if (g_api.cuCtxSetCurrent(g_context) != 0) return false;
+        bound = g_context;
+    }
+    return true;
+}
 
 struct Kernels {
     CUfunction rms_norm = nullptr;
@@ -325,9 +343,49 @@ bool load_apis() {
     if (cuda == nullptr) {
         cuda = dlopen("libcuda.so", RTLD_NOW | RTLD_GLOBAL);
     }
-    nvrtc = dlopen("libnvrtc.so", RTLD_NOW | RTLD_GLOBAL);
+    // Runtime-only installs (the distro `cuda-nvrtc-12-x` packages and the
+    // `nvidia-cuda-nvrtc-cu12` wheel) ship only the versioned soname; the
+    // bare `libnvrtc.so` symlink is a -dev package artifact. Probe the
+    // versioned names first, like cuBLAS below, then fall back to the
+    // toolkit directory named by CUDA_PATH / CUDA_HOME.
+    {
+        const char* names[] = {
+            "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11", "libnvrtc.so",
+        };
+        for (const char* name : names) {
+            nvrtc = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+            if (nvrtc != nullptr) break;
+        }
+        if (nvrtc == nullptr) {
+            const char* roots[] = {std::getenv("CUDA_PATH"), std::getenv("CUDA_HOME")};
+            for (const char* root : roots) {
+                if (root == nullptr || *root == '\0') continue;
+                for (const char* name : names) {
+                    const std::string path = std::string(root) + "/lib64/" + name;
+                    nvrtc = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+                    if (nvrtc != nullptr) break;
+                }
+                if (nvrtc != nullptr) break;
+            }
+        }
+    }
 #endif
     if (cuda == nullptr || nvrtc == nullptr) {
+        // Say which half is missing: "GPU unavailable" with a working driver
+        // is otherwise indistinguishable from a machine without one.
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr,
+                "[flyweight] CUDA disabled: %s not found\n",
+                cuda == nullptr ? "the NVIDIA driver library (libcuda)"
+                                : "the NVRTC library (libnvrtc, CUDA toolkit or "
+                                  "nvidia-cuda-nvrtc wheel)");
+        }
+#if !defined(_WIN32)
+        if (cuda != nullptr) dlclose(cuda);
+        if (nvrtc != nullptr) dlclose(nvrtc);
+#endif
         return false;
     }
     bool ok = true;
@@ -552,6 +610,7 @@ int launch(
             name, grid_x, grid_y, block_x, shared_bytes,
             reinterpret_cast<std::uint64_t>(stream), args);
     }
+    if (!driver_ready()) return -1;
     return g_api.cuLaunchKernel(
         function,
         grid_x, grid_y, 1,
@@ -751,6 +810,11 @@ extern "C" int flyweight_gpu_init(std::int32_t device) {
         if (g_api.cuDevicePrimaryCtxRetain(&g_context, device) != 0) {
             return -3;
         }
+        g_device = device;
+    } else if (device != g_device) {
+        // One primary context per process: a second device would silently
+        // run on the first one's context while compiling for its own arch.
+        return -5;
     }
     if (g_api.cuCtxSetCurrent(g_context) != 0) {
         return -4;
@@ -848,8 +912,16 @@ extern "C" int flyweight_gpu_compile(
     std::lock_guard<std::mutex> compile_lock(compile_mutex);
     int major = 0;
     int minor = 0;
-    g_api.cuDeviceGetAttribute(&major, kAttributeComputeMajor, device);
-    g_api.cuDeviceGetAttribute(&minor, kAttributeComputeMinor, device);
+    if (g_api.cuDeviceGetAttribute(&major, kAttributeComputeMajor, device) != 0
+        || g_api.cuDeviceGetAttribute(&minor, kAttributeComputeMinor, device) != 0
+        || major <= 0) {
+        // An unchecked failure here used to compile for "compute_00".
+        if (log_buffer != nullptr && log_capacity > 0)
+            std::snprintf(log_buffer, log_capacity,
+                          "cannot query the compute capability of device %d",
+                          device);
+        return -1;
+    }
     char arch[64];
     std::snprintf(
         arch, sizeof(arch), "--gpu-architecture=compute_%d%d", major, minor
@@ -920,11 +992,37 @@ extern "C" int flyweight_gpu_compile(
         );
         if (log_buffer != nullptr && log_capacity > 0) {
             size_t log_size = 0;
-            g_api.nvrtcGetProgramLogSize(program, &log_size);
-            std::vector<char> log(log_size + 1, '\0');
-            g_api.nvrtcGetProgramLog(program, log.data());
-            std::strncpy(log_buffer, log.data(), log_capacity - 1);
-            log_buffer[log_capacity - 1] = '\0';
+            log_buffer[0] = '\0';
+            if (g_api.nvrtcGetProgramLogSize(program, &log_size) == 0
+                && log_size > 0) {
+                std::vector<char> log(log_size + 1, '\0');
+                if (g_api.nvrtcGetProgramLog(program, log.data()) == 0) {
+                    const size_t length = std::strlen(log.data());
+                    const auto capacity = static_cast<size_t>(log_capacity);
+                    if (length < capacity) {
+                        std::memcpy(log_buffer, log.data(), length + 1);
+                    } else {
+                        // Keep the head and the tail: NVRTC lists diagnostics
+                        // in source order, so a long run of warnings used to
+                        // push the first `error:` line past a silent cut.
+                        const char marker[] = "\n...[log truncated]...\n";
+                        const size_t marker_length = sizeof(marker) - 1;
+                        if (capacity > marker_length + 2) {
+                            const size_t room = capacity - 1 - marker_length;
+                            const size_t head = room / 2;
+                            const size_t tail = room - head;
+                            std::memcpy(log_buffer, log.data(), head);
+                            std::memcpy(log_buffer + head, marker, marker_length);
+                            std::memcpy(log_buffer + head + marker_length,
+                                        log.data() + length - tail, tail);
+                            log_buffer[capacity - 1] = '\0';
+                        } else {
+                            std::memcpy(log_buffer, log.data(), capacity - 1);
+                            log_buffer[capacity - 1] = '\0';
+                        }
+                    }
+                }
+            }
         }
         if (compiled != 0) {
             g_api.nvrtcDestroyProgram(&program);
@@ -1419,7 +1517,7 @@ extern "C" int flyweight_gpu_q4_moe(
 extern "C" int flyweight_gpu_sync() {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_sync();
 
-    if (!g_api.loaded) {
+    if (!driver_ready()) {
         return -1;
     }
     return g_api.cuStreamSynchronize(nullptr) == 0 ? 0 : -2;
@@ -1428,8 +1526,7 @@ extern "C" int flyweight_gpu_sync() {
 extern "C" int flyweight_gpu_alloc(std::uint64_t bytes, std::uint64_t* pointer) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_alloc(bytes, pointer);
 
-    if (g_context == nullptr || pointer == nullptr || bytes == 0
-        || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
+    if (pointer == nullptr || bytes == 0 || !driver_ready()) return -1;
     CUdeviceptr allocation = 0;
     if (g_api.cuMemAlloc(&allocation, static_cast<size_t>(bytes)) != 0) return -2;
     *pointer = static_cast<std::uint64_t>(allocation);
@@ -1440,14 +1537,14 @@ extern "C" int flyweight_gpu_free(std::uint64_t pointer) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_free(pointer);
 
     if (pointer == 0) return 0;
-    if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
+    if (!driver_ready()) return -1;
     return g_api.cuMemFree(static_cast<CUdeviceptr>(pointer)) == 0 ? 0 : -2;
 }
 
 extern "C" int flyweight_gpu_host_alloc(std::uint64_t bytes, void** pointer) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_host_alloc(bytes, pointer);
 
-    if (pointer == nullptr || bytes == 0) return -1;
+    if (pointer == nullptr || bytes == 0 || !driver_ready()) return -1;
     return g_api.cuMemHostAlloc(pointer, static_cast<size_t>(bytes), 0) == 0
         ? 0 : -2;
 }
@@ -1456,6 +1553,7 @@ extern "C" int flyweight_gpu_host_free(void* pointer) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_host_free(pointer);
 
     if (pointer == nullptr) return 0;
+    if (!driver_ready()) return -1;
     return g_api.cuMemFreeHost(pointer) == 0 ? 0 : -1;
 }
 
@@ -1467,11 +1565,11 @@ extern "C" int flyweight_gpu_host_register(const void* pointer, std::uint64_t by
 
     if (pointer == nullptr || bytes == 0) return -1;
     if (g_api.cuMemHostRegister == nullptr) return -3;
-    // Bind the primary context like every other entry point here does. Without
-    // this the call works only on the thread that ran flyweight_gpu_init, which
+    // Binds the primary context on this thread (driver_ready). Without that
+    // the call worked only on the thread that ran flyweight_gpu_init, which
     // made background registration (a worker pinning expert tensors while the
     // main thread decodes) fail with INVALID_CONTEXT.
-    if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
+    if (!driver_ready()) return -1;
     void* host = const_cast<void*>(pointer);
     // READ_ONLY (0x08) is unsupported on many drivers (CUDA_ERROR_NOT_SUPPORTED);
     // PORTABLE (0x01) works once the mapping is writable copy-on-write.
@@ -1486,7 +1584,7 @@ extern "C" int flyweight_gpu_host_unregister(const void* pointer) {
 
     if (pointer == nullptr) return 0;
     if (g_api.cuMemHostUnregister == nullptr) return -3;
-    if (g_context == nullptr || g_api.cuCtxSetCurrent(g_context) != 0) return -1;
+    if (!driver_ready()) return -1;
     return g_api.cuMemHostUnregister(const_cast<void*>(pointer)) == 0 ? 0 : -1;
 }
 
@@ -1496,7 +1594,8 @@ extern "C" int flyweight_gpu_upload(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_upload(destination, source, bytes, stream);
 
-    if (destination == 0 || source == nullptr || bytes == 0) return -1;
+    if (destination == 0 || source == nullptr || bytes == 0 || !driver_ready())
+        return -1;
     return g_api.cuMemcpyHtoDAsync(
         static_cast<CUdeviceptr>(destination), source, static_cast<size_t>(bytes),
         reinterpret_cast<CUstream>(stream)
@@ -1508,7 +1607,8 @@ extern "C" int flyweight_gpu_upload_sync(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_upload_sync(destination, source, bytes);
 
-    if (destination == 0 || source == nullptr || bytes == 0) return -1;
+    if (destination == 0 || source == nullptr || bytes == 0 || !driver_ready())
+        return -1;
     return g_api.cuMemcpyHtoD(
         static_cast<CUdeviceptr>(destination), source, static_cast<size_t>(bytes)
     ) == 0 ? 0 : -2;
@@ -1520,7 +1620,8 @@ extern "C" int flyweight_gpu_download(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_download(destination, source, bytes, stream);
 
-    if (destination == nullptr || source == 0 || bytes == 0) return -1;
+    if (destination == nullptr || source == 0 || bytes == 0 || !driver_ready())
+        return -1;
     return g_api.cuMemcpyDtoHAsync(
         destination, static_cast<CUdeviceptr>(source), static_cast<size_t>(bytes),
         reinterpret_cast<CUstream>(stream)
@@ -1534,7 +1635,8 @@ extern "C" int flyweight_gpu_copy_device(
     if (flyweight_backend_is_cpu())
         return flyweight_cpu_copy_device(destination, source, bytes, stream);
 
-    if (destination == 0 || source == 0 || bytes == 0) return -1;
+    if (destination == 0 || source == 0 || bytes == 0 || !driver_ready())
+        return -1;
     return g_api.cuMemcpyDtoDAsync(
         static_cast<CUdeviceptr>(destination), static_cast<CUdeviceptr>(source),
         static_cast<size_t>(bytes), reinterpret_cast<CUstream>(stream)
@@ -1547,7 +1649,7 @@ extern "C" int flyweight_gpu_memset(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_memset(destination, value, bytes, stream);
 
-    if (destination == 0 || bytes == 0) return -1;
+    if (destination == 0 || bytes == 0 || !driver_ready()) return -1;
     return g_api.cuMemsetD8Async(
         static_cast<CUdeviceptr>(destination), value, static_cast<size_t>(bytes),
         reinterpret_cast<CUstream>(stream)
@@ -1557,7 +1659,7 @@ extern "C" int flyweight_gpu_memset(
 extern "C" int flyweight_gpu_stream_create(std::uint64_t* stream) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_create(stream);
 
-    if (stream == nullptr) return -1;
+    if (stream == nullptr || !driver_ready()) return -1;
     CUstream created = nullptr;
     if (g_api.cuStreamCreate(&created, 1) != 0) return -2;
     *stream = reinterpret_cast<std::uint64_t>(created);
@@ -1568,6 +1670,7 @@ extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_destroy(stream);
 
     if (stream == 0) return 0;
+    if (!driver_ready()) return -1;
     const auto cuda_stream = reinterpret_cast<CUstream>(stream);
     {
         // NVFP4 scratch is process-global and remembers the stream that last
@@ -1614,6 +1717,7 @@ extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
 extern "C" int flyweight_gpu_stream_sync(std::uint64_t stream) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_sync(stream);
 
+    if (!driver_ready()) return -1;
     return g_api.cuStreamSynchronize(reinterpret_cast<CUstream>(stream)) == 0
         ? 0 : -1;
 }
@@ -1621,7 +1725,7 @@ extern "C" int flyweight_gpu_stream_sync(std::uint64_t stream) {
 extern "C" int flyweight_gpu_stream_query(std::uint64_t stream) {
     if (flyweight_backend_is_cpu()) return 0;
 
-    if (g_api.cuStreamQuery == nullptr) return -1;
+    if (g_api.cuStreamQuery == nullptr || !driver_ready()) return -1;
     // Queried purely for its side effect on WDDM: submission of the batched
     // command buffer. 0 = idle, 1 = work still pending, -1 = error.
     const CUresult result =
@@ -1633,7 +1737,8 @@ extern "C" int flyweight_gpu_stream_query(std::uint64_t stream) {
 extern "C" int flyweight_gpu_graph_begin(std::uint64_t stream) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_begin(stream);
 
-    if (stream == 0 || g_api.cuStreamBeginCapture == nullptr) return -1;
+    if (stream == 0 || g_api.cuStreamBeginCapture == nullptr || !driver_ready())
+        return -1;
     return g_api.cuStreamBeginCapture(
         reinterpret_cast<CUstream>(stream), 2 /* relaxed */
     ) == 0 ? 0 : -2;
@@ -1644,7 +1749,8 @@ extern "C" int flyweight_gpu_graph_end(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_end(stream, handle);
 
-    if (stream == 0 || handle == nullptr || g_api.cuStreamEndCapture == nullptr)
+    if (stream == 0 || handle == nullptr || g_api.cuStreamEndCapture == nullptr
+        || !driver_ready())
         return -1;
     *handle = 0;
     void* graph = nullptr;
@@ -1664,7 +1770,8 @@ extern "C" int flyweight_gpu_graph_launch(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_launch(graph, stream);
 
-    if (graph == 0 || stream == 0 || g_api.cuGraphLaunch == nullptr) return -1;
+    if (graph == 0 || stream == 0 || g_api.cuGraphLaunch == nullptr
+        || !driver_ready()) return -1;
     return g_api.cuGraphLaunch(
         reinterpret_cast<void*>(graph), reinterpret_cast<CUstream>(stream)
     ) == 0 ? 0 : -2;
@@ -1674,14 +1781,14 @@ extern "C" int flyweight_gpu_graph_destroy(std::uint64_t graph) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_graph_destroy(graph);
 
     if (graph == 0) return 0;
-    if (g_api.cuGraphExecDestroy == nullptr) return -1;
+    if (g_api.cuGraphExecDestroy == nullptr || !driver_ready()) return -1;
     return g_api.cuGraphExecDestroy(reinterpret_cast<void*>(graph)) == 0 ? 0 : -2;
 }
 
 extern "C" int flyweight_gpu_event_create(std::uint64_t* event) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_event_create(event);
 
-    if (event == nullptr) return -1;
+    if (event == nullptr || !driver_ready()) return -1;
     CUevent created = nullptr;
     if (g_api.cuEventCreate(&created, 2 /* disable timing */) != 0) return -2;
     *event = reinterpret_cast<std::uint64_t>(created);
@@ -1691,7 +1798,7 @@ extern "C" int flyweight_gpu_event_create(std::uint64_t* event) {
 extern "C" int flyweight_gpu_timed_event_create(std::uint64_t* event) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_timed_event_create(event);
 
-    if (event == nullptr) return -1;
+    if (event == nullptr || !driver_ready()) return -1;
     CUevent created = nullptr;
     if (g_api.cuEventCreate(&created, 0) != 0) return -2;
     *event = reinterpret_cast<std::uint64_t>(created);
@@ -1703,7 +1810,7 @@ extern "C" int flyweight_gpu_event_record(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_event_record(event, stream);
 
-    if (event == 0) return -1;
+    if (event == 0 || !driver_ready()) return -1;
     return g_api.cuEventRecord(
         reinterpret_cast<CUevent>(event), reinterpret_cast<CUstream>(stream)
     ) == 0 ? 0 : -2;
@@ -1712,7 +1819,7 @@ extern "C" int flyweight_gpu_event_record(
 extern "C" int flyweight_gpu_event_sync(std::uint64_t event) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_event_sync(event);
 
-    if (event == 0) return -1;
+    if (event == 0 || !driver_ready()) return -1;
     return g_api.cuEventSynchronize(reinterpret_cast<CUevent>(event)) == 0
         ? 0 : -2;
 }
@@ -1722,7 +1829,7 @@ extern "C" int flyweight_gpu_stream_wait_event(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_wait_event(stream, event);
 
-    if (event == 0) return -1;
+    if (event == 0 || !driver_ready()) return -1;
     return g_api.cuStreamWaitEvent(
         reinterpret_cast<CUstream>(stream), reinterpret_cast<CUevent>(event), 0
     ) == 0 ? 0 : -2;
@@ -1732,6 +1839,7 @@ extern "C" int flyweight_gpu_event_destroy(std::uint64_t event) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_event_destroy(event);
 
     if (event == 0) return 0;
+    if (!driver_ready()) return -1;
     return g_api.cuEventDestroy(reinterpret_cast<CUevent>(event)) == 0
         ? 0 : -1;
 }
@@ -1741,7 +1849,8 @@ extern "C" int flyweight_gpu_event_elapsed(
 ) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_event_elapsed(start, end, milliseconds);
 
-    if (start == 0 || end == 0 || milliseconds == nullptr) return -1;
+    if (start == 0 || end == 0 || milliseconds == nullptr || !driver_ready())
+        return -1;
     return g_api.cuEventElapsedTime(
         milliseconds, reinterpret_cast<CUevent>(start),
         reinterpret_cast<CUevent>(end)

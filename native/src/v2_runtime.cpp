@@ -220,6 +220,47 @@ struct Tensor : flyweight::v2::TensorDescriptor {
     const uint8_t* source = nullptr;
 };
 
+// Bytes one row of `columns` elements occupies for the GGML types this
+// runtime lays out itself; `block_elements` is left at zero for a type it
+// does not describe (the dedicated MXFP4/NVFP4 tensors carry per-tensor
+// trailers and are validated by their own loaders).
+std::uint64_t gguf_row_bytes(std::uint32_t type,std::uint64_t columns,std::uint32_t&block_elements){
+    std::uint32_t block_bytes=0;
+    switch(type){
+        case 0: block_elements=1;block_bytes=4;break;   // F32
+        case 1: block_elements=1;block_bytes=2;break;   // F16
+        case 30:block_elements=1;block_bytes=2;break;   // BF16
+        case 24:block_elements=1;block_bytes=1;break;   // I8
+        case 25:block_elements=1;block_bytes=2;break;   // I16
+        case 26:block_elements=1;block_bytes=4;break;   // I32
+        case 27:block_elements=1;block_bytes=8;break;   // I64
+        case 28:block_elements=1;block_bytes=8;break;   // F64
+        case 2: block_elements=32;block_bytes=18;break; // Q4_0
+        case 3: block_elements=32;block_bytes=20;break; // Q4_1
+        case 6: block_elements=32;block_bytes=22;break; // Q5_0
+        case 7: block_elements=32;block_bytes=24;break; // Q5_1
+        case 8: block_elements=32;block_bytes=34;break; // Q8_0
+        case 9: block_elements=32;block_bytes=36;break; // Q8_1
+        case 10:block_elements=256;block_bytes=84;break;  // Q2_K
+        case 11:block_elements=256;block_bytes=110;break; // Q3_K
+        case 12:block_elements=256;block_bytes=144;break; // Q4_K
+        case 13:block_elements=256;block_bytes=176;break; // Q5_K
+        case 14:block_elements=256;block_bytes=210;break; // Q6_K
+        case 15:block_elements=256;block_bytes=292;break; // Q8_K
+        case 16:block_elements=256;block_bytes=66;break;  // IQ2_XXS
+        case 17:block_elements=256;block_bytes=74;break;  // IQ2_XS
+        case 18:block_elements=256;block_bytes=98;break;  // IQ3_XXS
+        case 19:block_elements=256;block_bytes=50;break;  // IQ1_S
+        case 20:block_elements=32;block_bytes=18;break;   // IQ4_NL
+        case 21:block_elements=256;block_bytes=110;break; // IQ3_S
+        case 22:block_elements=256;block_bytes=82;break;  // IQ2_S
+        case 23:block_elements=256;block_bytes=136;break; // IQ4_XS
+        case 29:block_elements=256;block_bytes=56;break;  // IQ1_M
+        default: block_elements=0;return 0;
+    }
+    return columns/block_elements*block_bytes;
+}
+
 struct Reader {
     const uint8_t* p; const uint8_t* end;
     template <class T> T get() { if (end-p < static_cast<ptrdiff_t>(sizeof(T))) throw std::runtime_error("truncated GGUF"); T v; std::memcpy(&v,p,sizeof(v)); p += sizeof(v); return v; }
@@ -751,6 +792,9 @@ struct FlyweightV2QwenRuntime {
     std::uint32_t lm_head_type = 2;
     std::uint64_t rope_factors = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t static_tensor_bytes = 0;
+    // static_tensor_bytes as the plan computed it, captured by the first
+    // prepare so a retried prepare can restart from it.
+    std::uint64_t plan_static_tensor_bytes = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t expert_tensor_bytes = 0;
     std::uint64_t mtp_tensor_bytes = 0;
     std::uint32_t scratch_elements = 0;
@@ -974,6 +1018,11 @@ struct FlyweightV2QwenRuntime {
     std::uint32_t mtp_fold_rows = 0;
     bool mtp_delta_layers = false;
     std::uint64_t mtp_cache_tokens = 0;
+    // Device rows the sampled MTP round hands the sampler: the verify batch's
+    // normalized hiddens, copied out of the rows workspace because the
+    // sampler's own scratch (decode-layout regions) may overlap them there.
+    // 8 x hidden floats, allocated on first use, freed with the device state.
+    std::uint64_t mtp_sampling_rows = 0;
     std::uint64_t decode_calls = 0;
     std::uint64_t decode_nanoseconds = 0;
     std::uint64_t route_wait_nanoseconds = 0;
@@ -1123,6 +1172,10 @@ struct FlyweightV2QwenRuntime {
     std::vector<std::uint64_t> engine_cancel_requests;
     std::uint64_t engine_next_task_id = 1;
     std::vector<struct QwenEngineTask> engine_tasks;
+    // What killed a task, keyed by id, for flyweight_v2_qwen_task_error.
+    // The event carries only a kind; without this every failure reached
+    // the client as the same fixed sentence. Guarded by engine_mutex.
+    std::unordered_map<std::uint64_t,std::string> engine_task_errors;
     std::vector<long long> slot_owner;
     std::size_t engine_cursor = 0;
     std::mutex engine_mutex;
@@ -1141,7 +1194,9 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t decode_slice_bytes = 0;
     std::uint64_t decode_host_block_bytes = 0;
     std::uint32_t multi_decode_capacity = 1;
-    bool cancelled = false;
+    // Set by flyweight_v2_qwen_runtime_cancel from any thread while a
+    // generate/engine step runs on another.
+    std::atomic<bool> cancelled{false};
     bool cache_admission_enabled = true;
     bool expert_residency_frozen = false;
     bool strict_cache_admission = true;
@@ -2037,6 +2092,8 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     runtime.host_ffn_q8_bytes = 0;
     if (runtime.embedding_event) flyweight_gpu_event_destroy(runtime.embedding_event);
     flyweight_gpu_host_free(runtime.embedding_host);
+    flyweight_gpu_free(runtime.mtp_sampling_rows);
+    runtime.mtp_sampling_rows = 0;
     flyweight_gpu_free(runtime.turbo_kv_stage);
     runtime.turbo_kv_stage = 0;
     runtime.turbo_kv_stage_bytes = 0;
@@ -2571,6 +2628,35 @@ int parse(FlyweightV2Model& m) {
     if(!m.config.intermediate_size)m.config.intermediate_size=m.config.expert_intermediate_size?m.config.expert_intermediate_size:m.config.dense_intermediate_size;
     uint64_t data_offset=align_to(static_cast<uint64_t>(r.p-m.data),m.alignment ? m.alignment : 32); if(data_offset>m.size) throw std::runtime_error("GGUF tensor data is outside the file"); for(auto& t:m.tensors) { if(t.offset>m.size-data_offset) throw std::runtime_error("GGUF tensor offset out of bounds"); t.offset += data_offset; }
     for(size_t i=0;i<m.tensors.size();i++) { auto& t=m.tensors[i]; uint64_t next=m.size; for(auto const& other:m.tensors) if(other.offset>t.offset) next=std::min(next,other.offset); t.size=next-t.offset; }
+    // A tensor's shape and type must be backed by bytes actually present.
+    // t.size above is the gap to the next tensor (or the file end), never
+    // compared with what the shape implies, and every consumer strides by
+    // shape -- so a truncated download or a header that lies about a shape
+    // read past the mapping (SIGBUS) or into the neighbouring tensor
+    // (silently wrong numerics) instead of failing here.
+    for(const auto& t:m.tensors){
+        if(t.shape.empty())continue;
+        std::uint32_t block_elements=0;
+        const auto row_bytes=gguf_row_bytes(t.type,t.shape[0],block_elements);
+        if(block_elements==0)continue;  // a type this table does not describe
+        if(t.shape[0]%block_elements)
+            throw std::runtime_error("GGUF tensor "+t.name+" has a row width of "+
+                std::to_string(t.shape[0])+" that is not a multiple of its "+
+                std::to_string(block_elements)+"-element block");
+        std::uint64_t rows=1;
+        for(std::size_t d=1;d<t.shape.size();++d){
+            if(t.shape[d]&&rows>std::numeric_limits<std::uint64_t>::max()/t.shape[d])
+                throw std::runtime_error("GGUF tensor "+t.name+" shape overflows");
+            rows*=t.shape[d];
+        }
+        if(row_bytes&&rows>std::numeric_limits<std::uint64_t>::max()/row_bytes)
+            throw std::runtime_error("GGUF tensor "+t.name+" shape overflows");
+        const auto expected=rows*row_bytes;
+        if(expected>t.size)
+            throw std::runtime_error("GGUF tensor "+t.name+" is truncated: its shape needs "+
+                std::to_string(expected)+" bytes but only "+std::to_string(t.size)+
+                " are present (the file is incomplete or its header is wrong)");
+    }
     build_tokenizer_tables(m);
     return 0;
 }
@@ -4385,7 +4471,29 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     else if(type==30){const auto*row_data=reinterpret_cast<const std::uint16_t*>(packed)+base;for(int index=0;index<elements;++index)output[index]=qwen_bf16_value(row_data[index]);}
     else if(type==1){for(int index=0;index<elements;++index){std::uint16_t bits=0;std::memcpy(&bits,packed+(base+index)*2,2);output[index]=qwen_half_value(bits);}}
     else if(type==0){const auto*row_data=reinterpret_cast<const float*>(packed)+base;for(int index=0;index<elements;++index)output[index]=row_data[index];}
-    else throw std::runtime_error("unsupported native CPU expert quantization");
+    else if(type==2){
+        // Q4_0: f16 scale then 16 bytes of nibbles, low half first (same walk
+        // as qwen_quant_dot). Advertised as a CPU expert type, but the row
+        // dequant the batched prefill uses had no branch, so a Q4_0 MoE
+        // decoded fine and threw on its first prefill chunk.
+        const auto*row_data=packed+row*static_cast<std::uint64_t>(elements/32)*18;
+        for(int block=0;block<elements/32;++block){
+            const auto*base_ptr=row_data+block*18;std::uint16_t scale_bits=0;std::memcpy(&scale_bits,base_ptr,2);
+            const float scale=qwen_half_value(scale_bits);float*dst=output+block*32;
+            for(int lane=0;lane<16;++lane){const auto byte=base_ptr[2+lane];dst[lane]=scale*static_cast<float>((byte&15)-8);dst[lane+16]=scale*static_cast<float>((byte>>4)-8);}
+        }
+    }
+    else if(type==39){
+        const int blocks=elements/kMxfp4BlockElements;
+        const std::uint64_t row_offset=static_cast<std::uint64_t>(row)*blocks*kMxfp4BlockSize;
+        for(int block=0;block<blocks;++block){
+            const auto*base_ptr=packed+row_offset+block*kMxfp4BlockSize;
+            const float scale=mxfp4_scale(base_ptr[0]);float*dst=output+block*kMxfp4BlockElements;
+            for(int lane=0;lane<16;++lane){const auto byte=base_ptr[1+lane];dst[lane]=scale*kMxfp4Lut[byte&15];dst[lane+16]=scale*kMxfp4Lut[byte>>4];}
+        }
+    }
+    else if(type==29)for(int index=0;index<elements;++index)output[index]=qwen_iq1m_value(packed,base+index);
+    else throw std::runtime_error("unsupported native CPU expert quantization: "+std::to_string(type));
 }
 
 void qwen_f32_dot_multi(const float*row,const float*const*inputs,int count,int elements,float*outputs){
@@ -4785,6 +4893,25 @@ void qwen_advise_access_pattern(const FlyweightV2QwenRuntime& runtime) {
 #endif
 }
 
+// Row stride of the n-gram table, checking the width tiles the type's block.
+// F32 and IQ4_NL are what the released GGUFs ship and keep their inline
+// decoders below; any other type the row dequant knows goes through it.
+std::uint64_t qwen4_ple_row_bytes(std::uint32_t type, std::uint64_t row_width) {
+    if (type == 0) return row_width * sizeof(float);
+    std::uint32_t block_elements = 0;
+    const auto row_bytes = gguf_row_bytes(type, row_width, block_elements);
+    if (block_elements == 0)
+        throw std::runtime_error(
+            "native qwen4exp PLE table type is not implemented yet: "
+            + std::to_string(type));
+    if (row_width % block_elements != 0)
+        throw std::runtime_error(
+            "native qwen4exp PLE rows must be a multiple of "
+            + std::to_string(block_elements) + " wide for type "
+            + std::to_string(type));
+    return row_bytes;
+}
+
 void qwen4_stage_ple_embed(
     FlyweightV2QwenRuntime& runtime, std::uint32_t token,
     const std::vector<std::uint32_t>& history, std::uint64_t destination
@@ -4800,18 +4927,9 @@ void qwen4_stage_ple_embed(
     const std::uint32_t head_count = (config.ple_ngram_size - 1) * heads_per;
     const auto& table = runtime.model->tensors[runtime.ple_table];
     const std::uint64_t row_width = config.per_layer_embedding_size;
-    if (table.type != 0 && table.type != 20)
-        throw std::runtime_error(
-            "native qwen4exp PLE table type is not implemented yet: "
-            + std::to_string(table.type));
-    if (table.type == 20 && row_width % kIq4nlBlockElements != 0)
-        throw std::runtime_error(
-            "native qwen4exp IQ4_NL PLE rows must be a multiple of 32 wide");
+    const std::uint64_t row_bytes = qwen4_ple_row_bytes(table.type, row_width);
     const auto* source = tensor_data(*runtime.model, table);
     const std::uint64_t rows_total = table.shape[1];  // GGUF shape [width, rows]
-    const std::uint64_t row_bytes = table.type == 20
-        ? row_width / kIq4nlBlockElements * kIq4nlBlockBytes
-        : row_width * sizeof(float);
     // Pageable source is fine here: an async upload from pageable memory
     // stages internally before returning, so the buffer can be reused.
     static thread_local std::vector<float> gathered;
@@ -4842,8 +4960,14 @@ void qwen4_stage_ple_embed(
                     out[element + 16] = scale * kIq4nlValues[byte >> 4];
                 }
             }
-        } else {
+        } else if (table.type == 0) {
             std::memcpy(destination, row_data, row_width * sizeof(float));
+        } else {
+            // Any other row-decodable type (the K-quants and the IQ family)
+            // through the shared row dequant; the stride check above already
+            // guaranteed the width tiles the block.
+            qwen_dequant_row(source, table.type, static_cast<int>(row_width), row,
+                             destination);
         }
     }
     if (flyweight_gpu_upload(destination, gathered.data(),
@@ -4868,15 +4992,9 @@ void qwen4_stage_ple_embed_rows(
     const std::uint32_t head_count = (config.ple_ngram_size - 1) * heads_per;
     const auto& table = runtime.model->tensors[runtime.ple_table];
     const std::uint64_t row_width = config.per_layer_embedding_size;
-    if (table.type != 0 && table.type != 20)
-        throw std::runtime_error(
-            "native qwen4exp PLE table type is not implemented yet: "
-            + std::to_string(table.type));
+    const std::uint64_t row_bytes = qwen4_ple_row_bytes(table.type, row_width);
     const auto* source = tensor_data(*runtime.model, table);
     const std::uint64_t rows_total = table.shape[1];
-    const std::uint64_t row_bytes = table.type == 20
-        ? row_width / kIq4nlBlockElements * kIq4nlBlockBytes
-        : row_width * sizeof(float);
     static thread_local std::vector<float> gathered;
     gathered.resize(static_cast<std::size_t>(count) * head_count * row_width);
     auto back = [&](int position, int shift) -> std::uint64_t {
@@ -4925,8 +5043,11 @@ void qwen4_stage_ple_embed_rows(
                         out[element + 16] = scale * kIq4nlValues[byte >> 4];
                     }
                 }
-            } else {
+            } else if (table.type == 0) {
                 std::memcpy(destination_row, row_data, row_width * sizeof(float));
+            } else {
+                qwen_dequant_row(source, table.type, static_cast<int>(row_width),
+                                 row, destination_row);
             }
         }
     }
@@ -5411,13 +5532,24 @@ void qwen_cpu_moe_rows(
     const bool moe_profile=qwen_cpu_moe_profile_enabled();
     const std::uint64_t t_setup0=moe_profile?qwen_moe_now():0;
     const int total=rows*routed_count;
-    // Reuse heap allocations across calls via static vectors.  These are
-    // filled sequentially before the OpenMP parallel region and only read
-    // inside it, so there is no data race.
-    static std::vector<int> counts;
-    static std::vector<int> offsets;
-    static std::vector<int> occurrences;
-    static std::vector<const float*> vectors;
+    // Reuse heap allocations across calls. These are filled sequentially
+    // before the OpenMP parallel region and only read inside it. thread_local
+    // rather than static: two runtimes in one process (the parity tests, an
+    // embedder holding two models) may prefill from different threads at
+    // once, and a shared CSR table would route one model's tokens through
+    // the other's experts.
+    // Bound to plain references before the OpenMP region: a thread_local
+    // named inside `#pragma omp parallel` is each worker's OWN (empty)
+    // instance, not the one this thread filled. The references are ordinary
+    // shared variables, so the workers read the caller's tables.
+    thread_local std::vector<int> tl_counts;
+    thread_local std::vector<int> tl_offsets;
+    thread_local std::vector<int> tl_occurrences;
+    thread_local std::vector<const float*> tl_vectors;
+    auto& counts=tl_counts;
+    auto& offsets=tl_offsets;
+    auto& occurrences=tl_occurrences;
+    auto& vectors=tl_vectors;
     counts.assign(experts,0);
     for(int route=0;route<total;++route){
         if(weights[route]==0.0f)continue;
@@ -5432,7 +5564,8 @@ void qwen_cpu_moe_rows(
     occurrences.resize(offsets[experts]);
     vectors.resize(offsets[experts]);
     {
-        static std::vector<int> cursor;
+        thread_local std::vector<int> tl_cursor;
+        auto& cursor=tl_cursor;
         cursor.assign(offsets.begin(),offsets.end()-1);
         for(int route=0;route<total;++route){
             if(weights[route]==0.0f)continue;
@@ -5441,7 +5574,8 @@ void qwen_cpu_moe_rows(
             vectors[slot]=input+static_cast<std::size_t>(route/routed_count)*hidden;
         }
     }
-    static std::vector<int> group_experts;
+    thread_local std::vector<int> tl_group_experts;
+    auto& group_experts=tl_group_experts;
     group_experts.clear();
     group_experts.reserve(256);
     for(int expert=0;expert<experts;++expert)if(counts[expert])group_experts.push_back(expert);
@@ -5562,7 +5696,8 @@ void qwen_cpu_moe_rows(
         }
         if(moe_profile)g_cpu_moe_profile.gate_activate+=qwen_moe_now()-t_act0;
     }
-    static std::vector<const float*> activated_vectors;
+    thread_local std::vector<const float*> tl_activated_vectors;
+    auto& activated_vectors=tl_activated_vectors;
     activated_vectors.resize(offsets[experts]);
     for(int slot=0;slot<offsets[experts];++slot)
         activated_vectors[slot]=activated+static_cast<std::size_t>(occurrences[slot])*intermediate;
@@ -5687,18 +5822,24 @@ int gpu_probe(FlyweightV2GpuInfo& out, int device) {
 #if defined(_WIN32)
     HMODULE lib = LoadLibraryW(L"nvcuda.dll");
     if (!lib) return 0;
-    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
-    auto init=reinterpret_cast<Init>(GetProcAddress(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(GetProcAddress(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(GetProcAddress(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(GetProcAddress(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(GetProcAddress(lib,"cuMemGetInfo_v2"));
+    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Release = int (*)(int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
+    auto init=reinterpret_cast<Init>(GetProcAddress(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(GetProcAddress(lib,"cuDevicePrimaryCtxRetain")); auto release=reinterpret_cast<Release>(GetProcAddress(lib,"cuDevicePrimaryCtxRelease_v2")); if(!release) release=reinterpret_cast<Release>(GetProcAddress(lib,"cuDevicePrimaryCtxRelease")); auto set=reinterpret_cast<Set>(GetProcAddress(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(GetProcAddress(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(GetProcAddress(lib,"cuMemGetInfo_v2"));
     if (!init || !retain || !set || !attr || init(0)!=0) { FreeLibrary(lib); return 0; }
-    void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { FreeLibrary(lib); return 0; }
-    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { FreeLibrary(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } FreeLibrary(lib); return 0;
+    void* context=nullptr; if(retain(&context,device)!=0) { FreeLibrary(lib); return 0; }
+    // Balance the retain on every exit: an unreleased probe kept the primary
+    // context alive (and its VRAM) for the life of the process.
+    if(set(context)!=0) { if(release) release(device); FreeLibrary(lib); return 0; }
+    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { if(release) release(device); FreeLibrary(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } if(release) release(device); FreeLibrary(lib); return 0;
 #else
     void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL); if (!lib) lib = dlopen("libcuda.so", RTLD_NOW | RTLD_LOCAL); if (!lib) return 0;
-    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
-    auto init=reinterpret_cast<Init>(dlsym(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(dlsym(lib,"cuDevicePrimaryCtxRetain")); auto set=reinterpret_cast<Set>(dlsym(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(dlsym(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(dlsym(lib,"cuMemGetInfo_v2"));
+    using Init = int (*)(unsigned int); using Retain = int (*)(void**, int); using Release = int (*)(int); using Set = int (*)(void*); using Attr = int (*)(int*, int, int); using Mem = int (*)(size_t*, size_t*);
+    auto init=reinterpret_cast<Init>(dlsym(lib,"cuInit")); auto retain=reinterpret_cast<Retain>(dlsym(lib,"cuDevicePrimaryCtxRetain")); auto release=reinterpret_cast<Release>(dlsym(lib,"cuDevicePrimaryCtxRelease_v2")); if(!release) release=reinterpret_cast<Release>(dlsym(lib,"cuDevicePrimaryCtxRelease")); auto set=reinterpret_cast<Set>(dlsym(lib,"cuCtxSetCurrent")); auto attr=reinterpret_cast<Attr>(dlsym(lib,"cuDeviceGetAttribute")); auto mem=reinterpret_cast<Mem>(dlsym(lib,"cuMemGetInfo_v2"));
     if (!init || !retain || !set || !attr || init(0)!=0) { dlclose(lib); return 0; }
-    void* context=nullptr; if(retain(&context,device)!=0 || set(context)!=0) { dlclose(lib); return 0; }
-    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { dlclose(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } dlclose(lib); return 0;
+    void* context=nullptr; if(retain(&context,device)!=0) { dlclose(lib); return 0; }
+    // Balance the retain on every exit: an unreleased probe kept the primary
+    // context alive (and its VRAM) for the life of the process.
+    if(set(context)!=0) { if(release) release(device); dlclose(lib); return 0; }
+    int major=0,minor=0; if(attr(&major,75,device)!=0 || attr(&minor,76,device)!=0) { if(release) release(device); dlclose(lib); return 0; } out.available=1; out.compute_major=major; out.compute_minor=minor; if(mem) { size_t free_bytes=0,total_bytes=0; if(mem(&free_bytes,&total_bytes)==0) { out.free_memory=free_bytes; out.total_memory=total_bytes; } } if(release) release(device); dlclose(lib); return 0;
 #endif
 }
 
@@ -6823,8 +6964,9 @@ std::uint64_t bailing_gpu_scratch(BailingGpu& gpu, std::size_t bytes) {
     std::uint64_t pointer = 0;
     if (flyweight_gpu_alloc(bytes, &pointer) != 0)
         throw std::runtime_error("out of device memory for bailing scratch");
-    flyweight_gpu_memset(pointer, 0, bytes, 0);
     gpu.owned.push_back(pointer);
+    if (flyweight_gpu_memset(pointer, 0, bytes, 0) != 0)
+        throw std::runtime_error("failed to clear bailing scratch");
     return pointer;
 }
 
@@ -6967,8 +7109,9 @@ void bailing_gpu_prepare(FlyweightV2BailingRuntime& runtime) {
             const auto& decoded = runtime.decoded_kv_b[index];
             if (flyweight_gpu_alloc(decoded.size() * 4, &L.kv_b) != 0)
                 throw std::runtime_error("out of device memory for kv_b");
-            flyweight_gpu_upload_sync(L.kv_b, decoded.data(), decoded.size() * 4);
             gpu.owned.push_back(L.kv_b);
+            if (flyweight_gpu_upload_sync(L.kv_b, decoded.data(), decoded.size() * 4) != 0)
+                throw std::runtime_error("failed to upload the decoded kv_b tensor");
         } else {
             L.ssm_q = bailing_gpu_matrix(gpu, m, prefix + "ssm_q.weight");
             L.ssm_k = bailing_gpu_matrix(gpu, m, prefix + "ssm_k.weight");
@@ -7000,7 +7143,10 @@ void bailing_gpu_prepare(FlyweightV2BailingRuntime& runtime) {
         }
     }
 
+    // wide_* also receive routed-expert (expert_size) and shared-expert
+    // (shared_size) outputs; nothing guarantees dense_size bounds either.
     const std::size_t widest = std::max({channels, g.heads * qk, (std::size_t)g.dense_size,
+                                         (std::size_t)g.expert_size, (std::size_t)g.shared_size,
                                          g.kv_lora + g.qk_rope, (std::size_t)g.experts});
     gpu.hidden_a = bailing_gpu_scratch(gpu, g.hidden * 4);
     gpu.hidden_b = bailing_gpu_scratch(gpu, g.hidden * 4);
@@ -8400,6 +8546,10 @@ int flyweight_v2_bailing_create_slots(const FlyweightV2Model* model, uint32_t ca
             if(runtime->gpu){
                 for(const auto pointer:runtime->gpu->owned)flyweight_gpu_free(pointer);
                 runtime->gpu->owned.clear();
+                if(runtime->gpu->stream){
+                    flyweight_gpu_stream_destroy(runtime->gpu->stream);
+                    runtime->gpu->stream=0;
+                }
             }
             if(forced_on) throw;
             runtime->gpu.reset();
@@ -8433,6 +8583,11 @@ void flyweight_v2_bailing_destroy(FlyweightV2BailingRuntime* runtime){
         if(runtime&&runtime->gpu){
             for(const auto pointer:runtime->gpu->owned)flyweight_gpu_free(pointer);
             runtime->gpu->owned.clear();
+            // One stream per runtime lifetime leaked before this.
+            if(runtime->gpu->stream){
+                flyweight_gpu_stream_destroy(runtime->gpu->stream);
+                runtime->gpu->stream=0;
+            }
         }
         delete runtime;
     }catch(...){}
@@ -8546,6 +8701,9 @@ int flyweight_v2_bailing_eval_slot(FlyweightV2BailingRuntime* runtime, uint32_t 
         bailing_gpu_prefill_tiled_supported(*runtime)) {
         if (!slot.cache_on_device) bailing_cache_transfer(*runtime, slot_index, true);
         bailing_gpu_prefill_tiled(*runtime, slot_index, tokens, count, logits);
+        // No host-side hidden for the last token: an MTP round must not draft
+        // from a hidden left over from an earlier host eval.
+        slot.has_target_hidden = false;
         if(watched) bailing_progress(*runtime, count, count);
         return 0;
     }
@@ -8570,6 +8728,7 @@ int flyweight_v2_bailing_eval_slot(FlyweightV2BailingRuntime* runtime, uint32_t 
             if(watched && (index & 127) == 127)
                 bailing_progress(*runtime, index + 1, count);
         }
+        slot.has_target_hidden = false;  // see the tiled path above
         if(watched) bailing_progress(*runtime, count, count);
         return 0;
     }
@@ -9296,10 +9455,14 @@ int flyweight_v2_model_attach_mtp(FlyweightV2Model* m,const char*path){return gu
        sidecar->config.expert_count!=m->config.expert_count||
        sidecar->config.expert_used_count!=m->config.expert_used_count)
         throw std::runtime_error("MTP sidecar model geometry does not match the base GGUF");
-    if(m->mtp_layer==std::numeric_limits<std::uint32_t>::max())
-        m->mtp_layer=sidecar->mtp_layer;
-    const std::string prefix="blk."+std::to_string(m->mtp_layer)+".";
-    std::size_t replaced=0;
+    const std::uint32_t mtp_layer=
+        m->mtp_layer==std::numeric_limits<std::uint32_t>::max()?sidecar->mtp_layer:m->mtp_layer;
+    const std::string prefix="blk."+std::to_string(mtp_layer)+".";
+    // Two passes: resolve and validate every replacement first, then apply.
+    // Rewriting in place while validating left the tensors already rewritten
+    // pointing into the sidecar mapping, which the failing throw unmapped --
+    // and the base model stayed "valid" for a retry, reading freed memory.
+    std::vector<std::pair<Tensor*,const Tensor*>> replacements;
     for(auto&target:m->tensors){
         if(target.name.rfind(prefix,0)!=0)continue;
         const auto found=std::find_if(sidecar->tensors.begin(),sidecar->tensors.end(),
@@ -9309,12 +9472,17 @@ int flyweight_v2_model_attach_mtp(FlyweightV2Model* m,const char*path){return gu
         auto elements=[](const Tensor&tensor){std::uint64_t result=1;for(const auto dimension:tensor.shape)result*=dimension;return result;};
         if(found->shape!=target.shape&&elements(*found)!=elements(target))
             throw std::runtime_error("MTP sidecar tensor shape mismatch: "+target.name);
-        target.type=found->type;
-        target.offset=found->offset;
-        target.size=found->size;
-        target.source=sidecar->data;
+        replacements.emplace_back(&target,&*found);
+    }
+    std::size_t replaced=0;
+    for(auto&[target,found]:replacements){
+        target->type=found->type;
+        target->offset=found->offset;
+        target->size=found->size;
+        target->source=sidecar->data;
         ++replaced;
     }
+    m->mtp_layer=mtp_layer;
     // Trunk-only GGUFs omit the optional draft block entirely. Append its
     // descriptors while keeping their bytes in the sidecar mapping.
     for(const auto&candidate:sidecar->tensors){
@@ -11073,9 +11241,16 @@ static int ds4_prefill_impl(
         if(tokens[index]>=rt.vocabulary)
             throw std::runtime_error("prefill token id is outside the vocabulary");
     const auto started=ds4_now();
+    // One scratch per row for the whole call. Every buffer is a per-call
+    // temporary (the single-token forward reuses rt.scratch across tokens
+    // the same way), so nothing needs resetting between chunks -- and the
+    // copy is far from free: `keys` alone spans the context's block capacity.
+    std::vector<Deepseek4Scratch> scratch(std::min(row_limit,count),rt.scratch);
     for(std::uint32_t chunk=0;chunk<count;chunk+=row_limit){
         const auto rows=std::min(row_limit,count-chunk);
-        std::vector<Deepseek4Scratch> scratch(rows,rt.scratch);
+        // ds4_cpu_moe_rows batches by scratch.size(); only the final chunk
+        // can be shorter, so this only ever shrinks.
+        if(scratch.size()>rows)scratch.resize(rows,rt.scratch);
         for(std::uint32_t row=0;row<rows;++row){
             auto& sc=scratch[row];
             if(flyweight_v2_qwen_embedding(&model,tokens[chunk+row],sc.embedding.data(),
@@ -12726,7 +12901,8 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(muse&&runtime->options.mtp_drafts)throw std::runtime_error("native Muse Glimmer MTP is not implemented");
     if(gemma4&&m->config.per_layer_embedding_size)throw std::runtime_error("native Gemma 4 per-layer embeddings are not implemented");
     if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
-    if(runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
+    if(m->config.expert_count&&runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
+    if(runtime->options.expert_paging>2)throw std::runtime_error("native Qwen expert paging mode is invalid");
     if(runtime->options.expert_top_p<0.0f||runtime->options.expert_top_p>1.0f)throw std::runtime_error("native Qwen expert_top_p must be within [0, 1]");
     if(runtime->options.prefill_cache_seed>256)throw std::runtime_error("native Qwen prefill_cache_seed supports at most 256 experts per layer");
     if(runtime->options.cpu_prefetch_auto>1)throw std::runtime_error("native Qwen cpu_prefetch_auto must be boolean");
@@ -13058,6 +13234,12 @@ static void qwen_reset_active_slot(FlyweightV2QwenRuntime& runtime) {
 }
 int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime*runtime){return guarded([&]{
     if(!runtime)throw std::runtime_error("invalid Qwen runtime handle");
+    {   // Same rule as blocking generate: a reset under live engine tasks
+        // would wipe state a later engine_step keeps decoding on.
+        std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+        if(!runtime->engine_tasks.empty()||!runtime->engine_pending.empty())
+            throw std::runtime_error("the cooperative engine has live tasks; cancel them before reset");
+    }
     // The public name promises the runtime, not a slot: under --parallel the
     // router would otherwise route a post-reset prompt back onto a sibling
     // slot's surviving conversation (or recall one from the host cache),
@@ -13124,6 +13306,21 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
     // read the way the rest of the mapping is, and the kernel cannot know that.
     qwen_advise_access_pattern(*runtime);
     if(runtime->static_arena)return 0;
+    // Everything below adjusts the plan's byte accounting (embedding table
+    // moved to the host, dense FFN blocks spilled, requantized tensors) and
+    // per-layer placement flags. A prepare retried after a failure must start
+    // from the plan again, or the adjustments compound: the second attempt
+    // subtracted the requant savings twice and spilled more blocks than the
+    // first.
+    if(runtime->plan_static_tensor_bytes==std::numeric_limits<std::uint64_t>::max())
+        runtime->plan_static_tensor_bytes=runtime->static_tensor_bytes;
+    else runtime->static_tensor_bytes=runtime->plan_static_tensor_bytes;
+    runtime->requantized_tensors=0;
+    runtime->requantized_saved_bytes=0;
+    runtime->host_ffn_layers=0;
+    runtime->host_ffn_bytes=0;
+    runtime->embeddings_host_resident=false;
+    for(auto&layer:runtime->layers)layer.ffn_on_host=false;
     if(flyweight_gpu_init(runtime->options.device)!=0)throw std::runtime_error("failed to initialize native CUDA runtime");
     std::vector<std::string> option_storage;
 #if !defined(_WIN32)
@@ -14849,10 +15046,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
            flyweight_gpu_memset(runtime->state,0,runtime->state_bytes,runtime->stream)!=0||
            flyweight_gpu_stream_sync(runtime->stream)!=0)throw std::runtime_error("failed to initialize native Qwen CUDA arenas");
     }catch(...){release_qwen_device(*runtime);throw;}
+    // The registration phase can throw as well (a forced direct-paging
+    // request that fits nothing). Left unreleased, the arenas stayed set with
+    // decode_ready false, and the next prepare returned success early.
+    try{
         const auto paging_policy=qwen_expert_policy(
             *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
-        if(runtime->options.expert_paging>2)
-            throw std::runtime_error("native Qwen expert paging mode is invalid");
         runtime->host_available_bytes=available_host_memory();
         const bool forced_direct=runtime->options.expert_paging==2||
             std::getenv("FLYWEIGHT_V2_DMA_PAGING");
@@ -15045,6 +15244,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 });
             }
         }
+    }catch(...){release_qwen_device(*runtime);throw;}
         runtime->decode_ready=true;
         // What is left for everything else on this card. On a machine whose GPU
         // also drives the display, the desktop compositor and the browser
@@ -15983,8 +16183,9 @@ std::uint32_t qwen4exp_mtp_draft(
     dense(1, normalized, first, hidden_size, q_size);
     dense(2, normalized, second, hidden_size, kv_size);
     dense(3, normalized, third, hidden_size, kv_size);
-    const int rotary = static_cast<int>(
-        config.rotary_dimension ? config.rotary_dimension : head_dim);
+    const int rotary = std::min(
+        static_cast<int>(config.rotary_dimension ? config.rotary_dimension : head_dim),
+        static_cast<int>(head_dim));
     const int position = static_cast<int>(runtime.mtp_cache_tokens);
     const float theta = config.rope_freq_base ? config.rope_freq_base : 1000000.0f;
     auto qnorm = tensor(5), knorm = tensor(6);
@@ -19361,6 +19562,11 @@ static std::uint32_t qwen_sample_last_logits(
     if(!sampling.enabled()&&!sampling.constrains()&&!sampling.penalizes()&&
        !ban_trips)
         return commit(greedy_token);
+    // With temperature the draw is from the candidate set, not the argmax, so
+    // the ban has to filter that set whenever it is armed -- testing only the
+    // greedy token let the markup through as any non-argmax candidate.
+    const bool ban_filters=ban_trips||
+        (sampling.markup_ban.enabled()&&sampling.enabled());
     struct SamplingTimer {
         std::uint64_t& nanoseconds;
         std::chrono::steady_clock::time_point started;
@@ -19382,7 +19588,7 @@ static std::uint32_t qwen_sample_last_logits(
     // changes the answer if something else is in the set to take its place, so
     // a top_k of 1 would make a configured penalty a silent no-op.
     const std::size_t count=(sampling.constrains()||sampling.penalizes()||
-                             ban_trips)
+                             ban_filters)
         ?std::min<std::size_t>(
             std::max<std::size_t>(
                 requested,flyweight::v2::workspace::kSamplingConstrainedMinimum),
@@ -19569,7 +19775,7 @@ static std::uint32_t qwen_sample_last_logits(
     // set the sampler may actually draw from -- in particular, a repetition
     // penalty must not spend its effect on a token that was never selectable.
     // The candidate list arrives sorted by logit and this preserves that order.
-    if(sampling.constrains()||ban_trips){
+    if(sampling.constrains()||ban_filters){
         static thread_local std::vector<std::uint32_t> allowed;
         static thread_local std::vector<float> allowed_logits;
         allowed.clear();
@@ -19610,7 +19816,20 @@ static std::uint32_t qwen_sample_last_logits(
     // rather than the whole vocabulary: a token the model is looping on is by
     // definition near the top of the distribution, so it is always in this
     // set, and penalizing 20 entries costs nothing next to a full download.
-    if(sampling.penalizes()&&!sampling.recent.empty()){
+    // Not inside a tool call. A call's arguments are verbatim by contract --
+    // an Edit reproduces the span of the file it is replacing, character for
+    // character -- and a penalty on recently emitted tokens is a penalty on
+    // exactly that reproduction: the quote drifts, the harness's exact-match
+    // check fails, and the model retreats to shell edits. The grammar knows
+    // when a call is open, so the penalties pause there and resume on prose,
+    // where the loop protection they exist for is wanted.
+    // FLYWEIGHT_TOOL_CALL_PENALTY=1 keeps them on inside calls, for comparison.
+    static const bool penalize_tool_calls=[]{
+        const char*setting=std::getenv("FLYWEIGHT_TOOL_CALL_PENALTY");
+        return setting&&setting[0]=='1';
+    }();
+    const bool inside_tool_call=sampling.grammar.armed()&&!penalize_tool_calls;
+    if(sampling.penalizes()&&!sampling.recent.empty()&&!inside_tool_call){
         for(std::size_t index=0;index<candidates.size();++index){
             std::uint32_t occurrences=0;
             for(const auto token:sampling.recent)
@@ -21333,7 +21552,16 @@ static void qwen_mtp_commit_true_cache(
 // always at least one, because the verifier's own token is committed even when
 // every draft is rejected. The returned tokens are target outputs, so drafting
 // quality only moves the acceptance rate, never the text.
-static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out){
+// `sampling` is the task's sampler state, or null for the bare greedy path.
+// With one, every verified row is put through the sampler in order -- the
+// penalties, the tool grammar, the markup ban, the temperature draw -- exactly
+// as the one-token decode path does, and the round stops at the first row
+// whose choice is not the draft. Each emitted token is then the token the
+// sequential path would have produced from the same logits and the same
+// sampler state (same RNG draw count, same penalty window, same grammar
+// position), so a drafting task's output is bit-identical to a non-drafting
+// one; the drafts only decide how many rows a round gets to keep.
+static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr){
     if(wanted>8)wanted=8;
     if(!wanted)wanted=1;
     // The draft block's KV cache is sized for the context limit and, unlike the
@@ -21382,6 +21610,44 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(wanted),verified.data(),&batch_hidden);
     runtime.mtp_fold_capture=false;
     runtime.mtp_verify_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-batch_started).count();
+    bool last_greedy=true;
+    if(sampling&&sampling->active()){
+        const int hidden=static_cast<int>(runtime.model->config.hidden_size);
+        const auto row_bytes=static_cast<std::uint64_t>(hidden)*sizeof(float);
+        if(!runtime.mtp_sampling_rows&&
+           flyweight_gpu_alloc(8*row_bytes,&runtime.mtp_sampling_rows)!=0)
+            throw std::runtime_error("native MTP sampling rows allocation failed");
+        // Two things the sampler's scratch could trample, taken out of the
+        // rows workspace first: the normalized rows it will read, and the
+        // hand-over hiddens the cache commit below reads. The latter go to
+        // the stable region the commit copies them to anyway, so its copy
+        // becomes a self-copy.
+        const auto normalized=runtime.rows_workspace_layout.normalized.address(runtime.workspace);
+        if(flyweight_gpu_copy_device(runtime.mtp_sampling_rows,normalized,
+               static_cast<std::uint64_t>(wanted)*row_bytes,runtime.stream)!=0)
+            throw std::runtime_error("native MTP sampling rows copy failed");
+        const int handover=runtime.qwen4exp
+            ?static_cast<int>(runtime.model->config.hyper_connection_count*runtime.model->config.hidden_size)
+            :hidden;
+        const auto stable_hidden=runtime.state+runtime.mtp_verified_hidden_offset;
+        if(flyweight_gpu_copy_device(stable_hidden,batch_hidden,
+               static_cast<std::uint64_t>(wanted)*handover*sizeof(float),runtime.stream)!=0)
+            throw std::runtime_error("native MTP hand-over rows copy failed");
+        batch_hidden=stable_hidden;
+        const auto logits=runtime.decode_workspace_layout.logits.address(runtime.workspace);
+        for(uint32_t row=0;row<wanted;++row){
+            runtime.last_sampling_normalized=runtime.mtp_sampling_rows+row*row_bytes;
+            runtime.last_sampling_logits=logits;
+            runtime.last_output_token=verified[row];
+            runtime.last_output_greedy=true;
+            const auto chosen=qwen_sample_last_logits(runtime,*sampling,verified[row]);
+            verified[row]=chosen;
+            // Rows past a disagreement were computed on the draft's prefix,
+            // not this token's; they are neither sampled nor committed.
+            if(chosen!=drafts[row])break;
+        }
+        last_greedy=runtime.last_output_greedy;
+    }
     uint32_t valid=0;
     bool rejected=false;
     for(;valid<wanted;++valid)if(verified[valid]!=drafts[valid]){++valid;rejected=true;break;}
@@ -21402,7 +21668,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);
         runtime.position+=valid;
         runtime.last_output_token=verified[valid-1];
-        runtime.last_output_greedy=true;
+        runtime.last_output_greedy=last_greedy;
         runtime.decode_calls+=valid;
         const auto rollback_elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-rollback_started).count();
         runtime.decode_nanoseconds+=rollback_elapsed;
@@ -21429,7 +21695,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);
         runtime.position+=valid;
         runtime.last_output_token=verified[valid-1];
-        runtime.last_output_greedy=true;
+        runtime.last_output_greedy=last_greedy;
         runtime.decode_calls+=valid;
         runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-replay_started).count();
         if(trace){
@@ -21449,7 +21715,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+wanted);
         runtime.position+=wanted;
         runtime.last_output_token=verified[wanted-1];
-        runtime.last_output_greedy=true;
+        runtime.last_output_greedy=last_greedy;
         runtime.decode_calls+=wanted;
         runtime.decode_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-batch_started).count();
         runtime.mtp_accepted_tokens+=rejected?wanted-1:wanted;
@@ -21757,6 +22023,19 @@ int flyweight_v2_qwen_task_cancel(FlyweightV2QwenRuntime*runtime,uint64_t task_i
     if(!runtime||!task_id)throw std::runtime_error("invalid native Qwen task handle");
     std::lock_guard<std::mutex> lock(runtime->engine_mutex);
     runtime->engine_cancel_requests.push_back(task_id);
+    return 0;
+});}
+int flyweight_v2_qwen_task_error(FlyweightV2QwenRuntime*runtime,uint64_t task_id,char*output,uint64_t capacity,uint64_t*length){return guarded([&]{
+    if(!runtime||!task_id||!length)throw std::runtime_error("invalid native Qwen task handle");
+    std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+    const auto found=runtime->engine_task_errors.find(task_id);
+    if(found==runtime->engine_task_errors.end()){*length=0;if(output&&capacity)output[0]='\0';return 0;}
+    const std::string&message=found->second;
+    *length=message.size();
+    if(!output||!capacity)return 0;  // size query: the entry stays for the copy
+    const auto copied=std::min<std::uint64_t>(capacity-1,message.size());
+    std::memcpy(output,message.data(),copied);output[copied]='\0';
+    if(copied==message.size())runtime->engine_task_errors.erase(found);
     return 0;
 });}
 
@@ -22783,6 +23062,12 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
         qwen_unfreeze_expert_residency(*runtime);
         return 0;
     }
+    auto record_failure=[&](std::uint64_t id,const char*what){
+        std::lock_guard<std::mutex> lock(runtime->engine_mutex);
+        // Bounded: a caller that never reads them must not grow this forever.
+        if(runtime->engine_task_errors.size()>=256)runtime->engine_task_errors.clear();
+        runtime->engine_task_errors[id]=what?what:"unknown error";
+    };
     auto emit=[&](std::uint64_t id,std::uint32_t token,std::uint32_t kind){
         // The visit-loop guard reserves room for every event this step can
         // produce, so a full buffer here is a scheduling bug -- but it must
@@ -22855,6 +23140,7 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
             std::fprintf(stderr,"[flyweight] engine task %llu failed: %s\n",
                 static_cast<unsigned long long>(task.id),error.what());
             if(task.phase!=0)qwen_poison_slot(*runtime,task.slot);
+            record_failure(task.id,error.what());
             finished.push_back(task.id);emit(task.id,0,2);
         }
     }
@@ -22940,6 +23226,7 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                     std::fprintf(stderr,
                         "[flyweight] engine task %llu sampling failed: %s\n",
                         static_cast<unsigned long long>(task->id),error.what());
+                    record_failure(task->id,error.what());
                     finished.push_back(task->id);emit(task->id,0,2);
                 }
             }
@@ -22948,20 +23235,19 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
             auto*task=pending_decode[i];
             try{
                 qwen_switch_sequence(*runtime,task->slot);
-                // Speculative decoding commits the verifier's greedy argmax, so
-                // it can only serve tasks that are themselves greedy; a sampled
-                // task would silently lose its temperature.
-                // Speculative rounds commit tokens the sampler never sees,
-                // so a constrained task cannot draft either -- its call
-                // would be built out of unchecked tokens.
-                if(runtime->options.mtp_drafts&&!task->sampling.active()&&
-                   qwen_mtp_should_draft(*runtime)){
+                // The round puts every verified row through the task's own
+                // sampler (see qwen_mtp_round), so sampled, penalized and
+                // grammar-constrained tasks draft too, with output identical
+                // to the one-token path. Before that, only a task with no
+                // sampler features could draft -- and every served request
+                // has some, so --mtp-drafts never engaged under serve.
+                if(runtime->options.mtp_drafts&&qwen_mtp_should_draft(*runtime)){
                     const auto wanted=static_cast<uint32_t>(std::min<std::uint64_t>(
                         runtime->options.mtp_drafts,task->max_tokens-task->emitted
                     ));
                     std::array<uint32_t,8>produced{};
                     const auto round_started=std::chrono::steady_clock::now();
-                    const auto valid=qwen_mtp_round(*runtime,task->next_token,wanted,produced.data());
+                    const auto valid=qwen_mtp_round(*runtime,task->next_token,wanted,produced.data(),&task->sampling);
                     qwen_mtp_record_round(
                         *runtime,
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -22973,7 +23259,7 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                     const auto decode_started=std::chrono::steady_clock::now();
                     const int status=flyweight_v2_qwen_runtime_decode(runtime,task->next_token,&task->next_token);
                     if(status)throw std::runtime_error("native Qwen decode failed");
-                    if(runtime->options.mtp_drafts&&!task->sampling.active())
+                    if(runtime->options.mtp_drafts)
                         qwen_mtp_record_decode(
                             *runtime,
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -22984,6 +23270,11 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
             }catch(const std::exception&error){
                 std::fprintf(stderr,"[flyweight] engine task %llu decode failed: %s\n",
                     static_cast<unsigned long long>(task->id),error.what());
+                // A throw mid-forward leaves the slot's recurrent/KV state
+                // half-stepped under clean bookkeeping; forget it like the
+                // batched path does rather than hand it to the next prompt.
+                qwen_poison_slot(*runtime,task->slot);
+                record_failure(task->id,error.what());
                 finished.push_back(task->id);emit(task->id,0,2);
             }
         }

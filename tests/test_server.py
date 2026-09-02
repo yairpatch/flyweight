@@ -1355,7 +1355,7 @@ class InferenceServiceTests(unittest.TestCase):
             _Finished("tool_calls", 5, 40),
         ]
 
-        def fake_events(request, progress=None):
+        def fake_events(request, progress=None, **_):
             return iter(generation_events)
 
         self.service._generation_events = fake_events
@@ -1771,7 +1771,7 @@ class InferenceServiceTests(unittest.TestCase):
             _Finished("stop", 5, 4),
         ]
         self.service._generation_events = (
-            lambda request, progress=None: iter(events_in)
+            lambda request, progress=None, **_: iter(events_in)
         )
         events = list(
             self.service.stream_anthropic_message(
@@ -2875,7 +2875,7 @@ class StreamKeepaliveTests(unittest.TestCase):
         self.thread.join(timeout=5)
 
     def _stalling(self, events):
-        def stream(payload, *, progress=None):
+        def stream(payload, *, progress=None, **_):
             time.sleep(0.3)  # stands in for a long prompt evaluation
             yield from events
 
@@ -2921,7 +2921,7 @@ class StreamKeepaliveTests(unittest.TestCase):
         self.assertIn("data: [DONE]", body)
 
     def test_stream_errors_still_propagate_through_the_keepalive_pump(self) -> None:
-        def failing(payload, *, progress=None):
+        def failing(payload, *, progress=None, **_):
             yield {"object": "chat.completion.chunk"}
             raise APIError(500, "boom", "server_error")
 

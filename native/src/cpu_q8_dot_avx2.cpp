@@ -6,6 +6,7 @@
 
 #include "cpu_q8_dot.h"
 
+#include <cstring>
 #include <immintrin.h>
 
 namespace {
@@ -27,7 +28,8 @@ inline void load_block_weights(const std::uint8_t* block, __m256 out[4]) {
 inline float scale_of(const std::uint8_t* block) {
     // Not _cvtsh_ss: that convenience spelling is GCC/Clang only. This is the
     // same F16C instruction and the spelling the other kernels already use.
-    const int bits = *reinterpret_cast<const std::uint16_t*>(block);
+    std::uint16_t bits = 0;
+    std::memcpy(&bits, block, sizeof(bits));  // no aliasing pun; same codegen
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
 }
 

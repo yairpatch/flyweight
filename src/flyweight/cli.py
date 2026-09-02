@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 import sysconfig
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1454,6 +1455,10 @@ def _generate(args: argparse.Namespace) -> int:
             context_window=args.context_window,
             max_new_tokens=args.max_new_tokens,
             gpu_cache_mib=args.gpu_cache_mib,
+            device=args.device,
+            # expert_top_k/top_p are benchmark-only knobs: they measure a
+            # cheaper model than the one being served, so generate does not
+            # take them. gpu_cache_bytes is spelled gpu_cache_mib above.
             **{key: value for key, value in _runtime_options(args).items()
                if key not in {"gpu_cache_bytes", "device", "expert_top_k", "expert_top_p"}},  # type: ignore[arg-type]
         )
@@ -1555,6 +1560,21 @@ def _serve(args: argparse.Namespace) -> int:
 
 
 def _serve_http(args: argparse.Namespace, service) -> int:
+    import signal
+
+    # systemd and docker stop a service with SIGTERM, whose default action
+    # killed the process outright: in-flight connections were never aborted,
+    # the engine's tasks never cancelled, the runtime never destroyed. Route
+    # it through the same graceful path Ctrl-C takes. Only the main thread
+    # may install handlers, and a library embedding this must keep its own.
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        def terminate(signum, frame):  # noqa: ARG001 - signal handler shape
+            raise KeyboardInterrupt
+        try:
+            previous = signal.signal(signal.SIGTERM, terminate)
+        except (ValueError, OSError):  # not the main thread after all, or no SIGTERM
+            previous = None
     try:
         print(f"Serving {service.model_name} at http://{args.host}:{args.port}", file=sys.stderr)
         serve_http(
@@ -1567,6 +1587,11 @@ def _serve_http(args: argparse.Namespace, service) -> int:
         pass
     finally:
         service.close()
+        if previous is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous)
+            except (ValueError, OSError):
+                pass
     return 0
 
 
@@ -1707,6 +1732,16 @@ def _doctor() -> int:
     report("python", sys.version_info >= (3, 11),
            platform.python_version(),
            "" if sys.version_info >= (3, 11) else "flyweight needs Python 3.11+")
+
+    # The one declared dependency. Chat templates render through it, so a
+    # broken or missing Jinja2 fails the first request rather than the install
+    # -- and this report used to say "can serve" regardless.
+    try:
+        import jinja2
+
+        report("jinja2", True, getattr(jinja2, "__version__", "present"))
+    except Exception as error:  # noqa: BLE001 - reported, not handled
+        report("jinja2", False, f"cannot import ({error})", "pip install jinja2")
 
     source = native_build.source_root()
 

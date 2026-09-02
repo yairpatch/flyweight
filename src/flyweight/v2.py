@@ -961,6 +961,14 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_uint64,
                 ]
                 lib.flyweight_v2_qwen_task_cancel.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_task_error.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_char_p,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.flyweight_v2_qwen_task_error.restype = ctypes.c_int
                 lib.flyweight_v2_gpu_probe.argtypes = [
                     ctypes.c_int32,
                     ctypes.POINTER(_GpuInfo),
@@ -1088,19 +1096,13 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_int32),
                 ]
                 lib.flyweight_v2_kv_cache_position.restype = ctypes.c_int
+                # cache, then exactly ten device pointers (input, norm_weights,
+                # normalized, qkv_packed, qkv_scales, qkv, attention_output,
+                # out_packed, out_scales, output): an eleventh entry here made
+                # ctypes reject every call before it reached C.
                 lib.flyweight_v2_gpu_decoder_attention_cached.argtypes = [
                     ctypes.c_void_p,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
-                    ctypes.c_uint64,
+                    *([ctypes.c_uint64] * 10),
                     ctypes.c_int32,
                     ctypes.c_int32,
                     ctypes.c_float,
@@ -2954,6 +2956,24 @@ class V2QwenRuntime:
 
     def task_cancel(self, task_id: int) -> None:
         self.model._check(self._lib.flyweight_v2_qwen_task_cancel(self._handle, task_id))
+
+    def task_error(self, task_id: int) -> str:
+        """The native exception text behind a task's error event, or ''."""
+        buffer = ctypes.create_string_buffer(1024)
+        length = ctypes.c_uint64()
+        self.model._check(
+            self._lib.flyweight_v2_qwen_task_error(
+                self._handle, task_id, buffer, len(buffer), ctypes.byref(length)
+            )
+        )
+        if length.value >= len(buffer):
+            buffer = ctypes.create_string_buffer(int(length.value) + 1)
+            self.model._check(
+                self._lib.flyweight_v2_qwen_task_error(
+                    self._handle, task_id, buffer, len(buffer), ctypes.byref(length)
+                )
+            )
+        return buffer.value.decode("utf-8", errors="replace")
 
 
 class V2KvCache:

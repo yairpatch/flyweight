@@ -690,6 +690,11 @@ FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_penalties(FlyweightV2QwenRunt
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, uint64_t* task_id);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime* runtime, FlyweightV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_cancel(FlyweightV2QwenRuntime* runtime, uint64_t task_id);
+/* Why a task reported kind 2 (error): the native exception text, retained
+   until read. `length` receives the byte count without the NUL; a null or
+   zero-capacity `output` only queries it. Length zero means no message is
+   held for that id. */
+FLYWEIGHT_V2_API int flyweight_v2_qwen_task_error(FlyweightV2QwenRuntime* runtime, uint64_t task_id, char* output, uint64_t capacity, uint64_t* length);
 
 FLYWEIGHT_V2_API const char* flyweight_v2_last_error(void);
 FLYWEIGHT_V2_API uint32_t flyweight_v2_version(void);

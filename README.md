@@ -33,7 +33,10 @@ loads from GGUF, including multi-file `-00001-of-0000N` splits.
   work (default on)
 - F32, F16, BF16, Q8_0, Turbo3, and Turbo4 KV caches
 - Sliding-window attention and compact circular KV storage
-- Multi-token prediction for Qwen checkpoints; DSpark draft speculation for
+- Multi-token prediction for Qwen checkpoints, under sampling, penalties and
+  the tool grammar alike (each verified row goes through the request's own
+  sampler, so a drafting request answers exactly as a non-drafting one);
+  DSpark draft speculation for
   DeepSeek-V4-Flash
 - Independent sequence slots and host-backed prompt-cache spill/restore
 - Cooperative concurrent request scheduling; sampled and greedy requests
@@ -353,9 +356,14 @@ quantized checkpoint can lock onto a line and repeat it until the token
 budget runs out. Only generated tokens are penalized -- penalizing the prompt
 would push the model away from the user's own wording. Set
 `repetition_penalty` to 1 to disable, or raise `penalty_window` to look
-further back. For edit-heavy agent work on higher-precision quants, consider
-`repetition_penalty: 1` -- verbatim reproduction of file content is
-repetition, and the penalty discourages exactly that. `seed` pins the sampler
+further back. The penalties pause while a tool call is open (the sampler
+grammar knows when one is): a call's arguments are verbatim by contract -- an
+Edit reproduces the span of the file it replaces, character for character --
+and penalizing recently emitted tokens there made the quote drift and the
+harness's exact-match check fail. `FLYWEIGHT_TOOL_CALL_PENALTY=1` restores the
+old behaviour for comparison. Outside tool calls the penalty still applies to
+quoted file content, so for edit-heavy agent work on higher-precision quants
+`repetition_penalty: 1` remains worth considering. `seed` pins the sampler
 per request.
 
 ## Inspect and generate
@@ -648,6 +656,17 @@ device are skipped.
 - Qwen sampled decoding currently transfers the vocabulary logits to the host
   when `top_k > 32`.
 - Dynamic MoE routing still has host synchronization points.
+- Special-token spellings inside message content (`<|im_start|>`,
+  `<tool_call>`, `<think>`, ...) are tokenized as the control tokens, as
+  they are by the HF and llama.cpp tokenizers: the rendered prompt is one
+  flat string. A client that relays untrusted text should strip them.
+- `logprobs`, `top_logprobs` and a non-empty `logit_bias` are rejected with
+  400 rather than ignored; `parallel_tool_calls: false` (and Anthropic's
+  `disable_parallel_tool_use`) cap a turn at one tool call.
+- Usage detail: `cached_tokens` / `cache_read_input_tokens` is the prompt
+  prefix the runtime reused; `reasoning_tokens` is counted by re-encoding the
+  chain-of-thought split out of the answer, so it is exact wherever the
+  tokenizer round-trips its own output (BPE does) and an estimate otherwise.
 - Persistent fused layer kernels are incomplete.
 - Image, audio, embedding, fine-tuning, and hosted-tool APIs are out of
   scope.

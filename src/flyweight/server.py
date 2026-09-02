@@ -209,7 +209,12 @@ _MUSE_MARKERS = ("<|eom|>", "<|eot|>", "<|start|>")
 _MUSE_LONGEST_MARKER = max(len(marker) for marker in _MUSE_MARKERS)
 
 
-@dataclass(frozen=True, slots=True)
+# Not frozen: a frozen dataclass rejects every attribute assignment, and the
+# interpreter's own machinery sets `__traceback__` on an exception from Python
+# code whenever it propagates through a contextlib-managed block. Under
+# frozen=True that turned every 400 raised inside `with service._admission()`
+# into a 500.
+@dataclass(slots=True, unsafe_hash=True)
 class APIError(Exception):
     status: int
     message: str
@@ -262,6 +267,11 @@ class _GenerationRequest:
     # of the tool-call loop the model is still inside and drops what the
     # conversation has moved past. Only ever set when a client asked.
     preserve_thinking: bool | None = None
+    # OpenAI `parallel_tool_calls: false` / Anthropic
+    # `disable_parallel_tool_use: true`: at most one call reaches the client
+    # per turn. The grammar cannot stop the model writing a second one, so
+    # the turn is cut after the first.
+    single_tool_call: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -587,7 +597,14 @@ class InferenceService:
         self._transcript = transcript_audit.recorder_from_env()
 
     @contextlib.contextmanager
-    def _generation_guard(self):
+    def _admission(self):
+        """Hold one of the bounded request slots, or raise the 429.
+
+        Split out of the guard so a streaming handler can take the slot
+        BEFORE it sends the SSE headers: taken inside the generator, the 429
+        arrived as an SSE error event on a 200 response and no SDK ever
+        backed off on it.
+        """
         if not self._request_slots.acquire(blocking=False):
             raise APIError(
                 429,
@@ -597,15 +614,25 @@ class InferenceService:
         with self._request_count_lock:
             self._active_requests += 1
         try:
-            if self._serialize_generation:
-                with self._generation_lock:
-                    yield
-            else:
-                yield
+            yield
         finally:
             with self._request_count_lock:
                 self._active_requests -= 1
             self._request_slots.release()
+
+    @contextlib.contextmanager
+    def _generation_guard(self, *, admitted: bool = False):
+        """Admission plus, for a single-sequence generator, the serialization.
+
+        `admitted` says the caller already holds a slot from `_admission`
+        and only the serialization is wanted here.
+        """
+        with contextlib.ExitStack() as stack:
+            if not admitted:
+                stack.enter_context(self._admission())
+            if self._serialize_generation:
+                stack.enter_context(self._generation_lock)
+            yield
 
     def health(self) -> dict[str, Any]:
         return {
@@ -656,10 +683,46 @@ class InferenceService:
                 request, tools=request.tools, progress=progress
             )
         return self._chat_response(
-            result, tools=request.tools, stop_sequences=request.stop_sequences
+            result, tools=request.tools, stop_sequences=request.stop_sequences,
+            single_tool_call=request.single_tool_call,
+        )
+
+    def _annotate_usage(
+        self, result: GenerationResult, cached_tokens: int
+    ) -> GenerationResult:
+        """The result with its usage detail filled in.
+
+        Reasoning tokens are counted by re-encoding the chain-of-thought the
+        turn split out of its text: the generator hands over decoded text,
+        not per-token channel labels, so this is the one count every path
+        (streamed, buffered, tool-stopped) can agree on. It is exact wherever
+        the tokenizer round-trips its own output, which BPE does.
+        """
+        reasoning_tokens = 0
+        if result.text:
+            _, reasoning = _split_reasoning_content(result.text)
+            encode = getattr(self.generator.tokenizer, "encode", None)
+            if reasoning and callable(encode):
+                try:
+                    reasoning_tokens = len(encode(reasoning))
+                except Exception:  # noqa: BLE001 - usage detail, never fatal
+                    reasoning_tokens = 0
+        return dataclasses.replace(
+            result, cached_tokens=cached_tokens, reasoning_tokens=reasoning_tokens
         )
 
     def _generate_request(
+        self,
+        request: _GenerationRequest,
+        *,
+        tools: Sequence[dict[str, Any]],
+        progress: Callable[[int, int], None] | None,
+    ) -> GenerationResult:
+        meter = _ReuseMeter(progress)
+        result = self._generate_request_raw(request, tools=tools, progress=meter)
+        return self._annotate_usage(result, meter.cached_tokens)
+
+    def _generate_request_raw(
         self,
         request: _GenerationRequest,
         *,
@@ -751,7 +814,12 @@ class InferenceService:
         *,
         progress: Callable[[int, int], None] | None = None,
         _prepared_request: _GenerationRequest | None = None,
+        _admitted: bool = False,
     ) -> Iterator[dict[str, Any] | str]:
+        # Everything up to the generator below runs at the call, not at the
+        # first event: a 400 from preparation reaches the HTTP layer before
+        # any header is sent. `_admitted` is the handler saying it holds a
+        # request slot already (see _admission).
         request = _prepared_request or self._prepare_chat(payload)
         stream_options = payload.get("stream_options") or {}
         if not isinstance(stream_options, dict):
@@ -782,7 +850,9 @@ class InferenceService:
                 created,
                 {"role": "assistant", "content": ""},
             )
-            for event in self._generation_events(request, progress=progress):
+            for event in self._generation_events(
+                request, progress=progress, admitted=_admitted
+            ):
                 if isinstance(event, _TextDelta):
                     yield _with_metrics(
                         self._chat_chunk(
@@ -870,8 +940,10 @@ class InferenceService:
                             "created": created,
                             "model": self.model_name,
                             "choices": [],
-                            "usage": _usage(
-                                event.prompt_tokens, event.completion_tokens
+                            "usage": (
+                                _result_usage(event.result)
+                                if event.result is not None
+                                else _usage(event.prompt_tokens, event.completion_tokens)
                             ),
                         }
                     yield "[DONE]"
@@ -883,6 +955,7 @@ class InferenceService:
         request: _GenerationRequest,
         *,
         progress: Callable[[int, int], None] | None = None,
+        admitted: bool = False,
     ) -> Iterator[_GenerationEvent]:
         """Run one generation and narrate it as protocol-neutral events.
 
@@ -890,15 +963,32 @@ class InferenceService:
         like tool-syntax holdback and the runaway-call bound cannot diverge
         between endpoints.
         """
-        if request.tools_enabled:
-            yield from self._tool_generation_events(request, progress)
-        else:
-            yield from self._plain_generation_events(request, progress)
+        meter = _ReuseMeter(progress)
+        inner = (
+            self._tool_generation_events(request, meter, admitted)
+            if request.tools_enabled
+            else self._plain_generation_events(request, meter, admitted)
+        )
+        try:
+            for event in inner:
+                if isinstance(event, _Finished) and event.result is not None:
+                    event = dataclasses.replace(
+                        event,
+                        result=self._annotate_usage(event.result, meter.cached_tokens),
+                    )
+                yield event
+        finally:
+            # Closing this generator (a client that went away) must close the
+            # one doing the work, which is what cancels the native task.
+            close = getattr(inner, "close", None)
+            if close is not None:
+                close()
 
     def _plain_generation_events(
         self,
         request: _GenerationRequest,
         progress: Callable[[int, int], None] | None,
+        admitted: bool = False,
     ) -> Iterator[_GenerationEvent]:
         final_step: GenerationStep | None = None
         last_step: GenerationStep | None = None
@@ -922,7 +1012,7 @@ class InferenceService:
             if request.stop_sequences
             else None
         )
-        with self._generation_guard():
+        with self._generation_guard(admitted=admitted):
             steps = self.generator.stream_messages(
                 request.messages,
                 prepared_prompt_ids=request.prompt_ids,
@@ -1033,6 +1123,7 @@ class InferenceService:
         self,
         request: _GenerationRequest,
         progress: Callable[[int, int], None] | None,
+        admitted: bool = False,
     ) -> Iterator[_GenerationEvent]:
         """Stream a tools-enabled turn, holding raw tool syntax back.
 
@@ -1070,7 +1161,7 @@ class InferenceService:
             if request.stop_sequences
             else None
         )
-        with self._generation_guard():
+        with self._generation_guard(admitted=admitted):
             steps = self.generator.stream_messages(
                 request.messages,
                 prepared_prompt_ids=request.prompt_ids,
@@ -1285,6 +1376,8 @@ class InferenceService:
             _, tool_calls = _parse_tool_calls(
                 accumulated, tools=request.tools,
                 keep_incomplete=final_step.stopped_on_eos)
+        if request.single_tool_call:
+            tool_calls = tool_calls[:1]
         streamed_tail: list[str] = []
         produced_tool_call = bool(tool_calls)
         streamed = tool_streamer is not None and tool_streamer.started
@@ -1434,6 +1527,7 @@ class InferenceService:
         payload: Mapping[str, Any],
         *,
         progress: Callable[[int, int], None] | None = None,
+        _admitted: bool = False,
     ) -> Iterator[dict[str, Any] | str]:
         request = self._prepare_text(payload)
         completion_id = f"cmpl-{uuid.uuid4().hex}"
@@ -1446,7 +1540,7 @@ class InferenceService:
                 if request.stop_sequences
                 else None
             )
-            with self._generation_guard():
+            with self._generation_guard(admitted=_admitted):
                 steps = self.generator.stream_text(
                     request.prompt,
                     max_new_tokens=request.max_new_tokens,
@@ -1574,6 +1668,7 @@ class InferenceService:
     ) -> dict[str, Any]:
         if _boolean_option(payload, "stream", False):
             raise APIError(400, "use the streaming response path", parameter="stream")
+        payload = _responses_payload_with_format(payload)
         messages = self._response_messages_with_history(payload)
         history_messages = [dict(message) for message in messages]
         tools = _response_tools(payload)
@@ -1597,7 +1692,9 @@ class InferenceService:
         payload: Mapping[str, Any],
         *,
         progress: Callable[[int, int], None] | None = None,
+        _admitted: bool = False,
     ) -> Iterator[dict[str, Any]]:
+        payload = _responses_payload_with_format(payload)
         messages = self._response_messages_with_history(payload)
         history_messages = [dict(message) for message in messages]
         tools = _response_tools(payload)
@@ -1782,7 +1879,9 @@ class InferenceService:
                     }
                 )
 
-            for event in self._generation_events(request, progress=progress):
+            for event in self._generation_events(
+                request, progress=progress, admitted=_admitted
+            ):
                 if isinstance(event, _TextDelta):
                     if not event.text:
                         continue
@@ -1879,7 +1978,8 @@ class InferenceService:
                 request, tools=request.tools, progress=progress
             )
         content_text, reasoning, tool_calls, finish_reason, stop_sequence = (
-            _finished_turn(result, request.tools, request.stop_sequences)
+            _finished_turn(result, request.tools, request.stop_sequences,
+                           single_tool_call=request.single_tool_call)
         )
         content: list[dict[str, Any]] = []
         if reasoning:
@@ -1913,12 +2013,7 @@ class InferenceService:
                 else _ANTHROPIC_STOP_REASONS.get(finish_reason, "end_turn")
             ),
             "stop_sequence": stop_sequence,
-            "usage": {
-                "input_tokens": len(result.prompt_ids),
-                "output_tokens": len(result.generated_ids),
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-            },
+            "usage": _anthropic_usage(result),
         }
 
     def stream_anthropic_message(
@@ -1926,6 +2021,7 @@ class InferenceService:
         payload: Mapping[str, Any],
         *,
         progress: Callable[[int, int], None] | None = None,
+        _admitted: bool = False,
     ) -> Iterator[dict[str, Any]]:
         request = self._prepare_anthropic(payload)
         input_tokens = len(request.prompt_ids)
@@ -1999,7 +2095,9 @@ class InferenceService:
                     event["flyweight"] = last_metrics
                 return event
 
-            for event in self._generation_events(request, progress=progress):
+            for event in self._generation_events(
+                request, progress=progress, admitted=_admitted
+            ):
                 metrics = getattr(event, "metrics", None)
                 if isinstance(metrics, _Metrics):
                     last_metrics = _metrics_payload(metrics)
@@ -2088,7 +2186,15 @@ class InferenceService:
                             ),
                             "stop_sequence": event.stop_sequence,
                         },
-                        "usage": {"output_tokens": event.completion_tokens},
+                        # The full accounting, not only output_tokens: the
+                        # prefix reuse is only known once prefill ran, after
+                        # message_start went out, and clients read the
+                        # cumulative usage from this delta.
+                        "usage": (
+                            _anthropic_usage(event.result)
+                            if event.result is not None
+                            else {"output_tokens": event.completion_tokens}
+                        ),
                         **(
                             {"flyweight": last_metrics}
                             if last_metrics is not None
@@ -2313,6 +2419,10 @@ class InferenceService:
                 else None
             ),
             reasoning_budget_tokens=reasoning_budget,
+            single_tool_call=(
+                payload.get("parallel_tool_calls") is False
+                or payload.get("disable_parallel_tool_use") is True
+            ),
         )
 
     def _record_transcript(
@@ -2432,9 +2542,10 @@ class InferenceService:
         *,
         tools: tuple[dict[str, Any], ...] = (),
         stop_sequences: tuple[str, ...] = (),
+        single_tool_call: bool = False,
     ) -> dict[str, Any]:
         content, reasoning, tool_calls, finish_reason, _ = _finished_turn(
-            result, tools, stop_sequences
+            result, tools, stop_sequences, single_tool_call=single_tool_call
         )
         message: dict[str, Any] = {
             "role": "assistant",
@@ -2459,7 +2570,7 @@ class InferenceService:
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": _usage(len(result.prompt_ids), len(result.generated_ids)),
+            "usage": _result_usage(result),
             "service_tier": "default",
             "system_fingerprint": None,
         }
@@ -2505,7 +2616,7 @@ class InferenceService:
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": _usage(len(result.prompt_ids), len(result.generated_ids)),
+            "usage": _result_usage(result),
         }
 
     def _completion_chunk(
@@ -2556,7 +2667,7 @@ class InferenceService:
             "temperature": _float_option(
                 payload, "temperature", float(self.generation_defaults["temperature"])
             ),
-            "text": {"format": {"type": "text"}},
+            "text": {"format": _responses_text_format(payload)},
             "tool_choice": payload.get(
                 "tool_choice", "auto" if payload.get("tools") else "none"
             ),
@@ -2607,7 +2718,7 @@ class InferenceService:
             "temperature": _float_option(
                 payload, "temperature", float(self.generation_defaults["temperature"])
             ),
-            "text": {"format": {"type": "text"}},
+            "text": {"format": _responses_text_format(payload)},
             "tool_choice": payload.get(
                 "tool_choice", "auto" if payload.get("tools") else "none"
             ),
@@ -2618,9 +2729,9 @@ class InferenceService:
             "truncation": "disabled",
             "usage": {
                 "input_tokens": len(result.prompt_ids),
-                "input_tokens_details": {"cached_tokens": 0},
+                "input_tokens_details": {"cached_tokens": result.cached_tokens},
                 "output_tokens": len(result.generated_ids),
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": result.reasoning_tokens},
                 "total_tokens": len(result.prompt_ids) + len(result.generated_ids),
             },
         }
@@ -2721,13 +2832,6 @@ class FlyweightHTTPServer(ThreadingHTTPServer):
 
 
 _SSE_KEEPALIVE = object()
-
-
-def _deferred_stream(
-    factory: Callable[[], Iterator[dict[str, Any] | str]],
-) -> Iterator[dict[str, Any] | str]:
-    """Defer request preparation until after SSE headers are sent."""
-    yield from factory()
 
 
 def _sse_with_keepalive(
@@ -2850,16 +2954,39 @@ def create_handler(
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def _guarded(self, body: Callable[[], None]) -> None:
+            """Run a handler body under the error policy do_POST already had.
+
+            A native-runtime failure inside /health or /props used to escape
+            the handler: socketserver printed the traceback and dropped the
+            connection with no HTTP response at all, which a health checker
+            reads as the server being down.
+            """
+            try:
+                body()
+            except APIError as error:
+                self._send_error(error)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            except Exception:
+                self.log_error("unhandled request error: %s", traceback.format_exc())
+                self._send_error(APIError(500, "internal server error", "server_error"))
+
         def do_GET(self) -> None:
+            self._guarded(self._do_get)
+
+        def do_HEAD(self) -> None:
+            self._guarded(self._do_head)
+
+        def do_DELETE(self) -> None:
+            self._guarded(self._do_delete)
+
+        def _do_get(self) -> None:
             path = urlsplit(self.path).path
             if path in UI_ASSETS:
                 self._send_static(path)
                 return
-            try:
-                self._authenticate()
-            except APIError as error:
-                self._send_error(error)
-                return
+            self._authenticate()
             if path == "/health":
                 self._send_json(200, service.health())
                 return
@@ -2903,36 +3030,30 @@ def create_handler(
                 return
             self._send_error(APIError(404, "endpoint not found", "not_found_error"))
 
-        def do_HEAD(self) -> None:
+        def _do_head(self) -> None:
             path = urlsplit(self.path).path
             if path in UI_ASSETS:
                 self._send_static(path, head_only=True)
                 return
-            try:
-                self._authenticate()
-                if path == "/v1/me":
-                    self._send_json(200, service.me(), head_only=True)
-                    return
-                if path == "/health":
-                    self._send_json(200, service.health(), head_only=True)
-                    return
-                if path == "/v1/models":
-                    self._send_json(200, service.models(), head_only=True)
-                    return
-                self._send_error(APIError(404, "endpoint not found", "not_found_error"))
-            except APIError as error:
-                self._send_error(error)
+            self._authenticate()
+            if path == "/v1/me":
+                self._send_json(200, service.me(), head_only=True)
+                return
+            if path == "/health":
+                self._send_json(200, service.health(), head_only=True)
+                return
+            if path == "/v1/models":
+                self._send_json(200, service.models(), head_only=True)
+                return
+            self._send_error(APIError(404, "endpoint not found", "not_found_error"))
 
-        def do_DELETE(self) -> None:
-            try:
-                self._authenticate()
-                path = urlsplit(self.path).path
-                if not path.startswith("/v1/responses/"):
-                    raise APIError(404, "endpoint not found", "not_found_error")
-                response_id = unquote(path[len("/v1/responses/") :])
-                self._send_json(200, service.delete_response(response_id))
-            except APIError as error:
-                self._send_error(error)
+        def _do_delete(self) -> None:
+            self._authenticate()
+            path = urlsplit(self.path).path
+            if not path.startswith("/v1/responses/"):
+                raise APIError(404, "endpoint not found", "not_found_error")
+            response_id = unquote(path[len("/v1/responses/") :])
+            self._send_json(200, service.delete_response(response_id))
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
@@ -2948,13 +3069,15 @@ def create_handler(
                 progress = self._prompt_progress(path)
                 if path == "/v1/chat/completions":
                     if _boolean_option(payload, "stream", False):
-                        self._send_sse(
-                            _deferred_stream(
-                                lambda: service.stream_chat_completion(
-                                    payload, progress=progress
+                        # Prepared and admitted before a byte of the response
+                        # goes out: a 400 or a 429 raised here is a real HTTP
+                        # status, not an error event on a 200 stream.
+                        with service._admission():
+                            self._send_sse(
+                                service.stream_chat_completion(
+                                    payload, progress=progress, _admitted=True
                                 )
                             )
-                        )
                     else:
                         self._send_json(
                             200, service.chat_completion(payload, progress=progress)
@@ -2963,13 +3086,12 @@ def create_handler(
                     return
                 if path == "/v1/completions":
                     if _boolean_option(payload, "stream", False):
-                        self._send_sse(
-                            _deferred_stream(
-                                lambda: service.stream_completion(
-                                    payload, progress=progress
+                        with service._admission():
+                            self._send_sse(
+                                service.stream_completion(
+                                    payload, progress=progress, _admitted=True
                                 )
                             )
-                        )
                     else:
                         self._send_json(
                             200, service.completion(payload, progress=progress)
@@ -2990,14 +3112,13 @@ def create_handler(
                     return
                 if path == "/v1/messages":
                     if _boolean_option(payload, "stream", False):
-                        self._send_sse(
-                            _deferred_stream(
-                                lambda: service.stream_anthropic_message(
-                                    payload, progress=progress
-                                )
-                            ),
-                            keepalive={"type": "ping"},
-                        )
+                        with service._admission():
+                            self._send_sse(
+                                service.stream_anthropic_message(
+                                    payload, progress=progress, _admitted=True
+                                ),
+                                keepalive={"type": "ping"},
+                            )
                     else:
                         self._send_json(
                             200,
@@ -3011,9 +3132,12 @@ def create_handler(
                     return
                 if path == "/v1/responses":
                     if _boolean_option(payload, "stream", False):
-                        self._send_sse(
-                            service.stream_response(payload, progress=progress)
-                        )
+                        with service._admission():
+                            self._send_sse(
+                                service.stream_response(
+                                    payload, progress=progress, _admitted=True
+                                )
+                            )
                     else:
                         self._send_json(
                             200, service.response(payload, progress=progress)
@@ -3309,6 +3433,16 @@ def create_handler(
                     sys.stderr.flush()
                 self.log_message("request completed: streaming events=%d", event_count)
             except (BrokenPipeError, ConnectionResetError):
+                stream_ok = False
+                self.close_connection = True
+            except TimeoutError:
+                # The socket write blocked for the request timeout: the client
+                # stopped reading while the buffer was full. Not a runtime
+                # fault, and blaming the runtime sent operators the wrong way.
+                self.log_error(
+                    "client stopped reading the stream for %ss; closing",
+                    service.request_timeout_seconds,
+                )
                 stream_ok = False
                 self.close_connection = True
             except OSError as error:
@@ -3795,6 +3929,8 @@ def _anthropic_request(
     }
     choice = payload.get("tool_choice")
     if isinstance(choice, dict):
+        if choice.get("disable_parallel_tool_use") is True:
+            options["disable_parallel_tool_use"] = True
         choice_type = choice.get("type")
         if choice_type == "any":
             options["tool_choice"] = "required"
@@ -3894,6 +4030,7 @@ def _anthropic_request(
                         ),
                         architecture=architecture,
                         tool_call_id=block.get("tool_use_id"),
+                        is_error=block.get("is_error") is True,
                     )
                 )
             else:
@@ -4045,14 +4182,21 @@ def _unsupported_block_text(block_type: Any) -> str:
 
 
 def _tool_turn(
-    content: str, *, architecture: str | None, tool_call_id: Any = None
+    content: str, *, architecture: str | None, tool_call_id: Any = None,
+    is_error: bool = False,
 ) -> dict[str, Any]:
     """One tool result in the prompt shape this architecture reads.
 
     A template that renders tool turns natively gets the role, and the call id
     when the client supplied one so parallel calls pair with their results;
     everywhere else the result is wrapped as user text.
+
+    `is_error` is Anthropic's flag for a tool that failed. Nothing in the
+    prompt shapes carries it, so the model was reading failure output as an
+    ordinary result; it is spelled out in the text instead.
     """
+    if is_error and not content.lower().startswith("error"):
+        content = f"Error: {content}" if content else "Error: the tool call failed"
     if architecture in NATIVE_TOOL_ARCHITECTURES:
         turn: dict[str, Any] = {"role": "tool", "content": content}
         if isinstance(tool_call_id, str) and tool_call_id:
@@ -4551,6 +4695,8 @@ def _finished_turn(
     result: GenerationResult,
     tools: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     stop_sequences: Sequence[str] = (),
+    *,
+    single_tool_call: bool = False,
 ) -> tuple[str | None, str | None, list[dict[str, Any]], str, str | None]:
     """(content, reasoning, tool_calls, finish_reason, stop_sequence).
 
@@ -4567,6 +4713,8 @@ def _finished_turn(
     visible, reasoning = _split_reasoning_content(result.text)
     content, tool_calls = _parse_tool_calls(
         visible, tools=tools, keep_incomplete=result.stopped_on_eos)
+    if single_tool_call:
+        tool_calls = tool_calls[:1]
     if _turn_is_silent(visible, content, tool_calls, result.stopped_on_eos):
         content = visible.strip()
     stop_sequence = None
@@ -5505,9 +5653,61 @@ def _optional_text_content(value: Any, message_index: int) -> str:
     return _text_content(value, message_index)
 
 
+def _responses_text_format(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The request's `text.format`, echoed back; `{"type": "text"}` if none."""
+    text = payload.get("text")
+    if isinstance(text, Mapping) and isinstance(text.get("format"), Mapping):
+        return dict(text["format"])
+    return {"type": "text"}
+
+
+def _responses_payload_with_format(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Translate the Responses API's `text.format` into `response_format`.
+
+    Structured output is asked for under `text.format` on this API --
+    `{"type": "json_schema", "name": ..., "schema": ...}` -- not
+    `response_format`, which is the chat spelling every parser here reads.
+    Clients built for Responses got free-form text and an echo claiming it.
+    """
+    text = payload.get("text")
+    if not isinstance(text, Mapping):
+        return payload
+    fmt = text.get("format")
+    if not isinstance(fmt, Mapping) or "response_format" in payload:
+        return payload
+    kind = fmt.get("type")
+    if kind == "json_object":
+        translated: dict[str, Any] = {"type": "json_object"}
+    elif kind == "json_schema":
+        schema = {
+            key: fmt[key] for key in ("name", "schema", "strict", "description")
+            if key in fmt
+        }
+        translated = {"type": "json_schema", "json_schema": schema}
+    elif kind in (None, "text"):
+        return payload
+    else:
+        raise APIError(400, f"text.format type '{kind}' is not supported",
+                       parameter="text.format")
+    merged = dict(payload)
+    merged["response_format"] = translated
+    return merged
+
+
 def _reject_unsupported_generation_options(payload: Mapping[str, Any]) -> None:
     if payload.get("n", 1) != 1:
         raise APIError(400, "only n=1 is supported", parameter="n")
+    # Rejected rather than ignored: a client that asked for logprobs to score
+    # or classify, or sent logit_bias to ban a token, got an ordinary-looking
+    # answer with nothing enforced. Saying no is the honest answer until the
+    # sampler reports them.
+    for name in ("logprobs", "top_logprobs"):
+        if payload.get(name):
+            raise APIError(
+                400, f"{name} are not implemented yet", parameter=name
+            )
+    if payload.get("logit_bias"):
+        raise APIError(400, "logit_bias is not supported", parameter="logit_bias")
 
 
 def _chat_template_kwargs(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -5543,19 +5743,74 @@ def _reasoning_budget(payload: Mapping[str, Any]) -> int | None:
     return value
 
 
-def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
+def _usage(
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    cached_tokens: int = 0,
+    reasoning_tokens: int = 0,
+) -> dict[str, Any]:
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
-        "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+        "prompt_tokens_details": {"cached_tokens": cached_tokens, "audio_tokens": 0},
         "completion_tokens_details": {
-            "reasoning_tokens": 0,
+            "reasoning_tokens": reasoning_tokens,
             "audio_tokens": 0,
             "accepted_prediction_tokens": 0,
             "rejected_prediction_tokens": 0,
         },
     }
+
+
+def _result_usage(result: GenerationResult | None) -> dict[str, Any]:
+    """OpenAI usage for a finished generation, with the detail fields filled."""
+    if result is None:
+        return _usage(0, 0)
+    return _usage(
+        len(result.prompt_ids), len(result.generated_ids),
+        cached_tokens=result.cached_tokens,
+        reasoning_tokens=result.reasoning_tokens,
+    )
+
+
+def _anthropic_usage(result: GenerationResult) -> dict[str, Any]:
+    """Anthropic usage: input_tokens is the UNCACHED part of the prompt.
+
+    Claude Code sums input_tokens and cache_read_input_tokens for its context
+    meter, so reporting the whole prompt under input_tokens while also filling
+    cache_read would double count the reused prefix.
+    """
+    prompt = len(result.prompt_ids)
+    cached = min(result.cached_tokens, prompt)
+    return {
+        "input_tokens": prompt - cached,
+        "output_tokens": len(result.generated_ids),
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
+    }
+
+
+class _ReuseMeter:
+    """Wrap a progress callback and remember how much prompt was reused.
+
+    The generator's first progress report is where prefill starts, which is
+    exactly the prefix the runtime reused instead of re-evaluating. Usage
+    reported this as zero while the runtime counted it all along.
+    """
+
+    def __init__(self, progress: Callable[[int, int], None] | None) -> None:
+        self._progress = progress
+        self.cached_tokens = 0
+        self._seen = False
+
+    def __call__(self, processed: int, total: int) -> None:
+        if not self._seen:
+            self._seen = True
+            self.cached_tokens = min(max(0, int(processed)), max(0, int(total)))
+        if self._progress is not None:
+            self._progress(processed, total)
 
 
 @overload

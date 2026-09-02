@@ -1,5 +1,6 @@
 #include "qwen_cpu_kernel.h"
 
+#include <algorithm>
 #include <cstring>
 #include <immintrin.h>
 
@@ -1219,8 +1220,13 @@ void qwen_quant_dot_two_rows_avx512(
     } else if (type == 40) {
         nvfp4_dot_two_rows(
             first_row, second_row, input, elements, *first_output, *second_output);
-    } else {
+    } else if (type == 8) {
         q8_dot_two_rows(first_row, second_row, input, elements, *first_output, *second_output);
+    } else {
+        // Same rule as qwen_quant_dot_avx512: an unknown type must not be
+        // walked with Q8_0's stride.
+        *first_output = 0.0f;
+        *second_output = 0.0f;
     }
 }
 
@@ -1325,7 +1331,8 @@ void qwen_quant_dot_pair_avx512(
     else if(type==13)q5_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*176,first,second,elements,*first_output,*second_output);
     else if(type==14)q6_dot_pair(packed+row*static_cast<std::uint64_t>(elements/256)*210,first,second,elements,*first_output,*second_output);
     else if(type==40){const float*inputs[2]={first,second};float outputs[2]{};nvfp4_dot_multi<2>(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);*first_output=outputs[0];*second_output=outputs[1];}
-    else q8_dot_pair(packed+row*static_cast<std::uint64_t>(elements/32)*34,first,second,elements,*first_output,*second_output);
+    else if(type==8)q8_dot_pair(packed+row*static_cast<std::uint64_t>(elements/32)*34,first,second,elements,*first_output,*second_output);
+    else{*first_output=0.0f;*second_output=0.0f;} // unknown type: never walk it as Q8_0
 }
 
 void qwen_quant_dot_quad_avx512(
@@ -1338,7 +1345,8 @@ void qwen_quant_dot_quad_avx512(
     else if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
     else if(type==40)nvfp4_dot_multi<4>(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);
-    else q8_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
+    else if(type==8)q8_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
+    else for(int i=0;i<4;++i)outputs[i]=0.0f; // unknown type: never walk it as Q8_0
 }
 
 void qwen_quant_dot_oct_avx512(
@@ -1351,7 +1359,8 @@ void qwen_quant_dot_oct_avx512(
     else if(type==13)q5_dot_oct(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_oct(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
     else if(type==40)nvfp4_dot_multi<8>(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);
-    else q8_dot_oct(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
+    else if(type==8)q8_dot_oct(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
+    else for(int i=0;i<8;++i)outputs[i]=0.0f; // unknown type: never walk it as Q8_0
 }
 
 void qwen_dequant_row_avx512(
@@ -1380,9 +1389,12 @@ void qwen_dequant_row_avx512(
         nvfp4_dequant(
             packed + row * static_cast<std::uint64_t>(elements / 64) * 36,
             output, elements);
-    } else {
+    } else if (type == 8) {
         q8_dequant(packed + row * static_cast<std::uint64_t>(elements / 32) * 34,
                    output, elements);
+    } else {
+        // Unknown type: never walk it as Q8_0.
+        std::fill(output, output + elements, 0.0f);
     }
 }
 

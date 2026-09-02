@@ -1353,7 +1353,11 @@ void qwen_quant_dot_quad_avx2(
     else if(type==13)q5_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*176,inputs,elements,outputs);
     else if(type==14)q6_dot_quad(packed+row*static_cast<std::uint64_t>(elements/256)*210,inputs,elements,outputs);
     else if(type==40)nvfp4_dot_quad(packed+row*static_cast<std::uint64_t>(elements/64)*36,inputs,elements,outputs);
-    else q8_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
+    else if(type==8)q8_dot_quad(packed+row*static_cast<std::uint64_t>(elements/32)*34,inputs,elements,outputs);
+    // Same rule as the single-row dispatch: a type this path does not know
+    // must not be read with Q8_0's stride. Zero outputs are diagnosable; an
+    // over-read of the mmap is not.
+    else for(int i=0;i<4;++i)outputs[i]=0.0f;
 }
 
 void qwen_quantize_q8_k_avx2(
@@ -1728,7 +1732,8 @@ void qwen_dequant_row_avx2(const std::uint8_t* packed,std::uint32_t type,int ele
     else if(type==19)iq1s_dequant(packed+row*static_cast<std::uint64_t>(elements/256)*kIq1sBlockBytes,output,elements);
     else if(type==20)iq4nl_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*kIq4nlBlockBytes,output,elements);
     else if(type==40)nvfp4_dequant(packed+row*static_cast<std::uint64_t>(elements/64)*36,output,elements);
-    else q8_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*34,output,elements);
+    else if(type==8)q8_dequant(packed+row*static_cast<std::uint64_t>(elements/32)*34,output,elements);
+    else std::fill(output,output+elements,0.0f); // unknown type: never walk it as Q8_0
 }
 
 void qwen_f32_dot_multi_avx2(const float* row,const float*const*inputs,int count,int elements,float*outputs){

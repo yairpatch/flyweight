@@ -13,6 +13,12 @@ class GenerationResult:
     text: str
     stopped_on_eos: bool
     state_tokens: int
+    # Usage detail the HTTP layer reports. `cached_tokens` is the prompt
+    # prefix the runtime reused instead of re-evaluating; `reasoning_tokens`
+    # is the token count of the chain-of-thought split out of `text`. Both
+    # default to zero so generators that do not know them stay valid.
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)

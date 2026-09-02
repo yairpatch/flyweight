@@ -84,10 +84,13 @@ std::uint32_t detect_features() {
 #else
     __cpuid(1, registers[0], registers[1], registers[2], registers[3]);
 #endif
+    const bool fma = (registers[2] & (1 << 12)) != 0;
     const bool osxsave = (registers[2] & (1 << 27)) != 0;
     const bool avx = (registers[2] & (1 << 28)) != 0;
     const bool f16c = (registers[2] & (1 << 29)) != 0;
-    if (!osxsave || !avx || !f16c) {
+    // Every AVX2 translation unit is built with -mfma and uses fmadd, so
+    // FMA is part of the AVX2 admission, not a separate feature.
+    if (!osxsave || !avx || !f16c || !fma) {
         return 0;
     }
     const std::uint64_t xcr0 = read_xcr0();
@@ -105,12 +108,14 @@ std::uint32_t detect_features() {
     }
     const bool avx512_hardware = (registers[1] & (1 << 16)) != 0;
     const bool avx512_bw = (registers[1] & (1 << 30)) != 0;
+    const bool avx512_vl = (registers[1] & (1 << 31)) != 0;
     const bool avx512_os = (xcr0 & 0xE0) == 0xE0;
     if (avx512_hardware && avx512_bw && avx512_os) {
         features |= kFeatureAvx512;
         // CPUID.7.0:ECX bit 11; only meaningful once the AVX-512 state checks
-        // above have passed.
-        if ((registers[2] & (1 << 11)) != 0) {
+        // above have passed. The VNNI-512 GEMM is also built with -mavx512vl
+        // (EBX bit 31), so that gates it too.
+        if ((registers[2] & (1 << 11)) != 0 && avx512_vl) {
             features |= kFeatureAvx512Vnni;
         }
     }

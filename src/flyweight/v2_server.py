@@ -201,6 +201,34 @@ class _NativeEngine:
         except V2Error:
             pass  # runtime may already be closed; the task queue is dropped below
 
+    def _task_error(self, task_id: int) -> str:
+        """The native reason a task failed, with the fixed sentence as fallback."""
+        detail = ""
+        reader = getattr(self.runtime, "task_error", None)
+        if callable(reader):
+            try:
+                detail = str(reader(task_id))
+            except Exception:  # noqa: BLE001 - the event already says it failed
+                detail = ""
+        return (
+            f"native v2 engine task failed: {detail}"
+            if detail
+            else "native v2 engine task failed"
+        )
+
+    def _fail_all(self, message: str) -> None:
+        """Fail every waiting request and cancel its native task.
+
+        Dropping only the Python queues left the native tasks alive: if the
+        failure was transient, the next submit woke the loop and the orphans
+        resumed decoding to max_tokens with no consumer, holding their slots.
+        """
+        with self._lock:
+            queues, self._queues = self._queues, {}
+        for task_id, task_queue in queues.items():
+            self.cancel(task_id)
+            self._replace_with_error(task_queue, message)
+
     def _run(self) -> None:
         while True:
             with self._lock:
@@ -223,21 +251,11 @@ class _NativeEngine:
                 # These indicate a bug in the native code (an unhandled
                 # C++ exception or memory corruption).  Surface the
                 # Windows error text so it is diagnosable.
-                with self._lock:
-                    queues, self._queues = self._queues, {}
-                for task_queue in queues.values():
-                    self._replace_with_error(
-                        task_queue, f"native engine failure: {error}"
-                    )
+                self._fail_all(f"native engine failure: {error}")
                 continue
             except Exception as error:
                 # Engine-level failure: fail every waiting request, not just one.
-                with self._lock:
-                    queues, self._queues = self._queues, {}
-                for task_queue in queues.values():
-                    self._replace_with_error(
-                        task_queue, f"native engine failure: {error}"
-                    )
+                self._fail_all(f"native engine failure: {error}")
                 continue
             if not events:
                 # Tasks exist but none progressed (e.g. waiting for a busy
@@ -259,9 +277,7 @@ class _NativeEngine:
                         with self._lock:
                             self._queues.pop(task_id, None)
                     elif kind == TASK_EVENT_ERROR:
-                        task_queue.put_nowait(
-                            ("error", "native v2 engine task failed")
-                        )
+                        task_queue.put_nowait(("error", self._task_error(task_id)))
                         with self._lock:
                             self._queues.pop(task_id, None)
                 except Full:
@@ -962,7 +978,7 @@ def _tool_grammar_specification(
 
 
 # (role, visible content, replayed reasoning) per turn.
-ChatKey = tuple[tuple[str, str, str], ...]
+ChatKey = tuple[tuple[str, ...], ...]
 # What a matched prefix carries: its prompt and generated ids, the raw text, and
 # the three render settings it was produced under, all of which have to agree
 # before it is a prefix of THIS conversation rather than a similar one.
@@ -977,14 +993,30 @@ def _chat_key(messages: Sequence[Mapping[str, object]]) -> ChatKey:
     Index 0 and 1 stay role and content, which the prefix matcher indexes
     positionally.
     """
-    return tuple(
-        (
-            str(message["role"]),
-            str(message["content"]).strip(),
-            str(message.get("reasoning_content", "") or "").strip(),
-        )
-        for message in messages
+    return tuple(_message_key(message) for message in messages)
+
+
+def _message_key(message: Mapping[str, object]) -> tuple[str, ...]:
+    key = (
+        str(message["role"]),
+        str(message["content"]).strip(),
+        str(message.get("reasoning_content", "") or "").strip(),
     )
+    # Structured fields the template renders from outside `content`: the tool
+    # declarations a native-tool architecture carries on the first message,
+    # and an assistant turn's structured tool calls. Without them two prompts
+    # that differ only in their tool set matched, and the model kept seeing
+    # the schemas of the old one. Appended only when present, so a plain
+    # conversation keeps the three-field key callers build by hand.
+    digest = _structured_digest(message)
+    return key + (digest,) if digest else key
+
+
+def _structured_digest(message: Mapping[str, object]) -> str:
+    parts = [message.get("tools"), message.get("tool_calls"), message.get("tool_call_id")]
+    if not any(part for part in parts):
+        return ""
+    return json.dumps(parts, sort_keys=True, default=str)
 
 
 def _optional_thinking(options: Mapping[str, object]) -> bool | None:
@@ -1272,7 +1304,7 @@ class ChatGenerator:
         """
         rendered = list(full) if full is not None else [
             {"role": role, "content": content, "reasoning_content": reasoning}
-            for role, content, reasoning in messages
+            for role, content, reasoning, *_ in messages
         ]
         candidates = list(self._chat_continuations.items())
         if self._chat_messages is not None:
@@ -1865,11 +1897,26 @@ class BailingEngine:
             return len(self._queues)
 
     def close(self) -> None:
+        # Drain what is queued and what is running, and tell each consumer.
+        # Left in place, pending tasks could never be admitted (the loop
+        # refuses while closing) yet kept the loop from exiting, so the join
+        # below waited out its 30 s and every waiting request hung forever.
         with self._lock:
             self._closing = True
+            pending, self._pending = self._pending, []
+            active, self._active = self._active, {}
+            orphaned = [self._queues.get(task[0]) for task in pending]
+            orphaned += [self._queues.get(task_id) for task_id in active]
+        for task_queue in orphaned:
+            if task_queue is None:
+                continue
+            try:
+                task_queue.put_nowait(("error", "bailing engine is shutting down"))
+            except Exception:  # noqa: BLE001 - a full queue still holds an event
+                pass
         self._wake.set()
         thread = self._thread
-        if thread is not None and thread.is_alive():
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=30.0)
 
     def _emit(self, task_id: int, event: tuple[str, object]) -> bool:
@@ -1899,7 +1946,7 @@ class BailingEngine:
         """
         while True:
             with self._lock:
-                if self._closing and not self._pending and not self._active:
+                if self._closing:
                     return
                 idle = not self._pending and not self._active
             if idle:
@@ -2263,23 +2310,31 @@ class NativeV2InferenceService(InferenceService):
         self.architecture = str(self.v2_model.info["architecture"])
         self.bailing_runtime: BailingRuntime | None = None
         if self.architecture == "bailingmoe3":
-            self._init_bailing(
-                model_name=model_name or Path(model_path).stem,
-                max_new_tokens=max_new_tokens,
-                context_window=context_window,
-                api_key=api_key,
-                cors_origin=cors_origin,
-                strict_model=strict_model,
-                max_concurrent_requests=max_concurrent_requests,
-                request_timeout_seconds=request_timeout_seconds,
-                sse_keepalive_seconds=sse_keepalive_seconds,
-                max_tool_call_tokens=max_tool_call_tokens,
-                default_thinking_budget=default_thinking_budget,
-                reasoning_effort=reasoning_effort,
-                generation_defaults=generation_defaults,
-                prompt_cache_mib=prompt_cache_mib,
-                parallel_sequences=parallel_sequences,
-            )
+            try:
+                self._init_bailing(
+                    model_name=model_name or Path(model_path).stem,
+                    max_new_tokens=max_new_tokens,
+                    context_window=context_window,
+                    api_key=api_key,
+                    cors_origin=cors_origin,
+                    strict_model=strict_model,
+                    max_concurrent_requests=max_concurrent_requests,
+                    request_timeout_seconds=request_timeout_seconds,
+                    sse_keepalive_seconds=sse_keepalive_seconds,
+                    max_tool_call_tokens=max_tool_call_tokens,
+                    default_thinking_budget=default_thinking_budget,
+                    reasoning_effort=reasoning_effort,
+                    generation_defaults=generation_defaults,
+                    prompt_cache_mib=prompt_cache_mib,
+                    parallel_sequences=parallel_sequences,
+                )
+            except BaseException:
+                runtime = getattr(self, "bailing_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+                    self.bailing_runtime = None
+                self.v2_model.close()
+                raise
             self.generation_defaults_source = generation_defaults_source
             self.gpu_cache_mib = gpu_cache_mib
             self.mtp_drafts = 0
@@ -2319,7 +2374,15 @@ class NativeV2InferenceService(InferenceService):
             self.v2_model.close()
             raise
         assert self.v2_runtime is not None
-        tokenizer = NativeV2Tokenizer(self.v2_model)
+        try:
+            tokenizer = NativeV2Tokenizer(self.v2_model)
+        except BaseException:
+            # A chat template that fails to parse, or an undecodable
+            # tokenizer key, used to leave the prepared runtime (its GPU
+            # arenas included) alive for the rest of the process.
+            self.v2_runtime.close()
+            self.v2_model.close()
+            raise
         super().__init__(
             model_name or Path(model_path).stem,
             NativeV2Generator(self.v2_model, self.v2_runtime, tokenizer),
