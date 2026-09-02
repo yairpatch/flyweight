@@ -19,6 +19,7 @@ GGUF_STRING = 8
 GGUF_UINT64 = 10
 GGML_F32 = 0
 GGML_Q8_0 = 8
+GGML_Q6_K = 14
 
 ALIGNMENT = 32
 
@@ -49,6 +50,55 @@ def _quantize_q8_0(data: np.ndarray) -> bytes:
         for block in range(columns // 32):
             out += scale_f16[row, block].tobytes()
             out += quantized[row, block].tobytes()
+    return bytes(out)
+
+
+def _quantize_q6_k(data: np.ndarray) -> bytes:
+    """Pack a row-major matrix as GGML Q6_K.
+
+    256 values per block: ``ql[128]`` low nibbles, ``qh[64]`` high bit pairs,
+    ``scales[16]`` int8 (one per 16 values) and an fp16 ``d``, 210 bytes.
+    ``value = d * scales[i // 16] * (q - 32)``. The nibble and bit-pair
+    placement mirrors the runtime's ``qwen_q6_value``: within each 128-value
+    half, value ``l + 32 * lane`` (``l < 32``) has its low nibble in
+    ``ql[l]`` (lanes 0 and 2, low/high nibble) or ``ql[l + 32]`` (lanes 1 and
+    3), and its two high bits at ``qh[l] >> (2 * lane)``.
+    """
+    rows, columns = data.shape
+    assert columns % 256 == 0, "Q6_K needs a multiple of 256 along the row"
+    blocks = data.reshape(rows, columns // 256, 16, 16).astype(np.float32)
+    sub_absmax = np.abs(blocks).max(axis=3)  # [rows, blocks, 16]
+    sub_scale = sub_absmax / 31.0
+    d = sub_scale.max(axis=2) / 127.0  # [rows, blocks]
+    d_safe = np.where(d > 0.0, d, 1.0)
+    scales = np.rint(sub_scale / d_safe[:, :, None]).clip(-128, 127).astype(np.int8)
+    effective = d[:, :, None] * scales.astype(np.float32)
+    effective_safe = np.where(effective != 0.0, effective, 1.0)
+    quant = np.rint(blocks / effective_safe[:, :, :, None]).clip(-32, 31).astype(np.int32)
+    quant = np.where(effective[:, :, :, None] != 0.0, quant, 0)
+    stored = (quant + 32).astype(np.uint8).reshape(rows, columns // 256, 256)
+
+    out = bytearray()
+    d_f16 = d.astype(np.float16)
+    for row in range(rows):
+        for block in range(columns // 256):
+            values = stored[row, block]
+            ql = np.zeros(128, dtype=np.uint8)
+            qh = np.zeros(64, dtype=np.uint8)
+            for half in range(2):
+                base = half * 128
+                for lane in range(4):
+                    lane_values = values[base + lane * 32 : base + lane * 32 + 32]
+                    low = lane_values & 0x0F
+                    high = lane_values >> 4
+                    ql_index = half * 64 + (0 if lane in (0, 2) else 32)
+                    shift = 0 if lane in (0, 1) else 4
+                    ql[ql_index : ql_index + 32] |= (low << shift).astype(np.uint8)
+                    qh[half * 32 : half * 32 + 32] |= (high << (2 * lane)).astype(np.uint8)
+            out += ql.tobytes()
+            out += qh.tobytes()
+            out += scales[row, block].tobytes()
+            out += d_f16[row, block].tobytes()
     return bytes(out)
 
 
@@ -275,21 +325,30 @@ def build_dense_qwen35_gguf(
         # The stacked expert tensors are 3-D [expert][output][input]; their
         # contiguous rows are shape[0] long exactly like a 2-D projection's,
         # so the same per-row packing applies.
-        use_q8 = (
-            quantize == "q8_0"
-            and len(shape) in (2, 3)
-            and shape[0] % 32 == 0
+        packable = (
+            len(shape) in (2, 3)
             and name.endswith(".weight")
             and "norm" not in name
         )
+        use_q8 = quantize == "q8_0" and packable and shape[0] % 32 == 0
+        # Q6_K blocks 256 values; a row narrower than that (the routed experts'
+        # 64-wide down projection) stays f32, exactly as a real pack would
+        # fall back to another format for it.
+        use_q6 = quantize == "q6_k" and packable and shape[0] % 256 == 0
         infos += _string(name)
         infos += struct.pack("<I", len(shape))
         infos += b"".join(struct.pack("<Q", dim) for dim in shape)
-        infos += struct.pack("<IQ", GGML_Q8_0 if use_q8 else GGML_F32, offset)
+        infos += struct.pack(
+            "<IQ", GGML_Q8_0 if use_q8 else GGML_Q6_K if use_q6 else GGML_F32, offset
+        )
         if use_q8:
             raw = _quantize_q8_0(np.ascontiguousarray(
                 data, dtype=np.float32).reshape(-1, shape[0]))
             assert len(raw) == int(np.prod(shape)) // 32 * 34, name
+        elif use_q6:
+            raw = _quantize_q6_k(np.ascontiguousarray(
+                data, dtype=np.float32).reshape(-1, shape[0]))
+            assert len(raw) == int(np.prod(shape)) // 256 * 210, name
         else:
             raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()
             assert len(raw) == int(np.prod(shape)) * 4, name

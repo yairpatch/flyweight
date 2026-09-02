@@ -4747,6 +4747,18 @@ const char* qwen_q8_matvec_kernel(std::uint32_t type) {
     return format ? format->matvec_q8_warp : nullptr;
 }
 
+// FLYWEIGHT_IQ2_Q8_DECODE=0 keeps every head on the reconstruct-in-float
+// argmax kernel; the default quantizes the activation to Q8 blocks and runs
+// the group-decode head, which reads the largest per-token tensor once at a
+// fraction of the float kernel's cost.
+bool qwen_q8_head_enabled() {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
+        return !setting || setting[0] != '0';
+    }();
+    return enabled;
+}
+
 const char* qwen_lm_head_argmax_kernel(std::uint32_t type) {
     const auto* format = flyweight::v2::qwen_format(type);
     if (format && format->lm_head_argmax) return format->lm_head_argmax;
@@ -16123,6 +16135,10 @@ std::uint32_t qwen4exp_mtp_draft(
     const auto router_logits = take(experts * sizeof(float));
     const auto selected_device = take(top_k * sizeof(std::int32_t));
     const auto route_weights = take(top_k * sizeof(float));
+    // Q8 activation for the group-decode head (see qwen_mtp_draft).
+    const auto draft_q8 = take(static_cast<std::uint64_t>(hidden_size));
+    const auto draft_q8_scales =
+        take((static_cast<std::uint64_t>(hidden_size) / 32 + 1) * sizeof(float));
     const auto argmax_device = take(sizeof(std::uint64_t));
     const auto attention_scores = take(
         static_cast<std::uint64_t>(heads) * runtime.options.context_limit * sizeof(float));
@@ -16346,10 +16362,26 @@ std::uint32_t qwen4exp_mtp_draft(
         throw std::runtime_error("native qwen4exp MTP argmax reset failed");
     int vocabulary = static_cast<int>(config.vocabulary_size);
     auto lm_head = runtime.device_tensors[runtime.lm_head];
-    void* argmax_args[] = {&lm_head, const_cast<std::uint64_t*>(&normalized),
+    if (const char* lm_q8_kernel = qwen_q8_lm_head_kernel(runtime.lm_head_type);
+        lm_q8_kernel && qwen_q8_head_enabled() && (hidden_size & 255) == 0) {
+        void* quant_args[] = {const_cast<std::uint64_t*>(&normalized),
+                              const_cast<std::uint64_t*>(&draft_q8),
+                              const_cast<std::uint64_t*>(&draft_q8_scales),
+                              const_cast<int*>(&hidden_size)};
+        if (flyweight_gpu_launch_named("quantize_q8_blocks", (hidden_size + 31) / 32, 1, 32,
+                                       0, runtime.stream, quant_args) != 0)
+            throw std::runtime_error("native qwen4exp MTP activation quantization failed");
+        void* lm_args[] = {&lm_head, const_cast<std::uint64_t*>(&draft_q8),
+                           const_cast<std::uint64_t*>(&draft_q8_scales),
                            const_cast<std::uint64_t*>(&argmax_device),
                            const_cast<int*>(&hidden_size), &vocabulary};
-    launch(qwen_lm_head_argmax_kernel(runtime.lm_head_type), (vocabulary + 7) / 8, 1, argmax_args);
+        launch(lm_q8_kernel, (vocabulary + 7) / 8, 1, lm_args);
+    } else {
+        void* argmax_args[] = {&lm_head, const_cast<std::uint64_t*>(&normalized),
+                               const_cast<std::uint64_t*>(&argmax_device),
+                               const_cast<int*>(&hidden_size), &vocabulary};
+        launch(qwen_lm_head_argmax_kernel(runtime.lm_head_type), (vocabulary + 7) / 8, 1, argmax_args);
+    }
     auto* packed_winner = reinterpret_cast<std::uint64_t*>(staging);
     if (flyweight_gpu_download(packed_winner, argmax_device, sizeof(*packed_winner),
                              runtime.stream) != 0
@@ -16394,6 +16426,11 @@ std::uint32_t qwen_mtp_draft(
     const auto route_weights=take(top_k*sizeof(float));
     const auto argmax_device=take(sizeof(std::uint64_t));
     const auto attention_scores=take(static_cast<std::uint64_t>(heads)*runtime.options.context_limit*sizeof(float));
+    // Q8 activation for the group-decode head: the draft's LM head is the
+    // same tensor the target reads, and it was the one place still on the
+    // float kernel -- once per drafted token, so once per round per draft.
+    const auto draft_q8=take(static_cast<std::uint64_t>(hidden_size));
+    const auto draft_q8_scales=take((static_cast<std::uint64_t>(hidden_size)/32+1)*sizeof(float));
     auto launch=[&](const char*name,std::uint32_t gx,std::uint32_t gy,void**args){if(flyweight_gpu_launch_named(name,gx,gy,256,0,runtime.stream,args)!=0)throw std::runtime_error(std::string("native MTP CUDA kernel failed: ")+name);};
     auto dense_index=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         qwen_mtp_dense_projection(
@@ -16515,7 +16552,16 @@ std::uint32_t qwen_mtp_draft(
     auto draft_hidden=runtime.state+runtime.mtp_draft_hidden_offset;void*copy_args[]={&hidden,&draft_hidden,const_cast<int*>(&hidden_size)};launch("qwen_copy_vector",(hidden_size+255)/256,1,copy_args);
     rms(hidden,runtime.device_tensors[runtime.mtp_special_tensors[3]],normalized);
     if(flyweight_gpu_memset(argmax_device,0,sizeof(std::uint64_t),runtime.stream)!=0)throw std::runtime_error("native MTP argmax reset failed");
-    int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&argmax_device),const_cast<int*>(&hidden_size),&vocabulary};launch(qwen_lm_head_argmax_kernel(runtime.lm_head_type),(vocabulary+7)/8,1,argmax_args);
+    int vocabulary=static_cast<int>(runtime.model->config.vocabulary_size);auto lm_head=runtime.device_tensors[runtime.lm_head];
+    if(const char*lm_q8_kernel=qwen_q8_lm_head_kernel(runtime.lm_head_type);
+       lm_q8_kernel&&qwen_q8_head_enabled()&&(hidden_size&255)==0){
+        void*quant_args[]={const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&draft_q8),const_cast<std::uint64_t*>(&draft_q8_scales),const_cast<int*>(&hidden_size)};
+        if(flyweight_gpu_launch_named("quantize_q8_blocks",(hidden_size+31)/32,1,32,0,runtime.stream,quant_args)!=0)throw std::runtime_error("native MTP activation quantization failed");
+        void*lm_args[]={&lm_head,const_cast<std::uint64_t*>(&draft_q8),const_cast<std::uint64_t*>(&draft_q8_scales),const_cast<std::uint64_t*>(&argmax_device),const_cast<int*>(&hidden_size),&vocabulary};
+        launch(lm_q8_kernel,(vocabulary+7)/8,1,lm_args);
+    }else{
+        void*argmax_args[]={&lm_head,const_cast<std::uint64_t*>(&normalized),const_cast<std::uint64_t*>(&argmax_device),const_cast<int*>(&hidden_size),&vocabulary};launch(qwen_lm_head_argmax_kernel(runtime.lm_head_type),(vocabulary+7)/8,1,argmax_args);
+    }
     auto*packed_winner=reinterpret_cast<std::uint64_t*>(staging);if(flyweight_gpu_download(packed_winner,argmax_device,sizeof(*packed_winner),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP output synchronization failed");
     ++runtime.mtp_cache_tokens;++runtime.mtp_draft_tokens;
     return 0xffffffffu-static_cast<std::uint32_t>(*packed_winner);
@@ -22922,8 +22968,20 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
         int vocabulary = static_cast<int>(runtime->model->config.vocabulary_size);
         if (flyweight_gpu_memset(s.argmax_device, 0, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen argmax reset failed");
         auto lm_head = runtime->device_tensors[runtime->lm_head];
-        void* argmax_args[] = {&lm_head, const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.argmax_device), const_cast<int*>(&hidden_size), &vocabulary};
-        launch_named(qwen_lm_head_argmax_kernel(runtime->lm_head_type), (vocabulary + 7) / 8, 1, 256, argmax_args);
+        // Same head dispatch as the single-token decode: quantize the row's
+        // activation once and run the group-decode head. This tail was the
+        // one place the batched decode still reconstructed the head in float,
+        // per sequence, per token.
+        if (const char* lm_q8_kernel = qwen_q8_lm_head_kernel(runtime->lm_head_type);
+            lm_q8_kernel && iq2_q8_enabled && (hidden_size & 255) == 0 && s.dense_q8 && s.dense_q8_scales) {
+            void* quant_args[] = {const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.dense_q8), const_cast<std::uint64_t*>(&s.dense_q8_scales), const_cast<int*>(&hidden_size)};
+            launch_named("quantize_q8_blocks", (hidden_size + 31) / 32, 1, 32, quant_args);
+            void* lm_args[] = {&lm_head, const_cast<std::uint64_t*>(&s.dense_q8), const_cast<std::uint64_t*>(&s.dense_q8_scales), const_cast<std::uint64_t*>(&s.argmax_device), const_cast<int*>(&hidden_size), &vocabulary};
+            launch_named(lm_q8_kernel, (vocabulary + 7) / 8, 1, 256, lm_args);
+        } else {
+            void* argmax_args[] = {&lm_head, const_cast<std::uint64_t*>(&s.normalized), const_cast<std::uint64_t*>(&s.argmax_device), const_cast<int*>(&hidden_size), &vocabulary};
+            launch_named(qwen_lm_head_argmax_kernel(runtime->lm_head_type), (vocabulary + 7) / 8, 1, 256, argmax_args);
+        }
         if (flyweight_gpu_download(s.winner_host, s.argmax_device, sizeof(std::uint64_t), runtime->stream) != 0) throw std::runtime_error("native Qwen output transfer failed");
     }
     const auto tail_wait_started = timing_enabled()?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
