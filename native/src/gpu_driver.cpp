@@ -1066,12 +1066,14 @@ extern "C" int flyweight_gpu_compile(
              "q3k_q8_matvec_transposed_warp",
              "q5k_q8_matvec_transposed_warp",
              "q6k_q8_matvec_transposed_warp",
+             "q80_q8_matvec_transposed_warp",
              "iq3xxs_q8_matvec_transposed_warp",
              "q2k_q8_lm_head_argmax_warp",
              "q3k_q8_lm_head_argmax_warp",
              "q4k_q8_lm_head_argmax_warp",
              "q5k_q8_lm_head_argmax_warp",
              "q6k_q8_lm_head_argmax_warp",
+             "q80_q8_lm_head_argmax_warp",
              "iq2xxs_q8_lm_head_argmax_warp",
              "iq3xxs_q8_lm_head_argmax_warp",
              "quantize_q8_blocks", "iq3xxs_matvec_transposed_warp",
@@ -1120,6 +1122,7 @@ extern "C" int flyweight_gpu_compile(
              // The symmetric K-quants take the same batched prompt path.
              "q3k_q8_matvec_transposed_rows", "q3k_q8_matmul_tiled", "q3k_q8_mmq",
              "q6k_q8_matvec_transposed_rows", "q6k_q8_matmul_tiled", "q6k_q8_mmq",
+             "q80_q8_matvec_transposed_rows", "q80_q8_matmul_tiled", "q80_q8_mmq",
              // And the asymmetric ones, which carry a per-sub-block minimum.
              "q2k_q8_matvec_transposed_rows", "q2k_q8_mmq",
              "q4k_q8_matvec_transposed_rows", "q4k_q8_mmq",

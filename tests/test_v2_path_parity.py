@@ -27,6 +27,22 @@ from flyweight.v2 import V2Model
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf
 from tests.laguna_gguf_fixture import build_laguna_gguf
 
+_Q8_SWITCH = "FLYWEIGHT_IQ2_Q8_DECODE"
+_saved_q8_switch: str | None = None
+
+
+def setUpModule() -> None:
+    # This harness detects LOGIC divergence between paths, which needs every
+    # path to run identical arithmetic. The Q8-activation kernels do not
+    # promise that: the tensor-core MMQ a chunked prefill takes and the warp
+    # kernel a single token takes accumulate in different orders, and on a
+    # random-weight fixture a near-tie flips. Pin the reconstruct-in-float
+    # kernels for this module only; the Q8 kernels are checked numerically
+    # in their own tests.
+    global _saved_q8_switch
+    _saved_q8_switch = os.environ.get(_Q8_SWITCH)
+    os.environ[_Q8_SWITCH] = "0"
+
 
 _WORKSPACES: list[tempfile.TemporaryDirectory] = []
 
@@ -35,6 +51,10 @@ def tearDownModule():
     for holder in _WORKSPACES:
         holder.cleanup()
     _WORKSPACES.clear()
+    if _saved_q8_switch is None:
+        os.environ.pop(_Q8_SWITCH, None)
+    else:
+        os.environ[_Q8_SWITCH] = _saved_q8_switch
 
 
 def _workspace(prefix: str) -> Path:

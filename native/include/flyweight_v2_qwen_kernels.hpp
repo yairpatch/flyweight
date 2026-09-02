@@ -7216,6 +7216,75 @@ FLYWEIGHT_Q8_MMQ(q6k_q8_mmq, q6k_q8_decode, 210)
 FLYWEIGHT_Q8_MMQ_ROUTED(q6k_q8_mmq_routed, q6k_q8_decode, 210, 8, 3)
 
 
+// Q8_0 against a Q8-blocked activation. A 34-byte block (fp16 d, 32 int8) is
+// only 2-byte aligned, so the weights are read from the 4-byte grid and
+// realigned with byte_perm: an even group starts two bytes into a word, an odd
+// group starts on one. Nine or eight 32-bit loads per 32 weights, against the
+// 34 byte loads plus 32 half loads of the per-element kernel that served
+// every Q8_0 dense tensor before -- the LM head an NVFP4 build requantizes to
+// Q8_0 among them. The 272-byte stride is eight blocks: the macros address
+// rows in 256-value super-blocks, and a row of 256k values starts 16-byte
+// aligned, which is what makes the word grid legal.
+__device__ __forceinline__ void q80_q8_decode(
+    const unsigned char* row_data, const int linear_group,
+    int* words, float* scale_low, float* scale_high) {
+    const unsigned char* base = row_data + linear_group * 34;
+    unsigned int scale_bits;
+    if ((linear_group & 1) == 0) {
+        const unsigned int* stream = (const unsigned int*)base;
+        unsigned int prev = stream[0];
+        scale_bits = prev & 0xffffu;
+        #pragma unroll
+        for (int quad = 0; quad < 8; ++quad) {
+            const unsigned int next = stream[quad + 1];
+            words[quad] = (int)__byte_perm(prev, next, 0x5432);
+            prev = next;
+        }
+    } else {
+        const unsigned int* stream = (const unsigned int*)(base + 2);
+        scale_bits = stream[-1] >> 16;
+        #pragma unroll
+        for (int quad = 0; quad < 8; ++quad) words[quad] = (int)stream[quad];
+    }
+    const float d = __half2float(__ushort_as_half((unsigned short)scale_bits));
+    *scale_low = d;
+    *scale_high = d;
+}
+
+__device__ __forceinline__ float q80_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    int words[8];
+    float d = 0.0f, unused = 0.0f;
+    q80_q8_decode(row_data, linear_group, words, &d, &unused);
+    const int4* activation_vectors = (const int4*)(vector + linear_group * 32);
+    const int4 low = activation_vectors[0];
+    const int4 high = activation_vectors[1];
+    // Two half-group sums combined the way the rows kernel combines them,
+    // so a token prefilled by rows and one decoded alone see the same value.
+    int dot_low = 0, dot_high = 0;
+    dot_low = __dp4a(words[0], low.x, dot_low);
+    dot_low = __dp4a(words[1], low.y, dot_low);
+    dot_low = __dp4a(words[2], low.z, dot_low);
+    dot_low = __dp4a(words[3], low.w, dot_low);
+    dot_high = __dp4a(words[4], high.x, dot_high);
+    dot_high = __dp4a(words[5], high.y, dot_high);
+    dot_high = __dp4a(words[6], high.z, dot_high);
+    dot_high = __dp4a(words[7], high.w, dot_high);
+    return ((float)dot_low * d + (float)dot_high * d)
+        * __half2float(vector_scales[linear_group]);
+}
+
+FLYWEIGHT_Q8_MATVEC(q80_q8_matvec_transposed_warp, q80_q8_group, 272)
+FLYWEIGHT_Q8_LM_HEAD(q80_q8_lm_head_argmax_warp, q80_q8_group, 272)
+FLYWEIGHT_Q8_MATVEC_ROWS(q80_q8_matvec_transposed_rows, q80_q8_decode, 272)
+FLYWEIGHT_Q8_MATMUL_TILED(q80_q8_matmul_tiled, q80_q8_decode, 272)
+FLYWEIGHT_Q8_MMQ(q80_q8_mmq, q80_q8_decode, 272)
+
+
 // Decode one complete 256-value Q6_K super-block per warp.  The scalar helper
 // above reloads ql/qh, d and the group scales for every reconstructed value.
 // Keeping a lane fixed at l=[0,31] lets it reuse two low bytes and one high

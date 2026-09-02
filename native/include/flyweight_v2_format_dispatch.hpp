@@ -92,10 +92,17 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
     // "q40" because the table-scan test reads underscored strings as kernel
     // names.
     {.type = 2, .family = "q40", .cpu_expert = true},
+    // Q8_0 dense tensors take the Q8-activation group kernels like the
+    // K-quants do; the per-element f32 kernels below them stay as the
+    // fallback for row widths that are not a multiple of 256.
     {.type = 8, .family = "q8",
+     .matvec_q8_warp = "q80_q8_matvec_transposed_warp", .rows_q8_gate = true,
+     .matvec_q8_rows = "q80_q8_matvec_transposed_rows",
+     .matmul_q8_tiled = "q80_q8_matmul_tiled", .matmul_q8_mmq = "q80_q8_mmq",
      .matmul_rows = "q8_matmul_tiled",
      .matmul_rows_grid = RowsMatmulGrid::tiled32,
      .lm_head_argmax = "q8_lm_head_argmax_warp",
+     .lm_head_argmax_q8 = "q80_q8_lm_head_argmax_warp",
      .embedding = "qwen_q8_embedding", .embedding_rows = "qwen_q8_embedding_rows",
      .cpu_expert = true},
     {.type = 10, .family = "q2k",

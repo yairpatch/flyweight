@@ -162,6 +162,27 @@ inline int __popc(unsigned int value) {
     return count;
 }
 
+// Byte select: nibble i of `selector` names byte i of the result, from the
+// 8-byte value {x (bytes 0-3), y (bytes 4-7)}; bit 3 of a nibble asks for
+// the sign-extended byte, which the corpus never uses.
+inline unsigned int __byte_perm(unsigned int x, unsigned int y, unsigned int selector) {
+    const unsigned long long source =
+        (static_cast<unsigned long long>(y) << 32) | x;
+    unsigned int out = 0;
+    for (int index = 0; index < 4; ++index) {
+        const unsigned int pick = (selector >> (index * 4)) & 0x7u;
+        const unsigned int byte = static_cast<unsigned int>((source >> (pick * 8)) & 0xffu);
+        out |= byte << (index * 8);
+    }
+    return out;
+}
+
+inline flyweight::cpu::Half __ushort_as_half(unsigned short bits) {
+    flyweight::cpu::Half value(0.0f);
+    value.bits = bits;
+    return value;
+}
+
 // SIMD-within-a-word intrinsics used by the integer quant kernels.
 inline int __dp4a(unsigned int a, unsigned int b, int c) {
     int sum = c;

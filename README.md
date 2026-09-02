@@ -586,6 +586,13 @@ enough to clear the spill at 16K but not at 32K. Needle retrieval stays exact
 under `turbo4` at 32K. The rule of thumb: if `prepare` reports dense blocks
 on CPU, spend KV precision to buy them back before anything else.
 
+Dense projections and the LM head take Q8-activation group-decode kernels
+(`dp4a` on the K-quants, IQ formats and, since this release, Q8_0 -- which is
+also the type an NVFP4 build requantizes its LM head to). `FLYWEIGHT_IQ2_Q8_DECODE=0`
+switches every one of them, decode and chunked prefill alike, back to the
+reconstruct-in-float kernels: slower, but bit-identical between the paths,
+which is what the path-parity tests pin.
+
 Qwen sampling with `top_k <= 32` reduces candidates on the GPU by default.
 `sampling_gpu_topk_*`, `sampling_full_download_bytes`, and
 `sampling_nanoseconds` expose its behavior; set `FLYWEIGHT_SAMPLING_GPU_TOPK=0`

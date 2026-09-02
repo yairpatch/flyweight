@@ -340,8 +340,15 @@ void qwen_forward_rows(
             ((mmq_kernel&&runtime.int8_tensor_cores)||tiled_kernel);
         // rows_q8_gate, not matvec_q8_warp alone: the table records which
         // formats this block has been measured on (see its drift note).
+        // FLYWEIGHT_IQ2_Q8_DECODE=0 keeps this block off as well, so the kill
+        // switch means the same thing here as in the single-token decode:
+        // every dense projection (and every streamed expert, which funnels
+        // through here) reconstructs in float. That is what lets the
+        // path-parity harness compare chunked against single-token prefill
+        // bit for bit; with the Q8 kernels on, the tensor-core MMQ and the
+        // warp kernel accumulate in different orders.
         if((experts>0?(rows<=8||batched_kernel):true)&&(input_size&255)==0&&
-           format&&format->rows_q8_gate)
+           format&&format->rows_q8_gate&&qwen_q8_head_enabled())
             q8_kernel=format->matvec_q8_warp;
         if(q8_kernel){
             // The scale rows sit on a float-sized stride (see rows_q8_scales in

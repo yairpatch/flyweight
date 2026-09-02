@@ -4756,12 +4756,12 @@ const char* qwen_q8_matvec_kernel(std::uint32_t type) {
 // argmax kernel; the default quantizes the activation to Q8 blocks and runs
 // the group-decode head, which reads the largest per-token tensor once at a
 // fraction of the float kernel's cost.
+// Read per call, like the decode path's own check: the switch is what the
+// path-parity harness flips to compare paths under identical f32 arithmetic,
+// and a latch would carry whichever value the first call in the process saw.
 bool qwen_q8_head_enabled() {
-    static const bool enabled = [] {
-        const char* setting = std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
-        return !setting || setting[0] != '0';
-    }();
-    return enabled;
+    const char* setting = std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
+    return !setting || setting[0] != '0';
 }
 
 const char* qwen_lm_head_argmax_kernel(std::uint32_t type) {
