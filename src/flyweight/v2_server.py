@@ -1273,6 +1273,10 @@ class ChatGenerator:
     continuation reuse, incremental UTF-8 decoding -- unchanged.
     """
 
+    # Honors the `stop_thinking` stream option (see InferenceService.
+    # stop_thinking); the server advertises the capability from this.
+    supports_stop_thinking = True
+
     def __init__(self, model: V2Model, engine, tokenizer: NativeV2Tokenizer):
         self.model = model
         self.tokenizer = tokenizer
@@ -1660,16 +1664,22 @@ class ChatGenerator:
         # cancel the task and force the block closed. Muse Glimmer is out for
         # the same reason as above: no <think> markers to meter.
         budget = options.get("reasoning_budget_tokens")
+        # A client's "answer now": an Event the server sets while the block is
+        # open. It rides the same forced-close path as the budget, so the
+        # meter is armed (with no limit) whenever there is an interrupt to
+        # honor, purely to know whether the block is open.
+        interrupt = options.get("stop_thinking")
+        if not callable(getattr(interrupt, "is_set", None)):
+            interrupt = None
         meter = None
-        if (
-            isinstance(budget, int)
-            and not isinstance(budget, bool)
-            and budget > 0
-            and getattr(self.tokenizer, "architecture", None) != "muse-glimmer"
-        ):
+        metered = getattr(self.tokenizer, "architecture", None) != "muse-glimmer"
+        has_budget = (
+            isinstance(budget, int) and not isinstance(budget, bool) and budget > 0
+        )
+        if metered and (has_budget or interrupt is not None):
             opens = options.get("thinking_open")
             meter = _ThinkingBudget(
-                budget,
+                budget if has_budget else sys.maxsize,
                 self._prompt_opens_thinking(prompt_ids)
                 if opens is None
                 else bool(opens),
@@ -1755,18 +1765,35 @@ class ChatGenerator:
                 )
                 if stopped:
                     continue
-                if meter is not None and meter.spend(delta):
-                    # The budget is spent with the block still open: force it
-                    # closed and resume the answer on a fresh task whose
-                    # prompt is everything decoded so far plus the close. The
-                    # engine treats that prompt like any other, so a prefix
-                    # cache absorbs the restage where one exists. Named in
-                    # the log because from outside, a capped think and a hung
-                    # one look identical until the answer arrives.
-                    sys.stderr.write(
-                        f"[gen ] thinking budget of {meter.budget} tokens "
-                        f"spent; closing the block and resuming the answer\n"
-                    )
+                exhausted = meter is not None and meter.spend(delta)
+                interrupted = (
+                    meter is not None
+                    and meter.inside
+                    and interrupt is not None
+                    and interrupt.is_set()
+                )
+                if exhausted or interrupted:
+                    # The budget is spent (or the client asked for the answer)
+                    # with the block still open: force it closed and resume
+                    # the answer on a fresh task whose prompt is everything
+                    # decoded so far plus the close. The engine treats that
+                    # prompt like any other, so a prefix cache absorbs the
+                    # restage where one exists. Named in the log because from
+                    # outside, a capped think and a hung one look identical
+                    # until the answer arrives.
+                    if interrupted:
+                        # One interrupt closes one block; a checkpoint that
+                        # reopens thinking afterwards gets to finish it.
+                        interrupt.clear()
+                        sys.stderr.write(
+                            "[gen ] thinking interrupted by the client; "
+                            "closing the block and resuming the answer\n"
+                        )
+                    else:
+                        sys.stderr.write(
+                            f"[gen ] thinking budget of {meter.budget} tokens "
+                            f"spent; closing the block and resuming the answer\n"
+                        )
                     self.engine.cancel(task_id)
                     self.engine.forget(task_id)
                     meter.close()

@@ -69,6 +69,8 @@ describe("chat completions stream", () => {
     const usage = parseChatFrame({ data: JSON.stringify({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 4, prompt_tokens_details: { cached_tokens: 8 }, completion_tokens_details: { reasoning_tokens: 2 } } }), raw: "" });
     expect(usage[0]).toEqual({ type: "usage", usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, cached_tokens: 8, reasoning_tokens: 2 } });
     expect(parseChatFrame({ data: "[DONE]", raw: "" })).toEqual([]);
+    const withId = parseChatFrame({ data: JSON.stringify({ id: "chatcmpl-1", choices: [{ delta: { content: "x" } }] }), raw: "" });
+    expect(withId[0]).toEqual({ type: "id", id: "chatcmpl-1" });
   });
 });
 
@@ -97,6 +99,7 @@ describe("anthropic messages", () => {
 
   it("parses named events into unified events", () => {
     const frames = [
+      { event: "message_start", data: JSON.stringify({ type: "message_start", message: { id: "msg_1" } }) },
       { event: "content_block_start", data: JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "tu", name: "f" } }) },
       { event: "content_block_delta", data: JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"a"' } }) },
       { event: "content_block_delta", data: JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "t" } }) },
@@ -104,9 +107,9 @@ describe("anthropic messages", () => {
       { event: "message_delta", data: JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 3 } }) },
     ].map((frame) => ({ ...frame, raw: "" }));
     const events = frames.flatMap(parseAnthropicFrame);
-    expect(events.map((event) => event.type)).toEqual(["tool_call_start", "tool_call_delta", "reasoning", "metrics", "text", "usage", "finish"]);
+    expect(events.map((event) => event.type)).toEqual(["id", "tool_call_start", "tool_call_delta", "reasoning", "metrics", "text", "usage", "finish"]);
     expect(events[events.length - 1]).toEqual({ type: "finish", reason: "tool_calls" });
-    expect(events[5]).toEqual({ type: "usage", usage: { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10, cached_tokens: 3 } });
+    expect(events[6]).toEqual({ type: "usage", usage: { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10, cached_tokens: 3 } });
   });
 });
 

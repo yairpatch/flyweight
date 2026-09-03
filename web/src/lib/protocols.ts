@@ -178,6 +178,7 @@ export function parseChatFrame(frame: SseFrame): StreamEvent[] {
       phase: metrics.phase,
     });
   }
+  if (typeof payload.id === "string" && payload.id) events.push({ type: "id", id: payload.id });
   const choice = (payload.choices as Array<Record<string, unknown>> | undefined)?.[0];
   if (choice) {
     const delta = (choice.delta ?? {}) as Record<string, unknown>;
@@ -316,6 +317,11 @@ export function parseAnthropicFrame(frame: SseFrame): StreamEvent[] {
     case "error": {
       const error = payload.error as { message?: string } | undefined;
       events.push({ type: "error", message: error?.message ?? "stream error" });
+      break;
+    }
+    case "message_start": {
+      const id = (payload.message as { id?: string } | undefined)?.id;
+      if (id) events.push({ type: "id", id });
       break;
     }
     case "content_block_start": {

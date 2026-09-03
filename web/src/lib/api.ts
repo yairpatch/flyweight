@@ -90,6 +90,12 @@ export const api = {
   detokenize: (tokens: number[]) => postJson<{ content: string }>("/detokenize", { tokens }),
   countAnthropic: (body: unknown) => postJson<{ input_tokens: number }>("/v1/messages/count_tokens", body),
   countResponses: (body: unknown) => postJson<{ input_tokens: number }>("/v1/responses/input_tokens", body),
+  /** Ask a live stream to close its thinking block and answer now. */
+  stopThinking: (protocol: "chat" | "anthropic", id: string) =>
+    postJson<{ status: string }>(
+      `${protocol === "anthropic" ? "/v1/messages" : "/v1/chat/completions"}/${encodeURIComponent(id)}/stop_thinking`,
+      {},
+    ),
   getResponse: (id: string) => fetchJson<Record<string, unknown>>(`/v1/responses/${encodeURIComponent(id)}`),
   deleteResponse: (id: string) => fetchJson<Record<string, unknown>>(`/v1/responses/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };

@@ -280,6 +280,10 @@ class _GenerationRequest:
     # generator forcing the block closed -- unlike reasoning_effort, which is
     # a request the checkpoint is free to overrun. None means unlimited.
     reasoning_budget_tokens: int | None = None
+    # Set by the streaming endpoints: an Event the client can trip through
+    # POST .../{id}/stop_thinking, which the generator honors by forcing an
+    # open thinking block closed and going straight to the answer.
+    stop_thinking: threading.Event | None = None
     # Whether an assistant turn's replayed chain-of-thought reaches the prompt.
     # None leaves the architecture's own convention, which keeps the reasoning
     # of the tool-call loop the model is still inside and drops what the
@@ -598,6 +602,9 @@ class InferenceService:
         }
         self.loaded_at = int(time.time())
         self._generation_lock = threading.Lock()
+        # Live streams that can be told to stop thinking, by completion id.
+        self._live_thinking: dict[str, threading.Event] = {}
+        self._live_thinking_lock = threading.Lock()
         # Generators that multiplex concurrent requests natively (the v2
         # cooperative engine) set this False so requests interleave instead of
         # queueing behind one long generation.
@@ -765,6 +772,7 @@ class InferenceService:
                 preserve_thinking=request.preserve_thinking,
                 reasoning_effort=request.reasoning_effort,
                 reasoning_budget_tokens=request.reasoning_budget_tokens,
+                stop_thinking=request.stop_thinking,
                 thinking_open=request.thinking_open,
                 progress=progress,
                 response_format=request.response_format,
@@ -782,6 +790,7 @@ class InferenceService:
             preserve_thinking=request.preserve_thinking,
             reasoning_effort=request.reasoning_effort,
             reasoning_budget_tokens=request.reasoning_budget_tokens,
+                stop_thinking=request.stop_thinking,
             thinking_open=request.thinking_open,
             progress=progress,
             # The declarations themselves, for a generator that can constrain
@@ -868,6 +877,10 @@ class InferenceService:
                 created,
                 {"role": "assistant", "content": ""},
             )
+            with self._interruptible(completion_id) as interrupt:
+                yield from generation(dataclasses.replace(request, stop_thinking=interrupt))
+
+        def generation(request: _GenerationRequest) -> Iterator[dict[str, Any] | str]:
             for event in self._generation_events(
                 request, progress=progress, admitted=_admitted
             ):
@@ -1040,6 +1053,7 @@ class InferenceService:
                 preserve_thinking=request.preserve_thinking,
                 reasoning_effort=request.reasoning_effort,
                 reasoning_budget_tokens=request.reasoning_budget_tokens,
+                stop_thinking=request.stop_thinking,
                 thinking_open=request.thinking_open,
                 progress=progress,
                 response_format=request.response_format,
@@ -1189,6 +1203,7 @@ class InferenceService:
                 preserve_thinking=request.preserve_thinking,
                 reasoning_effort=request.reasoning_effort,
                 reasoning_budget_tokens=request.reasoning_budget_tokens,
+                stop_thinking=request.stop_thinking,
                 thinking_open=request.thinking_open,
                 progress=progress,
                 # The declarations, so a generator that can constrain the
@@ -1669,8 +1684,45 @@ class InferenceService:
                 "responses_streaming",
                 "function_tools",
                 "tokenize",
+                *(["stop_thinking"] if self.supports_stop_thinking else []),
             ],
         }
+
+    @property
+    def supports_stop_thinking(self) -> bool:
+        return bool(getattr(self.generator, "supports_stop_thinking", False))
+
+    @contextlib.contextmanager
+    def _interruptible(self, request_id: str) -> Iterator[threading.Event]:
+        """Register a live stream so stop_thinking() can reach it."""
+        event = threading.Event()
+        with self._live_thinking_lock:
+            self._live_thinking[request_id] = event
+        try:
+            yield event
+        finally:
+            with self._live_thinking_lock:
+                self._live_thinking.pop(request_id, None)
+
+    def stop_thinking(self, request_id: str) -> dict[str, Any]:
+        """Ask a live stream to close its thinking block and answer.
+
+        `request_id` is the id the stream reported in its first event
+        (`chatcmpl-…` or `msg_…`). The generator closes the block on its next
+        token; a stream that is already answering is left alone.
+        """
+        if not self.supports_stop_thinking:
+            raise APIError(
+                501, "this runtime cannot interrupt thinking", "not_supported_error"
+            )
+        with self._live_thinking_lock:
+            event = self._live_thinking.get(request_id)
+        if event is None:
+            raise APIError(
+                404, f"no live stream with id {request_id!r}", "not_found_error"
+            )
+        event.set()
+        return {"id": request_id, "object": "stop_thinking", "status": "requested"}
 
     def slots(self) -> list[dict[str, Any]]:
         return [
@@ -2049,12 +2101,19 @@ class InferenceService:
         request = self._prepare_anthropic(payload)
         input_tokens = len(request.prompt_ids)
         model = payload.get("model", self.model_name)
+        message_id = f"msg_{uuid.uuid4().hex}"
 
         def events() -> Iterator[dict[str, Any]]:
+            with self._interruptible(message_id) as interrupt:
+                yield from generation(
+                    dataclasses.replace(request, stop_thinking=interrupt)
+                )
+
+        def generation(request: _GenerationRequest) -> Iterator[dict[str, Any]]:
             yield {
                 "type": "message_start",
                 "message": {
-                    "id": f"msg_{uuid.uuid4().hex}",
+                    "id": message_id,
                     "type": "message",
                     "role": "assistant",
                     "model": model,
@@ -2923,6 +2982,17 @@ def _sse_with_keepalive(
             worker.join(timeout=0.05)
 
 
+_STOP_THINKING_ROUTE = re.compile(
+    r"^/v1/(?:chat/completions|messages)/([A-Za-z0-9_\-]+)/stop_thinking$"
+)
+
+
+def _stop_thinking_target(path: str) -> str | None:
+    """The stream id named by a POST .../{id}/stop_thinking path, else None."""
+    match = _STOP_THINKING_ROUTE.match(path)
+    return match.group(1) if match else None
+
+
 def _ui_asset(path: str) -> Path | None:
     """Map a request path to a file inside the bundled UI, or None.
 
@@ -3122,6 +3192,11 @@ def create_handler(
                 payload = self._read_json()
                 self.log_message("request processing: %s", path)
                 progress = self._prompt_progress(path)
+                stop_target = _stop_thinking_target(path)
+                if stop_target is not None:
+                    self._send_json(200, service.stop_thinking(stop_target))
+                    self.log_message("request completed: %s", path)
+                    return
                 if path == "/v1/chat/completions":
                     if _boolean_option(payload, "stream", False):
                         # Prepared and admitted before a byte of the response

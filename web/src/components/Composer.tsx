@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
-import { ArrowUp, Braces, Brain, ImagePlus, Square, Wrench, X } from "lucide-react";
+import { ArrowUp, Braces, Brain, ImagePlus, Square, Wrench, X, Zap } from "lucide-react";
 import { useStore } from "../store";
 import { imageFilesFrom, readImageFile } from "../lib/images";
 import { api } from "../lib/api";
@@ -23,6 +23,14 @@ export function Composer() {
   const sendMessage = useStore((state) => state.sendMessage);
   const stopGeneration = useStore((state) => state.stopGeneration);
   const generating = useStore((state) => Boolean(state.generating));
+  const canStopThinking = useStore(
+    (state) =>
+      Boolean(state.generating?.requestId) &&
+      state.generating?.phase === "thinking" &&
+      state.settings.protocol !== "responses" &&
+      (state.props?.capabilities ?? []).includes("stop_thinking"),
+  );
+  const stopThinking = useStore((state) => state.stopThinking);
   const settings = useStore((state) => state.settings);
   const updateSettings = useStore((state) => state.updateSettings);
   const tools = useStore((state) => state.tools);
@@ -156,6 +164,11 @@ export function Composer() {
           </div>
           <div className="composer__right">
             {tokenCount !== null && <span className="composer__count" title="Tokens in the draft">{tokenCount} tok</span>}
+            {canStopThinking && (
+              <button className="chip chip--button chip--on" onClick={() => void stopThinking()} title="Close the thinking block and answer now">
+                <Zap size={13} /> Answer now
+              </button>
+            )}
             {generating ? (
               <button className="send send--stop" onClick={stopGeneration} aria-label="Stop generating" title="Stop (Esc)">
                 <Square size={14} />

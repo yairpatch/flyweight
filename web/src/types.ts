@@ -157,6 +157,7 @@ export interface SlotInfo {
 // ---- Unified stream events ---------------------------------------------
 
 export type StreamEvent =
+  | { type: "id"; id: string }
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "tool_call_start"; index: number; id: string; name: string }

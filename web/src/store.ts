@@ -8,6 +8,7 @@ import { db, migrateLegacyHistory } from "./lib/db";
 import { generate } from "./lib/generate";
 import { identifier, titleFromPrompt } from "./lib/format";
 import { buildRequest } from "./lib/protocols";
+import { holdPartialTag, splitThinking } from "./lib/thinking";
 import { loadSettings, saveSettings, settingsFromProps, DEFAULT_SETTINGS } from "./lib/settings";
 import type {
   Conversation,
@@ -108,7 +109,15 @@ interface StoreState {
   slots: SlotInfo[];
   status: RuntimeStatus;
   statusDetail: string;
-  generating: { conversationId: string; messageId: string; controller: AbortController } | null;
+  generating: {
+    conversationId: string;
+    messageId: string;
+    controller: AbortController;
+    /** The stream id the server reported, for stop_thinking. */
+    requestId?: string;
+    /** "thinking" while the model is inside its reasoning block. */
+    phase?: string;
+  } | null;
   requests: RequestRecord[];
   panel: Panel;
   theme: ThemePreference;
@@ -136,6 +145,7 @@ interface StoreState {
   // messages
   sendMessage: (text: string, images?: string[]) => Promise<void>;
   stopGeneration: () => void;
+  stopThinking: () => Promise<void>;
   regenerate: (messageId: string) => Promise<void>;
   editMessage: (messageId: string, text: string, resend: boolean) => Promise<void>;
   deleteMessage: (messageId: string) => void;
@@ -284,17 +294,36 @@ export const useStore = create<StoreState>()((set, get) => {
       if (frame === null) frame = requestAnimationFrame(flush);
     };
 
+    // The server reports the phase in its live metrics; when it does not
+    // (a runtime that streams inline <think> text), infer it from the text.
+    let serverPhase = false;
+    const setPhase = (phase: string) => {
+      const live = get().generating;
+      if (live && live.messageId === assistant.id && (live.phase ?? "") !== phase) set({ generating: { ...live, phase } });
+    };
+    const inferPhase = () => {
+      if (serverPhase) return;
+      if (draft.reasoning !== undefined) setPhase(draft.content ? "" : "thinking");
+      else setPhase(splitThinking(holdPartialTag(draft.content)).open ? "thinking" : "");
+    };
     const onEvent = (event: StreamEvent) => {
       switch (event.type) {
+        case "id":
+          if (get().generating?.messageId === assistant.id && get().generating?.requestId !== event.id) {
+            set((current) => (current.generating ? { generating: { ...current.generating, requestId: event.id } } : {}));
+          }
+          return;
         case "text":
           if (firstTokenAt === null) firstTokenAt = performance.now();
           if (reasoningStartedAt !== null && reasoningEndedAt === null) reasoningEndedAt = performance.now();
           draft = { ...draft, content: draft.content + event.text };
+          inferPhase();
           break;
         case "reasoning":
           if (firstTokenAt === null) firstTokenAt = performance.now();
           if (reasoningStartedAt === null) reasoningStartedAt = performance.now();
           draft = { ...draft, reasoning: (draft.reasoning ?? "") + event.text };
+          inferPhase();
           break;
         case "tool_call_start": {
           if (firstTokenAt === null) firstTokenAt = performance.now();
@@ -311,6 +340,10 @@ export const useStore = create<StoreState>()((set, get) => {
         }
         case "metrics": {
           metrics = { ...metrics, tokens: event.tokens, decodeSeconds: event.decodeSeconds };
+          if (event.phase !== undefined) {
+            serverPhase = true;
+            setPhase(event.phase);
+          }
           const samples = metrics.samples ?? [];
           samples.push([performance.now() - startedAt, event.tokens]);
           if (samples.length > 600) samples.splice(0, samples.length - 600);
@@ -552,6 +585,17 @@ export const useStore = create<StoreState>()((set, get) => {
       const { generating } = get();
       if (!generating) return;
       generating.controller.abort();
+    },
+
+    stopThinking: async () => {
+      const { generating, settings } = get();
+      if (!generating?.requestId || settings.protocol === "responses") return;
+      try {
+        await api.stopThinking(settings.protocol, generating.requestId);
+        get().toast("Asked the model to answer now", "info");
+      } catch (error) {
+        get().toast(error instanceof Error ? error.message : "Could not interrupt thinking", "error");
+      }
     },
 
     regenerate: async (messageId) => {

@@ -410,6 +410,13 @@ Reasoning models expose two knobs, one soft and one hard:
   it.
 - `reasoning_budget_tokens` is a hard ceiling the runtime enforces: at the
   limit the sampler forces the thinking block closed and the answer resumes.
+- `POST /v1/chat/completions/{id}/stop_thinking` (or
+  `/v1/messages/{id}/stop_thinking`) interrupts a live stream: the runtime
+  closes the open thinking block on the next token and goes straight to the
+  answer, through the same path as the budget. `{id}` is the id the stream
+  reported in its first event. `/props` lists `stop_thinking` under
+  `capabilities` when the loaded runtime supports it, and the chat UI shows
+  an **Answer now** button while the model is thinking.
   Anthropic's `thinking: {"type": "enabled", "budget_tokens": N}` maps onto
   it. Unlike hosted APIs, this budget is a guarantee, not a hint.
 
