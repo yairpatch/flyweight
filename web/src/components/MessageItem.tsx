@@ -91,11 +91,23 @@ function ReasoningPanel({ text, seconds, live }: { text: string; seconds?: numbe
   // follows the reasoning as it streams.
   const [open, setOpen] = useState(false);
   const body = useRef<HTMLDivElement>(null);
+  // Follows the reasoning while open and live, the same way the transcript
+  // follows the answer: a wheel-up inside the panel detaches, reaching the
+  // bottom again re-attaches.
+  const follow = useRef(true);
   const label = live ? "Thinking…" : seconds ? `Thought for ${formatSeconds(seconds)}` : "Thinking";
   useEffect(() => {
     const element = body.current;
-    if (open && live && element) element.scrollTop = element.scrollHeight;
+    if (open && live && follow.current && element) element.scrollTop = element.scrollHeight;
   }, [text, open, live]);
+  useEffect(() => {
+    if (open) follow.current = true;
+  }, [open]);
+  const onBodyScroll = () => {
+    const element = body.current;
+    if (!element) return;
+    follow.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 8;
+  };
   return (
     <details className={`thinking${live ? " thinking--live" : ""}`} open={open} onToggle={(event) => setOpen((event.target as HTMLDetailsElement).open)}>
       <summary>
@@ -103,7 +115,7 @@ function ReasoningPanel({ text, seconds, live }: { text: string; seconds?: numbe
         <span>{label}</span>
         <ChevronRight size={14} className="thinking__chevron" />
       </summary>
-      <div className="thinking__body markdown" dir={detectDirection(text)} ref={body}>
+      <div className="thinking__body markdown" dir={detectDirection(text)} ref={body} onScroll={onBodyScroll} onWheel={(event) => { if (event.deltaY < 0) follow.current = false; }}>
         <StreamingMarkdown text={text} live={live} />
       </div>
     </details>
