@@ -2561,20 +2561,46 @@ class HTTPServerTests(unittest.TestCase):
         html = response.read().decode("utf-8")
         self.assertEqual(response.status, 200)
         self.assertTrue(response.getheader("Content-Type").startswith("text/html"))
-        self.assertIn(
-            "default-src 'self'", response.getheader("Content-Security-Policy")
-        )
+        self.assertEqual(response.getheader("Cache-Control"), "no-cache")
+        policy = response.getheader("Content-Security-Policy")
+        self.assertIn("default-src 'self'", policy)
+        self.assertIn("script-src 'self'", policy)
         self.assertIn("Flyweight Chat", html)
 
-        self.connection.request("GET", "/app.js")
+        # The Vite build references hashed files under /assets/; every one
+        # index.html names must be served, immutable, with the right type.
+        assets = re.findall(r'(?:src|href)="(/assets/[^"]+)"', html)
+        self.assertTrue(assets, html)
+        self.assertTrue(any(asset.endswith(".js") for asset in assets))
+        self.assertTrue(any(asset.endswith(".css") for asset in assets))
+        for asset in assets:
+            self.connection.request("GET", asset)
+            response = self.connection.getresponse()
+            body = response.read()
+            self.assertEqual(response.status, 200, asset)
+            self.assertIn("immutable", response.getheader("Cache-Control"))
+            expected = "text/javascript" if asset.endswith(".js") else "text/css"
+            self.assertTrue(response.getheader("Content-Type").startswith(expected), asset)
+            if asset.endswith(".js"):
+                javascript = body.decode("utf-8")
+                for endpoint in ("/v1/chat/completions", "/v1/messages", "/v1/responses",
+                                 "/v1/completions", "/health", "/props", "/tokenize"):
+                    self.assertIn(endpoint, javascript)
+
+        self.connection.request("HEAD", "/")
         response = self.connection.getresponse()
-        javascript = response.read().decode("utf-8")
+        response.read()
         self.assertEqual(response.status, 200)
-        self.assertTrue(
-            response.getheader("Content-Type").startswith("text/javascript")
-        )
-        self.assertIn("/v1/chat/completions", javascript)
-        self.assertIn("decodeIntervals", javascript)
+        self.assertEqual(response.getheader("Content-Length"), str(len(html.encode("utf-8"))))
+
+        # Traversal and unknown files fall through to the JSON 404, and the
+        # asset table never exposes Python sources beside the UI directory.
+        for path in ("/../server.py", "/assets/../../server.py", "/assets/missing.js",
+                     "/index.html.bak", "/%2e%2e/server.py"):
+            self.connection.request("GET", path)
+            response = self.connection.getresponse()
+            response.read()
+            self.assertIn(response.status, (400, 404), path)
 
         self.connection.request("GET", "/preview.html")
         response = self.connection.getresponse()

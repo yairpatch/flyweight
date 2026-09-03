@@ -485,7 +485,7 @@ TASK_EVENT_TOKEN = 0
 TASK_EVENT_DONE = 1
 TASK_EVENT_ERROR = 2
 TASK_EVENT_PREFILL = 3
-NATIVE_ABI_VERSION = 5
+NATIVE_ABI_VERSION = 6
 # "Let the runtime pick the size" for the host prompt cache, carried through the
 # option struct as a size. Lives here rather than in the CLI so a caller that is
 # not the CLI -- and the runtimes that read it -- can say the same thing.
@@ -1004,6 +1004,7 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_float,
                     ctypes.c_uint32,
                     ctypes.c_float,
+                    ctypes.c_float,  # min_p
                     ctypes.c_float,
                     ctypes.c_float,
                     ctypes.c_float,
@@ -1024,6 +1025,7 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_float,
                     ctypes.c_uint32,
                     ctypes.c_float,
+                    ctypes.c_float,  # min_p
                     ctypes.c_float,
                     ctypes.c_float,
                     ctypes.c_float,
@@ -1519,6 +1521,7 @@ class BailingRuntime:
         temperature = float(getattr(config, "temperature", 0.0) or 0.0)
         top_k = int(getattr(config, "top_k", 0) or 0)
         top_p = float(getattr(config, "top_p", 0.0) or 0.0)
+        min_p = float(getattr(config, "min_p", 0.0) or 0.0)
         if _numpy is None or temperature <= 0.0:
             if _numpy is not None:
                 view = _numpy.frombuffer(self._logits, dtype=_numpy.float32)
@@ -1573,6 +1576,13 @@ class BailingRuntime:
             # Keep the smallest prefix whose mass reaches top_p, always at
             # least one token.
             keep = int(_numpy.searchsorted(cumulative, top_p) + 1)
+            candidates = candidates[:keep]
+            probabilities = probabilities[:keep]
+            probabilities = probabilities / probabilities.sum()
+        if 0.0 < min_p <= 1.0 and probabilities.size > 1:
+            # llama.cpp's min-p, after top_p: relative to the best candidate,
+            # which is first because the order is descending.
+            keep = max(1, int(_numpy.count_nonzero(probabilities >= min_p * probabilities[0])))
             candidates = candidates[:keep]
             probabilities = probabilities[:keep]
             probabilities = probabilities / probabilities.sum()
@@ -3082,6 +3092,7 @@ class V2QwenRuntime:
         temperature: float = 0.0,
         top_k: int = 20,
         top_p: float = 0.95,
+        min_p: float = 0.0,
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
@@ -3115,6 +3126,8 @@ class V2QwenRuntime:
             raise ValueError("prompt_tokens must not be empty")
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
+        if not 0.0 <= min_p <= 1.0:
+            raise ValueError("min_p must be in [0, 1]")
         values = (ctypes.c_uint32 * len(prompt_tokens))(*prompt_tokens)
         stops = (ctypes.c_uint32 * len(stop_tokens))(*stop_tokens) if stop_tokens else None
         task_id = ctypes.c_uint64()
@@ -3152,6 +3165,7 @@ class V2QwenRuntime:
                     temperature,
                     top_k,
                     top_p,
+                    min_p,
                     repetition_penalty,
                     presence_penalty,
                     frequency_penalty,
@@ -3177,6 +3191,7 @@ class V2QwenRuntime:
                 temperature,
                 top_k,
                 top_p,
+                min_p,
                 repetition_penalty,
                 presence_penalty,
                 frequency_penalty,

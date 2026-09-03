@@ -25,9 +25,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 flyweight = [
   "ui/*.html",
-  "ui/*.css",
-  "ui/*.js",
   "ui/*.svg",
+  "ui/assets/*",
 ]
 
 [tool.mypy]

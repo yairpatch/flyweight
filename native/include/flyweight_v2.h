@@ -719,11 +719,13 @@ FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_sampling(FlyweightV2QwenRunti
    penalized. Without these a low-bit checkpoint can lock onto a line and
    repeat it until the token budget runs out. */
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_penalties(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, uint64_t* task_id);
-/* As above, plus a tool specification -- `[{"name": ..., "parameters":
+/* As above, plus `min_p` -- llama.cpp's min-p cut: after top_p, drop every
+   candidate whose probability is below min_p times the best candidate's
+   (0 disables, [0, 1]) -- and a tool specification -- `[{"name": ..., "parameters":
    [{"name": ..., "required": true}]}]` -- that constrains the sampler while a
    tool call is open, so a required parameter cannot be skipped. Null or empty
    leaves the sampler unconstrained. */
-FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, uint64_t* task_id);
+FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, uint64_t* task_id);
 /* As flyweight_v2_qwen_task_submit_grammar, with images. Each image's
    pixels are HWC f32 normalized with the tower's mean/std and sized per
    flyweight_v2_vision_resize; `token_offset` is the prompt index of its
@@ -737,7 +739,7 @@ typedef struct FlyweightV2QwenImage {
     uint64_t token_offset;
     uint64_t hash;
 } FlyweightV2QwenImage;
-FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images, uint64_t image_count, uint64_t* task_id);
+FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images, uint64_t image_count, uint64_t* task_id);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime* runtime, FlyweightV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_cancel(FlyweightV2QwenRuntime* runtime, uint64_t task_id);
 /* Why a task reported kind 2 (error): the native exception text, retained

@@ -39,6 +39,13 @@ from .v2 import (
     V2QwenRuntime,
 )
 
+# What a direct caller gets when it passes no sampling config: greedy decode,
+# so a continuation served from a warm slot can be compared token-for-token
+# with a cold run. The HTTP layer always passes an explicit config built from
+# the request and the server defaults, so this never shapes a served answer.
+_GREEDY = SamplingConfig(temperature=0.0, top_k=1, top_p=1.0, min_p=0.0)
+
+
 
 class _GenerationExtension(Extension):
     """Render Hugging Face's generation block without token-span tracking."""
@@ -158,7 +165,7 @@ class _NativeEngine:
         task_queue: Queue[tuple[str, object]] = Queue(
             maxsize=self._MAX_BUFFERED_EVENTS
         )
-        sampling_config = sampling or SamplingConfig()
+        sampling_config = sampling or _GREEDY
         with self._lock:
             if self._closing:
                 raise RuntimeError("native v2 engine is shutting down")
@@ -171,6 +178,7 @@ class _NativeEngine:
                 temperature=sampling_config.temperature,
                 top_k=sampling_config.top_k,
                 top_p=sampling_config.top_p,
+                min_p=sampling_config.min_p,
                 repetition_penalty=sampling_config.repetition_penalty,
                 presence_penalty=sampling_config.presence_penalty,
                 frequency_penalty=sampling_config.frequency_penalty,
@@ -1620,7 +1628,7 @@ class ChatGenerator:
             raise ValueError("max_new_tokens must be positive")
         sampling = options.get("sampling")
         sampling_config = (
-            sampling if isinstance(sampling, SamplingConfig) else SamplingConfig()
+            sampling if isinstance(sampling, SamplingConfig) else _GREEDY
         )
         progress = options.get("progress")
         progress_callback = progress if callable(progress) else None
@@ -2013,7 +2021,7 @@ class BailingEngine:
             self._queues[task_id] = task_queue
             self._pending.append(
                 (task_id, list(prompt_ids), max_new_tokens, stop_tokens,
-                 sampling or SamplingConfig())
+                 sampling or _GREEDY)
             )
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(

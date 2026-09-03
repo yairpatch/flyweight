@@ -205,6 +205,18 @@ Do not keep an editable and a regular install in the same environment. The
 regular one wins every import, edits appear to do nothing, and `flyweight
 doctor` reports the shadowing on its `package` line.
 
+The chat UI is a Vite + React + TypeScript app in `web/`; the build is
+committed under `src/flyweight/ui/` so the Python package ships it without
+Node. After changing anything in `web/`, rebuild and commit the output:
+
+~~~bash
+cd web
+pnpm install
+pnpm test          # vitest: protocol adapters, SSE reader, direction
+pnpm build         # typecheck, then write src/flyweight/ui/
+pnpm dev           # live-reload dev server proxying to :8000
+~~~
+
 ## Commands
 
 | Command | What it does |
@@ -281,6 +293,39 @@ flyweight serve model.gguf \
   --request-timeout-seconds 30
 ~~~
 
+### Chat UI
+
+The bundled UI at `/` is a single-page app that reaches every function the
+server exposes, not only chat:
+
+- **Chat** streams through any of the three protocols (OpenAI chat
+  completions, Anthropic messages, OpenAI responses), switchable per
+  conversation from the composer. Thinking shows in a collapsible panel with
+  its duration; tool calls render as cards where you paste the result and
+  continue; images attach by button, paste, or drop when a vision tower is
+  loaded. Markdown, GFM tables, KaTeX math, and highlighted code with copy,
+  download, and a sandboxed **Run** for HTML/SVG/JS.
+- **Settings** (Ctrl+,) cover every sampling knob the server accepts,
+  stop sequences, seed, reasoning effort and budget, `preserve_thinking`,
+  JSON mode and JSON schema output, `chat_template_kwargs`, and named
+  presets. Defaults track `/props` until you change something.
+- **Tools** defines function tools (import OpenAI or Anthropic definitions),
+  `tool_choice`, and parallel calls; the sampler grammar enforces them.
+- **Runtime** polls `/health`, `/props`, and `/slots` and charts decode
+  throughput, GPU memory, KV and prefix cache, expert cache hit rate, MTP
+  acceptance, the time breakdown, and grammar counters, with the full
+  telemetry block and raw JSON one click away.
+- **Tokenizer** drives `/tokenize` and `/detokenize` and counts the current
+  conversation through both `/v1/messages/count_tokens` and
+  `/v1/responses/input_tokens`.
+- **Playground** streams raw prompts through `/v1/completions`.
+- **Inspector** keeps the exact request body, every SSE frame, and a curl
+  line for each request, and retrieves or deletes stored responses.
+
+Conversations live in IndexedDB (history from the previous UI is imported
+once), with search, pin, rename, and JSON or Markdown export. Ctrl+K opens a
+command palette; Ctrl+B toggles the sidebar; Esc stops a generation.
+
 ### Images
 
 A Qwen 3.5-family GGUF serves images when its vision tower is attached.
@@ -343,7 +388,9 @@ server model name.
 Chat requests use the GGUF's `tokenizer.chat_template` when it is present;
 the built-in architecture formatter is only a fallback for older files. If a
 `generation_config.json` is stored beside the GGUF, its `temperature`,
-`top_k`, `top_p`, `max_new_tokens`, and `do_sample` defaults are also loaded.
+`top_k`, `top_p`, `min_p`, the penalties, `max_new_tokens`, and `do_sample`
+defaults are also loaded. Without one, the built-in defaults are llama.cpp's:
+temperature 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05, penalties off.
 Explicit API request values always override model defaults. `GET /props`
 reports the resolved defaults and their sources, and the bundled UI adopts
 them until the user saves custom settings.

@@ -866,17 +866,23 @@ examples:
              "makes that optional",
     )
     sampling = generate.add_argument_group("sampling")
+    # llama.cpp's defaults, the same ones `serve` falls back to.
     sampling.add_argument(
-        "--temperature", type=float, default=0.0, metavar="X",
+        "--temperature", type=float, default=0.8, metavar="X",
         help="sampling temperature; 0 is greedy",
     )
     sampling.add_argument(
-        "--top-k", type=int, default=20, metavar="N",
+        "--top-k", type=int, default=40, metavar="N",
         help="how many candidates the sampler considers",
     )
     sampling.add_argument(
         "--top-p", type=float, default=0.95, metavar="X",
         help="nucleus cut over those candidates, in (0, 1]",
+    )
+    sampling.add_argument(
+        "--min-p", type=float, default=0.05, metavar="X",
+        help="drop candidates below this fraction of the best one's "
+             "probability, in [0, 1] (0 disables)",
     )
     sampling.add_argument(
         "--seed", type=int, metavar="N",
@@ -1500,6 +1506,7 @@ def _generate(args: argparse.Namespace) -> int:
             "temperature": args.temperature,
             "top_k": args.top_k,
             "top_p": args.top_p,
+            "min_p": args.min_p,
             "seed": args.seed,
             "enable_thinking": args.enable_thinking,
         })

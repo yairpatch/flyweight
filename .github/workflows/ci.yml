@@ -37,6 +37,20 @@ jobs:
         run: python -m flyweight.native_build
       - name: Native contract tests
         run: ctest --test-dir build/native --output-on-failure -C Release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The web UI build is committed; CI rebuilds it and fails if the
+      # committed bundle is stale, then the pytest run picks up vitest.
+      - name: Web UI
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd web
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm build
+          git -C .. diff --exit-code --stat -- src/flyweight/ui
       - name: Lint
         run: ruff check src tests setup.py
       - name: Type check

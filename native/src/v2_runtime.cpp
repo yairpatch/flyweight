@@ -753,6 +753,10 @@ struct QwenSamplingState {
     float temperature = 0.0f;
     std::uint32_t top_k = 20;
     float top_p = 0.95f;
+    // llama.cpp's min-p: relative to the best candidate rather than to the
+    // cumulative mass, so a flat distribution keeps many options and a peaked
+    // one keeps few. Applied after top_p, in llama.cpp's order.
+    float min_p = 0.0f;
     // Nothing here used to discourage a token the model had just produced, and
     // "no penalty" is not the neutral setting it looks like -- it is the
     // setting that lets a low-bit checkpoint fall into a loop and stay there.
@@ -6086,7 +6090,7 @@ int plan_memory(FlyweightV2MemoryPlan& out, uint64_t budget, uint64_t static_wei
 }
 
 extern "C" {
-uint32_t flyweight_v2_version() { return 5; }
+uint32_t flyweight_v2_version() { return 6; }
 uint64_t flyweight_v2_runtime_options_size() { return sizeof(FlyweightV2QwenRuntimeOptions); }
 uint64_t flyweight_v2_runtime_info_size() { return sizeof(FlyweightV2QwenRuntimeInfo); }
 const char* flyweight_v2_last_error() { return error.c_str(); }
@@ -20192,6 +20196,14 @@ static std::uint32_t qwen_sample_last_logits(
             if(cumulative>=sampling.top_p){keep=index+1;break;}
         }
     }
+    if(sampling.min_p>0.0f){
+        // Candidates are sorted by logit, so probabilities[0] is the maximum
+        // and the cut is a prefix. At least one survives by construction.
+        const double floor=static_cast<double>(sampling.min_p)*probabilities[0];
+        std::size_t kept=1;
+        while(kept<keep&&probabilities[kept]>=floor)++kept;
+        keep=kept;
+    }
     double kept_total=0.0;
     for(std::size_t index=0;index<keep;++index)kept_total+=probabilities[index];
     const double threshold=qwen_sampling_uniform(sampling)*kept_total;
@@ -22277,7 +22289,7 @@ static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
         float presence_penalty,float frequency_penalty,uint32_t penalty_window,
         uint64_t seed,bool has_seed,uint64_t*task_id,
         const char*tool_specification=nullptr,
-        std::vector<QwenTaskImage>*images=nullptr) {
+        std::vector<QwenTaskImage>*images=nullptr,float min_p=0.0f) {
     if(!runtime||!prompt||!prompt_count||!max_tokens||!task_id)throw std::runtime_error("invalid native Qwen task arguments");
     if(prompt_count>runtime->options.context_limit||
        max_tokens>runtime->options.context_limit-prompt_count)
@@ -22286,6 +22298,8 @@ static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
         throw std::runtime_error("native Qwen temperature must be finite and non-negative");
     if(!std::isfinite(top_p)||top_p<=0.0f||top_p>1.0f)
         throw std::runtime_error("native Qwen top_p must be in (0, 1]");
+    if(!std::isfinite(min_p)||min_p<0.0f||min_p>1.0f)
+        throw std::runtime_error("native Qwen min_p must be in [0, 1]");
     // A penalty below 1 rewards repetition, which is the failure this exists
     // to prevent; an unbounded one silences a token the answer may legitimately
     // need. Both are far more likely to be a caller's unit mistake than intent.
@@ -22309,6 +22323,7 @@ static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
     task.sampling.temperature=temperature;
     task.sampling.top_k=top_k;
     task.sampling.top_p=top_p;
+    task.sampling.min_p=min_p;
     task.sampling.repetition_penalty=repetition_penalty;
     task.sampling.presence_penalty=presence_penalty;
     task.sampling.frequency_penalty=frequency_penalty;
@@ -22380,17 +22395,17 @@ int flyweight_v2_qwen_task_submit_penalties(FlyweightV2QwenRuntime*runtime,const
 // The penalties entry point plus the tool specification the sampler constrains
 // tool calls to. Null or empty leaves the sampler unconstrained, which is what
 // every request without tools wants.
-int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,const char*tool_specification,uint64_t*task_id){return guarded([&]{
+int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,float min_p,float repetition_penalty,float presence_penalty,float frequency_penalty,uint32_t penalty_window,uint64_t seed,uint32_t has_seed,const char*tool_specification,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
         stop_count,temperature,top_k,top_p,repetition_penalty,presence_penalty,
         frequency_penalty,penalty_window,seed,has_seed!=0,task_id,
-        tool_specification);
+        tool_specification,nullptr,min_p);
     return 0;
 });}
 
 int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt,
         uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count,
-        float temperature, uint32_t top_k, float top_p, float repetition_penalty,
+        float temperature, uint32_t top_k, float top_p, float min_p, float repetition_penalty,
         float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed,
         uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images,
         uint64_t image_count, uint64_t* task_id) { return guarded([&]{
@@ -22421,7 +22436,7 @@ int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const 
     }
     qwen_task_submit_impl(runtime, prompt, prompt_count, max_tokens, stop_tokens, stop_count,
         temperature, top_k, top_p, repetition_penalty, presence_penalty, frequency_penalty,
-        penalty_window, seed, has_seed != 0, task_id, tool_specification, &copied);
+        penalty_window, seed, has_seed != 0, task_id, tool_specification, &copied, min_p);
     return 0;
 }); }
 

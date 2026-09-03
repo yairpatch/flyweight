@@ -9,16 +9,21 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True, slots=True)
 class SamplingConfig:
-    temperature: float = 0.0
-    top_k: int = 20
+    # The built-in defaults follow llama-server's, so a client that sends no
+    # sampling fields gets the same distribution it would from llama.cpp:
+    # temperature 0.8 with top_k 40, top_p 0.95, and min_p 0.05, penalties
+    # off, and a 64-token penalty window (llama.cpp's repeat_last_n) for a
+    # caller that turns them on. A request, a server flag, or a
+    # generation_config.json beside the checkpoint overrides any of them.
+    temperature: float = 0.8
+    top_k: int = 40
     top_p: float = 0.95
+    # llama.cpp's min-p: drop candidates whose probability is below min_p times
+    # the best candidate's. Unlike top_p it adapts to how peaked the
+    # distribution is, which is why llama.cpp keeps it on by default.
+    min_p: float = 0.05
     seed: int | None = None
-    # Defaults match llama.cpp's long-standing repeat_penalty/repeat_last_n,
-    # deliberately on rather than off: with no penalty a low-bit checkpoint
-    # locks onto a line and repeats it until the token budget runs out, which
-    # is a far more visible failure than the mild cost of 1.1 -- legitimately
-    # repetitive text, code especially, becomes slightly less likely.
-    repetition_penalty: float = 1.1
+    repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     penalty_window: int = 64
@@ -30,6 +35,8 @@ class SamplingConfig:
             raise ValueError("top_k must be non-negative")
         if not 0 < self.top_p <= 1:
             raise ValueError("top_p must be in (0, 1]")
+        if not 0 <= self.min_p <= 1:
+            raise ValueError("min_p must be in [0, 1]")
         if not 1.0 <= self.repetition_penalty <= 2.0:
             raise ValueError("repetition_penalty must be in [1, 2]")
         if not -2.0 <= self.presence_penalty <= 2.0:
@@ -67,6 +74,9 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("temperature", float, "sampling temperature (0 = greedy)"),
     Setting("top_k", int, "how many candidates the sampler considers"),
     Setting("top_p", float, "nucleus cut over those candidates, in (0, 1]"),
+    Setting("min_p", float,
+            "drop candidates below this fraction of the best one's "
+            "probability, in [0, 1] (0 disables)"),
     Setting("seed", int, "fixed RNG seed for a reproducible sample",
             optional=True, per_request_only=True),
     Setting("repetition_penalty", float,

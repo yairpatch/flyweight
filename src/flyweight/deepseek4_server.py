@@ -47,6 +47,13 @@ from .v2_server import (
 )
 
 
+# What a direct caller gets when it passes no sampling config: greedy decode,
+# so a continuation served from a warm slot can be compared token-for-token
+# with a cold run. The HTTP layer always passes an explicit config built from
+# the request and the server defaults, so this never shapes a served answer.
+_GREEDY = SamplingConfig(temperature=0.0, top_k=1, top_p=1.0, min_p=0.0)
+
+
 def sample_token(
     logits: np.ndarray, sampling: SamplingConfig, generator: np.random.Generator
 ) -> int:
@@ -54,9 +61,10 @@ def sample_token(
 
     Greedy at temperature zero -- which is both the default and what every
     parity check against the reference uses -- and otherwise temperature, then
-    top-k, then nucleus, in that order. Sampling happens here rather than
-    natively because the native sampler is wired into the Qwen engine's task
-    state; moving it is worth doing only once this path needs the speed.
+    top-k, nucleus, then min-p, in llama.cpp's order. Sampling happens here
+    rather than natively because the native sampler is wired into the Qwen
+    engine's task state; moving it is worth doing only once this path needs
+    the speed.
     """
     if sampling.temperature <= 0:
         return int(np.argmax(logits))
@@ -72,6 +80,12 @@ def sample_token(
         # Keep the first entry whose cumulative mass reaches top_p, so the
         # nucleus is never empty even when one token holds more than top_p.
         keep = int(np.searchsorted(cumulative, sampling.top_p) + 1)
+        order, probabilities = order[:keep], probabilities[:keep]
+        probabilities = probabilities / probabilities.sum()
+    min_p = float(getattr(sampling, "min_p", 0.0) or 0.0)
+    if min_p > 0.0 and probabilities.size > 1:
+        # llama.cpp's min-p after top_p, relative to the best candidate.
+        keep = max(1, int(np.count_nonzero(probabilities >= min_p * probabilities[0])))
         order, probabilities = order[:keep], probabilities[:keep]
         probabilities = probabilities / probabilities.sum()
     return int(generator.choice(order, p=probabilities))
@@ -231,7 +245,7 @@ class Deepseek4Engine:
             self._next_task_id += 1
             self._tasks[task_id] = _Task(
                 task_id, prompt, max_new_tokens, stop_tokens,
-                sampling or SamplingConfig(), queue,
+                sampling or _GREEDY, queue,
             )
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(

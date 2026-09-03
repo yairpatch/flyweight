@@ -27,7 +27,7 @@ from .vision import (
     IMAGE_PLACEHOLDER, ImageError, ImageInput, image_from_anthropic_block,
     image_from_openai_part,
 )
-from .sampling import SETTINGS, SamplingConfig
+from .sampling import SETTINGS, SamplingConfig, defaults as sampling_defaults
 
 # The settings a request may override, which is all of them: see
 # sampling.SETTINGS for the one list every surface reads.
@@ -95,18 +95,32 @@ class Tokenizer(Protocol):
 # The body is read into memory, so the bound stays finite.
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 UI_DIRECTORY = Path(__file__).with_name("ui")
-UI_ASSETS = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/index.html": ("index.html", "text/html; charset=utf-8"),
-    "/app.css": ("app.css", "text/css; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
-    "/preview.html": ("preview.html", "text/html; charset=utf-8"),
+# The UI is a Vite build (see web/): index.html plus hashed files under
+# assets/. Only these extensions are served, so a stray file in the package
+# directory is never reachable, and the path is resolved against the UI root
+# to keep traversal out.
+UI_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
 }
+# React writes inline `style` attributes and KaTeX positions glyphs with
+# them, so style-src allows inline styles; scripts stay same-origin only.
 UI_CSP = (
-    "default-src 'self'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
-    "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; "
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+    "form-action 'self'"
 )
 # The preview shell runs model-generated code. The sandbox directive gives it
 # an opaque origin with no access to the app origin, its storage, or the API,
@@ -548,19 +562,10 @@ class InferenceService:
         # checkpoint's own, which is the only safe answer for a template this
         # server has never seen.
         self.reasoning_effort = reasoning_effort
+        # Read from the dataclass rather than restated here, so the one place
+        # that documents the sampling defaults stays the only place.
         defaults: dict[str, int | float] = {
-            "temperature": 0.0,
-            "top_k": 20,
-            "top_p": 0.95,
-            # Read from the dataclass rather than restated here, so the one
-            # place that documents the penalty defaults stays the only place.
-            # `slots=True` means the class attribute is a slot descriptor, not
-            # the default, hence the field walk.
-            **{
-                field.name: field.default
-                for field in dataclasses.fields(SamplingConfig)
-                if field.name in _PENALTY_OPTIONS
-            },
+            **sampling_defaults(),
             "max_new_tokens": max_new_tokens,
         }
         defaults.update(generation_defaults or {})
@@ -569,6 +574,7 @@ class InferenceService:
                 temperature=float(defaults["temperature"]),
                 top_k=int(defaults["top_k"]),
                 top_p=float(defaults["top_p"]),
+                min_p=float(defaults["min_p"]),
                 repetition_penalty=float(defaults["repetition_penalty"]),
                 presence_penalty=float(defaults["presence_penalty"]),
                 frequency_penalty=float(defaults["frequency_penalty"]),
@@ -583,6 +589,7 @@ class InferenceService:
             "temperature": float(defaults["temperature"]),
             "top_k": int(defaults["top_k"]),
             "top_p": float(defaults["top_p"]),
+            "min_p": float(defaults["min_p"]),
             "repetition_penalty": float(defaults["repetition_penalty"]),
             "presence_penalty": float(defaults["presence_penalty"]),
             "frequency_penalty": float(defaults["frequency_penalty"]),
@@ -2916,6 +2923,34 @@ def _sse_with_keepalive(
             worker.join(timeout=0.05)
 
 
+def _ui_asset(path: str) -> Path | None:
+    """Map a request path to a file inside the bundled UI, or None.
+
+    `/` serves index.html. Anything else must name an existing file with a
+    known extension that resolves inside the UI directory; there is no SPA
+    fallback, so unknown paths fall through to the API 404.
+    """
+    if path in ("", "/"):
+        candidate = UI_DIRECTORY / "index.html"
+    else:
+        relative = unquote(path).lstrip("/")
+        if not relative or "\\" in relative or "\0" in relative:
+            return None
+        if any(part in ("", ".", "..") for part in relative.split("/")):
+            return None
+        candidate = UI_DIRECTORY / relative
+    if candidate.suffix.lower() not in UI_CONTENT_TYPES:
+        return None
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(UI_DIRECTORY.resolve())
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
 def create_handler(
     service: InferenceService,
 ) -> type[BaseHTTPRequestHandler]:
@@ -3001,8 +3036,9 @@ def create_handler(
 
         def _do_get(self) -> None:
             path = urlsplit(self.path).path
-            if path in UI_ASSETS:
-                self._send_static(path)
+            asset = _ui_asset(path)
+            if asset is not None:
+                self._send_static(asset)
                 return
             self._authenticate()
             if path == "/health":
@@ -3050,8 +3086,9 @@ def create_handler(
 
         def _do_head(self) -> None:
             path = urlsplit(self.path).path
-            if path in UI_ASSETS:
-                self._send_static(path, head_only=True)
+            asset = _ui_asset(path)
+            if asset is not None:
+                self._send_static(asset, head_only=True)
                 return
             self._authenticate()
             if path == "/v1/me":
@@ -3585,22 +3622,27 @@ def create_handler(
                 }
             return _error_payload(error)
 
-        def _send_static(self, path: str, *, head_only: bool = False) -> None:
-            filename, content_type = UI_ASSETS[path]
+        def _send_static(self, asset: Path, *, head_only: bool = False) -> None:
             try:
-                body = (UI_DIRECTORY / filename).read_bytes()
+                body = asset.read_bytes()
             except OSError:
                 self._send_error(APIError(404, "UI asset not found", "not_found_error"))
                 return
+            content_type = UI_CONTENT_TYPES[asset.suffix.lower()]
             self.send_response(200)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-cache")
+            # Vite hashes everything under assets/, so those can be cached
+            # forever; index.html and the preview shell must always revalidate.
+            if asset.parent.name == "assets":
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            else:
+                self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.send_header(
                 "Content-Security-Policy",
-                PREVIEW_CSP if filename == "preview.html" else UI_CSP,
+                PREVIEW_CSP if asset.name == "preview.html" else UI_CSP,
             )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
