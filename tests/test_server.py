@@ -1455,6 +1455,55 @@ class InferenceServiceTests(unittest.TestCase):
         )
         self.assertEqual(translated[-1]["content"], "What next?")
 
+    def test_anthropic_freeze_total_tokens_pins_claude_codes_counter(self) -> None:
+        # Claude Code rewrites this counter on every request, invalidating the
+        # prompt cache from the earliest one onward. Frozen, the history is
+        # byte-identical across turns; off, the request passes through as sent.
+        payload = {
+            "system": "Rules.\n\n<total_tokens>14904921 tokens left</total_tokens>",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Fix it"},
+                    {"type": "text", "text":
+                     "\n\n<total_tokens>14904636 tokens left</total_tokens>"},
+                ]},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": "run",
+                    "input": {"cmd": "echo <total_tokens>7 tokens left</total_tokens>"},
+                }]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": [{"type": "text", "text":
+                                  "ok <total_tokens>14904254 tokens left</total_tokens>"}]},
+                    {"type": "text", "text": "Next?"},
+                ]},
+            ],
+            "max_tokens": 4,
+        }
+        self.service.anthropic_message(payload)
+        passthrough = self.generator.calls[-1][0]
+        self.assertIn("14904921 tokens left", passthrough[0]["content"])
+        self.assertIn("14904636 tokens left", passthrough[1]["content"])
+
+        self.service.freeze_total_tokens = True
+        self.service.anthropic_message(payload)
+        frozen = self.generator.calls[-1][0]
+        rendered = "\n".join(str(turn) for turn in frozen)
+        self.assertNotIn("14904921", rendered)
+        self.assertNotIn("14904636", rendered)
+        self.assertNotIn("14904254", rendered)
+        self.assertEqual(rendered.count("<total_tokens>1000000 tokens left</total_tokens>"), 4)
+        # Everything around the counters is untouched, and the client's own
+        # payload is not mutated behind its back.
+        self.assertTrue(frozen[0]["content"].startswith("Rules.\n\n"))
+        self.assertTrue(frozen[1]["content"].startswith("Fix it\n\n"))
+        self.assertEqual(frozen[-1]["content"], "Next?")
+        self.assertIn("14904921", payload["system"])
+        self.assertEqual(
+            self.service.count_anthropic_input(payload)["input_tokens"],
+            len(self.generator.tokenizer.encode_messages(frozen)),
+        )
+
     def test_anthropic_protocol_validation_and_options(self) -> None:
         with self.assertRaisesRegex(APIError, "max_tokens"):
             self.service.anthropic_message(

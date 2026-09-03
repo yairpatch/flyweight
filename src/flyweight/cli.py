@@ -794,6 +794,14 @@ checkpoint's generation_config.json says.\
              "resumes. An explicit reasoning_budget_tokens overrides; "
              "0 disables the default and lets a think run to max-tokens",
     )
+    limits.add_argument(
+        "--freeze-total-tokens", action="store_true",
+        help="pin the <total_tokens>N tokens left</total_tokens> counter "
+             "Claude Code rewrites in the history on every request, so the "
+             "prompt cache reuses the whole conversation instead of "
+             "re-evaluating everything after the counter each turn; "
+             "/v1/messages only",
+    )
     _add_backend_option(
         serve.add_argument_group(
             "backend", "Which processor runs the model.",
@@ -1575,6 +1583,9 @@ def _serve_http(args: argparse.Namespace, service) -> int:
             previous = signal.signal(signal.SIGTERM, terminate)
         except (ValueError, OSError):  # not the main thread after all, or no SIGTERM
             previous = None
+    # Every service class inherits the attribute from InferenceService; one
+    # assignment here beats threading a keyword through their constructors.
+    service.freeze_total_tokens = bool(getattr(args, "freeze_total_tokens", False))
     try:
         print(f"Serving {service.model_name} at http://{args.host}:{args.port}", file=sys.stderr)
         serve_http(

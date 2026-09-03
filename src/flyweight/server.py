@@ -530,6 +530,10 @@ class InferenceService:
         self.sse_keepalive_seconds = sse_keepalive_seconds
         self.max_tool_call_tokens = max_tool_call_tokens
         self.default_thinking_budget = default_thinking_budget
+        # Pin Claude Code's per-request context counter on the Anthropic
+        # endpoint (see `_TOTAL_TOKENS_RE`). Set by the CLI after construction
+        # rather than threaded through three subclass constructors.
+        self.freeze_total_tokens = False
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(
                 "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS))
@@ -1621,6 +1625,7 @@ class InferenceService:
         options, messages, _ = _anthropic_request(
             {**payload, "max_tokens": payload.get("max_tokens", 1)},
             architecture=getattr(self.generator.tokenizer, "architecture", None),
+            freeze_total_tokens=self.freeze_total_tokens,
         )
         tokens = self.generator.tokenizer.encode_messages(
             messages,
@@ -1952,6 +1957,7 @@ class InferenceService:
         options, messages, tools_enabled = _anthropic_request(
             payload,
             architecture=getattr(self.generator.tokenizer, "architecture", None),
+            freeze_total_tokens=self.freeze_total_tokens,
         )
         tools = tuple(_selected_tools(options)) if tools_enabled else ()
         request = self._prepare_generation(
@@ -3864,8 +3870,50 @@ _ANTHROPIC_STOP_REASONS = {
 }
 
 
+# Claude Code's remaining-context counter. It appends
+# `<total_tokens>N tokens left</total_tokens>` to turns in the history and
+# rewrites N on every request, so the earliest counter in a long session is
+# where the prompt diverges from the cached one: measured live, a 95k-token
+# prompt re-evaluated 64k tokens per turn (two minutes at 525 tok/s) for a
+# reply of a few hundred, while OpenAI-protocol harnesses, whose history is
+# append-only, reused nearly all of it. `--freeze-total-tokens` pins N to a
+# constant so the history stays byte-identical across turns. The value is
+# not something the model can act on locally -- the context limit is this
+# server's, not the counter's -- so the exact figure is immaterial; a large
+# round one reads as "plenty" rather than as a budget about to run out.
+_TOTAL_TOKENS_RE = re.compile(r"<total_tokens>\d+ tokens left</total_tokens>")
+_FROZEN_TOTAL_TOKENS = "<total_tokens>1000000 tokens left</total_tokens>"
+
+
+def _freeze_total_tokens(value: Any) -> Any:
+    """Return `value` with every total_tokens counter pinned, recursively.
+
+    Walks the system prompt and message tree as the client sent it, strings,
+    lists and dicts alike, so counters reach the prompt frozen whichever
+    block carries them: user text, a tool result, the system field. Anything
+    without a counter is returned as the same object, so an untouched
+    request costs one regex scan per string and no copying.
+    """
+    if isinstance(value, str):
+        if "<total_tokens>" not in value:
+            return value
+        return _TOTAL_TOKENS_RE.sub(_FROZEN_TOTAL_TOKENS, value)
+    if isinstance(value, list):
+        frozen = [_freeze_total_tokens(item) for item in value]
+        return value if all(a is b for a, b in zip(frozen, value)) else frozen
+    if isinstance(value, Mapping):
+        frozen_map = {key: _freeze_total_tokens(item) for key, item in value.items()}
+        return (
+            value
+            if all(frozen_map[key] is value[key] for key in value)
+            else frozen_map
+        )
+    return value
+
+
 def _anthropic_request(
-    payload: Mapping[str, Any], *, architecture: str | None = None
+    payload: Mapping[str, Any], *, architecture: str | None = None,
+    freeze_total_tokens: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
     """Parse an Anthropic messages request straight into prompt messages.
 
@@ -3876,7 +3924,17 @@ def _anthropic_request(
     imposed OpenAI's rules -- an empty assistant turn, legal here, was a 400
     there -- and dropped everything the OpenAI shape cannot carry, thinking
     blocks and tool_use ids among it.
+
+    `freeze_total_tokens` pins Claude Code's per-request context counter (see
+    `_TOTAL_TOKENS_RE`) before any text is read, so the prompt cache sees the
+    same history turn after turn.
     """
+    if freeze_total_tokens:
+        payload = {
+            **payload,
+            "system": _freeze_total_tokens(payload.get("system")),
+            "messages": _freeze_total_tokens(payload.get("messages")),
+        }
     if payload.get("max_tokens") is None:
         raise APIError(400, "max_tokens is required", parameter="max_tokens")
     stop_sequences = payload.get("stop_sequences")

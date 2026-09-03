@@ -436,6 +436,10 @@ are accepted everywhere:
 - `--max-connections N`: cap simultaneous HTTP connection threads
 - `--request-timeout-seconds N`: bound idle/read time on client sockets
 - `--max-tool-call-tokens N`: bound a runaway tool call (0 = unbounded)
+- `--freeze-total-tokens`: pin the `<total_tokens>N tokens left</total_tokens>`
+  counter Claude Code rewrites in its history on every request, so
+  `/v1/messages` prompts stay cache-identical across turns instead of
+  re-evaluating everything after the counter
 - `--prefill-cache-seed auto|off|N`: post-prefill hot-expert placement
 - `--expert-paging auto|staged|direct`: legacy paging transfer policy
 - `--cpu-prefetch-auto`: warm prompt-relevant expert pages when beneficial
