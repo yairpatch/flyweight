@@ -24,6 +24,7 @@
 #include "flyweight_v2_workspace.hpp"
 #include "flyweight_v2_tool_grammar.hpp"
 #include "flyweight_v2_byte_alphabet.hpp"
+#include "flyweight_v2_vision.hpp"
 #include "qwen_cpu_kernel.h"
 #include "qwen_kquant.h"
 #include "qwen_kquant_pack_api.hpp"
@@ -299,6 +300,11 @@ struct Reader {
 // first WeightProvider; future providers can populate the same
 // tensor contract without changing CUDA/runtime code.
 struct FlyweightV2Model : flyweight::v2::WeightProvider { const uint8_t* data=nullptr; size_t size=0; uint32_t version=0, alignment=32; uint64_t metadata=0; std::string path, architecture, name, format_name="gguf", chat_template; flyweight::v2::ModelConfig config; uint32_t mtp_layer=std::numeric_limits<uint32_t>::max(); std::vector<std::string> vocabulary, merges; std::unordered_map<std::string,int> merge_ranks; std::unordered_map<std::string,uint32_t> vocabulary_ids; std::vector<Tensor> tensors; std::unique_ptr<FlyweightV2Model> mtp_sidecar;
+    // The mmproj vision tower attached beside a Qwen checkpoint, and the
+    // `clip.*` keys parsed off whichever file carried them (the sidecar's own
+    // `vision` is what the tower reads; the base model's stays absent).
+    std::unique_ptr<FlyweightV2Model> vision_sidecar;
+    flyweight::v2::VisionConfig vision;
     // GGUF tokenizer.ggml.pre selects the pre-tokenizer. Control tokens (GGUF
     // token type 3) never come out of BPE and have to be split off ahead of it.
     std::string tokenizer_pre; std::vector<std::uint32_t> token_types;
@@ -509,9 +515,103 @@ struct QwenCudaLayerProfile {
 // rewound: agentic clients re-encode the assistant reply differently than
 // it was generated, so the plain processed_tokens extension check misses
 // every multi-turn request. Attention KV needs no copy (position bounds it).
+// An image's tokens inside a sequence: where they sit, the merged grid they
+// span, and a content hash. Token ids alone cannot tell two images of the
+// same size apart, so every place a token history is kept or compared
+// (sequence, checkpoint, host spill, donation) carries its spans beside it.
+struct QwenImageSpan {
+    std::uint64_t start = 0;
+    std::uint32_t count = 0, grid_h = 0, grid_w = 0;
+    std::uint64_t hash = 0;
+    bool operator==(const QwenImageSpan& other) const {
+        return start == other.start && count == other.count && grid_h == other.grid_h &&
+               grid_w == other.grid_w && hash == other.hash;
+    }
+    bool operator!=(const QwenImageSpan& other) const { return !(*this == other); }
+};
+
+// The spans a history of `count` tokens has started on.
+static std::vector<QwenImageSpan> qwen_spans_before(
+        const std::vector<QwenImageSpan>& spans, std::uint64_t count) {
+    std::vector<QwenImageSpan> out;
+    for (const auto& span : spans) if (span.start < count) out.push_back(span);
+    return out;
+}
+
+// The longest prefix, at most `match`, on which two token histories also
+// agree about their images: a span one side starts inside the prefix must
+// exist identically on the other. A cut never lands inside an image the two
+// sides disagree on, so the KV rows reused are ones both describe.
+static std::uint64_t qwen_spans_agree(
+        const std::vector<QwenImageSpan>& a, const std::vector<QwenImageSpan>& b,
+        std::uint64_t match) {
+    auto check = [&](const std::vector<QwenImageSpan>& mine, const std::vector<QwenImageSpan>& theirs) {
+        for (const auto& span : mine) {
+            if (span.start >= match) continue;
+            bool found = false;
+            for (const auto& other : theirs) if (other == span) { found = true; break; }
+            if (!found) match = std::min(match, span.start);
+        }
+    };
+    check(a, b);
+    check(b, a);
+    return match;
+}
+
+// The three rotary positions of a KV index under interleaved M-RoPE. Text
+// tokens carry one position in all three, counted so that an image of
+// merged grid (h, w) advances the count by max(h, w) rather than by its
+// token count; image tokens take the image's start as the temporal position
+// and add their row and column to it (Qwen2-VL get_rope_index).
+struct QwenRopePosition { int t = 0, h = 0, w = 0; };
+
+static QwenRopePosition qwen_rope_position(
+        const std::vector<QwenImageSpan>& spans, std::uint64_t kv_index) {
+    std::uint64_t delta = 0;
+    for (const auto& span : spans) {
+        if (span.start > kv_index) continue;
+        const std::uint64_t extent = std::max(span.grid_h, span.grid_w);
+        if (kv_index < span.start + span.count) {
+            const std::uint64_t base = span.start - delta;
+            const std::uint64_t offset = kv_index - span.start;
+            const std::uint64_t width = span.grid_w ? span.grid_w : 1;
+            QwenRopePosition position;
+            position.t = static_cast<int>(base);
+            position.h = static_cast<int>(base + offset / width);
+            position.w = static_cast<int>(base + offset % width);
+            return position;
+        }
+        delta += span.count - std::min<std::uint64_t>(span.count, extent);
+    }
+    QwenRopePosition position;
+    position.t = position.h = position.w = static_cast<int>(kv_index - delta);
+    return position;
+}
+
+// One image a task carries: pixels as the tower wants them, and where its
+// tokens sit in the prompt.
+struct QwenTaskImage {
+    std::vector<float> pixels;
+    std::uint32_t width = 0, height = 0;
+    std::uint64_t token_offset = 0;
+    std::uint64_t hash = 0;
+};
+
+// The task's images once encoded: spans in prompt order, and their rows on
+// the device -- per span, `planes` blocks of [count][hidden] (the projected
+// embedding, then one block per deepstack layer) at `offsets[k]` floats.
+struct QwenTaskImages {
+    std::vector<QwenImageSpan> spans;
+    std::vector<std::uint64_t> offsets;
+    std::vector<std::uint64_t> devices;   // per image, zero until first prefilled
+    std::uint32_t planes = 1;
+    bool encoded = false;
+};
+
 struct QwenPrefillSnapshot {
     std::uint64_t device = 0;
     std::vector<std::uint32_t> tokens;
+    std::vector<QwenImageSpan> image_spans;
     std::uint32_t last_output = 0;
     // Whether last_output is the unadjusted argmax. A sampled or
     // grammar-overridden token must not seed a later greedy request's first
@@ -590,6 +690,7 @@ struct QwenSequence {
     std::uint32_t last_output_token = 0;
     bool last_output_greedy = true;     // see QwenPrefillSnapshot::last_output_greedy
     std::vector<std::uint32_t> processed_tokens;
+    std::vector<QwenImageSpan> image_spans;
     std::vector<QwenPrefillSnapshot> prefill_snapshots; // per-slot reuse checkpoints
     std::uint64_t prefill_snapshot_clock = 0;
     std::uint64_t clock = 0;            // LRU stamp across slots
@@ -605,6 +706,7 @@ struct QwenSequence {
 // A reuse checkpoint spilled to host RAM alongside a QwenHostPrompt.
 struct QwenHostSnapshot {
     std::vector<std::uint32_t> tokens;
+    std::vector<QwenImageSpan> image_spans;
     void* state = nullptr;             // host copy of the DeltaNet checkpoint buffer
     std::uint32_t last_output = 0;
     bool last_output_greedy = false;   // see QwenPrefillSnapshot::last_output_greedy
@@ -619,6 +721,7 @@ struct QwenHostSnapshot {
 // the client re-renders the prior assistant reply.
 struct QwenHostPrompt {
     std::vector<std::uint32_t> tokens;
+    std::vector<QwenImageSpan> image_spans;
     void* state = nullptr;             // host copy of the slot's KV+DeltaNet arena
     std::vector<QwenHostSnapshot> snapshots;
     std::uint64_t position = 0;
@@ -742,6 +845,8 @@ struct QwenSamplingState {
 struct QwenEngineTask {
     std::uint64_t id = 0;
     std::vector<std::uint32_t> prompt;
+    std::vector<QwenTaskImage> images;
+    QwenTaskImages encoded;
     std::vector<std::uint32_t> stop_tokens;
     std::uint64_t max_tokens = 0;
     QwenPromptPlan plan;
@@ -1112,6 +1217,8 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t prefill_snapshot_clock = 0;
     std::uint64_t stream = 0;
     std::uint64_t graph_stream = 0;
+    // The mmproj vision tower, uploaded at prepare when the model carries one.
+    flyweight::v2::VisionTowerState vision_tower;
     std::uint64_t route_event = 0;
     // Second route event for the two-half prefill pipeline: each half syncs
     // only its own route downloads, so one half's wait never extends to the
@@ -1157,6 +1264,12 @@ struct FlyweightV2QwenRuntime {
     std::uint32_t last_output_token = 0;
     bool last_output_greedy = true;    // see QwenPrefillSnapshot::last_output_greedy
     std::vector<std::uint32_t> processed_tokens;
+    // Images in the active sequence's history (mirrors processed_tokens; see
+    // QwenImageSpan), the spans of the prompt being admitted, and the
+    // encoded rows of the task whose prompt is prefilling right now.
+    std::vector<QwenImageSpan> image_spans;
+    std::vector<QwenImageSpan> pending_spans;
+    struct QwenEngineTask* active_task = nullptr;
     // Parallel decode slots (see QwenSequence). sequences[active_sequence] owns
     // the arena that runtime.state currently points at; its bookkeeping is the
     // live runtime.{position,last_output_token,processed_tokens}. Default 1 slot
@@ -2072,7 +2185,52 @@ void qwen_absorb_registration(FlyweightV2QwenRuntime& runtime) {
     runtime.registration_ready.store(0, std::memory_order_release);
 }
 
+// Defined in v2_vision.inc, which is included inside the extern "C" block
+// below, so the declarations carry the same linkage.
+extern "C" {
+static void qwen_vision_release(FlyweightV2QwenRuntime& runtime);
+static void qwen_vision_prepare(FlyweightV2QwenRuntime& runtime);
+static void qwen_task_encode_images(FlyweightV2QwenRuntime& runtime, QwenEngineTask& task);
+static void qwen_task_free_images(QwenEngineTask& task);
+static void qwen_image_rows_apply(FlyweightV2QwenRuntime& runtime, std::uint64_t first, int rows,
+                                  std::uint64_t hidden_rows, int hidden_size,
+                                  std::uint32_t plane, bool add);
+}
+
+// The rotary positions of a KV index as the *_mrope kernels take them: the
+// three components plus the model's rope sections (all zero without M-RoPE,
+// which the kernels read as the plain rotation). Every Qwen rope launch
+// goes through the M-RoPE kernels so text-only and multimodal checkpoints
+// share one code path; a text token's three positions coincide.
+struct QwenRopeArgs { int t = 0, h = 0, w = 0; int sections[4] = {0, 0, 0, 0}; };
+#define QWEN_MROPE_TAIL(rope) \
+    &(rope).h, &(rope).w, &(rope).sections[0], &(rope).sections[1], \
+    &(rope).sections[2], &(rope).sections[3]
+
+static QwenRopeArgs qwen_rope_args(const FlyweightV2QwenRuntime& runtime,
+        const std::vector<QwenImageSpan>& spans, std::uint64_t kv_index) {
+    QwenRopeArgs args;
+    const auto& config = runtime.model->config;
+    for (int i = 0; i < 4; ++i) args.sections[i] = static_cast<int>(config.rope_sections[i]);
+    if (spans.empty() || !config.has_rope_sections()) {
+        args.t = args.h = args.w = static_cast<int>(kv_index);
+        return args;
+    }
+    const auto position = qwen_rope_position(spans, kv_index);
+    args.t = position.t; args.h = position.h; args.w = position.w;
+    return args;
+}
+
+static const std::vector<QwenImageSpan>& qwen_slot_spans(
+        const FlyweightV2QwenRuntime& runtime, std::size_t slot) {
+    return slot == runtime.active_sequence ? runtime.image_spans
+                                           : runtime.sequences[slot].image_spans;
+}
+
 void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
+    qwen_vision_release(runtime);
+    for (auto& task : runtime.engine_tasks) qwen_task_free_images(task);
+    for (auto& task : runtime.engine_pending) qwen_task_free_images(task);
     // Stop the background registration before anything it writes to goes away.
     // It checks the flag between layers, so the wait is bounded by one layer's
     // registration (~0.4s) rather than by the whole checkpoint.
@@ -2465,6 +2623,39 @@ int parse(FlyweightV2Model& m) {
         else if (key=="tokenizer.chat_template" && type==8) m.chat_template=r.str();
         else if (key=="tokenizer.ggml.tokens" && type==9) {uint32_t element_type=r.get<uint32_t>();uint64_t count_tokens=r.get<uint64_t>();m.config.vocabulary_size=static_cast<uint32_t>(count_tokens);m.vocabulary.reserve(r.plausible(count_tokens,8));for(uint64_t token_index=0;token_index<count_tokens;token_index++){if(element_type==8)m.vocabulary.push_back(r.str());else r.value(element_type);}}
         else if (key=="tokenizer.ggml.pre" && type==8) m.tokenizer_pre=r.str();
+        // mmproj (`general.architecture = clip`) vision tower geometry.
+        else if (key=="clip.has_vision_encoder" && type==7) m.vision.present=r.get<uint8_t>()!=0;
+        else if (key=="clip.projector_type" && type==8) m.vision.projector_type=r.str();
+        else if (key=="clip.use_gelu" && type==7) m.vision.use_gelu=r.get<uint8_t>()!=0;
+        else if (key=="clip.vision.image_size" && type==4) m.vision.image_size=r.get<uint32_t>();
+        else if (key=="clip.vision.patch_size" && type==4) m.vision.patch_size=r.get<uint32_t>();
+        else if (key=="clip.vision.embedding_length" && type==4) m.vision.embedding_length=r.get<uint32_t>();
+        else if (key=="clip.vision.feed_forward_length" && type==4) m.vision.feed_forward_length=r.get<uint32_t>();
+        else if (key=="clip.vision.block_count" && type==4) m.vision.block_count=r.get<uint32_t>();
+        else if (key=="clip.vision.attention.head_count" && type==4) m.vision.head_count=r.get<uint32_t>();
+        else if (key=="clip.vision.spatial_merge_size" && type==4) m.vision.spatial_merge_size=r.get<uint32_t>();
+        else if (key=="clip.vision.projection_dim" && type==4) m.vision.projection_dim=r.get<uint32_t>();
+        else if (key=="clip.vision.attention.layer_norm_epsilon" && (type==6||type==12)) m.vision.layer_norm_epsilon=read_float(type);
+        else if ((key=="clip.vision.image_mean"||key=="clip.vision.image_std") && type==9) {
+            const auto values=read_float_array(type);
+            if(values.size()!=3)throw std::runtime_error(key+" must hold three channels");
+            float* target=key=="clip.vision.image_mean"?m.vision.image_mean:m.vision.image_std;
+            for(std::size_t c=0;c<3;++c)target[c]=values[c];
+        }
+        else if (key=="clip.vision.is_deepstack_layers" && type==9) {
+            // An array of bools, one per ViT block; only the set ones matter.
+            const auto element_type=r.get<uint32_t>();const auto count_layers=r.get<uint64_t>();
+            if(element_type!=7&&element_type!=4&&element_type!=5)
+                throw std::runtime_error("clip.vision.is_deepstack_layers is not a flag array");
+            for(std::uint64_t layer=0;layer<count_layers;++layer){
+                const bool set=element_type==7?r.get<uint8_t>()!=0:r.get<uint32_t>()!=0;
+                if(set)m.vision.deepstack_layers.push_back(static_cast<std::uint32_t>(layer));
+            }
+        }
+        else if (key.size()>=24 && key.compare(key.size()-24,24,".rope.dimension_sections")==0 && type==9) {
+            const auto sections=read_uint_array(type);
+            for(std::size_t i=0;i<4&&i<sections.size();++i)m.config.rope_sections[i]=sections[i];
+        }
         else if (key=="tokenizer.ggml.eos_token_id" && (type==4||type==10)) m.config.eos_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.eot_token_id" && (type==4||type==10)) m.config.eot_token_id=static_cast<uint32_t>(read_uint(type));
         else if (key=="tokenizer.ggml.bos_token_id" && (type==4||type==10)) m.config.bos_token_id=static_cast<uint32_t>(read_uint(type));
@@ -13272,6 +13463,7 @@ static void qwen_reset_active_slot(FlyweightV2QwenRuntime& runtime) {
     runtime.last_output_token = 0;
     runtime.last_output_greedy = true;
     runtime.processed_tokens.clear();
+    runtime.image_spans.clear();
     runtime.mtp_cache_tokens = 0;
     runtime.mtp_has_target_hidden = false;
     runtime.cancelled = false;
@@ -13304,6 +13496,7 @@ int flyweight_v2_qwen_runtime_reset(FlyweightV2QwenRuntime*runtime){return guard
             }
             seq.position=0;seq.last_output_token=0;seq.last_output_greedy=true;
             seq.processed_tokens.clear();
+            seq.image_spans.clear();
         }
         auto&snapshots=active?runtime->prefill_snapshots:seq.prefill_snapshots;
         for(auto&s:snapshots){s.valid=false;s.tokens.clear();}
@@ -15294,6 +15487,11 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             }
         }
     }catch(...){release_qwen_device(*runtime);throw;}
+        // The vision tower rides on the prepared stream and kernels; it is
+        // small next to the decoder, so it is uploaded after everything the
+        // decoder needs has been placed.
+        try{qwen_vision_prepare(*runtime);}
+        catch(...){release_qwen_device(*runtime);throw;}
         runtime->decode_ready=true;
         // What is left for everything else on this card. On a machine whose GPU
         // also drives the display, the desktop compositor and the browser
@@ -15808,15 +16006,17 @@ void qwen4exp_mtp_append_pair(
         static_cast<int>(config.rotary_dimension ? config.rotary_dimension : head_dim),
         static_cast<int>(head_dim));
     const int position = static_cast<int>(runtime.mtp_cache_tokens);
+    auto rope = qwen_rope_args(runtime, runtime.image_spans, runtime.mtp_cache_tokens);
     const float theta = config.rope_freq_base ? config.rope_freq_base : 1000000.0f;
     const auto key_norm = runtime.device_tensors[layer.static_tensors[6]];
     void* key_args[] = {const_cast<std::uint64_t*>(&keys),
                         const_cast<std::uint64_t*>(&key_norm),
                         const_cast<std::uint64_t*>(&rotated_keys),
                         const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
-                        const_cast<int*>(&rotary), const_cast<int*>(&position),
-                        const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
-    launch("qwen_attention_key", kv_heads, 1, key_args);
+                        const_cast<int*>(&rotary), &rope.t,
+                        const_cast<float*>(&theta), const_cast<float*>(&epsilon),
+                        QWEN_MROPE_TAIL(rope)};
+    launch("qwen_attention_key_mrope", kv_heads, 1, key_args);
     auto cache_keys = runtime.state + layer.state_first;
     auto cache_values = runtime.state + layer.state_second;
     int capacity = static_cast<int>(runtime.options.context_limit);
@@ -15917,14 +16117,15 @@ void qwen_mtp_append_pair(
         ? runtime.model->config.rope_freq_base : 1000000.0f;
     const auto key_norm = runtime.device_tensors[layer.static_tensors[6]];
     const auto rotated_keys = fused;
+    auto rope = qwen_rope_args(runtime, runtime.image_spans, runtime.mtp_cache_tokens);
     void* key_args[] = {
         const_cast<std::uint64_t*>(&keys), const_cast<std::uint64_t*>(&key_norm),
         const_cast<std::uint64_t*>(&rotated_keys), const_cast<int*>(&kv_heads),
         const_cast<int*>(&head_dim), const_cast<int*>(&rotary),
-        const_cast<int*>(&position), const_cast<float*>(&theta),
-        const_cast<float*>(&epsilon),
+        &rope.t, const_cast<float*>(&theta),
+        const_cast<float*>(&epsilon), QWEN_MROPE_TAIL(rope),
     };
-    launch("qwen_attention_key", kv_heads, 1, key_args);
+    launch("qwen_attention_key_mrope", kv_heads, 1, key_args);
     auto cache_keys = runtime.state + layer.state_first;
     auto cache_values = runtime.state + layer.state_second;
     int capacity = static_cast<int>(runtime.options.context_limit);
@@ -16043,11 +16244,12 @@ void qwen_mtp_append_pair_batch2(
         auto value=values+static_cast<std::uint64_t>(row)*kv_size*sizeof(float);
         auto rotated=fused+static_cast<std::uint64_t>(row)*hidden*sizeof(float);
         int position=static_cast<int>(runtime.mtp_cache_tokens)+row;
+        auto rope=qwen_rope_args(runtime,runtime.image_spans,runtime.mtp_cache_tokens+row);
         void*key_args[]={&key,const_cast<std::uint64_t*>(&key_norm),&rotated,
             const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),
-            const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),
-            const_cast<float*>(&epsilon)};
-        launch("qwen_attention_key",kv_heads,1,256,key_args);
+            const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),
+            const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope)};
+        launch("qwen_attention_key_mrope",kv_heads,1,256,key_args);
         void*key_store_args[]={&rotated,const_cast<std::uint64_t*>(&cache_keys),
             const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&position,&capacity};
         launch(kv_store_kernel(runtime.options.cache_type_k,true),kv_heads,1,256,key_store_args);
@@ -16240,20 +16442,23 @@ std::uint32_t qwen4exp_mtp_draft(
         static_cast<int>(config.rotary_dimension ? config.rotary_dimension : head_dim),
         static_cast<int>(head_dim));
     const int position = static_cast<int>(runtime.mtp_cache_tokens);
+    auto rope = qwen_rope_args(runtime, runtime.image_spans, runtime.mtp_cache_tokens);
     const float theta = config.rope_freq_base ? config.rope_freq_base : 1000000.0f;
     auto qnorm = tensor(5), knorm = tensor(6);
     std::uint64_t queries = fourth, gates = fourth + q_size / 2 * sizeof(float);
     void* q_args[] = {const_cast<std::uint64_t*>(&first), &qnorm, &queries, &gates,
                       const_cast<int*>(&heads), const_cast<int*>(&head_dim),
-                      const_cast<int*>(&rotary), const_cast<int*>(&position),
-                      const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
-    launch("qwen_attention_query", heads, 1, q_args);
+                      const_cast<int*>(&rotary), &rope.t,
+                      const_cast<float*>(&theta), const_cast<float*>(&epsilon),
+                      QWEN_MROPE_TAIL(rope)};
+    launch("qwen_attention_query_mrope", heads, 1, q_args);
     std::uint64_t keys = first;
     void* k_args[] = {const_cast<std::uint64_t*>(&second), &knorm, &keys,
                       const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim),
-                      const_cast<int*>(&rotary), const_cast<int*>(&position),
-                      const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
-    launch("qwen_attention_key", kv_heads, 1, k_args);
+                      const_cast<int*>(&rotary), &rope.t,
+                      const_cast<float*>(&theta), const_cast<float*>(&epsilon),
+                      QWEN_MROPE_TAIL(rope)};
+    launch("qwen_attention_key_mrope", kv_heads, 1, k_args);
     auto cache_keys = runtime.state + layer.state_first;
     auto cache_values = runtime.state + layer.state_second;
     int capacity = static_cast<int>(runtime.options.context_limit);
@@ -16463,13 +16668,14 @@ std::uint32_t qwen_mtp_draft(
     dense(3,normalized,third,hidden_size,kv_size);
     const int rotary=static_cast<int>(runtime.model->config.rotary_dimension?runtime.model->config.rotary_dimension:head_dim);
     const int position=static_cast<int>(runtime.mtp_cache_tokens);
+    auto rope=qwen_rope_args(runtime,runtime.image_spans,runtime.mtp_cache_tokens);
     const float theta=runtime.model->config.rope_freq_base?runtime.model->config.rope_freq_base:1000000.0f;
     auto qnorm=tensor(5),knorm=tensor(6);std::uint64_t queries=fourth,gates=fourth+q_size/2*sizeof(float);
-    void*q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,&queries,&gates,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),const_cast<int*>(&position),const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-    launch("qwen_attention_query",heads,1,q_args);
+    void*q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,&queries,&gates,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope)};
+    launch("qwen_attention_query_mrope",heads,1,q_args);
     std::uint64_t keys=first;
-    void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,&keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),const_cast<int*>(&position),const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-    launch("qwen_attention_key",kv_heads,1,k_args);
+    void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,&keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope)};
+    launch("qwen_attention_key_mrope",kv_heads,1,k_args);
     auto cache_keys=runtime.state+layer.state_first,cache_values=runtime.state+layer.state_second;int capacity=static_cast<int>(runtime.options.context_limit);
     void*key_store_args[]={&keys,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&position),&capacity};
     launch(kv_store_kernel(runtime.options.cache_type_k,true),kv_heads,1,key_store_args);
@@ -17060,6 +17266,7 @@ int qwen_nvfp4_prefill_tc_rows(const FlyweightV2QwenRuntime& runtime) {
 }
 
 #include "v2_mtp_verifier.inc"
+#include "v2_vision.inc"
 
 // Layer-synchronous chunked prefill. Attention stays a per-row pass with the
 // decode kernels -- a row's attention at layer L needs only earlier rows' KV
@@ -18374,6 +18581,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         const int token=runtime->embeddings_host_resident?0:static_cast<int>(input_token);int width=hidden_size;
         void*args[]={const_cast<std::uint64_t*>(&embedding),const_cast<std::uint64_t*>(&hidden),const_cast<int*>(&token),&width};
         launch_named(qwen_embedding_kernel(qwen_device_type(*runtime,runtime->token_embeddings),false),(hidden_size+255)/256,1,256,args);
+        qwen_image_rows_apply(*runtime,runtime->position,1,hidden,hidden_size,0,false);
         // Muse Glimmer RMS-normalizes the raw embedding before the first block,
         // with no learned weight of its own. Skipping it leaves the residual
         // stream off by the embedding norm and the model drifts within a few
@@ -18708,13 +18916,14 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             dense(3,normalized,third,hidden_size,kv_size);
             const int rotary=static_cast<int>(runtime->model->config.rotary_dimension?runtime->model->config.rotary_dimension:head_dim);
             const int position=static_cast<int>(runtime->position);
+            auto rope=qwen_rope_args(*runtime,runtime->image_spans,runtime->position);
             const float theta=runtime->model->config.rope_freq_base?runtime->model->config.rope_freq_base:1000000.0f;
             auto qnorm=tensor(5),knorm=tensor(6);std::uint64_t queries=fourth,gates=fourth+q_size/2*sizeof(float);
-            void*q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,&queries,&gates,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),const_cast<int*>(&position),const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-            launch_named("qwen_attention_query",heads,1,256,q_args);
+            void*q_args[]={const_cast<std::uint64_t*>(&first),&qnorm,&queries,&gates,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope)};
+            launch_named("qwen_attention_query_mrope",heads,1,256,q_args);
             std::uint64_t keys=first;
-            void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,&keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),const_cast<int*>(&position),const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-            launch_named("qwen_attention_key",kv_heads,1,256,k_args);
+            void*k_args[]={const_cast<std::uint64_t*>(&second),&knorm,&keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope)};
+            launch_named("qwen_attention_key_mrope",kv_heads,1,256,k_args);
             std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
             const auto view=attention_cache_view(layer,runtime->position);
             int slot=view.slot,capacity=view.capacity;
@@ -20064,6 +20273,7 @@ static void qwen_switch_sequence(FlyweightV2QwenRuntime& runtime, std::size_t ta
     cur.last_output_token = runtime.last_output_token;
     cur.last_output_greedy = runtime.last_output_greedy;
     cur.processed_tokens.swap(runtime.processed_tokens);
+    cur.image_spans.swap(runtime.image_spans);
     cur.prefill_snapshots.swap(runtime.prefill_snapshots);
     cur.prefill_snapshot_clock = runtime.prefill_snapshot_clock;
     QwenSequence& next = runtime.sequences[target];
@@ -20073,6 +20283,7 @@ static void qwen_switch_sequence(FlyweightV2QwenRuntime& runtime, std::size_t ta
     runtime.last_output_token = next.last_output_token;
     runtime.last_output_greedy = next.last_output_greedy;
     runtime.processed_tokens.swap(next.processed_tokens);
+    runtime.image_spans.swap(next.image_spans);
     runtime.prefill_snapshots.swap(next.prefill_snapshots);
     runtime.prefill_snapshot_clock = next.prefill_snapshot_clock;
     // The MTP draft cache is per-slot but its fill counter and the
@@ -20268,6 +20479,7 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
     const QwenSequence& seq = runtime.sequences[slot];
     const bool active = slot == runtime.active_sequence;
     const auto& tokens = active ? runtime.processed_tokens : seq.processed_tokens;
+    const auto& spans = active ? runtime.image_spans : seq.image_spans;
     const auto position = active ? runtime.position : seq.position;
     const auto last_output = active ? runtime.last_output_token : seq.last_output_token;
     const auto last_output_greedy =
@@ -20278,7 +20490,7 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
     if (tokens.size() < 256) return;
     for (std::size_t i = 0; i < runtime.host_prompts.size();) {
         auto& e = runtime.host_prompts[i];
-        if (e.tokens == tokens) { e.clock = ++runtime.host_cache_clock; return; }
+        if (e.tokens == tokens && e.image_spans == spans) { e.clock = ++runtime.host_cache_clock; return; }
         // An earlier spill of this same conversation -- its tokens a strict
         // prefix of ours -- is dominated: restoring the longer entry buys
         // everything the shorter one held. Keeping both wastes budget, and
@@ -20322,6 +20534,7 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
     if (copy_failed || flyweight_gpu_stream_sync(runtime.stream) != 0) { std::free(buf); return; }
     QwenHostPrompt e;
     e.tokens = tokens;
+    e.image_spans = spans;
     e.state = buf;
     e.position = position;
     e.last_output_token = last_output;
@@ -20344,7 +20557,7 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
         if (!sbuf) break;  // partial checkpoint set is fine; arena reuse still works
         if (flyweight_gpu_download(sbuf, s.device, runtime.prefill_snapshot_bytes, runtime.stream) != 0
             || flyweight_gpu_stream_sync(runtime.stream) != 0) { std::free(sbuf); break; }
-        e.snapshots.push_back({s.tokens, sbuf, s.last_output, s.last_output_greedy});
+        e.snapshots.push_back({s.tokens, s.image_spans, sbuf, s.last_output, s.last_output_greedy});
         e.bytes += runtime.prefill_snapshot_bytes;
         ++copied_snapshots;
     }
@@ -20362,6 +20575,7 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
     QwenSequence& seq = runtime.sequences[victim];
     const bool active = victim == runtime.active_sequence;
     auto& tokens = active ? runtime.processed_tokens : seq.processed_tokens;
+    auto& spans = active ? runtime.image_spans : seq.image_spans;
     auto& snapshots = active ? runtime.prefill_snapshots : seq.prefill_snapshots;
     auto& snapshot_clock = active
         ? runtime.prefill_snapshot_clock : seq.prefill_snapshot_clock;
@@ -20381,6 +20595,7 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
     // A refusal above leaves the victim intact; a failure below must not.
     const auto poison_victim = [&] {
         tokens.clear();
+        spans.clear();
         if (active) {
             runtime.position = 0;
             runtime.last_output_token = 0;
@@ -20406,6 +20621,7 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
         return false;
     }
     tokens = std::move(e.tokens);
+    spans = std::move(e.image_spans);
     if (active) {
         runtime.position = e.position;
         runtime.last_output_token = e.last_output_token;
@@ -20434,6 +20650,7 @@ static bool qwen_restore_host_to_slot(FlyweightV2QwenRuntime& runtime,
             break;
         }
         dst.tokens = std::move(hs.tokens);
+        dst.image_spans = std::move(hs.image_spans);
         dst.last_output = hs.last_output;
         dst.last_output_greedy = hs.last_output_greedy;
         dst.valid = true;
@@ -20594,6 +20811,7 @@ static bool qwen_donate_prefix(FlyweightV2QwenRuntime& runtime,
     // come from `prompt`, not the donor's checkpoint: they are equal by the
     // check above, and the switch has since swapped the snapshot vectors.
     runtime.processed_tokens.assign(prompt, prompt + donated);
+    runtime.image_spans = qwen_spans_before(runtime.pending_spans, donated);
     runtime.position = donated;
     runtime.last_output_token = last_output;
     // Only a checkpoint knows whether its token was the unadjusted argmax, and
@@ -20616,6 +20834,7 @@ static bool qwen_donate_prefix(FlyweightV2QwenRuntime& runtime,
                 runtime.prefill_snapshot_bytes, runtime.stream) == 0 &&
             flyweight_gpu_stream_sync(runtime.stream) == 0) {
             dst.tokens.assign(prompt, prompt + donated);
+            dst.image_spans = runtime.image_spans;
             dst.last_output = last_output;
             dst.last_output_greedy = last_output_greedy;
             dst.valid = true;
@@ -20654,7 +20873,9 @@ static void qwen_route_sequence(FlyweightV2QwenRuntime& runtime,
     std::uint64_t best_match = 0;
     auto consider = [&](std::size_t i, const std::vector<std::uint32_t>& tokens) {
         if (!fits(i)) return;
-        const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
+        const std::uint64_t m = qwen_spans_agree(
+            qwen_slot_spans(runtime, i), runtime.pending_spans,
+            qwen_sequence_match(tokens, prompt, prompt_count));
         if (m > best_match && qwen_cache_match_useful(m,tokens.size())) {
             best_match = m; best = i;
         }
@@ -20667,7 +20888,9 @@ static void qwen_route_sequence(FlyweightV2QwenRuntime& runtime,
     if (host_cache)
         for (std::size_t i = 0; i < runtime.host_prompts.size(); ++i) {
             const auto& t = runtime.host_prompts[i].tokens;
-            const std::uint64_t m = qwen_sequence_match(t, prompt, prompt_count);
+            const std::uint64_t m = qwen_spans_agree(
+                runtime.host_prompts[i].image_spans, runtime.pending_spans,
+                qwen_sequence_match(t, prompt, prompt_count));
             if (m > best_host_match && qwen_cache_match_useful(m,t.size())) {
                 best_host_match = m; best_host = i;
             }
@@ -20725,7 +20948,9 @@ static void qwen_route_sequence(FlyweightV2QwenRuntime& runtime,
         best_host_match=0;
         for(std::size_t i=0;i<runtime.host_prompts.size();++i){
             const auto&t=runtime.host_prompts[i].tokens;
-            const auto m=qwen_sequence_match(t,prompt,prompt_count);
+            const auto m=qwen_spans_agree(
+                runtime.host_prompts[i].image_spans,runtime.pending_spans,
+                qwen_sequence_match(t,prompt,prompt_count));
             if(m>best_host_match&&qwen_cache_match_useful(m,t.size())){
                 best_host_match=m;best_host=i;
             }
@@ -20873,6 +21098,10 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
             runtime->processed_tokens.begin(),runtime->processed_tokens.end(),
             prompt
         );
+        // The same token ids can stand for a different image.
+        if(reusable)reusable=qwen_spans_agree(
+            runtime->image_spans,runtime->pending_spans,
+            runtime->processed_tokens.size())==runtime->processed_tokens.size();
         // An exact full-prompt hit remembers the previously selected token but
         // not the full LM-head logits. Sampling must replay at least the final
         // uncached prompt section so it can draw a fresh token from real logits.
@@ -20936,6 +21165,8 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
                    runtime->sequences[runtime->active_sequence].geometry,
                    candidate.tokens.size(),runtime->position))continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),prompt))continue;
+            if(qwen_spans_agree(candidate.image_spans,runtime->pending_spans,
+                   candidate.tokens.size())!=candidate.tokens.size())continue;
             if(candidate.tokens.size()>runtime->processed_tokens.size())continue;
             if(!std::equal(candidate.tokens.begin(),candidate.tokens.end(),runtime->processed_tokens.begin()))continue;
             if(!snapshot||candidate.tokens.size()>snapshot->tokens.size())snapshot=&candidate;
@@ -20965,6 +21196,10 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
             qwen_reset_active_slot(*runtime);
         }
     }
+    // From here the sequence's history is this prompt's: whatever prefix was
+    // reused agreed with it, image for image, and the rest is about to be
+    // prefilled.
+    runtime->image_spans=runtime->pending_spans;
     runtime->prefix_cache_last_reused_tokens=prompt_start;
     runtime->prefix_cache_reprefilled_tokens+=prompt_count-prompt_start;
     qwen_drop_expert_pages_for_sweep(*runtime,prompt_count-prompt_start);
@@ -21049,6 +21284,7 @@ static void qwen_prompt_checkpoints(FlyweightV2QwenRuntime* runtime,
         auto&slot=runtime->prefill_snapshots[plan.next_target];
         qwen_prefill_snapshot_copy(*runtime,slot.device,false);
         slot.tokens.assign(prompt,prompt+runtime->position);
+        slot.image_spans=qwen_spans_before(runtime->image_spans,runtime->position);
         slot.last_output=0; // mid-prefill resume keeps prefilling; last_output unused
         slot.last_output_greedy=false;
         slot.valid=true;
@@ -21063,6 +21299,7 @@ static void qwen_prompt_checkpoints(FlyweightV2QwenRuntime* runtime,
         auto&slot=runtime->prefill_snapshots.back();
         qwen_prefill_snapshot_copy(*runtime,slot.device,false);
         slot.tokens.assign(prompt,prompt+runtime->position);
+        slot.image_spans=qwen_spans_before(runtime->image_spans,runtime->position);
         slot.last_output=0; // a restore always leaves the final token to evaluate
         slot.last_output_greedy=false;
         slot.valid=true;
@@ -21490,6 +21727,7 @@ static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
     if(!(slot->valid&&slot->tokens.size()==prompt_count)){
         qwen_prefill_snapshot_copy(*runtime,slot->device,false);
         slot->tokens.assign(prompt,prompt+prompt_count);
+        slot->image_spans=qwen_spans_before(runtime->image_spans,prompt_count);
         slot->last_output=next_token;
         // next_token may have come from the sampler; the runtime flag tracks
         // whether it still equals the unadjusted argmax (see the sampler).
@@ -21973,6 +22211,7 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
     // Pick the decode slot for this prompt before any reuse/diagnostics run.
     // Slots may differ in size, so the router is told what the whole request
     // will occupy, not just the prompt.
+    runtime->pending_spans.clear();
     qwen_route_sequence(*runtime, prompt, prompt_count, prompt_count + max_tokens);
     QwenPromptPlan plan;
     int status=qwen_prompt_begin(runtime,prompt,prompt_count,plan);if(status)return status;
@@ -22037,7 +22276,8 @@ static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
         uint32_t top_k,float top_p,float repetition_penalty,
         float presence_penalty,float frequency_penalty,uint32_t penalty_window,
         uint64_t seed,bool has_seed,uint64_t*task_id,
-        const char*tool_specification=nullptr) {
+        const char*tool_specification=nullptr,
+        std::vector<QwenTaskImage>*images=nullptr) {
     if(!runtime||!prompt||!prompt_count||!max_tokens||!task_id)throw std::runtime_error("invalid native Qwen task arguments");
     if(prompt_count>runtime->options.context_limit||
        max_tokens>runtime->options.context_limit-prompt_count)
@@ -22063,6 +22303,7 @@ static void qwen_task_submit_impl(FlyweightV2QwenRuntime*runtime,
         throw std::runtime_error("native Qwen frequency_penalty must be in [-2, 2]");
     QwenEngineTask task;
     task.prompt.assign(prompt,prompt+prompt_count);
+    if(images)task.images=std::move(*images);
     if(stop_tokens&&stop_count)task.stop_tokens.assign(stop_tokens,stop_tokens+stop_count);
     task.max_tokens=max_tokens;
     task.sampling.temperature=temperature;
@@ -22146,6 +22387,43 @@ int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime*runtime,const u
         tool_specification);
     return 0;
 });}
+
+int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt,
+        uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count,
+        float temperature, uint32_t top_k, float top_p, float repetition_penalty,
+        float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed,
+        uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images,
+        uint64_t image_count, uint64_t* task_id) { return guarded([&]{
+    if (image_count && !images) throw std::runtime_error("image array is null");
+    std::vector<QwenTaskImage> copied;
+    if (image_count) {
+        if (!runtime || !runtime->model->vision_sidecar)
+            throw std::runtime_error("the prompt carries images but no vision tower is attached");
+        const auto& config = runtime->model->vision_sidecar->vision;
+        const std::uint32_t side = config.token_side();
+        for (uint64_t k = 0; k < image_count; ++k) {
+            const auto& image = images[k];
+            if (!image.pixels || !image.width || !image.height || image.width % side || image.height % side)
+                throw std::runtime_error("image sides must be positive multiples of " + std::to_string(side));
+            const std::uint64_t tokens =
+                static_cast<std::uint64_t>(image.width / side) * (image.height / side);
+            if (image.token_offset + tokens > prompt_count)
+                throw std::runtime_error("image tokens run past the end of the prompt");
+            QwenTaskImage entry;
+            entry.width = image.width;
+            entry.height = image.height;
+            entry.token_offset = image.token_offset;
+            entry.hash = image.hash;
+            const std::size_t floats = static_cast<std::size_t>(image.width) * image.height * 3;
+            entry.pixels.assign(image.pixels, image.pixels + floats);
+            copied.push_back(std::move(entry));
+        }
+    }
+    qwen_task_submit_impl(runtime, prompt, prompt_count, max_tokens, stop_tokens, stop_count,
+        temperature, top_k, top_p, repetition_penalty, presence_penalty, frequency_penalty,
+        penalty_window, seed, has_seed != 0, task_id, tool_specification, &copied);
+    return 0;
+}); }
 
 int flyweight_v2_qwen_task_submit_sampling(FlyweightV2QwenRuntime*runtime,const uint32_t*prompt,uint64_t prompt_count,uint64_t max_tokens,const uint32_t*stop_tokens,uint64_t stop_count,float temperature,uint32_t top_k,float top_p,uint64_t seed,uint32_t has_seed,uint64_t*task_id){return guarded([&]{
     qwen_task_submit_impl(runtime,prompt,prompt_count,max_tokens,stop_tokens,
@@ -22521,14 +22799,15 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                 dense(3, s.normalized, s.third, hidden_size, kv_size);
                 const int rotary = static_cast<int>(runtime->model->config.rotary_dimension ? runtime->model->config.rotary_dimension : head_dim);
                 const int position = static_cast<int>(s.position);
+                auto rope = qwen_rope_args(*runtime, qwen_slot_spans(*runtime, s.slot), s.position);
                 const float theta = runtime->model->config.rope_freq_base ? runtime->model->config.rope_freq_base : 1000000.0f;
                 auto qnorm = tensor(5), knorm = tensor(6);
                 std::uint64_t queries = s.fourth, gates = s.fourth + q_size / 2 * sizeof(float);
-                void* q_args[] = {const_cast<std::uint64_t*>(&s.first), &qnorm, &queries, &gates, const_cast<int*>(&heads), const_cast<int*>(&head_dim), const_cast<int*>(&rotary), const_cast<int*>(&position), const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
-                launch_named("qwen_attention_query", heads, 1, 256, q_args);
+                void* q_args[] = {const_cast<std::uint64_t*>(&s.first), &qnorm, &queries, &gates, const_cast<int*>(&heads), const_cast<int*>(&head_dim), const_cast<int*>(&rotary), &rope.t, const_cast<float*>(&theta), const_cast<float*>(&epsilon), QWEN_MROPE_TAIL(rope)};
+                launch_named("qwen_attention_query_mrope", heads, 1, 256, q_args);
                 std::uint64_t keys = s.first;
-                void* k_args[] = {const_cast<std::uint64_t*>(&s.second), &knorm, &keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&rotary), const_cast<int*>(&position), const_cast<float*>(&theta), const_cast<float*>(&epsilon)};
-                launch_named("qwen_attention_key", kv_heads, 1, 256, k_args);
+                void* k_args[] = {const_cast<std::uint64_t*>(&s.second), &knorm, &keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), const_cast<int*>(&rotary), &rope.t, const_cast<float*>(&theta), const_cast<float*>(&epsilon), QWEN_MROPE_TAIL(rope)};
+                launch_named("qwen_attention_key_mrope", kv_heads, 1, 256, k_args);
                 std::uint64_t cache_keys = s.state + layer.state_first, cache_values = s.state + layer.state_second;
                 const auto view=attention_cache_view(layer,s.position);
                 int slot=view.slot,capacity=view.capacity;
@@ -23082,6 +23361,10 @@ static void qwen_poison_slot(FlyweightV2QwenRuntime& runtime, std::size_t slot) 
 static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTask& task) {
     const auto* prompt = task.prompt.data();
     const std::uint64_t prompt_count = task.prompt.size();
+    // Images are encoded once, here on the engine thread, whether or not a
+    // slot is free yet: their spans take part in the prefix matching below.
+    qwen_task_encode_images(runtime, task);
+    runtime.pending_spans = task.encoded.spans;
     constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
     auto tokens_of = [&](std::size_t i) -> const std::vector<std::uint32_t>& {
         return i == runtime.active_sequence ? runtime.processed_tokens
@@ -23097,7 +23380,9 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
     for (std::size_t i = 0; i < runtime.sequences.size(); ++i) {
         if (!fits(i)) continue;
         const auto& tokens = tokens_of(i);
-        const std::uint64_t m = qwen_sequence_match(tokens, prompt, prompt_count);
+        const std::uint64_t m = qwen_spans_agree(
+            qwen_slot_spans(runtime, i), runtime.pending_spans,
+            qwen_sequence_match(tokens, prompt, prompt_count));
         if (!qwen_cache_match_useful(m,tokens.size())) continue;
         if (owned(i)) busy_match = std::max(busy_match, m);
         else if (m > best_match) { best_match = m; best = i; }
@@ -23125,7 +23410,9 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
     if (host_cache)
         for (std::size_t i = 0; i < runtime.host_prompts.size(); ++i) {
             const auto& t = runtime.host_prompts[i].tokens;
-            const std::uint64_t m = qwen_sequence_match(t, prompt, prompt_count);
+            const std::uint64_t m = qwen_spans_agree(
+                runtime.host_prompts[i].image_spans, runtime.pending_spans,
+                qwen_sequence_match(t, prompt, prompt_count));
             if (m > best_host_match && qwen_cache_match_useful(m,t.size())) {
                 best_host_match = m; best_host = i;
             }
@@ -23160,7 +23447,9 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
         best_host_match=0;
         for(std::size_t i=0;i<runtime.host_prompts.size();++i){
             const auto&t=runtime.host_prompts[i].tokens;
-            const auto m=qwen_sequence_match(t,prompt,prompt_count);
+            const auto m=qwen_spans_agree(
+                runtime.host_prompts[i].image_spans,runtime.pending_spans,
+                qwen_sequence_match(t,prompt,prompt_count));
             if(m>best_host_match&&qwen_cache_match_useful(m,t.size())){
                 best_host_match=m;best_host=i;
             }
@@ -23249,7 +23538,13 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                 qwen_switch_sequence(*runtime,task.slot);
                 runtime->cache_admission_enabled=false;
                 bool done=false;
-                const int status=qwen_prefill_unit(runtime,task.prompt.data(),task.prompt.size(),task.plan,task.index,task.next_token,done,&task.sampling);
+                // The prefilling task's images are read by the row overlay;
+                // the pointer must not outlive this call, exception or not.
+                runtime->active_task=&task;
+                int status=0;
+                try{status=qwen_prefill_unit(runtime,task.prompt.data(),task.prompt.size(),task.plan,task.index,task.next_token,done,&task.sampling);}
+                catch(...){runtime->active_task=nullptr;throw;}
+                runtime->active_task=nullptr;
                 if(status)throw std::runtime_error(
                     error.empty()?"native Qwen prefill failed":
                     "native Qwen prefill failed: "+error);
@@ -23437,6 +23732,7 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
         for(const auto id:finished){
             for(std::size_t i=0;i<runtime->slot_owner.size();++i)
                 if(runtime->slot_owner[i]==static_cast<long long>(id))runtime->slot_owner[i]=-1;
+            for(auto&t:runtime->engine_tasks)if(t.id==id)qwen_task_free_images(t);
             runtime->engine_tasks.erase(
                 std::remove_if(runtime->engine_tasks.begin(),runtime->engine_tasks.end(),
                     [&](const QwenEngineTask&t){return t.id==id;}),

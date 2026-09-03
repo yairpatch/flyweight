@@ -8,7 +8,7 @@ Served model families:
 
 | Family | Formats | Notes |
 | --- | --- | --- |
-| Qwen 3 / 3.5 / 3.6, dense and MoE | GGUF, safetensors | Full feature set: MTP, expert offload, prefill pipeline. Text only -- the 3.5 vision tower is dropped on load |
+| Qwen 3 / 3.5 / 3.6, dense and MoE | GGUF, safetensors | Full feature set: MTP, expert offload, prefill pipeline. Image input on the 3.5 family through a llama.cpp `mmproj` GGUF (`--mmproj`); the safetensors loader still drops the tower |
 | Laguna 2.1 | GGUF | Per-head attention gate only; no MTP |
 | Muse Glimmer | GGUF | Channel-tagged reasoning; drafts via a DFlash sidecar, no in-model MTP |
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
@@ -43,6 +43,9 @@ loads from GGUF, including multi-file `-00001-of-0000N` splits.
   decode in the same batch
 - Sampler-enforced tool-call grammar (declared names, required parameters,
   well-formed JSON values) and sampler-enforced JSON response mode
+- Image input for Qwen 3.5-family checkpoints: the mmproj vision tower runs
+  natively, images take part in prefix reuse, and OpenAI `image_url`,
+  Responses `input_image` and Anthropic `image` parts are all accepted
 - Thinking controls: per-request effort for checkpoints that grade their
   reasoning, and a hard thinking-token budget the sampler cannot overrun
 - OpenAI Chat Completions, Responses, and legacy Completions APIs
@@ -278,6 +281,29 @@ flyweight serve model.gguf \
   --request-timeout-seconds 30
 ~~~
 
+### Images
+
+A Qwen 3.5-family GGUF serves images when its vision tower is attached.
+The tower is the `mmproj-*.gguf` llama.cpp publishes beside the model
+(projector type `qwen3vl_merger`); decoding needs Pillow, installed with
+`pip install 'flyweight[vision]'`:
+
+~~~bash
+flyweight serve Qwen3.5-35B-A3B-Q6_K.gguf \
+  --mmproj mmproj-Qwen3.5-35B-A3B-BF16.gguf --image-max-tokens 1024
+~~~
+
+Each image is resized so that both sides are multiples of 32 pixels, the
+aspect ratio is kept, and it covers at most `--image-max-tokens` tokens (one
+per 32x32 block; the default 1024 is about a megapixel). Image tokens count
+as prompt tokens in `usage`, and an image that sits inside a reused prefix is
+never encoded again. `--image-urls deny` refuses `http(s)` image URLs and
+keeps `data:` URLs; `/health` reports the tower under `execution.vision`,
+and the bundled chat UI shows an **Image** button (paste or drop works too)
+whenever it does. Without a tower an image part degrades to a visible
+`[image omitted: ...]` note in the prompt rather than failing the request,
+since the part sits in the client's history and would return on every retry.
+
 ## API
 
 ~~~bash
@@ -288,6 +314,20 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Say hi."}],
     "max_tokens": 64,
     "temperature": 0
+  }'
+~~~
+
+Image parts go where the OpenAI, Responses and Anthropic APIs put them:
+
+~~~bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local-model",
+    "messages": [{"role": "user", "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+      {"type": "text", "text": "What is in this picture?"}
+    ]}]
   }'
 ~~~
 
@@ -613,6 +653,11 @@ mypy src/flyweight
 pytest -q
 ~~~
 
+`check_vision_parity.py` runs the native vision tower against the NumPy
+reference in `native/tools/qwen_vision_reference.py` on a real mmproj
+(`--mmproj PATH`, `--backend cpu` for the host kernels); it needs no
+language model.
+
 Set `FLYWEIGHT_TEST_MODEL=/path/to/model.gguf` to opt into the real Qwen
 reference tests. A configured model path that is missing or fails to load is
 treated as a test failure; only an unset opt-in and an unavailable CUDA
@@ -634,9 +679,12 @@ device are skipped.
   `repetition_penalty: 1` (or `penalty_window: 0`) on every request. MTP,
   per-layer embeddings, and shared-KV tail layers are also unimplemented, and
   expert placement is restricted to `cpu`/`hybrid`.
-- The Qwen 3.5 safetensors loader reads only `text_config`: the vision tower
-  is dropped and M-RoPE is not implemented, so multimodal checkpoints serve
-  as text-only.
+- Vision covers still images through a GGUF `mmproj` on the Qwen 3.5 family:
+  no video, and the safetensors loader still reads only `text_config`. An
+  mmproj whose tower has deepstack layers (`clip.vision.is_deepstack_layers`)
+  is refused at attach until the decoder-side injection lands. The tower's
+  attention and GEMM kernels are plain CUDA rather than tensor-core paths, so
+  a 1024-token image costs a few seconds to encode.
 - BailingMoE3 decodes its slots by interleaving rather than batching them, so
   `--parallel` removes the waiting but does not multiply throughput the way a
   batched forward would. Its prompt evaluation also runs at admission, so a

@@ -4173,5 +4173,344 @@ void qwen_f16_matmul_rows(
     partial = block_reduce_sum(partial);
     if (threadIdx.x == 0) output[token * output_size + output_row] = partial;
 }
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// ---- Interleaved M-RoPE (Qwen3-VL / Qwen3.5) --------------------------------
+// The same head norm + rotation as qwen_attention_query/key, with three
+// positions: rotary pair p takes the temporal, height or width one by p % 3
+// while p lies inside three times that section (rope.dimension_sections);
+// with no sections, or for a text token where all three coincide, this is
+// exactly the plain rotation. Mirrors flyweight::v2::mrope_component.
+__device__ __forceinline__ float qwen_mrope_position(
+    const int pair, const int position_t, const int position_h, const int position_w,
+    const int sections_t, const int sections_h, const int sections_w, const int sections_e
+) {
+    const int total = sections_t + sections_h + sections_w + sections_e;
+    const int sector = total > 0 ? pair % total : pair;
+    const int which = sector % 3;
+    if (which == 1 && sector < 3 * sections_h) return (float)position_h;
+    if (which == 2 && sector < 3 * sections_w) return (float)position_w;
+    return (float)position_t;
+}
+
+extern "C" __global__
+void qwen_attention_query_mrope(
+    const float* projected, const float* norm_weights,
+    float* queries, float* gates, const int heads,
+    const int head_dim, const int rotary_dim, const int position,
+    const float theta, const float epsilon,
+    const int position_h, const int position_w,
+    const int sections_t, const int sections_h, const int sections_w, const int sections_e
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const float* source = projected + head * 2 * head_dim;
+    float square = 0.0f;
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x)
+        square += source[index] * source[index];
+    square = block_reduce_sum(square);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) inverse_rms = rsqrtf(square / (float)head_dim + epsilon);
+    __syncthreads();
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x) {
+        float value = source[index] * inverse_rms * norm_weights[index];
+        if (index < rotary_dim) {
+            const int half = rotary_dim / 2;
+            const int pair = index < half ? index : index - half;
+            const float other = source[index < half ? index + half : index - half]
+                * inverse_rms * norm_weights[index < half ? index + half : index - half];
+            const float rotation = qwen_mrope_position(
+                pair, position, position_h, position_w,
+                sections_t, sections_h, sections_w, sections_e);
+            const float angle = rotation
+                / powf(theta, 2.0f * (float)pair / (float)rotary_dim);
+            value = index < half
+                ? value * cosf(angle) - other * sinf(angle)
+                : value * cosf(angle) + other * sinf(angle);
+        }
+        queries[head * head_dim + index] = value;
+        gates[head * head_dim + index] = source[head_dim + index];
+    }
+}
+
+extern "C" __global__
+void qwen_attention_key_mrope(
+    const float* projected, const float* norm_weights,
+    float* keys, const int heads, const int head_dim,
+    const int rotary_dim, const int position,
+    const float theta, const float epsilon,
+    const int position_h, const int position_w,
+    const int sections_t, const int sections_h, const int sections_w, const int sections_e
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const float* source = projected + head * head_dim;
+    float square = 0.0f;
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x)
+        square += source[index] * source[index];
+    square = block_reduce_sum(square);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) inverse_rms = rsqrtf(square / (float)head_dim + epsilon);
+    __syncthreads();
+    for (int index = threadIdx.x; index < head_dim; index += blockDim.x) {
+        float value = source[index] * inverse_rms * norm_weights[index];
+        if (index < rotary_dim) {
+            const int half = rotary_dim / 2;
+            const int pair = index < half ? index : index - half;
+            const float other = source[index < half ? index + half : index - half]
+                * inverse_rms * norm_weights[index < half ? index + half : index - half];
+            const float rotation = qwen_mrope_position(
+                pair, position, position_h, position_w,
+                sections_t, sections_h, sections_w, sections_e);
+            const float angle = rotation
+                / powf(theta, 2.0f * (float)pair / (float)rotary_dim);
+            value = index < half
+                ? value * cosf(angle) - other * sinf(angle)
+                : value * cosf(angle) + other * sinf(angle);
+        }
+        keys[head * head_dim + index] = value;
+    }
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// ---- Vision tower (Qwen3-VL style SigLIP ViT + 2x2 merger) -----------------
+// Activations are f32 [rows][width] row-major throughout; one row per patch
+// in window-major order, so the merger's "4 patches -> 1 token" is a plain
+// reinterpretation of the same buffer as [rows/4][4*width].
+
+// Per-row LayerNorm with weight and bias (the ViT's norms are not RMS).
+extern "C" __global__
+void vision_layer_norm_rows(
+    const float* input, const float* weights, const float* bias, float* output,
+    const int width, const int rows, const float epsilon
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* source = input + (long long)row * width;
+    float* target = output + (long long)row * width;
+    float sum = 0.0f;
+    for (int index = threadIdx.x; index < width; index += blockDim.x) sum += source[index];
+    sum = block_reduce_sum(sum);
+    __shared__ float mean;
+    if (threadIdx.x == 0) mean = sum / (float)width;
+    __syncthreads();
+    float square = 0.0f;
+    for (int index = threadIdx.x; index < width; index += blockDim.x) {
+        const float centered = source[index] - mean;
+        square += centered * centered;
+    }
+    square = block_reduce_sum(square);
+    __shared__ float inverse_deviation;
+    if (threadIdx.x == 0) inverse_deviation = rsqrtf(square / (float)width + epsilon);
+    __syncthreads();
+    for (int index = threadIdx.x; index < width; index += blockDim.x)
+        target[index] = (source[index] - mean) * inverse_deviation * weights[index] + bias[index];
+}
+
+// output[M][N] = input[M][K] * matrix[N][K]^T + bias[N]. A 64x64 output tile
+// per 256-thread block, 4x4 outputs per thread, K walked in slabs of 16
+// through shared memory. `matrix` is bf16 (unsigned short) or f32 by the
+// wrapper; `bias` may be null.
+template <typename W>
+__device__ __forceinline__ float vision_weight_value(W value);
+template <>
+__device__ __forceinline__ float vision_weight_value<unsigned short>(unsigned short value) {
+    return __uint_as_float(((unsigned int)value) << 16);
+}
+template <>
+__device__ __forceinline__ float vision_weight_value<float>(float value) { return value; }
+
+template <typename W>
+__device__ __forceinline__ void vision_gemm_impl(
+    const W* matrix, const float* bias, const float* input, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    __shared__ float a_tile[64][17];
+    __shared__ float b_tile[64][17];
+    const int thread = threadIdx.x;
+    const int tx = thread & 15, ty = thread >> 4;
+    const int row_base = blockIdx.y * 64, column_base = blockIdx.x * 64;
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < input_size; k0 += 16) {
+        for (int load = thread; load < 64 * 16; load += 256) {
+            const int r = load >> 4, k = load & 15;
+            const int m = row_base + r, n = column_base + r, kk = k0 + k;
+            a_tile[r][k] = (m < rows && kk < input_size)
+                ? input[(long long)m * input_size + kk] : 0.0f;
+            b_tile[r][k] = (n < output_size && kk < input_size)
+                ? vision_weight_value<W>(matrix[(long long)n * input_size + kk]) : 0.0f;
+        }
+        __syncthreads();
+        for (int k = 0; k < 16; ++k) {
+            float a[4], b[4];
+            for (int i = 0; i < 4; ++i) a[i] = a_tile[ty * 4 + i][k];
+            for (int j = 0; j < 4; ++j) b[j] = b_tile[tx * 4 + j][k];
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int m = row_base + ty * 4 + i;
+        if (m >= rows) continue;
+        for (int j = 0; j < 4; ++j) {
+            const int n = column_base + tx * 4 + j;
+            if (n >= output_size) continue;
+            output[(long long)m * output_size + n] = acc[i][j] + (bias ? bias[n] : 0.0f);
+        }
+    }
+}
+
+extern "C" __global__
+void vision_bf16_gemm_rows(
+    const unsigned short* matrix, const float* bias, const float* input, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    vision_gemm_impl<unsigned short>(matrix, bias, input, output, input_size, output_size, rows);
+}
+
+extern "C" __global__
+void vision_f32_gemm_rows(
+    const float* matrix, const float* bias, const float* input, float* output,
+    const int input_size, const int output_size, const int rows
+) {
+    vision_gemm_impl<float>(matrix, bias, input, output, input_size, output_size, rows);
+}
+
+)FLYWEIGHT_CUDA"
+R"FLYWEIGHT_CUDA(
+// x += y, elementwise.
+extern "C" __global__
+void vision_add_rows(float* x, const float* y, const int elements) {
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += blockDim.x * gridDim.x)
+        x[index] += y[index];
+}
+
+// GELU, tanh form (ggml_gelu / gelu_pytorch_tanh), in place.
+extern "C" __global__
+void vision_gelu_rows(float* x, const int elements) {
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += blockDim.x * gridDim.x) {
+        const float v = x[index];
+        x[index] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+    }
+}
+
+// 2D rope over the q and k sections of a fused [rows][3*heads*head_dim]
+// projection. Pairs (j, j + head_dim/2): the first half of the pairs rotate
+// by the patch row, the second half by the patch column, each half with its
+// own frequency ramp over head_dim/2 (Qwen2-VL VisionRotaryEmbedding).
+extern "C" __global__
+void vision_rope_rows(
+    float* qkv, const int* rows_y, const int* rows_x,
+    const int heads, const int head_dim, const int rows, const float theta
+) {
+    const int row = blockIdx.x;
+    const int section = blockIdx.y;   // 0 = q, 1 = k
+    if (row >= rows || section > 1) return;
+    const int half = head_dim / 2, quarter = head_dim / 4;
+    const int stride = 3 * heads * head_dim;
+    float* base = qkv + (long long)row * stride + section * heads * head_dim;
+    const float y = (float)rows_y[row], x = (float)rows_x[row];
+    for (int index = threadIdx.x; index < heads * half; index += blockDim.x) {
+        const int head = index / half, j = index % half;
+        float* vector = base + head * head_dim;
+        const int frequency = j < quarter ? j : j - quarter;
+        const float position = j < quarter ? y : x;
+        const float angle = position / powf(theta, 2.0f * (float)frequency / (float)half);
+        const float c = cosf(angle), s = sinf(angle);
+        const float first = vector[j], second = vector[j + half];
+        vector[j] = first * c - second * s;
+        vector[j + half] = second * c + first * s;
+    }
+}
+
+// Full (non-causal) attention over every patch. One block per (head, tile
+// of 32 query rows): keys and values stream through shared memory in chunks
+// of 64 so each chunk is read once per 32 queries, and every query's softmax
+// runs online across the 8 threads that share it (one key in eight each,
+// merged with shuffles at the end). head_dim up to 128; blockDim 256.
+extern "C" __global__
+void vision_attention_rows(
+    const float* qkv, float* output,
+    const int heads, const int head_dim, const int rows, const float scale
+) {
+    const int head = blockIdx.y;
+    const int tile = blockIdx.x * 32;
+    if (head >= heads || tile >= rows) return;
+    const int stride = 3 * heads * head_dim;
+    const int query_index = threadIdx.x >> 3;      // 0..31 within the tile
+    const int lane_in_query = threadIdx.x & 7;     // which eighth of the keys
+    const int row = tile + query_index;
+    const bool live = row < rows;
+    __shared__ float k_tile[64][129];
+    __shared__ float v_tile[64][129];
+    __shared__ float q_tile[32][129];
+    if (live)
+        for (int d = lane_in_query; d < head_dim; d += 8)
+            q_tile[query_index][d] = qkv[(long long)row * stride + head * head_dim + d] * scale;
+    __syncthreads();
+    float running_max = -3.0e38f, running_sum = 0.0f;
+    float acc[128];
+    for (int d = 0; d < 128; ++d) acc[d] = 0.0f;
+    for (int chunk = 0; chunk < rows; chunk += 64) {
+        const int count = min(64, rows - chunk);
+        for (int load = threadIdx.x; load < 64 * head_dim; load += blockDim.x) {
+            const int key = load / head_dim, d = load % head_dim;
+            if (key < count) {
+                const long long base = (long long)(chunk + key) * stride + head * head_dim;
+                k_tile[key][d] = qkv[base + heads * head_dim + d];
+                v_tile[key][d] = qkv[base + 2 * heads * head_dim + d];
+            }
+        }
+        __syncthreads();
+        if (live) {
+            for (int key = lane_in_query; key < count; key += 8) {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d) dot += q_tile[query_index][d] * k_tile[key][d];
+                if (dot > running_max) {
+                    const float rescale = expf(running_max - dot);
+                    running_sum *= rescale;
+#pragma unroll
+                    for (int d = 0; d < 128; ++d) acc[d] *= rescale;
+                    running_max = dot;
+                }
+                const float weight = expf(dot - running_max);
+                running_sum += weight;
+#pragma unroll
+                for (int d = 0; d < 128; ++d)
+                    if (d < head_dim) acc[d] += weight * v_tile[key][d];
+            }
+        }
+        __syncthreads();
+    }
+    // Merge the eight partial softmax states of each query (lanes 8i..8i+7
+    // of one warp): bring every lane to the shared maximum, then sum.
+    float shared_max = running_max;
+    for (int offset = 4; offset > 0; offset >>= 1)
+        shared_max = fmaxf(shared_max, __shfl_xor_sync(0xffffffff, shared_max, offset));
+    const float rescale = expf(running_max - shared_max);
+    running_sum *= rescale;
+    for (int offset = 4; offset > 0; offset >>= 1)
+        running_sum += __shfl_xor_sync(0xffffffff, running_sum, offset);
+#pragma unroll
+    for (int d = 0; d < 128; ++d) {
+        float value = acc[d] * rescale;
+        for (int offset = 4; offset > 0; offset >>= 1)
+            value += __shfl_xor_sync(0xffffffff, value, offset);
+        acc[d] = value;
+    }
+    if (live) {
+#pragma unroll
+        for (int d = 0; d < 128; ++d)
+            if (d < head_dim && (d & 7) == lane_in_query)
+                output[(long long)row * heads * head_dim + head * head_dim + d] = acc[d] / running_sum;
+    }
+}
 )FLYWEIGHT_CUDA";
 }

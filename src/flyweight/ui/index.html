@@ -126,9 +126,16 @@
           <svg viewBox="0 0 24 24"><path d="M12 5v13M6 13l6 6 6-6"/></svg>
         </button>
         <div class="composer-shell" id="composer-shell">
+          <div class="attachment-strip" id="attachment-strip" hidden></div>
           <textarea id="prompt-input" rows="1" dir="auto" placeholder="Message Flyweight…" aria-label="Message"></textarea>
           <div class="composer-bottom">
             <div class="composer-options">
+              <button class="option-chip" id="attach-chip" type="button" hidden
+                      title="Attach an image (or paste / drop one)">
+                <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m3 16 5-5 4 4 3-3 6 6"/><circle cx="15.5" cy="9" r="1.5"/></svg>
+                Image
+              </button>
+              <input id="image-input" type="file" accept="image/*" multiple hidden>
               <button class="option-chip" id="thinking-chip" type="button" aria-pressed="false"
                       title="Reasoning off. Click to let the model use its own level.">
                 <svg viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M8.2 14.8A7 7 0 1 1 15.8 14.8c-.7.5-.8 1.2-.8 2.2H9c0-1-.1-1.7-.8-2.2Z"/></svg>

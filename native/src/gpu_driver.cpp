@@ -1101,6 +1101,11 @@ extern "C" int flyweight_gpu_compile(
              "q4k_q8_mmq_routed", "q5k_q8_mmq_routed",
              "q2k_q8_mmq_routed",
              "qwen_delta_recurrent", "qwen_delta_recurrent_split",
+             // Vision tower (mmproj)
+             "vision_layer_norm_rows", "vision_bf16_gemm_rows",
+             "vision_f32_gemm_rows", "vision_add_rows", "vision_gelu_rows",
+             "vision_rope_rows", "vision_attention_rows",
+             "qwen_attention_query_mrope", "qwen_attention_key_mrope",
              "qwen_attention_query",
              "qwen_attention_key", "qwen_attention_gate",
              "laguna_head_norm_rope", "laguna_attention_gate",

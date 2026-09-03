@@ -63,6 +63,31 @@ class UIJavaScriptTests(unittest.TestCase):
         # The control greys out with the toggle rather than contradicting it.
         self.assertIn("syncReasoningEffortAvailability", source)
 
+    def test_attached_images_become_image_url_parts(self) -> None:
+        """A user turn with pictures goes out as OpenAI content parts, the
+        pictures ahead of the text; a plain turn stays a string."""
+        source = APP.read_text(encoding="utf-8")
+        helper = self._slice(source, "function messageForAPI(", "\n// ---- Image attachments")
+        script = (
+            'const identifier = () => "id";\n' + helper +
+            "\nconst out = [messageForAPI({role: 'user', content: 'hi', images: ['data:x']}),"
+            " messageForAPI({role: 'user', content: 'plain'})];\n"
+            "console.log(JSON.stringify(out));"
+        )
+        result = subprocess.run(
+            [self.node, "-e", script], capture_output=True, text=True, check=True
+        )
+        first, second = json.loads(result.stdout)
+        self.assertEqual(first["content"][0], {"type": "image_url", "image_url": {"url": "data:x"}})
+        self.assertEqual(first["content"][1], {"type": "text", "text": "hi"})
+        self.assertEqual(second, {"role": "user", "content": "plain"})
+        index = Path(__file__).parents[1] / "src" / "flyweight" / "ui" / "index.html"
+        markup = index.read_text(encoding="utf-8")
+        self.assertIn('id="attach-chip"', markup)
+        self.assertIn('id="image-input"', markup)
+        # Shown only when /health reports a tower.
+        self.assertIn("elements.attachChip.hidden = !execution.vision", source)
+
     def test_the_composer_chip_cycles_the_whole_reasoning_state(self) -> None:
         """Reachable in one click, not behind the settings dialog.
 

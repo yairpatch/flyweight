@@ -356,6 +356,36 @@ FLYWEIGHT_V2_API int flyweight_v2_hf_quant_options(const char* directory,
     FlyweightV2HfQuantOption* out, uint32_t capacity, uint32_t* count);
 
 FLYWEIGHT_V2_API int flyweight_v2_model_open(const char* path, FlyweightV2Model** out);
+
+/* Vision: a llama.cpp-style `mmproj-*.gguf` (projector `qwen3vl_merger`)
+   attached beside a Qwen checkpoint. Images reach the language model as
+   rows of `row_width` floats per merged token: `projection_dim` values,
+   then one more `projection_dim` block per deepstack layer. */
+typedef struct FlyweightV2VisionInfo {
+    uint32_t attached;
+    uint32_t patch_size;
+    uint32_t spatial_merge_size;
+    uint32_t embedding_length;
+    uint32_t projection_dim;
+    uint32_t block_count;
+    uint32_t deepstack_layers;
+    uint64_t row_width;
+    float image_mean[3];
+    float image_std[3];
+} FlyweightV2VisionInfo;
+
+/* What an image of `width` x `height` pixels resizes to: sides rounded to
+   the merged patch with the aspect ratio kept and the token count held
+   within [min_tokens, max_tokens]; grid_w/grid_h count merged tokens. */
+typedef struct FlyweightV2VisionResize {
+    uint32_t width, height;
+    uint32_t grid_w, grid_h;
+    uint32_t tokens;
+} FlyweightV2VisionResize;
+
+FLYWEIGHT_V2_API int flyweight_v2_model_attach_vision(FlyweightV2Model* model, const char* path);
+FLYWEIGHT_V2_API int flyweight_v2_vision_info(const FlyweightV2Model* model, FlyweightV2VisionInfo* out);
+FLYWEIGHT_V2_API int flyweight_v2_vision_resize(const FlyweightV2Model* model, uint32_t width, uint32_t height, uint32_t min_tokens, uint32_t max_tokens, FlyweightV2VisionResize* out);
 /* Replace only the embedded Qwen MTP block with tensors from a compatible
    MTP-only GGUF. The sidecar mapping is owned by `model` after attachment. */
 FLYWEIGHT_V2_API int flyweight_v2_model_attach_mtp(FlyweightV2Model* model, const char* path);
@@ -661,6 +691,12 @@ FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_cancel(FlyweightV2QwenRuntime* ru
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_synchronize(FlyweightV2QwenRuntime* runtime);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime* runtime, uint32_t input_token, uint32_t* output_token);
+/* Run the attached vision tower over one image: `pixels` is HWC f32,
+   normalized with the tower's mean/std, sides multiples of
+   patch_size * spatial_merge_size (see flyweight_v2_vision_resize). Writes
+   tokens * row_width floats to `output`; `capacity` is in floats. Needs a
+   prepared runtime. */
+FLYWEIGHT_V2_API int flyweight_v2_qwen_vision_encode(FlyweightV2QwenRuntime* runtime, const float* pixels, uint32_t width, uint32_t height, float* output, uint64_t capacity);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, FlyweightV2TokenCallback callback, void* user_data);
 /* Writes one attention layer's live KV window as f32 for the TurboQuant
    quality harness: int32 count, int32 head_dim, then the keys and the values. */
@@ -688,6 +724,20 @@ FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_penalties(FlyweightV2QwenRunt
    tool call is open, so a required parameter cannot be skipped. Null or empty
    leaves the sampler unconstrained. */
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_grammar(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, uint64_t* task_id);
+/* As flyweight_v2_qwen_task_submit_grammar, with images. Each image's
+   pixels are HWC f32 normalized with the tower's mean/std and sized per
+   flyweight_v2_vision_resize; `token_offset` is the prompt index of its
+   first token, and the prompt must hold `tokens` placeholder ids from there
+   (their embeddings are replaced by the tower's rows). `hash` identifies the
+   content for prefix reuse: two prompts whose token ids agree but whose
+   images differ must not share cached KV. Pixels are copied at submit. */
+typedef struct FlyweightV2QwenImage {
+    const float* pixels;
+    uint32_t width, height;
+    uint64_t token_offset;
+    uint64_t hash;
+} FlyweightV2QwenImage;
+FLYWEIGHT_V2_API int flyweight_v2_qwen_task_submit_vision(FlyweightV2QwenRuntime* runtime, const uint32_t* prompt_tokens, uint64_t prompt_count, uint64_t max_tokens, const uint32_t* stop_tokens, uint64_t stop_count, float temperature, uint32_t top_k, float top_p, float repetition_penalty, float presence_penalty, float frequency_penalty, uint32_t penalty_window, uint64_t seed, uint32_t has_seed, const char* tool_specification, const FlyweightV2QwenImage* images, uint64_t image_count, uint64_t* task_id);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime* runtime, FlyweightV2QwenTaskEvent* events, uint64_t capacity, uint64_t* count);
 FLYWEIGHT_V2_API int flyweight_v2_qwen_task_cancel(FlyweightV2QwenRuntime* runtime, uint64_t task_id);
 /* Why a task reported kind 2 (error): the native exception text, retained

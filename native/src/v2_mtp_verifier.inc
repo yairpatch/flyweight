@@ -668,6 +668,9 @@ void qwen_forward_rows(
         ?runtime.embedding_row_index:token_device;
     void*embedding_args[]={const_cast<std::uint64_t*>(&embedding),const_cast<std::uint64_t*>(&embedding_index),&hidden,&rows,const_cast<int*>(&hidden_size)};
     launch(qwen_embedding_kernel(qwen_device_type(runtime,runtime.token_embeddings),true),(hidden_size+255)/256,rows,256,embedding_args);
+    // Image tokens take the vision tower's rows in place of their pad
+    // embedding.
+    qwen_image_rows_apply(runtime,runtime.position,rows,hidden,hidden_size,0,false);
     if(runtime.qwen4exp){
         // Streams init for the whole batch, and the chunk's n-gram gathers
         // staged up front so the PLE layer finds them uploaded.
@@ -1099,10 +1102,12 @@ void qwen_forward_rows(
                                    const_cast<float*>(&epsilon)};
                     launch("muse_head_norm_rope",kv_heads,1,256,k_args);
                 }else{
-                    void*q_args[]={&projected,&qnorm,&query,&gate,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-                    launch("qwen_attention_query",heads,1,256,q_args);
-                    void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&position,const_cast<float*>(&theta),const_cast<float*>(&epsilon)};
-                    launch("qwen_attention_key",kv_heads,1,256,k_args);
+                    auto rope=qwen_rope_args(runtime,runtime.image_spans,
+                        runtime.position+static_cast<std::uint64_t>(span_begin+token));
+                    void*q_args[]={&projected,&qnorm,&query,&gate,const_cast<int*>(&heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope)};
+                    launch("qwen_attention_query_mrope",heads,1,256,q_args);
+                    void*k_args[]={&projected_key,&knorm,&key,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),const_cast<int*>(&rotary),&rope.t,const_cast<float*>(&theta),const_cast<float*>(&epsilon),QWEN_MROPE_TAIL(rope)};
+                    launch("qwen_attention_key_mrope",kv_heads,1,256,k_args);
                 }
                 auto value=third+static_cast<std::uint64_t>(token)*kv_size*sizeof(float);
                 int slot=static_cast<int>(static_cast<std::uint64_t>(position)%layer.cache_capacity);

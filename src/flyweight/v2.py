@@ -6,7 +6,9 @@ native process and Python only owns handles and request-level data.
 
 from __future__ import annotations
 
+import array
 import ctypes
+import dataclasses
 import json
 import os
 import re
@@ -110,6 +112,41 @@ class _HfQuantOption(ctypes.Structure):
         ("cache_bytes", ctypes.c_uint64),
         ("cache_path", ctypes.c_char * 512),
         ("unavailable", ctypes.c_char * 128),
+    ]
+
+
+class _VisionInfo(ctypes.Structure):
+    _fields_ = [
+        ("attached", ctypes.c_uint32),
+        ("patch_size", ctypes.c_uint32),
+        ("spatial_merge_size", ctypes.c_uint32),
+        ("embedding_length", ctypes.c_uint32),
+        ("projection_dim", ctypes.c_uint32),
+        ("block_count", ctypes.c_uint32),
+        ("deepstack_layers", ctypes.c_uint32),
+        ("row_width", ctypes.c_uint64),
+        ("image_mean", ctypes.c_float * 3),
+        ("image_std", ctypes.c_float * 3),
+    ]
+
+
+class _QwenImage(ctypes.Structure):
+    _fields_ = [
+        ("pixels", ctypes.c_void_p),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("token_offset", ctypes.c_uint64),
+        ("hash", ctypes.c_uint64),
+    ]
+
+
+class _VisionResize(ctypes.Structure):
+    _fields_ = [
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("grid_w", ctypes.c_uint32),
+        ("grid_h", ctypes.c_uint32),
+        ("tokens", ctypes.c_uint32),
     ]
 
 
@@ -521,6 +558,34 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_char_p,
                 ]
                 lib.flyweight_v2_model_attach_mtp.restype = ctypes.c_int
+                lib.flyweight_v2_model_attach_vision.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                ]
+                lib.flyweight_v2_model_attach_vision.restype = ctypes.c_int
+                lib.flyweight_v2_vision_info.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_VisionInfo),
+                ]
+                lib.flyweight_v2_vision_info.restype = ctypes.c_int
+                lib.flyweight_v2_vision_resize.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(_VisionResize),
+                ]
+                lib.flyweight_v2_vision_resize.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_vision_encode.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                ]
+                lib.flyweight_v2_qwen_vision_encode.restype = ctypes.c_int
                 lib.flyweight_v2_hf_quant_options.argtypes = [
                     ctypes.c_char_p,
                     ctypes.POINTER(_HfQuantOption),
@@ -949,6 +1014,28 @@ def _library() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_uint64),
                 ]
                 lib.flyweight_v2_qwen_task_submit_grammar.restype = ctypes.c_int
+                lib.flyweight_v2_qwen_task_submit_vision.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.c_uint64,
+                    ctypes.c_float,
+                    ctypes.c_uint32,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_float,
+                    ctypes.c_uint32,
+                    ctypes.c_uint64,
+                    ctypes.c_uint32,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(_QwenImage),
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                lib.flyweight_v2_qwen_task_submit_vision.restype = ctypes.c_int
                 lib.flyweight_v2_qwen_engine_step.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(_QwenTaskEvent),
@@ -1550,9 +1637,16 @@ class BailingRuntime:
 
 
 class V2Model:
-    def __init__(self, path: str | Path, *, mtp_model: str | Path | None = None):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        mtp_model: str | Path | None = None,
+        mmproj: str | Path | None = None,
+    ):
         self.path = Path(path)
         self.mtp_model_path = Path(mtp_model) if mtp_model is not None else None
+        self.mmproj_path = Path(mmproj) if mmproj is not None else None
         self._lib = _library()
         self._handle = ctypes.c_void_p()
         self._tensor_catalog: dict[str, dict[str, object]] | None = None
@@ -1568,10 +1662,62 @@ class V2Model:
                         self._handle, str(self.mtp_model_path).encode()
                     )
                 )
+            if self.mmproj_path is not None:
+                self._check(
+                    self._lib.flyweight_v2_model_attach_vision(
+                        self._handle, str(self.mmproj_path).encode()
+                    )
+                )
         except Exception:
             self.close()
             raise
         self._architecture = str(self.info["architecture"])
+
+    @property
+    def vision(self) -> dict[str, object] | None:
+        """The attached vision tower's geometry, or None without one.
+
+        ``row_width`` is how many floats one merged image token carries into
+        the language model (the projection, plus one block per deepstack
+        layer); ``image_mean``/``image_std`` are the per-channel
+        normalization the tower was trained with.
+        """
+        value = _VisionInfo()
+        self._check(self._lib.flyweight_v2_vision_info(self._handle, ctypes.byref(value)))
+        if not value.attached:
+            return None
+        return {
+            "patch_size": int(value.patch_size),
+            "spatial_merge_size": int(value.spatial_merge_size),
+            "embedding_length": int(value.embedding_length),
+            "projection_dim": int(value.projection_dim),
+            "block_count": int(value.block_count),
+            "deepstack_layers": int(value.deepstack_layers),
+            "row_width": int(value.row_width),
+            "image_mean": tuple(float(v) for v in value.image_mean),
+            "image_std": tuple(float(v) for v in value.image_std),
+        }
+
+    def vision_resize(
+        self, width: int, height: int, *, min_tokens: int = 1, max_tokens: int = 4096
+    ) -> dict[str, int]:
+        """What an image resizes to before encoding: pixel sides (multiples
+        of the merged patch, aspect kept), the merged token grid, and the
+        token count the language model will see."""
+        value = _VisionResize()
+        self._check(
+            self._lib.flyweight_v2_vision_resize(
+                self._handle, int(width), int(height), int(min_tokens), int(max_tokens),
+                ctypes.byref(value),
+            )
+        )
+        return {
+            "width": int(value.width),
+            "height": int(value.height),
+            "grid_w": int(value.grid_w),
+            "grid_h": int(value.grid_h),
+            "tokens": int(value.tokens),
+        }
 
     @staticmethod
     def hf_quant_options(path: str | Path) -> list[dict[str, object]]:
@@ -2476,6 +2622,25 @@ def _constraint_specification(
     return json.dumps(document).encode("utf-8")
 
 
+@dataclasses.dataclass(frozen=True)
+class PromptImage:
+    """One picture in a prompt, ready for the vision tower.
+
+    ``pixels`` is ``height * width * 3`` little-endian float32 values, HWC,
+    normalized with the tower's mean/std, with sides from
+    ``V2Model.vision_resize``. ``token_offset`` is the prompt index of the
+    first placeholder token; ``tokens`` placeholders follow it. ``hash``
+    identifies the content for prefix-cache reuse.
+    """
+
+    pixels: bytes
+    width: int
+    height: int
+    token_offset: int
+    tokens: int
+    hash: int
+
+
 class V2QwenRuntime:
     """Owns a native Qwen or Gemma 4 execution plan and its CUDA state.
 
@@ -2762,6 +2927,39 @@ class V2QwenRuntime:
     def cancel(self) -> None:
         self.model._check(self._lib.flyweight_v2_qwen_runtime_cancel(self._handle))
 
+    def encode_image(
+        self, pixels: bytes | bytearray | memoryview, width: int, height: int
+    ) -> "array.array[float]":
+        """Run the attached vision tower over one image.
+
+        ``pixels`` is ``height * width * 3`` little-endian float32 values,
+        HWC, already normalized with the tower's mean/std and with sides
+        resized per ``V2Model.vision_resize``. Returns ``tokens * row_width``
+        floats, one row per merged token in row-major grid order.
+        """
+        vision = self.model.vision
+        if vision is None:
+            raise V2Error("no vision tower is attached to this model")
+        side = int(vision["patch_size"]) * int(vision["spatial_merge_size"])
+        if width <= 0 or height <= 0 or width % side or height % side:
+            raise V2Error(f"image sides must be positive multiples of {side}")
+        view = memoryview(pixels).cast("B")
+        expected = width * height * 3 * 4
+        if len(view) != expected:
+            raise V2Error(f"expected {expected} pixel bytes, got {len(view)}")
+        tokens = (width // side) * (height // side)
+        capacity = tokens * int(vision["row_width"])
+        output = (ctypes.c_float * capacity)()
+        source = (ctypes.c_char * len(view)).from_buffer_copy(view)
+        self.model._check(
+            self._lib.flyweight_v2_qwen_vision_encode(
+                self._handle, source, int(width), int(height), output, capacity
+            )
+        )
+        result = array.array("f")
+        result.frombytes(bytes(output))
+        return result
+
     def dump_kv(self, layer: int, path: str) -> None:
         """Write one attention layer's live KV window for bench_turboquant.
 
@@ -2892,8 +3090,14 @@ class V2QwenRuntime:
         tools: Sequence[Mapping[str, Any]] | None = None,
         response_format: Mapping[str, Any] | None = None,
         forbid_tool_calls: bool = False,
+        images: Sequence["PromptImage"] | None = None,
     ) -> int:
         """Queue a request on the cooperative engine; returns its task id.
+
+        `images` are the prompt's pictures for a model with a vision tower:
+        each a PromptImage whose pixels are already resized and normalized
+        (see V2Model.vision_resize) and whose token_offset points at the
+        first of its placeholder tokens in `prompt_tokens`.
 
         `tools` constrains the sampler while a tool call is open, so a required
         parameter cannot be skipped: each entry is `{"name": str, "parameters":
@@ -2917,6 +3121,51 @@ class V2QwenRuntime:
         specification = _constraint_specification(
             tools, response_format, forbid_tool_calls
         )
+        if images:
+            # Pixel buffers must outlive the call: the native side copies
+            # them during submit, so keeping the ctypes views in a list here
+            # is enough.
+            holders = []
+            entries = (_QwenImage * len(images))()
+            for index, image in enumerate(images):
+                view = memoryview(image.pixels).cast("B")
+                expected = image.width * image.height * 3 * 4
+                if len(view) != expected:
+                    raise V2Error(
+                        f"image {index}: expected {expected} pixel bytes, got {len(view)}"
+                    )
+                holder = (ctypes.c_char * len(view)).from_buffer_copy(view)
+                holders.append(holder)
+                entries[index].pixels = ctypes.cast(holder, ctypes.c_void_p)
+                entries[index].width = image.width
+                entries[index].height = image.height
+                entries[index].token_offset = image.token_offset
+                entries[index].hash = image.hash & ((1 << 64) - 1)
+            self.model._check(
+                self._lib.flyweight_v2_qwen_task_submit_vision(
+                    self._handle,
+                    values,
+                    len(prompt_tokens),
+                    max_tokens,
+                    stops,
+                    len(stop_tokens),
+                    temperature,
+                    top_k,
+                    top_p,
+                    repetition_penalty,
+                    presence_penalty,
+                    frequency_penalty,
+                    penalty_window,
+                    0 if seed is None else seed & ((1 << 64) - 1),
+                    int(seed is not None),
+                    specification,
+                    entries,
+                    len(images),
+                    ctypes.byref(task_id),
+                )
+            )
+            del holders
+            return int(task_id.value)
         self.model._check(
             self._lib.flyweight_v2_qwen_task_submit_grammar(
                 self._handle,

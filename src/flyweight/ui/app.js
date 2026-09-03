@@ -55,6 +55,9 @@ const elements = {
   scrollBottom: document.querySelector("#scroll-bottom"),
   promptInput: document.querySelector("#prompt-input"),
   composerShell: document.querySelector("#composer-shell"),
+  attachChip: document.querySelector("#attach-chip"),
+  imageInput: document.querySelector("#image-input"),
+  attachmentStrip: document.querySelector("#attachment-strip"),
   sendButton: document.querySelector("#send-button"),
   thinkingChip: document.querySelector("#thinking-chip"),
   tokenChip: document.querySelector("#token-chip"),
@@ -82,6 +85,9 @@ const elements = {
 const state = {
   conversations: loadConversations(),
   activeId: null,
+  // Pictures waiting in the composer: {id, dataUrl, name}. Sent with the
+  // next message as image_url parts.
+  attachments: [],
   settings: loadSettings(),
   settingsCustomized: hasPersistedSettings(),
   apiKey: readSession(API_KEY),
@@ -576,6 +582,7 @@ function renderMessageContent(content, message) {
     });
     content.append(panel);
   }
+  renderMessageImages(content, message);
   renderRichText(content, parts.answer);
   if (message.generating) {
     const cursor = document.createElement("span");
@@ -1682,7 +1689,8 @@ async function sendMessage(promptOverride = null) {
     return;
   }
   const prompt = (promptOverride ?? elements.promptInput.value).trim();
-  if (!prompt) {
+  const images = promptOverride === null ? state.attachments.map((item) => item.dataUrl) : [];
+  if (!prompt && !images.length) {
     return;
   }
   // A previous answer can still be draining its buffer. Settle it before the
@@ -1695,10 +1703,15 @@ async function sendMessage(promptOverride = null) {
     id: identifier(),
     role: "user",
     content: prompt,
+    ...(images.length ? { images } : {}),
     createdAt: now,
   });
   if (conversation.messages.filter((message) => message.role === "user").length === 1) {
-    conversation.title = titleFromPrompt(prompt);
+    conversation.title = titleFromPrompt(prompt) || "Image";
+  }
+  if (images.length) {
+    state.attachments = [];
+    renderAttachments();
   }
   const assistant = {
     id: identifier(),
@@ -1896,7 +1909,116 @@ function messageForAPI(message) {
       })),
     };
   }
+  if (message.images?.length) {
+    // OpenAI content parts: the pictures first, then the text, the way the
+    // chat template lays a picture before the question.
+    const parts = message.images.map((url) => ({ type: "image_url", image_url: { url } }));
+    if (message.content) {
+      parts.push({ type: "text", text: message.content });
+    }
+    return { role: message.role, content: parts };
+  }
   return { role: message.role, content: message.content };
+}
+
+// ---- Image attachments -----------------------------------------------------
+
+const ATTACHMENT_MAX_SIDE = 1536;
+const ATTACHMENT_KEEP_BYTES = 400 * 1024;
+
+function attachFiles(files) {
+  const images = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
+  if (!images.length) {
+    return;
+  }
+  if (elements.attachChip.hidden) {
+    toast("This model has no vision tower attached (start the server with --mmproj).", "error");
+    return;
+  }
+  for (const file of images) {
+    readImageFile(file)
+      .then((dataUrl) => {
+        state.attachments.push({ id: identifier(), dataUrl, name: file.name || "image" });
+        renderAttachments();
+        elements.promptInput.focus();
+      })
+      .catch(() => toast(`Could not read ${file.name || "the image"}.`, "error"));
+  }
+}
+
+// A data URL for the picture, downscaled through a canvas when it is large:
+// the server resizes to its token budget anyway, and the transcript is kept
+// in localStorage, whose quota a single phone photo would exhaust.
+function readImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const original = String(reader.result);
+      if (file.size <= ATTACHMENT_KEEP_BYTES) {
+        resolve(original);
+        return;
+      }
+      const image = new Image();
+      image.onerror = () => reject(new Error("decode"));
+      image.onload = () => {
+        const scale = Math.min(1, ATTACHMENT_MAX_SIDE / Math.max(image.width, image.height));
+        if (scale === 1 && file.size <= 4 * ATTACHMENT_KEEP_BYTES) {
+          resolve(original);
+          return;
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.9));
+      };
+      image.src = original;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function removeAttachment(id) {
+  state.attachments = state.attachments.filter((item) => item.id !== id);
+  renderAttachments();
+}
+
+function renderAttachments() {
+  const strip = elements.attachmentStrip;
+  strip.replaceChildren();
+  strip.hidden = state.attachments.length === 0;
+  for (const item of state.attachments) {
+    const figure = document.createElement("figure");
+    figure.className = "attachment";
+    const image = document.createElement("img");
+    image.src = item.dataUrl;
+    image.alt = item.name;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "attachment-remove";
+    remove.setAttribute("aria-label", `Remove ${item.name}`);
+    remove.textContent = "×";
+    remove.addEventListener("click", () => removeAttachment(item.id));
+    figure.append(image, remove);
+    strip.append(figure);
+  }
+}
+
+function renderMessageImages(container, message) {
+  if (!message.images?.length) {
+    return;
+  }
+  const gallery = document.createElement("div");
+  gallery.className = "message-images";
+  for (const url of message.images) {
+    const image = document.createElement("img");
+    image.src = url;
+    image.alt = "Attached image";
+    image.loading = "lazy";
+    gallery.append(image);
+  }
+  container.append(gallery);
 }
 
 function mergeToolCalls(message, deltas) {
@@ -2076,6 +2198,7 @@ function setRuntimeStatus(status) {
     return;
   }
   elements.runtimePill.hidden = false;
+  elements.attachChip.hidden = !execution.vision;
   const nativeCuda = execution.backend === "native-v2-cpp-cuda";
   const usesCuda = nativeCuda || execution.device === "cuda";
   elements.deviceLabel.textContent = usesCuda ? "CUDA" : "CPU";
@@ -2638,6 +2761,34 @@ function bindEvents() {
   elements.sidebarClose.addEventListener("click", toggleSidebar);
   elements.sidebarScrim.addEventListener("click", closeSidebar);
   elements.sendButton.addEventListener("click", () => sendMessage());
+  elements.attachChip.addEventListener("click", () => elements.imageInput.click());
+  elements.imageInput.addEventListener("change", () => {
+    attachFiles(elements.imageInput.files);
+    elements.imageInput.value = "";
+  });
+  elements.promptInput.addEventListener("paste", (event) => {
+    const files = Array.from(event.clipboardData?.files || []);
+    if (files.some((file) => file.type.startsWith("image/"))) {
+      event.preventDefault();
+      attachFiles(files);
+    }
+  });
+  elements.composerShell.addEventListener("dragover", (event) => {
+    if (Array.from(event.dataTransfer?.types || []).includes("Files")) {
+      event.preventDefault();
+      elements.composerShell.classList.add("dragging");
+    }
+  });
+  elements.composerShell.addEventListener("dragleave", () => {
+    elements.composerShell.classList.remove("dragging");
+  });
+  elements.composerShell.addEventListener("drop", (event) => {
+    elements.composerShell.classList.remove("dragging");
+    if (event.dataTransfer?.files?.length) {
+      event.preventDefault();
+      attachFiles(event.dataTransfer.files);
+    }
+  });
   elements.promptInput.addEventListener("input", resizePrompt);
   elements.promptInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {

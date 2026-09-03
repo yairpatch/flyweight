@@ -23,6 +23,10 @@ from urllib.parse import unquote, urlsplit
 
 from . import transcript_audit
 from .generation import GenerationResult, GenerationStep
+from .vision import (
+    IMAGE_PLACEHOLDER, ImageError, ImageInput, image_from_anthropic_block,
+    image_from_openai_part,
+)
 from .sampling import SETTINGS, SamplingConfig
 
 # The settings a request may override, which is all of them: see
@@ -534,6 +538,9 @@ class InferenceService:
         # endpoint (see `_TOTAL_TOKENS_RE`). Set by the CLI after construction
         # rather than threaded through three subclass constructors.
         self.freeze_total_tokens = False
+        # Whether an image part may name an http(s) URL for the server to
+        # fetch; data URLs are always accepted.
+        self.allow_remote_images = True
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(
                 "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS))
@@ -1610,7 +1617,8 @@ class InferenceService:
         }
 
     def count_response_input(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        messages = _response_messages(payload)
+        messages = _response_messages(
+            payload, allow_remote_images=self.allow_remote_images)
         tools = _response_tools(payload)
         if tools:
             _prepend_tool_prompt(messages, tools, payload.get("tool_choice"))
@@ -1626,6 +1634,7 @@ class InferenceService:
             {**payload, "max_tokens": payload.get("max_tokens", 1)},
             architecture=getattr(self.generator.tokenizer, "architecture", None),
             freeze_total_tokens=self.freeze_total_tokens,
+            allow_remote_images=self.allow_remote_images,
         )
         tokens = self.generator.tokenizer.encode_messages(
             messages,
@@ -1958,6 +1967,7 @@ class InferenceService:
             payload,
             architecture=getattr(self.generator.tokenizer, "architecture", None),
             freeze_total_tokens=self.freeze_total_tokens,
+            allow_remote_images=self.allow_remote_images,
         )
         tools = tuple(_selected_tools(options)) if tools_enabled else ()
         request = self._prepare_generation(
@@ -2232,7 +2242,8 @@ class InferenceService:
     def _response_messages_with_history(
         self, payload: Mapping[str, Any]
     ) -> list[dict[str, str]]:
-        current = _response_messages(payload)
+        current = _response_messages(
+            payload, allow_remote_images=self.allow_remote_images)
         previous_id = payload.get("previous_response_id")
         if previous_id is None:
             return current
@@ -2300,7 +2311,8 @@ class InferenceService:
 
     def _prepare_chat(self, payload: Mapping[str, Any]) -> _GenerationRequest:
         messages, tools_enabled = _chat_messages(
-            payload, architecture=getattr(self.generator.tokenizer, "architecture", None)
+            payload, architecture=getattr(self.generator.tokenizer, "architecture", None),
+            allow_remote_images=self.allow_remote_images,
         )
         tools = tuple(_selected_tools(payload)) if tools_enabled else ()
         request = self._prepare_generation(
@@ -3681,7 +3693,8 @@ def _template_tool_calls(
 
 
 def _chat_messages(
-    payload: Mapping[str, Any], *, architecture: str | None = None
+    payload: Mapping[str, Any], *, architecture: str | None = None,
+    allow_remote_images: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     value = payload.get("messages")
     if not isinstance(value, list) or not value:
@@ -3715,7 +3728,13 @@ def _chat_messages(
                 )
             )
             continue
-        content = _optional_text_content(message.get("content"), index)
+        images: list[ImageInput] = []
+        if role == "user":
+            content, images = _content_with_images(
+                message.get("content"), index, allow_remote=allow_remote_images
+            )
+        else:
+            content = _optional_text_content(message.get("content"), index)
         if role == "assistant" and message.get("tool_calls"):
             if architecture not in NATIVE_TOOL_ARCHITECTURES:
                 content = _render_tool_calls(content, message["tool_calls"], index)
@@ -3732,6 +3751,8 @@ def _chat_messages(
                 400, f"messages[{index}].content must be text", parameter="messages"
             )
         normalized: dict[str, Any] = {"role": role, "content": content}
+        if images:
+            normalized["images"] = images
         if (role == "assistant" and message.get("tool_calls")
                 and architecture in NATIVE_TOOL_ARCHITECTURES):
             normalized["tool_calls"] = _template_tool_calls(
@@ -3913,7 +3934,7 @@ def _freeze_total_tokens(value: Any) -> Any:
 
 def _anthropic_request(
     payload: Mapping[str, Any], *, architecture: str | None = None,
-    freeze_total_tokens: bool = False,
+    freeze_total_tokens: bool = False, allow_remote_images: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
     """Parse an Anthropic messages request straight into prompt messages.
 
@@ -4048,6 +4069,7 @@ def _anthropic_request(
         reasoning_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []
+        images: list[ImageInput] = []
         for block in content:
             if not isinstance(block, dict):
                 raise APIError(
@@ -4067,6 +4089,15 @@ def _anthropic_request(
                     reasoning_parts.append(thought)
             elif block_type == "redacted_thinking" and role == "assistant":
                 continue
+            elif block_type == "image" and role == "user":
+                try:
+                    images.append(image_from_anthropic_block(
+                        block, allow_remote=allow_remote_images))
+                except ImageError:
+                    # Same degradation as any other unrenderable block.
+                    text_parts.append(_unsupported_block_text(block_type))
+                else:
+                    text_parts.append(IMAGE_PLACEHOLDER)
             elif block_type == "tool_use" and role == "assistant":
                 tool_calls.append(
                     {
@@ -4103,6 +4134,8 @@ def _anthropic_request(
         if text_parts or reasoning_parts or tool_calls:
             content_text = "".join(text_parts)
             turn: dict[str, Any] = {"role": role, "content": content_text}
+            if images:
+                turn["images"] = images
             if tool_calls and architecture in NATIVE_TOOL_ARCHITECTURES:
                 turn["tool_calls"] = _template_tool_calls(tool_calls, architecture)
             elif tool_calls:
@@ -4232,6 +4265,10 @@ def _anthropic_prompt_text(value: Any, parameter: str) -> str:
         else:
             parts.append(_unsupported_block_text(block.get("type")))
     return "".join(parts)
+
+
+def _omitted_image_text(reason: object) -> str:
+    return f"[image omitted: {reason}]"
 
 
 def _unsupported_block_text(block_type: Any) -> str:
@@ -5580,7 +5617,9 @@ def _response_output(
     return output
 
 
-def _validate_response_input(value: Any) -> list[dict[str, str]]:
+def _validate_response_input(
+    value: Any, *, allow_remote_images: bool = True
+) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise APIError(400, "input must be a non-empty array", parameter="input")
     messages: list[dict[str, str]] = []
@@ -5612,6 +5651,18 @@ def _validate_response_input(value: Any) -> list[dict[str, str]]:
         role = item.get("role")
         if item_type not in (None, "message") or role not in VALID_ROLES:
             raise APIError(400, f"input[{index}] is invalid", parameter="input")
+        if role == "user":
+            content, images = _content_with_images(
+                item.get("content"), index, allow_remote=allow_remote_images,
+                parameter="input",
+            )
+            if not content:
+                raise APIError(400, f"input[{index}].content must be text", parameter="input")
+            turn: dict[str, Any] = {"role": role, "content": content}
+            if images:
+                turn["images"] = images
+            messages.append(turn)
+            continue
         content = _text_content(item.get("content"), index)
         messages.append(
             {"role": "system" if role == "developer" else role, "content": content}
@@ -5619,8 +5670,10 @@ def _validate_response_input(value: Any) -> list[dict[str, str]]:
     return messages
 
 
-def _response_messages(payload: Mapping[str, Any]) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
+def _response_messages(
+    payload: Mapping[str, Any], *, allow_remote_images: bool = True
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
     instructions = payload.get("instructions")
     if instructions is not None:
         if not isinstance(instructions, str) or not instructions.strip():
@@ -5632,7 +5685,8 @@ def _response_messages(payload: Mapping[str, Any]) -> list[dict[str, str]]:
             raise APIError(400, "input must not be empty", parameter="input")
         messages.append({"role": "user", "content": input_value})
     elif isinstance(input_value, list):
-        messages.extend(_validate_response_input(input_value))
+        messages.extend(_validate_response_input(
+            input_value, allow_remote_images=allow_remote_images))
     else:
         raise APIError(
             400, "input must be text or an array of messages", parameter="input"
@@ -5666,6 +5720,64 @@ def _validate_messages(value: Any) -> list[dict[str, str]]:
             400, "the last message must have role 'user'", parameter="messages"
         )
     return messages
+
+
+IMAGE_PART_TYPES = frozenset(("image_url", "input_image"))
+
+
+def _content_with_images(
+    value: Any, message_index: int, *, allow_remote: bool, parameter: str = "messages"
+) -> tuple[str, list[ImageInput]]:
+    """A user turn's text with each image part replaced by the model's
+    placeholder, plus the images in order of appearance.
+
+    Text-only content behaves exactly as _optional_text_content. An image
+    part becomes IMAGE_PLACEHOLDER in the text; the tokenizer facade expands
+    it to the picture's token count once it knows the tower's geometry, and
+    refuses the request when no tower is attached.
+    """
+    if value is None:
+        return "", []
+    if isinstance(value, str):
+        return (value if value.strip() else ""), []
+    if not isinstance(value, list):
+        raise APIError(
+            400, f"{parameter}[{message_index}].content is invalid", parameter=parameter
+        )
+    parts: list[str] = []
+    images: list[ImageInput] = []
+    for part_index, part in enumerate(value):
+        if not isinstance(part, dict):
+            raise APIError(
+                400,
+                f"{parameter}[{message_index}].content[{part_index}] must be a content part",
+                parameter=parameter,
+            )
+        kind = part.get("type")
+        if kind in TEXT_PART_TYPES:
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise APIError(
+                    400, "text content parts must contain text", parameter=parameter
+                )
+            parts.append(text)
+        elif kind in IMAGE_PART_TYPES:
+            # An image that cannot be read degrades to a visible note rather
+            # than a 400: it is in the client's history now and would come
+            # back with every retry.
+            try:
+                images.append(image_from_openai_part(part, allow_remote=allow_remote))
+            except ImageError as error:
+                parts.append(_omitted_image_text(error))
+            else:
+                parts.append(IMAGE_PLACEHOLDER)
+        else:
+            raise APIError(
+                400,
+                f"{parameter}[{message_index}].content[{part_index}] must be a text or image part",
+                parameter=parameter,
+            )
+    return "".join(parts), images
 
 
 def _text_content(value: Any, message_index: int) -> str:

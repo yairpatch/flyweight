@@ -504,6 +504,21 @@ def _add_runtime_options(
         help="optional MTP-only GGUF overlay; when omitted, the draft head "
              "embedded in the target model is used",
     )
+    add(
+        placement, "--mmproj", type=Path, metavar="PATH",
+        help="vision tower (llama.cpp mmproj-*.gguf, qwen3vl_merger projector) "
+             "for image input on Qwen 3.5-family checkpoints",
+    )
+    add(
+        placement, "--image-max-tokens", type=int, default=1024, metavar="N",
+        help="largest merged-token budget an image is resized to (each token "
+             "covers a 32x32 pixel block; default 1024)",
+    )
+    add(
+        placement, "--image-urls", choices=("allow", "deny"), default="allow",
+        help="whether image parts may name http(s) URLs for the server to "
+             "fetch; data: URLs are always accepted",
+    )
 
     add(
         tuning, "--hybrid-prefill", choices=("split", "cpu"), default=None,
@@ -1460,6 +1475,9 @@ def _generate(args: argparse.Namespace) -> int:
         service = NativeV2InferenceService(
             args.model,
             mtp_model_path=args.mtp_model,
+            mmproj_path=getattr(args, "mmproj", None),
+            image_max_tokens=getattr(args, "image_max_tokens", 1024),
+            image_urls=getattr(args, "image_urls", "allow"),
             context_window=args.context_window,
             max_new_tokens=args.max_new_tokens,
             gpu_cache_mib=args.gpu_cache_mib,
@@ -1528,6 +1546,9 @@ def _serve(args: argparse.Namespace) -> int:
     service = NativeV2InferenceService(
         args.model,
         mtp_model_path=args.mtp_model,
+        mmproj_path=getattr(args, "mmproj", None),
+        image_max_tokens=getattr(args, "image_max_tokens", 1024),
+        image_urls=getattr(args, "image_urls", "allow"),
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,

@@ -40,6 +40,15 @@ struct ModelConfig {
     std::uint32_t rotary_dimension_swa=0;
     float rope_freq_base_swa=0.0f, final_logit_softcap=0.0f;
     float rms_norm_epsilon=0.0f, rope_freq_base=0.0f;
+    // Interleaved M-RoPE (`rope.dimension_sections`, Qwen3-VL / Qwen3.5):
+    // rotary pairs per temporal, height, width and extra component. All zero
+    // means plain RoPE, where a text token's single position rotates every
+    // pair -- which is also what the sections degenerate to when the three
+    // positions coincide.
+    std::uint32_t rope_sections[4]={0,0,0,0};
+    bool has_rope_sections() const {
+        return rope_sections[0]||rope_sections[1]||rope_sections[2]||rope_sections[3];
+    }
     // Muse Glimmer scales the logits by a trained constant before the softcap.
     // Zero means the checkpoint carries no scale and the head output stands.
     float logit_scale=0.0f;

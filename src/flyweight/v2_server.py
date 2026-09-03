@@ -9,7 +9,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Iterator, Mapping, Sequence, overload
+from typing import Iterator, Mapping, Sequence, cast, overload
 
 from jinja2 import StrictUndefined, Template, nodes
 from jinja2.ext import Extension
@@ -22,7 +22,12 @@ from .sampling import (
     coerce as sampling_coerce,
 )
 from .server import InferenceService, _parse_tool_calls, _split_reasoning_content
+from .vision import (
+    IMAGE_PAD_TOKEN, IMAGE_PLACEHOLDER, ImageError, ImageInput, ImagePreprocessor,
+    PreparedImage, expand_image_pads, image_token_offsets,
+)
 from .v2 import (
+    PromptImage,
     AUTO_PROMPT_CACHE_MIB,
     TASK_EVENT_DONE,
     TASK_EVENT_ERROR,
@@ -148,6 +153,7 @@ class _NativeEngine:
         tools: list[dict[str, object]] | None = None,
         response_format: dict[str, object] | None = None,
         forbid_tool_calls: bool = False,
+        images: Sequence[PromptImage] | None = None,
     ) -> tuple[int, Queue[tuple[str, object]]]:
         task_queue: Queue[tuple[str, object]] = Queue(
             maxsize=self._MAX_BUFFERED_EVENTS
@@ -173,6 +179,9 @@ class _NativeEngine:
                 tools=tools,
                 response_format=response_format,
                 forbid_tool_calls=forbid_tool_calls,
+                # Only a prompt with pictures names the argument, so a
+                # runtime without the vision entry point keeps working.
+                **({"images": list(images)} if images else {}),
             )
             self._queues[task_id] = task_queue
             if self._thread is None or not self._thread.is_alive():
@@ -372,9 +381,28 @@ def _check_content(role: str, content: str, index: int) -> None:
 class NativeV2Tokenizer:
     """Chat formatting and tokenizer facade backed directly by GGUF metadata."""
 
-    def __init__(self, model: V2Model):
+    def __init__(self, model: V2Model, *, image_max_tokens: int = 1024):
         self.model = model
         self.architecture = str(model.info["architecture"])
+        # The vision tower, when the model has one attached: images in a
+        # request are decoded to its geometry and take the placeholder's
+        # place in the prompt as a run of pad tokens.
+        try:
+            self.vision = model.vision
+        except (AttributeError, V2Error):
+            self.vision = None
+        self.image_max_tokens = int(image_max_tokens)
+        self.images: ImagePreprocessor | None = (
+            ImagePreprocessor(model, max_tokens=self.image_max_tokens)
+            if self.vision else None
+        )
+        self.image_pad_id: int | None = None
+        if self.vision:
+            try:
+                self.image_pad_id = model.token_id(IMAGE_PAD_TOKEN)
+            except (V2Error, KeyError):
+                self.vision = None
+                self.images = None
         self.chat_template = getattr(model, "chat_template", None)
         self.chat_template_source = "gguf" if self.chat_template else "fallback"
         self._compiled_chat_template: Template | None = None
@@ -864,18 +892,69 @@ class NativeV2Tokenizer:
 
     def encode_messages(
         self,
-        messages: Sequence[Mapping[str, str]],
+        messages: Sequence[Mapping[str, object]],
         *,
         enable_thinking: bool | None = None,
         reasoning_effort: str | None = None,
         preserve_thinking: bool | None = None,
     ) -> list[int]:
-        return self.encode(
+        prepared = self.prepare_images(messages)
+        if prepared:
+            messages = _messages_with_failed_images_noted(messages, prepared)
+        tokens = self.encode(
             self.format_messages(
-                messages, enable_thinking=enable_thinking,
+                cast(Sequence[Mapping[str, str]], messages),
+                enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
                 preserve_thinking=preserve_thinking)
         )
+        usable = [image for image in prepared if isinstance(image, PreparedImage)]
+        if usable:
+            assert self.image_pad_id is not None
+            tokens = expand_image_pads(
+                tokens, self.image_pad_id, [image.tokens for image in usable])
+        return tokens
+
+    def prepare_images(
+        self, messages: Sequence[Mapping[str, object]]
+    ) -> list[PreparedImage | str]:
+        """Every image the conversation carries, in prompt order: resized to
+        the tower's geometry, or the reason it could not be (no tower
+        attached, undecodable bytes). A failed picture degrades to a visible
+        note in the prompt rather than failing the request: it sits in the
+        client's history and would come back with every retry."""
+        inputs = _message_images(messages)
+        if not inputs:
+            return []
+        if self.images is None:
+            _warn_once("images were sent but no vision tower is attached; "
+                       "start the server with --mmproj to use them")
+            return ["no vision tower attached (--mmproj)"] * len(inputs)
+        out: list[PreparedImage | str] = []
+        for image in inputs:
+            try:
+                out.append(self.images.prepare(image))
+            except ImageError as error:
+                out.append(str(error))
+        return out
+
+    def prompt_images(
+        self, messages: Sequence[Mapping[str, object]], prompt_ids: Sequence[int]
+    ) -> list[PromptImage]:
+        """The runtime's view of the conversation's images: pixels plus where
+        each one's pad run starts in the expanded prompt."""
+        prepared = [image for image in self.prepare_images(messages)
+                    if isinstance(image, PreparedImage)]
+        if not prepared:
+            return []
+        assert self.image_pad_id is not None
+        offsets = image_token_offsets(
+            prompt_ids, self.image_pad_id, [image.tokens for image in prepared])
+        return [
+            PromptImage(image.pixels, image.width, image.height, offset,
+                        image.tokens, image.hash)
+            for image, offset in zip(prepared, offsets)
+        ]
 
 
 def _merge_generation_defaults(
@@ -1013,10 +1092,74 @@ def _message_key(message: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _structured_digest(message: Mapping[str, object]) -> str:
-    parts = [message.get("tools"), message.get("tool_calls"), message.get("tool_call_id")]
+    parts: list[object] = [
+        message.get("tools"), message.get("tool_calls"), message.get("tool_call_id")]
+    # Two turns rendering the same placeholder text differ when the picture
+    # behind it differs, so the images' digests are part of the key too.
+    images = message.get("images")
+    if images:
+        parts.append([getattr(image, "digest", str(image)) for image in images])
     if not any(part for part in parts):
         return ""
     return json.dumps(parts, sort_keys=True, default=str)
+
+
+_WARNED: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    if message not in _WARNED:
+        _WARNED.add(message)
+        print(f"[flyweight] {message}", file=sys.stderr)
+
+
+def _messages_with_failed_images_noted(
+    messages: Sequence[Mapping[str, object]],
+    prepared: Sequence[PreparedImage | str],
+) -> list[Mapping[str, object]]:
+    """The messages with each failed picture's placeholder replaced by a
+    note carrying the reason, so the prompt says what the model cannot see
+    and the pad expansion only meets pictures that were prepared."""
+    if all(isinstance(image, PreparedImage) for image in prepared):
+        return list(messages)
+    cursor = 0
+    out: list[Mapping[str, object]] = []
+    for message in messages:
+        images = message.get("images") if isinstance(message, Mapping) else None
+        if not images:
+            out.append(message)
+            continue
+        content = str(message.get("content") or "")
+        pieces = content.split(IMAGE_PLACEHOLDER)
+        rebuilt = pieces[0]
+        kept: list[ImageInput] = []
+        for piece, image in zip(pieces[1:], images):
+            outcome = prepared[cursor] if cursor < len(prepared) else "image missing"
+            cursor += 1
+            if isinstance(outcome, PreparedImage):
+                rebuilt += IMAGE_PLACEHOLDER
+                kept.append(image)
+            else:
+                rebuilt += f"[image omitted: {outcome}]"
+            rebuilt += piece
+        copy = dict(message)
+        copy["content"] = rebuilt
+        if kept:
+            copy["images"] = kept
+        else:
+            copy.pop("images", None)
+        out.append(copy)
+    return out
+
+
+def _message_images(messages: Sequence[Mapping[str, object]]) -> list[ImageInput]:
+    """The images every message carries, in prompt order."""
+    out: list[ImageInput] = []
+    for message in messages:
+        images = message.get("images") if isinstance(message, Mapping) else None
+        if images:
+            out.extend(image for image in images if isinstance(image, ImageInput))
+    return out
 
 
 def _optional_thinking(options: Mapping[str, object]) -> bool | None:
@@ -1256,6 +1399,9 @@ class ChatGenerator:
                 messages, enable_thinking=thinking, reasoning_effort=effort,
                 preserve_thinking=_optional_preserve(options))
         )
+        prompt_images = getattr(self.tokenizer, "prompt_images", None)
+        if callable(prompt_images) and _message_images(messages):
+            options["images"] = prompt_images(messages, prompt_ids)
         final: GenerationStep | None = None
         for step in self._stream(prompt_ids, **options):
             if step.finished:
@@ -1536,6 +1682,7 @@ class ChatGenerator:
             # a tool-heavy transcript cannot leak one into plain text (an
             # opencode compaction stored exactly that as its summary).
             forbid_tool_calls=not tool_grammar,
+            **({"images": options["images"]} if options.get("images") else {}),
         )
         try:
             prefill_complete = False
@@ -2262,6 +2409,9 @@ class NativeV2InferenceService(InferenceService):
         model_path: Path | str,
         *,
         mtp_model_path: Path | str | None = None,
+        mmproj_path: Path | str | None = None,
+        image_max_tokens: int = 1024,
+        image_urls: str = "allow",
         model_name: str | None = None,
         device: int = 0,
         context_window: int = 32768,
@@ -2302,7 +2452,10 @@ class NativeV2InferenceService(InferenceService):
         generation_defaults, generation_defaults_source = _merge_generation_defaults(
             *_generation_config_for_model(model_path), generation_defaults
         )
-        self.v2_model = V2Model(model_path, mtp_model=mtp_model_path)
+        self.v2_model = V2Model(
+            model_path, mtp_model=mtp_model_path, mmproj=mmproj_path)
+        self.image_max_tokens = int(image_max_tokens)
+        self.image_urls = image_urls
         # BailingMoE3 runs on its own runtime rather than the Qwen one: 24 of
         # its 24 layers use attention the Qwen path does not implement. It is a
         # narrower runtime -- one sequence, no prefix cache, no expert paging --
@@ -2375,7 +2528,8 @@ class NativeV2InferenceService(InferenceService):
             raise
         assert self.v2_runtime is not None
         try:
-            tokenizer = NativeV2Tokenizer(self.v2_model)
+            tokenizer = NativeV2Tokenizer(
+            self.v2_model, image_max_tokens=self.image_max_tokens)
         except BaseException:
             # A chat template that fails to parse, or an undecodable
             # tokenizer key, used to leave the prepared runtime (its GPU
@@ -2411,6 +2565,7 @@ class NativeV2InferenceService(InferenceService):
         self.moe_device = self.expert_mode
         self.mtp_drafts = mtp_drafts
         self.gpu_cache_mib = gpu_cache_mib
+        self.allow_remote_images = image_urls != "deny"
         # The native cooperative engine interleaves concurrent requests itself
         # (per-slot KV, single CUDA thread), so the HTTP layer must not
         # serialize them.
@@ -2424,7 +2579,8 @@ class NativeV2InferenceService(InferenceService):
                       reasoning_effort=None, prompt_cache_mib=0,
                       parallel_sequences=1) -> None:
         self.v2_runtime = None
-        tokenizer = NativeV2Tokenizer(self.v2_model)
+        tokenizer = NativeV2Tokenizer(
+            self.v2_model, image_max_tokens=self.image_max_tokens)
         # --parallel means the same thing here as on the Qwen runtime:
         # independent sequences that decode without waiting for each other.
         # A slot costs its caches alone, and the runtime refuses a count that
@@ -2502,8 +2658,20 @@ class NativeV2InferenceService(InferenceService):
             "moe_device": self.moe_device,
             "mtp_drafts": self.mtp_drafts,
             "gpu_cache_mib": self.gpu_cache_mib,
+            "vision": self._vision_health(),
         }
         return value
+
+    def _vision_health(self) -> dict[str, object] | None:
+        tokenizer = getattr(self.generator, "tokenizer", None)
+        vision = getattr(tokenizer, "vision", None)
+        if not vision:
+            return None
+        return {
+            **vision,
+            "image_max_tokens": getattr(tokenizer, "image_max_tokens", None),
+            "remote_urls": bool(getattr(self, "allow_remote_images", True)),
+        }
 
     def properties(self) -> dict[str, object]:
         value = super().properties()

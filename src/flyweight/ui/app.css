@@ -1501,6 +1501,61 @@ body.sidebar-hidden .sidebar-action {
   border-color: var(--line-strong);
 }
 
+.composer-shell.dragging {
+  border-color: var(--line-strong);
+  background: var(--panel-soft);
+}
+
+.attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: 0 0 var(--space-2);
+}
+
+.attachment {
+  position: relative;
+  margin: 0;
+}
+
+.attachment img {
+  display: block;
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+.attachment-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.message-images img {
+  max-width: min(100%, 320px);
+  max-height: 320px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+}
+
 .composer-shell textarea {
   display: block;
   width: 100%;
