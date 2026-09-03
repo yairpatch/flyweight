@@ -11,6 +11,15 @@ import { DEFAULT_SETTINGS } from "./settings";
 import type { Message, ToolDefinition } from "../types";
 
 const user = (content: string, images?: string[]): Message => ({ id: "u", role: "user", content, images, createdAt: 0 });
+const withFile = (content: string): Message => ({
+  id: "u",
+  role: "user",
+  content,
+  createdAt: 0,
+  attachments: [
+    { id: "a", name: "main.py", kind: "text", mediaType: "text/x-python", size: 8, language: "python", text: "print(1)" },
+  ],
+});
 const tools: ToolDefinition[] = [
   { id: "t", name: "get_weather", description: "Weather", parameters: '{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}', enabled: true },
   { id: "off", name: "disabled_tool", description: "", parameters: "{}", enabled: false },
@@ -34,6 +43,12 @@ describe("chat completions request", () => {
       { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
       { type: "text", text: "look" },
     ]);
+  });
+
+  it("inlines attached file text ahead of what the user typed", () => {
+    const body = buildChatRequest({ model: "m", messages: [withFile("explain this")], settings: DEFAULT_SETTINGS, tools: [] });
+    const content = (body.messages as Array<{ content: string }>)[0].content;
+    expect(content).toBe("Attached file: main.py (1 line, 8 B)\n\n```python\nprint(1)\n```\n\nexplain this");
   });
 
   it("only sends enabled tools and a well-formed tool_choice", () => {
@@ -97,6 +112,13 @@ describe("anthropic messages", () => {
     expect(body.tool_choice).toEqual({ type: "auto" });
   });
 
+  it("inlines attached file text in the trailing text block", () => {
+    const body = buildAnthropicRequest({ model: "m", messages: [withFile("explain this")], settings: DEFAULT_SETTINGS, tools: [] });
+    const content = (body.messages as Array<{ content: Array<{ type: string; text: string }> }>)[0].content;
+    expect(content.at(-1)!.text).toContain("```python\nprint(1)\n```");
+    expect(content.at(-1)!.text.endsWith("explain this")).toBe(true);
+  });
+
   it("parses named events into unified events", () => {
     const frames = [
       { event: "message_start", data: JSON.stringify({ type: "message_start", message: { id: "msg_1" } }) },
@@ -127,6 +149,12 @@ describe("responses api", () => {
     const input = body.input as Array<Record<string, unknown>>;
     expect(input.map((item) => item.type)).toEqual(["message", "function_call", "function_call_output"]);
     expect(input[1].call_id).toBe("call_9");
+  });
+
+  it("inlines attached file text in the input_text part", () => {
+    const body = buildResponsesRequest({ model: "m", messages: [withFile("explain this")], settings: DEFAULT_SETTINGS, tools: [] });
+    const items = body.input as Array<{ content: Array<{ type: string; text: string }> }>;
+    expect(items[0].content.at(-1)!.text).toContain("Attached file: main.py");
   });
 
   it("parses deltas and completion", () => {

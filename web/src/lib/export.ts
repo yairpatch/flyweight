@@ -9,6 +9,8 @@ export function conversationToMarkdown(conversation: Conversation): string {
     if (message.reasoning) {
       lines.push("<details><summary>Thinking</summary>", "", message.reasoning, "", "</details>", "");
     }
+    const files = (message.attachments ?? []).filter((attachment) => attachment.kind !== "image");
+    if (files.length) lines.push(`_Attached: ${files.map((attachment) => attachment.name).join(", ")}_`, "");
     if (message.images?.length) lines.push(`_${message.images.length} image${message.images.length === 1 ? "" : "s"} attached_`, "");
     if (message.content) lines.push(message.content, "");
     for (const call of message.toolCalls ?? []) {

@@ -755,6 +755,12 @@ kbd {
   display: inline-block;
   max-width: 100%;
 }
+.msg__attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
 .msg__images {
   display: flex;
   flex-wrap: wrap;
@@ -1210,11 +1216,12 @@ kbd {
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
-.composer__images {
+.composer__attachments {
   display: flex;
   gap: 8px;
   padding: 12px 12px 0;
   flex-wrap: wrap;
+  align-items: center;
 }
 .composer__thumb {
   position: relative;
@@ -1999,4 +2006,75 @@ kbd {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* File attachments: one chip per non-image file, in the composer and in the
+   transcript. Images keep their thumbnail. */
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+  font-size: 12px;
+}
+.attachment--error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.attachment--busy {
+  opacity: 0.6;
+}
+.attachment__icon {
+  display: flex;
+  flex: 0 0 auto;
+  color: var(--text-3);
+}
+.attachment--error .attachment__icon {
+  color: inherit;
+}
+.attachment__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.3;
+}
+.attachment__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment__meta {
+  color: var(--text-3);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment--error .attachment__meta {
+  color: inherit;
+}
+.attachment__action {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.attachment__action:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.attachment__action:disabled {
+  cursor: default;
+  opacity: 0.5;
 }

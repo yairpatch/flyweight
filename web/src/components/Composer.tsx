@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
-import { ArrowUp, Braces, Brain, ImagePlus, Square, Wrench, X, Zap } from "lucide-react";
+import { ArrowUp, Braces, Brain, Paperclip, Square, Wrench, X, Zap } from "lucide-react";
 import { useStore } from "../store";
-import { imageFilesFrom, readImageFile } from "../lib/images";
+import { ACCEPT_ATTRIBUTE, MAX_ATTACHMENTS, filesFrom, readAttachment, setPdfMode } from "../lib/attachments";
+import { AttachmentChip } from "./AttachmentChip";
 import { api } from "../lib/api";
 import { PROTOCOL_LABELS } from "../lib/protocols";
-import type { ReasoningEffort } from "../types";
+import type { Attachment, ReasoningEffort } from "../types";
 
 const REASONING_CYCLE: Array<{ thinking: boolean; effort: ReasoningEffort; label: string }> = [
   { thinking: false, effort: "auto", label: "Thinking off" },
@@ -18,8 +19,8 @@ const REASONING_CYCLE: Array<{ thinking: boolean; effort: ReasoningEffort; label
 export function Composer() {
   const draft = useStore((state) => state.draft);
   const setDraft = useStore((state) => state.setDraft);
-  const pendingImages = useStore((state) => state.pendingImages);
-  const setPendingImages = useStore((state) => state.setPendingImages);
+  const pendingAttachments = useStore((state) => state.pendingAttachments);
+  const setPendingAttachments = useStore((state) => state.setPendingAttachments);
   const sendMessage = useStore((state) => state.sendMessage);
   const stopGeneration = useStore((state) => state.stopGeneration);
   const generating = useStore((state) => Boolean(state.generating));
@@ -42,8 +43,11 @@ export function Composer() {
   const fileInput = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [tokenCount, setTokenCount] = useState<number | null>(null);
+  const [reading, setReading] = useState(0);
 
+  const props = useStore((state) => state.props);
   const vision = Boolean(health?.execution?.vision);
+  const readContext = { vision, contextWindow: props?.context_window ?? health?.context_window };
   const enabledTools = tools.filter((tool) => tool.enabled).length;
   const reasoningIndex = Math.max(
     0,
@@ -71,22 +75,45 @@ export function Composer() {
 
   const attach = async (files: File[]) => {
     if (!files.length) return;
-    if (!vision) {
-      toast("The loaded model has no vision tower; images would be ignored", "error");
+    const room = MAX_ATTACHMENTS - pendingAttachments.length;
+    if (room <= 0) {
+      toast(`A turn takes at most ${MAX_ATTACHMENTS} attachments`, "error");
       return;
     }
-    const urls = await Promise.all(files.slice(0, 8).map(readImageFile));
-    setPendingImages([...pendingImages, ...urls].slice(0, 8));
+    if (files.length > room) toast(`Only the first ${room} of ${files.length} files were attached`, "info");
+    setReading((count) => count + 1);
+    try {
+      const read = await Promise.all(files.slice(0, room).map((file) => readAttachment(file, readContext)));
+      for (const attachment of read) {
+        if (attachment.error) toast(`${attachment.name}: ${attachment.error}`, "error");
+      }
+      setPendingAttachments([...useStore.getState().pendingAttachments, ...read].slice(0, MAX_ATTACHMENTS));
+    } finally {
+      setReading((count) => count - 1);
+    }
   };
 
+  const togglePages = async (attachment: Attachment) => {
+    setReading((count) => count + 1);
+    try {
+      const next = await setPdfMode(attachment, attachment.mode === "pages" ? "text" : "pages", readContext);
+      if (next.error) toast(`${next.name}: ${next.error}`, "error");
+      setPendingAttachments(useStore.getState().pendingAttachments.map((item) => (item.id === attachment.id ? next : item)));
+    } finally {
+      setReading((count) => count - 1);
+    }
+  };
+
+  const usable = pendingAttachments.filter((attachment) => !attachment.error);
+
   const submit = () => {
-    if (generating) return;
-    if (!draft.trim() && !pendingImages.length) return;
-    void sendMessage(draft, pendingImages);
+    if (generating || reading) return;
+    if (!draft.trim() && !usable.length) return;
+    void sendMessage(draft, pendingAttachments);
   };
 
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = imageFilesFrom(event.clipboardData?.items);
+    const files = filesFrom(event.clipboardData?.items);
     if (files.length) {
       event.preventDefault();
       void attach(files);
@@ -96,7 +123,7 @@ export function Composer() {
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     setDragging(false);
-    void attach(imageFilesFrom(event.dataTransfer?.files));
+    void attach(filesFrom(event.dataTransfer?.files));
   };
 
   const cycleReasoning = () => {
@@ -107,16 +134,30 @@ export function Composer() {
   return (
     <div className={`composer${dragging ? " composer--drag" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}>
       <div className="composer__box">
-        {pendingImages.length > 0 && (
-          <div className="composer__images">
-            {pendingImages.map((url, index) => (
-              <div key={index} className="composer__thumb">
-                <img src={url} alt="" />
-                <button className="composer__remove" onClick={() => setPendingImages(pendingImages.filter((_, i) => i !== index))} aria-label="Remove image">
-                  <X size={12} />
-                </button>
-              </div>
-            ))}
+        {pendingAttachments.length > 0 && (
+          <div className="composer__attachments">
+            {pendingAttachments.map((attachment) => {
+              const remove = () => setPendingAttachments(pendingAttachments.filter((item) => item.id !== attachment.id));
+              if (attachment.kind === "image" && attachment.url) {
+                return (
+                  <div key={attachment.id} className="composer__thumb">
+                    <img src={attachment.url} alt={attachment.name} />
+                    <button className="composer__remove" onClick={remove} aria-label={`Remove ${attachment.name}`}>
+                      <X size={12} />
+                    </button>
+                  </div>
+                );
+              }
+              return (
+                <AttachmentChip
+                  key={attachment.id}
+                  attachment={attachment}
+                  onRemove={remove}
+                  onTogglePages={attachment.kind === "pdf" && vision ? () => void togglePages(attachment) : undefined}
+                  busy={reading > 0}
+                />
+              );
+            })}
           </div>
         )}
         <textarea
@@ -155,12 +196,15 @@ export function Composer() {
                 </option>
               ))}
             </select>
-            {vision && (
-              <button className="chip chip--button" onClick={() => fileInput.current?.click()} title="Attach image">
-                <ImagePlus size={13} /> Image
-              </button>
-            )}
-            <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(event) => { void attach(imageFilesFrom(event.target.files)); event.target.value = ""; }} />
+            <button
+              className="chip chip--button"
+              onClick={() => fileInput.current?.click()}
+              disabled={reading > 0}
+              title={vision ? "Attach files: images, PDF, Word, Excel, text and code" : "Attach files: PDF, Word, Excel, text and code (no vision tower for images)"}
+            >
+              <Paperclip size={13} /> {reading > 0 ? "Reading…" : "Attach"}
+            </button>
+            <input ref={fileInput} type="file" accept={ACCEPT_ATTRIBUTE} multiple hidden onChange={(event) => { void attach(filesFrom(event.target.files)); event.target.value = ""; }} />
           </div>
           <div className="composer__right">
             {tokenCount !== null && <span className="composer__count" title="Tokens in the draft">{tokenCount} tok</span>}
@@ -174,7 +218,7 @@ export function Composer() {
                 <Square size={14} />
               </button>
             ) : (
-              <button className="send" onClick={submit} disabled={!draft.trim() && !pendingImages.length} aria-label="Send" title="Send (Enter)">
+              <button className="send" onClick={submit} disabled={reading > 0 || (!draft.trim() && !usable.length)} aria-label="Send" title="Send (Enter)">
                 <ArrowUp size={16} />
               </button>
             )}

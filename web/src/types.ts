@@ -30,6 +30,37 @@ export interface MessageMetrics {
   samples?: Array<[number, number]>;
 }
 
+export type AttachmentKind = "image" | "text" | "pdf" | "document" | "sheet";
+
+/**
+ * A file the user hung on a turn. The server only understands text and image
+ * content parts, so everything that is not a picture is extracted to text in
+ * the browser and inlined into the user turn at request-build time.
+ */
+export interface Attachment {
+  id: string;
+  name: string;
+  kind: AttachmentKind;
+  mediaType: string;
+  /** Size of the source file in bytes. */
+  size: number;
+  /** Data URL of the picture itself; images only. */
+  url?: string;
+  /** Extracted text, inlined into the prompt ahead of the user's own words. */
+  text?: string;
+  /** Language hint for the fence around `text`. */
+  language?: string;
+  /** Pages rendered for the vision tower; PDFs in "pages" mode. */
+  pages?: string[];
+  /** PDFs: how this file reaches the model, and how many pages it has. */
+  mode?: "text" | "pages";
+  pageCount?: number;
+  /** Set when `text` was cut to fit the context budget. */
+  truncated?: { shown: number; total: number; unit: string };
+  /** Extraction failed; the chip shows this and nothing is inlined. */
+  error?: string;
+}
+
 export interface Message {
   id: string;
   role: Role;
@@ -37,7 +68,10 @@ export interface Message {
   /** Separate reasoning channel (thinking). */
   reasoning?: string;
   reasoningSeconds?: number;
+  /** Every picture on the turn: image attachments plus rendered PDF pages. */
   images?: string[];
+  /** Full attachment records, for display and for the prompt prelude. */
+  attachments?: Attachment[];
   toolCalls?: ToolCall[];
   /** For role=tool: which call this answers. */
   toolCallId?: string;

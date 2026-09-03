@@ -11,6 +11,7 @@ import type {
   Usage,
 } from "../types";
 import type { SseFrame } from "./sse";
+import { attachmentPrelude } from "./attachments";
 
 export const PROTOCOL_URLS: Record<Protocol, string> = {
   chat: "/v1/chat/completions",
@@ -80,6 +81,11 @@ function reasoningEffort(settings: GenerationSettings): string | undefined {
   return settings.reasoningEffort;
 }
 
+/** A user turn as the model sees it: attached text, then what was typed. */
+function userText(message: Message): string {
+  return `${attachmentPrelude(message)}${message.content}`;
+}
+
 // ---- OpenAI chat completions -------------------------------------------
 
 function chatMessages(messages: Message[]): unknown[] {
@@ -98,12 +104,14 @@ function chatMessages(messages: Message[]): unknown[] {
       }
       return out;
     }
-    if (message.role === "user" && message.images?.length) {
+    if (message.role === "user") {
+      const text = userText(message);
+      if (!message.images?.length) return { role: "user", content: text };
       return {
         role: "user",
         content: [
           ...message.images.map((url) => ({ type: "image_url", image_url: { url } })),
-          { type: "text", text: message.content },
+          { type: "text", text },
         ],
       };
     }
@@ -253,7 +261,8 @@ function anthropicMessages(messages: Message[]): unknown[] {
           : { type: "image", source: { type: "url", url } },
       );
     }
-    if (message.content || !content.length) content.push({ type: "text", text: message.content });
+    const text = userText(message);
+    if (text || !content.length) content.push({ type: "text", text });
     out.push({ role: "user", content });
   }
   return out;
@@ -385,7 +394,7 @@ function responseItems(messages: Message[]): unknown[] {
     }
     const content: unknown[] = [];
     for (const url of message.images ?? []) content.push({ type: "input_image", image_url: url });
-    content.push({ type: "input_text", text: message.content });
+    content.push({ type: "input_text", text: userText(message) });
     items.push({ type: "message", role: "user", content });
   }
   return items;

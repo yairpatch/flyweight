@@ -9,8 +9,10 @@ import { generate } from "./lib/generate";
 import { identifier, titleFromPrompt } from "./lib/format";
 import { buildRequest } from "./lib/protocols";
 import { holdPartialTag, splitThinking } from "./lib/thinking";
+import { attachmentImages, forgetSources } from "./lib/attachments";
 import { loadSettings, saveSettings, settingsFromProps, DEFAULT_SETTINGS } from "./lib/settings";
 import type {
+  Attachment,
   Conversation,
   GenerationSettings,
   HealthPayload,
@@ -124,7 +126,7 @@ interface StoreState {
   sidebarOpen: boolean;
   paletteOpen: boolean;
   toasts: Toast[];
-  pendingImages: string[];
+  pendingAttachments: Attachment[];
   draft: string;
   previewSource: { language: string; code: string } | null;
 
@@ -143,7 +145,7 @@ interface StoreState {
   active: () => Conversation | null;
 
   // messages
-  sendMessage: (text: string, images?: string[]) => Promise<void>;
+  sendMessage: (text: string, attachments?: Attachment[]) => Promise<void>;
   stopGeneration: () => void;
   stopThinking: () => Promise<void>;
   regenerate: (messageId: string) => Promise<void>;
@@ -168,7 +170,7 @@ interface StoreState {
   setPaletteOpen: (open: boolean) => void;
   toast: (text: string, kind?: Toast["kind"]) => void;
   dismissToast: (id: string) => void;
-  setPendingImages: (images: string[]) => void;
+  setPendingAttachments: (attachments: Attachment[]) => void;
   setDraft: (draft: string) => void;
   setPreviewSource: (source: { language: string; code: string } | null) => void;
   clearRequests: () => void;
@@ -428,7 +430,7 @@ export const useStore = create<StoreState>()((set, get) => {
     sidebarOpen: readString(SIDEBAR_KEY, "visible") !== "hidden" && !isNarrow(),
     paletteOpen: false,
     toasts: [],
-    pendingImages: [],
+    pendingAttachments: [],
     draft: "",
     previewSource: null,
 
@@ -506,12 +508,16 @@ export const useStore = create<StoreState>()((set, get) => {
         updatedAt: Date.now(),
         messages: [],
       };
-      set((state) => ({ conversations: [conversation, ...state.conversations], activeId: conversation.id, pendingImages: [] }));
+      forgetSources();
+      set((state) => ({ conversations: [conversation, ...state.conversations], activeId: conversation.id, pendingAttachments: [] }));
       persist(conversation, true);
       return conversation.id;
     },
 
-    selectConversation: (id) => set({ activeId: id, pendingImages: [], ...(isNarrow() ? { sidebarOpen: false } : {}) }),
+    selectConversation: (id) => {
+      forgetSources();
+      set({ activeId: id, pendingAttachments: [], ...(isNarrow() ? { sidebarOpen: false } : {}) });
+    },
 
     deleteConversation: async (id) => {
       const state = get();
@@ -559,25 +565,31 @@ export const useStore = create<StoreState>()((set, get) => {
       return conversation.id;
     },
 
-    sendMessage: async (text, images = []) => {
+    sendMessage: async (text, attachments = []) => {
       const trimmed = text.trim();
-      if (!trimmed && !images.length) return;
+      const usable = attachments.filter((attachment) => !attachment.error);
+      if (!trimmed && !usable.length) return;
       const conversation = ensureConversation();
+      const images = attachmentImages(usable);
       const message: Message = {
         id: identifier("msg"),
         role: "user",
         content: trimmed,
         images: images.length ? images : undefined,
+        // The pictures live in `images`; keeping a second copy on every
+        // attachment would double what IndexedDB stores per turn.
+        attachments: usable.length ? usable.map(({ url: _url, pages: _pages, ...rest }) => rest) : undefined,
         createdAt: Date.now(),
       };
       updateConversation(conversation.id, (item) =>
         touch({
           ...item,
-          title: item.messages.length === 0 && item.title === "New conversation" ? titleFromPrompt(trimmed || "Image") : item.title,
+          title: item.messages.length === 0 && item.title === "New conversation" ? titleFromPrompt(trimmed || usable[0]?.name || "Attachment") : item.title,
           messages: [...item.messages, message],
         }),
       );
-      set({ pendingImages: [], draft: "" });
+      forgetSources();
+      set({ pendingAttachments: [], draft: "" });
       await runGeneration(conversation.id);
     },
 
@@ -745,7 +757,10 @@ export const useStore = create<StoreState>()((set, get) => {
     },
 
     dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((toast) => toast.id !== id) })),
-    setPendingImages: (images) => set({ pendingImages: images }),
+    setPendingAttachments: (attachments) => {
+      forgetSources(attachments);
+      set({ pendingAttachments: attachments });
+    },
     setDraft: (draft) => set({ draft }),
     setPreviewSource: (source) => set({ previewSource: source }),
     clearRequests: () => set({ requests: [] }),

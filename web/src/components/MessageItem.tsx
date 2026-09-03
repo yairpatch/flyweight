@@ -4,6 +4,7 @@ import type { Message, ToolCall } from "../types";
 import { useStore } from "../store";
 import { StreamingMarkdown } from "./Markdown";
 import { Sparkline } from "./charts";
+import { AttachmentChip } from "./AttachmentChip";
 import { detectDirection } from "../lib/direction";
 import { formatRate, formatSeconds, formatTime, prettyJson } from "../lib/format";
 import { holdPartialTag, splitThinking } from "../lib/thinking";
@@ -44,6 +45,15 @@ export const MessageItem = memo(function MessageItem({ message, previous, isLast
           </time>
           {message.protocol && message.role === "assistant" && <span className="msg__proto">{message.protocol}</span>}
         </header>
+        {(message.attachments ?? []).some((attachment) => attachment.kind !== "image") && (
+          <div className="msg__attachments">
+            {(message.attachments ?? [])
+              .filter((attachment) => attachment.kind !== "image")
+              .map((attachment) => (
+                <AttachmentChip key={attachment.id} attachment={attachment} />
+              ))}
+          </div>
+        )}
         {message.images && message.images.length > 0 && (
           <div className="msg__images">
             {message.images.map((url, index) => (

@@ -1,5 +1,7 @@
-// Image attachments: read a File into a data URL, downscaling large images
-// so a screenshot does not become a multi-megabyte request body.
+// Pictures: read a File into a data URL, downscaling large images so a
+// screenshot does not become a multi-megabyte request body. Picking files
+// out of a paste or a drop lives in attachments.ts, which handles every
+// type the composer takes.
 
 const MAX_SIDE = 1536;
 const RESIZE_ABOVE_BYTES = 400 * 1024;
@@ -36,18 +38,4 @@ function loadImage(url: string): Promise<HTMLImageElement> {
     image.onerror = () => reject(new Error("Could not decode image"));
     image.src = url;
   });
-}
-
-export function imageFilesFrom(items: DataTransferItemList | FileList | null | undefined): File[] {
-  if (!items) return [];
-  const files: File[] = [];
-  for (const item of Array.from(items as ArrayLike<DataTransferItem | File>)) {
-    if (item instanceof File) {
-      if (item.type.startsWith("image/")) files.push(item);
-    } else if (item.kind === "file" && item.type.startsWith("image/")) {
-      const file = item.getAsFile();
-      if (file) files.push(file);
-    }
-  }
-  return files;
 }
