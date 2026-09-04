@@ -434,7 +434,13 @@ class NativeV2Tokenizer:
             if value is not None and value != 0xFFFFFFFF:
                 eos.append(int(value))
         # Names still cover checkpoints whose metadata omits the ids.
-        for text in ("<|im_end|>", "<|endoftext|>", "<turn|>", "<eos>"):
+        for text in (
+            "<|im_end|>",
+            "<|ifm|im_end|>",
+            "<|endoftext|>",
+            "<turn|>",
+            "<eos>",
+        ):
             try:
                 eos.append(model.token_id(text))
             except (V2Error, KeyError):

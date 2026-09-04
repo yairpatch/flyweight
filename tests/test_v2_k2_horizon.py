@@ -117,16 +117,21 @@ class K2HorizonNativeTests(unittest.TestCase):
             model.close()
 
 
-DEFAULT_REAL_MODEL = "/home/yair/Downloads/gguf/models--IFM--K2-Horizon-7B-GGUF.gguf"
+CANDIDATE_MODELS = (
+    os.environ.get("FLYWEIGHT_TEST_K2_HORIZON_MODEL"),
+    "/home/yair/Downloads/K2-Horizon-7B-Q8_0.gguf",
+    "/home/yair/Downloads/gguf/models--IFM--K2-Horizon-7B-GGUF.gguf",
+)
+DEFAULT_REAL_MODEL = next((p for p in CANDIDATE_MODELS if p and os.path.isfile(p)), "")
 
 
 @unittest.skipUnless(
-    os.path.isfile(os.environ.get("FLYWEIGHT_TEST_K2_HORIZON_MODEL", DEFAULT_REAL_MODEL)),
+    os.path.isfile(DEFAULT_REAL_MODEL),
     "K2-Horizon GGUF checkpoint not available",
 )
 class K2HorizonRealModelTests(unittest.TestCase):
     def test_real_model_completion(self):
-        path = os.environ.get("FLYWEIGHT_TEST_K2_HORIZON_MODEL", DEFAULT_REAL_MODEL)
+        path = DEFAULT_REAL_MODEL
         with V2Model(path) as model:
             self.assertEqual(model.config["architecture"], "k2-horizon")
             self.assertEqual(model.config["norm_groups"], 4)
@@ -146,7 +151,7 @@ class K2HorizonRealModelTests(unittest.TestCase):
                 self.assertIn("Paris", text)
 
     def test_real_model_thinking_stream(self):
-        path = os.environ.get("FLYWEIGHT_TEST_K2_HORIZON_MODEL", DEFAULT_REAL_MODEL)
+        path = DEFAULT_REAL_MODEL
         from flyweight.v2_server import NativeV2InferenceService
 
         service = NativeV2InferenceService(
@@ -156,6 +161,10 @@ class K2HorizonRealModelTests(unittest.TestCase):
             context_window=1024,
         )
         try:
+            self.assertIn(
+                service.v2_model.token_id("<|ifm|im_end|>"),
+                service.generator.tokenizer.eos_token_ids,
+            )
             prompt_ids = service.generator.prepare_messages(
                 [{"role": "user", "content": "What is 2+2?"}],
                 enable_thinking=True,
@@ -186,8 +195,27 @@ class K2HorizonRealModelTests(unittest.TestCase):
             self.assertNotIn("</ifm|think>", reasoning)
             self.assertNotIn("<ifm|think>", content)
             self.assertNotIn("</ifm|think>", content)
+            self.assertNotIn("<|ifm|im_end|>", content)
+            self.assertNotIn("<|ifm|im_end|>", reasoning)
         finally:
             service.close()
+
+    @unittest.skipUnless(
+        os.path.isfile("/home/yair/Downloads/K2-Horizon-7B-Q8_0.gguf"),
+        "K2-Horizon Q8_0 checkpoint not available",
+    )
+    def test_q8_0_quant_completion(self):
+        with V2Model("/home/yair/Downloads/K2-Horizon-7B-Q8_0.gguf") as model:
+            q8_count = sum(1 for t in model.tensors() if t.get("ggml_type") == 8)
+            self.assertGreater(q8_count, 200)
+
+            tokens = model.tokenize("The capital of France is")
+            with model.native_runtime(context_limit=512, mtp_drafts=0) as runtime:
+                runtime.prepare()
+                output_tokens: list[int] = []
+                runtime.generate(tokens, 10, output_tokens.append)
+                text = "".join(model.token_text(t) for t in output_tokens)
+                self.assertIn("Paris", text)
 
 
 class K2HorizonThinkingTests(unittest.TestCase):
