@@ -3,7 +3,9 @@ requires = ["setuptools>=77", "wheel>=0.43"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flyweight"
+# The distribution name. "flyweight" is prohibited on PyPI; the import
+# package and the command are still `flyweight`.
+name = "flyweight-llm"
 version = "0.2.0"
 description = "Native GGUF inference runtime for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models"
 readme = "README.md"
