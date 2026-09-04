@@ -1,0 +1,37 @@
+name: Feature request
+description: Support for a model, format, kernel or API surface
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [Current limitations](https://github.com/yairpatch/flyweight#current-limitations)
+        first — several likely requests are listed there as deliberate omissions,
+        with the reason.
+
+  - type: textarea
+    id: request
+    attributes:
+      label: What you want
+      description: For a model, name the checkpoint and link the GGUF or HF repo. For a format, say which quantization.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it matters
+      description: What you are trying to do that you cannot do today, and what you are using instead.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: help
+    attributes:
+      label: Are you offering to implement it?
+      options:
+        - "No — requesting only"
+        - "Maybe, with guidance on where to start"
+        - "Yes"
+    validations:
+      required: true
