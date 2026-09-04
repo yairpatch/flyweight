@@ -33,3 +33,9 @@ src/flyweight/_native/*
 
 # third-party reference sources (llama.cpp / HF), kept out of the rename too
 refs/
+
+# profiler dumps and captured stderr from a bench or prof run. These are
+# per-machine scratch: they say what one card did on one afternoon, and a
+# committed copy only goes stale.
+/profile*.txt
+*.err
