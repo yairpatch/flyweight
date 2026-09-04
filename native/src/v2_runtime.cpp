@@ -14945,7 +14945,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     // bitwise-identity and transformers parity among them,
                     // changed their tokens. The residual disagreement is what
                     // the context clamp below absorbs.
-                    const std::uint64_t margin=std::max<std::uint64_t>(384ull*1024*1024,gi.total_memory/32);
+                    std::uint64_t margin=std::max<std::uint64_t>(384ull*1024*1024,gi.total_memory/32);
+                    // A context the caller chose is not going to yield below,
+                    // so the shortfall it would have absorbed lands here: use
+                    // the auto-fit margin and spill enough blocks to cover it.
+                    if(runtime->options.context_explicit)
+                        margin=std::max<std::uint64_t>(2048ull*1024*1024,gi.total_memory/8);
                     budget=gi.free_memory>margin?gi.free_memory-margin:0;
                 }
             }
@@ -15751,7 +15756,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // Only under auto-fit: an explicit --gpu-cache-mib is a statement about
         // the budget, and silently serving a shorter context than asked for
         // would answer a question the caller had already answered.
-        if(auto_fit&&!runtime->options.strict_resident&&gpu_budget&&
+        // ...and only for a context nobody chose. --context-window is that
+        // choice made; the dense spill above already took the larger margin
+        // to honor it, and a run that still does not fit is refused below
+        // with the numbers rather than served shorter than asked.
+        if(auto_fit&&!runtime->options.context_explicit&&
+           !runtime->options.strict_resident&&gpu_budget&&
            base_total_resolved>gpu_budget&&runtime->slots_state_bytes){
             const auto fixed=base_total_resolved-runtime->slots_state_bytes;
             const std::uint64_t requested=runtime->options.context_limit;

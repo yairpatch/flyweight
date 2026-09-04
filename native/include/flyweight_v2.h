@@ -144,6 +144,9 @@ typedef struct FlyweightV2QwenRuntimeOptions {
                                  small card symmetric slots spend expert cache on space
                                  agentic side traffic never touches. Prompts are routed
                                  only to slots that can hold them. */
+    uint32_t context_explicit; /* context_limit was chosen by the caller: never shrink it to fit,
+                                  spill a dense model's feed-forward further instead, and refuse
+                                  with the arithmetic when even that cannot fit */
 } FlyweightV2QwenRuntimeOptions;
 
 typedef struct FlyweightV2QwenRuntimeInfo {

@@ -2491,6 +2491,9 @@ class NativeV2InferenceService(InferenceService):
         model_name: str | None = None,
         device: int = 0,
         context_window: int = 32768,
+        # Whether context_window was chosen rather than defaulted; see the
+        # runtime option of the same name.
+        context_explicit: bool = False,
         max_new_tokens: int = 4096,
         gpu_cache_mib: int = 0,  # 0 = auto-fit the GPU expert cache to free VRAM
         expert_mode: str | None = None,
@@ -2573,6 +2576,7 @@ class NativeV2InferenceService(InferenceService):
             self.v2_runtime = self.v2_model.native_runtime(
                 device=device,
                 context_limit=context_window,
+                context_explicit=context_explicit,
                 gpu_cache_bytes=gpu_cache_mib * 1024**2,
                 expert_mode=expert_mode,
                 moe_device=moe_device,
