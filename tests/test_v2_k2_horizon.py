@@ -348,6 +348,49 @@ class K2HorizonDecodeAttentionTests(unittest.TestCase):
         self.assertEqual(staged, warp)
 
 
+class K2HorizonPrefixRewindTests(unittest.TestCase):
+    """K2 is attention-only, so a prompt that diverges from the cached
+    conversation near its tail rewinds the slot to the shared prefix rather
+    than reprefilling from zero -- the agentic-client case, where the last
+    assistant turn is re-rendered a few tokens differently every turn."""
+
+    def test_a_tail_divergence_reuses_the_shared_prefix(self):
+        first = [8 + (i * 7) % 80 for i in range(40)]
+        # Same first 30 tokens, a different last 10.
+        second = first[:30] + [9 + (i * 5) % 80 for i in range(10)]
+        model, _ = _model(spec=_mova_spec(), seed=3)
+        if not V2Model.gpu_info()["available"]:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+
+        def _runtime():
+            runtime = model.native_runtime(context_limit=256, mtp_drafts=0, expert_mode="cpu")
+            runtime.prepare()
+            return runtime
+
+        runtime = _runtime()
+        try:
+            runtime.generate(first, 3, lambda _t: None)
+            before = dict(runtime.info)
+            rewound: list[int] = []
+            runtime.generate(second, 4, rewound.append)
+            after = dict(runtime.info)
+        finally:
+            runtime.close()
+        self.assertEqual(after["prefix_cache_hits"] - before["prefix_cache_hits"], 1)
+        self.assertEqual(
+            after["prefix_cache_reused_tokens"] - before["prefix_cache_reused_tokens"], 30
+        )
+        # The rewound continuation must be what a cold runtime produces.
+        cold_runtime = _runtime()
+        try:
+            cold: list[int] = []
+            cold_runtime.generate(second, 4, cold.append)
+        finally:
+            cold_runtime.close()
+            model.close()
+        self.assertEqual(rewound, cold)
+
+
 DEFAULT_REAL_MOVA_MODEL = (
     "/home/yair/Downloads/K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf"
 )

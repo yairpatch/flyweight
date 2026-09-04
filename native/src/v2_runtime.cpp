@@ -22272,6 +22272,20 @@ void qwen_drop_expert_pages_for_sweep(
 #endif
 }
 
+// Whether a slot's state can be rewound to an earlier position by truncation
+// alone. True when every layer is attention (its KV rows are position-bound
+// and independent of what came after) and no draft state rides along; a
+// recurrent layer's state is the whole prefix folded together and needs a
+// snapshot to go back to.
+static bool qwen_kv_rewindable(const FlyweightV2QwenRuntime& runtime) {
+    if (runtime.gemma4) return true;
+    if (runtime.options.mtp_drafts) return false;
+    if (runtime.layers.empty()) return false;
+    for (const auto& layer : runtime.layers)
+        if (!layer.attention) return false;
+    return true;
+}
+
 static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, QwenPromptPlan& plan,
         bool require_last_logits=false) {
@@ -22343,11 +22357,16 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         ++runtime->prefix_cache_hits;
         runtime->prefix_cache_reused_tokens+=prompt_start;
         runtime->cancelled=false;
-    }else if(runtime->gemma4&&runtime->prefix_cache_last_lcp_live>0){
+    }else if(qwen_kv_rewindable(*runtime)&&runtime->prefix_cache_last_lcp_live>0){
         // Attention-only state can REWIND to a shared prefix: a KV row below
         // the cut depends only on tokens below it, so truncating position and
         // processed_tokens splices nothing. Recurrent archs cannot (that is
-        // what the exact-prefix rule and the snapshots exist for). The cut
+        // what the exact-prefix rule and the snapshots exist for). This used
+        // to be keyed on Gemma 4 alone; K2-Horizon, Laguna, Muse Glimmer and
+        // the dense Qwen3 checkpoints are attention-only too, and without it
+        // an agentic client that re-renders the last assistant turn (a
+        // thinking tag, a newline) re-evaluated a 27k-token prompt for a
+        // 100-token difference, every turn. The cut
         // must stay inside every sliding-window ring's rollback room -- the
         // batch_room slack past the window -- exactly like a snapshot
         // restore; past it the ring has overwritten the window's oldest
