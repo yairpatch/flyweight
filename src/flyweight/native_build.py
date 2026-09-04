@@ -26,6 +26,37 @@ def default_output() -> Path:
     return Path(__file__).with_name("_native")
 
 
+def _replace_library(built: Path, destination: Path) -> None:
+    """Install the freshly built library WITHOUT touching the old file's inode.
+
+    A running server has this library mmap'd. Copying onto it in place --
+    shutil.copy2 opens the destination with O_TRUNC and writes through the same
+    inode -- pulls the mapped pages out from under that process, and its next
+    call into the runtime dies with SIGBUS or SEGV_ACCERR somewhere with no
+    symbols left to name. That is a genuinely baffling crash to be handed by a
+    rebuild in another terminal, and it cost a live 45k-token session to
+    diagnose.
+
+    Writing a sibling and renaming is atomic: the old inode stays alive and
+    mapped for as long as the server holds it, so the running process keeps
+    working on the code it started with and picks the new library up when it is
+    next restarted. On Windows, where a loaded DLL cannot be replaced at all,
+    the rename fails and the old library is left in place rather than
+    half-overwritten -- so the message says which process to stop.
+    """
+    staged = destination.with_name(destination.name + ".new")
+    shutil.copy2(built, staged)
+    try:
+        os.replace(staged, destination)
+    except OSError as error:
+        staged.unlink(missing_ok=True)
+        raise OSError(
+            f"could not install the native library over {destination}: {error}. "
+            "Stop whatever has it loaded (a running `flyweight serve`) and "
+            "build again."
+        ) from error
+
+
 def build_native(
     *,
     output: Path | None = None,
@@ -111,7 +142,7 @@ def build_native(
                 continue
             destination = output / candidate.name
             if candidate != destination:
-                shutil.copy2(candidate, destination)
+                _replace_library(candidate, destination)
             return destination
     raise FileNotFoundError("native build completed without a runtime library")
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -41,6 +42,33 @@ class NativeBuildTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("no native sources", message)
         self.assertIn("wheel", message)
+
+    def test_installing_the_library_does_not_reuse_the_old_inode(self) -> None:
+        # A running server has the library mmap'd. Copying onto it in place
+        # truncates the inode those mappings point at, and the server's next
+        # call into the runtime dies with SIGBUS or SEGV_ACCERR in a frame with
+        # no symbols -- observed live, twice in one evening, from a rebuild in
+        # another terminal. Renaming a sibling into place leaves the old inode
+        # alive for whoever still holds it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "flyweight_v2.so"
+            destination.write_bytes(b"old library")
+            # Stand in for the running server: an open handle on the old inode.
+            with destination.open("rb") as mapped:
+                held = os.fstat(mapped.fileno()).st_ino
+                built = root / "built" / "flyweight_v2.so"
+                built.parent.mkdir()
+                built.write_bytes(b"new library")
+                native_build._replace_library(built, destination)
+                # The holder still reads what it opened, byte for byte.
+                self.assertEqual(mapped.read(), b"old library")
+            self.assertEqual(destination.read_bytes(), b"new library")
+            self.assertNotEqual(destination.stat().st_ino, held)
+            # And no staging file is left beside it.
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir()),
+                ["built", "flyweight_v2.so"])
 
 
 @unittest.skipUnless(os.name == "nt", "the Windows toolchain lookup")
