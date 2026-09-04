@@ -11106,14 +11106,19 @@ __device__ void kv_attention_gqa_mma_impl(
     // query head `group` at dims 2*quad, +1, +8, +9 of every 16-dim step.
     unsigned int query_operand[fragments][2];
     {
-        const float* row = query + (long long)(head_base + group) * head_dim;
+        // The mma's query dimension is eight columns wide. A group narrower
+        // than that (4-way GQA) fills the first `share` and zeroes the rest,
+        // so the spare columns cost their share of the tensor-core issue and
+        // nothing else -- the merge below never reads them.
+        const float* row = query + (long long)(head_base + (group < share ? group : 0)) * head_dim;
+        const float column_scale = group < share ? scale : 0.0f;
         #pragma unroll
         for (int fragment = 0; fragment < fragments; ++fragment) {
             const int start = fragment * 16 + 2 * quad;
             query_operand[fragment][0] = kv_mma_pack<Operand>(
-                row[start] * scale, row[start + 1] * scale);
+                row[start] * column_scale, row[start + 1] * column_scale);
             query_operand[fragment][1] = kv_mma_pack<Operand>(
-                row[start + 8] * scale, row[start + 9] * scale);
+                row[start + 8] * column_scale, row[start + 9] * column_scale);
         }
     }
 
@@ -11317,6 +11322,18 @@ KV_ATTENTION_GQA_MMA(
 KV_ATTENTION_GQA_MMA(
     kv_attention_gqa_mma_q8_256_s8_t256, unsigned char, unsigned char, __half,
     256, 8, 256)
+// 128-dim heads in 4-way groups (K2-Horizon, Laguna). Half the mma's query
+// columns idle; the tensor-core pass still beats the per-head kernels.
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_f16_128_s4_t512, __half, __half, __half, 128, 4, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_f16_128_s4_t256, __half, __half, __half, 128, 4, 256)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_q8_128_s4_t512, unsigned char, unsigned char, __half,
+    128, 4, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_q8_128_s4_t256, unsigned char, unsigned char, __half,
+    128, 4, 256)
 #endif
 // bf16 operands are one step later than f16 ones.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -11326,6 +11343,12 @@ KV_ATTENTION_GQA_MMA(
 KV_ATTENTION_GQA_MMA(
     kv_attention_gqa_mma_bf16_256_s8_t256, __nv_bfloat16, __nv_bfloat16,
     __nv_bfloat16, 256, 8, 256)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_bf16_128_s4_t512, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 128, 4, 512)
+KV_ATTENTION_GQA_MMA(
+    kv_attention_gqa_mma_bf16_128_s4_t256, __nv_bfloat16, __nv_bfloat16,
+    __nv_bfloat16, 128, 4, 256)
 #endif
 #undef KV_ATTENTION_GQA_MMA
 )FLYWEIGHT_CUDA"
