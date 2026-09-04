@@ -273,6 +273,54 @@ class K2HorizonValueCacheTests(unittest.TestCase):
         self.assertEqual(histories[0].stat().st_size, 44 + 12 * entries)
 
 
+class K2HorizonDecodeAttentionTests(unittest.TestCase):
+    """K2 decodes through the 128-dim attention dispatch (cuBLAS, fused
+    tiles, serial ring); the three must agree on greedy tokens."""
+
+    def _tokens(self, env: dict[str, str], prompt_tokens: int = 40,
+                context: int = 256, steps: int = 24) -> list[int]:
+        spec = K2HorizonSpec(heads=4, kv_heads=2, head_dim=128, rotary_dim=64)
+        with unittest.mock.patch.dict(os.environ, env):
+            model, _ = _model(spec=spec, seed=5)
+            if not V2Model.gpu_info()["available"]:
+                raise unittest.SkipTest("native CUDA runtime is unavailable")
+            runtime = model.native_runtime(
+                context_limit=context, mtp_drafts=0, expert_mode="cpu",
+                cache_type_k="f16", cache_type_v="f16",
+            )
+            runtime.prepare()
+            try:
+                produced: list[int] = []
+                prompt = [8 + (i * 7) % 80 for i in range(prompt_tokens)]
+                runtime.generate(prompt, steps, produced.append)
+                return produced
+            finally:
+                runtime.close()
+                model.close()
+
+    def test_the_three_decode_attention_paths_agree(self):
+        # The window has to be long enough to hit the cuBLAS threshold; the
+        # threshold is lowered so a 256-token fixture reaches it.
+        cublas = self._tokens({"FLYWEIGHT_CUBLAS_ATTENTION_MIN_TOKENS": "8"})
+        fused = self._tokens({"FLYWEIGHT_CUBLAS_ATTENTION": "0"})
+        ring = self._tokens({"FLYWEIGHT_CUBLAS_ATTENTION": "0",
+                             "FLYWEIGHT_FUSED_ATTENTION": "0"})
+        self.assertEqual(fused, ring)
+        self.assertEqual(cublas, ring)
+
+    def test_tensor_core_prefill_matches_the_warp_prefill(self):
+        """K2 runs the cuBLAS prefill attention ungated and gates afterwards;
+        forced on, it must reproduce the warp kernel's tokens."""
+        # The tensor-core tiles need a visible prefix of at least 256 tokens,
+        # so the prompt is long enough for the later chunks to qualify.
+        common = {"FLYWEIGHT_PREFILL_ROWS": "512", "FLYWEIGHT_CUBLAS_ATTENTION": "0"}
+        warp = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "0"},
+                            prompt_tokens=600, context=8192, steps=8)
+        tensor_core = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "1"},
+                                   prompt_tokens=600, context=8192, steps=8)
+        self.assertEqual(tensor_core, warp)
+
+
 DEFAULT_REAL_MOVA_MODEL = (
     "/home/yair/Downloads/K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf"
 )

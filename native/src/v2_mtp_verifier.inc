@@ -1244,9 +1244,11 @@ void qwen_forward_rows(
             // The tensor-core prefill routines fold Qwen's per-channel sigmoid
             // gate in themselves, so Laguna, whose gate is a per-head softplus,
             // cannot use them and takes the warp path with its own gate kernel.
+            // K2-Horizon runs them ungated (the unpack the rotated turbo path
+            // already uses) and applies its softplus gate afterwards.
             const bool cublas_prefill_done=
                 !qsa_chunk_selecting&&
-                cublas_prefill_requested&&!laguna&&!k2horizon&&!layer.attention_window&&
+                cublas_prefill_requested&&!laguna&&!layer.attention_window&&
                 // f16 and bf16 both: the cache is handed to cuBLAS in
                 // place, so what matters is that it is a 16-bit float the GEMM
                 // has a type code for, and that K and V agree -- one code feeds
@@ -1264,7 +1266,7 @@ void qwen_forward_rows(
                     attention_scores+packed_query_bytes,flash_state,third,
                     runtime.stream,heads,kv_heads,head_dim,rows,capacity,
                     static_cast<int>(runtime.position)+span_begin,
-                    cublas_tile_rows,cublas_block_tokens,scale,1)==0;
+                    cublas_tile_rows,cublas_block_tokens,scale,k2horizon?0:1)==0;
             // FLYWEIGHT_ATTN_PREFILL_TRACE=1: which attention path actually ran,
             // printed for the first few layers. The cuBLAS attempt fails
             // silently by design (missing library, kernel, workspace), so a
@@ -1343,7 +1345,13 @@ void qwen_forward_rows(
                     launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
                 }
             }else if(cublas_prefill_done){
-                // Tensor-core attention wrote the already-gated rows to third.
+                // Tensor-core attention wrote the rows to third: gated for
+                // Qwen, plain for K2-Horizon, whose gate runs here in place.
+                if(k2_gate){
+                    int elements=rows*query_elements;
+                    void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
+                    launch("k2_attention_gate",(elements+255)/256,1,256,gate_args);
+                }
             }else if(!layer.attention_window&&head_dim%32==0&&head_dim<=256&&
                      kv_fused_prefill_ok(runtime)&&
                      // ...unless the cache is one that stages onto the
@@ -1452,7 +1460,9 @@ void qwen_forward_rows(
                     }
                 }
             }
-            dense(4,(k2horizon&&!k2_gate)?second:third,residual,query_elements,hidden_size);
+            // K2-Horizon without a gate leaves the warp kernels' output in
+            // `second`; every other combination lands in `third`.
+            dense(4,(k2horizon&&!k2_gate&&!cublas_prefill_done)?second:third,residual,query_elements,hidden_size);
             // Muse Glimmer normalizes the attention output before the residual
             // join rather than adding it raw.
             if(muse)post_rms_rows(residual,tensor(8));
