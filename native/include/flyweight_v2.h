@@ -113,7 +113,7 @@ typedef struct FlyweightV2QwenRuntimeOptions {
     int32_t cache_type_k; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4, 6=auto */
     int32_t cache_type_v; /* 0=f32, 1=f16, 2=bf16, 3=q8_0, 4=turbo3, 5=turbo4, 6=auto */
     uint32_t prefill_checkpoint_interval; /* position of the first mid-prefill checkpoint; 0 disables (end snapshots only) */
-    uint32_t prefill_checkpoint_slots; /* total prefix-reuse snapshot slots; 0 = default (4) */
+    uint32_t prefill_checkpoint_slots; /* total prefix-reuse snapshot slots (slot 0 anchors the interval pin, the end-of-prompt checkpoint rotates through the rest); 0 = default (4) */
     uint32_t parallel_sequences; /* independent KV/decode slots (llama.cpp --parallel); 0/1 = single-sequence */
     uint32_t prompt_cache_mib; /* host RAM budget for spilled slot state (llama.cpp prompt cache); 0 disables */
     uint32_t swa_full; /* keep full-size SWA KV caches for unrestricted prefix reuse */

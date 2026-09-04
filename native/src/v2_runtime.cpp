@@ -744,9 +744,13 @@ struct QwenPromptPlan {
     std::vector<std::uint64_t> targets;
     std::size_t next_target = 0;
     // Position of the tail checkpoint, one token SHORT of the prompt's end,
-    // saved into the reserved snapshot slot as the prefill passes it. 0 when
-    // none is due (no reserved slot, or reuse already covered it).
+    // saved as the prefill passes it. 0 when none is due (no spare slot, or
+    // reuse already covered it).
     std::uint64_t tail_target = 0;
+    // Which slot the tail checkpoint takes. It ROTATES over the slots no mid
+    // target is about to claim, so consecutive turns leave a ladder of recent
+    // prompt boundaries instead of one another's only usable checkpoint.
+    std::size_t tail_slot = 1;
 };
 
 struct QwenSamplingState {
@@ -13239,11 +13243,13 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     // prompt diverges mid-stream (agentic clients mutate the prefix: injected
     // reminders, re-rendered tool calls) resume from the nearest checkpoint <=
     // the divergence point instead of reprefilling the whole prompt. `interval`
-    // is the position of the first checkpoint; the rest are geometric
-    // (interval<<k) so early coverage (the stable system+tools prefix) is dense.
-    // `slots` is the total snapshot pool (one reserved for the exact
-    // end-of-prompt snapshot). interval=0 disables mid checkpoints (end
-    // snapshots only, legacy behavior); slots=0 falls back to the default.
+    // is the position of the first checkpoint, pinned there as the reuse floor
+    // a compacted history falls back on; the rest spread over the prompt.
+    // `slots` is the total snapshot pool: slot 0 holds that pin, and the
+    // end-of-prompt snapshot rotates through the rest so a session keeps the
+    // last few prompt boundaries rather than one. interval=0 disables mid
+    // checkpoints (end snapshots only, legacy behavior); slots=0 falls back to
+    // the default.
     runtime->prefill_checkpoint_interval=runtime->options.prefill_checkpoint_interval;
     const std::size_t checkpoint_slots=runtime->options.prefill_checkpoint_slots
         ? std::clamp<std::size_t>(runtime->options.prefill_checkpoint_slots,1,256):4;
@@ -20554,14 +20560,19 @@ static void qwen_spill_slot_to_host(FlyweightV2QwenRuntime& runtime, std::size_t
     e.bytes = packed_bytes;
     e.geometry = seq.geometry;
     std::uint64_t copied_snapshots=0;
-    // Tail checkpoint first: under budget pressure snapshots_to_copy truncates
-    // this loop, and the end-of-prompt checkpoint in the reserved last slot is
-    // what lets the recalled turn reuse past the prompt boundary. Dropping
-    // early mids instead loses only mid-conversation fallbacks.
+    // Newest checkpoint first: under budget pressure snapshots_to_copy
+    // truncates this loop, and the end-of-prompt checkpoints are what let the
+    // recalled turn reuse past a prompt boundary. Dropping the oldest instead
+    // loses only the deepest mid-conversation fallbacks. Ordering by clock
+    // rather than by slot index because the tail rotates (qwen_prompt_begin) --
+    // the last slot is no longer reliably the freshest.
     std::vector<std::size_t> spill_order;
     spill_order.reserve(snapshots.size());
-    if (!snapshots.empty()) spill_order.push_back(snapshots.size() - 1);
-    for (std::size_t i = 0; i + 1 < snapshots.size(); ++i) spill_order.push_back(i);
+    for (std::size_t i = 0; i < snapshots.size(); ++i) spill_order.push_back(i);
+    std::stable_sort(spill_order.begin(), spill_order.end(),
+        [&](std::size_t a, std::size_t b) {
+            return snapshots[a].clock > snapshots[b].clock;
+        });
     for (const auto snapshot_index : spill_order) {
         const auto& s = snapshots[snapshot_index];
         if (!s.valid || s.tokens.empty() || copied_snapshots>=snapshots_to_copy) continue;
@@ -21246,8 +21257,8 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
     // clustering at 256/512/1024 (measured live: geometric placement reused
     // only 1024 of a 13313-token shared prefix -- but NO early checkpoint
     // meant a compacted conversation reused nothing at all, hence the pin).
-    // The last slot is reserved for the exact end-of-prompt snapshot saved
-    // below. Targets already covered by the reused prefix are skipped.
+    // One slot is left for the end-of-prompt snapshot saved below. Targets
+    // already covered by the reused prefix are skipped.
     plan.targets.clear();
     if(runtime->prefill_snapshot_bytes&&
        runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1){
@@ -21271,7 +21282,37 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
     }
     plan.next_target=0;
     while(plan.next_target<plan.targets.size()&&plan.targets[plan.next_target]<=prompt_start)++plan.next_target;
-    // The reserved slot's checkpoint is taken one token SHORT of the end, not
+    // The end-of-prompt checkpoint ROTATES through the slots this prefill is
+    // not about to write, instead of always taking the last one.
+    //
+    // A single reserved tail slot let the ladder ossify. Mid targets are
+    // fractions of the WHOLE prompt, and the loop above skips every target the
+    // reused prefix already covers -- so from the second turn of a conversation
+    // on, every mid is <= prompt_start and slots [0,mids) freeze at the first
+    // prompt's positions while the one tail slot is overwritten each turn. The
+    // gap between the highest checkpoint and the conversation tip then grows
+    // without bound. Measured live on a 14-turn agentic session: checkpoints
+    // stuck at {256, 4000, 8000} against a 38k tip, and a 67k-token turn that
+    // diverged at 66387 (a forced thinking-block close the client re-rendered)
+    // found its nearest checkpoint at 25820 and reprefilled 41411 tokens -- a
+    // sweep-shaped prefill that also evicts the expert cache, so the turn after
+    // it decodes cold too.
+    //
+    // Rotating spends the same slots on the last (slots-1) prompt boundaries,
+    // roughly one turn of spacing around the tip, which is where an agentic
+    // client actually rewrites. Slot 0 is never a tail: it holds the early
+    // anchor -- the interval pin, or a donated checkpoint -- that a compacted
+    // history falls back on (see the pin above and qwen_donate_prefix).
+    plan.tail_slot=runtime->prefill_snapshots.size()-1;
+    for(std::size_t i=1,best=0;i<runtime->prefill_snapshots.size();++i){
+        // A slot a pending mid target still owns is not free to take.
+        if(i>=plan.next_target&&i<plan.targets.size())continue;
+        const auto&candidate=runtime->prefill_snapshots[i];
+        const auto&incumbent=runtime->prefill_snapshots[plan.tail_slot];
+        if(!best++||!candidate.valid||
+           (incumbent.valid&&candidate.clock<incumbent.clock))plan.tail_slot=i;
+    }
+    // The tail checkpoint is taken one token SHORT of the end, not
     // at it. A prompt ends with the assistant header's forced "<think>" opener
     // plus a newline, and the next turn re-renders that reply with the
     // reasoning stripped -- where the newline re-tokenizes into a different
@@ -21308,7 +21349,7 @@ static void qwen_prompt_checkpoints(FlyweightV2QwenRuntime* runtime,
     // match is guaranteed on the way to the end of every prompt this is due
     // for.
     if(plan.tail_target&&runtime->position==plan.tail_target){
-        auto&slot=runtime->prefill_snapshots.back();
+        auto&slot=runtime->prefill_snapshots[plan.tail_slot];
         qwen_prefill_snapshot_copy(*runtime,slot.device,false);
         slot.tokens.assign(prompt,prompt+runtime->position);
         slot.image_spans=qwen_spans_before(runtime->image_spans,runtime->position);
@@ -21707,21 +21748,27 @@ static void qwen_prefetch_cpu_experts(FlyweightV2QwenRuntime& runtime) {
 // Save this prompt's end-of-prefill state so the next turn only prefills its
 // suffix, and re-enable expert-cache admission for decode.
 static void qwen_mtp_expire_calibration(FlyweightV2QwenRuntime&runtime);
+// `tail_slot` is the plan's -- see QwenPromptPlan::tail_slot. It travels as an
+// argument rather than on the runtime because the cooperative engine interleaves
+// tasks: each carries its own plan, and a second task admitted between this
+// prompt's begin and its finish would otherwise hand this one the wrong slot.
 static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
         const uint32_t* prompt, uint64_t prompt_count, uint32_t next_token,
-        uint64_t requested_generation_tokens) {
+        uint64_t requested_generation_tokens, std::size_t tail_slot) {
     runtime->cache_admission_enabled=true;
     if(runtime->options.mtp_drafts)qwen_mtp_expire_calibration(*runtime);
     qwen_prefetch_cpu_experts(*runtime);
     qwen_seed_prefill_experts(*runtime,requested_generation_tokens);
     if(!runtime->prefill_snapshot_bytes)return;
-    // Prefer the reserved slot when mid checkpoints exist, else the slot already
-    // tracking this conversation, else a free slot, else the LRU.
+    // Prefer this prompt's rotated tail slot when mid checkpoints exist, else
+    // the slot already tracking this conversation, else a free slot, else the
+    // LRU.
     QwenPrefillSnapshot*slot=nullptr;
     if(runtime->prefill_checkpoint_interval&&runtime->prefill_snapshots.size()>1){
-        // Mid-prefill checkpoints own slots [0,size-1); the end-of-prompt
-        // snapshot has the reserved last slot so it never evicts a mid.
-        slot=&runtime->prefill_snapshots.back();
+        // qwen_prompt_begin picked a slot no mid target of this prefill claims,
+        // and rotates it turn to turn so the previous boundaries survive.
+        slot=&runtime->prefill_snapshots[std::min(
+            tail_slot,runtime->prefill_snapshots.size()-1)];
         // When the prefill just wrote its tail checkpoint here (one token
         // short of this prompt -- see qwen_prompt_begin), keep it. Replacing
         // it with the exact end state traded the one snapshot the next turn
@@ -22234,7 +22281,8 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
         status=qwen_prefill_unit(runtime,prompt,prompt_count,plan,index,next_token,prefill_done);
         if(status)return status;
     }
-    qwen_prompt_finish(runtime,prompt,prompt_count,next_token,max_tokens);
+    qwen_prompt_finish(runtime,prompt,prompt_count,next_token,max_tokens,
+                       plan.tail_slot);
     QwenResidencyEpochGuard residency_epoch{*runtime};
     if(runtime->options.mtp_drafts){
         uint64_t emitted=0;
@@ -23489,7 +23537,8 @@ static bool qwen_engine_try_start(FlyweightV2QwenRuntime& runtime, QwenEngineTas
     task.next_token = task.plan.next_token;
     if (task.index >= prompt_count) {  // full reuse: nothing to prefill
         qwen_prompt_finish(
-            &runtime,prompt,prompt_count,task.next_token,task.max_tokens);
+            &runtime,prompt,prompt_count,task.next_token,task.max_tokens,
+            task.plan.tail_slot);
         task.phase = 2;
     } else {
         task.phase = 1;
@@ -23566,7 +23615,7 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                 if(done){
                     qwen_prompt_finish(
                         runtime,task.prompt.data(),task.prompt.size(),
-                        task.next_token,task.max_tokens);
+                        task.next_token,task.max_tokens,task.plan.tail_slot);
                     task.phase=2;
                 }
                 emit(task.id,static_cast<std::uint32_t>(task.index),3);
