@@ -875,6 +875,7 @@ struct FlyweightV2QwenRuntime {
     bool gemma4 = false;
     bool laguna = false;
     bool muse = false;
+    bool k2horizon = false;
     // qwen4exp (Qwen3.8-Flash-Next): gated-residual streams + PLE n-gram
     // embeddings on the qwen plan shapes. The flag gates the hc_pre/hc_post
     // bookends in the forward paths and, at bring-up, disables CUDA graphs
@@ -2688,6 +2689,7 @@ int parse(FlyweightV2Model& m) {
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.sliding_window_pattern")==0 && (type==4 || type==10)) m.config.sliding_window_period=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=12 && key.compare(key.size()-12,12,".logit_scale")==0 && (type==6 || type==12)) m.config.logit_scale=read_float(type);
         else if (key.size()>=33 && key.compare(key.size()-33,33,".attention.layer_norm_rms_epsilon")==0 && (type==6 || type==12)) m.config.rms_norm_epsilon=read_float(type);
+        else if (key.size()>=28 && key.compare(key.size()-28,28,".attention.group_norm_groups")==0 && (type==4 || type==10)) m.config.norm_groups=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=21 && key.compare(key.size()-21,21,".attention.key_length")==0 && (type==4 || type==10)) m.config.key_length=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=23 && key.compare(key.size()-23,23,".attention.value_length")==0 && (type==4 || type==10)) m.config.value_length=static_cast<uint32_t>(read_uint(type));
         else if (key.size()>=25 && key.compare(key.size()-25,25,".attention.key_length_swa")==0 && (type==4 || type==10)) m.config.key_length_swa=static_cast<uint32_t>(read_uint(type));
@@ -2933,6 +2935,13 @@ void add_static_tensor(
     runtime.static_tensor_bytes += runtime.model->tensors[index].size;
 }
 
+std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
+    if(runtime.laguna)return 8;
+    if(runtime.muse)return 9;
+    if(runtime.k2horizon)return 5;
+    return layer.attention?7:10;
+}
+
 void build_qwen_plan(FlyweightV2QwenRuntime& runtime) {
     auto& model = *runtime.model;
     runtime.token_embeddings = first_tensor_index(
@@ -2961,6 +2970,31 @@ void build_qwen_plan(FlyweightV2QwenRuntime& runtime) {
         layer.attention = has_tensor(model, prefix + "attn_q.weight");
         if(layer.attention)layer.attention_window=attention_window(model,layer_index);
         add_static_tensor(runtime, layer, prefix + "attn_norm.weight");
+        if (runtime.k2horizon) {
+            for (const char* suffix : {
+                     "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                     "attn_output.weight"
+                 }) add_static_tensor(runtime, layer, prefix + suffix);
+            layer.attention_heads=model.config.attention_heads;
+            layer.kv_heads=model.config.attention_kv_heads;
+            if(!layer.kv_heads||model.tensors[layer.static_tensors[2]].shape.size()<2)
+                throw std::runtime_error("GGUF attention geometry is incomplete: attention.head_count_kv is zero or attn_k is not a matrix");
+            layer.head_dim=static_cast<std::uint32_t>(model.tensors[layer.static_tensors[2]].shape[1]/layer.kv_heads);
+            layer.rotary_dim=std::min<std::uint32_t>(model.config.rotary_dimension?model.config.rotary_dimension:layer.head_dim,layer.head_dim);
+            layer.rope_theta=model.config.rope_freq_base?model.config.rope_freq_base:10000000.0f;
+            layer.dense_ffn = true;
+            const char* ffn_norm =
+                 has_tensor(model, prefix + "post_attention_norm.weight")
+                       ? "post_attention_norm.weight" : "ffn_norm.weight";
+            add_static_tensor(runtime, layer, prefix + ffn_norm);
+            for (const char* suffix : {
+                     "ffn_gate.weight",
+                     "ffn_up.weight",
+                     "ffn_down.weight"
+                 }) add_static_tensor(runtime, layer, prefix + suffix);
+            runtime.layers.push_back(std::move(layer));
+            continue;
+        }
         if (layer.attention) {
             for (const char* suffix : {
                      "attn_q.weight", "attn_k.weight", "attn_v.weight",
@@ -3110,7 +3144,7 @@ void build_qwen_plan(FlyweightV2QwenRuntime& runtime) {
     if(runtime.layers.empty())
         throw std::runtime_error("GGUF block_count is zero: the checkpoint has no layers to plan");
     const auto& front = runtime.layers.front();
-    const std::size_t ffn_base = front.attention ? 7 : 10;
+    const std::size_t ffn_base = qwen_ffn_base(runtime, front);
     const auto& gate = model.tensors[front.static_tensors[ffn_base + (front.dense_ffn ? 1 : 2)]];
     runtime.moe_intermediate=static_cast<std::uint32_t>(gate.shape[1]);
     // The dense SwiGLU stages gate and up contiguously so silu_mul can read one
@@ -3377,18 +3411,6 @@ void qwen_yarn_correction_dims(
     low=std::max(0.0f,std::floor(dimension(beta_fast)));
     high=std::min(static_cast<float>(rotary_dim-1),std::ceil(dimension(beta_slow)));
     if(high<low)high=low;
-}
-
-// Slot of the block's feed-forward norm within static_tensors, which every
-// later feed-forward tensor is addressed relative to. Laguna's attention blocks
-// carry an extra gate projection ahead of it; Qwen's DeltaNet blocks carry the
-// wider recurrent set.
-std::size_t qwen_ffn_base(const FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer) {
-    if(runtime.laguna)return 8;
-    // Muse Glimmer carries a post-attention norm that the other layouts do not,
-    // so its pre-FFN norm sits one slot later and gate/up/down at 10/11/12.
-    if(runtime.muse)return 9;
-    return layer.attention?7:10;
 }
 
 // Laguna (poolside): every block is full attention or sliding-window attention
@@ -9760,7 +9782,7 @@ out->draft_block_size=m->config.draft_block_size;
 out->target_layers_length=static_cast<std::uint32_t>(m->config.target_layers.size());
 out->mask_token_id=m->config.mask_token_id;
 out->logit_scale=m->config.logit_scale;
-out->final_logit_softcap=m->config.final_logit_softcap;return 0;});}
+out->final_logit_softcap=m->config.final_logit_softcap;out->norm_groups=m->config.norm_groups;return 0;});}
 
 // Multiply a model tensor by a vector, decoding whatever weight type the
 // checkpoint stores it as. GGUF reports a matrix as [inputs, outputs], so
@@ -12984,7 +13006,7 @@ void gguf_bpe_piece(const FlyweightV2Model& m, const std::string& piece,
 std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
                                           const std::string& text) {
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
-    if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
+    if(m.tokenizer_pre=="llama4"||m.tokenizer_pre=="k2-horizon")return gpt4o_pretokenize(text,3);
     if(m.tokenizer_pre=="llama-bpe")return llama_bpe_pretokenize(text);
     return laguna_pretokenize(text);
 }
@@ -13011,7 +13033,8 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
     // (<|start|>, <|message|>, <|eom|>, <|eot|>), and BPE would happily shred
     // them into ordinary text, so it takes the exact-match split too.
     if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"||
-       m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"){
+       m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"||
+       m->tokenizer_pre=="k2-horizon"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -13096,12 +13119,13 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     const bool laguna=m->config.architecture=="laguna";
     const bool muse=m->config.architecture=="muse-glimmer";
     const bool qwen4exp=m->config.architecture=="qwen4exp";
+    const bool k2horizon=m->config.architecture=="k2-horizon";
     // DeepSeek-V4 loads and describes itself but has no execution path yet, so
     // it gets its own message rather than looking like an unknown format.
     if(m->config.architecture=="deepseek4")throw std::runtime_error(
         "deepseek4 checkpoints load and report their configuration, but the native runtime "
         "cannot execute them yet (no hyper-connection, compressed-attention or indexer path)");
-    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse)throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna and Muse Glimmer models");
+    if(m->config.architecture.find("qwen")!=0&&!gemma4&&!laguna&&!muse&&!k2horizon)throw std::runtime_error("native runtime supports Qwen, Gemma 4, Laguna, Muse Glimmer and K2-Horizon models");
     // Dense checkpoints report no experts at all, so only require a routing
     // width from the ones that actually route.
     const bool dense_ffn=has_tensor(*m,"blk.0.ffn_gate.weight");
@@ -13144,6 +13168,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     // Muse Glimmer's speculative drafter is a separate DFlash checkpoint rather
     // than in-model MTP heads, so there is nothing here to draft with.
     if(muse&&runtime->options.mtp_drafts)throw std::runtime_error("native Muse Glimmer MTP is not implemented");
+    if(k2horizon&&runtime->options.mtp_drafts)throw std::runtime_error("native K2-Horizon MTP is not implemented");
     if(gemma4&&m->config.per_layer_embedding_size)throw std::runtime_error("native Gemma 4 per-layer embeddings are not implemented");
     if(gemma4&&m->config.shared_kv_layers)throw std::runtime_error("native Gemma 4 shared-KV tail layers are not implemented");
     if(m->config.expert_count&&runtime->options.expert_top_k>m->config.expert_used_count)throw std::runtime_error("native Qwen expert_top_k cannot exceed the model's trained expert_used_count");
@@ -13172,16 +13197,13 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>6)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>6)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
+    runtime->qwen4exp=qwen4exp;
+    runtime->k2horizon=k2horizon;
     if(gemma4)build_gemma4_plan(*runtime);
     else if(laguna)build_laguna_plan(*runtime);
     else if(muse)build_muse_glimmer_plan(*runtime);
     else if(qwen4exp)build_qwen4exp_plan(*runtime);
     else build_qwen_plan(*runtime);
-    // qwen4exp: the flag gates the gated-residual bookends in the forward
-    // paths, and the graph-capture sites refuse to capture on it at bring-up
-    // (the delta capture would bake in the plain residual add the bookends
-    // replace; a replay would corrupt the streams silently).
-    runtime->qwen4exp=qwen4exp;
     // Resolve cache type `auto`. Must run after the layer plan, which is what
     // supplies head_dim; the rule and its measurements live in
     // flyweight::v2::attention so they can be pinned by a contract test.
@@ -18433,7 +18455,17 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     // The Q8 copy of `normalized` is reused across the projections that share
     // it, so rms -- its only writer -- has to drop that memo.
     std::uint64_t q8_cached_input=0;
-    auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){int one_centered=0;q8_cached_input=0;void*args[]={&input,&weights,&output,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};launch_named("rms_norm",1,1,1024,args);};
+    auto rms=[&](std::uint64_t input,std::uint64_t weights,std::uint64_t output){
+        q8_cached_input=0;
+        if(runtime->k2horizon){
+            const int groups=static_cast<int>(runtime->model->config.norm_groups?runtime->model->config.norm_groups:4);
+            const int group_size=hidden_size/groups;
+            void*args[]={&input,&weights,&output,const_cast<int*>(&group_size),const_cast<float*>(&epsilon)};
+            launch_named("qwen4_group_rms",groups,1,256,args);
+            return;
+        }
+        int one_centered=0;void*args[]={&input,&weights,&output,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};launch_named("rms_norm",1,1,1024,args);
+    };
     // Muse Glimmer's two post-norms run at a tighter epsilon than the model's
     // own rms_norm_epsilon (1e-8 against 1e-5) and are safe in place: rms_norm
     // block-reduces before any write, then each thread only rewrites the index
@@ -18916,6 +18948,51 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             dense(4,gated,residual,q_size,hidden_size);
             add(residual,hidden);
             moe_base=8;
+        }else if(runtime->k2horizon){
+            const int heads=static_cast<int>(layer.attention_heads);
+            const int kv_heads=static_cast<int>(layer.kv_heads);
+            const int head_dim=static_cast<int>(layer.head_dim);
+            const int q_size=heads*head_dim,kv_size=kv_heads*head_dim;
+            dense(1,normalized,first,hidden_size,q_size);
+            dense(2,normalized,second,hidden_size,kv_size);
+            dense(3,normalized,third,hidden_size,kv_size);
+            const int rotary=static_cast<int>(layer.rotary_dim);
+            int position=static_cast<int>(runtime->position);
+            const float theta=layer.rope_theta;
+            std::uint64_t queries=fourth;
+            void*q_args[]={const_cast<std::uint64_t*>(&first),
+                           const_cast<std::uint64_t*>(&queries),
+                           const_cast<int*>(&heads),
+                           const_cast<int*>(&head_dim),
+                           const_cast<int*>(&rotary),
+                           &position,
+                           const_cast<float*>(&theta)};
+            launch_named("k2_half_split_rope",heads,1,256,q_args);
+            std::uint64_t keys=first;
+            void*k_args[]={const_cast<std::uint64_t*>(&second),
+                           const_cast<std::uint64_t*>(&keys),
+                           const_cast<int*>(&kv_heads),
+                           const_cast<int*>(&head_dim),
+                           const_cast<int*>(&rotary),
+                           &position,
+                           const_cast<float*>(&theta)};
+            launch_named("k2_half_split_rope",kv_heads,1,256,k_args);
+            std::uint64_t cache_keys=runtime->state+layer.state_first,cache_values=runtime->state+layer.state_second;
+            const auto view=attention_cache_view(layer,runtime->position);
+            int slot=view.slot,capacity=view.capacity;
+            void*k_store_args[]={&keys,&cache_keys,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_k,true),kv_heads,1,256,k_store_args);
+            void*v_store_args[]={const_cast<std::uint64_t*>(&third),&cache_values,const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&slot,&capacity};
+            launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
+            std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;
+            float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
+            void*score_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
+            launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
+            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
+            launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            dense(4,attended,residual,q_size,hidden_size);
+            add(residual,hidden);
+            moe_base=5;
         }else{
             const int heads=static_cast<int>(runtime->model->config.attention_heads);
             const int kv_heads=static_cast<int>(runtime->model->config.attention_kv_heads);
@@ -22632,7 +22709,17 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
     }
     auto launch_named = [&](const char* name, std::uint32_t gx, std::uint32_t gy, std::uint32_t bx, void** args, std::uint32_t shared = 0) { if (flyweight_gpu_launch_named(name, gx, gy, bx, shared, runtime->stream, args) != 0) throw std::runtime_error(std::string("native Qwen CUDA kernel failed: ") + name); };
     std::uint64_t q8_cached_input = 0, q8_cached_normalized = 0;
-    auto rms = [&](std::uint64_t input, std::uint64_t weights, std::uint64_t output) { int one_centered = 0; q8_cached_input = 0; void* args[] = {&input, &weights, &output, const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon), &one_centered}; launch_named("rms_norm", 1, 1, 1024, args); };
+    auto rms = [&](std::uint64_t input, std::uint64_t weights, std::uint64_t output) {
+        q8_cached_input = 0;
+        if (runtime->k2horizon) {
+            const int groups = static_cast<int>(runtime->model->config.norm_groups ? runtime->model->config.norm_groups : 4);
+            const int group_size = hidden_size / groups;
+            void* args[] = {&input, &weights, &output, const_cast<int*>(&group_size), const_cast<float*>(&epsilon)};
+            launch_named("qwen4_group_rms", groups, 1, 256, args);
+            return;
+        }
+        int one_centered = 0; void* args[] = {&input, &weights, &output, const_cast<int*>(&hidden_size), const_cast<float*>(&epsilon), &one_centered}; launch_named("rms_norm", 1, 1, 1024, args);
+    };
     auto q8 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { if (flyweight_gpu_q8_matvec_transposed(matrix, input, output, in_size, out_size, runtime->stream) != 0) throw std::runtime_error("native Qwen Q8 projection failed"); };
     auto f32 = [&](std::uint64_t matrix, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { void* args[] = {&matrix, &input, &output, &in_size, &out_size}; launch_named("qwen_f32_matvec_warp", (out_size + 7) / 8, 1, 256, args); };
     const char* iq2_q8_setting = std::getenv("FLYWEIGHT_IQ2_Q8_DECODE");
@@ -22793,7 +22880,7 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
         auto& layer = runtime->layers[layer_number];
         auto tensor = [&](std::size_t role) { return runtime->device_tensors[layer.static_tensors.at(role)]; };
         auto dense = [&](std::size_t role, std::uint64_t input, std::uint64_t output, int in_size, int out_size) { dense_matvec(layer.static_tensors.at(role), input, output, in_size, out_size); };
-        const std::size_t moe_base = layer.attention ? 7 : 10;
+        const std::size_t moe_base = qwen_ffn_base(*runtime, layer);
         // Pass A: queue every sequence's GPU work up to (and including) the
         // router readback + shared experts, recording that sequence's event.
         for (auto& s : seqs) {
@@ -22852,6 +22939,50 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                 dense(3, s.first, s.residual, value_dim, hidden_size);
                 if (runtime->qwen4exp) hc_post_multi(s, s.residual);
                 else add(s.residual, s.hidden);
+            } else if (runtime->k2horizon) {
+                const int heads = static_cast<int>(layer.attention_heads);
+                const int kv_heads = static_cast<int>(layer.kv_heads);
+                const int head_dim = static_cast<int>(layer.head_dim);
+                const int q_size = heads * head_dim, kv_size = kv_heads * head_dim;
+                dense(1, s.normalized, s.first, hidden_size, q_size);
+                dense(2, s.normalized, s.second, hidden_size, kv_size);
+                dense(3, s.normalized, s.third, hidden_size, kv_size);
+                const int rotary = static_cast<int>(layer.rotary_dim);
+                int position = static_cast<int>(s.position);
+                const float theta = layer.rope_theta;
+                std::uint64_t queries = s.fourth;
+                void* q_args[] = {const_cast<std::uint64_t*>(&s.first),
+                                  const_cast<std::uint64_t*>(&queries),
+                                  const_cast<int*>(&heads),
+                                  const_cast<int*>(&head_dim),
+                                  const_cast<int*>(&rotary),
+                                  &position,
+                                  const_cast<float*>(&theta)};
+                launch_named("k2_half_split_rope", heads, 1, 256, q_args);
+                std::uint64_t keys = s.first;
+                void* k_args[] = {const_cast<std::uint64_t*>(&s.second),
+                                  const_cast<std::uint64_t*>(&keys),
+                                  const_cast<int*>(&kv_heads),
+                                  const_cast<int*>(&head_dim),
+                                  const_cast<int*>(&rotary),
+                                  &position,
+                                  const_cast<float*>(&theta)};
+                launch_named("k2_half_split_rope", kv_heads, 1, 256, k_args);
+                std::uint64_t cache_keys = s.state + layer.state_first, cache_values = s.state + layer.state_second;
+                const auto view = attention_cache_view(layer, s.position);
+                int slot = view.slot, capacity = view.capacity;
+                void* k_store_args[] = {&keys, &cache_keys, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &slot, &capacity};
+                launch_named(kv_store_kernel(runtime->options.cache_type_k, true), kv_heads, 1, 256, k_store_args);
+                void* v_store_args[] = {const_cast<std::uint64_t*>(&s.third), &cache_values, const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &slot, &capacity};
+                launch_named(kv_store_kernel(runtime->options.cache_type_v, false), kv_heads, 1, 256, v_store_args);
+                std::uint64_t attended = s.second; int tokens = view.tokens, first_slot = view.first;
+                float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                void* score_args[] = {const_cast<std::uint64_t*>(&queries), &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot, &scale};
+                launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
+                void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot};
+                launch_named(kv_values_ring_kernel(*runtime), heads, 1, 256, value_args);
+                dense(4, attended, s.residual, q_size, hidden_size);
+                add(s.residual, s.hidden);
             } else {
                 const int heads = static_cast<int>(runtime->model->config.attention_heads);
                 const int kv_heads = static_cast<int>(runtime->model->config.attention_kv_heads);

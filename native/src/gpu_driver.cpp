@@ -1111,6 +1111,7 @@ extern "C" int flyweight_gpu_compile(
              "laguna_head_norm_rope", "laguna_attention_gate",
              "laguna_attention_gate_rows",
              "muse_head_norm_rope", "muse_logit_softcap",
+             "k2_half_split_rope",
              "iq2s_q8_matvec_transposed_warp",
              "iq2s_q8_matvec_transposed_rows",
              "iq2s_q8_matmul_tiled",

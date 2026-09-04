@@ -79,6 +79,7 @@ typedef struct FlyweightV2ModelConfig {
        candidates. Zero means routing is not group limited. Appended at the end
        so the struct stays layout-compatible with existing callers. */
     uint32_t expert_group_count, expert_group_used;
+    uint32_t norm_groups;
 } FlyweightV2ModelConfig;
 
 typedef struct FlyweightV2BailingRuntime FlyweightV2BailingRuntime;

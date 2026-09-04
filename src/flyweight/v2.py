@@ -198,6 +198,7 @@ class _ModelConfig(ctypes.Structure):
         ("final_logit_softcap", ctypes.c_float),
         ("expert_group_count", ctypes.c_uint32),
         ("expert_group_used", ctypes.c_uint32),
+        ("norm_groups", ctypes.c_uint32),
     ]
 
 

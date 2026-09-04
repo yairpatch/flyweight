@@ -254,6 +254,13 @@ void qwen_forward_rows(
         // projections reading the first one's quantized activations. The
         // single-token path invalidates on every norm for the same reason.
         q8_cached_input=0;q8_cached_width=0;
+        if(runtime.k2horizon){
+            const int groups=static_cast<int>(runtime.model->config.norm_groups?runtime.model->config.norm_groups:4);
+            const int group_size=hidden_size/groups;
+            void*args[]={&input,&weights,&output,const_cast<int*>(&groups),const_cast<int*>(&group_size),const_cast<float*>(&epsilon)};
+            launch("qwen4_group_rms_rows",groups,rows,256,args);
+            return;
+        }
         int one_centered=0;void*args[]={&input,&weights,&output,&rows,const_cast<int*>(&hidden_size),const_cast<float*>(&epsilon),&one_centered};
         launch("rms_norm_rows",rows,1,256,args);
     };
@@ -1024,13 +1031,14 @@ void qwen_forward_rows(
             // is per-channel like Qwen's, so it takes Laguna's projection shape
             // and Qwen's gate kernels.
             const bool muse=runtime.muse;
-            const int heads=laguna
+            const bool k2horizon=runtime.k2horizon;
+            const int heads=(laguna||k2horizon)
                 ?static_cast<int>(layer.attention_heads)
                 :static_cast<int>(runtime.model->config.attention_heads);
             const int kv_heads=static_cast<int>(runtime.model->config.attention_kv_heads);
             const int head_dim=static_cast<int>(runtime.model->tensors[layer.static_tensors[2]].shape[1]/kv_heads);
             const int query_elements=heads*head_dim;
-            const int q_size=(laguna||muse)?query_elements:query_elements*2;
+            const int q_size=(laguna||muse||k2horizon)?query_elements:query_elements*2;
             const int kv_size=kv_heads*head_dim;
             dense(1,normalized,first,hidden_size,q_size);
             dense(2,normalized,second,hidden_size,kv_size);
@@ -1038,10 +1046,10 @@ void qwen_forward_rows(
             // Both per-layer architectures carry their own rotary span and
             // theta. For Muse Glimmer the span is zero on full-attention
             // layers, which is how those run NoPE.
-            const int rotary=(laguna||muse)
+            const int rotary=(laguna||muse||k2horizon)
                 ?static_cast<int>(layer.rotary_dim)
                 :static_cast<int>(runtime.model->config.rotary_dimension?runtime.model->config.rotary_dimension:head_dim);
-            const float theta=(laguna||muse)
+            const float theta=(laguna||muse||k2horizon)
                 ?layer.rope_theta
                 :(runtime.model->config.rope_freq_base?runtime.model->config.rope_freq_base:1000000.0f);
             // Laguna's full-attention layers extend with YaRN; its sliding-window
@@ -1055,7 +1063,7 @@ void qwen_forward_rows(
                 qwen_yarn_correction_dims(
                     rotary,layer.rope_orig_context,theta,
                     layer.rope_beta_fast,layer.rope_beta_slow,corr_low,corr_high);
-            auto qnorm=tensor(5),knorm=tensor(6);
+            auto qnorm=k2horizon?0:tensor(5),knorm=k2horizon?0:tensor(6);
             const auto queries=fourth;
             // One scalar per head for Laguna, one per query channel for Qwen.
             const auto gates=fourth+static_cast<std::uint64_t>(rows)*query_elements*sizeof(float);
@@ -1101,6 +1109,15 @@ void qwen_forward_rows(
                                    &position,const_cast<float*>(&theta),
                                    const_cast<float*>(&epsilon)};
                     launch("muse_head_norm_rope",kv_heads,1,256,k_args);
+                }else if(k2horizon){
+                    void*q_args[]={&projected,&query,const_cast<int*>(&heads),
+                                   const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                                   &position,const_cast<float*>(&theta)};
+                    launch("k2_half_split_rope",heads,1,256,q_args);
+                    void*k_args[]={&projected_key,&key,const_cast<int*>(&kv_heads),
+                                   const_cast<int*>(&head_dim),const_cast<int*>(&rotary),
+                                   &position,const_cast<float*>(&theta)};
+                    launch("k2_half_split_rope",kv_heads,1,256,k_args);
                 }else{
                     auto rope=qwen_rope_args(runtime,runtime.image_spans,
                         runtime.position+static_cast<std::uint64_t>(span_begin+token));
@@ -1203,7 +1220,7 @@ void qwen_forward_rows(
             // cannot use them and takes the warp path with its own gate kernel.
             const bool cublas_prefill_done=
                 !qsa_chunk_selecting&&
-                cublas_prefill_requested&&!laguna&&!layer.attention_window&&
+                cublas_prefill_requested&&!laguna&&!k2horizon&&!layer.attention_window&&
                 // f16 and bf16 both: the cache is handed to cuBLAS in
                 // place, so what matters is that it is a 16-bit float the GEMM
                 // has a type code for, and that K and V agree -- one code feeds
@@ -1318,7 +1335,9 @@ void qwen_forward_rows(
                 void*attention_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,&cache_values,const_cast<std::uint64_t*>(&second),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&capacity,&scale};
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
-                if(laguna){
+                if(k2horizon){
+                    // ungated
+                }else if(laguna){
                     void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&rows,const_cast<int*>(&heads),const_cast<int*>(&head_dim)};
                     launch("laguna_attention_gate_rows",(elements+255)/256,1,256,gate_args);
                 }else{
@@ -1326,7 +1345,7 @@ void qwen_forward_rows(
                     launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
                 }
             }else if(std::uint64_t stage_keys=0,stage_values=0,staged=0;
-                     !laguna&&
+                     !laguna&&!k2horizon&&
                      (staged=qwen_kv_prefill_stage(
                          runtime,layer,queries,cache_keys,cache_values,
                          heads,kv_heads,head_dim,rows,
@@ -1385,16 +1404,20 @@ void qwen_forward_rows(
                 auto attended=second+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
                 void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
                 launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
-                auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);int elements=query_elements;
-                if(laguna){
-                    void*token_gate_args[]={&attended,&gate,&gated,
-                                            const_cast<int*>(&heads),const_cast<int*>(&head_dim)};
-                    launch("laguna_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                if(k2horizon){
+                    // ungated
                 }else{
-                    void*token_gate_args[]={&attended,&gate,&gated,&elements};launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                    auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);int elements=query_elements;
+                    if(laguna){
+                        void*token_gate_args[]={&attended,&gate,&gated,
+                                                const_cast<int*>(&heads),const_cast<int*>(&head_dim)};
+                        launch("laguna_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                    }else{
+                        void*token_gate_args[]={&attended,&gate,&gated,&elements};launch("qwen_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                    }
                 }
             }
-            dense(4,third,residual,query_elements,hidden_size);
+            dense(4,k2horizon?second:third,residual,query_elements,hidden_size);
             // Muse Glimmer normalizes the attention output before the residual
             // join rather than adding it raw.
             if(muse)post_rms_rows(residual,tensor(8));
