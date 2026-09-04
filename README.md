@@ -57,8 +57,18 @@ loads from GGUF, including multi-file `-00001-of-0000N` splits.
 
 ## Requirements
 
-There is no published wheel: Flyweight compiles its native runtime from source
-as part of the install, so a C++ toolchain is needed once, at install time.
+Wheels are published to PyPI as **`flyweight-llm`** for Linux x86-64
+(manylinux 2.28) and Windows x64 -- the import package and the command are
+still `flyweight`:
+
+~~~bash
+pip install flyweight-llm
+flyweight doctor
+~~~
+
+Everywhere else, and for a checkout, Flyweight compiles its native runtime from
+source as part of the install, so a C++ toolchain is needed once, at install
+time.
 
 | | Needed |
 | --- | --- |
@@ -332,7 +342,7 @@ command palette; Ctrl+B toggles the sidebar; Esc stops a generation.
 A Qwen 3.5-family GGUF serves images when its vision tower is attached.
 The tower is the `mmproj-*.gguf` llama.cpp publishes beside the model
 (projector type `qwen3vl_merger`); decoding needs Pillow, installed with
-`pip install 'flyweight[vision]'`:
+`pip install 'flyweight-llm[vision]'` (or `pip install '.[vision]'` from a checkout):
 
 ~~~bash
 flyweight serve Qwen3.5-35B-A3B-Q6_K.gguf \

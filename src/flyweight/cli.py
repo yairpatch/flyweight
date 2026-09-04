@@ -39,10 +39,14 @@ def _version() -> str:
     """The installed version, or a placeholder when running from a checkout."""
     from importlib.metadata import PackageNotFoundError, version
 
-    try:
-        return version("flyweight")
-    except PackageNotFoundError:
-        return "unknown"
+    # The distribution is published as flyweight-llm; a checkout installed
+    # before the rename still answers to the bare name.
+    for distribution in ("flyweight-llm", "flyweight"):
+        try:
+            return version(distribution)
+        except PackageNotFoundError:
+            continue
+    return "unknown"
 
 
 def _select_backend(args: argparse.Namespace) -> str:
