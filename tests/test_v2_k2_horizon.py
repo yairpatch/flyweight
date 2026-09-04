@@ -145,6 +145,89 @@ class K2HorizonRealModelTests(unittest.TestCase):
                 print(f"\nReal K2-Horizon output: {text!r}")
                 self.assertIn("Paris", text)
 
+    def test_real_model_thinking_stream(self):
+        path = os.environ.get("FLYWEIGHT_TEST_K2_HORIZON_MODEL", DEFAULT_REAL_MODEL)
+        from flyweight.v2_server import NativeV2InferenceService
+
+        service = NativeV2InferenceService(
+            path,
+            model_name="k2-horizon",
+            max_new_tokens=64,
+            context_window=1024,
+        )
+        try:
+            prompt_ids = service.generator.prepare_messages(
+                [{"role": "user", "content": "What is 2+2?"}],
+                enable_thinking=True,
+            )
+            self.assertTrue(service._prompt_opens_thinking(prompt_ids))
+
+            stream = service.stream_chat_completion({
+                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                "stream": True,
+                "max_tokens": 64,
+            })
+            reasoning_chunks = []
+            content_chunks = []
+            for item in stream:
+                if isinstance(item, dict) and "choices" in item and item["choices"]:
+                    delta = item["choices"][0].get("delta", {})
+                    if "reasoning_content" in delta and delta["reasoning_content"]:
+                        reasoning_chunks.append(delta["reasoning_content"])
+                    if "content" in delta and delta["content"]:
+                        content_chunks.append(delta["content"])
+
+            reasoning = "".join(reasoning_chunks)
+            content = "".join(content_chunks)
+            print(f"\nStreamed reasoning: {reasoning!r}")
+            print(f"Streamed content: {content!r}")
+            self.assertGreater(len(reasoning), 0)
+            self.assertNotIn("<ifm|think>", reasoning)
+            self.assertNotIn("</ifm|think>", reasoning)
+            self.assertNotIn("<ifm|think>", content)
+            self.assertNotIn("</ifm|think>", content)
+        finally:
+            service.close()
+
+
+class K2HorizonThinkingTests(unittest.TestCase):
+    def test_thinking_budget_meters_k2_horizon_blocks(self):
+        from flyweight.v2_server import _ThinkingBudget
+
+        meter = _ThinkingBudget(budget=3, thinking_open=True)
+        self.assertFalse(meter.spend("analyzing "))
+        self.assertFalse(meter.spend("step 1 "))
+        self.assertTrue(meter.spend("step 2 "))
+
+        meter.close()
+        self.assertFalse(meter.inside)
+
+        meter = _ThinkingBudget(budget=2, thinking_open=False)
+        self.assertFalse(meter.spend("hello "))
+        self.assertFalse(meter.inside)
+        self.assertFalse(meter.spend("<ifm|think_fast>first"))
+        self.assertTrue(meter.inside)
+        self.assertTrue(meter.spend("second"))
+
+    def test_split_reasoning_content_k2_tags(self):
+        from flyweight.server import _split_reasoning_content
+
+        vis, rsn = _split_reasoning_content("<ifm|think>deep thought</ifm|think>Result")
+        self.assertEqual(vis, "Result")
+        self.assertEqual(rsn, "deep thought")
+
+        vis, rsn = _split_reasoning_content("<ifm|think_fast>quick thought</ifm|think_fast>Result")
+        self.assertEqual(vis, "Result")
+        self.assertEqual(rsn, "quick thought")
+
+        vis, rsn = _split_reasoning_content("<ifm|think_faster>lightning thought</ifm|think_faster>Result")
+        self.assertEqual(vis, "Result")
+        self.assertEqual(rsn, "lightning thought")
+
+        vis, rsn = _split_reasoning_content("reasoning text\n</ifm|think>\nFinal answer")
+        self.assertEqual(vis, "Final answer")
+        self.assertEqual(rsn, "reasoning text")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -338,6 +338,20 @@ class ToolCallParsingTests(unittest.TestCase):
     def test_strips_non_thinking_protocol_close(self) -> None:
         self.assertEqual(_split_reasoning_content("</think>answer"), ("answer", None))
 
+    def test_splits_k2_horizon_reasoning_from_visible_content(self) -> None:
+        visible, reasoning = _split_reasoning_content(
+            "<ifm|think>considering options</ifm|think>final answer"
+        )
+        self.assertEqual(visible, "final answer")
+        self.assertEqual(reasoning, "considering options")
+
+    def test_strips_k2_horizon_bare_close(self) -> None:
+        self.assertEqual(_split_reasoning_content("</ifm|think>answer"), ("answer", None))
+        self.assertEqual(
+            _split_reasoning_content("pondering\n</ifm|think>\nanswer"),
+            ("answer", "pondering"),
+        )
+
     def test_parses_hermes_xml_format(self) -> None:
         content, calls = _parse_tool_calls(
             "sure\n<tool_call>\n<function=get_weather>\n"
@@ -701,6 +715,20 @@ class ToolCallParsingTests(unittest.TestCase):
         reasoning = "".join(r for _, r in deltas)
         self.assertEqual(visible, "Done.")
         self.assertEqual(reasoning, "Plan: call it.")
+        self.assertEqual(stream.flush(), ("", ""))
+
+    def test_streaming_reasoning_is_split_from_the_answer_k2_horizon(self) -> None:
+        from flyweight.server import ThinkingPrefixStream
+
+        stream = ThinkingPrefixStream()
+        deltas = [
+            stream.feed(part)
+            for part in ("Plan: ", "calculate 2+2.", "</ifm|", "think>", "4")
+        ]
+        visible = "".join(v for v, _ in deltas)
+        reasoning = "".join(r for _, r in deltas)
+        self.assertEqual(visible, "4")
+        self.assertEqual(reasoning, "Plan: calculate 2+2.")
         self.assertEqual(stream.flush(), ("", ""))
 
     def test_bailing_tagged_tool_call_is_decoded(self) -> None:

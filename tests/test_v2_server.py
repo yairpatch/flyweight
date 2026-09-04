@@ -1318,14 +1318,13 @@ class NativeV2ServerTests(unittest.TestCase):
         )
         self.assertEqual(runtime._last_penalties, (1.3, 0.4, 0.2, 128))
 
-    def test_native_generator_penalizes_repetition_by_default(self) -> None:
-        # An unset penalty must not mean "off": no penalty is the setting that
-        # produced the observed loop, so the default carries a real one.
+    def test_native_generator_defaults_penalties_off(self) -> None:
+        # Sampling defaults follow llama-server: repetition penalty off (1.0).
         generator, runtime = self.make_generator([10, 20])
         generator.generate_text("Hi", max_new_tokens=1,
                                 sampling=SamplingConfig(temperature=0.5))
         repetition, _, _, window = runtime._last_penalties
-        self.assertGreater(repetition, 1.0)
+        self.assertEqual(repetition, 1.0)
         self.assertGreater(window, 0)
 
     def test_native_generator_forwards_tool_schemas_to_the_sampler(self) -> None:
