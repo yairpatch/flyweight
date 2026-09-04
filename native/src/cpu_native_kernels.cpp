@@ -1197,6 +1197,88 @@ FLYWEIGHT_CPU_NATIVE_KERNEL("q8_matvec_transposed_warp", q8_matvec_transposed_wa
 FLYWEIGHT_CPU_NATIVE_KERNEL("q8_matmul_tiled", q8_matmul_tiled);
 FLYWEIGHT_CPU_NATIVE_KERNEL("rms_norm", rms_norm);
 FLYWEIGHT_CPU_NATIVE_KERNEL("scaled_add", scaled_add);
+void qwen4_group_rms(const Launch& launch, void** arguments) {
+    const float* input = *reinterpret_cast<const float**>(arguments[0]);
+    const float* weights = *reinterpret_cast<const float**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int group_size = *reinterpret_cast<const int*>(arguments[3]);
+    const float epsilon = *reinterpret_cast<const float*>(arguments[4]);
+    const int groups = static_cast<int>(launch.grid_x);
+
+    for (int group = 0; group < groups; ++group) {
+        const float* in = input + static_cast<std::int64_t>(group) * group_size;
+        const float* w = weights + static_cast<std::int64_t>(group) * group_size;
+        float* out = output + static_cast<std::int64_t>(group) * group_size;
+        double total = 0.0;
+        for (int i = 0; i < group_size; ++i) {
+            total += static_cast<double>(in[i]) * in[i];
+        }
+        const float scale = 1.0f / std::sqrt(static_cast<float>(total / group_size) + epsilon);
+        for (int i = 0; i < group_size; ++i) {
+            out[i] = in[i] * scale * w[i];
+        }
+    }
+}
+
+void qwen4_group_rms_rows(const Launch& launch, void** arguments) {
+    const float* input = *reinterpret_cast<const float**>(arguments[0]);
+    const float* weights = *reinterpret_cast<const float**>(arguments[1]);
+    float* output = *reinterpret_cast<float**>(arguments[2]);
+    const int groups = *reinterpret_cast<const int*>(arguments[3]);
+    const int group_size = *reinterpret_cast<const int*>(arguments[4]);
+    const float epsilon = *reinterpret_cast<const float*>(arguments[5]);
+    const int rows = static_cast<int>(launch.grid_y);
+
+    for (int row = 0; row < rows; ++row) {
+        for (int group = 0; group < groups; ++group) {
+            const std::int64_t at = (static_cast<std::int64_t>(row) * groups + group) * group_size;
+            const float* in = input + at;
+            const float* w = weights + static_cast<std::int64_t>(group) * group_size;
+            float* out = output + at;
+            double total = 0.0;
+            for (int i = 0; i < group_size; ++i) {
+                total += static_cast<double>(in[i]) * in[i];
+            }
+            const float scale = 1.0f / std::sqrt(static_cast<float>(total / group_size) + epsilon);
+            for (int i = 0; i < group_size; ++i) {
+                out[i] = in[i] * scale * w[i];
+            }
+        }
+    }
+}
+
+void k2_half_split_rope(const Launch&, void** arguments) {
+    const float* projected = *reinterpret_cast<const float**>(arguments[0]);
+    float* output = *reinterpret_cast<float**>(arguments[1]);
+    const int heads = *reinterpret_cast<const int*>(arguments[2]);
+    const int head_dim = *reinterpret_cast<const int*>(arguments[3]);
+    const int rotary_dim = *reinterpret_cast<const int*>(arguments[4]);
+    const int position = *reinterpret_cast<const int*>(arguments[5]);
+    const float theta = *reinterpret_cast<const float*>(arguments[6]);
+
+    const int half = rotary_dim / 2;
+    parallel_chunks(static_cast<std::uint64_t>(heads), [&](std::uint64_t head) {
+        const float* source = projected + static_cast<std::int64_t>(head) * head_dim;
+        float* out = output + static_cast<std::int64_t>(head) * head_dim;
+        for (int pair = 0; pair < half; ++pair) {
+            const float v0 = source[pair];
+            const float v1 = source[pair + half];
+            const float angle = static_cast<float>(position) /
+                std::pow(theta, 2.0f * static_cast<float>(pair) / static_cast<float>(rotary_dim));
+            const float cos_a = std::cos(angle);
+            const float sin_a = std::sin(angle);
+            out[pair] = v0 * cos_a - v1 * sin_a;
+            out[pair + half] = v1 * cos_a + v0 * sin_a;
+        }
+        for (int i = rotary_dim; i < head_dim; ++i) {
+            out[i] = source[i];
+        }
+    });
+}
+
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen4_group_rms", qwen4_group_rms);
+FLYWEIGHT_CPU_NATIVE_KERNEL("qwen4_group_rms_rows", qwen4_group_rms_rows);
+FLYWEIGHT_CPU_NATIVE_KERNEL("k2_half_split_rope", k2_half_split_rope);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matvec_warp", qwen_f32_matvec_warp);
 FLYWEIGHT_CPU_NATIVE_KERNEL("qwen_f32_matmul_rows", qwen_f32_matmul_rows);
 

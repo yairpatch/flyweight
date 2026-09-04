@@ -881,6 +881,34 @@ void laguna_attention_gate(
     }
 }
 
+// K2-Horizon Q/K projection tail: plain half-split (NEOX / rotate_half) RoPE
+// without per-head RMS normalization or learned norm weights.
+// Channels past rotary_dim pass through unrotated.
+extern "C" __global__
+void k2_half_split_rope(
+    const float* projected, float* output,
+    const int heads, const int head_dim, const int rotary_dim,
+    const int position, const float theta
+) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const float* source = projected + head * head_dim;
+    float* out = output + head * head_dim;
+    const int half = rotary_dim / 2;
+    for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+        const float v0 = source[pair];
+        const float v1 = source[pair + half];
+        const float angle = (float)position / powf(theta, 2.0f * (float)pair / (float)rotary_dim);
+        const float cos_a = cosf(angle);
+        const float sin_a = sinf(angle);
+        out[pair] = v0 * cos_a - v1 * sin_a;
+        out[pair + half] = v1 * cos_a + v0 * sin_a;
+    }
+    for (int i = rotary_dim + threadIdx.x; i < head_dim; i += blockDim.x) {
+        out[i] = source[i];
+    }
+}
+
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(// Muse Glimmer Q/K projection tail: per-head RMS norm against learned weights,
 // then RoPE over the leading `rotary_dim` channels.
