@@ -407,6 +407,12 @@ void qwen_forward_rows(
                         static_cast<std::uint64_t>(first)*output_size*sizeof(float);
                     void*mmq_args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
                         &input_size,&output_size,&batch,&scale_stride};
+                    // FLYWEIGHT_MMQ_TRACE=1: every launch, for pinning a fault
+                    // under CUDA_LAUNCH_BLOCKING to its arguments.
+                    static const bool mmq_trace=std::getenv("FLYWEIGHT_MMQ_TRACE")!=nullptr;
+                    if(mmq_trace)std::fprintf(stderr,"[mmq] %s tensor=%zu %dx%d rows=%d first=%d batch=%d pos=%llu\n",
+                        mmq_kernel,index,input_size,output_size,rows,first,batch,
+                        (unsigned long long)(runtime.position+span_begin));
                     launch(mmq_kernel,(output_size+mmq_rows-1)/mmq_rows,1,mmq_threads,mmq_args);
                 }
                 dense_trace(mmq_kernel);
@@ -1227,9 +1233,18 @@ void qwen_forward_rows(
             const int cublas_group=kv_heads?heads/kv_heads:0;
             const std::uint64_t score_workspace_bytes=
                 static_cast<std::uint64_t>(rows)*runtime.scratch_elements*sizeof(float);
+            // The score tile is [block][tile_rows * group] f32 PER KV HEAD, and
+            // the routine batches it over every KV head, so the block that
+            // fits `first` divides by heads, not by the group. Dividing by the
+            // group alone let the tile grow kv_heads times past the scratch:
+            // at 20k tokens on K2-Horizon (8 KV heads) it had overwritten the
+            // routine's own flash state a few regions downstream, the
+            // attention came back NaN, the router picked expert 0 at every
+            // rank and the streamed expert GEMM wrote 1024 rows into a
+            // 128-row tile -- an illegal address that poisoned the context.
             const std::uint64_t block_capacity=cublas_group
                 ?score_workspace_bytes/
-                    (16ULL*cublas_group*sizeof(float)):0;
+                    (16ULL*static_cast<std::uint64_t>(heads)*sizeof(float)):0;
             const int cublas_block_tokens=static_cast<int>(
                 std::min<std::uint64_t>(block_capacity,max_tokens));
             const int cublas_tile_rows=cublas_block_tokens>=256?16:0;
@@ -1899,6 +1914,19 @@ void qwen_forward_rows(
                     throw std::runtime_error("native Qwen rows forward selected an invalid expert");
                 ++expert_tokens[expert];
             }
+            // A token routes to an expert at most once, so no expert can hold
+            // more tokens than the chunk has rows -- unless the router's
+            // logits were NaN, in which case every comparison fails and it
+            // picks expert 0 at every rank. The staged tiles below are sized
+            // for `rows` tokens per expert; streaming such a group wrote past
+            // them and took the CUDA context down with an illegal address,
+            // which is a far worse failure than a request that errors out.
+            for(int expert=0;expert<experts;++expert)
+                if(expert_tokens[expert]>rows)
+                    throw std::runtime_error(
+                        "native Qwen rows forward routed one token to the same expert "
+                        "more than once (non-finite router logits at position "+
+                        std::to_string(runtime.position+static_cast<std::uint64_t>(span_begin))+")");
             std::vector<int> order;order.reserve(experts);
             for(int expert=0;expert<experts;++expert)
                 if(expert_tokens[expert])order.push_back(expert);
@@ -2110,6 +2138,10 @@ void qwen_forward_rows(
                             static_cast<std::uint64_t>(start)*out_size*sizeof(float);
                         void*args[]={&matrix,&batch_q8,&batch_scales,&batch_output,
                             &in_size,&out_size,&batch,&scale_stride};
+                        static const bool mmq_trace=std::getenv("FLYWEIGHT_MMQ_TRACE")!=nullptr;
+                        if(mmq_trace)std::fprintf(stderr,"[mmq] expert %s %dx%d count=%d start=%d batch=%d pos=%llu\n",
+                            format->matmul_q8_mmq,in_size,out_size,count,start,batch,
+                            (unsigned long long)(runtime.position+span_begin));
                         launch(format->matmul_q8_mmq,
                                (out_size+mmq_rows-1)/mmq_rows,1,mmq_threads,args);
                     }
