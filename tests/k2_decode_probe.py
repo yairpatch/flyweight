@@ -9,6 +9,7 @@ stderr carries the FLYWEIGHT_ATTENTION_DIAG announcement when asked for.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -32,7 +33,8 @@ def main() -> int:
     model = V2Model(path)
     runtime = model.native_runtime(
         context_limit=context, mtp_drafts=0, expert_mode="cpu",
-        cache_type_k="f16", cache_type_v="f16",
+        cache_type_k=os.environ.get("FLYWEIGHT_PROBE_KV", "f16"),
+        cache_type_v=os.environ.get("FLYWEIGHT_PROBE_KV", "f16"),
     )
     runtime.prepare()
     try:

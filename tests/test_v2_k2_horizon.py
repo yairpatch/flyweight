@@ -332,6 +332,17 @@ class K2HorizonDecodeAttentionTests(unittest.TestCase):
                                       prompt_tokens=600, context=8192, steps=8)
         self.assertEqual(tensor_core, warp)
 
+    def test_staged_tensor_core_prefill_matches_the_warp_prefill_on_q8_kv(self):
+        """With a q8_0 cache the window is widened to f16 and handed to the
+        same routine, ungated; it must match the warp kernel too."""
+        common = {"FLYWEIGHT_PREFILL_ROWS": "512", "FLYWEIGHT_CUBLAS_ATTENTION": "0",
+                  "FLYWEIGHT_PROBE_KV": "q8_0"}
+        warp, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "0"},
+                               prompt_tokens=600, context=8192, steps=8)
+        staged, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "1"},
+                                 prompt_tokens=600, context=8192, steps=8)
+        self.assertEqual(staged, warp)
+
 
 DEFAULT_REAL_MOVA_MODEL = (
     "/home/yair/Downloads/K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf"
