@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 build/
 dist/
+dist.*/
 *.egg-info/
 hardware-profile.json
 *-placement.json
@@ -20,3 +21,15 @@ hardware-profile.json
 *.coli
 *.safetensors
 *.gguf
+
+# native build outputs (rebuilt via `python -m flyweight.native_build`)
+src/flyweight/_native/*
+!src/flyweight/_native/.gitkeep
+# opencode agent workspace
+.opencode/
+# Claude Code per-machine permission state
+.claude/settings.local.json
+.claude/settings.local.json.tmp.*
+
+# third-party reference sources (llama.cpp / HF), kept out of the rename too
+refs/

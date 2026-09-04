@@ -1,0 +1,3 @@
+recursive-include native CMakeLists.txt *.h *.hpp *.cpp *.inc *.py
+recursive-exclude src/flyweight/_native *
+include LICENSE

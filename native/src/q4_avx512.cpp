@@ -17,11 +17,19 @@ int q4_matvec_avx512(
     const __m128i nibble_mask = _mm_set1_epi8(0x0F);
     const __m256i zero_point = _mm256_set1_epi8(8);
     for (std::int32_t row = 0; row < rows; ++row) {
-        __m512 accumulator = _mm512_setzero_ps();
+        // Two accumulators keep the two FMAs per block independent: a single
+        // accumulator serializes every FMA on its latency chain, which caps
+        // per-core throughput well below what the RAM stream can deliver.
+        __m512 accumulator0 = _mm512_setzero_ps();
+        __m512 accumulator1 = _mm512_setzero_ps();
         const std::int64_t block_start = static_cast<std::int64_t>(row)
             * blocks_per_row;
         for (std::int32_t block_index = 0; block_index < blocks_per_row; ++block_index) {
             const std::int64_t block = block_start + block_index;
+            _mm_prefetch(
+                reinterpret_cast<const char*>(packed + block * 16 + 1024),
+                _MM_HINT_T0
+            );
             const __m128i bytes = _mm_loadu_si128(
                 reinterpret_cast<const __m128i*>(packed + block * 16)
             );
@@ -43,14 +51,16 @@ int q4_matvec_avx512(
                 _mm_cvtph_ps(_mm_cvtsi32_si128(scales[block]))
             ));
             const float* input = vector + block_index * 32;
-            accumulator = _mm512_fmadd_ps(
-                _mm512_mul_ps(q0, scale), _mm512_loadu_ps(input), accumulator
+            accumulator0 = _mm512_fmadd_ps(
+                _mm512_mul_ps(q0, scale), _mm512_loadu_ps(input), accumulator0
             );
-            accumulator = _mm512_fmadd_ps(
-                _mm512_mul_ps(q1, scale), _mm512_loadu_ps(input + 16), accumulator
+            accumulator1 = _mm512_fmadd_ps(
+                _mm512_mul_ps(q1, scale), _mm512_loadu_ps(input + 16), accumulator1
             );
         }
-        output[row] = _mm512_reduce_add_ps(accumulator);
+        output[row] = _mm512_reduce_add_ps(
+            _mm512_add_ps(accumulator0, accumulator1)
+        );
     }
     return 0;
 }

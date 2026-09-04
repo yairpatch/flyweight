@@ -1,1 +1,1 @@
-"""Colibri Next test package."""
+"""Flyweight Next test package."""

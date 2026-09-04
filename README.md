@@ -1,427 +1,822 @@
-# Colibrì Next
+# Flyweight
 
-Colibrì Next is a hardware-adaptive sparse Mixture-of-Experts inference prototype.
+Flyweight is a native C++/CUDA GGUF inference runtime. Python provides the
+CLI, tokenizer-facing server adapter, and OpenAI/Anthropic-compatible HTTP
+API; model execution stays in the native runtime.
 
-~~~text
-storage -> RAM -> pinned RAM -> accelerator memory
-                         |
-                         v
-             CPU / CUDA / Metal / Vulkan / HIP
-~~~
+Served model families:
 
-The runtime can inspect and convert real Qwen checkpoints and generate decoded text through mixed Qwen3.5/Qwen3.6 decoder stacks.
+| Family | Formats | Notes |
+| --- | --- | --- |
+| Qwen 3 / 3.5 / 3.6, dense and MoE | GGUF, safetensors | Full feature set: MTP, expert offload, prefill pipeline. Image input on the 3.5 family through a llama.cpp `mmproj` GGUF (`--mmproj`); the safetensors loader still drops the tower |
+| Laguna 2.1 | GGUF | Per-head attention gate only; no MTP |
+| Muse Glimmer | GGUF | Channel-tagged reasoning; drafts via a DFlash sidecar, no in-model MTP |
+| DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
+| Gemma 4 | GGUF | Greedy decode with penalties disabled only -- see limitations |
+| BailingMoE3 | GGUF, safetensors | Independent sequence slots with snapshot prefix reuse across conversations; a GGUF conversion answers exactly as the checkpoint it came from |
+| Qwen3.8-Flash-Next (qwen4exp) | GGUF (split) | Qwen4-preview hybrid: gated-residual streams, hashed n-gram embeddings (host-side table), DeltaNet + gated attention. Sparse attention runs dense for now; no MTP/vision (absent from the GGUF) -- see limitations |
 
-## Implemented
+A safetensors checkpoint (Qwen 3.5 family and BailingMoE3) is packed to a
+chosen quantization on first open and cached beside the checkpoint --
+weighted by a llama.cpp `imatrix.dat` when one is present; everything else
+loads from GGUF, including multi-file `-00001-of-0000N` splits.
 
-- Hardware probing and portable placement profiles
-- SSD, RAM, VRAM, and unified-memory placement planning
-- Per-layer expert LRU, pinning, prefetch, and route prediction
-- Dependency-free safetensors metadata and byte-slice reader
-- Qwen checkpoint inspection and manifests
-- Direct BF16-to-Q4 routed-expert conversion
-- Q4 shared-expert conversion
-- BF16 router, shared gate, and RMSNorm tensor support
-- Normalized softmax top-k routing
-- Weighted routed-expert aggregation
-- Sigmoid-gated shared SwiGLU expert
-- Qwen RMSNorm and residual MoE path
-- BF16 full-attention projection conversion
-- Partial RoPE and grouped-query KV caching
-- Query output gating and attention residual path
-- Depthwise causal convolution and recurrent Gated DeltaNet state
-- Delta-rule updates, learned decay, gated RMSNorm, and residual path
-- Mixed decoder-layer assembly and persistent sequence state
-- Token embeddings, final RMSNorm, and chunked BF16 LM head
-- End-to-end token-ID-to-logits execution
-- Hugging Face tokenizer JSON integration and ChatML formatting
-- Greedy, top-k, and nucleus sampling
-- Stateful prompt-to-text generation
-- Bounded cross-request conversation prefix-state caching
-- Persistent OpenAI-compatible local HTTP server
-- Incremental Chat Completions SSE streaming
-- Streaming and stateful Responses API text generation
-- Legacy text completions and tokenizer endpoints
-- Native Qwen function calling with OpenAI tool-call responses
-- Optional bearer authentication and browser CORS
-- Packed BF16 and Q4 CUDA matrix-vector kernels
-- Expert-major CUDA prompt batching with one shared-expert batch
-- Bounded LRU VRAM weight cache with CPU fallback
-- NumPy and portable Python execution paths
-- Checksummed versioned tensor containers
+## Features
+
+- Memory-mapped GGUF loading, including split archives and metadata-only
+  first shards
+- Native CUDA attention, DeltaNet, dense FFN, and sparse MoE execution, with
+  CUDA-graph replay for decode
+- CPU, automatic hybrid, and strict resident expert placement
+- Prefill pipeline: routed experts stream to the GPU behind a byte budget and
+  run the dense batch kernels, with CPU experts overlapped under queued GPU
+  work (default on)
+- F32, F16, BF16, Q8_0, Turbo3, and Turbo4 KV caches
+- Sliding-window attention and compact circular KV storage
+- Multi-token prediction for Qwen checkpoints, under sampling, penalties and
+  the tool grammar alike (each verified row goes through the request's own
+  sampler, so a drafting request answers exactly as a non-drafting one);
+  DSpark draft speculation for
+  DeepSeek-V4-Flash
+- Independent sequence slots and host-backed prompt-cache spill/restore
+- Cooperative concurrent request scheduling; sampled and greedy requests
+  decode in the same batch
+- Sampler-enforced tool-call grammar (declared names, required parameters,
+  well-formed JSON values) and sampler-enforced JSON response mode
+- Image input for Qwen 3.5-family checkpoints: the mmproj vision tower runs
+  natively, images take part in prefix reuse, and OpenAI `image_url`,
+  Responses `input_image` and Anthropic `image` parts are all accepted
+- Thinking controls: per-request effort for checkpoints that grade their
+  reasoning, and a hard thinking-token budget the sampler cannot overrun
+- OpenAI Chat Completions, Responses, and legacy Completions APIs
+- Anthropic Messages with thinking blocks, plus token-count endpoints
+- Streaming SSE (including incremental tool-call arguments), bearer
+  authentication, CORS, and a bundled chat UI with a sandboxed preview
+- Repeatable JSONL runtime benchmark and regression comparison harness
+
+## Requirements
+
+There is no published wheel: Flyweight compiles its native runtime from source
+as part of the install, so a C++ toolchain is needed once, at install time.
+
+| | Needed |
+| --- | --- |
+| Python | 3.11 or newer, 64-bit |
+| CMake | 3.24 or newer |
+| Compiler | MSVC v143 (Windows) or GCC 13+ / Clang 16+ (Linux) |
+| GPU | Any current NVIDIA driver — **no CUDA toolkit**. `--backend cpu` serves without a GPU at all |
+| Disk | ~100 MB for the build tree, plus whatever the model weighs |
+
+CUDA kernels are compiled at runtime through the NVIDIA driver API, which is
+why the driver alone is enough and `nvcc` is never invoked. CuPy appears
+nowhere in this list — it is used only by low-level development checks, never
+by the runtime.
 
 ## Installation
 
-Colibrì Next supports Windows 10/11 and x86-64 Linux with Python 3.11 or
-newer. The native CPU backend needs CMake 3.24+ and a C++20 compiler. CUDA is
-optional and requires an NVIDIA driver plus the CuPy package matching the
-installed CUDA major version.
+Pick your platform below. Both end at `flyweight doctor`, which reports whether
+the machine can serve and names the fix for anything missing.
 
-### Windows PowerShell
+Expect the install to take a few minutes: the runtime is a few dozen large
+AVX-512 and kernel translation units, and they are compiled, not downloaded.
+
+### Windows
+
+Run this in PowerShell. Nothing here needs a Developer Command Prompt — the
+build locates the x64 MSVC toolchain itself, through the same `vswhere` lookup
+`flyweight doctor` reports.
 
 ~~~powershell
-$env_dir = ".venv"
-python -m venv $env_dir
-& "$env_dir\Scripts\Activate.ps1"
+# One-time prerequisites.
+winget install Kitware.CMake
+winget install Ninja-build.Ninja
+winget install --id Microsoft.VisualStudio.2022.BuildTools --override `
+  "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+
+# Close and reopen PowerShell so the new tools are on PATH, then:
+git clone https://github.com/yairpatch/flyweight
+cd flyweight
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-$env:PYTHONPATH = "src"
-pip install -e ".[fast,generation]"
-python -m colibri_next.native_build
-python -m unittest discover -s tests -v
+pip install .
+flyweight doctor
 ~~~
 
-Install Visual Studio 2022 Build Tools with the **Desktop development with
-C++** workload if `native_build` cannot find a compiler.
+Notes specific to Windows:
 
-### Linux Bash
+- **Any Visual Studio edition works** — Community, Professional, Enterprise, or
+  the standalone Build Tools, including installs on a non-system drive. Only
+  the x64 C++ compiler component matters, so an existing Visual Studio with
+  **Desktop development with C++** already ticked needs no `winget` line.
+- **Ninja is optional but worth installing.** Without it the build falls back to
+  NMake, which compiles one file at a time regardless of `--parallel`. Visual
+  Studio ships its own `ninja.exe` and that copy is found automatically, so the
+  `winget install Ninja-build.Ninja` line only matters if it is absent.
+- **Use 64-bit Python.** The runtime library is x64; a 32-bit interpreter fails
+  to load it with `WinError 193`.
+- **If the build says the C++ tools were not found**, run `flyweight doctor`. It
+  names which of CMake, MSVC, and the build tool it can and cannot see, instead
+  of stopping at the first one.
 
-On Ubuntu or Debian, install the system build prerequisites first:
+### Linux
 
 ~~~bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-dev build-essential cmake
+# Debian / Ubuntu -- one-time prerequisites.
+sudo apt install git python3-venv python3-pip build-essential cmake ninja-build
+# Fedora / RHEL:  sudo dnf install git python3-devel gcc-c++ cmake ninja-build
+# Arch:           sudo pacman -S git python gcc cmake ninja
 
+git clone https://github.com/yairpatch/flyweight
+cd flyweight
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-export PYTHONPATH=src
-pip install -e ".[fast,generation]"
-python -m colibri_next.native_build
-python -m unittest discover -s tests -v
+pip install .
+flyweight doctor
 ~~~
 
-The commands below use forward-slash paths under a local `models` directory;
-Python accepts this form on both Windows and Linux. Replace the paths with the
-locations of your checkpoints if needed.
+Notes specific to Linux:
 
-For CUDA acceleration, add the CuPy package matching the installed CUDA
-toolkit. This command is the same in PowerShell and Bash:
+- **Check the compiler version if the build fails on unknown syntax.** The
+  runtime is C++20 and needs GCC 13+ or Clang 16+; `g++ --version` settles it.
+  Older LTS releases ship GCC 11 or 12, where `sudo apt install g++-13` and
+  `export CXX=g++-13` before `pip install .` is the smallest fix.
+- **CMake older than 3.24** is the other common blocker on long-term releases.
+  `pip install cmake` inside the activated venv puts a current one on PATH
+  without touching the system package.
+- **A GPU needs only the proprietary NVIDIA driver.** `nvidia-smi` reporting a
+  device is the whole check; the `cuda-toolkit` package is not used. Without
+  one, serve with `--backend cpu`.
 
-~~~console
-# CUDA 13
-pip install -e ".[cuda13]"
+### Verifying the install
 
-# CUDA 12 (use instead of the cuda13 extra)
-pip install cupy-cuda12x
+~~~
+$ flyweight doctor
+[ok  ] python: 3.12.10
+[ok  ] package: .../.venv/lib/python3.12/site-packages/flyweight
+[ok  ] command: .../.venv/bin/flyweight
+[ok  ] native runtime: flyweight_v2.so, built 2026-08-31 14:04
+[warn] sources: no checkout beside this install
+       -> fine for a wheel; you cannot rebuild the runtime here
+[ok  ] nvidia gpu: device 0, compute 12.0, 10.8/11.9 GiB free
+
+this install can serve
 ~~~
 
-NumPy is optional but strongly recommended for conversion and CPU execution.
-`native_build` produces `colibri_native.dll` on Windows and
-`colibri_native.so` on Linux, compiling runtime-dispatched scalar, AVX2, and
-AVX-512 Q4 CPU kernels. Portable Python execution remains available when the
-native library or CuPy is unavailable.
+Read the last line first. Only `FAIL` lines stop the runtime, and each one
+prints the command that fixes it; `warn` lines are notes. The `sources` warning
+above is the normal state of an installed copy — it means the runtime cannot be
+rebuilt from there, which only matters if you intend to change it. Run
+`flyweight doctor` first whenever something refuses to start.
 
-## Hardware planning
+### If `flyweight` is "not recognized" or "command not found"
 
-~~~console
-python -m colibri_next.cli inspect-hardware --save hardware-profile.json
-python -m colibri_next.cli plan --hardware hardware-profile.json --model qwen3.6-35b-a3b --context 32768 --expert-bits 4 --save qwen36-placement.json
+The install succeeded and the console script simply is not on PATH. Run it as a
+module instead — identical arguments, no PATH entry required:
+
+~~~
+python -m flyweight doctor
+python -m flyweight serve model.gguf
 ~~~
 
-The detected 64 GB RAM and 12 GB VRAM profile places static tensors in VRAM, Q4 routed experts in RAM, active experts in a VRAM cache, and runtime state in VRAM.
+Activating the virtual environment as shown above normally prevents this,
+because activation puts the environment's script directory on PATH. It comes up
+without one on a Microsoft Store Python, whose per-user
+`...\LocalCache\local-packages\Python312\Scripts` is never added to PATH, and
+after any `pip install --user`. Both cases make pip print a warning and install
+anyway. `flyweight doctor` reports the exact directory to add if you would
+rather fix PATH permanently.
 
-## Qwen conversion
+### Developing on Flyweight itself
 
-~~~console
-python -m colibri_next.cli inspect-model models/Qwen3.6-35B-A3B
+Use an editable install, so edits to `src/flyweight` take effect without
+reinstalling, and build the contract tests and benchmarks that a plain install
+skips:
 
-python -m colibri_next.cli convert-qwen models/Qwen3.6-35B-A3B models/colibri-qwen36 --extract-experts --quantization q4
-
-python -m colibri_next.cli convert-moe-layers models/Qwen3.6-35B-A3B models/colibri-qwen36
-
-python -m colibri_next.cli convert-attention-layers models/Qwen3.6-35B-A3B models/colibri-qwen36 --quantization q4
-
-python -m colibri_next.cli convert-linear-layers models/Qwen3.6-35B-A3B models/colibri-qwen36 --quantization q4
-
-python -m colibri_next.cli convert-model-io models/Qwen3.6-35B-A3B models/colibri-qwen36 --quantization q4
-
-python -m colibri_next.cli convert-tokenizer models/Qwen3.6-35B-A3B models/colibri-qwen36
+~~~bash
+pip install -e .
+python -m flyweight.native_build     # same build tree, plus the test binaries
+ctest --test-dir build/native --output-on-failure
+pytest -q
 ~~~
 
-The first conversion creates independently loadable routed experts. The second converts every layer's router, shared expert, shared-expert gate, and post-attention RMSNorm. The remaining commands convert both token-mixer types, model input/output tensors, and tokenizer assets. Static converters accept `--quantization bf16` for compatibility or `--quantization q4` to reduce projection, embedding, and LM-head storage and VRAM-cache pressure. Existing converted models can be upgraded in place by rerunning the three static conversion commands with `--quantization q4 --overwrite`.
+Do not keep an editable and a regular install in the same environment. The
+regular one wins every import, edits appear to do nothing, and `flyweight
+doctor` reports the shadowing on its `package` line.
 
-Q4 uses one FP16 scale and 16 packed bytes for every 32 values. Routed experts require approximately 18.1 GB instead of roughly 64.4 GB BF16. The original checkpoint and Q4 output require about 90 GB combined before safety margin.
+The chat UI is a Vite + React + TypeScript app in `web/`; the build is
+committed under `src/flyweight/ui/` so the Python package ships it without
+Node. After changing anything in `web/`, rebuild and commit the output:
 
-## Execution
-
-Execute one routed expert:
-
-~~~console
-python -m colibri_next.cli benchmark-expert models/colibri-qwen36/experts/layer-000/expert-0000.coli --iterations 10
+~~~bash
+cd web
+pnpm install
+pnpm test          # vitest: protocol adapters, SSE reader, direction
+pnpm build         # typecheck, then write src/flyweight/ui/
+pnpm dev           # live-reload dev server proxying to :8000
 ~~~
 
-Execute one complete Qwen MoE feed-forward block:
+## Commands
 
-~~~console
-python -m colibri_next.cli benchmark-moe-layer models/colibri-qwen36 --layer 0 --iterations 3
+| Command | What it does |
+| --- | --- |
+| `flyweight serve MODEL` | serve the OpenAI/Anthropic APIs and chat UI |
+| `flyweight generate MODEL --prompt TEXT` | print one response and exit |
+| `flyweight benchmark MODEL` | measure prompt and decode speed as JSON |
+| `flyweight inspect MODEL` | print model metadata as JSON |
+| `flyweight imatrix MODEL --text FILE` | gather an importance matrix |
+| `flyweight probe MODEL` | run a few tokens and dump runtime counters |
 
-# Also apply post-attention RMSNorm and the residual connection.
-python -m colibri_next.cli benchmark-moe-layer models/colibri-qwen36 --layer 0 --iterations 3 --residual
+`MODEL` is a `.gguf` file or a safetensors checkpoint directory, everywhere.
+`flyweight COMMAND --help` lists every option that command accepts, grouped
+by what it does: the request, the backend, hardware placement, and advanced
+tuning. The older `serve-v2`, `generate-text-v2`, `benchmark-v2`,
+`inspect-gguf`, and `probe-native-v2` spellings remain accepted.
+
+## Serve a model
+
+~~~bash
+flyweight serve model.gguf
 ~~~
 
-The complete block performs the reference sequence:
+Open `http://127.0.0.1:8000/` for the local chat UI. The defaults select the
+backend and memory policy automatically; the options below are the ones worth
+reaching for first:
 
-1. BF16 router matrix-vector multiplication
-2. Float32 softmax over all experts
-3. Top-k selection and selected-probability renormalization
-4. Q4 SwiGLU execution for selected experts
-5. Routing-weighted expert aggregation
-6. Q4 shared SwiGLU execution
-7. Sigmoid shared-expert gating
-8. Routed plus shared output
-
-The residual mode first applies Qwen's one-centered RMSNorm and then adds the original hidden state.
-
-Execute incremental full attention with a growing grouped-query KV cache:
-
-~~~console
-python -m colibri_next.cli benchmark-attention-layer models/colibri-qwen36 --layer 3 --tokens 8
+~~~bash
+flyweight serve model.gguf \
+  --context 65536 --max-tokens 16384 \
+  --host 127.0.0.1 --port 8000
 ~~~
 
-The attention path applies input RMSNorm, Q/K/V projection, per-head Q/K RMSNorm, partial RoPE, grouped-query causal attention, sigmoid query gating, output projection, and the residual connection.
+Prompt caching is automatic: displaced conversations are packed into a
+byte-budgeted host-RAM LRU and restored by longest matching prefix, including
+when only one GPU sequence slot is configured. Use `--cache off` to disable it
+or `--cache 4096` to set an explicit 4 GiB budget. Automatic mode uses one
+eighth of currently available RAM, capped at 8 GiB.
 
-Execute incremental Gated DeltaNet with persistent convolution and recurrent state:
+The older `--context-window` and `--max-new-tokens` spellings of the limit
+flags remain accepted for script compatibility.
 
-~~~console
-python -m colibri_next.cli benchmark-linear-layer models/colibri-qwen36 --layer 0 --tokens 8
+The native expert modes are:
+
+| Mode | Prompt routed experts | Decode routed experts | Behavior |
+| --- | --- | --- | --- |
+| `cpu` | CPU | CPU | Minimum GPU expert memory |
+| `auto` | CPU | Stable hot set on GPU, misses on CPU | Default |
+| `resident` | GPU | GPU | Fails preparation unless every expert fits |
+
+Legacy `hybrid`, `gpu`, `legacy-hybrid`, and `legacy-paging` spellings remain
+compatibility aliases for the old paging policies, and `--moe-device` is an
+accepted alias of `--expert-mode`; new deployments should use the canonical
+modes. On `--backend cpu` the expert mode is forced to `cpu`.
+
+For concurrent agent clients, allocate independent sequence slots and optional
+host prompt-cache storage:
+
+~~~bash
+flyweight serve model.gguf \
+  --context 58000 \
+  --expert-mode cpu --cpu-threads 12 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --parallel 2 --cache 4096 --cpu-prefetch-auto
 ~~~
 
-The linear path applies input RMSNorm, projected depthwise causal convolution, Q/K L2 normalization, learned decay and delta-rule state updates, SiLU-gated RMSNorm, output projection, and the residual connection.
+Each sequence slot has its own KV and recurrent state. More slots improve
+conversation isolation but consume additional VRAM. Bound both admitted
+inference work and open HTTP connections for public-facing deployments:
 
-Execute every converted decoder layer with persistent per-layer state:
-
-~~~console
-python -m colibri_next.cli benchmark-decoder models/colibri-qwen36 --tokens 1
+~~~bash
+flyweight serve model.gguf \
+  --concurrency 8 --max-connections 64 \
+  --request-timeout-seconds 30
 ~~~
 
-The decoder stack selects each layer's configured token mixer, applies both residual paths, executes its sparse MoE block, and advances full-attention or recurrent state for the next token.
+### Chat UI
 
-Execute real token IDs through embeddings, every decoder layer, final RMSNorm, and the LM head:
+The bundled UI at `/` is a single-page app that reaches every function the
+server exposes, not only chat:
 
-~~~console
-python -m colibri_next.cli benchmark-logits models/colibri-qwen36 --token-ids 1,2,3 --device cuda --gpu-cache-mib 8192
+- **Chat** streams through any of the three protocols (OpenAI chat
+  completions, Anthropic messages, OpenAI responses), switchable per
+  conversation from the composer. Thinking shows in a collapsible panel with
+  its duration; tool calls render as cards where you paste the result and
+  continue; images attach by button, paste, or drop when a vision tower is
+  loaded. Markdown, GFM tables, KaTeX math, and highlighted code with copy,
+  download, and a sandboxed **Run** for HTML/SVG/JS.
+- **Settings** (Ctrl+,) cover every sampling knob the server accepts,
+  stop sequences, seed, reasoning effort and budget, `preserve_thinking`,
+  JSON mode and JSON schema output, `chat_template_kwargs`, and named
+  presets. Defaults track `/props` until you change something.
+- **Tools** defines function tools (import OpenAI or Anthropic definitions),
+  `tool_choice`, and parallel calls; the sampler grammar enforces them.
+- **Runtime** polls `/health`, `/props`, and `/slots` and charts decode
+  throughput, GPU memory, KV and prefix cache, expert cache hit rate, MTP
+  acceptance, the time breakdown, and grammar counters, with the full
+  telemetry block and raw JSON one click away.
+- **Tokenizer** drives `/tokenize` and `/detokenize` and counts the current
+  conversation through both `/v1/messages/count_tokens` and
+  `/v1/responses/input_tokens`.
+- **Playground** streams raw prompts through `/v1/completions`.
+- **Inspector** keeps the exact request body, every SSE frame, and a curl
+  line for each request, and retrieves or deletes stored responses.
+
+Conversations live in IndexedDB (history from the previous UI is imported
+once), with search, pin, rename, and JSON or Markdown export. Ctrl+K opens a
+command palette; Ctrl+B toggles the sidebar; Esc stops a generation.
+
+### Images
+
+A Qwen 3.5-family GGUF serves images when its vision tower is attached.
+The tower is the `mmproj-*.gguf` llama.cpp publishes beside the model
+(projector type `qwen3vl_merger`); decoding needs Pillow, installed with
+`pip install 'flyweight[vision]'`:
+
+~~~bash
+flyweight serve Qwen3.5-35B-A3B-Q6_K.gguf \
+  --mmproj mmproj-Qwen3.5-35B-A3B-BF16.gguf --image-max-tokens 1024
 ~~~
 
-CUDA keeps packed BF16 and Q4 weights in a bounded priority-aware VRAM cache and executes them without full dequantization. Routed and shared experts use grouped gate, activation, and weighted-down kernels, attention projections are batched, and Gated DeltaNet recurrent updates remain on the GPU. During generation, decoder hidden states, RMSNorm, residuals, routing probabilities, LM-head logits, and sampling stay device-resident; only selected expert IDs and the sampled token cross to the host. Evicted expert allocations are reused through CuPy's memory pool instead of forcing allocator-wide synchronization. Omit `--device cuda` for the portable CPU path; lower `--gpu-cache-mib` on smaller GPUs.
+Each image is resized so that both sides are multiples of 32 pixels, the
+aspect ratio is kept, and it covers at most `--image-max-tokens` tokens (one
+per 32x32 block; the default 1024 is about a megapixel). Image tokens count
+as prompt tokens in `usage`, and an image that sits inside a reused prefix is
+never encoded again. `--image-urls deny` refuses `http(s)` image URLs and
+keeps `data:` URLs; `/health` reports the tower under `execution.vision`,
+and the bundled chat UI shows an **Image** button (paste or drop works too)
+whenever it does. Without a tower an image part degrades to a visible
+`[image omitted: ...]` note in the prompt rather than failing the request,
+since the part sits in the client's history and would return on every retry.
 
-The generator skips unnecessary vocabulary projections during prompt prefill and only evaluates the LM head for the final prompt token. CUDA full attention keeps RoPE, KV-cache updates, grouped-query attention, gating, and residual execution on the GPU. Fused RMSNorm and routing kernels reduce launch count. Layer-major CUDA prefill batches static projections and routing across prompt tokens and synchronizes selected expert IDs once per layer instead of once per token and layer. In local RTX 5070 Ti Laptop GPU benchmarks using Qwen3.5-35B-A3B with experts preloaded into RAM, the original runtime produced 1.10 output tokens per second, grouped CUDA reached 4.27, device-resident decode reached 4.80, Q4 static weights reached 6.56, and fused normalization/routing reached 6.92 output tokens per second when total response time includes prompt processing. The corrected warmed decode harness measures about 16-18 generated tokens per second with GPU sampling included. A warmed 256-token prefill improved from 13.75 to 18.05 tokens per second after batched routing. Q4 static attention, DeltaNet, embeddings, and LM-head files occupy about 1.24 GiB, protected CUDA weights use about 1.08 GiB, and short measured runs had no weight-cache evictions. Treat these single-run numbers as directional; prompt length, early EOS, storage speed, power limits, and available VRAM materially affect throughput.
-
-Expert-major MoE dispatch groups prompt assignments by routed expert and runs the
-shared expert over the complete token batch. On the same RTX 5070 Ti, warmed
-256-token Q4 prefill improved from 37.93 to 39.25 tokens per second (about
-3.5%), while 64-token prefill regressed from 47.89 to 43.34. The runtime
-therefore uses tokenwise grouped dispatch below 128 tokens and expert-major
-dispatch at or above 128 tokens. Set `COLIBRI_EXPERT_MAJOR_PREFILL` to `0` or
-`1` to force either path, or tune the crossover with
-`COLIBRI_EXPERT_MAJOR_MIN_TOKENS`.
-
-Pinned-memory expert upload and a request-local cross-layer transition predictor
-are available experimentally. Enable them with
-`$env:COLIBRI_EXPERT_PREFETCH = "1"` in PowerShell or
-`export COLIBRI_EXPERT_PREFETCH=1` in Bash.
-`COLIBRI_EXPERT_PREFETCH_BUDGET` controls the number of predicted experts and
-defaults to `2`. The CUDA health statistics report requests, cache hits, waits,
-useful prefetched tensors, and transferred MiB. This remains opt-in because a
-forced 2 GiB cache benchmark showed no cold-decode improvement and a small
-warm-decode regression from cache pollution, while the normal 8 GiB
-short-prompt run already had all decode-used experts resident.
-
-Generate decoded text from a chat prompt:
-
-~~~console
-python -m colibri_next.cli generate-text models/colibri-qwen36 --prompt "Say hi." --max-new-tokens 8 --temperature 0 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0
-~~~
-
-Temperature zero performs greedy decoding. Positive temperatures support top-k and nucleus sampling through `--top-k`, `--top-p`, and `--seed`.
-
-## Transformers validation
-
-Install the optional reference dependencies and compare a converted model with its
-original Hugging Face checkpoint using identical token IDs:
-
-~~~console
-pip install -e ".[validation]"
-python -m colibri_next.cli validate-transformers models/colibri-qwen36 models/Qwen3.6-35B-A3B --token-ids 1,2,3 --generate-tokens 4 --device cuda --gpu-cache-mib 8192 --reference-device cuda --reference-dtype bfloat16
-~~~
-
-When the reference checkpoint does not fit in one GPU, use
-`--reference-device auto --reference-offload-dir models/transformers-offload`
-to let Accelerate place weights across GPU, RAM, and disk. The offload directory
-must have enough free space for the portion of the checkpoint that does not fit
-in accelerator and system memory. Use `--reference-gpu-memory-mib` and
-`--reference-cpu-memory-mib` to reserve capacity for Colibrì and the operating
-system.
-
-Add `--layerwise` with exactly one token ID to compare the embedding, decoder
-hidden states, and final normalization. This locates the first divergent layer
-after an end-to-end parity failure. Use `--component-layer N` to split a
-full-attention layer into normalization, token-mixer, MoE, and residual stages.
-
-The validator compares the complete next-token logit vectors, top-k membership,
-cosine similarity, and greedy token at every step. Generated steps are
-teacher-forced with the Transformers greedy token, so a mismatch does not put the
-two runtimes on different contexts. Use `--trust-remote-code` only for checkpoints
-whose repository code you have reviewed.
-
-In a local Qwen3.5-35B-A3B validation, a model with BF16 embeddings, attention,
-DeltaNet, and LM head plus Q4 experts matched all five Transformers greedy
-predictions for token `1` and four teacher-forced continuations. Logit cosine
-similarity ranged from 0.9803 to 0.9968. Quantizing the static weights to Q4
-changed the first greedy prediction and reduced cosine similarity to 0.7165.
-Layerwise diagnostics traced the sharp loss to residual cancellation amplifying
-accumulated quantization error. Treat Q4-static conversion as a throughput and
-memory optimization that can alter generation; use BF16 static tensors when
-reference fidelity is more important.
-
-## Local server
-
-Start one persistent model process with an 8 GiB CUDA weight cache:
-
-~~~console
-python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --gpu-cache-mib 8192 --cpu-moe-layers 0 --context-window 32768 --host 127.0.0.1 --port 8000
-~~~
-
-`--context-window` limits formatted input plus generated output. The browser
-reads this value from `/props` and no longer imposes a separate 4096-token cap.
-For example, a 32,768-token window with a 10,000-token conversation leaves at
-most 22,768 tokens for generation. Use `--max-new-tokens` only when you want an
-additional output ceiling below the total context window. Larger contexts grow
-full-attention KV storage and keep more recurrent/conversation state resident.
-
-The server defaults to `--expert-preload auto`. It preloads routed Q4 experts when available RAM can hold them while preserving an 8 GiB reserve, and otherwise continues with on-demand SSD loading. The tested Qwen3.5-35B-A3B conversion uses about 16.9 GiB for routed experts and took about 48.5 seconds to preload from SSD. Use `--expert-preload none` for faster startup or `--expert-preload all` to force preloading. The one-off `generate-text` command defaults to `none` because preload startup is usually not worthwhile for a single short response.
-
-`--cpu-moe-layers N` runs the first N MoE blocks through the parallel native Q4 CPU backend while attention, DeltaNet, and the remaining MoE blocks stay on CUDA. The native AVX-512 expert kernel measured about 31x faster than the NumPy fallback on the development machine. Keep the default `0` on the tested 12 GiB RTX 5070 Ti, where full GPU MoE remained fastest; try `10`, `20`, or higher on smaller GPUs to reduce expert-cache pressure and VRAM evictions. The active native instruction set and CPU layer count are reported by the health endpoint.
-
-Open `http://127.0.0.1:8000/` for the bundled browser chat UI. Conversations and generation settings are stored locally in the browser. If bearer authentication is enabled, enter the API key in the UI Settings panel.
-
-Send an OpenAI-compatible chat completion request from another terminal:
-
-Windows PowerShell:
-
-~~~powershell
-$body = @{
-  model = "colibri-qwen35"
-  messages = @(@{ role = "user"; content = "Say hi." })
-  max_tokens = 8
-  temperature = 0
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/v1/chat/completions -ContentType application/json -Body $body
-~~~
-
-Linux Bash:
+## API
 
 ~~~bash
 curl http://127.0.0.1:8000/v1/chat/completions \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "model": "colibri-qwen35",
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local-model",
     "messages": [{"role": "user", "content": "Say hi."}],
-    "max_tokens": 8,
+    "max_tokens": 64,
     "temperature": 0
   }'
 ~~~
 
-The server supports streaming and non-streaming `POST /v1/chat/completions`, `POST /v1/responses`, and legacy `POST /v1/completions`; stateful Responses continuation, retrieval, and deletion; Chat Completions and Responses function tools using Qwen's native tool format; `GET /v1/models`; and llama.cpp-style `/tokenize`, `/detokenize`, `/props`, and `/slots` endpoints. It keeps the CUDA cache warm and serializes generation on one GPU. The first request compiles CUDA kernels and fills VRAM, so later requests are faster.
-
-Completed generations retain a bounded decoder prefix state. When a later chat
-request begins with the same tokenized history, the server reuses its attention
-KV and DeltaNet recurrent state and prefills only newly appended tokens. The
-default cache holds four conversation branches; set
-`COLIBRI_PREFIX_CACHE_ENTRIES=0` to disable it or another non-negative value to
-change the capacity. `/health` reports entries, hits, misses, evictions, and
-reused tokens. A local two-turn Qwen3.5-35B-A3B smoke test reduced follow-up
-latency from 1.474 to 0.648 seconds by reusing 19 of 40 prompt tokens. Results
-depend on answer length, suffix size, expert residency, and cache pressure.
-
-Optional bearer authentication can be enabled without putting the key in shell history:
-
-Windows PowerShell:
-
-~~~powershell
-$env:COLIBRI_API_KEY = "replace-with-a-local-secret"
-python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --api-key $env:COLIBRI_API_KEY --cors-origin http://127.0.0.1:8000
-~~~
-
-Linux Bash:
+Image parts go where the OpenAI, Responses and Anthropic APIs put them:
 
 ~~~bash
-export COLIBRI_API_KEY="replace-with-a-local-secret"
-python -m colibri_next.cli serve models/colibri-qwen35 --device cuda --api-key "$COLIBRI_API_KEY" --cors-origin http://127.0.0.1:8000
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local-model",
+    "messages": [{"role": "user", "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+      {"type": "text", "text": "What is in this picture?"}
+    ]}]
+  }'
 ~~~
 
-The official OpenAI Python SDK can use the local server directly:
+Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (with
+retrieval and deletion by id), `/v1/models`, `/v1/messages` and
+`/v1/messages/count_tokens` (Anthropic), `/v1/responses/input_tokens`,
+`/tokenize`, `/detokenize`, `/health`, `/props`, and `/slots`. All generation
+endpoints stream over SSE. Set `FLYWEIGHT_API_KEY` or pass `--api-key` to
+require bearer authentication (`Authorization: Bearer` or `x-api-key`). Use
+`--strict-model` when request model IDs must exactly match the configured
+server model name.
 
-~~~console
-pip install openai
+Chat requests use the GGUF's `tokenizer.chat_template` when it is present;
+the built-in architecture formatter is only a fallback for older files. If a
+`generation_config.json` is stored beside the GGUF, its `temperature`,
+`top_k`, `top_p`, `min_p`, the penalties, `max_new_tokens`, and `do_sample`
+defaults are also loaded. Without one, the built-in defaults are llama.cpp's:
+temperature 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05, penalties off.
+Explicit API request values always override model defaults. `GET /props`
+reports the resolved defaults and their sources, and the bundled UI adopts
+them until the user saves custom settings.
+
+### Thinking controls
+
+Reasoning models expose two knobs, one soft and one hard:
+
+- `reasoning_effort` (`low` / `medium` / `high` / `xhigh`) is a template
+  variable for checkpoints that grade their reasoning (Qwen3.5 reads it
+  natively). It is read from the flat field, the Responses-style
+  `reasoning.effort`, vLLM-style `chat_template_kwargs.reasoning_effort`, or
+  Anthropic `output_config.effort` -- so Claude Code's `/effort` slider and
+  opencode reasoning presets work unchanged. `--reasoning-effort` sets a
+  server default. OpenAI's `minimal` clamps to `low`, Anthropic's `max` to
+  `xhigh`. This is trained behavior, not a limit: the checkpoint may overrun
+  it.
+- `reasoning_budget_tokens` is a hard ceiling the runtime enforces: at the
+  limit the sampler forces the thinking block closed and the answer resumes.
+- `POST /v1/chat/completions/{id}/stop_thinking` (or
+  `/v1/messages/{id}/stop_thinking`) interrupts a live stream: the runtime
+  closes the open thinking block on the next token and goes straight to the
+  answer, through the same path as the budget. `{id}` is the id the stream
+  reported in its first event. `/props` lists `stop_thinking` under
+  `capabilities` when the loaded runtime supports it, and the chat UI shows
+  an **Answer now** button while the model is thinking.
+  Anthropic's `thinking: {"type": "enabled", "budget_tokens": N}` maps onto
+  it. Unlike hosted APIs, this budget is a guarantee, not a hint.
+
+`enable_thinking` (top level or in `chat_template_kwargs`) switches thinking
+off entirely for templates with a switch, and `separate_reasoning` routes
+chain-of-thought to a `reasoning_content` delta field instead of the content
+stream. On `/v1/messages`, reasoning is returned as Anthropic thinking
+blocks.
+
+### Structured output and tools
+
+Declared tools are enforced by a sampler grammar, not just prompted: the tool
+name must be a declared one, required parameters must be present, and
+array/object argument values must be complete well-formed JSON. Scalar values
+are free text -- the declared schema types them after parsing.
+`response_format` (`json_object` / `json_schema`) is likewise enforced at the
+sampler. `FLYWEIGHT_TOOL_GRAMMAR=0` and `FLYWEIGHT_RESPONSE_GRAMMAR=0` disable
+each constraint independently without a rebuild. Tool-call arguments stream
+incrementally as JSON fragments, so a long file-writing call produces wire
+progress instead of a timeout. DeepSeek-V4 and BailingMoE3 templates render
+their own tool markup; every other architecture gets the generic Hermes-style
+tool prompt.
+
+### Sampling
+
+Sampling takes `repetition_penalty` (default 1.1 over the last 64 generated
+tokens), plus OpenAI's `presence_penalty` and `frequency_penalty` (default
+0). These are on by default because "no penalty" is not a neutral setting:
+with nothing discouraging a token the model has just produced, a heavily
+quantized checkpoint can lock onto a line and repeat it until the token
+budget runs out. Only generated tokens are penalized -- penalizing the prompt
+would push the model away from the user's own wording. Set
+`repetition_penalty` to 1 to disable, or raise `penalty_window` to look
+further back. The penalties pause while a tool call is open (the sampler
+grammar knows when one is): a call's arguments are verbatim by contract -- an
+Edit reproduces the span of the file it replaces, character for character --
+and penalizing recently emitted tokens there made the quote drift and the
+harness's exact-match check fail. `FLYWEIGHT_TOOL_CALL_PENALTY=1` restores the
+old behaviour for comparison. Outside tool calls the penalty still applies to
+quoted file content, so for edit-heavy agent work on higher-precision quants
+`repetition_penalty: 1` remains worth considering. `seed` pins the sampler
+per request.
+
+## Inspect and generate
+
+~~~bash
+flyweight inspect model.gguf
+
+flyweight generate model.gguf \
+  --prompt "Explain mixture-of-experts routing." \
+  --max-tokens 128 --temperature 0
 ~~~
 
-~~~python
-from openai import OpenAI
+## Benchmarking
 
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local")
+The direct benchmark separates preparation, prompt prefill, and steady decode:
 
-stream = client.chat.completions.create(
-    model="colibri-qwen35",
-    messages=[{"role": "user", "content": "Say hi."}],
-    max_tokens=8,
-    stream=True,
-)
-for chunk in stream:
-    if chunk.choices and chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
-
-response = client.responses.create(
-    model="colibri-qwen35", input="Say hi.", max_output_tokens=8
-)
-print(response.output_text)
+~~~bash
+flyweight benchmark model.gguf \
+  --prompt "Explain sliding-window attention." --chat \
+  --context 32768 --iterations 30 --warmup 10 \
+  --expert-mode auto --cache-type-k f16 --cache-type-v f16
 ~~~
-## Chat UI direction
 
-The bundled UI is a same-origin static web application served by the Python process at `/`. It uses plain HTML, CSS, and browser-native JavaScript modules, keeping the installed server a single-command, offline-capable package with no Node.js runtime. The browser consumes Chat Completions SSE with `fetch`, `ReadableStream`, and `AbortController`; stores conversations and generation settings in `localStorage`; renders tool calls as structured cards; and polls `/health` for CUDA cache and busy-state indicators. Fenced HTML, SVG, and JavaScript code blocks include a Run button that renders the code below the block inside a sandboxed opaque-origin iframe with no access to the app origin, its storage, or the API.
+For reproducible comparisons across prompt lengths, use the checked-in JSONL
+harness:
 
-## Architecture
+~~~bash
+PYTHONPATH=src python bench_runtime.py run model.gguf \
+  --output /tmp/baseline.jsonl --label baseline \
+  --prompt "Runtime regression benchmark." \
+  --prompt-lengths 256,1024,4096 \
+  --context 32768 --samples 5 --sample-warmup 1
 
-QwenSafetensorCheckpoint validates checkpoint geometry and source shards.
+PYTHONPATH=src python bench_runtime.py compare \
+  /tmp/baseline.jsonl /tmp/candidate.jsonl
+~~~
 
-QwenCheckpointConverter converts stacked routed-expert tensors into Q4 expert containers.
+Run GPU benchmarks in isolation. Another process changes free VRAM and
+therefore changes automatic expert-cache sizing.
 
-QwenMoELayerConverter creates one small layer container holding the BF16 router, shared gate, RMSNorm, and Q4 shared expert.
+## Runtime controls
 
-QwenMoELayer loads experts on demand and executes the official sparse MoE equations.
+The `serve` help shows only the common surface; the advanced options below
+are accepted everywhere:
 
-QwenAttentionConverter creates BF16 full-attention layer containers. QwenFullAttentionLayer executes one token at a time against AttentionKVCache.
+- `--quant ask|IQ2_XS|Q2_K|IQ3_XXS|Q3_K|IQ4_XS|Q4_K|Q5_K|Q6_K|Q8_0|F32`:
+  quantization for a safetensors checkpoint (see below)
+- `--imatrix PATH|off`: importance matrix for IQ packing; defaults to an
+  `imatrix.dat` beside the checkpoint when one exists
+- `--backend auto|cuda|cpu`: execution backend; `auto` uses CUDA when a
+  driver is present
+- `--gpu-cache-mib 0`: size allocations from currently free VRAM
+- `--cache-type-k` / `--cache-type-v` `auto|f32|f16|bf16|q8_0|turbo3|turbo4`:
+  KV precision (default `f16`)
+- `--mtp-drafts N`: multi-token prediction for Qwen checkpoints; a round
+  drafts N tokens and can commit N+1 (the drafts plus the token that verifies
+  the last one). The runtime times a short trial of drafting against
+  ordinary decode and keeps drafting only when it wins; the verdict expires
+  after `FLYWEIGHT_MTP_RECALIBRATE_TOKENS` decoded tokens (default 2048, 0
+  keeps the first verdict) so a reading taken under a load spike does not
+  last the whole process, and `FLYWEIGHT_MTP_ADAPTIVE=0` drafts
+  unconditionally. `--mtp-model` supplies a draft GGUF overlay (DSpark for
+  DeepSeek-V4-Flash)
+- `--dense-requant auto|q8|off`: control temporary BF16 dense-weight Q8 upload
+- `--parallel N`: independent sequence slots
+- `--cache auto|off|MIB`: host cache for displaced conversation state
+- `--cpu-threads N`: CPU expert worker count (physical cores by default)
+- `--reasoning-effort low|medium|high|xhigh`: server-wide default effort
+- `--concurrency N`: reject excess generation work with HTTP 429
+- `--max-connections N`: cap simultaneous HTTP connection threads
+- `--request-timeout-seconds N`: bound idle/read time on client sockets
+- `--max-tool-call-tokens N`: bound a runaway tool call (0 = unbounded)
+- `--freeze-total-tokens`: pin the `<total_tokens>N tokens left</total_tokens>`
+  counter Claude Code rewrites in its history on every request, so
+  `/v1/messages` prompts stay cache-identical across turns instead of
+  re-evaluating everything after the counter
+- `--prefill-cache-seed auto|off|N`: post-prefill hot-expert placement
+- `--expert-paging auto|staged|direct`: legacy paging transfer policy
+- `--cpu-prefetch-auto`: warm prompt-relevant expert pages when beneficial
+- `--swa-full`: trade VRAM for unrestricted sliding-layer rollback
 
-QwenGatedDeltaConverter creates BF16 linear-layer containers. QwenGatedDeltaLayer executes one token at a time against GatedDeltaState.
+Prefill expert streaming (staging routed experts to the GPU for the batched
+prefill kernels) is on by default with an automatically sized budget and has
+no CLI flag; `FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB` overrides the budget in MiB
+(`0` disables). `FLYWEIGHT_PREFILL_PIPELINE=0` restores the serial prefill and
+`FLYWEIGHT_CUDA_GRAPHS=0` disables graph replay, both for comparison only.
 
-QwenDecoderLayer combines one token mixer with its MoE block. QwenDecoderStack runs all configured layers against DecoderState.
+Runtime diagnostics are exposed through `/health`, including prefix-cache
+counters and the sampler-grammar counters
+(`grammar_constrained_steps`, `grammar_rejected_candidates`,
+`grammar_empty_candidate_sets`). Detailed profiling and experimental kernel
+switches use `FLYWEIGHT_*` environment variables; unset profiling variables for
+production serving.
 
-QwenModelIO provides embedding lookup, final RMSNorm, and chunked vocabulary projection. QwenForCausalLM maps token IDs to logits while advancing decoder state.
+## Quantization
 
-HuggingFaceTokenizer loads copied tokenizer JSON assets. TextGenerator formats ChatML prompts, samples logits, advances sequence state, and decodes generated IDs.
+A GGUF arrives quantized; a safetensors checkpoint does not, so the first
+open packs it and caches the result beside the checkpoint. On a terminal the
+CLI asks which quantization to pack, listing the exact size of each and
+marking the ones already cached -- picking a cached one opens in about a
+second, an uncached one costs a repack and the disk to store it. Anything
+non-interactive keeps the default (`Q6_K`), and `--quant`, or
+`FLYWEIGHT_HF_QUANT`, answers ahead of time:
 
-LayeredExpertCache, ResidencyManager, TransitionPredictor, and PlacementPlanner provide the storage hierarchy. The current QwenMoELayer has a local expert cache; connecting it directly to ResidencyManager is a later integration step.
+~~~
+Qwen3.8-27B is a safetensors checkpoint. Choose how to quantize it:
+  1) IQ2_XS          --   unavailable: needs an importance matrix
+  2) Q2_K        9.5 GiB   packs on first open, writes 9.5 GiB
+  3) IQ3_XXS    10.8 GiB   packs on first open, writes 10.8 GiB
+  4) Q3_K       11.9 GiB   packs on first open, writes 11.9 GiB
+  5) IQ4_XS     14.1 GiB   packs on first open, writes 14.1 GiB
+  6) Q4_K       14.9 GiB   cached, opens immediately
+  7) Q5_K       17.8 GiB   packs on first open, writes 17.8 GiB
+  8) Q6_K       20.9 GiB   cached, opens immediately  [default]
+  9) Q8_0       26.5 GiB   packs on first open, writes 26.5 GiB
+ 10) F32       101.8 GiB   packs on first open, writes 101.8 GiB
+quantization [Q6_K]:
+~~~
+
+Below `Q6_K` the tradeoff is accuracy against fit, and fit is what dominates:
+a dense block that does not fit in VRAM is executed on the CPU, at about 3 ms
+per token in decode -- prefill batches those blocks and pays less per token,
+but not little enough to ignore. On a 12 GB card the 27B above spills 51 of
+64 dense blocks at `Q6_K` and none at `Q2_K`, which is the difference between
+4 and 36 tokens/s of decode. Pick the largest target that still fits, not the
+largest you can pack.
+
+Two things to know about spilled blocks. Which blocks spill is decided from
+the VRAM free at startup, so on a card shared with a desktop the split can
+differ from one launch to the next; pass `--gpu-cache-mib` to pin it. And a
+spilled block whose weights are in a codebook format (IQ2/IQ3) is re-encoded
+to Q3_K for the host kernels, which is lossy: `FLYWEIGHT_HOST_FFN_FORMAT`
+picks `q2_k`, `q3_k` (default), `q8_0` or `off`, and
+`FLYWEIGHT_HOST_FFN_Q8_MIB` caps the re-encoded bytes (default 8192).
+
+`Q2_K` and `Q3_K` are dense-only: no GPU routed-expert kernel decodes either,
+so a mixture-of-experts checkpoint packed to one would run every routed layer
+on the CPU. Both are refused there rather than silently doing that -- `Q4_K`
+is the smallest a MoE checkpoint can be packed to -- and the menu marks them
+unavailable on such a model. `IQ3_XXS` has grouped expert kernels and no such
+restriction.
+
+`IQ3_XXS` is a codebook format -- 3.06 bits per weight, against Q3_K's 3.44
+-- and quantizing to it searches 256 patterns per four weights rather than
+rounding to a lattice, so packing the 27B above takes ~5 minutes against ~40
+seconds for a K-quant. It is a one-time cost, cached like any other. It also
+prefills fastest of the lot on the checkpoint above (196 tok/s at 1k context,
+against 273 for Q2_K only because Q2_K is 1.5 GiB smaller and spills
+nothing).
+
+The search accepts an importance matrix -- per-channel activation statistics
+gathered over calibration data, the `imatrix.dat` the ecosystem publishes
+beside checkpoints. An `imatrix.dat` in the checkpoint directory is picked up
+automatically, `--imatrix path` (or `FLYWEIGHT_HF_IMATRIX`) names one
+elsewhere, and `off` disables the probe. With a matrix the codebook search
+weights each channel by how hard the model actually drives it, which is what
+lifts IQ3_XXS above the K-quant accuracy curve; without one it uses
+llama.cpp's own no-matrix fallback weighting and lands on that curve, buying
+size only. The matrix is part of the cache fingerprint, so switching it packs
+a distinct cache.
+
+The runtime can also gather its own matrix, over any Qwen-family model it
+serves:
+
+~~~bash
+flyweight imatrix model.gguf \
+  --text calibration.txt --output imatrix.dat
+~~~
+
+Calibration prefills the text in chunks and accumulates activation energy at
+every projection's input -- dense projections on either backend, routed
+experts pinned to the CPU path for the run so no layer goes uncounted. The
+output is llama.cpp's legacy `.dat` layout, readable by both this packer and
+`llama-quantize`.
+
+`IQ4_XS` (4.25 bits against Q4_K's 4.5) packs through a 16-level nonlinear
+table rather than a codebook search, so it costs K-quant packing time, reads
+the importance matrix, and keeps grouped routed-expert GPU kernels -- on a
+mixture-of-experts checkpoint it is the smallest target that serves every
+routed layer on the GPU below Q4_K.
+
+`IQ2_XS` (2.31 bits) is offered **only with an importance matrix** -- the
+menu marks it unavailable and the loader refuses it otherwise. This mirrors
+llama.cpp's own policy, and the measurement behind it is pinned in the test
+suite: packed unweighted it round-trips *worse* than Q2_K, because at two
+bits the search's entire job is knowing which channels can afford to be
+wrong, and only calibration data can say. With a matrix it is the smallest
+pack whose routed experts still run on grouped GPU kernels. The remaining
+sub-3-bit formats (IQ2_XXS, IQ1_M) are still unoffered: no encoders yet.
+
+For GGUFs that arrive already quantized, the dense GPU kernels cover the K
+quants, Q8_0, IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ4_XS, and the 1-bit IQ1_S and
+IQ1_M; grouped routed-expert GPU kernels exist for Q4_K, Q5_K, Q6_K, Q8_0,
+IQ2_XS, IQ3_XXS, IQ4_XS, and NVFP4, and other formats run their experts on
+the CPU path. IQ1_M tensors that no kernel can read are requantized to Q8_0
+on upload; an IQ1_M embedding table is refused.
+
+`--dense-requant auto` keeps the GGUF unchanged and chooses the temporary GPU
+representation from the requested or available VRAM budget. It converts BF16
+dense tensors to Q8_0 when the BF16 working set plus useful routed-expert
+cache would exceed that budget. Use `q8` to force the memory-saving
+representation or `off` to preserve the checkpoint's dense precision exactly.
+
+`--cache-type-k` / `--cache-type-v` default to `f16`, and `auto` only reaches
+for `turbo4` on a checkpoint with routed experts, above 32K context. A
+*dense* checkpoint with a wide `head_dim` is the case that default serves
+badly, and it has to be set by hand. Qwen3.8-27B (`qwen35`) is the worked
+example: 16 full attention layers x 4 KV heads x head_dim 256 is 64 KiB of KV
+per token, so KV competes with the weights for VRAM, and every dense block
+that loses is re-read over PCIe on every token. On a 12 GB card with the
+UD-IQ2\_XXS build:
+
+| context | KV       | dense blocks spilled | decode      |
+| ------- | -------- | -------------------- | ----------- |
+| 16K     | `f16`    | 5 of 64 (408 MiB)    | 16.6 tok/s  |
+| 16K     | `q8_0`   | none                 | 23.2 tok/s  |
+| 16K     | `turbo4` | none                 | 24.0 tok/s  |
+| 32K     | `f16`    | 16 of 64 (1306 MiB)  | 10.8 tok/s  |
+| 32K     | `q8_0`   | 5 of 64 (408 MiB)    | 15.3 tok/s  |
+| 32K     | `turbo4` | none                 | 22.9 tok/s  |
+
+`q8_0` halves the cache and `turbo4` quarters it, which is why `q8_0` is
+enough to clear the spill at 16K but not at 32K. Needle retrieval stays exact
+under `turbo4` at 32K. The rule of thumb: if `prepare` reports dense blocks
+on CPU, spend KV precision to buy them back before anything else.
+
+Dense projections and the LM head take Q8-activation group-decode kernels
+(`dp4a` on the K-quants, IQ formats and, since this release, Q8_0 -- which is
+also the type an NVFP4 build requantizes its LM head to). `FLYWEIGHT_IQ2_Q8_DECODE=0`
+switches every one of them, decode and chunked prefill alike, back to the
+reconstruct-in-float kernels: slower, but bit-identical between the paths,
+which is what the path-parity tests pin.
+
+Qwen sampling with `top_k <= 32` reduces candidates on the GPU by default.
+`sampling_gpu_topk_*`, `sampling_full_download_bytes`, and
+`sampling_nanoseconds` expose its behavior; set `FLYWEIGHT_SAMPLING_GPU_TOPK=0`
+only when comparing against the full-vocabulary host fallback.
+
+## Testing
+
+The default suite builds synthetic fixtures and does not require model
+weights:
+
+~~~bash
+ruff check src tests setup.py
+mypy src/flyweight
+pytest -q
+~~~
+
+`check_vision_parity.py` runs the native vision tower against the NumPy
+reference in `native/tools/qwen_vision_reference.py` on a real mmproj
+(`--mmproj PATH`, `--backend cpu` for the host kernels); it needs no
+language model.
+
+Set `FLYWEIGHT_TEST_MODEL=/path/to/model.gguf` to opt into the real Qwen
+reference tests. A configured model path that is missing or fails to load is
+treated as a test failure; only an unset opt-in and an unavailable CUDA
+device are skipped.
 
 ## Current limitations
 
-- Dynamic expert selection still synchronizes selected IDs to the host once per MoE layer
-- Routers, shared gates, normalization vectors, and recurrent parameters remain BF16 or F32
-- Full CUDA graph replay and persistent fused layer kernels are not implemented
-- CUDA is the only implemented accelerator backend
-- Image, audio, embeddings, fine-tuning, and hosted OpenAI tools are not implemented
-- Tool calls are buffered before streaming because the native XML call must be parsed as a complete unit
-- DeltaNet recurrence and routed expert execution remain token-sequential during prefill
-- Response history and decoder prefix states are process-local; response records
-  are limited to 128 and prefix states default to four entries
+- CUDA is the only model-execution accelerator; `--backend cpu` serves
+  everything on the CPU kernels instead.
+- Qwen3.8-Flash-Next (qwen4exp) runs its 12 sparse-attention layers as dense
+  GQA: exact while the context fits the trained 2048-token selection budget,
+  an approximation beyond it -- the learned indexer is not implemented yet.
+  MTP is rejected at load (the released GGUF carries no draft block). The
+  n-gram embedding table stays in host memory (16 row reads per token), and
+  the IQ1_S/IQ4_NL experts run on the CPU MoE -- prefill is
+  expert-decode-bound until GPU kernels for those formats land.
+- Gemma 4 sampling is not implemented, and that includes the default
+  repetition penalty: serving Gemma 4 requires `temperature: 0` **and**
+  `repetition_penalty: 1` (or `penalty_window: 0`) on every request. MTP,
+  per-layer embeddings, and shared-KV tail layers are also unimplemented, and
+  expert placement is restricted to `cpu`/`hybrid`.
+- Vision covers still images through a GGUF `mmproj` on the Qwen 3.5 family:
+  no video, and the safetensors loader still reads only `text_config`. An
+  mmproj whose tower has deepstack layers (`clip.vision.is_deepstack_layers`)
+  is refused at attach until the decoder-side injection lands. The tower's
+  attention and GEMM kernels are plain CUDA rather than tensor-core paths, so
+  a 1024-token image costs a few seconds to encode.
+- BailingMoE3 decodes its slots by interleaving rather than batching them, so
+  `--parallel` removes the waiting but does not multiply throughput the way a
+  batched forward would. Its prompt evaluation also runs at admission, so a
+  very long prompt still holds the other slots for its duration. It has no
+  expert paging: a model that does not fit falls back to the host entirely
+  rather than keeping part of itself on the GPU.
+- BailingMoE3's grouped routed-expert GPU kernels cover Q4_K and Q6_K only.
+  Every other format its dispatch decodes -- the IQ formats among them --
+  runs the routed experts one expert at a time instead, which is correct but
+  much slower. Pack Ling to Q4_K or Q6_K unless the checkpoint does not
+  otherwise fit.
+- HF safetensors loading covers the Qwen 3.5 family and BailingMoE3 only;
+  other architectures are GGUF-only.
+- Laguna has no MTP, and supports only the per-head attention gate, so the
+  per-element gate the larger Laguna checkpoints use is rejected at load.
+- Laguna prefill uses the warp-online attention kernel. The tensor-core
+  prefill routines fold Qwen's per-channel sigmoid gate in themselves, so
+  Laguna's per-head softplus gate cannot use them and it forgoes that
+  long-context path.
+- Laguna's pre-tokenizer classifies non-ASCII letters by Unicode block rather
+  than by a full category table, so non-Latin prose can split differently
+  from the reference tokenizer.
+- Laguna concentrates available expert-cache VRAM into a contiguous suffix of
+  complete layers and pins every expert in those layers, using the CPU path
+  for earlier layers. Set `FLYWEIGHT_LAGUNA_WHOLE_LAYERS=0` to restore
+  per-expert placement for comparison, or to a positive integer to cap the
+  number of complete GPU layers.
+- Laguna prefill over IQ2_XS, IQ3_XXS or IQ4_XS experts uses the direct
+  quantized 8-token CPU kernel by default instead of expanding expert rows to
+  f32. Set `FLYWEIGHT_PREFILL_DIRECT_QUANT=0` only for comparison; `=1`
+  continues to opt other supported architectures into the same path.
+- On AVX-512 hosts, IQ2_XS decode widens a complete 16-value scale group at a
+  time and fuses the gate/up projections so they share each activation load.
+  Set `FLYWEIGHT_IQ_AVX512=0` to compare with the AVX2 kernel, or
+  `FLYWEIGHT_FUSED_MOE_GATE_UP=0` to disable only the automatic IQ2_XS fusion.
+- IQ expert decode is sensitive to memory bandwidth, clock sharing and thread
+  placement. The default uses physical cores; tune `--cpu-threads` for the
+  machine rather than assuming SMT helps (14 workers beat 8, 16 and 32 on the
+  reference 16-core Laguna host).
+- The tool-call grammar constrains the generic Hermes markup; DeepSeek-V4 and
+  Muse Glimmer emit their own formats, which are parsed tolerantly but not
+  sampler-enforced.
+- Qwen sampled decoding currently transfers the vocabulary logits to the host
+  when `top_k > 32`.
+- Dynamic MoE routing still has host synchronization points.
+- Special-token spellings inside message content (`<|im_start|>`,
+  `<tool_call>`, `<think>`, ...) are tokenized as the control tokens, as
+  they are by the HF and llama.cpp tokenizers: the rendered prompt is one
+  flat string. A client that relays untrusted text should strip them.
+- `logprobs`, `top_logprobs` and a non-empty `logit_bias` are rejected with
+  400 rather than ignored; `parallel_tool_calls: false` (and Anthropic's
+  `disable_parallel_tool_use`) cap a turn at one tool call.
+- Usage detail: `cached_tokens` / `cache_read_input_tokens` is the prompt
+  prefix the runtime reused; `reasoning_tokens` is counted by re-encoding the
+  chain-of-thought split out of the answer, so it is exact wherever the
+  tokenizer round-trips its own output (BPE does) and an estimate otherwise.
+- Persistent fused layer kernels are incomplete.
+- Image, audio, embedding, fine-tuning, and hosted-tool APIs are out of
+  scope.
+- Response records and prompt caches are process-local.
 
-## Next milestones
+## Architecture
 
-1. Run and publish full-checkpoint Transformers parity results.
-2. Add fused DeltaNet prompt scans and benchmark expert-major prefill dispatch.
-3. Improve expert prediction and reuse pinned staging buffers.
-4. Add CUDA graph replay and persistent fused layer kernels.
-5. Optimize Q8 activation and DP4A expert kernels after graph capture.
-6. Refactor architecture-specific behavior behind model adapters.
+- `native/src/v2_runtime.cpp`: GGUF parsing, memory planning, scheduling,
+  model orchestration, prefix reuse, and native runtime ABI
+- `native/src/gpu_driver.cpp`: CUDA driver, NVRTC, cuBLAS/cuBLASLt, graph,
+  and transfer integration
+- `native/include/flyweight_v2_qwen_kernels.hpp`: generated CUDA model kernels
+- `native/include/flyweight_v2_tool_grammar.hpp`: sampler-side tool and JSON
+  response constraints
+- `src/flyweight/v2.py`: Python bindings for the native ABI
+- `src/flyweight/v2_server.py`: tokenizer, cooperative engine thread, and
+  native inference service
+- `src/flyweight/deepseek4_server.py`: the dedicated DeepSeek-V4 service
+- `src/flyweight/server.py`: shared HTTP protocol implementation
+- `src/flyweight/sampling.py`: the sampling settings every surface shares
+- `src/flyweight/runtime_benchmark.py`: benchmark capture and comparison
 
-## Scope
+## License
 
-The project now executes complete mixed Qwen models from text prompts through decoded output. The current implementation supports portable CPU execution and optional bounded-memory NVIDIA CUDA acceleration.
+Apache-2.0.

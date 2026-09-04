@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Code preview</title>
+</head>
+<body>
+<script>
+  addEventListener("load", () => {
+    const source = location.hash.slice(1);
+    if (!source) {
+      return;
+    }
+    document.open();
+    document.write(decodeURIComponent(source));
+    document.close();
+  });
+</script>
+</body>
+</html>
