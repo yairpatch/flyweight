@@ -1095,6 +1095,11 @@ void qwen_forward_rows(
             // members of the family ship without it.
             const bool k2_gate=k2horizon&&
                 layer.attn_gate!=std::numeric_limits<std::uint64_t>::max();
+            // Where K2-Horizon's attention output lands before its gate: the
+            // warp kernels leave it in `second`, the tensor-core paths write
+            // `third` directly. The gate, where there is one, always ends in
+            // `third`.
+            std::uint64_t k2_attended=second;
             if(laguna)dense(7,normalized,gates,hidden_size,heads);
             else if(muse)dense(7,normalized,gates,hidden_size,query_elements);
             else if(k2_gate)dense_rows(layer.attn_gate,normalized,gates,hidden_size,query_elements);
@@ -1347,6 +1352,7 @@ void qwen_forward_rows(
             }else if(cublas_prefill_done){
                 // Tensor-core attention wrote the rows to third: gated for
                 // Qwen, plain for K2-Horizon, whose gate runs here in place.
+                k2_attended=third;
                 if(k2_gate){
                     int elements=rows*query_elements;
                     void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
@@ -1382,7 +1388,7 @@ void qwen_forward_rows(
                     launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
                 }
             }else if(std::uint64_t stage_keys=0,stage_values=0,staged=0;
-                     !laguna&&!k2horizon&&
+                     !laguna&&
                      (staged=qwen_kv_prefill_stage(
                          runtime,layer,queries,cache_keys,cache_values,
                          heads,kv_heads,head_dim,rows,
@@ -1412,7 +1418,7 @@ void qwen_forward_rows(
                         attention_scores+packed_query_bytes,flash_state,third,
                         runtime.stream,heads,kv_heads,head_dim,rows,window,
                         base,cublas_tile_rows,cublas_block_tokens,scale,
-                        rotated?0:1)==0;
+                        (rotated||k2horizon)?0:1)==0;
                 if(!staged_cublas){
                     void*attention_args[]={const_cast<std::uint64_t*>(&queries),&stage_keys,&stage_values,const_cast<std::uint64_t*>(&third),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&base,&rows,&staged_capacity,&scale};
                     launch("kv_attention_prefill_f16",heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
@@ -1425,7 +1431,13 @@ void qwen_forward_rows(
                     void*unrotate_args[]={const_cast<std::uint64_t*>(&third),&vectors,const_cast<int*>(&head_dim),&value_stream};
                     launch("turbo_unrotate_rows",static_cast<std::uint32_t>(vectors),1,256,unrotate_args);
                 }
-                if(rotated||!staged_cublas){
+                if(k2horizon){
+                    k2_attended=third;
+                    if(k2_gate){
+                        void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
+                        launch("k2_attention_gate",(elements+255)/256,1,256,gate_args);
+                    }
+                }else if(rotated||!staged_cublas){
                     void*gate_args[]={const_cast<std::uint64_t*>(&third),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
                     launch("qwen_attention_gate",(elements+255)/256,1,256,gate_args);
                 }
@@ -1460,9 +1472,7 @@ void qwen_forward_rows(
                     }
                 }
             }
-            // K2-Horizon without a gate leaves the warp kernels' output in
-            // `second`; every other combination lands in `third`.
-            dense(4,(k2horizon&&!k2_gate&&!cublas_prefill_done)?second:third,residual,query_elements,hidden_size);
+            dense(4,k2horizon?(k2_gate?third:k2_attended):third,residual,query_elements,hidden_size);
             // Muse Glimmer normalizes the attention output before the residual
             // join rather than adding it raw.
             if(muse)post_rms_rows(residual,tensor(8));
