@@ -11,7 +11,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Iterator, Mapping, Sequence, cast, overload
 
-from jinja2 import StrictUndefined, Template, nodes
+from jinja2 import Template, Undefined, nodes
 from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
@@ -456,10 +456,16 @@ class NativeV2Tokenizer:
             "eos_token": self._configured_token(config, "eos_token_id"),
         }
         if self.chat_template:
+            # Plain Undefined, as transformers' apply_chat_template renders:
+            # templates are written and tested against that, and read
+            # optional keys with a bare `spec.properties` that a strict
+            # undefined turns into an error. K2-Horizon's schema walker does
+            # exactly that on every leaf property and could not render a tool
+            # section at all under StrictUndefined.
             environment = ImmutableSandboxedEnvironment(
                 trim_blocks=True,
                 lstrip_blocks=True,
-                undefined=StrictUndefined,
+                undefined=Undefined,
                 extensions=[_GenerationExtension],
             )
             environment.globals["raise_exception"] = self._raise_template_exception

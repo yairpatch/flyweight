@@ -3769,3 +3769,130 @@ class ResponsesStreamingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class K2HorizonToolCallTests(unittest.TestCase):
+    """K2-Horizon wraps a turn's calls in one <ifm|tool_calls> block, each call
+    either a JSON object or a name followed by <ifm|arg_key>/<ifm|arg_value>
+    pairs (optionally typed). The template renders tools natively, so the
+    architecture is in NATIVE_TOOL_ARCHITECTURES and the server owns only the
+    parse and the streaming markers."""
+
+    BASH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"},
+                    "env": {"type": "object"},
+                },
+                "required": ["command"],
+            },
+        },
+    }
+
+    XML_BLOCK = (
+        "Let me look.\n\n<ifm|tool_calls>\n"
+        "<ifm|tool_call>bash\n"
+        "<ifm|arg_key>command</ifm|arg_key>\n"
+        "<ifm|arg_value>ls -la /home/yair/Documents/Rollercoster</ifm|arg_value>\n"
+        "<ifm|arg_key>timeout</ifm|arg_key>\n"
+        "<ifm|arg_value>30</ifm|arg_value>\n"
+        "</ifm|tool_call>\n"
+        "<ifm|tool_call>bash\n"
+        "<ifm|arg_key>command</ifm|arg_key>\n"
+        "<ifm|arg_value>node --version && npm --version</ifm|arg_value>\n"
+        "</ifm|tool_call>\n"
+        "</ifm|tool_calls>"
+    )
+
+    def test_k2_is_a_native_tool_architecture(self) -> None:
+        from flyweight.server import NATIVE_TOOL_ARCHITECTURES, _tool_markers
+
+        self.assertIn("k2-horizon", NATIVE_TOOL_ARCHITECTURES)
+        self.assertEqual(
+            _tool_markers("k2-horizon"), ("<ifm|tool_calls>", "</ifm|tool_calls>")
+        )
+        self.assertEqual(_tool_markers("qwen3"), ("<tool_call>", "</tool_call>"))
+
+    def test_parses_the_xml_block_with_several_calls(self) -> None:
+        content, calls = _parse_tool_calls(self.XML_BLOCK, tools=[self.BASH_TOOL])
+        self.assertEqual(content, "Let me look.")
+        self.assertEqual([call["function"]["name"] for call in calls], ["bash", "bash"])
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"command": "ls -la /home/yair/Documents/Rollercoster", "timeout": 30},
+        )
+        self.assertEqual(
+            json.loads(calls[1]["function"]["arguments"]),
+            {"command": "node --version && npm --version"},
+        )
+
+    def test_parses_the_json_body(self) -> None:
+        content, calls = _parse_tool_calls(
+            '<ifm|tool_calls>\n<ifm|tool_call>{"name": "bash", '
+            '"arguments": {"command": "pwd"}}</ifm|tool_call>\n</ifm|tool_calls>',
+            tools=[self.BASH_TOOL],
+        )
+        self.assertIsNone(content)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"command": "pwd"})
+
+    def test_parses_the_typed_xml_body(self) -> None:
+        _, calls = _parse_tool_calls(
+            "<ifm|tool_calls>\n<ifm|tool_call>bash\n"
+            "<ifm|arg_key>command</ifm|arg_key>\n"
+            "<ifm|arg_type>string</ifm|arg_type>\n"
+            "<ifm|arg_value>make</ifm|arg_value>\n"
+            "<ifm|arg_key>env</ifm|arg_key>\n"
+            "<ifm|arg_type>object</ifm|arg_type>\n"
+            '<ifm|arg_value>{"CC": "clang"}</ifm|arg_value>\n'
+            "</ifm|tool_call>\n</ifm|tool_calls>",
+            tools=[self.BASH_TOOL],
+        )
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"command": "make", "env": {"CC": "clang"}},
+        )
+
+    def test_a_truncated_block_does_not_leak_markup(self) -> None:
+        content, calls = _parse_tool_calls(
+            "clean\n<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command",
+            tools=[self.BASH_TOOL],
+        )
+        self.assertEqual(content, "clean")
+        self.assertEqual(calls, [])
+
+    def test_the_block_is_complete_only_at_the_outer_close(self) -> None:
+        from flyweight.server import _has_complete_tool_call
+
+        first_call = self.XML_BLOCK.split("</ifm|tool_call>")[0] + "</ifm|tool_call>"
+        self.assertFalse(_has_complete_tool_call(first_call, tools=[self.BASH_TOOL]))
+        self.assertTrue(_has_complete_tool_call(self.XML_BLOCK, tools=[self.BASH_TOOL]))
+
+    def test_streamer_streams_the_first_call_and_stops_at_its_close(self) -> None:
+        from flyweight.server import _ToolCallStreamer
+
+        body = self.XML_BLOCK.split("<ifm|tool_calls>")[1]
+        streamer = _ToolCallStreamer()
+        fragments: list[str] = []
+        fed = ""
+        for piece in [body[i : i + 7] for i in range(0, len(body), 7)]:
+            fed += piece
+            fragments.extend(streamer.feed(fed))
+            if streamer.started and streamer._schema is None:
+                streamer.bind_schema(self.BASH_TOOL["function"]["parameters"])
+                fragments.extend(streamer.feed(fed))
+        self.assertEqual(streamer.name, "bash")
+        streamed = "".join(fragments)
+        self.assertIn("ls -la /home/yair", streamed)
+        # The second call's command must not have been folded into the first.
+        self.assertNotIn("node --version", streamed)
+        _, calls = _parse_tool_calls(self.XML_BLOCK, tools=[self.BASH_TOOL])
+        tail = streamer.finish(json.loads(calls[0]["function"]["arguments"]))
+        self.assertEqual(
+            json.loads(streamed + "".join(tail)),
+            {"command": "ls -la /home/yair/Documents/Rollercoster", "timeout": 30},
+        )
