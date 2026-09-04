@@ -7,12 +7,15 @@ from pathlib import Path
 
 import numpy as np
 
+from tests.dense_gguf_fixture import _quantize_q8_0
+
 GGUF_UINT32 = 4
 GGUF_FLOAT32 = 6
 GGUF_BOOL = 7
 GGUF_STRING = 8
 GGUF_ARRAY = 9
 GGML_F32 = 0
+GGML_Q8_0 = 8
 
 ALIGNMENT = 32
 
@@ -54,6 +57,18 @@ class K2HorizonSpec:
         norm_groups: int = 4,
         rope_freq_base: float = 10_000_000.0,
         rotary_dim: int = 32,
+        # MoE and MoVA, as the 36B-A4B member carries them. Zero experts keeps
+        # the dense layout the smaller members ship, which is the default.
+        experts: int = 0,
+        experts_used: int = 2,
+        expert_intermediate: int = 64,
+        shared_intermediate: int = 64,
+        leading_dense: int = 1,
+        expert_weights_scale: float = 2.5,
+        expert_weights_norm: bool = True,
+        value_experts: int = 0,
+        value_experts_used: int = 2,
+        attention_gate: bool = False,
     ):
         self.hidden = hidden
         self.layers = layers
@@ -65,6 +80,22 @@ class K2HorizonSpec:
         self.norm_groups = norm_groups
         self.rope_freq_base = rope_freq_base
         self.rotary_dim = rotary_dim
+        self.experts = experts
+        self.experts_used = experts_used
+        self.expert_intermediate = expert_intermediate
+        self.shared_intermediate = shared_intermediate
+        self.leading_dense = leading_dense
+        self.expert_weights_scale = expert_weights_scale
+        self.expert_weights_norm = expert_weights_norm
+        self.value_experts = value_experts
+        self.value_experts_used = value_experts_used
+        self.attention_gate = attention_gate
+
+    def is_moe_layer(self, layer: int) -> bool:
+        return self.experts > 0 and layer >= self.leading_dense
+
+    def is_mova_layer(self, layer: int) -> bool:
+        return self.is_moe_layer(layer) and self.value_experts > 0
 
 
 def build_k2_horizon_gguf(
@@ -73,12 +104,13 @@ def build_k2_horizon_gguf(
     """Write the synthetic K2-Horizon fixture and return its geometry."""
     spec = spec or K2HorizonSpec()
     rng = np.random.default_rng(seed)
-    tensors: list[tuple[str, tuple[int, ...], np.ndarray]] = []
+    # (name, gguf shape, ggml type, payload bytes)
+    tensors: list[tuple[str, tuple[int, ...], int, bytes]] = []
 
     def projection(name: str, inputs: int, outputs: int, scale: float = 0.25) -> None:
         # GGUF reports [inputs, outputs] while the byte stream is [outputs, inputs].
         data = (rng.standard_normal((outputs, inputs)) * scale).astype(np.float32)
-        tensors.append((name, (inputs, outputs), data))
+        tensors.append((name, (inputs, outputs), GGML_F32, data.tobytes()))
 
     def vector(name: str, size: int, value: float | None = None, scale: float = 0.05) -> None:
         data = (
@@ -86,23 +118,58 @@ def build_k2_horizon_gguf(
             if value is not None
             else (rng.standard_normal(size) * scale).astype(np.float32)
         )
-        tensors.append((name, (size,), data.astype(np.float32)))
+        tensors.append((name, (size,), GGML_F32, data.astype(np.float32).tobytes()))
 
     projection("token_embd.weight", spec.hidden, spec.vocabulary)
     vector("output_norm.weight", spec.hidden, value=1.0)
     projection("output.weight", spec.hidden, spec.vocabulary)
 
+    def stack(name: str, inputs: int, outputs: int, count: int, scale: float = 0.25,
+              q8: bool = False) -> None:
+        """A 3-D expert stack, reported [inputs, outputs, count].
+
+        The value-expert stack is written as Q8_0 rather than f32: the device
+        value-expert kernels exist for the quantized types the published
+        checkpoints ship, and an f32 stack would keep the cache path untested.
+        """
+        data = (rng.standard_normal((count, outputs, inputs)) * scale).astype(np.float32)
+        if q8:
+            payload = _quantize_q8_0(data.reshape(count * outputs, inputs))
+            tensors.append((name, (inputs, outputs, count), GGML_Q8_0, payload))
+        else:
+            tensors.append((name, (inputs, outputs, count), GGML_F32, data.tobytes()))
+
+    kv_width = spec.kv_heads * spec.head_dim
     for layer in range(spec.layers):
         prefix = f"blk.{layer}."
         vector(prefix + "attn_norm.weight", spec.hidden, value=1.0)
         projection(prefix + "attn_q.weight", spec.hidden, spec.heads * spec.head_dim)
         projection(prefix + "attn_k.weight", spec.hidden, spec.kv_heads * spec.head_dim)
-        projection(prefix + "attn_v.weight", spec.hidden, spec.kv_heads * spec.head_dim)
+        if spec.is_mova_layer(layer):
+            # MoVA replaces attn_v with a router, its selection bias and the
+            # per-expert value stack.
+            projection(prefix + "attn_v_gate.weight", spec.hidden, spec.value_experts)
+            vector(prefix + "attn_v_gate.bias", spec.value_experts)
+            stack(prefix + "attn_v_exps.weight", spec.hidden, kv_width, spec.value_experts, q8=True)
+        else:
+            projection(prefix + "attn_v.weight", spec.hidden, kv_width)
         projection(prefix + "attn_output.weight", spec.heads * spec.head_dim, spec.hidden)
+        if spec.attention_gate:
+            projection(prefix + "attn_gate.weight", spec.hidden, spec.heads * spec.head_dim)
         vector(prefix + "ffn_norm.weight", spec.hidden, value=1.0)
-        projection(prefix + "ffn_gate.weight", spec.hidden, spec.intermediate)
-        projection(prefix + "ffn_up.weight", spec.hidden, spec.intermediate)
-        projection(prefix + "ffn_down.weight", spec.intermediate, spec.hidden)
+        if spec.is_moe_layer(layer):
+            projection(prefix + "ffn_gate_inp.weight", spec.hidden, spec.experts)
+            vector(prefix + "exp_probs_b.bias", spec.experts)
+            stack(prefix + "ffn_gate_exps.weight", spec.hidden, spec.expert_intermediate, spec.experts)
+            stack(prefix + "ffn_up_exps.weight", spec.hidden, spec.expert_intermediate, spec.experts)
+            stack(prefix + "ffn_down_exps.weight", spec.expert_intermediate, spec.hidden, spec.experts)
+            projection(prefix + "ffn_gate_shexp.weight", spec.hidden, spec.shared_intermediate)
+            projection(prefix + "ffn_up_shexp.weight", spec.hidden, spec.shared_intermediate)
+            projection(prefix + "ffn_down_shexp.weight", spec.shared_intermediate, spec.hidden)
+        else:
+            projection(prefix + "ffn_gate.weight", spec.hidden, spec.intermediate)
+            projection(prefix + "ffn_up.weight", spec.hidden, spec.intermediate)
+            projection(prefix + "ffn_down.weight", spec.intermediate, spec.hidden)
 
     vocabulary = [chr(index) for index in range(32, 32 + spec.vocabulary - 4)]
     control = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|unk|>"]
@@ -135,16 +202,37 @@ def build_k2_horizon_gguf(
         _kv("general.alignment", GGUF_UINT32, struct.pack("<I", ALIGNMENT)),
     ]
 
+    if spec.experts:
+        metadata += [
+            _kv("k2-horizon.expert_count", GGUF_UINT32, struct.pack("<I", spec.experts)),
+            _kv("k2-horizon.expert_used_count", GGUF_UINT32, struct.pack("<I", spec.experts_used)),
+            _kv("k2-horizon.expert_feed_forward_length", GGUF_UINT32, struct.pack("<I", spec.expert_intermediate)),
+            _kv("k2-horizon.expert_shared_count", GGUF_UINT32, struct.pack("<I", 1)),
+            _kv("k2-horizon.expert_shared_feed_forward_length", GGUF_UINT32, struct.pack("<I", spec.shared_intermediate)),
+            _kv("k2-horizon.leading_dense_block_count", GGUF_UINT32, struct.pack("<I", spec.leading_dense)),
+            _kv("k2-horizon.moe_every_n_layers", GGUF_UINT32, struct.pack("<I", 1)),
+            # 2 is sigmoid, the only gating the published checkpoints use.
+            _kv("k2-horizon.expert_gating_func", GGUF_UINT32, struct.pack("<I", 2)),
+            _kv("k2-horizon.expert_weights_scale", GGUF_FLOAT32, struct.pack("<f", spec.expert_weights_scale)),
+            _kv("k2-horizon.expert_weights_norm", GGUF_BOOL, struct.pack("<B", 1 if spec.expert_weights_norm else 0)),
+        ]
+    if spec.value_experts:
+        metadata += [
+            _kv("k2-horizon.attention.value_expert_count", GGUF_UINT32, struct.pack("<I", spec.value_experts)),
+            _kv("k2-horizon.attention.value_expert_used_count", GGUF_UINT32, struct.pack("<I", spec.value_experts_used)),
+        ]
+
     infos = bytearray()
     payloads = bytearray()
-    for name, shape, data in tensors:
+    for name, shape, ggml_type, raw in tensors:
         offset = len(payloads)
         infos += _string(name)
         infos += struct.pack("<I", len(shape))
         infos += b"".join(struct.pack("<Q", dim) for dim in shape)
-        infos += struct.pack("<IQ", GGML_F32, offset)
-        raw = np.ascontiguousarray(data, dtype=np.float32).tobytes()
-        assert len(raw) == int(np.prod(shape)) * 4, name
+        infos += struct.pack("<IQ", ggml_type, offset)
+        elements = int(np.prod(shape))
+        expected = elements * 4 if ggml_type == GGML_F32 else elements // 32 * 34
+        assert len(raw) == expected, name
         payloads += raw
         payloads += b"\0" * ((-len(payloads)) % ALIGNMENT)
 

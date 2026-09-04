@@ -386,4 +386,78 @@ constexpr QwenRowsHostLayout qwen_rows_host(
     return layout;
 }
 
+// K2-Horizon MoVA scratch. The routed value projection has its own routing
+// buffers and pointer tables rather than borrowing the feed-forward's: the
+// two sit in different halves of the layer and the chunked prefill overlaps
+// halves, so sharing the pinned tables would let one half's upload read the
+// other half's writes. Sized for `rows` tokens; decode uses row 0.
+//
+//   logits    rows x value_experts f32   router output
+//   selected  rows x value_used   i32    routed expert ids
+//   weights   rows x value_used   f32    routed mixture weights
+//   ptr_table rows x value_used   u64    device slot pointers (cache hits)
+//   wgt_table rows x value_used   f32    weights of the hits, compacted
+//   counts    rows                i32    hits per row
+//   partial   rows x kv_size      f32    host-computed misses, uploaded
+struct QwenMovaLayout {
+    Region logits;
+    Region selected;
+    Region weights;
+    Region ptr_table;
+    Region wgt_table;
+    Region counts;
+    Region partial;
+    std::uint64_t bytes = 0;
+};
+
+constexpr QwenMovaLayout qwen_mova(
+    std::uint64_t rows, std::uint64_t value_experts, std::uint64_t value_used,
+    std::uint64_t kv_size
+) {
+    Builder builder;
+    QwenMovaLayout layout;
+    if (value_experts == 0) return layout;
+    layout.logits = builder.add(rows * value_experts * sizeof(float));
+    layout.selected = builder.add(rows * value_used * sizeof(std::int32_t));
+    layout.weights = builder.add(rows * value_used * sizeof(float));
+    layout.ptr_table = builder.add(rows * value_used * sizeof(std::uint64_t));
+    layout.wgt_table = builder.add(rows * value_used * sizeof(float));
+    layout.counts = builder.add(rows * sizeof(std::int32_t));
+    layout.partial = builder.add(rows * kv_size * sizeof(float));
+    layout.bytes = builder.bytes();
+    return layout;
+}
+
+// Pinned host side of the same round trip: the routes come down, the
+// compacted tables and the host partial go up, and `input` carries the
+// normalized rows the host needs for the experts that missed.
+struct QwenMovaHostLayout {
+    Region selected;
+    Region weights;
+    Region ptr_table;
+    Region wgt_table;
+    Region counts;
+    Region input;
+    Region partial;
+    std::uint64_t bytes = 0;
+};
+
+constexpr QwenMovaHostLayout qwen_mova_host(
+    std::uint64_t rows, std::uint64_t hidden, std::uint64_t value_experts,
+    std::uint64_t value_used, std::uint64_t kv_size
+) {
+    Builder builder;
+    QwenMovaHostLayout layout;
+    if (value_experts == 0) return layout;
+    layout.selected = builder.add(rows * value_used * sizeof(std::int32_t));
+    layout.weights = builder.add(rows * value_used * sizeof(float));
+    layout.ptr_table = builder.add(rows * value_used * sizeof(std::uint64_t));
+    layout.wgt_table = builder.add(rows * value_used * sizeof(float));
+    layout.counts = builder.add(rows * sizeof(std::int32_t));
+    layout.input = builder.add(rows * hidden * sizeof(float));
+    layout.partial = builder.add(rows * kv_size * sizeof(float));
+    layout.bytes = builder.bytes();
+    return layout;
+}
+
 }  // namespace flyweight::v2::workspace

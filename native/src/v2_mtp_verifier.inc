@@ -1040,9 +1040,28 @@ void qwen_forward_rows(
             const int query_elements=heads*head_dim;
             const int q_size=(laguna||muse||k2horizon)?query_elements:query_elements*2;
             const int kv_size=kv_heads*head_dim;
+            // K2-Horizon's MoVA blocks have no attn_v to project: the value
+            // rows come from a 64-expert mixture that lives in the GGUF
+            // mapping, so the whole chunk goes to the host and back once.
+            const bool mova=layer.mova_v_exps!=std::numeric_limits<std::uint64_t>::max();
             dense(1,normalized,first,hidden_size,q_size);
             dense(2,normalized,second,hidden_size,kv_size);
-            dense(3,normalized,third,hidden_size,kv_size);
+            if(mova){
+                // Router logits on the device, then the routed projection:
+                // cache hits through the grouped kernel, misses on the host,
+                // both accumulated into `third`. The span's route event
+                // orders the download; prefill rows admit into the cache on
+                // the same terms the feed-forward experts do.
+                dense_rows(layer.mova_v_gate,normalized,
+                           runtime.mova_layout.logits.address(runtime.mova_workspace),
+                           hidden_size,static_cast<int>(runtime.model->config.value_expert_count));
+                k2_mova_routed_value(runtime,layer,layer_number,normalized,third,rows,
+                                     span.route_event,
+                                     expert_policy.misses_may_be_admitted()&&
+                                         !runtime.expert_residency_frozen,
+                                     expert_policy.records_prefill_frequency()||
+                                         expert_phase!=flyweight::v2::ExpertExecutionPhase::prefill);
+            }else dense(3,normalized,third,hidden_size,kv_size);
             // Both per-layer architectures carry their own rotary span and
             // theta. For Muse Glimmer the span is zero on full-attention
             // layers, which is how those run NoPE.
@@ -1070,8 +1089,14 @@ void qwen_forward_rows(
             // Laguna's gate is one scalar per head, Muse Glimmer's one per
             // query channel; both come from a tensor of their own rather than
             // riding in the query projection the way Qwen's does.
+            // K2-Horizon's gate is per query channel like Muse Glimmer's, but
+            // softplus rather than sigmoid, and it is optional: the dense
+            // members of the family ship without it.
+            const bool k2_gate=k2horizon&&
+                layer.attn_gate!=std::numeric_limits<std::uint64_t>::max();
             if(laguna)dense(7,normalized,gates,hidden_size,heads);
             else if(muse)dense(7,normalized,gates,hidden_size,query_elements);
+            else if(k2_gate)dense_rows(layer.attn_gate,normalized,gates,hidden_size,query_elements);
             auto cache_keys=runtime.state+layer.state_first,cache_values=runtime.state+layer.state_second;
             int capacity=static_cast<int>(layer.cache_capacity);
             phase(layer_number,"qkvproj");
@@ -1336,7 +1361,10 @@ void qwen_forward_rows(
                 launch(kv_prefill_kernel(runtime),heads,(static_cast<std::uint32_t>(rows)+31)/32,256,attention_args);
                 int elements=rows*query_elements;
                 if(k2horizon){
-                    // ungated
+                    if(k2_gate){
+                        void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&elements};
+                        launch("k2_attention_gate",(elements+255)/256,1,256,gate_args);
+                    }
                 }else if(laguna){
                     void*gate_args[]={const_cast<std::uint64_t*>(&second),const_cast<std::uint64_t*>(&gates),const_cast<std::uint64_t*>(&third),&rows,const_cast<int*>(&heads),const_cast<int*>(&head_dim)};
                     launch("laguna_attention_gate_rows",(elements+255)/256,1,256,gate_args);
@@ -1405,7 +1433,13 @@ void qwen_forward_rows(
                 void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
                 launch(kv_values_ring_kernel(runtime),heads,1,256,value_args);
                 if(k2horizon){
-                    // ungated
+                    if(k2_gate){
+                        auto gate=gates+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                        auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);
+                        int elements=query_elements;
+                        void*token_gate_args[]={&attended,&gate,&gated,&elements};
+                        launch("k2_attention_gate",(elements+255)/256,1,256,token_gate_args);
+                    }
                 }else{
                     auto gated=third+static_cast<std::uint64_t>(token)*query_elements*sizeof(float);int elements=query_elements;
                     if(laguna){
@@ -1417,7 +1451,7 @@ void qwen_forward_rows(
                     }
                 }
             }
-            dense(4,k2horizon?second:third,residual,query_elements,hidden_size);
+            dense(4,(k2horizon&&!k2_gate)?second:third,residual,query_elements,hidden_size);
             // Muse Glimmer normalizes the attention output before the residual
             // join rather than adding it raw.
             if(muse)post_rms_rows(residual,tensor(8));
@@ -1435,11 +1469,7 @@ void qwen_forward_rows(
         if(layer.dense_ffn){
             // Dense block over the whole row batch: one SwiGLU per token, no
             // router or experts. `first` holds gate and up back to back.
-            // Laguna's leading dense blocks are far wider than its expert
-            // blocks, so this width comes from the block's own gate projection.
-            const int dense_intermediate=runtime.laguna
-                ?static_cast<int>(runtime.model->tensors[layer.static_tensors.at(moe_base+1)].shape[1])
-                :static_cast<int>(runtime.moe_intermediate);
+            const int dense_intermediate=qwen_dense_intermediate(runtime,layer,moe_base);
             // A spilled block still has to produce this batch's feed-forward.
             // Doing it on the host is right for one token and badly wrong for a
             // batch: the host pays rows x 3 x hidden x intermediate MACs, and on
@@ -1524,8 +1554,9 @@ void qwen_forward_rows(
         }
         dense(moe_base+1,normalized,router_logits,hidden_size,experts);
         phase(layer_number,"router");
-        if(runtime.laguna){
-            auto bias=runtime.device_tensors[layer.router_bias];
+        if(qwen_sigmoid_bias_router(runtime)){
+            auto bias=layer.router_bias!=std::numeric_limits<std::uint64_t>::max()
+                ?runtime.device_tensors[layer.router_bias]:0;
             int normalize=runtime.model->config.expert_weights_norm?1:0;
             float weight_scale=runtime.model->config.expert_weights_scale;
             void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&bias,
@@ -1592,9 +1623,10 @@ void qwen_forward_rows(
             launch("silu_mul",(static_cast<std::uint32_t>(count)+255)/256,1,256,silu_args);
             dense(moe_base+4,second,third,intermediate,hidden_size);
         }
-        // Qwen gates the shared expert on a learned projection; Laguna's is
-        // always on, so its block ends at the down projection.
-        if(!runtime.laguna){
+        // Qwen gates the shared expert on a learned projection; the
+        // DeepSeek-shaped families leave theirs always on, so their block ends
+        // at the down projection.
+        if(qwen_shared_expert_gated(runtime)){
             auto shared_scale=tensor(moe_base+5);
             const auto sg_type=runtime.model->tensors[layer.static_tensors.at(moe_base+5)].type;
             void*scale_args[]={const_cast<std::uint64_t*>(&normalized),&shared_scale,const_cast<std::uint64_t*>(&third),&rows,const_cast<int*>(&hidden_size)};

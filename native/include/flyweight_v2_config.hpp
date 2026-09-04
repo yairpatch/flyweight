@@ -65,6 +65,7 @@ struct ModelConfig {
     // supply candidates. Zero means routing is not group limited.
     std::uint32_t expert_group_count=0, expert_group_used=0;
     std::uint32_t norm_groups=0;
+    std::uint32_t value_expert_count=0, value_expert_used_count=0;
     bool expert_weights_norm=false;
     float expert_weights_scale=1.0f;
     // YaRN rope extension. A zero factor means the layer runs plain RoPE.

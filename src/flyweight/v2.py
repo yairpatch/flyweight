@@ -199,6 +199,8 @@ class _ModelConfig(ctypes.Structure):
         ("expert_group_count", ctypes.c_uint32),
         ("expert_group_used", ctypes.c_uint32),
         ("norm_groups", ctypes.c_uint32),
+        ("value_expert_count", ctypes.c_uint32),
+        ("value_expert_used_count", ctypes.c_uint32),
     ]
 
 
@@ -450,6 +452,14 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("prefix_cache_last_old_count", ctypes.c_uint64),
         ("prefix_cache_last_new_tokens", ctypes.c_uint32 * 32),
         ("prefix_cache_last_new_count", ctypes.c_uint64),
+        # K2-Horizon MoVA host round trips; mirrors dense_host_nanoseconds.
+        ("mova_layers", ctypes.c_uint64),
+        ("mova_host_nanoseconds", ctypes.c_uint64),
+        ("mova_cache_bytes", ctypes.c_uint64),
+        ("mova_cache_hits", ctypes.c_uint64),
+        ("mova_cache_misses", ctypes.c_uint64),
+        ("mova_cache_admissions", ctypes.c_uint64),
+        ("mova_cache_evictions", ctypes.c_uint64),
     ]
 
 
