@@ -101,6 +101,7 @@ class StubV2Runtime:
         temperature=0.0,
         top_k=20,
         top_p=0.95,
+        min_p=0.0,
         seed=None,
         repetition_penalty=1.0,
         presence_penalty=0.0,
@@ -643,7 +644,7 @@ class NativeV2ServerTests(unittest.TestCase):
             model = Path(directory) / "model.gguf"
             model.write_bytes(b"")
             values = {
-                "temperature": 0.3, "top_k": 7, "top_p": 0.5,
+                "temperature": 0.3, "top_k": 7, "top_p": 0.5, "min_p": 0.05,
                 "repetition_penalty": 1.2, "presence_penalty": 0.25,
                 "frequency_penalty": -0.5, "penalty_window": 16,
             }
