@@ -10,6 +10,7 @@ Served model families:
 | --- | --- | --- |
 | Qwen 3 / 3.5 / 3.6, dense and MoE | GGUF, safetensors | Full feature set: MTP, expert offload, prefill pipeline. Image input on the 3.5 family through a llama.cpp `mmproj` GGUF (`--mmproj`); the safetensors loader still drops the tower |
 | Laguna 2.1 | GGUF | Per-head attention gate only; no MTP |
+| K2-Horizon (dense and MoVA 36B-A4B) | GGUF | Grouped RMS norms, softplus attention gate, DeepSeek-shaped MoE; the MoVA value experts page through their own device cache with a persisted routing history; no MTP |
 | Muse Glimmer | GGUF | Channel-tagged reasoning; drafts via a DFlash sidecar, no in-model MTP |
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
 | Gemma 4 | GGUF | Greedy decode with penalties disabled only -- see limitations |

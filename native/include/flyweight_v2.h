@@ -80,6 +80,7 @@ typedef struct FlyweightV2ModelConfig {
        so the struct stays layout-compatible with existing callers. */
     uint32_t expert_group_count, expert_group_used;
     uint32_t norm_groups;
+    uint32_t value_expert_count, value_expert_used_count;
 } FlyweightV2ModelConfig;
 
 typedef struct FlyweightV2BailingRuntime FlyweightV2BailingRuntime;
@@ -317,6 +318,19 @@ typedef struct FlyweightV2QwenRuntimeInfo {
     uint64_t prefix_cache_last_old_count;
     uint32_t prefix_cache_last_new_tokens[32];
     uint64_t prefix_cache_last_new_count;
+    /* K2-Horizon MoVA: attention blocks whose value projection is a routed
+       mixture read from the mapping on the host, and the wall time those round
+       trips cost. Sits alongside dense_host_nanoseconds -- same trade, made for
+       the value experts rather than for a spilled feed-forward. */
+    uint64_t mova_layers;
+    uint64_t mova_host_nanoseconds;
+    /* The value-expert cache: its size, and the hit/miss/admission counters
+       that mirror expert_cache_* for the feed-forward experts. */
+    uint64_t mova_cache_bytes;
+    uint64_t mova_cache_hits;
+    uint64_t mova_cache_misses;
+    uint64_t mova_cache_admissions;
+    uint64_t mova_cache_evictions;
 } FlyweightV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE

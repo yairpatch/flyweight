@@ -11960,5 +11960,99 @@ extern "C" __global__ void kv_attention_values_q8_indexed(
         output[head*head_dim+d]=result;
     }
 }
+
+// ---------------------------------------------------------------------------
+// K2-Horizon MoVA value experts.
+//
+// The value projection of a MoVA block is a routed mixture: each selected
+// expert is a whole hidden x kv_size matrix, its projection goes through SiLU
+// and the results are summed under the router's weights. Unlike the SwiGLU
+// experts there is no second matrix and no down projection, and the
+// activation sits on the *reduced* dot product, so a fused kernel does one
+// block per output channel and walks the selected experts inside it: dot,
+// reduce, SiLU, weight, accumulate. Output is accumulated (+=) so a host
+// partial for the experts that missed the cache can be folded in beside it.
+//
+// One instantiation per weight type the K-quant family ships; the decoder
+// macro is the same q*k_value() the grouped SwiGLU kernels use.
+#define FLYWEIGHT_VALUE_EXPERTS(prefix, decode)                                 \
+extern "C" __global__                                                          \
+void prefix##_value_experts(                                                   \
+    const unsigned long long* ptrs,                                            \
+    const float* weights,                                                      \
+    const float* vector,                                                       \
+    float* output,                                                             \
+    const int input_size,                                                      \
+    const int output_size,                                                     \
+    const int experts                                                          \
+) {                                                                            \
+    const int row = blockIdx.x;                                                \
+    if (row >= output_size) return;                                            \
+    float accumulated = 0.0f;                                                  \
+    for (int expert = 0; expert < experts; ++expert) {                         \
+        const unsigned char* packed = (const unsigned char*)ptrs[expert];      \
+        float partial = 0.0f;                                                  \
+        for (int input = threadIdx.x; input < input_size; input += blockDim.x) \
+            partial += decode(packed, row * input_size + input) * vector[input]; \
+        partial = block_reduce_sum(partial);                                   \
+        if (threadIdx.x == 0)                                                  \
+            accumulated += weights[expert] * (partial /                        \
+                (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, partial)))));         \
+        /* block_reduce_sum leaves its warp sums live for thread 0; the next */ \
+        /* expert's reduction must not overwrite them first. */                \
+        __syncthreads();                                                       \
+    }                                                                          \
+    if (threadIdx.x == 0) output[row] += accumulated;                          \
+}                                                                              \
+extern "C" __global__                                                          \
+void prefix##_value_experts_rows(                                              \
+    const unsigned long long* ptrs,                                            \
+    const float* weights,                                                      \
+    const int* counts,                                                         \
+    const float* vectors,                                                      \
+    float* output,                                                             \
+    const int input_size,                                                      \
+    const int output_size,                                                     \
+    const int top_k,                                                           \
+    const int rows                                                             \
+) {                                                                            \
+    const int row = blockIdx.x;                                                \
+    const int token = blockIdx.y;                                              \
+    if (row >= output_size || token >= rows) return;                           \
+    const float* vector = vectors + (long long)token * input_size;             \
+    const int base = token * top_k;                                            \
+    const int count = counts[token];                                           \
+    float accumulated = 0.0f;                                                  \
+    for (int rank = 0; rank < count; ++rank) {                                 \
+        const int route = base + rank;                                         \
+        const unsigned char* packed = (const unsigned char*)ptrs[route];       \
+        float partial = 0.0f;                                                  \
+        for (int input = threadIdx.x; input < input_size; input += blockDim.x) \
+            partial += decode(packed, row * input_size + input) * vector[input]; \
+        partial = block_reduce_sum(partial);                                   \
+        if (threadIdx.x == 0)                                                  \
+            accumulated += weights[route] * (partial /                         \
+                (1.0f + expf(-fminf(80.0f, fmaxf(-80.0f, partial)))));         \
+        __syncthreads();                                                       \
+    }                                                                          \
+    if (threadIdx.x == 0)                                                      \
+        output[(long long)token * output_size + row] += accumulated;           \
+}
+
+__device__ __forceinline__ float q8_0_value_at(
+    const unsigned char* packed, int absolute
+) {
+    const int block = absolute >> 5;
+    const int within = absolute & 31;
+    const float scale = __half2float(*((const __half*)(packed + block * 34)));
+    const signed char quant = *((const signed char*)(packed + block * 34 + 2 + within));
+    return (float)quant * scale;
+}
+
+FLYWEIGHT_VALUE_EXPERTS(q4k, q4k_value)
+FLYWEIGHT_VALUE_EXPERTS(q5k, q5k_value)
+FLYWEIGHT_VALUE_EXPERTS(q6k, q6k_value)
+FLYWEIGHT_VALUE_EXPERTS(q8, q8_0_value_at)
+#undef FLYWEIGHT_VALUE_EXPERTS
 )FLYWEIGHT_CUDA";
 }

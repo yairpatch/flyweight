@@ -881,6 +881,24 @@ void laguna_attention_gate(
     }
 }
 
+// K2-Horizon elementwise softplus attention gate:
+// g(x) = (1 / ln 2) * softplus(x * ln 2) = (1 / ln 2) * ln(1 + exp(x * ln 2))
+extern "C" __global__
+void k2_attention_gate(
+    const float* attended, const float* gates, float* output,
+    const int elements
+) {
+    constexpr float LN2 = 0.6931471805599453f;
+    constexpr float ONE_OVER_LN2 = 1.4426950408889634f;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += blockDim.x * gridDim.x) {
+        const float x = gates[index];
+        const float scaled_x = x * LN2;
+        const float sp = scaled_x > 20.0f ? scaled_x : (scaled_x < -20.0f ? expf(scaled_x) : log1pf(expf(scaled_x)));
+        output[index] = attended[index] * (sp * ONE_OVER_LN2);
+    }
+}
+
 // K2-Horizon Q/K projection tail: plain half-split (NEOX / rotate_half) RoPE
 // without per-head RMS normalization or learned norm weights.
 // Channels past rotary_dim pass through unrotated.

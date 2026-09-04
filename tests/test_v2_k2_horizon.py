@@ -218,6 +218,40 @@ class K2HorizonRealModelTests(unittest.TestCase):
                 self.assertIn("Paris", text)
 
 
+@unittest.skipUnless(
+    os.path.isfile(
+        os.environ.get("FLYWEIGHT_TEST_K2_MOVA_MODEL", DEFAULT_REAL_MOVA_MODEL)
+    ),
+    "K2-Horizon MoVA GGUF checkpoint not available",
+)
+class K2HorizonMoVARealModelTests(unittest.TestCase):
+    def test_real_mova_model_completion(self):
+        path = os.environ.get("FLYWEIGHT_TEST_K2_MOVA_MODEL", DEFAULT_REAL_MOVA_MODEL)
+        with V2Model(path) as model:
+            config = model.config
+            self.assertEqual(config["architecture"], "k2-horizon")
+            self.assertEqual(config["layer_count"], 48)
+            self.assertEqual(config["hidden_size"], 2560)
+            self.assertEqual(config["norm_groups"], 2)
+            self.assertEqual(config["expert_count"], 100)
+            self.assertEqual(config["expert_used_count"], 8)
+            self.assertEqual(config["value_expert_count"], 64)
+            self.assertEqual(config["value_expert_used_count"], 4)
+
+            tokens = model.tokenize("The capital of France is")
+            with model.native_runtime(
+                context_limit=512, mtp_drafts=0, expert_mode="cpu"
+            ) as runtime:
+                runtime.prepare()
+                # 45 of the 48 blocks are MoVA; the leading three are dense.
+                self.assertEqual(runtime.info["mova_layers"], 45)
+                output_tokens: list[int] = []
+                runtime.generate(tokens, 8, output_tokens.append)
+                text = "".join(model.token_text(t) for t in output_tokens)
+                print(f"\nReal K2-Horizon MoVA output: {text!r}")
+                self.assertIn("Paris", text)
+
+
 class K2HorizonThinkingTests(unittest.TestCase):
     def test_thinking_budget_meters_k2_horizon_blocks(self):
         from flyweight.v2_server import _ThinkingBudget
