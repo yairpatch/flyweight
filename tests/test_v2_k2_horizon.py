@@ -274,50 +274,62 @@ class K2HorizonValueCacheTests(unittest.TestCase):
 
 
 class K2HorizonDecodeAttentionTests(unittest.TestCase):
-    """K2 decodes through the 128-dim attention dispatch (cuBLAS, fused
-    tiles, serial ring); the three must agree on greedy tokens."""
+    """K2 decodes through the 128-dim attention dispatch (tensor-core MMA,
+    cuBLAS, fused tiles, serial ring); all of them must agree on greedy
+    tokens. Each runs in its own interpreter: the MMA switch latches once
+    per process."""
 
     def _tokens(self, env: dict[str, str], prompt_tokens: int = 40,
-                context: int = 256, steps: int = 24) -> list[int]:
-        spec = K2HorizonSpec(heads=4, kv_heads=2, head_dim=128, rotary_dim=64)
-        with unittest.mock.patch.dict(os.environ, env):
-            model, _ = _model(spec=spec, seed=5)
-            if not V2Model.gpu_info()["available"]:
-                raise unittest.SkipTest("native CUDA runtime is unavailable")
-            runtime = model.native_runtime(
-                context_limit=context, mtp_drafts=0, expert_mode="cpu",
-                cache_type_k="f16", cache_type_v="f16",
-            )
-            runtime.prepare()
-            try:
-                produced: list[int] = []
-                prompt = [8 + (i * 7) % 80 for i in range(prompt_tokens)]
-                runtime.generate(prompt, steps, produced.append)
-                return produced
-            finally:
-                runtime.close()
-                model.close()
+                context: int = 256, steps: int = 24) -> tuple[list[int], str]:
+        if not V2Model.gpu_info()["available"]:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        import subprocess, sys as _sys, json as _json
+        run = subprocess.run(
+            [_sys.executable, "-m", "tests.k2_decode_probe",
+             str(prompt_tokens), str(context), str(steps)],
+            env={**os.environ, **env, "FLYWEIGHT_ATTENTION_DIAG": "1"},
+            capture_output=True, text=True, timeout=600,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+        tokens = _json.loads(run.stdout.strip().splitlines()[-1])
+        if tokens is None:
+            raise unittest.SkipTest("native CUDA runtime is unavailable")
+        paths = [line for line in run.stderr.splitlines() if "[attention] decode path" in line]
+        return tokens, paths[-1] if paths else ""
 
-    def test_the_three_decode_attention_paths_agree(self):
+    def test_the_four_decode_attention_paths_agree(self):
         # The window has to be long enough to hit the cuBLAS threshold; the
         # threshold is lowered so a 256-token fixture reaches it.
-        cublas = self._tokens({"FLYWEIGHT_CUBLAS_ATTENTION_MIN_TOKENS": "8"})
-        fused = self._tokens({"FLYWEIGHT_CUBLAS_ATTENTION": "0"})
-        ring = self._tokens({"FLYWEIGHT_CUBLAS_ATTENTION": "0",
-                             "FLYWEIGHT_FUSED_ATTENTION": "0"})
-        self.assertEqual(fused, ring)
+        # The MMA tile rule wants one partial record per 256-token tile to
+        # fit the attention-scores workspace, which is context_limit wide.
+        mma, mma_path = self._tokens({}, context=1024)
+        cublas, cublas_path = self._tokens({"FLYWEIGHT_MMA_ATTENTION": "0",
+                                            "FLYWEIGHT_CUBLAS_ATTENTION_MIN_TOKENS": "8"},
+                                           context=1024)
+        fused, fused_path = self._tokens({"FLYWEIGHT_MMA_ATTENTION": "0",
+                                          "FLYWEIGHT_CUBLAS_ATTENTION": "0"}, context=1024)
+        ring, ring_path = self._tokens({"FLYWEIGHT_MMA_ATTENTION": "0",
+                                        "FLYWEIGHT_CUBLAS_ATTENTION": "0",
+                                        "FLYWEIGHT_FUSED_ATTENTION": "0"}, context=1024)
+        self.assertIn("gqa_mma_f16_128_s4", mma_path)
+        self.assertIn("cublas", cublas_path)
+        self.assertIn("fused per-head tiles", fused_path)
+        self.assertIn("serial ring", ring_path)
+        self.assertEqual(mma, ring)
         self.assertEqual(cublas, ring)
+        self.assertEqual(fused, ring)
 
     def test_tensor_core_prefill_matches_the_warp_prefill(self):
         """K2 runs the cuBLAS prefill attention ungated and gates afterwards;
         forced on, it must reproduce the warp kernel's tokens."""
-        # The tensor-core tiles need a visible prefix of at least 256 tokens,
-        # so the prompt is long enough for the later chunks to qualify.
+        # The tensor-core tiles need a visible prefix of at least 256 tokens
+        # and a context wide enough for their workspace bound.
         common = {"FLYWEIGHT_PREFILL_ROWS": "512", "FLYWEIGHT_CUBLAS_ATTENTION": "0"}
-        warp = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "0"},
-                            prompt_tokens=600, context=8192, steps=8)
-        tensor_core = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "1"},
-                                   prompt_tokens=600, context=8192, steps=8)
+        warp, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "0"},
+                               prompt_tokens=600, context=8192, steps=8)
+        tensor_core, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "1"},
+                                      prompt_tokens=600, context=8192, steps=8)
         self.assertEqual(tensor_core, warp)
 
 

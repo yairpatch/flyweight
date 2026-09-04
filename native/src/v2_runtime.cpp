@@ -16619,22 +16619,31 @@ inline const char* kv_gqa_mma_kernel(
         const char*env=std::getenv("FLYWEIGHT_MMA_ATTENTION");
         return !env||env[0]!='0';
     }();
-    if(!enabled||kv_heads<=0||head_dim!=256)return nullptr;
+    if(!enabled||kv_heads<=0)return nullptr;
     if(r.options.cache_type_k!=r.options.cache_type_v)return nullptr;
-    // The mma tile is 8 wide and the group fills it exactly; other ratios would
-    // leave that dimension half empty, which the grouped-rows kernel serves
-    // without waste.
-    if(heads!=kv_heads*8)return nullptr;
+    // Two instantiated shapes: 256-dim heads in groups of 8, which fill the
+    // mma's 8-wide query tile exactly, and 128-dim heads in groups of 4,
+    // which leave half of it idle and still come out ahead of the per-head
+    // kernels. Anything else falls through to the grouped-rows kernel.
+    const bool wide=head_dim==256&&heads==kv_heads*8;
+    const bool narrow_heads=head_dim==128&&heads==kv_heads*4;
+    if(!wide&&!narrow_heads)return nullptr;
     if(tile!=256&&tile!=512)return nullptr;
     const bool narrow=tile==256;
     const int t=r.options.cache_type_k;
-    const char* name=
+    const char* name=wide?(
         t==3?(narrow?"kv_attention_gqa_mma_q8_256_s8_t256"
                     :"kv_attention_gqa_mma_q8_256_s8_t512"):
         t==2?(narrow?"kv_attention_gqa_mma_bf16_256_s8_t256"
                     :"kv_attention_gqa_mma_bf16_256_s8_t512"):
         t==1?(narrow?"kv_attention_gqa_mma_f16_256_s8_t256"
-                    :"kv_attention_gqa_mma_f16_256_s8_t512"):nullptr;
+                    :"kv_attention_gqa_mma_f16_256_s8_t512"):nullptr):(
+        t==3?(narrow?"kv_attention_gqa_mma_q8_128_s4_t256"
+                    :"kv_attention_gqa_mma_q8_128_s4_t512"):
+        t==2?(narrow?"kv_attention_gqa_mma_bf16_128_s4_t256"
+                    :"kv_attention_gqa_mma_bf16_128_s4_t512"):
+        t==1?(narrow?"kv_attention_gqa_mma_f16_128_s4_t256"
+                    :"kv_attention_gqa_mma_f16_128_s4_t512"):nullptr);
     return name&&flyweight_gpu_kernel_available(name)?name:nullptr;
 }
 // Floats per (head, tile) partial record: the head dimension plus the running
@@ -16850,6 +16859,32 @@ void qwen_decode_attention_128(
 ) {
     const char* fused_tiles=kv_fused_tiles_kernel(runtime);
     const int fused_tile_tokens=kv_fused_tile_tokens(runtime);
+    // The fused tensor-core kernel outranks everything else where it exists
+    // (same tile rule and partial-record layout as the fused tiles, so the
+    // 128-dim merge serves both).
+    const int gqa_tile_tokens=runtime.fused_attention
+        ? kv_gqa_rows_tile_tokens(runtime,tokens) : 0;
+    const char* mma_tiles=gqa_tile_tokens
+        ? kv_gqa_mma_kernel(runtime,head_dim,heads,kv_heads,gqa_tile_tokens)
+        : nullptr;
+    if(mma_tiles){
+        int tile_count=(tokens+gqa_tile_tokens-1)/gqa_tile_tokens;
+        if(std::getenv("FLYWEIGHT_ATTENTION_DIAG")){
+            static const char*announced=nullptr;
+            if(announced!=mma_tiles){
+                announced=mma_tiles;
+                std::fprintf(stderr,"[attention] decode path (128): %s\n",mma_tiles);
+            }
+        }
+        void*gqa_args[]={&queries,&cache_keys,&cache_values,&attention_scores,
+            &heads,&kv_heads,&head_dim,&tokens,&capacity,&first_slot,&scale};
+        launch_named(mma_tiles,static_cast<std::uint32_t>(kv_heads),
+                     static_cast<std::uint32_t>(tile_count),256,gqa_args);
+        void*merge_args[]={&attention_scores,&attended,&heads,&head_dim,&tile_count};
+        launch_named(kv_fused_merge_kernel_name(runtime,128),
+                     static_cast<std::uint32_t>(heads),1,256,merge_args);
+        return;
+    }
     const bool cublas_done=
         qwen_turbo_cublas_attention(
             runtime,queries,scratch,cache_keys,cache_values,
