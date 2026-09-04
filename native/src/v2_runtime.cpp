@@ -709,6 +709,8 @@ struct QwenSequence {
     std::uint64_t prefill_snapshot_clock = 0;
     std::uint64_t clock = 0;            // LRU stamp across slots
     QwenExpertPrefetchState expert_prefetch;
+    // The value-expert counterpart, driven by its own transition table.
+    QwenExpertPrefetchState mova_prefetch;
     // Routes observed while this sequence prefills its current request.
     // Placement is shared, but evidence is not: cooperative requests must not
     // overwrite one another's prompt-local ranking signal.
@@ -1010,6 +1012,16 @@ struct FlyweightV2QwenRuntime {
     void* mova_stage = nullptr;
     std::uint64_t mova_stage_bytes = 0;
     std::uint64_t mova_stage_event = 0;
+    // Next-layer prefetch for the value experts: a (layers-1) x V x V
+    // transition table trained on consecutive layers' routes, and one pending
+    // upload batch on the prefetch stream, exactly as the feed-forward
+    // experts have. Enabled by the same --next-layer-prefetch budget.
+    std::vector<std::uint16_t> mova_transitions;
+    std::uint64_t mova_prefetch_event = 0;
+    bool mova_prefetch_pending = false;
+    std::uint32_t mova_prefetch_target_layer = std::numeric_limits<std::uint32_t>::max();
+    std::uint64_t mova_prefetch_predictions = 0, mova_prefetch_hits = 0;
+    std::uint64_t mova_prefetch_bytes = 0;
     std::uint32_t host_ffn_layers = 0;
     std::uint64_t host_ffn_bytes = 0;
     // Device staging for one spilled block's feed-forward triple. A spilled
@@ -2324,12 +2336,20 @@ std::size_t select_mova_cache_slot(
             static_cast<std::size_t>(layer) * experts + static_cast<std::uint32_t>(slot.key)];
     };
     auto victim = std::min_element(begin, end, [&](const QwenExpertSlot& left, const QwenExpertSlot& right) {
+        // A slot with an upload still landing in it cannot be reused; sort
+        // those last so they are only ever the victim when nothing else is.
+        const bool lp = left.prefetch_pins != 0, rp = right.prefetch_pins != 0;
+        if (lp != rp) return !lp;
         const auto& lh = history_of(left);
         const auto& rh = history_of(right);
         return lh.frequency != rh.frequency
             ? lh.frequency < rh.frequency
             : left.last_used < right.last_used;
     });
+    if (victim->prefetch_pins) {
+        ++runtime.mova_cache_rejections;
+        return kNoExpertSlot;
+    }
     if (!flyweight::v2::expert_admission_allowed(
             candidate.frequency, history_of(*victim).frequency, false,
             true, runtime.strict_cache_admission)) {
@@ -2536,6 +2556,10 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     runtime.staging_event = 0;
     flyweight_gpu_event_destroy(runtime.prefetch_event);
     runtime.prefetch_event = 0;
+    flyweight_gpu_event_destroy(runtime.mova_prefetch_event);
+    runtime.mova_prefetch_event = 0;
+    runtime.mova_prefetch_pending = false;
+    runtime.mova_prefetch_target_layer = std::numeric_limits<std::uint32_t>::max();
     flyweight_gpu_event_destroy(runtime.route_event);
     flyweight_gpu_event_destroy(runtime.route_event_pipeline);
     flyweight_gpu_event_destroy(runtime.stream_upload_event);
@@ -5111,6 +5135,137 @@ void k2_cpu_mova_misses(
     }
 }
 
+// Next-layer prefetch for the value experts. The mirror of
+// qwen_observe_and_prefetch_next_layer: layer L's picks train the L->L+1
+// transition counts and score L+1's candidates; the top `budget` are paged in
+// -- page hints while the mapping is unregistered, DMA uploads into value
+// slots on the prefetch stream once it is -- and pinned until L+1's route
+// has consumed them.
+static void qwen_wait_for_mova_prefetch_layer(
+    FlyweightV2QwenRuntime& runtime, std::uint32_t layer
+) {
+    if (!runtime.mova_prefetch_pending || runtime.mova_prefetch_target_layer != layer) return;
+    if (runtime.mova_prefetch_event &&
+        flyweight_gpu_stream_wait_event(runtime.stream, runtime.mova_prefetch_event) != 0)
+        throw std::runtime_error("native K2-Horizon prefetch wait failed");
+    runtime.mova_prefetch_pending = false;
+    runtime.mova_prefetch_target_layer = std::numeric_limits<std::uint32_t>::max();
+}
+
+static void qwen_observe_and_prefetch_next_value_layer(
+    FlyweightV2QwenRuntime& runtime, QwenExpertPrefetchState& state,
+    std::uint32_t layer, const std::int32_t* selected, int selected_count
+) {
+    const auto budget = runtime.options.next_layer_prefetch;
+    const std::uint32_t experts = runtime.model->config.value_expert_count;
+    const auto policy = qwen_expert_policy(runtime, flyweight::v2::ExpertExecutionPhase::decode);
+    if (!budget || !experts || selected_count <= 0 || runtime.mova_transitions.empty()) return;
+    auto unpin = [&](std::uint32_t target_layer, std::int32_t prediction) {
+        const auto key = (static_cast<std::uint64_t>(target_layer) << 32) | static_cast<std::uint32_t>(prediction);
+        const auto resident = runtime.mova_residency.find(key);
+        if (resident != runtime.mova_residency.end()) {
+            auto& slot = runtime.mova_slots[resident->second];
+            if (slot.prefetch_pins) --slot.prefetch_pins;
+        }
+    };
+    const auto no_layer = std::numeric_limits<std::uint32_t>::max();
+    if (state.previous_route_layer != no_layer && state.previous_route_layer + 1 == layer) {
+        for (const auto prediction : state.pending_predictions) {
+            for (int rank = 0; rank < selected_count; ++rank)
+                if (selected[rank] == prediction) { ++runtime.mova_prefetch_hits; break; }
+            unpin(layer, prediction);
+        }
+        const std::size_t boundary = static_cast<std::size_t>(layer - 1) * experts * experts;
+        for (const auto source : state.previous_layer_route) {
+            if (source < 0 || static_cast<std::uint32_t>(source) >= experts) continue;
+            for (int rank = 0; rank < selected_count; ++rank) {
+                const auto target = selected[rank];
+                if (target < 0 || static_cast<std::uint32_t>(target) >= experts) continue;
+                auto& count = runtime.mova_transitions[
+                    boundary + static_cast<std::size_t>(source) * experts + static_cast<std::uint32_t>(target)];
+                if (count != std::numeric_limits<std::uint16_t>::max()) ++count;
+            }
+        }
+    } else {
+        // A route that did not follow the pending prediction's layer (a new
+        // token, or a layer skipped by the caller) releases its pins unused.
+        if (state.previous_route_layer != no_layer)
+            for (const auto prediction : state.pending_predictions)
+                unpin(state.previous_route_layer + 1, prediction);
+    }
+    state.previous_layer_route.assign(selected, selected + selected_count);
+    state.previous_route_layer = layer;
+    state.pending_predictions.clear();
+    // Only a MoVA layer can be the target, and the last layer has none.
+    if (layer + 1 >= runtime.layers.size()) return;
+    const auto& next = runtime.layers[layer + 1];
+    if (next.mova_v_exps == std::numeric_limits<std::uint64_t>::max()) return;
+
+    const std::size_t boundary = static_cast<std::size_t>(layer) * experts * experts;
+    std::vector<std::pair<std::uint64_t, std::int32_t>> scores;
+    scores.reserve(experts);
+    for (std::uint32_t candidate = 0; candidate < experts; ++candidate) {
+        std::uint64_t score = 0;
+        for (const auto source : state.previous_layer_route)
+            if (source >= 0 && static_cast<std::uint32_t>(source) < experts)
+                score += runtime.mova_transitions[boundary + static_cast<std::size_t>(source) * experts + candidate];
+        if (score) scores.emplace_back(score, static_cast<std::int32_t>(candidate));
+    }
+    const auto count = std::min<std::size_t>(budget, scores.size());
+    std::partial_sort(scores.begin(), scores.begin() + count, scores.end(),
+        [](const auto& left, const auto& right) {
+            return left.first != right.first ? left.first > right.first : left.second < right.second;
+        });
+    const auto& exps = runtime.model->tensors[next.mova_v_exps];
+    const auto bytes = exps.size / experts;
+    bool queued_gpu_upload = false;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto expert = scores[index].second;
+        state.pending_predictions.push_back(expert);
+        ++runtime.mova_prefetch_predictions;
+        const auto key = (static_cast<std::uint64_t>(layer + 1) << 32) | static_cast<std::uint32_t>(expert);
+        const auto already_resident = runtime.mova_residency.find(key);
+        if (already_resident != runtime.mova_residency.end()) {
+            if (policy.is_streamed_gpu()) ++runtime.mova_slots[already_resident->second].prefetch_pins;
+            continue;
+        }
+        if (!next.expert_dma) {
+#if !defined(_WIN32)
+            if (runtime.model->fd >= 0) {
+                (void)posix_fadvise(runtime.model->fd,
+                    static_cast<off_t>(exps.offset + static_cast<std::uint64_t>(expert) * bytes),
+                    static_cast<off_t>(bytes), POSIX_FADV_WILLNEED);
+                runtime.mova_prefetch_bytes += bytes;
+            }
+#else
+            const auto* base = tensor_data(*runtime.model, exps) + static_cast<std::uint64_t>(expert) * bytes;
+            for (std::size_t pos = 0; pos < bytes; pos += 4096) (void)base[pos];
+            runtime.mova_prefetch_bytes += bytes;
+#endif
+        }
+        if (policy.is_streamed_gpu() && next.expert_dma && !runtime.mova_slots.empty()) {
+            const auto slot_index = select_mova_cache_slot(runtime, layer + 1, static_cast<std::uint32_t>(expert));
+            if (slot_index == kNoExpertSlot) continue;
+            auto& slot = runtime.mova_slots[slot_index];
+            if (flyweight_gpu_upload(runtime.mova_cache + slot_index * runtime.mova_slot_bytes,
+                                     tensor_data(*runtime.model, exps) + static_cast<std::uint64_t>(expert) * bytes,
+                                     bytes, runtime.prefetch_stream) != 0)
+                throw std::runtime_error("native K2-Horizon prefetch DMA upload failed");
+            runtime.mova_prefetch_bytes += bytes;
+            slot.key = key; slot.valid = true; slot.last_used = ++runtime.expert_clock;
+            ++slot.prefetch_pins;
+            runtime.mova_residency[key] = slot_index;
+            queued_gpu_upload = true;
+        }
+    }
+    if (queued_gpu_upload) {
+        if (flyweight_gpu_event_record(runtime.mova_prefetch_event, runtime.prefetch_stream) != 0)
+            throw std::runtime_error("native K2-Horizon prefetch event record failed");
+        runtime.mova_prefetch_pending = true;
+        runtime.mova_prefetch_target_layer = layer + 1;
+    }
+}
+
 // Runs the routed value projection for `rows` tokens whose router logits the
 // caller has already projected into the MoVA workspace. Writes rows x kv_size
 // into `output`. `route_event` is recorded after the route download and waited
@@ -5118,7 +5273,8 @@ void k2_cpu_mova_misses(
 void k2_mova_routed_value(
     FlyweightV2QwenRuntime& runtime, const QwenLayerPlan& layer,
     std::uint32_t layer_number, std::uint64_t normalized, std::uint64_t output,
-    int rows, std::uint64_t route_event, bool may_admit, bool record_history
+    int rows, std::uint64_t route_event, bool may_admit, bool record_history,
+    QwenExpertPrefetchState* prefetch
 ) {
     const auto& model = *runtime.model;
     const auto& ws = runtime.mova_layout;
@@ -5181,6 +5337,14 @@ void k2_mova_routed_value(
     if (flyweight_gpu_event_sync(route_event) != 0)
         throw std::runtime_error("native K2-Horizon MoVA route synchronization failed");
     const double t1 = trace ? now() : 0.0;
+
+    // Uploads predicted for this layer have to have landed before its slots
+    // are read; and this layer's picks, once known, train and issue the next
+    // layer's prediction (decode only: a prefill chunk's rows are not a
+    // token sequence the transition table describes).
+    qwen_wait_for_mova_prefetch_layer(runtime, layer_number);
+    if (prefetch && rows == 1)
+        qwen_observe_and_prefetch_next_value_layer(runtime, *prefetch, layer_number, selected_host, used);
 
     // Split the routes between the cache and the host.
     auto* ptr_host = reinterpret_cast<std::uint64_t*>(host + hl.ptr_table.offset);
@@ -5249,25 +5413,34 @@ void k2_mova_routed_value(
     }
 
     const double t2 = trace ? now() : 0.0;
-    // Admissions: stage from the mapping into pinned memory, upload into the
-    // slots. The stage is reused every call, so wait for the previous call's
-    // uploads to have read it before overwriting.
+    // Admissions. With the mapping registered (expert_dma) the upload DMAs
+    // straight from it; otherwise it goes through the pinned stage, which is
+    // reused every call and so waits for the previous call's uploads to have
+    // read it before being overwritten.
     if (!admissions.empty()) {
-        if (flyweight_gpu_event_sync(runtime.mova_stage_event) != 0)
-            throw std::runtime_error("native K2-Horizon MoVA stage fence failed");
         const auto& exps = model.tensors[layer.mova_v_exps];
         const std::uint64_t expert_bytes = exps.size / static_cast<std::uint64_t>(experts);
-        auto* stage = static_cast<std::uint8_t*>(runtime.mova_stage);
-        std::uint64_t cursor = 0;
-        for (const auto& [expert, slot_index] : admissions) {
-            std::memcpy(stage + cursor, tensor_data(model, exps) + static_cast<std::uint64_t>(expert) * expert_bytes, expert_bytes);
-            if (flyweight_gpu_upload(runtime.mova_cache + slot_index * runtime.mova_slot_bytes,
-                                     stage + cursor, expert_bytes, runtime.stream) != 0)
-                throw std::runtime_error("native K2-Horizon value-expert upload failed");
-            cursor += runtime.mova_slot_bytes;
+        if (layer.expert_dma) {
+            for (const auto& [expert, slot_index] : admissions)
+                if (flyweight_gpu_upload(runtime.mova_cache + slot_index * runtime.mova_slot_bytes,
+                                         tensor_data(model, exps) + static_cast<std::uint64_t>(expert) * expert_bytes,
+                                         expert_bytes, runtime.stream) != 0)
+                    throw std::runtime_error("native K2-Horizon value-expert DMA upload failed");
+        } else {
+            if (flyweight_gpu_event_sync(runtime.mova_stage_event) != 0)
+                throw std::runtime_error("native K2-Horizon MoVA stage fence failed");
+            auto* stage = static_cast<std::uint8_t*>(runtime.mova_stage);
+            std::uint64_t cursor = 0;
+            for (const auto& [expert, slot_index] : admissions) {
+                std::memcpy(stage + cursor, tensor_data(model, exps) + static_cast<std::uint64_t>(expert) * expert_bytes, expert_bytes);
+                if (flyweight_gpu_upload(runtime.mova_cache + slot_index * runtime.mova_slot_bytes,
+                                         stage + cursor, expert_bytes, runtime.stream) != 0)
+                    throw std::runtime_error("native K2-Horizon value-expert upload failed");
+                cursor += runtime.mova_slot_bytes;
+            }
+            if (flyweight_gpu_event_record(runtime.mova_stage_event, runtime.stream) != 0)
+                throw std::runtime_error("native K2-Horizon MoVA stage event failed");
         }
-        if (flyweight_gpu_event_record(runtime.mova_stage_event, runtime.stream) != 0)
-            throw std::runtime_error("native K2-Horizon MoVA stage event failed");
     }
 
     const double t3 = trace ? now() : 0.0;
@@ -13883,6 +14056,11 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
         runtime->expert_transitions.resize(
             (runtime->layers.size()-1)*experts*experts
         );
+        if(runtime->mova_layers){
+            const auto value_experts=static_cast<std::size_t>(m->config.value_expert_count);
+            runtime->mova_transitions.resize(
+                (runtime->layers.size()-1)*value_experts*value_experts);
+        }
     }
     if(runtime->options.mtp_drafts&&!runtime->mtp_available)throw std::runtime_error("native Qwen MTP was requested but the model has no draft block");
     // Prompt tokens are processed through the batched rows forward in chunks
@@ -14139,6 +14317,9 @@ int flyweight_v2_qwen_runtime_info(const FlyweightV2QwenRuntime*runtime,Flyweigh
     out->mova_cache_misses=runtime->mova_cache_misses;
     out->mova_cache_admissions=runtime->mova_cache_admissions;
     out->mova_cache_evictions=runtime->mova_cache_evictions;
+    out->mova_prefetch_predictions=runtime->mova_prefetch_predictions;
+    out->mova_prefetch_hits=runtime->mova_prefetch_hits;
+    out->mova_prefetch_bytes=runtime->mova_prefetch_bytes;
     return 0;
 });}
 // Reset ONLY the active slot's conversation: arena zeroed, bookkeeping
@@ -15317,6 +15498,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             if(flyweight_gpu_event_create(&event)!=0)throw std::runtime_error("failed to create native Qwen slot events");
         if(flyweight_gpu_event_create(&runtime->staging_event)!=0)throw std::runtime_error("failed to create native Qwen staging event");
         if(flyweight_gpu_event_create(&runtime->prefetch_event)!=0){flyweight_gpu_event_destroy(runtime->staging_event);throw std::runtime_error("failed to create native Qwen prefetch event");}
+        if(runtime->mova_layers&&flyweight_gpu_event_create(&runtime->mova_prefetch_event)!=0){flyweight_gpu_event_destroy(runtime->staging_event);flyweight_gpu_event_destroy(runtime->prefetch_event);throw std::runtime_error("failed to create native K2-Horizon prefetch event");}
         // Prefill expert-streaming arena, env-budgeted while the plan is in
         // its measured stages (plans/prefill-expert-stream.md). Charged into
         // the base total below like every other arena, so the expert cache
@@ -16098,8 +16280,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // of the next-layer prefetcher (which tests moe_device==0) dead code.
         // A dense model pages no experts, so pinning the whole mapping buys
         // nothing and costs seconds of registration plus locked host pages.
+        // "Dense" is decided over every layer: Laguna and K2-Horizon open with
+        // dense blocks ahead of their routed ones, and testing only the first
+        // layer left both of them staging every miss.
         const bool pages_experts=!runtime->options.strict_resident&&
-            !runtime->layers.empty()&&!runtime->layers.front().dense_ffn;
+            std::any_of(runtime->layers.begin(),runtime->layers.end(),
+                [](const QwenLayerPlan& layer){return !layer.dense_ffn;});
         if(pages_experts&&paging_policy.routed_gpu_execution_allowed()&&
            (forced_direct||auto_direct||budgeted_direct)){
             const auto registration_started=std::chrono::steady_clock::now();
@@ -16134,10 +16320,18 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 return Span{reinterpret_cast<const std::uint8_t*>(start),
                     reinterpret_cast<const std::uint8_t*>(end)};
             };
+            // A MoVA layer's value stack registers with its feed-forward
+            // triple, so `expert_dma` on the layer covers both.
+            auto has_mova=[](const QwenLayerPlan& layer){
+                return layer.mova_v_exps!=std::numeric_limits<std::uint64_t>::max();
+            };
             std::uint64_t expert_bytes=0;
-            for(const auto& layer:runtime->layers)
+            for(const auto& layer:runtime->layers){
                 for(int role=0;role<3;++role)
                     expert_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
+                if(has_mova(layer))
+                    expert_bytes+=runtime->model->tensors[layer.mova_v_exps].size;
+            }
             // Registration LOCKS pages, so anything else the decode reads out of
             // the mapping has to keep its page cache or the memcpy this removes
             // simply reappears as major faults. Measured on qwen4exp: pinning all
@@ -16166,10 +16360,16 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 std::uint64_t layer_bytes=0;
                 for(int role=0;role<3;++role)
                     layer_bytes+=runtime->model->tensors[layer.expert_tensors[role]].size;
+                if(has_mova(layer))
+                    layer_bytes+=runtime->model->tensors[layer.mova_v_exps].size;
                 if(planned+layer_bytes>budget)break;
                 planned+=layer_bytes;++covered;
                 for(int role=0;role<3;++role){
                     spans.push_back(tensor_span(layer.expert_tensors[role]));
+                    span_layer.push_back(index);
+                }
+                if(has_mova(layer)){
+                    spans.push_back(tensor_span(layer.mova_v_exps));
                     span_layer.push_back(index);
                 }
             }
@@ -19707,7 +19907,8 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                              hidden_size,static_cast<int>(runtime->model->config.value_expert_count));
                 k2_mova_routed_value(*runtime,layer,layer_number,normalized,third,1,
                                      runtime->route_event,
-                                     !runtime->expert_residency_frozen,true);
+                                     !runtime->expert_residency_frozen,true,
+                                     &runtime->sequences[runtime->active_sequence].mova_prefetch);
             }else dense(3,normalized,third,hidden_size,kv_size);
             const int rotary=static_cast<int>(layer.rotary_dim);
             int position=static_cast<int>(runtime->position);
@@ -23717,7 +23918,8 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                                  hidden_size, static_cast<int>(runtime->model->config.value_expert_count));
                     k2_mova_routed_value(*runtime, layer, layer_number, s.normalized, s.third, 1,
                                          runtime->route_event,
-                                         !runtime->expert_residency_frozen, true);
+                                         !runtime->expert_residency_frozen, true,
+                                         &runtime->sequences[s.slot].mova_prefetch);
                 } else dense(3, s.normalized, s.third, hidden_size, kv_size);
                 const int rotary = static_cast<int>(layer.rotary_dim);
                 int position = static_cast<int>(s.position);

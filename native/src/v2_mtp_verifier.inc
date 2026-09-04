@@ -1060,7 +1060,8 @@ void qwen_forward_rows(
                                      expert_policy.misses_may_be_admitted()&&
                                          !runtime.expert_residency_frozen,
                                      expert_policy.records_prefill_frequency()||
-                                         expert_phase!=flyweight::v2::ExpertExecutionPhase::prefill);
+                                         expert_phase!=flyweight::v2::ExpertExecutionPhase::prefill,
+                                     nullptr);
             }else dense(3,normalized,third,hidden_size,kv_size);
             // Both per-layer architectures carry their own rotary span and
             // theta. For Muse Glimmer the span is zero on full-attention
