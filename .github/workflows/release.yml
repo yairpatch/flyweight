@@ -121,6 +121,49 @@ jobs:
           # exits 0. A non-zero exit means a blocking problem with the install.
           flyweight doctor
 
+  github-release:
+    name: GitHub release
+    needs: [verify]
+    # Tags only, like publish. Independent of it on purpose: a PyPI-side
+    # problem (trusted publisher not yet configured, name squatted) should
+    # not also cost the release page and its wheels.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # gh needs the repository context to address the release.
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - name: Create the release with the wheels attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # A version with letters after its numbers (0.3.0rc1, 0.3.0a2,
+          # 0.3.0.dev1) is a pre-release on PyPI too; mark the page the same.
+          prerelease=""
+          case "${version}" in
+            *[0-9][a-zA-Z]*) prerelease="--prerelease" ;;
+          esac
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            # Re-run of a tag whose page already exists: refresh the assets,
+            # keep the notes someone may have edited by hand.
+            gh release upload "${tag}" dist/*.whl --clobber
+          else
+            gh release create "${tag}" dist/*.whl \
+              --title "flyweight ${version}" \
+              --generate-notes \
+              --verify-tag \
+              ${prerelease}
+          fi
+
   publish:
     name: Publish to PyPI
     needs: [verify]
