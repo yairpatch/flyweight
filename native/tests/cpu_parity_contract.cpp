@@ -844,6 +844,113 @@ void add_cases() {
         },
         1e-5f,
     });
+
+    // K2-Horizon's norm is grouped: the hidden vector is cut into `groups`
+    // contiguous spans and each is normalized against its own slice of the
+    // weight row, rather than one reduction across the whole width. The group
+    // count comes from the launch grid, so a case has to vary it to reach the
+    // indexing at all -- a single-group launch degenerates to plain rms_norm
+    // and would pass while the group stride was wrong.
+    cases().push_back(Case{
+        "qwen4_group_rms",
+        [](std::vector<std::vector<float>>& outputs) {
+            // group_size on and off the 256-thread block boundary, so the
+            // emulated reduction tree is exercised with and without a tail.
+            const int shapes[][2] = {{4, 256}, {4, 640}, {2, 1024}, {8, 33}};
+            for (const auto& shape : shapes) {
+                int groups = shape[0];
+                int group_size = shape[1];
+                const auto width =
+                    static_cast<std::size_t>(groups) * group_size;
+                auto input = random_vector(width, -4.0f, 4.0f);
+                auto weights = random_vector(width, 0.25f, 1.75f);
+                std::vector<float> output(width, 0.0f);
+
+                const float* input_p = input.data();
+                const float* weight_p = weights.data();
+                float* output_p = output.data();
+                float epsilon = 1e-6f;
+                void* arguments[] = {&input_p, &weight_p, &output_p,
+                                     &group_size, &epsilon};
+                flyweight_cpu_launch_named("qwen4_group_rms", groups, 1, 256, 0,
+                                         0, arguments);
+                outputs.push_back(std::move(output));
+            }
+        },
+        // Same split as rms_norm: the emulated path sums through a shuffle
+        // tree, the native path in double.
+        2e-6f,
+    });
+
+    // The row-batched twin. `groups` moves from the grid into an argument and
+    // the row index becomes grid_y, so the address arithmetic is genuinely a
+    // different expression and needs its own case -- rows > 1 is the point.
+    cases().push_back(Case{
+        "qwen4_group_rms_rows",
+        [](std::vector<std::vector<float>>& outputs) {
+            const int shapes[][3] = {
+                {4, 256, 1}, {4, 640, 5}, {2, 1024, 3}, {8, 33, 9}};
+            for (const auto& shape : shapes) {
+                int groups = shape[0];
+                int group_size = shape[1];
+                int rows = shape[2];
+                const auto width =
+                    static_cast<std::size_t>(groups) * group_size;
+                auto input =
+                    random_vector(width * static_cast<std::size_t>(rows),
+                                  -4.0f, 4.0f);
+                // One weight row shared by every token, indexed by group only.
+                auto weights = random_vector(width, 0.25f, 1.75f);
+                std::vector<float> output(
+                    width * static_cast<std::size_t>(rows), 0.0f);
+
+                const float* input_p = input.data();
+                const float* weight_p = weights.data();
+                float* output_p = output.data();
+                float epsilon = 1e-6f;
+                void* arguments[] = {&input_p, &weight_p, &output_p, &groups,
+                                     &group_size, &epsilon};
+                flyweight_cpu_launch_named("qwen4_group_rms_rows", groups, rows,
+                                         256, 0, 0, arguments);
+                outputs.push_back(std::move(output));
+            }
+        },
+        2e-6f,
+    });
+
+    // K2-Horizon's Q/K tail: half-split (NEOX) RoPE with no per-head norm and
+    // no learned weights, so the pair partner sits rotary_dim/2 away rather
+    // than adjacent. head_dim > rotary_dim covers the pass-through tail, which
+    // is the half of the kernel a rotation-only case never touches.
+    cases().push_back(Case{
+        "k2_half_split_rope",
+        [](std::vector<std::vector<float>>& outputs) {
+            const int shapes[][3] = {
+                {2, 128, 128}, {8, 64, 32}, {1, 96, 64}, {4, 128, 64}};
+            for (const auto& shape : shapes) {
+                int heads = shape[0];
+                int head_dim = shape[1];
+                int rotary_dim = shape[2];
+                for (int position : {0, 1, 517}) {
+                    auto projected = random_vector(
+                        static_cast<std::size_t>(heads) * head_dim, -2.0f, 2.0f);
+                    std::vector<float> rotated(
+                        static_cast<std::size_t>(heads) * head_dim, 0.0f);
+
+                    const float* projected_p = projected.data();
+                    float* rotated_p = rotated.data();
+                    float theta = 10000000.0f;
+                    void* arguments[] = {&projected_p, &rotated_p, &heads,
+                                         &head_dim, &rotary_dim, &position,
+                                         &theta};
+                    flyweight_cpu_launch_named("k2_half_split_rope", heads, 1,
+                                             256, 0, 0, arguments);
+                    outputs.push_back(std::move(rotated));
+                }
+            }
+        },
+        1e-5f,
+    });
 }
 
 }  // namespace
