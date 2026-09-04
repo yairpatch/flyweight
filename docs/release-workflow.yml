@@ -1,0 +1,153 @@
+# MOVE THIS FILE TO .github/workflows/release.yml BEFORE MERGING.
+#
+# It cannot be committed at that path from the session that opened this PR:
+# the GitHub App pushing the branch has no `workflows` permission, and both
+# git push and the contents API refuse the write. On this branch, run:
+#
+#     git mv docs/release-workflow.yml .github/workflows/release.yml
+#     git commit -m 'ci: move release workflow into place'
+#     git push
+#
+# The PR updates in place and GitHub picks the workflow up on merge. Until it
+# sits at the real path, Actions does not parse or run any of it.
+
+name: Release
+
+# Wheels are cheap to build and expensive to get wrong, so build them on every
+# push to a release tag AND on demand. `workflow_dispatch` publishes nothing --
+# it exists so the manylinux build can be exercised without minting a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Wheel (manylinux_2_28 x86-64)
+    runs-on: ubuntu-latest
+    # The wheel built by ordinary CI links against the runner's glibc and is
+    # tagged linux_x86_64, which PyPI rejects and pip will not install. Building
+    # inside the manylinux image pins the glibc floor instead.
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      # manylinux_2_28 is AlmaLinux 8: its system GCC is 8, and the image ships
+      # newer compilers as gcc-toolset packages. The runtime is C++20 and needs
+      # 13 or newer, so take the highest toolset present rather than pinning a
+      # version the image may drop.
+      - name: Select a C++20 toolchain
+        run: |
+          set -euo pipefail
+          toolset=""
+          for version in 15 14 13; do
+            if [ -f "/opt/rh/gcc-toolset-${version}/enable" ]; then
+              toolset="${version}"
+              break
+            fi
+          done
+          if [ -z "${toolset}" ]; then
+            echo "no gcc-toolset 13+ in this image; cannot build C++20" >&2
+            exit 1
+          fi
+          echo "enabling gcc-toolset-${toolset}"
+          # Fold the toolset's environment into every later step.
+          set +u
+          source "/opt/rh/gcc-toolset-${toolset}/enable"
+          set -u
+          {
+            echo "PATH=${PATH}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+            echo "CC=$(command -v gcc)"
+            echo "CXX=$(command -v g++)"
+          } >> "${GITHUB_ENV}"
+          g++ --version
+
+      - name: Build the wheel
+        run: |
+          set -euo pipefail
+          # Any 3.11+ interpreter produces the same artifact: the runtime is
+          # loaded with ctypes, not linked against the CPython ABI, so the wheel
+          # is tagged py3-none-<platform> and serves every later Python too.
+          /opt/python/cp311-cp311/bin/python -m pip install --upgrade pip build cmake ninja
+          /opt/python/cp311-cp311/bin/python -m build --wheel
+
+      - name: Retag for manylinux
+        run: |
+          set -euo pipefail
+          # `build` tags the wheel from the build host (linux_x86_64). auditwheel
+          # checks the symbol versions actually referenced, vendors what is
+          # needed (libgomp for the OpenMP paths) and applies the real tag.
+          # libcuda and libnvrtc are dlopen'd at runtime and never linked, so
+          # nothing CUDA is vendored here -- which is the point.
+          auditwheel repair dist/*.whl --plat manylinux_2_28_x86_64 -w wheelhouse
+          ls -l wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-manylinux-x86_64
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  windows:
+    name: Wheel (win_amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build cmake ninja
+          python -m build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-win-amd64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  verify:
+    name: Install the built wheel
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-manylinux-x86_64
+          path: wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          # Deliberately not the interpreter that built it. A py3-none wheel
+          # that only works on its build Python is a packaging bug, and this is
+          # where it surfaces rather than in someone's install.
+          python-version: "3.13"
+      - name: Install and report
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install wheelhouse/*.whl
+          # No GPU on this runner, so doctor reports no usable device and still
+          # exits 0. A non-zero exit means a blocking problem with the install.
+          flyweight doctor
+
+  publish:
+    name: Publish to PyPI
+    needs: [verify]
+    # Tags publish; a manual run stops at the artifacts above.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
