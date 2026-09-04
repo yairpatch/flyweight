@@ -460,6 +460,9 @@ class _QwenRuntimeInfo(ctypes.Structure):
         ("mova_cache_misses", ctypes.c_uint64),
         ("mova_cache_admissions", ctypes.c_uint64),
         ("mova_cache_evictions", ctypes.c_uint64),
+        ("mova_prefetch_predictions", ctypes.c_uint64),
+        ("mova_prefetch_hits", ctypes.c_uint64),
+        ("mova_prefetch_bytes", ctypes.c_uint64),
     ]
 
 

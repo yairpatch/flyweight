@@ -331,6 +331,9 @@ typedef struct FlyweightV2QwenRuntimeInfo {
     uint64_t mova_cache_misses;
     uint64_t mova_cache_admissions;
     uint64_t mova_cache_evictions;
+    uint64_t mova_prefetch_predictions;
+    uint64_t mova_prefetch_hits;
+    uint64_t mova_prefetch_bytes;
 } FlyweightV2QwenRuntimeInfo;
 
 /* Cooperative multi-request engine: tasks are submitted from any thread; ONE
