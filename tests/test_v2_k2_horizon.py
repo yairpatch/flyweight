@@ -324,23 +324,27 @@ class K2HorizonDecodeAttentionTests(unittest.TestCase):
         """K2 runs the cuBLAS prefill attention ungated and gates afterwards;
         forced on, it must reproduce the warp kernel's tokens."""
         # The tensor-core tiles need a visible prefix of at least 256 tokens
-        # and a context wide enough for their workspace bound.
-        common = {"FLYWEIGHT_PREFILL_ROWS": "512", "FLYWEIGHT_CUBLAS_ATTENTION": "0"}
+        # and a context wide enough for their workspace bound. The prompt runs
+        # past one score block (4096 tokens at this geometry) so the
+        # flash-blocked loop and its per-KV-head workspace bound are exercised:
+        # the bound once divided by the group instead of the head count and
+        # the tile overran the scratch by kv_heads x past that length.
+        common = {"FLYWEIGHT_PREFILL_ROWS": "128", "FLYWEIGHT_CUBLAS_ATTENTION": "0"}
         warp, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "0"},
-                               prompt_tokens=600, context=8192, steps=8)
+                               prompt_tokens=5000, context=8192, steps=8)
         tensor_core, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "1"},
-                                      prompt_tokens=600, context=8192, steps=8)
+                                      prompt_tokens=5000, context=8192, steps=8)
         self.assertEqual(tensor_core, warp)
 
     def test_staged_tensor_core_prefill_matches_the_warp_prefill_on_q8_kv(self):
         """With a q8_0 cache the window is widened to f16 and handed to the
         same routine, ungated; it must match the warp kernel too."""
-        common = {"FLYWEIGHT_PREFILL_ROWS": "512", "FLYWEIGHT_CUBLAS_ATTENTION": "0",
+        common = {"FLYWEIGHT_PREFILL_ROWS": "128", "FLYWEIGHT_CUBLAS_ATTENTION": "0",
                   "FLYWEIGHT_PROBE_KV": "q8_0"}
         warp, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "0"},
-                               prompt_tokens=600, context=8192, steps=8)
+                               prompt_tokens=5000, context=8192, steps=8)
         staged, _ = self._tokens({**common, "FLYWEIGHT_CUBLAS_PREFILL_ATTENTION": "1"},
-                                 prompt_tokens=600, context=8192, steps=8)
+                                 prompt_tokens=5000, context=8192, steps=8)
         self.assertEqual(staged, warp)
 
 
