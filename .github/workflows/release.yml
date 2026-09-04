@@ -1,16 +1,3 @@
-# MOVE THIS FILE TO .github/workflows/release.yml BEFORE MERGING.
-#
-# It cannot be committed at that path from the session that opened this PR:
-# the GitHub App pushing the branch has no `workflows` permission, and both
-# git push and the contents API refuse the write. On this branch, run:
-#
-#     git mv docs/release-workflow.yml .github/workflows/release.yml
-#     git commit -m 'ci: move release workflow into place'
-#     git push
-#
-# The PR updates in place and GitHub picks the workflow up on merge. Until it
-# sits at the real path, Actions does not parse or run any of it.
-
 name: Release
 
 # Wheels are cheap to build and expensive to get wrong, so build them on every
