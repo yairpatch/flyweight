@@ -190,7 +190,12 @@ DSML_PARAMETER_PATTERN = re.compile(
     r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)">'
     r'(.*?)</｜DSML｜parameter>', re.DOTALL
 )
-THINKING_BLOCK_PATTERN = re.compile(r"\A\s*<think>(.*?)</think>\s*", re.DOTALL)
+THINKING_OPEN_TAGS = ("<think>", "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>")
+THINKING_CLOSE_TAGS = ("</think>", "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>")
+THINKING_BLOCK_PATTERN = re.compile(
+    r"\A\s*<(?:think|ifm\|think(?:_fast(?:er)?)?)>(.*?)</(?:think|ifm\|think(?:_fast(?:er)?)?)>\s*",
+    re.DOTALL,
+)
 # How hard a checkpoint that grades its reasoning should think. OpenAI spells
 # this low / medium / high; Qwen3.5's template reads low / medium / xhigh and
 # maps high onto xhigh itself, so both vocabularies pass through untouched and
@@ -2548,10 +2553,11 @@ class InferenceService:
         if decode is None or not prompt_ids:
             return False
         try:
-            tail = decode(list(prompt_ids[-8:]), skip_special_tokens=False)
+            tail = decode(list(prompt_ids[-16:]), skip_special_tokens=False)
         except Exception:
             return False
-        return tail.rstrip().endswith("<think>")
+        tail = tail.rstrip()
+        return any(tail.endswith(tag) for tag in THINKING_OPEN_TAGS)
 
     def _fit_max_new_tokens(
         self, requested: int, prompt_tokens: int, *, parameter: str
@@ -4738,6 +4744,7 @@ class ThinkingPrefixStream:
     """
 
     _CLOSE = "</think>"
+    _CLOSE_TAGS = THINKING_CLOSE_TAGS
 
     def __init__(self) -> None:
         self._buffer = ""
@@ -4748,18 +4755,32 @@ class ThinkingPrefixStream:
         if self._closed:
             return delta, ""
         self._buffer += delta
-        end = self._buffer.find(self._CLOSE)
-        if end == -1:
-            # Hold back a tail that could still become the closing tag.
+
+        best_end = -1
+        matched_tag = ""
+        for tag in self._CLOSE_TAGS:
+            idx = self._buffer.find(tag)
+            if idx != -1 and (best_end == -1 or idx < best_end):
+                best_end = idx
+                matched_tag = tag
+
+        if best_end == -1:
+            # Hold back a tail that could still become any of the closing tags.
             settled = self._buffer
-            for size in range(min(len(settled), len(self._CLOSE) - 1), 0, -1):
-                if self._CLOSE.startswith(settled[-size:]):
-                    settled = settled[:-size]
-                    break
+            max_hold = 0
+            for tag in self._CLOSE_TAGS:
+                for size in range(min(len(settled), len(tag) - 1), 0, -1):
+                    if tag.startswith(settled[-size:]):
+                        if size > max_hold:
+                            max_hold = size
+                        break
+            if max_hold > 0:
+                settled = settled[:-max_hold]
             self._buffer = self._buffer[len(settled):]
             return "", settled
-        reasoning = self._buffer[:end]
-        visible = self._buffer[end + len(self._CLOSE):]
+
+        reasoning = self._buffer[:best_end]
+        visible = self._buffer[best_end + len(matched_tag):]
         self._buffer = ""
         self._closed = True
         return visible.lstrip(), reasoning
@@ -4897,9 +4918,17 @@ def _split_reasoning_content(text: str) -> tuple[str, str | None]:
     #
     # A closing tag with nothing before it is the same case with no reasoning
     # produced, which is what a non-thinking DeepSeek prompt emits.
-    closing = text.find("</think>")
-    if closing != -1 and "<think>" not in text[:closing]:
-        return text[closing + len("</think>"):].lstrip(), text[:closing].strip() or None
+    best_closing = -1
+    best_tag = None
+    for close_tag in THINKING_CLOSE_TAGS:
+        idx = text.find(close_tag)
+        if idx != -1 and (best_closing == -1 or idx < best_closing):
+            prefix = text[:idx]
+            if not any(open_tag in prefix for open_tag in THINKING_OPEN_TAGS):
+                best_closing = idx
+                best_tag = close_tag
+    if best_closing != -1 and best_tag is not None:
+        return text[best_closing + len(best_tag):].lstrip(), text[:best_closing].strip() or None
     return text, None
 
 

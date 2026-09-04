@@ -21,7 +21,13 @@ from .sampling import (
     SamplingConfig,
     coerce as sampling_coerce,
 )
-from .server import InferenceService, _parse_tool_calls, _split_reasoning_content
+from .server import (
+    InferenceService,
+    THINKING_CLOSE_TAGS,
+    THINKING_OPEN_TAGS,
+    _parse_tool_calls,
+    _split_reasoning_content,
+)
 from .vision import (
     IMAGE_PAD_TOKEN, IMAGE_PLACEHOLDER, ImageError, ImageInput, ImagePreprocessor,
     PreparedImage, expand_image_pads, image_token_offsets,
@@ -1231,6 +1237,8 @@ class _ThinkingBudget:
 
     _OPEN = "<think>"
     _CLOSE = "</think>"
+    _OPEN_TAGS = THINKING_OPEN_TAGS
+    _CLOSE_TAGS = THINKING_CLOSE_TAGS
 
     def __init__(self, budget: int, thinking_open: bool):
         self.budget = budget
@@ -1246,17 +1254,30 @@ class _ThinkingBudget:
     def spend(self, delta: str) -> bool:
         self._window += delta
         if not self.inside:
-            if self._OPEN not in self._window:
-                self._window = self._window[-(len(self._OPEN) - 1):]
+            matched_open = None
+            for open_tag in self._OPEN_TAGS:
+                if open_tag in self._window:
+                    matched_open = open_tag
+                    break
+            if matched_open is None:
+                max_open_len = max(len(t) for t in self._OPEN_TAGS)
+                self._window = self._window[-(max_open_len - 1):]
                 return False
             self.inside = True
-            self._window = self._window.split(self._OPEN, 1)[1]
-        if self._CLOSE in self._window:
+            self._window = self._window.split(matched_open, 1)[1]
+        matched_close = None
+        for close_tag in self._CLOSE_TAGS:
+            if close_tag in self._window:
+                matched_close = close_tag
+                break
+        if matched_close is not None:
             self.inside = False
-            self._window = self._window.split(self._CLOSE, 1)[1]
-            self._window = self._window[-(len(self._OPEN) - 1):]
+            self._window = self._window.split(matched_close, 1)[1]
+            max_open_len = max(len(t) for t in self._OPEN_TAGS)
+            self._window = self._window[-(max_open_len - 1):]
             return False
-        self._window = self._window[-(len(self._CLOSE) - 1):]
+        max_close_len = max(len(t) for t in self._CLOSE_TAGS)
+        self._window = self._window[-(max_close_len - 1):]
         # Undecodable and partial-UTF-8 tokens carry an empty delta but were
         # sampled all the same; the budget counts tokens, not characters.
         self.spent += 1
@@ -1609,8 +1630,15 @@ class ChatGenerator:
 
     def _thinking_close_ids(self) -> list[int]:
         if self._forced_close_ids is None:
+            if getattr(self.tokenizer, "architecture", None) == "k2-horizon":
+                close_text = (
+                    "\n\nConsidering the limited time by the user, I have to give the "
+                    "solution based on the thinking directly now.\n</ifm|think>\n\n"
+                )
+            else:
+                close_text = THINKING_BUDGET_CLOSE
             self._forced_close_ids = [
-                int(token) for token in self.tokenizer.encode(THINKING_BUDGET_CLOSE)
+                int(token) for token in self.tokenizer.encode(close_text)
             ]
         return self._forced_close_ids
 
@@ -1618,11 +1646,12 @@ class ChatGenerator:
         """Whether the rendered prompt leaves the turn inside a think block."""
         try:
             tail = self.tokenizer.decode(
-                list(prompt_ids[-8:]), skip_special_tokens=False
+                list(prompt_ids[-16:]), skip_special_tokens=False
             )
         except Exception:
             return False
-        return tail.rstrip().endswith("<think>")
+        tail = tail.rstrip()
+        return any(tail.endswith(tag) for tag in THINKING_OPEN_TAGS)
 
     def _stream(
         self, prompt_ids: list[int], **options: object
