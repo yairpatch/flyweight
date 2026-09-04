@@ -5111,6 +5111,58 @@ void k2_cpu_mova_misses(
     const auto exps_type = exps.type;
     const std::uint64_t expert_stride =
         exps.size / static_cast<std::uint64_t>(model.config.value_expert_count);
+    // A chunk routes the same expert from many rows (128 rows x 4 picks over
+    // 64 experts is ~8 rows each), so decode each expert row once and dot it
+    // against every row that picked it -- the batching the host dense path
+    // uses -- instead of re-decoding it per (row, channel). Parallel over the
+    // output channel so no two threads touch the same partial element. Kept
+    // to the formats with a vectorized row decoder, as the dense path is.
+    if (rows > 1 && qwen_simd_quant_type(exps_type)) {
+        std::vector<std::vector<int>> by_expert(static_cast<std::size_t>(model.config.value_expert_count));
+        for (std::size_t at = 0; at < misses.size(); ++at)
+            by_expert[static_cast<std::size_t>(misses[at].expert)].push_back(static_cast<int>(at));
+        std::vector<int> used_experts;
+        for (std::size_t expert = 0; expert < by_expert.size(); ++expert)
+            if (!by_expert[expert].empty()) used_experts.push_back(static_cast<int>(expert));
+        std::fill(partial, partial + static_cast<std::size_t>(rows) * kv_size, 0.0f);
+        const bool avx512 = (flyweight_cpu_features() & 2u) != 0;
+        const bool avx2 = (flyweight_cpu_features() & 1u) != 0;
+        #pragma omp parallel num_threads(qwen_cpu_thread_count(runtime))
+        {
+            std::vector<float> decoded(static_cast<std::size_t>(hidden_size));
+            std::vector<const float*> inputs;
+            std::vector<float> dots;
+            #pragma omp for schedule(static)
+            for (int channel = 0; channel < kv_size; ++channel) {
+                for (const int expert : used_experts) {
+                    const auto& list = by_expert[static_cast<std::size_t>(expert)];
+                    inputs.resize(list.size()); dots.resize(list.size());
+                    for (std::size_t i = 0; i < list.size(); ++i)
+                        inputs[i] = input + static_cast<std::size_t>(misses[static_cast<std::size_t>(list[i])].row) * hidden_size;
+                    qwen_dequant_row(exps_data + static_cast<std::uint64_t>(expert) * expert_stride,
+                                     exps_type, hidden_size, static_cast<std::uint64_t>(channel), decoded.data());
+                    const int count = static_cast<int>(list.size());
+                    if (avx512 && hidden_size % 32 == 0)
+                        qwen_f32_dot_multi_avx512(decoded.data(), inputs.data(), count, hidden_size, dots.data());
+                    else if (avx2 && hidden_size % 16 == 0)
+                        qwen_f32_dot_multi_avx2(decoded.data(), inputs.data(), count, hidden_size, dots.data());
+                    else
+                        for (int i = 0; i < count; ++i) {
+                            float sum = 0.0f;
+                            for (int k = 0; k < hidden_size; ++k) sum += decoded[k] * inputs[i][k];
+                            dots[i] = sum;
+                        }
+                    for (std::size_t i = 0; i < list.size(); ++i) {
+                        const auto& miss = misses[static_cast<std::size_t>(list[i])];
+                        const float dot = dots[i];
+                        partial[static_cast<std::size_t>(miss.row) * kv_size + channel] += miss.weight *
+                            (dot / (1.0f + std::exp(-std::min(80.0f, std::max(-80.0f, dot)))));
+                    }
+                }
+            }
+        }
+        return;
+    }
     std::vector<int> first(static_cast<std::size_t>(rows) + 1, 0);
     // Misses arrive grouped by row (the caller walks rows in order), so a
     // prefix count per row bounds each row's span in the list.
@@ -22547,6 +22599,73 @@ static int qwen_prefill_unit(FlyweightV2QwenRuntime* runtime, const uint32_t* pr
 // working set from prompt-local frequency plus decayed persistent history,
 // bounded by cache capacity and wall time. A low-value prompt leaves the
 // previous pinned set untouched, which is important for short side requests.
+// Warm the value-expert cache after a prompt: prefill never admits (the same
+// no-churn rule the feed-forward cache follows), so without this every
+// request's decode started cold and paid ~2.5 admissions a token for its
+// first few hundred tokens. Each MoVA layer's partition is filled with its
+// hottest value experts by routing history -- which the prompt just trained
+// -- through the ordinary slot selection, so nothing hotter is displaced.
+static void qwen_seed_prefill_value_experts(FlyweightV2QwenRuntime& runtime) {
+    if (runtime.mova_slots.empty() || runtime.expert_residency_frozen) return;
+    const auto& model = *runtime.model;
+    const auto experts = model.config.value_expert_count;
+    const auto layers = runtime.layers.size();
+    auto* stage = static_cast<std::uint8_t*>(runtime.mova_stage);
+    std::uint64_t staged = 0;
+    bool stage_dirty = false;
+    auto flush = [&] {
+        if (!stage_dirty) return;
+        if (flyweight_gpu_event_record(runtime.mova_stage_event, runtime.stream) != 0 ||
+            flyweight_gpu_event_sync(runtime.mova_stage_event) != 0)
+            throw std::runtime_error("native K2-Horizon value-expert seed fence failed");
+        staged = 0; stage_dirty = false;
+    };
+    std::size_t seeded = 0;
+    for (std::uint32_t layer_index = 0; layer_index < layers; ++layer_index) {
+        const auto& layer = runtime.layers[layer_index];
+        if (layer.mova_v_exps == std::numeric_limits<std::uint64_t>::max()) continue;
+        const auto& exps = model.tensors[layer.mova_v_exps];
+        const std::uint64_t bytes = exps.size / experts;
+        const auto slot_begin = runtime.mova_slots.size() * layer_index / layers;
+        const auto slot_end = runtime.mova_slots.size() * (layer_index + 1) / layers;
+        std::vector<std::uint32_t> candidates;
+        for (std::uint32_t expert = 0; expert < experts; ++expert)
+            if (runtime.mova_history[static_cast<std::size_t>(layer_index) * experts + expert].frequency)
+                candidates.push_back(expert);
+        std::sort(candidates.begin(), candidates.end(), [&](std::uint32_t a, std::uint32_t b) {
+            const auto& ha = runtime.mova_history[static_cast<std::size_t>(layer_index) * experts + a];
+            const auto& hb = runtime.mova_history[static_cast<std::size_t>(layer_index) * experts + b];
+            return ha.frequency != hb.frequency ? ha.frequency > hb.frequency
+                : (ha.last_used != hb.last_used ? ha.last_used > hb.last_used : a < b);
+        });
+        if (candidates.size() > slot_end - slot_begin) candidates.resize(slot_end - slot_begin);
+        for (const auto expert : candidates) {
+            const auto key = (static_cast<std::uint64_t>(layer_index) << 32) | expert;
+            if (runtime.mova_residency.count(key)) continue;
+            const auto slot_index = select_mova_cache_slot(runtime, layer_index, expert);
+            if (slot_index == kNoExpertSlot) continue;
+            auto& slot = runtime.mova_slots[slot_index];
+            slot.key = key; slot.valid = true; slot.last_used = ++runtime.expert_clock;
+            runtime.mova_residency[key] = slot_index;
+            const auto* source = tensor_data(model, exps) + static_cast<std::uint64_t>(expert) * bytes;
+            const auto target = runtime.mova_cache + slot_index * runtime.mova_slot_bytes;
+            if (layer.expert_dma) {
+                if (flyweight_gpu_upload(target, source, bytes, runtime.stream) != 0)
+                    throw std::runtime_error("native K2-Horizon value-expert seed upload failed");
+            } else {
+                if (staged + runtime.mova_slot_bytes > runtime.mova_stage_bytes) flush();
+                std::memcpy(stage + staged, source, bytes);
+                if (flyweight_gpu_upload(target, stage + staged, bytes, runtime.stream) != 0)
+                    throw std::runtime_error("native K2-Horizon value-expert seed upload failed");
+                staged += runtime.mova_slot_bytes; stage_dirty = true;
+            }
+            ++seeded;
+        }
+    }
+    flush();
+    runtime.prefill_cache_seed_selected_experts += seeded;
+}
+
 static void qwen_seed_prefill_experts(
         FlyweightV2QwenRuntime& runtime,
         std::uint64_t requested_generation_tokens) {
@@ -22897,6 +23016,7 @@ static void qwen_prompt_finish(FlyweightV2QwenRuntime* runtime,
     if(runtime->options.mtp_drafts)qwen_mtp_expire_calibration(*runtime);
     qwen_prefetch_cpu_experts(*runtime);
     qwen_seed_prefill_experts(*runtime,requested_generation_tokens);
+    qwen_seed_prefill_value_experts(*runtime);
     if(!runtime->prefill_snapshot_bytes)return;
     // Prefer this prompt's rotated tail slot when mid checkpoints exist, else
     // the slot already tracking this conversation, else a free slot, else the
