@@ -16831,6 +16831,71 @@ inline bool qwen_turbo_cublas_attention(
     return true;
 }
 
+extern "C++" {
+// Decode attention for a 128-dim head: the paths the Qwen dispatch takes at
+// that width, in the same order -- cuBLAS tensor-core GQA where the cache is
+// a 16-bit float and the window is long enough to amortize it, then the fused
+// per-head tiles + merge, then the serial scores/values pair. K2-Horizon,
+// which used to launch the serial pair unconditionally, lost ~half its decode
+// rate by 5k tokens to it: 48 full-attention layers each streaming the cache
+// once per query head.
+template<typename Launch>
+void qwen_decode_attention_128(
+    FlyweightV2QwenRuntime& runtime, Launch& launch_named,
+    std::uint64_t queries, std::uint64_t scratch,
+    std::uint64_t cache_keys, std::uint64_t cache_values,
+    std::uint64_t attention_scores, std::uint64_t attended,
+    int heads, int kv_heads, int head_dim, int tokens, int capacity,
+    int first_slot, float scale
+) {
+    const char* fused_tiles=kv_fused_tiles_kernel(runtime);
+    const int fused_tile_tokens=kv_fused_tile_tokens(runtime);
+    const bool cublas_done=
+        qwen_turbo_cublas_attention(
+            runtime,queries,scratch,cache_keys,cache_values,
+            attention_scores,attended,heads,kv_heads,head_dim,
+            tokens,capacity,first_slot,scale)||
+        (qwen_cublas_attention_eligible(runtime,tokens,first_slot,capacity)&&
+         flyweight_gpu_attention_16bit_cublas(
+            runtime.options.cache_type_k,
+            queries,scratch,cache_keys,cache_values,attention_scores,attended,
+            runtime.stream,heads,kv_heads,head_dim,tokens,capacity,first_slot,
+            scale)==0);
+    const int tile_count=(tokens+fused_tile_tokens-1)/fused_tile_tokens;
+    const bool fused_ok=runtime.fused_attention&&fused_tiles&&head_dim==128&&
+        heads/kv_heads<=8&&tile_count<=512&&
+        static_cast<std::uint64_t>(tile_count)*kv_fused_record_stride(128)<=
+            runtime.options.context_limit;
+    if(std::getenv("FLYWEIGHT_ATTENTION_DIAG")){
+        static const char*announced=nullptr;
+        const char*chosen=cublas_done?"cublas":fused_ok?"fused per-head tiles":"serial ring";
+        if(announced!=chosen){
+            announced=chosen;
+            std::fprintf(stderr,"[attention] decode path (128): %s\n",chosen);
+        }
+    }
+    if(cublas_done)return;
+    if(fused_ok){
+        void*fused_args[]={&queries,&cache_keys,&cache_values,&attention_scores,
+            &heads,&kv_heads,&head_dim,&tokens,&capacity,&first_slot,&scale};
+        launch_named(fused_tiles,kv_fused_grid_heads(runtime,heads,kv_heads),
+                     static_cast<std::uint32_t>(tile_count),256,fused_args);
+        int count=tile_count;
+        void*merge_args[]={&attention_scores,&attended,&heads,&head_dim,&count};
+        launch_named(kv_fused_merge_kernel_name(runtime,128),
+                     static_cast<std::uint32_t>(heads),1,256,merge_args);
+        return;
+    }
+    void*score_args[]={&queries,&cache_keys,&attention_scores,&heads,&kv_heads,
+        &head_dim,&tokens,&capacity,&first_slot,&scale};
+    launch_named(kv_scores_ring_kernel(runtime),static_cast<std::uint32_t>(heads),
+                 static_cast<std::uint32_t>((tokens+255)/256),256,score_args);
+    void*value_args[]={&attention_scores,&cache_values,&attended,&heads,&kv_heads,
+        &head_dim,&tokens,&capacity,&first_slot};
+    launch_named(kv_values_ring_kernel(runtime),static_cast<std::uint32_t>(heads),1,256,value_args);
+}
+}  // extern "C++"
+
 void qwen_mtp_dense_projection(
     FlyweightV2QwenRuntime& runtime, std::size_t tensor_index_value,
     std::uint64_t input, std::uint64_t output,
@@ -19942,10 +20007,10 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             launch_named(kv_store_kernel(runtime->options.cache_type_v,false),kv_heads,1,256,v_store_args);
             std::uint64_t attended=second;int tokens=view.tokens,first_slot=view.first;
             float scale=1.0f/std::sqrt(static_cast<float>(head_dim));
-            void*score_args[]={const_cast<std::uint64_t*>(&queries),&cache_keys,const_cast<std::uint64_t*>(&attention_scores),const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot,&scale};
-            launch_named(kv_scores_ring_kernel(*runtime),heads,(tokens+255)/256,256,score_args);
-            void*value_args[]={const_cast<std::uint64_t*>(&attention_scores),&cache_values,&attended,const_cast<int*>(&heads),const_cast<int*>(&kv_heads),const_cast<int*>(&head_dim),&tokens,&capacity,&first_slot};
-            launch_named(kv_values_ring_kernel(*runtime),heads,1,256,value_args);
+            // `first` is free again: its roped key went to the cache above.
+            qwen_decode_attention_128(*runtime,launch_named,queries,first,
+                cache_keys,cache_values,attention_scores,attended,
+                heads,kv_heads,head_dim,tokens,capacity,first_slot,scale);
             std::uint64_t projected_from=attended;
             if(k2_gate){
                 std::uint64_t gated=third;int elements=q_size;
@@ -23953,10 +24018,9 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
                 launch_named(kv_store_kernel(runtime->options.cache_type_v, false), kv_heads, 1, 256, v_store_args);
                 std::uint64_t attended = s.second; int tokens = view.tokens, first_slot = view.first;
                 float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-                void* score_args[] = {const_cast<std::uint64_t*>(&queries), &cache_keys, const_cast<std::uint64_t*>(&s.attention_scores), const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot, &scale};
-                launch_named(kv_scores_ring_kernel(*runtime), heads, (tokens + 255) / 256, 256, score_args);
-                void* value_args[] = {const_cast<std::uint64_t*>(&s.attention_scores), &cache_values, &attended, const_cast<int*>(&heads), const_cast<int*>(&kv_heads), const_cast<int*>(&head_dim), &tokens, &capacity, &first_slot};
-                launch_named(kv_values_ring_kernel(*runtime), heads, 1, 256, value_args);
+                qwen_decode_attention_128(*runtime, launch_named, queries, s.first,
+                    cache_keys, cache_values, s.attention_scores, attended,
+                    heads, kv_heads, head_dim, tokens, capacity, first_slot, scale);
                 std::uint64_t projected_from = attended;
                 if (k2_gate) {
                     std::uint64_t gated = s.third; int elements = q_size;
