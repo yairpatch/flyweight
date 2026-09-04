@@ -178,22 +178,6 @@ TOOL_PARAMETER_OPEN_PATTERN = re.compile(
 )
 TOOL_PARAMETER_LEAD = re.compile(r"\A\r?\n")
 TOOL_PARAMETER_TAIL = re.compile(r"\r?\n[ \t]*\Z")
-# K2-Horizon wraps a turn's calls in one <ifm|tool_calls> block. Its template
-# can ask the model for any of three bodies: a JSON object per call, or the
-# function name on the first line followed by <ifm|arg_key>/<ifm|arg_value>
-# pairs (the default), optionally with an <ifm|arg_type> between them.
-K2_TOOL_CALLS_MARKER = "<ifm|tool_calls>"
-K2_TOOL_CALLS_END_MARKER = "</ifm|tool_calls>"
-K2_TOOL_CALL_BLOCK_PATTERN = re.compile(
-    r"<ifm\|tool_call>\s*(.*?)\s*</ifm\|tool_call>", re.DOTALL
-)
-K2_ARG_KEY_PATTERN = re.compile(r"<ifm\|arg_key>")
-K2_ARG_PAIR_PATTERN = re.compile(
-    r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*"
-    r"(?:<ifm\|arg_type>(.*?)</ifm\|arg_type>\s*)?"
-    r"<ifm\|arg_value>(.*?)</ifm\|arg_value>",
-    re.DOTALL,
-)
 DSML_TOOL_CALL_MARKER = "<｜DSML｜tool_calls>"
 DSML_TOOL_CALL_END_MARKER = "</｜DSML｜tool_calls>"
 DSML_TOOL_CALL_BLOCK_PATTERN = re.compile(
@@ -206,21 +190,6 @@ DSML_PARAMETER_PATTERN = re.compile(
     r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)">'
     r'(.*?)</｜DSML｜parameter>', re.DOTALL
 )
-
-
-def _tool_markers(architecture: str | None) -> tuple[str, str]:
-    """The markup that opens and closes a turn's tool calls on this family.
-
-    The streaming loops hold text back at the opening marker and stop the
-    generation at the closing one, so both have to be the family's own: K2's
-    calls live in an outer block that closes once for the whole set, while
-    the Qwen shapes close per call.
-    """
-    if architecture == "k2-horizon":
-        return K2_TOOL_CALLS_MARKER, K2_TOOL_CALLS_END_MARKER
-    return TOOL_CALL_MARKER, TOOL_CALL_END_MARKER
-
-
 THINKING_OPEN_TAGS = ("<think>", "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>")
 THINKING_CLOSE_TAGS = ("</think>", "</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>")
 THINKING_BLOCK_PATTERN = re.compile(
@@ -837,18 +806,15 @@ class InferenceService:
             tools=tuple(tools),
             response_format=request.response_format,
         )
-        _, end_marker = _tool_markers(
-            getattr(self.generator.tokenizer, "architecture", None)
-        )
         try:
             for step in steps:
                 final_step = step
                 if step.text_delta:
                     text_parts.append(step.text_delta)
                     marker_window = end_marker_tail + step.text_delta
-                    end_marker_tail = marker_window[-len(end_marker) :]
+                    end_marker_tail = marker_window[-len(TOOL_CALL_END_MARKER) :]
                 complete_call = (
-                    end_marker in marker_window
+                    TOOL_CALL_END_MARKER in marker_window
                     if step.text_delta
                     else False
                 )
@@ -1218,9 +1184,7 @@ class InferenceService:
         tool_body = ""  # text after the marker, fed to the streamer
         tool_start_tokens = 0  # generated-token count when the call opened
         tool_streamer: _ToolCallStreamer | None = None
-        marker, end_marker = _tool_markers(
-            getattr(self.generator.tokenizer, "architecture", None)
-        )
+        marker = TOOL_CALL_MARKER
         holdback = len(marker) - 1
         tool_channels = (
             MuseChannelStream()
@@ -1306,7 +1270,9 @@ class InferenceService:
                             tool_start_tokens = len(step.generated_ids)
                             marker_window = pending
                             tool_body = pending[len(marker) :]
-                            tool_end_tail = marker_window[-len(end_marker) :]
+                            tool_end_tail = marker_window[
+                                -len(TOOL_CALL_END_MARKER) :
+                            ]
                         else:
                             # Hold back a possible partial marker at the tail,
                             # and any whitespace before it: it may be the
@@ -1335,8 +1301,12 @@ class InferenceService:
                     else:
                         marker_window = tool_end_tail + delta_text
                         tool_body += delta_text
-                        tool_end_tail = marker_window[-len(end_marker) :]
-                    if tool_start is not None and end_marker in marker_window:
+                        tool_end_tail = marker_window[
+                            -len(TOOL_CALL_END_MARKER) :
+                        ]
+                    if tool_start is not None and (
+                        TOOL_CALL_END_MARKER in marker_window
+                    ):
                         accumulated = "".join(text_parts)
                         _, tool_calls = _parse_tool_calls(
                             accumulated, tools=request.tools
@@ -3815,7 +3785,7 @@ def serve(
 # Architectures whose own chat template renders tools: the schemas, the call
 # markup and the result blocks. Anything else gets the generic Hermes prompt and
 # our own rendering, which is what a checkpoint without tool support needs.
-NATIVE_TOOL_ARCHITECTURES = ("deepseek4", "bailingmoe3", "k2-horizon")
+NATIVE_TOOL_ARCHITECTURES = ("deepseek4", "bailingmoe3")
 
 
 def _template_tool_calls(
@@ -4589,9 +4559,6 @@ def _parse_tool_calls(
         )
         name, arguments = _decode_tool_call_body(match.group(1))
         decoded.append((name, arguments, following))
-    for block in K2_TOOL_CALL_BLOCK_PATTERN.finditer(text):
-        name, arguments = _decode_k2_tool_call_body(block.group(1))
-        decoded.append((name, arguments, ""))
     for block in DSML_TOOL_CALL_BLOCK_PATTERN.finditer(text):
         for invoke in DSML_INVOKE_PATTERN.finditer(block.group(1)):
             arguments: dict[str, Any] = {}
@@ -4671,8 +4638,7 @@ def _parse_tool_calls(
     # "length"/"stop" finish reason instead of a wall of <tool_call> tags.
     markers = [
         position for position in (
-            text.find(TOOL_CALL_MARKER), text.find(DSML_TOOL_CALL_MARKER),
-            text.find(K2_TOOL_CALLS_MARKER),
+            text.find(TOOL_CALL_MARKER), text.find(DSML_TOOL_CALL_MARKER)
         ) if position != -1
     ]
     marker = min(markers) if markers else -1
@@ -5035,20 +5001,12 @@ def _turn_is_silent(
     del stopped_on_eos  # every silent turn is rescued, however it ended
     if content or tool_calls:
         return False
-    return (
-        TOOL_CALL_MARKER in text
-        or DSML_TOOL_CALL_MARKER in text
-        or K2_TOOL_CALLS_MARKER in text
-    )
+    return TOOL_CALL_MARKER in text or DSML_TOOL_CALL_MARKER in text
 
 
 def _has_complete_tool_call(text: str, *, tools: Sequence[dict[str, Any]]) -> bool:
     """Return true only for closed native markup that parses as a tool call."""
-    if (
-        TOOL_CALL_END_MARKER not in text
-        and DSML_TOOL_CALL_END_MARKER not in text
-        and K2_TOOL_CALLS_END_MARKER not in text
-    ):
+    if TOOL_CALL_END_MARKER not in text and DSML_TOOL_CALL_END_MARKER not in text:
         return False
     _, calls = _parse_tool_calls(text, tools=list(tools))
     return bool(calls)
@@ -5213,19 +5171,12 @@ class _ToolCallStreamer:
     # newline that _trim_parameter_text() removes.
     _FORMATS = (
         ("<arg_value>", "</arg_value>"),
-        ("<ifm|arg_value>", "</ifm|arg_value>"),
         (None, "</parameter>"),
     )
-    # The tagged-pair shape comes in two spellings: BailingMoE3's bare tags
-    # and K2-Horizon's `ifm|`-prefixed ones, whose call also closes with a
-    # tag of its own. Discovery picks the set; the pair scanner reads it.
-    _TAGGED = {
-        "bailing": ("<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", None, None),
-        "k2": ("<ifm|arg_key>", "</ifm|arg_key>", "<ifm|arg_value>", "</ifm|arg_value>",
-               "<ifm|tool_call>", "</ifm|tool_call>"),
-    }
     _BAILING_KEY_OPEN = "<arg_key>"
-    _K2_KEY_OPEN = "<ifm|arg_key>"
+    _BAILING_KEY_CLOSE = "</arg_key>"
+    _BAILING_VALUE_OPEN = "<arg_value>"
+    _BAILING_VALUE_CLOSE = "</arg_value>"
     _HERMES_NAME = "<function="
     _HERMES_OPEN = "<parameter="
     _HERMES_CLOSE = "</parameter>"
@@ -5248,11 +5199,7 @@ class _ToolCallStreamer:
         # decode path.
         self._seen = 0  # length of the body last fed
         self._scan = 0  # name/format discovery progress
-        self._format: str | None = None  # "bailing" | "k2" | "hermes"
-        # The tagged-pair spelling in use; set with _format.
-        self._key_open = self._key_close = self._value_open = self._value_close = ""
-        self._call_open: str | None = None
-        self._call_close: str | None = None
+        self._format: str | None = None  # "bailing" | "hermes"
         self._dead = False  # streaming abandoned; finish() still settles
         self._pos = 0  # start of the unconsumed argument region
         self._key_scan = 0  # key-tag search progress within that region
@@ -5352,26 +5299,17 @@ class _ToolCallStreamer:
 
     def _discover(self, body: str) -> None:
         """Decide the body's format and tool name, scanning only new text."""
-        overlap = max(len(self._K2_KEY_OPEN), len(self._HERMES_NAME)) - 1
+        overlap = max(len(self._BAILING_KEY_OPEN), len(self._HERMES_NAME)) - 1
         start = max(0, self._scan - overlap)
-        for spelling, key_open in (("k2", self._K2_KEY_OPEN),
-                                   ("bailing", self._BAILING_KEY_OPEN)):
-            key_at = body.find(key_open, start)
-            if key_at == -1:
-                continue
-            # The name is the line preceding the first tag. On K2 the body
-            # begins inside the outer block, so that line still carries the
-            # per-call opening tag.
-            (self._key_open, self._key_close, self._value_open,
-             self._value_close, self._call_open, self._call_close) = self._TAGGED[spelling]
+        key_at = body.find(self._BAILING_KEY_OPEN, start)
+        if key_at != -1:
+            # BailingMoE3: the name is the line preceding the first tag.
             head = body[:key_at].strip()
-            if self._call_open:
-                head = head.replace(self._call_open, " ").strip()
             if not head:
                 self._dead = True  # the batch decoder finds no name either
                 return
             self._name = head.splitlines()[0].strip()
-            self._format = spelling
+            self._format = "bailing"
             self._pos = key_at
             self._key_scan = key_at
             return
@@ -5408,9 +5346,9 @@ class _ToolCallStreamer:
                     return
                 continue
             closer = (
-                self._HERMES_CLOSE
-                if self._format == "hermes"
-                else self._value_close
+                self._BAILING_VALUE_CLOSE
+                if self._format == "bailing"
+                else self._HERMES_CLOSE
             )
             hunt = max(self._vstart, self._value_scan - (len(closer) - 1))
             end = body.find(closer, hunt)
@@ -5426,45 +5364,37 @@ class _ToolCallStreamer:
 
     def _begin_pair(self, body: str, n: int) -> bool:
         """Consume the next key opening; False when more text is needed."""
-        if self._format != "hermes":
+        if self._format == "bailing":
             start = max(
-                self._pos, self._key_scan - (len(self._key_open) - 1)
+                self._pos, self._key_scan - (len(self._BAILING_KEY_OPEN) - 1)
             )
-            tag = body.find(self._key_open, start)
-            if self._call_close:
-                # K2 closes each call with a tag of its own and may open
-                # another in the same block. The streamer owns the first
-                # call only: once its close is in sight before the next key,
-                # streaming stops and the calls after it are emitted whole.
-                closed = body.find(self._call_close, self._pos)
-                if closed != -1 and (tag == -1 or closed < tag):
-                    self._dead = True
-                    return False
+            tag = body.find(self._BAILING_KEY_OPEN, start)
             if tag == -1:
                 self._key_scan = n
                 return False
-            key_end = body.find(self._key_close, tag + len(self._key_open))
+            key_end = body.find(
+                self._BAILING_KEY_CLOSE, tag + len(self._BAILING_KEY_OPEN)
+            )
             if key_end == -1:
                 self._key_scan = tag
                 return False
-            cursor = key_end + len(self._key_close)
+            cursor = key_end + len(self._BAILING_KEY_CLOSE)
             while cursor < n and body[cursor].isspace():
                 cursor += 1
-            head = body[cursor : cursor + len(self._value_open)]
-            if len(head) < len(self._value_open):
-                if self._value_open.startswith(head):
+            head = body[cursor : cursor + len(self._BAILING_VALUE_OPEN)]
+            if len(head) < len(self._BAILING_VALUE_OPEN):
+                if self._BAILING_VALUE_OPEN.startswith(head):
                     self._key_scan = tag  # the opening tag may still arrive
                 else:
                     self._dead = True
                 return False
-            if head != self._value_open:
-                # The strict pattern would not match this pair (K2's typed
-                # variant puts an <ifm|arg_type> here). A later pair might,
-                # but streaming stops; finish() recovers the rest.
+            if head != self._BAILING_VALUE_OPEN:
+                # The strict pattern would not match this pair. A later pair
+                # might, but streaming stops here; finish() recovers the rest.
                 self._dead = True
                 return False
-            self._key = body[tag + len(self._key_open) : key_end].strip()
-            self._vstart = cursor + len(self._value_open)
+            self._key = body[tag + len(self._BAILING_KEY_OPEN) : key_end].strip()
+            self._vstart = cursor + len(self._BAILING_VALUE_OPEN)
         else:
             start = max(self._pos, self._key_scan - (len(self._HERMES_OPEN) - 1))
             while True:
@@ -5666,39 +5596,6 @@ def _recover_trailing_parameters(
     for key, value in TOOL_PARAMETER_LOOSE_PATTERN.findall(following):
         recovered.setdefault(key.strip(), _trim_parameter_text(value))
     return recovered
-
-
-def _decode_k2_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
-    """Decode one K2-Horizon <ifm|tool_call> body.
-
-    Either a JSON object ({"name": ..., "arguments": {...}}) or the function
-    name on the first line followed by tagged pairs, with an optional
-    <ifm|arg_type> between key and value. Values stay text here: the declared
-    schema types them in _normalize_schema_value, and the type tag, where the
-    model wrote one, only decides what an undeclared tool's value becomes.
-    """
-    body = body.strip()
-    if body.startswith("{"):
-        return _decode_tool_call_body(body)
-    key_match = K2_ARG_KEY_PATTERN.search(body)
-    head = body[: key_match.start()] if key_match else body
-    lines = head.strip().splitlines()
-    name = lines[0].strip() if lines else ""
-    arguments: dict[str, Any] = {}
-    for key, declared_type, value in K2_ARG_PAIR_PATTERN.findall(body):
-        text = _trim_parameter_text(value)
-        if declared_type and declared_type.strip() not in ("string", "str"):
-            # "Array and object parameters should be written as JSON
-            # literals", per the template, and the typed variant names the
-            # type; a literal that does not parse stays text, exactly as an
-            # untyped one would.
-            try:
-                arguments[key.strip()] = json.loads(text)
-                continue
-            except json.JSONDecodeError:
-                pass
-        arguments[key.strip()] = text
-    return (name or None), arguments
 
 
 def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
