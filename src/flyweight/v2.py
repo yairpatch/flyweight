@@ -297,6 +297,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("prefill_expert_stream_mib", ctypes.c_int32),
         ("routed_moe", ctypes.c_uint32),
         ("scratch_context", ctypes.c_uint64),
+        ("context_explicit", ctypes.c_uint32),
     ]
 
 
@@ -2273,6 +2274,7 @@ class V2Model:
         prefill_expert_stream_mib: int = -1,
         routed_moe: bool = False,
         scratch_context: int = 0,
+        context_explicit: bool = False,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -2303,6 +2305,7 @@ class V2Model:
             prefill_expert_stream_mib=prefill_expert_stream_mib,
             routed_moe=routed_moe,
             scratch_context=scratch_context,
+            context_explicit=context_explicit,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -2704,6 +2707,10 @@ class V2QwenRuntime:
         prefill_expert_stream_mib: int = -1,
         routed_moe: bool = False,
         scratch_context: int = 0,
+        # The caller chose context_limit: the runtime must not shrink it to
+        # fit the card. A dense model spills more feed-forward to the host
+        # instead; a run that still does not fit is refused with the numbers.
+        context_explicit: bool = False,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -2880,6 +2887,7 @@ class V2QwenRuntime:
             prefill_expert_stream_mib,
             int(routed_moe),
             scratch_context,
+            int(context_explicit),
         )
         model._check(
             self._lib.flyweight_v2_qwen_runtime_create(

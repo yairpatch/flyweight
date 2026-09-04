@@ -670,6 +670,19 @@ def _add_command(
     return parser
 
 
+class _ExplicitContext(argparse.Action):
+    """Store the context and remember that the caller typed it.
+
+    A typed context is a decision; the default is a guess the runtime may
+    shrink to what the card holds. The runtime is told which it got, so the
+    number on the command line is honored rather than silently reduced.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.context_explicit = True
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="flyweight",
@@ -767,8 +780,9 @@ checkpoint's generation_config.json says.\
     )
     limits.add_argument(
         "--context", "--context-window", dest="context_window", type=int,
-        default=32768, metavar="N",
-        help="maximum prompt + output tokens per sequence",
+        default=32768, metavar="N", action=_ExplicitContext,
+        help="maximum prompt + output tokens per sequence (default 32768; a "
+             "value you pass is honored as-is rather than shrunk to fit the GPU)",
     )
     limits.add_argument(
         "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
@@ -862,7 +876,8 @@ examples:
     )
     request.add_argument(
         "--context", "--context-window", dest="context_window", type=int,
-        default=32768, metavar="N", help="maximum prompt + output tokens",
+        default=32768, metavar="N", action=_ExplicitContext,
+        help="maximum prompt + output tokens (default 32768; honored as-is)",
     )
     request.add_argument(
         "--enable-thinking", action="store_true",
@@ -1489,6 +1504,7 @@ def _generate(args: argparse.Namespace) -> int:
             image_max_tokens=getattr(args, "image_max_tokens", 1024),
             image_urls=getattr(args, "image_urls", "allow"),
             context_window=args.context_window,
+            context_explicit=getattr(args, "context_explicit", False),
             max_new_tokens=args.max_new_tokens,
             gpu_cache_mib=args.gpu_cache_mib,
             device=args.device,
@@ -1563,6 +1579,7 @@ def _serve(args: argparse.Namespace) -> int:
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,
+        context_explicit=getattr(args, "context_explicit", False),
         max_new_tokens=args.max_new_tokens,
         gpu_cache_mib=args.gpu_cache_mib,
         expert_mode=args.expert_mode,

@@ -1697,6 +1697,18 @@ class NativeV2ServerTests(unittest.TestCase):
         self.assertEqual(args.dense_requant, "auto")
         self.assertEqual(args.prompt_cache_mib, (1 << 32) - 1)
 
+    def test_a_typed_context_window_is_marked_explicit(self) -> None:
+        """A context the caller typed must reach the runtime as a decision, so
+        it spills a dense model further instead of being shrunk to fit."""
+        defaulted = _parser().parse_args(["serve", "model.gguf"])
+        self.assertEqual(defaulted.context_window, 32768)
+        self.assertFalse(getattr(defaulted, "context_explicit", False))
+        typed = _parser().parse_args(["serve", "model.gguf", "--context-window", "30000"])
+        self.assertEqual(typed.context_window, 30000)
+        self.assertTrue(typed.context_explicit)
+        alias = _parser().parse_args(["generate", "model.gguf", "--prompt", "hi", "--context", "4096"])
+        self.assertEqual((alias.context_window, alias.context_explicit), (4096, True))
+
     def test_serve_cache_has_simple_public_modes(self) -> None:
         automatic = _parser().parse_args(["serve", "model.gguf", "--cache", "auto"])
         disabled = _parser().parse_args(["serve", "model.gguf", "--cache", "off"])
