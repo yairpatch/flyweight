@@ -1,0 +1,69 @@
+name: Bug report
+description: Something loads, serves or generates incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check
+        [Current limitations](https://github.com/yairpatch/flyweight#current-limitations) —
+        a fair number of rough edges are known and recorded there.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The exact command line, and the request if it is a serving bug.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: flyweight doctor
+      description: Output of `flyweight doctor`. This covers the install, toolchain and driver in one paste.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and quantization
+      description: The checkpoint and its format — behaviour genuinely differs between them.
+      placeholder: Qwen3.5-27B, unsloth UD-IQ2_XXS GGUF
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: GPU and driver
+      description: Write "CPU backend" if you are running with `--backend cpu`.
+      placeholder: RTX 4070 12 GB, driver 560.35
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Python
+      placeholder: Arch Linux, Python 3.13
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: Relevant stderr. `prepare` output is especially useful for placement and VRAM problems.
+      render: shell
