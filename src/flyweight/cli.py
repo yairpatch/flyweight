@@ -799,7 +799,9 @@ checkpoint's generation_config.json says.\
     limits.add_argument(
         "--max-tokens", "--max-new-tokens", dest="max_new_tokens", type=int,
         default=4096, metavar="N",
-        help="maximum generated tokens per request",
+        help="generated tokens for a request that sets no max_tokens of its "
+             "own; a request's own value is honored as-is, bounded only by "
+             "the context window",
     )
     limits.add_argument(
         "--reasoning-effort", choices=("low", "medium", "high", "xhigh"),
@@ -832,12 +834,15 @@ checkpoint's generation_config.json says.\
              "call can be as large as the file it writes",
     )
     limits.add_argument(
-        "--thinking-budget", type=int, default=2048, metavar="N",
+        "--thinking-budget", type=int, default=None, metavar="N",
         help="thinking-token cap for requests that enable thinking without "
-             "naming a budget (Claude Code sends exactly that on every "
-             "request); the block is closed at the cap and the answer "
-             "resumes. An explicit reasoning_budget_tokens overrides; "
-             "0 disables the default and lets a think run to max-tokens",
+             "naming a budget; the block is closed at the cap and the answer "
+             "resumes. Left unset, the cap guards only /v1/messages (Claude "
+             "Code sends a budget-less 'adaptive' on every request) at 2048 "
+             "tokens, and OpenAI-endpoint clients think uncapped as they "
+             "would against llama-server. A value set here applies to every "
+             "endpoint; an explicit reasoning_budget_tokens overrides; 0 "
+             "disables the cap everywhere",
     )
     limits.add_argument(
         "--freeze-total-tokens", action="store_true",
@@ -1206,7 +1211,7 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         raise SystemExit("--sse-keepalive-seconds must be positive")
     if getattr(args, "max_tool_call_tokens", 0) < 0:
         raise SystemExit("--max-tool-call-tokens must be non-negative")
-    if getattr(args, "thinking_budget", 0) < 0:
+    if (getattr(args, "thinking_budget", None) or 0) < 0:
         raise SystemExit("--thinking-budget must be non-negative")
     if args.cpu_prefetch_mib and args.cpu_prefetch_auto:
         raise SystemExit("use either --cpu-prefetch-mib or --cpu-prefetch-auto")
@@ -1496,7 +1501,7 @@ def _deepseek4_service(args: argparse.Namespace, command: str):
         request_timeout_seconds=getattr(args, "request_timeout_seconds", 30.0),
         sse_keepalive_seconds=getattr(args, "sse_keepalive_seconds", 10.0),
         max_tool_call_tokens=getattr(args, "max_tool_call_tokens", 0),
-        default_thinking_budget=getattr(args, "thinking_budget", 2048),
+        default_thinking_budget=getattr(args, "thinking_budget", None),
     )
 
 
@@ -1621,7 +1626,7 @@ def _serve(args: argparse.Namespace) -> int:
         request_timeout_seconds=args.request_timeout_seconds,
         sse_keepalive_seconds=args.sse_keepalive_seconds,
         max_tool_call_tokens=args.max_tool_call_tokens,
-        default_thinking_budget=getattr(args, "thinking_budget", 2048),
+        default_thinking_budget=getattr(args, "thinking_budget", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         generation_defaults=_sampling_overrides(args),
     )

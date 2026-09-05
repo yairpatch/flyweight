@@ -529,11 +529,13 @@ Reasoning models expose two knobs, one soft and one hard:
   it.
 - `reasoning_budget_tokens` is a hard ceiling the runtime enforces: at the
   limit the sampler forces the thinking block closed and the answer resumes.
-  A request that thinks without naming a budget gets a default cap of half
-  its `max_tokens` or `--thinking-budget` (2048), whichever is smaller, so a
+  On `/v1/messages`, a request that thinks without naming a budget gets a
+  default cap of half its `max_tokens` or 2048, whichever is smaller, so a
   model cannot spend the whole completion deliberating and end the turn with
   no visible text; Claude Code's `thinking: {"type": "adaptive"}` is exactly
-  that request. `--thinking-budget 0` removes the default, and
+  that request. OpenAI-endpoint requests think uncapped by default, the same
+  behavior llama-server gives them. `--thinking-budget N` applies one cap to
+  every endpoint, 0 removes it everywhere, and
   `thinking: {"type": "disabled"}` never arms it.
 - `POST /v1/chat/completions/{id}/stop_thinking` (or
   `/v1/messages/{id}/stop_thinking`) interrupts a live stream: the runtime
@@ -690,8 +692,9 @@ Server options (`serve` only):
 - `--model-name NAME`, `--cors-origin ORIGIN`, `--api-key KEY`,
   `--strict-model`
 - `--reasoning-effort low|medium|high|xhigh`: server-wide default effort
-- `--thinking-budget N` (default 2048): cap for requests that think without
-  naming a budget (0 disables the default)
+- `--thinking-budget N`: cap for requests that think without naming a budget;
+  unset it guards only `/v1/messages` (at 2048), a value applies everywhere,
+  0 disables it everywhere
 - `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--repetition-penalty`,
   `--presence-penalty`, `--frequency-penalty`, `--penalty-window`:
   server-wide sampling defaults

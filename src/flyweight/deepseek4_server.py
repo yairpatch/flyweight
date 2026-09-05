@@ -609,7 +609,7 @@ class NativeDeepseek4InferenceService(InferenceService):
         max_concurrent_requests: int = 64,
         request_timeout_seconds: float = 30.0,
         sse_keepalive_seconds: float = 10.0,
-        default_thinking_budget: int = 2048,
+        default_thinking_budget: int | None = None,
         **unsupported: object,
     ):
         _reject_unsupported(unsupported)

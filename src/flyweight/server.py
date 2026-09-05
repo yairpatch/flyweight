@@ -235,6 +235,11 @@ THINKING_BLOCK_PATTERN = re.compile(
 # maps high onto xhigh itself, so both vocabularies pass through untouched and
 # a checkpoint that ignores the variable is unaffected.
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+
+# The thinking cap /v1/messages requests get when the operator sets no
+# --thinking-budget of their own. Claude Code's compaction request is why the
+# guard exists at all (see default_thinking_budget in InferenceService).
+ANTHROPIC_THINKING_BUDGET = 2048
 # Levels other protocols grade past this scale's ends: OpenAI's "minimal"
 # sits below low, Anthropic's "max" above xhigh. Both clamp to the nearest
 # level a checkpoint was trained on rather than 400 on a request whose intent
@@ -825,8 +830,12 @@ class InferenceService:
         # 32k-token completion budget arms a 16k thinking cap, which at 40
         # tok/s is six minutes of deliberation -- indistinguishable from a
         # hang, and Claude Code's compaction sat behind exactly that. Tokens;
-        # 0 disables the default (explicit budgets always apply).
-        default_thinking_budget: int = 2048,
+        # None scopes the built-in default to /v1/messages, where that
+        # starvation was observed -- OpenAI-endpoint clients think uncapped,
+        # exactly as they would against llama-server. A value set here applies
+        # to every endpoint, and 0 disables the default everywhere (explicit
+        # budgets always apply).
+        default_thinking_budget: int | None = None,
         reasoning_effort: str | None = None,
         generation_defaults: Mapping[str, int | float] | None = None,
     ):
@@ -844,7 +853,7 @@ class InferenceService:
             raise ValueError("sse_keepalive_seconds must be positive")
         if max_tool_call_tokens < 0:
             raise ValueError("max_tool_call_tokens must be non-negative")
-        if default_thinking_budget < 0:
+        if default_thinking_budget is not None and default_thinking_budget < 0:
             raise ValueError("default_thinking_budget must be non-negative")
         self.model_name = model_name
         self.generator = generator
@@ -2341,6 +2350,7 @@ class InferenceService:
             max_key="max_completion_tokens",
             tools_enabled=bool(tools),
             tools=tools,
+            anthropic=True,
         )
         # The client's own payload, not the translated options: the audit
         # reads tool_use blocks in the shape the harness sent them.
@@ -2707,6 +2717,7 @@ class InferenceService:
         fallback_max_key: str | None = None,
         tools_enabled: bool = False,
         tools: tuple[dict[str, Any], ...] = (),
+        anthropic: bool = False,
     ) -> _GenerationRequest:
         self._validate_model(payload.get("model"))
         _reject_unsupported_generation_options(payload)
@@ -2767,10 +2778,17 @@ class InferenceService:
         thinking_open = self._prompt_opens_thinking(prompt_ids)
         format_shape = _response_format_shape(payload.get("response_format"))
         reasoning_budget = _reasoning_budget(payload)
+        default_budget = self.default_thinking_budget
+        if default_budget is None:
+            # Unset scopes the guard to the endpoint whose client needs it:
+            # OpenAI-endpoint callers think uncapped, the same behaviour they
+            # would get from llama-server, so A/B runs between the two servers
+            # compare the model rather than this default.
+            default_budget = ANTHROPIC_THINKING_BUDGET if anthropic else 0
         if (
             reasoning_budget is None
             and enable_thinking is not False
-            and self.default_thinking_budget
+            and default_budget
         ):
             # A model that thinks with no ceiling can spend the whole
             # completion budget inside <think> and end the turn with no
@@ -2786,7 +2804,7 @@ class InferenceService:
             # reasoning_budget_tokens still overrides, and thinking:
             # {"type": "disabled"} never arms the meter.
             reasoning_budget = min(
-                max(1, max_new_tokens // 2), self.default_thinking_budget
+                max(1, max_new_tokens // 2), default_budget
             )
         return _GenerationRequest(
             messages,
@@ -2863,12 +2881,14 @@ class InferenceService:
     def _fit_max_new_tokens(
         self, requested: int, prompt_tokens: int, *, parameter: str
     ) -> int:
-        """Clamp requested output tokens to the service limit and context room.
+        """Clamp requested output tokens to the room the context window leaves.
 
-        Agentic clients (Claude Code, Codex, ...) routinely request far more
-        output tokens than a small local deployment allows, and treat that as
-        an upper bound, not an exact demand. Clamp instead of rejecting so those
-        requests still run; only error when the prompt alone leaves no room.
+        Only the window clamps: a request that names its own limit is honored
+        as-is, the way llama-server honors it, and --max-tokens is the default
+        for requests that name none rather than a ceiling that second-guesses
+        ones that do. Clamp instead of rejecting because agentic clients
+        (Claude Code, Codex, ...) treat max_tokens as an upper bound, not an
+        exact demand; only error when the prompt alone leaves no room.
         """
         if requested <= 0:
             raise APIError(400, f"{parameter} must be positive", parameter=parameter)
@@ -2886,7 +2906,7 @@ class InferenceService:
                 parameter=parameter,
                 code="context_length_exceeded",
             )
-        return max(1, min(requested, self.max_new_tokens, room))
+        return max(1, min(requested, room))
 
     def _reasoning_effort(self, payload: Mapping[str, Any]) -> str | None:
         """The effort this request asks for, or the service default.

@@ -2565,7 +2565,7 @@ class NativeV2InferenceService(InferenceService):
         request_timeout_seconds: float = 30.0,
         sse_keepalive_seconds: float = 10.0,
         max_tool_call_tokens: int = 0,
-        default_thinking_budget: int = 2048,
+        default_thinking_budget: int | None = None,
         reasoning_effort: str | None = None,
         generation_defaults: Mapping[str, float | int] | None = None,
     ):
@@ -2696,7 +2696,7 @@ class NativeV2InferenceService(InferenceService):
                       cors_origin, strict_model, max_concurrent_requests,
                       request_timeout_seconds, sse_keepalive_seconds,
                       max_tool_call_tokens, generation_defaults,
-                      default_thinking_budget=2048,
+                      default_thinking_budget=None,
                       reasoning_effort=None, prompt_cache_mib=0,
                       parallel_sequences=1) -> None:
         self.v2_runtime = None
