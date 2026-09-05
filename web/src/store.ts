@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { api, ApiError } from "./lib/api";
 import { db, migrateLegacyHistory } from "./lib/db";
 import { generate } from "./lib/generate";
+import { runToolExecutor } from "./lib/executor";
 import { identifier, titleFromPrompt } from "./lib/format";
 import { buildRequest } from "./lib/protocols";
 import { holdPartialTag, splitThinking } from "./lib/thinking";
@@ -14,6 +15,7 @@ import { loadSettings, saveSettings, settingsFromProps, DEFAULT_SETTINGS } from 
 import type {
   Attachment,
   Conversation,
+  ConversationKind,
   GenerationSettings,
   HealthPayload,
   Message,
@@ -45,6 +47,7 @@ export interface HealthSample {
 
 const TOOLS_KEY = "flyweight.tools.v1";
 const THEME_KEY = "flyweight.theme";
+const MODE_KEY = "flyweight.mode";
 const SIDEBAR_KEY = "flyweight.sidebar";
 const MODEL_KEY = "flyweight.model";
 const HEALTH_HISTORY = 180;
@@ -92,14 +95,22 @@ const DEFAULT_TOOLS: ToolDefinition[] = [
       null,
       2,
     ),
+    executor: 'return { city: args.city, forecast: "sunny", temperature: args.unit === "fahrenheit" ? 72 : 22 };',
     enabled: false,
   },
 ];
+
+/** The kind a conversation belongs to; stored conversations predate `kind`. */
+export function kindOf(conversation: Conversation): ConversationKind {
+  return conversation.kind ?? "chat";
+}
 
 interface StoreState {
   ready: boolean;
   conversations: Conversation[];
   activeId: string | null;
+  /** Which workspace tab is showing: chat conversations or agent runs. */
+  mode: ConversationKind;
   settings: GenerationSettings;
   tools: ToolDefinition[];
   presets: Preset[];
@@ -135,7 +146,8 @@ interface StoreState {
   pollRuntime: () => Promise<void>;
 
   // conversations
-  newConversation: () => string;
+  setMode: (mode: ConversationKind) => void;
+  newConversation: (kind?: ConversationKind) => string;
   selectConversation: (id: string | null) => void;
   deleteConversation: (id: string) => Promise<void>;
   renameConversation: (id: string, title: string) => void;
@@ -242,8 +254,64 @@ export const useStore = create<StoreState>()((set, get) => {
     return get().conversations.find((conversation) => conversation.id === id)!;
   };
 
+  /** Insert a tool result after the assistant turn and its existing results. */
+  const appendToolResult = (conversationId: string, assistantMessageId: string, result: Message) => {
+    updateConversation(conversationId, (item) => {
+      const index = item.messages.findIndex((message) => message.id === assistantMessageId);
+      let insertAt = index + 1;
+      while (insertAt < item.messages.length && item.messages[insertAt].role === "tool") insertAt += 1;
+      const messages = [...item.messages];
+      messages.splice(insertAt, 0, result);
+      return touch({ ...item, messages });
+    });
+  };
+
+  /**
+   * The agentic loop, for agent conversations only: when a turn ended in
+   * tool calls and every called tool has a handler, run the handlers
+   * sandboxed, append their results, and let the model continue — until it
+   * answers, the turn cap is reached, or a call has no handler (which pauses
+   * the loop for a manual result).
+   */
+  const maybeContinueAgent = async (conversationId: string, assistant: Message, agentTurn: number) => {
+    const { settings, tools, toast, conversations } = get();
+    const conversation = conversations.find((item) => item.id === conversationId);
+    const calls = assistant.toolCalls ?? [];
+    if (!conversation || kindOf(conversation) !== "agent" || !calls.length) return;
+    if (agentTurn >= settings.agentMaxTurns) {
+      toast(`Agent paused after ${agentTurn} turns — continue manually or raise the cap`, "info");
+      return;
+    }
+    const handlers = calls.map((call) => tools.find((tool) => tool.enabled && tool.name === call.name)?.executor?.trim());
+    const missing = calls.filter((_, index) => !handlers[index]);
+    if (missing.length) {
+      toast(`No handler for ${missing.map((call) => call.name).join(", ")} — paste the result${missing.length === 1 ? "" : "s"} manually`, "info");
+      return;
+    }
+    const controller = new AbortController();
+    set({ generating: { conversationId, messageId: assistant.id, controller, phase: "tools" } });
+    try {
+      for (let index = 0; index < calls.length; index += 1) {
+        const execution = await runToolExecutor(handlers[index]!, calls[index].arguments, { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        appendToolResult(conversationId, assistant.id, {
+          id: identifier("msg"),
+          role: "tool",
+          content: execution.ok ? execution.result : `Tool execution failed: ${execution.result}`,
+          toolCallId: calls[index].id,
+          toolName: calls[index].name,
+          auto: true,
+          createdAt: Date.now(),
+        });
+      }
+    } finally {
+      set({ generating: null });
+    }
+    if (!controller.signal.aborted) await runGeneration(conversationId, agentTurn + 1);
+  };
+
   /** Run a generation for the conversation as it stands, appending an assistant turn. */
-  const runGeneration = async (conversationId: string) => {
+  const runGeneration = async (conversationId: string, agentTurn = 1) => {
     const state = get();
     if (state.generating) {
       state.toast("A generation is already running", "info");
@@ -404,14 +472,21 @@ export const useStore = create<StoreState>()((set, get) => {
     if (responseId) (finished as Message & { responseId?: string }).responseId = responseId;
     updateMessage(conversationId, assistant.id, () => finished, true);
     set({ generating: null });
-    if (record.error && record.status === 401) set({ status: "locked", panel: "settings" });
-    else void get().pollRuntime();
+    if (record.error && record.status === 401) {
+      set({ status: "locked", panel: "settings" });
+      return;
+    }
+    void get().pollRuntime();
+    if (!record.error && !finished.error && !controller.signal.aborted) {
+      await maybeContinueAgent(conversationId, finished, agentTurn);
+    }
   };
 
   return {
     ready: false,
     conversations: [],
     activeId: null,
+    mode: readString(MODE_KEY, "chat") === "agent" ? "agent" : "chat",
     settings: loadSettings(),
     tools: readJson<ToolDefinition[]>(TOOLS_KEY, DEFAULT_TOOLS),
     presets: [],
@@ -447,7 +522,8 @@ export const useStore = create<StoreState>()((set, get) => {
         db.conversations.orderBy("updatedAt").reverse().toArray(),
         db.presets.toArray(),
       ]);
-      set({ conversations, presets, ready: true, activeId: conversations[0]?.id ?? null });
+      const mode = get().mode;
+      set({ conversations, presets, ready: true, activeId: conversations.find((item) => kindOf(item) === mode)?.id ?? null });
       await get().pollRuntime();
     },
 
@@ -500,30 +576,47 @@ export const useStore = create<StoreState>()((set, get) => {
       return conversations.find((conversation) => conversation.id === activeId) ?? null;
     },
 
-    newConversation: () => {
+    setMode: (mode) => {
+      if (mode === get().mode) return;
+      try {
+        localStorage.setItem(MODE_KEY, mode);
+      } catch {
+        /* ignore */
+      }
+      forgetSources();
+      // Land on the tab's most recent conversation, or its empty state.
+      const latest = get().conversations.find((item) => kindOf(item) === mode);
+      set({ mode, activeId: latest?.id ?? null, pendingAttachments: [] });
+    },
+
+    newConversation: (kind) => {
       const conversation: Conversation = {
         id: identifier("conv"),
-        title: "New conversation",
+        title: kind === "agent" || (kind === undefined && get().mode === "agent") ? "New agent run" : "New conversation",
         createdAt: Date.now(),
         updatedAt: Date.now(),
         messages: [],
+        kind: kind ?? get().mode,
       };
       forgetSources();
-      set((state) => ({ conversations: [conversation, ...state.conversations], activeId: conversation.id, pendingAttachments: [] }));
+      set((state) => ({ conversations: [conversation, ...state.conversations], activeId: conversation.id, mode: kindOf(conversation), pendingAttachments: [] }));
       persist(conversation, true);
       return conversation.id;
     },
 
     selectConversation: (id) => {
       forgetSources();
-      set({ activeId: id, pendingAttachments: [], ...(isNarrow() ? { sidebarOpen: false } : {}) });
+      // Selecting across tabs (palette, search) follows the conversation's kind.
+      const selected = id ? get().conversations.find((item) => item.id === id) : null;
+      set({ activeId: id, ...(selected ? { mode: kindOf(selected) } : {}), pendingAttachments: [], ...(isNarrow() ? { sidebarOpen: false } : {}) });
     },
 
     deleteConversation: async (id) => {
       const state = get();
       if (state.generating?.conversationId === id) state.stopGeneration();
       const remaining = state.conversations.filter((conversation) => conversation.id !== id);
-      set({ conversations: remaining, activeId: state.activeId === id ? remaining[0]?.id ?? null : state.activeId });
+      const next = remaining.find((conversation) => kindOf(conversation) === state.mode);
+      set({ conversations: remaining, activeId: state.activeId === id ? next?.id ?? null : state.activeId });
       await db.conversations.delete(id);
     },
 
@@ -551,6 +644,7 @@ export const useStore = create<StoreState>()((set, get) => {
         title: typeof source.title === "string" && source.title ? source.title : "Imported conversation",
         createdAt: now,
         updatedAt: now,
+        kind: source.kind === "agent" ? "agent" : undefined,
         messages: (source.messages as Message[])
           .filter((message) => message && typeof message.content === "string" && typeof message.role === "string")
           .map((message, index) => ({
@@ -560,7 +654,7 @@ export const useStore = create<StoreState>()((set, get) => {
             generating: undefined,
           })),
       };
-      set((state) => ({ conversations: [conversation, ...state.conversations], activeId: conversation.id }));
+      set((state) => ({ conversations: [conversation, ...state.conversations], activeId: conversation.id, mode: kindOf(conversation) }));
       await db.conversations.put(conversation);
       return conversation.id;
     },
@@ -584,7 +678,10 @@ export const useStore = create<StoreState>()((set, get) => {
       updateConversation(conversation.id, (item) =>
         touch({
           ...item,
-          title: item.messages.length === 0 && item.title === "New conversation" ? titleFromPrompt(trimmed || usable[0]?.name || "Attachment") : item.title,
+          title:
+            item.messages.length === 0 && (item.title === "New conversation" || item.title === "New agent run")
+              ? titleFromPrompt(trimmed || usable[0]?.name || "Attachment")
+              : item.title,
           messages: [...item.messages, message],
         }),
       );
@@ -658,15 +755,7 @@ export const useStore = create<StoreState>()((set, get) => {
         toolName: call?.name,
         createdAt: Date.now(),
       };
-      updateConversation(conversation.id, (item) => {
-        const index = item.messages.findIndex((message) => message.id === assistantMessageId);
-        // Insert after the assistant turn and any existing tool results for it.
-        let insertAt = index + 1;
-        while (insertAt < item.messages.length && item.messages[insertAt].role === "tool") insertAt += 1;
-        const messages = [...item.messages];
-        messages.splice(insertAt, 0, result);
-        return touch({ ...item, messages });
-      });
+      appendToolResult(conversation.id, assistantMessageId, result);
       if (continueGeneration) await runGeneration(conversation.id);
     },
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
-import { ArrowUp, Braces, Brain, Paperclip, Square, Wrench, X, Zap } from "lucide-react";
+import { ArrowUp, Bot, Braces, Brain, Paperclip, Square, Wrench, X, Zap } from "lucide-react";
 import { useStore } from "../store";
 import { ACCEPT_ATTRIBUTE, MAX_ATTACHMENTS, filesFrom, readAttachment, setPdfMode } from "../lib/attachments";
 import { AttachmentChip } from "./AttachmentChip";
@@ -34,6 +34,7 @@ export function Composer() {
   const stopThinking = useStore((state) => state.stopThinking);
   const settings = useStore((state) => state.settings);
   const updateSettings = useStore((state) => state.updateSettings);
+  const mode = useStore((state) => state.mode);
   const tools = useStore((state) => state.tools);
   const setPanel = useStore((state) => state.setPanel);
   const health = useStore((state) => state.health);
@@ -163,7 +164,7 @@ export function Composer() {
         <textarea
           ref={textarea}
           className="composer__input"
-          placeholder={status === "locked" ? "Enter the API key in settings to start" : "Message the model…"}
+          placeholder={status === "locked" ? "Enter the API key in settings to start" : mode === "agent" ? "Give the agent a task…" : "Message the model…"}
           value={draft}
           rows={1}
           onChange={(event) => setDraft(event.target.value)}
@@ -184,6 +185,11 @@ export function Composer() {
             <button className={`chip chip--button${enabledTools ? " chip--on" : ""}`} onClick={() => setPanel("tools")} title="Tools">
               <Wrench size={13} /> {enabledTools ? `${enabledTools} tool${enabledTools === 1 ? "" : "s"}` : "Tools"}
             </button>
+            {mode === "agent" && (
+              <button className="chip chip--button chip--on" onClick={() => setPanel("tools")} title={`Agent run: tool calls run through their handlers automatically, up to ${settings.agentMaxTurns} turns`}>
+                <Bot size={13} /> Agent · {settings.agentMaxTurns} turns
+              </button>
+            )}
             {settings.responseFormat !== "text" && (
               <button className="chip chip--button chip--on" onClick={() => setPanel("settings")} title="Response format">
                 <Braces size={13} /> {settings.responseFormat === "json_object" ? "JSON" : "JSON schema"}

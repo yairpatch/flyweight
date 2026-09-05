@@ -76,6 +76,8 @@ export interface Message {
   /** For role=tool: which call this answers. */
   toolCallId?: string;
   toolName?: string;
+  /** For role=tool: the agentic loop produced this result from the tool's handler. */
+  auto?: boolean;
   createdAt: number;
   finishReason?: string;
   usage?: Usage;
@@ -99,6 +101,8 @@ export interface ToolDefinition {
   /** JSON Schema text for the parameters object. */
   parameters: string;
   enabled: boolean;
+  /** Optional async JavaScript handler body; the agentic loop runs it sandboxed with the parsed arguments as `args`. */
+  executor?: string;
 }
 
 export interface GenerationSettings {
@@ -122,6 +126,8 @@ export interface GenerationSettings {
   jsonSchema: string;
   toolChoice: "auto" | "none" | "required" | string;
   parallelToolCalls: boolean;
+  /** Model turns one agentic loop may run before pausing for the user. */
+  agentMaxTurns: number;
   chatTemplateKwargs: string;
   protocol: Protocol;
   /** True after the user edits anything; until then defaults track /props. */
@@ -135,6 +141,9 @@ export interface Preset {
   tools: ToolDefinition[];
 }
 
+/** Chat converses turn by turn; agent runs the tool loop automatically. */
+export type ConversationKind = "chat" | "agent";
+
 export interface Conversation {
   id: string;
   title: string;
@@ -142,6 +151,8 @@ export interface Conversation {
   updatedAt: number;
   pinned?: boolean;
   messages: Message[];
+  /** Which mode owns this conversation; stored conversations without one are chat. */
+  kind?: ConversationKind;
   /** Per-conversation settings override; undefined means use global. */
   model?: string;
 }

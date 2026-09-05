@@ -408,8 +408,16 @@ server exposes, not only chat:
   field for is greyed with a *not sent on ...* hint (Anthropic messages has
   no effort or `response_format`, Responses has no budget, and
   `chat_template_kwargs` exists on chat completions only).
+- **Agent** is a separate sidebar tab beside Chat, with its own
+  conversations: give the model a task, and its tool calls run through
+  their tools' JavaScript handlers automatically, with the results fed back
+  until it answers, under a configurable turn cap. Handlers execute in the
+  code preview's sandbox (opaque origin, no access to the app's storage or
+  API key; network subject to CORS); a call whose tool has no handler
+  pauses the run for a manual result, and Esc stops it.
 - **Tools** defines function tools (import OpenAI or Anthropic definitions),
-  `tool_choice`, and parallel calls; the sampler grammar enforces them.
+  `tool_choice`, parallel calls, and each tool's optional agent handler; the
+  sampler grammar enforces the declared calls.
 - **Runtime** polls `/health`, `/props`, and `/slots` and charts decode
   throughput, GPU memory, KV and prefix cache, expert cache hit rate, MTP
   acceptance, the time breakdown, and grammar counters, with the full

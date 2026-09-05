@@ -23,7 +23,8 @@ export function CommandPalette() {
   const commands = useMemo<Command[]>(() => {
     const s = useStore.getState();
     const base: Command[] = [
-      { id: "new", label: "New conversation", hint: "Ctrl+Shift+O", run: () => s.newConversation() },
+      { id: "new", label: "New conversation", hint: "Ctrl+Shift+O", run: () => s.newConversation("chat") },
+      { id: "new-agent", label: "New agent run", run: () => s.newConversation("agent") },
       { id: "settings", label: "Open generation settings", hint: "Ctrl+,", run: () => s.setPanel("settings") },
       { id: "tools", label: "Open tools", run: () => s.setPanel("tools") },
       { id: "runtime", label: "Open runtime dashboard", run: () => s.setPanel("runtime") },

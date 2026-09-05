@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import { Plus, Trash2, Upload } from "lucide-react";
 import { useStore } from "../../store";
-import { identifier } from "../../lib/format";
+import { clamp, identifier } from "../../lib/format";
 import type { ToolDefinition } from "../../types";
 
 function validJson(text: string): boolean {
@@ -57,8 +57,29 @@ export function ToolsPanel() {
     <div className="tools-panel">
       <p className="muted">
         Tools are sent with every request while enabled. The runtime's sampler enforces the call grammar: a declared name, required parameters present,
-        and arguments that parse as JSON. When the model calls a tool, paste the result into the card and continue.
+        and arguments that parse as JSON. In a chat, paste the result into the card and continue; in an agent run, a tool's handler answers the call
+        automatically.
       </p>
+      <div className="settings__section">
+        <h3>Agent runs</h3>
+        <p className="muted">
+          In the sidebar's <strong>Agent</strong> tab, tool calls run through their handlers automatically and the results go back to the model until
+          it answers. Handlers run in the same sandboxed frame as the code preview: an opaque origin with no access to this app's storage or API key,
+          and network requests subject to CORS. A call whose tool has no handler pauses the run for a manual result; Stop (Esc) interrupts it.
+        </p>
+        <label className="field">
+          <span className="field__label">
+            Turn cap <small>model turns per run</small>
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={100}
+            value={settings.agentMaxTurns}
+            onChange={(event) => updateSettings({ agentMaxTurns: clamp(Math.trunc(Number(event.target.value) || 1), 1, 100) })}
+          />
+        </label>
+      </div>
       <div className="settings__section">
         <h3>Calling policy</h3>
         <label className="field">
@@ -116,6 +137,19 @@ export function ToolsPanel() {
                 Parameters <small>JSON schema</small>
               </span>
               <textarea rows={8} className={validJson(tool.parameters) ? "mono" : "mono invalid"} spellCheck={false} value={tool.parameters} onChange={(event) => patch(tool.id, { parameters: event.target.value })} />
+            </label>
+            <label className="field">
+              <span className="field__label">
+                Handler <small>async JavaScript · used by agent runs</small>
+              </span>
+              <textarea
+                rows={6}
+                className="mono"
+                spellCheck={false}
+                placeholder={"// Runs sandboxed with the call's parsed arguments as `args`.\n// Return a string or any JSON-able value; `await fetch(...)` works.\nreturn `sunny in ${args.city}`;"}
+                value={tool.executor ?? ""}
+                onChange={(event) => patch(tool.id, { executor: event.target.value })}
+              />
             </label>
           </details>
         ))}

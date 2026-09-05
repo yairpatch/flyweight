@@ -1,6 +1,8 @@
 import { useMemo, useRef, useState } from "react";
 import {
+  Bot,
   Download,
+  MessageSquare,
   MessageSquarePlus,
   PanelLeftClose,
   PanelLeftOpen,
@@ -10,13 +12,15 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { useStore } from "../store";
+import { kindOf, useStore } from "../store";
 import { relativeDay, slugify } from "../lib/format";
 import type { Conversation } from "../types";
 
 export function Sidebar() {
   const conversations = useStore((state) => state.conversations);
   const activeId = useStore((state) => state.activeId);
+  const mode = useStore((state) => state.mode);
+  const setMode = useStore((state) => state.setMode);
   const open = useStore((state) => state.sidebarOpen);
   const toggleSidebar = useStore((state) => state.toggleSidebar);
   const newConversation = useStore((state) => state.newConversation);
@@ -29,6 +33,7 @@ export function Sidebar() {
   const groups = useMemo(() => {
     const needle = query.trim().toLowerCase();
     const filtered = conversations.filter((conversation) => {
+      if (kindOf(conversation) !== mode) return false;
       if (!needle) return true;
       if (conversation.title.toLowerCase().includes(needle)) return true;
       return conversation.messages.some((message) => message.content.toLowerCase().includes(needle));
@@ -47,7 +52,7 @@ export function Sidebar() {
       if (items?.length) out.push([label, items]);
     }
     return out;
-  }, [conversations, query]);
+  }, [conversations, query, mode]);
 
   const onImport = async (files: FileList | null) => {
     const file = files?.[0];
@@ -70,9 +75,19 @@ export function Sidebar() {
         <button className="icon-button" onClick={() => toggleSidebar()} title={open ? "Collapse sidebar (Ctrl+B)" : "Expand sidebar (Ctrl+B)"} aria-label="Toggle sidebar">
           {open ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
         </button>
-        <button className="button button--primary sidebar__new" onClick={() => newConversation()} title="New conversation (Ctrl+Shift+O)">
-          <MessageSquarePlus size={16} />
-          <span className="sidebar__label">New chat</span>
+        <button className="button button--primary sidebar__new" onClick={() => newConversation()} title={mode === "agent" ? "New agent run (Ctrl+Shift+O)" : "New conversation (Ctrl+Shift+O)"}>
+          {mode === "agent" ? <Bot size={16} /> : <MessageSquarePlus size={16} />}
+          <span className="sidebar__label">{mode === "agent" ? "New run" : "New chat"}</span>
+        </button>
+      </div>
+      <div className="modetabs" role="tablist" aria-label="Workspace mode">
+        <button className={`modetabs__tab${mode === "chat" ? " modetabs__tab--on" : ""}`} role="tab" aria-selected={mode === "chat"} onClick={() => setMode("chat")} title="Chat conversations">
+          <MessageSquare size={14} />
+          <span className="sidebar__label">Chat</span>
+        </button>
+        <button className={`modetabs__tab${mode === "agent" ? " modetabs__tab--on" : ""}`} role="tab" aria-selected={mode === "agent"} onClick={() => setMode("agent")} title="Agent runs: tool calls execute automatically">
+          <Bot size={14} />
+          <span className="sidebar__label">Agent</span>
         </button>
       </div>
       <label className="sidebar__search">
@@ -86,7 +101,7 @@ export function Sidebar() {
         />
       </label>
       <nav className="sidebar__list">
-        {groups.length === 0 && <p className="sidebar__empty">{query ? "No matches." : "No conversations yet."}</p>}
+        {groups.length === 0 && <p className="sidebar__empty">{query ? "No matches." : mode === "agent" ? "No agent runs yet." : "No conversations yet."}</p>}
         {groups.map(([label, items]) => (
           <section key={label} className="sidebar__group">
             <h2 className="sidebar__group-title">{label}</h2>

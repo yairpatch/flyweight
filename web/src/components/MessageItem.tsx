@@ -136,6 +136,7 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
   const conversation = useStore((state) => state.conversations.find((item) => item.id === state.activeId));
   const submitToolResult = useStore((state) => state.submitToolResult);
   const busy = useStore((state) => Boolean(state.generating));
+  const executing = useStore((state) => state.generating?.phase === "tools" && state.generating.messageId === messageId);
   const [result, setResult] = useState("");
   const answered = conversation?.messages.some((message) => message.role === "tool" && message.toolCallId === call.id);
   const args = useMemo(() => prettyJson(call.arguments), [call.arguments]);
@@ -150,7 +151,8 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
       <pre className="tool__args">
         <code>{args}</code>
       </pre>
-      {!live && !answered && isLast && (
+      {executing && !answered && <div className="tool__answered">Running handler…</div>}
+      {!live && !answered && !executing && isLast && (
         <div className="tool__reply">
           <textarea
             className="tool__input"
@@ -185,6 +187,7 @@ function ToolResult({ message }: { message: Message }) {
         <header className="msg__meta">
           <span className="msg__role">Tool result · {message.toolName ?? message.toolCallId}</span>
           <time className="msg__time">{formatTime(message.createdAt)}</time>
+          {message.auto && <span className="msg__proto">auto</span>}
         </header>
         <pre className="tool__args">
           <code>{prettyJson(message.content) || "(empty)"}</code>

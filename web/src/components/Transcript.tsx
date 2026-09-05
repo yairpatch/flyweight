@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowDown, Sparkles } from "lucide-react";
+import { ArrowDown, Bot, Sparkles } from "lucide-react";
 import { useActiveConversation, useStore } from "../store";
 import { MessageItem } from "./MessageItem";
 
@@ -16,6 +16,8 @@ const SUGGESTIONS = [
 export function Transcript() {
   const conversation = useActiveConversation();
   const sendMessage = useStore((state) => state.sendMessage);
+  const setPanel = useStore((state) => state.setPanel);
+  const mode = useStore((state) => state.mode);
   const ready = useStore((state) => state.ready);
   const scroller = useRef<HTMLDivElement>(null);
   const inner = useRef<HTMLDivElement>(null);
@@ -93,7 +95,23 @@ export function Transcript() {
 
   return (
     <div className="transcript" ref={scroller} onScroll={onScroll} aria-live="polite">
-      {ready && messages.length === 0 && (
+      {ready && messages.length === 0 && (mode === "agent" ? (
+        <div className="empty">
+          <div className="empty__badge">
+            <Bot size={22} />
+          </div>
+          <h2>Give the agent a task</h2>
+          <p>
+            The model calls the enabled tools, their JavaScript handlers run in a sandbox, and the results go back to the model until it answers —
+            without you pasting anything.
+          </p>
+          <div className="empty__grid">
+            <button className="empty__card" onClick={() => setPanel("tools")}>
+              Open the Tools panel to enable tools and write their handlers.
+            </button>
+          </div>
+        </div>
+      ) : (
         <div className="empty">
           <div className="empty__badge">
             <Sparkles size={22} />
@@ -108,7 +126,7 @@ export function Transcript() {
             ))}
           </div>
         </div>
-      )}
+      ))}
       <div className="transcript__inner" ref={inner}>
         {messages.map((message, index) => (
           <MessageItem key={message.id} message={message} previous={messages[index - 1]} isLast={index === messages.length - 1} />

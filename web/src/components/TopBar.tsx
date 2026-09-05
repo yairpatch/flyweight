@@ -18,6 +18,7 @@ export function TopBar() {
   const theme = useStore((state) => state.theme);
   const setTheme = useStore((state) => state.setTheme);
   const setPaletteOpen = useStore((state) => state.setPaletteOpen);
+  const mode = useStore((state) => state.mode);
   const conversation = useActiveConversation();
 
   const execution = health?.execution ?? {};
@@ -44,7 +45,7 @@ export function TopBar() {
           <Menu size={18} />
         </button>
         <h1 className="topbar__title" title={conversation?.title}>
-          {conversation?.title ?? "Flyweight Chat"}
+          {conversation?.title ?? (mode === "agent" ? "Flyweight Agent" : "Flyweight Chat")}
         </h1>
       </div>
       <div className="topbar__center">
