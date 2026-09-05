@@ -71,11 +71,30 @@ describe("agentSystemPrompt", () => {
     expect(prompt).toContain("CRLF");
   });
 
-  it("says nothing about PowerShell on a POSIX host", () => {
+  it("warns a POSIX host about its own shell instead", () => {
     const prompt = agentSystemPrompt("/srv/work", { os: "linux", shell: "sh", path_separator: "/", line_ending: "lf" });
+    expect(prompt).toContain("Linux");
     expect(prompt).toContain("commands go to sh");
+    // /bin/sh is dash on most distributions, which is the POSIX equivalent of
+    // the PowerShell trap: bash syntax fails before the task is attempted.
+    expect(prompt).toContain("not bash");
+    expect(prompt).toContain("forward slashes");
     expect(prompt).not.toContain("Select-String");
     expect(prompt).not.toContain("CRLF");
+  });
+
+  it("names macOS rather than the platform string the server reports", () => {
+    const prompt = agentSystemPrompt("/Users/me/work", { os: "darwin", shell: "sh", path_separator: "/", line_ending: "lf" });
+    expect(prompt).toContain("The machine runs macOS");
+    expect(prompt).not.toContain("darwin");
+  });
+
+  it("leaves a shell it was told nothing about alone", () => {
+    // FLYWEIGHT_AGENT_SHELL=fish, say: naming the shell is still right, but
+    // none of the sh advice applies to it.
+    const prompt = agentSystemPrompt("/srv/work", { os: "linux", shell: "fish", path_separator: "/", line_ending: "lf" });
+    expect(prompt).toContain("commands go to fish");
+    expect(prompt).not.toContain("not bash");
   });
 
   it("still works when the server reports no platform", () => {

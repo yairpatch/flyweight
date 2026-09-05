@@ -248,9 +248,14 @@ export function turnCapReason(turns: number, cap: number): string {
  * slashes — and on a Windows host half of those fail or, worse, half-succeed.
  * The server reports the shell it will actually spawn, so the prompt names it.
  */
+/** The host under the name it is known by; the server reports sys.platform. */
+function osLabel(os: string): string {
+  return { windows: "Windows", darwin: "macOS", linux: "Linux" }[os] ?? os;
+}
+
 function platformLines(platform: AgentPlatform): string[] {
   const windows = platform.os === "windows";
-  const lines = [`The machine runs ${platform.os} and commands go to ${platform.shell}, so write every command in that shell's syntax.`];
+  const lines = [`The machine runs ${osLabel(platform.os)} and commands go to ${platform.shell}, so write every command in that shell's syntax.`];
   if (windows && (platform.shell === "powershell" || platform.shell === "pwsh")) {
     // The aliases are real, so say so: a model told only "this is Windows"
     // reaches for cmd builtins like `dir /b` and `type`, which PowerShell
@@ -262,6 +267,13 @@ function platformLines(platform: AgentPlatform): string[] {
     );
   } else if (windows) {
     lines.push("Use cmd.exe syntax: dir, type, copy, del, and %VAR% for variables.");
+  } else if (platform.shell === "sh") {
+    // The POSIX counterpart of the PowerShell problem: /bin/sh is dash on
+    // most Linux distributions, so the bash a model writes by reflex --
+    // [[ ]], arrays, source, pipefail -- fails on syntax, not on the task.
+    lines.push(
+      "That shell is /bin/sh, which is not bash on most Linux systems: [[ ]], arrays, source and pipefail are not available. Write portable sh, or run bash -c '...' explicitly when you need it.",
+    );
   }
   lines.push(
     `Paths on this host use ${platform.path_separator === "\\" ? "backslashes" : "forward slashes"}, and the tools accept either; keep tool paths relative to the workspace root.`,
