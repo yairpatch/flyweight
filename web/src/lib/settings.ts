@@ -74,13 +74,27 @@ export function normalizeSettings(input: Partial<GenerationSettings> | null | un
   };
 }
 
+/**
+ * The largest `max_tokens` worth offering for this model.
+ *
+ * The context window, and only the window. `/props.max_output_tokens` reports
+ * the server's `--max-tokens`, which is what a request gets when it names no
+ * limit of its own -- the server honors a larger one, bounded by the room the
+ * prompt leaves. Treating that default as a ceiling pinned the UI at 4096 no
+ * matter what the user asked for, which is the one setting an agent run most
+ * needs to raise: a turn that writes a file spends its whole budget on one
+ * tool call.
+ */
+export function maxTokensCeiling(props: PropsPayload | null): number {
+  const window = props?.context_window;
+  return window && window > 0 ? window : 131072;
+}
+
 /** Settings seeded from the server's own defaults for the loaded model. */
 export function settingsFromProps(props: PropsPayload | null, current: GenerationSettings): GenerationSettings {
   const defaults = props?.generation_defaults ?? {};
-  const contextWindow = props?.context_window ?? Infinity;
-  const maxOutput = props?.max_output_tokens ?? Infinity;
-  const cap = Math.min(contextWindow, maxOutput);
-  const maxTokens = Math.min(Number.isFinite(cap) ? cap : DEFAULT_SETTINGS.maxTokens, num(defaults.max_new_tokens, DEFAULT_SETTINGS.maxTokens));
+  const preferred = num(defaults.max_new_tokens, num(props?.max_output_tokens, DEFAULT_SETTINGS.maxTokens));
+  const maxTokens = Math.min(maxTokensCeiling(props), preferred);
   return normalizeSettings({
     ...current,
     maxTokens,

@@ -112,7 +112,9 @@ export function RuntimePanel() {
             ["Device", runtimeDeviceLabel(exec)],
             ...(exec.architecture ? [["Architecture", String(exec.architecture)] as [string, string]] : []),
             ["Context window", formatInteger(health.context_window ?? props?.context_window)],
-            ["Max output", formatInteger(props?.max_output_tokens)],
+            // --max-tokens: what a request gets when it asks for nothing, not
+            // a limit on what it may ask for.
+            ["Default max tokens", formatInteger(props?.max_output_tokens)],
             ...(exec.cache_type_k ? [["KV cache types", `${exec.cache_type_k} / ${exec.cache_type_v}`] as [string, string]] : []),
             ...(n(exec, "layers") !== undefined ? [["Layers", `${formatInteger(n(exec, "layers"))}${n(exec, "attention_layers") !== undefined ? ` (${n(exec, "attention_layers")} attn, ${n(exec, "deltanet_layers") ?? 0} deltanet, ${n(exec, "swa_layers") ?? 0} swa)` : ""}`] as [string, string]] : []),
             ...(n(exec, "expert_count") !== undefined ? [["Experts", `${formatInteger(n(exec, "expert_count"))} total · ${formatInteger(n(exec, "expert_used_count"))} active`] as [string, string]] : []),

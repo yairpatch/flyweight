@@ -3,7 +3,7 @@ import { Save, Trash2 } from "lucide-react";
 import { useStore } from "../../store";
 import { getApiKey, setApiKey } from "../../lib/api";
 import { PROTOCOL_LABELS } from "../../lib/protocols";
-import { REASONING_EFFORTS } from "../../lib/settings";
+import { maxTokensCeiling, REASONING_EFFORTS } from "../../lib/settings";
 import type { GenerationSettings, Protocol } from "../../types";
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
@@ -60,7 +60,9 @@ export function SettingsPanel() {
 
   const set = <K extends keyof GenerationSettings>(key: K) => (value: GenerationSettings[K]) => update({ [key]: value } as Partial<GenerationSettings>);
   const protocol = settings.protocol;
-  const maxCap = Math.min(props?.context_window ?? 131072, props?.max_output_tokens ?? 131072);
+  // The window is the only ceiling; max_output_tokens is the server's default
+  // for a request that names none, and it honors a larger one.
+  const maxCap = maxTokensCeiling(props);
   const notOn = (list: Protocol[]) => (list.includes(protocol) ? `not sent on ${PROTOCOL_LABELS[protocol]}` : undefined);
 
   return (
@@ -105,7 +107,7 @@ export function SettingsPanel() {
 
       <section className="settings__section">
         <h3>Sampling</h3>
-        <Range label="Max tokens" value={settings.maxTokens} min={1} max={maxCap} step={1} onChange={set("maxTokens")} hint={props ? `cap ${maxCap}` : undefined} />
+        <Range label="Max tokens" value={settings.maxTokens} min={1} max={maxCap} step={1} onChange={set("maxTokens")} hint={props ? `up to the ${maxCap} context window` : undefined} />
         <Range label="Temperature" value={settings.temperature} min={0} max={2} step={0.01} onChange={set("temperature")} />
         <Range label="Top-p" value={settings.topP} min={0.01} max={1} step={0.01} onChange={set("topP")} />
         <Range label="Min-p" value={settings.minP} min={0} max={1} step={0.01} onChange={set("minP")} hint="relative to the best token; 0 disables" />
