@@ -1790,3 +1790,63 @@ class NativeV2ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class K2ThinkingCloseTagTests(unittest.TestCase):
+    """A forced close must terminate the block with the tag that opened it.
+
+    K2-Horizon's generation prompt picks one of three thinking tags from
+    reasoning_effort. Closing `<ifm|think_faster>` with `</ifm|think>` left
+    the block unterminated for the model -- which kept reasoning and repeated
+    itself -- and made the next turn's template re-render the reply under
+    `<ifm|think>`, diverging from the cached prefix and reprefilling the whole
+    conversation.
+    """
+
+    class _Tokenizer:
+        architecture = "k2-horizon"
+
+        def encode(self, text):
+            return [ord(c) for c in text]
+
+    def _generator(self):
+        from flyweight.v2_server import ChatGenerator
+
+        generator = ChatGenerator.__new__(ChatGenerator)
+        generator.tokenizer = self._Tokenizer()
+        generator._forced_close_ids = None
+        return generator
+
+    def _close_text(self, generator, tag):
+        return "".join(chr(t) for t in generator._thinking_close_ids(tag))
+
+    def test_each_thinking_tag_closes_with_its_own_closer(self) -> None:
+        generator = self._generator()
+        for tag in ("<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>"):
+            text = self._close_text(generator, tag)
+            self.assertIn("</" + tag[1:], text, tag)
+            other = {"<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>"} - {tag}
+            for wrong in other:
+                self.assertNotIn("</" + wrong[1:], text, (tag, wrong))
+
+    def test_an_unknown_tag_falls_back_to_the_plain_closer(self) -> None:
+        generator = self._generator()
+        self.assertIn("</ifm|think>", self._close_text(generator, None))
+
+    def test_the_meter_reports_the_tag_that_opened_the_block(self) -> None:
+        from flyweight.v2_server import _ThinkingBudget
+
+        meter = _ThinkingBudget(4, False)
+        self.assertIsNone(meter.open_tag)
+        meter.spend("<ifm|think_faster>")
+        self.assertEqual(meter.open_tag, "<ifm|think_faster>")
+        meter.spend("</ifm|think_faster>")
+        self.assertIsNone(meter.open_tag)
+
+    def test_a_prompt_that_opens_a_block_reports_its_tag(self) -> None:
+        generator = self._generator()
+        generator.tokenizer.decode = lambda ids, **_: "assistant\n<ifm|think_fast>\n"
+        self.assertEqual(
+            generator._prompt_thinking_tag([1, 2, 3]), "<ifm|think_fast>"
+        )
+        self.assertTrue(generator._prompt_opens_thinking([1, 2, 3]))
