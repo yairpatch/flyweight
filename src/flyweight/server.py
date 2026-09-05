@@ -517,6 +517,39 @@ def _agent_relines(text: str, newline: str) -> str:
     return text.replace("\r\n", "\n").replace("\n", "\r\n")
 
 
+# The edited region echoed back by edit_file: this many lines of context on
+# each side, and no more than this many lines in all before the middle of a
+# long replacement is elided. The seams — where the new text meets the old —
+# are where a slipped indent lives, so a capped snippet keeps both ends.
+_AGENT_EDIT_CONTEXT_LINES = 2
+_AGENT_EDIT_SNIPPET_LINES = 30
+
+
+def _agent_edit_snippet(text: str, start: int, end: int) -> tuple[str, int]:
+    """The lines an edit touched, with context, and the first one's number.
+
+    old_string is guarded by an exact match, but nothing checks new_string:
+    an indent the model miscounted lands in the file silently, and it finds
+    out turns later when the interpreter does. Echoing the region back is
+    what lets it see the lines it actually wrote while the edit is still one
+    turn old.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # a trailing newline is not one more empty line
+    first = text.count("\n", 0, start)
+    last = text.count("\n", 0, max(start, end - 1))
+    lo = max(0, first - _AGENT_EDIT_CONTEXT_LINES)
+    hi = min(len(lines) - 1, last + _AGENT_EDIT_CONTEXT_LINES)
+    kept = [line.rstrip("\r") for line in lines[lo : hi + 1]]
+    if len(kept) > _AGENT_EDIT_SNIPPET_LINES:
+        head = _AGENT_EDIT_SNIPPET_LINES // 2
+        tail = _AGENT_EDIT_SNIPPET_LINES - head
+        elided = len(kept) - head - tail
+        kept = kept[:head] + [f"[... {elided} lines ...]"] + kept[-tail:]
+    return "\n".join(kept), lo + 1
+
+
 def _agent_shell() -> tuple[tuple[str, ...] | None, str]:
     """The shell agent commands run in, as argv prefix and a name.
 
@@ -804,11 +837,19 @@ class AgentWorkspace:
         replacement = _agent_relines(new, newline)
         updated = text.replace(needle, replacement, -1 if replace_all else 1)
         written = self._write_text(path, updated, bom, encoding)
+        # The text before the first match is unchanged, so the first
+        # replacement sits at the same offset in `updated`.
+        first = text.index(needle)
+        snippet, snippet_line = _agent_edit_snippet(
+            updated, first, first + len(replacement)
+        )
         return {
             "path": self._relative(path),
             "replacements": matches if replace_all else 1,
             "bytes": written,
             "line_ending": "crlf" if newline == "\r\n" else "lf",
+            "snippet": snippet,
+            "snippet_line": snippet_line,
         }
 
     def list_dir(self, payload: Mapping[str, Any]) -> dict[str, Any]:

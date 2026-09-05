@@ -8,6 +8,14 @@ import type { AgentPlatform, PropsPayload, ToolDefinition } from "../types";
 /** Shell commands are the one built-in that asks before it runs. */
 export const APPROVAL_TOOL = "run_command";
 
+/**
+ * The temperature ceiling for a run with workspace tools, whatever the chat
+ * slider says. A run of eight spaces and a run of nine are adjacent tokens,
+ * so chat temperature flips exactly the near-ties that put a wrong indent
+ * into new_string; code wants the argmax, not variety.
+ */
+export const AGENT_TEMPERATURE_CAP = 0.2;
+
 /** Whether a called name is the shell tool, however the model spelled it. */
 export function needsApproval(name: string): boolean {
   return canonicalName(name) === APPROVAL_TOOL;
@@ -186,7 +194,13 @@ function formatResult(name: string, payload: Record<string, unknown>): string {
   }
   if (name === "edit_file") {
     const count = Number(payload.replacements ?? 0);
-    return `Replaced ${count} occurrence${count === 1 ? "" : "s"} in ${payload.path} (${payload.bytes} bytes)`;
+    const head = `Replaced ${count} occurrence${count === 1 ? "" : "s"} in ${payload.path} (${payload.bytes} bytes)`;
+    // new_string is the one string no exact match guards: a miscounted indent
+    // lands silently and surfaces turns later as an interpreter error. The
+    // echoed region lets the model see the lines it wrote while the mistake
+    // is still one edit_file away from fixed. Older servers send no snippet.
+    if (!payload.snippet) return head;
+    return `${head}. The edited region now reads, from line ${payload.snippet_line}:\n${payload.snippet}`;
   }
   if (name === "list_dir") {
     const entries = (payload.entries as Array<{ name: string; kind: string; size?: number }>) ?? [];
@@ -294,7 +308,7 @@ const TOOL_GUIDANCE: Record<string, string> = {
   list_dir: "see what is in a directory before guessing at a name",
   read_file: "read a file; do this before editing one, because edit_file needs text you have actually seen",
   edit_file: "change part of a file that exists — the normal way to edit",
-  write_file: "create a file, or replace one whole; not for a small change",
+  write_file: "create a file, or replace one whole; not for a small change, and never for a formatting fix",
   [APPROVAL_TOOL]: "build, test, search, inspect. The user approves each command before it runs",
   fetch_url: "read a web page as text; always pass query so you get the part you need",
 };
@@ -356,7 +370,8 @@ export function agentSystemPrompt(context: AgentPromptContext): string {
     [
       "WORKING",
       "- Look before you write: list or read first, edit second, then run something that proves it worked.",
-      "- Change files with edit_file. Reach for write_file only for a new file or a deliberate whole-file replacement.",
+      "- Change files with edit_file. Reach for write_file only for a new file — never to fix indentation or formatting, which a rewrite makes worse; repair the broken lines with edit_file, or run a formatter.",
+      "- An edit's result shows the region it changed. Check its indentation, and fix it now if it is wrong.",
       "- Every result stays in your context for the rest of the run, so ask narrowly: search with a command instead of reading files one by one, read the file you need rather than everything near it, and give fetch_url a query instead of pulling a whole page.",
       "- Before a command needs approval, say in one line what it will do and why, so the user can decide without reading the flags.",
       "- If the user denies a command, do not send it again. Find another way or ask what they would prefer.",

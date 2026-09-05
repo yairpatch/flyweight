@@ -4168,6 +4168,30 @@ class AgentWorkspaceTests(unittest.TestCase):
             "import os\n\n\ndef main():\n    return 1\n",
         )
 
+    def test_an_edit_echoes_the_region_it_changed(self) -> None:
+        # new_string is the one string no exact match guards: a miscounted
+        # indent lands silently unless the model sees the lines it wrote.
+        (self.root / "app.py").write_text(
+            "import os\n\n\ndef main():\n    x = 1\n    return x\n"
+        )
+        result = self.workspace.edit_file(
+            {"path": "app.py", "old_string": "    x = 1", "new_string": "     x = 2"}
+        )
+        self.assertEqual(result["snippet_line"], 3)
+        self.assertEqual(result["snippet"], "\ndef main():\n     x = 2\n    return x")
+        # A long replacement keeps both seams and elides the middle: the
+        # joins with the old text are where a slipped indent lives.
+        big = self.workspace.edit_file(
+            {
+                "path": "app.py",
+                "old_string": "    return x",
+                "new_string": "\n".join(f"    line{i}" for i in range(40)),
+            }
+        )
+        self.assertIn(" lines ...]", big["snippet"])
+        self.assertIn("    line0", big["snippet"])
+        self.assertIn("    line39", big["snippet"])
+
     def test_an_edit_that_cannot_be_placed_says_how_to_fix_it(self) -> None:
         (self.root / "dup.py").write_text("x = 1\ny = 1\n")
         with self.assertRaises(APIError) as caught:
@@ -4200,10 +4224,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         # is what stops an edit from showing up as a whole-file diff.
         crlf = self.root / "win.py"
         crlf.write_bytes(b'\xef\xbb\xbfprint("old")\r\nexit(0)\r\n')
-        self.workspace.edit_file(
+        edited = self.workspace.edit_file(
             {"path": "win.py", "old_string": 'print("old")', "new_string": 'print("new")'}
         )
         self.assertEqual(crlf.read_bytes(), b'\xef\xbb\xbfprint("new")\r\nexit(0)\r\n')
+        # The echoed region is model-facing text: LF, whatever the file uses.
+        self.assertEqual(edited["snippet"], 'print("new")\nexit(0)')
+        self.assertEqual(edited["snippet_line"], 1)
         rewritten = self.workspace.write_file({"path": "win.py", "content": "a\nb\n"})
         self.assertEqual(rewritten["line_ending"], "crlf")
         self.assertFalse(rewritten["created"])

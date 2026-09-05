@@ -112,6 +112,10 @@ describe("agentSystemPrompt", () => {
     expect(prompt).toContain("One call at a time");
     expect(prompt).toContain("stays in your context");
     expect(prompt).toContain("Stop as soon as the task is done");
+    // The indentation spiral: a slipped indent, then a whole-file rewrite
+    // that slips more. The prompt blocks the rewrite and points at the echo.
+    expect(prompt).toContain("never to fix indentation");
+    expect(prompt).toContain("Check its indentation");
   });
 
   it("says what each tool it was given is for, and nothing about the rest", () => {
@@ -200,12 +204,21 @@ describe("runBuiltinTool", () => {
     expect(result.result).toContain("outside the agent workspace");
   });
 
-  it("reports an edit by what it changed", async () => {
+  it("reports an edit by what it changed, counts alone on a server with no snippet", async () => {
     const fetchMock = respondWith({ path: "app.py", replacements: 2, bytes: 512, line_ending: "crlf" });
     const result = await runBuiltinTool("edit_file", '{"path":"app.py","old_string":"a","new_string":"b","replace_all":true}');
     expect(result.ok).toBe(true);
     expect(result.result).toBe("Replaced 2 occurrences in app.py (512 bytes)");
     expect(fetchMock.mock.calls[0][0]).toBe("/agent/fs/edit");
+  });
+
+  it("echoes the edited region so the model sees the lines it wrote", async () => {
+    // new_string is the one string no exact match guards; without the echo a
+    // slipped indent surfaces turns later, as an interpreter error.
+    respondWith({ path: "app.py", replacements: 1, bytes: 512, line_ending: "lf", snippet: "def main():\n     x = 2\n    return x", snippet_line: 4 });
+    const result = await runBuiltinTool("edit_file", '{"path":"app.py","old_string":"    x = 1","new_string":"     x = 2"}');
+    expect(result.result).toContain("Replaced 1 occurrence in app.py");
+    expect(result.result).toContain("from line 4:\ndef main():\n     x = 2");
   });
 
   it("passes a failed edit's advice through to the model", async () => {

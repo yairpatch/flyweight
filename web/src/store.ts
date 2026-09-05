@@ -8,6 +8,7 @@ import { db, migrateLegacyHistory } from "./lib/db";
 import { generate } from "./lib/generate";
 import { runToolExecutor } from "./lib/executor";
 import {
+  AGENT_TEMPERATURE_CAP,
   agentSystemPrompt,
   builtinToolDefinitions,
   isBuiltinTool,
@@ -515,7 +516,14 @@ export const useStore = create<StoreState>()((set, get) => {
     set({ generating: { conversationId, messageId: assistant.id, controller }, agentPause: null });
 
     const prelude = [agentPrompt, state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n");
-    const settings = prelude === state.settings.systemPrompt ? state.settings : { ...state.settings, systemPrompt: prelude };
+    // A run that edits files samples nearly greedily: whitespace runs are
+    // adjacent tokens, and chat temperature flips exactly those near-ties
+    // into misindented new_strings. The chat slider still rules chats.
+    const temperature = workspace ? Math.min(state.settings.temperature, AGENT_TEMPERATURE_CAP) : state.settings.temperature;
+    const settings =
+      prelude === state.settings.systemPrompt && temperature === state.settings.temperature
+        ? state.settings
+        : { ...state.settings, systemPrompt: prelude, temperature };
 
     // Text that changes from turn to turn — the budget countdown, the note
     // about what compaction removed — rides after the newest message. The
