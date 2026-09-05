@@ -1065,6 +1065,19 @@ class InferenceServiceTests(unittest.TestCase):
         self.service.completion({"prompt": "Hi"})
         self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 32)
 
+    def test_request_max_tokens_wins_over_the_service_default(self) -> None:
+        # --max-tokens is the default for requests that name no limit, not a
+        # ceiling that second-guesses ones that do: a client that asks for
+        # more than the server default gets it, bounded only by the context
+        # window, exactly as llama-server would honor it.
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 500,
+            }
+        )
+        self.assertEqual(self.generator.calls[-1][1]["max_new_tokens"], 500)
+
     def test_model_generation_defaults_apply_only_when_request_omits_values(self) -> None:
         service = InferenceService(
             "qwen-local",
@@ -1746,6 +1759,33 @@ class InferenceServiceTests(unittest.TestCase):
                     "reasoning_budget_tokens": 0,
                 }
             )
+
+    def test_default_thinking_budget_guards_only_the_anthropic_endpoint(
+        self,
+    ) -> None:
+        # The built-in default exists for Claude Code's budget-less "adaptive"
+        # on /v1/messages. An OpenAI-endpoint client never sends that shape,
+        # and llama-server would let it think to max_tokens -- so must the
+        # default here, or an A/B between the servers compares this cap
+        # rather than the model.
+        self.service.chat_completion(
+            {"messages": [{"role": "user", "content": "Think"}]}
+        )
+        self.assertIsNone(
+            self.generator.calls[-1][1]["reasoning_budget_tokens"]
+        )
+        # An operator's explicit value is a choice, and applies everywhere.
+        generator = StubGenerator()
+        service = InferenceService(
+            "qwen-local", generator, max_new_tokens=32000,
+            context_window=131072, default_thinking_budget=1024,
+        )
+        service.chat_completion(
+            {"messages": [{"role": "user", "content": "Think"}]}
+        )
+        self.assertEqual(
+            generator.calls[-1][1]["reasoning_budget_tokens"], 1024
+        )
 
     def test_chat_template_kwargs_supply_template_variables(self) -> None:
         # vLLM's spelling, which harness reasoning presets are written
