@@ -561,14 +561,17 @@ class BailingSlotTests(unittest.TestCase):
     def test_a_slot_index_past_the_end_is_refused(self) -> None:
         with self.runtime(False, slots=2) as runtime:
             self.assertEqual(runtime.slot_count, 2)
-            for call in (
-                lambda: runtime.eval([5], slot=2),
-                lambda: runtime.eval_into([5], slot=7),
-                lambda: runtime.reset(2),
-                lambda: runtime.save_state(slot=2),
-                lambda: runtime.load_state(b"", slot=2),
+            # Named rather than bare lambdas: a subtest parameter is
+            # serialized back to the controller under `pytest -n`, and a
+            # function is not serializable.
+            for name, call in (
+                ("eval", lambda: runtime.eval([5], slot=2)),
+                ("eval_into", lambda: runtime.eval_into([5], slot=7)),
+                ("reset", lambda: runtime.reset(2)),
+                ("save_state", lambda: runtime.save_state(slot=2)),
+                ("load_state", lambda: runtime.load_state(b"", slot=2)),
             ):
-                with self.subTest(call=call):
+                with self.subTest(call=name):
                     with self.assertRaises(V2Error) as failure:
                         call()
                     # The message has to name the runtime's actual count: "out

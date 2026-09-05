@@ -20,6 +20,8 @@ from unittest import mock
 from flyweight.v2 import V2Model
 from tests import qwen35_hf_fixture as fixture
 
+import pytest
+
 PROMPTS = ([3, 9, 17, 4, 21, 33, 8, 12], [5, 40, 2, 19, 7])
 GENERATED = 24
 
@@ -77,6 +79,7 @@ class DraftQ8HeadTests(_Q6KFixture):
                 runtime.close()
                 model.close()
 
+    @pytest.mark.slow
     def test_q6k_head_drafts_and_matches_the_one_token_path(self) -> None:
         # FLYWEIGHT_IQ2_Q8_DECODE is latched once per process, so this file
         # runs the default (Q8) head only; the float fallback is the kernel
@@ -190,6 +193,7 @@ class MultiDecodeQ8HeadTests(unittest.TestCase):
         reference = weights @ x.astype(np.float64)
         self.assertLess(float(np.abs(y - reference).max()), 1e-4 * max(1.0, float(np.abs(reference).max())))
 
+    @pytest.mark.slow
     def test_two_sequences_batched_match_their_solo_decodes(self) -> None:
         solo = [self._solo(self.q6_path, prompt) for prompt in self._prompts]
         model, runtime = self._runtime(self.q6_path, parallel_sequences=2)

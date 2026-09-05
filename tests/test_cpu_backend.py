@@ -16,6 +16,8 @@ from flyweight.v2 import V2Error, V2Model
 
 from tests.dense_gguf_fixture import build_dense_qwen35_gguf
 
+import pytest
+
 
 class CpuBackendSelectionTests(unittest.TestCase):
     def tearDown(self) -> None:
@@ -147,6 +149,7 @@ class CpuCublasFallbackTests(unittest.TestCase):
                 runtime.generate(prompt, 8, produced.append)
                 return produced
 
+    @pytest.mark.slow
     def test_cublas_attention_toggle_does_not_change_cpu_output(self):
         V2Model.select_backend("cpu")
         # 140 crosses the 128-token eligibility threshold; 100 does not, and is

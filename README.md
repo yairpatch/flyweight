@@ -199,6 +199,21 @@ after any `pip install --user`. Both cases make pip print a warning and install
 anyway. `flyweight doctor` reports the exact directory to add if you would
 rather fix PATH permanently.
 
+### Running the tests
+
+~~~bash
+pip install -e '.[test]'
+pytest                 # ~3 minutes: everything except the slow parity tests
+pytest --run-slow      # all of it
+pytest -n auto --run-slow   # in parallel; ~10 minutes on 32 threads
+~~~
+
+Four parity tests are 81% of the suite's wall time. Each builds a fixture,
+loads the native runtime and generates the same tokens twice to compare them
+bit for bit, and the worst runs that on the CPU backend, where every CUDA
+kernel is emulated. They are marked `slow` and skipped unless asked for; CI
+runs them on every push.
+
 ### Developing on Flyweight itself
 
 Use an editable install, so edits to `src/flyweight` take effect without
