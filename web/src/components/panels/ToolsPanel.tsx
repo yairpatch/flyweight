@@ -2,7 +2,7 @@ import { useRef } from "react";
 import { Plus, Trash2, Upload } from "lucide-react";
 import { useStore } from "../../store";
 import { clamp, identifier } from "../../lib/format";
-import { workspaceRoot } from "../../lib/agentTools";
+import { workspacePlatform, workspaceRoot } from "../../lib/agentTools";
 import type { ToolDefinition } from "../../types";
 
 function validJson(text: string): boolean {
@@ -21,6 +21,7 @@ export function ToolsPanel() {
   const updateSettings = useStore((state) => state.updateSettings);
   const toast = useStore((state) => state.toast);
   const workspace = useStore((state) => workspaceRoot(state.props));
+  const platform = useStore((state) => workspacePlatform(state.props));
   const fileInput = useRef<HTMLInputElement>(null);
 
   const patch = (id: string, changes: Partial<ToolDefinition>) => setTools(tools.map((tool) => (tool.id === id ? { ...tool, ...changes } : tool)));
@@ -70,11 +71,22 @@ export function ToolsPanel() {
           and network requests subject to CORS. A call whose tool has no handler pauses the run for a manual result; Stop (Esc) interrupts it.
         </p>
         {workspace ? (
-          <p className="muted">
-            The server also offers built-in tools, confined to <code>{workspace}</code>: <code>list_dir</code>, <code>read_file</code>,{" "}
-            <code>write_file</code>, <code>run_command</code>, and <code>fetch_url</code>. They are sent with every agent run and need no handler.
-            Every <code>run_command</code> call waits for your approval in the transcript before anything executes.
-          </p>
+          <>
+            <p className="muted">
+              The server also offers built-in tools, confined to <code>{workspace}</code>: <code>list_dir</code>, <code>read_file</code>,{" "}
+              <code>edit_file</code>, <code>write_file</code>, <code>run_command</code>, and <code>fetch_url</code>. They are sent with every agent run
+              and need no handler. Every <code>run_command</code> call waits for your approval in the transcript before anything executes.
+            </p>
+            <p className="muted">
+              {platform ? (
+                <>
+                  Commands run in <code>{platform.shell}</code> on {platform.os}, and the agent is told so before it writes one.{" "}
+                </>
+              ) : null}
+              <code>edit_file</code> replaces an exact snippet rather than rewriting the file, and both writers keep a file's existing line endings and
+              encoding — a CRLF file stays CRLF.
+            </p>
+          </>
         ) : (
           <p className="muted">
             Built-in file, shell, and fetch tools are off. Start the server with <code>--agent-workspace DIR</code> to give agent runs a directory to

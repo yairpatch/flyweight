@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { builtinToolDefinitions, isBuiltinTool, missingHandlerReason, needsApproval, runBuiltinTool, turnCapReason } from "./agentTools";
+import {
+  agentSystemPrompt,
+  builtinToolDefinitions,
+  isBuiltinTool,
+  missingHandlerReason,
+  needsApproval,
+  runBuiltinTool,
+  turnCapReason,
+} from "./agentTools";
 
 function respondWith(payload: unknown, ok = true) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
@@ -17,6 +25,7 @@ describe("builtinToolDefinitions", () => {
   it("declares each workspace tool with a parseable schema", () => {
     const definitions = builtinToolDefinitions();
     expect(definitions.map((tool) => tool.name).sort()).toEqual([
+      "edit_file",
       "fetch_url",
       "list_dir",
       "read_file",
@@ -48,6 +57,31 @@ describe("name matching", () => {
     expect(needsApproval("functions.run_command")).toBe(true);
     expect(needsApproval("run_command")).toBe(true);
     expect(needsApproval("read_file")).toBe(false);
+  });
+});
+
+describe("agentSystemPrompt", () => {
+  it("tells the model which shell it is writing for on Windows", () => {
+    const prompt = agentSystemPrompt("C:\\work", { os: "windows", shell: "powershell", path_separator: "\\", line_ending: "crlf" });
+    expect(prompt).toContain("C:\\work");
+    expect(prompt).toContain("powershell");
+    expect(prompt).toContain("Select-String");
+    expect(prompt).toContain("call operator");
+    expect(prompt).toContain("backslashes");
+    expect(prompt).toContain("CRLF");
+  });
+
+  it("says nothing about PowerShell on a POSIX host", () => {
+    const prompt = agentSystemPrompt("/srv/work", { os: "linux", shell: "sh", path_separator: "/", line_ending: "lf" });
+    expect(prompt).toContain("commands go to sh");
+    expect(prompt).not.toContain("Select-String");
+    expect(prompt).not.toContain("CRLF");
+  });
+
+  it("still works when the server reports no platform", () => {
+    const prompt = agentSystemPrompt("/srv/work");
+    expect(prompt).toContain("/srv/work");
+    expect(prompt).toContain("edit_file");
   });
 });
 
@@ -100,6 +134,27 @@ describe("runBuiltinTool", () => {
     const result = await runBuiltinTool("read_file", '{"path":"../../etc/passwd"}');
     expect(result.ok).toBe(false);
     expect(result.result).toContain("outside the agent workspace");
+  });
+
+  it("reports an edit by what it changed", async () => {
+    const fetchMock = respondWith({ path: "app.py", replacements: 2, bytes: 512, line_ending: "crlf" });
+    const result = await runBuiltinTool("edit_file", '{"path":"app.py","old_string":"a","new_string":"b","replace_all":true}');
+    expect(result.ok).toBe(true);
+    expect(result.result).toBe("Replaced 2 occurrences in app.py (512 bytes)");
+    expect(fetchMock.mock.calls[0][0]).toBe("/agent/fs/edit");
+  });
+
+  it("passes a failed edit's advice through to the model", async () => {
+    respondWith({ error: { message: "old_string appears 3 times in app.py; include the surrounding lines to make it unique, or pass replace_all" } }, false);
+    const result = await runBuiltinTool("edit_file", '{"path":"app.py","old_string":"x","new_string":"y"}');
+    expect(result.ok).toBe(false);
+    expect(result.result).toContain("replace_all");
+  });
+
+  it("says whether a write created the file and what endings it kept", async () => {
+    respondWith({ path: "new.txt", bytes: 12, created: true, line_ending: "lf" });
+    const result = await runBuiltinTool("write_file", '{"path":"new.txt","content":"hello"}');
+    expect(result.result).toBe("Created new.txt (12 bytes, lf line endings)");
   });
 
   it("hands malformed arguments back to the model instead of calling the server", async () => {

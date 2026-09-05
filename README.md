@@ -416,12 +416,18 @@ server exposes, not only chat:
   tools run their JavaScript handler in the code preview's sandbox (opaque
   origin, no access to the app's storage or API key; network subject to
   CORS). Starting the server with `--agent-workspace DIR` adds built-in
-  tools that reach the machine — `list_dir`, `read_file`, `write_file`,
-  `run_command`, and `fetch_url` — every one of them confined to `DIR`, and
-  each `run_command` shown for approval in the transcript before it runs
-  (with an *always allow* for the rest of the run). Without the flag those
-  endpoints return 404, and they never carry a CORS grant, so only the
-  bundled UI and clients holding the API key can call them. A long run stays
+  tools that reach the machine — `list_dir`, `read_file`, `edit_file`,
+  `write_file`, `run_command`, and `fetch_url` — every one of them confined
+  to `DIR`, and each `run_command` shown for approval in the transcript
+  before it runs (with an *always allow* for the rest of the run). Without
+  the flag those endpoints return 404, and they never carry a CORS grant, so
+  only the bundled UI and clients holding the API key can call them. The run
+  is told what machine it is on: the OS, the shell its commands will
+  actually go to, and the path style, so a model on Windows writes
+  PowerShell rather than the Unix commands it defaults to. `edit_file`
+  replaces an exact snippet instead of rewriting a file, and both writers
+  keep a file's existing line endings and BOM, so an edit to a CRLF file is
+  not a whole-file diff. A long run stays
   inside the context window on its own: before each request the prompt is
   fitted to the window by stubbing the run's oldest tool results, then
   dropping its oldest steps whole (an assistant turn always leaves with the
@@ -528,15 +534,31 @@ endpoints stream over SSE, and chat streams honour
 request model IDs must exactly match the configured server model name.
 
 `--agent-workspace DIR` adds the endpoints the chat UI's agent runs use:
-`/agent/fs/read`, `/agent/fs/write`, `/agent/fs/list`, `/agent/exec`, and
-`/agent/fetch`. Every path resolves inside `DIR` or the request is refused
-with 403, commands start there, and results are clipped to what a prompt can
-hold. They are absent (404) unless the flag is given, they require the API
-key like everything else, and they are the one part of the API that never
-sends an `Access-Control-Allow-Origin` header, so a page on another origin
-cannot drive them through a visitor's browser. `/props` then
-lists `agent_workspace` in its capabilities and reports the resolved
-directory.
+`/agent/fs/read`, `/agent/fs/write`, `/agent/fs/edit`, `/agent/fs/list`,
+`/agent/exec`, and `/agent/fetch`. Every path resolves inside `DIR` or the
+request is refused with 403, commands start there, and results are clipped to
+what a prompt can hold. They are absent (404) unless the flag is given, they
+require the API key like everything else, and they are the one part of the
+API that never sends an `Access-Control-Allow-Origin` header, so a page on
+another origin cannot drive them through a visitor's browser. `/props` then
+lists `agent_workspace` in its capabilities, reports the resolved directory,
+and describes the host in `agent_platform` (`os`, `shell`,
+`path_separator`, `line_ending`) so a client can tell the model what it is
+working on.
+
+The tools are written for a model that does not know which OS it landed on.
+Paths may use either separator. Files are decoded as UTF-8 and then, on
+Windows, as the ANSI code page rather than becoming a row of replacement
+characters, and a file's line endings, BOM, and code page survive being
+written back — an edit to an ANSI file stays ANSI unless the new text needs
+characters that code page has no room for.
+`/agent/fs/edit` takes `old_string`/`new_string` (plus `replace_all`) and
+refuses an edit it cannot place exactly once, which is a wasted turn rather
+than a mangled file. Commands run in PowerShell on Windows — so `ls`, `cat`
+and `rm` work — with the error stream decoded out of PowerShell's CLIXML,
+the exit code preserved, and the whole process tree killed on timeout. Set
+`FLYWEIGHT_AGENT_SHELL` to a shell command line (for example `cmd`, `bash`,
+or a full path) to override the choice.
 
 Chat requests use the GGUF's `tokenizer.chat_template` when it is present;
 the built-in architecture formatter is only a fallback for older files. If a

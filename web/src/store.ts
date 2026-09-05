@@ -15,6 +15,7 @@ import {
   needsApproval,
   runBuiltinTool,
   turnCapReason,
+  workspacePlatform,
   workspaceRoot,
 } from "./lib/agentTools";
 import {
@@ -487,7 +488,9 @@ export const useStore = create<StoreState>()((set, get) => {
     const controller = new AbortController();
     set({ generating: { conversationId, messageId: assistant.id, controller }, agentPause: null });
 
-    const prelude = [workspace ? agentSystemPrompt(workspace) : "", note, state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n");
+    const prelude = [workspace ? agentSystemPrompt(workspace, workspacePlatform(state.props)) : "", note, state.settings.systemPrompt.trim()]
+      .filter(Boolean)
+      .join("\n\n");
     const settings = prelude === state.settings.systemPrompt ? state.settings : { ...state.settings, systemPrompt: prelude };
     const body = buildRequest(protocol, {
       model: state.model || state.health?.model || "local",

@@ -300,10 +300,155 @@ _AGENT_EXEC_TIMEOUT_MAX = 300.0
 _AGENT_FETCH_TIMEOUT = 20.0
 
 
-def _agent_clip(data: bytes, limit: int) -> tuple[str, bool]:
+def _agent_decoded(data: bytes, *, console: bool = False) -> tuple[str, str]:
+    """Text out of bytes that were not necessarily written as UTF-8, and how.
+
+    Console tools on Windows still emit the OEM code page, and Windows text
+    files are as often ANSI as UTF-8. Decoding those as UTF-8 with `replace`
+    turns every accented character into a question mark in the model's
+    context, and -- worse for an editing agent -- a file read that way cannot
+    be written back without corrupting it. Try the encodings a host actually
+    produces before falling back to lossy UTF-8.
+
+    The two code pages differ (`0xe9` is an accented e in ANSI and a Greek
+    theta in OEM) and neither ever fails to decode, so the order matters: a
+    file gets ANSI first, a command's output OEM first. The codec comes back
+    with the text so an edit can write the file in the encoding it was in.
+    """
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", errors="replace"), "utf-8"
+    fallbacks: tuple[str, ...] = ()
+    if os.name == "nt":
+        fallbacks = ("oem", "mbcs") if console else ("mbcs", "oem")
+    for encoding in ("utf-8", *fallbacks):
+        try:
+            return data.decode(encoding), encoding
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace"), "utf-8"
+
+
+def _agent_decode(data: bytes, *, console: bool = False) -> str:
+    return _agent_decoded(data, console=console)[0]
+
+
+def _agent_clip(data: bytes, limit: int, *, console: bool = False) -> tuple[str, bool]:
     """Decode tool output for the model, cut to what a prompt can afford."""
-    clipped = data[:limit]
-    return clipped.decode("utf-8", errors="replace"), len(data) > limit
+    return _agent_decode(data[:limit], console=console), len(data) > limit
+
+
+def _agent_clip_text(text: str, limit: int) -> tuple[str, bool]:
+    return text[:limit], len(text) > limit
+
+
+def _agent_unclixml(text: str) -> str:
+    """Plain text out of PowerShell's serialized error stream.
+
+    Windows PowerShell writes stderr as CLIXML whenever it is redirected, so
+    `cat missing.txt` hands the model 900 characters of XML instead of "cannot
+    find path". The error strings are the `<S>` elements; the progress records
+    around them are noise from the host and go.
+    """
+    if not text.startswith("#< CLIXML"):
+        return text
+    from xml.etree import ElementTree
+
+    _, _, body = text.partition("\n")
+    try:
+        root = ElementTree.fromstring(body.strip())
+    except ElementTree.ParseError:
+        return text
+    namespace = "{http://schemas.microsoft.com/powershell/2004/04}"
+    joined = "".join(node.text or "" for node in root.findall(f"{namespace}S"))
+    return re.sub(
+        r"_x([0-9A-Fa-f]{4})_", lambda match: chr(int(match.group(1), 16)), joined
+    )
+
+
+def _agent_newline(text: str) -> str:
+    """The line ending a file already uses; what an edit has to write back."""
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _agent_relines(text: str, newline: str) -> str:
+    """Retype the model's LF text in the file's own line ending."""
+    if newline == "\n":
+        return text.replace("\r\n", "\n")
+    return text.replace("\r\n", "\n").replace("\n", "\r\n")
+
+
+def _agent_shell() -> tuple[tuple[str, ...] | None, str]:
+    """The shell agent commands run in, as argv prefix and a name.
+
+    Models write POSIX: `ls`, `cat file`, `grep -r`, `rm -f`. On Windows
+    `cmd.exe` knows none of those, so a run against a Windows workspace fails
+    on its first exploratory command. PowerShell aliases all of them, so it is
+    preferred there and the model is told which shell it got. A `None` prefix
+    means "hand the string to the platform shell", which is `cmd.exe` here and
+    `/bin/sh` everywhere else.
+    """
+    override = os.environ.get("FLYWEIGHT_AGENT_SHELL", "").strip()
+    if os.name != "nt":
+        if override:
+            return (override, "-c"), Path(override).name
+        return None, "sh"
+    import shutil
+
+    candidates = [override] if override else ["pwsh", "powershell"]
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            name = Path(found).stem.lower()
+            if name in {"pwsh", "powershell"}:
+                return (found, "-NoProfile", "-NonInteractive", "-EncodedCommand"), name
+            return (found, "/c"), name
+    return None, "cmd"
+
+
+# PowerShell writes its pipes in the console's code page unless told
+# otherwise, and reports the exit code of a native command only if the script
+# ends on one. Both are fixed by wrapping the model's command.
+_AGENT_PS_PRELUDE = (
+    "$ErrorActionPreference='Continue';"
+    "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+    "$OutputEncoding=[Text.Encoding]::UTF8;"
+)
+_AGENT_PS_EPILOGUE = (
+    "\nexit $(if ($null -ne $LASTEXITCODE) { $LASTEXITCODE }"
+    " elseif ($?) { 0 } else { 1 })"
+)
+
+
+def _agent_kill_tree(process: Any) -> None:
+    """End a timed-out command and everything it started.
+
+    `Popen.kill()` reaches the shell only, so a `pytest` or an `npm install`
+    behind it keeps running against the workspace after the tool reported a
+    timeout. POSIX gets the process group; Windows has taskkill walk the tree.
+    """
+    import subprocess
+
+    if os.name == "nt":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+    else:
+        import signal
+
+        # Spelled through getattr because a type checker running on Windows
+        # sees an `os` and a `signal` module that have none of these.
+        killpg = getattr(os, "killpg", None)
+        getpgid = getattr(os, "getpgid", None)
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        if killpg and getpgid:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                killpg(getpgid(process.pid), sigkill)
+    with contextlib.suppress(OSError):
+        process.kill()
 
 
 class AgentWorkspace:
@@ -323,10 +468,20 @@ class AgentWorkspace:
             raise ValueError(f"agent workspace is not a directory: {resolved}")
         self.root = resolved
 
+    def platform(self) -> dict[str, str]:
+        """What the model needs to know about the host it is working on."""
+        return {
+            "os": "windows" if os.name == "nt" else sys.platform,
+            "shell": _agent_shell()[1],
+            "path_separator": "\\" if os.name == "nt" else "/",
+            "line_ending": "crlf" if os.name == "nt" else "lf",
+        }
+
     def handle(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
             "/agent/fs/read": self.read_file,
             "/agent/fs/write": self.write_file,
+            "/agent/fs/edit": self.edit_file,
             "/agent/fs/list": self.list_dir,
             "/agent/exec": self.run_command,
             "/agent/fetch": self.fetch_url,
@@ -343,7 +498,14 @@ class AgentWorkspace:
             raise APIError(
                 400, "path must be a non-empty string", parameter="path"
             )
-        candidate = Path(raw.strip())
+        text = raw.strip()
+        # Windows takes either separator natively; POSIX does not, and a model
+        # writing "src\\main.py" there means a subdirectory, not a file with a
+        # backslash in its name. Translate only when nothing by that literal
+        # name exists, so the rare real filename still wins.
+        if os.name != "nt" and "\\" in text and not (self.root / text).exists():
+            text = text.replace("\\", "/")
+        candidate = Path(text)
         base = candidate if candidate.is_absolute() else self.root / candidate
         try:
             resolved = base.resolve()
@@ -380,7 +542,42 @@ class AgentWorkspace:
             "content": content,
             "size": size,
             "truncated": truncated,
+            "line_ending": "crlf" if _agent_newline(content) == "\r\n" else "lf",
         }
+
+    def _existing_style(self, path: Path) -> tuple[str, bool, str]:
+        """The line ending, BOM, and encoding a file has, for writing it back."""
+        try:
+            head = path.read_bytes()[:_AGENT_FILE_BYTES]
+        except OSError:
+            return "\n", False, "utf-8"
+        return (
+            "\r\n" if b"\r\n" in head else "\n",
+            head.startswith(b"\xef\xbb\xbf"),
+            _agent_decoded(head)[1],
+        )
+
+    def _write_text(self, path: Path, text: str, bom: bool, encoding: str = "utf-8") -> int:
+        """Write text back the way the file was already written.
+
+        The caller decides line endings: a full write retypes everything in
+        the file's style, while an edit touches only the snippet it replaced
+        and leaves the rest of the file's bytes exactly as they were. Keeping
+        the encoding matters for the same reason -- re-encoding an ANSI file
+        as UTF-8 rewrites every accented byte in it -- but only as far as the
+        code page reaches, so text it cannot spell goes out as UTF-8.
+        """
+        try:
+            body = text.encode(encoding)
+        except (UnicodeEncodeError, LookupError):
+            body = text.encode("utf-8")
+        data = (b"\xef\xbb\xbf" if bom else b"") + body
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        except OSError as error:
+            raise APIError(400, f"cannot write file: {error}") from error
+        return len(data)
 
     def write_file(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         path = self._resolve(payload.get("path"))
@@ -391,13 +588,88 @@ class AgentWorkspace:
             )
         if path == self.root or path.is_dir():
             raise APIError(400, "path names a directory", parameter="path")
-        data = content.encode("utf-8")
+        # Models write "\n" whatever the host. Rewriting a CRLF file with LF
+        # endings turns a one-line change into a whole-file diff, so an
+        # existing file keeps the line ending and BOM it already had.
+        existed = path.is_file()
+        newline, bom, encoding = self._existing_style(path) if existed else ("\n", False, "utf-8")
+        written = self._write_text(path, _agent_relines(content, newline), bom, encoding)
+        return {
+            "path": self._relative(path),
+            "bytes": written,
+            "created": not existed,
+            "line_ending": "crlf" if newline == "\r\n" else "lf",
+        }
+
+    def edit_file(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace an exact snippet in a file, leaving the rest byte for byte.
+
+        Rewriting a whole file to change three lines costs the model the
+        file's length in output tokens and loses whatever it failed to
+        reproduce, which on Windows starts with the line endings. An exact
+        replacement keeps the cost proportional to the change, and matching
+        the model's LF snippet against the file's own line ending is what
+        makes the same call work on either host.
+        """
+        path = self._resolve(payload.get("path"))
+        old = payload.get("old_string")
+        new = payload.get("new_string")
+        if not isinstance(old, str) or not old:
+            raise APIError(
+                400,
+                "old_string must be a non-empty string",
+                parameter="old_string",
+            )
+        if not isinstance(new, str):
+            raise APIError(
+                400, "new_string must be a string", parameter="new_string"
+            )
+        replace_all = bool(payload.get("replace_all", False))
+        if not path.is_file():
+            raise APIError(
+                404, f"no such file: {self._relative(path)}", "not_found_error"
+            )
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+            data = path.read_bytes()
         except OSError as error:
-            raise APIError(400, f"cannot write file: {error}") from error
-        return {"path": self._relative(path), "bytes": len(data)}
+            raise APIError(400, f"cannot read file: {error}") from error
+        if len(data) > _AGENT_FILE_BYTES:
+            raise APIError(
+                400,
+                f"file is too large to edit: {len(data)} bytes > "
+                f"{_AGENT_FILE_BYTES} maximum",
+                parameter="path",
+            )
+        bom = data.startswith(b"\xef\xbb\xbf")
+        text, encoding = _agent_decoded(data)
+        newline = _agent_newline(text)
+        needle = _agent_relines(old, newline)
+        matches = text.count(needle)
+        if matches == 0:
+            raise APIError(
+                400,
+                "old_string does not appear in "
+                f"{self._relative(path)}; read the file again and copy the "
+                "snippet exactly, including its indentation",
+                parameter="old_string",
+            )
+        if matches > 1 and not replace_all:
+            raise APIError(
+                400,
+                f"old_string appears {matches} times in "
+                f"{self._relative(path)}; include the surrounding lines to "
+                "make it unique, or pass replace_all",
+                parameter="old_string",
+            )
+        replacement = _agent_relines(new, newline)
+        updated = text.replace(needle, replacement, -1 if replace_all else 1)
+        written = self._write_text(path, updated, bom, encoding)
+        return {
+            "path": self._relative(path),
+            "replacements": matches if replace_all else 1,
+            "bytes": written,
+            "line_ending": "crlf" if newline == "\r\n" else "lf",
+        }
 
     def list_dir(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         path = self._resolve(payload.get("path"), default=".")
@@ -440,28 +712,58 @@ class AgentWorkspace:
             )
         timeout = _float_option(payload, "timeout_seconds", _AGENT_EXEC_TIMEOUT)
         timeout = min(max(timeout, 1.0), _AGENT_EXEC_TIMEOUT_MAX)
+        prefix, shell_name = _agent_shell()
+        argv: str | Sequence[str]
+        options: dict[str, Any] = {}
+        if prefix is None:
+            argv, options["shell"] = command, True
+        elif shell_name in {"pwsh", "powershell"}:
+            script = _AGENT_PS_PRELUDE + command + _AGENT_PS_EPILOGUE
+            # -EncodedCommand takes UTF-16LE base64, which sidesteps every
+            # quoting rule between here and PowerShell's parser: the model's
+            # quotes, backticks and percent signs arrive intact.
+            import base64
+
+            argv = [*prefix, base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
+        else:
+            argv = [*prefix, command]
+        # A timeout has to take the whole tree with it: killing the shell
+        # leaves the build or the test run it started holding the workspace.
+        if os.name == "nt":
+            options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            options["start_new_session"] = True
         try:
-            completed = subprocess.run(  # noqa: S602 - the workspace flag is the opt-in
-                command,
-                shell=True,
+            process = subprocess.Popen(  # noqa: S602 - the workspace flag is the opt-in
+                argv,
                 cwd=self.root,
-                capture_output=True,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **options,
             )
-            stdout_raw, stderr_raw = completed.stdout, completed.stderr
-            exit_code: int | None = completed.returncode
-            timed_out = False
-        except subprocess.TimeoutExpired as expired:
-            stdout_raw = expired.stdout or b""
-            stderr_raw = expired.stderr or b""
-            exit_code = None
-            timed_out = True
         except OSError as error:
             raise APIError(400, f"cannot run command: {error}") from error
-        stdout, stdout_truncated = _agent_clip(stdout_raw, _AGENT_OUTPUT_BYTES)
-        stderr, stderr_truncated = _agent_clip(stderr_raw, _AGENT_OUTPUT_BYTES)
+        try:
+            stdout_raw, stderr_raw = process.communicate(timeout=timeout)
+            exit_code: int | None = process.returncode
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            _agent_kill_tree(process)
+            stdout_raw, stderr_raw = process.communicate()
+            exit_code = None
+            timed_out = True
+        stdout, stdout_truncated = _agent_clip(stdout_raw or b"", _AGENT_OUTPUT_BYTES, console=True)
+        # PowerShell's CLIXML has to be decoded whole before it can be cut, so
+        # read a generous head of it and clip the plain text that comes out.
+        raw_errors = stderr_raw or b""
+        head = raw_errors[: _AGENT_OUTPUT_BYTES * 8]
+        stderr, stderr_truncated = _agent_clip_text(
+            _agent_unclixml(_agent_decode(head, console=True)), _AGENT_OUTPUT_BYTES
+        )
+        stderr_truncated = stderr_truncated or len(raw_errors) > len(head)
         return {
             "command": command,
+            "shell": shell_name,
             "exit_code": exit_code,
             "timed_out": timed_out,
             "stdout": stdout,
@@ -2229,7 +2531,13 @@ class InferenceService:
                 *(["agent_workspace"] if self.agent_workspace else []),
             ],
             **(
-                {"agent_workspace": str(self.agent_workspace.root)}
+                {
+                    "agent_workspace": str(self.agent_workspace.root),
+                    # The UI puts this in the run's system prompt: a model
+                    # that knows it is on Windows in PowerShell stops opening
+                    # with `ls -la` and `cat`.
+                    "agent_platform": self.agent_workspace.platform(),
+                }
                 if self.agent_workspace
                 else {}
             ),

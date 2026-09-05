@@ -189,6 +189,18 @@ export interface PropsPayload {
   capabilities?: string[];
   /** Directory the server's agent tools are confined to; absent unless --agent-workspace was given. */
   agent_workspace?: string;
+  /** What the workspace host is, so the agent writes commands and paths that work there. */
+  agent_platform?: AgentPlatform;
+}
+
+/** The workspace machine as the server sees it. */
+export interface AgentPlatform {
+  /** "windows", "linux", "darwin", or whatever `sys.platform` says. */
+  os: string;
+  /** The shell commands run in: "powershell", "pwsh", "cmd", or the login shell. */
+  shell: string;
+  path_separator: string;
+  line_ending: "crlf" | "lf";
 }
 
 export interface ModelInfo {

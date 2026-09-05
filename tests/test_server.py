@@ -4155,25 +4155,152 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 403)
         self.assertFalse((self.root.parent / "escaped.txt").exists())
 
+    def test_an_edit_replaces_one_snippet_and_leaves_the_rest(self) -> None:
+        # The reason edit_file exists: a model that can only rewrite whole
+        # files rewrites the parts it was not asked to touch.
+        (self.root / "app.py").write_text("import os\n\n\ndef main():\n    return 0\n")
+        result = self.workspace.edit_file(
+            {"path": "app.py", "old_string": "return 0", "new_string": "return 1"}
+        )
+        self.assertEqual(result["replacements"], 1)
+        self.assertEqual(
+            (self.root / "app.py").read_text(),
+            "import os\n\n\ndef main():\n    return 1\n",
+        )
+
+    def test_an_edit_that_cannot_be_placed_says_how_to_fix_it(self) -> None:
+        (self.root / "dup.py").write_text("x = 1\ny = 1\n")
+        with self.assertRaises(APIError) as caught:
+            self.workspace.edit_file(
+                {"path": "dup.py", "old_string": "= 1", "new_string": "= 2"}
+            )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("appears 2 times", str(caught.exception))
+        self.assertIn("replace_all", str(caught.exception))
+        with self.assertRaises(APIError) as caught:
+            self.workspace.edit_file(
+                {"path": "dup.py", "old_string": "z = 9", "new_string": "z = 8"}
+            )
+        self.assertIn("does not appear", str(caught.exception))
+        with self.assertRaises(APIError) as caught:
+            self.workspace.edit_file(
+                {"path": "gone.py", "old_string": "a", "new_string": "b"}
+            )
+        self.assertEqual(caught.exception.status, 404)
+        # A refused edit leaves the file exactly as it was.
+        self.assertEqual((self.root / "dup.py").read_text(), "x = 1\ny = 1\n")
+        every = self.workspace.edit_file(
+            {"path": "dup.py", "old_string": "= 1", "new_string": "= 2", "replace_all": True}
+        )
+        self.assertEqual(every["replacements"], 2)
+        self.assertEqual((self.root / "dup.py").read_text(), "x = 2\ny = 2\n")
+
+    def test_writing_keeps_a_windows_file_windows(self) -> None:
+        # The model writes "\n" whatever the host is. Re-lining on the way out
+        # is what stops an edit from showing up as a whole-file diff.
+        crlf = self.root / "win.py"
+        crlf.write_bytes(b'\xef\xbb\xbfprint("old")\r\nexit(0)\r\n')
+        self.workspace.edit_file(
+            {"path": "win.py", "old_string": 'print("old")', "new_string": 'print("new")'}
+        )
+        self.assertEqual(crlf.read_bytes(), b'\xef\xbb\xbfprint("new")\r\nexit(0)\r\n')
+        rewritten = self.workspace.write_file({"path": "win.py", "content": "a\nb\n"})
+        self.assertEqual(rewritten["line_ending"], "crlf")
+        self.assertFalse(rewritten["created"])
+        self.assertEqual(crlf.read_bytes(), b"\xef\xbb\xbfa\r\nb\r\n")
+        # A file that did not exist is the model's own: plain UTF-8, LF.
+        fresh = self.workspace.write_file({"path": "fresh.txt", "content": "a\nb\n"})
+        self.assertTrue(fresh["created"])
+        self.assertEqual(fresh["line_ending"], "lf")
+        self.assertEqual((self.root / "fresh.txt").read_bytes(), b"a\nb\n")
+
+    def test_a_windows_style_path_is_accepted_anywhere(self) -> None:
+        # Models write the separator of the OS they were told about, and get it
+        # wrong often enough that refusing the other one wastes a turn.
+        self.workspace.write_file({"path": "pkg/mod.py", "content": "x = 1\n"})
+        self.assertEqual(
+            self.workspace.read_file({"path": "pkg\\mod.py"})["content"], "x = 1\n"
+        )
+
+    def test_an_ansi_file_reads_as_text_rather_than_question_marks(self) -> None:
+        from flyweight.server import _agent_decode
+
+        (self.root / "ansi.txt").write_bytes("café\n".encode("cp1252"))
+        content = self.workspace.read_file({"path": "ansi.txt"})["content"]
+        self.assertEqual(content, "café\n" if os.name == "nt" else "caf�\n")
+        if os.name == "nt":
+            # An edit is a snippet replacement, not a conversion: the rest of
+            # the file keeps the bytes -- and the code page -- it had.
+            self.workspace.edit_file(
+                {"path": "ansi.txt", "old_string": "café", "new_string": "thé café"}
+            )
+            self.assertEqual(
+                (self.root / "ansi.txt").read_bytes(), "thé café\n".encode("cp1252")
+            )
+            # Unless the model writes something the code page cannot spell, in
+            # which case the text wins and the file becomes UTF-8.
+            self.workspace.edit_file(
+                {"path": "ansi.txt", "old_string": "thé", "new_string": "茶"}
+            )
+            self.assertEqual(
+                (self.root / "ansi.txt").read_bytes(), "茶 café\n".encode("utf-8")
+            )
+        # The same byte is a different character in each Windows code page, so
+        # files get ANSI first and console output OEM first.
+        if os.name == "nt":
+            self.assertEqual(_agent_decode(b"caf\xe9"), "café")
+            self.assertEqual(_agent_decode(b"caf\xe9", console=True), "cafΘ")
+        self.assertEqual(_agent_decode(b"\xef\xbb\xbfhi"), "hi")
+
+    def test_powershell_error_xml_is_unwrapped_before_the_model_sees_it(self) -> None:
+        from flyweight.server import _agent_unclixml
+
+        clixml = (
+            '#< CLIXML\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com'
+            '/powershell/2004/04"><Obj S="progress"><TN><T>Noise</T></TN></Obj>'
+            '<S S="Error">cat : Cannot find path_x000D__x000A_</S></Objs>'
+        )
+        self.assertEqual(_agent_unclixml(clixml), "cat : Cannot find path\r\n")
+        self.assertNotIn("Noise", _agent_unclixml(clixml))
+        self.assertEqual(_agent_unclixml("plain error\n"), "plain error\n")
+
+    def test_the_platform_matches_the_shell_commands_actually_run_in(self) -> None:
+        platform = self.workspace.platform()
+        result = self.workspace.run_command({"command": self._python("pass")})
+        self.assertEqual(result["shell"], platform["shell"])
+        self.assertEqual(platform["os"], "windows" if os.name == "nt" else sys.platform)
+        self.assertEqual(platform["path_separator"], os.sep)
+        self.assertEqual(platform["line_ending"], "crlf" if os.name == "nt" else "lf")
+
+    def _python(self, source: str) -> str:
+        """`source` run by this interpreter, in the shell the workspace uses.
+
+        PowerShell treats a quoted path as a string to print, not a program to
+        run, so an invocation that works from cmd or sh needs the call
+        operator there -- the same wrinkle the agent's system prompt warns the
+        model about.
+        """
+        prefix = "& " if self.workspace.platform()["shell"] in {"pwsh", "powershell"} else ""
+        return f'{prefix}"{sys.executable}" -c "{source}"'
+
     def test_a_command_runs_inside_the_workspace(self) -> None:
         (self.root / "marker.txt").write_text("here")
         result = self.workspace.run_command(
-            {"command": f'"{sys.executable}" -c "import os;print(os.path.isfile(\'marker.txt\'))"'}
+            {"command": self._python("import os;print(os.path.isfile('marker.txt'))")}
         )
         self.assertEqual(result["exit_code"], 0)
         self.assertFalse(result["timed_out"])
         self.assertIn("True", result["stdout"])
 
     def test_a_failing_command_reports_its_status_rather_than_raising(self) -> None:
-        result = self.workspace.run_command(
-            {"command": f'"{sys.executable}" -c "raise SystemExit(3)"'}
-        )
+        result = self.workspace.run_command({"command": self._python("raise SystemExit(3)")})
         self.assertEqual(result["exit_code"], 3)
+        self.assertEqual(result["stderr"], "")
 
     def test_a_command_that_hangs_is_killed_at_the_timeout(self) -> None:
         result = self.workspace.run_command(
             {
-                "command": f'"{sys.executable}" -c "import time;time.sleep(30)"',
+                "command": self._python("import time;time.sleep(30)"),
                 "timeout_seconds": 1,
             }
         )

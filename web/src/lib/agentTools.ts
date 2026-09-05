@@ -3,7 +3,7 @@
 // advertises the workspace, and these definitions are sent alongside any
 // user-defined tools. Everything is confined to that directory server-side.
 import { postJson } from "./api";
-import type { PropsPayload, ToolDefinition } from "../types";
+import type { AgentPlatform, PropsPayload, ToolDefinition } from "../types";
 
 /** Shell commands are the one built-in that asks before it runs. */
 export const APPROVAL_TOOL = "run_command";
@@ -19,6 +19,10 @@ export function workspaceRoot(props: PropsPayload | null): string | null {
 
 export function hasWorkspace(props: PropsPayload | null): boolean {
   return Boolean(workspaceRoot(props));
+}
+
+export function workspacePlatform(props: PropsPayload | null): AgentPlatform | null {
+  return props?.agent_platform ?? null;
 }
 
 interface BuiltinTool {
@@ -42,7 +46,8 @@ const BUILTINS: BuiltinTool[] = [
   },
   {
     name: "read_file",
-    description: "Read a UTF-8 text file from the agent workspace. Long files come back truncated with a flag saying so.",
+    description:
+      "Read a text file from the agent workspace. Long files come back truncated with a flag saying so. Read a file before editing it: edit_file needs the exact text that is in it.",
     endpoint: "/agent/fs/read",
     parameters: {
       type: "object",
@@ -51,8 +56,25 @@ const BUILTINS: BuiltinTool[] = [
     },
   },
   {
+    name: "edit_file",
+    description:
+      "Replace an exact snippet of an existing file with new text. Prefer this over write_file for any change to a file that already exists: it leaves the rest of the file untouched. old_string must match the file exactly, including indentation, and must be unique unless replace_all is true — include surrounding lines to make it unique. Write both strings with plain \\n newlines; the file's own line endings are preserved.",
+    endpoint: "/agent/fs/edit",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File relative to the workspace root." },
+        old_string: { type: "string", description: "The exact text to replace, copied from the file." },
+        new_string: { type: "string", description: "The text to put in its place; empty to delete the snippet." },
+        replace_all: { type: "boolean", description: "Replace every occurrence instead of requiring a unique one." },
+      },
+      required: ["path", "old_string", "new_string"],
+    },
+  },
+  {
     name: "write_file",
-    description: "Create or overwrite a text file in the agent workspace, making parent directories as needed. Write the file's complete new contents.",
+    description:
+      "Create a file, or replace one whole file's contents, making parent directories as needed. Use edit_file to change part of an existing file. Write plain \\n newlines; an existing file keeps its own line endings and encoding.",
     endpoint: "/agent/fs/write",
     parameters: {
       type: "object",
@@ -66,7 +88,7 @@ const BUILTINS: BuiltinTool[] = [
   {
     name: APPROVAL_TOOL,
     description:
-      "Run a shell command in the agent workspace and return its exit code, stdout, and stderr. The user approves each command before it runs. Use it to build, test, search, or inspect.",
+      "Run a shell command in the agent workspace and return its exit code, stdout, and stderr. The user approves each command before it runs. Use it to build, test, search, or inspect. The shell is the host's own — the system prompt says which one, and the command must be written for it.",
     endpoint: "/agent/exec",
     parameters: {
       type: "object",
@@ -153,7 +175,13 @@ function formatResult(name: string, payload: Record<string, unknown>): string {
     const suffix = payload.truncated ? `\n[truncated: showing the first part of ${payload.size} bytes]` : "";
     return `${payload.content ?? ""}${suffix}`;
   }
-  if (name === "write_file") return `Wrote ${payload.bytes} bytes to ${payload.path}`;
+  if (name === "write_file") {
+    return `${payload.created ? "Created" : "Wrote"} ${payload.path} (${payload.bytes} bytes, ${payload.line_ending ?? "lf"} line endings)`;
+  }
+  if (name === "edit_file") {
+    const count = Number(payload.replacements ?? 0);
+    return `Replaced ${count} occurrence${count === 1 ? "" : "s"} in ${payload.path} (${payload.bytes} bytes)`;
+  }
   if (name === "list_dir") {
     const entries = (payload.entries as Array<{ name: string; kind: string; size?: number }>) ?? [];
     if (!entries.length) return `${payload.path} is empty`;
@@ -198,12 +226,44 @@ export function turnCapReason(turns: number, cap: number): string {
   return `The agent used its ${cap}-turn budget (${turns} model turns). Raise the turn cap in the Tools panel, or answer the call by hand below to keep going.`;
 }
 
+/**
+ * What the model needs to know about the machine it is working on. Without it
+ * a model defaults to Unix habits — `ls -la`, `grep -r`, `rm -rf`, forward
+ * slashes — and on a Windows host half of those fail or, worse, half-succeed.
+ * The server reports the shell it will actually spawn, so the prompt names it.
+ */
+function platformLines(platform: AgentPlatform): string[] {
+  const windows = platform.os === "windows";
+  const lines = [`The machine runs ${platform.os} and commands go to ${platform.shell}, so write every command in that shell's syntax.`];
+  if (windows && (platform.shell === "powershell" || platform.shell === "pwsh")) {
+    // The aliases are real, so say so: a model told only "this is Windows"
+    // reaches for cmd builtins like `dir /b` and `type`, which PowerShell
+    // parses differently.
+    lines.push(
+      "PowerShell aliases ls, cat, cp, mv, rm and pwd to its own cmdlets, so those work; grep, sed, awk and && do not. Use Select-String instead of grep and separate statements with ; instead of &&.",
+      // The single most common way an agent's first Windows command fails.
+      'Run a program whose path you had to quote with the call operator: & "C:\\path with spaces\\tool.exe" --flag. Without the &, PowerShell prints the path instead of running it.',
+    );
+  } else if (windows) {
+    lines.push("Use cmd.exe syntax: dir, type, copy, del, and %VAR% for variables.");
+  }
+  lines.push(
+    `Paths on this host use ${platform.path_separator === "\\" ? "backslashes" : "forward slashes"}, and the tools accept either; keep tool paths relative to the workspace root.`,
+  );
+  if (platform.line_ending === "crlf") {
+    lines.push("Files here tend to use CRLF line endings; write \\n in tool arguments and the server keeps each file's existing endings.");
+  }
+  return lines;
+}
+
 /** The system prompt an agent run prepends when the workspace tools exist. */
-export function agentSystemPrompt(root: string): string {
+export function agentSystemPrompt(root: string, platform?: AgentPlatform | null): string {
   return [
     `You are an agent working in the directory ${root} on the user's machine.`,
     "Use the provided tools to inspect and change files, run commands, and fetch URLs; every path is relative to that directory.",
+    ...(platform ? platformLines(platform) : []),
     "Work in small steps: look before you edit, and check your work by running something afterwards.",
+    "To change an existing file, read it and then call edit_file with an exact snippet; write_file replaces a whole file and is for new ones.",
     "When a command needs approval the user sees it first, so state what you are about to run and why.",
     "Stop and answer the user when the task is done or when you need a decision only they can make.",
   ].join(" ");
