@@ -1252,15 +1252,23 @@ class _ThinkingBudget:
     _OPEN_TAGS = THINKING_OPEN_TAGS
     _CLOSE_TAGS = THINKING_CLOSE_TAGS
 
-    def __init__(self, budget: int, thinking_open: bool):
+    def __init__(self, budget: int, thinking_open: bool, open_tag: str | None = None):
         self.budget = budget
         self.inside = thinking_open
         self.spent = 0
         self._window = ""
+        # Which tag opened the block that is currently live. K2-Horizon has
+        # three (<ifm|think>, _fast, _faster) and the generation prompt picks
+        # one from reasoning_effort, so a forced close has to write the
+        # matching closer -- not a fixed one, which leaves the block open as
+        # far as the model is concerned and re-renders under a different tag
+        # on the next turn.
+        self.open_tag = open_tag if thinking_open else None
 
     def close(self) -> None:
         """Record that the caller forced the block shut."""
         self.inside = False
+        self.open_tag = None
         self._window = ""
 
     def spend(self, delta: str) -> bool:
@@ -1276,6 +1284,7 @@ class _ThinkingBudget:
                 self._window = self._window[-(max_open_len - 1):]
                 return False
             self.inside = True
+            self.open_tag = matched_open
             self._window = self._window.split(matched_open, 1)[1]
         matched_close = None
         for close_tag in self._CLOSE_TAGS:
@@ -1284,6 +1293,7 @@ class _ThinkingBudget:
                 break
         if matched_close is not None:
             self.inside = False
+            self.open_tag = None
             self._window = self._window.split(matched_close, 1)[1]
             max_open_len = max(len(t) for t in self._OPEN_TAGS)
             self._window = self._window[-(max_open_len - 1):]
@@ -1329,7 +1339,7 @@ class ChatGenerator:
         # by the request history instead.
         self._chat_continuations: OrderedDict[ChatKey, ChatRecord] = OrderedDict()
         self._chat_continuation_capacity = 32
-        self._forced_close_ids: list[int] | None = None
+        self._forced_close_ids: dict[str, list[int]] | None = None
 
     # How long a request may hear nothing before its scheduling is checked on.
     # Generous: it costs one wakeup per request per interval and only ever
@@ -1640,30 +1650,51 @@ class ChatGenerator:
             final.state_tokens,
         )
 
-    def _thinking_close_ids(self) -> list[int]:
-        if self._forced_close_ids is None:
-            if getattr(self.tokenizer, "architecture", None) == "k2-horizon":
-                close_text = (
-                    "\n\nConsidering the limited time by the user, I have to give the "
-                    "solution based on the thinking directly now.\n</ifm|think>\n\n"
-                )
-            else:
-                close_text = THINKING_BUDGET_CLOSE
-            self._forced_close_ids = [
+    def _thinking_close_ids(self, open_tag: str | None = None) -> list[int]:
+        """The tokens that close a thinking block the caller is cutting short.
+
+        Keyed on the tag that opened it: closing `<ifm|think_faster>` with
+        `</ifm|think>` leaves the block unterminated for the model (which
+        keeps reasoning, and repeats itself) and makes the next turn's
+        template re-render the reply under a different tag -- which diverges
+        from the cached prefix and costs the whole prompt.
+        """
+        if getattr(self.tokenizer, "architecture", None) == "k2-horizon":
+            tag = open_tag if open_tag in THINKING_OPEN_TAGS else "<ifm|think>"
+            closer = "</" + tag[1:]
+            close_text = (
+                "\n\nConsidering the limited time by the user, I have to give the "
+                "solution based on the thinking directly now.\n" + closer + "\n\n"
+            )
+        else:
+            close_text = THINKING_BUDGET_CLOSE
+        cached = self._forced_close_ids
+        if not isinstance(cached, dict):
+            cached = {}
+            self._forced_close_ids = cached
+        if close_text not in cached:
+            cached[close_text] = [
                 int(token) for token in self.tokenizer.encode(close_text)
             ]
-        return self._forced_close_ids
+        return cached[close_text]
 
-    def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
-        """Whether the rendered prompt leaves the turn inside a think block."""
+    def _prompt_thinking_tag(self, prompt_ids: Sequence[int]) -> str | None:
+        """The open thinking tag the rendered prompt ends on, if any."""
         try:
             tail = self.tokenizer.decode(
                 list(prompt_ids[-16:]), skip_special_tokens=False
             )
         except Exception:
-            return False
+            return None
         tail = tail.rstrip()
-        return any(tail.endswith(tag) for tag in THINKING_OPEN_TAGS)
+        for tag in THINKING_OPEN_TAGS:
+            if tail.endswith(tag):
+                return tag
+        return None
+
+    def _prompt_opens_thinking(self, prompt_ids: Sequence[int]) -> bool:
+        """Whether the rendered prompt leaves the turn inside a think block."""
+        return self._prompt_thinking_tag(prompt_ids) is not None
 
     def _stream(
         self, prompt_ids: list[int], **options: object
@@ -1719,11 +1750,11 @@ class ChatGenerator:
         )
         if metered and (has_budget or interrupt is not None):
             opens = options.get("thinking_open")
+            prompt_tag = self._prompt_thinking_tag(prompt_ids)
             meter = _ThinkingBudget(
                 budget if has_budget else sys.maxsize,
-                self._prompt_opens_thinking(prompt_ids)
-                if opens is None
-                else bool(opens),
+                (prompt_tag is not None) if opens is None else bool(opens),
+                prompt_tag,
             )
         task_id, queue = self.engine.submit(
             prompt_ids,
@@ -1837,8 +1868,9 @@ class ChatGenerator:
                         )
                     self.engine.cancel(task_id)
                     self.engine.forget(task_id)
+                    open_tag = meter.open_tag
                     meter.close()
-                    for forced in self._thinking_close_ids():
+                    for forced in self._thinking_close_ids(open_tag):
                         generated.append(forced)
                         try:
                             forced_delta = utf8.decode(
