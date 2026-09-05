@@ -3851,6 +3851,12 @@ class InferenceService:
 # A client going away mid-connection. Never the server's fault, and never worth
 # a traceback: an agentic harness cancels turns and reaps pooled connections as
 # a matter of course.
+#
+# All three members matter, and which one arrives is the platform's choice:
+# POSIX raises BrokenPipeError or ConnectionResetError, Windows raises
+# ConnectionAbortedError (WinError 10053) for the same event. Catch this tuple,
+# never a subset of it -- a handler spelling out the POSIX pair turned every
+# cancelled request on Windows into a logged traceback and a 500.
 _PEER_GONE = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
 
 
@@ -4215,7 +4221,7 @@ def create_handler(
                 body()
             except APIError as error:
                 self._send_error(error)
-            except (BrokenPipeError, ConnectionResetError):
+            except _PEER_GONE:
                 self.close_connection = True
             except Exception:
                 self.log_error("unhandled request error: %s", traceback.format_exc())
@@ -4417,7 +4423,13 @@ def create_handler(
             except APIError as error:
                 self._drop_unread_body()
                 self._send_error(error)
-            except (BrokenPipeError, ConnectionResetError):
+            except _PEER_GONE:
+                # The work is done and nobody is left to read it -- an agent
+                # run stopped mid-command, a harness cancelling a turn. Worth
+                # a line under --verbose, because a tool call that reached the
+                # workspace and then vanished is otherwise unaccountable, but
+                # not an error: there is no failure here to report.
+                self.log_message("client disconnected before the response: %s", path)
                 self.close_connection = True
             except Exception:
                 # The client only ever sees "internal server error", so the
@@ -4719,7 +4731,7 @@ def create_handler(
                     self._fw_decode_phase = decode_phase
                 LOG.end_progress()
                 self.log_message("request completed: streaming events=%d", event_count)
-            except (BrokenPipeError, ConnectionResetError):
+            except _PEER_GONE:
                 stream_ok = False
                 self.close_connection = True
             except TimeoutError:
@@ -4749,7 +4761,7 @@ def create_handler(
                     # name and a data-only error never reached their handlers.
                     body = self._error_body(error)
                     self._write_sse_event(json.dumps(body), body)
-                except (BrokenPipeError, ConnectionResetError):
+                except _PEER_GONE:
                     stream_ok = False
                     self.close_connection = True
             except Exception as error:
@@ -4764,7 +4776,7 @@ def create_handler(
                         APIError(500, "internal server error", "server_error")
                     )
                     self._write_sse_event(json.dumps(body), body)
-                except (BrokenPipeError, ConnectionResetError):
+                except _PEER_GONE:
                     stream_ok = False
                     self.close_connection = True
             finally:
@@ -4775,7 +4787,7 @@ def create_handler(
                     try:
                         self.wfile.write(b"0\r\n\r\n")  # terminating chunk
                         self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
+                    except _PEER_GONE:
                         self.close_connection = True
 
         def _client_is_gone(self) -> bool:

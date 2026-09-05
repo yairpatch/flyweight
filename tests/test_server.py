@@ -4439,6 +4439,43 @@ class AgentEndpointTests(unittest.TestCase):
         response.read()
         self.assertEqual(response.getheader("Access-Control-Allow-Origin"), "*")
 
+    def test_a_client_that_vanishes_mid_response_is_not_a_server_error(self) -> None:
+        # An agent run stopped mid-command aborts its fetch, and the command
+        # finishes for nobody: the response write then fails. Windows raises
+        # ConnectionAbortedError (WinError 10053) where POSIX raises
+        # ConnectionResetError, and the handler caught only the POSIX pair --
+        # so on Windows every stopped run logged a traceback and answered
+        # "/agent/exec 500 internal server error" for a request the client had
+        # already walked away from.
+        service = InferenceService("qwen-local", StubGenerator())
+        service.agent_workspace = AgentWorkspace(self._workspace_dir())
+        connection = self._serve(service)
+        errors = StringIO()
+        with patch.object(
+            AgentWorkspace, "handle", side_effect=ConnectionAbortedError(10053, "aborted")
+        ), redirect_stderr(errors):
+            connection.request(
+                "POST",
+                "/agent/exec",
+                body=json.dumps({"command": "echo hi"}),
+                headers={"Content-Type": "application/json"},
+            )
+            # Nothing can be sent to a peer that is gone; the connection closes.
+            with self.assertRaises(http.client.HTTPException):
+                connection.getresponse().read()
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertNotIn("ConnectionAbortedError", errors.getvalue())
+        self.assertNotIn("internal server error", errors.getvalue())
+
+        # ...and the server is still serving.
+        fresh = http.client.HTTPConnection(
+            "127.0.0.1", connection.port, timeout=10
+        )
+        self.addCleanup(fresh.close)
+        response, body = self._post(fresh, "/agent/fs/list", {})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body)["path"], ".")
+
     def test_the_api_key_guards_the_agent_endpoints(self) -> None:
         service = InferenceService("qwen-local", StubGenerator(), api_key="secret")
         service.agent_workspace = AgentWorkspace(self._workspace_dir())
