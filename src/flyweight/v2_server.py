@@ -1375,8 +1375,8 @@ class ChatGenerator:
         if active <= 1:
             return
         log_notice(
-            f"queued: {prompt_tokens} prompt tokens waiting for a KV slot "
-            f"({active} requests in flight); raise --parallel to overlap them"
+            f"queued behind {active - 1} request(s): {prompt_tokens} prompt "
+            f"tokens waiting for a KV slot (--parallel overlaps them)"
         )
 
     def close(self) -> None:
@@ -1856,14 +1856,11 @@ class ChatGenerator:
                         # One interrupt closes one block; a checkpoint that
                         # reopens thinking afterwards gets to finish it.
                         interrupt.clear()
-                        log_notice(
-                            "thinking interrupted by the client; closing the "
-                            "block and resuming the answer"
-                        )
+                        log_notice("thinking interrupted; closing the block")
                     else:
                         log_notice(
                             f"thinking budget of {meter.budget} tokens spent; "
-                            "closing the block and resuming the answer"
+                            "closing the block"
                         )
                     self.engine.cancel(task_id)
                     self.engine.forget(task_id)

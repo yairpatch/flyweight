@@ -720,16 +720,20 @@ def _log_request_row(
     produced = str(out_tokens) if out_tokens else "--"
     speed = f"{rate:.1f}" if rate > 0 else "--"
     spent = f"{total:.1f}s" if total is not None else "--"
+    # A failure fills the same columns -- `--` where there is no number -- and
+    # puts its reason AFTER the table rather than through it. A message that
+    # started in the `out` column pushed every later column out of line, which
+    # is what made one bad request derail a screen of good ones.
     if status >= 400:
-        finish = paint(f"{status} {finish}", paint.RED if status >= 500 else paint.YELLOW)
-        # An error has no output columns to fill; let the reason use the room.
-        return (
-            f"{paint(f'{endpoint:<9}', paint.CYAN)} {prompt:>7} {share:>7}"
-            f" {first:>6}  {finish}"
-        )
+        colour = paint.RED if status >= 500 else paint.YELLOW
+        cell = paint(f"{status:<11}", colour, paint.BOLD)
+        trailing = "  " + paint(finish, colour)
+    else:
+        cell = paint(f"{finish:<11}", paint.DIM)
+        trailing = ""
     return (
         f"{paint(f'{endpoint:<9}', paint.CYAN)} {prompt:>7} {share:>7} {first:>6}"
-        f"  {produced:>6} {speed:>7}  {paint(f'{finish:<11}', paint.DIM)} {spent:>7}"
+        f"  {produced:>6} {speed:>7}  {cell} {spent:>7}{trailing}"
     )
 
 
@@ -761,12 +765,17 @@ def _log_progress_row(
 def log_notice(text: str) -> None:
     """A one-off remark from anywhere in the process.
 
-    The generator used to write these straight to stderr, which collided with
-    the progress line rewriting itself: "36.5 tok/s 56.0s thinking[gen ]
-    thinking budget of 2048 tokens spent". Through here they queue behind the
-    same lock and the progress line is cleared first.
+    Two things this fixes. The generator used to write these straight to
+    stderr, which collided with the progress line rewriting itself ("36.5
+    tok/s 56.0s thinking[gen ] thinking budget of 2048 tokens spent"); through
+    here they queue behind the same lock and the progress line is cleared
+    first. And a full-width sentence dropped between table rows breaks the
+    column the eye is following, so a notice is marked and indented to the
+    grid instead -- one glyph in the endpoint column, the text where the
+    numbers would start.
     """
-    LOG.line(LOG.paint(text, LOG.paint.DIM))
+    paint = LOG.paint
+    LOG.line(f"{paint(f'{chr(0x2022):<9}', paint.DIM)} {paint(text, paint.DIM)}")
 
 
 def _metrics_payload(metrics: _Metrics) -> dict[str, Any]:
