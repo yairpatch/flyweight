@@ -14,7 +14,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, ClassVar, Iterator, Mapping, Sequence
 
 try:  # optional: only used to keep the logits path off the Python interpreter
     import numpy as _numpy
@@ -302,9 +302,12 @@ class _QwenRuntimeOptions(ctypes.Structure):
 
 
 class _QwenRuntimeInfo(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_uint32)
-        for name in (
+    # Annotated because the mixed field types otherwise join to
+    # `tuple[str, object]`, which is not what the Structure base declares.
+    _fields_: ClassVar[Sequence[tuple[str, Any]]] = [
+        *(
+            (name, ctypes.c_uint32)
+            for name in (
             "layers",
             "deltanet_layers",
             "attention_layers",
@@ -319,7 +322,7 @@ class _QwenRuntimeInfo(ctypes.Structure):
             "mtp_drafts",
             "mtp_layer",
         )
-    ] + [
+        ),
         ("context_limit", ctypes.c_uint64),
         ("static_tensor_bytes", ctypes.c_uint64),
         ("expert_tensor_bytes", ctypes.c_uint64),
@@ -1272,7 +1275,7 @@ class BailingRuntime:
         self._model = model
         self._lib = model._lib
         self._handle = ctypes.c_void_p()
-        self._vocabulary = int(model.config["vocabulary_size"])
+        self._vocabulary = int(str(model.config["vocabulary_size"]))
         self._lib.flyweight_v2_bailing_create_slots.argtypes = [
             ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_void_p)

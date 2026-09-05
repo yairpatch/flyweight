@@ -123,7 +123,7 @@ class DsparkRuntime:
     def close(self) -> None:
         if getattr(self, "_handle", None):
             self._library.flyweight_v2_dspark_runtime_free(self._handle)
-            self._handle = None
+            self._handle = ctypes.c_void_p()
             self._model = None
 
     def __enter__(self):
@@ -270,12 +270,14 @@ class DsparkSession:
                 logits = self.forward_target(correction, logits=True)
 
     def close(self) -> None:
+        # Dropped rather than set to None so the attributes keep their runtime
+        # type; the getattr guards make a second close a no-op either way.
         if getattr(self, "draft", None) is not None:
             self.draft.close()
-            self.draft = None
+            del self.draft
         if getattr(self, "target", None) is not None:
             self.target.close()
-            self.target = None
+            del self.target
 
     def __enter__(self):
         return self

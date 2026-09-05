@@ -91,12 +91,17 @@ def sample_token(
     return int(generator.choice(order, p=probabilities))
 
 
+def _target_runtime(slot: "Deepseek4Runtime | DsparkSession") -> Deepseek4Runtime:
+    """The target-model runtime behind a slot, drafted or not."""
+    return slot.target if isinstance(slot, DsparkSession) else slot
+
+
 class _Slot:
     """One sequence's native state, plus the tokens it has consumed."""
 
     __slots__ = ("runtime", "tokens", "serial", "dirty")
 
-    def __init__(self, runtime: Deepseek4Runtime):
+    def __init__(self, runtime: "Deepseek4Runtime | DsparkSession"):
         self.runtime = runtime
         self.tokens: list[int] = []
         self.serial = 0
@@ -178,16 +183,16 @@ class Deepseek4Engine:
         if dspark_drafts < 0:
             raise ValueError("DSpark draft count must be non-negative")
         self.dspark_drafts = int(dspark_drafts)
-        self._slots = [
+        self._slots: list[Deepseek4Runtime | DsparkSession] = [
             DsparkSession(model, dspark_model, context_limit) if dspark_model is not None
             else Deepseek4Runtime(model, context_limit)
             for _ in range(slots)
         ]
         if device is not None:
-            owner = self._slots[0].target if dspark_model is not None else self._slots[0]
+            owner = _target_runtime(self._slots[0])
             owner.use_gpu(device)
             for runtime in self._slots[1:]:
-                (runtime.target if dspark_model is not None else runtime).share_gpu(owner)
+                _target_runtime(runtime).share_gpu(owner)
         self._pool = [_Slot(runtime) for runtime in self._slots]
         self._lock = threading.Lock()
         self._tasks: OrderedDict[int, _Task] = OrderedDict()
@@ -390,11 +395,11 @@ class Deepseek4Engine:
         if task.fed < len(task.prompt) - 1:
             end = min(task.fed + self._PREFILL_CHUNK, len(task.prompt) - 1)
             chunk = task.prompt[task.fed:end]
-            if dspark is None:
-                slot.runtime.prefill(chunk)
-            else:
+            if isinstance(slot.runtime, DsparkSession):
                 for token in chunk:
-                    dspark.forward_target(token, logits=False)
+                    slot.runtime.forward_target(token, logits=False)
+            else:
+                slot.runtime.prefill(chunk)
             slot.tokens.extend(chunk)
             task.fed = end
             self._emit(task, ("prefill", task.fed))
@@ -402,9 +407,9 @@ class Deepseek4Engine:
         current = (
             task.prompt[-1] if task.fed == len(task.prompt) - 1 else task.pending
         )
-        if dspark is not None:
+        if isinstance(slot.runtime, DsparkSession):
             if task.logits is None:
-                task.logits = dspark.forward_target(current)
+                task.logits = slot.runtime.forward_target(current)
                 slot.tokens.append(current)
             logits = task.logits
         else:
@@ -649,6 +654,9 @@ class NativeDeepseek4InferenceService(InferenceService):
             generation_defaults=generation_defaults,
         )
         self.generation_defaults_source = generation_defaults_source
+        # The base class holds it as the Generator protocol; this service also
+        # needs its engine and close(), which the protocol does not carry.
+        self.deepseek_generator = generator
         self.parallel_sequences = parallel_sequences
         self.device = device
         self.dspark_drafts = dspark_drafts
@@ -657,14 +665,14 @@ class NativeDeepseek4InferenceService(InferenceService):
         self._serialize_generation = False
 
     def close(self) -> None:
-        self.generator.close()
+        self.deepseek_generator.close()
         if self.dspark_model is not None:
             self.dspark_model.close()
         self.v2_model.close()
 
     def health(self) -> dict[str, object]:
         value = super().health()
-        runtime = self.generator.engine._pool[0].runtime
+        runtime = self.deepseek_generator.engine._pool[0].runtime
         target = runtime.target if isinstance(runtime, DsparkSession) else runtime
         value["execution"] = {
             "backend": (

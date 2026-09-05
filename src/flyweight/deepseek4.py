@@ -118,7 +118,7 @@ class Deepseek4Runtime:
     def close(self) -> None:
         if getattr(self, "_handle", None):
             self._library.flyweight_v2_deepseek4_runtime_free(self._handle)
-            self._handle = None
+            self._handle = ctypes.c_void_p()
             self._model = None
 
     def __del__(self):

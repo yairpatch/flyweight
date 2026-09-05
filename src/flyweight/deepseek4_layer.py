@@ -14,6 +14,7 @@ answer the runtime path gets built against, not to be that path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -108,6 +109,7 @@ class DeepSeek4Block:
         # A non-zero ratio moves the query and key rotation onto the compressed
         # frequency base with YaRN. This follows the reference rather than
         # measurement: at short prompt lengths the two are hard to tell apart.
+        self.rope_kwargs: dict[str, Any]
         if self.ratio:
             scale = 1.0 / float(config["rope_scaling_factor"])
             self.rope_kwargs = dict(

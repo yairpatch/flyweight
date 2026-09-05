@@ -9,7 +9,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Iterator, Mapping, Sequence, cast, overload
+from typing import Any, Iterator, Mapping, Sequence, cast, overload
 
 from jinja2 import Template, Undefined, nodes
 from jinja2.ext import Extension
@@ -771,7 +771,7 @@ class NativeV2Tokenizer:
 
     @staticmethod
     def _format_deepseek4(
-        messages: Sequence[Mapping[str, str]], *, enable_thinking: bool,
+        messages: Sequence[Mapping[str, Any]], *, enable_thinking: bool,
         preserve_thinking: bool | None = None,
     ) -> str:
         """Render the text-only core of DeepSeek-V4's GGUF chat template.
@@ -1124,7 +1124,7 @@ def _structured_digest(message: Mapping[str, object]) -> str:
     # Two turns rendering the same placeholder text differ when the picture
     # behind it differs, so the images' digests are part of the key too.
     images = message.get("images")
-    if images:
+    if isinstance(images, (list, tuple)) and images:
         parts.append([getattr(image, "digest", str(image)) for image in images])
     if not any(part for part in parts):
         return ""
@@ -1179,12 +1179,19 @@ def _messages_with_failed_images_noted(
     return out
 
 
+def _int_list(value: object) -> list[int]:
+    """A runtime info field that should be a token list, as ints; else empty."""
+    if isinstance(value, (list, tuple)):
+        return [int(t) for t in value]
+    return []
+
+
 def _message_images(messages: Sequence[Mapping[str, object]]) -> list[ImageInput]:
     """The images every message carries, in prompt order."""
     out: list[ImageInput] = []
     for message in messages:
         images = message.get("images") if isinstance(message, Mapping) else None
-        if images:
+        if isinstance(images, (list, tuple)):
             out.extend(image for image in images if isinstance(image, ImageInput))
     return out
 
@@ -1443,7 +1450,11 @@ class ChatGenerator:
                      if isinstance(message, Mapping) and message.get("tools")),
                     None,
                 )
-            options["tool_grammar"] = _tool_grammar_specification(declared)
+            options["tool_grammar"] = _tool_grammar_specification(
+                declared
+                if isinstance(declared, Sequence) and not isinstance(declared, str)
+                else None
+            )
         normalized = _chat_key(messages)
         prepared = options.get("prepared_prompt_ids")
         prompt_ids = (
@@ -1740,18 +1751,20 @@ class ChatGenerator:
         # meter is armed (with no limit) whenever there is an interrupt to
         # honor, purely to know whether the block is open.
         interrupt = options.get("stop_thinking")
-        if not callable(getattr(interrupt, "is_set", None)):
+        if not isinstance(interrupt, threading.Event):
             interrupt = None
-        meter = None
+        meter: _ThinkingBudget | None = None
         metered = getattr(self.tokenizer, "architecture", None) != "muse-glimmer"
-        has_budget = (
-            isinstance(budget, int) and not isinstance(budget, bool) and budget > 0
+        budget_tokens = (
+            budget
+            if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0
+            else None
         )
-        if metered and (has_budget or interrupt is not None):
+        if metered and (budget_tokens is not None or interrupt is not None):
             opens = options.get("thinking_open")
             prompt_tag = self._prompt_thinking_tag(prompt_ids)
             meter = _ThinkingBudget(
-                budget if has_budget else sys.maxsize,
+                budget_tokens if budget_tokens is not None else sys.maxsize,
                 (prompt_tag is not None) if opens is None else bool(opens),
                 prompt_tag,
             )
@@ -1843,7 +1856,7 @@ class ChatGenerator:
                     and interrupt is not None
                     and interrupt.is_set()
                 )
-                if exhausted or interrupted:
+                if meter is not None and (exhausted or interrupted):
                     # The budget is spent (or the client asked for the answer)
                     # with the block still open: force it closed and resume
                     # the answer on a fresh task whose prompt is everything
@@ -1852,7 +1865,7 @@ class ChatGenerator:
                     # restage where one exists. Named in the log because from
                     # outside, a capped think and a hung one look identical
                     # until the answer arrives.
-                    if interrupted:
+                    if interrupted and interrupt is not None:
                         # One interrupt closes one block; a checkpoint that
                         # reopens thinking afterwards gets to finish it.
                         interrupt.clear()
@@ -1997,8 +2010,8 @@ class NativeV2Generator(ChatGenerator):
             return None
         old_count = int(info.get("prefix_cache_last_old_count", 0))
         new_count = int(info.get("prefix_cache_last_new_count", 0))
-        old_ids = [int(t) for t in info.get("prefix_cache_last_old_tokens", [])]
-        new_ids = [int(t) for t in info.get("prefix_cache_last_new_tokens", [])]
+        old_ids = _int_list(info.get("prefix_cache_last_old_tokens"))
+        new_ids = _int_list(info.get("prefix_cache_last_new_tokens"))
         return {
             "slot": int(info.get("prefix_cache_last_slot", 0)),
             "cached_tokens": int(info.get("prefix_cache_last_cached_tokens", 0)),
@@ -2732,8 +2745,9 @@ class NativeV2InferenceService(InferenceService):
         generator_close = getattr(self.generator, "close", None)
         if callable(generator_close):
             generator_close()
-        if getattr(self, "bailing_runtime", None) is not None:
-            self.bailing_runtime.close()
+        bailing = getattr(self, "bailing_runtime", None)
+        if bailing is not None:
+            bailing.close()
             self.bailing_runtime = None
         if self.v2_runtime is not None:
             self.v2_runtime.close()
@@ -2743,14 +2757,15 @@ class NativeV2InferenceService(InferenceService):
     def health(self) -> dict[str, object]:
         # getattr rather than attribute access: tests construct this service
         # without running __init__, so the field may not exist.
-        if getattr(self, "bailing_runtime", None) is not None:
+        bailing = getattr(self, "bailing_runtime", None)
+        if bailing is not None:
             value = super().health()
             value["execution"] = {
                 "backend": "native-v2-bailingmoe3",
                 "architecture": self.architecture,
-                "device": "gpu" if self.bailing_runtime.uses_gpu else "cpu",
+                "device": "gpu" if bailing.uses_gpu else "cpu",
                 "parallel_sequences": int(
-                    getattr(self.bailing_runtime, "slot_count", 1)
+                    getattr(bailing, "slot_count", 1)
                 ),
             }
             return value
