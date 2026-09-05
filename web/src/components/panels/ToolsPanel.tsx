@@ -84,7 +84,8 @@ export function ToolsPanel() {
                 </>
               ) : null}
               <code>edit_file</code> replaces an exact snippet rather than rewriting the file, and both writers keep a file's existing line endings and
-              encoding — a CRLF file stays CRLF.
+              encoding — a CRLF file stays CRLF. <code>fetch_url</code> returns a page as readable text, and with a <code>query</code> only the
+              passages matching it, so one page cannot swallow the context window.
             </p>
           </>
         ) : (

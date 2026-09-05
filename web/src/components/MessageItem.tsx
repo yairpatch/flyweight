@@ -161,18 +161,18 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
   const approval = useStore((state) => (state.approval?.callId === call.id ? state.approval : null));
   const [result, setResult] = useState("");
   const answered = conversation?.messages.some((message) => message.role === "tool" && message.toolCallId === call.id);
-  const args = useMemo(() => prettyJson(call.arguments), [call.arguments]);
+  const parsed = useMemo(() => parseArguments(call.arguments), [call.arguments]);
+  const subject = parsed ? callSubject(parsed) : "";
 
   return (
     <div className={`tool${live ? " tool--live" : ""}${approval ? " tool--approval" : ""}`} dir="ltr">
       <div className="tool__head">
         <Wrench size={14} />
         <span className="tool__name">{call.name || "tool"}</span>
+        {subject && <span className="tool__subject">{subject}</span>}
         <span className="tool__id">{call.id}</span>
       </div>
-      <pre className="tool__args">
-        <code>{args}</code>
-      </pre>
+      <ToolArguments name={call.name} text={call.arguments} parsed={parsed} />
       {approval && <ApprovalPrompt command={approval.command} />}
       {executing && !answered && !approval && <div className="tool__answered">Running…</div>}
       {!live && !answered && !loopActive && isLast && (
@@ -198,6 +198,113 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
     </div>
   );
 }
+
+/** The call's arguments, when the model has finished writing them. */
+function parseArguments(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    const value: unknown = JSON.parse(trimmed);
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The one argument that says what a call is about, for the card's header. */
+function callSubject(args: Record<string, unknown>): string {
+  for (const key of ["path", "command", "url", "query"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return value.length > 90 ? `${value.slice(0, 90)}…` : value;
+  }
+  return "";
+}
+
+/**
+ * A call's arguments, shaped by what they are.
+ *
+ * Arguments stream in a character at a time, and a half-written JSON object
+ * has no formatting to give it: printing the partial text as it arrives is
+ * the wall of dense text a long file write looks like. So while it streams
+ * the card says how much has arrived and shows the tail; once the object
+ * parses it becomes fields, with the strings big enough to matter -- a file's
+ * new contents, an edit's two sides -- in their own blocks.
+ */
+function ToolArguments({ name, text, parsed }: { name: string; text: string; parsed: Record<string, unknown> | null }) {
+  const [open, setOpen] = useState(false);
+  if (!parsed) {
+    return (
+      <div className="tool__pending">
+        <span className="tool__pending-label">Writing arguments… {text.length} chars</span>
+        <code className="tool__pending-tail">{text.slice(-80)}</code>
+      </div>
+    );
+  }
+  const short = Object.entries(parsed).filter(([, value]) => typeof value !== "string" || value.length <= 120);
+  const long = Object.entries(parsed).filter(([, value]) => typeof value === "string" && value.length > 120) as [string, string][];
+  const edit = name.endsWith("edit_file") && typeof parsed.old_string === "string" && typeof parsed.new_string === "string";
+  return (
+    <div className="tool__args">
+      {short.length > 0 && (
+        <dl className="tool__fields">
+          {short.map(([key, value]) => (
+            <div className="tool__field" key={key}>
+              <dt>{key}</dt>
+              <dd>{typeof value === "string" ? value : JSON.stringify(value)}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {edit ? (
+        <div className="tool__diff">
+          <CodeBlock label="− old_string" text={String(parsed.old_string)} tone="del" />
+          <CodeBlock label="+ new_string" text={String(parsed.new_string)} tone="ins" />
+        </div>
+      ) : (
+        long.map(([key, value]) => <CodeBlock key={key} label={key} text={value} />)
+      )}
+      {(long.length > 0 || edit) && (
+        <button className="tool__raw-toggle" onClick={() => setOpen(!open)}>
+          {open ? "Hide raw JSON" : "Show raw JSON"}
+        </button>
+      )}
+      {open && (
+        <pre className="tool__raw">
+          <code>{prettyJson(text)}</code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
+/** A labelled block of text, folded down to its head when it is long. */
+function CodeBlock({ label, text, tone }: { label: string; text: string; tone?: "del" | "ins" }) {
+  const [open, setOpen] = useState(false);
+  const lines = text.split("\n");
+  const folded = !open && lines.length > FOLD_LINES;
+  const shown = folded ? lines.slice(0, FOLD_LINES).join("\n") : text;
+  return (
+    <figure className={`code-block${tone ? ` code-block--${tone}` : ""}`}>
+      <figcaption>
+        <span>{label}</span>
+        <span className="code-block__size">
+          {lines.length} line{lines.length === 1 ? "" : "s"} · {text.length} chars
+        </span>
+      </figcaption>
+      <pre>
+        <code>{shown}</code>
+      </pre>
+      {lines.length > FOLD_LINES && (
+        <button className="code-block__toggle" onClick={() => setOpen(!open)}>
+          {folded ? `Show all ${lines.length} lines` : "Collapse"}
+        </button>
+      )}
+    </figure>
+  );
+}
+
+/** Lines of a long block shown before it folds. */
+const FOLD_LINES = 14;
 
 /**
  * An agent run that stopped on these calls says why here. Without it the only
@@ -253,6 +360,11 @@ function ApprovalPrompt({ command }: { command: string }) {
 
 function ToolResult({ message }: { message: Message }) {
   const deleteMessage = useStore((state) => state.deleteMessage);
+  // A result is a file, a page, or a build log: it is long by nature, and
+  // printing it whole buries the conversation it belongs to. The head is
+  // almost always the part being read -- a listing's first entries, a
+  // command's first error -- so that is what stays open.
+  const text = prettyJson(message.content) || "(empty)";
   return (
     <article className="msg msg--tool" dir="ltr">
       <div className="msg__avatar" aria-hidden="true">
@@ -264,9 +376,7 @@ function ToolResult({ message }: { message: Message }) {
           <time className="msg__time">{formatTime(message.createdAt)}</time>
           {message.auto && <span className="msg__proto">auto</span>}
         </header>
-        <pre className="tool__args">
-          <code>{prettyJson(message.content) || "(empty)"}</code>
-        </pre>
+        <CodeBlock label={message.toolName ?? "result"} text={text} />
         <div className="msg__toolbar">
           <button className="icon-button icon-button--small" onClick={() => deleteMessage(message.id)} title="Delete" aria-label="Delete tool result">
             <Trash2 size={13} />

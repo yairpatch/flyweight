@@ -16,6 +16,7 @@ import traceback
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import collections.abc
@@ -294,6 +295,11 @@ class APIError(Exception):
 _AGENT_FILE_BYTES = 256 * 1024
 _AGENT_OUTPUT_BYTES = 64 * 1024
 _AGENT_FETCH_BYTES = 512 * 1024
+# What a fetched page is allowed to cost the model's context by default, and
+# the most it may ask for. The byte cap above is about what the server will
+# hold; this is about what a run can afford to carry for the rest of its life.
+_AGENT_FETCH_CHARS = 6000
+_AGENT_FETCH_CHARS_MAX = 40000
 _AGENT_LIST_ENTRIES = 500
 _AGENT_EXEC_TIMEOUT = 30.0
 _AGENT_EXEC_TIMEOUT_MAX = 300.0
@@ -363,6 +369,140 @@ def _agent_unclixml(text: str) -> str:
     return re.sub(
         r"_x([0-9A-Fa-f]{4})_", lambda match: chr(int(match.group(1), 16)), joined
     )
+
+
+class _AgentHTMLText(HTMLParser):
+    """A page's readable text, without the parts that are not reading matter.
+
+    A fetched page is mostly markup, navigation, and inline script; handing
+    all of it to the model spends the context window on things no question is
+    ever about. Dropping the non-content elements and keeping block structure
+    gets a typical article down by an order of magnitude before anything else
+    has to be decided.
+    """
+
+    _SKIP = {"script", "style", "noscript", "template", "svg", "canvas", "nav", "header", "footer", "aside", "form"}
+    _BLOCK = {
+        "p", "div", "section", "article", "br", "li", "tr", "td", "th",
+        "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "table", "ul", "ol",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.title = ""
+        self._skipping = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag in self._SKIP:
+            self._skipping += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP:
+            self._skipping = max(0, self._skipping - 1)
+        elif tag == "title":
+            self._in_title = False
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title += data.strip()
+        elif not self._skipping and data.strip():
+            self.parts.append(data)
+
+
+def _agent_html_text(html: str) -> tuple[str, str]:
+    """The title and readable text of a page, block structure preserved."""
+    parser = _AgentHTMLText()
+    with contextlib.suppress(Exception):
+        parser.feed(html)
+        parser.close()
+    text = "".join(parser.parts)
+    # Runs of spaces inside a line collapse; blank lines survive, because they
+    # are what separates one passage from the next below.
+    text = re.sub(r"[^\S\n]+", " ", text)
+    text = re.sub(r" ?\n ?", "\n", text)
+    return parser.title.strip(), re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _agent_passages(text: str) -> list[str]:
+    """The document as blocks, which is the unit relevance is judged in."""
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    return blocks or ([text.strip()] if text.strip() else [])
+
+
+def _agent_terms(query: str) -> list[str]:
+    """The words of a question worth matching on."""
+    stop = {
+        "the", "a", "an", "and", "or", "of", "to", "in", "is", "are", "was",
+        "were", "for", "on", "with", "what", "which", "how", "does", "do",
+        "did", "why", "when", "where", "who", "this", "that", "it", "its",
+        "from", "by", "at", "as", "be", "can", "i", "we", "you",
+    }
+    words = re.findall(r"[\w.#+-]{2,}", query.lower())
+    return [word for word in words if word not in stop]
+
+
+def _agent_select(text: str, query: str, budget: int, offset: int) -> tuple[str, bool]:
+    """The part of a document worth sending, and whether anything was left.
+
+    With a question, the passages that answer it are picked wherever they are
+    and stitched back in document order with the gaps marked, so the model
+    sees the paragraph it needs rather than the first screen of a page. With
+    no question there is nothing to rank by, so it is the document from
+    `offset` -- the model can ask for the next stretch by moving it.
+    """
+    body = text[offset:] if offset else text
+    if len(body) <= budget:
+        return body, offset > 0
+    terms = _agent_terms(query)
+    if not terms:
+        return body[:budget], True
+
+    passages = _agent_passages(body)
+    scored: list[tuple[float, int]] = []
+    for index, passage in enumerate(passages):
+        lowered = passage.lower()
+        hits = sum(lowered.count(term) for term in terms)
+        if not hits:
+            continue
+        distinct = sum(1 for term in terms if term in lowered)
+        # Distinct terms in one passage beat one term repeated: a paragraph
+        # holding every word of the question is the paragraph that answers it.
+        # Dividing by length keeps a whole page-sized block from winning on
+        # sheer volume.
+        scored.append((distinct * 10 + hits - len(passage) / 2000, index))
+    if not scored:
+        return body[:budget], True
+
+    scored.sort(reverse=True)
+    chosen: set[int] = set()
+    used = 0
+    for _, index in scored:
+        cost = len(passages[index]) + 2
+        if used + cost > budget:
+            continue
+        chosen.add(index)
+        used += cost
+    if not chosen:
+        return body[:budget], True
+
+    kept: list[str] = []
+    previous = -1
+    for index in sorted(chosen):
+        if index != previous + 1:
+            kept.append("[...]")
+        kept.append(passages[index])
+        previous = index
+    if previous != len(passages) - 1:
+        kept.append("[...]")
+    return "\n\n".join(kept), True
 
 
 def _agent_newline(text: str) -> str:
@@ -803,13 +943,33 @@ class AgentWorkspace:
             final_url = url
         except (urllib.error.URLError, OSError, ValueError) as error:
             raise APIError(400, f"cannot fetch url: {error}") from error
-        body, truncated = _agent_clip(data, _AGENT_FETCH_BYTES)
+        raw, over_cap = _agent_clip(data, _AGENT_FETCH_BYTES)
+        # A page is worth a paragraph of the model's context, not a quarter of
+        # it. Markup goes first, then the passages that answer the question the
+        # model came with; without a question it gets the head and can page.
+        title = ""
+        if "html" in (content_type or "") or raw.lstrip()[:1] == "<":
+            title, text = _agent_html_text(raw)
+        else:
+            text = raw
+        budget = int(min(max(_float_option(payload, "max_chars", _AGENT_FETCH_CHARS), 500), _AGENT_FETCH_CHARS_MAX))
+        offset = max(0, int(_float_option(payload, "offset", 0)))
+        query = payload.get("query")
+        query = query.strip() if isinstance(query, str) else ""
+        body, partial = _agent_select(text, query, budget, offset)
         return {
             "url": final_url,
             "status": status,
             "content_type": content_type,
+            "title": title,
             "body": body,
-            "truncated": truncated,
+            "chars": len(body),
+            "total_chars": len(text),
+            # Where reading on would start, so a model paging through a long
+            # document does not have to work the arithmetic out itself.
+            "next_offset": offset + len(body),
+            "selection": "query" if query and partial else "head",
+            "truncated": partial or over_cap,
         }
 
 

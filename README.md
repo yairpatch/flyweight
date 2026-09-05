@@ -554,7 +554,13 @@ written back — an edit to an ANSI file stays ANSI unless the new text needs
 characters that code page has no room for.
 `/agent/fs/edit` takes `old_string`/`new_string` (plus `replace_all`) and
 refuses an edit it cannot place exactly once, which is a wasted turn rather
-than a mangled file. Commands run in PowerShell on Windows — so `ls`, `cat`
+than a mangled file. `/agent/fetch` returns a page's readable text with the
+markup, scripts, and navigation stripped, and only as much of it as a run can
+afford: 6000 characters by default (`max_chars`, up to 40000). Passing
+`query` returns the passages that match it, in document order with the gaps
+marked, instead of the top of the page; `offset` and the reply's
+`next_offset` page through a long document. Without it one fetch of an
+ordinary page costs more context than the rest of the run put together. Commands run in PowerShell on Windows — so `ls`, `cat`
 and `rm` work — with the error stream decoded out of PowerShell's CLIXML,
 the exit code preserved, and the whole process tree killed on timeout. Set
 `FLYWEIGHT_AGENT_SHELL` to a shell command line (for example `cmd`, `bash`,

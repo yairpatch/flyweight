@@ -101,11 +101,17 @@ const BUILTINS: BuiltinTool[] = [
   },
   {
     name: "fetch_url",
-    description: "Fetch an http(s) URL from the server and return its status and body text. Not subject to browser CORS.",
+    description:
+      "Fetch an http(s) URL from the server and return its readable text with the markup, navigation and scripts stripped. Not subject to browser CORS. Always pass query: a page is far larger than the answer you want from it, and query makes the server send back the passages that match instead of the top of the page. Raise max_chars only when you truly need more, or page through a long document with offset.",
     endpoint: "/agent/fetch",
     parameters: {
       type: "object",
-      properties: { url: { type: "string", description: "The absolute http or https URL." } },
+      properties: {
+        url: { type: "string", description: "The absolute http or https URL." },
+        query: { type: "string", description: "What you are looking for on the page, in words that would appear in it." },
+        max_chars: { type: "number", description: "Characters of text to return (default 6000, max 40000)." },
+        offset: { type: "number", description: "Skip this many characters first; use it to read on where the last call stopped." },
+      },
       required: ["url"],
     },
   },
@@ -199,7 +205,17 @@ function formatResult(name: string, payload: Record<string, unknown>): string {
     return parts.join("\n");
   }
   if (name === "fetch_url") {
-    return `HTTP ${payload.status} ${payload.content_type ?? ""}\n\n${payload.body ?? ""}${payload.truncated ? "\n[truncated]" : ""}`;
+    const head = [`HTTP ${payload.status} ${payload.content_type ?? ""}`.trim(), payload.title ? String(payload.title) : ""].filter(Boolean).join(" — ");
+    // Saying what was left behind, and how to reach it, is what keeps the
+    // model from re-fetching the same page to look for the rest.
+    const total = Number(payload.total_chars ?? 0);
+    const shown = Number(payload.chars ?? 0);
+    const note = payload.truncated
+      ? payload.selection === "query"
+        ? `\n\n[showing the passages matching your query: ${shown} of ${total} characters. Raise max_chars or drop the query for more.]`
+        : `\n\n[showing ${shown} of ${total} characters. Call again with offset ${payload.next_offset ?? shown} for the next part, or pass a query to jump to what you need.]`
+      : "";
+    return `${head}\n\n${payload.body ?? ""}${note}`;
   }
   return JSON.stringify(payload, null, 2);
 }

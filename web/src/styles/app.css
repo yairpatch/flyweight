@@ -956,14 +956,130 @@ kbd {
   font-size: 11px;
   color: var(--text-3);
 }
+.tool__subject {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .tool__args {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   margin: 0;
   padding: 10px 12px;
   font-size: 12.5px;
   line-height: 1.5;
+}
+/* Arguments still streaming: a length and a tail, not a growing wall. */
+.tool__pending {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.tool__pending-tail {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+}
+.tool__fields {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+}
+.tool__field {
+  display: flex;
+  gap: 8px;
+}
+.tool__field dt {
+  font-family: var(--mono);
+  color: var(--text-3);
+  flex: none;
+  min-width: 84px;
+}
+.tool__field dd {
+  margin: 0;
+  font-family: var(--mono);
+  color: var(--text);
+  word-break: break-word;
+}
+.tool__diff {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tool__raw-toggle,
+.code-block__toggle {
+  align-self: flex-start;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--text-3);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.tool__raw-toggle:hover,
+.code-block__toggle:hover {
+  color: var(--text);
+}
+.tool__raw {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  font-size: 12px;
   overflow-x: auto;
+}
+
+/* A labelled block of tool text: a file, a page, a command's output. */
+.code-block {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  overflow: hidden;
+}
+.code-block figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.code-block__size {
+  flex: none;
+}
+.code-block pre {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 420px;
+  overflow: auto;
+  font-size: 12.5px;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.code-block__toggle {
+  padding: 4px 10px 6px;
+}
+.code-block--del figcaption {
+  color: var(--danger);
+}
+.code-block--ins figcaption {
+  color: var(--success);
 }
 .tool__reply {
   border-top: 1px solid var(--border);

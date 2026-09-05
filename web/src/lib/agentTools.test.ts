@@ -157,6 +157,32 @@ describe("runBuiltinTool", () => {
     expect(result.result).toBe("Created new.txt (12 bytes, lf line endings)");
   });
 
+  it("says what a page's extract left out and how to reach the rest", async () => {
+    respondWith({
+      url: "https://example.com/docs",
+      status: 200,
+      content_type: "text/html",
+      title: "Widget docs",
+      body: "The timeout is eight seconds.",
+      chars: 29,
+      total_chars: 40000,
+      next_offset: 29,
+      selection: "query",
+      truncated: true,
+    });
+    const result = await runBuiltinTool("fetch_url", '{"url":"https://example.com/docs","query":"timeout"}');
+    expect(result.result).toContain("Widget docs");
+    expect(result.result).toContain("The timeout is eight seconds.");
+    expect(result.result).toContain("passages matching your query: 29 of 40000");
+  });
+
+  it("offers the next offset when it sent the head of a long page", async () => {
+    respondWith({ status: 200, content_type: "text/plain", body: "x", chars: 6000, total_chars: 20000, next_offset: 6000, selection: "head", truncated: true });
+    const result = await runBuiltinTool("fetch_url", '{"url":"https://example.com/log"}');
+    expect(result.result).toContain("offset 6000");
+    expect(result.result).toContain("pass a query");
+  });
+
   it("hands malformed arguments back to the model instead of calling the server", async () => {
     const fetchMock = respondWith({});
     const result = await runBuiltinTool("write_file", "{not json");

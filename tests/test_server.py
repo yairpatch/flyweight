@@ -4315,6 +4315,42 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.workspace.fetch_url({"url": "file:///etc/passwd"})
         self.assertEqual(caught.exception.status, 400)
 
+    def test_a_page_is_read_for_its_text_not_its_markup(self) -> None:
+        from flyweight.server import _agent_html_text
+
+        title, text = _agent_html_text(
+            "<html><head><title>Widget</title><style>b{color:red}</style></head>"
+            "<body><nav>Home About</nav><script>var x=1;</script>"
+            "<h1>Widget</h1><p>The timeout is in seconds.</p>"
+            "<footer>&copy; 2026</footer></body></html>"
+        )
+        self.assertEqual(title, "Widget")
+        self.assertIn("The timeout is in seconds.", text)
+        for noise in ("var x", "color:red", "Home About", "2026"):
+            self.assertNotIn(noise, text)
+
+    def test_a_long_page_comes_back_as_the_part_that_was_asked_about(self) -> None:
+        # The failure this prevents: one fetch of an ordinary page filling the
+        # context window, so every later step of the run is compacted away.
+        from flyweight.server import _agent_select
+
+        filler = "\n\n".join(f"Paragraph {index} about unrelated things." * 10 for index in range(60))
+        answer = "The timeout option waits eight seconds before giving up."
+        document = f"{filler}\n\n{answer}\n\n{filler}"
+        body, partial = _agent_select(document, "how long is the timeout", 600, 0)
+        self.assertIn(answer, body)
+        self.assertLessEqual(len(body), 600)
+        self.assertTrue(partial)
+        self.assertIn("[...]", body)
+        # No question to rank by: the head of the document, and an offset to
+        # read on from.
+        head, partial = _agent_select(document, "", 200, 0)
+        self.assertTrue(document.startswith(head))
+        self.assertTrue(partial)
+        self.assertTrue(_agent_select(document, "", 200, 200)[0].startswith(document[200:220]))
+        # Short enough to send whole: nothing is cut and nothing is claimed.
+        self.assertEqual(_agent_select("all of it", "anything", 600, 0), ("all of it", False))
+
     def test_an_unknown_agent_path_is_a_404(self) -> None:
         with self.assertRaises(APIError) as caught:
             self.workspace.handle("/agent/rm-rf", {})
