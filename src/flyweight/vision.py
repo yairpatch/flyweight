@@ -8,7 +8,7 @@ the placeholder to that many pad tokens, and hands the resized, normalized
 pixels to the runtime beside the prompt.
 
 Pillow does the decoding and resizing; it is an optional dependency
-(``pip install flyweight[vision]``) so a text-only install carries nothing
+(``pip install flyweight-llm[vision]``) so a text-only install carries nothing
 extra.
 """
 from __future__ import annotations
@@ -163,7 +163,7 @@ class ImagePreprocessor:
             from PIL import Image
         except ImportError:
             raise ImageError(
-                "image input needs Pillow: pip install 'flyweight[vision]'"
+                "image input needs Pillow: pip install 'flyweight-llm[vision]'"
             ) from None
         try:
             with Image.open(io.BytesIO(image.data)) as opened:
