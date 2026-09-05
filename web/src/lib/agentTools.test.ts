@@ -6,6 +6,7 @@ import {
   missingHandlerReason,
   needsApproval,
   runBuiltinTool,
+  turnBudgetNote,
   turnCapReason,
 } from "./agentTools";
 
@@ -122,12 +123,13 @@ describe("agentSystemPrompt", () => {
     expect(prompt).not.toContain("- fetch_url:");
   });
 
-  it("tells the run how much budget is left when there is a cap", () => {
-    expect(agentSystemPrompt({ root: "/w", turn: 1, turnCap: 8 })).toContain("7 tool-calling turns left");
-    expect(agentSystemPrompt({ root: "/w", turn: 7, turnCap: 8 })).toContain("1 tool-calling turn left");
-    // Spent, or unknown: nothing to promise.
-    expect(agentSystemPrompt({ root: "/w", turn: 8, turnCap: 8 })).not.toContain("turns left");
-    expect(agentSystemPrompt({ root: "/w" })).not.toContain("turns left");
+  it("states the budget as a fixed fact, so the prompt is byte-identical every turn", () => {
+    // The countdown lives in turnBudgetNote at the request's tail; a number
+    // that changed here would invalidate the server's cached prefix per turn.
+    const prompt = agentSystemPrompt({ root: "/w", turnCap: 8 });
+    expect(prompt).toContain("budget of 8 tool-calling turns");
+    expect(prompt).toContain("note under the newest message");
+    expect(agentSystemPrompt({ root: "/w" })).not.toContain("budget");
   });
 
   it("still works when the server reports no platform", () => {
@@ -135,6 +137,15 @@ describe("agentSystemPrompt", () => {
     expect(prompt).toContain("/srv/work");
     expect(prompt).toContain("edit_file");
     expect(prompt).not.toContain("HOST");
+  });
+});
+
+describe("turnBudgetNote", () => {
+  it("counts down what the system prompt only promises", () => {
+    expect(turnBudgetNote(1, 8)).toBe("[7 tool-calling turns left in this run.]");
+    expect(turnBudgetNote(7, 8)).toBe("[1 tool-calling turn left in this run.]");
+    // Spent: nothing to promise.
+    expect(turnBudgetNote(8, 8)).toBe("");
   });
 });
 

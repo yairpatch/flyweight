@@ -173,7 +173,12 @@ function clipRecent(outcome: CompactionOutcome, current: number, budget: number)
   return { messages, removedChars, stubbed, dropped };
 }
 
-/** What the model is told about the gap, appended to the run's system prompt. */
+/**
+ * What the model is told about the gap. It changes as compaction deepens, so
+ * the request appends it after the newest message rather than to the system
+ * prompt, where every wording change would invalidate the server's cached
+ * prefix from the first token.
+ */
 export function compactionNote(outcome: CompactionOutcome): string {
   if (!outcome.removedChars) return "";
   const parts: string[] = [];

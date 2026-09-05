@@ -14,6 +14,7 @@ import {
   missingHandlerReason,
   needsApproval,
   runBuiltinTool,
+  turnBudgetNote,
   turnCapReason,
   workspacePlatform,
   workspaceRoot,
@@ -471,7 +472,6 @@ export const useStore = create<StoreState>()((set, get) => {
           root: workspace,
           platform: workspacePlatform(state.props),
           tools: requestTools.filter((tool) => tool.enabled).map((tool) => tool.name),
-          turn: agentTurn,
           turnCap: state.settings.agentMaxTurns,
         })
       : "";
@@ -514,11 +514,22 @@ export const useStore = create<StoreState>()((set, get) => {
     const controller = new AbortController();
     set({ generating: { conversationId, messageId: assistant.id, controller }, agentPause: null });
 
-    const prelude = [agentPrompt, note, state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n");
+    const prelude = [agentPrompt, state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n");
     const settings = prelude === state.settings.systemPrompt ? state.settings : { ...state.settings, systemPrompt: prelude };
+
+    // Text that changes from turn to turn — the budget countdown, the note
+    // about what compaction removed — rides after the newest message. The
+    // system prompt is the prefix the server's cache matches against, so a
+    // per-turn number there would re-prefill the whole transcript every turn.
+    const tailNote = [note, workspace ? turnBudgetNote(agentTurn, state.settings.agentMaxTurns) : ""].filter(Boolean).join("\n\n");
+    const last = compacted.messages[compacted.messages.length - 1];
+    const requestMessages =
+      tailNote && last
+        ? [...compacted.messages.slice(0, -1), { ...last, content: `${last.content}\n\n${tailNote}` }]
+        : compacted.messages;
     const body = buildRequest(protocol, {
       model: state.model || state.health?.model || "local",
-      messages: compacted.messages,
+      messages: requestMessages,
       settings,
       tools: requestTools,
     });

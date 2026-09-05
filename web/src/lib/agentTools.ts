@@ -315,8 +315,7 @@ export interface AgentPromptContext {
   platform?: AgentPlatform | null;
   /** Tool names being sent with this request, built-in and user-defined. */
   tools?: string[];
-  /** Model turns already spent in this run, and the cap that will stop it. */
-  turn?: number;
+  /** The turn cap that will stop the run. */
   turnCap?: number;
 }
 
@@ -333,7 +332,7 @@ export interface AgentPromptContext {
  * description of the job.
  */
 export function agentSystemPrompt(context: AgentPromptContext): string {
-  const { root, platform, tools = [], turn, turnCap } = context;
+  const { root, platform, tools = [], turnCap } = context;
   const sections: string[] = [
     [
       `You are a coding agent working in ${root} on the user's machine.`,
@@ -371,9 +370,25 @@ export function agentSystemPrompt(context: AgentPromptContext): string {
   );
 
   // A model that knows its budget spends it on the task; one that does not
-  // explores until the cap stops it mid-step.
-  if (turnCap && turn && turnCap > turn) {
-    sections.push(`You have ${turnCap - turn} tool-calling turn${turnCap - turn === 1 ? "" : "s"} left in this run. When they run short, finish what matters most and report where you got to.`);
+  // explores until the cap stops it mid-step. Only the cap goes here: this
+  // prompt is the prefix of every request in the run, and the server's prefix
+  // cache dies at the first changed token, so the number that changes each
+  // turn rides at the tail of the messages instead (turnBudgetNote).
+  if (turnCap) {
+    sections.push(
+      `This run has a budget of ${turnCap} tool-calling turns; a note under the newest message counts down how many are left. When they run short, finish what matters most and report where you got to.`,
+    );
   }
   return sections.join("\n\n");
+}
+
+/**
+ * The countdown appended after the newest message of each request. It changes
+ * every turn, which is why it lives at the tail — the only place in the
+ * request where changed text costs no cached prefix.
+ */
+export function turnBudgetNote(turn: number, turnCap: number): string {
+  const left = turnCap - turn;
+  if (left <= 0) return "";
+  return `[${left} tool-calling turn${left === 1 ? "" : "s"} left in this run.]`;
 }
