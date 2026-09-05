@@ -18,6 +18,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import collections.abc
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, overload
 from urllib.parse import unquote, urlsplit
 
@@ -83,6 +84,8 @@ class Tokenizer(Protocol):
         messages: Sequence[Mapping[str, str]],
         *,
         enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
+        preserve_thinking: bool | None = None,
     ) -> list[int]: ...
     def decode(
         self, tokens: list[int], *, skip_special_tokens: bool = True
@@ -1432,20 +1435,20 @@ class InferenceService:
         if scanner is not None and scanner.matched is not None:
             # A stop sequence ended the turn; the generator was cancelled, so
             # the last decoded step is the turn's extent.
-            step = final_step or last_step
-            if step is None:
+            extent = final_step or last_step
+            if extent is None:
                 raise RuntimeError("generation stream ended without a final result")
             yield _Finished(
                 "stop",
-                len(step.prompt_ids),
-                len(step.generated_ids),
+                len(extent.prompt_ids),
+                len(extent.generated_ids),
                 stop_sequence=scanner.matched,
                 result=GenerationResult(
-                    prompt_ids=tuple(step.prompt_ids),
-                    generated_ids=tuple(step.generated_ids),
+                    prompt_ids=tuple(extent.prompt_ids),
+                    generated_ids=tuple(extent.generated_ids),
                     text="".join(text_parts),
                     stopped_on_eos=False,
-                    state_tokens=step.state_tokens,
+                    state_tokens=extent.state_tokens,
                 ),
             )
             return
@@ -1717,7 +1720,7 @@ class InferenceService:
         streamed_tail: list[str] = []
         produced_tool_call = bool(tool_calls)
         streamed = tool_streamer is not None and tool_streamer.started
-        if streamed:
+        if tool_streamer is not None and streamed:
             # Reconcile: whatever was streamed is a prefix of the
             # authoritative arguments, and this closes the difference. A call
             # that failed to parse still gets its JSON closed so the client is
@@ -3207,7 +3210,9 @@ class FlyweightHTTPServer(ThreadingHTTPServer):
                 pass
         super().server_close()
 
-    def handle_error(self, request: object, client_address: object) -> None:
+    def handle_error(
+        self, request: socket.socket | tuple[bytes, socket.socket], client_address: Any
+    ) -> None:
         """Report a failed request, but stay quiet about disconnects.
 
         socketserver's default prints a stack trace for anything that escapes
@@ -3224,7 +3229,7 @@ _SSE_KEEPALIVE = object()
 
 def _sse_with_keepalive(
     events: Iterator[dict[str, Any] | str], interval: float
-) -> Iterator[object]:
+) -> collections.abc.Generator[object, None, None]:
     """Yield the upstream events, injecting _SSE_KEEPALIVE while they stall.
 
     Evaluating a long prompt holds the generator for minutes before the first
@@ -4965,7 +4970,7 @@ def _parse_tool_calls(
         decoded.append((name, arguments, ""))
     for block in DSML_TOOL_CALL_BLOCK_PATTERN.finditer(text):
         for invoke in DSML_INVOKE_PATTERN.finditer(block.group(1)):
-            arguments: dict[str, Any] = {}
+            arguments = {}
             for parameter in DSML_PARAMETER_PATTERN.finditer(invoke.group(2)):
                 key, string_flag, raw = parameter.groups()
                 if string_flag == "true":
@@ -6096,7 +6101,7 @@ def _decode_tool_call_body(body: str) -> tuple[str | None, dict[str, Any]]:
         return (name or None), arguments
     function_match = TOOL_FUNCTION_PATTERN.search(body)
     if function_match:
-        arguments: dict[str, Any] = {}
+        arguments = {}
         for parameter in TOOL_PARAMETER_PATTERN.finditer(body):
             # Kept as text. Typing it here would have to guess, and guessing
             # JSON turns file content that happens to parse (a .json edit, a

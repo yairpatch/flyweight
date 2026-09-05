@@ -16,7 +16,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .server import serve as serve_http
-from .v2 import AUTO_PROMPT_CACHE_MIB as _AUTO_PROMPT_CACHE_MIB, V2Error, V2Model
+from .v2 import (
+    AUTO_PROMPT_CACHE_MIB as _AUTO_PROMPT_CACHE_MIB, V2Error, V2Model, V2QwenRuntime,
+)
 
 
 EXPERT_MODE_CHOICES = (
@@ -1244,7 +1246,7 @@ def _prompt_tokens(model: V2Model, args: argparse.Namespace) -> list[int]:
 
 
 def _benchmark_native_generate(
-    runtime: object, prompt: list[int], tokens: int,
+    runtime: V2QwenRuntime, prompt: list[int], tokens: int,
 ) -> tuple[list[int], list[float], float]:
     """Time one complete generate call, retaining callback arrival times.
 
@@ -1302,7 +1304,7 @@ def _benchmark(args: argparse.Namespace) -> int:
             from .v2 import BailingRuntime
 
             started = time.perf_counter()
-            runtime = BailingRuntime(model, capacity=args.context)
+            bailing = BailingRuntime(model, capacity=args.context)
             prepare_seconds = time.perf_counter() - started
             try:
                 sampling = SimpleNamespace(
@@ -1310,11 +1312,11 @@ def _benchmark(args: argparse.Namespace) -> int:
                     top_p=args.top_p, seed=None,
                 )
                 all_generated, arrivals, total_seconds = _benchmark_bailing_generate(
-                    runtime, prompt, 1 + args.warmup + args.iterations, sampling,
+                    bailing, prompt, 1 + args.warmup + args.iterations, sampling,
                 )
             finally:
-                runtime.close()
-            info = {"expert_mode": "bailing-gpu-or-host"}
+                bailing.close()
+            info: dict[str, object] = {"expert_mode": "bailing-gpu-or-host"}
             request_counters = None
         else:
             options = _runtime_options(args)

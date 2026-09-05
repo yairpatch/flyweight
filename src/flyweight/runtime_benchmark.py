@@ -22,9 +22,9 @@ from typing import Any, TextIO
 # benchmark harness -- and the `flyweight benchmark` command that imports it --
 # fail on Windows with ModuleNotFoundError before running anything.
 if os.name == "nt":
-    resource = None
+    resource: Any = None
 else:
-    import resource  # type: ignore[no-redef]
+    import resource  # type: ignore[no-redef,assignment]
 
 from .v2 import V2Model
 
