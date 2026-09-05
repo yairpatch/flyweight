@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { builtinToolDefinitions, isBuiltinTool, runBuiltinTool } from "./agentTools";
+import { builtinToolDefinitions, isBuiltinTool, missingHandlerReason, needsApproval, runBuiltinTool, turnCapReason } from "./agentTools";
 
 function respondWith(payload: unknown, ok = true) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
@@ -30,6 +30,43 @@ describe("builtinToolDefinitions", () => {
       expect(isBuiltinTool(tool.name)).toBe(true);
     }
     expect(isBuiltinTool("get_weather")).toBe(false);
+  });
+});
+
+describe("name matching", () => {
+  it("recognizes a namespaced or padded call as the same built-in", async () => {
+    expect(isBuiltinTool("functions.list_dir")).toBe(true);
+    expect(isBuiltinTool(" read_file\n")).toBe(true);
+    expect(isBuiltinTool("functions.get_weather")).toBe(false);
+    const fetchMock = respondWith({ path: "a.txt", content: "hi", size: 2, truncated: false });
+    const result = await runBuiltinTool("functions.read_file", '{"path":"a.txt"}');
+    expect(result).toEqual({ ok: true, result: "hi" });
+    expect(fetchMock.mock.calls[0][0]).toBe("/agent/fs/read");
+  });
+
+  it("still asks for approval when the shell tool is namespaced", () => {
+    expect(needsApproval("functions.run_command")).toBe(true);
+    expect(needsApproval("run_command")).toBe(true);
+    expect(needsApproval("read_file")).toBe(false);
+  });
+});
+
+describe("pause reasons", () => {
+  it("names the missing server flag when the model asked for a workspace tool", () => {
+    const reason = missingHandlerReason(["list_dir"], false);
+    expect(reason).toContain("list_dir is a workspace tool");
+    expect(reason).toContain("--agent-workspace DIR");
+  });
+
+  it("points at the Tools panel when a user tool has no handler", () => {
+    const reason = missingHandlerReason(["get_weather"], true);
+    expect(reason).toContain("get_weather");
+    expect(reason).toContain("no JavaScript handler");
+    expect(reason).not.toContain("--agent-workspace");
+  });
+
+  it("says what the turn cap was", () => {
+    expect(turnCapReason(8, 8)).toContain("8-turn budget");
   });
 });
 

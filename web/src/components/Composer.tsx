@@ -17,6 +17,12 @@ const REASONING_CYCLE: Array<{ thinking: boolean; effort: ReasoningEffort; label
   { thinking: true, effort: "xhigh", label: "Thinking · xhigh" },
 ];
 
+/** Last segment of the workspace path, for the chip; the tooltip has the rest. */
+function folderName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
 export function Composer() {
   const draft = useStore((state) => state.draft);
   const setDraft = useStore((state) => state.setDraft);
@@ -194,10 +200,10 @@ export function Composer() {
                 title={
                   workspace
                     ? `Agent run in ${workspace}: files, shell (with approval), and fetch, up to ${settings.agentMaxTurns} turns`
-                    : `Agent run: tool calls run through their handlers automatically, up to ${settings.agentMaxTurns} turns`
+                    : `No agent workspace: only tools with a JavaScript handler can run. Restart the server with --agent-workspace DIR for files, shell, and fetch. Up to ${settings.agentMaxTurns} turns.`
                 }
               >
-                <Bot size={13} /> Agent · {settings.agentMaxTurns} turns
+                <Bot size={13} /> Agent · {workspace ? folderName(workspace) : "no workspace"}
               </button>
             )}
             {settings.responseFormat !== "text" && (

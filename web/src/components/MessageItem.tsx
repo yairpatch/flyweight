@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { Ban, Bot, Brain, Check, Copy, Pencil, RefreshCw, ShieldAlert, Trash2, User, Wrench, AlertTriangle, ChevronRight, Play } from "lucide-react";
+import { Ban, Bot, Brain, Check, Copy, PauseCircle, Pencil, RefreshCw, ShieldAlert, Trash2, User, Wrench, AlertTriangle, ChevronRight, Play } from "lucide-react";
 import type { Message, ToolCall } from "../types";
 import { useStore } from "../store";
 import { StreamingMarkdown } from "./Markdown";
@@ -80,6 +80,7 @@ export const MessageItem = memo(function MessageItem({ message, previous, isLast
         {message.toolCalls?.map((call) => (
           <ToolCallCard key={call.id} call={call} messageId={message.id} live={generating} isLast={isLast} />
         ))}
+        {message.toolCalls?.length ? <AgentPauseNote messageId={message.id} /> : null}
         {message.error && (
           <div className="msg__error" role="alert">
             <AlertTriangle size={15} />
@@ -178,6 +179,26 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
         </div>
       )}
       {answered && <div className="tool__answered">Result provided</div>}
+    </div>
+  );
+}
+
+/**
+ * An agent run that stopped on these calls says why here. Without it the only
+ * sign is the manual reply box, which looks like the loop simply ignored the
+ * call rather than having nowhere to run it.
+ */
+function AgentPauseNote({ messageId }: { messageId: string }) {
+  const pause = useStore((state) => (state.agentPause?.messageId === messageId ? state.agentPause : null));
+  const setPanel = useStore((state) => state.setPanel);
+  if (!pause) return null;
+  return (
+    <div className="agent-pause" role="status">
+      <PauseCircle size={14} />
+      <span>{pause.reason}</span>
+      <button className="button button--small" onClick={() => setPanel("tools")}>
+        Tools panel
+      </button>
     </div>
   );
 }

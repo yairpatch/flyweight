@@ -8,11 +8,13 @@ import { db, migrateLegacyHistory } from "./lib/db";
 import { generate } from "./lib/generate";
 import { runToolExecutor } from "./lib/executor";
 import {
-  APPROVAL_TOOL,
   agentSystemPrompt,
   builtinToolDefinitions,
   isBuiltinTool,
+  missingHandlerReason,
+  needsApproval,
   runBuiltinTool,
+  turnCapReason,
   workspaceRoot,
 } from "./lib/agentTools";
 import { identifier, titleFromPrompt } from "./lib/format";
@@ -64,6 +66,17 @@ export interface PendingApproval {
   /** The command as the model wrote it, or the raw arguments if unparseable. */
   command: string;
   timeoutSeconds?: number;
+}
+
+/**
+ * Why an agent run stopped on a turn that ended in tool calls. Shown under the
+ * calls it could not run, so a paused loop explains itself instead of leaving
+ * the bare "paste the result" box.
+ */
+export interface AgentPause {
+  conversationId: string;
+  messageId: string;
+  reason: string;
 }
 
 const TOOLS_KEY = "flyweight.tools.v1";
@@ -154,6 +167,8 @@ interface StoreState {
   } | null;
   /** Set while an agent run waits for the user to approve a shell command. */
   approval: PendingApproval | null;
+  /** Why the last agent run stopped on its tool calls; cleared on the next run. */
+  agentPause: AgentPause | null;
   requests: RequestRecord[];
   panel: Panel;
   theme: ThemePreference;
@@ -340,8 +355,12 @@ export const useStore = create<StoreState>()((set, get) => {
     const conversation = conversations.find((item) => item.id === conversationId);
     const calls = assistant.toolCalls ?? [];
     if (!conversation || kindOf(conversation) !== "agent" || !calls.length) return;
+    const pause = (reason: string) => {
+      set({ agentPause: { conversationId, messageId: assistant.id, reason } });
+      toast("Agent run paused — see the note under the tool call", "info");
+    };
     if (agentTurn >= settings.agentMaxTurns) {
-      toast(`Agent paused after ${agentTurn} turns — continue manually or raise the cap`, "info");
+      pause(turnCapReason(agentTurn, settings.agentMaxTurns));
       return;
     }
     const builtinsLive = Boolean(workspaceRoot(props));
@@ -352,7 +371,7 @@ export const useStore = create<StoreState>()((set, get) => {
     });
     const missing = calls.filter((_, index) => !runners[index]);
     if (missing.length) {
-      toast(`No handler for ${missing.map((call) => call.name).join(", ")} — paste the result${missing.length === 1 ? "" : "s"} manually`, "info");
+      pause(missingHandlerReason(missing.map((call) => call.name), builtinsLive));
       return;
     }
     const controller = new AbortController();
@@ -363,7 +382,7 @@ export const useStore = create<StoreState>()((set, get) => {
         const runner = runners[index]!;
         let execution: { ok: boolean; result: string };
         if (runner.kind === "builtin") {
-          if (call.name === APPROVAL_TOOL && !alwaysAllow.has(conversationId)) {
+          if (needsApproval(call.name) && !alwaysAllow.has(conversationId)) {
             const { command, timeoutSeconds } = commandOf(call.arguments);
             set({ generating: { conversationId, messageId: assistant.id, controller, phase: "approval" } });
             const decision = await askApproval({ conversationId, messageId: assistant.id, callId: call.id, command, timeoutSeconds }, controller.signal);
@@ -424,7 +443,7 @@ export const useStore = create<StoreState>()((set, get) => {
     };
     updateConversation(conversationId, (item) => touch({ ...item, messages: [...item.messages, assistant] }));
     const controller = new AbortController();
-    set({ generating: { conversationId, messageId: assistant.id, controller } });
+    set({ generating: { conversationId, messageId: assistant.id, controller }, agentPause: null });
 
     // Agent runs get the workspace tools and a system prompt describing the
     // directory, on top of whatever tools the user defined; a user tool that
@@ -605,6 +624,7 @@ export const useStore = create<StoreState>()((set, get) => {
     statusDetail: "Connecting…",
     generating: null,
     approval: null,
+    agentPause: null,
     requests: [],
     panel: null,
     theme: (readString(THEME_KEY, "system") as ThemePreference) || "system",

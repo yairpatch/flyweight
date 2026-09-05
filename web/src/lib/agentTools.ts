@@ -8,6 +8,11 @@ import type { PropsPayload, ToolDefinition } from "../types";
 /** Shell commands are the one built-in that asks before it runs. */
 export const APPROVAL_TOOL = "run_command";
 
+/** Whether a called name is the shell tool, however the model spelled it. */
+export function needsApproval(name: string): boolean {
+  return canonicalName(name) === APPROVAL_TOOL;
+}
+
 export function workspaceRoot(props: PropsPayload | null): string | null {
   return props?.agent_workspace ?? null;
 }
@@ -86,8 +91,20 @@ const BUILTINS: BuiltinTool[] = [
 
 const BY_NAME = new Map(BUILTINS.map((tool) => [tool.name, tool]));
 
+/**
+ * A called name as the built-ins know it. Names arrive as the model wrote
+ * them: some templates namespace a call ("functions.read_file") and streamed
+ * names can carry stray whitespace. Matching loosely here is the difference
+ * between the loop running the call and pausing for a manual result.
+ */
+function canonicalName(name: string): string {
+  const trimmed = name.trim();
+  const dot = trimmed.lastIndexOf(".");
+  return dot === -1 ? trimmed : trimmed.slice(dot + 1);
+}
+
 export function isBuiltinTool(name: string): boolean {
-  return BY_NAME.has(name);
+  return BY_NAME.has(canonicalName(name));
 }
 
 /** The built-ins as tool definitions for the request builder. */
@@ -113,7 +130,7 @@ export interface BuiltinResult {
  * continue and the model can correct itself.
  */
 export async function runBuiltinTool(name: string, argsText: string, signal?: AbortSignal): Promise<BuiltinResult> {
-  const tool = BY_NAME.get(name);
+  const tool = BY_NAME.get(canonicalName(name));
   if (!tool) return { ok: false, result: `No built-in tool named ${name}` };
   let args: unknown;
   try {
@@ -123,7 +140,7 @@ export async function runBuiltinTool(name: string, argsText: string, signal?: Ab
   }
   try {
     const payload = await postJson<Record<string, unknown>>(tool.endpoint, args, { signal });
-    return { ok: true, result: formatResult(name, payload) };
+    return { ok: true, result: formatResult(tool.name, payload) };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, result: message };
@@ -157,6 +174,28 @@ function formatResult(name: string, payload: Record<string, unknown>): string {
     return `HTTP ${payload.status} ${payload.content_type ?? ""}\n\n${payload.body ?? ""}${payload.truncated ? "\n[truncated]" : ""}`;
   }
   return JSON.stringify(payload, null, 2);
+}
+
+/**
+ * Why the loop stopped short of running the calls it was handed, in the words
+ * the user needs to fix it. A built-in name with no workspace is the common
+ * case: the model asked for a file or a shell because agent runs advertise
+ * those tools, but the server was started without a directory to confine them
+ * to, so nothing can run them.
+ */
+export function missingHandlerReason(names: string[], workspaceLive: boolean): string {
+  const list = names.join(", ");
+  const plural = names.length > 1;
+  const builtins = names.filter(isBuiltinTool);
+  if (!workspaceLive && builtins.length) {
+    return `${builtins.join(", ")} ${plural ? "are workspace tools" : "is a workspace tool"}, and this server has no agent workspace. Restart it with --agent-workspace DIR to let the agent list, read, and write files, run commands, and fetch URLs inside DIR — or answer the call by hand below.`;
+  }
+  return `Nothing here can run ${list}: ${plural ? "these tools have" : "this tool has"} no JavaScript handler. Add one in the Tools panel, or answer the call by hand below.`;
+}
+
+/** The turn cap stopped the loop; say what the cap is and where to raise it. */
+export function turnCapReason(turns: number, cap: number): string {
+  return `The agent used its ${cap}-turn budget (${turns} model turns). Raise the turn cap in the Tools panel, or answer the call by hand below to keep going.`;
 }
 
 /** The system prompt an agent run prepends when the workspace tools exist. */
