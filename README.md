@@ -207,7 +207,15 @@ Each request is one row, under a header that names the columns:
           endpoint   prompt  cached   ttft     out   tok/s  finish        total
 10:49:45  chat        26.5k     98%   1.7s     112    35.8  tool call      4.9s
 10:49:50  chat        26.7k     99%   1.1s     105    35.9  tool call      4.1s
-10:52:07  chat        31.5k     99%   1.4s  400 prompt is too long: 31471 > 30000
+11:30:01  chat           --      --     --      --      --  400           --  prompt is too long
+~~~
+
+A failure fills the same columns (`--` where there is no number) and puts its
+reason after them, and a notice is marked and indented to the grid, so one
+unusual line never pushes the rest out of alignment:
+
+~~~
+10:56:35  •        queued behind 2 request(s): 538 prompt tokens waiting for a KV slot
 ~~~
 
 `prompt` is what the request rendered to, `cached` how much of it the prefix

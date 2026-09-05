@@ -4015,3 +4015,39 @@ class ServerLogTests(unittest.TestCase):
             )
         self.assertIn("400", row)
         self.assertIn("prompt is too long", row)
+
+    def test_a_failure_keeps_the_columns_and_trails_its_reason(self) -> None:
+        # A reason printed THROUGH the columns pushed every later column out
+        # of line, so one bad request derailed a screen of good ones.
+        from flyweight import server as module
+
+        log, _ = self._log(tty=False)
+        with patch.object(module, "LOG", log):
+            good = module._log_request_row(
+                "chat", 31471, 31200, 1.4, 112, 35.8, "tool call", 4.9
+            )
+            bad = module._log_request_row(
+                "chat", None, 0, None, 0, 0.0, "prompt is too long", None, 400
+            )
+        # Every column up to and including `total` occupies the same span, so
+        # the reason begins past where a good row ends.
+        self.assertEqual(len(good), len(bad[: len(good)]))
+        self.assertTrue(bad.startswith(bad[: len(good)]))
+        self.assertIn("prompt is too long", bad[len(good):])
+        self.assertEqual(bad[: len(good)].count("--"), 6)
+
+    def test_a_notice_is_indented_into_the_grid(self) -> None:
+        # A full-width sentence dropped between rows breaks the column the eye
+        # is following; a notice is marked and starts where the numbers do.
+        from flyweight import server as module
+
+        log, stream = self._log(tty=False)
+        with patch.object(module, "LOG", log):
+            module.log_notice("queued behind 2 requests")
+            row = module._log_request_row(
+                "chat", 31471, 31200, 1.4, 112, 35.8, "tool call", 4.9
+            )
+        notice = stream.text.split("  ", 1)[1].rstrip("\n")
+        self.assertTrue(notice.startswith("\u2022"))
+        # The text begins at the column the endpoint's own text vacates.
+        self.assertEqual(notice.index("queued"), row.index("31.5k") - 2)
