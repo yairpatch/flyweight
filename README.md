@@ -8,14 +8,14 @@ Served model families:
 
 | Family | Formats | Notes |
 | --- | --- | --- |
-| Qwen 3 / 3.5 / 3.6, dense and MoE | GGUF, safetensors | Full feature set: MTP, expert offload, prefill pipeline. Image input on the 3.5 family through a llama.cpp `mmproj` GGUF (`--mmproj`); the safetensors loader still drops the tower |
+| Qwen 3 / 3.5 / 3.6, dense and MoE | GGUF; safetensors (3.5 family) | Full feature set: MTP, expert offload, prefill pipeline. Image input on the 3.5 family through a llama.cpp `mmproj` GGUF (`--mmproj`); the safetensors loader still drops the tower |
 | Laguna 2.1 | GGUF | Per-head attention gate only; no MTP |
 | K2-Horizon (dense and MoVA 36B-A4B) | GGUF | Grouped RMS norms, softplus attention gate, DeepSeek-shaped MoE; the MoVA value experts page through their own device cache with a persisted routing history; no MTP |
-| Muse Glimmer | GGUF | Channel-tagged reasoning; drafts via a DFlash sidecar, no in-model MTP |
+| Muse Glimmer | GGUF | Channel-tagged reasoning; no speculative decoding (it has no in-model MTP heads, and its separate DFlash drafter is not wired up) |
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
-| Gemma 4 | GGUF | Greedy decode with penalties disabled only -- see limitations |
+| Gemma 4 | GGUF | Sampling, penalties and the tool grammar all work; no MTP, expert placement `cpu`/`hybrid` only -- see limitations |
 | BailingMoE3 | GGUF, safetensors | Independent sequence slots with snapshot prefix reuse across conversations; a GGUF conversion answers exactly as the checkpoint it came from |
-| Qwen3.8-Flash-Next (qwen4exp) | GGUF (split) | Qwen4-preview hybrid: gated-residual streams, hashed n-gram embeddings (host-side table), DeltaNet + gated attention. Sparse attention runs dense for now; no MTP/vision (absent from the GGUF) -- see limitations |
+| Qwen3.8-Flash-Next (qwen4exp) | GGUF (split) | Qwen4-preview hybrid: gated-residual streams, hashed n-gram embeddings (host-side table), DeltaNet + gated attention. Sparse attention runs dense by default; MTP needs a release with a draft block or the standalone MTP file via `--mtp-model`; no vision -- see limitations |
 
 A safetensors checkpoint (Qwen 3.5 family and BailingMoE3) is packed to a
 chosen quantization on first open and cached beside the checkpoint --
@@ -75,13 +75,18 @@ time.
 | Python | 3.11 or newer, 64-bit |
 | CMake | 3.24 or newer |
 | Compiler | MSVC v143 (Windows) or GCC 13+ / Clang 16+ (Linux) |
-| GPU | Any current NVIDIA driver — **no CUDA toolkit**. `--backend cpu` serves without a GPU at all |
-| Disk | ~100 MB for the build tree, plus whatever the model weighs |
+| GPU | A current NVIDIA driver, the NVRTC library, and the CUDA headers -- **no `nvcc`**, and nothing CUDA is linked at build time. `--backend cpu` serves without a GPU at all |
+| Disk | a few tens of MB for the build tree, plus whatever the model weighs |
 
-CUDA kernels are compiled at runtime through the NVIDIA driver API, which is
-why the driver alone is enough and `nvcc` is never invoked. CuPy appears
-nowhere in this list — it is used only by low-level development checks, never
-by the runtime.
+CUDA kernels are compiled at runtime by NVRTC through the driver API, so the
+build itself needs no CUDA toolkit and `nvcc` is never invoked. At serve time
+the runtime `dlopen`s `libcuda` and `libnvrtc` (`nvrtc64_*.dll` on Windows)
+and hands NVRTC the toolkit headers (`cuda_fp16.h`, CUB), which it looks for
+under `CUDA_PATH`, `CUDA_HOME`, `/opt/cuda` and `/usr/local/cuda`. A distro
+`cuda` package or the toolkit installer provides both; when either half is
+missing, the runtime says which one and falls back to `--backend cpu`. cuBLAS
+is optional and only used when present. CuPy is never required: the runtime
+only probes it, if installed, as one more place to find the headers.
 
 ## Installation
 
@@ -126,9 +131,11 @@ Notes specific to Windows:
   `winget install Ninja-build.Ninja` line only matters if it is absent.
 - **Use 64-bit Python.** The runtime library is x64; a 32-bit interpreter fails
   to load it with `WinError 193`.
-- **If the build says the C++ tools were not found**, run `flyweight doctor`. It
-  names which of CMake, MSVC, and the build tool it can and cannot see, instead
-  of stopping at the first one.
+- **If the build says the C++ tools were not found**, run
+  `PYTHONPATH=src python -m flyweight doctor` from the checkout (the console
+  script does not exist yet when the install failed). It names which of CMake,
+  MSVC, and the build tool it can and cannot see, instead of stopping at the
+  first one.
 
 ### Linux
 
@@ -156,15 +163,18 @@ Notes specific to Linux:
 - **CMake older than 3.24** is the other common blocker on long-term releases.
   `pip install cmake` inside the activated venv puts a current one on PATH
   without touching the system package.
-- **A GPU needs only the proprietary NVIDIA driver.** `nvidia-smi` reporting a
-  device is the whole check; the `cuda-toolkit` package is not used. Without
-  one, serve with `--backend cpu`.
+- **A GPU needs the proprietary NVIDIA driver plus NVRTC and the CUDA
+  headers.** `nvidia-smi` reporting a device covers the driver; the distro
+  `cuda` package (Arch) or `cuda-toolkit` (Debian/Ubuntu, Fedora) covers the
+  rest, and `flyweight doctor` shows whether the runtime can see both. Without
+  a GPU, serve with `--backend cpu`.
 
 ### Verifying the install
 
 ~~~
 $ flyweight doctor
 [ok  ] python: 3.12.10
+[ok  ] jinja2: 3.1.4
 [ok  ] package: .../.venv/lib/python3.12/site-packages/flyweight
 [ok  ] command: .../.venv/bin/flyweight
 [ok  ] native runtime: flyweight_v2.so, built 2026-08-31 14:04
@@ -175,8 +185,9 @@ $ flyweight doctor
 this install can serve
 ~~~
 
-Read the last line first. Only `FAIL` lines stop the runtime, and each one
-prints the command that fixes it; `warn` lines are notes. The `sources` warning
+Read the last line first. Only `FAIL` lines are blocking (and make `doctor`
+exit non-zero); each one prints the command that fixes it where there is one.
+`warn` lines are notes. The `sources` warning
 above is the normal state of an installed copy — it means the runtime cannot be
 rebuilt from there, which only matters if you intend to change it. Run
 `flyweight doctor` first whenever something refuses to start.
@@ -207,7 +218,7 @@ Each request is one row, under a header that names the columns:
           endpoint   prompt  cached   ttft     out   tok/s  finish        total
 10:49:45  chat        26.5k     98%   1.7s     112    35.8  tool call      4.9s
 10:49:50  chat        26.7k     99%   1.1s     105    35.9  tool call      4.1s
-11:30:01  chat           --      --     --      --      --  400           --  prompt is too long
+11:30:01  chat           --      --     --      --      --  400         0.1s  prompt is too long: 70212 tokens > 65536 maximum
 ~~~
 
 A failure fills the same columns (`--` where there is no number) and puts its
@@ -221,9 +232,12 @@ unusual line never pushes the rest out of alignment:
 `prompt` is what the request rendered to, `cached` how much of it the prefix
 cache served (a low number here on a conversation that only appended is what
 a cache problem looks like), `ttft` the wait before the first token, `out`
-and `tok/s` the answer and its decode rate, `finish` why generation stopped.
-While a request runs, the same row is drawn live and rewritten in place, so
-the numbers a reader is watching are the ones that commit.
+and `tok/s` the answer and its decode rate, `finish` why generation stopped
+(the finish reason for a non-streaming request; a stream shows the phase it
+ended in, `tool call` or `thinking`, and `--` for a plain stop). On a
+terminal the row of a running request is drawn live and rewritten in place, so
+the numbers a reader is watching are the ones that commit; a redirected log
+gets only the committed rows.
 
 `--quiet` prints nothing but failures. `--verbose` adds the HTTP access log,
 the prefill/decode split and the prefix-cache diagnostics (where a
@@ -270,7 +284,8 @@ Node. After changing anything in `web/`, rebuild and commit the output:
 ~~~bash
 cd web
 pnpm install
-pnpm test          # vitest: protocol adapters, SSE reader, direction
+pnpm test          # vitest: protocol adapters, SSE reader, thinking tags,
+                   # text direction, attachments, PDF/DOCX/XLSX extraction
 pnpm build         # typecheck, then write src/flyweight/ui/
 pnpm dev           # live-reload dev server proxying to :8000
 ~~~
@@ -285,12 +300,24 @@ pnpm dev           # live-reload dev server proxying to :8000
 | `flyweight inspect MODEL` | print model metadata as JSON |
 | `flyweight imatrix MODEL --text FILE` | gather an importance matrix |
 | `flyweight probe MODEL` | run a few tokens and dump runtime counters |
+| `flyweight doctor` | check the install and name the fix for anything missing |
+| `flyweight transcript-audit DIR` | explain a coding harness's failed edits from a request dump (see below) |
 
-`MODEL` is a `.gguf` file or a safetensors checkpoint directory, everywhere.
-`flyweight COMMAND --help` lists every option that command accepts, grouped
-by what it does: the request, the backend, hardware placement, and advanced
-tuning. The older `serve-v2`, `generate-text-v2`, `benchmark-v2`,
-`inspect-gguf`, and `probe-native-v2` spellings remain accepted.
+`MODEL` is a `.gguf` file or a safetensors checkpoint directory, for every
+model command. `flyweight COMMAND --help` lists every option that command
+accepts, grouped by what it does: the model, the command's own inputs (server,
+request, workload), the backend, hardware placement, and advanced tuning. The
+older `serve-v2`, `generate-text-v2`, `benchmark-v2`, `inspect-gguf`,
+`probe-native` and `probe-native-v2` spellings remain accepted, and
+`flyweight --version` prints the package version.
+
+`transcript-audit` is for one question: when a coding harness's edit replaces
+text that is not in the file, did the model edit blind, or did the read result
+reach the server and get lost on the way to the model? With
+`FLYWEIGHT_TRANSCRIPT_DUMP=DIR` set, `serve` writes one JSON file per request
+holding both the transcript the client sent and the prompt the model saw
+(`FLYWEIGHT_TRANSCRIPT_PROMPT=0` keeps a digest instead of the prompt text),
+and the audit checks each edit against both, in order.
 
 ## Serve a model
 
@@ -315,7 +342,11 @@ or `--cache 4096` to set an explicit 4 GiB budget. Automatic mode uses one
 eighth of currently available RAM, capped at 8 GiB.
 
 The older `--context-window` and `--max-new-tokens` spellings of the limit
-flags remain accepted for script compatibility.
+flags remain accepted on `serve` and `generate` for script compatibility.
+`--model-name` sets the id the model answers to in the API and `/v1/models`,
+and every sampling default (`--temperature`, `--top-k`, `--top-p`, `--min-p`,
+`--repetition-penalty`, `--presence-penalty`, `--frequency-penalty`,
+`--penalty-window`) can be set server-wide the same way.
 
 The native expert modes are:
 
@@ -342,13 +373,15 @@ flyweight serve model.gguf \
 ~~~
 
 Each sequence slot has its own KV and recurrent state. More slots improve
-conversation isolation but consume additional VRAM. Bound both admitted
-inference work and open HTTP connections for public-facing deployments:
+conversation isolation but consume additional VRAM; `--scratch-context` gives
+the slots past the first a smaller context than the first one. Bound both
+admitted inference work and open HTTP connections for public-facing
+deployments:
 
 ~~~bash
 flyweight serve model.gguf \
   --concurrency 8 --max-connections 64 \
-  --request-timeout-seconds 30
+  --request-timeout-seconds 30 --cors-origin https://app.example
 ~~~
 
 ### Chat UI
@@ -359,14 +392,22 @@ server exposes, not only chat:
 - **Chat** streams through any of the three protocols (OpenAI chat
   completions, Anthropic messages, OpenAI responses), switchable per
   conversation from the composer. Thinking shows in a collapsible panel with
-  its duration; tool calls render as cards where you paste the result and
-  continue; images attach by button, paste, or drop when a vision tower is
-  loaded. Markdown, GFM tables, KaTeX math, and highlighted code with copy,
-  download, and a sandboxed **Run** for HTML/SVG/JS.
+  its duration, and an **Answer now** button closes it early on the chat
+  completions and Anthropic protocols; tool calls render as cards where you
+  paste the result and continue. Files attach by the **Attach** button, paste,
+  or drop: images when a vision tower is loaded, and PDF, Word, Excel, and
+  text or code files always (see below). Markdown, GFM tables, KaTeX math,
+  and highlighted code with copy, download, and a sandboxed **Run** for
+  HTML/SVG/JS. Right-to-left text is detected per message and laid out
+  accordingly, with code blocks kept left-to-right.
 - **Settings** (Ctrl+,) cover every sampling knob the server accepts,
   stop sequences, seed, reasoning effort and budget, `preserve_thinking`,
   JSON mode and JSON schema output, `chat_template_kwargs`, and named
-  presets. Defaults track `/props` until you change something.
+  presets (a preset stores the tool definitions too). Defaults track
+  `/props` until you change something. A knob the selected protocol has no
+  field for is greyed with a *not sent on ...* hint (Anthropic messages has
+  no effort or `response_format`, Responses has no budget, and
+  `chat_template_kwargs` exists on chat completions only).
 - **Tools** defines function tools (import OpenAI or Anthropic definitions),
   `tool_choice`, and parallel calls; the sampler grammar enforces them.
 - **Runtime** polls `/health`, `/props`, and `/slots` and charts decode
@@ -381,8 +422,22 @@ server exposes, not only chat:
   line for each request, and retrieves or deletes stored responses.
 
 Conversations live in IndexedDB (history from the previous UI is imported
-once), with search, pin, rename, and JSON or Markdown export. Ctrl+K opens a
-command palette; Ctrl+B toggles the sidebar; Esc stops a generation.
+once), with search over message bodies, pin, rename, JSON import, and JSON or
+Markdown export. Ctrl+K opens a command palette; Ctrl+B toggles the sidebar;
+Ctrl+Shift+O starts a conversation; Esc stops a generation. The API key is
+kept in session storage, so it lives as long as the tab. A model selector
+appears in the top bar when `/v1/models` lists more than one.
+
+Document attachments never touch the server as files: the browser extracts
+them to text and places it ahead of the typed message in the user turn, as a
+fenced block headed `Attached file: NAME`. PDFs contribute their text layer
+page by page; a PDF with no text layer (a scan) is rendered to page images
+instead when a vision tower is loaded, and refused when not. Word files
+become Markdown with headings, lists and tables kept; spreadsheets become one
+CSV block per sheet; anything that sniffs as UTF-8 text is taken as code or
+prose. Each file is cut to a quarter of the server's context window, on a
+line boundary, with a visible `[truncated: ...]` marker; up to 8 files of at
+most 32 MB each go in one turn.
 
 ### Images
 
@@ -401,10 +456,12 @@ aspect ratio is kept, and it covers at most `--image-max-tokens` tokens (one
 per 32x32 block; the default 1024 is about a megapixel). Image tokens count
 as prompt tokens in `usage`, and an image that sits inside a reused prefix is
 never encoded again. `--image-urls deny` refuses `http(s)` image URLs and
-keeps `data:` URLs; `/health` reports the tower under `execution.vision`,
-and the bundled chat UI shows an **Image** button (paste or drop works too)
-whenever it does. Without a tower an image part degrades to a visible
-`[image omitted: ...]` note in the prompt rather than failing the request,
+keeps `data:` URLs (a remote image is capped at 32 MiB and 20 seconds);
+`/health` reports the tower under `execution.vision`, and the bundled chat
+UI's **Attach** button accepts images (paste or drop works too) whenever it
+does. Without a tower an image part degrades to a visible
+`[image omitted: ...]` note in the prompt (`[unsupported image block
+omitted]` for an Anthropic `image` block) rather than failing the request,
 since the part sits in the client's history and would return on every retry.
 
 ## API
@@ -435,13 +492,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ~~~
 
 Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (with
-retrieval and deletion by id), `/v1/models`, `/v1/messages` and
-`/v1/messages/count_tokens` (Anthropic), `/v1/responses/input_tokens`,
+retrieval and deletion by id; the 128 most recent are kept, `store: false`
+skips a record), `/v1/models` and `/v1/models/{id}`, `/v1/me`, `/v1/messages`
+and `/v1/messages/count_tokens` (Anthropic), `/v1/responses/input_tokens`,
 `/tokenize`, `/detokenize`, `/health`, `/props`, and `/slots`. All generation
-endpoints stream over SSE. Set `FLYWEIGHT_API_KEY` or pass `--api-key` to
-require bearer authentication (`Authorization: Bearer` or `x-api-key`). Use
-`--strict-model` when request model IDs must exactly match the configured
-server model name.
+endpoints stream over SSE, and chat streams honour
+`stream_options.include_usage`. Request bodies are capped at 16 MiB. Set
+`FLYWEIGHT_API_KEY` or pass `--api-key` to require bearer authentication
+(`Authorization: Bearer` or `x-api-key`); `--cors-origin` sets
+`Access-Control-Allow-Origin` (default `*`). Use `--strict-model` when
+request model IDs must exactly match the configured server model name.
 
 Chat requests use the GGUF's `tokenizer.chat_template` when it is present;
 the built-in architecture formatter is only a fallback for older files. If a
@@ -449,7 +509,8 @@ the built-in architecture formatter is only a fallback for older files. If a
 `top_k`, `top_p`, `min_p`, the penalties, `max_new_tokens`, and `do_sample`
 defaults are also loaded. Without one, the built-in defaults are llama.cpp's:
 temperature 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05, penalties off.
-Explicit API request values always override model defaults. `GET /props`
+Precedence is request, then server flag, then `generation_config.json`, then
+the built-in default. `GET /props`
 reports the resolved defaults and their sources, and the bundled UI adopts
 them until the user saves custom settings.
 
@@ -468,6 +529,12 @@ Reasoning models expose two knobs, one soft and one hard:
   it.
 - `reasoning_budget_tokens` is a hard ceiling the runtime enforces: at the
   limit the sampler forces the thinking block closed and the answer resumes.
+  A request that thinks without naming a budget gets a default cap of half
+  its `max_tokens` or `--thinking-budget` (2048), whichever is smaller, so a
+  model cannot spend the whole completion deliberating and end the turn with
+  no visible text; Claude Code's `thinking: {"type": "adaptive"}` is exactly
+  that request. `--thinking-budget 0` removes the default, and
+  `thinking: {"type": "disabled"}` never arms it.
 - `POST /v1/chat/completions/{id}/stop_thinking` (or
   `/v1/messages/{id}/stop_thinking`) interrupts a live stream: the runtime
   closes the open thinking block on the next token and goes straight to the
@@ -479,9 +546,12 @@ Reasoning models expose two knobs, one soft and one hard:
   it. Unlike hosted APIs, this budget is a guarantee, not a hint.
 
 `enable_thinking` (top level or in `chat_template_kwargs`) switches thinking
-off entirely for templates with a switch, and `separate_reasoning` routes
-chain-of-thought to a `reasoning_content` delta field instead of the content
-stream. On `/v1/messages`, reasoning is returned as Anthropic thinking
+off entirely for templates with a switch. Chain-of-thought always arrives in
+`reasoning_content` (on the message and as stream deltas), never in
+`content`: a model told to write a file drafts it while thinking, and
+streaming that draft as the answer made harnesses render the file instead of
+writing it. `separate_reasoning` is accepted for compatibility and changes
+nothing. On `/v1/messages`, reasoning is returned as Anthropic thinking
 blocks.
 
 ### Structured output and tools
@@ -490,33 +560,36 @@ Declared tools are enforced by a sampler grammar, not just prompted: the tool
 name must be a declared one, required parameters must be present, and
 array/object argument values must be complete well-formed JSON. Scalar values
 are free text -- the declared schema types them after parsing.
-`response_format` (`json_object` / `json_schema`) is likewise enforced at the
-sampler. `FLYWEIGHT_TOOL_GRAMMAR=0` and `FLYWEIGHT_RESPONSE_GRAMMAR=0` disable
-each constraint independently without a rebuild. Tool-call arguments stream
-incrementally as JSON fragments, so a long file-writing call produces wire
-progress instead of a timeout. DeepSeek-V4 and BailingMoE3 templates render
-their own tool markup; every other architecture gets the generic Hermes-style
-tool prompt.
+`response_format` (`json_object` / `json_schema`; `text.format` on
+`/v1/responses`) is likewise enforced at the sampler. `FLYWEIGHT_TOOL_GRAMMAR=0`
+and `FLYWEIGHT_RESPONSE_GRAMMAR=0` disable each constraint independently
+without a rebuild. Tool-call arguments stream incrementally as JSON fragments,
+so a long file-writing call produces wire progress instead of a timeout.
+DeepSeek-V4, BailingMoE3 and K2-Horizon templates render their own tool
+markup; every other architecture gets the generic Hermes-style tool prompt.
 
 ### Sampling
 
-Sampling takes `repetition_penalty` (default 1.1 over the last 64 generated
-tokens), plus OpenAI's `presence_penalty` and `frequency_penalty` (default
-0). These are on by default because "no penalty" is not a neutral setting:
-with nothing discouraging a token the model has just produced, a heavily
-quantized checkpoint can lock onto a line and repeat it until the token
-budget runs out. Only generated tokens are penalized -- penalizing the prompt
-would push the model away from the user's own wording. Set
-`repetition_penalty` to 1 to disable, or raise `penalty_window` to look
-further back. The penalties pause while a tool call is open (the sampler
+Sampling takes `repetition_penalty` (1 = off, the default; a value above it
+looks over the last 64 generated tokens), plus OpenAI's `presence_penalty`
+and `frequency_penalty` (default 0). The defaults match llama.cpp, so a
+client that sends nothing gets the distribution it would get there. "No
+penalty" is not always a neutral setting, though: with nothing discouraging a
+token the model has just produced, a heavily quantized checkpoint can lock
+onto a line and repeat it until the token budget runs out, and
+`repetition_penalty: 1.1` per request (or `--repetition-penalty 1.1` on
+`serve`) is the usual remedy. Only generated tokens are penalized --
+penalizing the prompt would push the model away from the user's own wording.
+Raise `penalty_window` to look further back, or set it to 0 to switch all
+three penalties off at once. The penalties pause while a tool call is open (the sampler
 grammar knows when one is): a call's arguments are verbatim by contract -- an
 Edit reproduces the span of the file it replaces, character for character --
 and penalizing recently emitted tokens there made the quote drift and the
 harness's exact-match check fail. `FLYWEIGHT_TOOL_CALL_PENALTY=1` restores the
-old behaviour for comparison. Outside tool calls the penalty still applies to
+old behaviour for comparison. Outside tool calls a penalty still applies to
 quoted file content, so for edit-heavy agent work on higher-precision quants
-`repetition_penalty: 1` remains worth considering. `seed` pins the sampler
-per request.
+leave it off. `seed` pins the sampler per request; `n` other than 1 is
+rejected.
 
 ## Inspect and generate
 
@@ -543,30 +616,38 @@ For reproducible comparisons across prompt lengths, use the checked-in JSONL
 harness:
 
 ~~~bash
-PYTHONPATH=src python bench_runtime.py run model.gguf \
+python -m flyweight.runtime_benchmark run model.gguf \
   --output /tmp/baseline.jsonl --label baseline \
   --prompt "Runtime regression benchmark." \
   --prompt-lengths 256,1024,4096 \
   --context 32768 --samples 5 --sample-warmup 1
 
-PYTHONPATH=src python bench_runtime.py compare \
+python -m flyweight.runtime_benchmark compare \
   /tmp/baseline.jsonl /tmp/candidate.jsonl
 ~~~
+
+(`bench_runtime.py` at the repository root is a shim for the same module.)
+`bench_server_ab.py` and `bench_server_client.py` drive a running server over
+HTTP for end-to-end A/B comparisons. The other `bench_*.py` and `prof_*.py`
+scripts at the root are one-off investigation tools kept for reference; some
+need CuPy.
 
 Run GPU benchmarks in isolation. Another process changes free VRAM and
 therefore changes automatic expert-cache sizing.
 
 ## Runtime controls
 
-The `serve` help shows only the common surface; the advanced options below
-are accepted everywhere:
+`--help` on any command lists all of these; the runtime options are shared by
+every command that builds a runtime (`imatrix` leaves out `--expert-mode` and
+the MTP flags), and the server options belong to `serve` alone:
 
 - `--quant ask|IQ2_XS|Q2_K|IQ3_XXS|Q3_K|IQ4_XS|Q4_K|Q5_K|Q6_K|Q8_0|F32`:
   quantization for a safetensors checkpoint (see below)
 - `--imatrix PATH|off`: importance matrix for IQ packing; defaults to an
   `imatrix.dat` beside the checkpoint when one exists
-- `--backend auto|cuda|cpu`: execution backend; `auto` uses CUDA when a
-  driver is present
+- `--backend auto|cuda|cpu`: execution backend; `auto` uses CUDA when the
+  driver and NVRTC load
+- `--device N`: CUDA device index (default 0)
 - `--gpu-cache-mib 0`: size allocations from currently free VRAM
 - `--cache-type-k` / `--cache-type-v` `auto|f32|f16|bf16|q8_0|turbo3|turbo4`:
   KV precision (default `f16`)
@@ -580,22 +661,54 @@ are accepted everywhere:
   unconditionally. `--mtp-model` supplies a draft GGUF overlay (DSpark for
   DeepSeek-V4-Flash)
 - `--dense-requant auto|q8|off`: control temporary BF16 dense-weight Q8 upload
-- `--parallel N`: independent sequence slots
-- `--cache auto|off|MIB`: host cache for displaced conversation state
-- `--cpu-threads N`: CPU expert worker count (physical cores by default)
+- `--parallel N`: independent sequence slots; `--scratch-context TOKENS`
+  gives the slots past the first a smaller context
+- `--cache auto|off|MIB` (alias `--prompt-cache-mib`): host cache for
+  displaced conversation state
+- `--prefill-checkpoint-interval N` (default 256) and
+  `--prefill-checkpoint-slots N` (default 4): how often a mid-prefill
+  prefix-reuse snapshot is taken and how many are kept (`serve`, `generate`)
+- `--cpu-threads N`: CPU expert worker count (0, the default, picks the
+  physical cores)
+- `--hybrid-prefill split|cpu`: whether prompt processing splits routed
+  experts between the resident GPU set and the host or runs them all on the
+  host (default `cpu` under `--expert-mode auto`, `split` otherwise)
+- `--expert-residency mutable|immutable`: whether the GPU hot set may move
+  during decode
+- `--routed-moe`: run prompt processing's routed experts through the
+  block-table MMQ kernels, and refuse to start rather than quietly not engage
+- `--prefill-cache-seed auto|off|N`: post-prefill hot-expert placement
+- `--expert-paging auto|staged|direct`: legacy paging transfer policy
+- `--cpu-prefetch-auto` / `--cpu-prefetch-mib MIB`: warm prompt-relevant
+  expert pages when beneficial, or under an explicit budget
+- `--next-layer-prefetch N`: experts to page-hint per layer from observed
+  layer-to-layer routing (0-64)
+- `--swa-full`: trade VRAM for unrestricted sliding-layer rollback
+
+Server options (`serve` only):
+
+- `--model-name NAME`, `--cors-origin ORIGIN`, `--api-key KEY`,
+  `--strict-model`
 - `--reasoning-effort low|medium|high|xhigh`: server-wide default effort
-- `--concurrency N`: reject excess generation work with HTTP 429
-- `--max-connections N`: cap simultaneous HTTP connection threads
-- `--request-timeout-seconds N`: bound idle/read time on client sockets
+- `--thinking-budget N` (default 2048): cap for requests that think without
+  naming a budget (0 disables the default)
+- `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--repetition-penalty`,
+  `--presence-penalty`, `--frequency-penalty`, `--penalty-window`:
+  server-wide sampling defaults
+- `--concurrency N` (alias `--max-concurrent-requests`, default 64): requests
+  admitted to inference at once; the rest get HTTP 429 with `Retry-After`
+- `--max-connections N` (default 128): cap simultaneous HTTP connection
+  threads
+- `--request-timeout-seconds N` (default 30): how long a client may take to
+  send its request before the connection is dropped
+- `--sse-keepalive-seconds S` (default 10): interval between keepalive
+  comments on an idle stream
 - `--max-tool-call-tokens N`: bound a runaway tool call (0 = unbounded)
 - `--freeze-total-tokens`: pin the `<total_tokens>N tokens left</total_tokens>`
   counter Claude Code rewrites in its history on every request, so
   `/v1/messages` prompts stay cache-identical across turns instead of
   re-evaluating everything after the counter
-- `--prefill-cache-seed auto|off|N`: post-prefill hot-expert placement
-- `--expert-paging auto|staged|direct`: legacy paging transfer policy
-- `--cpu-prefetch-auto`: warm prompt-relevant expert pages when beneficial
-- `--swa-full`: trade VRAM for unrestricted sliding-layer rollback
+- `--quiet` / `--verbose` (`-q` / `-v`): see "Reading the server log"
 
 Prefill expert streaming (staging routed experts to the GPU for the batched
 prefill kernels) is on by default with an automatically sized budget and has
@@ -606,9 +719,16 @@ no CLI flag; `FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB` overrides the budget in MiB
 Runtime diagnostics are exposed through `/health`, including prefix-cache
 counters and the sampler-grammar counters
 (`grammar_constrained_steps`, `grammar_rejected_candidates`,
-`grammar_empty_candidate_sets`). Detailed profiling and experimental kernel
-switches use `FLYWEIGHT_*` environment variables; unset profiling variables for
-production serving.
+`grammar_empty_candidate_sets`); `FLYWEIGHT_ROUTE_RECURRENCE=1` adds routing
+recurrence statistics. A few more environment switches are worth knowing:
+`FLYWEIGHT_HF_CACHE` relocates (or, set to `off`, disables) the packed
+safetensors cache; `FLYWEIGHT_DS4_EXPERT_CACHE_MIB` opts DeepSeek-V4 into a
+GPU expert cache of that size; `FLYWEIGHT_QSA=1` enables the experimental
+qwen4exp sparse-attention indexer; `FLYWEIGHT_V2_MLOCK=1` populates and locks
+the mapped model in RAM; `FLYWEIGHT_CPU_THREADS` overrides the CPU-backend
+team size. Beyond those, detailed profiling and experimental kernel switches
+use `FLYWEIGHT_*` environment variables named in the source; unset profiling
+variables for production serving.
 
 ## Quantization
 
@@ -706,12 +826,14 @@ wrong, and only calibration data can say. With a matrix it is the smallest
 pack whose routed experts still run on grouped GPU kernels. The remaining
 sub-3-bit formats (IQ2_XXS, IQ1_M) are still unoffered: no encoders yet.
 
-For GGUFs that arrive already quantized, the dense GPU kernels cover the K
-quants, Q8_0, IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ4_XS, and the 1-bit IQ1_S and
-IQ1_M; grouped routed-expert GPU kernels exist for Q4_K, Q5_K, Q6_K, Q8_0,
-IQ2_XS, IQ3_XXS, IQ4_XS, and NVFP4, and other formats run their experts on
-the CPU path. IQ1_M tensors that no kernel can read are requantized to Q8_0
-on upload; an IQ1_M embedding table is refused.
+For GGUFs that arrive already quantized, the dense GPU kernels cover F32,
+F16, BF16, the K quants, Q8_0, IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS/
+IQ4_NL, and the 1-bit IQ1_S and IQ1_M; grouped routed-expert GPU kernels
+exist for Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S,
+IQ4_XS, IQ4_NL, and NVFP4, and other formats (IQ2_S among them) run their
+experts on the CPU path. IQ1_M has neither an expert kernel on either side
+nor a readable LM head: an IQ1_M head is requantized to Q8_0 on upload, an
+IQ1_M embedding table is refused, and IQ1_M routed experts are unsupported.
 
 `--dense-requant auto` keeps the GGUF unchanged and chooses the temporary GPU
 representation from the requested or available VRAM budget. It converts BF16
@@ -720,7 +842,8 @@ cache would exceed that budget. Use `q8` to force the memory-saving
 representation or `off` to preserve the checkpoint's dense precision exactly.
 
 `--cache-type-k` / `--cache-type-v` default to `f16`, and `auto` only reaches
-for `turbo4` on a checkpoint with routed experts, above 32K context. A
+for `turbo4` on a checkpoint with routed experts, above 32K context, whose
+attention `head_dim` is a power of two between 32 and 512. A
 *dense* checkpoint with a wide `head_dim` is the case that default serves
 badly, and it has to be set by hand. Qwen3.8-27B (`qwen35`) is the worked
 example: 16 full attention layers x 4 KV heads x head_dim 256 is 64 KiB of KV
@@ -749,7 +872,9 @@ switches every one of them, decode and chunked prefill alike, back to the
 reconstruct-in-float kernels: slower, but bit-identical between the paths,
 which is what the path-parity tests pin.
 
-Qwen sampling with `top_k <= 32` reduces candidates on the GPU by default.
+Qwen sampling with `top_k <= 256` reduces candidates on the GPU by default
+(a grammar or penalty widens the candidate set it asks for, but the ceiling
+is the same).
 `sampling_gpu_topk_*`, `sampling_full_download_bytes`, and
 `sampling_nanoseconds` expose its behavior; set `FLYWEIGHT_SAMPLING_GPU_TOPK=0`
 only when comparing against the full-vocabulary host fallback.
@@ -760,15 +885,19 @@ The default suite builds synthetic fixtures and does not require model
 weights:
 
 ~~~bash
+pip install ruff mypy      # CI installs these ad hoc; they are in no extra
 ruff check src tests setup.py
 mypy src/flyweight
 pytest -q
 ~~~
 
-`check_vision_parity.py` runs the native vision tower against the NumPy
-reference in `native/tools/qwen_vision_reference.py` on a real mmproj
-(`--mmproj PATH`, `--backend cpu` for the host kernels); it needs no
-language model.
+The `check_*.py` scripts at the repository root need a checkout and real
+weights. `check_vision_parity.py --mmproj PATH` runs the native vision tower
+against the NumPy reference in `native/tools/qwen_vision_reference.py`
+(`--backend cpu` for the host kernels) and needs no language model;
+`check_greedy_determinism.py`, `check_q8_decode_parity.py`,
+`check_attention_parity.py` and `check_expert_path_divergence.py` pin the
+decode paths against each other on a model of your choosing.
 
 Set `FLYWEIGHT_TEST_MODEL=/path/to/model.gguf` to opt into the real Qwen
 reference tests. A configured model path that is missing or fails to load is
@@ -780,17 +909,17 @@ device are skipped.
 - CUDA is the only model-execution accelerator; `--backend cpu` serves
   everything on the CPU kernels instead.
 - Qwen3.8-Flash-Next (qwen4exp) runs its 12 sparse-attention layers as dense
-  GQA: exact while the context fits the trained 2048-token selection budget,
-  an approximation beyond it -- the learned indexer is not implemented yet.
-  MTP is rejected at load (the released GGUF carries no draft block). The
-  n-gram embedding table stays in host memory (16 row reads per token), and
-  the IQ1_S/IQ4_NL experts run on the CPU MoE -- prefill is
-  expert-decode-bound until GPU kernels for those formats land.
-- Gemma 4 sampling is not implemented, and that includes the default
-  repetition penalty: serving Gemma 4 requires `temperature: 0` **and**
-  `repetition_penalty: 1` (or `penalty_window: 0`) on every request. MTP,
-  per-layer embeddings, and shared-KV tail layers are also unimplemented, and
-  expert placement is restricted to `cpu`/`hybrid`.
+  GQA by default: exact while the context fits the trained 2048-token
+  selection budget, an approximation beyond it. `FLYWEIGHT_QSA=1` opts into
+  the learned indexer, which is experimental. MTP needs a draft block: the
+  Q4_K_XL release carries one, the standalone MTP file attaches through
+  `--mtp-model`, and `--mtp-drafts` is rejected on UD-IQ1_S, which has none.
+  The n-gram embedding table stays in host memory (16 row reads per token).
+  Its IQ1_S/IQ4_NL experts have grouped GPU kernels, so under
+  `--expert-mode cpu` prefill is expert-decode-bound on the host.
+- Gemma 4: MTP, per-layer embeddings, shared-KV tail layers and next-layer
+  prefetch are unimplemented, and expert placement is restricted to
+  `cpu`/`hybrid`. The routed experts must be Q4_0 (the QAT release).
 - Vision covers still images through a GGUF `mmproj` on the Qwen 3.5 family:
   no video, and the safetensors loader still reads only `text_config`. An
   mmproj whose tower has deepstack layers (`clip.vision.is_deepstack_layers`)
@@ -819,11 +948,12 @@ device are skipped.
 - Laguna's pre-tokenizer classifies non-ASCII letters by Unicode block rather
   than by a full category table, so non-Latin prose can split differently
   from the reference tokenizer.
-- Laguna concentrates available expert-cache VRAM into a contiguous suffix of
-  complete layers and pins every expert in those layers, using the CPU path
-  for earlier layers. Set `FLYWEIGHT_LAGUNA_WHOLE_LAYERS=0` to restore
-  per-expert placement for comparison, or to a positive integer to cap the
-  number of complete GPU layers.
+- Laguna (with IQ experts) and Gemma 4 concentrate available expert-cache
+  VRAM into a contiguous suffix of complete layers and pin every expert in
+  those layers, using the CPU path for earlier layers. Set
+  `FLYWEIGHT_LAGUNA_WHOLE_LAYERS=0` to restore per-expert placement for
+  comparison, or to a positive integer to cap the number of complete GPU
+  layers.
 - Laguna prefill over IQ2_XS, IQ3_XXS or IQ4_XS experts uses the direct
   quantized 8-token CPU kernel by default instead of expanding expert rows to
   f32. Set `FLYWEIGHT_PREFILL_DIRECT_QUANT=0` only for comparison; `=1`
@@ -836,11 +966,13 @@ device are skipped.
   placement. The default uses physical cores; tune `--cpu-threads` for the
   machine rather than assuming SMT helps (14 workers beat 8, 16 and 32 on the
   reference 16-core Laguna host).
-- The tool-call grammar constrains the generic Hermes markup; DeepSeek-V4 and
-  Muse Glimmer emit their own formats, which are parsed tolerantly but not
-  sampler-enforced.
+- The tool-call grammar constrains the generic Hermes markup; DeepSeek-V4,
+  BailingMoE3, K2-Horizon and Muse Glimmer emit their own formats, which are
+  parsed tolerantly but not sampler-enforced. Muse Glimmer also has no
+  sampler-enforced JSON response mode and no thinking budget or
+  `stop_thinking`.
 - Qwen sampled decoding currently transfers the vocabulary logits to the host
-  when `top_k > 32`.
+  when `top_k > 256`.
 - Dynamic MoE routing still has host synchronization points.
 - Special-token spellings inside message content (`<|im_start|>`,
   `<tool_call>`, `<think>`, ...) are tokenized as the control tokens, as
@@ -861,19 +993,41 @@ device are skipped.
 ## Architecture
 
 - `native/src/v2_runtime.cpp`: GGUF parsing, memory planning, scheduling,
-  model orchestration, prefix reuse, and native runtime ABI
+  model orchestration, prefix reuse, sampling, and the native runtime ABI;
+  `native/src/v2_mtp_verifier.inc` (the prefill driver and MTP verifier) and
+  `native/src/v2_vision.inc` (the mmproj tower) are compiled into it
 - `native/src/gpu_driver.cpp`: CUDA driver, NVRTC, cuBLAS/cuBLASLt, graph,
   and transfer integration
-- `native/include/flyweight_v2_qwen_kernels.hpp`: generated CUDA model kernels
+- `native/include/flyweight_v2_qwen_kernels.hpp`: the CUDA kernel source,
+  JIT-compiled by NVRTC at startup and compiled as host C++ for
+  `--backend cpu`; `native/src/cpu_backend.cpp` and the `cpu_*`, `q4_*` and
+  `qwen_cpu_*` files are the host kernels
+- `native/include/flyweight_v2_format_dispatch.hpp`: which kernel reads which
+  tensor format, on each side
+- `native/include/flyweight_v2_hf.hpp`, `_hf_quantize.hpp`, `_hf_cache.hpp`,
+  `_imatrix.hpp`: the safetensors loader, packer and cache
+- `native/include/flyweight_v2_bailing.hpp`, `flyweight_v2_deepseek4*.hpp`:
+  the BailingMoE3 and DeepSeek-V4 runtimes
 - `native/include/flyweight_v2_tool_grammar.hpp`: sampler-side tool and JSON
   response constraints
+- `src/flyweight/cli.py`: the command line, `doctor`, and the quantization
+  menu; `src/flyweight/native_build.py`: the CMake driver `pip install` uses
 - `src/flyweight/v2.py`: Python bindings for the native ABI
 - `src/flyweight/v2_server.py`: tokenizer, cooperative engine thread, and
-  native inference service
-- `src/flyweight/deepseek4_server.py`: the dedicated DeepSeek-V4 service
+  native inference service; `src/flyweight/vision.py`: image decoding and
+  the encoded-image cache
+- `src/flyweight/deepseek4_server.py`, `deepseek4.py`, `dspark.py`: the
+  dedicated DeepSeek-V4 service and its DSpark drafter
 - `src/flyweight/server.py`: shared HTTP protocol implementation
 - `src/flyweight/sampling.py`: the sampling settings every surface shares
+- `src/flyweight/transcript_audit.py`: request dumps and the
+  `transcript-audit` command
 - `src/flyweight/runtime_benchmark.py`: benchmark capture and comparison
+- `plans/`: design notes for the deliberate omissions and the semantics of
+  each architecture, referenced from the code
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are expected to arrive
+and [SECURITY.md](SECURITY.md) for reporting a vulnerability.
 
 ## License
 

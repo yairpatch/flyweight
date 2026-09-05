@@ -74,7 +74,9 @@ jobs:
           # package beside the real one -- two libraries in one wheel, and the
           # count above was the only thing that noticed. Name the cause too.
           packages = {name.split("/")[0] for name in names}
-          assert packages <= {"flyweight", "flyweight-0.2.0.dist-info"}, packages
+          # setuptools normalises the distribution name flyweight-llm to
+          # flyweight_llm in the dist-info directory.
+          assert packages <= {"flyweight", "flyweight_llm-0.2.0.dist-info"}, packages
           # Contract tests and benchmarks belong in the build tree, never in
           # the shipped package.
           strays = [

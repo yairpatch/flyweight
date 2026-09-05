@@ -15,8 +15,9 @@ format the dispatch misses — need no discussion; send them.
 
 ## Setting up
 
-The install compiles the native runtime from source. There is no published
-wheel, so a C++ toolchain is required once, at install time:
+A checkout compiles the native runtime from source (the published
+`flyweight-llm` wheels are for using Flyweight, not changing it), so a C++
+toolchain is required once, at install time:
 
 | | Needed |
 | --- | --- |
@@ -73,8 +74,8 @@ length you measured at, and give the before and after. `bench_runtime.py`
 produces a comparable JSONL record:
 
 ```bash
-PYTHONPATH=src python bench_runtime.py run model.gguf --output after.jsonl
-PYTHONPATH=src python bench_runtime.py compare before.jsonl after.jsonl
+python -m flyweight.runtime_benchmark run model.gguf --output after.jsonl
+python -m flyweight.runtime_benchmark compare before.jsonl after.jsonl
 ```
 
 Numbers from one card do not transfer to another. If a change helps your

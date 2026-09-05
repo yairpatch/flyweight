@@ -758,7 +758,8 @@ checkpoint's generation_config.json says.\
     endpoint.add_argument(
         "--concurrency", "--max-concurrent-requests",
         dest="max_concurrent_requests", type=int, default=64, metavar="N",
-        help="requests admitted to inference at once; the rest queue",
+        help="requests admitted to inference at once; the rest are refused "
+             "with HTTP 429 and a Retry-After header",
     )
     endpoint.add_argument(
         "--max-connections", type=int, default=128, metavar="N",
@@ -1779,6 +1780,63 @@ def _console_script() -> Path | None:
     return None
 
 
+def _cuda_libraries_present() -> tuple[bool, bool]:
+    """Whether the driver library and NVRTC each load, by the runtime's rules.
+
+    Mirrors the search in gpu_driver.cpp: the driver under its one name, NVRTC
+    under its versioned sonames and then inside the toolkit named by CUDA_PATH
+    or CUDA_HOME. Runtime-only installs ship only the versioned soname, so the
+    bare `libnvrtc.so` is tried last rather than first.
+    """
+    import ctypes
+
+    def loads(path: str) -> bool:
+        try:
+            ctypes.CDLL(path)
+            return True
+        except OSError:
+            return False
+
+    roots = [value for name in ("CUDA_PATH", "CUDA_HOME")
+             if (value := os.environ.get(name))]
+    if sys.platform == "win32":
+        driver = loads("nvcuda.dll")
+        names = ["nvrtc64_130_0.dll", "nvrtc64_120_0.dll", "nvrtc64_112_0.dll",
+                 "nvrtc64_111_0.dll", "nvrtc64_110_0.dll"]
+        candidates = [str(Path(root) / "bin" / sub / name)
+                      for root in roots for sub in ("x64", "") for name in names]
+        candidates += names
+    else:
+        driver = loads("libcuda.so.1") or loads("libcuda.so")
+        names = ["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11", "libnvrtc.so"]
+        candidates = list(names)
+        candidates += [str(Path(root) / "lib64" / name)
+                       for root in roots for name in names]
+    nvrtc = any(loads(candidate) for candidate in candidates)
+    return driver, nvrtc
+
+
+def _cuda_headers_dir() -> Path | None:
+    """The include directory NVRTC will be handed, or None when there is none.
+
+    The same places the runtime looks (v2_runtime.cpp): CUDA_PATH and CUDA_HOME
+    first, then the usual toolkit roots. `cuda_fp16.h` is the witness because
+    every kernel source starts by including it.
+    """
+    roots: list[Path] = []
+    for name in ("CUDA_PATH", "CUDA_HOME"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value) / "include")
+            roots.append(Path(value) / "targets" / "x86_64-linux" / "include")
+    roots += [Path("/opt/cuda/include"), Path("/usr/local/cuda/include"),
+              Path("/opt/cuda/targets/x86_64-linux/include"), Path("/usr/include")]
+    for root in roots:
+        if (root / "cuda_fp16.h").is_file():
+            return root
+    return None
+
+
 def _doctor() -> int:
     """Say what this install can do, and name the fix for what it cannot.
 
@@ -1956,9 +2014,32 @@ def _doctor() -> int:
                 report("nvidia gpu", True,
                        f"device 0, compute {gpu.get('compute_major')}."
                        f"{gpu.get('compute_minor')}, {free:.1f}/{total:.1f} GiB free")
+                # The kernels are compiled at startup by NVRTC, which needs the
+                # toolkit headers (cuda_fp16.h and CUB) even though the build
+                # did not. A GPU that probes fine with no headers fails at the
+                # first kernel, which is a worse place to learn about it.
+                headers = _cuda_headers_dir()
+                if headers:
+                    report("cuda headers", True, str(headers))
+                else:
+                    report("cuda headers", None, "cuda_fp16.h not found",
+                           "install the CUDA toolkit headers, or point CUDA_HOME "
+                           "at a toolkit; until then serve with --backend cpu")
             else:
-                report("nvidia gpu", None, "no usable device",
-                       "serve with --backend cpu, or install an NVIDIA driver")
+                # The probe says only "no"; the two libraries it needs fail
+                # for different reasons with different fixes, so look at each.
+                driver, nvrtc = _cuda_libraries_present()
+                if not driver:
+                    report("nvidia gpu", None, "no NVIDIA driver library (libcuda)",
+                           "serve with --backend cpu, or install an NVIDIA driver")
+                elif not nvrtc:
+                    report("nvidia gpu", None,
+                           "driver found, but the NVRTC library is missing",
+                           "install the CUDA toolkit (it provides libnvrtc), or "
+                           "serve with --backend cpu")
+                else:
+                    report("nvidia gpu", None, "no usable device",
+                           "serve with --backend cpu, or install an NVIDIA driver")
         except Exception as error:  # noqa: BLE001 - no driver is not a failure
             report("nvidia gpu", None, f"unavailable ({error})",
                    "serve with --backend cpu, or install an NVIDIA driver")
