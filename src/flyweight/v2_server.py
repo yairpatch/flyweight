@@ -23,6 +23,7 @@ from .sampling import (
 )
 from .server import (
     InferenceService,
+    log_notice,
     THINKING_CLOSE_TAGS,
     THINKING_OPEN_TAGS,
     _parse_tool_calls,
@@ -1373,12 +1374,10 @@ class ChatGenerator:
         active = counter() if callable(counter) else 0
         if active <= 1:
             return
-        sys.stderr.write(
-            f"[queue] request of {prompt_tokens} prompt tokens is waiting for a "
-            f"KV slot ({active} requests in flight); raise --parallel to overlap "
-            f"them\n"
+        log_notice(
+            f"queued: {prompt_tokens} prompt tokens waiting for a KV slot "
+            f"({active} requests in flight); raise --parallel to overlap them"
         )
-        sys.stderr.flush()
 
     def close(self) -> None:
         self.engine.close()
@@ -1857,14 +1856,14 @@ class ChatGenerator:
                         # One interrupt closes one block; a checkpoint that
                         # reopens thinking afterwards gets to finish it.
                         interrupt.clear()
-                        sys.stderr.write(
-                            "[gen ] thinking interrupted by the client; "
-                            "closing the block and resuming the answer\n"
+                        log_notice(
+                            "thinking interrupted by the client; closing the "
+                            "block and resuming the answer"
                         )
                     else:
-                        sys.stderr.write(
-                            f"[gen ] thinking budget of {meter.budget} tokens "
-                            f"spent; closing the block and resuming the answer\n"
+                        log_notice(
+                            f"thinking budget of {meter.budget} tokens spent; "
+                            "closing the block and resuming the answer"
                         )
                     self.engine.cancel(task_id)
                     self.engine.forget(task_id)

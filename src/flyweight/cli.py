@@ -774,6 +774,15 @@ checkpoint's generation_config.json says.\
         help="interval between keepalive comments on an idle stream",
     )
 
+    serve.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="print nothing but failures: no per-request statistics",
+    )
+    serve.add_argument(
+        "--verbose", "-v", dest="verbose", action="store_true",
+        help="add the HTTP access log and prefix-cache diagnostics",
+    )
+
     limits = serve.add_argument_group(
         "generation defaults",
         "What a request gets when it does not say otherwise.",
@@ -1642,6 +1651,8 @@ def _serve_http(args: argparse.Namespace, service) -> int:
             host=args.host,
             port=args.port,
             max_connections=args.max_connections,
+            quiet=getattr(args, "quiet", False),
+            verbose=getattr(args, "verbose", False),
         )
     except KeyboardInterrupt:
         pass

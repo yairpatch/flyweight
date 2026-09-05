@@ -505,9 +505,268 @@ def _truncate_at_stop(
 # What the live [gen] status line appends for the phase a stream is in, so
 # a long silent stretch names itself instead of reading as a stall.
 _PHASE_LABELS = {
-    "tool_call": " [building tool call]",
-    "thinking": " [thinking]",
+    "tool_call": "tool call",
+    "thinking": "thinking",
 }
+
+# Endpoints worth a line of their own. Everything else (/health, /slots,
+# /tokenize, the UI assets) is plumbing a running server emits constantly and
+# nobody reads; it appears only under --verbose.
+_ENDPOINT_LABELS = {
+    "/v1/chat/completions": "chat",
+    "/v1/completions": "completions",
+    "/v1/messages": "messages",
+    "/v1/responses": "responses",
+}
+
+
+def _compact(count: int) -> str:
+    """A token count at a glance: exact below 10k, one decimal above."""
+    if count < 10_000:
+        return str(count)
+    return f"{count / 1000:.1f}k"
+
+
+class _Palette:
+    """ANSI styling, or nothing at all.
+
+    Colour is applied only on a terminal, and only when the environment has
+    not asked otherwise: NO_COLOR is the cross-tool opt-out, TERM=dumb is the
+    editor terminals and CI logs that render escapes literally. Redirected to
+    a file the output is the same text without the escapes, so a log stays
+    greppable.
+    """
+
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+
+    def __init__(self) -> None:
+        self.enabled = False
+
+    def __call__(self, text: str, *styles: str) -> str:
+        if not self.enabled or not text:
+            return text
+        return "".join(styles) + text + self.RESET
+
+    def status(self, code: int) -> str:
+        if code >= 500:
+            return self(str(code), self.RED, self.BOLD)
+        if code >= 400:
+            return self(str(code), self.YELLOW, self.BOLD)
+        return self(str(code), self.GREEN)
+
+
+class ServerLog:
+    """Everything the server prints, through one writer.
+
+    Two problems this exists to solve. The progress line rewrites itself with
+    a carriage return while the access log writes whole lines to the same
+    stream, so the two interleaved into unreadable hybrids ("[gen ] 34 tokens
+    31.7 tok/s 1.0s [thinking]127.0.0.1 - - [05/Sep/2026 00:44:36] request
+    decoding"). And there was no way to turn any of it off.
+
+    One lock serializes writers, an in-place progress line is always cleared
+    before a full line goes out, and the carriage-return form is used only on
+    a terminal -- piped to a file or journald it would be one enormous line.
+    """
+
+    QUIET, NORMAL, VERBOSE = 0, 1, 2
+
+    def __init__(self, stream: object | None = None) -> None:
+        self.level = self.NORMAL
+        self._lock = threading.Lock()
+        # Resolved per write, not captured: sys.stderr is swapped by
+        # contextlib.redirect_stderr (which the tests use) and by anything
+        # that reopens the stream, and a reference taken at import would keep
+        # writing to the old one.
+        self._fixed_stream = stream
+        self._progress = ""
+        self._progress_width = 0
+        self._header_shown = False
+        self.paint = _Palette()
+
+    @property
+    def _stream(self) -> Any:
+        return self._fixed_stream if self._fixed_stream is not None else sys.stderr
+
+    def configure(self, *, quiet: bool = False, verbose: bool = False) -> None:
+        self.level = self.QUIET if quiet else self.VERBOSE if verbose else self.NORMAL
+        self._header_shown = False
+        self.paint.enabled = (
+            self._tty()
+            and not os.environ.get("NO_COLOR")
+            and os.environ.get("TERM", "") != "dumb"
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.level > self.QUIET
+
+    @property
+    def verbose(self) -> bool:
+        return self.level >= self.VERBOSE
+
+    def _tty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except Exception:
+            return False
+
+    def _erase(self) -> None:
+        if self._progress:
+            self._stream.write("\r" + " " * self._progress_width + "\r")
+            self._progress = ""
+            self._progress_width = 0
+
+    def line(self, text: str, *, when: float | None = None) -> None:
+        """One timestamped line. Always shown unless quiet."""
+        if not self.enabled:
+            return
+        stamp = self.paint(time.strftime("%H:%M:%S", time.localtime(when)), self.paint.DIM)
+        with self._lock:
+            self._erase()
+            self._stream.write(f"{stamp}  {text}\n")
+            self._stream.flush()
+
+    def plain(self, text: str) -> None:
+        """A line with no timestamp: the table header."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._erase()
+            self._stream.write(text + "\n")
+            self._stream.flush()
+
+    def error(self, text: str) -> None:
+        """A failure. Shown even when quiet: silence here hides outages."""
+        stamp = self.paint(time.strftime("%H:%M:%S"), self.paint.DIM)
+        with self._lock:
+            self._erase()
+            self._stream.write(f"{stamp}  {text}\n")
+            self._stream.flush()
+
+    def detail(self, text: str) -> None:
+        """Diagnostics only a --verbose reader wants."""
+        if self.verbose:
+            self.line(text)
+
+    def progress(self, text: str) -> None:
+        """A line that rewrites itself. Dropped when not on a terminal."""
+        if not self.enabled or not self._tty():
+            return
+        with self._lock:
+            # Padding is measured on the PLAIN text: escape sequences occupy
+            # no columns, and counting them left a trail of stale characters
+            # when a longer line was replaced by a shorter one.
+            padding = max(0, self._progress_width - len(text))
+            self._stream.write("\r" + self.paint(text, self.paint.DIM) + " " * padding)
+            self._stream.flush()
+            self._progress = text
+            self._progress_width = len(text)
+
+    def end_progress(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._erase()
+            self._stream.flush()
+
+
+LOG = ServerLog()
+
+
+# The request log is a table: one row per request, one column per thing a
+# reader looks for, and a header so the columns are named rather than guessed.
+#
+# Two lines per request (prefill, then decode) was the first shape and it does
+# not survive an agentic session: the loop turns over every few seconds, so the
+# screen fills with sixty near-identical rows and the eye has nothing to anchor
+# on. A request is the unit a reader thinks in, so a request is one row; the
+# prefill/decode split is still there under --verbose, and live progress
+# already answers "is it working" while the request runs.
+_LOG_HEADER = (
+    f"{'':8}  {'endpoint':<9} {'prompt':>7} {'cached':>7} {'ttft':>6}"
+    f"  {'out':>6} {'tok/s':>7}  {'finish':<11} {'total':>7}"
+)
+
+
+def _log_header_once() -> None:
+    if LOG._header_shown or not LOG.enabled:
+        return
+    LOG._header_shown = True
+    LOG.plain(LOG.paint(_LOG_HEADER, LOG.paint.DIM))
+
+
+def _log_request_row(
+    endpoint: str,
+    prompt_tokens: int | None,
+    cached_tokens: int,
+    ttft: float | None,
+    out_tokens: int,
+    rate: float,
+    finish: str,
+    total: float | None,
+    status: int = 200,
+) -> str:
+    paint = LOG.paint
+    prompt = _compact(prompt_tokens) if prompt_tokens else "--"
+    share = f"{100 * cached_tokens // prompt_tokens}%" if prompt_tokens else "--"
+    first = f"{ttft:.1f}s" if ttft is not None else "--"
+    produced = str(out_tokens) if out_tokens else "--"
+    speed = f"{rate:.1f}" if rate > 0 else "--"
+    spent = f"{total:.1f}s" if total is not None else "--"
+    if status >= 400:
+        finish = paint(f"{status} {finish}", paint.RED if status >= 500 else paint.YELLOW)
+        # An error has no output columns to fill; let the reason use the room.
+        return (
+            f"{paint(f'{endpoint:<9}', paint.CYAN)} {prompt:>7} {share:>7}"
+            f" {first:>6}  {finish}"
+        )
+    return (
+        f"{paint(f'{endpoint:<9}', paint.CYAN)} {prompt:>7} {share:>7} {first:>6}"
+        f"  {produced:>6} {speed:>7}  {paint(f'{finish:<11}', paint.DIM)} {spent:>7}"
+    )
+
+
+def _log_progress_row(
+    endpoint: str,
+    prompt_tokens: int | None,
+    cached_tokens: int,
+    ttft: float | None,
+    out_tokens: int,
+    rate: float,
+    note: str,
+) -> str:
+    """The row for a request still running: the same columns, filled so far.
+
+    Rendering progress in the table's own shape means the line a reader is
+    watching becomes the line that commits -- the numbers do not move.
+    """
+    prompt = _compact(prompt_tokens) if prompt_tokens else "--"
+    share = f"{100 * cached_tokens // prompt_tokens}%" if prompt_tokens else "--"
+    first = f"{ttft:.1f}s" if ttft is not None else "--"
+    produced = str(out_tokens) if out_tokens else "--"
+    speed = f"{rate:.1f}" if rate > 0 else "--"
+    return (
+        f"{'':8}  {endpoint:<9} {prompt:>7} {share:>7} {first:>6}"
+        f"  {produced:>6} {speed:>7}  {note}"
+    )
+
+
+def log_notice(text: str) -> None:
+    """A one-off remark from anywhere in the process.
+
+    The generator used to write these straight to stderr, which collided with
+    the progress line rewriting itself: "36.5 tok/s 56.0s thinking[gen ]
+    thinking budget of 2048 tokens spent". Through here they queue behind the
+    same lock and the progress line is cleared first.
+    """
+    LOG.line(LOG.paint(text, LOG.paint.DIM))
 
 
 def _metrics_payload(metrics: _Metrics) -> dict[str, Any]:
@@ -3064,6 +3323,102 @@ def create_handler(
         server_version = "flyweight/0.2"
         protocol_version = "HTTP/1.1"
 
+        # Per-request statistics, collected wherever they become known and
+        # spent by _log_summary at the end of the request.
+        _fw_status: int | None = None
+        _fw_error: str | None = None
+        _fw_prompt_tokens: int | None = None
+        _fw_reused_tokens: int = 0
+        _fw_slot: int | None = None
+        _fw_prefill_done: float | None = None
+        _fw_decode_tokens: int = 0
+        _fw_decode_seconds: float = 0.0
+        _fw_decode_phase: str | None = None
+        _fw_finish: str | None = None
+        _fw_started: float | None = None
+
+        def _fw_reset(self) -> None:
+            self._fw_status = None
+            self._fw_error = None
+            self._fw_prompt_tokens = None
+            self._fw_reused_tokens = 0
+            self._fw_slot = None
+            self._fw_prefill_done = None
+            self._fw_decode_tokens = 0
+            self._fw_decode_seconds = 0.0
+            self._fw_decode_phase = None
+            self._fw_finish = None
+            self._fw_started = time.perf_counter()
+
+        def send_response(self, code: int, message: str | None = None) -> None:
+            self._fw_status = int(code)
+            super().send_response(code, message)
+
+        def log_message(self, format: str, *args: object) -> None:
+            """The access log and the lifecycle chatter, for --verbose only.
+
+            What a reader wants by default is the two summary lines; the
+            status and path they carried are folded into those.
+            """
+            LOG.detail(f"{self.address_string()} {format % args}")
+
+        def log_error(self, format: str, *args: object) -> None:
+            LOG.error(f"{self.address_string()} {format % args}")
+
+        def _log_summary(self, path: str) -> None:
+            """The request's closing line: what it produced, or why it failed.
+
+            Only for the endpoints that generate. The plumbing a running
+            server emits constantly (/health, /slots, the UI) says nothing a
+            reader needs and drowns what does.
+            """
+            endpoint = _ENDPOINT_LABELS.get(path)
+            status = self._fw_status or 0
+            if endpoint is None:
+                if self._fw_error is not None:
+                    LOG.error(
+                        f"{LOG.paint(f'{path:<9}', LOG.paint.CYAN)} "
+                        f"{LOG.paint.status(status)}  {self._fw_error}"
+                    )
+                return
+            total = (
+                time.perf_counter() - self._fw_started
+                if self._fw_started is not None else None
+            )
+            ttft = (
+                self._fw_prefill_done - self._fw_started
+                if self._fw_prefill_done is not None and self._fw_started is not None
+                else None
+            )
+            if self._fw_error is not None:
+                _log_header_once()
+                LOG.error(
+                    _log_request_row(
+                        endpoint, self._fw_prompt_tokens, self._fw_reused_tokens,
+                        ttft, 0, 0.0, self._fw_error, total, status,
+                    )
+                )
+                return
+            seconds = self._fw_decode_seconds
+            if seconds <= 0 and self._fw_prefill_done is not None:
+                seconds = max(0.0, time.perf_counter() - self._fw_prefill_done)
+            # Rate over the INTERVALS between tokens: the first token's time
+            # belongs to prefill, and counting it here understates decode.
+            intervals = self._fw_decode_tokens - 1
+            rate = (intervals / seconds) if intervals > 0 and seconds > 0 else 0.0
+            finish = (
+                self._fw_finish
+                or _PHASE_LABELS.get(self._fw_decode_phase or "")
+                or ("--" if self._fw_decode_tokens else "no output")
+            )
+            _log_header_once()
+            LOG.line(
+                _log_request_row(
+                    endpoint, self._fw_prompt_tokens, self._fw_reused_tokens,
+                    ttft, self._fw_decode_tokens, rate, finish, total, status,
+                )
+            )
+
         def setup(self) -> None:
             super().setup()
             # Waiting for a request is not the same as servicing one; see
@@ -3113,7 +3468,7 @@ def create_handler(
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _guarded(self, body: Callable[[], None]) -> None:
+        def _guarded(self, body: Callable[[], None]) -> None:  # noqa: D401
             """Run a handler body under the error policy do_POST already had.
 
             A native-runtime failure inside /health or /props used to escape
@@ -3218,6 +3573,7 @@ def create_handler(
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
+            self._fw_reset()
             try:
                 self._authenticate()
                 if path == "/v1/me":
@@ -3320,6 +3676,9 @@ def create_handler(
                 # traceback has to reach the log or the failure is undebuggable.
                 self.log_error("unhandled request error: %s", traceback.format_exc())
                 self._send_error(APIError(500, "internal server error", "server_error"))
+            finally:
+                LOG.end_progress()
+                self._log_summary(path)
 
         def _authenticate(self) -> None:
             if service.api_key is None:
@@ -3337,17 +3696,15 @@ def create_handler(
                 )
 
         def _prompt_progress(self, path: str) -> Callable[[int, int], None]:
-            label = f"[prefill {uuid.uuid4().hex[:8]}] {path}"
+            endpoint = _ENDPOINT_LABELS.get(path, path)
             last_seen = -1
-            last_logged = -1
+            last_shown_at = 0.0
             started = time.perf_counter()
-            last_logged_at = started
             first_report = True
             reused = 0
 
             def report(processed: int, total: int) -> None:
-                nonlocal first_report, last_logged, last_logged_at, last_seen
-                nonlocal reused, started
+                nonlocal first_report, last_shown_at, last_seen, reused
                 if processed == last_seen:
                     return
                 last_seen = processed
@@ -3355,8 +3712,8 @@ def create_handler(
                 if first_report:
                     first_report = False
                     reused = min(max(0, processed), total)
-                    remaining = max(0, total - reused)
-                    cached = f", {reused} cached/reused" if reused else ""
+                    self._fw_prompt_tokens = total
+                    self._fw_reused_tokens = reused
                     detail = None
                     diagnostics = getattr(
                         getattr(service, "generator", None),
@@ -3373,11 +3730,8 @@ def create_handler(
                     # read, so only trust a record describing this prompt.
                     if detail is not None and detail["prompt_tokens"] != total:
                         detail = None
-                    slot = f" [slot {detail['slot']}]" if detail is not None else ""
-                    sys.stderr.write(
-                        f"{label}: starting {total} prompt tokens"
-                        f"{cached}, {remaining} to evaluate{slot}\n"
-                    )
+                    if detail is not None:
+                        self._fw_slot = detail["slot"]
                     if detail is not None and 0 < detail["divergence"] < detail[
                         "cached_tokens"
                     ]:
@@ -3387,68 +3741,58 @@ def create_handler(
                             return text[:80] + ("…" if len(text) > 80 else "")
 
                         snapped = (
-                            f", reuse snapped back to {detail['reused_tokens']}"
+                            f", reuse fell back to {detail['reused_tokens']}"
                             f" (nearest checkpoint)"
                             if detail["reused_tokens"] < detail["divergence"]
                             else ""
                         )
-                        sys.stderr.write(
-                            f"{label}: history rewritten at token"
+                        LOG.detail(
+                            f"{endpoint:<11} history rewritten at token"
                             f" {detail['divergence']} of"
-                            f" {detail['cached_tokens']} cached{snapped}\n"
-                            f"{label}:   cached: {clip(detail['old_text'])}\n"
-                            f"{label}:   prompt: {clip(detail['new_text'])}\n"
+                            f" {detail['cached_tokens']} cached{snapped}"
                         )
-                    sys.stderr.flush()
+                        LOG.detail(f"{'':<11}   cached: {clip(detail['old_text'])}")
+                        LOG.detail(f"{'':<11}   prompt: {clip(detail['new_text'])}")
                     # The clock is NOT restarted here, and that is deliberate.
-                    #
-                    # It used to be, on the reasoning that the first callback
-                    # reports cache reuse, which costs nothing and should not
-                    # drag the rate down. But a runtime that emits no
-                    # incremental prefill events gets a compatibility fallback
-                    # in v2_server, which synthesizes both callbacks back to
-                    # back once the first token arrives. The clock then started
-                    # and stopped microseconds apart and the rate came out as
-                    # "1227 tokens at 48521041 tok/s" -- a number with no
-                    # relationship to anything.
-                    #
-                    # `started` is set when this reporter is built, just after
-                    # the request is read, so it brackets tokenization, prefill
-                    # and (on the fallback path) the first token. That
-                    # over-counts the setup slightly. Over-counting by a
-                    # constant beats under-counting by three orders of
-                    # magnitude, and unlike the reset it cannot produce a figure
-                    # that is obviously false yet easy to quote.
-                    last_logged = processed
-                    last_logged_at = now
+                    # A runtime that emits no incremental prefill events gets a
+                    # compatibility fallback in v2_server, which synthesizes
+                    # both callbacks back to back once the first token arrives;
+                    # restarting here made the rate come out as "1227 tokens at
+                    # 48521041 tok/s". `started` is set when this reporter is
+                    # built, just after the request is read, so it brackets
+                    # tokenization and prefill -- over-counting by a constant
+                    # beats a figure with no relationship to anything.
                     if processed < total:
                         return
-                minimum_step = max(1, total // 20)
-                if (
-                    processed < total
-                    and processed - last_logged < minimum_step
-                    and now - last_logged_at < 1.0
-                ):
-                    return
-                pct = (100 * processed / total) if total else 100
-                elapsed = now - started
                 evaluated = max(0, processed - reused)
+                elapsed = now - started
                 rate = (evaluated / elapsed) if elapsed > 0 else 0.0
-                sys.stderr.write(
-                    f"{label}: {processed}/{total} tokens "
-                    f"({pct:5.1f}%) {rate:6.1f} tok/s"
-                    "\n"
-                )
-                sys.stderr.flush()
-                last_logged = processed
-                last_logged_at = now
-                if processed >= total:
-                    sys.stderr.write(
-                        f"{label}: ready in {elapsed:5.2f}s "
-                        f"({evaluated} evaluated, {reused} reused, "
-                        f"{rate:6.1f} tok/s)\n"
+                if processed < total:
+                    if now - last_shown_at < 0.25:
+                        return
+                    last_shown_at = now
+                    pct = (100 * processed / total) if total else 100.0
+                    remaining = max(0, total - processed)
+                    eta = f", eta {remaining / rate:.0f}s" if rate > 0 else ""
+                    LOG.progress(
+                        _log_progress_row(
+                            endpoint, total, reused, None, 0, rate,
+                            f"prefill {pct:.0f}%{eta}",
+                        )
                     )
-                    sys.stderr.flush()
+                    return
+                LOG.end_progress()
+                self._fw_prefill_done = now
+                cached = (
+                    "fully cached" if evaluated == 0
+                    else f"{_compact(reused)} of {_compact(total)} cached" if reused
+                    else "nothing cached"
+                )
+                slot = f", slot {self._fw_slot}" if self._fw_slot is not None else ""
+                LOG.detail(
+                    f"{endpoint:<9} prefill  {evaluated} of {total} tokens"
+                    f" evaluated ({cached}{slot})  {elapsed:.1f}s  {rate:.0f} tok/s"
+                )
 
             return report
 
@@ -3557,7 +3901,7 @@ def create_handler(
                                     phase if isinstance(phase, str) else None
                                 )
                                 now = time.perf_counter()
-                                if now - last_stat >= 1.0:
+                                if now - last_stat >= 0.25:
                                     last_stat = now
                                     intervals = tokens - 1
                                     rate = (
@@ -3565,38 +3909,36 @@ def create_handler(
                                         if intervals > 0 and elapsed > 0
                                         else 0.0
                                     )
-                                    sys.stderr.write(
-                                        f"\r[gen ] {tokens} tokens "
-                                        f"{rate:6.1f} tok/s {elapsed:5.1f}s"
-                                        + _PHASE_LABELS.get(decode_phase or "", "")
+                                    endpoint = _ENDPOINT_LABELS.get(
+                                        urlsplit(self.path).path, ""
                                     )
-                                    sys.stderr.flush()
+                                    ttft = (
+                                        self._fw_prefill_done - self._fw_started
+                                        if self._fw_prefill_done is not None
+                                        and self._fw_started is not None
+                                        else None
+                                    )
+                                    LOG.progress(
+                                        _log_progress_row(
+                                            endpoint, self._fw_prompt_tokens,
+                                            self._fw_reused_tokens, ttft,
+                                            tokens, rate,
+                                            _PHASE_LABELS.get(
+                                                decode_phase or "", "decoding"
+                                            ),
+                                        )
+                                    )
                     self._write_sse_event(
                         data, event if isinstance(event, dict) else None
                     )
+                # The last chunk's own span, not the wall time to the end of
+                # the stream: the tail after the final token is teardown, not
+                # decode, and counting it understated the rate.
                 if decode_tokens:
-                    # The last chunk's own span, not the wall time to the end of
-                    # the stream: the tail after the final token is teardown, not
-                    # decode, and counting it understated the rate.
-                    intervals = decode_tokens - 1
-                    rate = (
-                        intervals / decode_elapsed
-                        if intervals > 0 and decode_elapsed > 0
-                        else 0.0
-                    )
-                    sys.stderr.write(
-                        f"\n[gen ] done {decode_tokens} tokens "
-                        f"in {decode_elapsed:5.2f}s ({rate:6.1f} tok/s)"
-                        + (
-                            " [tool call ready]"
-                            if decode_phase == "tool_call"
-                            else " [ended while thinking]"
-                            if decode_phase == "thinking"
-                            else ""
-                        )
-                        + "\n"
-                    )
-                    sys.stderr.flush()
+                    self._fw_decode_tokens = decode_tokens
+                    self._fw_decode_seconds = decode_elapsed
+                    self._fw_decode_phase = decode_phase
+                LOG.end_progress()
                 self.log_message("request completed: streaming events=%d", event_count)
             except (BrokenPipeError, ConnectionResetError):
                 stream_ok = False
@@ -3711,6 +4053,7 @@ def create_handler(
             self.send_header("Vary", "Origin")
 
         def _send_error(self, error: APIError) -> None:
+            self._fw_error = error.message
             self._send_json(error.status, self._error_body(error))
 
         def _error_body(self, error: APIError) -> dict[str, Any]:
@@ -3767,6 +4110,22 @@ def create_handler(
             *,
             head_only: bool = False,
         ) -> None:
+            # A non-streaming generation carries its own counts; take them
+            # here so both response shapes end with the same summary line.
+            usage = payload.get("usage") if isinstance(payload, Mapping) else None
+            if isinstance(usage, Mapping):
+                produced = usage.get("completion_tokens")
+                if not isinstance(produced, int):
+                    produced = usage.get("output_tokens")
+                if isinstance(produced, int) and produced > 0:
+                    self._fw_decode_tokens = produced
+            choices = payload.get("choices") if isinstance(payload, Mapping) else None
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                if isinstance(first, Mapping):
+                    reason = first.get("finish_reason")
+                    if isinstance(reason, str):
+                        self._fw_finish = reason
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -3792,9 +4151,12 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8000,
     max_connections: int = 128,
+    quiet: bool = False,
+    verbose: bool = False,
 ) -> None:
     if not 0 <= port <= 65535:
         raise ValueError("port must be between 0 and 65535")
+    LOG.configure(quiet=quiet, verbose=verbose)
     server = FlyweightHTTPServer(
         (host, port), create_handler(service), max_connections=max_connections
     )
