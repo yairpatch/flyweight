@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, Brain, Check, Copy, Pencil, RefreshCw, Trash2, User, Wrench, AlertTriangle, ChevronRight, Play } from "lucide-react";
+import { Ban, Bot, Brain, Check, Copy, Pencil, RefreshCw, ShieldAlert, Trash2, User, Wrench, AlertTriangle, ChevronRight, Play } from "lucide-react";
 import type { Message, ToolCall } from "../types";
 import { useStore } from "../store";
 import { StreamingMarkdown } from "./Markdown";
@@ -136,13 +136,18 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
   const conversation = useStore((state) => state.conversations.find((item) => item.id === state.activeId));
   const submitToolResult = useStore((state) => state.submitToolResult);
   const busy = useStore((state) => Boolean(state.generating));
+  // The agent loop owns this turn's calls while it runs them, whether it is
+  // executing one or waiting on an approval; the manual reply box stays away
+  // until it is done.
+  const loopActive = useStore((state) => state.generating?.messageId === messageId && state.generating.phase !== undefined);
   const executing = useStore((state) => state.generating?.phase === "tools" && state.generating.messageId === messageId);
+  const approval = useStore((state) => (state.approval?.callId === call.id ? state.approval : null));
   const [result, setResult] = useState("");
   const answered = conversation?.messages.some((message) => message.role === "tool" && message.toolCallId === call.id);
   const args = useMemo(() => prettyJson(call.arguments), [call.arguments]);
 
   return (
-    <div className={`tool${live ? " tool--live" : ""}`} dir="ltr">
+    <div className={`tool${live ? " tool--live" : ""}${approval ? " tool--approval" : ""}`} dir="ltr">
       <div className="tool__head">
         <Wrench size={14} />
         <span className="tool__name">{call.name || "tool"}</span>
@@ -151,8 +156,9 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
       <pre className="tool__args">
         <code>{args}</code>
       </pre>
-      {executing && !answered && <div className="tool__answered">Running handler…</div>}
-      {!live && !answered && !executing && isLast && (
+      {approval && <ApprovalPrompt command={approval.command} />}
+      {executing && !answered && !approval && <div className="tool__answered">Running…</div>}
+      {!live && !answered && !loopActive && isLast && (
         <div className="tool__reply">
           <textarea
             className="tool__input"
@@ -172,6 +178,38 @@ function ToolCallCard({ call, messageId, live, isLast }: { call: ToolCall; messa
         </div>
       )}
       {answered && <div className="tool__answered">Result provided</div>}
+    </div>
+  );
+}
+
+/**
+ * The agent wants to run a shell command in the workspace. Nothing runs until
+ * one of these buttons is pressed; stopping the run counts as a denial.
+ */
+function ApprovalPrompt({ command }: { command: string }) {
+  const resolveApproval = useStore((state) => state.resolveApproval);
+  const approve = useRef<HTMLButtonElement>(null);
+  useEffect(() => approve.current?.focus(), []);
+  return (
+    <div className="approval" role="group" aria-label="Approve shell command">
+      <div className="approval__head">
+        <ShieldAlert size={14} />
+        <span>Run this command in the agent workspace?</span>
+      </div>
+      <pre className="approval__command">
+        <code>{command}</code>
+      </pre>
+      <div className="approval__actions">
+        <button className="button button--small button--primary" ref={approve} onClick={() => resolveApproval("approve")}>
+          <Play size={13} /> Run
+        </button>
+        <button className="button button--small" onClick={() => resolveApproval("approve-all")}>
+          Always allow in this run
+        </button>
+        <button className="button button--small button--danger" onClick={() => resolveApproval("deny")}>
+          <Ban size={13} /> Deny
+        </button>
+      </div>
     </div>
   );
 }

@@ -185,6 +185,8 @@ export interface PropsPayload {
   generation_defaults?: Record<string, number>;
   generation_defaults_source?: string;
   capabilities?: string[];
+  /** Directory the server's agent tools are confined to; absent unless --agent-workspace was given. */
+  agent_workspace?: string;
 }
 
 export interface ModelInfo {

@@ -2,6 +2,7 @@ import { useRef } from "react";
 import { Plus, Trash2, Upload } from "lucide-react";
 import { useStore } from "../../store";
 import { clamp, identifier } from "../../lib/format";
+import { workspaceRoot } from "../../lib/agentTools";
 import type { ToolDefinition } from "../../types";
 
 function validJson(text: string): boolean {
@@ -19,6 +20,7 @@ export function ToolsPanel() {
   const settings = useStore((state) => state.settings);
   const updateSettings = useStore((state) => state.updateSettings);
   const toast = useStore((state) => state.toast);
+  const workspace = useStore((state) => workspaceRoot(state.props));
   const fileInput = useRef<HTMLInputElement>(null);
 
   const patch = (id: string, changes: Partial<ToolDefinition>) => setTools(tools.map((tool) => (tool.id === id ? { ...tool, ...changes } : tool)));
@@ -67,6 +69,18 @@ export function ToolsPanel() {
           it answers. Handlers run in the same sandboxed frame as the code preview: an opaque origin with no access to this app's storage or API key,
           and network requests subject to CORS. A call whose tool has no handler pauses the run for a manual result; Stop (Esc) interrupts it.
         </p>
+        {workspace ? (
+          <p className="muted">
+            The server also offers built-in tools, confined to <code>{workspace}</code>: <code>list_dir</code>, <code>read_file</code>,{" "}
+            <code>write_file</code>, <code>run_command</code>, and <code>fetch_url</code>. They are sent with every agent run and need no handler.
+            Every <code>run_command</code> call waits for your approval in the transcript before anything executes.
+          </p>
+        ) : (
+          <p className="muted">
+            Built-in file, shell, and fetch tools are off. Start the server with <code>--agent-workspace DIR</code> to give agent runs a directory to
+            work in.
+          </p>
+        )}
         <label className="field">
           <span className="field__label">
             Turn cap <small>model turns per run</small>

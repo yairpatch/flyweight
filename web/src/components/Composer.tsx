@@ -5,6 +5,7 @@ import { ACCEPT_ATTRIBUTE, MAX_ATTACHMENTS, filesFrom, readAttachment, setPdfMod
 import { AttachmentChip } from "./AttachmentChip";
 import { api } from "../lib/api";
 import { PROTOCOL_LABELS } from "../lib/protocols";
+import { workspaceRoot } from "../lib/agentTools";
 import type { Attachment, ReasoningEffort } from "../types";
 
 const REASONING_CYCLE: Array<{ thinking: boolean; effort: ReasoningEffort; label: string }> = [
@@ -47,6 +48,7 @@ export function Composer() {
   const [reading, setReading] = useState(0);
 
   const props = useStore((state) => state.props);
+  const workspace = workspaceRoot(props);
   const vision = Boolean(health?.execution?.vision);
   const readContext = { vision, contextWindow: props?.context_window ?? health?.context_window };
   const enabledTools = tools.filter((tool) => tool.enabled).length;
@@ -186,7 +188,15 @@ export function Composer() {
               <Wrench size={13} /> {enabledTools ? `${enabledTools} tool${enabledTools === 1 ? "" : "s"}` : "Tools"}
             </button>
             {mode === "agent" && (
-              <button className="chip chip--button chip--on" onClick={() => setPanel("tools")} title={`Agent run: tool calls run through their handlers automatically, up to ${settings.agentMaxTurns} turns`}>
+              <button
+                className="chip chip--button chip--on"
+                onClick={() => setPanel("tools")}
+                title={
+                  workspace
+                    ? `Agent run in ${workspace}: files, shell (with approval), and fetch, up to ${settings.agentMaxTurns} turns`
+                    : `Agent run: tool calls run through their handlers automatically, up to ${settings.agentMaxTurns} turns`
+                }
+              >
                 <Bot size={13} /> Agent · {settings.agentMaxTurns} turns
               </button>
             )}

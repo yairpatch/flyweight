@@ -1,0 +1,2 @@
+const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/mammoth.browser-C_W41-cL.js","assets/index-JB54-oPY.js","assets/index-INu2oIbm.css"])))=>i.map(i=>d[i]);
+import{i as e,t}from"./index-JB54-oPY.js";async function n(n){let r=await t(()=>import(`./mammoth.browser-C_W41-cL.js`).then(t=>e(t.default,1)),__vite__mapDeps([0,1,2]));return(await(r.default??r).convertToMarkdown({arrayBuffer:await n.arrayBuffer()})).value.trim()}export{n as docxToMarkdown};

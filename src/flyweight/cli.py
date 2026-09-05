@@ -758,6 +758,12 @@ checkpoint's generation_config.json says.\
              "instead of serving it anyway",
     )
     endpoint.add_argument(
+        "--agent-workspace", metavar="DIR", default=None,
+        help="enable the chat UI's agent tools (read/write/list files, run "
+             "shell commands, fetch URLs) confined to this directory; off "
+             "unless given. Commands still require approval in the UI",
+    )
+    endpoint.add_argument(
         "--concurrency", "--max-concurrent-requests",
         dest="max_concurrent_requests", type=int, default=64, metavar="N",
         help="requests admitted to inference at once; the rest are refused "
@@ -1652,6 +1658,17 @@ def _serve_http(args: argparse.Namespace, service) -> int:
     # Every service class inherits the attribute from InferenceService; one
     # assignment here beats threading a keyword through their constructors.
     service.freeze_total_tokens = bool(getattr(args, "freeze_total_tokens", False))
+    workspace_dir = getattr(args, "agent_workspace", None)
+    if workspace_dir:
+        from .server import AgentWorkspace
+        try:
+            service.agent_workspace = AgentWorkspace(workspace_dir)
+        except ValueError as error:
+            raise SystemExit(f"--agent-workspace: {error}") from error
+        print(
+            f"Agent tools enabled in {service.agent_workspace.root}",
+            file=sys.stderr,
+        )
     try:
         print(f"Serving {service.model_name} at http://{args.host}:{args.port}", file=sys.stderr)
         serve_http(

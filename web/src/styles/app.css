@@ -283,6 +283,13 @@ kbd {
   padding: 5px 10px;
   font-size: 12.5px;
 }
+.button--danger {
+  color: var(--danger);
+}
+.button--danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
 
 .icon-button {
   display: inline-flex;
@@ -975,6 +982,41 @@ kbd {
   font-size: 12px;
   color: var(--success);
   border-top: 1px solid var(--border);
+}
+
+/* A shell command waiting on the user; nothing runs until they answer. */
+.tool--approval {
+  border-color: var(--warning, var(--accent));
+}
+.approval {
+  border-top: 1px solid var(--border);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.approval__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+.approval__command {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.approval__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .edit {

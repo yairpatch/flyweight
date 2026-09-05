@@ -288,6 +288,229 @@ class APIError(Exception):
     code: str | None = None
 
 
+# Caps for the agent workspace endpoints. Results travel back into the
+# model's context, so "as much as fits in a prompt" is the budget, not "as
+# much as the disk holds".
+_AGENT_FILE_BYTES = 256 * 1024
+_AGENT_OUTPUT_BYTES = 64 * 1024
+_AGENT_FETCH_BYTES = 512 * 1024
+_AGENT_LIST_ENTRIES = 500
+_AGENT_EXEC_TIMEOUT = 30.0
+_AGENT_EXEC_TIMEOUT_MAX = 300.0
+_AGENT_FETCH_TIMEOUT = 20.0
+
+
+def _agent_clip(data: bytes, limit: int) -> tuple[str, bool]:
+    """Decode tool output for the model, cut to what a prompt can afford."""
+    clipped = data[:limit]
+    return clipped.decode("utf-8", errors="replace"), len(data) > limit
+
+
+class AgentWorkspace:
+    """Host-side tools for the chat UI's agent runs.
+
+    Enabled only by `serve --agent-workspace DIR`. Every file operation and
+    command is confined to (or started in) that directory, and the handler
+    never sends a CORS grant for `/agent/*`, so a foreign web page cannot
+    drive these endpoints through a visitor's browser -- only same-origin
+    callers (the bundled UI) and non-browser clients that already hold the
+    API key can.
+    """
+
+    def __init__(self, root: str | os.PathLike[str]):
+        resolved = Path(root).resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"agent workspace is not a directory: {resolved}")
+        self.root = resolved
+
+    def handle(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
+            "/agent/fs/read": self.read_file,
+            "/agent/fs/write": self.write_file,
+            "/agent/fs/list": self.list_dir,
+            "/agent/exec": self.run_command,
+            "/agent/fetch": self.fetch_url,
+        }
+        handler = handlers.get(path)
+        if handler is None:
+            raise APIError(404, "endpoint not found", "not_found_error")
+        return handler(payload)
+
+    def _resolve(self, raw: object, *, default: str | None = None) -> Path:
+        if raw is None and default is not None:
+            raw = default
+        if not isinstance(raw, str) or not raw.strip():
+            raise APIError(
+                400, "path must be a non-empty string", parameter="path"
+            )
+        candidate = Path(raw.strip())
+        base = candidate if candidate.is_absolute() else self.root / candidate
+        try:
+            resolved = base.resolve()
+        except OSError as error:
+            raise APIError(
+                400, f"path cannot be resolved: {error}", parameter="path"
+            ) from error
+        if resolved != self.root and self.root not in resolved.parents:
+            raise APIError(
+                403,
+                f"path is outside the agent workspace {self.root}",
+                parameter="path",
+            )
+        return resolved
+
+    def _relative(self, path: Path) -> str:
+        return str(path.relative_to(self.root)).replace(os.sep, "/") or "."
+
+    def read_file(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        path = self._resolve(payload.get("path"))
+        if not path.is_file():
+            raise APIError(
+                404, f"no such file: {self._relative(path)}", "not_found_error"
+            )
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(_AGENT_FILE_BYTES + 1)
+            size = path.stat().st_size
+        except OSError as error:
+            raise APIError(400, f"cannot read file: {error}") from error
+        content, truncated = _agent_clip(data, _AGENT_FILE_BYTES)
+        return {
+            "path": self._relative(path),
+            "content": content,
+            "size": size,
+            "truncated": truncated,
+        }
+
+    def write_file(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        path = self._resolve(payload.get("path"))
+        content = payload.get("content")
+        if not isinstance(content, str):
+            raise APIError(
+                400, "content must be a string", parameter="content"
+            )
+        if path == self.root or path.is_dir():
+            raise APIError(400, "path names a directory", parameter="path")
+        data = content.encode("utf-8")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        except OSError as error:
+            raise APIError(400, f"cannot write file: {error}") from error
+        return {"path": self._relative(path), "bytes": len(data)}
+
+    def list_dir(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        path = self._resolve(payload.get("path"), default=".")
+        if not path.is_dir():
+            raise APIError(
+                404,
+                f"no such directory: {self._relative(path)}",
+                "not_found_error",
+            )
+        try:
+            children = sorted(
+                path.iterdir(),
+                key=lambda child: (child.is_file(), child.name.lower()),
+            )
+        except OSError as error:
+            raise APIError(400, f"cannot list directory: {error}") from error
+        entries = []
+        for child in children[:_AGENT_LIST_ENTRIES]:
+            entry: dict[str, Any] = {
+                "name": child.name,
+                "kind": "dir" if child.is_dir() else "file",
+            }
+            if entry["kind"] == "file":
+                with contextlib.suppress(OSError):
+                    entry["size"] = child.stat().st_size
+            entries.append(entry)
+        return {
+            "path": self._relative(path),
+            "entries": entries,
+            "truncated": len(children) > _AGENT_LIST_ENTRIES,
+        }
+
+    def run_command(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        import subprocess
+
+        command = payload.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise APIError(
+                400, "command must be a non-empty string", parameter="command"
+            )
+        timeout = _float_option(payload, "timeout_seconds", _AGENT_EXEC_TIMEOUT)
+        timeout = min(max(timeout, 1.0), _AGENT_EXEC_TIMEOUT_MAX)
+        try:
+            completed = subprocess.run(  # noqa: S602 - the workspace flag is the opt-in
+                command,
+                shell=True,
+                cwd=self.root,
+                capture_output=True,
+                timeout=timeout,
+            )
+            stdout_raw, stderr_raw = completed.stdout, completed.stderr
+            exit_code: int | None = completed.returncode
+            timed_out = False
+        except subprocess.TimeoutExpired as expired:
+            stdout_raw = expired.stdout or b""
+            stderr_raw = expired.stderr or b""
+            exit_code = None
+            timed_out = True
+        except OSError as error:
+            raise APIError(400, f"cannot run command: {error}") from error
+        stdout, stdout_truncated = _agent_clip(stdout_raw, _AGENT_OUTPUT_BYTES)
+        stderr, stderr_truncated = _agent_clip(stderr_raw, _AGENT_OUTPUT_BYTES)
+        return {
+            "command": command,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
+
+    def fetch_url(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        import urllib.error
+        import urllib.request
+
+        url = payload.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise APIError(400, "url must be a non-empty string", parameter="url")
+        url = url.strip()
+        scheme = urlsplit(url).scheme.lower()
+        if scheme not in {"http", "https"}:
+            raise APIError(
+                400, "url must be http or https", parameter="url"
+            )
+        request = urllib.request.Request(  # noqa: S310 - scheme checked above
+            url, headers={"User-Agent": "flyweight-agent/0.1"}
+        )
+        try:
+            with urllib.request.urlopen(  # noqa: S310
+                request, timeout=_AGENT_FETCH_TIMEOUT
+            ) as response:
+                data = response.read(_AGENT_FETCH_BYTES + 1)
+                status = int(response.status)
+                content_type = response.headers.get_content_type()
+                final_url = response.geturl()
+        except urllib.error.HTTPError as error:
+            data = error.read(_AGENT_FETCH_BYTES + 1) if error.fp else b""
+            status = int(error.code)
+            content_type = error.headers.get_content_type() if error.headers else ""
+            final_url = url
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            raise APIError(400, f"cannot fetch url: {error}") from error
+        body, truncated = _agent_clip(data, _AGENT_FETCH_BYTES)
+        return {
+            "url": final_url,
+            "status": status,
+            "content_type": content_type,
+            "body": body,
+            "truncated": truncated,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class _GenerationRequest:
     messages: list[dict[str, str]]
@@ -875,6 +1098,9 @@ class InferenceService:
         # Whether an image part may name an http(s) URL for the server to
         # fetch; data URLs are always accepted.
         self.allow_remote_images = True
+        # Host-side tools for the UI's agent runs; set by the CLI when
+        # --agent-workspace names a directory, like freeze_total_tokens.
+        self.agent_workspace: AgentWorkspace | None = None
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(
                 "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS))
@@ -2000,7 +2226,13 @@ class InferenceService:
                 "function_tools",
                 "tokenize",
                 *(["stop_thinking"] if self.supports_stop_thinking else []),
+                *(["agent_workspace"] if self.agent_workspace else []),
             ],
+            **(
+                {"agent_workspace": str(self.agent_workspace.root)}
+                if self.agent_workspace
+                else {}
+            ),
         }
 
     @property
@@ -3382,6 +3614,7 @@ def create_handler(
             self._fw_decode_seconds = 0.0
             self._fw_decode_phase = None
             self._fw_finish = None
+            self._fw_body_read = False
             self._fw_started = time.perf_counter()
 
         def send_response(self, code: int, message: str | None = None) -> None:
@@ -3682,6 +3915,18 @@ def create_handler(
                         )
                         self.log_message("request completed: %s", path)
                     return
+                if path.startswith("/agent/"):
+                    workspace = service.agent_workspace
+                    if workspace is None:
+                        raise APIError(
+                            404,
+                            "agent tools are not enabled; start serve with "
+                            "--agent-workspace DIR",
+                            "not_found_error",
+                        )
+                    self._send_json(200, workspace.handle(path, payload))
+                    self.log_message("request completed: %s", path)
+                    return
                 if path == "/v1/responses/input_tokens":
                     self._send_json(200, service.count_response_input(payload))
                     self.log_message("request completed: %s", path)
@@ -3702,6 +3947,7 @@ def create_handler(
                     return
                 raise APIError(404, "endpoint not found", "not_found_error")
             except APIError as error:
+                self._drop_unread_body()
                 self._send_error(error)
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
@@ -3709,6 +3955,7 @@ def create_handler(
                 # The client only ever sees "internal server error", so the
                 # traceback has to reach the log or the failure is undebuggable.
                 self.log_error("unhandled request error: %s", traceback.format_exc())
+                self._drop_unread_body()
                 self._send_error(APIError(500, "internal server error", "server_error"))
             finally:
                 LOG.end_progress()
@@ -3843,7 +4090,11 @@ def create_handler(
             if length > MAX_REQUEST_BYTES:
                 raise APIError(413, "request body is too large")
             try:
-                payload = json.loads(self.rfile.read(length))
+                body = self.rfile.read(length)
+            finally:
+                self._fw_body_read = True
+            try:
+                payload = json.loads(body)
             except (json.JSONDecodeError, UnicodeDecodeError) as error:
                 raise APIError(400, "request body must be valid JSON") from error
             if not isinstance(payload, dict):
@@ -3860,6 +4111,32 @@ def create_handler(
                 raise APIError(413, "request body is too large")
             if length:
                 self.rfile.read(length)
+            self._fw_body_read = True
+
+        def _drop_unread_body(self) -> None:
+            """Swallow the body of a request that failed before reading it.
+
+            A POST rejected by `_authenticate` (or by any check that runs
+            before `_read_json`) leaves its body in the socket, and the next
+            request on that pooled connection begins mid-JSON -- the client
+            sees a 501 for a method named `{}POST`. Draining restores the
+            framing; a body too large to drain closes the connection instead.
+            """
+            if self._fw_body_read:
+                return
+            self._fw_body_read = True
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_REQUEST_BYTES:
+                self.close_connection = True
+                return
+            try:
+                if length:
+                    self.rfile.read(length)
+            except OSError:
+                self.close_connection = True
 
         def _send_sse(
             self,
@@ -4083,6 +4360,12 @@ def create_handler(
             self.wfile.flush()
 
         def _send_cors_headers(self) -> None:
+            # The agent endpoints execute on the host, so they never get a
+            # CORS grant: a foreign page's preflight fails and the browser
+            # refuses to send the request. Only same-origin callers (the
+            # bundled UI) and non-browser clients can reach them.
+            if urlsplit(self.path).path.startswith("/agent/"):
+                return
             self.send_header("Access-Control-Allow-Origin", service.cors_origin)
             self.send_header("Vary", "Origin")
 

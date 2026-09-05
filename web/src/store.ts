@@ -7,6 +7,14 @@ import { api, ApiError } from "./lib/api";
 import { db, migrateLegacyHistory } from "./lib/db";
 import { generate } from "./lib/generate";
 import { runToolExecutor } from "./lib/executor";
+import {
+  APPROVAL_TOOL,
+  agentSystemPrompt,
+  builtinToolDefinitions,
+  isBuiltinTool,
+  runBuiltinTool,
+  workspaceRoot,
+} from "./lib/agentTools";
 import { identifier, titleFromPrompt } from "./lib/format";
 import { buildRequest } from "./lib/protocols";
 import { holdPartialTag, splitThinking } from "./lib/thinking";
@@ -43,6 +51,19 @@ export interface Toast {
 export interface HealthSample {
   at: number;
   health: HealthPayload;
+}
+
+/** What the user answered when an agent run asked to run a shell command. */
+export type ApprovalDecision = "approve" | "approve-all" | "deny";
+
+/** A shell command an agent run is holding on until the user answers. */
+export interface PendingApproval {
+  conversationId: string;
+  messageId: string;
+  callId: string;
+  /** The command as the model wrote it, or the raw arguments if unparseable. */
+  command: string;
+  timeoutSeconds?: number;
 }
 
 const TOOLS_KEY = "flyweight.tools.v1";
@@ -131,6 +152,8 @@ interface StoreState {
     /** "thinking" while the model is inside its reasoning block. */
     phase?: string;
   } | null;
+  /** Set while an agent run waits for the user to approve a shell command. */
+  approval: PendingApproval | null;
   requests: RequestRecord[];
   panel: Panel;
   theme: ThemePreference;
@@ -165,6 +188,7 @@ interface StoreState {
   deleteMessage: (messageId: string) => void;
   submitToolResult: (assistantMessageId: string, callId: string, content: string, continueGeneration: boolean) => Promise<void>;
   continueGeneration: () => Promise<void>;
+  resolveApproval: (decision: ApprovalDecision) => void;
 
   // settings and tools
   updateSettings: (patch: Partial<GenerationSettings>) => void;
@@ -267,14 +291,52 @@ export const useStore = create<StoreState>()((set, get) => {
   };
 
   /**
-   * The agentic loop, for agent conversations only: when a turn ended in
-   * tool calls and every called tool has a handler, run the handlers
-   * sandboxed, append their results, and let the model continue — until it
-   * answers, the turn cap is reached, or a call has no handler (which pauses
-   * the loop for a manual result).
+   * Hold the run until the user approves a shell command. The resolver lives
+   * here rather than in the store so state stays plain data; aborting the run
+   * (Esc, Stop) resolves it as a denial so the loop can unwind.
+   */
+  let settleApproval: ((decision: ApprovalDecision) => void) | null = null;
+  /** Conversations where the user chose "always allow" for this run. */
+  const alwaysAllow = new Set<string>();
+
+  const askApproval = (pending: PendingApproval, signal: AbortSignal): Promise<ApprovalDecision> =>
+    new Promise((resolve) => {
+      const finish = (decision: ApprovalDecision) => {
+        signal.removeEventListener("abort", onAbort);
+        settleApproval = null;
+        set({ approval: null });
+        resolve(decision);
+      };
+      const onAbort = () => finish("deny");
+      if (signal.aborted) return finish("deny");
+      signal.addEventListener("abort", onAbort, { once: true });
+      settleApproval = finish;
+      set({ approval: pending });
+    });
+
+  /** The command a run_command call wants, for the approval card. */
+  const commandOf = (argsText: string): { command: string; timeoutSeconds?: number } => {
+    try {
+      const parsed = JSON.parse(argsText) as { command?: unknown; timeout_seconds?: unknown };
+      if (typeof parsed?.command === "string") {
+        return { command: parsed.command, timeoutSeconds: typeof parsed.timeout_seconds === "number" ? parsed.timeout_seconds : undefined };
+      }
+    } catch {
+      /* the model wrote something malformed; show it verbatim */
+    }
+    return { command: argsText };
+  };
+
+  /**
+   * The agentic loop, for agent conversations only: when a turn ended in tool
+   * calls and every called tool can run — a workspace built-in, or a user tool
+   * with a handler — execute them, append their results, and let the model
+   * continue, until it answers, the turn cap is reached, or a call has nowhere
+   * to run (which pauses the loop for a manual result). Shell commands stop
+   * for the user's approval first.
    */
   const maybeContinueAgent = async (conversationId: string, assistant: Message, agentTurn: number) => {
-    const { settings, tools, toast, conversations } = get();
+    const { settings, tools, toast, conversations, props } = get();
     const conversation = conversations.find((item) => item.id === conversationId);
     const calls = assistant.toolCalls ?? [];
     if (!conversation || kindOf(conversation) !== "agent" || !calls.length) return;
@@ -282,8 +344,13 @@ export const useStore = create<StoreState>()((set, get) => {
       toast(`Agent paused after ${agentTurn} turns — continue manually or raise the cap`, "info");
       return;
     }
-    const handlers = calls.map((call) => tools.find((tool) => tool.enabled && tool.name === call.name)?.executor?.trim());
-    const missing = calls.filter((_, index) => !handlers[index]);
+    const builtinsLive = Boolean(workspaceRoot(props));
+    const runners = calls.map((call) => {
+      if (builtinsLive && isBuiltinTool(call.name)) return { kind: "builtin" as const };
+      const source = tools.find((tool) => tool.enabled && tool.name === call.name)?.executor?.trim();
+      return source ? { kind: "js" as const, source } : null;
+    });
+    const missing = calls.filter((_, index) => !runners[index]);
     if (missing.length) {
       toast(`No handler for ${missing.map((call) => call.name).join(", ")} — paste the result${missing.length === 1 ? "" : "s"} manually`, "info");
       return;
@@ -292,20 +359,47 @@ export const useStore = create<StoreState>()((set, get) => {
     set({ generating: { conversationId, messageId: assistant.id, controller, phase: "tools" } });
     try {
       for (let index = 0; index < calls.length; index += 1) {
-        const execution = await runToolExecutor(handlers[index]!, calls[index].arguments, { signal: controller.signal });
+        const call = calls[index];
+        const runner = runners[index]!;
+        let execution: { ok: boolean; result: string };
+        if (runner.kind === "builtin") {
+          if (call.name === APPROVAL_TOOL && !alwaysAllow.has(conversationId)) {
+            const { command, timeoutSeconds } = commandOf(call.arguments);
+            set({ generating: { conversationId, messageId: assistant.id, controller, phase: "approval" } });
+            const decision = await askApproval({ conversationId, messageId: assistant.id, callId: call.id, command, timeoutSeconds }, controller.signal);
+            if (controller.signal.aborted) return;
+            set({ generating: { conversationId, messageId: assistant.id, controller, phase: "tools" } });
+            if (decision === "approve-all") alwaysAllow.add(conversationId);
+            if (decision === "deny") {
+              appendToolResult(conversationId, assistant.id, {
+                id: identifier("msg"),
+                role: "tool",
+                content: "The user declined to run this command. Do not retry it; suggest another approach or ask them what to do.",
+                toolCallId: call.id,
+                toolName: call.name,
+                auto: true,
+                createdAt: Date.now(),
+              });
+              continue;
+            }
+          }
+          execution = await runBuiltinTool(call.name, call.arguments, controller.signal);
+        } else {
+          execution = await runToolExecutor(runner.source, call.arguments, { signal: controller.signal });
+        }
         if (controller.signal.aborted) return;
         appendToolResult(conversationId, assistant.id, {
           id: identifier("msg"),
           role: "tool",
           content: execution.ok ? execution.result : `Tool execution failed: ${execution.result}`,
-          toolCallId: calls[index].id,
-          toolName: calls[index].name,
+          toolCallId: call.id,
+          toolName: call.name,
           auto: true,
           createdAt: Date.now(),
         });
       }
     } finally {
-      set({ generating: null });
+      set({ generating: null, approval: null });
     }
     if (!controller.signal.aborted) await runGeneration(conversationId, agentTurn + 1);
   };
@@ -332,11 +426,22 @@ export const useStore = create<StoreState>()((set, get) => {
     const controller = new AbortController();
     set({ generating: { conversationId, messageId: assistant.id, controller } });
 
+    // Agent runs get the workspace tools and a system prompt describing the
+    // directory, on top of whatever tools the user defined; a user tool that
+    // shadows a built-in name loses, so the model sees one of each name.
+    const workspace = kindOf(conversation) === "agent" ? workspaceRoot(state.props) : null;
+    const builtins = workspace ? builtinToolDefinitions() : [];
+    const settings = workspace
+      ? {
+          ...state.settings,
+          systemPrompt: [agentSystemPrompt(workspace), state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n"),
+        }
+      : state.settings;
     const body = buildRequest(protocol, {
       model: state.model || state.health?.model || "local",
       messages: conversation.messages,
-      settings: state.settings,
-      tools: state.tools,
+      settings,
+      tools: [...builtins, ...state.tools.filter((tool) => !builtins.some((builtin) => builtin.name === tool.name))],
     });
 
     // Accumulate in a local draft and flush on animation frames so a fast
@@ -499,6 +604,7 @@ export const useStore = create<StoreState>()((set, get) => {
     status: "connecting",
     statusDetail: "Connecting…",
     generating: null,
+    approval: null,
     requests: [],
     panel: null,
     theme: (readString(THEME_KEY, "system") as ThemePreference) || "system",
@@ -686,6 +792,8 @@ export const useStore = create<StoreState>()((set, get) => {
         }),
       );
       forgetSources();
+      // A new task means the previous "always allow" no longer applies.
+      alwaysAllow.delete(conversation.id);
       set({ pendingAttachments: [], draft: "" });
       await runGeneration(conversation.id);
     },
@@ -763,6 +871,10 @@ export const useStore = create<StoreState>()((set, get) => {
       const conversation = get().active();
       if (!conversation || !conversation.messages.length) return;
       await runGeneration(conversation.id);
+    },
+
+    resolveApproval: (decision) => {
+      settleApproval?.(decision);
     },
 
     updateSettings: (patch) => {

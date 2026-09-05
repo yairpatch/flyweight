@@ -409,12 +409,19 @@ server exposes, not only chat:
   no effort or `response_format`, Responses has no budget, and
   `chat_template_kwargs` exists on chat completions only).
 - **Agent** is a separate sidebar tab beside Chat, with its own
-  conversations: give the model a task, and its tool calls run through
-  their tools' JavaScript handlers automatically, with the results fed back
-  until it answers, under a configurable turn cap. Handlers execute in the
-  code preview's sandbox (opaque origin, no access to the app's storage or
-  API key; network subject to CORS); a call whose tool has no handler
-  pauses the run for a manual result, and Esc stops it.
+  conversations: give the model a task, and its tool calls run
+  automatically, with the results fed back until it answers, under a
+  configurable turn cap. A call whose tool has no handler pauses the run for
+  a manual result, and Esc stops it. Tools come from two places. Your own
+  tools run their JavaScript handler in the code preview's sandbox (opaque
+  origin, no access to the app's storage or API key; network subject to
+  CORS). Starting the server with `--agent-workspace DIR` adds built-in
+  tools that reach the machine — `list_dir`, `read_file`, `write_file`,
+  `run_command`, and `fetch_url` — every one of them confined to `DIR`, and
+  each `run_command` shown for approval in the transcript before it runs
+  (with an *always allow* for the rest of the run). Without the flag those
+  endpoints return 404, and they never carry a CORS grant, so only the
+  bundled UI and clients holding the API key can call them.
 - **Tools** defines function tools (import OpenAI or Anthropic definitions),
   `tool_choice`, parallel calls, and each tool's optional agent handler; the
   sampler grammar enforces the declared calls.
@@ -510,6 +517,17 @@ endpoints stream over SSE, and chat streams honour
 (`Authorization: Bearer` or `x-api-key`); `--cors-origin` sets
 `Access-Control-Allow-Origin` (default `*`). Use `--strict-model` when
 request model IDs must exactly match the configured server model name.
+
+`--agent-workspace DIR` adds the endpoints the chat UI's agent runs use:
+`/agent/fs/read`, `/agent/fs/write`, `/agent/fs/list`, `/agent/exec`, and
+`/agent/fetch`. Every path resolves inside `DIR` or the request is refused
+with 403, commands start there, and results are clipped to what a prompt can
+hold. They are absent (404) unless the flag is given, they require the API
+key like everything else, and they are the one part of the API that never
+sends an `Access-Control-Allow-Origin` header, so a page on another origin
+cannot drive them through a visitor's browser. `/props` then
+lists `agent_workspace` in its capabilities and reports the resolved
+directory.
 
 Chat requests use the GGUF's `tokenizer.chat_template` when it is present;
 the built-in architecture formatter is only a fallback for older files. If a
@@ -699,6 +717,9 @@ Server options (`serve` only):
 
 - `--model-name NAME`, `--cors-origin ORIGIN`, `--api-key KEY`,
   `--strict-model`
+- `--agent-workspace DIR`: give the chat UI's agent runs file, shell, and
+  URL-fetch tools confined to `DIR` (off by default; commands still need
+  approval in the UI)
 - `--reasoning-effort low|medium|high|xhigh`: server-wide default effort
 - `--thinking-budget N`: cap for requests that think without naming a budget;
   unset it guards only `/v1/messages` (at 2048), a value applies everywhere,

@@ -5,12 +5,15 @@ import json
 import re
 import socket
 import struct
+import sys
+import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 try:
@@ -21,6 +24,7 @@ from flyweight.cli import main
 from flyweight.generation import GenerationResult, GenerationStep
 from flyweight.sampling import SamplingConfig
 from flyweight.server import (
+    AgentWorkspace,
     APIError,
     FlyweightHTTPServer,
     InferenceService,
@@ -4091,3 +4095,199 @@ class ServerLogTests(unittest.TestCase):
         self.assertTrue(notice.startswith("\u2022"))
         # The text begins at the column the endpoint's own text vacates.
         self.assertEqual(notice.index("queued"), row.index("31.5k") - 2)
+
+
+class AgentWorkspaceTests(unittest.TestCase):
+    """The host-side tools an agent run drives, and the fence around them."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.workspace = AgentWorkspace(self.root)
+
+    def test_a_missing_directory_is_refused_at_construction(self) -> None:
+        with self.assertRaises(ValueError):
+            AgentWorkspace(self.root / "nowhere")
+
+    def test_files_round_trip_through_write_and_read(self) -> None:
+        written = self.workspace.write_file(
+            {"path": "notes/todo.md", "content": "ship it\n"}
+        )
+        self.assertEqual(written["bytes"], len(b"ship it\n"))
+        self.assertEqual((self.root / "notes" / "todo.md").read_text(), "ship it\n")
+        read = self.workspace.read_file({"path": "notes/todo.md"})
+        self.assertEqual(read["content"], "ship it\n")
+        self.assertFalse(read["truncated"])
+
+    def test_a_long_file_comes_back_clipped_and_says_so(self) -> None:
+        from flyweight.server import _AGENT_FILE_BYTES
+
+        (self.root / "big.txt").write_bytes(b"x" * (_AGENT_FILE_BYTES + 10))
+        read = self.workspace.read_file({"path": "big.txt"})
+        self.assertTrue(read["truncated"])
+        self.assertEqual(len(read["content"]), _AGENT_FILE_BYTES)
+        self.assertEqual(read["size"], _AGENT_FILE_BYTES + 10)
+
+    def test_listing_puts_directories_first_and_sizes_the_files(self) -> None:
+        (self.root / "src").mkdir()
+        (self.root / "readme.md").write_text("hi")
+        listing = self.workspace.list_dir({})
+        names = [entry["name"] for entry in listing["entries"]]
+        self.assertEqual(names, ["src", "readme.md"])
+        self.assertEqual(listing["entries"][0]["kind"], "dir")
+        self.assertEqual(listing["entries"][1]["size"], 2)
+        self.assertFalse(listing["truncated"])
+
+    def test_a_path_outside_the_workspace_is_refused(self) -> None:
+        # Traversal, and an absolute path elsewhere: the model can ask for
+        # either, and neither may reach past the directory the user named.
+        outside = self.root.parent / "flyweight-agent-secret.txt"
+        outside.write_text("nope")
+        self.addCleanup(outside.unlink)
+        for payload in ({"path": "../flyweight-agent-secret.txt"}, {"path": str(outside)}):
+            for call in (self.workspace.read_file, self.workspace.list_dir):
+                with self.assertRaises(APIError) as caught:
+                    call(payload)
+                self.assertEqual(caught.exception.status, 403)
+        with self.assertRaises(APIError) as caught:
+            self.workspace.write_file({"path": "../escaped.txt", "content": "x"})
+        self.assertEqual(caught.exception.status, 403)
+        self.assertFalse((self.root.parent / "escaped.txt").exists())
+
+    def test_a_command_runs_inside_the_workspace(self) -> None:
+        (self.root / "marker.txt").write_text("here")
+        result = self.workspace.run_command(
+            {"command": f'"{sys.executable}" -c "import os;print(os.path.isfile(\'marker.txt\'))"'}
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["timed_out"])
+        self.assertIn("True", result["stdout"])
+
+    def test_a_failing_command_reports_its_status_rather_than_raising(self) -> None:
+        result = self.workspace.run_command(
+            {"command": f'"{sys.executable}" -c "raise SystemExit(3)"'}
+        )
+        self.assertEqual(result["exit_code"], 3)
+
+    def test_a_command_that_hangs_is_killed_at_the_timeout(self) -> None:
+        result = self.workspace.run_command(
+            {
+                "command": f'"{sys.executable}" -c "import time;time.sleep(30)"',
+                "timeout_seconds": 1,
+            }
+        )
+        self.assertTrue(result["timed_out"])
+        self.assertIsNone(result["exit_code"])
+
+    def test_an_empty_command_and_a_non_http_url_are_rejected(self) -> None:
+        with self.assertRaises(APIError) as caught:
+            self.workspace.run_command({"command": "   "})
+        self.assertEqual(caught.exception.status, 400)
+        with self.assertRaises(APIError) as caught:
+            self.workspace.fetch_url({"url": "file:///etc/passwd"})
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_an_unknown_agent_path_is_a_404(self) -> None:
+        with self.assertRaises(APIError) as caught:
+            self.workspace.handle("/agent/rm-rf", {})
+        self.assertEqual(caught.exception.status, 404)
+
+
+class AgentEndpointTests(unittest.TestCase):
+    """How the workspace reaches the network: opt-in, same-origin, authed."""
+
+    def _serve(self, service):
+        server = FlyweightHTTPServer(("127.0.0.1", 0), create_handler(service))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_port, timeout=10
+        )
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(connection.close)
+        return connection
+
+    def _workspace_dir(self) -> Path:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        return Path(temp.name)
+
+    def _post(self, connection, path, payload, headers=None):
+        connection.request(
+            "POST",
+            path,
+            body=json.dumps(payload),
+            headers={"Content-Type": "application/json", **(headers or {})},
+        )
+        response = connection.getresponse()
+        return response, response.read()
+
+    def test_the_endpoints_are_absent_until_the_flag_names_a_directory(self) -> None:
+        service = InferenceService("qwen-local", StubGenerator())
+        connection = self._serve(service)
+        response, body = self._post(connection, "/agent/fs/list", {})
+        self.assertEqual(response.status, 404)
+        self.assertIn("--agent-workspace", json.loads(body)["error"]["message"])
+        self.assertNotIn("agent_workspace", service.properties()["capabilities"])
+
+    def test_an_enabled_workspace_is_advertised_and_serves_its_tools(self) -> None:
+        root = self._workspace_dir()
+        (root / "hello.txt").write_text("world")
+        service = InferenceService("qwen-local", StubGenerator())
+        service.agent_workspace = AgentWorkspace(root)
+        connection = self._serve(service)
+
+        properties = service.properties()
+        self.assertIn("agent_workspace", properties["capabilities"])
+        self.assertEqual(properties["agent_workspace"], str(root.resolve()))
+
+        response, body = self._post(connection, "/agent/fs/read", {"path": "hello.txt"})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body)["content"], "world")
+
+        response, _ = self._post(connection, "/agent/fs/read", {"path": "../x"})
+        self.assertEqual(response.status, 403)
+
+    def test_the_agent_endpoints_never_grant_cors(self) -> None:
+        # A page on another origin must not be able to drive these through a
+        # visitor's browser, however permissive the server's CORS setting is.
+        service = InferenceService("qwen-local", StubGenerator(), cors_origin="*")
+        service.agent_workspace = AgentWorkspace(self._workspace_dir())
+        connection = self._serve(service)
+
+        connection.request(
+            "OPTIONS", "/agent/exec", headers={"Origin": "https://evil.example"}
+        )
+        response = connection.getresponse()
+        response.read()
+        self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
+
+        response, _ = self._post(
+            connection, "/agent/fs/list", {}, {"Origin": "https://evil.example"}
+        )
+        self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
+
+        # The ordinary endpoints keep theirs.
+        connection.request("OPTIONS", "/v1/chat/completions")
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.getheader("Access-Control-Allow-Origin"), "*")
+
+    def test_the_api_key_guards_the_agent_endpoints(self) -> None:
+        service = InferenceService("qwen-local", StubGenerator(), api_key="secret")
+        service.agent_workspace = AgentWorkspace(self._workspace_dir())
+        connection = self._serve(service)
+
+        response, _ = self._post(connection, "/agent/fs/list", {})
+        self.assertEqual(response.status, 401)
+
+        # ...and the rejected POST leaves the pooled connection usable: its
+        # unread body used to sit in the socket and derail the next request.
+        response, body = self._post(
+            connection, "/agent/fs/list", {}, {"Authorization": "Bearer secret"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body)["path"], ".")

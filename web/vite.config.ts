@@ -25,6 +25,7 @@ export default defineConfig({
       "/slots": "http://127.0.0.1:8000",
       "/tokenize": "http://127.0.0.1:8000",
       "/detokenize": "http://127.0.0.1:8000",
+      "/agent": "http://127.0.0.1:8000",
     },
   },
   test: {
