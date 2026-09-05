@@ -199,6 +199,30 @@ after any `pip install --user`. Both cases make pip print a warning and install
 anyway. `flyweight doctor` reports the exact directory to add if you would
 rather fix PATH permanently.
 
+### Reading the server log
+
+Each request is one row, under a header that names the columns:
+
+~~~
+          endpoint   prompt  cached   ttft     out   tok/s  finish        total
+10:49:45  chat        26.5k     98%   1.7s     112    35.8  tool call      4.9s
+10:49:50  chat        26.7k     99%   1.1s     105    35.9  tool call      4.1s
+10:52:07  chat        31.5k     99%   1.4s  400 prompt is too long: 31471 > 30000
+~~~
+
+`prompt` is what the request rendered to, `cached` how much of it the prefix
+cache served (a low number here on a conversation that only appended is what
+a cache problem looks like), `ttft` the wait before the first token, `out`
+and `tok/s` the answer and its decode rate, `finish` why generation stopped.
+While a request runs, the same row is drawn live and rewritten in place, so
+the numbers a reader is watching are the ones that commit.
+
+`--quiet` prints nothing but failures. `--verbose` adds the HTTP access log,
+the prefill/decode split and the prefix-cache diagnostics (where a
+conversation diverged from what was cached, and the text on each side).
+Colour is used only on a terminal, and never when `NO_COLOR` is set or
+`TERM=dumb`, so a redirected log stays plain and greppable.
+
 ### Running the tests
 
 ~~~bash

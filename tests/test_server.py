@@ -1,5 +1,6 @@
 import http.client
 import itertools
+import os
 import json
 import re
 import socket
@@ -2782,17 +2783,14 @@ class HTTPServerTests(unittest.TestCase):
                     headers={"Content-Type": "application/json"},
                 )
                 self.connection.getresponse().read()
-        done = re.search(
-            r"\[gen \] done (\d+) tokens in\s*([\d.]+)s \(\s*([\d.]+) tok/s\)",
-            captured.getvalue(),
-        )
-        self.assertIsNotNone(done, captured.getvalue())
-        tokens, elapsed, rate = (
-            int(done.group(1)), float(done.group(2)), float(done.group(3))
-        )
-        self.assertGreater(tokens, 1)
-        self.assertGreater(elapsed, 0.0)
-        self.assertAlmostEqual(rate, (tokens - 1) / elapsed, delta=0.05)
+        # The request row's `out` and `tok/s` columns. The stub streams two
+        # tokens 0.5 s apart, so the honest rate is one interval over 0.5 s =
+        # 2.0 tok/s; dividing tokens by the same span would print 4.0.
+        row = re.search(r"chat\s.*?\s(\d+)\s+([\d.]+)\s", captured.getvalue())
+        self.assertIsNotNone(row, captured.getvalue())
+        tokens, rate = int(row.group(1)), float(row.group(2))
+        self.assertEqual(tokens, 2)
+        self.assertAlmostEqual(rate, (tokens - 1) / 0.5, delta=0.05)
 
     def test_anthropic_errors_use_anthropic_envelope(self) -> None:
         response, payload = self.request_json(
@@ -2946,6 +2944,8 @@ class ServerCLITests(unittest.TestCase):
             host="127.0.0.1",
             port=9012,
             max_connections=128,
+            quiet=False,
+            verbose=False,
         )
         load_model.return_value.close.assert_called_once()
 
@@ -3896,3 +3896,122 @@ class K2HorizonToolCallTests(unittest.TestCase):
             json.loads(streamed + "".join(tail)),
             {"command": "ls -la /home/yair/Documents/Rollercoster", "timeout": 30},
         )
+
+
+class ServerLogTests(unittest.TestCase):
+    """The request log: one row per request, a header, and an off switch."""
+
+    class _Stream:
+        def __init__(self, tty: bool) -> None:
+            self.text = ""
+            self._tty = tty
+
+        def write(self, text: str) -> int:
+            self.text += text
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+        def isatty(self) -> bool:
+            return self._tty
+
+    def _log(self, *, tty: bool = True, **level):
+        from flyweight.server import ServerLog
+
+        stream = self._Stream(tty)
+        log = ServerLog(stream)
+        log.configure(**level)
+        return log, stream
+
+    def test_quiet_prints_statistics_but_never_swallows_a_failure(self) -> None:
+        log, stream = self._log(quiet=True)
+        log.line("a request row")
+        log.detail("a diagnostic")
+        log.progress("live")
+        self.assertEqual(stream.text, "")
+        log.error("something broke")
+        self.assertIn("something broke", stream.text)
+
+    def test_verbose_adds_the_diagnostics_the_default_hides(self) -> None:
+        normal, normal_stream = self._log()
+        verbose, verbose_stream = self._log(verbose=True)
+        for log in (normal, verbose):
+            log.detail("history rewritten at token 900")
+        self.assertNotIn("history rewritten", normal_stream.text)
+        self.assertIn("history rewritten", verbose_stream.text)
+
+    def test_progress_is_dropped_when_the_stream_is_not_a_terminal(self) -> None:
+        # Piped to a file or journald, a carriage return produces one enormous
+        # line rather than a live counter.
+        log, stream = self._log(tty=False)
+        log.progress("chat  prefill 40%")
+        self.assertEqual(stream.text, "")
+        log.line("committed")
+        self.assertIn("committed", stream.text)
+
+    def test_a_full_line_erases_the_progress_it_interrupts(self) -> None:
+        # The bug this prevents: the access log and the progress line wrote to
+        # the same stream and produced "36.5 tok/s thinking[gen ] budget spent".
+        log, stream = self._log()
+        log.progress("chat  decode 672 tokens")
+        log.line("chat  200  done")
+        self.assertNotIn("tokens" + "chat", stream.text.replace("\r", ""))
+        erased = stream.text.split("\r")
+        self.assertTrue(any(part.strip() == "" for part in erased[1:]))
+
+    def test_colour_is_only_for_a_terminal_that_wants_it(self) -> None:
+        from flyweight.server import ServerLog
+
+        for tty, environment, expected in (
+            (True, {}, True),
+            (False, {}, False),
+            (True, {"NO_COLOR": "1"}, False),
+            (True, {"TERM": "dumb"}, False),
+        ):
+            with self.subTest(tty=tty, environment=environment):
+                log = ServerLog(self._Stream(tty))
+                with patch.dict(os.environ, environment, clear=False):
+                    if "NO_COLOR" not in environment:
+                        os.environ.pop("NO_COLOR", None)
+                    log.configure()
+                self.assertEqual(log.paint.enabled, expected)
+
+    def test_the_header_names_the_columns_once(self) -> None:
+        from flyweight import server as module
+
+        log, stream = self._log()
+        with patch.object(module, "LOG", log):
+            module._log_header_once()
+            module._log_header_once()
+        self.assertEqual(stream.text.count("endpoint"), 1)
+        for column in ("prompt", "cached", "ttft", "out", "tok/s", "finish", "total"):
+            self.assertIn(column, stream.text)
+
+    def test_a_request_row_carries_the_numbers_a_reader_scans_for(self) -> None:
+        from flyweight import server as module
+
+        log, _ = self._log(tty=False)
+        with patch.object(module, "LOG", log):
+            row = module._log_request_row(
+                "chat", 26539, 26200, 1.7, 112, 35.8, "tool call", 4.9
+            )
+        self.assertIn("26.5k", row)   # prompt, compacted
+        self.assertIn("98%", row)     # cache share, not two raw counts
+        self.assertIn("1.7s", row)    # time to first token
+        self.assertIn("112", row)     # output tokens
+        self.assertIn("35.8", row)    # decode rate
+        self.assertIn("tool call", row)
+        self.assertIn("4.9s", row)
+
+    def test_a_failed_request_reports_its_status_and_reason(self) -> None:
+        from flyweight import server as module
+
+        log, _ = self._log(tty=False)
+        with patch.object(module, "LOG", log):
+            row = module._log_request_row(
+                "chat", 31471, 31200, 1.4, 0, 0.0,
+                "prompt is too long: 31471 > 30000", 1.4, 400,
+            )
+        self.assertIn("400", row)
+        self.assertIn("prompt is too long", row)
