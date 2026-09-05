@@ -783,6 +783,10 @@ kbd {
   border-radius: 4px;
   background: var(--bg-elev-2);
 }
+.msg__proto--warn {
+  color: var(--warning);
+  cursor: help;
+}
 .msg__content {
   font-size: 15px;
   line-height: 1.65;

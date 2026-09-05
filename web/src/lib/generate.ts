@@ -47,6 +47,7 @@ export async function generate(options: GenerateOptions): Promise<RequestRecord>
     } else if (error instanceof ApiError) {
       record.status = error.status;
       record.error = error.message;
+      record.errorCode = error.code;
       options.onEvent({ type: "error", message: error.message });
     } else {
       const message = error instanceof Error ? error.message : String(error);

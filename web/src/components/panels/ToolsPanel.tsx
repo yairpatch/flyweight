@@ -81,6 +81,10 @@ export function ToolsPanel() {
             work in.
           </p>
         )}
+        <p className="muted">
+          Long runs fit themselves to the context window: the oldest tool results shrink to a line saying what was dropped, then the oldest steps go,
+          and the model is told. The transcript keeps every message either way, and a turn built on a compacted prompt is marked <em>compacted</em>.
+        </p>
         <label className="field">
           <span className="field__label">
             Turn cap <small>model turns per run</small>

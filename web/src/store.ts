@@ -17,6 +17,15 @@ import {
   turnCapReason,
   workspaceRoot,
 } from "./lib/agentTools";
+import {
+  budgetChars,
+  compactMessages,
+  compactionNote,
+  contextOverflow,
+  conversationChars,
+  observedCharsPerToken,
+  retryBudget,
+} from "./lib/compaction";
 import { identifier, titleFromPrompt } from "./lib/format";
 import { buildRequest } from "./lib/protocols";
 import { holdPartialTag, splitThinking } from "./lib/thinking";
@@ -313,6 +322,12 @@ export const useStore = create<StoreState>()((set, get) => {
   let settleApproval: ((decision: ApprovalDecision) => void) | null = null;
   /** Conversations where the user chose "always allow" for this run. */
   const alwaysAllow = new Set<string>();
+  /**
+   * Characters per prompt token as this model actually measures, learned from
+   * the usage of the last request. It replaces the built-in guess when the
+   * agent loop sizes a prompt, so the budget matches the tokenizer in use.
+   */
+  let charsPerToken: number | null = null;
 
   const askApproval = (pending: PendingApproval, signal: AbortSignal): Promise<ApprovalDecision> =>
     new Promise((resolve) => {
@@ -423,8 +438,12 @@ export const useStore = create<StoreState>()((set, get) => {
     if (!controller.signal.aborted) await runGeneration(conversationId, agentTurn + 1);
   };
 
-  /** Run a generation for the conversation as it stands, appending an assistant turn. */
-  const runGeneration = async (conversationId: string, agentTurn = 1) => {
+  /**
+   * Run a generation for the conversation as it stands, appending an assistant
+   * turn. `budget` overrides the prompt's character budget; the overflow retry
+   * uses it to come back with the server's own numbers.
+   */
+  const runGeneration = async (conversationId: string, agentTurn = 1, budget?: number) => {
     const state = get();
     if (state.generating) {
       state.toast("A generation is already running", "info");
@@ -433,6 +452,26 @@ export const useStore = create<StoreState>()((set, get) => {
     const conversation = state.conversations.find((item) => item.id === conversationId);
     if (!conversation) return;
     const protocol = state.settings.protocol;
+
+    // Agent runs get the workspace tools and a system prompt describing the
+    // directory, on top of whatever tools the user defined; a user tool that
+    // shadows a built-in name loses, so the model sees one of each name.
+    const workspace = kindOf(conversation) === "agent" ? workspaceRoot(state.props) : null;
+    const builtins = workspace ? builtinToolDefinitions() : [];
+
+    // An agent run writes its own prompt: every file it reads and every command
+    // it runs stays in the transcript. Fit the messages to the window before
+    // sending, so the run degrades by forgetting its oldest output rather than
+    // dying on whichever step crossed the line. Chats are left alone — there
+    // the user controls the length.
+    const contextWindow = state.props?.context_window ?? state.health?.context_window;
+    const limit =
+      kindOf(conversation) === "agent"
+        ? (budget ?? budgetChars(contextWindow, state.settings.maxTokens, charsPerToken ?? undefined))
+        : Number.POSITIVE_INFINITY;
+    const compacted = compactMessages(conversation.messages, limit);
+    const note = compactionNote(compacted);
+
     const assistant: Message = {
       id: identifier("msg"),
       role: "assistant",
@@ -440,25 +479,19 @@ export const useStore = create<StoreState>()((set, get) => {
       createdAt: Date.now(),
       generating: true,
       protocol,
+      ...(compacted.removedChars
+        ? { compaction: { stubbed: compacted.stubbed, dropped: compacted.dropped, removedChars: compacted.removedChars } }
+        : {}),
     };
     updateConversation(conversationId, (item) => touch({ ...item, messages: [...item.messages, assistant] }));
     const controller = new AbortController();
     set({ generating: { conversationId, messageId: assistant.id, controller }, agentPause: null });
 
-    // Agent runs get the workspace tools and a system prompt describing the
-    // directory, on top of whatever tools the user defined; a user tool that
-    // shadows a built-in name loses, so the model sees one of each name.
-    const workspace = kindOf(conversation) === "agent" ? workspaceRoot(state.props) : null;
-    const builtins = workspace ? builtinToolDefinitions() : [];
-    const settings = workspace
-      ? {
-          ...state.settings,
-          systemPrompt: [agentSystemPrompt(workspace), state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n"),
-        }
-      : state.settings;
+    const prelude = [workspace ? agentSystemPrompt(workspace) : "", note, state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n");
+    const settings = prelude === state.settings.systemPrompt ? state.settings : { ...state.settings, systemPrompt: prelude };
     const body = buildRequest(protocol, {
       model: state.model || state.health?.model || "local",
-      messages: conversation.messages,
+      messages: compacted.messages,
       settings,
       tools: [...builtins, ...state.tools.filter((tool) => !builtins.some((builtin) => builtin.name === tool.name))],
     });
@@ -596,9 +629,26 @@ export const useStore = create<StoreState>()((set, get) => {
     if (responseId) (finished as Message & { responseId?: string }).responseId = responseId;
     updateMessage(conversationId, assistant.id, () => finished, true);
     set({ generating: null });
+    charsPerToken = observedCharsPerToken(conversationChars(compacted.messages), finished.usage?.prompt_tokens) ?? charsPerToken;
     if (record.error && record.status === 401) {
       set({ status: "locked", panel: "settings" });
       return;
+    }
+
+    // The prompt did not fit after all: the estimate was off, or the run was
+    // already over the line when it started. The server reports the tokens it
+    // counted, which calibrates the budget exactly; retry once on it, dropping
+    // the failed turn so the transcript does not keep a dead error.
+    const overflow = kindOf(conversation) === "agent" && !controller.signal.aborted ? contextOverflow(record) : null;
+    if (overflow && budget === undefined) {
+      const tighter = retryBudget(overflow, conversationChars(compacted.messages), limit);
+      const retried = compactMessages(conversation.messages, tighter);
+      if (retried.removedChars > compacted.removedChars) {
+        updateConversation(conversationId, (item) => ({ ...item, messages: item.messages.filter((message) => message.id !== assistant.id) }));
+        get().toast("Context was full — compacted the run and retried", "info");
+        await runGeneration(conversationId, agentTurn, tighter);
+        return;
+      }
     }
     void get().pollRuntime();
     if (!record.error && !finished.error && !controller.signal.aborted) {

@@ -86,6 +86,8 @@ export interface Message {
   /** Which API produced the turn; informational. */
   protocol?: Protocol;
   generating?: boolean;
+  /** Set when the run's prompt was compacted to fit the context window. */
+  compaction?: { stubbed: number; dropped: number; removedChars: number };
 }
 
 export type Protocol = "chat" | "anthropic" | "responses";
@@ -229,4 +231,6 @@ export interface RequestRecord {
   durationMs?: number;
   rawEvents: RawLogEntry[];
   error?: string;
+  /** The server's error code, e.g. "context_length_exceeded". */
+  errorCode?: string;
 }

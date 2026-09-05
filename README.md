@@ -421,7 +421,16 @@ server exposes, not only chat:
   each `run_command` shown for approval in the transcript before it runs
   (with an *always allow* for the rest of the run). Without the flag those
   endpoints return 404, and they never carry a CORS grant, so only the
-  bundled UI and clients holding the API key can call them.
+  bundled UI and clients holding the API key can call them. A long run stays
+  inside the context window on its own: before each request the prompt is
+  fitted to the window by stubbing the run's oldest tool results, then
+  dropping its oldest steps whole (an assistant turn always leaves with the
+  results answering it), and the model is told what went missing. The task
+  that opened the run and the last few messages are never touched, the
+  transcript keeps everything, and a turn built on a compacted prompt is
+  marked *compacted*. If the prompt still does not fit, the server's
+  `context_length_exceeded` reply carries the tokens it counted, which
+  calibrates a tighter budget for one automatic retry.
 - **Tools** defines function tools (import OpenAI or Anthropic definitions),
   `tool_choice`, parallel calls, and each tool's optional agent handler; the
   sampler grammar enforces the declared calls.

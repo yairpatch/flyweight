@@ -28,10 +28,13 @@ export function setApiKey(key: string): void {
 export class ApiError extends Error {
   status: number;
   kind: string;
-  constructor(status: number, message: string, kind = "api_error") {
+  /** The server's machine-readable code, e.g. "context_length_exceeded". */
+  code?: string;
+  constructor(status: number, message: string, kind = "api_error", code?: string) {
     super(message);
     this.status = status;
     this.kind = kind;
+    this.code = code;
   }
 }
 
@@ -45,15 +48,17 @@ export function authHeaders(extra: Record<string, string> = {}): Record<string, 
 async function errorFromResponse(response: Response): Promise<ApiError> {
   let message = `${response.status} ${response.statusText}`;
   let kind = "api_error";
+  let code: string | undefined;
   try {
     const payload = await response.json();
     const error = payload?.error ?? payload;
     if (error?.message) message = String(error.message);
     if (error?.type) kind = String(error.type);
+    if (error?.code) code = String(error.code);
   } catch {
     /* body was not JSON */
   }
-  return new ApiError(response.status, message, kind);
+  return new ApiError(response.status, message, kind, code);
 }
 
 export async function fetchJson<T>(

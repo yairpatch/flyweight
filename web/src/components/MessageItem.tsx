@@ -44,6 +44,14 @@ export const MessageItem = memo(function MessageItem({ message, previous, isLast
             {formatTime(message.createdAt)}
           </time>
           {message.protocol && message.role === "assistant" && <span className="msg__proto">{message.protocol}</span>}
+          {message.compaction && (
+            <span
+              className="msg__proto msg__proto--warn"
+              title={`The run no longer fit the context window, so ${describeCompaction(message.compaction)} were left out of this request. The transcript still has them.`}
+            >
+              compacted
+            </span>
+          )}
         </header>
         {(message.attachments ?? []).some((attachment) => attachment.kind !== "image") && (
           <div className="msg__attachments">
@@ -95,6 +103,14 @@ export const MessageItem = memo(function MessageItem({ message, previous, isLast
     </article>
   );
 });
+
+/** What the prompt lost to the context window, for the "compacted" tooltip. */
+function describeCompaction({ stubbed, dropped }: NonNullable<Message["compaction"]>): string {
+  const parts: string[] = [];
+  if (stubbed) parts.push(`${stubbed} older tool result${stubbed === 1 ? "" : "s"}`);
+  if (dropped) parts.push(`${dropped} older message${dropped === 1 ? "" : "s"}`);
+  return parts.join(" and ") || "older steps";
+}
 
 function ReasoningPanel({ text, seconds, live }: { text: string; seconds?: number; live: boolean }) {
   // Collapsed by default, live or not: the header's shimmer says thinking is
