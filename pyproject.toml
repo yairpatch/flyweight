@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # package and the command are still `flyweight`.
 name = "flyweight-llm"
 version = "0.2.0"
-description = "Native GGUF inference runtime for Qwen, Laguna, Muse, DeepSeek-V4 and Gemma models"
+description = "Native GGUF and safetensors inference runtime for Qwen, Laguna, K2-Horizon, Muse, DeepSeek-V4, Gemma and BailingMoE3 models"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -40,6 +40,13 @@ flyweight = [
   "ui/*.svg",
   "ui/assets/*",
 ]
+
+[tool.ruff.lint]
+# The classic default set, spelled out. ruff 0.16 widened its defaults (import
+# sorting, shebang checks, blind-except, ...) and CI, which installs the latest
+# ruff, started failing on rules this code never opted into while an older
+# local ruff passed. Pinning the selection keeps the two in agreement.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
 python_version = "3.12"

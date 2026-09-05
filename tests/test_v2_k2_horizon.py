@@ -283,7 +283,9 @@ class K2HorizonDecodeAttentionTests(unittest.TestCase):
                 context: int = 256, steps: int = 24) -> tuple[list[int], str]:
         if not V2Model.gpu_info()["available"]:
             raise unittest.SkipTest("native CUDA runtime is unavailable")
-        import subprocess, sys as _sys, json as _json
+        import json as _json
+        import subprocess
+        import sys as _sys
         run = subprocess.run(
             [_sys.executable, "-m", "tests.k2_decode_probe",
              str(prompt_tokens), str(context), str(steps)],
