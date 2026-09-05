@@ -15,11 +15,21 @@ dependencies = ["Jinja2>=3.1"]
 
 [project.optional-dependencies]
 client = ["openai>=2.0"]
+# The suite as CI runs it. pytest-xdist is what makes the parity tests
+# (a fixture build plus two full generations each) run side by side rather
+# than one after another.
+test = ["pytest>=8", "pytest-xdist>=3"]
 # Image input decoding and resizing for the vision tower (--mmproj).
 vision = ["Pillow>=10"]
 
 [project.scripts]
 flyweight = "flyweight.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `slow` is declared here as well as in conftest so `-m slow` works before
+# the plugin has configured.
+markers = ["slow: exhaustive parity test measured in minutes; needs --run-slow"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

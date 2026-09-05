@@ -26,6 +26,8 @@ from pathlib import Path
 from flyweight.v2 import V2Model
 from tests import qwen35_hf_fixture as fixture
 
+import pytest
+
 # Long enough to pass the batched thresholds: more than the 8 rows the rows
 # kernel takes in one launch, so the wider tiles are exercised too.
 PROMPT = [3, 9, 17, 4, 21, 33, 8, 12, 5, 19, 27, 11]
@@ -70,6 +72,7 @@ class PrefillParityTest(unittest.TestCase):
                 out.append(runtime.decode(out[-1]))
             return out
 
+    @pytest.mark.slow
     def test_every_quantization_prefills_as_it_decodes(self) -> None:
         previous = os.environ.get("FLYWEIGHT_HF_QUANT")
         try:
