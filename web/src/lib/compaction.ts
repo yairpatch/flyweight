@@ -23,7 +23,14 @@ const RECENT_KEEP = 6;
 const STUB_MIN = 300;
 /** How much of a result survives when even the recent ones must be clipped. */
 const CLIP_CHARS = 2000;
-/** Room left for the system prompt, tool schemas, and the template's own text. */
+/**
+ * Room left for everything in the request that is not the messages, when the
+ * caller cannot measure it: the system prompt, the tool schemas, and the chat
+ * template's own text. A caller that knows what it is about to send should
+ * pass the real figure -- an agent run's prompt and six tool schemas are well
+ * over this, and a budget that ignores them overflows the window it was
+ * supposed to fit.
+ */
 const OVERHEAD_TOKENS = 1500;
 
 export interface CompactionOutcome {
@@ -52,10 +59,24 @@ export function conversationChars(messages: Message[]): number {
  * context window minus what the answer and the scaffolding need. Infinite when
  * the window is unknown, which leaves the server's error as the only trigger.
  */
-export function budgetChars(contextWindow: number | undefined, maxOutputTokens: number, charsPerToken = CHARS_PER_TOKEN): number {
+export function budgetChars(
+  contextWindow: number | undefined,
+  maxOutputTokens: number,
+  charsPerToken = CHARS_PER_TOKEN,
+  overheadTokens = OVERHEAD_TOKENS,
+): number {
   if (!contextWindow || contextWindow <= 0) return Number.POSITIVE_INFINITY;
-  const room = contextWindow - Math.max(0, maxOutputTokens) - OVERHEAD_TOKENS;
+  const room = contextWindow - Math.max(0, maxOutputTokens) - Math.max(0, overheadTokens);
   return Math.max(2000, room * Math.max(1, charsPerToken));
+}
+
+/**
+ * What the non-message part of a request will cost, from the text of it. The
+ * template wraps each tool and each turn in markup of its own, which no
+ * client can see, so the count is rounded up rather than taken at face value.
+ */
+export function overheadTokens(chars: number, charsPerToken = CHARS_PER_TOKEN): number {
+  return Math.ceil(chars / Math.max(1, charsPerToken)) + 200;
 }
 
 /**

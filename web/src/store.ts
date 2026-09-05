@@ -25,6 +25,7 @@ import {
   contextOverflow,
   conversationChars,
   observedCharsPerToken,
+  overheadTokens,
   retryBudget,
 } from "./lib/compaction";
 import { identifier, titleFromPrompt } from "./lib/format";
@@ -460,15 +461,40 @@ export const useStore = create<StoreState>()((set, get) => {
     const workspace = kindOf(conversation) === "agent" ? workspaceRoot(state.props) : null;
     const builtins = workspace ? builtinToolDefinitions() : [];
 
+    // The prompt and the tool schemas are written before the messages are
+    // fitted, because they are what the messages have to fit around: an agent
+    // run's instructions and six schemas are a real fraction of a small
+    // window, and a budget that ignores them overflows it.
+    const requestTools = [...builtins, ...state.tools.filter((tool) => !builtins.some((builtin) => builtin.name === tool.name))];
+    const agentPrompt = workspace
+      ? agentSystemPrompt({
+          root: workspace,
+          platform: workspacePlatform(state.props),
+          tools: requestTools.filter((tool) => tool.enabled).map((tool) => tool.name),
+          turn: agentTurn,
+          turnCap: state.settings.agentMaxTurns,
+        })
+      : "";
+
     // An agent run writes its own prompt: every file it reads and every command
     // it runs stays in the transcript. Fit the messages to the window before
     // sending, so the run degrades by forgetting its oldest output rather than
     // dying on whichever step crossed the line. Chats are left alone — there
     // the user controls the length.
     const contextWindow = state.props?.context_window ?? state.health?.context_window;
+    const scaffolding =
+      agentPrompt.length +
+      state.settings.systemPrompt.trim().length +
+      requestTools.reduce((total, tool) => total + tool.name.length + tool.description.length + tool.parameters.length, 0);
     const limit =
       kindOf(conversation) === "agent"
-        ? (budget ?? budgetChars(contextWindow, state.settings.maxTokens, charsPerToken ?? undefined))
+        ? (budget ??
+          budgetChars(
+            contextWindow,
+            state.settings.maxTokens,
+            charsPerToken ?? undefined,
+            overheadTokens(scaffolding, charsPerToken ?? undefined),
+          ))
         : Number.POSITIVE_INFINITY;
     const compacted = compactMessages(conversation.messages, limit);
     const note = compactionNote(compacted);
@@ -488,15 +514,13 @@ export const useStore = create<StoreState>()((set, get) => {
     const controller = new AbortController();
     set({ generating: { conversationId, messageId: assistant.id, controller }, agentPause: null });
 
-    const prelude = [workspace ? agentSystemPrompt(workspace, workspacePlatform(state.props)) : "", note, state.settings.systemPrompt.trim()]
-      .filter(Boolean)
-      .join("\n\n");
+    const prelude = [agentPrompt, note, state.settings.systemPrompt.trim()].filter(Boolean).join("\n\n");
     const settings = prelude === state.settings.systemPrompt ? state.settings : { ...state.settings, systemPrompt: prelude };
     const body = buildRequest(protocol, {
       model: state.model || state.health?.model || "local",
       messages: compacted.messages,
       settings,
-      tools: [...builtins, ...state.tools.filter((tool) => !builtins.some((builtin) => builtin.name === tool.name))],
+      tools: requestTools,
     });
 
     // Accumulate in a local draft and flush on animation frames so a fast

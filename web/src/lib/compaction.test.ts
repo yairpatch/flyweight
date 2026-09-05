@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { budgetChars, compactMessages, compactionNote, contextOverflow, conversationChars, observedCharsPerToken, retryBudget } from "./compaction";
+import { budgetChars, compactMessages, compactionNote, contextOverflow, conversationChars, observedCharsPerToken, overheadTokens, retryBudget } from "./compaction";
 import type { Message, RequestRecord } from "../types";
 
 let counter = 0;
@@ -84,6 +84,17 @@ describe("budgetChars", () => {
     expect(budgetChars(32768, 4096)).toBeGreaterThan(0);
     // A window swallowed entirely by the output cap still leaves a floor.
     expect(budgetChars(4096, 4096)).toBe(2000);
+  });
+
+  it("counts the prompt and schemas it was actually given", () => {
+    // A 4k window with a 1k answer: the default allowance leaves ~1500 tokens
+    // of messages, but an agent prompt and six schemas eat most of that, and
+    // pretending otherwise is how a request overflows the window.
+    const measured = budgetChars(4096, 1024, 3.5, overheadTokens(3300 + 4000));
+    expect(measured).toBeLessThan(budgetChars(4096, 1024));
+    expect(overheadTokens(3500, 3.5)).toBe(1200);
+    // A big window barely notices, which is the point of measuring.
+    expect(budgetChars(131072, 4096, 3.5, overheadTokens(7300))).toBeGreaterThan(budgetChars(131072, 4096) * 0.9);
   });
 
   it("uses the model's measured ratio when one is known", () => {

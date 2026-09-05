@@ -61,8 +61,11 @@ describe("name matching", () => {
 });
 
 describe("agentSystemPrompt", () => {
+  const windows = { os: "windows", shell: "powershell", path_separator: "\\", line_ending: "crlf" } as const;
+  const linux = { os: "linux", shell: "sh", path_separator: "/", line_ending: "lf" } as const;
+
   it("tells the model which shell it is writing for on Windows", () => {
-    const prompt = agentSystemPrompt("C:\\work", { os: "windows", shell: "powershell", path_separator: "\\", line_ending: "crlf" });
+    const prompt = agentSystemPrompt({ root: "C:\\work", platform: windows });
     expect(prompt).toContain("C:\\work");
     expect(prompt).toContain("powershell");
     expect(prompt).toContain("Select-String");
@@ -72,7 +75,7 @@ describe("agentSystemPrompt", () => {
   });
 
   it("warns a POSIX host about its own shell instead", () => {
-    const prompt = agentSystemPrompt("/srv/work", { os: "linux", shell: "sh", path_separator: "/", line_ending: "lf" });
+    const prompt = agentSystemPrompt({ root: "/srv/work", platform: linux });
     expect(prompt).toContain("Linux");
     expect(prompt).toContain("commands go to sh");
     // /bin/sh is dash on most distributions, which is the POSIX equivalent of
@@ -84,7 +87,7 @@ describe("agentSystemPrompt", () => {
   });
 
   it("names macOS rather than the platform string the server reports", () => {
-    const prompt = agentSystemPrompt("/Users/me/work", { os: "darwin", shell: "sh", path_separator: "/", line_ending: "lf" });
+    const prompt = agentSystemPrompt({ root: "/Users/me/work", platform: { ...linux, os: "darwin" } });
     expect(prompt).toContain("The machine runs macOS");
     expect(prompt).not.toContain("darwin");
   });
@@ -92,15 +95,46 @@ describe("agentSystemPrompt", () => {
   it("leaves a shell it was told nothing about alone", () => {
     // FLYWEIGHT_AGENT_SHELL=fish, say: naming the shell is still right, but
     // none of the sh advice applies to it.
-    const prompt = agentSystemPrompt("/srv/work", { os: "linux", shell: "fish", path_separator: "/", line_ending: "lf" });
+    const prompt = agentSystemPrompt({ root: "/srv/work", platform: { ...linux, shell: "fish" } });
     expect(prompt).toContain("commands go to fish");
     expect(prompt).not.toContain("not bash");
   });
 
+  it("names the loop's own failure modes, not just the job", () => {
+    const prompt = agentSystemPrompt({ root: "/srv/work", platform: linux, tools: builtinToolDefinitions().map((tool) => tool.name) });
+    for (const heading of ["HOST", "TOOLS", "CALLING A TOOL", "WORKING", "FINISHING"]) {
+      expect(prompt).toContain(heading);
+    }
+    // The specific ways a small model breaks a run.
+    expect(prompt).toContain("Never write a tool result yourself");
+    expect(prompt).toContain("fails the same way when repeated");
+    expect(prompt).toContain("One call at a time");
+    expect(prompt).toContain("stays in your context");
+    expect(prompt).toContain("Stop as soon as the task is done");
+  });
+
+  it("says what each tool it was given is for, and nothing about the rest", () => {
+    const prompt = agentSystemPrompt({ root: "/srv/work", tools: ["read_file", "edit_file", "get_weather"] });
+    expect(prompt).toContain("- edit_file: change part of a file that exists");
+    expect(prompt).toContain("Also available: get_weather");
+    // A tool this run cannot call has no business being described to it.
+    expect(prompt).not.toContain("- run_command:");
+    expect(prompt).not.toContain("- fetch_url:");
+  });
+
+  it("tells the run how much budget is left when there is a cap", () => {
+    expect(agentSystemPrompt({ root: "/w", turn: 1, turnCap: 8 })).toContain("7 tool-calling turns left");
+    expect(agentSystemPrompt({ root: "/w", turn: 7, turnCap: 8 })).toContain("1 tool-calling turn left");
+    // Spent, or unknown: nothing to promise.
+    expect(agentSystemPrompt({ root: "/w", turn: 8, turnCap: 8 })).not.toContain("turns left");
+    expect(agentSystemPrompt({ root: "/w" })).not.toContain("turns left");
+  });
+
   it("still works when the server reports no platform", () => {
-    const prompt = agentSystemPrompt("/srv/work");
+    const prompt = agentSystemPrompt({ root: "/srv/work" });
     expect(prompt).toContain("/srv/work");
     expect(prompt).toContain("edit_file");
+    expect(prompt).not.toContain("HOST");
   });
 });
 

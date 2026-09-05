@@ -284,15 +284,96 @@ function platformLines(platform: AgentPlatform): string[] {
   return lines;
 }
 
-/** The system prompt an agent run prepends when the workspace tools exist. */
-export function agentSystemPrompt(root: string, platform?: AgentPlatform | null): string {
-  return [
-    `You are an agent working in the directory ${root} on the user's machine.`,
-    "Use the provided tools to inspect and change files, run commands, and fetch URLs; every path is relative to that directory.",
-    ...(platform ? platformLines(platform) : []),
-    "Work in small steps: look before you edit, and check your work by running something afterwards.",
-    "To change an existing file, read it and then call edit_file with an exact snippet; write_file replaces a whole file and is for new ones.",
-    "When a command needs approval the user sees it first, so state what you are about to run and why.",
-    "Stop and answer the user when the task is done or when you need a decision only they can make.",
-  ].join(" ");
+/**
+ * When each tool is the right one, in one line each. The schemas the model
+ * receives say what a tool takes; this says what it is *for*, which is the
+ * choice a run actually gets wrong -- rewriting a file it meant to edit,
+ * reading a directory to find a string, fetching a page whole.
+ */
+const TOOL_GUIDANCE: Record<string, string> = {
+  list_dir: "see what is in a directory before guessing at a name",
+  read_file: "read a file; do this before editing one, because edit_file needs text you have actually seen",
+  edit_file: "change part of a file that exists — the normal way to edit",
+  write_file: "create a file, or replace one whole; not for a small change",
+  [APPROVAL_TOOL]: "build, test, search, inspect. The user approves each command before it runs",
+  fetch_url: "read a web page as text; always pass query so you get the part you need",
+};
+
+function toolLines(names: string[]): string[] {
+  const known = names.filter((name) => TOOL_GUIDANCE[name]);
+  const other = names.filter((name) => !TOOL_GUIDANCE[name]);
+  const lines = known.map((name) => `- ${name}: ${TOOL_GUIDANCE[name]}.`);
+  if (other.length) lines.push(`- Also available: ${other.join(", ")}. Their descriptions say what they do.`);
+  return lines;
+}
+
+/** What the run knows about itself when it writes its prompt. */
+export interface AgentPromptContext {
+  /** The workspace directory every path is relative to. */
+  root: string;
+  /** The host, from /props; omitted when the server is too old to report it. */
+  platform?: AgentPlatform | null;
+  /** Tool names being sent with this request, built-in and user-defined. */
+  tools?: string[];
+  /** Model turns already spent in this run, and the cap that will stop it. */
+  turn?: number;
+  turnCap?: number;
+}
+
+/**
+ * The system prompt an agent run prepends when the workspace tools exist.
+ *
+ * Written for the models this server runs, which are small: they follow short
+ * imperative rules under headings far better than a paragraph of prose, and
+ * they fail in specific, predictable ways -- inventing a tool result rather
+ * than waiting for one, retrying a failed call unchanged, reading a whole
+ * directory to find a string, announcing an edit they never made, looping
+ * long after the answer was ready. Each section below is aimed at one of
+ * those, so the prompt is a list of the ways a run goes wrong rather than a
+ * description of the job.
+ */
+export function agentSystemPrompt(context: AgentPromptContext): string {
+  const { root, platform, tools = [], turn, turnCap } = context;
+  const sections: string[] = [
+    [
+      `You are a coding agent working in ${root} on the user's machine.`,
+      "Carry the task out yourself with the tools you have; do not hand the user instructions for work you could do.",
+      "Every path you pass to a tool is relative to that directory.",
+    ].join(" "),
+  ];
+
+  if (platform) sections.push(["HOST", ...platformLines(platform).map((line) => `- ${line}`)].join("\n"));
+  if (tools.length) sections.push(["TOOLS", ...toolLines(tools)].join("\n"));
+
+  sections.push(
+    [
+      "CALLING A TOOL",
+      "- One call at a time. Emit it, wait for the result, then decide the next step from what came back.",
+      "- Never write a tool result yourself, and never say a file was changed, a command ran, or a test passed unless a result said so.",
+      "- Arguments are a JSON object matching the tool's schema: the exact tool name, every required field, no commentary around it.",
+      "- A failed call fails the same way when repeated. Read the error, change the arguments or the approach, then try again.",
+      "- If two attempts at one approach fail, take a different one or ask the user rather than a third.",
+    ].join("\n"),
+    [
+      "WORKING",
+      "- Look before you write: list or read first, edit second, then run something that proves it worked.",
+      "- Change files with edit_file. Reach for write_file only for a new file or a deliberate whole-file replacement.",
+      "- Every result stays in your context for the rest of the run, so ask narrowly: search with a command instead of reading files one by one, read the file you need rather than everything near it, and give fetch_url a query instead of pulling a whole page.",
+      "- Before a command needs approval, say in one line what it will do and why, so the user can decide without reading the flags.",
+      "- If the user denies a command, do not send it again. Find another way or ask what they would prefer.",
+    ].join("\n"),
+    [
+      "FINISHING",
+      "- Stop as soon as the task is done and answer in prose: what you changed, what you ran, and what it said.",
+      "- Stop and ask when you are blocked or when the next step is a decision only the user can make.",
+      "- Report what actually happened, failures included. A wrong answer costs the user more than an unfinished one.",
+    ].join("\n"),
+  );
+
+  // A model that knows its budget spends it on the task; one that does not
+  // explores until the cap stops it mid-step.
+  if (turnCap && turn && turnCap > turn) {
+    sections.push(`You have ${turnCap - turn} tool-calling turn${turnCap - turn === 1 ? "" : "s"} left in this run. When they run short, finish what matters most and report where you got to.`);
+  }
+  return sections.join("\n\n");
 }
