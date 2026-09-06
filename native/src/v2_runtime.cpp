@@ -1032,19 +1032,22 @@ struct FlyweightV2QwenRuntime {
     // streamed here instead and the ordinary device path runs on them.
     std::uint64_t host_ffn_stage = 0;
     std::uint64_t host_ffn_stage_bytes = 0;
-    // Spilled feed-forward weights re-encoded as Q8_0, keyed by tensor index.
-    // The host dot for a codebook format converts every weight to float through
-    // a grid lookup and a sign expansion -- about six vector ops per eight MACs,
-    // redone for each of the thousands of output rows, which lands at a couple
-    // of percent of FMA peak. Q8_0 has no codebook and no signs, so it reaches
-    // the existing SIMD row kernels and becomes bandwidth-bound instead. Costs
-    // host RAM (2.56 bpw -> 8.5), which is the resource that is spare precisely
-    // when weights are being spilled. The device keeps reading the original
-    // bytes: its codebook kernels are fast and the compact form is what makes
-    // the batch upload cheap.
+    // Spilled feed-forward weights re-encoded to a SIMD-capable k-quant, keyed
+    // by tensor index. The host dot for a codebook format converts every
+    // weight to float through a grid lookup and a sign expansion -- about six
+    // vector ops per eight MACs, redone for each of the thousands of output
+    // rows, which lands at a couple of percent of FMA peak. The k-quants have
+    // no codebook and no signs, so they reach the existing SIMD row kernels
+    // and become bandwidth-bound instead. Q3_K by default (1.34x the IQ3
+    // bytes; Q8_0 at 3.3x measured slower than the codebook path, see the
+    // format choice in prepare), FLYWEIGHT_HOST_FFN_FORMAT overrides. Costs
+    // host RAM, which is the resource that is spare precisely when weights
+    // are being spilled. The device keeps reading the original bytes: its
+    // codebook kernels are fast and the compact form is what makes the batch
+    // upload cheap.
     std::unordered_map<std::uint64_t,std::vector<std::uint8_t>> host_ffn_q8;
     std::uint64_t host_ffn_q8_bytes = 0;
-    std::uint32_t host_ffn_q8_type = 8;
+    std::uint32_t host_ffn_q8_type = 11;  // Q3_K; overwritten by prepare
     std::uint64_t dense_host_nanoseconds = 0;
     // Cacheable mirror of the pinned dense scratch; see qwen_cpu_dense_ffn.
     std::vector<float> dense_scratch;
@@ -4916,15 +4919,22 @@ void qwen_cpu_dense_ffn(
     float*local_input=runtime.dense_scratch.data();
     float*activated=local_input+hidden;
     std::memcpy(local_input,input,static_cast<std::size_t>(hidden)*sizeof(float));
-    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
-    for(int row=0;row<intermediate;++row){
-        const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row);
-        const float up=qwen_quant_dot(up_data,up_type,local_input,hidden,row);
-        activated[row]=gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))*up;
+    // One team for both phases: the implicit barrier after the first loop
+    // orders the down projection after the SwiGLU, and a spilled 27B pays this
+    // per block, thirty-odd times a token, so the second region launch was
+    // pure overhead.
+    #pragma omp parallel num_threads(qwen_cpu_thread_count(runtime))
+    {
+        #pragma omp for schedule(static)
+        for(int row=0;row<intermediate;++row){
+            const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row);
+            const float up=qwen_quant_dot(up_data,up_type,local_input,hidden,row);
+            activated[row]=gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))*up;
+        }
+        #pragma omp for schedule(static)
+        for(int row=0;row<hidden;++row)
+            output[row]=qwen_quant_dot(down_data,down_type,activated,intermediate,row);
     }
-    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
-    for(int row=0;row<hidden;++row)
-        output[row]=qwen_quant_dot(down_data,down_type,activated,intermediate,row);
 }
 
 void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
@@ -15035,7 +15045,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // blocks' feed-forward to the host until the static set fits, working
         // from the last block back; attention and the DeltaNet recurrence stay
         // on the GPU because they are far smaller and latency-critical.
-        if(!runtime->layers.empty()&&runtime->layers.front().dense_ffn){
+        // Only qwen_decode, the batched decode and qwen_forward_rows honour
+        // ffn_on_host; the Gemma 4 drivers have no host branch. Their first
+        // block is MoE so this gate never fired for them, but a Gemma 4 file
+        // whose first block were dense would silently run a spilled block on
+        // weights that were never uploaded. Excluded explicitly.
+        if(!runtime->layers.empty()&&runtime->layers.front().dense_ffn&&!runtime->gemma4){
             std::uint64_t resident=0;
             for(const auto&layer:runtime->layers)for(auto tensor:layer.static_tensors)resident+=device_align(runtime->model->tensors[tensor].size);
             for(auto tensor:{runtime->token_embeddings,runtime->final_norm,runtime->lm_head}){
