@@ -4478,9 +4478,18 @@ void vision_rope_rows(
 
 // Full (non-causal) attention over every patch. One block per (head, tile
 // of 32 query rows): keys and values stream through shared memory in chunks
-// of 64 so each chunk is read once per 32 queries, and every query's softmax
+// of 24 so each chunk is read once per 32 queries, and every query's softmax
 // runs online across the 8 threads that share it (one key in eight each,
 // merged with shuffles at the end). head_dim up to 128; blockDim 256.
+//
+// The chunk is 24, not 64, because the three tiles are static shared memory
+// and static shared memory is capped at 48 KB on every architecture: 64-key
+// tiles came to 82 KB, which a Blackwell driver happened to accept and an
+// Ada driver refused with CUDA_ERROR_INVALID_PTX -- for the whole corpus, so
+// no kernel loaded at all on an RTX 4070, vision model or not. 24 keys keep
+// the padded tiles at 41 KB. The launch helper passes no dynamic size, so a
+// bigger chunk would need that plumbing plus a per-kernel opt-in attribute.
+#define FLYWEIGHT_VISION_KEY_CHUNK 24
 extern "C" __global__
 void vision_attention_rows(
     const float* qkv, float* output,
@@ -4494,8 +4503,8 @@ void vision_attention_rows(
     const int lane_in_query = threadIdx.x & 7;     // which eighth of the keys
     const int row = tile + query_index;
     const bool live = row < rows;
-    __shared__ float k_tile[64][129];
-    __shared__ float v_tile[64][129];
+    __shared__ float k_tile[FLYWEIGHT_VISION_KEY_CHUNK][129];
+    __shared__ float v_tile[FLYWEIGHT_VISION_KEY_CHUNK][129];
     __shared__ float q_tile[32][129];
     if (live)
         for (int d = lane_in_query; d < head_dim; d += 8)
@@ -4504,9 +4513,9 @@ void vision_attention_rows(
     float running_max = -3.0e38f, running_sum = 0.0f;
     float acc[128];
     for (int d = 0; d < 128; ++d) acc[d] = 0.0f;
-    for (int chunk = 0; chunk < rows; chunk += 64) {
-        const int count = min(64, rows - chunk);
-        for (int load = threadIdx.x; load < 64 * head_dim; load += blockDim.x) {
+    for (int chunk = 0; chunk < rows; chunk += FLYWEIGHT_VISION_KEY_CHUNK) {
+        const int count = min(FLYWEIGHT_VISION_KEY_CHUNK, rows - chunk);
+        for (int load = threadIdx.x; load < FLYWEIGHT_VISION_KEY_CHUNK * head_dim; load += blockDim.x) {
             const int key = load / head_dim, d = load % head_dim;
             if (key < count) {
                 const long long base = (long long)(chunk + key) * stride + head * head_dim;
