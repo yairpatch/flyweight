@@ -13618,12 +13618,14 @@ std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t 
 // The quantifiers are possessive (`?+`, `++`), so the optional leading
 // character in the letter branch is never given back: if it is consumed and no
 // letter follows, the branch fails outright rather than retrying without it.
-// Shared by the llama3 and Qwen transcriptions below. `marks` is the one
-// place the two regexes differ: Qwen3.6's letter run is `[\p{L}\p{M}]+` and
-// its punctuation class excludes `\p{M}`, so a combining accent travels with
-// the letter it decorates instead of starting a punctuation piece.
+// Shared by the llama3, Qwen and K2-Horizon transcriptions below, which are
+// one regex with three knobs. `marks`: the letter run is `[\p{L}\p{M}]+` and
+// the punctuation class excludes `\p{M}`, so a combining accent travels with
+// the letter it decorates (Qwen3.6, K2). `joiners`: U+200C/U+200D count as
+// letters too (K2). `max_digit_run`: `\p{N}{1,3}` (K2) against `\p{N}`.
 static std::vector<std::string> apostrophe_bpe_pretokenize(
-        const std::string& text, bool marks) {
+        const std::string& text, bool marks, std::size_t max_digit_run,
+        bool joiners) {
     const auto decoded=gguf_utf8_decode(text);
     const std::size_t count=decoded.code.size();
     std::vector<std::string> pieces;
@@ -13634,7 +13636,10 @@ static std::vector<std::string> apostrophe_bpe_pretokenize(
     auto is_space=[&](std::uint32_t c){return gguf_codepoint_is_space(c);};
     auto is_letter=[&](std::uint32_t c){return joyai_is_letter(c);};
     auto is_number=[&](std::uint32_t c){return joyai_is_number(c);};
-    auto is_mark=[&](std::uint32_t c){return marks&&joyai_is_accent_mark(c);};
+    auto is_mark=[&](std::uint32_t c){
+        return (marks&&joyai_is_accent_mark(c))||
+               (joiners&&(c==0x200C||c==0x200D));
+    };
 
     for(std::size_t at=0;at<count;){
         // Alternative 1: an apostrophe plus a contraction tail, either case.
@@ -13669,9 +13674,11 @@ static std::vector<std::string> apostrophe_bpe_pretokenize(
                 pieces.push_back(slice(at,end));at=end;continue;
             }
         }
-        // Alternative 3: exactly one digit.
+        // Alternative 3: a digit run of at most `max_digit_run`.
         if(is_number(at_code(at))){
-            pieces.push_back(slice(at,at+1));at+=1;continue;
+            std::size_t end=at;
+            while(end<count&&end-at<max_digit_run&&is_number(at_code(end)))++end;
+            pieces.push_back(slice(at,end));at=end;continue;
         }
         // Alternative 4: an optional single leading space, then a run of
         // characters that are neither whitespace, letters nor digits, then any
@@ -13720,7 +13727,27 @@ static std::vector<std::string> apostrophe_bpe_pretokenize(
 }
 
 std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
-    return apostrophe_bpe_pretokenize(text,false);
+    return apostrophe_bpe_pretokenize(text,false,1,false);
+}
+
+// K2-Horizon, transcribed from the regex in IFM/K2-Horizon-*'s tokenizer.json:
+//
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+// | [^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+
+// | \p{N}{1,3}
+// |  ?[^\s\p{L}\p{N}]+[\r\n]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+//
+// It used to ride on the GPT-4o transcription, which is close and wrong in
+// three places the reference is not: GPT-4o splits a letter run at an
+// upper-to-lower transition ("camelCase" -> "camel", "Case"), attaches a
+// contraction to its word ("don't" stays whole where K2 makes "don", "'t"),
+// and lets a punctuation run swallow trailing slashes, so "';\n\n/**" gave
+// the "/" to the previous piece.
+std::vector<std::string> k2_horizon_pretokenize(const std::string& text) {
+    return apostrophe_bpe_pretokenize(text,true,3,true);
 }
 
 // The Qwen pre-tokenizer (`qwen35` in GGUF, which llama.cpp gives the whole
@@ -13743,7 +13770,7 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
 // space too many on every line, and "this. _speed" for "this._speed". The
 // symptom looked like a small model miscounting indentation. It was not.
 std::vector<std::string> qwen35_pretokenize(const std::string& text) {
-    return apostrophe_bpe_pretokenize(text,true);
+    return apostrophe_bpe_pretokenize(text,true,1,false);
 }
 
 std::vector<std::string> gpt4o_pretokenize(const std::string& text,
@@ -13898,18 +13925,25 @@ void gguf_bpe_piece(const FlyweightV2Model& m, const std::string& piece,
     }
 }
 
-// The pre-tokenizer a checkpoint asks for by name. Anything unlisted keeps the
-// historical behaviour of no pre-tokenization at all. Qwen used to be in that
-// group, which is what mis-split every indented line (see
-// qwen35_pretokenize); `qwen2` is the same regex without the \p{M} additions.
+// The pre-tokenizer a checkpoint asks for by name. Anything unlisted gets no
+// pre-tokenization at all -- the whole text is one piece, which is exactly
+// what flyweight_v2_tokenize does for it, so the diagnostic split and the
+// real one agree. Qwen used to be in that group, which is what mis-split
+// every indented line (see qwen35_pretokenize).
 std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
                                           const std::string& text) {
     if(m.tokenizer_pre=="qwen35")return qwen35_pretokenize(text);
-    if(m.tokenizer_pre=="qwen2")return llama_bpe_pretokenize(text);
+    if(m.tokenizer_pre=="k2-horizon")return k2_horizon_pretokenize(text);
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
-    if(m.tokenizer_pre=="llama4"||m.tokenizer_pre=="k2-horizon")return gpt4o_pretokenize(text,3);
-    if(m.tokenizer_pre=="llama-bpe")return llama_bpe_pretokenize(text);
-    return laguna_pretokenize(text);
+    if(m.tokenizer_pre=="laguna")return laguna_pretokenize(text);
+    if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
+    // Three names, one regex: Ling's tokenizer.json carries the llama3 pattern
+    // verbatim (single digits, no case split), and Qwen2's is the same
+    // pattern spelled with apostrophes.
+    if(m.tokenizer_pre=="llama-bpe"||m.tokenizer_pre=="qwen2"||
+       m.tokenizer_pre=="bailingmoe2"||m.tokenizer_pre=="bailingmoe3")
+        return llama_bpe_pretokenize(text);
+    return text.empty()?std::vector<std::string>{}:std::vector<std::string>{text};
 }
 
 // Pre-tokenizer boundaries, so the split can be checked against the reference
@@ -13936,7 +13970,8 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
     if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"||
        m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"||
        m->tokenizer_pre=="k2-horizon"||m->tokenizer_pre=="qwen35"||
-       m->tokenizer_pre=="qwen2"){
+       m->tokenizer_pre=="qwen2"||m->tokenizer_pre=="bailingmoe2"||
+       m->tokenizer_pre=="bailingmoe3"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.

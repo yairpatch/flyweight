@@ -134,5 +134,20 @@ class Qwen35PretokenizerTests(unittest.TestCase):
         self.assertEqual(self.model.pretokenize("cafe\u0301 x"), ("cafe\u0301", " x"))
 
 
+class UnlistedPretokenizerTests(unittest.TestCase):
+    def test_a_checkpoint_naming_no_pretokenizer_is_one_piece(self) -> None:
+        # What flyweight_v2_tokenize does for an unlisted name is BPE over the
+        # whole text, so the diagnostic split reports exactly that rather than
+        # a plausible-looking split the tokenizer never applies.
+        from tests.dense_gguf_fixture import build_dense_qwen35_gguf
+
+        with tempfile.TemporaryDirectory(prefix="flyweight-nopre-") as directory:
+            path = Path(directory) / "dense.gguf"
+            build_dense_qwen35_gguf(path)
+            with V2Model(path) as model:
+                self.assertEqual(model.pretokenize("\n    private _x"), ("\n    private _x",))
+                self.assertEqual(model.pretokenize(""), ())
+
+
 if __name__ == "__main__":
     unittest.main()

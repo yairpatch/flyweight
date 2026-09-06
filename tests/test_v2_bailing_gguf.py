@@ -26,6 +26,20 @@ class BailingGgufTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._directory.cleanup()
 
+    def test_the_gguf_splits_text_like_the_hf_checkpoint(self) -> None:
+        # The GGUF names its pre-tokenizer "bailingmoe2"; the HF loader reads
+        # the same regex out of tokenizer.json. Both must reach the llama3
+        # splitter: an unlisted name gets no pre-tokenization, which is what
+        # mis-split every indented line on Qwen before its name was listed.
+        text = "\n    private _speed = 0;\n"
+        with V2Model(self.gguf_path) as converted, V2Model(self.hf_path) as original:
+            self.assertEqual(
+                converted.pretokenize(text),
+                ("\n", "   ", " private", " _", "speed", " =", " ", "0", ";\n"),
+            )
+            self.assertEqual(converted.pretokenize(text), original.pretokenize(text))
+            self.assertEqual(list(converted.tokenize(text)), list(original.tokenize(text)))
+
     def test_it_reads_the_architecture_and_geometry_from_gguf_metadata(self) -> None:
         with V2Model(self.gguf_path) as model:
             info = model.info
