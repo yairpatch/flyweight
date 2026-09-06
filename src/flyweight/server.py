@@ -635,11 +635,33 @@ class AgentWorkspace:
     API key can.
     """
 
-    def __init__(self, root: str | os.PathLike[str]):
+    def __init__(self, root: str | os.PathLike[str], *, source: str = "flag"):
         resolved = Path(root).resolve()
         if not resolved.is_dir():
             raise ValueError(f"agent workspace is not a directory: {resolved}")
         self.root = resolved
+        # "flag" roots come from the command line and cannot be removed over
+        # HTTP; "registered" ones were added from the UI and can be.
+        self.source = source
+
+    @property
+    def id(self) -> str:
+        """A stable handle for the directory: the same path gets the same id
+        across restarts, so a run saved in the browser still names its root."""
+        return _agent_workspace_id(self.root)
+
+    @property
+    def title(self) -> str:
+        return self.root.name or str(self.root)
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "path": str(self.root),
+            "title": self.title,
+            "source": self.source,
+            "exists": self.root.is_dir(),
+        }
 
     def platform(self) -> dict[str, str]:
         """What the model needs to know about the host it is working on."""
@@ -662,6 +684,29 @@ class AgentWorkspace:
         handler = handlers.get(path)
         if handler is None:
             raise APIError(404, "endpoint not found", "not_found_error")
+        if not self.root.is_dir():
+            raise APIError(
+                404,
+                f"the agent workspace {self.root} no longer exists",
+                "not_found_error",
+            )
+        # A run the user put in read-only mode gets its writers refused here
+        # as well as withheld from the model: the fence is the server's, not
+        # the prompt's. Commands are not confined -- the approval prompt is
+        # the only control on them -- and the UI says so.
+        mode = payload.get("mode")
+        if mode is not None and mode not in _AGENT_MODES:
+            raise APIError(
+                400,
+                "mode must be one of " + ", ".join(_AGENT_MODES),
+                parameter="mode",
+            )
+        if mode == "read-only" and path in {"/agent/fs/write", "/agent/fs/edit"}:
+            raise APIError(
+                403,
+                "this run is read-only: the user has not allowed file changes",
+                parameter="mode",
+            )
         return handler(payload)
 
     def _resolve(self, raw: object, *, default: str | None = None) -> Path:
@@ -1012,6 +1057,211 @@ class AgentWorkspace:
             "selection": "query" if query and partial else "head",
             "truncated": partial or over_cap,
         }
+
+
+# File-effect modes an agent run may declare on its tool calls. "read-only"
+# is enforced on the file tools; "workspace-write" is the default fence; the
+# UI's auto-approve preset is a client-side choice and sends workspace-write.
+_AGENT_MODES = ("read-only", "workspace-write")
+
+
+def _agent_workspace_id(root: Path) -> str:
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"flyweight-agent-workspace:{root}").hex[:16]
+
+
+def agent_state_file() -> Path:
+    """Where registered workspaces persist across restarts."""
+    override = os.environ.get("FLYWEIGHT_STATE_DIR")
+    base = Path(override).expanduser() if override else Path.home() / ".flyweight"
+    return base / "agent-workspaces.json"
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Whether a Host/Origin hostname can only mean this machine."""
+    import ipaddress
+
+    name = host.strip().lower()
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_ip_literal(host: str) -> bool:
+    import ipaddress
+
+    name = host.strip()
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
+
+
+def _hostname_of(netloc: str) -> str:
+    """The host part of a Host header or Origin netloc, port stripped."""
+    text = netloc.strip()
+    if text.startswith("["):
+        return text.split("]", 1)[0] + "]"
+    return text.rsplit(":", 1)[0] if text.count(":") == 1 else text
+
+
+class AgentWorkspaceRegistry:
+    """The directories agent runs may work in, and where they come from.
+
+    Roots named on the command line are fixed for the server's lifetime.
+    Roots registered over HTTP (`POST /agent/workspaces`) persist in a state
+    file so a directory chosen once in the UI is still there after a
+    restart. Registration is the one operation that lets a client name an
+    arbitrary path, so the handler only accepts it from a loopback peer whose
+    request is same-origin -- a browser on this machine showing the bundled
+    UI -- and never from the network.
+    """
+
+    def __init__(
+        self,
+        roots: Sequence[str | os.PathLike[str]] = (),
+        *,
+        state_file: Path | None = None,
+    ):
+        self.fixed: list[AgentWorkspace] = []
+        for root in roots:
+            workspace = AgentWorkspace(root, source="flag")
+            if all(existing.root != workspace.root for existing in self.fixed):
+                self.fixed.append(workspace)
+        self.state_file = state_file
+        self.registered: list[AgentWorkspace] = []
+        self._lock = threading.Lock()
+        self._load()
+
+    # -- persistence --------------------------------------------------------
+
+    def _load(self) -> None:
+        if self.state_file is None or not self.state_file.is_file():
+            return
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        entries = data.get("workspaces") if isinstance(data, Mapping) else None
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            path = entry.get("path") if isinstance(entry, Mapping) else None
+            if not isinstance(path, str):
+                continue
+            root = Path(path)
+            # A directory that has gone away stays on the list, marked so:
+            # the user removes it, or restores it and their runs still work.
+            workspace = AgentWorkspace.__new__(AgentWorkspace)
+            workspace.root = root
+            workspace.source = "registered"
+            if all(w.root != root for w in [*self.fixed, *self.registered]):
+                self.registered.append(workspace)
+
+    def _save(self) -> None:
+        if self.state_file is None:
+            return
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"workspaces": [{"path": str(w.root)} for w in self.registered]}
+        tmp = self.state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, self.state_file)
+
+    # -- lookup -------------------------------------------------------------
+
+    @property
+    def all(self) -> list[AgentWorkspace]:
+        return [*self.fixed, *self.registered]
+
+    def default(self) -> AgentWorkspace | None:
+        """The root a call that names none gets: the first flag, else the
+        first registered directory that still exists."""
+        for workspace in self.all:
+            if workspace.root.is_dir():
+                return workspace
+        return None
+
+    def describe(self) -> list[dict[str, Any]]:
+        return [workspace.describe() for workspace in self.all]
+
+    def get(self, workspace_id: str) -> AgentWorkspace | None:
+        for workspace in self.all:
+            if workspace.id == workspace_id:
+                return workspace
+        return None
+
+    def resolve(self, payload: Mapping[str, Any]) -> AgentWorkspace:
+        """The workspace a tool call runs in: `workspace` names one by id;
+        absent, the default."""
+        requested = payload.get("workspace")
+        if requested is None:
+            workspace = self.default()
+            if workspace is None:
+                raise APIError(
+                    404,
+                    "no agent workspace: add a directory in the UI's Agent tab "
+                    "or start serve with --agent-workspace DIR",
+                    "not_found_error",
+                )
+            return workspace
+        if not isinstance(requested, str):
+            raise APIError(400, "workspace must be an id string", parameter="workspace")
+        workspace = self.get(requested)
+        if workspace is None:
+            raise APIError(
+                404,
+                "unknown agent workspace; list /agent/workspaces and pick one",
+                "not_found_error",
+                parameter="workspace",
+            )
+        return workspace
+
+    # -- mutation -----------------------------------------------------------
+
+    def register(self, raw: object) -> AgentWorkspace:
+        if not isinstance(raw, str) or not raw.strip():
+            raise APIError(400, "path must be a non-empty string", parameter="path")
+        candidate = Path(raw.strip()).expanduser()
+        if not candidate.is_absolute():
+            raise APIError(400, "path must be absolute", parameter="path")
+        try:
+            workspace = AgentWorkspace(candidate, source="registered")
+        except ValueError as error:
+            raise APIError(400, str(error), parameter="path") from error
+        with self._lock:
+            for existing in self.all:
+                if existing.root == workspace.root:
+                    return existing
+            self.registered.append(workspace)
+            self._save()
+        return workspace
+
+    def unregister(self, workspace_id: str) -> AgentWorkspace:
+        with self._lock:
+            for workspace in self.fixed:
+                if workspace.id == workspace_id:
+                    raise APIError(
+                        403,
+                        "this workspace was named on the command line and "
+                        "cannot be removed over HTTP",
+                        "permission_error",
+                    )
+            for index, workspace in enumerate(self.registered):
+                if workspace.id == workspace_id:
+                    del self.registered[index]
+                    self._save()
+                    return workspace
+        raise APIError(404, "unknown agent workspace", "not_found_error")
+
+    def platform(self) -> dict[str, str]:
+        return AgentWorkspace.platform(AgentWorkspace.__new__(AgentWorkspace))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1601,9 +1851,11 @@ class InferenceService:
         # Whether an image part may name an http(s) URL for the server to
         # fetch; data URLs are always accepted.
         self.allow_remote_images = True
-        # Host-side tools for the UI's agent runs; set by the CLI when
-        # --agent-workspace names a directory, like freeze_total_tokens.
-        self.agent_workspace: AgentWorkspace | None = None
+        # Host-side tools for the UI's agent runs. The registry holds the
+        # roots from --agent-workspace plus any the UI registered; None means
+        # the CLI turned the tools off (--no-agent-tools). Set by the CLI
+        # after construction, like freeze_total_tokens.
+        self.agent_workspaces: AgentWorkspaceRegistry | None = AgentWorkspaceRegistry()
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(
                 "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS))
@@ -2729,20 +2981,40 @@ class InferenceService:
                 "function_tools",
                 "tokenize",
                 *(["stop_thinking"] if self.supports_stop_thinking else []),
+                # "agent_workspaces": the registry endpoints exist and the UI
+                # may offer to add directories; "agent_workspace": at least
+                # one directory is ready, so the tools can run right now.
+                *(["agent_workspaces"] if self.agent_workspaces is not None else []),
                 *(["agent_workspace"] if self.agent_workspace else []),
             ],
             **(
                 {
-                    "agent_workspace": str(self.agent_workspace.root),
+                    "agent_workspaces": self.agent_workspaces.describe(),
                     # The UI puts this in the run's system prompt: a model
                     # that knows it is on Windows in PowerShell stops opening
                     # with `ls -la` and `cat`.
-                    "agent_platform": self.agent_workspace.platform(),
+                    "agent_platform": self.agent_workspaces.platform(),
                 }
+                if self.agent_workspaces is not None
+                else {}
+            ),
+            **(
+                {"agent_workspace": str(self.agent_workspace.root)}
                 if self.agent_workspace
                 else {}
             ),
         }
+
+    @property
+    def agent_workspace(self) -> AgentWorkspace | None:
+        """The default root, for callers that predate the registry."""
+        return self.agent_workspaces.default() if self.agent_workspaces else None
+
+    @agent_workspace.setter
+    def agent_workspace(self, workspace: AgentWorkspace | None) -> None:
+        self.agent_workspaces = (
+            AgentWorkspaceRegistry([workspace.root]) if workspace else None
+        )
 
     @property
     def supports_stop_thinking(self) -> bool:
@@ -4299,6 +4571,20 @@ def create_handler(
             if path == "/slots":
                 self._send_json(200, {"slots": service.slots()})
                 return
+            if path == "/agent/workspaces":
+                registry = self._agent_registry()
+                self._send_json(
+                    200,
+                    {
+                        "workspaces": registry.describe(),
+                        "platform": registry.platform(),
+                        # Whether this caller may add directories: only a
+                        # browser on this machine, so the UI can hide the
+                        # form from everyone else instead of failing it.
+                        "can_register": self._peer_is_loopback(),
+                    },
+                )
+                return
             if path.startswith("/v1/responses/"):
                 response_id = unquote(path[len("/v1/responses/") :])
                 try:
@@ -4348,6 +4634,12 @@ def create_handler(
         def _do_delete(self) -> None:
             self._authenticate()
             path = urlsplit(self.path).path
+            if path.startswith("/agent/workspaces/"):
+                registry = self._agent_registry()
+                self._require_local_peer()
+                workspace_id = unquote(path[len("/agent/workspaces/") :])
+                self._send_json(200, registry.unregister(workspace_id).describe())
+                return
             if not path.startswith("/v1/responses/"):
                 raise APIError(404, "endpoint not found", "not_found_error")
             response_id = unquote(path[len("/v1/responses/") :])
@@ -4431,14 +4723,14 @@ def create_handler(
                         self.log_message("request completed: %s", path)
                     return
                 if path.startswith("/agent/"):
-                    workspace = service.agent_workspace
-                    if workspace is None:
-                        raise APIError(
-                            404,
-                            "agent tools are not enabled; start serve with "
-                            "--agent-workspace DIR",
-                            "not_found_error",
-                        )
+                    registry = self._agent_registry()
+                    if path == "/agent/workspaces":
+                        self._require_local_peer()
+                        workspace = registry.register(payload.get("path"))
+                        self._send_json(200, workspace.describe())
+                        self.log_message("request completed: %s", path)
+                        return
+                    workspace = registry.resolve(payload)
                     self._send_json(200, workspace.handle(path, payload))
                     self.log_message("request completed: %s", path)
                     return
@@ -4481,6 +4773,78 @@ def create_handler(
             finally:
                 LOG.end_progress()
                 self._log_summary(path)
+
+        def _agent_registry(self) -> AgentWorkspaceRegistry:
+            """The registry, after the checks every /agent/* call must pass."""
+            registry = service.agent_workspaces
+            if registry is None:
+                raise APIError(
+                    404,
+                    "agent tools are disabled on this server (--no-agent-tools)",
+                    "not_found_error",
+                )
+            self._check_agent_origin()
+            return registry
+
+        def _check_agent_origin(self) -> None:
+            """Refuse a browser request that did not come from this server's
+            own page.
+
+            The missing CORS grant stops a foreign page from *reading* a
+            response; it does not stop a simple POST from being *sent*, and a
+            command runs whether or not its output is readable. So a request
+            that carries an Origin must match its Host exactly. The Host
+            itself must be an address, not a name: a page at evil.example that
+            resolves that name to 127.0.0.1 arrives with matching Origin and
+            Host and would pass an equality check alone.
+            """
+            host = self.headers.get("Host", "")
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return  # not a browser, or a same-origin GET; the API key rules
+            netloc = urlsplit(origin).netloc if origin != "null" else ""
+            if not netloc or netloc.lower() != host.lower():
+                raise APIError(
+                    403,
+                    "agent tools accept requests only from this server's own page",
+                    "permission_error",
+                )
+            hostname = _hostname_of(host)
+            allowed = {
+                name.strip().lower()
+                for name in os.environ.get("FLYWEIGHT_AGENT_HOSTS", "").split(",")
+                if name.strip()
+            }
+            if not (
+                _is_loopback_host(hostname)
+                or _is_ip_literal(hostname)
+                or hostname.lower() in allowed
+            ):
+                raise APIError(
+                    403,
+                    "agent tools accept a browser request only when the page was "
+                    "opened by address (or a name listed in FLYWEIGHT_AGENT_HOSTS)",
+                    "permission_error",
+                )
+
+        def _peer_is_loopback(self) -> bool:
+            import ipaddress
+
+            try:
+                return ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                return False
+
+        def _require_local_peer(self) -> None:
+            """Registering a directory names an arbitrary path on the host,
+            so only a caller on the host may do it."""
+            if not self._peer_is_loopback():
+                raise APIError(
+                    403,
+                    "workspaces can be added or removed only from this machine; "
+                    "elsewhere, start serve with --agent-workspace DIR",
+                    "permission_error",
+                )
 
         def _authenticate(self) -> None:
             if service.api_key is None:

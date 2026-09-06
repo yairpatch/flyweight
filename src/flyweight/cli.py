@@ -758,10 +758,18 @@ checkpoint's generation_config.json says.\
              "instead of serving it anyway",
     )
     endpoint.add_argument(
-        "--agent-workspace", metavar="DIR", default=None,
-        help="enable the chat UI's agent tools (read/write/list files, run "
-             "shell commands, fetch URLs) confined to this directory; off "
-             "unless given. Commands still require approval in the UI",
+        "--agent-workspace", metavar="DIR", action="append", default=None,
+        help="a directory the chat UI's agent runs may work in (read/write/"
+             "list files, run shell commands, fetch URLs), fixed for this "
+             "server's lifetime; repeatable. Without it, a browser on this "
+             "machine can add directories from the Agent tab, and they "
+             "persist under ~/.flyweight. Commands still require approval "
+             "in the UI",
+    )
+    endpoint.add_argument(
+        "--no-agent-tools", action="store_true",
+        help="turn the agent tools off entirely: no /agent/* endpoints, and "
+             "the Agent tab cannot add directories",
     )
     endpoint.add_argument(
         "--concurrency", "--max-concurrent-requests",
@@ -1658,17 +1666,26 @@ def _serve_http(args: argparse.Namespace, service) -> int:
     # Every service class inherits the attribute from InferenceService; one
     # assignment here beats threading a keyword through their constructors.
     service.freeze_total_tokens = bool(getattr(args, "freeze_total_tokens", False))
-    workspace_dir = getattr(args, "agent_workspace", None)
-    if workspace_dir:
-        from .server import AgentWorkspace
+    if getattr(args, "no_agent_tools", False):
+        service.agent_workspaces = None
+    else:
+        from .server import AgentWorkspaceRegistry, agent_state_file
         try:
-            service.agent_workspace = AgentWorkspace(workspace_dir)
+            service.agent_workspaces = AgentWorkspaceRegistry(
+                getattr(args, "agent_workspace", None) or (),
+                state_file=agent_state_file(),
+            )
         except ValueError as error:
             raise SystemExit(f"--agent-workspace: {error}") from error
-        print(
-            f"Agent tools enabled in {service.agent_workspace.root}",
-            file=sys.stderr,
-        )
+        roots = [str(workspace.root) for workspace in service.agent_workspaces.all]
+        if roots:
+            print("Agent tools enabled in " + ", ".join(roots), file=sys.stderr)
+        else:
+            print(
+                "Agent tools enabled; add a directory from the Agent tab "
+                "(or pass --agent-workspace DIR)",
+                file=sys.stderr,
+            )
     try:
         print(f"Serving {service.model_name} at http://{args.host}:{args.port}", file=sys.stderr)
         serve_http(

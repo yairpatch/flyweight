@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, Bot, Sparkles } from "lucide-react";
 import { useActiveConversation, useStore } from "../store";
-import { workspaceRoot } from "../lib/agentTools";
+import { workspaceFor } from "../lib/agentTools";
+import { AgentSetup } from "./AgentSetup";
 import { MessageItem } from "./MessageItem";
 
 const STICK_THRESHOLD = 8;
@@ -25,7 +26,7 @@ export function Transcript() {
   const sendMessage = useStore((state) => state.sendMessage);
   const setPanel = useStore((state) => state.setPanel);
   const mode = useStore((state) => state.mode);
-  const workspace = useStore((state) => workspaceRoot(state.props));
+  const workspace = useStore((state) => workspaceFor(state.props, conversation?.workspaceId));
   const ready = useStore((state) => state.ready);
   const scroller = useRef<HTMLDivElement>(null);
   const inner = useRef<HTMLDivElement>(null);
@@ -109,11 +110,12 @@ export function Transcript() {
             <Bot size={22} />
           </div>
           <h2>Give the agent a task</h2>
-          {workspace ? (
+          <AgentSetup conversation={conversation} />
+          {workspace?.exists ? (
             <>
               <p>
-                The model works in <code>{workspace}</code>: it can list, read, and write files there, run shell commands with your approval, and
-                fetch URLs. Results go back to it until the task is done.
+                The model works in <code>{workspace.path}</code>: it can list and read files there, change them if the preset allows, run shell
+                commands, and fetch URLs. Results go back to it until the task is done.
               </p>
               <div className="empty__grid">
                 {AGENT_SUGGESTIONS.map((text) => (
@@ -126,15 +128,12 @@ export function Transcript() {
           ) : (
             <>
               <p>
-                The model calls the enabled tools, their JavaScript handlers run in a sandbox, and the results go back to the model until it answers —
-                without you pasting anything.
+                Without a workspace the model can only call tools that have a JavaScript handler; those run in a sandbox and their results go back to
+                the model until it answers.
               </p>
               <div className="empty__grid">
                 <button className="empty__card" onClick={() => setPanel("tools")}>
                   Open the Tools panel to enable tools and write their handlers.
-                </button>
-                <button className="empty__card" onClick={() => setPanel("tools")}>
-                  For files and a shell, restart the server with <code>--agent-workspace DIR</code>.
                 </button>
               </div>
             </>

@@ -2,7 +2,7 @@ import { useRef } from "react";
 import { Plus, Trash2, Upload } from "lucide-react";
 import { useStore } from "../../store";
 import { clamp, identifier } from "../../lib/format";
-import { workspacePlatform, workspaceRoot } from "../../lib/agentTools";
+import { agentToolsAvailable, workspaceList, workspacePlatform } from "../../lib/agentTools";
 import type { ToolDefinition } from "../../types";
 
 function validJson(text: string): boolean {
@@ -20,7 +20,9 @@ export function ToolsPanel() {
   const settings = useStore((state) => state.settings);
   const updateSettings = useStore((state) => state.updateSettings);
   const toast = useStore((state) => state.toast);
-  const workspace = useStore((state) => workspaceRoot(state.props));
+  const workspaces = useStore((state) => workspaceList(state.props));
+  const toolsAvailable = useStore((state) => agentToolsAvailable(state.props));
+  const canRegister = useStore((state) => state.canRegisterWorkspaces);
   const platform = useStore((state) => workspacePlatform(state.props));
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -70,12 +72,22 @@ export function ToolsPanel() {
           it answers. Handlers run in the same sandboxed frame as the code preview: an opaque origin with no access to this app's storage or API key,
           and network requests subject to CORS. A call whose tool has no handler pauses the run for a manual result; Stop (Esc) interrupts it.
         </p>
-        {workspace ? (
+        {toolsAvailable ? (
           <>
             <p className="muted">
-              The server also offers built-in tools, confined to <code>{workspace}</code>: <code>list_dir</code>, <code>read_file</code>,{" "}
+              The server also offers built-in tools, confined to the run's workspace: <code>list_dir</code>, <code>read_file</code>,{" "}
               <code>edit_file</code>, <code>write_file</code>, <code>run_command</code>, and <code>fetch_url</code>. They are sent with every agent run
-              and need no handler. Every <code>run_command</code> call waits for your approval in the transcript before anything executes.
+              that has a workspace and need no handler. Each run picks its directory and a permissions preset before its first message: read only,
+              workspace write with a prompt before every command, or auto-approve. File tools never leave the workspace; commands are not sandboxed,
+              so the approval prompt is the only thing between the model and the shell.
+            </p>
+            <p className="muted">
+              {workspaces.length
+                ? `Directories on offer: ${workspaces.map((workspace) => workspace.path).join(", ")}. `
+                : "No directory is registered yet. "}
+              {canRegister
+                ? "This browser is on the server's machine, so the Agent tab can add and remove directories; the server remembers them."
+                : "Only a browser on the server's own machine can add directories here; elsewhere, start the server with --agent-workspace DIR."}
             </p>
             <p className="muted">
               {platform ? (
@@ -90,8 +102,7 @@ export function ToolsPanel() {
           </>
         ) : (
           <p className="muted">
-            Built-in file, shell, and fetch tools are off. Start the server with <code>--agent-workspace DIR</code> to give agent runs a directory to
-            work in.
+            Built-in file, shell, and fetch tools are off on this server (<code>--no-agent-tools</code>), or the server predates them.
           </p>
         )}
         <p className="muted">

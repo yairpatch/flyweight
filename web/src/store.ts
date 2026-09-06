@@ -9,16 +9,20 @@ import { generate } from "./lib/generate";
 import { runToolExecutor } from "./lib/executor";
 import {
   AGENT_TEMPERATURE_CAP,
+  DEFAULT_PERMISSIONS,
   agentSystemPrompt,
+  agentToolsAvailable,
   builtinToolDefinitions,
   isBuiltinTool,
   missingHandlerReason,
+  modeOf,
   needsApproval,
   runBuiltinTool,
   turnBudgetNote,
   turnCapReason,
+  workspaceFor,
+  workspaceList,
   workspacePlatform,
-  workspaceRoot,
 } from "./lib/agentTools";
 import {
   budgetChars,
@@ -35,6 +39,7 @@ import { buildRequest } from "./lib/protocols";
 import { holdPartialTag, splitThinking } from "./lib/thinking";
 import { attachmentImages, forgetSources } from "./lib/attachments";
 import { loadSettings, saveSettings, settingsFromProps, DEFAULT_SETTINGS } from "./lib/settings";
+import type { AgentPermissions } from "./types";
 import type {
   Attachment,
   Conversation,
@@ -95,6 +100,17 @@ export interface AgentPause {
 const TOOLS_KEY = "flyweight.tools.v1";
 const THEME_KEY = "flyweight.theme";
 const MODE_KEY = "flyweight.mode";
+/** The workspace and preset the last agent run used; a new run starts from them. */
+const WORKSPACE_KEY = "flyweight.agent.workspace";
+const PERMISSIONS_KEY = "flyweight.agent.permissions";
+
+function writeString(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* ignore */
+  }
+}
 const SIDEBAR_KEY = "flyweight.sidebar";
 const MODEL_KEY = "flyweight.model";
 const HEALTH_HISTORY = 180;
@@ -182,6 +198,11 @@ interface StoreState {
   approval: PendingApproval | null;
   /** Why the last agent run stopped on its tool calls; cleared on the next run. */
   agentPause: AgentPause | null;
+  /**
+   * Whether this browser may add and remove workspace directories: the server
+   * allows it only from its own machine. Null until asked.
+   */
+  canRegisterWorkspaces: boolean | null;
   requests: RequestRecord[];
   panel: Panel;
   theme: ThemePreference;
@@ -238,6 +259,16 @@ interface StoreState {
   setDraft: (draft: string) => void;
   setPreviewSource: (source: { language: string; code: string } | null) => void;
   clearRequests: () => void;
+
+  // agent workspaces
+  /** Re-read the server's workspace list and this browser's right to change it. */
+  refreshWorkspaces: () => Promise<void>;
+  /** Register a directory on the server; resolves to its id, or null on failure (toasted). */
+  addWorkspace: (path: string) => Promise<string | null>;
+  removeWorkspace: (id: string) => Promise<void>;
+  /** Point a run at a workspace; only allowed while the run has no messages. */
+  setRunWorkspace: (conversationId: string, workspaceId: string) => void;
+  setRunPermissions: (conversationId: string, permissions: AgentPermissions) => void;
 }
 
 function applyTheme(theme: ThemePreference): void {
@@ -297,6 +328,19 @@ export const useStore = create<StoreState>()((set, get) => {
       }),
       immediate,
     );
+  };
+
+  /**
+   * Where a new run starts: the workspace and preset the last run used, if the
+   * server still lists that workspace; else the first directory it offers.
+   */
+  const defaultRunSetup = (): Pick<Conversation, "workspaceId" | "permissions"> => {
+    const list = workspaceList(get().props).filter((workspace) => workspace.exists);
+    const remembered = readString(WORKSPACE_KEY, "");
+    const workspace = list.find((item) => item.id === remembered) ?? list[0];
+    const stored = readString(PERMISSIONS_KEY, DEFAULT_PERMISSIONS) as AgentPermissions;
+    const permissions = ["workspace-write", "read-only", "auto-approve"].includes(stored) ? stored : DEFAULT_PERMISSIONS;
+    return { ...(workspace ? { workspaceId: workspace.id } : {}), permissions };
   };
 
   const ensureConversation = (): Conversation => {
@@ -382,7 +426,10 @@ export const useStore = create<StoreState>()((set, get) => {
       pause(turnCapReason(agentTurn, settings.agentMaxTurns));
       return;
     }
-    const builtinsLive = Boolean(workspaceRoot(props));
+    const run = workspaceFor(props, conversation.workspaceId);
+    const builtinsLive = Boolean(run?.exists);
+    const permissions = conversation.permissions ?? DEFAULT_PERMISSIONS;
+    const runContext = { workspace: run?.id, mode: modeOf(permissions) };
     const runners = calls.map((call) => {
       if (builtinsLive && isBuiltinTool(call.name)) return { kind: "builtin" as const };
       const source = tools.find((tool) => tool.enabled && tool.name === call.name)?.executor?.trim();
@@ -401,7 +448,7 @@ export const useStore = create<StoreState>()((set, get) => {
         const runner = runners[index]!;
         let execution: { ok: boolean; result: string };
         if (runner.kind === "builtin") {
-          if (needsApproval(call.name) && !alwaysAllow.has(conversationId)) {
+          if (needsApproval(call.name) && permissions !== "auto-approve" && !alwaysAllow.has(conversationId)) {
             const { command, timeoutSeconds } = commandOf(call.arguments);
             set({ generating: { conversationId, messageId: assistant.id, controller, phase: "approval" } });
             const decision = await askApproval({ conversationId, messageId: assistant.id, callId: call.id, command, timeoutSeconds }, controller.signal);
@@ -421,7 +468,7 @@ export const useStore = create<StoreState>()((set, get) => {
               continue;
             }
           }
-          execution = await runBuiltinTool(call.name, call.arguments, controller.signal);
+          execution = await runBuiltinTool(call.name, call.arguments, controller.signal, runContext);
         } else {
           execution = await runToolExecutor(runner.source, call.arguments, { signal: controller.signal });
         }
@@ -460,8 +507,10 @@ export const useStore = create<StoreState>()((set, get) => {
     // Agent runs get the workspace tools and a system prompt describing the
     // directory, on top of whatever tools the user defined; a user tool that
     // shadows a built-in name loses, so the model sees one of each name.
-    const workspace = kindOf(conversation) === "agent" ? workspaceRoot(state.props) : null;
-    const builtins = workspace ? builtinToolDefinitions() : [];
+    const run = kindOf(conversation) === "agent" ? workspaceFor(state.props, conversation.workspaceId) : null;
+    const workspace = run?.exists ? run.path : null;
+    const permissions = conversation.permissions ?? DEFAULT_PERMISSIONS;
+    const builtins = workspace ? builtinToolDefinitions(permissions) : [];
 
     // The prompt and the tool schemas are written before the messages are
     // fitted, because they are what the messages have to fit around: an agent
@@ -474,6 +523,7 @@ export const useStore = create<StoreState>()((set, get) => {
           platform: workspacePlatform(state.props),
           tools: requestTools.filter((tool) => tool.enabled).map((tool) => tool.name),
           turnCap: state.settings.agentMaxTurns,
+          permissions,
         })
       : "";
 
@@ -721,6 +771,7 @@ export const useStore = create<StoreState>()((set, get) => {
     generating: null,
     approval: null,
     agentPause: null,
+    canRegisterWorkspaces: null,
     requests: [],
     panel: null,
     theme: (readString(THEME_KEY, "system") as ThemePreference) || "system",
@@ -760,7 +811,13 @@ export const useStore = create<StoreState>()((set, get) => {
           status: busy ? "busy" : "online",
           statusDetail: busy ? "Generating" : "Ready",
         }));
-        if (!state.props || !state.models.length) {
+        // /props is read once per server, not once per page: a tab left open
+        // across a restart would otherwise keep the old server's answer, and
+        // an agent run on a server restarted with --agent-workspace would
+        // send no tools and read as an ordinary chat. loaded_at is the
+        // server's identity; a new value means a new process.
+        const restarted = state.health?.loaded_at !== undefined && health.loaded_at !== state.health.loaded_at;
+        if (!state.props || !state.models.length || restarted) {
           const [props, models, slots] = await Promise.all([
             api.props().catch(() => null),
             api.models().catch(() => [] as ModelInfo[]),
@@ -775,6 +832,7 @@ export const useStore = create<StoreState>()((set, get) => {
             patch.settings = settingsFromProps(props, current.settings);
           }
           set(patch);
+          if (agentToolsAvailable(props)) void get().refreshWorkspaces();
         } else {
           api.slots().then((slots) => set({ slots })).catch(() => undefined);
         }
@@ -812,13 +870,15 @@ export const useStore = create<StoreState>()((set, get) => {
     },
 
     newConversation: (kind) => {
+      const resolved = kind ?? get().mode;
       const conversation: Conversation = {
         id: identifier("conv"),
-        title: kind === "agent" || (kind === undefined && get().mode === "agent") ? "New agent run" : "New conversation",
+        title: resolved === "agent" ? "New agent run" : "New conversation",
         createdAt: Date.now(),
         updatedAt: Date.now(),
         messages: [],
-        kind: kind ?? get().mode,
+        kind: resolved,
+        ...(resolved === "agent" ? defaultRunSetup() : {}),
       };
       forgetSources();
       set((state) => ({ conversations: [conversation, ...state.conversations], activeId: conversation.id, mode: kindOf(conversation), pendingAttachments: [] }));
@@ -885,7 +945,16 @@ export const useStore = create<StoreState>()((set, get) => {
       const trimmed = text.trim();
       const usable = attachments.filter((attachment) => !attachment.error);
       if (!trimmed && !usable.length) return;
-      const conversation = ensureConversation();
+      let conversation = ensureConversation();
+      if (kindOf(conversation) === "agent" && conversation.messages.length === 0 && !workspaceFor(get().props, conversation.workspaceId)) {
+        // The run was opened before the server listed any directory (or its
+        // directory went away); take the default now rather than run without.
+        const setup = defaultRunSetup();
+        if (setup.workspaceId) {
+          updateConversation(conversation.id, (item) => ({ ...item, workspaceId: setup.workspaceId }));
+          conversation = get().conversations.find((item) => item.id === conversation.id) ?? conversation;
+        }
+      }
       const images = attachmentImages(usable);
       const message: Message = {
         id: identifier("msg"),
@@ -1081,6 +1150,57 @@ export const useStore = create<StoreState>()((set, get) => {
     setDraft: (draft) => set({ draft }),
     setPreviewSource: (source) => set({ previewSource: source }),
     clearRequests: () => set({ requests: [] }),
+
+    refreshWorkspaces: async () => {
+      try {
+        const payload = await api.agentWorkspaces();
+        set((state) => ({
+          canRegisterWorkspaces: payload.can_register,
+          props: state.props ? { ...state.props, agent_workspaces: payload.workspaces, agent_platform: payload.platform } : state.props,
+        }));
+      } catch {
+        set({ canRegisterWorkspaces: false });
+      }
+    },
+
+    addWorkspace: async (path) => {
+      try {
+        const workspace = await api.addAgentWorkspace(path);
+        await get().refreshWorkspaces();
+        // The default directory is the first one the server lists; refresh
+        // /props so chats and older runs see it too.
+        const props = await api.props().catch(() => null);
+        if (props) set((state) => ({ props: { ...props, agent_workspaces: state.props?.agent_workspaces ?? props.agent_workspaces } }));
+        get().toast(`Added ${workspace.path}`, "success");
+        return workspace.id;
+      } catch (error) {
+        get().toast(error instanceof Error ? error.message : "Could not add the directory", "error");
+        return null;
+      }
+    },
+
+    removeWorkspace: async (id) => {
+      try {
+        await api.removeAgentWorkspace(id);
+        await get().refreshWorkspaces();
+        const props = await api.props().catch(() => null);
+        if (props) set((state) => ({ props: { ...props, agent_workspaces: state.props?.agent_workspaces ?? props.agent_workspaces } }));
+      } catch (error) {
+        get().toast(error instanceof Error ? error.message : "Could not remove the directory", "error");
+      }
+    },
+
+    setRunWorkspace: (conversationId, workspaceId) => {
+      const conversation = get().conversations.find((item) => item.id === conversationId);
+      if (!conversation || conversation.messages.length) return;
+      writeString(WORKSPACE_KEY, workspaceId);
+      updateConversation(conversationId, (item) => ({ ...item, workspaceId }));
+    },
+
+    setRunPermissions: (conversationId, permissions) => {
+      writeString(PERMISSIONS_KEY, permissions);
+      updateConversation(conversationId, (item) => ({ ...item, permissions }));
+    },
   };
 });
 

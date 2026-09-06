@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  PERMISSION_PRESETS,
   agentSystemPrompt,
   builtinToolDefinitions,
+  modeOf,
+  workspaceFor,
   isBuiltinTool,
   missingHandlerReason,
   needsApproval,
@@ -40,6 +43,57 @@ describe("builtinToolDefinitions", () => {
       expect(isBuiltinTool(tool.name)).toBe(true);
     }
     expect(isBuiltinTool("get_weather")).toBe(false);
+  });
+});
+
+describe("permissions", () => {
+  it("withholds the writing tools from a read-only run", () => {
+    const names = builtinToolDefinitions("read-only").map((tool) => tool.name);
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("edit_file");
+    expect(names).toContain("read_file");
+    expect(builtinToolDefinitions("auto-approve").map((tool) => tool.name)).toContain("write_file");
+  });
+
+  it("maps each preset to the mode the server enforces", () => {
+    expect(modeOf("read-only")).toBe("read-only");
+    expect(modeOf("workspace-write")).toBe("workspace-write");
+    expect(modeOf("auto-approve")).toBe("workspace-write");
+    expect(modeOf(undefined)).toBe("workspace-write");
+  });
+
+  it("lists the presets safest first and never promises a command sandbox", () => {
+    expect(PERMISSION_PRESETS.map((preset) => preset.value)).toEqual(["read-only", "workspace-write", "auto-approve"]);
+    for (const preset of PERMISSION_PRESETS) expect(preset.description).not.toMatch(/sandboxed\./);
+    expect(PERMISSION_PRESETS[2].description).toContain("not sandboxed");
+  });
+
+  it("tells a read-only run not to change anything, and an auto-approve run to be careful", () => {
+    const readOnly = agentSystemPrompt({ root: "/w", permissions: "read-only" });
+    expect(readOnly).toContain("read-only");
+    expect(readOnly).not.toContain("Change files with edit_file");
+    const auto = agentSystemPrompt({ root: "/w", permissions: "auto-approve" });
+    expect(auto).toContain("without the user's approval");
+    expect(auto).not.toContain("Before a command needs approval");
+    const asks = agentSystemPrompt({ root: "/w" });
+    expect(asks).toContain("Before a command needs approval");
+  });
+});
+
+describe("workspaceFor", () => {
+  const props = {
+    agent_workspace: "/srv/one",
+    agent_workspaces: [
+      { id: "a", path: "/srv/one", title: "one", source: "flag" as const, exists: true },
+      { id: "b", path: "/srv/two", title: "two", source: "registered" as const, exists: false },
+    ],
+  };
+
+  it("finds a run's workspace by id, and an old run's by the server default", () => {
+    expect(workspaceFor(props, "b")?.path).toBe("/srv/two");
+    expect(workspaceFor(props, undefined)?.id).toBe("a");
+    expect(workspaceFor(props, "gone")).toBeNull();
+    expect(workspaceFor(null, "a")).toBeNull();
   });
 });
 
@@ -154,9 +208,10 @@ describe("turnBudgetNote", () => {
 });
 
 describe("pause reasons", () => {
-  it("names the missing server flag when the model asked for a workspace tool", () => {
+  it("says where a workspace comes from when the model asked for a workspace tool", () => {
     const reason = missingHandlerReason(["list_dir"], false);
     expect(reason).toContain("list_dir is a workspace tool");
+    expect(reason).toContain("Agent tab");
     expect(reason).toContain("--agent-workspace DIR");
   });
 
@@ -180,6 +235,23 @@ describe("runBuiltinTool", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/agent/fs/read");
     expect(JSON.parse(String(init?.body))).toEqual({ path: "notes.md" });
+  });
+
+  it("names the run's workspace and mode after the model's arguments, so the model cannot pick another", async () => {
+    const fetchMock = respondWith({ path: "notes.md", content: "hello", size: 5, truncated: false });
+    await runBuiltinTool("read_file", '{"path":"notes.md","workspace":"elsewhere","mode":"workspace-write"}', undefined, {
+      workspace: "ws-1",
+      mode: "read-only",
+    });
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(String(init?.body))).toEqual({ path: "notes.md", workspace: "ws-1", mode: "read-only" });
+  });
+
+  it("refuses arguments that are not an object before they reach the server", async () => {
+    const fetchMock = respondWith({});
+    const result = await runBuiltinTool("list_dir", "[1, 2]");
+    expect(result.ok).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("tells the model when a result was clipped", async () => {

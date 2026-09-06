@@ -1,5 +1,7 @@
 // Thin fetch layer: auth header, JSON helpers, and typed endpoint wrappers.
 import type {
+  AgentWorkspaceInfo,
+  AgentWorkspacesPayload,
   HealthPayload,
   ModelInfo,
   PropsPayload,
@@ -101,6 +103,11 @@ export const api = {
       `${protocol === "anthropic" ? "/v1/messages" : "/v1/chat/completions"}/${encodeURIComponent(id)}/stop_thinking`,
       {},
     ),
+  /** The directories agent runs may work in, and whether this browser may add one. */
+  agentWorkspaces: () => fetchJson<AgentWorkspacesPayload>("/agent/workspaces", { timeoutMs: 15000 }),
+  addAgentWorkspace: (path: string) => postJson<AgentWorkspaceInfo>("/agent/workspaces", { path }),
+  removeAgentWorkspace: (id: string) =>
+    fetchJson<AgentWorkspaceInfo>(`/agent/workspaces/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getResponse: (id: string) => fetchJson<Record<string, unknown>>(`/v1/responses/${encodeURIComponent(id)}`),
   deleteResponse: (id: string) => fetchJson<Record<string, unknown>>(`/v1/responses/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };

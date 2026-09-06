@@ -25,6 +25,7 @@ from flyweight.generation import GenerationResult, GenerationStep
 from flyweight.sampling import SamplingConfig
 from flyweight.server import (
     AgentWorkspace,
+    AgentWorkspaceRegistry,
     APIError,
     FlyweightHTTPServer,
     InferenceService,
@@ -4384,6 +4385,86 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 404)
 
 
+class AgentWorkspaceRegistryTests(unittest.TestCase):
+    """Where agent runs may work: flag roots, registered roots, and the file
+    that remembers the latter."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.state = self.base / "state" / "agent-workspaces.json"
+
+    def _dir(self, name: str) -> Path:
+        path = self.base / name
+        path.mkdir()
+        return path
+
+    def test_registered_directories_survive_a_restart(self) -> None:
+        project = self._dir("project")
+        registry = AgentWorkspaceRegistry(state_file=self.state)
+        self.assertIsNone(registry.default())
+        entry = registry.register(str(project))
+        self.assertEqual(entry.source, "registered")
+        self.assertTrue(self.state.is_file())
+
+        again = AgentWorkspaceRegistry(state_file=self.state)
+        self.assertEqual([w.root for w in again.all], [project])
+        # The same path gets the same id, so a run saved in the browser
+        # still names its directory after the restart.
+        self.assertEqual(again.all[0].id, entry.id)
+        self.assertIs(again.get(entry.id), again.all[0])
+
+    def test_a_flag_root_comes_first_and_is_never_duplicated(self) -> None:
+        fixed = self._dir("fixed")
+        registry = AgentWorkspaceRegistry([fixed, fixed], state_file=self.state)
+        self.assertEqual(len(registry.all), 1)
+        self.assertIs(registry.register(str(fixed)), registry.fixed[0])
+        other = self._dir("other")
+        registry.register(str(other))
+        self.assertEqual(registry.default().root, fixed)
+        self.assertEqual([w["source"] for w in registry.describe()], ["flag", "registered"])
+        with self.assertRaises(APIError) as caught:
+            registry.unregister(registry.fixed[0].id)
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_a_directory_that_disappears_is_listed_but_cannot_run_tools(self) -> None:
+        gone = self._dir("gone")
+        registry = AgentWorkspaceRegistry(state_file=self.state)
+        entry = registry.register(str(gone))
+        gone.rmdir()
+        reloaded = AgentWorkspaceRegistry(state_file=self.state)
+        self.assertFalse(reloaded.describe()[0]["exists"])
+        self.assertIsNone(reloaded.default())
+        with self.assertRaises(APIError) as caught:
+            reloaded.resolve({"workspace": entry.id}).handle("/agent/fs/list", {})
+        self.assertEqual(caught.exception.status, 404)
+        reloaded.unregister(entry.id)
+        self.assertEqual(AgentWorkspaceRegistry(state_file=self.state).all, [])
+
+    def test_registration_wants_an_absolute_existing_directory(self) -> None:
+        registry = AgentWorkspaceRegistry(state_file=self.state)
+        for bad in ("", "relative/dir", str(self.base / "nowhere"), 7):
+            with self.assertRaises(APIError, msg=repr(bad)) as caught:
+                registry.register(bad)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertFalse(self.state.exists())
+
+    def test_resolve_names_a_workspace_by_id_or_falls_back_to_the_default(self) -> None:
+        one, two = self._dir("one"), self._dir("two")
+        registry = AgentWorkspaceRegistry([one], state_file=self.state)
+        second = registry.register(str(two))
+        self.assertEqual(registry.resolve({}).root, one)
+        self.assertEqual(registry.resolve({"workspace": second.id}).root, two)
+        with self.assertRaises(APIError) as caught:
+            registry.resolve({"workspace": "missing"})
+        self.assertEqual(caught.exception.status, 404)
+        with self.assertRaises(APIError) as caught:
+            registry.resolve({"workspace": 3})
+        self.assertEqual(caught.exception.status, 400)
+
+
+
 class AgentEndpointTests(unittest.TestCase):
     """How the workspace reaches the network: opt-in, same-origin, authed."""
 
@@ -4415,13 +4496,168 @@ class AgentEndpointTests(unittest.TestCase):
         response = connection.getresponse()
         return response, response.read()
 
-    def test_the_endpoints_are_absent_until_the_flag_names_a_directory(self) -> None:
+    def test_the_tools_have_nowhere_to_run_until_a_directory_is_named(self) -> None:
+        # The endpoints exist, so the UI can offer to add a directory, but a
+        # tool call with no workspace to run in is refused and says how to
+        # get one.
         service = InferenceService("qwen-local", StubGenerator())
         connection = self._serve(service)
         response, body = self._post(connection, "/agent/fs/list", {})
         self.assertEqual(response.status, 404)
         self.assertIn("--agent-workspace", json.loads(body)["error"]["message"])
-        self.assertNotIn("agent_workspace", service.properties()["capabilities"])
+        properties = service.properties()
+        self.assertIn("agent_workspaces", properties["capabilities"])
+        self.assertNotIn("agent_workspace", properties["capabilities"])
+        self.assertEqual(properties["agent_workspaces"], [])
+
+    def test_no_agent_tools_removes_the_endpoints(self) -> None:
+        service = InferenceService("qwen-local", StubGenerator())
+        service.agent_workspaces = None
+        connection = self._serve(service)
+        response, _ = self._post(connection, "/agent/workspaces", {"path": "/"})
+        self.assertEqual(response.status, 404)
+        connection.request("GET", "/agent/workspaces")
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 404)
+        self.assertNotIn("agent_workspaces", service.properties()["capabilities"])
+
+    def _get(self, connection, path, headers=None):
+        connection.request("GET", path, headers=headers or {})
+        response = connection.getresponse()
+        return response, response.read()
+
+    def test_a_local_browser_registers_a_directory_and_runs_tools_in_it(self) -> None:
+        root = self._workspace_dir()
+        (root / "hello.txt").write_text("world")
+        service = InferenceService("qwen-local", StubGenerator())
+        connection = self._serve(service)
+        same_origin = {"Host": f"127.0.0.1:{connection.port}", "Origin": f"http://127.0.0.1:{connection.port}"}
+
+        response, body = self._get(connection, "/agent/workspaces", same_origin)
+        self.assertEqual(response.status, 200)
+        listing = json.loads(body)
+        self.assertEqual(listing["workspaces"], [])
+        self.assertTrue(listing["can_register"])
+        self.assertIn("shell", listing["platform"])
+
+        response, body = self._post(connection, "/agent/workspaces", {"path": str(root)}, same_origin)
+        self.assertEqual(response.status, 200)
+        entry = json.loads(body)
+        self.assertEqual(entry["path"], str(root.resolve()))
+        self.assertEqual(entry["source"], "registered")
+        self.assertTrue(entry["exists"])
+
+        # Registering the same directory again is the same entry, not a twin.
+        response, body = self._post(connection, "/agent/workspaces", {"path": str(root)}, same_origin)
+        self.assertEqual(json.loads(body)["id"], entry["id"])
+        self.assertEqual(len(service.agent_workspaces.all), 1)
+
+        # /props now advertises it, and a call may name it by id.
+        properties = service.properties()
+        self.assertIn("agent_workspace", properties["capabilities"])
+        self.assertEqual(properties["agent_workspaces"][0]["id"], entry["id"])
+        response, body = self._post(
+            connection, "/agent/fs/read", {"path": "hello.txt", "workspace": entry["id"]}, same_origin
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body)["content"], "world")
+        response, body = self._post(connection, "/agent/fs/read", {"path": "hello.txt", "workspace": "nope"}, same_origin)
+        self.assertEqual(response.status, 404)
+
+        # A read-only run cannot write, whatever the model asks for.
+        response, body = self._post(
+            connection,
+            "/agent/fs/write",
+            {"path": "new.txt", "content": "x", "workspace": entry["id"], "mode": "read-only"},
+            same_origin,
+        )
+        self.assertEqual(response.status, 403)
+        self.assertFalse((root / "new.txt").exists())
+        response, _ = self._post(
+            connection, "/agent/fs/read", {"path": "hello.txt", "workspace": entry["id"], "mode": "read-only"}, same_origin
+        )
+        self.assertEqual(response.status, 200)
+        response, _ = self._post(connection, "/agent/fs/list", {"mode": "sideways"}, same_origin)
+        self.assertEqual(response.status, 400)
+
+        connection.request("DELETE", f"/agent/workspaces/{entry['id']}", headers=same_origin)
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(service.agent_workspaces.all, [])
+
+    def test_registration_is_refused_from_anywhere_but_this_machine(self) -> None:
+        # The tools themselves stay reachable from the network (behind the
+        # API key); naming a new directory does not.
+        root = self._workspace_dir()
+        service = InferenceService("qwen-local", StubGenerator())
+        service.agent_workspace = AgentWorkspace(root)
+        handler = create_handler(service)
+        server = FlyweightHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(connection.close)
+        with patch.object(handler, "_peer_is_loopback", return_value=False):
+            response, body = self._get(connection, "/agent/workspaces")
+            self.assertFalse(json.loads(body)["can_register"])
+            response, _ = self._post(connection, "/agent/workspaces", {"path": str(root)})
+            self.assertEqual(response.status, 403)
+            connection.request("DELETE", f"/agent/workspaces/{service.agent_workspace.id}")
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+            response, _ = self._post(connection, "/agent/fs/list", {})
+            self.assertEqual(response.status, 200)
+
+    def test_a_flag_workspace_cannot_be_removed_over_http(self) -> None:
+        service = InferenceService("qwen-local", StubGenerator())
+        service.agent_workspace = AgentWorkspace(self._workspace_dir())
+        connection = self._serve(service)
+        connection.request("DELETE", f"/agent/workspaces/{service.agent_workspace.id}")
+        response = connection.getresponse()
+        body = response.read()
+        self.assertEqual(response.status, 403)
+        self.assertIn("command line", json.loads(body)["error"]["message"])
+
+    def test_a_browser_request_must_be_same_origin_by_address(self) -> None:
+        service = InferenceService("qwen-local", StubGenerator())
+        service.agent_workspace = AgentWorkspace(self._workspace_dir())
+        connection = self._serve(service)
+        port = connection.port
+
+        # A foreign page's simple POST is sent regardless of CORS; the
+        # server refuses it on its Origin.
+        response, _ = self._post(
+            connection, "/agent/fs/list", {}, {"Host": f"127.0.0.1:{port}", "Origin": "https://evil.example"}
+        )
+        self.assertEqual(response.status, 403)
+        # A sandboxed frame reports Origin "null"; that is not this page either.
+        response, _ = self._post(connection, "/agent/fs/list", {}, {"Host": f"127.0.0.1:{port}", "Origin": "null"})
+        self.assertEqual(response.status, 403)
+        # DNS rebinding: a name the attacker points at 127.0.0.1 makes Origin
+        # and Host agree, so agreement alone is not enough.
+        response, _ = self._post(
+            connection, "/agent/fs/list", {}, {"Host": f"evil.example:{port}", "Origin": f"http://evil.example:{port}"}
+        )
+        self.assertEqual(response.status, 403)
+        # The bundled UI, opened by address or as localhost, passes.
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}", f"192.168.1.20:{port}"):
+            response, _ = self._post(connection, "/agent/fs/list", {}, {"Host": host, "Origin": f"http://{host}"})
+            self.assertEqual(response.status, 200, host)
+        # ...and so does a name the operator listed.
+        with patch.dict(os.environ, {"FLYWEIGHT_AGENT_HOSTS": "gpubox.lan"}):
+            response, _ = self._post(
+                connection, "/agent/fs/list", {}, {"Host": f"gpubox.lan:{port}", "Origin": f"http://gpubox.lan:{port}"}
+            )
+            self.assertEqual(response.status, 200)
+        # A client with no Origin is not a browser; the API key is its gate.
+        response, _ = self._post(connection, "/agent/fs/list", {})
+        self.assertEqual(response.status, 200)
 
     def test_an_enabled_workspace_is_advertised_and_serves_its_tools(self) -> None:
         root = self._workspace_dir()

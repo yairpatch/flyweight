@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
 import { ArrowUp, Bot, Braces, Brain, Paperclip, Square, Wrench, X, Zap } from "lucide-react";
-import { useStore } from "../store";
+import { useActiveConversation, useStore } from "../store";
 import { ACCEPT_ATTRIBUTE, MAX_ATTACHMENTS, filesFrom, readAttachment, setPdfMode } from "../lib/attachments";
 import { AttachmentChip } from "./AttachmentChip";
 import { api } from "../lib/api";
 import { PROTOCOL_LABELS } from "../lib/protocols";
-import { workspaceRoot } from "../lib/agentTools";
-import type { Attachment, ReasoningEffort } from "../types";
+import { PERMISSION_PRESETS, permissionPreset, workspaceFor } from "../lib/agentTools";
+import type { AgentPermissions, Attachment, ReasoningEffort } from "../types";
 
 const REASONING_CYCLE: Array<{ thinking: boolean; effort: ReasoningEffort; label: string }> = [
   { thinking: false, effort: "auto", label: "Thinking off" },
@@ -16,12 +16,6 @@ const REASONING_CYCLE: Array<{ thinking: boolean; effort: ReasoningEffort; label
   { thinking: true, effort: "high", label: "Thinking · high" },
   { thinking: true, effort: "xhigh", label: "Thinking · xhigh" },
 ];
-
-/** Last segment of the workspace path, for the chip; the tooltip has the rest. */
-function folderName(path: string): string {
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts[parts.length - 1] ?? path;
-}
 
 export function Composer() {
   const draft = useStore((state) => state.draft);
@@ -54,7 +48,10 @@ export function Composer() {
   const [reading, setReading] = useState(0);
 
   const props = useStore((state) => state.props);
-  const workspace = workspaceRoot(props);
+  const conversation = useActiveConversation();
+  const workspace = workspaceFor(props, conversation?.workspaceId);
+  const setRunPermissions = useStore((state) => state.setRunPermissions);
+  const permissions = permissionPreset(conversation?.permissions);
   const vision = Boolean(health?.execution?.vision);
   const readContext = { vision, contextWindow: props?.context_window ?? health?.context_window };
   const enabledTools = tools.filter((tool) => tool.enabled).length;
@@ -194,17 +191,34 @@ export function Composer() {
               <Wrench size={13} /> {enabledTools ? `${enabledTools} tool${enabledTools === 1 ? "" : "s"}` : "Tools"}
             </button>
             {mode === "agent" && (
-              <button
-                className="chip chip--button chip--on"
-                onClick={() => setPanel("tools")}
-                title={
-                  workspace
-                    ? `Agent run in ${workspace}: files, shell (with approval), and fetch, up to ${settings.agentMaxTurns} turns`
-                    : `No agent workspace: only tools with a JavaScript handler can run. Restart the server with --agent-workspace DIR for files, shell, and fetch. Up to ${settings.agentMaxTurns} turns.`
-                }
-              >
-                <Bot size={13} /> Agent · {workspace ? folderName(workspace) : "no workspace"}
-              </button>
+              <>
+                <button
+                  className="chip chip--button chip--on"
+                  onClick={() => setPanel("tools")}
+                  title={
+                    workspace?.exists
+                      ? `Agent run in ${workspace.path}: files, shell, and fetch, up to ${settings.agentMaxTurns} turns`
+                      : `No workspace for this run: only tools with a JavaScript handler can run. Pick or add a directory above. Up to ${settings.agentMaxTurns} turns.`
+                  }
+                >
+                  <Bot size={13} /> Agent · {workspace ? workspace.title : "no workspace"}
+                </button>
+                {conversation && workspace && (
+                  <select
+                    className="chip chip--select"
+                    value={permissions.value}
+                    onChange={(event) => setRunPermissions(conversation.id, event.target.value as AgentPermissions)}
+                    aria-label="Run permissions"
+                    title={permissions.description}
+                  >
+                    {PERMISSION_PRESETS.map((preset) => (
+                      <option key={preset.value} value={preset.value}>
+                        {preset.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </>
             )}
             {settings.responseFormat !== "text" && (
               <button className="chip chip--button chip--on" onClick={() => setPanel("settings")} title="Response format">

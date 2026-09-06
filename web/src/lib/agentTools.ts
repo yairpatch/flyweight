@@ -3,7 +3,7 @@
 // advertises the workspace, and these definitions are sent alongside any
 // user-defined tools. Everything is confined to that directory server-side.
 import { postJson } from "./api";
-import type { AgentPlatform, PropsPayload, ToolDefinition } from "../types";
+import type { AgentPermissions, AgentPlatform, AgentWorkspaceInfo, PropsPayload, ToolDefinition } from "../types";
 
 /** Shell commands are the one built-in that asks before it runs. */
 export const APPROVAL_TOOL = "run_command";
@@ -21,12 +21,86 @@ export function needsApproval(name: string): boolean {
   return canonicalName(name) === APPROVAL_TOOL;
 }
 
+/** The server's default workspace directory, if it has one ready. */
 export function workspaceRoot(props: PropsPayload | null): string | null {
   return props?.agent_workspace ?? null;
 }
 
 export function hasWorkspace(props: PropsPayload | null): boolean {
   return Boolean(workspaceRoot(props));
+}
+
+/** Whether the server has agent tools at all (it may still have no directory). */
+export function agentToolsAvailable(props: PropsPayload | null): boolean {
+  return Array.isArray(props?.agent_workspaces);
+}
+
+/** Every directory the server offers, in its order: flag roots first. */
+export function workspaceList(props: PropsPayload | null): AgentWorkspaceInfo[] {
+  return props?.agent_workspaces ?? [];
+}
+
+/**
+ * The directory a run works in. A run names one by id; a run saved before
+ * the registry existed has none and gets the server's default, which is what
+ * it had at the time.
+ */
+export function workspaceFor(props: PropsPayload | null, workspaceId: string | undefined): AgentWorkspaceInfo | null {
+  const list = workspaceList(props);
+  if (workspaceId) return list.find((workspace) => workspace.id === workspaceId) ?? null;
+  const root = workspaceRoot(props);
+  return list.find((workspace) => workspace.path === root) ?? null;
+}
+
+// ---- Permissions -------------------------------------------------------------
+
+export const DEFAULT_PERMISSIONS: AgentPermissions = "workspace-write";
+
+export interface PermissionPreset {
+  value: AgentPermissions;
+  label: string;
+  /** One sentence on what the preset lets the run do. */
+  description: string;
+}
+
+/**
+ * The presets a run chooses between. Their order is the order the UI shows
+ * them, safest first. Every preset confines the file tools to the workspace;
+ * none confines a shell command, so the description says what the approval
+ * prompt is doing rather than promising a sandbox.
+ */
+export const PERMISSION_PRESETS: PermissionPreset[] = [
+  {
+    value: "read-only",
+    label: "Read only",
+    description: "The model can list and read files; the server refuses every write and edit. Commands still run only with your approval, and nothing stops an approved command from changing files.",
+  },
+  {
+    value: "workspace-write",
+    label: "Workspace write, ask",
+    description: "The model can read, write, and edit files inside the workspace. Every shell command waits for your approval.",
+  },
+  {
+    value: "auto-approve",
+    label: "Auto-approve commands",
+    description: "As above, but shell commands run without asking. Commands are not sandboxed: use this only in a directory you can afford to lose.",
+  },
+];
+
+export function permissionPreset(value: AgentPermissions | undefined): PermissionPreset {
+  return PERMISSION_PRESETS.find((preset) => preset.value === (value ?? DEFAULT_PERMISSIONS)) ?? PERMISSION_PRESETS[1];
+}
+
+/** The file-effect mode the server enforces for a preset. */
+export function modeOf(permissions: AgentPermissions | undefined): "read-only" | "workspace-write" {
+  return permissions === "read-only" ? "read-only" : "workspace-write";
+}
+
+/** What a tool call carries so the server runs it in the right place, the right way. */
+export interface RunContext {
+  /** The workspace id; omitted, the server uses its default. */
+  workspace?: string;
+  mode?: "read-only" | "workspace-write";
 }
 
 export function workspacePlatform(props: PropsPayload | null): AgentPlatform | null {
@@ -143,9 +217,14 @@ export function isBuiltinTool(name: string): boolean {
   return BY_NAME.has(canonicalName(name));
 }
 
-/** The built-ins as tool definitions for the request builder. */
-export function builtinToolDefinitions(): ToolDefinition[] {
-  return BUILTINS.map((tool) => ({
+/**
+ * The built-ins as tool definitions for the request builder. A read-only run
+ * is not offered the writers at all: a tool the model cannot use is a call it
+ * will make anyway and a turn spent on the refusal.
+ */
+export function builtinToolDefinitions(permissions: AgentPermissions = DEFAULT_PERMISSIONS): ToolDefinition[] {
+  const offered = permissions === "read-only" ? BUILTINS.filter((tool) => tool.name !== "write_file" && tool.name !== "edit_file") : BUILTINS;
+  return offered.map((tool) => ({
     id: `builtin-${tool.name}`,
     name: tool.name,
     description: tool.description,
@@ -165,7 +244,7 @@ export interface BuiltinResult {
  * malformed body is reported to the model rather than thrown, so the run can
  * continue and the model can correct itself.
  */
-export async function runBuiltinTool(name: string, argsText: string, signal?: AbortSignal): Promise<BuiltinResult> {
+export async function runBuiltinTool(name: string, argsText: string, signal?: AbortSignal, run: RunContext = {}): Promise<BuiltinResult> {
   const tool = BY_NAME.get(canonicalName(name));
   if (!tool) return { ok: false, result: `No built-in tool named ${name}` };
   let args: unknown;
@@ -174,8 +253,14 @@ export async function runBuiltinTool(name: string, argsText: string, signal?: Ab
   } catch {
     return { ok: false, result: "Arguments were not valid JSON; call the tool again with a well-formed arguments object." };
   }
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { ok: false, result: "Arguments must be a JSON object matching the tool's schema." };
+  }
+  // The run's workspace and mode ride on every call, after the model's
+  // arguments so a model cannot pick a different directory by naming one.
+  const body = { ...(args as Record<string, unknown>), ...(run.workspace ? { workspace: run.workspace } : {}), ...(run.mode ? { mode: run.mode } : {}) };
   try {
-    const payload = await postJson<Record<string, unknown>>(tool.endpoint, args, { signal });
+    const payload = await postJson<Record<string, unknown>>(tool.endpoint, body, { signal });
     return { ok: true, result: formatResult(tool.name, payload) };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -246,7 +331,7 @@ export function missingHandlerReason(names: string[], workspaceLive: boolean): s
   const plural = names.length > 1;
   const builtins = names.filter(isBuiltinTool);
   if (!workspaceLive && builtins.length) {
-    return `${builtins.join(", ")} ${plural ? "are workspace tools" : "is a workspace tool"}, and this server has no agent workspace. Restart it with --agent-workspace DIR to let the agent list, read, and write files, run commands, and fetch URLs inside DIR — or answer the call by hand below.`;
+    return `${builtins.join(", ")} ${plural ? "are workspace tools" : "is a workspace tool"}, and this run has no workspace. Add a directory in the Agent tab (from a browser on the server's machine) or restart the server with --agent-workspace DIR — or answer the call by hand below.`;
   }
   return `Nothing here can run ${list}: ${plural ? "these tools have" : "this tool has"} no JavaScript handler. Add one in the Tools panel, or answer the call by hand below.`;
 }
@@ -331,6 +416,8 @@ export interface AgentPromptContext {
   tools?: string[];
   /** The turn cap that will stop the run. */
   turnCap?: number;
+  /** What the run may do; shapes the WORKING rules. */
+  permissions?: AgentPermissions;
 }
 
 /**
@@ -346,7 +433,7 @@ export interface AgentPromptContext {
  * description of the job.
  */
 export function agentSystemPrompt(context: AgentPromptContext): string {
-  const { root, platform, tools = [], turnCap } = context;
+  const { root, platform, tools = [], turnCap, permissions = DEFAULT_PERMISSIONS } = context;
   const sections: string[] = [
     [
       `You are a coding agent working in ${root} on the user's machine.`,
@@ -369,12 +456,22 @@ export function agentSystemPrompt(context: AgentPromptContext): string {
     ].join("\n"),
     [
       "WORKING",
-      "- Look before you write: list or read first, edit second, then run something that proves it worked.",
-      "- Change files with edit_file. Reach for write_file only for a new file — never to fix indentation or formatting, which a rewrite makes worse; repair the broken lines with edit_file, or run a formatter.",
-      "- An edit's result shows the region it changed. Check its indentation, and fix it now if it is wrong.",
+      ...(permissions === "read-only"
+        ? [
+            "- This run is read-only: you have no tools that change files, and you must not run a command that creates, modifies, or deletes anything. Read, search, and report; if the task needs a change, describe it for the user instead.",
+          ]
+        : [
+            "- Look before you write: list or read first, edit second, then run something that proves it worked.",
+            "- Change files with edit_file. Reach for write_file only for a new file — never to fix indentation or formatting, which a rewrite makes worse; repair the broken lines with edit_file, or run a formatter.",
+            "- An edit's result shows the region it changed. Check its indentation, and fix it now if it is wrong.",
+          ]),
       "- Every result stays in your context for the rest of the run, so ask narrowly: search with a command instead of reading files one by one, read the file you need rather than everything near it, and give fetch_url a query instead of pulling a whole page.",
-      "- Before a command needs approval, say in one line what it will do and why, so the user can decide without reading the flags.",
-      "- If the user denies a command, do not send it again. Find another way or ask what they would prefer.",
+      ...(permissions === "auto-approve"
+        ? ["- Commands run without the user's approval in this run, so be conservative: no command that deletes, overwrites, or reaches outside the workspace unless the task plainly requires it."]
+        : [
+            "- Before a command needs approval, say in one line what it will do and why, so the user can decide without reading the flags.",
+            "- If the user denies a command, do not send it again. Find another way or ask what they would prefer.",
+          ]),
     ].join("\n"),
     [
       "FINISHING",

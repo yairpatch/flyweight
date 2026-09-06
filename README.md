@@ -415,13 +415,22 @@ server exposes, not only chat:
   a manual result, and Esc stops it. Tools come from two places. Your own
   tools run their JavaScript handler in the code preview's sandbox (opaque
   origin, no access to the app's storage or API key; network subject to
-  CORS). Starting the server with `--agent-workspace DIR` adds built-in
-  tools that reach the machine — `list_dir`, `read_file`, `edit_file`,
-  `write_file`, `run_command`, and `fetch_url` — every one of them confined
-  to `DIR`, and each `run_command` shown for approval in the transcript
-  before it runs (with an *always allow* for the rest of the run). Without
-  the flag those endpoints return 404, and they never carry a CORS grant, so
-  only the bundled UI and clients holding the API key can call them. The run
+  CORS). The server's built-in tools reach the machine — `list_dir`,
+  `read_file`, `edit_file`, `write_file`, `run_command`, and `fetch_url` —
+  every one of them confined to the run's *workspace*, a directory chosen
+  per run before its first message. Directories come from
+  `--agent-workspace DIR` (repeatable) or from the Agent tab itself, which
+  can add one when the browser is on the server's own machine; the server
+  remembers those under `~/.flyweight`. Each run also picks a permissions
+  preset: *read only* (the server refuses writes, and the model is not
+  offered the writing tools), *workspace write* with every `run_command`
+  shown for approval in the transcript (and an *always allow* for the rest
+  of the run), or *auto-approve*, which runs commands without asking.
+  Commands are never sandboxed; the approval prompt is the control. The
+  endpoints never carry a CORS grant, refuse a browser request whose
+  Origin is not this server's own page opened by address, and accept a new
+  directory only from a loopback peer, so a page elsewhere cannot point the
+  agent at your home directory. The run
   is told what machine it is on: the OS, the shell its commands will
   actually go to, and the path style, so a model on Windows writes
   PowerShell rather than the Unix commands it defaults to. `edit_file`
@@ -533,18 +542,31 @@ endpoints stream over SSE, and chat streams honour
 `Access-Control-Allow-Origin` (default `*`). Use `--strict-model` when
 request model IDs must exactly match the configured server model name.
 
-`--agent-workspace DIR` adds the endpoints the chat UI's agent runs use:
-`/agent/fs/read`, `/agent/fs/write`, `/agent/fs/edit`, `/agent/fs/list`,
-`/agent/exec`, and `/agent/fetch`. Every path resolves inside `DIR` or the
-request is refused with 403, commands start there, and results are clipped to
-what a prompt can hold. They are absent (404) unless the flag is given, they
-require the API key like everything else, and they are the one part of the
-API that never sends an `Access-Control-Allow-Origin` header, so a page on
-another origin cannot drive them through a visitor's browser. `/props` then
-lists `agent_workspace` in its capabilities, reports the resolved directory,
-and describes the host in `agent_platform` (`os`, `shell`,
-`path_separator`, `line_ending`) so a client can tell the model what it is
-working on.
+The chat UI's agent runs use `/agent/fs/read`, `/agent/fs/write`,
+`/agent/fs/edit`, `/agent/fs/list`, `/agent/exec`, and `/agent/fetch`. Each
+call runs in a *workspace*: `workspace` in the body names one by id, and a
+call that names none gets the server's default (the first directory it
+lists). Every path resolves inside that directory or the request is refused
+with 403, commands start there, and results are clipped to what a prompt can
+hold. A call may also carry `mode`: `read-only` makes the server refuse
+`/agent/fs/write` and `/agent/fs/edit` for that call, whatever the model
+asked; `workspace-write` is the default. `/agent/workspaces` lists the
+directories on offer (`GET`), adds one (`POST {"path": ...}`), and forgets a
+registered one (`DELETE /agent/workspaces/ID`); the `GET` also says whether
+the caller may change the list (`can_register`), which is true only for a
+loopback peer. Directories named with `--agent-workspace` are fixed and
+cannot be removed over HTTP; `--no-agent-tools` removes all of these
+endpoints (404). They require the API key like everything else, they are
+the one part of the API that never sends an `Access-Control-Allow-Origin`
+header, and a request carrying an `Origin` must match its `Host` exactly,
+with the host an address or `localhost` (or a name in
+`FLYWEIGHT_AGENT_HOSTS`), which is what stops a DNS-rebinding page from
+driving them. `/props` lists `agent_workspaces` in its capabilities when
+the endpoints exist and `agent_workspace` when a directory is ready,
+reports every directory in `agent_workspaces` (`id`, `path`, `title`,
+`source`, `exists`) and the default in `agent_workspace`, and describes the
+host in `agent_platform` (`os`, `shell`, `path_separator`, `line_ending`) so
+a client can tell the model what it is working on.
 
 The tools are written for a model that does not know which OS it landed on.
 Paths may use either separator. Files are decoded as UTF-8 and then, on
@@ -754,9 +776,13 @@ Server options (`serve` only):
 
 - `--model-name NAME`, `--cors-origin ORIGIN`, `--api-key KEY`,
   `--strict-model`
-- `--agent-workspace DIR`: give the chat UI's agent runs file, shell, and
-  URL-fetch tools confined to `DIR` (off by default; commands still need
-  approval in the UI)
+- `--agent-workspace DIR`: a directory the chat UI's agent runs may work
+  in, fixed for the server's lifetime; repeatable. Without it, a browser on
+  the server's machine adds directories from the Agent tab, remembered in
+  `~/.flyweight/agent-workspaces.json` (`FLYWEIGHT_STATE_DIR` moves it)
+- `--no-agent-tools`: no `/agent/*` endpoints at all
+- `FLYWEIGHT_AGENT_HOSTS`: comma-separated hostnames, besides addresses and
+  `localhost`, from which a browser may drive the agent tools
 - `--reasoning-effort low|medium|high|xhigh`: server-wide default effort
 - `--thinking-budget N`: cap for requests that think without naming a budget;
   unset it guards only `/v1/messages` (at 2048), a value applies everywhere,

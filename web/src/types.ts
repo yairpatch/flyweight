@@ -155,6 +155,10 @@ export interface Conversation {
   messages: Message[];
   /** Which mode owns this conversation; stored conversations without one are chat. */
   kind?: ConversationKind;
+  /** Agent runs: the server workspace the run works in, by id. Fixed once the run has messages. */
+  workspaceId?: string;
+  /** Agent runs: what the run may do; undefined means the default preset. */
+  permissions?: AgentPermissions;
   /** Per-conversation settings override; undefined means use global. */
   model?: string;
 }
@@ -187,11 +191,39 @@ export interface PropsPayload {
   generation_defaults?: Record<string, number>;
   generation_defaults_source?: string;
   capabilities?: string[];
-  /** Directory the server's agent tools are confined to; absent unless --agent-workspace was given. */
+  /** The default workspace directory; absent when the server has none ready. */
   agent_workspace?: string;
+  /** Every directory agent runs may work in; absent when the tools are off (--no-agent-tools). */
+  agent_workspaces?: AgentWorkspaceInfo[];
   /** What the workspace host is, so the agent writes commands and paths that work there. */
   agent_platform?: AgentPlatform;
 }
+
+/** One directory agent runs may work in, as the server lists it. */
+export interface AgentWorkspaceInfo {
+  id: string;
+  path: string;
+  title: string;
+  /** "flag" for --agent-workspace roots (fixed), "registered" for ones added from the UI. */
+  source: "flag" | "registered";
+  /** False when the directory has gone away since it was registered. */
+  exists: boolean;
+}
+
+/** GET /agent/workspaces: the list, plus whether this browser may add to it. */
+export interface AgentWorkspacesPayload {
+  workspaces: AgentWorkspaceInfo[];
+  platform: AgentPlatform;
+  can_register: boolean;
+}
+
+/**
+ * What an agent run may do, chosen per run. The file tools are confined to
+ * the workspace in every preset; "read-only" also refuses writes server-side
+ * and withholds the writing tools from the model; "auto-approve" runs shell
+ * commands without asking. Commands are never sandboxed.
+ */
+export type AgentPermissions = "workspace-write" | "read-only" | "auto-approve";
 
 /** The workspace machine as the server sees it. */
 export interface AgentPlatform {
