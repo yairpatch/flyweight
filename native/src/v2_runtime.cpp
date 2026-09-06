@@ -21036,6 +21036,12 @@ static std::string qwen_token_bytes(
     return gguf_byte_decode(runtime.model->vocabulary[token]);
 }
 
+// The most temperature a token inside an open tool call is drawn at. The
+// web UI arrived at 0.2 for its own agent runs: low enough that whitespace
+// near-ties resolve the way greedy would, high enough to leave a seed some
+// say. Overridden by FLYWEIGHT_TOOL_CALL_TEMPERATURE.
+static constexpr float kToolCallTemperature=0.2f;
+
 static std::uint32_t qwen_sample_last_logits(
         FlyweightV2QwenRuntime& runtime,QwenSamplingState& sampling,
         std::uint32_t greedy_token) {
@@ -21331,6 +21337,28 @@ static std::uint32_t qwen_sample_last_logits(
         return setting&&setting[0]=='1';
     }();
     const bool inside_tool_call=sampling.grammar.armed()&&!penalize_tool_calls;
+    // Nor is chat temperature. The verbatim contract that pauses the penalties
+    // makes a sampled draw inside a call a liability of its own: whitespace
+    // runs are adjacent tokens, and at 0.8 the near-ties among them flip often
+    // enough that an Edit's old_string comes out misindented and fails the
+    // harness's exact-match check. A client the server does not control --
+    // Claude Code, opencode, a bare curl -- sends its chat temperature or
+    // nothing, and the served default is 0.8. So the cap lives here, where
+    // every client's calls pass: inside an open call the temperature is at
+    // most kToolCallTemperature, and prose keeps what the request asked for.
+    // FLYWEIGHT_TOOL_CALL_TEMPERATURE=<x> moves the cap; a negative value
+    // switches it off, for comparison.
+    static const float tool_call_temperature=[]{
+        const char*setting=std::getenv("FLYWEIGHT_TOOL_CALL_TEMPERATURE");
+        if(!setting||!setting[0])return kToolCallTemperature;
+        char*end=nullptr;
+        const float value=std::strtof(setting,&end);
+        return end==setting?kToolCallTemperature:value;
+    }();
+    const float temperature=
+        sampling.grammar.armed()&&tool_call_temperature>=0.0f
+        ?std::min(sampling.temperature,tool_call_temperature)
+        :sampling.temperature;
     if(sampling.penalizes()&&!sampling.recent.empty()&&!inside_tool_call){
         for(std::size_t index=0;index<candidates.size();++index){
             std::uint32_t occurrences=0;
@@ -21371,8 +21399,9 @@ static std::uint32_t qwen_sample_last_logits(
     // Greedy decode, now that the candidates carry whatever the grammar and the
     // penalties had to say about them: the best surviving candidate is the
     // answer, and it is where the fused argmax's token gets overridden. Below
-    // this point everything reads `temperature`, which is zero here.
-    if(!sampling.enabled()){
+    // this point everything reads `temperature`, which is zero here -- by the
+    // request's choice, or by the tool-call cap.
+    if(!(temperature>0.0f)){
         // Equality with the fused argmax, not provenance, is what a later
         // full-prompt reuse needs: a penalty or grammar that happened to keep
         // the argmax leaves the remembered token valid for a greedy hit.
@@ -21381,13 +21410,13 @@ static std::uint32_t qwen_sample_last_logits(
         return commit(candidates.front());
     }
     const double maximum=static_cast<double>(candidate_logits.front())/
-        sampling.temperature;
+        temperature;
     static thread_local std::vector<double> probabilities;
     probabilities.resize(candidates.size());
     double total=0.0;
     for(std::size_t index=0;index<candidates.size();++index){
         const double scaled=static_cast<double>(candidate_logits[index])/
-            sampling.temperature;
+            temperature;
         const double probability=std::isfinite(scaled)?
             std::exp(scaled-maximum):0.0;
         probabilities[index]=probability;total+=probability;
