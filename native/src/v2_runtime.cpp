@@ -6331,12 +6331,25 @@ void qwen_cpu_moe(
         && hidden % 256 == 0 && intermediate % 256 == 0
         && gate_type == 12 && up_type == 12 && down_type == 12
         && (!q4_tile_setting || q4_tile_setting[0] != '0');
+    // IQ1_S gate/up experts take the Q8_K activation through their own
+    // whole-block VNNI kernel (qwen_cpu_iq1s_vnni512.cpp): the float IQ1_S dot
+    // is compute-bound at a fifth of the DRAM roof. Independent of use_q8
+    // because the down projection of those checkpoints is IQ4_NL, whose float
+    // AVX-512 dot already runs at bandwidth and has no Q8_K form.
+    // FLYWEIGHT_IQ1S_Q8=0 keeps the float path for A/B; FLYWEIGHT_Q8_ACTIVATIONS=0
+    // turns every int8-activation path off, this one included.
+    static const char* iq1s_q8_setting = std::getenv("FLYWEIGHT_IQ1S_Q8");
+    const bool iq1s_q8 = !use_q8 && (cpu_features & 8u) != 0
+        && gate_type == 19 && up_type == 19 && hidden % 256 == 0
+        && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
+        && !(q8_setting && q8_setting[0] == '0');
     thread_local std::vector<QwenQ8KBlock> input_q8, activated_q8;
-    if (use_q8) {
+    if (use_q8 || iq1s_q8) {
         input_q8.resize(hidden / 256);
-        activated_q8.resize(static_cast<std::size_t>(routed_count) * (intermediate / 256));
         qwen_quantize_q8_k_avx2(input, hidden, input_q8.data());
     }
+    if (use_q8)
+        activated_q8.resize(static_cast<std::size_t>(routed_count) * (intermediate / 256));
 #if defined(_OPENMP)
     // Decode is bandwidth-bound on expert weights. SMT siblings contend for the
     // same load ports and memory bandwidth, so use physical cores by default.
@@ -6364,7 +6377,10 @@ void qwen_cpu_moe(
         const int row = task % intermediate;
         float gate_value = 0.0f;
         float up_value = 0.0f;
-        if (use_q8) {
+        if (iq1s_q8) {
+            gate_value = qwen_iq1s_dot_q8_k_vnni512(gate[rank], input_q8_data, hidden, row);
+            up_value = qwen_iq1s_dot_q8_k_vnni512(up[rank], input_q8_data, hidden, row);
+        } else if (use_q8) {
             gate_value = q8_dot(
                 gate[rank], gate_type, input_q8_data, hidden, row
             );

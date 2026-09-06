@@ -178,6 +178,15 @@ void qwen_quant_dot_quad_avx2(
     float outputs[4]
 );
 
+// IQ1_S row against Q8_K activations, whole super-block per step: vectorized
+// grid indices, gathered octets, dpbusd. Requires AVX512-VNNI (feature bit 3).
+float qwen_iq1s_dot_q8_k_vnni512(
+    const std::uint8_t* packed,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t row
+);
+
 void qwen_quantize_q8_k_avx2(
     const float* input,
     int elements,
