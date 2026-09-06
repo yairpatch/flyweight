@@ -590,7 +590,11 @@ and penalizing recently emitted tokens there made the quote drift and the
 harness's exact-match check fail. `FLYWEIGHT_TOOL_CALL_PENALTY=1` restores the
 old behaviour for comparison. Outside tool calls a penalty still applies to
 quoted file content, so for edit-heavy agent work on higher-precision quants
-leave it off. `seed` pins the sampler per request; `n` other than 1 is
+leave it off. Temperature is capped inside a call the same way, at 0.2: an
+agent client sends its chat temperature (or nothing, which is 0.8 here), and at
+that heat the near-tie whitespace tokens flip often enough to misindent an
+Edit's `old_string`. Prose outside the call keeps the request's temperature.
+`FLYWEIGHT_TOOL_CALL_TEMPERATURE` moves the cap; a negative value removes it. `seed` pins the sampler per request; `n` other than 1 is
 rejected.
 
 ## Inspect and generate
