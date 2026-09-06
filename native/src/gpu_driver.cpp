@@ -123,6 +123,10 @@ struct CudaApi {
     nvrtcResult (*nvrtcGetProgramLogSize)(nvrtcProgram, size_t*) = nullptr;
     nvrtcResult (*nvrtcGetProgramLog)(nvrtcProgram, char*) = nullptr;
     nvrtcResult (*nvrtcDestroyProgram)(nvrtcProgram*) = nullptr;
+    // Optional: names the result code when a compile fails without a
+    // diagnostic in the log (a missing nvrtc-builtins DLL, an unsupported
+    // architecture), which every NVRTC since 7.0 exports.
+    const char* (*nvrtcGetErrorString)(nvrtcResult) = nullptr;
 
     bool loaded = false;
 };
@@ -443,6 +447,7 @@ bool load_apis() {
     );
     ok &= load_symbol(nvrtc, "nvrtcGetProgramLog", g_api.nvrtcGetProgramLog);
     ok &= load_symbol(nvrtc, "nvrtcDestroyProgram", g_api.nvrtcDestroyProgram);
+    load_symbol(nvrtc, "nvrtcGetErrorString", g_api.nvrtcGetErrorString);
     g_api.loaded = ok;
     return ok;
 }
@@ -969,6 +974,21 @@ extern "C" int flyweight_gpu_compile(
     // not an option: g_functions keeps entries resolved from earlier corpora
     // (another architecture's kernels), and those must stay launchable. The
     // cache makes the loaded set bounded by the number of distinct corpora.
+    // Append a line to the caller's log buffer, keeping whatever NVRTC wrote.
+    const auto append_log = [&](const std::string& line) {
+        if (log_buffer == nullptr || log_capacity <= 0) return;
+        const size_t used = std::strlen(log_buffer);
+        const size_t capacity = static_cast<size_t>(log_capacity);
+        if (used + 1 >= capacity) return;
+        std::snprintf(log_buffer + used, capacity - used, "%s%s",
+                      used ? "\n" : "", line.c_str());
+    };
+    const auto nvrtc_name = [&](nvrtcResult result) -> std::string {
+        const char* text = g_api.nvrtcGetErrorString
+            ? g_api.nvrtcGetErrorString(result) : nullptr;
+        return std::string(text ? text : "nvrtc error") + " (code "
+            + std::to_string(static_cast<int>(result)) + ")";
+    };
     static std::unordered_map<std::string, CUmodule> module_cache;
     std::string cache_key;
     cache_key.reserve(std::strlen(source) + 256);
@@ -985,6 +1005,7 @@ extern "C" int flyweight_gpu_compile(
         if (g_api.nvrtcCreateProgram(
                 &program, source, "flyweight_kernels.cu", 0, nullptr, nullptr
             ) != 0) {
+            append_log("nvrtcCreateProgram failed");
             return -2;
         }
         const nvrtcResult compiled = g_api.nvrtcCompileProgram(
@@ -1025,16 +1046,28 @@ extern "C" int flyweight_gpu_compile(
             }
         }
         if (compiled != 0) {
+            // A log of warnings alone is the common shape of this failure:
+            // the front end ran, then NVRTC could not finish -- on Windows,
+            // usually because nvrtc-builtins64_*.dll was not found beside
+            // nvrtc64_*.dll. Name the result so the reader is not left
+            // looking for an error line that was never written.
+            append_log("nvrtcCompileProgram: " + nvrtc_name(compiled)
+                       + " for " + std::string(arch)
+                       + "; the warnings above are not the cause");
             g_api.nvrtcDestroyProgram(&program);
             return -3;
         }
         size_t ptx_size = 0;
-        if (g_api.nvrtcGetPTXSize(program, &ptx_size) != 0 || ptx_size == 0) {
+        const nvrtcResult sized = g_api.nvrtcGetPTXSize(program, &ptx_size);
+        if (sized != 0 || ptx_size == 0) {
+            append_log("nvrtcGetPTXSize: " + nvrtc_name(sized));
             g_api.nvrtcDestroyProgram(&program);
             return -3;
         }
         std::vector<char> ptx(ptx_size);
-        if (g_api.nvrtcGetPTX(program, ptx.data()) != 0) {
+        const nvrtcResult fetched = g_api.nvrtcGetPTX(program, ptx.data());
+        if (fetched != 0) {
+            append_log("nvrtcGetPTX: " + nvrtc_name(fetched));
             g_api.nvrtcDestroyProgram(&program);
             return -3;
         }
