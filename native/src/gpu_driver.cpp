@@ -65,6 +65,9 @@ struct CublasLtHeuristicResult {
 
 struct CudaApi {
     CUresult (*cuInit)(unsigned int) = nullptr;
+    // Optional: names a driver result in the compile log (a PTX the driver
+    // is too old to load is the common one).
+    CUresult (*cuGetErrorName)(CUresult, const char**) = nullptr;
     CUresult (*cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice) = nullptr;
     CUresult (*cuCtxSetCurrent)(CUcontext) = nullptr;
     CUresult (*cuDeviceGetAttribute)(int*, int, CUdevice) = nullptr;
@@ -394,6 +397,7 @@ bool load_apis() {
     }
     bool ok = true;
     ok &= load_symbol(cuda, "cuInit", g_api.cuInit);
+    load_symbol(cuda, "cuGetErrorName", g_api.cuGetErrorName);
     ok &= load_symbol(
         cuda, "cuDevicePrimaryCtxRetain", g_api.cuDevicePrimaryCtxRetain
     );
@@ -1072,14 +1076,29 @@ extern "C" int flyweight_gpu_compile(
             return -3;
         }
         g_api.nvrtcDestroyProgram(&program);
-        if (g_api.cuModuleLoadDataEx(&g_module, ptx.data(), 0, nullptr, nullptr)
-            != 0) {
+        const CUresult loaded = g_api.cuModuleLoadDataEx(
+            &g_module, ptx.data(), 0, nullptr, nullptr);
+        if (loaded != 0) {
+            // NVRTC compiled fine (its warnings are what the log holds); the
+            // DRIVER refused the PTX. CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222)
+            // is the everyday case: a toolkit newer than the installed driver.
+            const char* name = nullptr;
+            if (g_api.cuGetErrorName) g_api.cuGetErrorName(loaded, &name);
+            append_log("cuModuleLoadDataEx: " + std::string(name ? name : "CUDA error")
+                       + " (code " + std::to_string(static_cast<int>(loaded))
+                       + ") loading PTX for " + std::string(arch)
+                       + "; the compile succeeded and the warnings above are not "
+                         "the cause. Code 222 means the NVIDIA driver is older "
+                         "than the CUDA toolkit: update the driver, or install "
+                         "a toolkit the driver supports.");
             return -4;
         }
         module_cache.emplace(std::move(cache_key), g_module);
     }
     for (const Entry& entry : kNamedKernels) {
         if (g_api.cuModuleGetFunction(entry.slot, g_module, entry.name) != 0) {
+            append_log("cuModuleGetFunction: kernel " + std::string(entry.name)
+                       + " is missing from the compiled module");
             return -5;
         }
         g_functions[entry.name] = *entry.slot;
