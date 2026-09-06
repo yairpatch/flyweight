@@ -19705,7 +19705,17 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     auto dense_matvec=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         std::uint64_t matrix=runtime->device_tensors[index];
         const auto type=qwen_device_type(*runtime,index);
-        if(type==0){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);return;}
+        if(type==0){
+            void*args[]={&matrix,&input,&output,&input_size,&output_size};
+            // Warp per row starves a projection with a handful of long rows:
+            // qwen4exp's hyper-connection inject is 4 rows of 10240, and four
+            // warps streaming 40 KB each took 20 us, 96 times a token. A full
+            // block per row reads the same bytes with 32 warps in flight.
+            if(output_size<=16&&input_size>=2048)
+                launch_named("qwen_f32_matvec",output_size,1,1024,args);
+            else launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);
+            return;
+        }
         // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
         if(type==30){void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
         const auto*format=flyweight::v2::qwen_format(type);
@@ -19872,21 +19882,57 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         // Profiling and diagnostics both inject event records and stream syncs
         // into the block below, neither of which survives capture, so they keep
         // the eager path.
-        // qwen4exp: the delta capture would bake in the skipped residual add
-        // and the streams would never see the inject on replay; graphs stay
-        // off for the arch until the bookends are capture-clean.
+        // qwen4exp: enqueue_delta skips the residual add for the arch and the
+        // hyper-connection bookends (hc_pre before, hc_post after) run eagerly
+        // around the captured block, so the capture is clean. It was held off
+        // while that was being sorted out; FLYWEIGHT_CUDA_GRAPH_QWEN4EXP=0
+        // restores the eager path for A/B.
+        static const bool env_graph_qwen4exp=[]{const char*s=std::getenv("FLYWEIGHT_CUDA_GRAPH_QWEN4EXP");return !s||s[0]!='0';}();
         const bool graph_capturable=runtime->cuda_graphs&&!profile&&!env_lm_diag
-            &&!runtime->qwen4exp;
+            &&(!runtime->qwen4exp||env_graph_qwen4exp);
         const bool graph_eligible=graph_capturable&&env_graph_delta;
         const bool ffn_graph_eligible=graph_capturable&&env_graph_ffn;
         if(profile)profile_record(profile->pre_start);
         auto tensor=[&](std::size_t role){return runtime->device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size){dense_matvec(layer.static_tensors.at(role),input,output,input_size,output_size);};
+        // The router, as one enqueue so the qwen4exp layer-front graph below
+        // can carry it: a router matvec and a top-k, both on fixed workspace
+        // addresses, token-invariant.
+        auto enqueue_router=[&](std::size_t base){
+            dense(base+1,normalized,router_logits,hidden_size,experts);
+            if(qwen_sigmoid_bias_router(*runtime)){
+                // Sigmoid routing with the score-correction bias, sum-normalized
+                // over the selection and scaled by the trained routing factor.
+                auto bias=layer.router_bias!=std::numeric_limits<std::uint64_t>::max()
+                    ?runtime->device_tensors[layer.router_bias]:0;
+                int normalize=runtime->model->config.expert_weights_norm?1:0;
+                float weight_scale=runtime->model->config.expert_weights_scale;
+                void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&bias,
+                                   const_cast<std::uint64_t*>(&selected_device),
+                                   const_cast<std::uint64_t*>(&route_weights),
+                                   const_cast<int*>(&experts),const_cast<int*>(&top_k),
+                                   &normalize,&weight_scale};
+                launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
+                             static_cast<std::uint32_t>(2*experts*sizeof(float)));
+            }else if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,launch_stream)!=0)throw std::runtime_error("native Qwen routing failed");
+        };
+        // qwen4exp routed delta layers capture the whole layer front as one
+        // graph: hc_pre, the delta block, hc_post, the feed-forward hc_pre and
+        // the router. Everything in it reads and writes fixed addresses (the
+        // hyper-connection streams, the conv/recurrent state of this slot, the
+        // workspace vectors); the only per-token inputs are the streams left
+        // by the previous layer. That is ~20 launches a layer that the eager
+        // path paid in submission latency -- the whole of the route wait on a
+        // CPU-expert decode. The route download and its event stay eager.
+        const bool front_graph=runtime->qwen4exp&&!layer.attention
+            &&!layer.dense_ffn&&graph_eligible;
+        bool front_done=false;
         if(runtime->qwen4exp){
             if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max())
                 ple_block(layer);
-            hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
-                   layer.hc_attn_inject);
+            if(!front_graph)
+                hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
+                       layer.hc_attn_inject);
         }else rms(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
         if(!layer.attention){
@@ -19962,9 +20008,20 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                 }
             }
             // qwen4exp replaces the residual add with the gated-residual
-            // inject AFTER the (never-captured) block; see below.
+            // inject after the block (hc_post), in the layer-front graph or
+            // eagerly; see front_graph.
             if(!runtime->qwen4exp)add(residual,hidden);
             };
+            auto enqueue_front=[&]{
+                hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
+                       layer.hc_attn_inject);
+                enqueue_delta();
+                hc_post(residual);
+                hc_pre(tensor(10),layer.hc_ffn_down,layer.hc_ffn_up,
+                       layer.hc_ffn_inject);
+                enqueue_router(10);
+            };
+            auto enqueue_block=[&]{if(front_graph)enqueue_front();else enqueue_delta();};
             // Capture records without executing, so the in-place state update
             // happens exactly once per token -- via the replay below, never via
             // the capture pass. The graph is launched on runtime->stream so it
@@ -19991,7 +20048,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                 if(flyweight_gpu_graph_begin(runtime->graph_stream)==0){
                     bool capture_enqueued=true;
                     launch_stream=runtime->graph_stream;
-                    try{enqueue_delta();}catch(...){capture_enqueued=false;}
+                    try{enqueue_block();}catch(...){capture_enqueued=false;}
                     launch_stream=runtime->stream;
                     std::uint64_t captured_graph=0;
                     const int capture_status=flyweight_gpu_graph_end(runtime->graph_stream,&captured_graph);
@@ -20009,13 +20066,19 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     }
                 }
             }
-            if(!delta_launched)enqueue_delta();
+            if(!delta_launched)enqueue_block();
             if(env_graph_trace){
                 runtime->delta_host_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-delta_started).count();
                 ++runtime->delta_host_calls;
             }
-            if(runtime->qwen4exp)hc_post(residual);
+            if(front_graph){
+                // Replay ran hc_pre without the host seeing it: `normalized`
+                // was rewritten behind the q8 memo, exactly as the eager
+                // hc_pre records.
+                front_done=true;
+                q8_cached_input=0;
+            }else if(runtime->qwen4exp)hc_post(residual);
             moe_base=10;
         }else if(runtime->muse){
             // Muse Glimmer attention: plain Q/K/V projections, per-head QK RMS
@@ -20415,10 +20478,11 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             else add(residual,hidden);
             moe_base=7;
         }
-        if(runtime->qwen4exp)
-            hc_pre(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
-                   layer.hc_ffn_inject);
-        else rms(residual,tensor(moe_base),normalized);
+        if(runtime->qwen4exp){
+            if(!front_done)
+                hc_pre(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
+                       layer.hc_ffn_inject);
+        }else rms(residual,tensor(moe_base),normalized);
         if(qwen_lm_diag_enabled()&&layer_number==0){
             float v[4]={};flyweight_gpu_stream_sync(runtime->stream);
             if(flyweight_gpu_download(v,normalized,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
@@ -20493,22 +20557,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             }
             if(profile){profile_record(profile->pre_end);profile_record(profile->shared_start);profile_record(profile->shared_end);profile_record(profile->expert_start);}
         }else{
-        dense(moe_base+1,normalized,router_logits,hidden_size,experts);
-        if(qwen_sigmoid_bias_router(*runtime)){
-            // Sigmoid routing with the score-correction bias, sum-normalized
-            // over the selection and scaled by the trained routing factor.
-            auto bias=layer.router_bias!=std::numeric_limits<std::uint64_t>::max()
-                ?runtime->device_tensors[layer.router_bias]:0;
-            int normalize=runtime->model->config.expert_weights_norm?1:0;
-            float weight_scale=runtime->model->config.expert_weights_scale;
-            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&bias,
-                               const_cast<std::uint64_t*>(&selected_device),
-                               const_cast<std::uint64_t*>(&route_weights),
-                               const_cast<int*>(&experts),const_cast<int*>(&top_k),
-                               &normalize,&weight_scale};
-            launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
-                         static_cast<std::uint32_t>(2*experts*sizeof(float)));
-        }else if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime->stream)!=0)throw std::runtime_error("native Qwen routing failed");
+        if(!front_done)enqueue_router(moe_base);
         const auto cpu_weights_offset=device_align(top_k*sizeof(std::int32_t));
         const auto cpu_input_offset=cpu_weights_offset+device_align(top_k*sizeof(float));
         const auto cpu_activated_offset=cpu_input_offset+device_align(hidden_size*sizeof(float));
