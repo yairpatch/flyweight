@@ -955,6 +955,9 @@ device are skipped.
 - Laguna's pre-tokenizer classifies non-ASCII letters by Unicode block rather
   than by a full category table, so non-Latin prose can split differently
   from the reference tokenizer.
+- The Qwen pre-tokenizer matches the reference split, but the reference also
+  NFC-normalizes text first and this runtime does not, so a decomposed accent
+  (a letter followed by a combining mark) can tokenize differently.
 - Laguna (with IQ experts) and Gemma 4 concentrate available expert-cache
   VRAM into a contiguous suffix of complete layers and pin every expert in
   those layers, using the CPU path for earlier layers. Set
