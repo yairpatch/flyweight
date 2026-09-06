@@ -103,7 +103,22 @@ int main() {
             ++failures;
         }
     }
-    std::printf("qwen_iq1s_vnni512_contract: %d rows, worst rel error %.2e vs exact, %.2e vs float path\n",
+    // The dequantizer must be bit-identical to the AVX2 decoder it displaces.
+    std::vector<float> decoded_vnni(kElements), decoded_avx2(kElements);
+    int dequant_mismatches = 0;
+    for (int row = 0; row < kRows; ++row) {
+        qwen_iq1s_dequant_row_vnni512(packed.data(), kElements, row, decoded_vnni.data());
+        qwen_dequant_row_avx2(packed.data(), 19, kElements, row, decoded_avx2.data());
+        for (int index = 0; index < kElements; ++index)
+            if (std::memcmp(&decoded_vnni[index], &decoded_avx2[index], sizeof(float)) != 0)
+                ++dequant_mismatches;
+    }
+    if (dequant_mismatches) {
+        std::printf("dequantizer differs from the AVX2 decoder in %d of %d values\n",
+                    dequant_mismatches, kRows * kElements);
+        ++failures;
+    }
+    std::printf("qwen_iq1s_vnni512_contract: %d rows, worst rel error %.2e vs exact, %.2e vs float path, dequant bit-exact\n",
                 kRows, worst_tight, worst_loose);
     return failures ? 1 : 0;
 }

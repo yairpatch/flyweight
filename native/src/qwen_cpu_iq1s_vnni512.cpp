@@ -19,6 +19,13 @@
 //
 // Numerically this is the Q8_K activation path the IQ2_XS/IQ3_XXS experts
 // already take: the only approximation is the int8 activation rounding.
+//
+// The row dequantizer below shares the index build and the gathers, and
+// writes the same floats the AVX2 decoder does, bit for bit. The batched
+// expert path (prefill, multi-sequence decode) decodes each routed row to
+// float once per chunk before its GEMM, and on the UD-IQ1_S checkpoints that
+// decode was the largest single cost of a chunk: 41 Gweights/s on 16 cores
+// through the octet-at-a-time decoder, 73 through this one.
 
 #include <qwen_cpu_kernel.h>
 
@@ -53,7 +60,80 @@ const __m512i kScaleLanes[4] = {
     _mm512_set_epi32(7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6),
 };
 
+// The 32 grid indices of one super-block, as four vectors of eight dwords in
+// octet order, ready for the gathers.
+inline void iq1s_block_indices(const std::uint8_t* base, __m256i octets[4], __m128i& qh) {
+    const __m512i qs = _mm512_cvtepu8_epi16(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 2)));
+    qh = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 34));
+    const __m512i qh_by_lane =
+        _mm512_permutexvar_epi16(kGroupOfLane, _mm512_castsi128_si512(qh));
+    const __m512i high = _mm512_slli_epi16(
+        _mm512_and_si512(_mm512_srlv_epi16(qh_by_lane, kOctetShift), _mm512_set1_epi16(7)), 8);
+    const __m512i index = _mm512_or_si512(qs, high);
+    const __m512i index_low = _mm512_cvtepu16_epi32(_mm512_castsi512_si256(index));
+    const __m512i index_high =
+        _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(index, 1));
+    octets[0] = _mm512_castsi512_si256(index_low);
+    octets[1] = _mm512_extracti64x4_epi64(index_low, 1);
+    octets[2] = _mm512_castsi512_si256(index_high);
+    octets[3] = _mm512_extracti64x4_epi64(index_high, 1);
+}
+
 }  // namespace
+
+void qwen_iq1s_dequant_row_vnni512(
+    const std::uint8_t* packed,
+    int elements,
+    std::uint64_t row,
+    float* output
+) {
+    const int blocks = elements / 256;
+    const auto* row_data =
+        packed + row * static_cast<std::uint64_t>(blocks) * kIq1sBlockBytes;
+    const __m256 plus_delta = _mm256_set1_ps(kIq1sDelta);
+    const __m256 minus_delta = _mm256_set1_ps(-kIq1sDelta);
+    for (int block = 0; block < blocks; ++block) {
+        const auto* base = row_data + block * kIq1sBlockBytes;
+        __m256i index_octets[4];
+        __m128i qh;
+        iq1s_block_indices(base, index_octets, qh);
+        // Per-group scale d * (2s + 1) and signed delta, spilled to eight
+        // floats each: the same values the AVX2 decoder broadcasts, in the same
+        // order of operations, so the output is bit-identical to it.
+        const __m256i qh32 = _mm256_cvtepu16_epi32(qh);
+        const __m256 scale = _mm256_mul_ps(
+            _mm256_set1_ps(half_value(base)),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(
+                _mm256_slli_epi32(
+                    _mm256_and_si256(_mm256_srli_epi32(qh32, 12), _mm256_set1_epi32(7)), 1),
+                _mm256_set1_epi32(1))));
+        const __m256i negative = _mm256_srai_epi32(_mm256_slli_epi32(qh32, 16), 31);
+        const __m256 delta =
+            _mm256_blendv_ps(plus_delta, minus_delta, _mm256_castsi256_ps(negative));
+        alignas(32) float scales[8];
+        alignas(32) float deltas[8];
+        _mm256_store_ps(scales, scale);
+        _mm256_store_ps(deltas, delta);
+        float* out = output + block * 256;
+        for (int pair = 0; pair < 4; ++pair) {
+            const __m512i octets = _mm512_i32gather_epi64(
+                index_octets[pair], static_cast<const void*>(kIq1sGrid), 8);
+            const __m128i quarters[4] = {
+                _mm512_castsi512_si128(octets), _mm512_extracti32x4_epi32(octets, 1),
+                _mm512_extracti32x4_epi32(octets, 2), _mm512_extracti32x4_epi32(octets, 3),
+            };
+            for (int quarter = 0; quarter < 4; ++quarter) {
+                const int group = pair * 2 + quarter / 2;
+                const __m512 weights = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(quarters[quarter]));
+                _mm512_storeu_ps(
+                    out + pair * 64 + quarter * 16,
+                    _mm512_mul_ps(_mm512_set1_ps(scales[group]),
+                                  _mm512_add_ps(weights, _mm512_set1_ps(deltas[group]))));
+            }
+        }
+    }
+}
 
 float qwen_iq1s_dot_q8_k_vnni512(
     const std::uint8_t* packed,
@@ -65,29 +145,15 @@ float qwen_iq1s_dot_q8_k_vnni512(
     const auto* row_data =
         packed + row * static_cast<std::uint64_t>(blocks) * kIq1sBlockBytes;
     const __m512i one = _mm512_set1_epi8(1);
-    const __m512i seven = _mm512_set1_epi16(7);
     const __m256i plus_delta = _mm256_castps_si256(_mm256_set1_ps(kIq1sDelta - 1.0f));
     const __m256i minus_delta = _mm256_castps_si256(_mm256_set1_ps(-kIq1sDelta - 1.0f));
     float result = 0.0f;
     for (int block = 0; block < blocks; ++block) {
         const auto* base = row_data + block * kIq1sBlockBytes;
         const auto& q8 = input[block];
-        // 32 grid indices: qs byte | (three qh bits of the group) << 8.
-        const __m512i qs = _mm512_cvtepu8_epi16(
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 2)));
-        const __m128i qh = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 34));
-        const __m512i qh_by_lane =
-            _mm512_permutexvar_epi16(kGroupOfLane, _mm512_castsi128_si512(qh));
-        const __m512i high = _mm512_slli_epi16(
-            _mm512_and_si512(_mm512_srlv_epi16(qh_by_lane, kOctetShift), seven), 8);
-        const __m512i index = _mm512_or_si512(qs, high);
-        const __m512i index_low = _mm512_cvtepu16_epi32(_mm512_castsi512_si256(index));
-        const __m512i index_high =
-            _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(index, 1));
-        const __m256i index_octets[4] = {
-            _mm512_castsi512_si256(index_low), _mm512_extracti64x4_epi64(index_low, 1),
-            _mm512_castsi512_si256(index_high), _mm512_extracti64x4_epi64(index_high, 1),
-        };
+        __m256i index_octets[4];
+        __m128i qh;
+        iq1s_block_indices(base, index_octets, qh);
         // Per-group scale 2*s+1 from qh bits 12-14, as eight dwords.
         const __m256i qh32 = _mm256_cvtepu16_epi32(qh);
         const __m256i scales = _mm256_add_epi32(

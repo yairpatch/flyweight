@@ -187,6 +187,15 @@ float qwen_iq1s_dot_q8_k_vnni512(
     std::uint64_t row
 );
 
+// IQ1_S row to float, same index build and gathers; bit-identical to the AVX2
+// decoder. Requires AVX512-VNNI only because it lives in that translation unit.
+void qwen_iq1s_dequant_row_vnni512(
+    const std::uint8_t* packed,
+    int elements,
+    std::uint64_t row,
+    float* output
+);
+
 void qwen_quantize_q8_k_avx2(
     const float* input,
     int elements,

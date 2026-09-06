@@ -5551,6 +5551,10 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     // 21 and 23 were the qwen4exp repeat of the same story: the UD-IQ4_XS mix
     // ships most gate/up expert stacks as IQ3_S with a few promoted to
     // IQ4_XS, and the tripwire below caught both on the scalar path.
+    // IQ1_S first through the whole-block gather decoder: 1.8x the octet-at-
+    // a-time AVX2 one, and it was the largest cost of a UD-IQ1_S prefill chunk.
+    if(type==19&&(flyweight_cpu_features()&8u)!=0&&elements%256==0){
+        qwen_iq1s_dequant_row_vnni512(packed,elements,row,output);return;}
     if((type==16||type==17||type==18||type==19||type==21||type==23)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
@@ -6749,6 +6753,27 @@ void qwen_cpu_moe_rows(
     // fallback, whose per-task cost varies much more with route count.
     const int schedule_chunk=direct_quant?32:4;
     const int gate_blocks=(intermediate+kRowBlock-1)/kRowBlock;
+    // Experts routed one or two tokens take single-row dots rather than the
+    // dequant-and-GEMM below; for IQ1_S gate/up those go through the Q8_K
+    // VNNI kernel the single-token path uses (qwen_cpu_iq1s_vnni512.cpp), on
+    // a per-token int8 copy of the input quantized once here. Same gates as
+    // qwen_cpu_moe's iq1s_q8.
+    static const char* iq1s_q8_setting=std::getenv("FLYWEIGHT_IQ1S_Q8");
+    static const char* q8_setting=std::getenv("FLYWEIGHT_Q8_ACTIVATIONS");
+    const bool iq1s_q8=(flyweight_cpu_features()&8u)!=0
+        &&gate_type==19&&up_type==19&&hidden%256==0
+        &&!(iq1s_q8_setting&&iq1s_q8_setting[0]=='0')
+        &&!(q8_setting&&q8_setting[0]=='0');
+    thread_local std::vector<QwenQ8KBlock> tl_input_q8;
+    auto& input_q8=tl_input_q8;
+    const int q8_blocks=hidden/256;
+    if(iq1s_q8){
+        input_q8.resize(static_cast<std::size_t>(rows)*q8_blocks);
+        for(int token=0;token<rows;++token)
+            qwen_quantize_q8_k_avx2(input+static_cast<std::size_t>(token)*hidden,hidden,
+                                    input_q8.data()+static_cast<std::size_t>(token)*q8_blocks);
+    }
+    const QwenQ8KBlock* input_q8_data=input_q8.data();
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*gate_blocks;++task){
         const int group=task/gate_blocks;const int row0=(task%gate_blocks)*kRowBlock;
@@ -6764,7 +6789,14 @@ void qwen_cpu_moe_rows(
         if(count<=2){
             for(int i=0;i<mr;++i){
                 float gate_values[2]{},up_values[2]{};
-                if((runtime.fused_moe_gate_up||auto_fused_iq2xs)&&gate_type==up_type){
+                if(iq1s_q8){
+                    for(int occurrence=0;occurrence<count;++occurrence){
+                        const auto*q8=input_q8_data+static_cast<std::size_t>(
+                            occurrences[begin+occurrence]/routed_count)*q8_blocks;
+                        gate_values[occurrence]=qwen_iq1s_dot_q8_k_vnni512(gate_data,q8,hidden,row0+i);
+                        up_values[occurrence]=qwen_iq1s_dot_q8_k_vnni512(up_data,q8,hidden,row0+i);
+                    }
+                }else if((runtime.fused_moe_gate_up||auto_fused_iq2xs)&&gate_type==up_type){
                     if(count==1){
                         qwen_quant_dot_two_rows(
                             gate_data, up_data, gate_type, vectors[begin],
