@@ -13618,7 +13618,12 @@ std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t 
 // The quantifiers are possessive (`?+`, `++`), so the optional leading
 // character in the letter branch is never given back: if it is consumed and no
 // letter follows, the branch fails outright rather than retrying without it.
-std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
+// Shared by the llama3 and Qwen transcriptions below. `marks` is the one
+// place the two regexes differ: Qwen3.6's letter run is `[\p{L}\p{M}]+` and
+// its punctuation class excludes `\p{M}`, so a combining accent travels with
+// the letter it decorates instead of starting a punctuation piece.
+static std::vector<std::string> apostrophe_bpe_pretokenize(
+        const std::string& text, bool marks) {
     const auto decoded=gguf_utf8_decode(text);
     const std::size_t count=decoded.code.size();
     std::vector<std::string> pieces;
@@ -13629,6 +13634,7 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
     auto is_space=[&](std::uint32_t c){return gguf_codepoint_is_space(c);};
     auto is_letter=[&](std::uint32_t c){return joyai_is_letter(c);};
     auto is_number=[&](std::uint32_t c){return joyai_is_number(c);};
+    auto is_mark=[&](std::uint32_t c){return marks&&joyai_is_accent_mark(c);};
 
     for(std::size_t at=0;at<count;){
         // Alternative 1: an apostrophe plus a contraction tail, either case.
@@ -13649,14 +13655,17 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
             if(length){pieces.push_back(slice(at,at+length));at+=length;continue;}
         }
         // Alternative 2: an optional leading character that is neither a line
-        // break, a letter nor a digit, then a run of letters.
+        // break, a letter nor a digit, then a run of letters (and, for Qwen,
+        // marks). A mark can open the run directly, so it is never spent as
+        // the leading character.
         {
             std::size_t probe=at;
             const auto first=at_code(probe);
-            if(first!='\r'&&first!='\n'&&!is_letter(first)&&!is_number(first))++probe;
-            if(probe<count&&is_letter(at_code(probe))){
+            if(first!='\r'&&first!='\n'&&!is_letter(first)&&!is_number(first)&&
+               !is_mark(first))++probe;
+            if(probe<count&&(is_letter(at_code(probe))||is_mark(at_code(probe)))){
                 std::size_t end=probe;
-                while(end<count&&is_letter(at_code(end)))++end;
+                while(end<count&&(is_letter(at_code(end))||is_mark(at_code(end))))++end;
                 pieces.push_back(slice(at,end));at=end;continue;
             }
         }
@@ -13670,7 +13679,7 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
         {
             auto plain=[&](std::size_t index){
                 const auto c=at_code(index);
-                return !is_space(c)&&!is_letter(c)&&!is_number(c);
+                return !is_space(c)&&!is_letter(c)&&!is_number(c)&&!is_mark(c);
             };
             std::size_t probe=at;
             if(at_code(probe)==' '&&probe+1<count&&plain(probe+1))++probe;
@@ -13708,6 +13717,33 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
         pieces.push_back(slice(at,at+1));at+=1;
     }
     return pieces;
+}
+
+std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
+    return apostrophe_bpe_pretokenize(text,false);
+}
+
+// The Qwen pre-tokenizer (`qwen35` in GGUF, which llama.cpp gives the whole
+// Qwen3.5+ family), transcribed from the regex in Qwen3.6's tokenizer.json:
+//
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+// | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+// | \p{N}
+// |  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+//
+// Before this existed, a Qwen checkpoint ran BPE over the whole text with no
+// splitting at all, and the merges did what merges do: "\n    private" became
+// "\n", "    ", "private" where the reference makes "\n", "   ", " private".
+// Every indented line of every prompt reached the model in a shape it had
+// never been trained on, and it answered in kind -- copying the whitespace
+// token it was shown and then the space-prefixed word it knows, which is one
+// space too many on every line, and "this. _speed" for "this._speed". The
+// symptom looked like a small model miscounting indentation. It was not.
+std::vector<std::string> qwen35_pretokenize(const std::string& text) {
+    return apostrophe_bpe_pretokenize(text,true);
 }
 
 std::vector<std::string> gpt4o_pretokenize(const std::string& text,
@@ -13863,10 +13899,13 @@ void gguf_bpe_piece(const FlyweightV2Model& m, const std::string& piece,
 }
 
 // The pre-tokenizer a checkpoint asks for by name. Anything unlisted keeps the
-// historical behaviour of no pre-tokenization at all, which is what the Qwen
-// checkpoints have always run.
+// historical behaviour of no pre-tokenization at all. Qwen used to be in that
+// group, which is what mis-split every indented line (see
+// qwen35_pretokenize); `qwen2` is the same regex without the \p{M} additions.
 std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
                                           const std::string& text) {
+    if(m.tokenizer_pre=="qwen35")return qwen35_pretokenize(text);
+    if(m.tokenizer_pre=="qwen2")return llama_bpe_pretokenize(text);
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
     if(m.tokenizer_pre=="llama4"||m.tokenizer_pre=="k2-horizon")return gpt4o_pretokenize(text,3);
     if(m.tokenizer_pre=="llama-bpe")return llama_bpe_pretokenize(text);
@@ -13896,7 +13935,8 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
     // them into ordinary text, so it takes the exact-match split too.
     if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"||
        m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"||
-       m->tokenizer_pre=="k2-horizon"){
+       m->tokenizer_pre=="k2-horizon"||m->tokenizer_pre=="qwen35"||
+       m->tokenizer_pre=="qwen2"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
