@@ -5565,6 +5565,8 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     // a-time AVX2 one, and it was the largest cost of a UD-IQ1_S prefill chunk.
     if(type==19&&(flyweight_cpu_features()&8u)!=0&&elements%256==0){
         qwen_iq1s_dequant_row_vnni512(packed,elements,row,output);return;}
+    if(type==21&&(flyweight_cpu_features()&8u)!=0&&elements%256==0){
+        qwen_iq3s_dequant_row_vnni512(packed,elements,row,output);return;}
     if((type==16||type==17||type==18||type==19||type==21||type==23)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
@@ -6345,18 +6347,22 @@ void qwen_cpu_moe(
         && hidden % 256 == 0 && intermediate % 256 == 0
         && gate_type == 12 && up_type == 12 && down_type == 12
         && (!q4_tile_setting || q4_tile_setting[0] != '0');
-    // IQ1_S gate/up experts take the Q8_K activation through their own
-    // whole-block VNNI kernel (qwen_cpu_iq1s_vnni512.cpp): the float IQ1_S dot
-    // is compute-bound at a fifth of the DRAM roof. Independent of use_q8
-    // because the down projection of those checkpoints is IQ4_NL, whose float
-    // AVX-512 dot already runs at bandwidth and has no Q8_K form.
-    // FLYWEIGHT_IQ1S_Q8=0 keeps the float path for A/B; FLYWEIGHT_Q8_ACTIVATIONS=0
-    // turns every int8-activation path off, this one included.
+    // IQ1_S and IQ3_S gate/up experts take the Q8_K activation through their
+    // whole-block VNNI kernels (qwen_cpu_iq1s_vnni512.cpp): the float IQ1_S
+    // dot is compute-bound at a fifth of the DRAM roof, the IQ3_S one at two
+    // thirds. Independent of use_q8 because the down projection of those
+    // checkpoints is IQ4_NL, whose float AVX-512 dot already runs at
+    // bandwidth and has no Q8_K form. FLYWEIGHT_IQ1S_Q8=0 keeps the float
+    // path for A/B; FLYWEIGHT_Q8_ACTIVATIONS=0 turns every int8-activation
+    // path off, this one included.
     static const char* iq1s_q8_setting = std::getenv("FLYWEIGHT_IQ1S_Q8");
     const bool iq1s_q8 = !use_q8 && (cpu_features & 8u) != 0
-        && gate_type == 19 && up_type == 19 && hidden % 256 == 0
+        && (gate_type == 19 || gate_type == 21) && up_type == gate_type
+        && hidden % 256 == 0
         && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
         && !(q8_setting && q8_setting[0] == '0');
+    const auto iq_q8_dot = gate_type == 21
+        ? &qwen_iq3s_dot_q8_k_vnni512 : &qwen_iq1s_dot_q8_k_vnni512;
     thread_local std::vector<QwenQ8KBlock> input_q8, activated_q8;
     if (use_q8 || iq1s_q8) {
         input_q8.resize(hidden / 256);
@@ -6392,8 +6398,8 @@ void qwen_cpu_moe(
         float gate_value = 0.0f;
         float up_value = 0.0f;
         if (iq1s_q8) {
-            gate_value = qwen_iq1s_dot_q8_k_vnni512(gate[rank], input_q8_data, hidden, row);
-            up_value = qwen_iq1s_dot_q8_k_vnni512(up[rank], input_q8_data, hidden, row);
+            gate_value = iq_q8_dot(gate[rank], input_q8_data, hidden, row);
+            up_value = iq_q8_dot(up[rank], input_q8_data, hidden, row);
         } else if (use_q8) {
             gate_value = q8_dot(
                 gate[rank], gate_type, input_q8_data, hidden, row
@@ -6771,9 +6777,11 @@ void qwen_cpu_moe_rows(
     static const char* iq1s_q8_setting=std::getenv("FLYWEIGHT_IQ1S_Q8");
     static const char* q8_setting=std::getenv("FLYWEIGHT_Q8_ACTIVATIONS");
     const bool iq1s_q8=(flyweight_cpu_features()&8u)!=0
-        &&gate_type==19&&up_type==19&&hidden%256==0
+        &&(gate_type==19||gate_type==21)&&up_type==gate_type&&hidden%256==0
         &&!(iq1s_q8_setting&&iq1s_q8_setting[0]=='0')
         &&!(q8_setting&&q8_setting[0]=='0');
+    const auto iq_q8_dot=gate_type==21
+        ?&qwen_iq3s_dot_q8_k_vnni512:&qwen_iq1s_dot_q8_k_vnni512;
     thread_local std::vector<QwenQ8KBlock> tl_input_q8;
     auto& input_q8=tl_input_q8;
     const int q8_blocks=hidden/256;
@@ -6803,8 +6811,8 @@ void qwen_cpu_moe_rows(
                     for(int occurrence=0;occurrence<count;++occurrence){
                         const auto*q8=input_q8_data+static_cast<std::size_t>(
                             occurrences[begin+occurrence]/routed_count)*q8_blocks;
-                        gate_values[occurrence]=qwen_iq1s_dot_q8_k_vnni512(gate_data,q8,hidden,row0+i);
-                        up_values[occurrence]=qwen_iq1s_dot_q8_k_vnni512(up_data,q8,hidden,row0+i);
+                        gate_values[occurrence]=iq_q8_dot(gate_data,q8,hidden,row0+i);
+                        up_values[occurrence]=iq_q8_dot(up_data,q8,hidden,row0+i);
                     }
                 }else if((runtime.fused_moe_gate_up||auto_fused_iq2xs)&&gate_type==up_type){
                     if(count==1){
