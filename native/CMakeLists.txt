@@ -280,6 +280,22 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    flyweight_qwen_rows_q8_vnni512_contract
+    tests/qwen_rows_q8_vnni512_contract.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx512.cpp
+    src/qwen_cpu_iq1s_vnni512.cpp
+)
+target_compile_features(flyweight_qwen_rows_q8_vnni512_contract PRIVATE cxx_std_20)
+target_include_directories(flyweight_qwen_rows_q8_vnni512_contract PRIVATE src include)
+if(BUILD_TESTING)
+    add_test(
+        NAME flyweight_qwen_rows_q8_vnni512_contract
+        COMMAND flyweight_qwen_rows_q8_vnni512_contract
+    )
+endif()
+
+add_executable(
     flyweight_qwen_cpu_bench
     tools/bench_q8_cpu.cpp
     src/qwen_cpu_avx2.cpp
