@@ -251,6 +251,13 @@ void qwen_dequant_row_avx512(
     float* output
 );
 
+// Copy with non-temporal stores: the destination is a pinned staging mirror
+// the CPU never reads back, so skipping the read-for-ownership and the cache
+// fill turns a 3x-traffic memcpy into 2x. Both pointers must be 64-byte
+// aligned and bytes a multiple of 64; the caller falls back to memcpy
+// otherwise. Ends with a store fence so the DMA issued after it sees the data.
+void qwen_stream_copy_avx512(void* destination, const void* source, std::uint64_t bytes);
+
 void qwen_dequant_row_avx2(
     const std::uint8_t* packed,
     std::uint32_t type,

@@ -63,6 +63,7 @@
 #include <initializer_list>
 #include <limits>
 #include <thread>
+#include <exception>
 #include <set>
 #include <mutex>
 #include <memory>
@@ -1069,6 +1070,11 @@ struct FlyweightV2QwenRuntime {
     // experts wholly on the host, which is today's behavior.
     std::uint64_t prefill_stream_arena = 0;
     std::uint64_t prefill_stream_bytes = 0;
+    // Pinned host mirror of the arena. The staged experts of a half-layer
+    // are packed into it by the OpenMP team and land on the device as one
+    // copy per slice, so the engine thread never blocks on the driver's
+    // pageable bounce for thousands of small expert uploads out of the mmap.
+    void* prefill_stream_mirror = nullptr;
     // Scratch for the expert-GEMM path: packed activation tiles, their Q8
     // form, the SwiGLU intermediates and the down output, two span slices.
     // Layout order must match the offsets qwen_forward_rows derives.
@@ -1301,6 +1307,12 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t stream_upload_event_pipeline = 0;
     std::uint64_t stream_consumed_event = 0;
     std::uint64_t stream_consumed_event_pipeline = 0;
+    // Drain events for the pinned mirror ring: [span][slot]. A slot is
+    // repacked only after the copy issued out of it two layers earlier has
+    // finished, which keeps the host off the compute stream's queue depth.
+    static constexpr int kStreamMirrorSlots = 2;
+    std::uint64_t stream_mirror_events[2][kStreamMirrorSlots] = {};
+    std::uint64_t stream_mirror_uploads[2] = {0, 0};
     std::uint64_t prefill_layer_start_event = 0;
     std::uint64_t prefill_core_end_event = 0;
     std::uint64_t prefill_router_end_event = 0;
@@ -2512,6 +2524,8 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_free(runtime.prefill_stream_arena);
     runtime.prefill_stream_arena = 0;
     runtime.prefill_stream_bytes = 0;
+    if (runtime.prefill_stream_mirror) flyweight_gpu_host_free(runtime.prefill_stream_mirror);
+    runtime.prefill_stream_mirror = nullptr;
     flyweight_gpu_free(runtime.prefill_stream_scratch);
     runtime.prefill_stream_scratch = 0;
     runtime.prefill_stream_scratch_bytes = 0;
@@ -2570,6 +2584,8 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_event_destroy(runtime.stream_consumed_event);
     flyweight_gpu_event_destroy(runtime.stream_consumed_event_pipeline);
     runtime.stream_upload_event=runtime.stream_upload_event_pipeline=0;
+    for(auto&span_events:runtime.stream_mirror_events)
+        for(auto&event:span_events){flyweight_gpu_event_destroy(event);event=0;}
     runtime.stream_consumed_event=runtime.stream_consumed_event_pipeline=0;
     flyweight_gpu_event_destroy(runtime.prefill_layer_start_event);
     flyweight_gpu_event_destroy(runtime.prefill_core_end_event);
@@ -14686,6 +14702,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         release_qwen_device(*runtime);
         throw std::runtime_error("failed to create native Qwen pipeline route event");
     }
+    for(auto&span_events:runtime->stream_mirror_events)
+        for(auto&event:span_events)
+            if(flyweight_gpu_event_create(&event)!=0){
+                release_qwen_device(*runtime);
+                throw std::runtime_error("failed to create native Qwen stream mirror event");
+            }
     if(runtime->prefill_profile&&(
        flyweight_gpu_timed_event_create(&runtime->prefill_layer_start_event)!=0||
        flyweight_gpu_timed_event_create(&runtime->prefill_core_end_event)!=0||
@@ -16095,6 +16117,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
            flyweight_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
            (runtime->expert_staging_bytes&&flyweight_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0)||
            (runtime->prefill_stream_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_bytes,&runtime->prefill_stream_arena)!=0)||
+           (runtime->prefill_stream_bytes&&flyweight_gpu_host_alloc(
+               runtime->prefill_stream_bytes*FlyweightV2QwenRuntime::kStreamMirrorSlots,
+               &runtime->prefill_stream_mirror)!=0)||
            (runtime->prefill_stream_scratch_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
            (runtime->host_staging_bytes&&flyweight_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
         // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
