@@ -774,8 +774,12 @@ void qwen_forward_rows(
     // Both halves route to nearly the same experts, so sharing halves the
     // host pack and the PCIe bytes for the same GPU share. Two slices give
     // layer L+1's upload a slice whose last reader (layer L-1's GEMMs) is
-    // long done. The serial driver has one span and uses the whole arena as
-    // a single slice. Uploads ride the prefetch stream: upload_ready fences
+    // long done. The serial driver (one span: a chunk too short to halve)
+    // uses the same two slices, because a chunk's slice events and mirror
+    // slots must line up with the previous chunk's -- a whole-arena upload
+    // waiting on slice 0's fences alone raced the previous chunk's last odd
+    // layer, which was still reading slice 1 and draining its mirror slot.
+    // Uploads ride the prefetch stream: upload_ready fences
     // the compute stream before the GEMMs read staged weights, consumed
     // fences the prefetch stream before a later layer overwrites the slice.
     struct StreamGroup{int expert;std::uint64_t matrix;int offset;int count;};
@@ -798,7 +802,7 @@ void qwen_forward_rows(
     }();
     std::thread stream_worker;
     std::exception_ptr stream_worker_error;
-    const int stream_slice_count=pipelined?2:1;
+    const int stream_slice_count=2;
     const std::uint64_t stream_slice_bytes=
         runtime.prefill_stream_bytes/static_cast<std::uint64_t>(stream_slice_count)
         /flyweight::v2::workspace::kDeviceAlignment
@@ -994,9 +998,20 @@ void qwen_forward_rows(
             // `rows` steps to rows/64 and the grid widened past `value_heads`.
             // Requires the workspace regions sized at prepare time, so the guard
             // is the same head_dim test that sized them.
+            // The row floor is a throughput threshold, not a sizing one (the
+            // regions are sized for the whole chunk); FLYWEIGHT_DELTA_CHUNKED_MIN_ROWS
+            // overrides it so the pipeline's halves can take the WY path.
+            static const std::uint64_t chunked_min_rows=[]{
+                const char*setting=std::getenv("FLYWEIGHT_DELTA_CHUNKED_MIN_ROWS");
+                const long value=setting?std::strtol(setting,nullptr,10):0;
+                return value>0?static_cast<std::uint64_t>(value)
+                    :flyweight::v2::workspace::kDeltaChunkedMinimumRows;
+            }();
             const bool chunked_delta=
                 flyweight::v2::workspace::use_chunked_delta(
-                    static_cast<std::uint64_t>(rows),
+                    std::max<std::uint64_t>(static_cast<std::uint64_t>(rows),
+                        rows>=static_cast<int>(chunked_min_rows)
+                            ?flyweight::v2::workspace::kDeltaChunkedMinimumRows:0),
                     static_cast<std::uint64_t>(head_dim),
                     static_cast<std::uint64_t>(value_heads),
                     runtime.delta_value_heads)&&
@@ -1762,7 +1777,7 @@ void qwen_forward_rows(
         // model mapping is registered, so the gate no longer asks for DMA
         // paging (auto registration needs the whole file plus headroom in
         // RAM, which the large qwen4exp checkpoints never satisfy).
-        const int stream_slice=pipelined?static_cast<int>(layer_number&1u):0;
+        const int stream_slice=static_cast<int>(layer_number&1u);
         const std::uint64_t stream_slice_base=runtime.prefill_stream_arena+
             static_cast<std::uint64_t>(stream_slice)*stream_slice_bytes;
         const auto stream_upload_ready_event=stream_slice
@@ -1873,6 +1888,7 @@ void qwen_forward_rows(
         // budget is deterministic. The scratch walk mirrors the prepare-time
         // sizing exactly.
         std::vector<StreamGroup> stream_groups;
+        bool stream_follower_for_trace=false;
         // Hoisted out of the staging block for the routed MMQ below: which
         // group holds an expert, and what the route weights were before
         // staging zeroed the ones it claimed.
@@ -1969,6 +1985,7 @@ void qwen_forward_rows(
                         std::to_string(runtime.position+static_cast<std::uint64_t>(span_begin))+")");
             const bool stream_follower=
                 staged_layer.layer==static_cast<std::int64_t>(layer_number);
+            stream_follower_for_trace=stream_follower;
             if(stream_follower){
                 // The other half staged this layer: same experts, same
                 // arena addresses; only the token lists are this span's.
@@ -2222,6 +2239,35 @@ void qwen_forward_rows(
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
         }
+        // FLYWEIGHT_STREAM_TRACE=3: verify the staged slice against the mmap
+        // after the upload lands (leader spans only; slow, diagnostic).
+        static const bool verify_trace=std::getenv("FLYWEIGHT_STREAM_TRACE")&&
+            std::getenv("FLYWEIGHT_STREAM_TRACE")[0]=='3';
+        if(verify_trace&&!stream_groups.empty()&&
+           staged_layer.layer==static_cast<std::int64_t>(layer_number)&&
+           !stream_follower_for_trace){
+            flyweight_gpu_stream_sync(runtime.prefetch_stream);
+            std::uint64_t triple=0;
+            for(int role=0;role<3;++role)triple+=stream_role_bytes[role];
+            std::vector<unsigned char> host(triple);
+            std::size_t bad_experts=0,bad_bytes=0;
+            for(const auto&group:stream_groups){
+                flyweight_gpu_download(host.data(),group.matrix,triple,runtime.stream);
+                flyweight_gpu_stream_sync(runtime.stream);
+                std::uint64_t offset=0;bool bad=false;
+                for(int role=0;role<3;++role){
+                    const auto*source=tensor_data(*runtime.model,
+                        runtime.model->tensors[layer.expert_tensors[role]])+
+                        static_cast<std::uint64_t>(group.expert)*stream_role_bytes[role];
+                    for(std::uint64_t i=0;i<stream_role_bytes[role];++i)
+                        if(host[offset+i]!=source[i]){++bad_bytes;bad=true;}
+                    offset+=stream_role_bytes[role];
+                }
+                if(bad)++bad_experts;
+            }
+            std::fprintf(stderr,"[verify] layer %u span %d staged %zu bad_experts %zu bad_bytes %zu\n",
+                layer_number,span_begin,stream_groups.size(),bad_experts,bad_bytes);
+        }
         // Expert-GEMM execution: pack, project, activate, project, fold back.
         if(!stream_groups.empty()){
             if(!gpu_table_path){
@@ -2326,6 +2372,8 @@ void qwen_forward_rows(
             // The option is the supported switch; the env var stays as an
             // override so the path can be A/B'd against itself without
             // rebuilding a runtime.
+            // 1 = on, 2 = auto: both mean "where the kernels exist", which
+            // the per-role check below decides; 0 keeps the per-expert GEMM.
             static const char*routed_env=std::getenv("FLYWEIGHT_ROUTED_MOE");
             const bool routed_setting=routed_env
                 ? routed_env[0]=='1'
@@ -2335,15 +2383,7 @@ void qwen_forward_rows(
             // IQ4_NL's flat blocks, which is what lets the 640-wide down
             // projection in at all.
             auto routed_kernel=[&](std::uint32_t type,int in_size){
-                auto name=qwen_iq_grouped_kernel(type,"_q8_mmq_routed");
-                if(name.empty()){
-                    // The K-quant names are not derived from an IQ prefix.
-                    const char*family=type==10?"q2k":type==11?"q3k"
-                        :type==12?"q4k":type==13?"q5k":type==14?"q6k":nullptr;
-                    if(family)name=std::string(family)+"_q8_mmq_routed";
-                }
-                const int unit=type==20?32:256;
-                return (!name.empty()&&in_size%unit==0)?name:std::string();
+                return qwen_routed_mmq_kernel(type,in_size);
             };
             // Q2_K, Q4_K and Q5_K carry a per-group minimum, so they come from
             // the _MIN routed macro: 64 rows over 16 warps rather than 128 over
@@ -2579,6 +2619,28 @@ void qwen_forward_rows(
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
             span.gpu_experts=true;
+            // FLYWEIGHT_STREAM_TRACE=2: per-layer checksums of the GPU expert
+            // accumulator and the CPU sweep output, for run-to-run diffing.
+            static const bool checksum_trace=std::getenv("FLYWEIGHT_STREAM_TRACE")&&
+                std::getenv("FLYWEIGHT_STREAM_TRACE")[0]=='2';
+            if(checksum_trace){
+                std::vector<float> host(static_cast<std::size_t>(rows)*hidden_size);
+                flyweight_gpu_stream_sync(runtime.stream);
+                flyweight_gpu_download(host.data(),fourth,host.size()*sizeof(float),runtime.stream);
+                flyweight_gpu_stream_sync(runtime.stream);
+                double gpu_sum=0,cpu_sum=0,in_sum=0;
+                for(const float v:host)gpu_sum+=std::fabs(v);
+                for(std::size_t i=0;i<host.size();++i)cpu_sum+=std::fabs(output_host[i]);
+                flyweight_gpu_download(host.data(),normalized,host.size()*sizeof(float),runtime.stream);
+                flyweight_gpu_stream_sync(runtime.stream);
+                for(const float v:host)in_sum+=std::fabs(v);
+                std::uint64_t route_hash=1469598103934665603ull;
+                for(int route=0;route<rows*top_k;++route)
+                    route_hash=(route_hash^static_cast<std::uint64_t>(selected_host[route]+7))*1099511628211ull;
+                std::fprintf(stderr,"[cksum] layer %u span %d rows %d routed %d groups %zu in %.9e routes %016llx gpu %.9e cpu %.9e\n",
+                    layer_number,span_begin,rows,(int)routed_moe,stream_groups.size(),in_sum,
+                    (unsigned long long)route_hash,gpu_sum,cpu_sum);
+            }
         }
     };
     // Phase three of a layer: fold the experts back in -- upload the CPU

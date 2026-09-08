@@ -4355,6 +4355,44 @@ std::string qwen_iq_grouped_kernel(std::uint32_t type, const char* suffix) {
     return prefix?std::string(prefix)+suffix:std::string();
 }
 
+// The routed block-table MMQ kernel for an expert role, or empty where the
+// format has none or the width does not divide its blocking: 256 for the
+// super-block formats, 32 for IQ4_NL's flat blocks (what lets qwen4exp's
+// 640-wide down projection in).
+std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
+    auto name = qwen_iq_grouped_kernel(type, "_q8_mmq_routed");
+    if (name.empty()) {
+        const char* family = type == 10 ? "q2k" : type == 11 ? "q3k"
+            : type == 12 ? "q4k" : type == 13 ? "q5k" : type == 14 ? "q6k" : nullptr;
+        if (family) name = std::string(family) + "_q8_mmq_routed";
+    }
+    const int unit = type == 20 ? 32 : 256;
+    return (!name.empty() && in_size % unit == 0) ? name : std::string();
+}
+
+// Whether the routed MMQ carries most MoE layers: the UD checkpoints keep a
+// few layers' down experts in Q8_0, which has no routed kernel and falls
+// back to the per-expert GEMM for that layer alone; those few do not decide
+// the budget for the rest.
+bool qwen_routed_mmq_available(const FlyweightV2QwenRuntime& runtime) {
+    if (!runtime.int8_tensor_cores) return false;
+    const int hidden = static_cast<int>(runtime.model->config.hidden_size);
+    const int intermediate = static_cast<int>(runtime.moe_intermediate);
+    std::size_t moe_layers = 0, routed_layers = 0;
+    for (const auto& layer : runtime.layers) {
+        if (layer.dense_ffn) continue;
+        ++moe_layers;
+        const int widths[3] = {hidden, hidden, intermediate};
+        bool routed = true;
+        for (int role = 0; role < 3 && routed; ++role) {
+            const auto type = runtime.model->tensors[layer.expert_tensors[role]].type;
+            routed = !qwen_routed_mmq_kernel(type, widths[role]).empty();
+        }
+        if (routed) ++routed_layers;
+    }
+    return moe_layers && routed_layers * 2 >= moe_layers;
+}
+
 bool qwen_gpu_expert_type_supported(std::uint32_t type) {
     return type==8||type==12||type==13||type==14||type==40||
            qwen_iq_kernel_prefix(type)!=nullptr;
@@ -15863,7 +15901,17 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                std::getenv("FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"))
             stream_request=std::strtoll(stream_setting,nullptr,10);
         bool stream_auto=stream_request<0;
-        if(stream_auto)stream_request=48;
+        // Auto: 48 MiB where the per-expert GEMM runs (its restaging cost
+        // grows with the budget), 256 MiB where the routed block-table MMQ
+        // will take the streamed share (measured optimum on qwen4exp
+        // UD-IQ1_S and the 35B Q6_K alike; 512 and above lose to uploads).
+        if(stream_auto){
+            const char*routed_env=std::getenv("FLYWEIGHT_ROUTED_MOE");
+            const bool routed_requested=routed_env
+                ?routed_env[0]=='1':runtime->options.routed_moe!=0;
+            stream_request=routed_requested&&qwen_routed_mmq_available(*runtime)
+                ?256:48;
+        }
         if(stream_request>0&&runtime->model->config.expert_count&&
            !flyweight_backend_is_cpu()&&
            qwen_expert_policy(*runtime,
