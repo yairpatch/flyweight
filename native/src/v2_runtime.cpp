@@ -63,6 +63,7 @@
 #include <initializer_list>
 #include <limits>
 #include <thread>
+#include <exception>
 #include <set>
 #include <mutex>
 #include <memory>
@@ -1069,6 +1070,11 @@ struct FlyweightV2QwenRuntime {
     // experts wholly on the host, which is today's behavior.
     std::uint64_t prefill_stream_arena = 0;
     std::uint64_t prefill_stream_bytes = 0;
+    // Pinned host mirror of the arena. The staged experts of a half-layer
+    // are packed into it by the OpenMP team and land on the device as one
+    // copy per slice, so the engine thread never blocks on the driver's
+    // pageable bounce for thousands of small expert uploads out of the mmap.
+    void* prefill_stream_mirror = nullptr;
     // Scratch for the expert-GEMM path: packed activation tiles, their Q8
     // form, the SwiGLU intermediates and the down output, two span slices.
     // Layout order must match the offsets qwen_forward_rows derives.
@@ -1301,6 +1307,12 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t stream_upload_event_pipeline = 0;
     std::uint64_t stream_consumed_event = 0;
     std::uint64_t stream_consumed_event_pipeline = 0;
+    // Drain events for the pinned mirror ring: [span][slot]. A slot is
+    // repacked only after the copy issued out of it two layers earlier has
+    // finished, which keeps the host off the compute stream's queue depth.
+    static constexpr int kStreamMirrorSlots = 2;
+    std::uint64_t stream_mirror_events[2][kStreamMirrorSlots] = {};
+    std::uint64_t stream_mirror_uploads[2] = {0, 0};
     std::uint64_t prefill_layer_start_event = 0;
     std::uint64_t prefill_core_end_event = 0;
     std::uint64_t prefill_router_end_event = 0;
@@ -2512,6 +2524,8 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_free(runtime.prefill_stream_arena);
     runtime.prefill_stream_arena = 0;
     runtime.prefill_stream_bytes = 0;
+    if (runtime.prefill_stream_mirror) flyweight_gpu_host_free(runtime.prefill_stream_mirror);
+    runtime.prefill_stream_mirror = nullptr;
     flyweight_gpu_free(runtime.prefill_stream_scratch);
     runtime.prefill_stream_scratch = 0;
     runtime.prefill_stream_scratch_bytes = 0;
@@ -2570,6 +2584,8 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_event_destroy(runtime.stream_consumed_event);
     flyweight_gpu_event_destroy(runtime.stream_consumed_event_pipeline);
     runtime.stream_upload_event=runtime.stream_upload_event_pipeline=0;
+    for(auto&span_events:runtime.stream_mirror_events)
+        for(auto&event:span_events){flyweight_gpu_event_destroy(event);event=0;}
     runtime.stream_consumed_event=runtime.stream_consumed_event_pipeline=0;
     flyweight_gpu_event_destroy(runtime.prefill_layer_start_event);
     flyweight_gpu_event_destroy(runtime.prefill_core_end_event);
@@ -4337,6 +4353,44 @@ const char* qwen_iq_kernel_prefix(std::uint32_t type) {
 std::string qwen_iq_grouped_kernel(std::uint32_t type, const char* suffix) {
     const char* prefix=qwen_iq_kernel_prefix(type);
     return prefix?std::string(prefix)+suffix:std::string();
+}
+
+// The routed block-table MMQ kernel for an expert role, or empty where the
+// format has none or the width does not divide its blocking: 256 for the
+// super-block formats, 32 for IQ4_NL's flat blocks (what lets qwen4exp's
+// 640-wide down projection in).
+std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
+    auto name = qwen_iq_grouped_kernel(type, "_q8_mmq_routed");
+    if (name.empty()) {
+        const char* family = type == 10 ? "q2k" : type == 11 ? "q3k"
+            : type == 12 ? "q4k" : type == 13 ? "q5k" : type == 14 ? "q6k" : nullptr;
+        if (family) name = std::string(family) + "_q8_mmq_routed";
+    }
+    const int unit = type == 20 ? 32 : 256;
+    return (!name.empty() && in_size % unit == 0) ? name : std::string();
+}
+
+// Whether the routed MMQ carries most MoE layers: the UD checkpoints keep a
+// few layers' down experts in Q8_0, which has no routed kernel and falls
+// back to the per-expert GEMM for that layer alone; those few do not decide
+// the budget for the rest.
+bool qwen_routed_mmq_available(const FlyweightV2QwenRuntime& runtime) {
+    if (!runtime.int8_tensor_cores) return false;
+    const int hidden = static_cast<int>(runtime.model->config.hidden_size);
+    const int intermediate = static_cast<int>(runtime.moe_intermediate);
+    std::size_t moe_layers = 0, routed_layers = 0;
+    for (const auto& layer : runtime.layers) {
+        if (layer.dense_ffn) continue;
+        ++moe_layers;
+        const int widths[3] = {hidden, hidden, intermediate};
+        bool routed = true;
+        for (int role = 0; role < 3 && routed; ++role) {
+            const auto type = runtime.model->tensors[layer.expert_tensors[role]].type;
+            routed = !qwen_routed_mmq_kernel(type, widths[role]).empty();
+        }
+        if (routed) ++routed_layers;
+    }
+    return moe_layers && routed_layers * 2 >= moe_layers;
 }
 
 bool qwen_gpu_expert_type_supported(std::uint32_t type) {
@@ -6792,6 +6846,44 @@ void qwen_cpu_moe_rows(
                                     input_q8.data()+static_cast<std::size_t>(token)*q8_blocks);
     }
     const QwenQ8KBlock* input_q8_data=input_q8.data();
+    // Whole-batch int8 rows path (qwen_cpu_iq1s_vnni512.cpp): rows folded
+    // once to int8, dpbusd against unsigned-8 activations. Covers the
+    // UD-IQ1_S qwen4exp shape (IQ1_S gate/up, IQ4_NL down); the other
+    // formats keep the dequant-and-f32-GEMM path below. FLYWEIGHT_ROWS_Q8=0
+    // disables it for A/B.
+    static const char* rows_q8_setting=std::getenv("FLYWEIGHT_ROWS_Q8");
+    const bool rows_q8=(flyweight_cpu_features()&8u)!=0&&!direct_quant
+        &&gate_type==19&&up_type==19&&hidden%256==0
+        &&down_type==20&&intermediate%64==0
+        &&!(rows_q8_setting&&rows_q8_setting[0]=='0')
+        &&!(q8_setting&&q8_setting[0]=='0');
+    // Off by default: measured 10-20% slower than the f32 path on the
+    // 640-wide IQ4_NL down projection (the per-32 scale vectors on both
+    // sides cost a vector multiply per 64 values, and the f32 GEMM at -O3
+    // is already close to its own bound). FLYWEIGHT_ROWS_Q8_DOWN=1 enables.
+    static const char* rows_q8_down_setting=std::getenv("FLYWEIGHT_ROWS_Q8_DOWN");
+    const bool rows_q8_down=rows_q8&&
+        rows_q8_down_setting&&rows_q8_down_setting[0]=='1';
+    thread_local std::vector<std::uint8_t> tl_input_u8;
+    thread_local std::vector<float> tl_input_u8_scales;
+    thread_local std::vector<float> tl_input_u8_sums;
+    auto& input_u8=tl_input_u8;
+    auto& input_u8_scales=tl_input_u8_scales;
+    auto& input_u8_sums=tl_input_u8_sums;
+    if(rows_q8){
+        input_u8.resize(static_cast<std::size_t>(rows)*hidden);
+        input_u8_scales.resize(static_cast<std::size_t>(rows)*q8_blocks);
+        input_u8_sums.resize(static_cast<std::size_t>(rows)*q8_blocks*8);
+#pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+        for(int token=0;token<rows;++token)
+            qwen_quantize_u8_k256_vnni512(input+static_cast<std::size_t>(token)*hidden,hidden,
+                input_u8.data()+static_cast<std::size_t>(token)*hidden,
+                input_u8_scales.data()+static_cast<std::size_t>(token)*q8_blocks,
+                input_u8_sums.data()+static_cast<std::size_t>(token)*q8_blocks*8);
+    }
+    const std::uint8_t* input_u8_data=input_u8.data();
+    const float* input_u8_scale_data=input_u8_scales.data();
+    const float* input_u8_sum_data=input_u8_sums.data();
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*gate_blocks;++task){
         const int group=task/gate_blocks;const int row0=(task%gate_blocks)*kRowBlock;
@@ -6866,16 +6958,54 @@ void qwen_cpu_moe_rows(
             continue;
         }
         thread_local std::vector<float> gate_block,up_block,gate_values,up_values;
-        gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
         gate_values.resize(static_cast<std::size_t>(kRowBlock)*count);up_values.resize(static_cast<std::size_t>(kRowBlock)*count);
-        const std::uint64_t t_dq0=moe_profile?qwen_moe_now():0;
+        std::uint64_t t_dq0=0,t_gemm0=0;
+        if(rows_q8){
+            thread_local std::vector<std::int8_t> fold_gate,fold_up;
+            thread_local std::vector<float> fold_gate_scales,fold_up_scales;
+            thread_local std::vector<float> fold_gate_deltas,fold_up_deltas;
+            thread_local std::vector<std::int32_t> fold_gate_corr,fold_up_corr;
+            thread_local std::vector<const std::uint8_t*> act_ptrs;
+            thread_local std::vector<const float*> act_scale_ptrs,act_sum_ptrs;
+            fold_gate.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+            fold_up.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+            fold_gate_scales.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            fold_up_scales.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            fold_gate_deltas.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks*8);
+            fold_up_deltas.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks*8);
+            fold_gate_corr.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            fold_up_corr.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            act_ptrs.resize(count);act_scale_ptrs.resize(count);act_sum_ptrs.resize(count);
+            for(int occurrence=0;occurrence<count;++occurrence){
+                const std::size_t token=static_cast<std::size_t>(
+                    occurrences[begin+occurrence]/routed_count);
+                act_ptrs[occurrence]=input_u8_data+token*hidden;
+                act_scale_ptrs[occurrence]=input_u8_scale_data+token*q8_blocks;
+                act_sum_ptrs[occurrence]=input_u8_sum_data+token*q8_blocks*8;
+            }
+            t_dq0=moe_profile?qwen_moe_now():0;
+            qwen_iq1s_fold_rows_vnni512(gate_data,hidden,row0,mr,fold_gate.data(),
+                fold_gate_scales.data(),fold_gate_corr.data(),fold_gate_deltas.data());
+            qwen_iq1s_fold_rows_vnni512(up_data,hidden,row0,mr,fold_up.data(),
+                fold_up_scales.data(),fold_up_corr.data(),fold_up_deltas.data());
+            t_gemm0=moe_profile?qwen_moe_now():0;
+            qwen_u8_gemm_k256_vnni512(fold_gate.data(),fold_gate_scales.data(),
+                fold_gate_corr.data(),fold_gate_deltas.data(),mr,act_ptrs.data(),
+                act_scale_ptrs.data(),act_sum_ptrs.data(),count,hidden,gate_values.data());
+            qwen_u8_gemm_k256_vnni512(fold_up.data(),fold_up_scales.data(),
+                fold_up_corr.data(),fold_up_deltas.data(),mr,act_ptrs.data(),
+                act_scale_ptrs.data(),act_sum_ptrs.data(),count,hidden,up_values.data());
+        }else{
+        gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+        t_dq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i){
             qwen_dequant_row(gate_data,gate_type,hidden,row0+i,gate_block.data()+static_cast<std::size_t>(i)*hidden);
             qwen_dequant_row(up_data,up_type,hidden,row0+i,up_block.data()+static_cast<std::size_t>(i)*hidden);
         }
-        const std::uint64_t t_gemm0=moe_profile?qwen_moe_now():0;
+        t_gemm0=moe_profile?qwen_moe_now():0;
         qwen_f32_gemm_rows(gate_block.data(),mr,&vectors[begin],count,hidden,gate_values.data());
         qwen_f32_gemm_rows(up_block.data(),mr,&vectors[begin],count,hidden,up_values.data());
+        }
         const std::uint64_t t_act0=moe_profile?qwen_moe_now():0;
         if(moe_profile){g_cpu_moe_profile.gate_dequant+=t_gemm0-t_dq0;
             g_cpu_moe_profile.gate_gemm+=t_act0-t_gemm0;
@@ -6901,6 +7031,32 @@ void qwen_cpu_moe_rows(
             qwen_imatrix_note_expert(runtime,layer.expert_tensors[2],expert,
                                      &activated_vectors[offsets[expert]],
                                      counts[expert],intermediate);
+    // Down-projection activations for the int8 path: one unsigned-8 row and
+    // its per-32 scale vectors per routed slot, quantized once here.
+    thread_local std::vector<std::uint8_t> tl_activated_u8;
+    thread_local std::vector<float> tl_activated_u8_scales;
+    thread_local std::vector<const std::uint8_t*> tl_activated_u8_vectors;
+    thread_local std::vector<const float*> tl_activated_u8_scale_vectors;
+    auto& activated_u8=tl_activated_u8;
+    auto& activated_u8_scales=tl_activated_u8_scales;
+    auto& activated_u8_vectors=tl_activated_u8_vectors;
+    auto& activated_u8_scale_vectors=tl_activated_u8_scale_vectors;
+    const int down_pair_floats=(intermediate/64)*16;
+    if(rows_q8_down){
+        const int used=offsets[experts];
+        activated_u8.resize(static_cast<std::size_t>(used)*intermediate);
+        activated_u8_scales.resize(static_cast<std::size_t>(used)*down_pair_floats);
+        activated_u8_vectors.resize(used);
+        activated_u8_scale_vectors.resize(used);
+#pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+        for(int slot=0;slot<used;++slot){
+            auto*values=activated_u8.data()+static_cast<std::size_t>(slot)*intermediate;
+            auto*scales=activated_u8_scales.data()+static_cast<std::size_t>(slot)*down_pair_floats;
+            qwen_quantize_u8_k32_vnni512(activated_vectors[slot],intermediate,values,scales);
+            activated_u8_vectors[slot]=values;
+            activated_u8_scale_vectors[slot]=scales;
+        }
+    }
     const int down_blocks=(hidden+kRowBlock-1)/kRowBlock;
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*down_blocks;++task){
@@ -6941,11 +7097,29 @@ void qwen_cpu_moe_rows(
             continue;
         }
         thread_local std::vector<float> down_block,values;
-        down_block.resize(static_cast<std::size_t>(kRowBlock)*intermediate);values.resize(static_cast<std::size_t>(kRowBlock)*count);
-        const std::uint64_t t_ddq0=moe_profile?qwen_moe_now():0;
+        values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        std::uint64_t t_ddq0=0,t_dgemm0=0;
+        if(rows_q8_down){
+            thread_local std::vector<std::int8_t> fold_down;
+            thread_local std::vector<float> fold_down_scales;
+            thread_local std::vector<std::int32_t> fold_down_init;
+            fold_down.resize(static_cast<std::size_t>(kRowBlock)*intermediate);
+            fold_down_scales.resize(static_cast<std::size_t>(kRowBlock)*down_pair_floats);
+            fold_down_init.resize(static_cast<std::size_t>(kRowBlock)*down_pair_floats);
+            t_ddq0=moe_profile?qwen_moe_now():0;
+            qwen_iq4nl_fold_rows_vnni512(down_data,intermediate,row0,mr,fold_down.data(),
+                fold_down_scales.data(),fold_down_init.data());
+            t_dgemm0=moe_profile?qwen_moe_now():0;
+            qwen_u8_gemm_k32_vnni512(fold_down.data(),fold_down_scales.data(),
+                fold_down_init.data(),mr,&activated_u8_vectors[begin],
+                &activated_u8_scale_vectors[begin],count,intermediate,values.data());
+        }else{
+        down_block.resize(static_cast<std::size_t>(kRowBlock)*intermediate);
+        t_ddq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i)qwen_dequant_row(down_data,down_type,intermediate,row0+i,down_block.data()+static_cast<std::size_t>(i)*intermediate);
-        const std::uint64_t t_dgemm0=moe_profile?qwen_moe_now():0;
+        t_dgemm0=moe_profile?qwen_moe_now():0;
         qwen_f32_gemm_rows(down_block.data(),mr,&activated_vectors[begin],count,intermediate,values.data());
+        }
         const std::uint64_t t_dst0=moe_profile?qwen_moe_now():0;
         if(moe_profile){g_cpu_moe_profile.down_dequant+=t_dgemm0-t_ddq0;
             g_cpu_moe_profile.down_gemm+=t_dst0-t_dgemm0;
@@ -14686,6 +14860,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         release_qwen_device(*runtime);
         throw std::runtime_error("failed to create native Qwen pipeline route event");
     }
+    for(auto&span_events:runtime->stream_mirror_events)
+        for(auto&event:span_events)
+            if(flyweight_gpu_event_create(&event)!=0){
+                release_qwen_device(*runtime);
+                throw std::runtime_error("failed to create native Qwen stream mirror event");
+            }
     if(runtime->prefill_profile&&(
        flyweight_gpu_timed_event_create(&runtime->prefill_layer_start_event)!=0||
        flyweight_gpu_timed_event_create(&runtime->prefill_core_end_event)!=0||
@@ -15721,7 +15901,17 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                std::getenv("FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"))
             stream_request=std::strtoll(stream_setting,nullptr,10);
         bool stream_auto=stream_request<0;
-        if(stream_auto)stream_request=48;
+        // Auto: 48 MiB where the per-expert GEMM runs (its restaging cost
+        // grows with the budget), 256 MiB where the routed block-table MMQ
+        // will take the streamed share (measured optimum on qwen4exp
+        // UD-IQ1_S and the 35B Q6_K alike; 512 and above lose to uploads).
+        if(stream_auto){
+            const char*routed_env=std::getenv("FLYWEIGHT_ROUTED_MOE");
+            const bool routed_requested=routed_env
+                ?routed_env[0]=='1':runtime->options.routed_moe!=0;
+            stream_request=routed_requested&&qwen_routed_mmq_available(*runtime)
+                ?256:48;
+        }
         if(stream_request>0&&runtime->model->config.expert_count&&
            !flyweight_backend_is_cpu()&&
            qwen_expert_policy(*runtime,
@@ -16095,6 +16285,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
            flyweight_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
            (runtime->expert_staging_bytes&&flyweight_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0)||
            (runtime->prefill_stream_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_bytes,&runtime->prefill_stream_arena)!=0)||
+           (runtime->prefill_stream_bytes&&flyweight_gpu_host_alloc(
+               runtime->prefill_stream_bytes*FlyweightV2QwenRuntime::kStreamMirrorSlots,
+               &runtime->prefill_stream_mirror)!=0)||
            (runtime->prefill_stream_scratch_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
            (runtime->host_staging_bytes&&flyweight_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
         // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
@@ -22718,10 +22911,30 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         if(interval<prompt_count)plan.targets.push_back(interval);
         const std::uint64_t spacing=std::max<std::uint64_t>(
             interval,prompt_count/std::max<std::size_t>(mid_slots,std::size_t{1}));
+        // The spread targets snap to the chunk boundaries the pin implies
+        // (interval + k * prefill_rows) rather than splitting chunks: a
+        // target inside a chunk shortens it, and on the MoE sweep every
+        // routed expert is decoded once per pipeline half, so 682-token
+        // chunks cost ~11% of a 2048-token prefill against 1024-token ones.
+        // Only prompts at least two chunks long snap; shorter ones keep the
+        // dense uniform spread (their chunks are short whatever the plan).
+        const std::uint64_t grid=
+            runtime->prefill_rows>1&&prompt_count>=2ull*runtime->prefill_rows
+                ?runtime->prefill_rows:1;
+        auto snap=[&](std::uint64_t pos){
+            if(pos<=interval||grid==1)return pos;
+            const std::uint64_t beyond=pos-interval;
+            const std::uint64_t down=beyond/grid*grid;
+            const std::uint64_t up=down+grid;
+            return interval+(beyond-down<up-beyond?down:up);
+        };
         for(std::uint64_t pos=spacing;
-            pos<prompt_count&&plan.targets.size()<mid_slots;pos+=spacing)
-            if(plan.targets.empty()||pos>plan.targets.back())
-                plan.targets.push_back(pos);
+            pos<prompt_count&&plan.targets.size()<mid_slots;pos+=spacing){
+            const std::uint64_t snapped=snap(pos);
+            if(snapped<prompt_count&&
+               (plan.targets.empty()||snapped>plan.targets.back()))
+                plan.targets.push_back(snapped);
+        }
     }
     plan.next_target=0;
     while(plan.next_target<plan.targets.size()&&plan.targets[plan.next_target]<=prompt_start)++plan.next_target;

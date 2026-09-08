@@ -2275,7 +2275,7 @@ class V2Model:
         expert_residency: str | None = None,
         dense_requant: str = "auto",
         prefill_expert_stream_mib: int = -1,
-        routed_moe: bool = False,
+        routed_moe: bool | None = None,
         scratch_context: int = 0,
         context_explicit: bool = False,
     ) -> "V2QwenRuntime":
@@ -2708,7 +2708,7 @@ class V2QwenRuntime:
         expert_residency: str | None = None,
         dense_requant: str = "auto",
         prefill_expert_stream_mib: int = -1,
-        routed_moe: bool = False,
+        routed_moe: bool | None = None,
         scratch_context: int = 0,
         # The caller chose context_limit: the runtime must not shrink it to
         # fit the card. A dense model spills more feed-forward to the host
@@ -2752,10 +2752,6 @@ class V2QwenRuntime:
             "legacy-hybrid",
             "legacy-paging",
         }
-        # Captured before the default below overwrites it: routed_moe must be
-        # able to tell "the caller asked for off" from "a legacy policy chose
-        # off for them", and only refuse the first.
-        prefill_cache_seed_requested = prefill_cache_seed is not None
         if prefill_cache_seed is None:
             prefill_cache_seed = "off" if legacy_policy else "auto"
         if expert_residency is None:
@@ -2808,6 +2804,12 @@ class V2QwenRuntime:
         # unset, and refuses outright where the caller asked for the opposite.
         # `None` is what makes that distinction expressible, which is why the
         # defaulting lives here and not in the native prepare.
+        # None is auto: the native side turns the routed kernels on wherever
+        # every expert role has one, and sizes the stream arena to match.
+        # An explicit True keeps the old contract of supplying what it needs
+        # and refusing the incompatible; the streaming path no longer needs
+        # DMA registration (it packs through a pinned mirror), so direct
+        # paging and a cache seed are no longer among the prerequisites.
         if routed_moe:
             if hybrid_prefill == "split":
                 raise ValueError(
@@ -2818,27 +2820,11 @@ class V2QwenRuntime:
                 )
             if hybrid_prefill is None:
                 effective_hybrid_prefill = "cpu"
-            if expert_paging == "staged":
-                raise ValueError(
-                    "routed_moe needs expert_paging='direct': staging copies "
-                    "leave dma_paging off, and the streaming path requires it"
-                )
-            expert_paging = "direct"
-            if prefill_cache_seed_requested and prefill_cache_seed == "off":
-                raise ValueError(
-                    "routed_moe needs a prefill cache seed: direct paging only "
-                    "registers expert tensors when routed GPU execution is "
-                    "allowed, which seeding is what turns on"
-                )
-            if prefill_cache_seed == "off":
-                prefill_cache_seed_count, prefill_cache_seed_auto = (
-                    _normalize_prefill_cache_seed("auto")
-                )
-            # -1 is "auto", which resolves to the 48 MiB tuned for the old
-            # per-expert path. The routed kernels measured best at 512 MiB
-            # (246 tok/s against 217 at 1024 and 209 at 2048).
+            # -1 is "auto", which the native side resolves to 256 MiB for the
+            # routed kernels (measured optimum on qwen4exp UD-IQ1_S and the
+            # 35B Q6_K; 512 and above lose to uploads) and 48 MiB otherwise.
             if prefill_expert_stream_mib < 0:
-                prefill_expert_stream_mib = 512
+                prefill_expert_stream_mib = 256
         effective_expert_residency = expert_residency
         if mtp_drafts < 0 or mtp_drafts > 8:
             raise ValueError("mtp_drafts must be between 0 and 8")
@@ -2888,7 +2874,7 @@ class V2QwenRuntime:
             int(strict_resident),
             {"auto": 0, "q8": 1, "off": 2}[dense_requant],
             prefill_expert_stream_mib,
-            int(routed_moe),
+            2 if routed_moe is None else int(bool(routed_moe)),
             scratch_context,
             int(context_explicit),
         )

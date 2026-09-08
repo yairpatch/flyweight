@@ -213,6 +213,32 @@ void qwen_iq1s_dequant_row_vnni512(
     float* output
 );
 
+// Batched rows x tokens int8 path for the prefill expert sweep (AVX512-VNNI).
+// Rows are folded once to int8 (IQ1_S: group scale and delta folded, per-256
+// float scale and a 128*sum correction; IQ4_NL: per-32 float scales and the
+// correction as a 16-lane accumulator seed per 64 values), activations are
+// unsigned-8 (q+128) with per-256 or per-32 scales, and each (row, token)
+// dot is dpbusd over the folded bytes. out is rows x count, row-major.
+void qwen_iq1s_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int8_t* weights, float* scales, std::int32_t* corrections, float* deltas);
+void qwen_iq4nl_fold_rows_vnni512(
+    const std::uint8_t* packed, int elements, std::uint64_t row0, int rows,
+    std::int8_t* weights, float* pair_scales, std::int32_t* pair_init);
+void qwen_quantize_u8_k256_vnni512(
+    const float* input, int elements, std::uint8_t* output, float* scales, float* group_sums);
+void qwen_quantize_u8_k32_vnni512(
+    const float* input, int elements, std::uint8_t* output, float* pair_scales);
+void qwen_u8_gemm_k256_vnni512(
+    const std::int8_t* weights, const float* scales, const std::int32_t* corrections,
+    const float* deltas, int rows, const std::uint8_t* const* activations,
+    const float* const* activation_scales, const float* const* activation_sums, int count,
+    int elements, float* out);
+void qwen_u8_gemm_k32_vnni512(
+    const std::int8_t* weights, const float* pair_scales, const std::int32_t* pair_init, int rows,
+    const std::uint8_t* const* activations, const float* const* activation_pair_scales, int count,
+    int elements, float* out);
+
 void qwen_quantize_q8_k_avx2(
     const float* input,
     int elements,
@@ -250,6 +276,13 @@ void qwen_dequant_row_avx512(
     std::uint64_t row,
     float* output
 );
+
+// Copy with non-temporal stores: the destination is a pinned staging mirror
+// the CPU never reads back, so skipping the read-for-ownership and the cache
+// fill turns a 3x-traffic memcpy into 2x. Both pointers must be 64-byte
+// aligned and bytes a multiple of 64; the caller falls back to memcpy
+// otherwise. Ends with a store fence so the DMA issued after it sees the data.
+void qwen_stream_copy_avx512(void* destination, const void* source, std::uint64_t bytes);
 
 void qwen_dequant_row_avx2(
     const std::uint8_t* packed,

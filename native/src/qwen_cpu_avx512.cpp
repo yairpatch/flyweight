@@ -1501,3 +1501,22 @@ void qwen_f32_gemm_rows_avx512(
             elements, out + static_cast<std::size_t>(i) * count
         );
 }
+
+void qwen_stream_copy_avx512(void* destination, const void* source, std::uint64_t bytes) {
+    auto* out = static_cast<char*>(destination);
+    const auto* in = static_cast<const char*>(source);
+    std::uint64_t at = 0;
+    for (; at + 256 <= bytes; at += 256) {
+        const __m512i a = _mm512_loadu_si512(in + at);
+        const __m512i b = _mm512_loadu_si512(in + at + 64);
+        const __m512i c = _mm512_loadu_si512(in + at + 128);
+        const __m512i d = _mm512_loadu_si512(in + at + 192);
+        _mm512_stream_si512(reinterpret_cast<__m512i*>(out + at), a);
+        _mm512_stream_si512(reinterpret_cast<__m512i*>(out + at + 64), b);
+        _mm512_stream_si512(reinterpret_cast<__m512i*>(out + at + 128), c);
+        _mm512_stream_si512(reinterpret_cast<__m512i*>(out + at + 192), d);
+    }
+    for (; at + 64 <= bytes; at += 64)
+        _mm512_stream_si512(reinterpret_cast<__m512i*>(out + at), _mm512_loadu_si512(in + at));
+    _mm_sfence();
+}

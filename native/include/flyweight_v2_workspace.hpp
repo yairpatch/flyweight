@@ -213,7 +213,10 @@ struct QwenRowsWorkspaceLayout {
 
 constexpr std::uint64_t kDeltaChunk = 64;
 constexpr std::uint64_t kDeltaDim = 128;
-constexpr std::uint64_t kDeltaChunkedMinimumRows = 1024;
+// Rows below which the sequential recurrence is used instead of the WY
+// chunked form. 512 so the two-half prefill pipeline's halves of a 1024-row
+// chunk take the chunked path (token-identical; measured +3% on qwen4exp).
+constexpr std::uint64_t kDeltaChunkedMinimumRows = 512;
 
 constexpr bool use_chunked_delta(
     std::uint64_t rows, std::uint64_t head_dim,

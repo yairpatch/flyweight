@@ -23,6 +23,13 @@ __device__ __forceinline__ float block_reduce_sum(float value) {
     if (lane == 0) warp_sums[warp] = value;
     __syncthreads();
     value = (int)threadIdx.x < warps ? warp_sums[lane] : 0.0f;
+    // Every thread has read warp_sums before anyone can enter the next call
+    // and overwrite it. Without this, back-to-back reductions in one block
+    // (the *_matmul_rows four-token tile, for one) let a fast warp publish
+    // its next partial while warp 0 was still reading the current ones:
+    // run-to-run drift in the last bits, seen as greedy-token flips on
+    // qwen4exp's IQ3_S per-expert prefill path.
+    __syncthreads();
     if (warp == 0) {
         for (int offset = 16; offset > 0; offset >>= 1) {
             value += __shfl_down_sync(0xffffffff, value, offset);
