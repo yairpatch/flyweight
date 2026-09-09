@@ -16043,14 +16043,36 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         if(stream_auto&&gpu_budget&&base_total_resolved>gpu_budget&&
            base_total_resolved-runtime->prefill_stream_bytes-
                runtime->prefill_stream_scratch_bytes<=gpu_budget){
-            base_total_resolved-=runtime->prefill_stream_bytes+
-                runtime->prefill_stream_scratch_bytes;
-            runtime->prefill_stream_bytes=0;
-            runtime->prefill_stream_scratch_bytes=0;
-            runtime->prefill_stream_scratch_span=0;
-            std::fprintf(stderr,
-                "[flyweight] prefill expert streaming disabled: the GPU "
-                "budget cannot carry the arena\n");
+            // Step down before giving up: a 128K context window leaves a
+            // budget that cannot carry 256 MiB but can carry 128 or 64, and
+            // on the MoE sweep a smaller streamed share still beats none
+            // (the expert cache such a window leaves is too small to matter
+            // for decode). The scratch is sized by rows, not budget, so it
+            // stays; only the arena shrinks.
+            const std::uint64_t excess=base_total_resolved-gpu_budget;
+            std::uint64_t kept=0;
+            for(const std::uint64_t candidate:{128ull,64ull,48ull}){
+                const std::uint64_t bytes=candidate*1024ull*1024;
+                if(bytes<runtime->prefill_stream_bytes&&
+                   runtime->prefill_stream_bytes-bytes>=excess){kept=bytes;break;}
+            }
+            if(kept){
+                base_total_resolved-=runtime->prefill_stream_bytes-kept;
+                runtime->prefill_stream_bytes=kept;
+                std::fprintf(stderr,
+                    "[flyweight] prefill expert streaming arena reduced to %llu MiB: "
+                    "the GPU budget cannot carry the auto size\n",
+                    (unsigned long long)(kept/(1024*1024)));
+            }else{
+                base_total_resolved-=runtime->prefill_stream_bytes+
+                    runtime->prefill_stream_scratch_bytes;
+                runtime->prefill_stream_bytes=0;
+                runtime->prefill_stream_scratch_bytes=0;
+                runtime->prefill_stream_scratch_span=0;
+                std::fprintf(stderr,
+                    "[flyweight] prefill expert streaming disabled: the GPU "
+                    "budget cannot carry the arena\n");
+            }
         }
         // Auto-fit was exempt from this, on the theory that it yields rather
         // than fails. It does yield -- but only for the expert cache and the
