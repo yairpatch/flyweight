@@ -4,8 +4,8 @@
 outright on the grounds that no released GGUF carried one. That was true of
 UD-IQ1_S (block_count 48, zero nextn tensors) and false of UD-Q4_K_XL
 (block_count 49, the block in shard 5) and of the standalone
-Qwen3.8-Flash-Next-MTP GGUF. These tests pin the loading half of the fix; the
-draft forward is still unimplemented and is expected to say so.
+Qwen3.8-Flash-Next-MTP GGUF. These tests pin the loading half of the fix and the
+decode half: drafting on vs off must be token-identical, greedy and sampled.
 
 CPU backend, synthetic fixture, no real checkpoint needed.
 """
@@ -202,6 +202,69 @@ class Qwen4ExpMtpSidecarTest(unittest.TestCase):
                 drafted, info = self._generate(drafts, sidecar=True)
                 self.assertEqual(base, drafted)
                 self.assertGreater(int(info["mtp_draft_tokens"]), 0)
+
+
+class Qwen4ExpSampledMtpTest(unittest.TestCase):
+    """A rejected round on qwen4exp takes the full-replay rollback (the PLE
+    ring keeps the fold off). The replay used to write its own argmaxes over
+    the tokens the sampler had chosen, so a penalized or sampled task came out
+    as the bare greedy stream exactly where the sampler had overruled the
+    draft. qwen35 never showed it: the fold path leaves the choices alone."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = tempfile.TemporaryDirectory()
+        cls.path = Path(cls._directory.name) / "qwen4exp-mtp.gguf"
+        build_qwen4exp_gguf(cls.path, mtp=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    def _engine_tokens(self, drafts: int, **sampling) -> tuple[list[int], dict]:
+        with mock.patch.dict(os.environ, {"FLYWEIGHT_MTP_ADAPTIVE": "0"}):
+            V2Model.select_backend("cpu")
+            try:
+                with V2Model(str(self.path)) as model:
+                    with model.native_qwen_runtime(
+                        context_limit=256, mtp_drafts=drafts
+                    ) as runtime:
+                        runtime.prepare()
+                        task_id = runtime.task_submit(PROMPT, GENERATED, **sampling)
+                        tokens: list[int] = []
+                        for _ in range(4096):
+                            for event_task, token, kind in runtime.engine_step():
+                                if event_task != task_id:
+                                    continue
+                                if kind == 0:
+                                    tokens.append(token)
+                                elif kind == 1:
+                                    return tokens, runtime.info
+                                elif kind == 2:
+                                    raise AssertionError(
+                                        "engine task failed: " + runtime.task_error(task_id)
+                                    )
+            finally:
+                V2Model.select_backend("auto")
+        raise AssertionError("engine task did not finish")
+
+    def test_penalized_task_matches_after_replay_rollback(self) -> None:
+        # A heavy penalty so that the random fixture's stream really is steered
+        # away from its argmaxes over a 24-token run (1.1 leaves it unchanged).
+        sampling = dict(repetition_penalty=1.8, penalty_window=64, forbid_tool_calls=True)
+        plain, _ = self._engine_tokens(0, **sampling)
+        drafted, info = self._engine_tokens(2, **sampling)
+        self.assertGreater(int(info["mtp_rejected_tokens"]), 0)
+        self.assertEqual(drafted, plain)
+        bare, _ = self._engine_tokens(0, forbid_tool_calls=True)
+        self.assertNotEqual(plain, bare)
+
+    def test_sampled_task_matches_seed_for_seed(self) -> None:
+        sampling = dict(temperature=0.8, top_k=20, top_p=0.95, seed=1234, forbid_tool_calls=True)
+        plain, _ = self._engine_tokens(0, **sampling)
+        drafted, info = self._engine_tokens(2, **sampling)
+        self.assertGreater(int(info["mtp_rejected_tokens"]), 0)
+        self.assertEqual(drafted, plain)
 
 
 if __name__ == "__main__":

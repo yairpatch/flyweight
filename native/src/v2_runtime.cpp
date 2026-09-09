@@ -23805,7 +23805,15 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         qwen_snapshot_delta_state(runtime,true);
         std::uint64_t replay_hidden=0;
         const auto replay_started=std::chrono::steady_clock::now();
-        qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(valid),verified.data(),&replay_hidden);
+        // The replay's own argmaxes go to scratch: `verified` holds what the
+        // sampler chose for each row, and a sampled task's rejected row IS a
+        // sampler choice (the penalty or the temperature draw overruled the
+        // draft). Writing the replay over it re-emitted the greedy token on
+        // every checkpoint that takes this path (qwen4exp, whose PLE ring
+        // keeps the fold off) -- the round's output stopped matching the
+        // one-token path exactly where the sampler had made a difference.
+        std::array<uint32_t,9>replayed{};
+        qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(valid),replayed.data(),&replay_hidden);
         qwen_mtp_commit_true_cache(
             runtime,base_cache_tokens,inputs.data(),valid,replay_hidden);
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);
