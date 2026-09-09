@@ -128,6 +128,12 @@ struct CudaApi {
     // driver at least as new as the toolkit that wrote it.
     nvrtcResult (*nvrtcGetCUBINSize)(nvrtcProgram, size_t*) = nullptr;
     nvrtcResult (*nvrtcGetCUBIN)(nvrtcProgram, char*) = nullptr;
+    // Optional (CUDA 11.2+): which architectures this NVRTC can target. A
+    // toolkit older than the GPU (a 12.6 NVRTC on a Blackwell card) knows
+    // neither sm_120 nor compute_120 and rejects both as an invalid option.
+    nvrtcResult (*nvrtcGetNumSupportedArchs)(int*) = nullptr;
+    nvrtcResult (*nvrtcGetSupportedArchs)(int*) = nullptr;
+    nvrtcResult (*nvrtcVersion)(int*, int*) = nullptr;
     nvrtcResult (*nvrtcGetProgramLogSize)(nvrtcProgram, size_t*) = nullptr;
     nvrtcResult (*nvrtcGetProgramLog)(nvrtcProgram, char*) = nullptr;
     nvrtcResult (*nvrtcDestroyProgram)(nvrtcProgram*) = nullptr;
@@ -459,6 +465,9 @@ bool load_apis() {
     load_symbol(nvrtc, "nvrtcGetErrorString", g_api.nvrtcGetErrorString);
     load_symbol(nvrtc, "nvrtcGetCUBINSize", g_api.nvrtcGetCUBINSize);
     load_symbol(nvrtc, "nvrtcGetCUBIN", g_api.nvrtcGetCUBIN);
+    load_symbol(nvrtc, "nvrtcGetNumSupportedArchs", g_api.nvrtcGetNumSupportedArchs);
+    load_symbol(nvrtc, "nvrtcGetSupportedArchs", g_api.nvrtcGetSupportedArchs);
+    load_symbol(nvrtc, "nvrtcVersion", g_api.nvrtcVersion);
     g_api.loaded = ok;
     return ok;
 }
@@ -945,13 +954,46 @@ extern "C" int flyweight_gpu_compile(
     // is the everyday case. The cubin only needs the same CUDA major, and it
     // skips the JIT at startup besides. FLYWEIGHT_NVRTC_PTX=1 keeps the PTX
     // route for comparison.
-    const bool want_cubin = g_api.nvrtcGetCUBINSize != nullptr
+    //
+    // When NVRTC predates the GPU it cannot target the device at all. PTX is
+    // forward compatible, so the newest architecture NVRTC does know is
+    // compiled as PTX and the (newer) driver JITs it for the real device; a
+    // cubin for another architecture would not run there.
+    const int device_arch = major * 10 + minor;
+    int target_arch = device_arch;
+    std::string arch_note;
+    if (g_api.nvrtcGetNumSupportedArchs != nullptr && g_api.nvrtcGetSupportedArchs != nullptr) {
+        int count = 0;
+        if (g_api.nvrtcGetNumSupportedArchs(&count) == 0 && count > 0) {
+            std::vector<int> supported(static_cast<size_t>(count), 0);
+            if (g_api.nvrtcGetSupportedArchs(supported.data()) == 0) {
+                bool exact = false;
+                int best = 0;
+                for (const int candidate : supported) {
+                    if (candidate == device_arch) exact = true;
+                    if (candidate <= device_arch && candidate > best) best = candidate;
+                }
+                if (!exact && best > 0) {
+                    target_arch = best;
+                    int nvrtc_major = 0;
+                    int nvrtc_minor = 0;
+                    if (g_api.nvrtcVersion) g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor);
+                    arch_note = "NVRTC " + std::to_string(nvrtc_major) + "."
+                        + std::to_string(nvrtc_minor) + " does not know sm_"
+                        + std::to_string(device_arch) + "; compiling PTX for compute_"
+                        + std::to_string(best) + " for the driver to JIT";
+                }
+            }
+        }
+    }
+    const bool want_cubin = target_arch == device_arch
+        && g_api.nvrtcGetCUBINSize != nullptr
         && g_api.nvrtcGetCUBIN != nullptr
         && std::getenv("FLYWEIGHT_NVRTC_PTX") == nullptr;
     char arch[64];
     std::snprintf(
-        arch, sizeof(arch), "--gpu-architecture=%s_%d%d",
-        want_cubin ? "sm" : "compute", major, minor
+        arch, sizeof(arch), "--gpu-architecture=%s_%d",
+        want_cubin ? "sm" : "compute", target_arch
     );
     std::vector<const char*> all_options;
     all_options.push_back(arch);
@@ -1067,6 +1109,7 @@ extern "C" int flyweight_gpu_compile(
                 }
             }
         }
+        if (!arch_note.empty()) append_log(arch_note);
         if (compiled != 0) {
             // A log of warnings alone is the common shape of this failure:
             // the front end ran, then NVRTC could not finish -- on Windows,
