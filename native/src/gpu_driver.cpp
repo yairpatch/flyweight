@@ -65,6 +65,8 @@ struct CublasLtHeuristicResult {
 
 struct CudaApi {
     CUresult (*cuInit)(unsigned int) = nullptr;
+    // Optional: the driver's CUDA version, to decide PTX versus cubin.
+    CUresult (*cuDriverGetVersion)(int*) = nullptr;
     // Optional: names a driver result in the compile log (a PTX the driver
     // is too old to load is the common one).
     CUresult (*cuGetErrorName)(CUresult, const char**) = nullptr;
@@ -408,6 +410,7 @@ bool load_apis() {
     }
     bool ok = true;
     ok &= load_symbol(cuda, "cuInit", g_api.cuInit);
+    load_symbol(cuda, "cuDriverGetVersion", g_api.cuDriverGetVersion);
     load_symbol(cuda, "cuGetErrorName", g_api.cuGetErrorName);
     ok &= load_symbol(
         cuda, "cuDevicePrimaryCtxRetain", g_api.cuDevicePrimaryCtxRetain
@@ -947,13 +950,16 @@ extern "C" int flyweight_gpu_compile(
                           device);
         return -1;
     }
-    // sm_XY asks NVRTC for SASS (a cubin) for this exact device; compute_XY
-    // yields PTX that the driver's own JIT must accept, which fails with
-    // CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222) whenever the toolkit's NVRTC is
-    // newer than the driver -- a fresh toolkit on a laptop with a stock driver
-    // is the everyday case. The cubin only needs the same CUDA major, and it
-    // skips the JIT at startup besides. FLYWEIGHT_NVRTC_PTX=1 keeps the PTX
-    // route for comparison.
+    // compute_XY yields PTX that the driver's own JIT must accept, which
+    // fails with CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222) whenever the
+    // toolkit's NVRTC is newer than the driver -- a fresh toolkit on a laptop
+    // with a stock driver is the everyday case. sm_XY asks NVRTC for SASS (a
+    // cubin) for this exact device instead, which only needs the same CUDA
+    // major. PTX stays the default wherever the driver can take it: the
+    // driver caches its JIT output on disk, so a model reopens in a couple of
+    // seconds, whereas NVRTC assembles a cubin from scratch on every open
+    // (about 12 s more on a 5070 Ti). FLYWEIGHT_NVRTC_CUBIN=1 forces the
+    // cubin and FLYWEIGHT_NVRTC_PTX=1 forces PTX, for comparison.
     //
     // When NVRTC predates the GPU it cannot target the device at all. PTX is
     // forward compatible, so the newest architecture NVRTC does know is
@@ -986,10 +992,24 @@ extern "C" int flyweight_gpu_compile(
             }
         }
     }
+    bool driver_older_than_nvrtc = false;
+    {
+        int driver_version = 0;
+        int nvrtc_major = 0;
+        int nvrtc_minor = 0;
+        if (g_api.cuDriverGetVersion && g_api.nvrtcVersion
+            && g_api.cuDriverGetVersion(&driver_version) == 0
+            && g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor) == 0) {
+            driver_older_than_nvrtc =
+                driver_version < nvrtc_major * 1000 + nvrtc_minor * 10;
+        }
+    }
     const bool want_cubin = target_arch == device_arch
         && g_api.nvrtcGetCUBINSize != nullptr
         && g_api.nvrtcGetCUBIN != nullptr
-        && std::getenv("FLYWEIGHT_NVRTC_PTX") == nullptr;
+        && std::getenv("FLYWEIGHT_NVRTC_PTX") == nullptr
+        && (driver_older_than_nvrtc
+            || std::getenv("FLYWEIGHT_NVRTC_CUBIN") != nullptr);
     char arch[64];
     std::snprintf(
         arch, sizeof(arch), "--gpu-architecture=%s_%d",
