@@ -52,22 +52,34 @@ float half_value(const std::uint8_t* pointer) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
 }
 
+// Lane tables live as plain integer arrays in memory (lane 0 first) and are
+// loaded inside the kernels. A namespace-scope __m512i built with
+// _mm512_set_* is not a constant expression to either compiler: both emit a
+// dynamic initializer that copies it with zmm moves, and that initializer runs
+// when the library loads -- before any CPU check -- so a machine without
+// AVX-512 (every Intel consumer part since Alder Lake) faulted at dlopen /
+// DllMain with an illegal instruction.
+//
 // Lane i of the 32 index lanes is group i/4, octet i%4: its qh halfword and
 // the shift that brings that octet's three high bits down.
-const __m512i kGroupOfLane = _mm512_set_epi16(
-    7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4,
-    3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
-const __m512i kOctetShift = _mm512_set_epi16(
-    9, 6, 3, 0, 9, 6, 3, 0, 9, 6, 3, 0, 9, 6, 3, 0,
-    9, 6, 3, 0, 9, 6, 3, 0, 9, 6, 3, 0, 9, 6, 3, 0);
+alignas(64) constexpr std::int16_t kGroupOfLane[32] = {
+    0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+    4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7};
+alignas(64) constexpr std::int16_t kOctetShift[32] = {
+    0, 3, 6, 9, 0, 3, 6, 9, 0, 3, 6, 9, 0, 3, 6, 9,
+    0, 3, 6, 9, 0, 3, 6, 9, 0, 3, 6, 9, 0, 3, 6, 9};
 // dpbusd over 64 activations yields 16 dwords: the first eight belong to the
 // even group of the pair, the rest to the odd one.
-const __m512i kScaleLanes[4] = {
-    _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0),
-    _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2),
-    _mm512_set_epi32(5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4),
-    _mm512_set_epi32(7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6),
+alignas(64) constexpr std::int32_t kScaleLanes[4][16] = {
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1},
+    {2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3},
+    {4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5},
+    {6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7},
 };
+
+inline __m512i scale_lane_select(int pair) {
+    return _mm512_load_si512(static_cast<const void*>(kScaleLanes[pair]));
+}
 
 // The 32 grid indices of one super-block, as four vectors of eight dwords in
 // octet order, ready for the gathers.
@@ -75,10 +87,12 @@ inline void iq1s_block_indices(const std::uint8_t* base, __m256i octets[4], __m1
     const __m512i qs = _mm512_cvtepu8_epi16(
         _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 2)));
     qh = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 34));
+    const __m512i group_of_lane = _mm512_load_si512(static_cast<const void*>(kGroupOfLane));
+    const __m512i octet_shift = _mm512_load_si512(static_cast<const void*>(kOctetShift));
     const __m512i qh_by_lane =
-        _mm512_permutexvar_epi16(kGroupOfLane, _mm512_castsi128_si512(qh));
+        _mm512_permutexvar_epi16(group_of_lane, _mm512_castsi128_si512(qh));
     const __m512i high = _mm512_slli_epi16(
-        _mm512_and_si512(_mm512_srlv_epi16(qh_by_lane, kOctetShift), _mm512_set1_epi16(7)), 8);
+        _mm512_and_si512(_mm512_srlv_epi16(qh_by_lane, octet_shift), _mm512_set1_epi16(7)), 8);
     const __m512i index = _mm512_or_si512(qs, high);
     const __m512i index_low = _mm512_cvtepu16_epi32(_mm512_castsi512_si256(index));
     const __m512i index_high =
@@ -180,7 +194,7 @@ float qwen_iq1s_dot_q8_k_vnni512(
             const __m512i dots = _mm512_dpbusd_epi32(_mm512_setzero_si512(), lifted, activation);
             accumulator = _mm512_add_epi32(
                 accumulator,
-                _mm512_mullo_epi32(dots, _mm512_permutexvar_epi32(kScaleLanes[pair], scales512)));
+                _mm512_mullo_epi32(dots, _mm512_permutexvar_epi32(scale_lane_select(pair), scales512)));
         }
         // The lift and the delta both ride the group's activation sum:
         // sum((w + 1) x) - sum(x) + delta * sum(x) = sum(w x) + delta * sum(x).
@@ -254,7 +268,7 @@ float qwen_iq3s_dot_q8_k_vnni512(
             const __m512i dots = _mm512_dpbusd_epi32(zero, magnitudes, signed_activation);
             accumulator = _mm512_add_epi32(
                 accumulator,
-                _mm512_mullo_epi32(dots, _mm512_permutexvar_epi32(kScaleLanes[gather], scales512)));
+                _mm512_mullo_epi32(dots, _mm512_permutexvar_epi32(scale_lane_select(gather), scales512)));
         }
         result += half_value(base) * q8.scale *
             static_cast<float>(_mm512_reduce_add_epi32(accumulator));
