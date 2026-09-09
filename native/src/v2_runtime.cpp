@@ -1218,6 +1218,17 @@ struct FlyweightV2QwenRuntime {
     std::uint32_t mtp_fold_rows = 0;
     bool mtp_delta_layers = false;
     std::uint64_t mtp_cache_tokens = 0;
+    // Prompt-lookup (n-gram) self-speculation: drafts come from the
+    // sequence's own history instead of a draft block, and go through the
+    // same verify / accept / rollback round as MTP. Output is unchanged by
+    // construction (every row is re-scored by the target); only the
+    // acceptance rate moves. 0 disables. See qwen_lookup_draft.
+    std::uint32_t lookup_drafts = 0;
+    std::uint32_t lookup_ngram_min = 4;
+    std::uint32_t lookup_ngram_max = 32;
+    std::uint64_t lookup_rounds = 0;
+    std::uint64_t lookup_misses = 0;
+    std::size_t lookup_last_match = 0;
     // Device rows the sampled MTP round hands the sampler: the verify batch's
     // normalized hiddens, copied out of the rows workspace because the
     // sampler's own scratch (decode-layout regions) may overlap them there.
@@ -1440,6 +1451,14 @@ struct FlyweightV2QwenRuntime {
     std::atomic<bool> registration_cancel{false};
     bool model_registered = false; // whether we cuMemHostRegister'd model->data
 };
+
+// Speculative row budget: the draft block's drafts when the checkpoint has one,
+// otherwise the prompt-lookup budget. Everything the batched verify needs
+// (rows workspace, DeltaNet snapshot arena, single sequence slot) keys off
+// this; only the draft block's own cache and hand-over key off mtp_drafts.
+static inline std::uint32_t qwen_spec_drafts(const FlyweightV2QwenRuntime& runtime) {
+    return runtime.options.mtp_drafts ? runtime.options.mtp_drafts : runtime.lookup_drafts;
+}
 
 flyweight::v2::ExpertExecutionPolicy qwen_expert_policy(
     const FlyweightV2QwenRuntime& runtime,
@@ -14333,6 +14352,22 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
             flyweight::v2::expert_execution_mode_value(runtime->expert_mode);
     }
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
+    if(const char*lookup=std::getenv("FLYWEIGHT_LOOKUP_DRAFTS")){
+        const auto value=std::strtoul(lookup,nullptr,10);
+        // 7, not the verifier's 8: with 8 drafts the verify runs 9 rows, one
+        // past the 8-row batched matvec, and the dense projections fall onto
+        // the tensor-core MMQ path sized for 64-row prefill chunks -- measured
+        // 2.5-3.5x the dense cost of an 8-row pass. A 7-draft round is the
+        // widest one that stays on the rows kernel.
+        if(value>7)throw std::runtime_error("FLYWEIGHT_LOOKUP_DRAFTS supports at most 7 drafts (8 rows keep the dense projections on the batched matvec)");
+        if(value&&runtime->options.mtp_drafts)
+            std::fprintf(stderr,"[flyweight] FLYWEIGHT_LOOKUP_DRAFTS ignored: the draft block is drafting (--mtp-drafts)\n");
+        else runtime->lookup_drafts=static_cast<std::uint32_t>(value);
+        if(const char*n=std::getenv("FLYWEIGHT_LOOKUP_NGRAM_MIN"))
+            runtime->lookup_ngram_min=std::max(1u,static_cast<unsigned>(std::strtoul(n,nullptr,10)));
+        if(const char*n=std::getenv("FLYWEIGHT_LOOKUP_NGRAM_MAX"))
+            runtime->lookup_ngram_max=std::max(runtime->lookup_ngram_min,static_cast<unsigned>(std::strtoul(n,nullptr,10)));
+    }
     // qwen4exp MTP runs in stream space end to end (draft, cache replay,
     // verify hand-over); see plans/qwen4exp-semantics.md. A checkpoint with no
     // draft block -- UD-IQ1_S is one -- trips the generic check below.
@@ -14385,7 +14420,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
         throw std::runtime_error(
             "native Qwen strict resident policy requires streamed GPU execution");
      if(gemma4&&runtime->options.next_layer_prefetch)throw std::runtime_error("native Gemma 4 next-layer prefetch is not implemented");
-     if(runtime->options.next_layer_prefetch&&runtime->options.mtp_drafts)throw std::runtime_error("native Qwen next-layer prefetch does not support MTP yet");
+     if(runtime->options.next_layer_prefetch&&qwen_spec_drafts(*runtime))throw std::runtime_error("native Qwen next-layer prefetch does not support MTP yet");
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>6)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>6)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
@@ -14491,7 +14526,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
             throw std::runtime_error(
                 "native Qwen scratch context needs --parallel 2 or more; with a single slot "
                 "there are no side slots to shrink");
-        if(runtime->options.mtp_drafts)
+        if(qwen_spec_drafts(*runtime))
             throw std::runtime_error(
                 "native Qwen scratch context is unavailable under MTP drafting, which runs "
                 "one slot");
@@ -14980,14 +15015,16 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     static_cast<std::uint64_t>(layer.qsa_ratio)*key_len*sizeof(float));
             }
         }
-        if(runtime->options.mtp_drafts){
-            auto&layer=runtime->mtp_layer_plan;
-            layer.cache_capacity=geometry_context;
-            const auto&key=runtime->model->tensors[layer.static_tensors[2]];
-            const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
-            const auto cache_floats=runtime->model->config.attention_kv_heads*geometry_context*head_dim;
-            layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
-            layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
+        if(qwen_spec_drafts(*runtime)){
+            if(runtime->options.mtp_drafts){
+                auto&layer=runtime->mtp_layer_plan;
+                layer.cache_capacity=geometry_context;
+                const auto&key=runtime->model->tensors[layer.static_tensors[2]];
+                const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
+                const auto cache_floats=runtime->model->config.attention_kv_heads*geometry_context*head_dim;
+                layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
+                layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
+            }
             // What the trunk hands the draft. On qwen4exp that is the
             // hyper-connection STREAMS (hc_count*hidden), not the collapsed
             // hidden the LM head sees: the draft's hnorm spans the whole
@@ -15100,7 +15137,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 build_geometry();
             }
             runtime->state_bytes=runtime->geometries[0].state_bytes;
-            const std::size_t planned_slots=runtime->options.mtp_drafts?1:
+            const std::size_t planned_slots=qwen_spec_drafts(*runtime)?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             runtime->slots_state_bytes=0;
             for(std::size_t i=0;i<planned_slots;++i)
@@ -15156,7 +15193,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             runtime->moe_intermediate,runtime->model->config.expert_count,
             runtime->model->config.attention_heads,
             runtime->options.context_limit,delta_value_heads,
-            runtime->options.mtp_drafts!=0,
+            qwen_spec_drafts(*runtime)!=0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
             runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
@@ -15298,7 +15335,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // the host is different arithmetic, so it moves that run's tokens.
             // Measured: it re-spills the dense contract fixture entirely and
             // the host and resident paths stop agreeing.
-            const std::size_t snapshot_slots=runtime->options.mtp_drafts?1:
+            const std::size_t snapshot_slots=qwen_spec_drafts(*runtime)?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             // Estimated here rather than read from prefill_snapshot_bytes,
             // which is not sized until after this point. Moving that sizing
@@ -15741,7 +15778,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     if(gi.free_memory>margin)auto_budget=gi.free_memory-margin;
                 }
             }
-            const std::uint64_t requant_slots=runtime->options.mtp_drafts?1:
+            const std::uint64_t requant_slots=qwen_spec_drafts(*runtime)?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             const std::uint64_t estimated_base=persistent_bytes+
                 runtime->workspace_bytes+runtime->slots_state_bytes;
@@ -15808,7 +15845,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         auto prepare_policy=qwen_expert_policy(
             *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
         runtime->multi_decode_capacity=1;
-        const std::uint64_t decode_slots=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+        const std::uint64_t decode_slots=qwen_spec_drafts(*runtime)?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
         // Gemma 4 supports independent sequence slots, but its hybrid expert
         // path currently schedules those slots sequentially. The Qwen
         // layer-overlapped multi-decode driver assumes separate gate/up/down
@@ -15862,10 +15899,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         runtime->prefill_snapshot_bytes=snapshot_floats?device_align(snapshot_floats*sizeof(float)):0;
         // One KV+DeltaNet state arena per parallel decode slot. MTP manages its
         // own state inside the arena, so it stays single-slot.
-        const std::size_t slot_count=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+        const std::size_t slot_count=qwen_spec_drafts(*runtime)?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
         // --parallel is always typed on purpose; degrading it silently under
         // --mtp-draft contradicted that (scratch+MTP already refuses loudly).
-        if(runtime->options.mtp_drafts&&runtime->parallel_sequences>1)
+        if(qwen_spec_drafts(*runtime)&&runtime->parallel_sequences>1)
             std::fprintf(stderr,
                 "[flyweight] --mtp-draft keeps a single sequence slot; "
                 "--parallel %u is reduced to 1\n",
@@ -22696,7 +22733,7 @@ void qwen_drop_expert_pages_for_sweep(
 // snapshot to go back to.
 static bool qwen_kv_rewindable(const FlyweightV2QwenRuntime& runtime) {
     if (runtime.gemma4) return true;
-    if (runtime.options.mtp_drafts) return false;
+    if (qwen_spec_drafts(runtime)) return false;
     if (runtime.layers.empty()) return false;
     for (const auto& layer : runtime.layers)
         if (!layer.attention) return false;
@@ -23598,7 +23635,9 @@ static void qwen_mtp_commit_true_cache(
     const std::uint32_t* inputs, std::uint32_t count,
     std::uint64_t verified_hidden
 ) {
-    if (!count) return;
+    // Lookup drafting has no draft block, so there is no draft cache to keep
+    // in step with the target.
+    if (!count || !runtime.options.mtp_drafts) return;
     // The hand-over width, not the model's hidden width: on qwen4exp every one
     // of these vectors is a hyper-connection stream row (hc_count*hidden).
     const int hidden = runtime.qwen4exp
@@ -23667,7 +23706,64 @@ static void qwen_mtp_commit_true_cache(
 // sampler state (same RNG draw count, same penalty window, same grammar
 // position), so a drafting task's output is bit-identical to a non-drafting
 // one; the drafts only decide how many rows a round gets to keep.
-static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr){
+// Prompt-lookup drafting. The sequence's committed history plus `next_token`
+// is the text; the last `n` tokens of it are looked for earlier in the same
+// text, longest match first (n from lookup_ngram_max down to lookup_ngram_min,
+// most recent occurrence on ties), and the tokens that followed that earlier
+// occurrence become the drafts. Returns how many drafts were written to `out`
+// (at most `wanted`), 0 when nothing in the history matches -- the caller
+// then takes the plain one-token decode, so a non-repetitive stretch costs
+// only this scan.
+//
+// The round is sized by the match, because a verify row costs real expert
+// bytes (each row routes to its own experts, so a 9-row verify is not much
+// cheaper than 9 decodes on a paged MoE) and only accepted rows pay for
+// themselves. Measured on Flash-Next IQ1_S, 8 drafts: a 3-token match
+// accepted 2 of 8 on code and under 1 on prose; matches of 12+ accepted 7.8
+// of 8. So the budget is match_len-1, capped at the configured drafts, and
+// matches under lookup_ngram_min (4) do not draft at all. Code, edits, quoted
+// context and structured output repeat themselves constantly; free prose
+// does not, and this is what keeps prose at the sequential speed.
+//
+// Why a small cap is right even at 90%+ acceptance: a verify row costs about
+// 17 ms here against a 30 ms decode (the experts are the same RAM-bound bytes
+// either way; only the dense work amortizes), and every row past the first
+// rejection is wasted. With per-draft acceptance p the expected tokens of a
+// W-draft round are (1-p^(W+1))/(1-p), so at p=0.9 four drafts cost ~19.5 ms
+// per token and eight cost ~23; at p=0.96 they are within 1 ms. Four is the
+// recommended budget.
+static uint32_t qwen_lookup_draft(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out){
+    const auto&history=runtime.processed_tokens;
+    const std::size_t total=history.size()+1;  // + next_token
+    auto at=[&](std::size_t index)->std::uint32_t{
+        return index<history.size()?history[index]:next_token;
+    };
+    const std::size_t n_min=runtime.lookup_ngram_min;
+    const std::size_t n_max=std::max<std::size_t>(n_min,runtime.lookup_ngram_max);
+    if(!wanted||total<n_min+1)return 0;
+    // Candidate `end` is the index one past a would-be earlier occurrence of
+    // the tail; it must leave at least one token to draft, and must not be the
+    // tail itself.
+    std::size_t best_end=0,best_len=0;
+    for(std::size_t end=total-1;end>=n_min;--end){
+        // Cheap reject on the last token, then extend the match backwards.
+        std::size_t len=0;
+        while(len<n_max&&len<end&&at(end-1-len)==at(total-1-len))++len;
+        if(len>=n_min&&len>best_len){best_len=len;best_end=end;if(len==n_max)break;}
+        if(end==n_min)break;
+    }
+    uint32_t count=0;
+    runtime.lookup_last_match=best_len;
+    if(best_len>=1)wanted=static_cast<uint32_t>(std::min<std::size_t>(wanted,std::max<std::size_t>(1,best_len-1)));
+    if(best_len)for(std::size_t index=best_end;index<total&&count<wanted;++index)out[count++]=at(index);
+    static const bool trace=std::getenv("FLYWEIGHT_LOOKUP_TRACE")!=nullptr;
+    if(trace)
+        std::fprintf(stderr,"lookup history=%zu next=%u n=[%zu,%zu] match_len=%zu drafts=%u\n",
+            history.size(),next_token,n_min,n_max,best_len,count);
+    return count;
+}
+
+static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr,const uint32_t*preset_drafts=nullptr){
     if(wanted>8)wanted=8;
     if(!wanted)wanted=1;
     // One row per draft plus one more: the verify batch's row k answers "what
@@ -23686,7 +23782,11 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     uint32_t draft_input=next_token;
     std::uint64_t draft_hidden=runtime.state+runtime.mtp_target_hidden_offset;
     const auto draft_started=std::chrono::steady_clock::now();
-    for(uint32_t index=0;index<wanted;++index){
+    if(preset_drafts){
+        for(uint32_t index=0;index<wanted;++index)drafts[index]=preset_drafts[index];
+        runtime.mtp_draft_tokens+=wanted;
+        ++runtime.lookup_rounds;
+    }else for(uint32_t index=0;index<wanted;++index){
         drafts[index]=runtime.qwen4exp
             ?qwen4exp_mtp_draft(runtime,draft_input,draft_hidden)
             :qwen_mtp_draft(runtime,draft_input,draft_hidden);
@@ -23828,7 +23928,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
             if(flyweight_gpu_download(replay_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP replay trace download failed");
             float maximum=0.0f;
             for(int index=0;index<trace_hidden;++index)maximum=std::max(maximum,std::fabs(batch_trace[index]-replay_trace[index]));
-            std::fprintf(stderr,"mtp reject position=%llu row=%u draft=%u batch=%u replay=%u hidden_max_diff=%g\n",static_cast<unsigned long long>(runtime.position-valid),valid-1,drafts[valid-1],batch_rejected_token,verified[valid-1],maximum);
+            std::fprintf(stderr,"mtp reject position=%llu row=%u draft=%u batch=%u replay=%u hidden_max_diff=%g\n",static_cast<unsigned long long>(runtime.position-valid),valid-1,drafts[valid-1],batch_rejected_token,replayed[valid-1],maximum);
         }
         runtime.mtp_accepted_tokens+=valid-1;
         ++runtime.mtp_rejected_tokens;
@@ -23846,6 +23946,11 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         valid=rows;
     }
     for(uint32_t index=0;index<valid;++index)out[index]=verified[index];
+    if(preset_drafts){
+        static const bool trace=std::getenv("FLYWEIGHT_LOOKUP_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"lookup round match=%zu wanted=%u valid=%u rejected=%d\n",
+            runtime.lookup_last_match,wanted,valid,rejected?1:0);
+    }
     return valid;
 }
 
@@ -23894,6 +23999,11 @@ static constexpr std::uint32_t kQwenMtpWarmupTokens=8;
 static constexpr std::uint64_t kQwenMtpKeepPercent=80;
 
 static bool qwen_mtp_should_draft(const FlyweightV2QwenRuntime&runtime){
+    // Lookup drafting gates itself on whether the history offers a match
+    // (qwen_lookup_draft returns 0 otherwise); the timing calibration below
+    // is the draft block's, and its arms would only measure rounds that the
+    // match test had already admitted.
+    if(!runtime.options.mtp_drafts)return runtime.lookup_drafts!=0;
     if(!qwen_mtp_adaptive_enabled())return runtime.options.mtp_drafts!=0;
     if(runtime.options.mtp_drafts<2||runtime.mtp_adaptive_disabled)return false;
     if(runtime.mtp_calibration_done)return true;
@@ -24016,14 +24126,25 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
     qwen_prompt_finish(runtime,prompt,prompt_count,next_token,max_tokens,
                        plan.tail_slot);
     QwenResidencyEpochGuard residency_epoch{*runtime};
-    if(runtime->options.mtp_drafts){
+    if(qwen_spec_drafts(*runtime)){
         uint64_t emitted=0;
         if(callback(next_token,user)!=0)return 0;
         ++emitted;
         while(emitted<max_tokens&&!runtime->cancelled){
             // A round commits up to wanted+1 tokens; with one token of room
             // left it would advance the sequence past what gets emitted.
-            if(!qwen_mtp_should_draft(*runtime)||max_tokens-emitted<2){
+            uint32_t wanted=0;
+            std::array<uint32_t,8>lookup{};
+            const uint32_t*preset=nullptr;
+            if(qwen_mtp_should_draft(*runtime)&&max_tokens-emitted>=2){
+                wanted=static_cast<uint32_t>(std::min<uint64_t>(
+                    qwen_spec_drafts(*runtime),max_tokens-emitted-1));
+                if(!runtime->options.mtp_drafts){
+                    wanted=qwen_lookup_draft(*runtime,next_token,wanted,lookup.data());
+                    if(wanted)preset=lookup.data();else ++runtime->lookup_misses;
+                }
+            }
+            if(!wanted){
                 const auto decode_started=std::chrono::steady_clock::now();
                 status=flyweight_v2_qwen_runtime_decode(
                     runtime,next_token,&next_token);
@@ -24036,12 +24157,9 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
                 ++emitted;
                 continue;
             }
-            const auto wanted=static_cast<uint32_t>(std::min<uint64_t>(
-                runtime->options.mtp_drafts,max_tokens-emitted-1
-            ));
             std::array<uint32_t,9>produced{};
             const auto round_started=std::chrono::steady_clock::now();
-            const auto valid=qwen_mtp_round(*runtime,next_token,wanted,produced.data());
+            const auto valid=qwen_mtp_round(*runtime,next_token,wanted,produced.data(),nullptr,preset);
             qwen_mtp_record_round(
                 *runtime,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -25566,17 +25684,26 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                 // to the one-token path. Before that, only a task with no
                 // sampler features could draft -- and every served request
                 // has some, so --mtp-drafts never engaged under serve.
-                if(runtime->options.mtp_drafts&&qwen_mtp_should_draft(*runtime)&&
+                uint32_t wanted=0;
+                std::array<uint32_t,8>lookup{};
+                const uint32_t*preset=nullptr;
+                if(qwen_spec_drafts(*runtime)&&qwen_mtp_should_draft(*runtime)&&
                    task->max_tokens-task->emitted>=2){
                     // A round commits up to wanted+1 tokens (the drafts plus
                     // the row that verifies the last one), so it needs that
                     // much room under max_tokens.
-                    const auto wanted=static_cast<uint32_t>(std::min<std::uint64_t>(
-                        runtime->options.mtp_drafts,task->max_tokens-task->emitted-1
+                    wanted=static_cast<uint32_t>(std::min<std::uint64_t>(
+                        qwen_spec_drafts(*runtime),task->max_tokens-task->emitted-1
                     ));
+                    if(!runtime->options.mtp_drafts){
+                        wanted=qwen_lookup_draft(*runtime,task->next_token,wanted,lookup.data());
+                        if(wanted)preset=lookup.data();else ++runtime->lookup_misses;
+                    }
+                }
+                if(wanted){
                     std::array<uint32_t,9>produced{};
                     const auto round_started=std::chrono::steady_clock::now();
-                    const auto valid=qwen_mtp_round(*runtime,task->next_token,wanted,produced.data(),&task->sampling);
+                    const auto valid=qwen_mtp_round(*runtime,task->next_token,wanted,produced.data(),&task->sampling,preset);
                     qwen_mtp_record_round(
                         *runtime,
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
