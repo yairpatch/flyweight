@@ -6,8 +6,34 @@ inline constexpr char qwen_cuda_source[] = R"FLYWEIGHT_CUDA(
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include <cuda_fp4.h>
 #include <cub/block/block_radix_sort.cuh>
+
+// FP4 E2M1 encoding, round to nearest even with saturation: what the
+// fp4x2 e2m1 float2 constructor in the toolkit's fp4 header computes. Written
+// out here because that header first shipped with CUDA 12.8, and a toolkit
+// older than that is still a working toolkit for every other kernel in this
+// corpus. Verified bit for bit against the header over a sweep of float
+// values, ties, NaN, and infinities. Codes 0..7 are 0, 0.5, 1, 1.5, 2, 3, 4,
+// 6; bit 3 is the sign; NaN encodes as +6; x takes the low nibble and y the
+// high one.
+__device__ __forceinline__ unsigned char fp4_e2m1_encode(float v) {
+    const float a = fabsf(v);
+    unsigned char code;
+    if (a <= 0.25f) code = 0;
+    else if (a < 0.75f) code = 1;
+    else if (a <= 1.25f) code = 2;
+    else if (a < 1.75f) code = 3;
+    else if (a <= 2.5f) code = 4;
+    else if (a < 3.5f) code = 5;
+    else if (a <= 5.0f) code = 6;
+    else code = 7;
+    if (a != a) return 7;
+    return (unsigned char)(code | ((__float_as_uint(v) >> 31) << 3));
+}
+
+__device__ __forceinline__ unsigned char fp4x2_e2m1_encode(float x, float y) {
+    return (unsigned char)((fp4_e2m1_encode(y) << 4) | fp4_e2m1_encode(x));
+}
 
 __device__ __forceinline__ float block_reduce_sum(float value) {
     const int lane = threadIdx.x & 31;
@@ -8019,9 +8045,8 @@ void nvfp4_quantize_cublaslt(
         const float second = input[
             (unsigned long long)row * columns + inner * 16 + lane * 2 + 1];
         const float inverse = scale_code ? 1.0f / quant_scale : 0.0f;
-        __nv_fp4x2_e2m1 encoded(make_float2(first * inverse, second * inverse));
         values[(unsigned long long)row * (columns >> 1) + inner * 8 + lane] =
-            encoded.__x;
+            fp4x2_e2m1_encode(first * inverse, second * inverse);
     }
 }
 
@@ -8298,10 +8323,8 @@ R"FLYWEIGHT_CUDA(    const int row = scaled_block / blocks_per_row;
         const float first = row == 0 ? input[inner * 16 + lane * 2] : 0.0f;
         const float second =
             row == 0 ? input[inner * 16 + lane * 2 + 1] : 0.0f;
-        __nv_fp4x2_e2m1 encoded(
-            make_float2(first * inverse, second * inverse));
         values[(unsigned long long)row * (columns >> 1) + inner * 8 + lane] =
-            encoded.__x;
+            fp4x2_e2m1_encode(first * inverse, second * inverse);
     }
 }
 
@@ -8404,11 +8427,9 @@ void nvfp4_quantize_weighted_moe_cublaslt(
             ? activated[base + lane * 2] * route_weight : 0.0f;
         const float second = row == 0
             ? activated[base + lane * 2 + 1] * route_weight : 0.0f;
-        __nv_fp4x2_e2m1 encoded(make_float2(
-            first * inverse, second * inverse));
         values[(unsigned long long)row * (experts * input_size >> 1)
                + expert * (input_size >> 1) + expert_block * 8 + lane] =
-                   encoded.__x;
+                   fp4x2_e2m1_encode(first * inverse, second * inverse);
     }
 }
 
