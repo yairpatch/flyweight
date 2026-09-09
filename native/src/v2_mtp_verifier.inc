@@ -873,7 +873,7 @@ void qwen_forward_rows(
         if(!trace_phases)return;
         flyweight_gpu_stream_sync(runtime.stream);
         const auto now=std::chrono::steady_clock::now();
-        std::fprintf(stderr,"[phase] layer %2u %-10s %.1fms\n",layer_number,name,
+        std::fprintf(stderr,"[phase] rows %d layer %2u %-10s %.1fms\n",rows,layer_number,name,
             std::chrono::duration_cast<std::chrono::nanoseconds>(now-phase_clock).count()/1e6);
         phase_clock=now;
     };
