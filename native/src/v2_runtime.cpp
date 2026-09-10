@@ -12977,10 +12977,12 @@ int flyweight_v2_deepseek4_gpu_matvec_check(
     std::uint64_t weights=0,vector=0,result=0;
     if(flyweight_gpu_alloc(weight_bytes,&weights)!=0)
         throw std::runtime_error("cannot allocate device weights");
-    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0)
-        throw std::runtime_error("cannot allocate the device input");
-    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0)
-        throw std::runtime_error("cannot allocate the device output");
+    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0){
+        flyweight_gpu_free(weights);
+        throw std::runtime_error("cannot allocate the device input");}
+    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0){
+        flyweight_gpu_free(weights);flyweight_gpu_free(vector);
+        throw std::runtime_error("cannot allocate the device output");}
     int status=flyweight_gpu_upload_sync(weights,tensor_data(*model,*found),weight_bytes);
     if(status==0)status=flyweight_gpu_upload_sync(vector,input,
         static_cast<std::uint64_t>(inputs)*sizeof(float));

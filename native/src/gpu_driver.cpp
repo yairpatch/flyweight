@@ -1804,6 +1804,8 @@ extern "C" int flyweight_gpu_stream_create(std::uint64_t* stream) {
     return 0;
 }
 
+static void nvfp4_clear_cublas_plans();
+
 extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_destroy(stream);
 
@@ -1840,6 +1842,10 @@ extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
                     release(entry.second.scales);
                 }
                 g_nvfp4_dense_repacks.clear();
+                // The cuBLASLt plans are host objects keyed by shape and
+                // only ever dropped when the scratch grows; a reload that
+                // never regrows it would keep them for the process lifetime.
+                nvfp4_clear_cublas_plans();
             }
             const CUevent handoff = g_nvfp4_scratch.handoff;
             g_nvfp4_scratch = Nvfp4Scratch{};
