@@ -20,6 +20,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <vector>
 
 #ifdef _OPENMP
@@ -768,14 +769,14 @@ inline void moe_block(
     float* output
 ) {
     std::vector<float> logits(experts);
-    ProfileScope* route = new ProfileScope(profile().moe_route);
+    std::optional<ProfileScope> route; route.emplace(profile().moe_route);
     matvec(router_weights, hidden, hidden_size, experts, logits.data());
 
     std::vector<std::int32_t> chosen(used);
     std::vector<float> weights(used);
     moe_router(logits.data(), router_bias, experts, used, groups, groups_used,
                weight_scale, normalize, chosen.data(), weights.data());
-    delete route;
+    route.reset();
 
     // One expert's slice, in bytes: the stacked block is expert-major, so the
     // stride is however much one expert's matrix occupies in its own storage.
@@ -796,7 +797,7 @@ inline void moe_block(
     // leaving the thread pool than they recover. Measured on Ling 3.0 Flash's
     // geometry: 29.8 GB/s per-expert against 40.5 GB/s fused, same kernel and
     // same bytes.
-    ProfileScope* work = new ProfileScope(profile().moe_experts);
+    std::optional<ProfileScope> work; work.emplace(profile().moe_experts);
     std::vector<float> activated(used * expert_size);
     {
         // gate and up over every chosen expert. Row r decodes to (half, slot,
@@ -842,7 +843,7 @@ inline void moe_block(
             output[row] = total;
         }
     }
-    delete work;
+    work.reset();
 
     if (shared_gate && shared_up && shared_down && shared_size) {
         ProfileScope shared(profile().moe_shared);
@@ -1602,7 +1603,7 @@ inline void moe_block_batch(
     float swiglu_limit, float shared_swiglu_limit, float* output
 ) {
     std::vector<float> logits(tokens * experts);
-    ProfileScope* route = new ProfileScope(profile().moe_route);
+    std::optional<ProfileScope> route; route.emplace(profile().moe_route);
     matmul(router_weights, hidden, tokens, hidden_size, experts, logits.data());
 
     std::vector<std::int32_t> chosen(tokens * used);
@@ -1613,7 +1614,7 @@ inline void moe_block_batch(
                    chosen.data() + token * used, weights.data() + token * used);
 
     std::fill(output, output + tokens * hidden_size, 0.0f);
-    delete route;
+    route.reset();
 
     // Invert the routing: which tokens picked each expert, and with what weight.
     std::vector<std::vector<std::pair<std::size_t, float>>> assignment(experts);
@@ -1654,7 +1655,7 @@ inline void moe_block_batch(
         up.resize(count * expert_size);
         activated.resize(count * expert_size);
         projected.resize(count * hidden_size);
-        ProfileScope* work = new ProfileScope(profile().moe_experts);
+        std::optional<ProfileScope> work; work.emplace(profile().moe_experts);
         matmul({gate_base + expert * narrow_stride, gate_experts.type},
                gathered.data(), count, hidden_size, expert_size, gate.data());
         matmul({up_base + expert * narrow_stride, up_experts.type},
@@ -1663,7 +1664,7 @@ inline void moe_block_batch(
                activated.data());
         matmul({down_base + expert * wide_stride, down_experts.type},
                activated.data(), count, expert_size, hidden_size, projected.data());
-        delete work;
+        work.reset();
         ProfileScope scatter(profile().moe_gather);
         for (std::size_t i = 0; i < count; ++i) {
             float* target = output + members[i].first * hidden_size;
@@ -1789,7 +1790,7 @@ inline void decoder_layer_batch(
         std::vector<float> low_rank(tokens * g.q_lora), qnorm(tokens * g.q_lora),
             query(tokens * g.heads * qk), compressed(tokens * (g.kv_lora + g.qk_rope)),
             gate(tokens * g.heads), attended(tokens * g.heads * g.v_head_dim);
-        ProfileScope* stage = new ProfileScope(profile().projections);
+        std::optional<ProfileScope> stage; stage.emplace(profile().projections);
         if (g.q_lora) {
             matmul(w.mla.q_a, normalized.data(), tokens, hidden, g.q_lora, low_rank.data());
             for (std::size_t t = 0; t < tokens; ++t)
@@ -1803,7 +1804,7 @@ inline void decoder_layer_batch(
         matmul(w.mla.kv_a_mqa, normalized.data(), tokens, hidden,
                g.kv_lora + g.qk_rope, compressed.data());
         matmul(w.mla.gate, normalized.data(), tokens, hidden, g.heads, gate.data());
-        delete stage;
+        stage.reset();
 
         {
         ProfileScope attention(profile().mla);
@@ -1845,14 +1846,14 @@ inline void decoder_layer_batch(
         std::vector<float> q(tokens * channels), k(tokens * channels),
             v(tokens * channels), decay(tokens * channels), beta(tokens * g.heads),
             gate(tokens * channels), attended(tokens * channels);
-        ProfileScope* stage = new ProfileScope(profile().projections);
+        std::optional<ProfileScope> stage; stage.emplace(profile().projections);
         matmul(w.kda.query, normalized.data(), tokens, hidden, channels, q.data());
         matmul(w.kda.key, normalized.data(), tokens, hidden, channels, k.data());
         matmul(w.kda.value, normalized.data(), tokens, hidden, channels, v.data());
         matmul(w.kda.decay, normalized.data(), tokens, hidden, channels, decay.data());
         matmul(w.kda.beta, normalized.data(), tokens, hidden, g.heads, beta.data());
         matmul(w.kda.gate, normalized.data(), tokens, hidden, channels, gate.data());
-        delete stage;
+        stage.reset();
         if (capture) {
             std::memcpy(capture->q, q.data(), tokens * channels * sizeof(float));
             std::memcpy(capture->k, k.data(), tokens * channels * sizeof(float));
