@@ -70,7 +70,7 @@ cd web && pnpm install --frozen-lockfile && pnpm build
 
 This project is largely about throughput, so a performance change needs a
 measurement, not an argument. Say which model, quantization, GPU and context
-length you measured at, and give the before and after. `bench_runtime.py`
+length you measured at, and give the before and after. `bench/bench_runtime.py`
 produces a comparable JSONL record:
 
 ```bash

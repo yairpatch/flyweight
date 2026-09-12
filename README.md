@@ -632,11 +632,11 @@ python -m flyweight.runtime_benchmark compare \
   /tmp/baseline.jsonl /tmp/candidate.jsonl
 ~~~
 
-(`bench_runtime.py` at the repository root is a shim for the same module.)
-`bench_server_ab.py` and `bench_server_client.py` drive a running server over
-HTTP for end-to-end A/B comparisons. The other `bench_*.py` and `prof_*.py`
-scripts at the root are one-off investigation tools kept for reference; some
-need CuPy.
+(`bench/bench_runtime.py` is a shim for the same module.)
+`bench/bench_server_ab.py` and `bench/bench_server_client.py` drive a running
+server over HTTP for end-to-end A/B comparisons. The other `bench/bench_*.py`
+scripts, and the `prof_*.py` profilers under `tools/`, are one-off
+investigation tools kept for reference; some need CuPy.
 
 Run GPU benchmarks in isolation. Another process changes free VRAM and
 therefore changes automatic expert-cache sizing.
@@ -898,12 +898,12 @@ mypy src/flyweight
 pytest -q
 ~~~
 
-The `check_*.py` scripts at the repository root need a checkout and real
-weights. `check_vision_parity.py --mmproj PATH` runs the native vision tower
+The `tools/check_*.py` scripts need a checkout and real
+weights. `tools/check_vision_parity.py --mmproj PATH` runs the native vision tower
 against the NumPy reference in `native/tools/qwen_vision_reference.py`
 (`--backend cpu` for the host kernels) and needs no language model;
-`check_greedy_determinism.py`, `check_q8_decode_parity.py`,
-`check_attention_parity.py` and `check_expert_path_divergence.py` pin the
+`tools/check_greedy_determinism.py`, `tools/check_q8_decode_parity.py`,
+`tools/check_attention_parity.py` and `tools/check_expert_path_divergence.py` pin the
 decode paths against each other on a model of your choosing.
 
 Set `FLYWEIGHT_TEST_MODEL=/path/to/model.gguf` to opt into the real Qwen
