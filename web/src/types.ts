@@ -159,6 +159,12 @@ export interface Conversation {
   workspaceId?: string;
   /** Agent runs: what the run may do; undefined means the default preset. */
   permissions?: AgentPermissions;
+  /**
+   * Agent runs: the newest message compaction has stubbed through. Kept on the
+   * run so every later turn re-applies the same boundary and stays an append
+   * the server's prefix cache can reuse; see compactMessages.
+   */
+  compactedThrough?: string;
   /** Per-conversation settings override; undefined means use global. */
   model?: string;
 }

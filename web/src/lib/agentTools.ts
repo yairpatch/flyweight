@@ -528,23 +528,37 @@ export function agentSystemPrompt(context: AgentPromptContext): string {
   // A model that knows its budget spends it on the task; one that does not
   // explores until the cap stops it mid-step. Only the cap goes here: this
   // prompt is the prefix of every request in the run, and the server's prefix
-  // cache dies at the first changed token, so the number that changes each
-  // turn rides at the tail of the messages instead (turnBudgetNote).
+  // cache dies at the first changed token.
   if (turnCap) {
     sections.push(
-      `This run has a budget of ${turnCap} tool-calling turns; a note under the newest message counts down how many are left. When they run short, finish what matters most and report where you got to.`,
+      `This run has a budget of ${turnCap} tool-calling turns; when few are left a note under the newest message says so. Finish what matters most by then and report where you got to.`,
     );
   }
   return sections.join("\n\n");
 }
 
 /**
- * The countdown appended after the newest message of each request. It changes
- * every turn, which is why it lives at the tail — the only place in the
- * request where changed text costs no cached prefix.
+ * How many turns from the cap the countdown starts. Before that there is no
+ * note at all: see turnBudgetNote for why silence is worth more than a number.
+ */
+export const TURN_WARNING_AT = 3;
+
+/**
+ * The warning appended after the newest message when the budget runs short.
+ *
+ * It used to count down on every turn, which cost more than it was worth. A
+ * note appended to the newest message is not part of the run's history, so
+ * next turn that message goes out without it — and a request that rewrites
+ * even the last few characters of the previous one is no longer an extension
+ * of it. On a runtime whose KV cannot rewind (any recurrent layer, or
+ * speculative drafts) reuse then falls back to a sparse checkpoint, which
+ * measured 40% of a 10k-token prompt re-evaluated every turn. Every turn that
+ * sends no note is a strict extension of the last, which is the case the
+ * cache handles perfectly, so the note is saved for the turns where knowing
+ * actually changes what the model should do.
  */
 export function turnBudgetNote(turn: number, turnCap: number): string {
   const left = turnCap - turn;
-  if (left <= 0) return "";
+  if (left <= 0 || left > TURN_WARNING_AT) return "";
   return `[${left} tool-calling turn${left === 1 ? "" : "s"} left in this run.]`;
 }

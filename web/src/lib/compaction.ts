@@ -32,6 +32,25 @@ const CLIP_CHARS = 2000;
  * supposed to fit.
  */
 const OVERHEAD_TOKENS = 1500;
+/**
+ * How far below the budget a compaction trims, once it has to trim at all.
+ *
+ * Compacting to just under the ceiling is the obvious thing and it is a
+ * disaster for the server's prefix cache. What compaction removes is the
+ * OLDEST material, which lives at the FRONT of the prompt, and the cache
+ * matches from the front: one stub invalidates everything after it. Trimming
+ * to the ceiling leaves the run sitting exactly on it, so the next turn's few
+ * thousand characters push it over again, and it stubs one more result from
+ * the front -- every turn, for the rest of the run. Measured on a 71k-token
+ * agent run that is a fully cold prefill on every single turn: 280 s to first
+ * token instead of 80 s, forever.
+ *
+ * Trimming well below the ceiling instead buys a stretch of turns that need
+ * no trimming at all, and those turns are pure appends, which the cache reuses
+ * whole. The cost is history dropped earlier than strictly necessary; the
+ * return is one cold prefill every twenty-odd turns instead of every one.
+ */
+const COMPACTION_TARGET = 0.7;
 
 export interface CompactionOutcome {
   /** The messages to send; the same array when nothing had to go. */
@@ -42,6 +61,12 @@ export interface CompactionOutcome {
   stubbed: number;
   /** Whole messages dropped. */
   dropped: number;
+  /**
+   * The newest message the stub boundary covers. Store it on the run and pass
+   * it to the next turn: it is what keeps a compacted prompt stable, and a
+   * stable prompt is one the server's prefix cache can reuse.
+   */
+  through?: string;
 }
 
 export function messageChars(message: Message): number {
@@ -97,10 +122,23 @@ export function observedCharsPerToken(sentChars: number, promptTokens: number | 
  * stubbed first because they are the bulk of a run, and only then are whole
  * steps dropped. An assistant turn leaves together with the tool results that
  * answer it: a result whose call is gone is a malformed request.
+ *
+ * `through` is the boundary a previous turn settled on, and passing it back is
+ * what makes this stable. Everything up to it stays stubbed whether or not
+ * this turn needs the room, so a turn that fits under the ceiling sends
+ * exactly what the last one sent plus its new messages -- an append, which the
+ * server's prefix cache reuses whole. Without it the boundary advances every
+ * turn (the transcript keeps growing, so hitting any target needs one more
+ * stub each time) and, because the boundary sits at the front of the prompt,
+ * every turn is a cold prefill.
  */
-export function compactMessages(messages: Message[], budget: number): CompactionOutcome {
-  const total = conversationChars(messages);
-  if (!Number.isFinite(budget) || total <= budget) return { messages, removedChars: 0, stubbed: 0, dropped: 0 };
+export function compactMessages(messages: Message[], budget: number, through?: string): CompactionOutcome {
+  const raw = conversationChars(messages);
+  const boundaryOf = (id: string | undefined) => (id ? messages.findIndex((message) => message.id === id) : -1);
+  if (!Number.isFinite(budget) || (raw <= budget && boundaryOf(through) < 0)) {
+    return { messages, removedChars: 0, stubbed: 0, dropped: 0, through };
+  }
+  const target = budget * COMPACTION_TARGET;
 
   const firstUser = messages.findIndex((message) => message.role === "user");
   const keepFrom = Math.max(0, messages.length - RECENT_KEEP);
@@ -110,18 +148,41 @@ export function compactMessages(messages: Message[], budget: number): Compaction
   let stubbed = 0;
   let dropped = 0;
 
-  for (let index = 0; index < working.length && total - removed > budget; index += 1) {
+  /** Replace one result with the line that says what was there. */
+  const stub = (index: number): boolean => {
     const message = working[index];
-    if (!touchable(index) || message.role !== "tool" || message.content.length < STUB_MIN) continue;
-    const stub = `[${message.toolName ?? "tool"} result removed to fit the context window: ${message.content.length} characters]`;
-    removed += message.content.length - stub.length;
-    working[index] = { ...message, content: stub };
+    if (!touchable(index) || message.role !== "tool" || message.content.length < STUB_MIN) return false;
+    const text = `[${message.toolName ?? "tool"} result removed to fit the context window: ${message.content.length} characters]`;
+    removed += message.content.length - text.length;
+    working[index] = { ...message, content: text };
     stubbed += 1;
-  }
+    return true;
+  };
 
-  if (total - removed > budget) {
+  // Everything the last checkpoint covered, re-applied verbatim.
+  let boundary = Math.min(boundaryOf(through), keepFrom - 1);
+  for (let index = 0; index <= boundary; index += 1) stub(index);
+
+  // Only if that no longer fits does the boundary move, and then it moves all
+  // the way to the low-water mark rather than just under the ceiling -- see
+  // COMPACTION_TARGET. This is the cold prefill, spent once for many turns.
+  if (raw - removed > budget) {
+    for (let index = boundary + 1; index < working.length && raw - removed > target; index += 1) {
+      stub(index);
+      boundary = index;
+    }
+  }
+  const settled = boundary >= 0 ? messages[boundary].id : through;
+
+  // Dropping whole steps is for when stubbing every result the boundary can
+  // reach still does not fit -- so it triggers on the ceiling, like the
+  // boundary does, and not on the low-water mark. Gating it on the mark
+  // instead made it re-drop a little more every turn, which moves the front of
+  // the prompt every turn and costs the whole cache.
+  if (raw - removed > budget) {
+    const total = raw;
     const doomed = new Set<string>();
-    for (let index = 0; index < working.length && total - removed > budget; index += 1) {
+    for (let index = 0; index < working.length && total - removed > target; index += 1) {
       if (!touchable(index) || working[index].role === "tool") continue;
       const group = [index];
       const calls = new Set((working[index].toolCalls ?? []).map((call) => call.id));
@@ -142,11 +203,11 @@ export function compactMessages(messages: Message[], budget: number): Compaction
     }
     if (doomed.size) {
       const kept = working.filter((message) => !doomed.has(message.id));
-      return clipRecent({ messages: kept, removedChars: removed, stubbed, dropped }, conversationChars(kept), budget);
+      return clipRecent({ messages: kept, removedChars: removed, stubbed, dropped, through: settled }, conversationChars(kept), budget);
     }
   }
 
-  return clipRecent({ messages: working, removedChars: removed, stubbed, dropped }, total - removed, budget);
+  return clipRecent({ messages: working, removedChars: removed, stubbed, dropped, through: settled }, raw - removed, budget);
 }
 
 /**

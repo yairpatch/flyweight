@@ -139,3 +139,82 @@ describe("contextOverflow", () => {
     expect(retryBudget({}, 140000, 100000)).toBe(50000);
   });
 });
+
+describe("compaction and the prefix cache", () => {
+  /** What the request looks like as text, which is what the cache matches on. */
+  const render = (messages: Message[]) => messages.map((m) => `${m.role}:${m.content}`).join("\n");
+  const sharedPrefix = (a: string, b: string) => {
+    let index = 0;
+    while (index < a.length && index < b.length && a[index] === b[index]) index += 1;
+    return index;
+  };
+
+  it("keeps a compacted run byte-identical from turn to turn", () => {
+    // The failure this prevents, measured on a real 71k-token run: once
+    // compaction engaged, every single turn came back 0% cached and took
+    // 280 s to first token instead of 80 s. Compaction removes the OLDEST
+    // material, which is the FRONT of the prompt, so a boundary that moves
+    // even one message per turn invalidates the entire cached prefix every
+    // turn. The boundary must therefore be a checkpoint, not a per-turn
+    // recomputation -- and the transcript keeps growing, so "trim until it
+    // fits" moves it every turn by construction.
+    const budget = 60_000;
+    let messages = run(12);
+    let through: string | undefined;
+    let previous = "";
+    const shares: number[] = [];
+    let checkpoints = 0;
+    for (let turn = 0; turn < 10; turn += 1) {
+      const callId = `late-${turn}`;
+      messages = [
+        ...messages,
+        message("assistant", "", { toolCalls: [{ id: callId, name: "read_file", arguments: "{}" }] }),
+        message("tool", "y".repeat(2000), { toolCallId: callId, toolName: "read_file" }),
+      ];
+      const outcome = compactMessages(messages, budget, through);
+      if (outcome.through !== through) checkpoints += 1;
+      through = outcome.through;
+      const prompt = render(outcome.messages);
+      if (previous) shares.push(sharedPrefix(previous, prompt) / previous.length);
+      previous = prompt;
+    }
+    // One checkpoint, not ten: the boundary moves when the run crosses the
+    // ceiling and then stays put.
+    expect(checkpoints).toBeLessThanOrEqual(2);
+    // Every turn that is not a checkpoint sends the previous prompt entire,
+    // plus its new messages. That is what the server can reuse.
+    const appended = shares.filter((share) => share === 1).length;
+    expect(appended).toBeGreaterThanOrEqual(shares.length - 2);
+  });
+
+  it("trims well below the ceiling so the next turns need no trimming", () => {
+    const budget = 60_000;
+    const messages = run(20);
+    const outcome = compactMessages(messages, budget);
+    const size = conversationChars(outcome.messages);
+    expect(size).toBeLessThanOrEqual(budget * 0.7);
+    // Room left over is the point: it is how many turns pass before the next
+    // cold prefill.
+    expect(budget - size).toBeGreaterThan(10_000);
+  });
+
+  it("re-applies a boundary even when the run would now fit without it", () => {
+    // Once a result has been stubbed it stays stubbed. Restoring it because
+    // there is room again would rewrite the front of the prompt for a saving
+    // the model never asked for.
+    const messages = run(12);
+    const compacted = compactMessages(messages, 20_000);
+    expect(compacted.stubbed).toBeGreaterThan(0);
+    const roomy = compactMessages(messages, 1_000_000, compacted.through);
+    expect(roomy.stubbed).toBe(compacted.stubbed);
+    expect(render(roomy.messages)).toBe(render(compacted.messages));
+  });
+
+  it("still fits a run whose newest result is bigger than the whole budget", () => {
+    // The last resort has to keep working: a boundary cannot help when the
+    // message over the line is one the boundary may not touch.
+    const messages = [...run(2), message("tool", "z".repeat(80_000), { toolCallId: "big", toolName: "read_file" })];
+    const outcome = compactMessages(messages, 20_000);
+    expect(conversationChars(outcome.messages)).toBeLessThanOrEqual(20_000);
+  });
+});

@@ -10,6 +10,7 @@ import {
   needsApproval,
   runBuiltinTool,
   searchAvailable,
+  TURN_WARNING_AT,
   turnBudgetNote,
   turnCapReason,
 } from "./agentTools";
@@ -213,11 +214,21 @@ describe("agentSystemPrompt", () => {
 });
 
 describe("turnBudgetNote", () => {
-  it("counts down what the system prompt only promises", () => {
-    expect(turnBudgetNote(1, 8)).toBe("[7 tool-calling turns left in this run.]");
+  it("warns near the cap and says nothing before it", () => {
+    expect(turnBudgetNote(6, 8)).toBe("[2 tool-calling turns left in this run.]");
     expect(turnBudgetNote(7, 8)).toBe("[1 tool-calling turn left in this run.]");
     // Spent: nothing to promise.
     expect(turnBudgetNote(8, 8)).toBe("");
+  });
+
+  it("stays silent while there is budget, so the request keeps growing by appends only", () => {
+    // A note is not part of the run's history, so the message it hangs on
+    // goes out without it next turn -- and a request that rewrites the tail
+    // of the last one is no longer an extension of it. On a runtime whose KV
+    // cannot rewind that costs the whole cached prefix back to a checkpoint,
+    // every turn, which is far more than a countdown is worth.
+    for (let turn = 1; turn < 8 - TURN_WARNING_AT; turn += 1) expect(turnBudgetNote(turn, 8)).toBe("");
+    expect(turnBudgetNote(8 - TURN_WARNING_AT, 8)).not.toBe("");
   });
 });
 

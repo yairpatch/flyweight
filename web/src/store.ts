@@ -548,8 +548,18 @@ export const useStore = create<StoreState>()((set, get) => {
             overheadTokens(scaffolding, charsPerToken ?? undefined),
           ))
         : Number.POSITIVE_INFINITY;
-    const compacted = compactMessages(conversation.messages, limit);
-    const note = compactionNote(compacted);
+    const compacted = compactMessages(conversation.messages, limit, conversation.compactedThrough);
+    // The boundary this turn settled on is what the next turn re-applies, so
+    // it has to outlive the request. Only a checkpoint moves it.
+    const checkpointed = compacted.through !== conversation.compactedThrough;
+    if (checkpointed) {
+      updateConversation(conversationId, (item) => ({ ...item, compactedThrough: compacted.through }));
+    }
+    // Said once, on the turn the removal happens. Repeating it every turn
+    // would rewrite the tail of every request for a fact that has not
+    // changed, and the stubs left in place say the same thing where the
+    // material used to be.
+    const note = checkpointed ? compactionNote(compacted) : "";
 
     const assistant: Message = {
       id: identifier("msg"),
@@ -739,7 +749,7 @@ export const useStore = create<StoreState>()((set, get) => {
     const overflow = kindOf(conversation) === "agent" && !controller.signal.aborted ? contextOverflow(record) : null;
     if (overflow && budget === undefined) {
       const tighter = retryBudget(overflow, conversationChars(compacted.messages), limit);
-      const retried = compactMessages(conversation.messages, tighter);
+      const retried = compactMessages(conversation.messages, tighter, conversation.compactedThrough);
       if (retried.removedChars > compacted.removedChars) {
         updateConversation(conversationId, (item) => ({ ...item, messages: item.messages.filter((message) => message.id !== assistant.id) }));
         get().toast("Context was full — compacted the run and retried", "info");
