@@ -3,7 +3,7 @@ import { Save, Trash2 } from "lucide-react";
 import { useStore } from "../../store";
 import { getApiKey, setApiKey } from "../../lib/api";
 import { PROTOCOL_LABELS } from "../../lib/protocols";
-import { REASONING_EFFORTS } from "../../lib/settings";
+import { availableEfforts } from "../../lib/settings";
 import type { GenerationSettings, Protocol } from "../../types";
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
@@ -54,6 +54,7 @@ export function SettingsPanel() {
   const deletePreset = useStore((state) => state.deletePreset);
   const pollRuntime = useStore((state) => state.pollRuntime);
   const toast = useStore((state) => state.toast);
+  const efforts = availableEfforts(props);
   const [apiKey, setKey] = useState(getApiKey());
   const [presetName, setPresetName] = useState("");
   const [stopDraft, setStopDraft] = useState("");
@@ -151,7 +152,7 @@ export function SettingsPanel() {
         </label>
         <Field label="Reasoning effort" hint={notOn(["anthropic"]) ?? "auto keeps the checkpoint default"}>
           <select value={settings.reasoningEffort} disabled={!settings.thinking} onChange={(event) => set("reasoningEffort")(event.target.value as GenerationSettings["reasoningEffort"])}>
-            {REASONING_EFFORTS.map((effort) => (
+            {efforts.map((effort) => (
               <option key={effort} value={effort}>
                 {effort}
               </option>

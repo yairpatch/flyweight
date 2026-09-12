@@ -10,7 +10,7 @@ import { identifier, titleFromPrompt } from "./lib/format";
 import { buildRequest } from "./lib/protocols";
 import { holdPartialTag, splitThinking } from "./lib/thinking";
 import { attachmentImages, forgetSources } from "./lib/attachments";
-import { loadSettings, saveSettings, settingsFromProps, DEFAULT_SETTINGS } from "./lib/settings";
+import { availableEfforts, loadSettings, saveSettings, settingsFromProps, DEFAULT_SETTINGS } from "./lib/settings";
 import type {
   Attachment,
   Conversation,
@@ -504,6 +504,15 @@ export const useStore = create<StoreState>()((set, get) => {
           }
           if (props && !current.settings.customized) {
             patch.settings = settingsFromProps(props, current.settings);
+          }
+          // A saved effort the loaded checkpoint does not name -- "high",
+          // stored against one that reads xhigh -- would leave the picker
+          // showing a value it no longer offers. The server clamps such a
+          // request rather than failing it, so this is cosmetic, but the honest
+          // label for "the checkpoint decides" is the one the UI already has.
+          const settings = patch.settings ?? current.settings;
+          if (props && !availableEfforts(props).includes(settings.reasoningEffort)) {
+            patch.settings = { ...settings, reasoningEffort: "auto" };
           }
           set(patch);
         } else {

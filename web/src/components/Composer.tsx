@@ -1,20 +1,26 @@
-import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
 import { ArrowUp, Braces, Brain, Paperclip, Square, Wrench, X, Zap } from "lucide-react";
 import { useStore } from "../store";
 import { ACCEPT_ATTRIBUTE, MAX_ATTACHMENTS, filesFrom, readAttachment, setPdfMode } from "../lib/attachments";
 import { AttachmentChip } from "./AttachmentChip";
 import { api } from "../lib/api";
 import { PROTOCOL_LABELS } from "../lib/protocols";
+import { availableEfforts } from "../lib/settings";
 import type { Attachment, ReasoningEffort } from "../types";
 
-const REASONING_CYCLE: Array<{ thinking: boolean; effort: ReasoningEffort; label: string }> = [
-  { thinking: false, effort: "auto", label: "Thinking off" },
-  { thinking: true, effort: "auto", label: "Thinking on" },
-  { thinking: true, effort: "low", label: "Thinking · low" },
-  { thinking: true, effort: "medium", label: "Thinking · medium" },
-  { thinking: true, effort: "high", label: "Thinking · high" },
-  { thinking: true, effort: "xhigh", label: "Thinking · xhigh" },
-];
+// Off, on, then one stop per effort level the loaded checkpoint actually
+// names. Cycling through a level the checkpoint reads as another one made two
+// presses of this button mean the same thing.
+function reasoningCycle(efforts: ReasoningEffort[]): Array<{ thinking: boolean; effort: ReasoningEffort; label: string }> {
+  return [
+    { thinking: false, effort: "auto" as ReasoningEffort, label: "Thinking off" },
+    ...efforts.map((effort) => ({
+      thinking: true,
+      effort,
+      label: effort === "auto" ? "Thinking on" : `Thinking · ${effort}`,
+    })),
+  ];
+}
 
 export function Composer() {
   const draft = useStore((state) => state.draft);
@@ -49,9 +55,10 @@ export function Composer() {
   const vision = Boolean(health?.execution?.vision);
   const readContext = { vision, contextWindow: props?.context_window ?? health?.context_window };
   const enabledTools = tools.filter((tool) => tool.enabled).length;
+  const cycle = useMemo(() => reasoningCycle(availableEfforts(props)), [props]);
   const reasoningIndex = Math.max(
     0,
-    REASONING_CYCLE.findIndex((entry) => entry.thinking === settings.thinking && (entry.thinking ? entry.effort === settings.reasoningEffort : true)),
+    cycle.findIndex((entry) => entry.thinking === settings.thinking && (entry.thinking ? entry.effort === settings.reasoningEffort : true)),
   );
 
   useEffect(() => {
@@ -127,7 +134,7 @@ export function Composer() {
   };
 
   const cycleReasoning = () => {
-    const next = REASONING_CYCLE[(reasoningIndex + 1) % REASONING_CYCLE.length];
+    const next = cycle[(reasoningIndex + 1) % cycle.length];
     updateSettings({ thinking: next.thinking, reasoningEffort: next.effort });
   };
 
@@ -179,7 +186,7 @@ export function Composer() {
         <div className="composer__bar">
           <div className="composer__chips">
             <button className={`chip chip--button${settings.thinking ? " chip--on" : ""}`} onClick={cycleReasoning} aria-pressed={settings.thinking} title="Cycle thinking level">
-              <Brain size={13} /> {REASONING_CYCLE[reasoningIndex].label}
+              <Brain size={13} /> {cycle[reasoningIndex].label}
             </button>
             <button className={`chip chip--button${enabledTools ? " chip--on" : ""}`} onClick={() => setPanel("tools")} title="Tools">
               <Wrench size={13} /> {enabledTools ? `${enabledTools} tool${enabledTools === 1 ? "" : "s"}` : "Tools"}
