@@ -831,6 +831,55 @@ kbd {
   margin-inline-start: 2px;
 }
 
+/* Prefill: what the server is doing before there is anything to show. */
+.prefill {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 420px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev-2);
+}
+.prefill__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+.prefill__label {
+  color: var(--text);
+}
+.prefill__percent {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.prefill__track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+.prefill__fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  /* The step is 0.2 s, so the bar eases between frames instead of jumping. */
+  transition: width 0.2s linear;
+}
+.prefill__detail {
+  color: var(--text-2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+@media (prefers-reduced-motion: reduce) {
+  .prefill__fill {
+    transition: none;
+  }
+}
+
 /* Thinking */
 .thinking {
   margin: 4px 0 10px;

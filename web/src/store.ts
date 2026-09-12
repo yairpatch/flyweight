@@ -20,6 +20,7 @@ import type {
   MessageMetrics,
   ModelInfo,
   Preset,
+  PrefillProgress,
   PropsPayload,
   RequestRecord,
   SlotInfo,
@@ -119,6 +120,12 @@ interface StoreState {
     requestId?: string;
     /** "thinking" while the model is inside its reasoning block. */
     phase?: string;
+    /**
+     * How far the server has got evaluating the prompt. Set while prefill is
+     * running and cleared by the first output, which is what tells the UI to
+     * stop showing a bar and start showing an answer.
+     */
+    prefill?: PrefillProgress;
   } | null;
   requests: RequestRecord[];
   panel: Panel;
@@ -269,6 +276,9 @@ export const useStore = create<StoreState>()((set, get) => {
       messages: conversation.messages,
       settings: state.settings,
       tools: state.tools,
+      // Only when the server says it understands the field: an older
+      // flyweight, or another OpenAI-compatible server, may reject it.
+      prefillProgress: (state.props?.capabilities ?? []).includes("prefill_progress"),
     });
 
     // Accumulate in a local draft and flush on animation frames so a fast
@@ -308,6 +318,11 @@ export const useStore = create<StoreState>()((set, get) => {
       if (draft.reasoning !== undefined) setPhase(draft.content ? "" : "thinking");
       else setPhase(splitThinking(holdPartialTag(draft.content)).open ? "thinking" : "");
     };
+    /** The prompt is done being read; whatever comes next is the answer. */
+    const clearPrefill = () => {
+      const live = get().generating;
+      if (live?.prefill && live.messageId === assistant.id) set({ generating: { ...live, prefill: undefined } });
+    };
     const onEvent = (event: StreamEvent) => {
       switch (event.type) {
         case "id":
@@ -315,20 +330,34 @@ export const useStore = create<StoreState>()((set, get) => {
             set((current) => (current.generating ? { generating: { ...current.generating, requestId: event.id } } : {}));
           }
           return;
+        case "prefill": {
+          // Only while the answer is still empty: the server sends a final
+          // 100% frame, and a bar that outlived the first token would sit
+          // over the answer it was waiting for.
+          const { type: _prefill, ...progress } = event;
+          const live = get().generating;
+          if (live && live.messageId === assistant.id && firstTokenAt === null) {
+            set({ generating: { ...live, prefill: progress } });
+          }
+          return;
+        }
         case "text":
           if (firstTokenAt === null) firstTokenAt = performance.now();
           if (reasoningStartedAt !== null && reasoningEndedAt === null) reasoningEndedAt = performance.now();
+          clearPrefill();
           draft = { ...draft, content: draft.content + event.text };
           inferPhase();
           break;
         case "reasoning":
           if (firstTokenAt === null) firstTokenAt = performance.now();
           if (reasoningStartedAt === null) reasoningStartedAt = performance.now();
+          clearPrefill();
           draft = { ...draft, reasoning: (draft.reasoning ?? "") + event.text };
           inferPhase();
           break;
         case "tool_call_start": {
           if (firstTokenAt === null) firstTokenAt = performance.now();
+          clearPrefill();
           const existing = toolCalls[event.index];
           toolCalls[event.index] = existing
             ? { ...existing, id: existing.id || event.id, name: existing.name || event.name }
