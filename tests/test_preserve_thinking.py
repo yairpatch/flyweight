@@ -85,6 +85,109 @@ class FallbackFormatterTests(unittest.TestCase):
         self.assertIn("<think>inline</think>Answer", rendered)
 
 
+class JinjaTemplateTests(unittest.TestCase):
+    """A template with its own rule keeps it; one without still gets ours.
+
+    Qwen3.8-Flash-Next reads `preserve_thinking` itself, and its rule is finer
+    than "drop all of it": reasoning survives for the turns after the last user
+    message -- the tool loop the model is still inside -- and is dropped before
+    it. Blanking every message overrode that and left the turn whose reasoning
+    the model was about to act on carrying an empty block instead.
+    """
+
+    # The shape of that rule, reduced to the part under test.
+    SELECTIVE = """
+{%- set last_user = namespace(index=0) %}
+{%- for message in messages %}
+{%- if message.role == 'user' %}{% set last_user.index = loop.index0 %}{% endif %}
+{%- endfor %}
+{%- for message in messages %}
+{%- if message.role == 'assistant' %}
+{%- if preserve_thinking is undefined or preserve_thinking is true
+       or loop.index0 > last_user.index %}
+assistant: <think>{{ message.reasoning_content }}</think>{{ message.content }}
+{%- else %}
+assistant: {{ message.content }}
+{%- endif %}
+{%- else %}
+{{ message.role }}: {{ message.content }}
+{%- endif %}
+{%- endfor %}
+"""
+    # One that never reads the flag, which is why withholding the text exists.
+    ALWAYS_REPLAYS = """
+{%- for message in messages %}
+{{ message.role }}: <think>{{ message.reasoning_content }}</think>{{ message.content }}
+{%- endfor %}
+"""
+
+    MESSAGES = [
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "Older answer", "reasoning_content": "OLD"},
+        {"role": "user", "content": "Second"},
+        {"role": "assistant", "content": "Calling a tool", "reasoning_content": "CURRENT"},
+        {"role": "tool", "content": "42"},
+    ]
+
+    @staticmethod
+    def _tokenizer(template: str) -> NativeV2Tokenizer:
+        from jinja2 import Undefined  # noqa: PLC0415
+        from jinja2.sandbox import ImmutableSandboxedEnvironment  # noqa: PLC0415
+
+        tokenizer = NativeV2Tokenizer.__new__(NativeV2Tokenizer)
+        tokenizer.architecture = "qwen4exp"
+        tokenizer._template_tokens = {"bos_token": "", "eos_token": ""}
+        environment = ImmutableSandboxedEnvironment(
+            trim_blocks=True, lstrip_blocks=True, undefined=Undefined
+        )
+        environment.globals["raise_exception"] = tokenizer._raise_template_exception
+        tokenizer._compiled_chat_template = environment.from_string(template)
+        return tokenizer
+
+    def test_a_template_with_its_own_rule_is_detected(self) -> None:
+        self.assertTrue(
+            self._tokenizer(self.SELECTIVE)._template_honors_preserve_thinking()
+        )
+
+    def test_a_template_that_ignores_the_flag_is_detected(self) -> None:
+        self.assertFalse(
+            self._tokenizer(self.ALWAYS_REPLAYS)._template_honors_preserve_thinking()
+        )
+
+    def test_the_probe_runs_once(self) -> None:
+        tokenizer = self._tokenizer(self.SELECTIVE)
+        self.assertTrue(tokenizer._template_honors_preserve_thinking())
+        tokenizer._compiled_chat_template = None
+        self.assertTrue(tokenizer._template_honors_preserve_thinking())
+
+    def test_false_leaves_the_current_loop_to_a_template_that_reads_it(self) -> None:
+        rendered = self._tokenizer(self.SELECTIVE).format_messages(
+            self.MESSAGES, preserve_thinking=False
+        )
+        self.assertIn("CURRENT", rendered)
+        self.assertNotIn("OLD", rendered)
+        # And the kept turn carries its reasoning, not the empty block that
+        # marks a turn which did not think.
+        self.assertIn("<think>CURRENT</think>", rendered)
+
+    def test_false_still_withholds_from_a_template_that_ignores_it(self) -> None:
+        rendered = self._tokenizer(self.ALWAYS_REPLAYS).format_messages(
+            self.MESSAGES, preserve_thinking=False
+        )
+        self.assertNotIn("CURRENT", rendered)
+        self.assertNotIn("OLD", rendered)
+
+    def test_unstated_and_true_replay_everything_either_way(self) -> None:
+        for template in (self.SELECTIVE, self.ALWAYS_REPLAYS):
+            for preserve in (None, True):
+                with self.subTest(preserve=preserve):
+                    rendered = self._tokenizer(template).format_messages(
+                        self.MESSAGES, preserve_thinking=preserve
+                    )
+                    self.assertIn("CURRENT", rendered)
+                    self.assertIn("OLD", rendered)
+
+
 class ContinuationKeyTests(unittest.TestCase):
     def test_replayed_reasoning_is_part_of_the_cache_key(self) -> None:
         # Reducing to (role, content) matched a turn rendered from a different

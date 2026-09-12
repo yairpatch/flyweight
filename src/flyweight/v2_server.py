@@ -422,10 +422,13 @@ class NativeV2Tokenizer:
         self.chat_template = getattr(model, "chat_template", None)
         self.chat_template_source = "gguf" if self.chat_template else "fallback"
         self._compiled_chat_template: Template | None = None
-        # Which effort levels this checkpoint's template actually accepts,
-        # discovered on first use. See _accepted_reasoning_efforts.
+        # What this checkpoint's template does with the thinking variables,
+        # discovered on first use. See _accepted_reasoning_efforts and
+        # _template_honors_preserve_thinking.
         self._accepted_efforts: tuple[str, ...] | None = None
         self._efforts_probed = False
+        self._template_preserves = False
+        self._preserve_probed = False
         eos: list[int] = []
         # The GGUF's own terminator ids first. eot ends a chat turn where eos
         # ends generation, and a model that closes its turn with a dedicated
@@ -568,6 +571,59 @@ class NativeV2Tokenizer:
         """
         return self._accepted_reasoning_efforts()
 
+    def _template_honors_preserve_thinking(self) -> bool:
+        """Whether the template drops replayed reasoning on its own when asked.
+
+        Asked the same way as the effort vocabulary, and for the same reason:
+        the answer is a property of the checkpoint's template, and guessing it
+        was wrong. Render a two-round conversation whose assistant turns carry
+        reasoning, once with the flag true and once false, and see whether the
+        second keeps fewer of the blocks than the first.
+
+        Counting the marker rather than comparing the two renders keeps a
+        template that stamps a clock (`strftime_now`) from reading as a
+        difference. False -- the template ignores the flag, or could not render
+        the probe -- means a `false` still has to be enforced by withholding the
+        text, which is where this started.
+        """
+        if getattr(self, "_preserve_probed", False):
+            return self._template_preserves
+        template = getattr(self, "_compiled_chat_template", None)
+        honors = False
+        if template is not None:
+            marker = "ZZPROBEREASONINGZZ"
+            probe = [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b", "reasoning_content": marker},
+                {"role": "user", "content": "c"},
+                {"role": "assistant", "content": "d", "reasoning_content": marker},
+            ]
+            rendered = []
+            for preserve in (True, False):
+                try:
+                    rendered.append(template.render(
+                        messages=[
+                            {**message, "tool_calls": [], "tools": [],
+                             "reasoning_content": message.get("reasoning_content", "")}
+                            for message in probe
+                        ],
+                        add_generation_prompt=True,
+                        preserve_thinking=preserve,
+                        reasoning_strength="high",
+                        tools=None,
+                        documents=None,
+                        **getattr(self, "_template_tokens", {}),
+                    ))
+                except Exception:  # noqa: BLE001 - unrenderable means "cannot tell"
+                    rendered = []
+                    break
+            if rendered:
+                kept, dropped = (text.count(marker) for text in rendered)
+                honors = kept > 0 and dropped < kept
+        self._template_preserves = honors
+        self._preserve_probed = True
+        return honors
+
     def _supported_reasoning_effort(self, effort: str) -> str:
         """`effort` itself, or the nearest level this checkpoint accepts."""
         accepted = self._accepted_reasoning_efforts()
@@ -707,9 +763,14 @@ class NativeV2Tokenizer:
         `preserve_thinking` decides whether an assistant turn's replayed
         chain-of-thought reaches the prompt; None leaves that to the
         architecture's own convention (see keeps_replayed_reasoning). It is
-        only a full override for the formatters written here -- on the jinja
-        path a false can be enforced by withholding the text, but a true cannot
-        make a template that strips history reasoning keep it.
+        only a full override for the formatters written here. On the jinja path
+        a false is handed to a template that acts on it, and enforced by
+        withholding the text only from one that does not -- the checkpoint's own
+        rule is finer than "drop all of it" (Flash-Next keeps the current tool
+        loop's reasoning and drops what the conversation has moved past), and
+        overriding it cost the model the thinking behind the call it was about
+        to read a result for. A true remains advisory in the other direction: it
+        cannot make a template that strips history reasoning keep it.
 
         `reasoning_effort` is the same idea one level down, for a checkpoint
         that grades its reasoning rather than switching it. Qwen3.5 reads
@@ -732,6 +793,18 @@ class NativeV2Tokenizer:
             raise ValueError("messages must not be empty")
         compiled_template = getattr(self, "_compiled_chat_template", None)
         if compiled_template is not None:
+            # Withholding the text is the only way to enforce a `false` on a
+            # template that always replays reasoning -- but on one that reads
+            # the flag itself it destroys what that flag was asking for.
+            # Flash-Next keeps the reasoning of the tool loop the model is still
+            # inside and drops only what the conversation has moved past;
+            # blanking every message left the turn whose reasoning the model is
+            # about to act on carrying `<think>\n\n</think>` instead, which is
+            # the marker for "this turn did not think".
+            withhold_reasoning = (
+                preserve_thinking is False
+                and not self._template_honors_preserve_thinking()
+            )
             normalized: list[dict[str, object]] = []
             for index, message in enumerate(messages):
                 role = message["role"]
@@ -745,22 +818,19 @@ class NativeV2Tokenizer:
                 # the architectures whose template renders them itself; for the
                 # rest the compatibility layer has already put that history in
                 # content, and an empty collection preserves it.
-                # An explicit false is enforced here rather than left to the
-                # template: withholding the text is the only way to make a
-                # template that always replays reasoning stop. The reverse does
-                # not work -- passing it cannot make a template that strips it
-                # keep it -- so `preserve_thinking` is advisory in that
-                # direction, and is also exposed as a template variable for a
-                # template that reads one.
+                # An explicit false is enforced here only for a template that
+                # ignores it (see withhold_reasoning above). The reverse never
+                # works -- passing the flag cannot make a template that strips
+                # reasoning keep it -- so `preserve_thinking` stays advisory in
+                # that direction, and is passed as a template variable either
+                # way for a template that reads one.
                 reasoning = message.get("reasoning_content", "")
                 normalized.append(
                     {
                         "role": role,
                         "content": content,
                         "tool_calls": message.get("tool_calls", []),
-                        "reasoning_content": (
-                            "" if preserve_thinking is False else reasoning
-                        ),
+                        "reasoning_content": "" if withhold_reasoning else reasoning,
                         "tools": message.get("tools", []),
                     }
                 )
