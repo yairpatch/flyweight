@@ -247,16 +247,29 @@ ANTHROPIC_THINKING_BUDGET = 2048
 # level a checkpoint was trained on rather than 400 on a request whose intent
 # is unambiguous.
 EFFORT_ALIASES = {"minimal": "low", "max": "xhigh"}
+# Not a level: the off switch, spelled in the effort field. llama.cpp reads
+# "none" there as "do not reason at all", and the OpenAI-shaped clients built
+# against it send exactly that, so it is accepted wherever an effort is --
+# and then resolved into enable_thinking=False before anything downstream
+# sees it. It stays out of REASONING_EFFORTS deliberately: a template is
+# never handed "none" as a grade, and /props never offers it as a choice.
+EFFORT_OFF = "none"
+# pi grades its slider off / minimal / low / medium / high / xhigh / max and
+# sends the level it shows, so "off" arrives meaning the same request.
+EFFORT_OFF_SPELLINGS = ("none", "off")
 
 
 def _normalized_effort(value: Any, parameter: str) -> str:
+    """One level in this server's vocabulary, or EFFORT_OFF for "don't think"."""
     if isinstance(value, str):
+        if value in EFFORT_OFF_SPELLINGS:
+            return EFFORT_OFF
         effort = EFFORT_ALIASES.get(value, value)
         if effort in REASONING_EFFORTS:
             return effort
     raise APIError(
         400,
-        parameter + " must be one of " + ", ".join(REASONING_EFFORTS),
+        parameter + " must be one of " + ", ".join((EFFORT_OFF, *REASONING_EFFORTS)),
         parameter=parameter,
     )
 # Muse Glimmer renders an assistant turn as a run of recipient-tagged messages
@@ -877,12 +890,16 @@ class InferenceService:
         # Whether an image part may name an http(s) URL for the server to
         # fetch; data URLs are always accepted.
         self.allow_remote_images = True
-        if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+        accepted_efforts = (EFFORT_OFF, *REASONING_EFFORTS)
+        if reasoning_effort is not None and reasoning_effort not in accepted_efforts:
             raise ValueError(
-                "reasoning_effort must be one of " + ", ".join(REASONING_EFFORTS))
+                "reasoning_effort must be one of " + ", ".join(accepted_efforts))
         # The default for requests that do not ask. None leaves the
         # checkpoint's own, which is the only safe answer for a template this
-        # server has never seen.
+        # server has never seen. "none" is the operator saying this server does
+        # not reason unless a request asks it to -- the only answer available
+        # against a client that expresses "thinking off" by sending no field at
+        # all (pi does), where the checkpoint's own default is thinking on.
         self.reasoning_effort = reasoning_effort
         # Read from the dataclass rather than restated here, so the one place
         # that documents the sampling defaults stays the only place.
@@ -1961,9 +1978,11 @@ class InferenceService:
         tools = _response_tools(payload)
         if tools:
             _prepend_tool_prompt(messages, tools, payload.get("tool_choice"))
+        enable_thinking, reasoning_effort = self._reasoning_request(payload)
         tokens = self.generator.tokenizer.encode_messages(
             messages,
-            enable_thinking=_boolean_option(payload, "enable_thinking", None),
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
         )
         return {"object": "response.input_tokens", "input_tokens": len(tokens)}
 
@@ -1975,9 +1994,11 @@ class InferenceService:
             freeze_total_tokens=self.freeze_total_tokens,
             allow_remote_images=self.allow_remote_images,
         )
+        enable_thinking, reasoning_effort = self._reasoning_request(options)
         tokens = self.generator.tokenizer.encode_messages(
             messages,
-            enable_thinking=_boolean_option(options, "enable_thinking", None),
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
         )
         return {"input_tokens": len(tokens)}
 
@@ -2748,25 +2769,18 @@ class InferenceService:
             sampling = _sampling_from_payload(payload, self.generation_defaults)
         except ValueError as error:
             raise APIError(400, str(error)) from error
-        enable_thinking = _boolean_option(payload, "enable_thinking", None)
-        # vLLM's spelling of template variables, which harness reasoning
-        # presets are written against; the flat field wins when both appear.
+        # Resolved together, and before the prompt is rendered rather than
+        # after: both are template variables, so they have to be in hand when
+        # the template runs. Passing the effort only to the generate call left
+        # it silently ignored -- every level produced a byte-identical prompt.
+        enable_thinking, reasoning_effort = self._reasoning_request(payload)
         template_kwargs = _chat_template_kwargs(payload)
-        if enable_thinking is None:
-            enable_thinking = _boolean_option(
-                template_kwargs, "enable_thinking", None
-            )
         preserve_thinking = _boolean_option(payload, "preserve_thinking", None)
         if preserve_thinking is None:
             preserve_thinking = _boolean_option(
                 template_kwargs, "preserve_thinking", None
             )
         separate_reasoning = _boolean_option(payload, "separate_reasoning", False)
-        # Resolved before the prompt is rendered, not after: this is a template
-        # variable, so it has to be in hand when the template runs. Passing it
-        # only to the generate call left the effort silently ignored -- every
-        # level produced a byte-identical prompt.
-        reasoning_effort = self._reasoning_effort(payload)
         try:
             prepare_messages = getattr(self.generator, "prepare_messages", None)
             prompt_ids = tuple(
@@ -2925,6 +2939,42 @@ class InferenceService:
             )
         return max(1, min(requested, room))
 
+    def _reasoning_request(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[bool | None, str | None]:
+        """The two questions a request asks about reasoning: whether, and how hard.
+
+        Clients spell them in whatever combination their SDK settled on --
+        `enable_thinking` (vLLM, and llama.cpp's chat_template_kwargs),
+        `reasoning_effort: "none"` (llama.cpp's own reading, and every
+        OpenAI-shaped client built against it), Anthropic's `thinking` block
+        and `output_config.effort`. They are one setting here, so they are
+        resolved in one place and every endpoint reads the answer from it,
+        including the token counters -- which have to render the same prompt
+        the generation will, or their count is of something else.
+
+        Precedence follows how specific the client was being. An explicit
+        `enable_thinking` is a direct answer to "whether" and wins outright;
+        an effort of "none" answers it indirectly and so only outranks the
+        template-variable bundle, where `enable_thinking` is usually a preset
+        someone else wrote rather than this request's own choice.
+        """
+        enable_thinking = _boolean_option(payload, "enable_thinking", None)
+        effort = self._reasoning_effort(payload)
+        if effort == EFFORT_OFF:
+            # Never forwarded as a level: "none" is not a grade any template
+            # was trained on, and one that validates its input raises on it.
+            effort = None
+            if enable_thinking is None:
+                enable_thinking = False
+        elif enable_thinking is None:
+            # vLLM's spelling of template variables, which harness reasoning
+            # presets are written against; the flat field wins when both appear.
+            enable_thinking = _boolean_option(
+                _chat_template_kwargs(payload), "enable_thinking", None
+            )
+        return enable_thinking, effort
+
     def _reasoning_effort(self, payload: Mapping[str, Any]) -> str | None:
         """The effort this request asks for, or the service default.
 
@@ -2935,20 +2985,26 @@ class InferenceService:
         The flat `reasoning_effort` is Chat Completions' spelling; the
         Responses API nests the same value as `reasoning.effort`, and clients
         built against that shape send it on both endpoints, where it used to
-        pass through unread.
+        pass through unread. `reasoningEffort` is the same field arriving in
+        the case its SDK wrote it in: an opencode model option goes into the
+        body verbatim through @ai-sdk/openai-compatible, so the camelCase key
+        is what a local provider actually receives. Unknown keys are ignored
+        rather than rejected here, so reading only the snake_case spelling
+        meant opencode's effort setting silently did nothing.
         """
-        requested = payload.get("reasoning_effort")
-        if requested is not None:
-            return _normalized_effort(requested, "reasoning_effort")
+        for key in ("reasoning_effort", "reasoningEffort"):
+            requested = payload.get(key)
+            if requested is not None:
+                return _normalized_effort(requested, key)
         reasoning = payload.get("reasoning")
         if isinstance(reasoning, Mapping) and reasoning.get("effort") is not None:
             return _normalized_effort(reasoning["effort"], "reasoning.effort")
         template_kwargs = _chat_template_kwargs(payload)
-        if template_kwargs.get("reasoning_effort") is not None:
-            return _normalized_effort(
-                template_kwargs["reasoning_effort"],
-                "chat_template_kwargs.reasoning_effort",
-            )
+        for key in ("reasoning_effort", "reasoningEffort"):
+            if template_kwargs.get(key) is not None:
+                return _normalized_effort(
+                    template_kwargs[key], "chat_template_kwargs." + key
+                )
         return self.reasoning_effort
 
     def _validate_model(self, requested_model: Any) -> None:
@@ -4875,8 +4931,11 @@ def _anthropic_effort(payload: Mapping[str, Any]) -> str | None:
 
     Claude Code's /effort slider arrives here as `output_config.effort`
     alongside `thinking: {"type": "adaptive"}`. The levels are the local
-    vocabulary plus "max", which clamps to xhigh; until this was read, the
-    slider changed nothing against a checkpoint that grades its reasoning.
+    vocabulary plus "max", which clamps to xhigh, and "none", which is not a
+    level at all but the slider's off position -- `_reasoning_request` turns
+    it into the same suppression `thinking: {"type": "disabled"}` asks for.
+    Until this was read, the slider changed nothing against a checkpoint that
+    grades its reasoning.
     """
     config = payload.get("output_config")
     if config is None:
