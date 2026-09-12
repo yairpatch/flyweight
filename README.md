@@ -546,6 +546,19 @@ Reasoning models expose two knobs, one soft and one hard:
   an **Answer now** button while the model is thinking.
   Anthropic's `thinking: {"type": "enabled", "budget_tokens": N}` maps onto
   it. Unlike hosted APIs, this budget is a guarantee, not a hint.
+- `prefill_progress: true` on a streaming request adds progress frames while
+  the prompt is being evaluated, which is the one phase that otherwise
+  produces nothing at all: on a long prompt a client has no way to tell a
+  slow prefill from a stalled server. Each frame is typed `ping` -- an event
+  every protocol already defines -- and carries
+  `flyweight.prefill` with `processed`, `total`, `cached` (what the prefix
+  cache spared), `tokens_per_second`, and `eta_seconds` once there is a rate
+  to estimate from. The first arrives before any of the prompt has been
+  evaluated, so a bar can appear immediately, and a final one reports the
+  full count. It is opt-in because it is an extension: a client that did not
+  ask never sees a frame its SDK has no model for. `/props` lists
+  `prefill_progress` under `capabilities`, and the chat UI shows a bar with
+  the estimate in place of the blinking cursor.
 
 `enable_thinking` (top level or in `chat_template_kwargs`) switches thinking
 off entirely for templates with a switch. Chain-of-thought always arrives in

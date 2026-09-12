@@ -190,6 +190,20 @@ export interface SlotInfo {
 
 // ---- Unified stream events ---------------------------------------------
 
+/**
+ * How far the server has got evaluating a prompt, while it is still doing it.
+ * `cached` is the part the prefix cache spared, which is what separates "this
+ * prompt is long" from "this prompt is new".
+ */
+export interface PrefillProgress {
+  processed: number;
+  total: number;
+  cached: number;
+  tokensPerSecond: number;
+  /** Absent until there is a rate to estimate from, and once it is done. */
+  etaSeconds?: number;
+}
+
 export type StreamEvent =
   | { type: "id"; id: string }
   | { type: "text"; text: string }
@@ -197,6 +211,7 @@ export type StreamEvent =
   | { type: "tool_call_start"; index: number; id: string; name: string }
   | { type: "tool_call_delta"; index: number; arguments: string }
   | { type: "metrics"; tokens: number; decodeSeconds: number; phase?: string }
+  | ({ type: "prefill" } & PrefillProgress)
   | { type: "usage"; usage: Usage }
   | { type: "finish"; reason: string }
   | { type: "error"; message: string };

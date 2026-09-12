@@ -1999,6 +1999,10 @@ class InferenceService:
                 "responses_streaming",
                 "function_tools",
                 "tokenize",
+                # A streaming request may ask for prefill progress; without
+                # this a client cannot tell an old server (which would ignore
+                # the field and show a bar that never moves) from a new one.
+                "prefill_progress",
                 *(["stop_thinking"] if self.supports_stop_thinking else []),
             ],
         }
@@ -3251,6 +3255,10 @@ class FlyweightHTTPServer(ThreadingHTTPServer):
 
 
 _SSE_KEEPALIVE = object()
+# How often a streaming client hears how far prefill has got. Fast enough
+# that a bar moves, slow enough that a 100k-token prompt does not spend its
+# prefill writing progress frames.
+_PREFILL_EVENT_SECONDS = 0.2
 
 
 def _sse_with_keepalive(
@@ -3389,6 +3397,13 @@ def create_handler(
             self._fw_decode_phase = None
             self._fw_finish = None
             self._fw_started = time.perf_counter()
+            # True only between the SSE headers and the end of the stream,
+            # which is the window in which a prefill event may be written.
+            self._fw_sse_open = False
+            # Held for the length of one SSE frame. Reentrant because the
+            # prefill writer checks _fw_sse_open under it and then writes
+            # through the ordinary event path, which takes it again.
+            self._fw_write_lock = threading.RLock()
 
         def send_response(self, code: int, message: str | None = None) -> None:
             self._fw_status = int(code)
@@ -3623,7 +3638,13 @@ def create_handler(
                     return
                 payload = self._read_json()
                 self.log_message("request processing: %s", path)
-                progress = self._prompt_progress(path)
+                # Prefill events are opt-in: they are a flyweight extension,
+                # and a client that did not ask for one should not have to
+                # skip frames its own SDK never modelled.
+                progress = self._prompt_progress(
+                    path,
+                    stream=_boolean_option(payload, "prefill_progress", False),
+                )
                 stop_target = _stop_thinking_target(path)
                 if stop_target is not None:
                     self._send_json(200, service.stop_thinking(stop_target))
@@ -3741,13 +3762,25 @@ def create_handler(
                     error_type="authentication_error",
                 )
 
-        def _prompt_progress(self, path: str) -> Callable[[int, int], None]:
+        def _prompt_progress(
+            self, path: str, *, stream: bool = False
+        ) -> Callable[[int, int], None]:
             endpoint = _ENDPOINT_LABELS.get(path, path)
             last_seen = -1
             last_shown_at = 0.0
+            last_sent_at = 0.0
+            last_sent = -1
             started = time.perf_counter()
             first_report = True
             reused = 0
+
+            def send(processed: int, total: int, rate: float, now: float) -> None:
+                """One prefill frame, at most one per position."""
+                nonlocal last_sent_at, last_sent
+                if last_sent == processed:
+                    return
+                last_sent_at, last_sent = now, processed
+                self._write_prefill_event(processed, total, reused, rate)
 
             def report(processed: int, total: int) -> None:
                 nonlocal first_report, last_shown_at, last_seen, reused
@@ -3808,12 +3841,25 @@ def create_handler(
                     # built, just after the request is read, so it brackets
                     # tokenization and prefill -- over-counting by a constant
                     # beats a figure with no relationship to anything.
+                    #
+                    # The client hears about the prompt here, before any of it
+                    # has been evaluated: this first report is what carries the
+                    # total and how much the cache spared, which is everything
+                    # a bar needs to appear. There is no rate yet.
+                    if stream:
+                        send(processed, total, 0.0, now)
                     if processed < total:
                         return
                 evaluated = max(0, processed - reused)
                 elapsed = now - started
                 rate = (evaluated / elapsed) if elapsed > 0 else 0.0
                 if processed < total:
+                    # The stream carries the same figures the console line
+                    # shows, on their own clock: a browser that renders every
+                    # step is one thing, a terminal rewriting a line in place
+                    # is another, and neither should throttle the other.
+                    if stream and now - last_sent_at >= _PREFILL_EVENT_SECONDS:
+                        send(processed, total, rate, now)
                     if now - last_shown_at < 0.25:
                         return
                     last_shown_at = now
@@ -3827,6 +3873,11 @@ def create_handler(
                         )
                     )
                     return
+                # The step that finished prefill: say so, so a client showing
+                # a bar completes it rather than leaving it at 94% until the
+                # first token lands (which on a long prompt is a while).
+                if stream:
+                    send(total, total, rate, now)
                 LOG.end_progress()
                 self._fw_prefill_done = now
                 cached = (
@@ -3892,6 +3943,10 @@ def create_handler(
             self._send_cors_headers()
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            # From here a prefill event may go out: the headers are written,
+            # and the generator below has not been started, so nothing else
+            # is writing to this socket yet.
+            self._fw_sse_open = True
             stream_ok = True
             decoding_logged = False
             event_count = 0
@@ -4035,13 +4090,19 @@ def create_handler(
                     stream_ok = False
                     self.close_connection = True
             finally:
+                # Closed before the worker is, and under the same lock the
+                # worker writes with, so a prefill frame cannot land after the
+                # terminating chunk.
+                with self._fw_write_lock:
+                    self._fw_sse_open = False
                 # Closing the wrapper stops its worker, which owns closing the
                 # upstream generator.
                 stream.close()
                 if stream_ok:
                     try:
-                        self.wfile.write(b"0\r\n\r\n")  # terminating chunk
-                        self.wfile.flush()
+                        with self._fw_write_lock:
+                            self.wfile.write(b"0\r\n\r\n")  # terminating chunk
+                            self.wfile.flush()
                     except _PEER_GONE:
                         self.close_connection = True
 
@@ -4076,23 +4137,80 @@ def create_handler(
             # An SSE comment: valid framing that every compliant client
             # ignores, so it is safe on the OpenAI-shaped endpoints where no
             # keepalive event type is defined.
-            payload = b": keepalive\n\n"
-            self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
-            self.wfile.write(payload)
-            self.wfile.write(b"\r\n")
-            self.wfile.flush()
+            self._write_sse_chunk(b": keepalive\n\n")
+
+        def _write_prefill_event(
+            self, processed: int, total: int, cached: int, rate: float
+        ) -> None:
+            """Tell a streaming client how far the prompt has got.
+
+            Prefill is the one phase that produces nothing: a long prompt
+            leaves a blinking cursor and no way to tell a slow model from a
+            stalled one. The numbers already exist for the console line, so
+            this puts them on the wire as well.
+
+            The frame rides in `flyweight`, the same envelope the live decode
+            metrics use, and is typed `ping` so a client that does not know
+            the field still sees an event its protocol defines. It is written
+            straight to the socket rather than yielded, because prefill runs
+            inside the first `next()` of the event generator -- there is no
+            yield to hang it on, and this is the same thread, between the
+            headers and the first real event.
+            """
+            remaining = max(0, total - processed)
+            payload: dict[str, Any] = {
+                "type": "ping",
+                "flyweight": {
+                    "prefill": {
+                        "processed": int(processed),
+                        "total": int(total),
+                        # What the prefix cache spared: the difference between
+                        # "this prompt is long" and "this prompt is new".
+                        "cached": int(cached),
+                        "tokens_per_second": round(rate, 1),
+                        **(
+                            {"eta_seconds": round(remaining / rate, 1)}
+                            if rate > 0 and remaining
+                            else {}
+                        ),
+                    }
+                },
+            }
+            with self._fw_write_lock:
+                # Under the lock: the stream may be closing on the other
+                # thread, and a frame after the terminating chunk is a
+                # corrupt response rather than a late one.
+                if not self._fw_sse_open:
+                    return
+                with contextlib.suppress(*_PEER_GONE):
+                    self._write_sse_event(
+                        json.dumps(payload, ensure_ascii=False), payload
+                    )
 
         def _write_sse_event(
             self, data: str, event: Mapping[str, Any] | None = None
         ) -> None:
             event_name = event.get("type") if event is not None else None
             prefix = f"event: {event_name}\n" if event_name else ""
-            payload = f"{prefix}data: {data}\n\n".encode("utf-8")
-            # One HTTP chunk per SSE event: "<hex length>\r\n<payload>\r\n".
-            self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
-            self.wfile.write(payload)
-            self.wfile.write(b"\r\n")
-            self.wfile.flush()
+            self._write_sse_chunk(f"{prefix}data: {data}\n\n".encode("utf-8"))
+
+        def _write_sse_chunk(self, payload: bytes) -> None:
+            """One SSE frame, as one HTTP chunk, written whole.
+
+            Two threads write to a stream: the one iterating the events, and
+            the generator's own thread reporting prefill progress from inside
+            `_sse_with_keepalive`'s worker. A chunk is three writes -- length,
+            body, terminator -- and interleaving two of those produces a
+            stream no client can parse. The lock makes each frame atomic; the
+            order frames arrive in does not matter, because each one stands
+            alone.
+            """
+            with self._fw_write_lock:
+                # "<hex length>\r\n<payload>\r\n"
+                self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
+                self.wfile.write(payload)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
 
         def _send_cors_headers(self) -> None:
             self.send_header("Access-Control-Allow-Origin", service.cors_origin)

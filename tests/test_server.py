@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import itertools
 import os
@@ -11,6 +12,7 @@ import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
+from typing import Any
 from unittest.mock import Mock, patch
 
 try:
@@ -2823,6 +2825,74 @@ class HTTPServerTests(unittest.TestCase):
         )
         self.assertIn('"object": "chat.completion.chunk"', stream_body)
         self.assertIn("data: [DONE]", stream_body)
+
+    def _prefill_stream(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """One streamed request whose generator reports prefill progress."""
+
+        class PrefillGenerator(StubGenerator):
+            def stream_messages(self, messages, **options):
+                report = options.get("progress")
+                if report is not None:
+                    report(2048, 8192)   # part way through a cold prompt
+                    report(8192, 8192)   # and done
+                yield from StubGenerator.stream_messages(self, messages, **options)
+
+        service = InferenceService("qwen-local", PrefillGenerator())
+        server = FlyweightHTTPServer(("127.0.0.1", 0), create_handler(service))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        try:
+            connection.request(
+                "POST", "/v1/chat/completions", body=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+            body = connection.getresponse().read().decode("utf-8")
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        frames = []
+        for line in body.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            with contextlib.suppress(ValueError):
+                frames.append(json.loads(line[len("data: ") :]))
+        return frames
+
+    def test_a_streamed_prefill_reports_how_far_it_has_got(self) -> None:
+        # The failure this prevents: a long prompt shows a blinking cursor and
+        # nothing else, so a slow prefill and a hung server look identical.
+        frames = self._prefill_stream(
+            {"messages": [{"role": "user", "content": "Hi"}], "stream": True, "prefill_progress": True}
+        )
+        prefill = [frame["flyweight"]["prefill"] for frame in frames if "prefill" in frame.get("flyweight", {})]
+        self.assertEqual([step["processed"] for step in prefill], [2048, 8192])
+        self.assertEqual(prefill[0]["total"], 8192)
+        # What the prefix cache spared is part of the answer: it is the
+        # difference between a prompt that is long and one that is new.
+        self.assertEqual(prefill[0]["cached"], 2048)
+        # The first frame is what makes a bar appear, and it comes before any
+        # of the prompt has been evaluated: a total and a cached count, but no
+        # rate yet and so no estimate to give.
+        self.assertEqual(prefill[0]["tokens_per_second"], 0)
+        self.assertNotIn("eta_seconds", prefill[0])
+        self.assertGreater(prefill[-1]["tokens_per_second"], 0)
+        # The frame is typed as something every protocol already defines, so a
+        # client that ignores the extension sees an event it knows.
+        self.assertEqual({frame["type"] for frame in frames if "flyweight" in frame and "prefill" in frame["flyweight"]}, {"ping"})
+        # The text of the answer still arrives after it.
+        self.assertTrue(any(frame.get("choices") for frame in frames))
+
+    def test_prefill_progress_is_not_sent_to_a_client_that_did_not_ask(self) -> None:
+        # It is an extension: a client whose SDK models the protocol strictly
+        # should never have to skip a frame it did not opt into.
+        frames = self._prefill_stream(
+            {"messages": [{"role": "user", "content": "Hi"}], "stream": True}
+        )
+        self.assertFalse([frame for frame in frames if "prefill" in frame.get("flyweight", {})])
+        self.assertTrue(any(frame.get("choices") for frame in frames))
 
     def test_stream_console_rate_counts_intervals_not_tokens(self) -> None:
         # N streamed tokens span N-1 intervals: the first token ends prompt

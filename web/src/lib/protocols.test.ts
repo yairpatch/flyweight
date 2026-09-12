@@ -168,3 +168,40 @@ describe("responses api", () => {
     expect(events[4]).toEqual({ type: "finish", reason: "tool_calls" });
   });
 });
+
+describe("prefill progress", () => {
+  const frame = (payload: unknown) => {
+    const data = JSON.stringify(payload);
+    return { event: "", data, raw: `data: ${data}` };
+  };
+  const progress = {
+    type: "ping",
+    flyweight: { prefill: { processed: 4300, total: 10600, cached: 2048, tokens_per_second: 940.5, eta_seconds: 6.7 } },
+  };
+
+  it("is asked for only when the caller says the server understands it", () => {
+    const context = { model: "m", messages: [user("hi")], settings: DEFAULT_SETTINGS, tools: [] };
+    expect(buildChatRequest(context).prefill_progress).toBeUndefined();
+    expect(buildChatRequest({ ...context, prefillProgress: true }).prefill_progress).toBe(true);
+    expect(buildAnthropicRequest({ ...context, prefillProgress: true }).prefill_progress).toBe(true);
+    expect(buildResponsesRequest({ ...context, prefillProgress: true }).prefill_progress).toBe(true);
+  });
+
+  it("reaches the UI whichever protocol the stream is in", () => {
+    for (const parse of [parseChatFrame, parseAnthropicFrame, parseResponsesFrame]) {
+      const events = parse(frame(progress));
+      expect(events).toEqual([
+        { type: "prefill", processed: 4300, total: 10600, cached: 2048, tokensPerSecond: 940.5, etaSeconds: 6.7 },
+      ]);
+    }
+  });
+
+  it("ignores a frame that carries no prefill, and one whose numbers are missing", () => {
+    expect(parseChatFrame(frame({ type: "ping" }))).toEqual([]);
+    expect(parseChatFrame(frame({ type: "ping", flyweight: { prefill: { total: 10 } } }))).toEqual([]);
+    // Decode metrics ride in the same envelope and must still come through.
+    expect(parseChatFrame(frame({ flyweight: { generated_tokens: 3, decode_elapsed_seconds: 0.5 } }))).toEqual([
+      { type: "metrics", tokens: 3, decodeSeconds: 0.5, phase: undefined },
+    ]);
+  });
+});

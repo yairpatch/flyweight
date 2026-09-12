@@ -30,9 +30,41 @@ export interface RequestContext {
   messages: Message[];
   settings: GenerationSettings;
   tools: ToolDefinition[];
+  /**
+   * Ask the server to report prefill progress on the stream. A flyweight
+   * extension, so it is sent only when /props advertises it: another
+   * OpenAI-compatible server may reject a field it does not know.
+   */
+  prefillProgress?: boolean;
 }
 
 // ---- Helpers ---------------------------------------------------------------
+
+/** The `flyweight` envelope every protocol's frames may carry. */
+interface FlyweightFrame {
+  generated_tokens?: number;
+  decode_elapsed_seconds?: number;
+  phase?: string;
+  prefill?: { processed?: number; total?: number; cached?: number; tokens_per_second?: number; eta_seconds?: number };
+}
+
+/**
+ * Prefill progress, when the frame carries it. Prefill is the phase that
+ * produces no output, so without this a long prompt is indistinguishable
+ * from a stalled server.
+ */
+function prefillFrom(frame: FlyweightFrame | undefined): StreamEvent | null {
+  const prefill = frame?.prefill;
+  if (!prefill || typeof prefill.processed !== "number" || typeof prefill.total !== "number") return null;
+  return {
+    type: "prefill",
+    processed: prefill.processed,
+    total: prefill.total,
+    cached: prefill.cached ?? 0,
+    tokensPerSecond: prefill.tokens_per_second ?? 0,
+    etaSeconds: prefill.eta_seconds,
+  };
+}
 
 export function parseJsonObject(text: string, fallback: Record<string, unknown> = {}): Record<string, unknown> {
   const trimmed = text.trim();
@@ -138,6 +170,7 @@ export function buildChatRequest(ctx: RequestContext): Record<string, unknown> {
   if (effort) body.reasoning_effort = effort;
   if (settings.thinking && settings.reasoningBudget) body.reasoning_budget_tokens = settings.reasoningBudget;
   if (settings.preserveThinking) body.preserve_thinking = true;
+  if (ctx.prefillProgress) body.prefill_progress = true;
   const tools = enabledTools(ctx.tools);
   if (tools.length) {
     body.tools = tools.map((tool) => ({
@@ -177,7 +210,9 @@ export function parseChatFrame(frame: SseFrame): StreamEvent[] {
     events.push({ type: "error", message: error.message ?? "stream error" });
     return events;
   }
-  const metrics = payload.flyweight as { generated_tokens?: number; decode_elapsed_seconds?: number; phase?: string } | undefined;
+  const metrics = payload.flyweight as FlyweightFrame | undefined;
+  const prefillEvent = prefillFrom(metrics);
+  if (prefillEvent) events.push(prefillEvent);
   if (metrics && typeof metrics.generated_tokens === "number") {
     events.push({
       type: "metrics",
@@ -283,6 +318,7 @@ export function buildAnthropicRequest(ctx: RequestContext): Record<string, unkno
     ? { type: "enabled", budget_tokens: settings.reasoningBudget ?? Math.max(1024, Math.floor(settings.maxTokens / 2)) }
     : { type: "disabled" };
   if (settings.preserveThinking) body.preserve_thinking = true;
+  if (ctx.prefillProgress) body.prefill_progress = true;
   const tools = enabledTools(ctx.tools);
   if (tools.length) {
     body.tools = tools.map((tool) => ({
@@ -318,7 +354,9 @@ export function parseAnthropicFrame(frame: SseFrame): StreamEvent[] {
   }
   const events: StreamEvent[] = [];
   const type = (payload.type as string) ?? frame.event ?? "";
-  const metrics = payload.flyweight as { generated_tokens?: number; decode_elapsed_seconds?: number; phase?: string } | undefined;
+  const metrics = payload.flyweight as FlyweightFrame | undefined;
+  const prefillEvent = prefillFrom(metrics);
+  if (prefillEvent) events.push(prefillEvent);
   if (metrics && typeof metrics.generated_tokens === "number") {
     events.push({ type: "metrics", tokens: metrics.generated_tokens, decodeSeconds: metrics.decode_elapsed_seconds ?? 0, phase: metrics.phase });
   }
@@ -410,6 +448,7 @@ export function buildResponsesRequest(ctx: RequestContext): Record<string, unkno
     ...samplingFields(settings),
   };
   if (settings.systemPrompt.trim()) body.instructions = settings.systemPrompt;
+  if (ctx.prefillProgress) body.prefill_progress = true;
   const effort = reasoningEffort(settings);
   if (effort) body.reasoning = { effort };
   const tools = enabledTools(ctx.tools);
@@ -441,7 +480,9 @@ export function parseResponsesFrame(frame: SseFrame): StreamEvent[] {
   }
   const events: StreamEvent[] = [];
   const type = (payload.type as string) ?? frame.event ?? "";
-  const metrics = payload.flyweight as { generated_tokens?: number; decode_elapsed_seconds?: number; phase?: string } | undefined;
+  const metrics = payload.flyweight as FlyweightFrame | undefined;
+  const prefillEvent = prefillFrom(metrics);
+  if (prefillEvent) events.push(prefillEvent);
   if (metrics && typeof metrics.generated_tokens === "number") {
     events.push({ type: "metrics", tokens: metrics.generated_tokens, decodeSeconds: metrics.decode_elapsed_seconds ?? 0, phase: metrics.phase });
   }

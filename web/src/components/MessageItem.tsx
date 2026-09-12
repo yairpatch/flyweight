@@ -3,6 +3,7 @@ import { Bot, Brain, Check, Copy, Pencil, RefreshCw, Trash2, User, Wrench, Alert
 import type { Message, ToolCall } from "../types";
 import { useStore } from "../store";
 import { StreamingMarkdown } from "./Markdown";
+import { PrefillStatus } from "./PrefillStatus";
 import { Sparkline } from "./charts";
 import { AttachmentChip } from "./AttachmentChip";
 import { detectDirection } from "../lib/direction";
@@ -18,6 +19,8 @@ interface Props {
 export const MessageItem = memo(function MessageItem({ message, previous, isLast }: Props) {
   const [editing, setEditing] = useState(false);
   const generating = Boolean(message.generating);
+  // While the prompt is being read there is a bar to show instead of a caret.
+  const prefilling = useStore((state) => Boolean(state.generating?.messageId === message.id && state.generating.prefill));
   // Reasoning arrives on its own channel normally; fall back to inline
   // <think> blocks for stored turns and servers that do not split it.
   const { reasoning, answer, reasoningLive } = useMemo(() => {
@@ -73,7 +76,8 @@ export const MessageItem = memo(function MessageItem({ message, previous, isLast
         ) : (
           <div className="msg__content markdown">
             {answer ? <StreamingMarkdown text={answer} live={generating} /> : null}
-            {generating && !reasoning && !answer && !message.toolCalls?.length && <span className="caret" aria-label="Generating" />}
+            {generating && !reasoning && !answer && !message.toolCalls?.length &&
+              (prefilling ? <PrefillStatus messageId={message.id} /> : <span className="caret" aria-label="Generating" />)}
             {generating && answer && <span className="caret caret--inline" />}
           </div>
         )}
