@@ -1993,6 +1993,17 @@ class InferenceService:
                 or "unknown"
             ),
             "generation_defaults": dict(self.generation_defaults),
+            # The effort levels this checkpoint's own template names. The
+            # renderer clamps anything outside them, so a request never fails
+            # on the difference -- but a client that offered the whole ladder
+            # showed "high" and "xhigh" as separate choices where the
+            # checkpoint has only one of them. A tokenizer with no opinion
+            # (no jinja template, or one that takes every level) reports the
+            # full ladder, which is what clients assumed before they could ask.
+            "reasoning_efforts": list(
+                getattr(self.generator.tokenizer, "reasoning_efforts", None)
+                or REASONING_EFFORTS
+            ),
             "capabilities": [
                 "completion",
                 "chat",

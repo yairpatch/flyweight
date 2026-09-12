@@ -15,7 +15,12 @@ import unittest
 from jinja2 import Undefined
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from flyweight.server import REASONING_EFFORTS
 from flyweight.v2_server import NativeV2Tokenizer
+
+# "the attribute is not there at all", distinct from a tokenizer that has it
+# and reports None.
+_ABSENT = object()
 
 
 # The shape of Flash-Next's template, reduced to the part under test: a fixed
@@ -121,6 +126,36 @@ class ClampTests(unittest.TestCase):
         # Not ours to place: pass it to the template and let it decide.
         self.assertEqual(
             self.tokenizer._supported_reasoning_effort("turbo"), "turbo"
+        )
+
+
+class PropsTests(unittest.TestCase):
+    """What /props tells a client to offer."""
+
+    def _properties(self, efforts: object) -> dict:
+        from flyweight.server import InferenceService
+
+        from tests.test_server import StubGenerator
+
+        generator = StubGenerator()
+        if efforts is not _ABSENT:
+            generator.tokenizer.reasoning_efforts = efforts
+        return InferenceService("stub", generator, max_new_tokens=32).properties()
+
+    def test_it_reports_the_levels_the_checkpoint_names(self) -> None:
+        properties = self._properties(("low", "medium", "xhigh"))
+        self.assertEqual(properties["reasoning_efforts"], ["low", "medium", "xhigh"])
+
+    def test_a_checkpoint_with_no_opinion_reports_the_whole_ladder(self) -> None:
+        # What a client assumed before it could ask, so nothing narrows.
+        self.assertEqual(
+            self._properties(None)["reasoning_efforts"], list(REASONING_EFFORTS)
+        )
+
+    def test_a_tokenizer_that_cannot_answer_reports_the_whole_ladder(self) -> None:
+        # DeepSeek-V4 and the stub generators have no probe at all.
+        self.assertEqual(
+            self._properties(_ABSENT)["reasoning_efforts"], list(REASONING_EFFORTS)
         )
 
 

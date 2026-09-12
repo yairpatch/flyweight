@@ -557,6 +557,17 @@ class NativeV2Tokenizer:
         self._efforts_probed = True
         return decided
 
+    @property
+    def reasoning_efforts(self) -> tuple[str, ...] | None:
+        """The levels a client should offer, or None when nothing narrows them.
+
+        The clamp below keeps a request working whatever it asks for, but a UI
+        that offers both "high" and "xhigh" against a checkpoint that reads
+        only one of them is presenting two controls for one behaviour. This is
+        how /props tells it which ones are real.
+        """
+        return self._accepted_reasoning_efforts()
+
     def _supported_reasoning_effort(self, effort: str) -> str:
         """`effort` itself, or the nearest level this checkpoint accepts."""
         accepted = self._accepted_reasoning_efforts()

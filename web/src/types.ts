@@ -173,6 +173,9 @@ export interface PropsPayload {
   chat_template_source?: string;
   generation_defaults?: Record<string, number>;
   generation_defaults_source?: string;
+  // The effort levels the loaded checkpoint's chat template actually names.
+  // Absent on a server too old to report them; see availableEfforts.
+  reasoning_efforts?: string[];
   capabilities?: string[];
 }
 

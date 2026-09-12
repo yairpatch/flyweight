@@ -6,6 +6,23 @@ import { clamp } from "./format";
 export const SETTINGS_KEY = "flyweight.settings.v2";
 export const REASONING_EFFORTS: ReasoningEffort[] = ["auto", "low", "medium", "high", "xhigh"];
 
+// What to offer for "reasoning effort". The list above is the union of every
+// protocol's vocabulary; a checkpoint's template names a subset of it, and the
+// server reports which in /props. Offering the rest presented "high" and
+// "xhigh" as different answers on a checkpoint that has only one of them --
+// the server clamps them onto each other, so the second control did nothing.
+//
+// "auto" is the UI's own entry (send no effort at all, keep the checkpoint's
+// default) and always survives. A server that reports nothing, or reports only
+// levels this build has never heard of, falls back to the full ladder: showing
+// too much beats showing a single choice.
+export function availableEfforts(props: { reasoning_efforts?: string[] } | null | undefined): ReasoningEffort[] {
+  const reported = props?.reasoning_efforts;
+  if (!reported?.length) return REASONING_EFFORTS;
+  const offered = REASONING_EFFORTS.filter((effort) => effort === "auto" || reported.includes(effort));
+  return offered.length > 1 ? offered : REASONING_EFFORTS;
+}
+
 export const DEFAULT_SETTINGS: GenerationSettings = {
   systemPrompt: "",
   maxTokens: 4096,
