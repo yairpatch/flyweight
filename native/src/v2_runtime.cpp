@@ -972,6 +972,12 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t aliased_tensor_bytes = 0;
     std::uint64_t workspace = 0;
     std::uint64_t workspace_bytes = 0;
+    // The vision tower's workspace, planned before the expert cache is sized
+    // and allocated when the tower is prepared. Counted with the base
+    // allocations because it is one: it lives for the life of the runtime,
+    // and leaving it out let the cache take VRAM the first image then could
+    // not get.
+    std::uint64_t vision_workspace_bytes = 0;
     flyweight::v2::workspace::QwenDecodeWorkspaceLayout decode_workspace_layout;
     flyweight::v2::workspace::QwenRowsWorkspaceLayout rows_workspace_layout;
     // Non-zero when the model's DeltaNet layers match the chunked prefill
@@ -2418,6 +2424,8 @@ void qwen_absorb_registration(FlyweightV2QwenRuntime& runtime) {
 extern "C" {
 static void qwen_vision_release(FlyweightV2QwenRuntime& runtime);
 static void qwen_vision_prepare(FlyweightV2QwenRuntime& runtime);
+static std::uint64_t vision_workspace_reservation(
+    const flyweight::v2::VisionConfig& config, std::uint64_t max_tokens);
 static void qwen_task_encode_images(FlyweightV2QwenRuntime& runtime, QwenEngineTask& task);
 static void qwen_task_free_images(QwenEngineTask& task);
 static void qwen_image_rows_apply(FlyweightV2QwenRuntime& runtime, std::uint64_t first, int rows,
@@ -2647,6 +2655,7 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
         runtime.prefill_router_end_event=0;
     runtime.prefill_profile=false;
     runtime.static_arena_bytes = runtime.workspace_bytes = 0;
+    runtime.vision_workspace_bytes = 0;
     runtime.decode_workspace_layout = {};
     runtime.rows_workspace_layout = {};
     runtime.decode_host_layout = {};
@@ -16028,7 +16037,15 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             runtime->mova_stage_bytes=
                 runtime->mova_slot_bytes*runtime->model->config.value_expert_used_count;
         }
-        const auto base_total=runtime->static_arena_bytes+runtime->workspace_bytes+runtime->slots_state_bytes+runtime->expert_staging_bytes+runtime->mova_workspace_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
+        // Planned here rather than at prepare: the tower is uploaded after the
+        // decoder is placed, by which point the expert cache has taken every
+        // free byte, and a 233 MiB workspace that would have fit at startup
+        // fails in the middle of the first image request instead.
+        if(runtime->model->vision_sidecar&&runtime->options.vision_max_tokens)
+            runtime->vision_workspace_bytes=vision_workspace_reservation(
+                runtime->model->vision_sidecar->vision,
+                runtime->options.vision_max_tokens);
+        const auto base_total=runtime->vision_workspace_bytes+runtime->static_arena_bytes+runtime->workspace_bytes+runtime->slots_state_bytes+runtime->expert_staging_bytes+runtime->mova_workspace_bytes+slot_count*runtime->prefill_snapshots.size()*runtime->prefill_snapshot_bytes+runtime->host_ffn_stage_bytes+runtime->prefill_stream_bytes+runtime->prefill_stream_scratch_bytes;
         const char* nvfp4_persistent_env =
             std::getenv("FLYWEIGHT_NVFP4_PERSISTENT");
         const bool persistent_nvfp4_eligible=
@@ -16201,7 +16218,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             auto mib=[](std::uint64_t b){return std::to_string(b/(1024ull*1024));};
             throw std::runtime_error(
                 "native Qwen base CUDA allocations ("+mib(base_total_resolved)+" MiB = static weights "
-                +mib(runtime->static_arena_bytes)+" + workspace "+mib(runtime->workspace_bytes)+" + "
+                +mib(runtime->static_arena_bytes)+" + workspace "+mib(runtime->workspace_bytes)
+                +(runtime->vision_workspace_bytes
+                    ?" + vision "+mib(runtime->vision_workspace_bytes):"")+" + "
                 +(runtime->geometries.size()>1
                     ?"1x KV slot "+mib(runtime->geometries[0].state_bytes)+" + "
                      +std::to_string(slot_count-1)+"x scratch slot "

@@ -940,6 +940,13 @@ device are skipped.
 - Gemma 4: MTP, per-layer embeddings, shared-KV tail layers and next-layer
   prefetch are unimplemented, and expert placement is restricted to
   `cpu`/`hybrid`. The routed experts must be Q4_0 (the QAT release).
+- The vision tower's activation workspace is reserved when the model is
+  prepared, sized for `--image-max-tokens` (the default 1024 merged tokens
+  costs about 233 MiB), and counted with the base allocations so the expert
+  cache is sized around it. Allocating it on first use instead put it behind
+  a cache that had already taken every free byte, and the first image failed
+  on a request the card had room for at startup. A reservation that does not
+  fit is refused at load, with the arithmetic, rather than mid-generation.
 - Vision covers still images through a GGUF `mmproj` on the Qwen 3.5 family:
   no video, and the safetensors loader still reads only `text_config`. An
   mmproj whose tower has deepstack layers (`clip.vision.is_deepstack_layers`)

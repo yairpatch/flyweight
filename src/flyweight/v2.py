@@ -298,6 +298,7 @@ class _QwenRuntimeOptions(ctypes.Structure):
         ("routed_moe", ctypes.c_uint32),
         ("scratch_context", ctypes.c_uint64),
         ("context_explicit", ctypes.c_uint32),
+        ("vision_max_tokens", ctypes.c_uint32),
     ]
 
 
@@ -2278,6 +2279,7 @@ class V2Model:
         routed_moe: bool | None = None,
         scratch_context: int = 0,
         context_explicit: bool = False,
+        vision_max_tokens: int = 0,
     ) -> "V2QwenRuntime":
         return V2QwenRuntime(
             self,
@@ -2309,6 +2311,7 @@ class V2Model:
             routed_moe=routed_moe,
             scratch_context=scratch_context,
             context_explicit=context_explicit,
+            vision_max_tokens=vision_max_tokens,
         )
 
     def native_runtime(self, **options: Any) -> "V2QwenRuntime":
@@ -2714,6 +2717,11 @@ class V2QwenRuntime:
         # fit the card. A dense model spills more feed-forward to the host
         # instead; a run that still does not fit is refused with the numbers.
         context_explicit: bool = False,
+        # The --image-max-tokens ceiling, so the tower's workspace is reserved
+        # at load and the expert cache sizes around it. 0 leaves the workspace
+        # to be allocated on first use, which is right for a run with no
+        # images and wrong for one with them: by then the cache holds the VRAM.
+        vision_max_tokens: int = 0,
     ):
         # gpu_cache_bytes is the total CUDA budget (base allocations + expert
         # cache). 0 = auto-fit to free VRAM; any positive value is an exact
@@ -2877,6 +2885,7 @@ class V2QwenRuntime:
             2 if routed_moe is None else int(bool(routed_moe)),
             scratch_context,
             int(context_explicit),
+            max(0, int(vision_max_tokens)),
         )
         model._check(
             self._lib.flyweight_v2_qwen_runtime_create(

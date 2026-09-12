@@ -2644,6 +2644,12 @@ class NativeV2InferenceService(InferenceService):
                 hybrid_prefill=hybrid_prefill,
                 expert_residency=expert_residency,
                 dense_requant=dense_requant,
+                # Only with a tower attached: the reservation is real VRAM,
+                # taken for the life of the process, and a text-only run
+                # should not pay for an image it will never be sent.
+                vision_max_tokens=(
+                    self.image_max_tokens if self.v2_model.vision() else 0
+                ),
             )
             self.v2_runtime.prepare()
         except Exception:

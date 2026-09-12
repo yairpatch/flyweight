@@ -145,6 +145,13 @@ typedef struct FlyweightV2QwenRuntimeOptions {
     uint32_t context_explicit; /* context_limit was chosen by the caller: never shrink it to fit,
                                   spill a dense model's feed-forward further instead, and refuse
                                   with the arithmetic when even that cannot fit */
+    uint32_t vision_max_tokens; /* largest merged-token count any image will be resized to
+                                   (--image-max-tokens). The tower's workspace is reserved for
+                                   exactly that at prepare and counted against the base
+                                   allocations, so the expert cache sizes around it instead of
+                                   taking the VRAM the first image then cannot get. 0 = no
+                                   reservation: the workspace is allocated on first use, which
+                                   is what a caller that never sends images wants. */
 } FlyweightV2QwenRuntimeOptions;
 
 typedef struct FlyweightV2QwenRuntimeInfo {
