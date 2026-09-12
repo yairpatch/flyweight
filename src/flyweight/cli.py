@@ -513,7 +513,8 @@ def _add_runtime_options(
     add(
         placement, "--mmproj", type=Path, metavar="PATH",
         help="vision tower (llama.cpp mmproj-*.gguf, qwen3vl_merger projector) "
-             "for image input on Qwen 3.5-family checkpoints",
+             "for image input on Qwen 3.5-family and Qwen3.8-Flash-Next "
+             "checkpoints",
     )
     add(
         placement, "--image-max-tokens", type=int, default=1024, metavar="N",

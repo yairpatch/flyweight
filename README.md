@@ -15,7 +15,7 @@ Served model families:
 | DeepSeek-V4 / V4-Flash | GGUF (split) | Dedicated CPU/hybrid runtime with half-precision caches; DSpark speculative drafts via `--mtp-model` |
 | Gemma 4 | GGUF | Sampling, penalties and the tool grammar all work; no MTP, expert placement `cpu`/`hybrid` only -- see limitations |
 | BailingMoE3 | GGUF, safetensors | Independent sequence slots with snapshot prefix reuse across conversations; a GGUF conversion answers exactly as the checkpoint it came from |
-| Qwen3.8-Flash-Next (qwen4exp) | GGUF (split) | Qwen4-preview hybrid: gated-residual streams, hashed n-gram embeddings (host-side table), DeltaNet + gated attention. Sparse attention runs dense by default; MTP needs a release with a draft block or the standalone MTP file via `--mtp-model`; no vision -- see limitations |
+| Qwen3.8-Flash-Next (qwen4exp) | GGUF (split) | Qwen4-preview hybrid: gated-residual streams, hashed n-gram embeddings (host-side table), DeltaNet + gated attention. Sparse attention runs dense by default; MTP needs a release with a draft block or the standalone MTP file via `--mtp-model`. Image input works through the release's `mmproj` |
 
 A safetensors checkpoint (Qwen 3.5 family and BailingMoE3) is packed to a
 chosen quantization on first open and cached beside the checkpoint --
@@ -44,9 +44,10 @@ loads from GGUF, including multi-file `-00001-of-0000N` splits.
   decode in the same batch
 - Sampler-enforced tool-call grammar (declared names, required parameters,
   well-formed JSON values) and sampler-enforced JSON response mode
-- Image input for Qwen 3.5-family checkpoints: the mmproj vision tower runs
-  natively, images take part in prefix reuse, and OpenAI `image_url`,
-  Responses `input_image` and Anthropic `image` parts are all accepted
+- Image input for the Qwen 3.5 family and Qwen3.8-Flash-Next: the mmproj
+  vision tower runs natively, images take part in prefix reuse, and OpenAI
+  `image_url`, Responses `input_image` and Anthropic `image` parts are all
+  accepted
 - Thinking controls: per-request effort for checkpoints that grade their
   reasoning, and a hard thinking-token budget the sampler cannot overrun
 - OpenAI Chat Completions, Responses, and legacy Completions APIs
@@ -441,14 +442,18 @@ most 32 MB each go in one turn.
 
 ### Images
 
-A Qwen 3.5-family GGUF serves images when its vision tower is attached.
-The tower is the `mmproj-*.gguf` llama.cpp publishes beside the model
-(projector type `qwen3vl_merger`); decoding needs Pillow, installed with
-`pip install 'flyweight-llm[vision]'` (or `pip install '.[vision]'` from a checkout):
+A Qwen 3.5-family or Qwen3.8-Flash-Next GGUF serves images when its vision
+tower is attached. The tower is the `mmproj-*.gguf` published beside the
+model (projector type `qwen3vl_merger`); decoding needs Pillow, installed
+with `pip install 'flyweight-llm[vision]'` (or `pip install '.[vision]'` from
+a checkout):
 
 ~~~bash
 flyweight serve Qwen3.5-35B-A3B-Q6_K.gguf \
   --mmproj mmproj-Qwen3.5-35B-A3B-BF16.gguf --image-max-tokens 1024
+
+flyweight serve Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+  --mmproj mmproj-F16.gguf
 ~~~
 
 Each image is resized so that both sides are multiples of 32 pixels, the
@@ -947,8 +952,10 @@ device are skipped.
   a cache that had already taken every free byte, and the first image failed
   on a request the card had room for at startup. A reservation that does not
   fit is refused at load, with the arithmetic, rather than mid-generation.
-- Vision covers still images through a GGUF `mmproj` on the Qwen 3.5 family:
-  no video, and the safetensors loader still reads only `text_config`. An
+- Vision covers still images through a GGUF `mmproj` on the Qwen 3.5 family
+  and Qwen3.8-Flash-Next: no video, and the safetensors loader still reads
+  only `text_config`, so an image needs the GGUF path even where the
+  checkpoint carries its tower. An
   mmproj whose tower has deepstack layers (`clip.vision.is_deepstack_layers`)
   is refused at attach until the decoder-side injection lands. The tower's
   attention and GEMM kernels are plain CUDA rather than tensor-core paths, so
