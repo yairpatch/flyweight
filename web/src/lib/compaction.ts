@@ -219,7 +219,12 @@ export function compactMessages(messages: Message[], budget: number, through?: s
 function clipRecent(outcome: CompactionOutcome, current: number, budget: number): CompactionOutcome {
   if (current <= budget) return outcome;
   const messages = outcome.messages.slice();
+  // `through` rides along untouched. Rebuilding the outcome without it lost
+  // the checkpoint on every turn that clipped, which sent the next turn back
+  // to deriving the whole compaction from scratch -- the churn this boundary
+  // exists to stop, reintroduced by the last resort.
   let { removedChars, stubbed, dropped } = outcome;
+  const through = outcome.through;
   let size = current;
   for (let index = 0; index < messages.length && size > budget; index += 1) {
     const message = messages[index];
@@ -231,7 +236,7 @@ function clipRecent(outcome: CompactionOutcome, current: number, budget: number)
     messages[index] = { ...message, content: clipped };
     stubbed += 1;
   }
-  return { messages, removedChars, stubbed, dropped };
+  return { messages, removedChars, stubbed, dropped, through };
 }
 
 /**

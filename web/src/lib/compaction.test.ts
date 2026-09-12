@@ -218,3 +218,38 @@ describe("compaction and the prefix cache", () => {
     expect(conversationChars(outcome.messages)).toBeLessThanOrEqual(20_000);
   });
 });
+
+describe("the checkpoint survives the last resort", () => {
+  it("keeps the boundary when a recent result had to be clipped", () => {
+    // clipRecent rebuilt the outcome and dropped `through` on the way out, so
+    // any turn that clipped forgot the checkpoint and the next one re-derived
+    // the whole compaction — the churn the boundary exists to prevent,
+    // reintroduced by the path that runs when a single result is enormous.
+    const messages = [...run(8), message("tool", "z".repeat(60_000), { toolCallId: "big", toolName: "read_file" })];
+    const outcome = compactMessages(messages, 20_000);
+    expect(conversationChars(outcome.messages)).toBeLessThanOrEqual(20_000);
+    expect(outcome.through).toBeTruthy();
+  });
+
+  it("does not churn while the budget wobbles turn to turn", () => {
+    // The store re-measures characters-per-token after every request, so the
+    // budget is never twice the same number. The low-water mark has to absorb
+    // that: a boundary that moved on a 3% wobble would cost the cache as
+    // surely as one that moved on every turn.
+    let messages = run(10);
+    let through: string | undefined;
+    let checkpoints = 0;
+    for (let turn = 0; turn < 12; turn += 1) {
+      const callId = `wobble-${turn}`;
+      messages = [
+        ...messages,
+        message("assistant", "", { toolCalls: [{ id: callId, name: "read_file", arguments: "{}" }] }),
+        message("tool", `result ${turn} `.repeat(120), { toolCallId: callId, toolName: "read_file" }),
+      ];
+      const outcome = compactMessages(messages, 60_000 * (1 + 0.03 * Math.sin(turn)), through);
+      if (outcome.through !== through) checkpoints += 1;
+      through = outcome.through;
+    }
+    expect(checkpoints).toBeLessThanOrEqual(1);
+  });
+});
