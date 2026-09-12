@@ -89,6 +89,21 @@ static void qwen_vision_prepare(FlyweightV2QwenRuntime& runtime) {
     flyweight::v2::validate_vision_config(config);
     auto& tower = runtime.vision_tower;
     qwen_vision_release(runtime);
+    // The workspace goes first, at the size the budget was told about. Taking
+    // it here, at load, is the whole point: on first use the expert cache has
+    // already taken what was free, and this allocation is the one that fails.
+    if (runtime.vision_workspace_bytes) {
+        if (flyweight_gpu_alloc(runtime.vision_workspace_bytes, &tower.workspace) != 0 ||
+            !tower.workspace) {
+            tower.workspace = 0;
+            throw std::runtime_error(
+                "vision workspace reservation failed (" +
+                std::to_string(runtime.vision_workspace_bytes / 1048576) +
+                " MiB for --image-max-tokens). Lower --image-max-tokens, or free "
+                "VRAM on this device.");
+        }
+        tower.workspace_bytes = runtime.vision_workspace_bytes;
+    }
     const std::uint64_t width = config.embedding_length, ffn = config.feed_forward_length;
     const std::uint64_t patch_inputs = 3ull * config.patch_size * config.patch_size;
     const std::uint64_t merged = width * config.spatial_merge_size * config.spatial_merge_size;
@@ -191,6 +206,65 @@ static std::uint64_t qwen_vision_row_width(const VisionConfig& config) {
     return static_cast<std::uint64_t>(config.projection_dim) * (1 + config.deepstack_layers.size());
 }
 
+// Where each stage of the tower keeps its activations inside the one
+// workspace allocation, and how large that allocation has to be.
+//
+// Both the encoder and the reservation made at load go through this, because
+// a reservation computed a different way is a reservation that is quietly the
+// wrong size -- and the failure mode of "too small" is an allocation in the
+// middle of a request, which is the thing the reservation exists to avoid.
+struct VisionWorkspace {
+    std::uint64_t patches = 0, positions = 0, hidden = 0, normed = 0;
+    std::uint64_t qkv = 0, attn = 0, mlp = 0, merge = 0, output = 0;
+    std::uint64_t rows_y = 0, rows_x = 0;
+    std::uint64_t total = 0;
+};
+
+static VisionWorkspace vision_workspace_layout(const VisionConfig& config,
+                                               std::uint64_t patch_count,
+                                               std::uint64_t token_count) {
+    const std::uint64_t width = config.embedding_length;
+    const std::uint64_t ffn = config.feed_forward_length;
+    const std::uint64_t patch_inputs = 3ull * config.patch_size * config.patch_size;
+    const std::uint64_t merged = width * config.spatial_merge_size * config.spatial_merge_size;
+    const std::uint64_t projection = config.projection_dim;
+    VisionWorkspace layout;
+    std::uint64_t cursor = 0;
+    auto reserve = [&](std::uint64_t bytes) {
+        const std::uint64_t at = cursor;
+        cursor += (bytes + 255) & ~static_cast<std::uint64_t>(255);
+        return at;
+    };
+    auto floats = [](std::uint64_t elements) { return elements * sizeof(float); };
+    layout.patches = reserve(floats(patch_count * patch_inputs));
+    layout.positions = reserve(floats(patch_count * width));
+    layout.hidden = reserve(floats(patch_count * width));
+    layout.normed = reserve(floats(patch_count * width));
+    layout.qkv = reserve(floats(patch_count * 3 * width));
+    layout.attn = reserve(floats(patch_count * width));
+    layout.mlp = reserve(floats(patch_count * ffn));
+    layout.merge = reserve(floats(token_count * merged));
+    layout.output = reserve(floats(token_count * projection));
+    layout.rows_y = reserve(patch_count * sizeof(std::int32_t));
+    layout.rows_x = reserve(patch_count * sizeof(std::int32_t));
+    layout.total = cursor;
+    return layout;
+}
+
+/**
+ * What the tower needs for the largest image it will ever be given.
+ *
+ * `--image-max-tokens` caps every image at that many merged tokens, so this
+ * is a real ceiling rather than a guess: the encoder can never ask for more.
+ */
+static std::uint64_t vision_workspace_reservation(
+    const flyweight::v2::VisionConfig& config, std::uint64_t max_tokens) {
+    if (!max_tokens) return 0;
+    const std::uint64_t merge = static_cast<std::uint64_t>(config.spatial_merge_size) *
+                                config.spatial_merge_size;
+    return vision_workspace_layout(config, max_tokens * merge, max_tokens).total;
+}
+
 // Encode one image. `pixels` is HWC f32, normalized, with sides already
 // multiples of the merged patch. Writes `tokens * row_width` floats.
 static void qwen_vision_encode(FlyweightV2QwenRuntime& runtime, const float* pixels,
@@ -224,41 +298,32 @@ static void qwen_vision_encode(FlyweightV2QwenRuntime& runtime, const float* pix
     const int head_dim = static_cast<int>(config.head_dim());
     const int deepstack_count = static_cast<int>(config.deepstack_layers.size());
 
-    // Workspace layout, f32 unless noted.
     auto bytes_of = [](std::uint64_t elements) { return elements * sizeof(float); };
     const std::uint64_t n64 = static_cast<std::uint64_t>(n), t64 = static_cast<std::uint64_t>(tokens);
-    std::uint64_t cursor = 0;
-    auto reserve = [&](std::uint64_t bytes) {
-        const std::uint64_t at = cursor;
-        cursor += (bytes + 255) & ~static_cast<std::uint64_t>(255);
-        return at;
-    };
-    const std::uint64_t off_patches = reserve(bytes_of(n64 * patch_inputs));
-    const std::uint64_t off_positions = reserve(bytes_of(n64 * width));
-    const std::uint64_t off_hidden = reserve(bytes_of(n64 * width));
-    const std::uint64_t off_normed = reserve(bytes_of(n64 * width));
-    const std::uint64_t off_qkv = reserve(bytes_of(n64 * 3 * width));
-    const std::uint64_t off_attn = reserve(bytes_of(n64 * width));
-    const std::uint64_t off_mlp = reserve(bytes_of(n64 * ffn));
-    const std::uint64_t off_merge = reserve(bytes_of(t64 * merged));
-    const std::uint64_t off_output = reserve(bytes_of(t64 * projection));
-    const std::uint64_t off_rows_y = reserve(n64 * sizeof(std::int32_t));
-    const std::uint64_t off_rows_x = reserve(n64 * sizeof(std::int32_t));
-    if (cursor > tower.workspace_bytes) {
+    const VisionWorkspace layout = vision_workspace_layout(config, n64, t64);
+    // Normally already reserved at load, sized for --image-max-tokens, which
+    // is why this is the quiet path: an allocation here competes with an
+    // expert cache that has taken everything free, and a 233 MiB request that
+    // would have succeeded at startup fails in the middle of a request.
+    if (layout.total > tower.workspace_bytes) {
         if (tower.workspace) flyweight_gpu_free(tower.workspace);
         tower.workspace = 0;
         tower.workspace_bytes = 0;
-        if (flyweight_gpu_alloc(cursor, &tower.workspace) != 0 || !tower.workspace)
-            throw std::runtime_error("vision workspace allocation failed (" +
-                                     std::to_string(cursor / 1048576) + " MiB)");
-        tower.workspace_bytes = cursor;
+        if (flyweight_gpu_alloc(layout.total, &tower.workspace) != 0 || !tower.workspace)
+            throw std::runtime_error(
+                "vision workspace allocation failed (" +
+                std::to_string(layout.total / 1048576) + " MiB for " +
+                std::to_string(t64) + " image tokens; the reservation made at load was " +
+                std::to_string(tower.workspace_bytes / 1048576) +
+                " MiB). Lower --image-max-tokens, or free VRAM on this device.");
+        tower.workspace_bytes = layout.total;
     }
     const std::uint64_t base = tower.workspace;
-    const std::uint64_t d_patches = base + off_patches, d_positions = base + off_positions;
-    const std::uint64_t d_hidden = base + off_hidden, d_normed = base + off_normed;
-    const std::uint64_t d_qkv = base + off_qkv, d_attn = base + off_attn, d_mlp = base + off_mlp;
-    const std::uint64_t d_merge = base + off_merge, d_output = base + off_output;
-    const std::uint64_t d_rows_y = base + off_rows_y, d_rows_x = base + off_rows_x;
+    const std::uint64_t d_patches = base + layout.patches, d_positions = base + layout.positions;
+    const std::uint64_t d_hidden = base + layout.hidden, d_normed = base + layout.normed;
+    const std::uint64_t d_qkv = base + layout.qkv, d_attn = base + layout.attn, d_mlp = base + layout.mlp;
+    const std::uint64_t d_merge = base + layout.merge, d_output = base + layout.output;
+    const std::uint64_t d_rows_y = base + layout.rows_y, d_rows_x = base + layout.rows_x;
 
     auto upload = [&](std::uint64_t destination, const void* source, std::uint64_t bytes) {
         if (flyweight_gpu_upload(destination, source, bytes, runtime.stream) != 0)
