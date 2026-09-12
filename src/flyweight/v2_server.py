@@ -23,6 +23,7 @@ from .sampling import (
 )
 from .server import (
     InferenceService,
+    REASONING_EFFORTS,
     log_notice,
     THINKING_CLOSE_TAGS,
     THINKING_OPEN_TAGS,
@@ -421,6 +422,10 @@ class NativeV2Tokenizer:
         self.chat_template = getattr(model, "chat_template", None)
         self.chat_template_source = "gguf" if self.chat_template else "fallback"
         self._compiled_chat_template: Template | None = None
+        # Which effort levels this checkpoint's template actually accepts,
+        # discovered on first use. See _accepted_reasoning_efforts.
+        self._accepted_efforts: tuple[str, ...] | None = None
+        self._efforts_probed = False
         eos: list[int] = []
         # The GGUF's own terminator ids first. eot ends a chat turn where eos
         # ends generation, and a model that closes its turn with a dedicated
@@ -493,6 +498,90 @@ class NativeV2Tokenizer:
     @staticmethod
     def _raise_template_exception(message: object) -> None:
         raise ValueError(str(message))
+
+    def _accepted_reasoning_efforts(self) -> tuple[str, ...] | None:
+        """The effort levels this checkpoint's template renders, or None.
+
+        Templates disagree about the vocabulary. Qwen3.5 reads low / medium /
+        xhigh and folds high into xhigh itself, so passing the whole ladder
+        through was harmless; Qwen3.8-Flash-Next reads the same three and calls
+        raise_exception on anything else. Forwarding the "high" that every
+        OpenAI-shaped client sends therefore failed the render -- and the
+        render happens during generation, below the handlers that turn a bad
+        parameter into a 400, so the request died instead of being answered at
+        the nearest level the checkpoint knows.
+
+        Rather than carry a table of checkpoint vocabularies that the next one
+        invalidates, ask the template: render a one-turn conversation at each
+        level once, and keep the levels that survive. Four renders of two
+        messages, on the first request that names an effort.
+
+        None means "no opinion": no jinja template, a template that took every
+        level, or one that rendered at none of them -- which says nothing about
+        the effort variable and everything about the probe conversation. All
+        three leave the requested level exactly as it arrived.
+        """
+        # Read through getattr for the same reason the template itself is: a
+        # tokenizer built by __new__ (the formatter tests) has no __init__ state.
+        if getattr(self, "_efforts_probed", False):
+            return self._accepted_efforts
+        template = getattr(self, "_compiled_chat_template", None)
+        accepted: list[str] = []
+        if template is not None:
+            probe = [{"role": "user", "content": "hi", "tool_calls": [],
+                      "reasoning_content": "", "tools": []}]
+            for effort in REASONING_EFFORTS:
+                try:
+                    template.render(
+                        messages=probe,
+                        add_generation_prompt=True,
+                        reasoning_effort=effort,
+                        reasoning_strength="high",
+                        tools=None,
+                        documents=None,
+                        **getattr(self, "_template_tokens", {}),
+                    )
+                except Exception:  # noqa: BLE001 - any failure means "not this one"
+                    continue
+                accepted.append(effort)
+        decided = (
+            None if not accepted or len(accepted) == len(REASONING_EFFORTS)
+            else tuple(accepted)
+        )
+        # The result lands before the flag that publishes it. Requests arrive on
+        # a thread each, and the reverse order lets a second thread read "already
+        # probed, no opinion" while the first is still rendering -- which costs
+        # that request its clamp. The probe is pure, so the worst a racing
+        # thread can do now is repeat it.
+        self._accepted_efforts = decided
+        self._efforts_probed = True
+        return decided
+
+    def _supported_reasoning_effort(self, effort: str) -> str:
+        """`effort` itself, or the nearest level this checkpoint accepts."""
+        accepted = self._accepted_reasoning_efforts()
+        if accepted is None or effort in accepted:
+            return effort
+        if effort not in REASONING_EFFORTS:
+            return effort
+        wanted = REASONING_EFFORTS.index(effort)
+        # Nearest on the ladder, the stronger level winning a tie: a level the
+        # template does not name is one the checkpoint does not distinguish, and
+        # answering "high" with "medium" is a quieter wrong answer than
+        # answering it with "xhigh".
+        nearest = min(
+            accepted,
+            key=lambda level: (
+                abs(REASONING_EFFORTS.index(level) - wanted),
+                -REASONING_EFFORTS.index(level),
+            ),
+        )
+        _warn_once(
+            f"this checkpoint's chat template does not accept reasoning effort "
+            f"'{effort}' (it reads {', '.join(accepted)}); rendering at "
+            f"'{nearest}'"
+        )
+        return nearest
 
     @staticmethod
     def _to_json(
@@ -669,10 +758,12 @@ class NativeV2Tokenizer:
                 else {"enable_thinking": enable_thinking}
             )
             if reasoning_effort:
-                thinking_variables["reasoning_effort"] = reasoning_effort
+                thinking_variables["reasoning_effort"] = (
+                    self._supported_reasoning_effort(reasoning_effort)
+                )
             if preserve_thinking is not None:
                 thinking_variables["preserve_thinking"] = preserve_thinking
-            return compiled_template.render(
+            variables: dict[str, object] = dict(
                 messages=normalized,
                 add_generation_prompt=True,
                 **thinking_variables,
@@ -699,6 +790,25 @@ class NativeV2Tokenizer:
                 documents=None,
                 **self._template_tokens,
             )
+            try:
+                return compiled_template.render(**variables)
+            except Exception:  # noqa: BLE001 - retried once, then re-raised
+                if "reasoning_effort" not in variables:
+                    raise
+                # The probe cleared this level on a bare conversation, so the
+                # template is refusing it for something else this request
+                # carries. An answer at the checkpoint's own default beats a
+                # failed generation: this runs below the handlers that turn a
+                # bad parameter into a 400, so the alternative is a 500 on a
+                # request whose only fault is an effort the client had no way
+                # to know was unavailable.
+                _warn_once(
+                    "this checkpoint's chat template refused reasoning effort "
+                    f"'{variables['reasoning_effort']}' on this conversation; "
+                    "rendering at its default"
+                )
+                del variables["reasoning_effort"]
+                return compiled_template.render(**variables)
         if self.architecture == "gemma4":
             return self._format_gemma4(messages, enable_thinking=bool(enable_thinking))
         if self.architecture == "laguna":

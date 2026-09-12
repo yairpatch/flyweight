@@ -230,10 +230,12 @@ THINKING_BLOCK_PATTERN = re.compile(
     r"\A\s*<(?:think|ifm\|think(?:_fast(?:er)?)?)>(.*?)</(?:think|ifm\|think(?:_fast(?:er)?)?)>\s*",
     re.DOTALL,
 )
-# How hard a checkpoint that grades its reasoning should think. OpenAI spells
-# this low / medium / high; Qwen3.5's template reads low / medium / xhigh and
-# maps high onto xhigh itself, so both vocabularies pass through untouched and
-# a checkpoint that ignores the variable is unaffected.
+# How hard a checkpoint that grades its reasoning should think, weakest first.
+# This is the union of the vocabularies, not any one checkpoint's: OpenAI
+# spells it low / medium / high, and the Qwen templates read low / medium /
+# xhigh. Qwen3.5's folds high into xhigh itself, but Flash-Next's raises on it,
+# so a level is not passed to a template until the renderer has clamped it to
+# what that template names (NativeV2Tokenizer._supported_reasoning_effort).
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 
 # The thinking cap /v1/messages requests get when the operator sets no
