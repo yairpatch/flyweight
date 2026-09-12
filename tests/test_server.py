@@ -4548,6 +4548,34 @@ class AgentWorkspaceTests(unittest.TestCase):
         empty = b'<html><body><div class="no-results">No results.</div></body></html>'
         self.assertEqual(self._search(empty)["results"], [])
 
+    def test_a_python_with_no_ca_bundle_is_named_as_the_cause(self) -> None:
+        # The failure this prevents: a conda whose OpenSSL points at a build
+        # directory that is not on the machine trusts nothing, so every https
+        # call dies on the certificate. The raw message blames the site, and
+        # the model retries a request that can never succeed.
+        import ssl
+        from collections import namedtuple
+
+        from flyweight.server import _agent_tls_note
+
+        verification = ssl.SSLCertVerificationError("certificate verify failed")
+        wrapped = OSError("cannot reach it")
+        wrapped.__cause__ = verification
+        paths = namedtuple("Paths", "cafile capath openssl_cafile openssl_capath")
+        missing = paths(None, None, "/nowhere/build/ssl/cert.pem", "/nowhere/build/ssl/certs")
+        with patch("ssl.get_default_verify_paths", lambda: missing):
+            note = _agent_tls_note(wrapped)
+        self.assertIn("not the site", note)
+        self.assertIn("/nowhere/build/ssl/cert.pem", note)
+        self.assertIn("SSL_CERT_FILE=", note)
+        # A store that is present and still refused the chain is a real
+        # certificate failure, and nothing should argue the reader out of it.
+        present = paths(__file__, None, __file__, "/nowhere")
+        with patch("ssl.get_default_verify_paths", lambda: present):
+            self.assertEqual(_agent_tls_note(wrapped), "")
+        # An ordinary connection failure is not a certificate story at all.
+        self.assertEqual(_agent_tls_note(OSError("connection refused")), "")
+
     def test_an_empty_search_query_is_rejected(self) -> None:
         with self.assertRaises(APIError) as caught:
             self.workspace.search_web({"query": "  "})

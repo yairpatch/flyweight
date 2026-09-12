@@ -586,6 +586,47 @@ def _agent_ddg_url(href: str) -> str:
     return href
 
 
+def _agent_tls_note(error: BaseException) -> str:
+    """What to do about a certificate failure, when it is not the site's.
+
+    A Python whose OpenSSL was built with an OPENSSLDIR that is not on this
+    machine -- a relocated or distro-packaged conda is the usual way to get
+    one -- trusts no authority at all, so *every* https request fails on the
+    certificate and none of them will ever succeed. The site is not the
+    problem and a retry cannot help, which is exactly what the raw OpenSSL
+    message leads both the user and the model to try. So: only when the
+    default paths really are missing, say so and name a bundle that is
+    actually here.
+    """
+    import ssl
+
+    seen: BaseException | None = error
+    while seen is not None and not isinstance(seen, ssl.SSLCertVerificationError):
+        seen = seen.__cause__ or seen.__context__
+    if seen is None:
+        return ""
+    paths = ssl.get_default_verify_paths()
+    if (paths.cafile and Path(paths.cafile).is_file()) or (
+        paths.capath and Path(paths.capath).is_dir()
+    ):
+        # The store is there and the certificate still did not verify: that is
+        # a real failure -- an intercepting proxy, or an expired chain -- and
+        # nothing here should talk the reader out of believing it.
+        return ""
+    candidates = [paths.openssl_cafile, "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"]
+    with contextlib.suppress(ImportError):
+        import certifi
+
+        candidates.insert(0, certifi.where())
+    have = next((path for path in candidates if path and Path(path).is_file()), None)
+    note = (
+        ". This is not the site: the Python running this server has no CA "
+        f"bundle where its OpenSSL expects one ({paths.openssl_cafile}), so "
+        "no https request from it can verify"
+    )
+    return note + (f". Set SSL_CERT_FILE={have} and restart" if have else "")
+
+
 def _agent_http(
     url: str,
     *,
@@ -612,7 +653,9 @@ def _agent_http(
             502, f"the search provider answered {error.code}: {body.strip()[:200]}"
         ) from error
     except (urllib.error.URLError, OSError, ValueError) as error:
-        raise APIError(502, f"cannot reach the search provider: {error}") from error
+        raise APIError(
+            502, f"cannot reach the search provider: {error}{_agent_tls_note(error)}"
+        ) from error
 
 
 def _search_duckduckgo(query: str, count: int, config: _AgentSearch) -> list[dict[str, str]]:
@@ -1320,7 +1363,7 @@ class AgentWorkspace:
             content_type = error.headers.get_content_type() if error.headers else ""
             final_url = url
         except (urllib.error.URLError, OSError, ValueError) as error:
-            raise APIError(400, f"cannot fetch url: {error}") from error
+            raise APIError(400, f"cannot fetch url: {error}{_agent_tls_note(error)}") from error
         raw, over_cap = _agent_clip(data, _AGENT_FETCH_BYTES)
         # A page is worth a paragraph of the model's context, not a quarter of
         # it. Markup goes first, then the passages that answer the question the
