@@ -2,7 +2,7 @@ import { useRef } from "react";
 import { Plus, Trash2, Upload } from "lucide-react";
 import { useStore } from "../../store";
 import { clamp, identifier } from "../../lib/format";
-import { agentToolsAvailable, workspaceList, workspacePlatform } from "../../lib/agentTools";
+import { agentToolsAvailable, searchInfo, workspaceList, workspacePlatform } from "../../lib/agentTools";
 import type { ToolDefinition } from "../../types";
 
 function validJson(text: string): boolean {
@@ -24,6 +24,7 @@ export function ToolsPanel() {
   const toolsAvailable = useStore((state) => agentToolsAvailable(state.props));
   const canRegister = useStore((state) => state.canRegisterWorkspaces);
   const platform = useStore((state) => workspacePlatform(state.props));
+  const search = useStore((state) => searchInfo(state.props));
   const fileInput = useRef<HTMLInputElement>(null);
 
   const patch = (id: string, changes: Partial<ToolDefinition>) => setTools(tools.map((tool) => (tool.id === id ? { ...tool, ...changes } : tool)));
@@ -76,7 +77,8 @@ export function ToolsPanel() {
           <>
             <p className="muted">
               The server also offers built-in tools, confined to the run's workspace: <code>list_dir</code>, <code>read_file</code>,{" "}
-              <code>edit_file</code>, <code>write_file</code>, <code>run_command</code>, and <code>fetch_url</code>. They are sent with every agent run
+              <code>edit_file</code>, <code>write_file</code>, <code>run_command</code>, <code>web_search</code>, and <code>fetch_url</code>. They are
+              sent with every agent run
               that has a workspace and need no handler. Each run picks its directory and a permissions preset before its first message: read only,
               workspace write with a prompt before every command, or auto-approve. File tools never leave the workspace; commands are not sandboxed,
               so the approval prompt is the only thing between the model and the shell.
@@ -98,6 +100,20 @@ export function ToolsPanel() {
               <code>edit_file</code> replaces an exact snippet rather than rewriting the file, and both writers keep a file's existing line endings and
               encoding — a CRLF file stays CRLF. <code>fetch_url</code> returns a page as readable text, and with a <code>query</code> only the
               passages matching it, so one page cannot swallow the context window.
+            </p>
+            <p className="muted">
+              {search?.ready ? (
+                <>
+                  <code>web_search</code> searches through {search.provider} and answers with links for the model to fetch, so a run can find a page it
+                  was not given. Both web tools reach the public internet under every permissions preset.
+                </>
+              ) : (
+                <>
+                  <code>web_search</code> is off on this server{search?.detail ? ` — ${search.detail}` : ""}, so the model is not offered it. Set{" "}
+                  <code>FLYWEIGHT_SEARCH_PROVIDER</code> (with <code>FLYWEIGHT_SEARCH_KEY</code> or <code>FLYWEIGHT_SEARCH_URL</code>) to turn it on;{" "}
+                  <code>fetch_url</code> still reads any page the model is given.
+                </>
+              )}
             </p>
           </>
         ) : (

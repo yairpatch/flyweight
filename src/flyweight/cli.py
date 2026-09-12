@@ -760,7 +760,8 @@ checkpoint's generation_config.json says.\
     endpoint.add_argument(
         "--agent-workspace", metavar="DIR", action="append", default=None,
         help="a directory the chat UI's agent runs may work in (read/write/"
-             "list files, run shell commands, fetch URLs), fixed for this "
+             "list files, run shell commands, search the web and fetch "
+             "URLs), fixed for this "
              "server's lifetime; repeatable. Without it, a browser on this "
              "machine can add directories from the Agent tab, and they "
              "persist under ~/.flyweight. Commands still require approval "

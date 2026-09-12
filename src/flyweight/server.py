@@ -304,6 +304,21 @@ _AGENT_LIST_ENTRIES = 500
 _AGENT_EXEC_TIMEOUT = 30.0
 _AGENT_EXEC_TIMEOUT_MAX = 300.0
 _AGENT_FETCH_TIMEOUT = 20.0
+# A search answer is a list of links to choose between, not reading matter:
+# five results and a sentence each is what a model needs to pick one and
+# fetch it, and more of them crowds out the page it is about to read.
+_AGENT_SEARCH_RESULTS = 5
+_AGENT_SEARCH_RESULTS_MAX = 20
+_AGENT_SEARCH_SNIPPET = 400
+_AGENT_SEARCH_BYTES = 2 * 1024 * 1024
+_AGENT_SEARCH_TIMEOUT = 15.0
+# DuckDuckGo's HTML endpoint serves a near-empty page to a client that admits
+# to being a script, so the request has to look like a browser's. It is the
+# same page a person gets, asked for once per tool call.
+_AGENT_SEARCH_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
 
 
 def _agent_decoded(data: bytes, *, console: bool = False) -> tuple[str, str]:
@@ -505,6 +520,261 @@ def _agent_select(text: str, query: str, budget: int, offset: int) -> tuple[str,
     return "\n\n".join(kept), True
 
 
+class _AgentSearchResults(HTMLParser):
+    """DuckDuckGo's HTML result page, as a list of results.
+
+    The no-key endpoint answers in HTML, not JSON, so the results have to be
+    read out of the markup: each one is an `<a class="result__a">` holding the
+    title and the link, followed by an `<a class="result__snippet">` holding
+    the summary. Anything else on the page -- ads, related searches, the
+    search box -- carries neither class and is skipped.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._field = ""
+
+    @staticmethod
+    def _classes(attrs: Any) -> set[str]:
+        for name, value in attrs:
+            if name == "class" and value:
+                return set(str(value).split())
+        return set()
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag != "a":
+            return
+        classes = self._classes(attrs)
+        if "result__a" in classes:
+            href = next((value for name, value in attrs if name == "href"), "")
+            self.results.append({"title": "", "url": _agent_ddg_url(href or ""), "snippet": ""})
+            self._field = "title"
+        elif "result__snippet" in classes and self.results:
+            self._field = "snippet"
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a":
+            self._field = ""
+
+    def handle_data(self, data: str) -> None:
+        if self._field and self.results:
+            self.results[-1][self._field] += data
+
+
+def _agent_ddg_url(href: str) -> str:
+    """The real destination behind a DuckDuckGo redirect link.
+
+    Results link to `//duckduckgo.com/l/?uddg=<the url>`, which is a redirect
+    the model would have to follow before it could fetch anything. Unwrapping
+    it here means the url in a result is the url fetch_url takes.
+    """
+    from urllib.parse import parse_qs
+
+    if href.startswith("//"):
+        href = "https:" + href
+    split = urlsplit(href)
+    if split.netloc.endswith("duckduckgo.com") and split.path.startswith("/l/"):
+        target = parse_qs(split.query).get("uddg")
+        if target and target[0]:
+            return target[0]
+    return href
+
+
+def _agent_http(
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    data: bytes | None = None,
+    timeout: float = 20.0,
+) -> bytes:
+    """One http(s) request, for the search providers. The seam the tests
+    replace: everything above it is parsing, which is what actually breaks."""
+    import urllib.error
+    import urllib.request
+
+    if urlsplit(url).scheme.lower() not in {"http", "https"}:
+        raise APIError(400, "search endpoint must be http or https")
+    request = urllib.request.Request(  # noqa: S310 - scheme checked above
+        url, data=data, headers={"User-Agent": _AGENT_SEARCH_AGENT, **(headers or {})}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            return bytes(response.read(_AGENT_SEARCH_BYTES + 1))
+    except urllib.error.HTTPError as error:
+        body = _agent_decode(error.read(2048)) if error.fp else ""
+        raise APIError(
+            502, f"the search provider answered {error.code}: {body.strip()[:200]}"
+        ) from error
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise APIError(502, f"cannot reach the search provider: {error}") from error
+
+
+def _search_duckduckgo(query: str, count: int, config: _AgentSearch) -> list[dict[str, str]]:
+    from urllib.parse import urlencode
+
+    body = _agent_http(
+        "https://html.duckduckgo.com/html/",
+        data=urlencode({"q": query}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=config.timeout,
+    )
+    parser = _AgentSearchResults()
+    with contextlib.suppress(Exception):
+        parser.feed(_agent_decode(body))
+        parser.close()
+    return [result for result in parser.results if result["url"]][:count]
+
+
+def _search_brave(query: str, count: int, config: _AgentSearch) -> list[dict[str, str]]:
+    from urllib.parse import urlencode
+
+    payload = json.loads(
+        _agent_http(
+            "https://api.search.brave.com/res/v1/web/search?"
+            + urlencode({"q": query, "count": count}),
+            headers={"Accept": "application/json", "X-Subscription-Token": config.key},
+            timeout=config.timeout,
+        )
+    )
+    web = payload.get("web") if isinstance(payload, Mapping) else None
+    entries = web.get("results") if isinstance(web, Mapping) else None
+    return _agent_search_rows(entries, count, url="url", title="title", snippet="description")
+
+
+def _search_tavily(query: str, count: int, config: _AgentSearch) -> list[dict[str, str]]:
+    payload = json.loads(
+        _agent_http(
+            "https://api.tavily.com/search",
+            data=json.dumps({"query": query, "max_results": count}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {config.key}",
+            },
+            timeout=config.timeout,
+        )
+    )
+    entries = payload.get("results") if isinstance(payload, Mapping) else None
+    return _agent_search_rows(entries, count, url="url", title="title", snippet="content")
+
+
+def _search_searxng(query: str, count: int, config: _AgentSearch) -> list[dict[str, str]]:
+    from urllib.parse import urlencode
+
+    payload = json.loads(
+        _agent_http(
+            config.url.rstrip("/") + "/search?" + urlencode({"q": query, "format": "json"}),
+            headers={"Accept": "application/json"},
+            timeout=config.timeout,
+        )
+    )
+    entries = payload.get("results") if isinstance(payload, Mapping) else None
+    return _agent_search_rows(entries, count, url="url", title="title", snippet="content")
+
+
+def _agent_search_rows(
+    entries: object, count: int, *, url: str, title: str, snippet: str
+) -> list[dict[str, str]]:
+    """A provider's JSON results in the one shape the tool answers in."""
+    rows: list[dict[str, str]] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, Mapping) or not entry.get(url):
+            continue
+        rows.append(
+            {
+                "title": str(entry.get(title) or ""),
+                "url": str(entry.get(url)),
+                # Brave marks the query's words with <strong> in its
+                # descriptions; the model wants the sentence, not the markup.
+                "snippet": _agent_html_text(str(entry.get(snippet) or ""))[1],
+            }
+        )
+        if len(rows) >= count:
+            break
+    return rows
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentSearch:
+    """Which search backend the tool calls, and what it needs to call it.
+
+    Read from the environment at each call rather than at startup, so a key
+    can be set and the tool used without restarting the server.
+    """
+
+    provider: str
+    key: str = ""
+    url: str = ""
+    timeout: float = 15.0
+
+    @classmethod
+    def from_env(cls) -> _AgentSearch:
+        key = os.environ.get("FLYWEIGHT_SEARCH_KEY", "").strip()
+        url = os.environ.get("FLYWEIGHT_SEARCH_URL", "").strip()
+        named = os.environ.get("FLYWEIGHT_SEARCH_PROVIDER", "").strip().lower()
+        # Unnamed, the provider follows from what else is configured: a url is
+        # the user's own SearXNG, nothing at all is the backend that needs
+        # nothing. A key alone names no provider -- two of them take one -- so
+        # that stays empty and backend() says what is missing, rather than
+        # quietly searching somewhere the key was not for.
+        provider = named or ("" if key else "searxng" if url else "duckduckgo")
+        return cls(provider, key, url, _AGENT_SEARCH_TIMEOUT)
+
+    def backend(self) -> Callable[[str, int, _AgentSearch], list[dict[str, str]]]:
+        if not self.provider:
+            raise APIError(
+                400,
+                "FLYWEIGHT_SEARCH_KEY is set but FLYWEIGHT_SEARCH_PROVIDER is "
+                "not: name the provider the key is for ("
+                + ", ".join(sorted(_AGENT_SEARCH_KEYED))
+                + "), or unset the key to use the key-free default",
+            )
+        backend = _AGENT_SEARCH_BACKENDS.get(self.provider)
+        if backend is None:
+            raise APIError(
+                400,
+                f"unknown search provider {self.provider!r}: set "
+                "FLYWEIGHT_SEARCH_PROVIDER to one of "
+                + ", ".join(sorted(_AGENT_SEARCH_BACKENDS)),
+            )
+        if self.provider in _AGENT_SEARCH_KEYED and not self.key:
+            raise APIError(
+                400,
+                f"the {self.provider} search provider needs an API key: set "
+                "FLYWEIGHT_SEARCH_KEY, or unset FLYWEIGHT_SEARCH_PROVIDER to "
+                "use the key-free default",
+            )
+        if self.provider == "searxng" and not self.url:
+            raise APIError(
+                400,
+                "the searxng search provider needs an instance: set "
+                "FLYWEIGHT_SEARCH_URL to its base url",
+            )
+        return backend
+
+    def describe(self) -> dict[str, Any]:
+        """What /props says about search: which backend, and whether it can
+        run right now. A provider named but not configured is reported as not
+        ready with the reason, so the UI can say so instead of the model
+        discovering it one wasted turn later."""
+        try:
+            self.backend()
+        except APIError as error:
+            return {"provider": self.provider, "ready": False, "detail": error.message}
+        return {"provider": self.provider, "ready": True}
+
+
+_AGENT_SEARCH_BACKENDS: dict[
+    str, Callable[[str, int, _AgentSearch], list[dict[str, str]]]
+] = {
+    "duckduckgo": _search_duckduckgo,
+    "brave": _search_brave,
+    "tavily": _search_tavily,
+    "searxng": _search_searxng,
+}
+_AGENT_SEARCH_KEYED = {"brave", "tavily"}
+
+
 def _agent_newline(text: str) -> str:
     """The line ending a file already uses; what an edit has to write back."""
     return "\r\n" if "\r\n" in text else "\n"
@@ -680,6 +950,7 @@ class AgentWorkspace:
             "/agent/fs/list": self.list_dir,
             "/agent/exec": self.run_command,
             "/agent/fetch": self.fetch_url,
+            "/agent/search": self.search_web,
         }
         handler = handlers.get(path)
         if handler is None:
@@ -1056,6 +1327,38 @@ class AgentWorkspace:
             "next_offset": offset + len(body),
             "selection": "query" if query and partial else "head",
             "truncated": partial or over_cap,
+        }
+
+    def search_web(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Search the web and answer with the links, not the pages.
+
+        fetch_url can read any page the model can name; this is how it comes
+        to name one. The answer is deliberately thin -- title, url, a sentence
+        -- because the next call is a fetch of whichever result looks right,
+        and snippets the model does not follow are context it pays for twice.
+        """
+        query = payload.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise APIError(400, "query must be a non-empty string", parameter="query")
+        query = query.strip()
+        count = int(
+            min(
+                max(_float_option(payload, "count", _AGENT_SEARCH_RESULTS), 1),
+                _AGENT_SEARCH_RESULTS_MAX,
+            )
+        )
+        config = _AgentSearch.from_env()
+        results = config.backend()(query, count, config)
+        for result in results:
+            result["title"] = " ".join(result["title"].split())
+            result["snippet"] = _agent_clip_text(
+                " ".join(result["snippet"].split()), _AGENT_SEARCH_SNIPPET
+            )[0]
+        return {
+            "query": query,
+            "provider": config.provider,
+            "results": results,
+            "count": len(results),
         }
 
 
@@ -2994,6 +3297,10 @@ class InferenceService:
                     # that knows it is on Windows in PowerShell stops opening
                     # with `ls -la` and `cat`.
                     "agent_platform": self.agent_workspaces.platform(),
+                    # Which search backend web_search will call, and whether
+                    # it is configured. The UI offers the tool either way and
+                    # shows the reason when it is not ready.
+                    "agent_search": _AgentSearch.from_env().describe(),
                 }
                 if self.agent_workspaces is not None
                 else {}

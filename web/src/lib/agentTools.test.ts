@@ -9,9 +9,11 @@ import {
   missingHandlerReason,
   needsApproval,
   runBuiltinTool,
+  searchAvailable,
   turnBudgetNote,
   turnCapReason,
 } from "./agentTools";
+import type { PropsPayload } from "../types";
 
 function respondWith(payload: unknown, ok = true) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
@@ -34,6 +36,7 @@ describe("builtinToolDefinitions", () => {
       "list_dir",
       "read_file",
       "run_command",
+      "web_search",
       "write_file",
     ]);
     for (const tool of definitions) {
@@ -53,6 +56,17 @@ describe("permissions", () => {
     expect(names).not.toContain("edit_file");
     expect(names).toContain("read_file");
     expect(builtinToolDefinitions("auto-approve").map((tool) => tool.name)).toContain("write_file");
+  });
+
+  it("withholds web_search from a server that cannot search", () => {
+    // A tool the server would refuse is a turn spent on the refusal, so a
+    // server with no working backend is not offered the tool at all.
+    expect(builtinToolDefinitions("workspace-write", false).map((tool) => tool.name)).not.toContain("web_search");
+    expect(searchAvailable({ agent_search: { provider: "brave", ready: false, detail: "needs a key" } } as PropsPayload)).toBe(false);
+    expect(searchAvailable({ agent_search: { provider: "duckduckgo", ready: true } } as PropsPayload)).toBe(true);
+    // A server too old to report search has no /agent/search either.
+    expect(searchAvailable({} as PropsPayload)).toBe(false);
+    expect(searchAvailable(null)).toBe(false);
   });
 
   it("maps each preset to the mode the server enforces", () => {
@@ -330,6 +344,33 @@ describe("runBuiltinTool", () => {
     const result = await runBuiltinTool("fetch_url", '{"url":"https://example.com/log"}');
     expect(result.result).toContain("offset 6000");
     expect(result.result).toContain("pass a query");
+  });
+
+  it("lists search results as numbered links to fetch next", async () => {
+    respondWith({
+      query: "gguf runtime",
+      provider: "duckduckgo",
+      count: 2,
+      results: [
+        { title: "Flyweight", url: "https://example.com/a", snippet: "A GGUF runtime." },
+        { title: "", url: "https://example.org/b", snippet: "" },
+      ],
+    });
+    const result = await runBuiltinTool("web_search", '{"query":"gguf runtime"}');
+    expect(result.ok).toBe(true);
+    expect(result.result).toContain("1. Flyweight");
+    expect(result.result).toContain("https://example.com/a");
+    expect(result.result).toContain("A GGUF runtime.");
+    // A result with nothing in it still has to be pickable by its number.
+    expect(result.result).toContain("2. (untitled)");
+    expect(result.result).toContain("(no summary)");
+  });
+
+  it("tells the model what to do when a search finds nothing", async () => {
+    respondWith({ query: "asdfqwer", provider: "duckduckgo", count: 0, results: [] });
+    const result = await runBuiltinTool("web_search", '{"query":"asdfqwer"}');
+    expect(result.result).toContain("No results");
+    expect(result.result).toContain("fetch_url");
   });
 
   it("hands malformed arguments back to the model instead of calling the server", async () => {

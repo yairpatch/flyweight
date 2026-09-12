@@ -13,6 +13,7 @@ import {
   agentSystemPrompt,
   agentToolsAvailable,
   builtinToolDefinitions,
+  searchAvailable,
   isBuiltinTool,
   missingHandlerReason,
   modeOf,
@@ -510,7 +511,7 @@ export const useStore = create<StoreState>()((set, get) => {
     const run = kindOf(conversation) === "agent" ? workspaceFor(state.props, conversation.workspaceId) : null;
     const workspace = run?.exists ? run.path : null;
     const permissions = conversation.permissions ?? DEFAULT_PERMISSIONS;
-    const builtins = workspace ? builtinToolDefinitions(permissions) : [];
+    const builtins = workspace ? builtinToolDefinitions(permissions, searchAvailable(state.props)) : [];
 
     // The prompt and the tool schemas are written before the messages are
     // fitted, because they are what the messages have to fit around: an agent

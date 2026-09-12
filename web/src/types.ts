@@ -197,6 +197,19 @@ export interface PropsPayload {
   agent_workspaces?: AgentWorkspaceInfo[];
   /** What the workspace host is, so the agent writes commands and paths that work there. */
   agent_platform?: AgentPlatform;
+  /** Which search backend web_search calls, and whether it is configured. */
+  agent_search?: AgentSearchInfo;
+}
+
+/**
+ * The state of the server's web search. `ready` false means the backend is
+ * named but unusable — a keyed provider with no key, a SearXNG with no
+ * instance — and `detail` says which variable is missing.
+ */
+export interface AgentSearchInfo {
+  provider: string;
+  ready: boolean;
+  detail?: string;
 }
 
 /** One directory agent runs may work in, as the server lists it. */

@@ -543,7 +543,8 @@ endpoints stream over SSE, and chat streams honour
 request model IDs must exactly match the configured server model name.
 
 The chat UI's agent runs use `/agent/fs/read`, `/agent/fs/write`,
-`/agent/fs/edit`, `/agent/fs/list`, `/agent/exec`, and `/agent/fetch`. Each
+`/agent/fs/edit`, `/agent/fs/list`, `/agent/exec`, `/agent/fetch`, and
+`/agent/search`. Each
 call runs in a *workspace*: `workspace` in the body names one by id, and a
 call that names none gets the server's default (the first directory it
 lists). Every path resolves inside that directory or the request is refused
@@ -566,7 +567,9 @@ the endpoints exist and `agent_workspace` when a directory is ready,
 reports every directory in `agent_workspaces` (`id`, `path`, `title`,
 `source`, `exists`) and the default in `agent_workspace`, and describes the
 host in `agent_platform` (`os`, `shell`, `path_separator`, `line_ending`) so
-a client can tell the model what it is working on.
+a client can tell the model what it is working on, and reports the search
+backend in `agent_search` (`provider`, `ready`, and `detail` when it is
+not).
 
 The tools are written for a model that does not know which OS it landed on.
 Paths may use either separator. Files are decoded as UTF-8 and then, on
@@ -582,7 +585,20 @@ afford: 6000 characters by default (`max_chars`, up to 40000). Passing
 `query` returns the passages that match it, in document order with the gaps
 marked, instead of the top of the page; `offset` and the reply's
 `next_offset` page through a long document. Without it one fetch of an
-ordinary page costs more context than the rest of the run put together. Commands run in PowerShell on Windows — so `ls`, `cat`
+ordinary page costs more context than the rest of the run put together.
+`/agent/search` is how a run finds a page to fetch: `query` (and optionally
+`count`, five by default and twenty at most) comes back as a list of
+`title`, `url`, and a one-sentence `snippet`, with search-engine redirects
+already unwrapped so the `url` is the one `/agent/fetch` takes. The backend
+is DuckDuckGo's HTML endpoint, which needs no key and is what a server
+searches with unless told otherwise. `FLYWEIGHT_SEARCH_PROVIDER` picks
+another: `brave` or `tavily` with the key in `FLYWEIGHT_SEARCH_KEY`, or
+`searxng` with your instance's base URL in `FLYWEIGHT_SEARCH_URL` (setting
+only the URL is enough to select it). The variables are read per call, so a
+key can be added without a restart, and a provider that is named but not
+configured is reported in `/props` rather than discovered on the first
+search — the UI withholds the tool from the model in that case, so the run
+does not spend a turn on the refusal. Commands run in PowerShell on Windows — so `ls`, `cat`
 and `rm` work — with the error stream decoded out of PowerShell's CLIXML,
 the exit code preserved, and the whole process tree killed on timeout. Set
 `FLYWEIGHT_AGENT_SHELL` to a shell command line (for example `cmd`, `bash`,

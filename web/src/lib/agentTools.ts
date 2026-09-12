@@ -3,7 +3,7 @@
 // advertises the workspace, and these definitions are sent alongside any
 // user-defined tools. Everything is confined to that directory server-side.
 import { postJson } from "./api";
-import type { AgentPermissions, AgentPlatform, AgentWorkspaceInfo, PropsPayload, ToolDefinition } from "../types";
+import type { AgentPermissions, AgentPlatform, AgentSearchInfo, AgentWorkspaceInfo, PropsPayload, ToolDefinition } from "../types";
 
 /** Shell commands are the one built-in that asks before it runs. */
 export const APPROVAL_TOOL = "run_command";
@@ -107,6 +107,21 @@ export function workspacePlatform(props: PropsPayload | null): AgentPlatform | n
   return props?.agent_platform ?? null;
 }
 
+/** What the server says about web search; null on a server too old to say. */
+export function searchInfo(props: PropsPayload | null): AgentSearchInfo | null {
+  return props?.agent_search ?? null;
+}
+
+/**
+ * Whether to offer web_search this run. A server that cannot search — no key
+ * for the provider it was pointed at — is one where every search is a turn
+ * spent on a 400, so the tool is withheld instead. A server too old to report
+ * anything has no /agent/search either.
+ */
+export function searchAvailable(props: PropsPayload | null): boolean {
+  return searchInfo(props)?.ready === true;
+}
+
 interface BuiltinTool {
   name: string;
   description: string;
@@ -182,6 +197,20 @@ const BUILTINS: BuiltinTool[] = [
     },
   },
   {
+    name: "web_search",
+    description:
+      "Search the web and get back a handful of results: title, url, and a sentence each. Use it when you do not already know the page that answers the question, then read the most promising result with fetch_url — the snippets are there to choose between, not to answer from. One search with the words that would appear on the page beats three vague ones.",
+    endpoint: "/agent/search",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to search for, as you would type it into a search engine." },
+        count: { type: "number", description: "How many results to return (default 5, max 20)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "fetch_url",
     description:
       "Fetch an http(s) URL from the server and return its readable text with the markup, navigation and scripts stripped. Not subject to browser CORS. Always pass query: a page is far larger than the answer you want from it, and query makes the server send back the passages that match instead of the top of the page. Raise max_chars only when you truly need more, or page through a long document with offset.",
@@ -222,8 +251,13 @@ export function isBuiltinTool(name: string): boolean {
  * is not offered the writers at all: a tool the model cannot use is a call it
  * will make anyway and a turn spent on the refusal.
  */
-export function builtinToolDefinitions(permissions: AgentPermissions = DEFAULT_PERMISSIONS): ToolDefinition[] {
-  const offered = permissions === "read-only" ? BUILTINS.filter((tool) => tool.name !== "write_file" && tool.name !== "edit_file") : BUILTINS;
+export function builtinToolDefinitions(permissions: AgentPermissions = DEFAULT_PERMISSIONS, search = true): ToolDefinition[] {
+  const withheld = new Set<string>();
+  if (permissions === "read-only") {
+    withheld.add("write_file").add("edit_file");
+  }
+  if (!search) withheld.add("web_search");
+  const offered = BUILTINS.filter((tool) => !withheld.has(tool.name));
   return offered.map((tool) => ({
     id: `builtin-${tool.name}`,
     name: tool.name,
@@ -302,6 +336,15 @@ function formatResult(name: string, payload: Record<string, unknown>): string {
     if (stderr) parts.push(`stderr:\n${stderr}${payload.stderr_truncated ? "\n[truncated]" : ""}`);
     if (!stdout && !stderr) parts.push("(no output)");
     return parts.join("\n");
+  }
+  if (name === "web_search") {
+    const results = (payload.results as Array<{ title?: string; url?: string; snippet?: string }>) ?? [];
+    if (!results.length) return `No results for "${payload.query}" (${payload.provider}). Try different words, or fetch_url a page you already know.`;
+    // Numbered, url on its own line: the next call is a fetch of one of
+    // these, and the model has to copy the url exactly to make it.
+    return results
+      .map((result, index) => `${index + 1}. ${result.title || "(untitled)"}\n   ${result.url}\n   ${result.snippet || "(no summary)"}`)
+      .join("\n");
   }
   if (name === "fetch_url") {
     const head = [`HTTP ${payload.status} ${payload.content_type ?? ""}`.trim(), payload.title ? String(payload.title) : ""].filter(Boolean).join(" — ");
@@ -395,6 +438,7 @@ const TOOL_GUIDANCE: Record<string, string> = {
   edit_file: "change part of a file that exists — the normal way to edit",
   write_file: "create a file, or replace one whole; not for a small change, and never for a formatting fix",
   [APPROVAL_TOOL]: "build, test, search, inspect. The user approves each command before it runs",
+  web_search: "find pages when you do not already have a url; read the one you pick with fetch_url",
   fetch_url: "read a web page as text; always pass query so you get the part you need",
 };
 

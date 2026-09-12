@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { FolderPlus, Trash2 } from "lucide-react";
 import { useStore } from "../store";
-import { PERMISSION_PRESETS, DEFAULT_PERMISSIONS, permissionPreset, workspaceFor, workspaceList } from "../lib/agentTools";
+import { PERMISSION_PRESETS, DEFAULT_PERMISSIONS, permissionPreset, searchInfo, workspaceFor, workspaceList } from "../lib/agentTools";
 import type { AgentPermissions, Conversation } from "../types";
 
 /**
@@ -28,6 +28,7 @@ export function AgentSetup({ conversation }: { conversation: Conversation | null
   const permissions = conversation?.permissions ?? DEFAULT_PERMISSIONS;
   const locked = Boolean(conversation?.messages.length);
   const toolsOff = !Array.isArray(props?.agent_workspaces);
+  const search = searchInfo(props);
 
   /** The run these choices belong to; made on demand so a choice is never lost. */
   const runId = () => conversation?.id ?? newConversation("agent");
@@ -124,6 +125,22 @@ export function AgentSetup({ conversation }: { conversation: Conversation | null
         </select>
         <small className="muted">{permissionPreset(permissions).description}</small>
       </label>
+      <p className="muted">
+        {/* Every preset reaches the internet: none of them fences the network,
+            and a user choosing "read only" for the disk should not have to
+            discover that from a transcript. */}
+        Web: this run can read public pages with <code>fetch_url</code>
+        {search?.ready ? (
+          <>
+            {" "}
+            and search with <code>web_search</code> ({search.provider}).
+          </>
+        ) : (
+          <>
+            . Search is off{search?.detail ? ` — ${search.detail}` : ""}.
+          </>
+        )}
+      </p>
     </div>
   );
 }

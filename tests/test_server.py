@@ -14,6 +14,7 @@ from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 try:
@@ -4403,6 +4404,135 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(_agent_select(document, "", 200, 200)[0].startswith(document[200:220]))
         # Short enough to send whole: nothing is cut and nothing is claimed.
         self.assertEqual(_agent_select("all of it", "anything", 600, 0), ("all of it", False))
+
+    def _search(self, body: bytes, **env: str) -> dict[str, Any]:
+        """One web_search call against a canned provider response.
+
+        The network is the one part of search that cannot be tested and is
+        not what breaks: the parsing is. `_agent_http` is the seam, and the
+        environment picks which parser runs on the bytes handed back.
+        """
+        import flyweight.server as server_module
+
+        sent: dict[str, Any] = {}
+
+        def fake_http(url: str, **kwargs: Any) -> bytes:
+            sent["url"] = url
+            sent.update(kwargs)
+            return body
+
+        patches = patch.dict(
+            os.environ,
+            {
+                "FLYWEIGHT_SEARCH_PROVIDER": "",
+                "FLYWEIGHT_SEARCH_KEY": "",
+                "FLYWEIGHT_SEARCH_URL": "",
+                **env,
+            },
+        )
+        with patches, patch.object(server_module, "_agent_http", fake_http):
+            result = self.workspace.search_web({"query": "flyweight gguf runtime"})
+        result["sent"] = sent
+        return result
+
+    def test_a_search_comes_back_as_links_to_choose_between(self) -> None:
+        # The failure this prevents: a model with no way to find a page, or a
+        # result list of DuckDuckGo redirect urls that fetch_url cannot read.
+        page = (
+            '<html><body><div class="results">'
+            '<div class="result results_links"><h2 class="result__title">'
+            '<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg='
+            'https%3A%2F%2Fexample.com%2Fdocs&amp;rut=abc">The  Docs</a></h2>'
+            '<a class="result__snippet">How the\n runtime loads a GGUF.</a></div>'
+            '<div class="result"><h2 class="result__title">'
+            '<a class="result__a" href="https://example.org/two">Two</a></h2>'
+            '<a class="result__snippet">Second result.</a></div>'
+            '<div class="nav"><a class="next" href="/more">Next page</a></div>'
+            "</div></body></html>"
+        ).encode("utf-8")
+        result = self._search(page)
+        self.assertEqual(result["provider"], "duckduckgo")
+        self.assertEqual(result["count"], 2)
+        first = result["results"][0]
+        # The redirect is unwrapped, so the url in a result is the url the
+        # next fetch_url call takes.
+        self.assertEqual(first["url"], "https://example.com/docs")
+        self.assertEqual(first["title"], "The Docs")
+        self.assertEqual(first["snippet"], "How the runtime loads a GGUF.")
+        self.assertEqual(result["results"][1]["url"], "https://example.org/two")
+        # A link that is not a result is not a result.
+        self.assertNotIn("/more", [row["url"] for row in result["results"]])
+
+    def test_a_json_provider_answers_in_the_same_shape(self) -> None:
+        payload = json.dumps(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Flyweight",
+                            "url": "https://example.com/a",
+                            "description": "A <strong>GGUF</strong> runtime.",
+                        },
+                        {"title": "No url", "description": "dropped"},
+                    ]
+                }
+            }
+        ).encode("utf-8")
+        result = self._search(
+            payload, FLYWEIGHT_SEARCH_PROVIDER="brave", FLYWEIGHT_SEARCH_KEY="k"
+        )
+        self.assertEqual(result["provider"], "brave")
+        self.assertEqual(result["count"], 1)
+        # The provider's own highlighting markup is not reading matter.
+        self.assertEqual(result["results"][0]["snippet"], "A GGUF runtime.")
+        self.assertEqual(result["sent"]["headers"]["X-Subscription-Token"], "k")
+
+    def test_a_searxng_instance_is_reached_at_its_own_url(self) -> None:
+        payload = json.dumps(
+            {"results": [{"title": "T", "url": "https://example.com/x", "content": "C"}]}
+        ).encode("utf-8")
+        result = self._search(payload, FLYWEIGHT_SEARCH_URL="http://localhost:8888/")
+        self.assertEqual(result["provider"], "searxng")
+        self.assertTrue(result["sent"]["url"].startswith("http://localhost:8888/search?"))
+        self.assertEqual(result["results"][0]["url"], "https://example.com/x")
+
+    def test_search_that_is_not_configured_says_what_is_missing(self) -> None:
+        from flyweight.server import _AgentSearch
+
+        def config(**env: str) -> _AgentSearch:
+            with patch.dict(
+                os.environ,
+                {
+                    "FLYWEIGHT_SEARCH_PROVIDER": "",
+                    "FLYWEIGHT_SEARCH_KEY": "",
+                    "FLYWEIGHT_SEARCH_URL": "",
+                    **env,
+                },
+            ):
+                return _AgentSearch.from_env()
+
+        # A key with no provider names nothing: two providers take one.
+        ambiguous = config(FLYWEIGHT_SEARCH_KEY="k")
+        self.assertFalse(ambiguous.describe()["ready"])
+        self.assertIn("FLYWEIGHT_SEARCH_PROVIDER", ambiguous.describe()["detail"])
+        # A keyed provider with no key, and an instance-less searxng, each say
+        # which variable to set rather than failing at the request.
+        for env, wanted in (
+            ({"FLYWEIGHT_SEARCH_PROVIDER": "tavily"}, "FLYWEIGHT_SEARCH_KEY"),
+            ({"FLYWEIGHT_SEARCH_PROVIDER": "searxng"}, "FLYWEIGHT_SEARCH_URL"),
+            ({"FLYWEIGHT_SEARCH_PROVIDER": "bing"}, "unknown search provider"),
+        ):
+            described = config(**env).describe()
+            self.assertFalse(described["ready"])
+            self.assertIn(wanted, described["detail"])
+        # The default needs nothing at all.
+        self.assertEqual(config().describe(), {"provider": "duckduckgo", "ready": True})
+
+    def test_an_empty_search_query_is_rejected(self) -> None:
+        with self.assertRaises(APIError) as caught:
+            self.workspace.search_web({"query": "  "})
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.parameter, "query")
 
     def test_an_unknown_agent_path_is_a_404(self) -> None:
         with self.assertRaises(APIError) as caught:
