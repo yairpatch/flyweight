@@ -807,8 +807,10 @@ checkpoint's generation_config.json says.\
     limits.add_argument(
         "--reasoning-effort", choices=("low", "medium", "high", "xhigh"),
         default=None,
-        help="thinking budget for checkpoints that grade it (Qwen3.5 reads "
-             "low/medium/xhigh and defaults to xhigh, its maximum)",
+        help="thinking budget for checkpoints that grade it, clamped to the "
+             "levels the checkpoint's own template names (Qwen3.5 and "
+             "Flash-Next read low/medium/xhigh and default to xhigh, their "
+             "maximum, so high is served as xhigh)",
     )
     # One flag per setting in sampling.SERVER_SETTINGS so this list cannot fall
     # behind the sampler, giving request > flag > generation_config.json beside

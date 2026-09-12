@@ -530,8 +530,12 @@ Reasoning models expose two knobs, one soft and one hard:
   Anthropic `output_config.effort` -- so Claude Code's `/effort` slider and
   opencode reasoning presets work unchanged. `--reasoning-effort` sets a
   server default. OpenAI's `minimal` clamps to `low`, Anthropic's `max` to
-  `xhigh`. This is trained behavior, not a limit: the checkpoint may overrun
-  it.
+  `xhigh`. The four levels above are the union of the vocabularies, not any one
+  checkpoint's: a template is asked once which of them it renders, and a level
+  it does not name is served as its nearest neighbour, the stronger one winning
+  a tie. So `high` reaches Qwen3.5 and Flash-Next as `xhigh`, which is what
+  both were trained on, instead of failing the render. This is trained
+  behavior, not a limit: the checkpoint may overrun it.
 - `reasoning_budget_tokens` is a hard ceiling the runtime enforces: at the
   limit the sampler forces the thinking block closed and the answer resumes.
   On `/v1/messages`, a request that thinks without naming a budget gets a
