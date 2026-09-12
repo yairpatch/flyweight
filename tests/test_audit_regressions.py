@@ -520,3 +520,26 @@ class ToolCallPenaltyTests(unittest.TestCase):
         )
         self.assertIn("sampling.grammar.armed()&&!penalize_tool_calls", text)
         self.assertIn("FLYWEIGHT_TOOL_CALL_PENALTY", text)
+
+    def test_sampler_caps_temperature_inside_a_tool_call(self) -> None:
+        # The same contract, for the draw itself: whitespace runs are adjacent
+        # tokens, and chat temperature flips the near-ties among them into a
+        # misindented old_string. External clients send 0.8 or 1.0 (or nothing,
+        # which is 0.8 served), so the cap has to be the server's.
+        root = Path(v2.__file__).resolve().parents[2]
+        source = root / "native" / "src" / "v2_runtime.cpp"
+        if not source.is_file():
+            self.skipTest("no checkout beside this install")
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("static constexpr float kToolCallTemperature=0.2f;", text)
+        self.assertIn(
+            "sampling.grammar.armed()&&tool_call_temperature>=0.0f\n"
+            "        ?std::min(sampling.temperature,tool_call_temperature)",
+            text,
+        )
+        self.assertIn("FLYWEIGHT_TOOL_CALL_TEMPERATURE", text)
+        # Every draw reads the capped value: nothing below the greedy branch
+        # may reach for the request's own temperature.
+        tail = text.split("if(!(temperature>0.0f)){", 1)[1]
+        tail = tail.split("static std::uint64_t qwen_sequence_match(", 1)[0]
+        self.assertNotIn("sampling.temperature", tail)

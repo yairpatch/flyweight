@@ -74,19 +74,9 @@ inline uint2 make_uint2(unsigned int x, unsigned int y) { return uint2{x, y}; }
 inline int2 make_int2(int x, int y) { return int2{x, y}; }
 inline float2 make_float2(float x, float y) { return float2{x, y}; }
 
-// Narrow float types. Declared here rather than beside their conversions
-// because __nv_fp4x2_e2m1 packs a float2, which only exists at this point.
+// Narrow float types. The corpus encodes FP4 E2M1 itself (fp4x2_e2m1_encode),
+// so only the FP8 type is borrowed from the toolkit's header.
 using __nv_fp8_e4m3 = flyweight::cpu::__nv_fp8_e4m3;
-
-struct __nv_fp4x2_e2m1 {
-    // Low nibble holds .x, high nibble holds .y, matching the device type.
-    unsigned char __x = 0;
-    __nv_fp4x2_e2m1() = default;
-    explicit __nv_fp4x2_e2m1(float2 pair)
-        : __x(static_cast<unsigned char>(
-              flyweight::cpu::float_to_e2m1_bits(pair.x) |
-              (flyweight::cpu::float_to_e2m1_bits(pair.y) << 4))) {}
-};
 
 // ---------------------------------------------------------------------------
 // Device math builtins

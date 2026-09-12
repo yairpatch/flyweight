@@ -759,20 +759,54 @@ void qwen_forward_rows(
         // it from the other half's core and stretch this half's route wait
         // over work it does not depend on.
         std::uint64_t route_event;
-        // This span's slice of the prefill expert-streaming arena (halves get
-        // disjoint slices, reused layer to layer). Zero bytes disables
-        // streaming for the span. Uploads ride the prefetch stream:
-        // upload_ready fences the compute stream before the grouped kernels
-        // read staged weights, consumed fences the prefetch stream before the
-        // next layer's uploads overwrite the slice.
-        std::uint64_t stream_base;std::uint64_t stream_bytes;
+        // This span's expert-GEMM scratch slice (halves get disjoint
+        // slices). The streamed weights themselves live in per-layer arena
+        // slices shared by both halves; see StagedLayer below.
         std::uint64_t stream_scratch;
-        std::uint64_t upload_ready_event;std::uint64_t consumed_event;
         // Whether cpu_phase queued GPU expert work whose accumulator
         // queue_combine must fold into the residual.
         bool gpu_experts;
         std::chrono::steady_clock::time_point pager_started;
     };
+    // Prefill expert streaming stages one expert set per layer, chosen by
+    // whichever half reaches the layer first, into the arena slice of the
+    // layer's parity; the other half reuses it with its own token lists.
+    // Both halves route to nearly the same experts, so sharing halves the
+    // host pack and the PCIe bytes for the same GPU share. Two slices give
+    // layer L+1's upload a slice whose last reader (layer L-1's GEMMs) is
+    // long done. The serial driver (one span: a chunk too short to halve)
+    // uses the same two slices, because a chunk's slice events and mirror
+    // slots must line up with the previous chunk's -- a whole-arena upload
+    // waiting on slice 0's fences alone raced the previous chunk's last odd
+    // layer, which was still reading slice 1 and draining its mirror slot.
+    // Uploads ride the prefetch stream: upload_ready fences
+    // the compute stream before the GEMMs read staged weights, consumed
+    // fences the prefetch stream before a later layer overwrites the slice.
+    struct StreamGroup{int expert;std::uint64_t matrix;int offset;int count;};
+    struct StagedLayer{
+        std::int64_t layer=-1;
+        std::vector<StreamGroup> groups;
+        std::vector<std::int32_t> group_of;
+    } staged_layer;
+    // The leader half's pack+upload runs on a worker while the engine thread
+    // sweeps its CPU experts; the GEMM enqueue joins it first. Disabled by
+    // FLYWEIGHT_STREAM_WORKER=0 (inline pack, for A/B).
+    static const bool stream_worker_enabled=[]{
+        const char*setting=std::getenv("FLYWEIGHT_STREAM_WORKER");
+        return !setting||setting[0]!='0';
+    }();
+    static const int stream_worker_threads=[]{
+        const char*setting=std::getenv("FLYWEIGHT_STREAM_WORKER_THREADS");
+        const int value=setting?std::atoi(setting):4;
+        return std::max(1,std::min(value,16));
+    }();
+    std::thread stream_worker;
+    std::exception_ptr stream_worker_error;
+    const int stream_slice_count=2;
+    const std::uint64_t stream_slice_bytes=
+        runtime.prefill_stream_bytes/static_cast<std::uint64_t>(stream_slice_count)
+        /flyweight::v2::workspace::kDeviceAlignment
+        *flyweight::v2::workspace::kDeviceAlignment;
     const auto scratch_stride=static_cast<std::uint64_t>(runtime.scratch_elements);
     auto install_span=[&](const RowsSpan&span){
         rows=span.count;
@@ -839,7 +873,7 @@ void qwen_forward_rows(
         if(!trace_phases)return;
         flyweight_gpu_stream_sync(runtime.stream);
         const auto now=std::chrono::steady_clock::now();
-        std::fprintf(stderr,"[phase] layer %2u %-10s %.1fms\n",layer_number,name,
+        std::fprintf(stderr,"[phase] rows %d layer %2u %-10s %.1fms\n",rows,layer_number,name,
             std::chrono::duration_cast<std::chrono::nanoseconds>(now-phase_clock).count()/1e6);
         phase_clock=now;
     };
@@ -964,9 +998,20 @@ void qwen_forward_rows(
             // `rows` steps to rows/64 and the grid widened past `value_heads`.
             // Requires the workspace regions sized at prepare time, so the guard
             // is the same head_dim test that sized them.
+            // The row floor is a throughput threshold, not a sizing one (the
+            // regions are sized for the whole chunk); FLYWEIGHT_DELTA_CHUNKED_MIN_ROWS
+            // overrides it so the pipeline's halves can take the WY path.
+            static const std::uint64_t chunked_min_rows=[]{
+                const char*setting=std::getenv("FLYWEIGHT_DELTA_CHUNKED_MIN_ROWS");
+                const long value=setting?std::strtol(setting,nullptr,10):0;
+                return value>0?static_cast<std::uint64_t>(value)
+                    :flyweight::v2::workspace::kDeltaChunkedMinimumRows;
+            }();
             const bool chunked_delta=
                 flyweight::v2::workspace::use_chunked_delta(
-                    static_cast<std::uint64_t>(rows),
+                    std::max<std::uint64_t>(static_cast<std::uint64_t>(rows),
+                        rows>=static_cast<int>(chunked_min_rows)
+                            ?flyweight::v2::workspace::kDeltaChunkedMinimumRows:0),
                     static_cast<std::uint64_t>(head_dim),
                     static_cast<std::uint64_t>(value_heads),
                     runtime.delta_value_heads)&&
@@ -1728,8 +1773,19 @@ void qwen_forward_rows(
         // pipeline does: configurations whose routed prefill experts run
         // wholly on the host. A budget of zero (the default, and every
         // config without the arena) leaves this path untouched.
-        const bool stream_experts=span.stream_bytes>0&&
-            runtime.dma_paging&&
+        // The pinned mirror makes the uploads independent of whether the
+        // model mapping is registered, so the gate no longer asks for DMA
+        // paging (auto registration needs the whole file plus headroom in
+        // RAM, which the large qwen4exp checkpoints never satisfy).
+        const int stream_slice=static_cast<int>(layer_number&1u);
+        const std::uint64_t stream_slice_base=runtime.prefill_stream_arena+
+            static_cast<std::uint64_t>(stream_slice)*stream_slice_bytes;
+        const auto stream_upload_ready_event=stream_slice
+            ?runtime.stream_upload_event_pipeline:runtime.stream_upload_event;
+        const auto stream_consumed_event=stream_slice
+            ?runtime.stream_consumed_event_pipeline:runtime.stream_consumed_event;
+        const bool stream_experts=stream_slice_bytes>0&&
+            runtime.prefill_stream_mirror!=nullptr&&
             expert_phase==flyweight::v2::ExpertExecutionPhase::prefill&&
             (expert_policy.hybrid_prefill_cpu||
              !expert_policy.routed_gpu_execution_allowed());
@@ -1737,9 +1793,9 @@ void qwen_forward_rows(
             static int shown=0;
             if(shown<3){++shown;
                 std::fprintf(stderr,
-                    "[stream-gate] stream_bytes=%llu dma=%d phase_prefill=%d "
+                    "[stream-gate] stream_bytes=%llu mirror=%d phase_prefill=%d "
                     "hybrid_prefill_cpu=%d routed_gpu_allowed=%d => %d\n",
-                    (unsigned long long)span.stream_bytes,(int)runtime.dma_paging,
+                    (unsigned long long)stream_slice_bytes,(int)(runtime.prefill_stream_mirror!=nullptr),
                     (int)(expert_phase==flyweight::v2::ExpertExecutionPhase::prefill),
                     (int)expert_policy.hybrid_prefill_cpu,
                     (int)expert_policy.routed_gpu_execution_allowed(),
@@ -1831,8 +1887,8 @@ void qwen_forward_rows(
         // and every token list is a pure function of the routes, so a fixed
         // budget is deterministic. The scratch walk mirrors the prepare-time
         // sizing exactly.
-        struct StreamGroup{int expert;std::uint64_t matrix;int offset;int count;};
         std::vector<StreamGroup> stream_groups;
+        bool stream_follower_for_trace=false;
         // Hoisted out of the staging block for the routed MMQ below: which
         // group holds an expert, and what the route weights were before
         // staging zeroed the ones it claimed.
@@ -1927,6 +1983,16 @@ void qwen_forward_rows(
                         "native Qwen rows forward routed one token to the same expert "
                         "more than once (non-finite router logits at position "+
                         std::to_string(runtime.position+static_cast<std::uint64_t>(span_begin))+")");
+            const bool stream_follower=
+                staged_layer.layer==static_cast<std::int64_t>(layer_number);
+            stream_follower_for_trace=stream_follower;
+            if(stream_follower){
+                // The other half staged this layer: same experts, same
+                // arena addresses; only the token lists are this span's.
+                stream_groups=staged_layer.groups;
+                for(auto&group:stream_groups)group.offset=group.count=0;
+                group_of=staged_layer.group_of;
+            }else{
             std::vector<int> order;order.reserve(experts);
             for(int expert=0;expert<experts;++expert)
                 if(expert_tokens[expert])order.push_back(expert);
@@ -1940,7 +2006,7 @@ void qwen_forward_rows(
             // The slice was last read by this span's previous layer's GEMMs,
             // so overwriting waits for that consumption first.
             if(flyweight_gpu_stream_wait_event(
-                   runtime.prefetch_stream,span.consumed_event)!=0)
+                   runtime.prefetch_stream,stream_consumed_event)!=0)
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
             const double t_upload=moe_now();
@@ -1951,8 +2017,9 @@ void qwen_forward_rows(
                 runtime.model->tensors[layer.expert_tensors[0]].type==40&&
                 runtime.model->tensors[layer.expert_tensors[1]].type==40&&
                 runtime.model->tensors[layer.expert_tensors[2]].type==40;
+            std::vector<int> staged;staged.reserve(order.size());
             for(const int expert:order){
-                if(cursor+stride>span.stream_bytes)break;
+                if(cursor+stride>stream_slice_bytes)break;
                 // Other formats' GEMM kernels have no seam for a per-expert
                 // scale, so their scaled experts stay on the CPU.
                 if(!stream_scales_ok&&
@@ -1960,33 +2027,114 @@ void qwen_forward_rows(
                     qwen_expert_role_scale(runtime,layer.expert_up_scale,expert)!=1.0f||
                     qwen_expert_role_scale(runtime,layer.expert_down_scale,expert)!=1.0f))
                     continue;
-                const auto base=span.stream_base+cursor;
-                std::uint64_t offset=0;
-                for(int role=0;role<3;++role){
-                    const auto&source=
-                        runtime.model->tensors[layer.expert_tensors[role]];
-                    if(flyweight_gpu_upload(base+offset,
-                           tensor_data(*runtime.model,source)+
-                               static_cast<std::uint64_t>(expert)*stream_role_bytes[role],
-                           stream_role_bytes[role],runtime.prefetch_stream)!=0)
-                        throw std::runtime_error(
-                            "native Qwen prefill expert stream upload failed");
-                    offset+=stream_role_bytes[role];
-                }
                 group_of[expert]=static_cast<std::int32_t>(stream_groups.size());
-                stream_groups.push_back({expert,base,0,0});
+                stream_groups.push_back({expert,stream_slice_base+cursor,0,0});
+                staged.push_back(expert);
                 cursor+=stride;
                 runtime.prefill_streamed_bytes+=triple_bytes;
             }
+            if(cursor){
+                // Pack the staged triples into this span's slice of the
+                // pinned mirror, then move the slice in one copy. The slice
+                // was the source of this span's previous layer upload; the
+                // host waits for that copy to drain before overwriting it
+                // (the sweep in between makes the wait a formality).
+                auto&mirror_uploads=runtime.stream_mirror_uploads[stream_slice];
+                const int slot=static_cast<int>(
+                    mirror_uploads%FlyweightV2QwenRuntime::kStreamMirrorSlots);
+                const auto mirror_event=
+                    runtime.stream_mirror_events[stream_slice][slot];
+                auto*mirror=static_cast<unsigned char*>(runtime.prefill_stream_mirror)+
+                    static_cast<std::uint64_t>(slot)*runtime.prefill_stream_bytes+
+                    (stream_slice_base-runtime.prefill_stream_arena);
+                if(mirror_uploads>=FlyweightV2QwenRuntime::kStreamMirrorSlots&&
+                   flyweight_gpu_event_sync(mirror_event)!=0)
+                    throw std::runtime_error(
+                        "native Qwen prefill expert stream mirror sync failed");
+                const unsigned char*role_source[3];
+                std::uint64_t role_offset[3];
+                std::uint64_t offset=0;
+                for(int role=0;role<3;++role){
+                    role_source[role]=tensor_data(*runtime.model,
+                        runtime.model->tensors[layer.expert_tensors[role]]);
+                    role_offset[role]=offset;
+                    offset+=stream_role_bytes[role];
+                }
+                const auto staged_count=static_cast<std::int64_t>(staged.size());
+                static const bool stream_copy_nt=(flyweight_cpu_features()&2u)!=0&&
+                    !(std::getenv("FLYWEIGHT_STREAM_COPY_NT")&&
+                      std::getenv("FLYWEIGHT_STREAM_COPY_NT")[0]=='0');
+                const bool on_worker=stream_worker_enabled&&staged_count>0;
+                const int pack_threads=on_worker?stream_worker_threads
+                    :qwen_cpu_thread_count(runtime);
+                // Everything the pack needs, by value: the worker outlives
+                // this scope's locals only through these copies.
+                auto stage_upload=[&runtime,staged=std::move(staged),staged_count,
+                                   mirror,stride,cursor,stream_slice_base,
+                                   mirror_event,stream_upload_ready_event,
+                                   pack_threads,stream_slice,
+                                   role_source_0=role_source[0],
+                                   role_source_1=role_source[1],
+                                   role_source_2=role_source[2],
+                                   role_offset_0=role_offset[0],
+                                   role_offset_1=role_offset[1],
+                                   role_offset_2=role_offset[2],
+                                   role_bytes_0=stream_role_bytes[0],
+                                   role_bytes_1=stream_role_bytes[1],
+                                   role_bytes_2=stream_role_bytes[2]](){
+                const unsigned char*role_source[3]={role_source_0,role_source_1,role_source_2};
+                const std::uint64_t role_offset[3]={role_offset_0,role_offset_1,role_offset_2};
+                const std::uint64_t stream_role_bytes[3]={role_bytes_0,role_bytes_1,role_bytes_2};
+                const double t_pack=moe_now();
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic,1) num_threads(pack_threads)
+#endif
+                for(std::int64_t task=0;task<staged_count*3;++task){
+                    const int slot=static_cast<int>(task/3);
+                    const int role=static_cast<int>(task%3);
+                    auto*destination=mirror+
+                        static_cast<std::uint64_t>(slot)*stride+role_offset[role];
+                    const auto*source=role_source[role]+
+                        static_cast<std::uint64_t>(staged[slot])*stream_role_bytes[role];
+                    const auto bytes=stream_role_bytes[role];
+                    if(stream_copy_nt&&
+                       (reinterpret_cast<std::uintptr_t>(destination)&63u)==0&&
+                       (bytes&63u)==0)
+                        qwen_stream_copy_avx512(destination,source,bytes);
+                    else std::memcpy(destination,source,bytes);
+                }
+                if(flyweight_gpu_upload(stream_slice_base,mirror,cursor,
+                       runtime.prefetch_stream)!=0||
+                   flyweight_gpu_event_record(mirror_event,runtime.prefetch_stream)!=0||
+                   flyweight_gpu_event_record(
+                       stream_upload_ready_event,runtime.prefetch_stream)!=0)
+                    throw std::runtime_error(
+                        "native Qwen prefill expert stream upload failed");
+                ++runtime.stream_mirror_uploads[stream_slice];
+                if(moe_profile_enabled())
+                    qwen_moe_profile().stream_upload+=moe_now()-t_pack;
+                };
+                if(on_worker){
+                    stream_worker_error=nullptr;
+                    stream_worker=std::thread([&stream_worker_error,
+                                               stage=std::move(stage_upload)](){
+                        try{stage();}
+                        catch(...){stream_worker_error=std::current_exception();}
+                    });
+                }else{
+                    stage_upload();
+                    if(flyweight_gpu_stream_wait_event(
+                           runtime.stream,stream_upload_ready_event)!=0)
+                        throw std::runtime_error(
+                            "native Qwen prefill expert stream fence failed");
+                }
+            }
             if(moe_profile_enabled())
                 qwen_moe_profile().stream_upload+=moe_now()-t_upload;
-            if(cursor&&
-               (flyweight_gpu_event_record(
-                    span.upload_ready_event,runtime.prefetch_stream)!=0||
-                flyweight_gpu_stream_wait_event(
-                    runtime.stream,span.upload_ready_event)!=0))
-                throw std::runtime_error(
-                    "native Qwen prefill expert stream fence failed");
+            staged_layer.layer=static_cast<std::int64_t>(layer_number);
+            staged_layer.groups=stream_groups;
+            staged_layer.group_of=group_of;
+            }
             // Token lists per group, tokens ascending. The streamed routes
             // leave weights_host so the CPU sweep skips them; their route
             // weights ride the scatter instead.
@@ -2070,6 +2218,55 @@ void qwen_forward_rows(
                 void*down_args[]={const_cast<std::uint64_t*>(&gpu_down_table),const_cast<std::uint64_t*>(&gpu_activated),const_cast<std::uint64_t*>(&fourth),const_cast<std::uint64_t*>(&gpu_weight_table),const_cast<std::uint64_t*>(&gpu_count_table),const_cast<int*>(&intermediate),const_cast<int*>(&hidden_size),const_cast<int*>(&top_k),&rows};
                 launch(qwen_grouped_accumulate_rows_name(down_type).c_str(),hidden_size,rows,256,down_args);
             }
+        }
+        // The CPU sweep runs before the GEMM enqueue so the leader's pack
+        // worker overlaps it; the GPU meanwhile has the other half's core
+        // work queued, so the later enqueue costs it nothing.
+        {
+            const auto cpu_expert_started=std::chrono::steady_clock::now();
+            qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);
+            if(expert_policy.records_prefill_frequency())
+                runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now()-cpu_expert_started).count();
+        }
+        if(stream_worker.joinable()){
+            stream_worker.join();
+            if(stream_worker_error)std::rethrow_exception(stream_worker_error);
+            // The worker recorded upload_ready on the prefetch stream; the
+            // compute stream's wait has to be queued after that record.
+            if(flyweight_gpu_stream_wait_event(
+                   runtime.stream,stream_upload_ready_event)!=0)
+                throw std::runtime_error(
+                    "native Qwen prefill expert stream fence failed");
+        }
+        // FLYWEIGHT_STREAM_TRACE=3: verify the staged slice against the mmap
+        // after the upload lands (leader spans only; slow, diagnostic).
+        static const bool verify_trace=std::getenv("FLYWEIGHT_STREAM_TRACE")&&
+            std::getenv("FLYWEIGHT_STREAM_TRACE")[0]=='3';
+        if(verify_trace&&!stream_groups.empty()&&
+           staged_layer.layer==static_cast<std::int64_t>(layer_number)&&
+           !stream_follower_for_trace){
+            flyweight_gpu_stream_sync(runtime.prefetch_stream);
+            std::uint64_t triple=0;
+            for(int role=0;role<3;++role)triple+=stream_role_bytes[role];
+            std::vector<unsigned char> host(triple);
+            std::size_t bad_experts=0,bad_bytes=0;
+            for(const auto&group:stream_groups){
+                flyweight_gpu_download(host.data(),group.matrix,triple,runtime.stream);
+                flyweight_gpu_stream_sync(runtime.stream);
+                std::uint64_t offset=0;bool bad=false;
+                for(int role=0;role<3;++role){
+                    const auto*source=tensor_data(*runtime.model,
+                        runtime.model->tensors[layer.expert_tensors[role]])+
+                        static_cast<std::uint64_t>(group.expert)*stream_role_bytes[role];
+                    for(std::uint64_t i=0;i<stream_role_bytes[role];++i)
+                        if(host[offset+i]!=source[i]){++bad_bytes;bad=true;}
+                    offset+=stream_role_bytes[role];
+                }
+                if(bad)++bad_experts;
+            }
+            std::fprintf(stderr,"[verify] layer %u span %d staged %zu bad_experts %zu bad_bytes %zu\n",
+                layer_number,span_begin,stream_groups.size(),bad_experts,bad_bytes);
         }
         // Expert-GEMM execution: pack, project, activate, project, fold back.
         if(!stream_groups.empty()){
@@ -2175,6 +2372,8 @@ void qwen_forward_rows(
             // The option is the supported switch; the env var stays as an
             // override so the path can be A/B'd against itself without
             // rebuilding a runtime.
+            // 1 = on, 2 = auto: both mean "where the kernels exist", which
+            // the per-role check below decides; 0 keeps the per-expert GEMM.
             static const char*routed_env=std::getenv("FLYWEIGHT_ROUTED_MOE");
             const bool routed_setting=routed_env
                 ? routed_env[0]=='1'
@@ -2184,15 +2383,7 @@ void qwen_forward_rows(
             // IQ4_NL's flat blocks, which is what lets the 640-wide down
             // projection in at all.
             auto routed_kernel=[&](std::uint32_t type,int in_size){
-                auto name=qwen_iq_grouped_kernel(type,"_q8_mmq_routed");
-                if(name.empty()){
-                    // The K-quant names are not derived from an IQ prefix.
-                    const char*family=type==10?"q2k":type==11?"q3k"
-                        :type==12?"q4k":type==13?"q5k":type==14?"q6k":nullptr;
-                    if(family)name=std::string(family)+"_q8_mmq_routed";
-                }
-                const int unit=type==20?32:256;
-                return (!name.empty()&&in_size%unit==0)?name:std::string();
+                return qwen_routed_mmq_kernel(type,in_size);
             };
             // Q2_K, Q4_K and Q5_K carry a per-group minimum, so they come from
             // the _MIN routed macro: 64 rows over 16 warps rather than 128 over
@@ -2424,16 +2615,33 @@ void qwen_forward_rows(
             }
             // The GEMMs above are the last readers of this span's streamed
             // slice; the next layer's uploads wait on this marker.
-            if(flyweight_gpu_event_record(span.consumed_event,runtime.stream)!=0)
+            if(flyweight_gpu_event_record(stream_consumed_event,runtime.stream)!=0)
                 throw std::runtime_error(
                     "native Qwen prefill expert stream fence failed");
             span.gpu_experts=true;
+            // FLYWEIGHT_STREAM_TRACE=2: per-layer checksums of the GPU expert
+            // accumulator and the CPU sweep output, for run-to-run diffing.
+            static const bool checksum_trace=std::getenv("FLYWEIGHT_STREAM_TRACE")&&
+                std::getenv("FLYWEIGHT_STREAM_TRACE")[0]=='2';
+            if(checksum_trace){
+                std::vector<float> host(static_cast<std::size_t>(rows)*hidden_size);
+                flyweight_gpu_stream_sync(runtime.stream);
+                flyweight_gpu_download(host.data(),fourth,host.size()*sizeof(float),runtime.stream);
+                flyweight_gpu_stream_sync(runtime.stream);
+                double gpu_sum=0,cpu_sum=0,in_sum=0;
+                for(const float v:host)gpu_sum+=std::fabs(v);
+                for(std::size_t i=0;i<host.size();++i)cpu_sum+=std::fabs(output_host[i]);
+                flyweight_gpu_download(host.data(),normalized,host.size()*sizeof(float),runtime.stream);
+                flyweight_gpu_stream_sync(runtime.stream);
+                for(const float v:host)in_sum+=std::fabs(v);
+                std::uint64_t route_hash=1469598103934665603ull;
+                for(int route=0;route<rows*top_k;++route)
+                    route_hash=(route_hash^static_cast<std::uint64_t>(selected_host[route]+7))*1099511628211ull;
+                std::fprintf(stderr,"[cksum] layer %u span %d rows %d routed %d groups %zu in %.9e routes %016llx gpu %.9e cpu %.9e\n",
+                    layer_number,span_begin,rows,(int)routed_moe,stream_groups.size(),in_sum,
+                    (unsigned long long)route_hash,gpu_sum,cpu_sum);
+            }
         }
-        const auto cpu_expert_started=std::chrono::steady_clock::now();
-        qwen_cpu_moe_rows(runtime,layer,selected_host,weights_host,rows,top_k,input_host,activated_host,down_host,output_host);
-        if(expert_policy.records_prefill_frequency())
-            runtime.prefill_expert_nanoseconds+=std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now()-cpu_expert_started).count();
     };
     // Phase three of a layer: fold the experts back in -- upload the CPU
     // result, sum the GPU-expert and shared-expert contributions into the
@@ -2460,32 +2668,16 @@ void qwen_forward_rows(
     // half A's KV/DeltaNet state through normal stream ordering because A's
     // core for a layer is always queued before B's.
     RowsSpan whole{0,total_rows,hidden,residual,runtime.route_event,
-                   runtime.prefill_stream_arena,runtime.prefill_stream_bytes,
-                   runtime.prefill_stream_scratch,
-                   runtime.stream_upload_event,runtime.stream_consumed_event,
-                   false,{}};
+                   runtime.prefill_stream_scratch,false,{}};
     if(pipelined){
-        // Halves stage into disjoint slices of the streaming arena; round the
-        // front's share down to the device alignment so the back's base stays
-        // aligned.
-        const std::uint64_t stream_half=
-            runtime.prefill_stream_bytes/2
-            /flyweight::v2::workspace::kDeviceAlignment
-            *flyweight::v2::workspace::kDeviceAlignment;
         RowsSpan front{0,pipeline_half,hidden,residual,
                        runtime.route_event,
-                       runtime.prefill_stream_arena,stream_half,
-                       runtime.prefill_stream_scratch,
-                       runtime.stream_upload_event,
-                       runtime.stream_consumed_event,false,{}};
+                       runtime.prefill_stream_scratch,false,{}};
         RowsSpan back{pipeline_half,total_rows-pipeline_half,hidden,residual,
                       runtime.route_event_pipeline,
-                      runtime.prefill_stream_arena+stream_half,
-                      runtime.prefill_stream_bytes-stream_half,
                       runtime.prefill_stream_scratch+
                           runtime.prefill_stream_scratch_span,
-                      runtime.stream_upload_event_pipeline,
-                      runtime.stream_consumed_event_pipeline,false,{}};
+                      false,{}};
         // Queue core phases until one is a MoE layer whose expert work is
         // pending; dense feed-forward layers complete inside queue_core.
         auto advance=[&](RowsSpan&span,std::uint32_t&next)->bool{

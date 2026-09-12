@@ -2629,6 +2629,31 @@ class HTTPServerTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         response.read()
 
+    def test_a_client_that_vanishes_mid_response_is_not_a_server_error(self) -> None:
+        # A harness that cancels a turn aborts its request, and the work
+        # finishes for nobody: the response write then fails. Windows raises
+        # ConnectionAbortedError (WinError 10053) where POSIX raises
+        # ConnectionResetError, and the POST handler caught only the POSIX
+        # pair -- so on Windows every cancelled request logged a traceback and
+        # answered "500 internal server error" to a peer that was gone.
+        errors = StringIO()
+        with patch.object(
+            InferenceService,
+            "count_response_input",
+            side_effect=ConnectionAbortedError(10053, "aborted"),
+        ), redirect_stderr(errors):
+            self.connection.request(
+                "POST",
+                "/v1/responses/input_tokens",
+                body=json.dumps({"input": "hi"}),
+                headers={"Content-Type": "application/json"},
+            )
+            # Nothing can be sent to a peer that is gone; the connection closes.
+            with self.assertRaises(http.client.HTTPException):
+                self.connection.getresponse().read()
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertNotIn("ConnectionAbortedError", errors.getvalue())
+
     def test_chat_ui_static_assets(self) -> None:
         self.connection.request("GET", "/")
         response = self.connection.getresponse()

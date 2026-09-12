@@ -76,23 +76,17 @@ class V2RuntimeTests(unittest.TestCase):
         # Host-side prefill placement, or the stream gate the routed kernels
         # run behind never opens.
         self.assertEqual(native.hybrid_prefill_cpu, 1)
-        # Direct paging, or dma_paging stays off and the gate closes again.
-        self.assertEqual(native.expert_paging, 2)
-        # A seed, because direct registration only happens when routed GPU
-        # execution is allowed, which seeding is what turns on.
-        self.assertEqual(native.prefill_cache_seed_auto, 1)
+        # The streaming path packs through a pinned mirror, so it no longer
+        # needs direct paging or a cache seed: those stay at their defaults.
+        self.assertEqual(native.expert_paging, 0)
         # The arena the routed kernels measured best with, rather than the
         # 48 MiB auto tuned for the per-expert path they replace.
-        self.assertEqual(native.prefill_expert_stream_mib, 512)
+        self.assertEqual(native.prefill_expert_stream_mib, 256)
 
     def test_routed_moe_refuses_settings_that_would_disable_it(self):
         """Silently not engaging is the failure this flag exists to prevent."""
         with self.assertRaisesRegex(ValueError, "hybrid_prefill"):
             V2QwenRuntime(object(), routed_moe=True, hybrid_prefill="split")
-        with self.assertRaisesRegex(ValueError, "expert_paging"):
-            V2QwenRuntime(object(), routed_moe=True, expert_paging="staged")
-        with self.assertRaisesRegex(ValueError, "prefill cache seed"):
-            V2QwenRuntime(object(), routed_moe=True, prefill_cache_seed="off")
 
     def test_routed_moe_leaves_explicit_choices_alone(self):
         """Only unset settings are defaulted; a compatible explicit one stands."""

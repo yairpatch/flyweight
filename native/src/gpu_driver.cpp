@@ -65,6 +65,8 @@ struct CublasLtHeuristicResult {
 
 struct CudaApi {
     CUresult (*cuInit)(unsigned int) = nullptr;
+    // Optional: the driver's CUDA version, to decide PTX versus cubin.
+    CUresult (*cuDriverGetVersion)(int*) = nullptr;
     // Optional: names a driver result in the compile log (a PTX the driver
     // is too old to load is the common one).
     CUresult (*cuGetErrorName)(CUresult, const char**) = nullptr;
@@ -123,6 +125,17 @@ struct CudaApi {
     ) = nullptr;
     nvrtcResult (*nvrtcGetPTXSize)(nvrtcProgram, size_t*) = nullptr;
     nvrtcResult (*nvrtcGetPTX)(nvrtcProgram, char*) = nullptr;
+    // Optional (CUDA 11.1+): SASS for the exact device instead of PTX. A cubin
+    // loads on any driver of the toolkit's CUDA major, where PTX needs a
+    // driver at least as new as the toolkit that wrote it.
+    nvrtcResult (*nvrtcGetCUBINSize)(nvrtcProgram, size_t*) = nullptr;
+    nvrtcResult (*nvrtcGetCUBIN)(nvrtcProgram, char*) = nullptr;
+    // Optional (CUDA 11.2+): which architectures this NVRTC can target. A
+    // toolkit older than the GPU (a 12.6 NVRTC on a Blackwell card) knows
+    // neither sm_120 nor compute_120 and rejects both as an invalid option.
+    nvrtcResult (*nvrtcGetNumSupportedArchs)(int*) = nullptr;
+    nvrtcResult (*nvrtcGetSupportedArchs)(int*) = nullptr;
+    nvrtcResult (*nvrtcVersion)(int*, int*) = nullptr;
     nvrtcResult (*nvrtcGetProgramLogSize)(nvrtcProgram, size_t*) = nullptr;
     nvrtcResult (*nvrtcGetProgramLog)(nvrtcProgram, char*) = nullptr;
     nvrtcResult (*nvrtcDestroyProgram)(nvrtcProgram*) = nullptr;
@@ -397,6 +410,7 @@ bool load_apis() {
     }
     bool ok = true;
     ok &= load_symbol(cuda, "cuInit", g_api.cuInit);
+    load_symbol(cuda, "cuDriverGetVersion", g_api.cuDriverGetVersion);
     load_symbol(cuda, "cuGetErrorName", g_api.cuGetErrorName);
     ok &= load_symbol(
         cuda, "cuDevicePrimaryCtxRetain", g_api.cuDevicePrimaryCtxRetain
@@ -452,6 +466,11 @@ bool load_apis() {
     ok &= load_symbol(nvrtc, "nvrtcGetProgramLog", g_api.nvrtcGetProgramLog);
     ok &= load_symbol(nvrtc, "nvrtcDestroyProgram", g_api.nvrtcDestroyProgram);
     load_symbol(nvrtc, "nvrtcGetErrorString", g_api.nvrtcGetErrorString);
+    load_symbol(nvrtc, "nvrtcGetCUBINSize", g_api.nvrtcGetCUBINSize);
+    load_symbol(nvrtc, "nvrtcGetCUBIN", g_api.nvrtcGetCUBIN);
+    load_symbol(nvrtc, "nvrtcGetNumSupportedArchs", g_api.nvrtcGetNumSupportedArchs);
+    load_symbol(nvrtc, "nvrtcGetSupportedArchs", g_api.nvrtcGetSupportedArchs);
+    load_symbol(nvrtc, "nvrtcVersion", g_api.nvrtcVersion);
     g_api.loaded = ok;
     return ok;
 }
@@ -931,9 +950,70 @@ extern "C" int flyweight_gpu_compile(
                           device);
         return -1;
     }
+    // compute_XY yields PTX that the driver's own JIT must accept, which
+    // fails with CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222) whenever the
+    // toolkit's NVRTC is newer than the driver -- a fresh toolkit on a laptop
+    // with a stock driver is the everyday case. sm_XY asks NVRTC for SASS (a
+    // cubin) for this exact device instead, which only needs the same CUDA
+    // major. PTX stays the default wherever the driver can take it: the
+    // driver caches its JIT output on disk, so a model reopens in a couple of
+    // seconds, whereas NVRTC assembles a cubin from scratch on every open
+    // (about 12 s more on a 5070 Ti). FLYWEIGHT_NVRTC_CUBIN=1 forces the
+    // cubin and FLYWEIGHT_NVRTC_PTX=1 forces PTX, for comparison.
+    //
+    // When NVRTC predates the GPU it cannot target the device at all. PTX is
+    // forward compatible, so the newest architecture NVRTC does know is
+    // compiled as PTX and the (newer) driver JITs it for the real device; a
+    // cubin for another architecture would not run there.
+    const int device_arch = major * 10 + minor;
+    int target_arch = device_arch;
+    std::string arch_note;
+    if (g_api.nvrtcGetNumSupportedArchs != nullptr && g_api.nvrtcGetSupportedArchs != nullptr) {
+        int count = 0;
+        if (g_api.nvrtcGetNumSupportedArchs(&count) == 0 && count > 0) {
+            std::vector<int> supported(static_cast<size_t>(count), 0);
+            if (g_api.nvrtcGetSupportedArchs(supported.data()) == 0) {
+                bool exact = false;
+                int best = 0;
+                for (const int candidate : supported) {
+                    if (candidate == device_arch) exact = true;
+                    if (candidate <= device_arch && candidate > best) best = candidate;
+                }
+                if (!exact && best > 0) {
+                    target_arch = best;
+                    int nvrtc_major = 0;
+                    int nvrtc_minor = 0;
+                    if (g_api.nvrtcVersion) g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor);
+                    arch_note = "NVRTC " + std::to_string(nvrtc_major) + "."
+                        + std::to_string(nvrtc_minor) + " does not know sm_"
+                        + std::to_string(device_arch) + "; compiling PTX for compute_"
+                        + std::to_string(best) + " for the driver to JIT";
+                }
+            }
+        }
+    }
+    bool driver_older_than_nvrtc = false;
+    {
+        int driver_version = 0;
+        int nvrtc_major = 0;
+        int nvrtc_minor = 0;
+        if (g_api.cuDriverGetVersion && g_api.nvrtcVersion
+            && g_api.cuDriverGetVersion(&driver_version) == 0
+            && g_api.nvrtcVersion(&nvrtc_major, &nvrtc_minor) == 0) {
+            driver_older_than_nvrtc =
+                driver_version < nvrtc_major * 1000 + nvrtc_minor * 10;
+        }
+    }
+    const bool want_cubin = target_arch == device_arch
+        && g_api.nvrtcGetCUBINSize != nullptr
+        && g_api.nvrtcGetCUBIN != nullptr
+        && std::getenv("FLYWEIGHT_NVRTC_PTX") == nullptr
+        && (driver_older_than_nvrtc
+            || std::getenv("FLYWEIGHT_NVRTC_CUBIN") != nullptr);
     char arch[64];
     std::snprintf(
-        arch, sizeof(arch), "--gpu-architecture=compute_%d%d", major, minor
+        arch, sizeof(arch), "--gpu-architecture=%s_%d",
+        want_cubin ? "sm" : "compute", target_arch
     );
     std::vector<const char*> all_options;
     all_options.push_back(arch);
@@ -1049,6 +1129,7 @@ extern "C" int flyweight_gpu_compile(
                 }
             }
         }
+        if (!arch_note.empty()) append_log(arch_note);
         if (compiled != 0) {
             // A log of warnings alone is the common shape of this failure:
             // the front end ran, then NVRTC could not finish -- on Windows,
@@ -1061,36 +1142,45 @@ extern "C" int flyweight_gpu_compile(
             g_api.nvrtcDestroyProgram(&program);
             return -3;
         }
-        size_t ptx_size = 0;
-        const nvrtcResult sized = g_api.nvrtcGetPTXSize(program, &ptx_size);
-        if (sized != 0 || ptx_size == 0) {
-            append_log("nvrtcGetPTXSize: " + nvrtc_name(sized));
+        const char* image_kind = want_cubin ? "CUBIN" : "PTX";
+        auto get_size = want_cubin ? g_api.nvrtcGetCUBINSize : g_api.nvrtcGetPTXSize;
+        auto get_image = want_cubin ? g_api.nvrtcGetCUBIN : g_api.nvrtcGetPTX;
+        size_t image_size = 0;
+        const nvrtcResult sized = get_size(program, &image_size);
+        if (sized != 0 || image_size == 0) {
+            append_log("nvrtcGet" + std::string(image_kind) + "Size: " + nvrtc_name(sized));
             g_api.nvrtcDestroyProgram(&program);
             return -3;
         }
-        std::vector<char> ptx(ptx_size);
-        const nvrtcResult fetched = g_api.nvrtcGetPTX(program, ptx.data());
+        std::vector<char> image(image_size);
+        const nvrtcResult fetched = get_image(program, image.data());
         if (fetched != 0) {
-            append_log("nvrtcGetPTX: " + nvrtc_name(fetched));
+            append_log("nvrtcGet" + std::string(image_kind) + ": " + nvrtc_name(fetched));
             g_api.nvrtcDestroyProgram(&program);
             return -3;
         }
         g_api.nvrtcDestroyProgram(&program);
         const CUresult loaded = g_api.cuModuleLoadDataEx(
-            &g_module, ptx.data(), 0, nullptr, nullptr);
+            &g_module, image.data(), 0, nullptr, nullptr);
         if (loaded != 0) {
             // NVRTC compiled fine (its warnings are what the log holds); the
-            // DRIVER refused the PTX. CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222)
-            // is the everyday case: a toolkit newer than the installed driver.
+            // DRIVER refused the image. For PTX, CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+            // (222) is the everyday case: a toolkit newer than the installed
+            // driver. A cubin only fails that way across a CUDA major.
             const char* name = nullptr;
             if (g_api.cuGetErrorName) g_api.cuGetErrorName(loaded, &name);
             append_log("cuModuleLoadDataEx: " + std::string(name ? name : "CUDA error")
                        + " (code " + std::to_string(static_cast<int>(loaded))
-                       + ") loading PTX for " + std::string(arch)
+                       + ") loading " + image_kind + " for " + std::string(arch)
                        + "; the compile succeeded and the warnings above are not "
-                         "the cause. Code 222 means the NVIDIA driver is older "
-                         "than the CUDA toolkit: update the driver, or install "
-                         "a toolkit the driver supports.");
+                         "the cause. "
+                       + (want_cubin
+                          ? "The NVIDIA driver does not accept code from this CUDA "
+                            "toolkit's major version: update the driver, or install "
+                            "a toolkit the driver supports."
+                          : "Code 222 means the NVIDIA driver is older than the CUDA "
+                            "toolkit: update the driver, or install a toolkit the "
+                            "driver supports."));
             return -4;
         }
         module_cache.emplace(std::move(cache_key), g_module);
@@ -1734,6 +1824,8 @@ extern "C" int flyweight_gpu_stream_create(std::uint64_t* stream) {
     return 0;
 }
 
+static void nvfp4_clear_cublas_plans();
+
 extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
     if (flyweight_backend_is_cpu()) return flyweight_cpu_stream_destroy(stream);
 
@@ -1770,6 +1862,10 @@ extern "C" int flyweight_gpu_stream_destroy(std::uint64_t stream) {
                     release(entry.second.scales);
                 }
                 g_nvfp4_dense_repacks.clear();
+                // The cuBLASLt plans are host objects keyed by shape and
+                // only ever dropped when the scratch grows; a reload that
+                // never regrows it would keep them for the process lifetime.
+                nvfp4_clear_cublas_plans();
             }
             const CUevent handoff = g_nvfp4_scratch.handoff;
             g_nvfp4_scratch = Nvfp4Scratch{};

@@ -1938,7 +1938,11 @@ class ChatGenerator:
                 True,
                 len(prompt_ids) + len(generated),
             )
-        except GeneratorExit:
+        except BaseException:
+            # Every abnormal exit -- the consumer closing the generator, a
+            # progress callback raising, a decode error -- must stop the native
+            # task, or it decodes to max_tokens with nobody reading and holds
+            # its KV slot the whole way.
             self.engine.cancel(task_id)
             raise
         finally:

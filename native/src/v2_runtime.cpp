@@ -63,6 +63,7 @@
 #include <initializer_list>
 #include <limits>
 #include <thread>
+#include <exception>
 #include <set>
 #include <mutex>
 #include <memory>
@@ -1032,19 +1033,22 @@ struct FlyweightV2QwenRuntime {
     // streamed here instead and the ordinary device path runs on them.
     std::uint64_t host_ffn_stage = 0;
     std::uint64_t host_ffn_stage_bytes = 0;
-    // Spilled feed-forward weights re-encoded as Q8_0, keyed by tensor index.
-    // The host dot for a codebook format converts every weight to float through
-    // a grid lookup and a sign expansion -- about six vector ops per eight MACs,
-    // redone for each of the thousands of output rows, which lands at a couple
-    // of percent of FMA peak. Q8_0 has no codebook and no signs, so it reaches
-    // the existing SIMD row kernels and becomes bandwidth-bound instead. Costs
-    // host RAM (2.56 bpw -> 8.5), which is the resource that is spare precisely
-    // when weights are being spilled. The device keeps reading the original
-    // bytes: its codebook kernels are fast and the compact form is what makes
-    // the batch upload cheap.
+    // Spilled feed-forward weights re-encoded to a SIMD-capable k-quant, keyed
+    // by tensor index. The host dot for a codebook format converts every
+    // weight to float through a grid lookup and a sign expansion -- about six
+    // vector ops per eight MACs, redone for each of the thousands of output
+    // rows, which lands at a couple of percent of FMA peak. The k-quants have
+    // no codebook and no signs, so they reach the existing SIMD row kernels
+    // and become bandwidth-bound instead. Q3_K by default (1.34x the IQ3
+    // bytes; Q8_0 at 3.3x measured slower than the codebook path, see the
+    // format choice in prepare), FLYWEIGHT_HOST_FFN_FORMAT overrides. Costs
+    // host RAM, which is the resource that is spare precisely when weights
+    // are being spilled. The device keeps reading the original bytes: its
+    // codebook kernels are fast and the compact form is what makes the batch
+    // upload cheap.
     std::unordered_map<std::uint64_t,std::vector<std::uint8_t>> host_ffn_q8;
     std::uint64_t host_ffn_q8_bytes = 0;
-    std::uint32_t host_ffn_q8_type = 8;
+    std::uint32_t host_ffn_q8_type = 11;  // Q3_K; overwritten by prepare
     std::uint64_t dense_host_nanoseconds = 0;
     // Cacheable mirror of the pinned dense scratch; see qwen_cpu_dense_ffn.
     std::vector<float> dense_scratch;
@@ -1066,6 +1070,11 @@ struct FlyweightV2QwenRuntime {
     // experts wholly on the host, which is today's behavior.
     std::uint64_t prefill_stream_arena = 0;
     std::uint64_t prefill_stream_bytes = 0;
+    // Pinned host mirror of the arena. The staged experts of a half-layer
+    // are packed into it by the OpenMP team and land on the device as one
+    // copy per slice, so the engine thread never blocks on the driver's
+    // pageable bounce for thousands of small expert uploads out of the mmap.
+    void* prefill_stream_mirror = nullptr;
     // Scratch for the expert-GEMM path: packed activation tiles, their Q8
     // form, the SwiGLU intermediates and the down output, two span slices.
     // Layout order must match the offsets qwen_forward_rows derives.
@@ -1209,6 +1218,17 @@ struct FlyweightV2QwenRuntime {
     std::uint32_t mtp_fold_rows = 0;
     bool mtp_delta_layers = false;
     std::uint64_t mtp_cache_tokens = 0;
+    // Prompt-lookup (n-gram) self-speculation: drafts come from the
+    // sequence's own history instead of a draft block, and go through the
+    // same verify / accept / rollback round as MTP. Output is unchanged by
+    // construction (every row is re-scored by the target); only the
+    // acceptance rate moves. 0 disables. See qwen_lookup_draft.
+    std::uint32_t lookup_drafts = 0;
+    std::uint32_t lookup_ngram_min = 4;
+    std::uint32_t lookup_ngram_max = 32;
+    std::uint64_t lookup_rounds = 0;
+    std::uint64_t lookup_misses = 0;
+    std::size_t lookup_last_match = 0;
     // Device rows the sampled MTP round hands the sampler: the verify batch's
     // normalized hiddens, copied out of the rows workspace because the
     // sampler's own scratch (decode-layout regions) may overlap them there.
@@ -1298,6 +1318,12 @@ struct FlyweightV2QwenRuntime {
     std::uint64_t stream_upload_event_pipeline = 0;
     std::uint64_t stream_consumed_event = 0;
     std::uint64_t stream_consumed_event_pipeline = 0;
+    // Drain events for the pinned mirror ring: [span][slot]. A slot is
+    // repacked only after the copy issued out of it two layers earlier has
+    // finished, which keeps the host off the compute stream's queue depth.
+    static constexpr int kStreamMirrorSlots = 2;
+    std::uint64_t stream_mirror_events[2][kStreamMirrorSlots] = {};
+    std::uint64_t stream_mirror_uploads[2] = {0, 0};
     std::uint64_t prefill_layer_start_event = 0;
     std::uint64_t prefill_core_end_event = 0;
     std::uint64_t prefill_router_end_event = 0;
@@ -1425,6 +1451,14 @@ struct FlyweightV2QwenRuntime {
     std::atomic<bool> registration_cancel{false};
     bool model_registered = false; // whether we cuMemHostRegister'd model->data
 };
+
+// Speculative row budget: the draft block's drafts when the checkpoint has one,
+// otherwise the prompt-lookup budget. Everything the batched verify needs
+// (rows workspace, DeltaNet snapshot arena, single sequence slot) keys off
+// this; only the draft block's own cache and hand-over key off mtp_drafts.
+static inline std::uint32_t qwen_spec_drafts(const FlyweightV2QwenRuntime& runtime) {
+    return runtime.options.mtp_drafts ? runtime.options.mtp_drafts : runtime.lookup_drafts;
+}
 
 flyweight::v2::ExpertExecutionPolicy qwen_expert_policy(
     const FlyweightV2QwenRuntime& runtime,
@@ -2509,6 +2543,8 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_free(runtime.prefill_stream_arena);
     runtime.prefill_stream_arena = 0;
     runtime.prefill_stream_bytes = 0;
+    if (runtime.prefill_stream_mirror) flyweight_gpu_host_free(runtime.prefill_stream_mirror);
+    runtime.prefill_stream_mirror = nullptr;
     flyweight_gpu_free(runtime.prefill_stream_scratch);
     runtime.prefill_stream_scratch = 0;
     runtime.prefill_stream_scratch_bytes = 0;
@@ -2567,6 +2603,8 @@ void release_qwen_device(FlyweightV2QwenRuntime& runtime) {
     flyweight_gpu_event_destroy(runtime.stream_consumed_event);
     flyweight_gpu_event_destroy(runtime.stream_consumed_event_pipeline);
     runtime.stream_upload_event=runtime.stream_upload_event_pipeline=0;
+    for(auto&span_events:runtime.stream_mirror_events)
+        for(auto&event:span_events){flyweight_gpu_event_destroy(event);event=0;}
     runtime.stream_consumed_event=runtime.stream_consumed_event_pipeline=0;
     flyweight_gpu_event_destroy(runtime.prefill_layer_start_event);
     flyweight_gpu_event_destroy(runtime.prefill_core_end_event);
@@ -4336,6 +4374,44 @@ std::string qwen_iq_grouped_kernel(std::uint32_t type, const char* suffix) {
     return prefix?std::string(prefix)+suffix:std::string();
 }
 
+// The routed block-table MMQ kernel for an expert role, or empty where the
+// format has none or the width does not divide its blocking: 256 for the
+// super-block formats, 32 for IQ4_NL's flat blocks (what lets qwen4exp's
+// 640-wide down projection in).
+std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
+    auto name = qwen_iq_grouped_kernel(type, "_q8_mmq_routed");
+    if (name.empty()) {
+        const char* family = type == 10 ? "q2k" : type == 11 ? "q3k"
+            : type == 12 ? "q4k" : type == 13 ? "q5k" : type == 14 ? "q6k" : nullptr;
+        if (family) name = std::string(family) + "_q8_mmq_routed";
+    }
+    const int unit = type == 20 ? 32 : 256;
+    return (!name.empty() && in_size % unit == 0) ? name : std::string();
+}
+
+// Whether the routed MMQ carries most MoE layers: the UD checkpoints keep a
+// few layers' down experts in Q8_0, which has no routed kernel and falls
+// back to the per-expert GEMM for that layer alone; those few do not decide
+// the budget for the rest.
+bool qwen_routed_mmq_available(const FlyweightV2QwenRuntime& runtime) {
+    if (!runtime.int8_tensor_cores) return false;
+    const int hidden = static_cast<int>(runtime.model->config.hidden_size);
+    const int intermediate = static_cast<int>(runtime.moe_intermediate);
+    std::size_t moe_layers = 0, routed_layers = 0;
+    for (const auto& layer : runtime.layers) {
+        if (layer.dense_ffn) continue;
+        ++moe_layers;
+        const int widths[3] = {hidden, hidden, intermediate};
+        bool routed = true;
+        for (int role = 0; role < 3 && routed; ++role) {
+            const auto type = runtime.model->tensors[layer.expert_tensors[role]].type;
+            routed = !qwen_routed_mmq_kernel(type, widths[role]).empty();
+        }
+        if (routed) ++routed_layers;
+    }
+    return moe_layers && routed_layers * 2 >= moe_layers;
+}
+
 bool qwen_gpu_expert_type_supported(std::uint32_t type) {
     return type==8||type==12||type==13||type==14||type==40||
            qwen_iq_kernel_prefix(type)!=nullptr;
@@ -4916,15 +4992,22 @@ void qwen_cpu_dense_ffn(
     float*local_input=runtime.dense_scratch.data();
     float*activated=local_input+hidden;
     std::memcpy(local_input,input,static_cast<std::size_t>(hidden)*sizeof(float));
-    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
-    for(int row=0;row<intermediate;++row){
-        const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row);
-        const float up=qwen_quant_dot(up_data,up_type,local_input,hidden,row);
-        activated[row]=gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))*up;
+    // One team for both phases: the implicit barrier after the first loop
+    // orders the down projection after the SwiGLU, and a spilled 27B pays this
+    // per block, thirty-odd times a token, so the second region launch was
+    // pure overhead.
+    #pragma omp parallel num_threads(qwen_cpu_thread_count(runtime))
+    {
+        #pragma omp for schedule(static)
+        for(int row=0;row<intermediate;++row){
+            const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row);
+            const float up=qwen_quant_dot(up_data,up_type,local_input,hidden,row);
+            activated[row]=gate/(1.0f+std::exp(-std::min(80.0f,std::max(-80.0f,gate))))*up;
+        }
+        #pragma omp for schedule(static)
+        for(int row=0;row<hidden;++row)
+            output[row]=qwen_quant_dot(down_data,down_type,activated,intermediate,row);
     }
-    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
-    for(int row=0;row<hidden;++row)
-        output[row]=qwen_quant_dot(down_data,down_type,activated,intermediate,row);
 }
 
 void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
@@ -5551,6 +5634,12 @@ void qwen_dequant_row(const std::uint8_t*packed,std::uint32_t type,int elements,
     // 21 and 23 were the qwen4exp repeat of the same story: the UD-IQ4_XS mix
     // ships most gate/up expert stacks as IQ3_S with a few promoted to
     // IQ4_XS, and the tripwire below caught both on the scalar path.
+    // IQ1_S first through the whole-block gather decoder: 1.8x the octet-at-
+    // a-time AVX2 one, and it was the largest cost of a UD-IQ1_S prefill chunk.
+    if(type==19&&(flyweight_cpu_features()&8u)!=0&&elements%256==0){
+        qwen_iq1s_dequant_row_vnni512(packed,elements,row,output);return;}
+    if(type==21&&(flyweight_cpu_features()&8u)!=0&&elements%256==0){
+        qwen_iq3s_dequant_row_vnni512(packed,elements,row,output);return;}
     if((type==16||type==17||type==18||type==19||type==21||type==23)&&
        (flyweight_cpu_features()&1u)!=0&&elements%256==0){
         qwen_dequant_row_avx2(packed,type,elements,row,output);return;}
@@ -6331,12 +6420,29 @@ void qwen_cpu_moe(
         && hidden % 256 == 0 && intermediate % 256 == 0
         && gate_type == 12 && up_type == 12 && down_type == 12
         && (!q4_tile_setting || q4_tile_setting[0] != '0');
+    // IQ1_S and IQ3_S gate/up experts take the Q8_K activation through their
+    // whole-block VNNI kernels (qwen_cpu_iq1s_vnni512.cpp): the float IQ1_S
+    // dot is compute-bound at a fifth of the DRAM roof, the IQ3_S one at two
+    // thirds. Independent of use_q8 because the down projection of those
+    // checkpoints is IQ4_NL, whose float AVX-512 dot already runs at
+    // bandwidth and has no Q8_K form. FLYWEIGHT_IQ1S_Q8=0 keeps the float
+    // path for A/B; FLYWEIGHT_Q8_ACTIVATIONS=0 turns every int8-activation
+    // path off, this one included.
+    static const char* iq1s_q8_setting = std::getenv("FLYWEIGHT_IQ1S_Q8");
+    const bool iq1s_q8 = !use_q8 && (cpu_features & 8u) != 0
+        && (gate_type == 19 || gate_type == 21) && up_type == gate_type
+        && hidden % 256 == 0
+        && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
+        && !(q8_setting && q8_setting[0] == '0');
+    const auto iq_q8_dot = gate_type == 21
+        ? &qwen_iq3s_dot_q8_k_vnni512 : &qwen_iq1s_dot_q8_k_vnni512;
     thread_local std::vector<QwenQ8KBlock> input_q8, activated_q8;
-    if (use_q8) {
+    if (use_q8 || iq1s_q8) {
         input_q8.resize(hidden / 256);
-        activated_q8.resize(static_cast<std::size_t>(routed_count) * (intermediate / 256));
         qwen_quantize_q8_k_avx2(input, hidden, input_q8.data());
     }
+    if (use_q8)
+        activated_q8.resize(static_cast<std::size_t>(routed_count) * (intermediate / 256));
 #if defined(_OPENMP)
     // Decode is bandwidth-bound on expert weights. SMT siblings contend for the
     // same load ports and memory bandwidth, so use physical cores by default.
@@ -6364,7 +6470,10 @@ void qwen_cpu_moe(
         const int row = task % intermediate;
         float gate_value = 0.0f;
         float up_value = 0.0f;
-        if (use_q8) {
+        if (iq1s_q8) {
+            gate_value = iq_q8_dot(gate[rank], input_q8_data, hidden, row);
+            up_value = iq_q8_dot(up[rank], input_q8_data, hidden, row);
+        } else if (use_q8) {
             gate_value = q8_dot(
                 gate[rank], gate_type, input_q8_data, hidden, row
             );
@@ -6733,6 +6842,67 @@ void qwen_cpu_moe_rows(
     // fallback, whose per-task cost varies much more with route count.
     const int schedule_chunk=direct_quant?32:4;
     const int gate_blocks=(intermediate+kRowBlock-1)/kRowBlock;
+    // Experts routed one or two tokens take single-row dots rather than the
+    // dequant-and-GEMM below; for IQ1_S gate/up those go through the Q8_K
+    // VNNI kernel the single-token path uses (qwen_cpu_iq1s_vnni512.cpp), on
+    // a per-token int8 copy of the input quantized once here. Same gates as
+    // qwen_cpu_moe's iq1s_q8.
+    static const char* iq1s_q8_setting=std::getenv("FLYWEIGHT_IQ1S_Q8");
+    static const char* q8_setting=std::getenv("FLYWEIGHT_Q8_ACTIVATIONS");
+    const bool iq1s_q8=(flyweight_cpu_features()&8u)!=0
+        &&(gate_type==19||gate_type==21)&&up_type==gate_type&&hidden%256==0
+        &&!(iq1s_q8_setting&&iq1s_q8_setting[0]=='0')
+        &&!(q8_setting&&q8_setting[0]=='0');
+    const auto iq_q8_dot=gate_type==21
+        ?&qwen_iq3s_dot_q8_k_vnni512:&qwen_iq1s_dot_q8_k_vnni512;
+    thread_local std::vector<QwenQ8KBlock> tl_input_q8;
+    auto& input_q8=tl_input_q8;
+    const int q8_blocks=hidden/256;
+    if(iq1s_q8){
+        input_q8.resize(static_cast<std::size_t>(rows)*q8_blocks);
+        for(int token=0;token<rows;++token)
+            qwen_quantize_q8_k_avx2(input+static_cast<std::size_t>(token)*hidden,hidden,
+                                    input_q8.data()+static_cast<std::size_t>(token)*q8_blocks);
+    }
+    const QwenQ8KBlock* input_q8_data=input_q8.data();
+    // Whole-batch int8 rows path (qwen_cpu_iq1s_vnni512.cpp): rows folded
+    // once to int8, dpbusd against unsigned-8 activations. Covers the
+    // UD-IQ1_S qwen4exp shape (IQ1_S gate/up, IQ4_NL down); the other
+    // formats keep the dequant-and-f32-GEMM path below. FLYWEIGHT_ROWS_Q8=0
+    // disables it for A/B.
+    static const char* rows_q8_setting=std::getenv("FLYWEIGHT_ROWS_Q8");
+    const bool rows_q8=(flyweight_cpu_features()&8u)!=0&&!direct_quant
+        &&gate_type==19&&up_type==19&&hidden%256==0
+        &&down_type==20&&intermediate%64==0
+        &&!(rows_q8_setting&&rows_q8_setting[0]=='0')
+        &&!(q8_setting&&q8_setting[0]=='0');
+    // Off by default: measured 10-20% slower than the f32 path on the
+    // 640-wide IQ4_NL down projection (the per-32 scale vectors on both
+    // sides cost a vector multiply per 64 values, and the f32 GEMM at -O3
+    // is already close to its own bound). FLYWEIGHT_ROWS_Q8_DOWN=1 enables.
+    static const char* rows_q8_down_setting=std::getenv("FLYWEIGHT_ROWS_Q8_DOWN");
+    const bool rows_q8_down=rows_q8&&
+        rows_q8_down_setting&&rows_q8_down_setting[0]=='1';
+    thread_local std::vector<std::uint8_t> tl_input_u8;
+    thread_local std::vector<float> tl_input_u8_scales;
+    thread_local std::vector<float> tl_input_u8_sums;
+    auto& input_u8=tl_input_u8;
+    auto& input_u8_scales=tl_input_u8_scales;
+    auto& input_u8_sums=tl_input_u8_sums;
+    if(rows_q8){
+        input_u8.resize(static_cast<std::size_t>(rows)*hidden);
+        input_u8_scales.resize(static_cast<std::size_t>(rows)*q8_blocks);
+        input_u8_sums.resize(static_cast<std::size_t>(rows)*q8_blocks*8);
+#pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+        for(int token=0;token<rows;++token)
+            qwen_quantize_u8_k256_vnni512(input+static_cast<std::size_t>(token)*hidden,hidden,
+                input_u8.data()+static_cast<std::size_t>(token)*hidden,
+                input_u8_scales.data()+static_cast<std::size_t>(token)*q8_blocks,
+                input_u8_sums.data()+static_cast<std::size_t>(token)*q8_blocks*8);
+    }
+    const std::uint8_t* input_u8_data=input_u8.data();
+    const float* input_u8_scale_data=input_u8_scales.data();
+    const float* input_u8_sum_data=input_u8_sums.data();
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*gate_blocks;++task){
         const int group=task/gate_blocks;const int row0=(task%gate_blocks)*kRowBlock;
@@ -6748,7 +6918,14 @@ void qwen_cpu_moe_rows(
         if(count<=2){
             for(int i=0;i<mr;++i){
                 float gate_values[2]{},up_values[2]{};
-                if((runtime.fused_moe_gate_up||auto_fused_iq2xs)&&gate_type==up_type){
+                if(iq1s_q8){
+                    for(int occurrence=0;occurrence<count;++occurrence){
+                        const auto*q8=input_q8_data+static_cast<std::size_t>(
+                            occurrences[begin+occurrence]/routed_count)*q8_blocks;
+                        gate_values[occurrence]=iq_q8_dot(gate_data,q8,hidden,row0+i);
+                        up_values[occurrence]=iq_q8_dot(up_data,q8,hidden,row0+i);
+                    }
+                }else if((runtime.fused_moe_gate_up||auto_fused_iq2xs)&&gate_type==up_type){
                     if(count==1){
                         qwen_quant_dot_two_rows(
                             gate_data, up_data, gate_type, vectors[begin],
@@ -6800,16 +6977,54 @@ void qwen_cpu_moe_rows(
             continue;
         }
         thread_local std::vector<float> gate_block,up_block,gate_values,up_values;
-        gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
         gate_values.resize(static_cast<std::size_t>(kRowBlock)*count);up_values.resize(static_cast<std::size_t>(kRowBlock)*count);
-        const std::uint64_t t_dq0=moe_profile?qwen_moe_now():0;
+        std::uint64_t t_dq0=0,t_gemm0=0;
+        if(rows_q8){
+            thread_local std::vector<std::int8_t> fold_gate,fold_up;
+            thread_local std::vector<float> fold_gate_scales,fold_up_scales;
+            thread_local std::vector<float> fold_gate_deltas,fold_up_deltas;
+            thread_local std::vector<std::int32_t> fold_gate_corr,fold_up_corr;
+            thread_local std::vector<const std::uint8_t*> act_ptrs;
+            thread_local std::vector<const float*> act_scale_ptrs,act_sum_ptrs;
+            fold_gate.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+            fold_up.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+            fold_gate_scales.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            fold_up_scales.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            fold_gate_deltas.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks*8);
+            fold_up_deltas.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks*8);
+            fold_gate_corr.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            fold_up_corr.resize(static_cast<std::size_t>(kRowBlock)*q8_blocks);
+            act_ptrs.resize(count);act_scale_ptrs.resize(count);act_sum_ptrs.resize(count);
+            for(int occurrence=0;occurrence<count;++occurrence){
+                const std::size_t token=static_cast<std::size_t>(
+                    occurrences[begin+occurrence]/routed_count);
+                act_ptrs[occurrence]=input_u8_data+token*hidden;
+                act_scale_ptrs[occurrence]=input_u8_scale_data+token*q8_blocks;
+                act_sum_ptrs[occurrence]=input_u8_sum_data+token*q8_blocks*8;
+            }
+            t_dq0=moe_profile?qwen_moe_now():0;
+            qwen_iq1s_fold_rows_vnni512(gate_data,hidden,row0,mr,fold_gate.data(),
+                fold_gate_scales.data(),fold_gate_corr.data(),fold_gate_deltas.data());
+            qwen_iq1s_fold_rows_vnni512(up_data,hidden,row0,mr,fold_up.data(),
+                fold_up_scales.data(),fold_up_corr.data(),fold_up_deltas.data());
+            t_gemm0=moe_profile?qwen_moe_now():0;
+            qwen_u8_gemm_k256_vnni512(fold_gate.data(),fold_gate_scales.data(),
+                fold_gate_corr.data(),fold_gate_deltas.data(),mr,act_ptrs.data(),
+                act_scale_ptrs.data(),act_sum_ptrs.data(),count,hidden,gate_values.data());
+            qwen_u8_gemm_k256_vnni512(fold_up.data(),fold_up_scales.data(),
+                fold_up_corr.data(),fold_up_deltas.data(),mr,act_ptrs.data(),
+                act_scale_ptrs.data(),act_sum_ptrs.data(),count,hidden,up_values.data());
+        }else{
+        gate_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);up_block.resize(static_cast<std::size_t>(kRowBlock)*hidden);
+        t_dq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i){
             qwen_dequant_row(gate_data,gate_type,hidden,row0+i,gate_block.data()+static_cast<std::size_t>(i)*hidden);
             qwen_dequant_row(up_data,up_type,hidden,row0+i,up_block.data()+static_cast<std::size_t>(i)*hidden);
         }
-        const std::uint64_t t_gemm0=moe_profile?qwen_moe_now():0;
+        t_gemm0=moe_profile?qwen_moe_now():0;
         qwen_f32_gemm_rows(gate_block.data(),mr,&vectors[begin],count,hidden,gate_values.data());
         qwen_f32_gemm_rows(up_block.data(),mr,&vectors[begin],count,hidden,up_values.data());
+        }
         const std::uint64_t t_act0=moe_profile?qwen_moe_now():0;
         if(moe_profile){g_cpu_moe_profile.gate_dequant+=t_gemm0-t_dq0;
             g_cpu_moe_profile.gate_gemm+=t_act0-t_gemm0;
@@ -6835,6 +7050,32 @@ void qwen_cpu_moe_rows(
             qwen_imatrix_note_expert(runtime,layer.expert_tensors[2],expert,
                                      &activated_vectors[offsets[expert]],
                                      counts[expert],intermediate);
+    // Down-projection activations for the int8 path: one unsigned-8 row and
+    // its per-32 scale vectors per routed slot, quantized once here.
+    thread_local std::vector<std::uint8_t> tl_activated_u8;
+    thread_local std::vector<float> tl_activated_u8_scales;
+    thread_local std::vector<const std::uint8_t*> tl_activated_u8_vectors;
+    thread_local std::vector<const float*> tl_activated_u8_scale_vectors;
+    auto& activated_u8=tl_activated_u8;
+    auto& activated_u8_scales=tl_activated_u8_scales;
+    auto& activated_u8_vectors=tl_activated_u8_vectors;
+    auto& activated_u8_scale_vectors=tl_activated_u8_scale_vectors;
+    const int down_pair_floats=(intermediate/64)*16;
+    if(rows_q8_down){
+        const int used=offsets[experts];
+        activated_u8.resize(static_cast<std::size_t>(used)*intermediate);
+        activated_u8_scales.resize(static_cast<std::size_t>(used)*down_pair_floats);
+        activated_u8_vectors.resize(used);
+        activated_u8_scale_vectors.resize(used);
+#pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+        for(int slot=0;slot<used;++slot){
+            auto*values=activated_u8.data()+static_cast<std::size_t>(slot)*intermediate;
+            auto*scales=activated_u8_scales.data()+static_cast<std::size_t>(slot)*down_pair_floats;
+            qwen_quantize_u8_k32_vnni512(activated_vectors[slot],intermediate,values,scales);
+            activated_u8_vectors[slot]=values;
+            activated_u8_scale_vectors[slot]=scales;
+        }
+    }
     const int down_blocks=(hidden+kRowBlock-1)/kRowBlock;
 #pragma omp parallel for schedule(dynamic,schedule_chunk) num_threads(qwen_cpu_thread_count(runtime))
     for(int task=0;task<group_count*down_blocks;++task){
@@ -6875,11 +7116,29 @@ void qwen_cpu_moe_rows(
             continue;
         }
         thread_local std::vector<float> down_block,values;
-        down_block.resize(static_cast<std::size_t>(kRowBlock)*intermediate);values.resize(static_cast<std::size_t>(kRowBlock)*count);
-        const std::uint64_t t_ddq0=moe_profile?qwen_moe_now():0;
+        values.resize(static_cast<std::size_t>(kRowBlock)*count);
+        std::uint64_t t_ddq0=0,t_dgemm0=0;
+        if(rows_q8_down){
+            thread_local std::vector<std::int8_t> fold_down;
+            thread_local std::vector<float> fold_down_scales;
+            thread_local std::vector<std::int32_t> fold_down_init;
+            fold_down.resize(static_cast<std::size_t>(kRowBlock)*intermediate);
+            fold_down_scales.resize(static_cast<std::size_t>(kRowBlock)*down_pair_floats);
+            fold_down_init.resize(static_cast<std::size_t>(kRowBlock)*down_pair_floats);
+            t_ddq0=moe_profile?qwen_moe_now():0;
+            qwen_iq4nl_fold_rows_vnni512(down_data,intermediate,row0,mr,fold_down.data(),
+                fold_down_scales.data(),fold_down_init.data());
+            t_dgemm0=moe_profile?qwen_moe_now():0;
+            qwen_u8_gemm_k32_vnni512(fold_down.data(),fold_down_scales.data(),
+                fold_down_init.data(),mr,&activated_u8_vectors[begin],
+                &activated_u8_scale_vectors[begin],count,intermediate,values.data());
+        }else{
+        down_block.resize(static_cast<std::size_t>(kRowBlock)*intermediate);
+        t_ddq0=moe_profile?qwen_moe_now():0;
         for(int i=0;i<mr;++i)qwen_dequant_row(down_data,down_type,intermediate,row0+i,down_block.data()+static_cast<std::size_t>(i)*intermediate);
-        const std::uint64_t t_dgemm0=moe_profile?qwen_moe_now():0;
+        t_dgemm0=moe_profile?qwen_moe_now():0;
         qwen_f32_gemm_rows(down_block.data(),mr,&activated_vectors[begin],count,intermediate,values.data());
+        }
         const std::uint64_t t_dst0=moe_profile?qwen_moe_now():0;
         if(moe_profile){g_cpu_moe_profile.down_dequant+=t_dgemm0-t_ddq0;
             g_cpu_moe_profile.down_gemm+=t_dst0-t_dgemm0;
@@ -12718,10 +12977,12 @@ int flyweight_v2_deepseek4_gpu_matvec_check(
     std::uint64_t weights=0,vector=0,result=0;
     if(flyweight_gpu_alloc(weight_bytes,&weights)!=0)
         throw std::runtime_error("cannot allocate device weights");
-    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0)
-        throw std::runtime_error("cannot allocate the device input");
-    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0)
-        throw std::runtime_error("cannot allocate the device output");
+    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(inputs)*sizeof(float),&vector)!=0){
+        flyweight_gpu_free(weights);
+        throw std::runtime_error("cannot allocate the device input");}
+    if(flyweight_gpu_alloc(static_cast<std::uint64_t>(outputs)*sizeof(float),&result)!=0){
+        flyweight_gpu_free(weights);flyweight_gpu_free(vector);
+        throw std::runtime_error("cannot allocate the device output");}
     int status=flyweight_gpu_upload_sync(weights,tensor_data(*model,*found),weight_bytes);
     if(status==0)status=flyweight_gpu_upload_sync(vector,input,
         static_cast<std::uint64_t>(inputs)*sizeof(float));
@@ -13618,7 +13879,14 @@ std::size_t joyai_match_word(const std::vector<std::uint32_t>& code,std::size_t 
 // The quantifiers are possessive (`?+`, `++`), so the optional leading
 // character in the letter branch is never given back: if it is consumed and no
 // letter follows, the branch fails outright rather than retrying without it.
-std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
+// Shared by the llama3, Qwen and K2-Horizon transcriptions below, which are
+// one regex with three knobs. `marks`: the letter run is `[\p{L}\p{M}]+` and
+// the punctuation class excludes `\p{M}`, so a combining accent travels with
+// the letter it decorates (Qwen3.6, K2). `joiners`: U+200C/U+200D count as
+// letters too (K2). `max_digit_run`: `\p{N}{1,3}` (K2) against `\p{N}`.
+static std::vector<std::string> apostrophe_bpe_pretokenize(
+        const std::string& text, bool marks, std::size_t max_digit_run,
+        bool joiners) {
     const auto decoded=gguf_utf8_decode(text);
     const std::size_t count=decoded.code.size();
     std::vector<std::string> pieces;
@@ -13629,6 +13897,10 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
     auto is_space=[&](std::uint32_t c){return gguf_codepoint_is_space(c);};
     auto is_letter=[&](std::uint32_t c){return joyai_is_letter(c);};
     auto is_number=[&](std::uint32_t c){return joyai_is_number(c);};
+    auto is_mark=[&](std::uint32_t c){
+        return (marks&&joyai_is_accent_mark(c))||
+               (joiners&&(c==0x200C||c==0x200D));
+    };
 
     for(std::size_t at=0;at<count;){
         // Alternative 1: an apostrophe plus a contraction tail, either case.
@@ -13649,20 +13921,25 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
             if(length){pieces.push_back(slice(at,at+length));at+=length;continue;}
         }
         // Alternative 2: an optional leading character that is neither a line
-        // break, a letter nor a digit, then a run of letters.
+        // break, a letter nor a digit, then a run of letters (and, for Qwen,
+        // marks). A mark can open the run directly, so it is never spent as
+        // the leading character.
         {
             std::size_t probe=at;
             const auto first=at_code(probe);
-            if(first!='\r'&&first!='\n'&&!is_letter(first)&&!is_number(first))++probe;
-            if(probe<count&&is_letter(at_code(probe))){
+            if(first!='\r'&&first!='\n'&&!is_letter(first)&&!is_number(first)&&
+               !is_mark(first))++probe;
+            if(probe<count&&(is_letter(at_code(probe))||is_mark(at_code(probe)))){
                 std::size_t end=probe;
-                while(end<count&&is_letter(at_code(end)))++end;
+                while(end<count&&(is_letter(at_code(end))||is_mark(at_code(end))))++end;
                 pieces.push_back(slice(at,end));at=end;continue;
             }
         }
-        // Alternative 3: exactly one digit.
+        // Alternative 3: a digit run of at most `max_digit_run`.
         if(is_number(at_code(at))){
-            pieces.push_back(slice(at,at+1));at+=1;continue;
+            std::size_t end=at;
+            while(end<count&&end-at<max_digit_run&&is_number(at_code(end)))++end;
+            pieces.push_back(slice(at,end));at=end;continue;
         }
         // Alternative 4: an optional single leading space, then a run of
         // characters that are neither whitespace, letters nor digits, then any
@@ -13670,7 +13947,7 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
         {
             auto plain=[&](std::size_t index){
                 const auto c=at_code(index);
-                return !is_space(c)&&!is_letter(c)&&!is_number(c);
+                return !is_space(c)&&!is_letter(c)&&!is_number(c)&&!is_mark(c);
             };
             std::size_t probe=at;
             if(at_code(probe)==' '&&probe+1<count&&plain(probe+1))++probe;
@@ -13708,6 +13985,53 @@ std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
         pieces.push_back(slice(at,at+1));at+=1;
     }
     return pieces;
+}
+
+std::vector<std::string> llama_bpe_pretokenize(const std::string& text) {
+    return apostrophe_bpe_pretokenize(text,false,1,false);
+}
+
+// K2-Horizon, transcribed from the regex in IFM/K2-Horizon-*'s tokenizer.json:
+//
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+// | [^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+
+// | \p{N}{1,3}
+// |  ?[^\s\p{L}\p{N}]+[\r\n]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+//
+// It used to ride on the GPT-4o transcription, which is close and wrong in
+// three places the reference is not: GPT-4o splits a letter run at an
+// upper-to-lower transition ("camelCase" -> "camel", "Case"), attaches a
+// contraction to its word ("don't" stays whole where K2 makes "don", "'t"),
+// and lets a punctuation run swallow trailing slashes, so "';\n\n/**" gave
+// the "/" to the previous piece.
+std::vector<std::string> k2_horizon_pretokenize(const std::string& text) {
+    return apostrophe_bpe_pretokenize(text,true,3,true);
+}
+
+// The Qwen pre-tokenizer (`qwen35` in GGUF, which llama.cpp gives the whole
+// Qwen3.5+ family), transcribed from the regex in Qwen3.6's tokenizer.json:
+//
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+// | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+// | \p{N}
+// |  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+//
+// Before this existed, a Qwen checkpoint ran BPE over the whole text with no
+// splitting at all, and the merges did what merges do: "\n    private" became
+// "\n", "    ", "private" where the reference makes "\n", "   ", " private".
+// Every indented line of every prompt reached the model in a shape it had
+// never been trained on, and it answered in kind -- copying the whitespace
+// token it was shown and then the space-prefixed word it knows, which is one
+// space too many on every line, and "this. _speed" for "this._speed". The
+// symptom looked like a small model miscounting indentation. It was not.
+std::vector<std::string> qwen35_pretokenize(const std::string& text) {
+    return apostrophe_bpe_pretokenize(text,true,1,false);
 }
 
 std::vector<std::string> gpt4o_pretokenize(const std::string& text,
@@ -13862,15 +14186,25 @@ void gguf_bpe_piece(const FlyweightV2Model& m, const std::string& piece,
     }
 }
 
-// The pre-tokenizer a checkpoint asks for by name. Anything unlisted keeps the
-// historical behaviour of no pre-tokenization at all, which is what the Qwen
-// checkpoints have always run.
+// The pre-tokenizer a checkpoint asks for by name. Anything unlisted gets no
+// pre-tokenization at all -- the whole text is one piece, which is exactly
+// what flyweight_v2_tokenize does for it, so the diagnostic split and the
+// real one agree. Qwen used to be in that group, which is what mis-split
+// every indented line (see qwen35_pretokenize).
 std::vector<std::string> gguf_pretokenize(const FlyweightV2Model& m,
                                           const std::string& text) {
+    if(m.tokenizer_pre=="qwen35")return qwen35_pretokenize(text);
+    if(m.tokenizer_pre=="k2-horizon")return k2_horizon_pretokenize(text);
     if(m.tokenizer_pre=="joyai-llm")return deepseek4_pretokenize(text);
-    if(m.tokenizer_pre=="llama4"||m.tokenizer_pre=="k2-horizon")return gpt4o_pretokenize(text,3);
-    if(m.tokenizer_pre=="llama-bpe")return llama_bpe_pretokenize(text);
-    return laguna_pretokenize(text);
+    if(m.tokenizer_pre=="laguna")return laguna_pretokenize(text);
+    if(m.tokenizer_pre=="llama4")return gpt4o_pretokenize(text,3);
+    // Three names, one regex: Ling's tokenizer.json carries the llama3 pattern
+    // verbatim (single digits, no case split), and Qwen2's is the same
+    // pattern spelled with apostrophes.
+    if(m.tokenizer_pre=="llama-bpe"||m.tokenizer_pre=="qwen2"||
+       m.tokenizer_pre=="bailingmoe2"||m.tokenizer_pre=="bailingmoe3")
+        return llama_bpe_pretokenize(text);
+    return text.empty()?std::vector<std::string>{}:std::vector<std::string>{text};
 }
 
 // Pre-tokenizer boundaries, so the split can be checked against the reference
@@ -13896,7 +14230,9 @@ int flyweight_v2_tokenize(const FlyweightV2Model*m,const char*text,uint32_t*toke
     // them into ordinary text, so it takes the exact-match split too.
     if(m->tokenizer_pre=="laguna"||m->tokenizer_pre=="joyai-llm"||
        m->tokenizer_pre=="llama4"||m->tokenizer_pre=="llama-bpe"||
-       m->tokenizer_pre=="k2-horizon"){
+       m->tokenizer_pre=="k2-horizon"||m->tokenizer_pre=="qwen35"||
+       m->tokenizer_pre=="qwen2"||m->tokenizer_pre=="bailingmoe2"||
+       m->tokenizer_pre=="bailingmoe3"){
         // Control tokens are split out by exact match first: they are ordinary
         // text to BPE, and Laguna spells them with characters whose merges would
         // never reassemble the single reserved id.
@@ -14018,6 +14354,22 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
             flyweight::v2::expert_execution_mode_value(runtime->expert_mode);
     }
     if(runtime->options.mtp_drafts>8)throw std::runtime_error("native Qwen MTP supports at most 8 drafts");
+    if(const char*lookup=std::getenv("FLYWEIGHT_LOOKUP_DRAFTS")){
+        const auto value=std::strtoul(lookup,nullptr,10);
+        // 7, not the verifier's 8: with 8 drafts the verify runs 9 rows, one
+        // past the 8-row batched matvec, and the dense projections fall onto
+        // the tensor-core MMQ path sized for 64-row prefill chunks -- measured
+        // 2.5-3.5x the dense cost of an 8-row pass. A 7-draft round is the
+        // widest one that stays on the rows kernel.
+        if(value>7)throw std::runtime_error("FLYWEIGHT_LOOKUP_DRAFTS supports at most 7 drafts (8 rows keep the dense projections on the batched matvec)");
+        if(value&&runtime->options.mtp_drafts)
+            std::fprintf(stderr,"[flyweight] FLYWEIGHT_LOOKUP_DRAFTS ignored: the draft block is drafting (--mtp-drafts)\n");
+        else runtime->lookup_drafts=static_cast<std::uint32_t>(value);
+        if(const char*n=std::getenv("FLYWEIGHT_LOOKUP_NGRAM_MIN"))
+            runtime->lookup_ngram_min=std::max(1u,static_cast<unsigned>(std::strtoul(n,nullptr,10)));
+        if(const char*n=std::getenv("FLYWEIGHT_LOOKUP_NGRAM_MAX"))
+            runtime->lookup_ngram_max=std::max(runtime->lookup_ngram_min,static_cast<unsigned>(std::strtoul(n,nullptr,10)));
+    }
     // qwen4exp MTP runs in stream space end to end (draft, cache replay,
     // verify hand-over); see plans/qwen4exp-semantics.md. A checkpoint with no
     // draft block -- UD-IQ1_S is one -- trips the generic check below.
@@ -14070,7 +14422,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
         throw std::runtime_error(
             "native Qwen strict resident policy requires streamed GPU execution");
      if(gemma4&&runtime->options.next_layer_prefetch)throw std::runtime_error("native Gemma 4 next-layer prefetch is not implemented");
-     if(runtime->options.next_layer_prefetch&&runtime->options.mtp_drafts)throw std::runtime_error("native Qwen next-layer prefetch does not support MTP yet");
+     if(runtime->options.next_layer_prefetch&&qwen_spec_drafts(*runtime))throw std::runtime_error("native Qwen next-layer prefetch does not support MTP yet");
     if(runtime->options.cache_type_k<0||runtime->options.cache_type_k>6)throw std::runtime_error("native Qwen cache_type_k must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
     if(runtime->options.cache_type_v<0||runtime->options.cache_type_v>6)throw std::runtime_error("native Qwen cache_type_v must be 0 (f32), 1 (f16), 2 (bf16), 3 (q8_0), 4 (turbo3), 5 (turbo4), or 6 (auto)");
     if(!runtime->options.context_limit)runtime->options.context_limit=m->config.context_length?m->config.context_length:4096;
@@ -14176,7 +14528,7 @@ int flyweight_v2_qwen_runtime_create(FlyweightV2Model*m,const FlyweightV2QwenRun
             throw std::runtime_error(
                 "native Qwen scratch context needs --parallel 2 or more; with a single slot "
                 "there are no side slots to shrink");
-        if(runtime->options.mtp_drafts)
+        if(qwen_spec_drafts(*runtime))
             throw std::runtime_error(
                 "native Qwen scratch context is unavailable under MTP drafting, which runs "
                 "one slot");
@@ -14545,6 +14897,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         release_qwen_device(*runtime);
         throw std::runtime_error("failed to create native Qwen pipeline route event");
     }
+    for(auto&span_events:runtime->stream_mirror_events)
+        for(auto&event:span_events)
+            if(flyweight_gpu_event_create(&event)!=0){
+                release_qwen_device(*runtime);
+                throw std::runtime_error("failed to create native Qwen stream mirror event");
+            }
     if(runtime->prefill_profile&&(
        flyweight_gpu_timed_event_create(&runtime->prefill_layer_start_event)!=0||
        flyweight_gpu_timed_event_create(&runtime->prefill_core_end_event)!=0||
@@ -14659,14 +15017,16 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     static_cast<std::uint64_t>(layer.qsa_ratio)*key_len*sizeof(float));
             }
         }
-        if(runtime->options.mtp_drafts){
-            auto&layer=runtime->mtp_layer_plan;
-            layer.cache_capacity=geometry_context;
-            const auto&key=runtime->model->tensors[layer.static_tensors[2]];
-            const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
-            const auto cache_floats=runtime->model->config.attention_kv_heads*geometry_context*head_dim;
-            layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
-            layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
+        if(qwen_spec_drafts(*runtime)){
+            if(runtime->options.mtp_drafts){
+                auto&layer=runtime->mtp_layer_plan;
+                layer.cache_capacity=geometry_context;
+                const auto&key=runtime->model->tensors[layer.static_tensors[2]];
+                const auto head_dim=key.shape[1]/runtime->model->config.attention_kv_heads;
+                const auto cache_floats=runtime->model->config.attention_kv_heads*geometry_context*head_dim;
+                layer.state_first=reserve(kv_bytes(cache_floats,ck_type));
+                layer.state_second=reserve(kv_bytes(cache_floats,cv_type));
+            }
             // What the trunk hands the draft. On qwen4exp that is the
             // hyper-connection STREAMS (hc_count*hidden), not the collapsed
             // hidden the LM head sees: the draft's hnorm spans the whole
@@ -14779,7 +15139,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 build_geometry();
             }
             runtime->state_bytes=runtime->geometries[0].state_bytes;
-            const std::size_t planned_slots=runtime->options.mtp_drafts?1:
+            const std::size_t planned_slots=qwen_spec_drafts(*runtime)?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             runtime->slots_state_bytes=0;
             for(std::size_t i=0;i<planned_slots;++i)
@@ -14835,7 +15195,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             runtime->moe_intermediate,runtime->model->config.expert_count,
             runtime->model->config.attention_heads,
             runtime->options.context_limit,delta_value_heads,
-            runtime->options.mtp_drafts!=0,
+            qwen_spec_drafts(*runtime)!=0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_count:0,
             runtime->qwen4exp?runtime->model->config.hyper_connection_low_rank:0,
             runtime->qwen4exp&&!runtime->model->config.ple_layers.empty(),
@@ -14912,7 +15272,12 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         // blocks' feed-forward to the host until the static set fits, working
         // from the last block back; attention and the DeltaNet recurrence stay
         // on the GPU because they are far smaller and latency-critical.
-        if(!runtime->layers.empty()&&runtime->layers.front().dense_ffn){
+        // Only qwen_decode, the batched decode and qwen_forward_rows honour
+        // ffn_on_host; the Gemma 4 drivers have no host branch. Their first
+        // block is MoE so this gate never fired for them, but a Gemma 4 file
+        // whose first block were dense would silently run a spilled block on
+        // weights that were never uploaded. Excluded explicitly.
+        if(!runtime->layers.empty()&&runtime->layers.front().dense_ffn&&!runtime->gemma4){
             std::uint64_t resident=0;
             for(const auto&layer:runtime->layers)for(auto tensor:layer.static_tensors)resident+=device_align(runtime->model->tensors[tensor].size);
             for(auto tensor:{runtime->token_embeddings,runtime->final_norm,runtime->lm_head}){
@@ -14972,7 +15337,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // the host is different arithmetic, so it moves that run's tokens.
             // Measured: it re-spills the dense contract fixture entirely and
             // the host and resident paths stop agreeing.
-            const std::size_t snapshot_slots=runtime->options.mtp_drafts?1:
+            const std::size_t snapshot_slots=qwen_spec_drafts(*runtime)?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             // Estimated here rather than read from prefill_snapshot_bytes,
             // which is not sized until after this point. Moving that sizing
@@ -15415,7 +15780,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                     if(gi.free_memory>margin)auto_budget=gi.free_memory-margin;
                 }
             }
-            const std::uint64_t requant_slots=runtime->options.mtp_drafts?1:
+            const std::uint64_t requant_slots=qwen_spec_drafts(*runtime)?1:
                 std::max<std::uint32_t>(1u,runtime->parallel_sequences);
             const std::uint64_t estimated_base=persistent_bytes+
                 runtime->workspace_bytes+runtime->slots_state_bytes;
@@ -15482,7 +15847,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         auto prepare_policy=qwen_expert_policy(
             *runtime,flyweight::v2::ExpertExecutionPhase::prepare);
         runtime->multi_decode_capacity=1;
-        const std::uint64_t decode_slots=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+        const std::uint64_t decode_slots=qwen_spec_drafts(*runtime)?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
         // Gemma 4 supports independent sequence slots, but its hybrid expert
         // path currently schedules those slots sequentially. The Qwen
         // layer-overlapped multi-decode driver assumes separate gate/up/down
@@ -15536,10 +15901,10 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         runtime->prefill_snapshot_bytes=snapshot_floats?device_align(snapshot_floats*sizeof(float)):0;
         // One KV+DeltaNet state arena per parallel decode slot. MTP manages its
         // own state inside the arena, so it stays single-slot.
-        const std::size_t slot_count=runtime->options.mtp_drafts?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
+        const std::size_t slot_count=qwen_spec_drafts(*runtime)?1:std::max<std::uint32_t>(1u,runtime->parallel_sequences);
         // --parallel is always typed on purpose; degrading it silently under
         // --mtp-draft contradicted that (scratch+MTP already refuses loudly).
-        if(runtime->options.mtp_drafts&&runtime->parallel_sequences>1)
+        if(qwen_spec_drafts(*runtime)&&runtime->parallel_sequences>1)
             std::fprintf(stderr,
                 "[flyweight] --mtp-draft keeps a single sequence slot; "
                 "--parallel %u is reduced to 1\n",
@@ -15575,7 +15940,17 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                std::getenv("FLYWEIGHT_PREFILL_EXPERT_STREAM_MIB"))
             stream_request=std::strtoll(stream_setting,nullptr,10);
         bool stream_auto=stream_request<0;
-        if(stream_auto)stream_request=48;
+        // Auto: 48 MiB where the per-expert GEMM runs (its restaging cost
+        // grows with the budget), 256 MiB where the routed block-table MMQ
+        // will take the streamed share (measured optimum on qwen4exp
+        // UD-IQ1_S and the 35B Q6_K alike; 512 and above lose to uploads).
+        if(stream_auto){
+            const char*routed_env=std::getenv("FLYWEIGHT_ROUTED_MOE");
+            const bool routed_requested=routed_env
+                ?routed_env[0]=='1':runtime->options.routed_moe!=0;
+            stream_request=routed_requested&&qwen_routed_mmq_available(*runtime)
+                ?256:48;
+        }
         if(stream_request>0&&runtime->model->config.expert_count&&
            !flyweight_backend_is_cpu()&&
            qwen_expert_policy(*runtime,
@@ -15707,14 +16082,36 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         if(stream_auto&&gpu_budget&&base_total_resolved>gpu_budget&&
            base_total_resolved-runtime->prefill_stream_bytes-
                runtime->prefill_stream_scratch_bytes<=gpu_budget){
-            base_total_resolved-=runtime->prefill_stream_bytes+
-                runtime->prefill_stream_scratch_bytes;
-            runtime->prefill_stream_bytes=0;
-            runtime->prefill_stream_scratch_bytes=0;
-            runtime->prefill_stream_scratch_span=0;
-            std::fprintf(stderr,
-                "[flyweight] prefill expert streaming disabled: the GPU "
-                "budget cannot carry the arena\n");
+            // Step down before giving up: a 128K context window leaves a
+            // budget that cannot carry 256 MiB but can carry 128 or 64, and
+            // on the MoE sweep a smaller streamed share still beats none
+            // (the expert cache such a window leaves is too small to matter
+            // for decode). The scratch is sized by rows, not budget, so it
+            // stays; only the arena shrinks.
+            const std::uint64_t excess=base_total_resolved-gpu_budget;
+            std::uint64_t kept=0;
+            for(const std::uint64_t candidate:{128ull,64ull,48ull}){
+                const std::uint64_t bytes=candidate*1024ull*1024;
+                if(bytes<runtime->prefill_stream_bytes&&
+                   runtime->prefill_stream_bytes-bytes>=excess){kept=bytes;break;}
+            }
+            if(kept){
+                base_total_resolved-=runtime->prefill_stream_bytes-kept;
+                runtime->prefill_stream_bytes=kept;
+                std::fprintf(stderr,
+                    "[flyweight] prefill expert streaming arena reduced to %llu MiB: "
+                    "the GPU budget cannot carry the auto size\n",
+                    (unsigned long long)(kept/(1024*1024)));
+            }else{
+                base_total_resolved-=runtime->prefill_stream_bytes+
+                    runtime->prefill_stream_scratch_bytes;
+                runtime->prefill_stream_bytes=0;
+                runtime->prefill_stream_scratch_bytes=0;
+                runtime->prefill_stream_scratch_span=0;
+                std::fprintf(stderr,
+                    "[flyweight] prefill expert streaming disabled: the GPU "
+                    "budget cannot carry the arena\n");
+            }
         }
         // Auto-fit was exempt from this, on the theory that it yields rather
         // than fails. It does yield -- but only for the expert cache and the
@@ -15949,6 +16346,9 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
            flyweight_gpu_alloc(runtime->workspace_bytes,&runtime->workspace)!=0||
            (runtime->expert_staging_bytes&&flyweight_gpu_alloc(runtime->expert_staging_bytes,&runtime->expert_staging)!=0)||
            (runtime->prefill_stream_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_bytes,&runtime->prefill_stream_arena)!=0)||
+           (runtime->prefill_stream_bytes&&flyweight_gpu_host_alloc(
+               runtime->prefill_stream_bytes*FlyweightV2QwenRuntime::kStreamMirrorSlots,
+               &runtime->prefill_stream_mirror)!=0)||
            (runtime->prefill_stream_scratch_bytes&&flyweight_gpu_alloc(runtime->prefill_stream_scratch_bytes,&runtime->prefill_stream_scratch)!=0)||
            (runtime->host_staging_bytes&&flyweight_gpu_host_alloc(runtime->host_staging_bytes,&runtime->host_staging)!=0))throw std::runtime_error("failed to allocate native Qwen CUDA arenas");
         // A turbo cache is expanded to f16 one layer at a time so the cuBLAS
@@ -19617,7 +20017,17 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
     auto dense_matvec=[&](std::size_t index,std::uint64_t input,std::uint64_t output,int input_size,int output_size){
         std::uint64_t matrix=runtime->device_tensors[index];
         const auto type=qwen_device_type(*runtime,index);
-        if(type==0){void*args[]={&matrix,&input,&output,&input_size,&output_size};launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);return;}
+        if(type==0){
+            void*args[]={&matrix,&input,&output,&input_size,&output_size};
+            // Warp per row starves a projection with a handful of long rows:
+            // qwen4exp's hyper-connection inject is 4 rows of 10240, and four
+            // warps streaming 40 KB each took 20 us, 96 times a token. A full
+            // block per row reads the same bytes with 32 warps in flight.
+            if(output_size<=16&&input_size>=2048)
+                launch_named("qwen_f32_matvec",output_size,1,1024,args);
+            else launch_named("qwen_f32_matvec_warp",(output_size+7)/8,1,256,args);
+            return;
+        }
         // bf16_matvec takes (rows, columns), the reverse of the quantized matvecs.
         if(type==30){void*args[]={&matrix,&input,&output,&output_size,&input_size};launch_named("bf16_matvec_warp",(output_size+7)/8,1,256,args);return;}
         const auto*format=flyweight::v2::qwen_format(type);
@@ -19784,21 +20194,57 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         // Profiling and diagnostics both inject event records and stream syncs
         // into the block below, neither of which survives capture, so they keep
         // the eager path.
-        // qwen4exp: the delta capture would bake in the skipped residual add
-        // and the streams would never see the inject on replay; graphs stay
-        // off for the arch until the bookends are capture-clean.
+        // qwen4exp: enqueue_delta skips the residual add for the arch and the
+        // hyper-connection bookends (hc_pre before, hc_post after) run eagerly
+        // around the captured block, so the capture is clean. It was held off
+        // while that was being sorted out; FLYWEIGHT_CUDA_GRAPH_QWEN4EXP=0
+        // restores the eager path for A/B.
+        static const bool env_graph_qwen4exp=[]{const char*s=std::getenv("FLYWEIGHT_CUDA_GRAPH_QWEN4EXP");return !s||s[0]!='0';}();
         const bool graph_capturable=runtime->cuda_graphs&&!profile&&!env_lm_diag
-            &&!runtime->qwen4exp;
+            &&(!runtime->qwen4exp||env_graph_qwen4exp);
         const bool graph_eligible=graph_capturable&&env_graph_delta;
         const bool ffn_graph_eligible=graph_capturable&&env_graph_ffn;
         if(profile)profile_record(profile->pre_start);
         auto tensor=[&](std::size_t role){return runtime->device_tensors[layer.static_tensors.at(role)];};
         auto dense=[&](std::size_t role,std::uint64_t input,std::uint64_t output,int input_size,int output_size){dense_matvec(layer.static_tensors.at(role),input,output,input_size,output_size);};
+        // The router, as one enqueue so the qwen4exp layer-front graph below
+        // can carry it: a router matvec and a top-k, both on fixed workspace
+        // addresses, token-invariant.
+        auto enqueue_router=[&](std::size_t base){
+            dense(base+1,normalized,router_logits,hidden_size,experts);
+            if(qwen_sigmoid_bias_router(*runtime)){
+                // Sigmoid routing with the score-correction bias, sum-normalized
+                // over the selection and scaled by the trained routing factor.
+                auto bias=layer.router_bias!=std::numeric_limits<std::uint64_t>::max()
+                    ?runtime->device_tensors[layer.router_bias]:0;
+                int normalize=runtime->model->config.expert_weights_norm?1:0;
+                float weight_scale=runtime->model->config.expert_weights_scale;
+                void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&bias,
+                                   const_cast<std::uint64_t*>(&selected_device),
+                                   const_cast<std::uint64_t*>(&route_weights),
+                                   const_cast<int*>(&experts),const_cast<int*>(&top_k),
+                                   &normalize,&weight_scale};
+                launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
+                             static_cast<std::uint32_t>(2*experts*sizeof(float)));
+            }else if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,launch_stream)!=0)throw std::runtime_error("native Qwen routing failed");
+        };
+        // qwen4exp routed delta layers capture the whole layer front as one
+        // graph: hc_pre, the delta block, hc_post, the feed-forward hc_pre and
+        // the router. Everything in it reads and writes fixed addresses (the
+        // hyper-connection streams, the conv/recurrent state of this slot, the
+        // workspace vectors); the only per-token inputs are the streams left
+        // by the previous layer. That is ~20 launches a layer that the eager
+        // path paid in submission latency -- the whole of the route wait on a
+        // CPU-expert decode. The route download and its event stay eager.
+        const bool front_graph=runtime->qwen4exp&&!layer.attention
+            &&!layer.dense_ffn&&graph_eligible;
+        bool front_done=false;
         if(runtime->qwen4exp){
             if(layer.ple_conv!=std::numeric_limits<std::uint64_t>::max())
                 ple_block(layer);
-            hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
-                   layer.hc_attn_inject);
+            if(!front_graph)
+                hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
+                       layer.hc_attn_inject);
         }else rms(hidden,tensor(0),normalized);
         std::size_t moe_base=0;
         if(!layer.attention){
@@ -19874,9 +20320,20 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                 }
             }
             // qwen4exp replaces the residual add with the gated-residual
-            // inject AFTER the (never-captured) block; see below.
+            // inject after the block (hc_post), in the layer-front graph or
+            // eagerly; see front_graph.
             if(!runtime->qwen4exp)add(residual,hidden);
             };
+            auto enqueue_front=[&]{
+                hc_pre(tensor(0),layer.hc_attn_down,layer.hc_attn_up,
+                       layer.hc_attn_inject);
+                enqueue_delta();
+                hc_post(residual);
+                hc_pre(tensor(10),layer.hc_ffn_down,layer.hc_ffn_up,
+                       layer.hc_ffn_inject);
+                enqueue_router(10);
+            };
+            auto enqueue_block=[&]{if(front_graph)enqueue_front();else enqueue_delta();};
             // Capture records without executing, so the in-place state update
             // happens exactly once per token -- via the replay below, never via
             // the capture pass. The graph is launched on runtime->stream so it
@@ -19903,7 +20360,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                 if(flyweight_gpu_graph_begin(runtime->graph_stream)==0){
                     bool capture_enqueued=true;
                     launch_stream=runtime->graph_stream;
-                    try{enqueue_delta();}catch(...){capture_enqueued=false;}
+                    try{enqueue_block();}catch(...){capture_enqueued=false;}
                     launch_stream=runtime->stream;
                     std::uint64_t captured_graph=0;
                     const int capture_status=flyweight_gpu_graph_end(runtime->graph_stream,&captured_graph);
@@ -19921,13 +20378,19 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
                     }
                 }
             }
-            if(!delta_launched)enqueue_delta();
+            if(!delta_launched)enqueue_block();
             if(env_graph_trace){
                 runtime->delta_host_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now()-delta_started).count();
                 ++runtime->delta_host_calls;
             }
-            if(runtime->qwen4exp)hc_post(residual);
+            if(front_graph){
+                // Replay ran hc_pre without the host seeing it: `normalized`
+                // was rewritten behind the q8 memo, exactly as the eager
+                // hc_pre records.
+                front_done=true;
+                q8_cached_input=0;
+            }else if(runtime->qwen4exp)hc_post(residual);
             moe_base=10;
         }else if(runtime->muse){
             // Muse Glimmer attention: plain Q/K/V projections, per-head QK RMS
@@ -20327,10 +20790,11 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             else add(residual,hidden);
             moe_base=7;
         }
-        if(runtime->qwen4exp)
-            hc_pre(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
-                   layer.hc_ffn_inject);
-        else rms(residual,tensor(moe_base),normalized);
+        if(runtime->qwen4exp){
+            if(!front_done)
+                hc_pre(tensor(moe_base),layer.hc_ffn_down,layer.hc_ffn_up,
+                       layer.hc_ffn_inject);
+        }else rms(residual,tensor(moe_base),normalized);
         if(qwen_lm_diag_enabled()&&layer_number==0){
             float v[4]={};flyweight_gpu_stream_sync(runtime->stream);
             if(flyweight_gpu_download(v,normalized,sizeof(v),runtime->stream)==0&&flyweight_gpu_stream_sync(runtime->stream)==0)
@@ -20405,22 +20869,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
             }
             if(profile){profile_record(profile->pre_end);profile_record(profile->shared_start);profile_record(profile->shared_end);profile_record(profile->expert_start);}
         }else{
-        dense(moe_base+1,normalized,router_logits,hidden_size,experts);
-        if(qwen_sigmoid_bias_router(*runtime)){
-            // Sigmoid routing with the score-correction bias, sum-normalized
-            // over the selection and scaled by the trained routing factor.
-            auto bias=layer.router_bias!=std::numeric_limits<std::uint64_t>::max()
-                ?runtime->device_tensors[layer.router_bias]:0;
-            int normalize=runtime->model->config.expert_weights_norm?1:0;
-            float weight_scale=runtime->model->config.expert_weights_scale;
-            void*route_args[]={const_cast<std::uint64_t*>(&router_logits),&bias,
-                               const_cast<std::uint64_t*>(&selected_device),
-                               const_cast<std::uint64_t*>(&route_weights),
-                               const_cast<int*>(&experts),const_cast<int*>(&top_k),
-                               &normalize,&weight_scale};
-            launch_named("route_topk_sigmoid_bias",1,1,256,route_args,
-                         static_cast<std::uint32_t>(2*experts*sizeof(float)));
-        }else if(flyweight_gpu_route_topk(router_logits,selected_device,route_weights,experts,top_k,runtime->stream)!=0)throw std::runtime_error("native Qwen routing failed");
+        if(!front_done)enqueue_router(moe_base);
         const auto cpu_weights_offset=device_align(top_k*sizeof(std::int32_t));
         const auto cpu_input_offset=cpu_weights_offset+device_align(top_k*sizeof(float));
         const auto cpu_activated_offset=cpu_input_offset+device_align(hidden_size*sizeof(float));
@@ -21036,6 +21485,12 @@ static std::string qwen_token_bytes(
     return gguf_byte_decode(runtime.model->vocabulary[token]);
 }
 
+// The most temperature a token inside an open tool call is drawn at. The
+// web UI arrived at 0.2 for its own agent runs: low enough that whitespace
+// near-ties resolve the way greedy would, high enough to leave a seed some
+// say. Overridden by FLYWEIGHT_TOOL_CALL_TEMPERATURE.
+static constexpr float kToolCallTemperature=0.2f;
+
 static std::uint32_t qwen_sample_last_logits(
         FlyweightV2QwenRuntime& runtime,QwenSamplingState& sampling,
         std::uint32_t greedy_token) {
@@ -21331,6 +21786,28 @@ static std::uint32_t qwen_sample_last_logits(
         return setting&&setting[0]=='1';
     }();
     const bool inside_tool_call=sampling.grammar.armed()&&!penalize_tool_calls;
+    // Nor is chat temperature. The verbatim contract that pauses the penalties
+    // makes a sampled draw inside a call a liability of its own: whitespace
+    // runs are adjacent tokens, and at 0.8 the near-ties among them flip often
+    // enough that an Edit's old_string comes out misindented and fails the
+    // harness's exact-match check. A client the server does not control --
+    // Claude Code, opencode, a bare curl -- sends its chat temperature or
+    // nothing, and the served default is 0.8. So the cap lives here, where
+    // every client's calls pass: inside an open call the temperature is at
+    // most kToolCallTemperature, and prose keeps what the request asked for.
+    // FLYWEIGHT_TOOL_CALL_TEMPERATURE=<x> moves the cap; a negative value
+    // switches it off, for comparison.
+    static const float tool_call_temperature=[]{
+        const char*setting=std::getenv("FLYWEIGHT_TOOL_CALL_TEMPERATURE");
+        if(!setting||!setting[0])return kToolCallTemperature;
+        char*end=nullptr;
+        const float value=std::strtof(setting,&end);
+        return end==setting?kToolCallTemperature:value;
+    }();
+    const float temperature=
+        sampling.grammar.armed()&&tool_call_temperature>=0.0f
+        ?std::min(sampling.temperature,tool_call_temperature)
+        :sampling.temperature;
     if(sampling.penalizes()&&!sampling.recent.empty()&&!inside_tool_call){
         for(std::size_t index=0;index<candidates.size();++index){
             std::uint32_t occurrences=0;
@@ -21371,8 +21848,9 @@ static std::uint32_t qwen_sample_last_logits(
     // Greedy decode, now that the candidates carry whatever the grammar and the
     // penalties had to say about them: the best surviving candidate is the
     // answer, and it is where the fused argmax's token gets overridden. Below
-    // this point everything reads `temperature`, which is zero here.
-    if(!sampling.enabled()){
+    // this point everything reads `temperature`, which is zero here -- by the
+    // request's choice, or by the tool-call cap.
+    if(!(temperature>0.0f)){
         // Equality with the fused argmax, not provenance, is what a later
         // full-prompt reuse needs: a penalty or grammar that happened to keep
         // the argmax leaves the remembered token valid for a greedy hit.
@@ -21381,13 +21859,13 @@ static std::uint32_t qwen_sample_last_logits(
         return commit(candidates.front());
     }
     const double maximum=static_cast<double>(candidate_logits.front())/
-        sampling.temperature;
+        temperature;
     static thread_local std::vector<double> probabilities;
     probabilities.resize(candidates.size());
     double total=0.0;
     for(std::size_t index=0;index<candidates.size();++index){
         const double scaled=static_cast<double>(candidate_logits[index])/
-            sampling.temperature;
+            temperature;
         const double probability=std::isfinite(scaled)?
             std::exp(scaled-maximum):0.0;
         probabilities[index]=probability;total+=probability;
@@ -22279,7 +22757,7 @@ void qwen_drop_expert_pages_for_sweep(
 // snapshot to go back to.
 static bool qwen_kv_rewindable(const FlyweightV2QwenRuntime& runtime) {
     if (runtime.gemma4) return true;
-    if (runtime.options.mtp_drafts) return false;
+    if (qwen_spec_drafts(runtime)) return false;
     if (runtime.layers.empty()) return false;
     for (const auto& layer : runtime.layers)
         if (!layer.attention) return false;
@@ -22494,10 +22972,30 @@ static int qwen_prompt_begin(FlyweightV2QwenRuntime* runtime,
         if(interval<prompt_count)plan.targets.push_back(interval);
         const std::uint64_t spacing=std::max<std::uint64_t>(
             interval,prompt_count/std::max<std::size_t>(mid_slots,std::size_t{1}));
+        // The spread targets snap to the chunk boundaries the pin implies
+        // (interval + k * prefill_rows) rather than splitting chunks: a
+        // target inside a chunk shortens it, and on the MoE sweep every
+        // routed expert is decoded once per pipeline half, so 682-token
+        // chunks cost ~11% of a 2048-token prefill against 1024-token ones.
+        // Only prompts at least two chunks long snap; shorter ones keep the
+        // dense uniform spread (their chunks are short whatever the plan).
+        const std::uint64_t grid=
+            runtime->prefill_rows>1&&prompt_count>=2ull*runtime->prefill_rows
+                ?runtime->prefill_rows:1;
+        auto snap=[&](std::uint64_t pos){
+            if(pos<=interval||grid==1)return pos;
+            const std::uint64_t beyond=pos-interval;
+            const std::uint64_t down=beyond/grid*grid;
+            const std::uint64_t up=down+grid;
+            return interval+(beyond-down<up-beyond?down:up);
+        };
         for(std::uint64_t pos=spacing;
-            pos<prompt_count&&plan.targets.size()<mid_slots;pos+=spacing)
-            if(plan.targets.empty()||pos>plan.targets.back())
-                plan.targets.push_back(pos);
+            pos<prompt_count&&plan.targets.size()<mid_slots;pos+=spacing){
+            const std::uint64_t snapped=snap(pos);
+            if(snapped<prompt_count&&
+               (plan.targets.empty()||snapped>plan.targets.back()))
+                plan.targets.push_back(snapped);
+        }
     }
     plan.next_target=0;
     while(plan.next_target<plan.targets.size()&&plan.targets[plan.next_target]<=prompt_start)++plan.next_target;
@@ -23161,7 +23659,9 @@ static void qwen_mtp_commit_true_cache(
     const std::uint32_t* inputs, std::uint32_t count,
     std::uint64_t verified_hidden
 ) {
-    if (!count) return;
+    // Lookup drafting has no draft block, so there is no draft cache to keep
+    // in step with the target.
+    if (!count || !runtime.options.mtp_drafts) return;
     // The hand-over width, not the model's hidden width: on qwen4exp every one
     // of these vectors is a hyper-connection stream row (hc_count*hidden).
     const int hidden = runtime.qwen4exp
@@ -23230,7 +23730,64 @@ static void qwen_mtp_commit_true_cache(
 // sampler state (same RNG draw count, same penalty window, same grammar
 // position), so a drafting task's output is bit-identical to a non-drafting
 // one; the drafts only decide how many rows a round gets to keep.
-static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr){
+// Prompt-lookup drafting. The sequence's committed history plus `next_token`
+// is the text; the last `n` tokens of it are looked for earlier in the same
+// text, longest match first (n from lookup_ngram_max down to lookup_ngram_min,
+// most recent occurrence on ties), and the tokens that followed that earlier
+// occurrence become the drafts. Returns how many drafts were written to `out`
+// (at most `wanted`), 0 when nothing in the history matches -- the caller
+// then takes the plain one-token decode, so a non-repetitive stretch costs
+// only this scan.
+//
+// The round is sized by the match, because a verify row costs real expert
+// bytes (each row routes to its own experts, so a 9-row verify is not much
+// cheaper than 9 decodes on a paged MoE) and only accepted rows pay for
+// themselves. Measured on Flash-Next IQ1_S, 8 drafts: a 3-token match
+// accepted 2 of 8 on code and under 1 on prose; matches of 12+ accepted 7.8
+// of 8. So the budget is match_len-1, capped at the configured drafts, and
+// matches under lookup_ngram_min (4) do not draft at all. Code, edits, quoted
+// context and structured output repeat themselves constantly; free prose
+// does not, and this is what keeps prose at the sequential speed.
+//
+// Why a small cap is right even at 90%+ acceptance: a verify row costs about
+// 17 ms here against a 30 ms decode (the experts are the same RAM-bound bytes
+// either way; only the dense work amortizes), and every row past the first
+// rejection is wasted. With per-draft acceptance p the expected tokens of a
+// W-draft round are (1-p^(W+1))/(1-p), so at p=0.9 four drafts cost ~19.5 ms
+// per token and eight cost ~23; at p=0.96 they are within 1 ms. Four is the
+// recommended budget.
+static uint32_t qwen_lookup_draft(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out){
+    const auto&history=runtime.processed_tokens;
+    const std::size_t total=history.size()+1;  // + next_token
+    auto at=[&](std::size_t index)->std::uint32_t{
+        return index<history.size()?history[index]:next_token;
+    };
+    const std::size_t n_min=runtime.lookup_ngram_min;
+    const std::size_t n_max=std::max<std::size_t>(n_min,runtime.lookup_ngram_max);
+    if(!wanted||total<n_min+1)return 0;
+    // Candidate `end` is the index one past a would-be earlier occurrence of
+    // the tail; it must leave at least one token to draft, and must not be the
+    // tail itself.
+    std::size_t best_end=0,best_len=0;
+    for(std::size_t end=total-1;end>=n_min;--end){
+        // Cheap reject on the last token, then extend the match backwards.
+        std::size_t len=0;
+        while(len<n_max&&len<end&&at(end-1-len)==at(total-1-len))++len;
+        if(len>=n_min&&len>best_len){best_len=len;best_end=end;if(len==n_max)break;}
+        if(end==n_min)break;
+    }
+    uint32_t count=0;
+    runtime.lookup_last_match=best_len;
+    if(best_len>=1)wanted=static_cast<uint32_t>(std::min<std::size_t>(wanted,std::max<std::size_t>(1,best_len-1)));
+    if(best_len)for(std::size_t index=best_end;index<total&&count<wanted;++index)out[count++]=at(index);
+    static const bool trace=std::getenv("FLYWEIGHT_LOOKUP_TRACE")!=nullptr;
+    if(trace)
+        std::fprintf(stderr,"lookup history=%zu next=%u n=[%zu,%zu] match_len=%zu drafts=%u\n",
+            history.size(),next_token,n_min,n_max,best_len,count);
+    return count;
+}
+
+static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_token,uint32_t wanted,uint32_t*out,QwenSamplingState*sampling=nullptr,const uint32_t*preset_drafts=nullptr){
     if(wanted>8)wanted=8;
     if(!wanted)wanted=1;
     // One row per draft plus one more: the verify batch's row k answers "what
@@ -23249,7 +23806,11 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
     uint32_t draft_input=next_token;
     std::uint64_t draft_hidden=runtime.state+runtime.mtp_target_hidden_offset;
     const auto draft_started=std::chrono::steady_clock::now();
-    for(uint32_t index=0;index<wanted;++index){
+    if(preset_drafts){
+        for(uint32_t index=0;index<wanted;++index)drafts[index]=preset_drafts[index];
+        runtime.mtp_draft_tokens+=wanted;
+        ++runtime.lookup_rounds;
+    }else for(uint32_t index=0;index<wanted;++index){
         drafts[index]=runtime.qwen4exp
             ?qwen4exp_mtp_draft(runtime,draft_input,draft_hidden)
             :qwen_mtp_draft(runtime,draft_input,draft_hidden);
@@ -23368,7 +23929,15 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         qwen_snapshot_delta_state(runtime,true);
         std::uint64_t replay_hidden=0;
         const auto replay_started=std::chrono::steady_clock::now();
-        qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(valid),verified.data(),&replay_hidden);
+        // The replay's own argmaxes go to scratch: `verified` holds what the
+        // sampler chose for each row, and a sampled task's rejected row IS a
+        // sampler choice (the penalty or the temperature draw overruled the
+        // draft). Writing the replay over it re-emitted the greedy token on
+        // every checkpoint that takes this path (qwen4exp, whose PLE ring
+        // keeps the fold off) -- the round's output stopped matching the
+        // one-token path exactly where the sampler had made a difference.
+        std::array<uint32_t,9>replayed{};
+        qwen_verify_target_rows(runtime,inputs.data(),static_cast<int>(valid),replayed.data(),&replay_hidden);
         qwen_mtp_commit_true_cache(
             runtime,base_cache_tokens,inputs.data(),valid,replay_hidden);
         runtime.processed_tokens.insert(runtime.processed_tokens.end(),inputs.begin(),inputs.begin()+valid);
@@ -23383,7 +23952,7 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
             if(flyweight_gpu_download(replay_trace.data(),trace_source,trace_hidden*sizeof(float),runtime.stream)!=0||flyweight_gpu_stream_sync(runtime.stream)!=0)throw std::runtime_error("native MTP replay trace download failed");
             float maximum=0.0f;
             for(int index=0;index<trace_hidden;++index)maximum=std::max(maximum,std::fabs(batch_trace[index]-replay_trace[index]));
-            std::fprintf(stderr,"mtp reject position=%llu row=%u draft=%u batch=%u replay=%u hidden_max_diff=%g\n",static_cast<unsigned long long>(runtime.position-valid),valid-1,drafts[valid-1],batch_rejected_token,verified[valid-1],maximum);
+            std::fprintf(stderr,"mtp reject position=%llu row=%u draft=%u batch=%u replay=%u hidden_max_diff=%g\n",static_cast<unsigned long long>(runtime.position-valid),valid-1,drafts[valid-1],batch_rejected_token,replayed[valid-1],maximum);
         }
         runtime.mtp_accepted_tokens+=valid-1;
         ++runtime.mtp_rejected_tokens;
@@ -23401,6 +23970,11 @@ static uint32_t qwen_mtp_round(FlyweightV2QwenRuntime&runtime,uint32_t next_toke
         valid=rows;
     }
     for(uint32_t index=0;index<valid;++index)out[index]=verified[index];
+    if(preset_drafts){
+        static const bool trace=std::getenv("FLYWEIGHT_LOOKUP_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"lookup round match=%zu wanted=%u valid=%u rejected=%d\n",
+            runtime.lookup_last_match,wanted,valid,rejected?1:0);
+    }
     return valid;
 }
 
@@ -23449,6 +24023,11 @@ static constexpr std::uint32_t kQwenMtpWarmupTokens=8;
 static constexpr std::uint64_t kQwenMtpKeepPercent=80;
 
 static bool qwen_mtp_should_draft(const FlyweightV2QwenRuntime&runtime){
+    // Lookup drafting gates itself on whether the history offers a match
+    // (qwen_lookup_draft returns 0 otherwise); the timing calibration below
+    // is the draft block's, and its arms would only measure rounds that the
+    // match test had already admitted.
+    if(!runtime.options.mtp_drafts)return runtime.lookup_drafts!=0;
     if(!qwen_mtp_adaptive_enabled())return runtime.options.mtp_drafts!=0;
     if(runtime.options.mtp_drafts<2||runtime.mtp_adaptive_disabled)return false;
     if(runtime.mtp_calibration_done)return true;
@@ -23571,14 +24150,25 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
     qwen_prompt_finish(runtime,prompt,prompt_count,next_token,max_tokens,
                        plan.tail_slot);
     QwenResidencyEpochGuard residency_epoch{*runtime};
-    if(runtime->options.mtp_drafts){
+    if(qwen_spec_drafts(*runtime)){
         uint64_t emitted=0;
         if(callback(next_token,user)!=0)return 0;
         ++emitted;
         while(emitted<max_tokens&&!runtime->cancelled){
             // A round commits up to wanted+1 tokens; with one token of room
             // left it would advance the sequence past what gets emitted.
-            if(!qwen_mtp_should_draft(*runtime)||max_tokens-emitted<2){
+            uint32_t wanted=0;
+            std::array<uint32_t,8>lookup{};
+            const uint32_t*preset=nullptr;
+            if(qwen_mtp_should_draft(*runtime)&&max_tokens-emitted>=2){
+                wanted=static_cast<uint32_t>(std::min<uint64_t>(
+                    qwen_spec_drafts(*runtime),max_tokens-emitted-1));
+                if(!runtime->options.mtp_drafts){
+                    wanted=qwen_lookup_draft(*runtime,next_token,wanted,lookup.data());
+                    if(wanted)preset=lookup.data();else ++runtime->lookup_misses;
+                }
+            }
+            if(!wanted){
                 const auto decode_started=std::chrono::steady_clock::now();
                 status=flyweight_v2_qwen_runtime_decode(
                     runtime,next_token,&next_token);
@@ -23591,12 +24181,9 @@ int flyweight_v2_qwen_runtime_generate(FlyweightV2QwenRuntime*runtime,const uint
                 ++emitted;
                 continue;
             }
-            const auto wanted=static_cast<uint32_t>(std::min<uint64_t>(
-                runtime->options.mtp_drafts,max_tokens-emitted-1
-            ));
             std::array<uint32_t,9>produced{};
             const auto round_started=std::chrono::steady_clock::now();
-            const auto valid=qwen_mtp_round(*runtime,next_token,wanted,produced.data());
+            const auto valid=qwen_mtp_round(*runtime,next_token,wanted,produced.data(),nullptr,preset);
             qwen_mtp_record_round(
                 *runtime,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -25121,17 +25708,26 @@ int flyweight_v2_qwen_engine_step(FlyweightV2QwenRuntime*runtime,FlyweightV2Qwen
                 // to the one-token path. Before that, only a task with no
                 // sampler features could draft -- and every served request
                 // has some, so --mtp-drafts never engaged under serve.
-                if(runtime->options.mtp_drafts&&qwen_mtp_should_draft(*runtime)&&
+                uint32_t wanted=0;
+                std::array<uint32_t,8>lookup{};
+                const uint32_t*preset=nullptr;
+                if(qwen_spec_drafts(*runtime)&&qwen_mtp_should_draft(*runtime)&&
                    task->max_tokens-task->emitted>=2){
                     // A round commits up to wanted+1 tokens (the drafts plus
                     // the row that verifies the last one), so it needs that
                     // much room under max_tokens.
-                    const auto wanted=static_cast<uint32_t>(std::min<std::uint64_t>(
-                        runtime->options.mtp_drafts,task->max_tokens-task->emitted-1
+                    wanted=static_cast<uint32_t>(std::min<std::uint64_t>(
+                        qwen_spec_drafts(*runtime),task->max_tokens-task->emitted-1
                     ));
+                    if(!runtime->options.mtp_drafts){
+                        wanted=qwen_lookup_draft(*runtime,task->next_token,wanted,lookup.data());
+                        if(wanted)preset=lookup.data();else ++runtime->lookup_misses;
+                    }
+                }
+                if(wanted){
                     std::array<uint32_t,9>produced{};
                     const auto round_started=std::chrono::steady_clock::now();
-                    const auto valid=qwen_mtp_round(*runtime,task->next_token,wanted,produced.data(),&task->sampling);
+                    const auto valid=qwen_mtp_round(*runtime,task->next_token,wanted,produced.data(),&task->sampling,preset);
                     qwen_mtp_record_round(
                         *runtime,
                         std::chrono::duration_cast<std::chrono::nanoseconds>(

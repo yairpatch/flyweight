@@ -547,7 +547,7 @@ def _add_runtime_options(
              "buffer, direct DMAs from registered host memory",
     )
     add(
-        tuning, "--routed-moe", action="store_true",
+        tuning, "--routed-moe", action="store_true", default=None,
         help="run prompt processing's routed experts through the block-table "
              "MMQ kernels, which is several times faster than the host expert "
              "phase on checkpoints whose experts do not fit in VRAM. Supplies "

@@ -265,6 +265,37 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(
+    flyweight_qwen_iq1s_vnni512_contract
+    tests/qwen_iq1s_vnni512_contract.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_iq1s_vnni512.cpp
+)
+target_compile_features(flyweight_qwen_iq1s_vnni512_contract PRIVATE cxx_std_20)
+target_include_directories(flyweight_qwen_iq1s_vnni512_contract PRIVATE src include)
+if(BUILD_TESTING)
+    add_test(
+        NAME flyweight_qwen_iq1s_vnni512_contract
+        COMMAND flyweight_qwen_iq1s_vnni512_contract
+    )
+endif()
+
+add_executable(
+    flyweight_qwen_rows_q8_vnni512_contract
+    tests/qwen_rows_q8_vnni512_contract.cpp
+    src/qwen_cpu_avx2.cpp
+    src/qwen_cpu_avx512.cpp
+    src/qwen_cpu_iq1s_vnni512.cpp
+)
+target_compile_features(flyweight_qwen_rows_q8_vnni512_contract PRIVATE cxx_std_20)
+target_include_directories(flyweight_qwen_rows_q8_vnni512_contract PRIVATE src include)
+if(BUILD_TESTING)
+    add_test(
+        NAME flyweight_qwen_rows_q8_vnni512_contract
+        COMMAND flyweight_qwen_rows_q8_vnni512_contract
+    )
+endif()
+
+add_executable(
     flyweight_qwen_cpu_bench
     tools/bench_q8_cpu.cpp
     src/qwen_cpu_avx2.cpp
@@ -488,6 +519,7 @@ add_library(
     src/qwen_cpu_avx_vnni.cpp
     src/qwen_cpu_avx512.cpp
     src/qwen_cpu_q4_gemm_vnni512.cpp
+    src/qwen_cpu_iq1s_vnni512.cpp
     src/qwen_kquant_pack.cpp
     src/qwen_kquant_pack_avx2.cpp
     ${FLYWEIGHT_CPU_KERNEL_BODY}
@@ -564,6 +596,7 @@ endif()
 if(MSVC)
     set_source_files_properties(src/qwen_cpu_avx_vnni.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX2)
     set_source_files_properties(src/qwen_cpu_q4_gemm_vnni512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
+    set_source_files_properties(src/qwen_cpu_iq1s_vnni512.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
 else()
     set_source_files_properties(
         src/qwen_cpu_avx_vnni.cpp
@@ -571,6 +604,10 @@ else()
     )
     set_source_files_properties(
         src/qwen_cpu_q4_gemm_vnni512.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mf16c;-mfma"
+    )
+    set_source_files_properties(
+        src/qwen_cpu_iq1s_vnni512.cpp
         PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mf16c;-mfma"
     )
 endif()
