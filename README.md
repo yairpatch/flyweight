@@ -525,12 +525,15 @@ Reasoning models expose two knobs, one soft and one hard:
 
 - `reasoning_effort` (`low` / `medium` / `high` / `xhigh`) is a template
   variable for checkpoints that grade their reasoning (Qwen3.5 reads it
-  natively). It is read from the flat field, the Responses-style
-  `reasoning.effort`, vLLM-style `chat_template_kwargs.reasoning_effort`, or
-  Anthropic `output_config.effort` -- so Claude Code's `/effort` slider and
-  opencode reasoning presets work unchanged. `--reasoning-effort` sets a
-  server default. OpenAI's `minimal` clamps to `low`, Anthropic's `max` to
-  `xhigh`. The four levels above are the union of the vocabularies, not any one
+  natively). It is read from the flat field, its camelCase spelling
+  `reasoningEffort` (what an opencode model option becomes on the wire, since
+  `@ai-sdk/openai-compatible` copies the config key into the body as written),
+  the Responses-style `reasoning.effort`, vLLM-style
+  `chat_template_kwargs.reasoning_effort`, or Anthropic
+  `output_config.effort` -- so Claude Code's `/effort` slider, opencode
+  variants and pi's thinking levels all work unchanged. `--reasoning-effort`
+  sets a server default. OpenAI's `minimal` clamps to `low`, Anthropic's `max`
+  to `xhigh`. The four levels above are the union of the vocabularies, not any one
   checkpoint's: a template is asked once which of them it renders, and a level
   it does not name is served as its nearest neighbour, the stronger one winning
   a tie. So `high` reaches Qwen3.5 and Flash-Next as `xhigh`, which is what
@@ -570,7 +573,25 @@ Reasoning models expose two knobs, one soft and one hard:
   the estimate in place of the blinking cursor.
 
 `enable_thinking` (top level or in `chat_template_kwargs`) switches thinking
-off entirely for templates with a switch. Chain-of-thought always arrives in
+off entirely for templates with a switch. An effort of `none` -- or `off`,
+which is how pi spells the same slider position -- is the other way to ask for
+the same thing, and is accepted anywhere an effort is: flat, camelCase,
+`reasoning.effort`, `chat_template_kwargs`, or Anthropic
+`output_config.effort`. It is not a fifth level. Nothing downstream ever sees
+`none` as a grade, `/props` does not offer it among `reasoning_efforts`, and a
+picker built from that list still needs its own off control. Where a request
+answers both questions, the direct answer wins: `enable_thinking: true`
+alongside `reasoning_effort: "none"` thinks. An effort of `none` does outrank
+`chat_template_kwargs.enable_thinking`, which is usually a preset bundle
+rather than this request's own choice.
+
+Clients that express "thinking off" by sending no field at all (pi omits the
+parameter) cannot be served by any of this, because silence is how a request
+asks for the checkpoint's own default -- which for Qwen is thinking on.
+`--reasoning-effort none` is the operator's answer: this server does not
+reason unless a request asks it to. A request that names a level still wins.
+
+Chain-of-thought always arrives in
 `reasoning_content` (on the message and as stream deltas), never in
 `content`: a model told to write a file drafts it while thinking, and
 streaming that draft as the answer made harnesses render the file instead of
@@ -717,7 +738,8 @@ Server options (`serve` only):
 
 - `--model-name NAME`, `--cors-origin ORIGIN`, `--api-key KEY`,
   `--strict-model`
-- `--reasoning-effort low|medium|high|xhigh`: server-wide default effort
+- `--reasoning-effort none|low|medium|high|xhigh`: server-wide default effort;
+  `none` means this server does not reason unless a request asks it to
 - `--thinking-budget N`: cap for requests that think without naming a budget;
   unset it guards only `/v1/messages` (at 2048), a value applies everywhere,
   0 disables it everywhere

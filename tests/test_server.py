@@ -40,7 +40,10 @@ class StubTokenizer:
     def encode(self, text):
         return [ord(character) for character in text]
 
-    def encode_messages(self, messages, *, enable_thinking=False):
+    def encode_messages(
+        self, messages, *, enable_thinking=False, reasoning_effort=None,
+        preserve_thinking=None,
+    ):
         return self.encode("".join(message["content"] for message in messages))
 
     def decode(self, tokens, *, skip_special_tokens=True):
@@ -1664,6 +1667,111 @@ class InferenceServiceTests(unittest.TestCase):
                     "reasoning": {"effort": "extreme"},
                 }
             )
+
+    def test_effort_none_is_the_off_switch_not_a_level(self) -> None:
+        # llama.cpp reads "none" in the effort field as "do not reason", and
+        # the OpenAI-shaped clients built against it send exactly that --
+        # opencode offers it as a variant, pi grades its own slider "off".
+        # Both spellings mean the switch, and neither may be forwarded as a
+        # grade: no template was trained on one, and a template that validates
+        # its input raises on it.
+        for payload, thinking in (
+            ({"reasoning_effort": "none"}, False),
+            ({"reasoning_effort": "off"}, False),
+            ({"reasoning": {"effort": "none"}}, False),
+            ({"chat_template_kwargs": {"reasoning_effort": "none"}}, False),
+            # The switch is indirect, so a direct answer outranks it.
+            ({"reasoning_effort": "none", "enable_thinking": True}, True),
+            # ... but a preset bundle someone else wrote does not.
+            (
+                {
+                    "reasoning_effort": "none",
+                    "chat_template_kwargs": {"enable_thinking": True},
+                },
+                False,
+            ),
+        ):
+            self.service.chat_completion(
+                {"messages": [{"role": "user", "content": "Think"}], **payload}
+            )
+            _, options = self.generator.calls[-1]
+            self.assertEqual(options["enable_thinking"], thinking, msg=str(payload))
+            self.assertIsNone(options["reasoning_effort"], msg=str(payload))
+
+    def test_camel_case_effort_is_read_as_the_same_field(self) -> None:
+        # An opencode model option goes into the body verbatim through
+        # @ai-sdk/openai-compatible, so a local provider receives the key in
+        # the case the config was written in. Unknown keys are ignored rather
+        # than rejected, so reading only snake_case meant the setting silently
+        # did nothing -- including its off position.
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "reasoningEffort": "high",
+            }
+        )
+        self.assertEqual(self.generator.calls[-1][1]["reasoning_effort"], "high")
+        self.service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "reasoningEffort": "none",
+            }
+        )
+        _, options = self.generator.calls[-1]
+        self.assertIs(options["enable_thinking"], False)
+        self.assertIsNone(options["reasoning_effort"])
+        with self.assertRaisesRegex(APIError, "reasoningEffort"):
+            self.service.chat_completion(
+                {
+                    "messages": [{"role": "user", "content": "Think"}],
+                    "reasoningEffort": "extreme",
+                }
+            )
+
+    def test_anthropic_effort_none_suppresses_thinking(self) -> None:
+        # Claude Code's slider sends its position as output_config.effort
+        # beside adaptive thinking, so its off position has to mean what
+        # thinking: {"type": "disabled"} means on the same request.
+        self.service.anthropic_message(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "none"},
+                "max_tokens": 4,
+            }
+        )
+        _, options = self.generator.calls[-1]
+        self.assertIs(options["enable_thinking"], False)
+        self.assertIsNone(options["reasoning_effort"])
+
+    def test_default_effort_none_serves_a_server_that_waits_to_be_asked(
+        self,
+    ) -> None:
+        # The one answer available against a client that expresses "thinking
+        # off" by sending no field at all (pi does): the checkpoint's own
+        # default is thinking on, so silence cannot mean off without the
+        # operator saying so. A request that does ask still wins.
+        service = InferenceService(
+            "qwen-local", self.generator, max_new_tokens=32, reasoning_effort="none"
+        )
+        service.chat_completion({"messages": [{"role": "user", "content": "Think"}]})
+        _, options = self.generator.calls[-1]
+        self.assertIs(options["enable_thinking"], False)
+        self.assertIsNone(options["reasoning_effort"])
+        service.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "Think"}],
+                "reasoning_effort": "high",
+            }
+        )
+        _, options = self.generator.calls[-1]
+        self.assertIsNone(options["enable_thinking"])
+        self.assertEqual(options["reasoning_effort"], "high")
+
+    def test_properties_never_offer_off_as_an_effort_level(self) -> None:
+        # A picker built from this list shows grades. Off is a separate
+        # control, and listing it here would make it a fifth grade.
+        self.assertNotIn("none", self.service.properties()["reasoning_efforts"])
 
     def test_reasoning_budget_reaches_the_generator_from_both_protocols(
         self,

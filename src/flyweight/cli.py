@@ -805,12 +805,15 @@ checkpoint's generation_config.json says.\
              "the context window",
     )
     limits.add_argument(
-        "--reasoning-effort", choices=("low", "medium", "high", "xhigh"),
+        "--reasoning-effort",
+        choices=("none", "low", "medium", "high", "xhigh"),
         default=None,
         help="thinking budget for checkpoints that grade it, clamped to the "
              "levels the checkpoint's own template names (Qwen3.5 and "
              "Flash-Next read low/medium/xhigh and default to xhigh, their "
-             "maximum, so high is served as xhigh)",
+             "maximum, so high is served as xhigh); none turns reasoning off "
+             "for requests that ask for nothing, for clients that express "
+             "'thinking off' by sending no field at all",
     )
     # One flag per setting in sampling.SERVER_SETTINGS so this list cannot fall
     # behind the sampler, giving request > flag > generation_config.json beside
