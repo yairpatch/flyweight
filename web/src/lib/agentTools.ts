@@ -306,7 +306,11 @@ export async function runBuiltinTool(name: string, argsText: string, signal?: Ab
 function formatResult(name: string, payload: Record<string, unknown>): string {
   if (name === "read_file") {
     const suffix = payload.truncated ? `\n[truncated: showing the first part of ${payload.size} bytes]` : "";
-    return `${payload.content ?? ""}${suffix}`;
+    const content = String(payload.content ?? "");
+    // An empty file is a real answer, but a result with no characters in it
+    // reads to the model as a turn that said nothing at all.
+    if (!content) return `${payload.path ?? "the file"} is empty (0 bytes)`;
+    return `${content}${suffix}`;
   }
   if (name === "write_file") {
     return `${payload.created ? "Created" : "Wrote"} ${payload.path} (${payload.bytes} bytes, ${payload.line_ending ?? "lf"} line endings)`;

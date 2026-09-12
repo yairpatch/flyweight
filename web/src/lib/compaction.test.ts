@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { budgetChars, compactMessages, compactionNote, contextOverflow, conversationChars, observedCharsPerToken, overheadTokens, retryBudget } from "./compaction";
+import { budgetChars, compactMessages, compactionNote, contextOverflow, conversationChars, isSilentTurn, observedCharsPerToken, overheadTokens, retryBudget } from "./compaction";
 import type { Message, RequestRecord } from "../types";
 
 let counter = 0;
@@ -251,5 +251,31 @@ describe("the checkpoint survives the last resort", () => {
       through = outcome.through;
     }
     expect(checkpoints).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("turns that produced nothing", () => {
+  it("keeps a failed or stopped turn out of the request", () => {
+    // The failure this prevents: a generation that errors or is stopped
+    // before its first token leaves an assistant message with the error and
+    // no content. Sent back on the next request it is an empty assistant
+    // turn, and the model answers the only way it can — "the user's message
+    // is empty". They accumulate, so a run that has hit a few failures says
+    // it more and more often.
+    const failed = message("assistant", "", { error: "vision workspace allocation failed (233 MiB)" });
+    const stopped = message("assistant", "", { finishReason: "stopped" });
+    expect(isSilentTurn(failed)).toBe(true);
+    expect(isSilentTurn(stopped)).toBe(true);
+  });
+
+  it("does not mistake a tool-calling turn for an empty one", () => {
+    // No text is exactly what a turn that only calls a tool looks like.
+    const calling = message("assistant", "", { toolCalls: [{ id: "c", name: "read_file", arguments: "{}" }] });
+    expect(isSilentTurn(calling)).toBe(false);
+    // Nor a turn that only thought.
+    expect(isSilentTurn(message("assistant", "", { reasoning: "considering the options" }))).toBe(false);
+    // And never anything the user or a tool said, however short.
+    expect(isSilentTurn(message("user", ""))).toBe(false);
+    expect(isSilentTurn(message("tool", "", { toolCallId: "c" }))).toBe(false);
   });
 });

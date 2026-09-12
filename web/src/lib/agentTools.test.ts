@@ -392,3 +392,13 @@ describe("runBuiltinTool", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("results that would read as silence", () => {
+  it("says a file is empty rather than returning nothing", async () => {
+    // A zero-character tool result is a turn that says nothing, and the model
+    // treats it as one.
+    respondWith({ path: "notes.md", content: "", size: 0, truncated: false });
+    const result = await runBuiltinTool("read_file", '{"path":"notes.md"}');
+    expect(result.result).toBe("notes.md is empty (0 bytes)");
+  });
+});

@@ -31,6 +31,7 @@ import {
   compactionNote,
   contextOverflow,
   conversationChars,
+  isSilentTurn,
   observedCharsPerToken,
   overheadTokens,
   retryBudget,
@@ -548,7 +549,9 @@ export const useStore = create<StoreState>()((set, get) => {
             overheadTokens(scaffolding, charsPerToken ?? undefined),
           ))
         : Number.POSITIVE_INFINITY;
-    const compacted = compactMessages(conversation.messages, limit, conversation.compactedThrough);
+    // Turns that produced nothing never reach the model; see isSilentTurn.
+    const spoken = conversation.messages.filter((message) => !isSilentTurn(message));
+    const compacted = compactMessages(spoken, limit, conversation.compactedThrough);
     // The boundary this turn settled on is what the next turn re-applies, so
     // it has to outlive the request. Only a checkpoint moves it.
     const checkpointed = compacted.through !== conversation.compactedThrough;
@@ -749,7 +752,7 @@ export const useStore = create<StoreState>()((set, get) => {
     const overflow = kindOf(conversation) === "agent" && !controller.signal.aborted ? contextOverflow(record) : null;
     if (overflow && budget === undefined) {
       const tighter = retryBudget(overflow, conversationChars(compacted.messages), limit);
-      const retried = compactMessages(conversation.messages, tighter, conversation.compactedThrough);
+      const retried = compactMessages(spoken, tighter, conversation.compactedThrough);
       if (retried.removedChars > compacted.removedChars) {
         updateConversation(conversationId, (item) => ({ ...item, messages: item.messages.filter((message) => message.id !== assistant.id) }));
         get().toast("Context was full — compacted the run and retried", "info");

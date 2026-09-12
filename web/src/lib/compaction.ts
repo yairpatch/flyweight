@@ -69,6 +69,29 @@ export interface CompactionOutcome {
   through?: string;
 }
 
+/**
+ * A turn that produced nothing, and so has nothing to say to the model.
+ *
+ * A generation that fails or is stopped before its first token still leaves
+ * its assistant message in the transcript, carrying the error for the user to
+ * read and no content at all. Replayed on the next request that is an empty
+ * assistant turn, and a model handed one answers the only way it can: "the
+ * user's message is empty". A run that has hit a few failures accumulates
+ * them, so it happens more the longer the run goes on. The transcript keeps
+ * them -- the error is the whole point of them -- and the request does not.
+ *
+ * An assistant turn that is only tool calls is NOT empty: no text is exactly
+ * what a tool-calling turn looks like.
+ */
+export function isSilentTurn(message: Message): boolean {
+  return (
+    message.role === "assistant" &&
+    !message.content.trim() &&
+    !message.reasoning?.trim() &&
+    !message.toolCalls?.length
+  );
+}
+
 export function messageChars(message: Message): number {
   const attachments = (message.attachments ?? []).reduce((total, item) => total + (item.text?.length ?? 0), 0);
   const calls = (message.toolCalls ?? []).reduce((total, call) => total + call.name.length + call.arguments.length, 0);
