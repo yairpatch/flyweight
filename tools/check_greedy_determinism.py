@@ -15,9 +15,9 @@ FLYWEIGHT_EXPERT_HISTORY=off) and free VRAM sampled by the gpu_cache_bytes=0
 auto-fit (pin with --option gpu_cache_bytes=...). Runs that leave either
 uncontrolled measure the drift of that state, not the runtime.
 
-    ./check_greedy_determinism.py MODEL.gguf --runs 3
-    ./check_greedy_determinism.py MODEL.gguf --env FLYWEIGHT_IQ2_Q8_DECODE=0
-    ./check_greedy_determinism.py MODEL.gguf --option expert_residency=immutable
+    ./tools/check_greedy_determinism.py MODEL.gguf --runs 3
+    ./tools/check_greedy_determinism.py MODEL.gguf --env FLYWEIGHT_IQ2_Q8_DECODE=0
+    ./tools/check_greedy_determinism.py MODEL.gguf --option expert_residency=immutable
 """
 
 import argparse

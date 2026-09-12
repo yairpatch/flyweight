@@ -14,7 +14,7 @@ pointers aimed at either VRAM or a large registered host arena. The host arena i
 deliberately much larger than the working set and the experts are scattered
 through it, so the reads are as cache-hostile as the real thing.
 
-    python bench_host_expert_reads.py
+    python bench/bench_host_expert_reads.py
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ IQ_BLOCK_BYTES = {"iq1s": 50, "iq4nl": 144}
 
 
 def _load():
-    here = Path(__file__).resolve().parent
+    here = Path(__file__).resolve().parents[1]
     lib = ctypes.CDLL(str(here / "src/flyweight/_native/flyweight_v2.so"))
     lib.flyweight_gpu_init.restype = ctypes.c_int
     lib.flyweight_gpu_init.argtypes = [ctypes.c_int]
@@ -69,7 +69,7 @@ def _compile_kernels():
     IQ kernels by name in this same process."""
     import tempfile
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from flyweight.v2 import V2Model
     from tests.qwen4exp_gguf_fixture import build_qwen4exp_gguf
 

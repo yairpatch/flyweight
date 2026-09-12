@@ -9,7 +9,7 @@ between chunks, so the serial depth drops to rows/64 and the grid widens.
 Both paths are checked against native/tools/deltanet_reference.py, which is
 itself checked against the sequential kernel.
 
-    python bench_deltanet.py [rows ...]
+    python bench/bench_deltanet.py [rows ...]
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent / "native" / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "native" / "tools"))
 
 import cupy as cp  # noqa: E402
 
@@ -37,7 +37,7 @@ KEY_HEADS, VALUE_HEADS = GEOMETRY[os.environ.get("FLYWEIGHT_GEOMETRY", "dense-27
 EPSILON = 1e-6
 # Once the kernels are embedded in flyweight_v2_native_kernels.hpp the corpus
 # already defines them; appending the prototype again would be a redefinition.
-_PROTOTYPE_PATH = Path(__file__).parent / "native" / "tools" / "deltanet_chunked.cu"
+_PROTOTYPE_PATH = Path(__file__).resolve().parents[1] / "native" / "tools" / "deltanet_chunked.cu"
 PROTOTYPE = ("" if "qwen_delta_wy_scores" in kh.source()
              else _PROTOTYPE_PATH.read_text())
 
@@ -46,7 +46,9 @@ def chunked(g, rows, key_heads, value_heads, state, buffers):
     """Run the four chunked kernels; returns (output, state) device arrays."""
     chunks = (rows + CHUNK - 1) // CHUNK
     attn, pmat, gcum, beta, qinv, kinv, w_rows, u_rows, core, out = buffers
-    launch = lambda name, grid, block, args: kh.kernel(name, PROTOTYPE)(grid, block, args)
+    def launch(name, grid, block, args):
+        kh.kernel(name, PROTOTYPE)(grid, block, args)
+
     r, k, v = np.int32(rows), np.int32(key_heads), np.int32(value_heads)
     launch("qwen_delta_wy_scores", (chunks, value_heads, 1), (256, 1, 1),
            (g["convolved"], g["beta_logits"], g["decay_logits"], g["a_log"],
@@ -72,7 +74,9 @@ def sequential(g, rows, key_heads, value_heads, state, out):
 
 def allocate(rows, value_heads):
     chunks = (rows + CHUNK - 1) // CHUNK
-    zeros = lambda shape: cp.zeros(shape, dtype=cp.float32)
+    def zeros(shape):
+        return cp.zeros(shape, dtype=cp.float32)
+
     return (zeros((chunks, value_heads, CHUNK, CHUNK)),
             zeros((chunks, value_heads, CHUNK, CHUNK)),
             zeros((rows, value_heads)), zeros((rows, value_heads)),
@@ -172,7 +176,9 @@ def replay(directory):
     epsilon = float(meta["epsilon"])
     if head_dim != DIM:
         raise SystemExit(f"dump has head_dim {head_dim}; these kernels require {DIM}")
-    load = lambda name: np.fromfile(root / f"delta_{name}.f32", dtype=np.float32)
+    def load(name):
+        return np.fromfile(root / f"delta_{name}.f32", dtype=np.float32)
+
     data = dict(
         convolved=load("convolved").reshape(rows, int(meta["channels"])),
         gates=load("gates").reshape(rows, value_heads * head_dim),

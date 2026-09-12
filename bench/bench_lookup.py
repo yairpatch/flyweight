@@ -7,7 +7,7 @@ construction, so the token streams are compared exactly. Lookup mode is
 fixed at runtime creation, so each arm builds its own runtime; the arms
 alternate so page-cache and clock drift land on both.
 
-    python bench_lookup.py <model.gguf> [--drafts 4] [--rounds 2] [--tokens 320]
+    python bench/bench_lookup.py <model.gguf> [--drafts 4] [--rounds 2] [--tokens 320]
 """
 from __future__ import annotations
 

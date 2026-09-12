@@ -1,6 +1,7 @@
 """Clean interleaved speed: full vs top-p=0.85, to defeat thermal drift."""
 from __future__ import annotations
-import sys, time
+import sys
+import time
 from flyweight.v2 import V2Model
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
@@ -15,10 +16,13 @@ def run(model, top_p):
     prompt = model.tokenize(PROMPT)
     layers = rt.info["layers"]
     out = []
-    rt.reset(); rt.generate(prompt, 16, lambda t: out.append(t)); out.clear()  # warm
+    rt.reset()  # warm
+    rt.generate(prompt, 16, lambda t: out.append(t))
+    out.clear()
     rt.reset()
     b = rt.info
-    t0 = time.perf_counter(); rt.generate(prompt, N, lambda t: out.append(t))
+    t0 = time.perf_counter()
+    rt.generate(prompt, N, lambda t: out.append(t))
     wall = time.perf_counter() - t0
     a = rt.info
     exp = (a["route_expert_sum"] - b["route_expert_sum"]) / (a["decode_calls"] - b["decode_calls"]) / layers

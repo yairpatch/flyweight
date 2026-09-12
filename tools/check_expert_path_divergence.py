@@ -25,7 +25,7 @@ GPU path quantising activations while the CPU path keeps them in f32 -- that is
 a precision *choice* to standardise, not a bug. Anything much larger than that
 is a genuine defect in one path.
 
-    ./check_expert_path_divergence.py MODEL.gguf
+    ./tools/check_expert_path_divergence.py MODEL.gguf
 """
 
 import argparse

@@ -13,7 +13,7 @@ shared memory once and let a TILE of query rows consume it, for both the score
 and the accumulate. MLA makes that unusually attractive -- the key and the value
 are the same latent row, so one staged chunk serves both halves of attention.
 
-Run: python bench_bailing_mla.py
+Run: python bench/bench_bailing_mla.py
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from pathlib import Path
 import cupy as cp
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "native" / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "native" / "tools"))
 import kernel_harness as harness  # noqa: E402
 
 # Ling-3.0-tiny, which is what the measurements above were taken on.
@@ -285,7 +285,10 @@ def main() -> None:
         scale = float(cp.abs(want).max())
         timings, errors = {}, {}
 
-        def check(result) -> float:
+        # want and scale are bound as defaults: the loop deletes `want` at the
+        # end of each iteration to free the reference arrays, and a closure
+        # over the deleted name would not survive that.
+        def check(result, want=want, scale=scale) -> float:
             return float(cp.abs(result - want).max()) / scale
 
         scores_kernel((ROWS * HEADS, (base_position + ROWS + 7) // 8), (256,),

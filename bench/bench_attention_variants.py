@@ -38,7 +38,7 @@ import numpy
 
 from flyweight.v2 import _library
 
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 HEAD_DIM = 256
 
 

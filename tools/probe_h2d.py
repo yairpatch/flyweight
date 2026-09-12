@@ -160,7 +160,7 @@ def main():
     per_token = 23.05 * EXPERT
     print(f"decode streams 23.05 misses/token x 2.46 MiB = {per_token/1e6:.1f} MB/token")
     print(f"  at 27 GB/s (re-touch)   : {per_token/27e9*1e3:6.2f} ms/token")
-    print(f"  observed expert bucket  :  15.80 ms/token")
+    print("  observed expert bucket  :  15.80 ms/token")
 
 
 if __name__ == "__main__":
