@@ -5,7 +5,8 @@ Reports the cache size each mode chose, plus a short decode to confirm it
 works and the expert hit rate.
 """
 from __future__ import annotations
-import sys, time
+import sys
+import time
 from flyweight.v2 import V2Model
 
 MODEL = "/home/yair/Downloads/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
@@ -21,10 +22,13 @@ def run(model, label, gpu_cache_bytes):
     info = rt.info
     prompt = model.tokenize(PROMPT)
     out = []
-    rt.reset(); rt.generate(prompt, 16, lambda t: out.append(t)); out.clear()  # warm
+    rt.reset()  # warm
+    rt.generate(prompt, 16, lambda t: out.append(t))
+    out.clear()
     rt.reset()
     b = rt.info
-    t0 = time.perf_counter(); rt.generate(prompt, N, lambda t: out.append(t))
+    t0 = time.perf_counter()
+    rt.generate(prompt, N, lambda t: out.append(t))
     wall = time.perf_counter() - t0
     a = rt.info
     hits = a["expert_cache_hits"] - b["expert_cache_hits"]

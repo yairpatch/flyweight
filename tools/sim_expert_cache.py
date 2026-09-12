@@ -99,7 +99,7 @@ def main():
     print(f"{len(raw)} routes, {n_layers} layers, {SLOTS} slots/layer, "
           f"{int(experts.max())+1} experts")
 
-    per_layer = [experts[layers == l] for l in range(n_layers)]
+    per_layer = [experts[layers == layer] for layer in range(n_layers)]
 
     uniq = [len(set(t.tolist())) for t in per_layer]
     print(f"unique experts touched per layer: min {min(uniq)} "

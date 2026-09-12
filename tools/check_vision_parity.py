@@ -5,7 +5,7 @@ a real language model, so a synthetic qwen35 GGUF sized to the mmproj's
 projection width stands in for one. Pixels are random; the check is the
 arithmetic, not the picture.
 
-    python check_vision_parity.py [--mmproj PATH] [--side 128] [--backend cuda|cpu]
+    python tools/check_vision_parity.py [--mmproj PATH] [--side 128] [--backend cuda|cpu]
 
 Exit status is non-zero when the largest deviation exceeds the tolerance
 (bf16 weights with f32 accumulation put the native path within ~1e-3 of the
@@ -21,8 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "native" / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "native" / "tools"))
 
 from tests.dense_gguf_fixture import DenseQwenSpec, build_dense_qwen35_gguf  # noqa: E402
 from flyweight.v2 import V2Model  # noqa: E402

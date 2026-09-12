@@ -6,7 +6,7 @@ breakdown from runtime.info deltas (decode/route/expert-page/tail nanoseconds
 plus prompt-cache bypasses).
 
 Run:
-    PYTHONPATH=src python3 bench_prefill.py
+    PYTHONPATH=src python3 bench/bench_prefill.py
 Env knobs:
     FLYWEIGHT_MODEL      GGUF path (default Qwen3.6-35B-A3B-UD-Q5_K_M.gguf)
     FLYWEIGHT_MOE_DEVICE gpu|cpu|hybrid (default hybrid)
@@ -69,12 +69,6 @@ def main() -> int:
         base = model.tokenize(SENTENCE)
         full = (base * 256)[: max(PROMPT_LENGTHS)]
 
-        phase_keys = [
-            "decode_nanoseconds",
-            "route_wait_nanoseconds",
-            "expert_page_nanoseconds",
-            "tail_wait_nanoseconds",
-        ]
         print(
             f"\n{'P':>6} {'prompt_tok/s':>13} {'wall_s':>8} "
             f"{'route_ms':>9} {'page_ms':>9} {'miss':>7} {'hit':>6} "

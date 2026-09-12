@@ -52,7 +52,7 @@ jobs:
           pnpm build
           git -C .. diff --exit-code --stat -- src/flyweight/ui
       - name: Lint
-        run: ruff check src tests setup.py
+        run: ruff check src tests bench tools native/tools setup.py
       - name: Type check
         run: mypy src/flyweight
       - name: Test

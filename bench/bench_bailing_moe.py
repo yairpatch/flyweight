@@ -13,7 +13,7 @@ to run the expert phase on a WIDER row batch than the attention phase rather
 than to write a new kernel. If that is right, throughput per token should climb
 steeply with the tile width and then flatten.
 
-Run: python bench_bailing_moe.py
+Run: python bench/bench_bailing_moe.py
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import cupy as cp
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "native" / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "native" / "tools"))
 import kernel_harness as harness  # noqa: E402
 
 # Ling-3.0-tiny.

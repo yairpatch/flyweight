@@ -10,7 +10,7 @@ Attention layers are found by probing: dump_kv rejects Gated DeltaNet layers,
 which carry recurrent state and no KV cache at all, so those are skipped.
 
 Run:
-    PYTHONPATH=src python3 bench_kv_dump.py
+    PYTHONPATH=src python3 bench/bench_kv_dump.py
 Env knobs:
     FLYWEIGHT_MODEL      GGUF path (default Qwen3.6-35B-A3B-UD-Q5_K_M.gguf)
     FLYWEIGHT_MOE_DEVICE gpu|cpu|hybrid (default hybrid)
@@ -58,7 +58,7 @@ def find_bench() -> str | None:
     found = shutil.which("flyweight_turboquant_bench")
     if found:
         return found
-    for candidate in Path(__file__).parent.rglob("flyweight_turboquant_bench"):
+    for candidate in Path(__file__).resolve().parents[1].rglob("flyweight_turboquant_bench"):
         if candidate.is_file():
             return str(candidate)
     return None

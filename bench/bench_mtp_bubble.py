@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import os
 import statistics
-import sys
 import time
 
 from flyweight.v2 import V2Model

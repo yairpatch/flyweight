@@ -35,7 +35,8 @@ def make(model, *, top_k=0, top_p=0.0):
 def timed_greedy(rt, prompt, layers):
     out = []
     rt.reset()
-    rt.generate(prompt, min(8, N), lambda t: out.append(t)); out.clear()
+    rt.generate(prompt, min(8, N), lambda t: out.append(t))
+    out.clear()
     rt.reset()
     before = rt.info
     t0 = time.perf_counter()
@@ -54,7 +55,8 @@ def agreement(rt, prompt, reference):
         rt.decode(t)
     ctx, agree = prompt[-1], 0
     for ref in reference:
-        agree += int(rt.decode(ctx) == ref); ctx = ref
+        agree += int(rt.decode(ctx) == ref)
+        ctx = ref
     return agree / max(1, len(reference))
 
 
@@ -85,7 +87,8 @@ def main() -> None:
                 out, tok_s, avg_exp = timed_greedy(rt, toks[n], layers)
                 agr = 1.0 if not kw else agreement(rt, toks[n], refs[n])
                 per[n] = (agr, avg_exp)
-                tok_s_all.append(tok_s); exp_all.append(avg_exp)
+                tok_s_all.append(tok_s)
+                exp_all.append(avg_exp)
             rt.close()
             mean_agr = sum(per[n][0] for n in PROMPTS) / len(PROMPTS)
             mean_exp = sum(exp_all) / len(exp_all)
