@@ -4528,6 +4528,26 @@ class AgentWorkspaceTests(unittest.TestCase):
         # The default needs nothing at all.
         self.assertEqual(config().describe(), {"provider": "duckduckgo", "ready": True})
 
+    def test_a_bot_check_is_reported_as_one_rather_than_as_no_results(self) -> None:
+        # The failure this prevents: the scraped endpoint answers a network it
+        # dislikes with a challenge page and a normal status, which parses to
+        # zero results -- so the model reads it as "the web has nothing on
+        # this", rephrases, and burns the run's turns on a query that was
+        # never going to be answered.
+        challenge = (
+            b'<html><head><title>DuckDuckGo</title></head><body>'
+            b'<div id="anomaly-modal"><p>Unfortunately, bots use DuckDuckGo too.</p>'
+            b"</div></body></html>"
+        )
+        with self.assertRaises(APIError) as caught:
+            self._search(challenge)
+        self.assertEqual(caught.exception.status, 502)
+        self.assertIn("bot check", caught.exception.message)
+        self.assertIn("FLYWEIGHT_SEARCH_PROVIDER", caught.exception.message)
+        # A results page with no matches on it is still an honest empty answer.
+        empty = b'<html><body><div class="no-results">No results.</div></body></html>'
+        self.assertEqual(self._search(empty)["results"], [])
+
     def test_an_empty_search_query_is_rejected(self) -> None:
         with self.assertRaises(APIError) as caught:
             self.workspace.search_web({"query": "  "})

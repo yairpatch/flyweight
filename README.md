@@ -591,7 +591,11 @@ ordinary page costs more context than the rest of the run put together.
 `title`, `url`, and a one-sentence `snippet`, with search-engine redirects
 already unwrapped so the `url` is the one `/agent/fetch` takes. The backend
 is DuckDuckGo's HTML endpoint, which needs no key and is what a server
-searches with unless told otherwise. `FLYWEIGHT_SEARCH_PROVIDER` picks
+searches with unless told otherwise. That endpoint is scraped rather than an
+API, and it answers some networks with a bot-check page instead of results;
+that comes back as a 502 naming the alternatives rather than as an empty
+search, so a run does not spend its turns rephrasing a query that was never
+going to be answered. `FLYWEIGHT_SEARCH_PROVIDER` picks
 another: `brave` or `tavily` with the key in `FLYWEIGHT_SEARCH_KEY`, or
 `searxng` with your instance's base URL in `FLYWEIGHT_SEARCH_URL` (setting
 only the URL is enough to select it). The variables are read per call, so a

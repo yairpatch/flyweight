@@ -319,6 +319,11 @@ _AGENT_SEARCH_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Safari/537.36"
 )
+# What a challenge page says instead of results. Matched only when nothing
+# parsed, so a page that genuinely mentions captchas is still searchable.
+_AGENT_SEARCH_CHALLENGE = re.compile(
+    r"anomaly[-_ ]?modal|captcha|are you a robot|unusual traffic", re.IGNORECASE
+)
 
 
 def _agent_decoded(data: bytes, *, console: bool = False) -> tuple[str, str]:
@@ -619,11 +624,27 @@ def _search_duckduckgo(query: str, count: int, config: _AgentSearch) -> list[dic
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=config.timeout,
     )
+    page = _agent_decode(body)
     parser = _AgentSearchResults()
     with contextlib.suppress(Exception):
-        parser.feed(_agent_decode(body))
+        parser.feed(page)
         parser.close()
-    return [result for result in parser.results if result["url"]][:count]
+    results = [result for result in parser.results if result["url"]][:count]
+    # No results and no result markup is a bot check, not an obscure query:
+    # the endpoint is scraped, not an API, and it answers a source it does
+    # not like with a challenge page carrying the same 200. Reported as an
+    # empty search it would look like the web had nothing to say, and the
+    # model would rephrase and try again for as many turns as it has.
+    if not results and _AGENT_SEARCH_CHALLENGE.search(page):
+        raise APIError(
+            502,
+            "DuckDuckGo answered with a bot check instead of results. Its "
+            "HTML endpoint is scraped rather than an API and refuses some "
+            "networks; set FLYWEIGHT_SEARCH_PROVIDER (brave or tavily, with "
+            "FLYWEIGHT_SEARCH_KEY) or point FLYWEIGHT_SEARCH_URL at a SearXNG "
+            "instance",
+        )
+    return results
 
 
 def _search_brave(query: str, count: int, config: _AgentSearch) -> list[dict[str, str]]:
