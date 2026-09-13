@@ -5933,6 +5933,40 @@ const char* qwen_q8_matvec_kernel(std::uint32_t type) {
     return format ? format->matvec_q8_warp : nullptr;
 }
 
+// Block width for FLYWEIGHT_Q8_MATVEC, which walks a row's 32-value groups in
+// blockDim strides and reduces across at most four warps.
+//
+// A fixed 128 wastes the tail of every stride that does not divide the group
+// count, and the group count is a property of the checkpoint's row width, not
+// of the kernel: a 5120-wide projection is 160 groups, so 128 threads run two
+// strides at 62% occupancy of their own slots. Picking the width that wastes
+// the fewest slots took the IQ2_XXS projections of the 27B hybrid from ~434 to
+// ~459 GB/s; the K-quants measure flat, their decode being cheap enough that
+// the stride tail hides under the loads either way.
+//
+// Ties go to the widest candidate -- fewer strides for the same waste -- and 32
+// is excluded because one warp per row does not keep enough loads in flight to
+// cover the codebook latency (measured below 64 on every shape).
+std::uint32_t qwen_q8_matvec_block(int input_size) {
+    // FLYWEIGHT_Q8_MATVEC_BLOCK=128 pins the old fixed width for A/B.
+    static const std::uint32_t pinned = [] {
+        const char* setting = std::getenv("FLYWEIGHT_Q8_MATVEC_BLOCK");
+        if (!setting || !setting[0]) return 0u;
+        const auto value = static_cast<std::uint32_t>(std::atoi(setting));
+        return (value >= 32 && value <= 128 && (value & 31) == 0) ? value : 0u;
+    }();
+    if (pinned) return pinned;
+    if (input_size & 255) return 128;  // Not this kernel's shape; caller gates.
+    const std::uint32_t groups = static_cast<std::uint32_t>(input_size >> 5);
+    std::uint32_t best = 128, best_waste = ~0u;
+    for (const std::uint32_t block : {std::uint32_t{64}, std::uint32_t{96},
+                                      std::uint32_t{128}}) {
+        const std::uint32_t waste = (groups + block - 1) / block * block - groups;
+        if (waste <= best_waste) { best_waste = waste; best = block; }
+    }
+    return best;
+}
+
 // FLYWEIGHT_IQ2_Q8_DECODE=0 keeps every head on the reconstruct-in-float
 // argmax kernel; the default quantizes the activation to Q8 blocks and runs
 // the group-decode head, which reads the largest per-token tensor once at a
@@ -20026,7 +20060,7 @@ int flyweight_v2_qwen_runtime_decode(FlyweightV2QwenRuntime*runtime,uint32_t inp
         void*matvec_args[]={&matrix,const_cast<std::uint64_t*>(&dense_q8),
             const_cast<std::uint64_t*>(&dense_q8_scales),&output,
             &input_size,&output_size};
-        launch_named(kernel,output_size,1,128,matvec_args);
+        launch_named(kernel,output_size,1,qwen_q8_matvec_block(input_size),matvec_args);
         return true;
     };
     // Dense projections keep whatever type the checkpoint stored. The NVFP4 Qwen3.6
@@ -24557,7 +24591,7 @@ static void qwen_decode_multi(FlyweightV2QwenRuntime* runtime, std::size_t n,
         void* matvec_args[] = {
             &matrix, &active_dense_q8, &active_dense_q8_scales, &output,
             &in_size, &out_size};
-        launch_named(kernel, out_size, 1, 128, matvec_args);
+        launch_named(kernel, out_size, 1, qwen_q8_matvec_block(in_size), matvec_args);
         return true;
     };
     // Same type dispatch as the single-token decode: dense weights carry the
