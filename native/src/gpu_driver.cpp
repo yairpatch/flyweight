@@ -1284,6 +1284,12 @@ extern "C" int flyweight_gpu_compile(
              "iq1m_q8_matvec_transposed_rows", "iq1m_q8_matmul_tiled",
              "iq1m_q8_mmq",
              "iq4xs_q8_matvec_transposed_warp",
+             // IQ3_S: the 27B hybrid's ssm_out projections. Its decode already
+             // served the routed MMQ path; these are the dense consumers.
+             "iq3s_q8_matvec_transposed_warp",
+             "iq3s_q8_lm_head_argmax_warp",
+             "iq3s_q8_matvec_transposed_rows",
+             "iq3s_q8_matmul_tiled", "iq3s_q8_mmq",
              "quantize_q8_blocks_rows",
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",
              // Grouped routed-expert kernels for the IQ codebook formats.

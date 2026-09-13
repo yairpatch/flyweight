@@ -2138,7 +2138,13 @@ extern "C" __global__ void name(                                               \
     if (lane == 0) warp_sums[warp] = partial;                                  \
     __syncthreads();                                                           \
     if (warp == 0) {                                                           \
-        partial = lane < 4 ? warp_sums[lane] : 0.0f;                           \
+        /* Only the warps that exist wrote a slot. Reading a fixed four left  */\
+        /* the tail uninitialized for any launch narrower than 128 threads,   */\
+        /* which qwen_q8_matvec_block now issues -- and uninitialized shared  */\
+        /* reads as whatever the last block left there, so the row came out   */\
+        /* garbage rather than merely wrong. blockDim is a multiple of 32 at   */\
+        /* every call site.                                                   */\
+        partial = lane < (int)(blockDim.x >> 5) ? warp_sums[lane] : 0.0f;       \
         for (int offset = 16; offset > 0; offset >>= 1)                        \
             partial += __shfl_down_sync(0xffffffffu, partial, offset);         \
         if (lane == 0) output[row] = partial;                                  \
@@ -4880,6 +4886,65 @@ void iq3s_matvec_transposed(
     if (threadIdx.x == 0) output[row] = partial;
 }
 
+// Decode IQ3_S against a vector quantized in independent 32-value Q8 blocks.
+// Same eight grid entries as iq3s_q8_decode below, with the dot folded in: the
+// 32 products become eight DP4A instead of 32 f32 weight reconstructions.
+//
+// Without this, type 21 was the one codebook format in the table with no Q8
+// group matvec, so every IQ3_S dense projection fell through to
+// iq3s_matvec_transposed_warp -- a per-element decode that recomputes the
+// super-block pointers, the grid entry and the sign bit for each of the row's
+// values. On the 27B hybrid checkpoint, whose 47 ssm_out projections carry this
+// type, that path measured 93 GB/s against 502 for the IQ4_XS group kernel on
+// the same shape: ~6.4 ms of a 33 ms token spent decoding 9% of the weights.
+__device__ __forceinline__ float iq3s_q8_group(
+    const unsigned char* row_data,
+    const signed char* vector,
+    const __half* vector_scales,
+    const int linear_group
+) {
+    const int block = linear_group >> 3;
+    const int group = linear_group & 7;
+    const unsigned char* base = row_data + block * 110;
+    const unsigned char* quants = base + 2;
+    const unsigned char* high = base + 66;
+    const unsigned char* signs = base + 74;
+    const unsigned char* scales = base + 106;
+    const unsigned int qh_byte = high[group];
+    const int first_index = group * 8;
+
+    // A 110-byte super-block leaves qs 2-byte aligned, so the codebook indices
+    // stay on byte loads; the activation block is 32-byte aligned and loads as
+    // two int4 instead of eight scalars.
+    const int4* activation_vectors = (const int4*)(vector + linear_group * 32);
+    const int4 activation_low = activation_vectors[0];
+    const int4 activation_high = activation_vectors[1];
+    const int acts[8] = {
+        activation_low.x, activation_low.y,
+        activation_low.z, activation_low.w,
+        activation_high.x, activation_high.y,
+        activation_high.z, activation_high.w};
+
+    int dot = 0;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        const int index = first_index + step;
+        const int entry = quants[index] | (int)(((qh_byte >> step) & 1u) << 8);
+        const unsigned int sign_word =
+            (unsigned int)signs[group * 4 + (step >> 1)] * 0x01010101u;
+        const int masks = __vcmpne4(
+            sign_word & ((step & 1) ? 0x80402010u : 0x08040201u), 0);
+        const int weights = __vsub4((int)kIq3sGrid[entry] ^ masks, masks);
+        dot = __dp4a(weights, acts[step], dot);
+    }
+    const float scale = __half2float(*((const __half*)base))
+        * (float)(1 + 2 * ((scales[group >> 1] >> (4 * (group & 1))) & 15));
+    return (float)dot * scale * __half2float(vector_scales[linear_group]);
+}
+
+FLYWEIGHT_Q8_MATVEC(iq3s_q8_matvec_transposed_warp, iq3s_q8_group, 110)
+FLYWEIGHT_Q8_LM_HEAD(iq3s_q8_lm_head_argmax_warp, iq3s_q8_group, 110)
+
 // Batched decode for IQ3_S: a 32-value group is eight 4-value grid entries,
 // each negated bytewise by its half of a sign byte. Unlike IQ2_S the 4-bit odd
 // scale covers the whole group, so both returned halves carry the same value;
@@ -4914,6 +4979,9 @@ __device__ __forceinline__ void iq3s_q8_decode(
 
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
+FLYWEIGHT_Q8_MATVEC_ROWS(iq3s_q8_matvec_transposed_rows, iq3s_q8_decode, 110)
+FLYWEIGHT_Q8_MATMUL_TILED(iq3s_q8_matmul_tiled, iq3s_q8_decode, 110)
+FLYWEIGHT_Q8_MMQ(iq3s_q8_mmq, iq3s_q8_decode, 110)
 FLYWEIGHT_Q8_MMQ_ROUTED(iq3s_q8_mmq_routed, iq3s_q8_decode, 110, 8, 3)
 
 __device__ const unsigned long long kIq2xsGrid[512] = {

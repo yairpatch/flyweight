@@ -456,7 +456,8 @@ void qwen_forward_rows(
                 auto row_output=output+static_cast<std::uint64_t>(row)*output_size*sizeof(float);
                 void*matvec_args[]={&matrix,&row_q8,&row_scales,&row_output,
                     &input_size,&output_size};
-                launch(q8_kernel,output_size,1,128,matvec_args);
+                launch(q8_kernel,output_size,1,
+                       qwen_q8_matvec_block(input_size),matvec_args);
             }
             return;
         }

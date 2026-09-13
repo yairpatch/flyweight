@@ -194,10 +194,19 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .matmul_rows = "iq1s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .iq_expert_prefix = "iq1s", .cpu_expert = true},
+    // IQ3_S carried a routed-expert decode but no dense Q8 group kernels, so
+    // every IQ3_S dense projection ran the per-element float matvec: 93 GB/s
+    // against 502 for IQ4_XS on the same shape, measured on the 27B hybrid
+    // checkpoint whose 47 ssm_out projections are this type. The kernels below
+    // are the same iq3s_q8_decode the routed MMQ path already used.
     {.type = 21, .family = "iq3s",
+     .matvec_q8_warp = "iq3s_q8_matvec_transposed_warp", .rows_q8_gate = true,
+     .matvec_q8_rows = "iq3s_q8_matvec_transposed_rows",
+     .matmul_q8_tiled = "iq3s_q8_matmul_tiled", .matmul_q8_mmq = "iq3s_q8_mmq",
      .matmul_rows = "iq3s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
      .lm_head_argmax = "iq3s_lm_head_argmax_warp",
+     .lm_head_argmax_q8 = "iq3s_q8_lm_head_argmax_warp",
      .embedding = "qwen_iq3s_embedding",
      .embedding_rows = "qwen_iq3s_embedding_rows",
      .iq_expert_prefix = "iq3s", .cpu_expert = true},
