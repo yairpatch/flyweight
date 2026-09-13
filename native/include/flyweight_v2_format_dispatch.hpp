@@ -64,9 +64,17 @@ struct QwenFormatKernels {
     const char* embedding = nullptr;
     const char* embedding_rows = nullptr;
 
-    // Grouped IQ expert kernel family stem (qwen_iq_grouped_kernel), null
-    // where the format has no grouped expert kernels.
-    const char* iq_expert_prefix = nullptr;
+    // Grouped routed-expert kernel family stem (qwen_grouped_expert_kernel),
+    // null where the format has no grouped expert kernels. Set for every
+    // format whose device octet decoder is wired into FLYWEIGHT_GROUPED_EXPERTS
+    // -- the IQ codebook formats plus Q2_K and Q4_0, which is why this is not
+    // named for IQ any more.
+    //
+    // No row-width field goes with it: GGUF cannot store a quantized tensor
+    // whose row is not a whole number of blocks, so a row always starts on a
+    // block boundary and every octet decoder can address it. (The MMQ path's
+    // `% unit` check is a separate tile-geometry rule, not this one.)
+    const char* grouped_expert_prefix = nullptr;
 
     // Whether qwen_quant_dot can execute this type on the CPU expert path.
     bool cpu_expert = false;
@@ -87,11 +95,22 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .embedding = "qwen_f16_embedding", .embedding_rows = "qwen_f16_embedding_rows",
      .cpu_expert = true},
     // GGML type 2 is Q4_0 (this row was historically mislabeled "f16"; the
-    // family string is only a name stem for the contract test, and every
-    // kernel field here is null, so the label was inert either way). Written
-    // "q40" because the table-scan test reads underscored strings as kernel
-    // names.
-    {.type = 2, .family = "q40", .cpu_expert = true},
+    // family string is only a name stem for the contract test). Written "q40"
+    // because the table-scan test reads underscored strings as kernel names.
+    //
+    // The rows matmul is what admits a Q4_0 dense tensor to chunked prefill.
+    // Without it a checkpoint carrying one threw out of the rows projection's
+    // per-token fallback, because qwen_gpu_matvec_by_type had no case 2
+    // either: qwen4exp packed as Q2_K puts its hyper-connection up
+    // projections (320x10240) in Q4_0, since 320 is not a multiple of 256 and
+    // no K-quant can tile it.
+    // The grouped prefix covers the routed down projection: qwen4exp packed as
+    // Q2_K stores ffn_down_exps in Q4_0 for the same 640-wide reason.
+    {.type = 2, .family = "q40",
+     .matmul_rows = "q40_matmul_rows",
+     .matmul_rows_grid = RowsMatmulGrid::quad_pack,
+     .grouped_expert_prefix = "q40",
+     .cpu_expert = true},
     // Q8_0 dense tensors take the Q8-activation group kernels like the
     // K-quants do; the per-element f32 kernels below them stay as the
     // fallback for row widths that are not a multiple of 256.
@@ -114,6 +133,11 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax = "q2k_lm_head_argmax_warp",
      .lm_head_argmax_q8 = "q2k_q8_lm_head_argmax_warp",
      .embedding = "qwen_q2k_embedding", .embedding_rows = "qwen_q2k_embedding_rows",
+     // Routed gate/up of a Q2_K MoE checkpoint. Q3_K has no grouped kernel
+     // because no packer puts routed experts there -- it has no octet decoder
+     // in the corpus, so leaving this null keeps such a model on the CPU
+     // instead of decoding Q3_K bytes as something else.
+     .grouped_expert_prefix = "q2k",
      .cpu_expert = true},
     {.type = 11, .family = "q3k",
      .matvec_q8_warp = "q3k_q8_matvec_transposed_warp", .rows_q8_gate = true,
@@ -165,7 +189,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax_q8 = "iq2xxs_q8_lm_head_argmax_warp",
      .embedding = "qwen_iq2xxs_embedding",
      .embedding_rows = "qwen_iq2xxs_embedding_rows",
-     .iq_expert_prefix = "iq2xxs", .cpu_expert = true},
+     .grouped_expert_prefix = "iq2xxs", .cpu_expert = true},
     {.type = 17, .family = "iq2xs",
      .matvec_q8_warp = "iq2xs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq2xs_q8_matvec_transposed_rows",
@@ -175,7 +199,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax = "iq2xs_lm_head_argmax_warp",
      .embedding = "qwen_iq2xs_embedding",
      .embedding_rows = "qwen_iq2xs_embedding_rows",
-     .iq_expert_prefix = "iq2xs", .cpu_expert = true},
+     .grouped_expert_prefix = "iq2xs", .cpu_expert = true},
     {.type = 18, .family = "iq3xxs",
      .matvec_q8_warp = "iq3xxs_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq3xxs_q8_matvec_transposed_rows",
@@ -186,14 +210,14 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax_q8 = "iq3xxs_q8_lm_head_argmax_warp",
      .embedding = "qwen_iq3xxs_embedding",
      .embedding_rows = "qwen_iq3xxs_embedding_rows",
-     .iq_expert_prefix = "iq3xxs", .cpu_expert = true},
+     .grouped_expert_prefix = "iq3xxs", .cpu_expert = true},
     {.type = 19, .family = "iq1s",
      .matvec_q8_warp = "iq1s_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq1s_q8_matvec_transposed_rows",
      .matmul_q8_tiled = "iq1s_q8_matmul_tiled", .matmul_q8_mmq = "iq1s_q8_mmq",
      .matmul_rows = "iq1s_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     .iq_expert_prefix = "iq1s", .cpu_expert = true},
+     .grouped_expert_prefix = "iq1s", .cpu_expert = true},
     // IQ3_S carried a routed-expert decode but no dense Q8 group kernels, so
     // every IQ3_S dense projection ran the per-element float matvec: 93 GB/s
     // against 502 for IQ4_XS on the same shape, measured on the 27B hybrid
@@ -209,7 +233,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax_q8 = "iq3s_q8_lm_head_argmax_warp",
      .embedding = "qwen_iq3s_embedding",
      .embedding_rows = "qwen_iq3s_embedding_rows",
-     .iq_expert_prefix = "iq3s", .cpu_expert = true},
+     .grouped_expert_prefix = "iq3s", .cpu_expert = true},
     {.type = 22, .family = "iq2s",
      .matvec_q8_warp = "iq2s_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq2s_q8_matvec_transposed_rows",
@@ -229,7 +253,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      .lm_head_argmax = "iq4xs_lm_head_argmax_warp",
      .embedding = "qwen_iq4xs_embedding",
      .embedding_rows = "qwen_iq4xs_embedding_rows",
-     .iq_expert_prefix = "iq4xs", .cpu_expert = true},
+     .grouped_expert_prefix = "iq4xs", .cpu_expert = true},
     // IQ4_NL: IQ4_XS's non-superblock sibling (18B per 32 values, same
     // codebook, no sub-block scales). qwen4exp carries its ffn_down_exps and
     // the PLE n-gram table in it; the table is host row-gathered, the experts
@@ -243,7 +267,7 @@ inline constexpr QwenFormatKernels kQwenFormats[] = {
      // kernels that re-decode weights once per routed token.
      .matmul_rows = "iq4nl_matmul_rows",
      .matmul_rows_grid = RowsMatmulGrid::quad_pack,
-     .iq_expert_prefix = "iq4nl", .cpu_expert = true},
+     .grouped_expert_prefix = "iq4nl", .cpu_expert = true},
     {.type = 29, .family = "iq1m",
      .matvec_q8_warp = "iq1m_q8_matvec_transposed_warp", .rows_q8_gate = true,
      .matvec_q8_rows = "iq1m_q8_matvec_transposed_rows",

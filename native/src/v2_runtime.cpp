@@ -4364,22 +4364,21 @@ void qwen_quant_dot_pair(const std::uint8_t*packed,std::uint32_t type,const floa
     first_output=qwen_quant_dot(packed,type,first,elements,row);second_output=qwen_quant_dot(packed,type,second,elements,row);
 }
 
-// Weight types the grouped GPU expert kernels can execute. The IQ codebook
-// formats have no grouped kernel: they have to stay on the CPU expert path,
-// which decodes every type qwen_quant_dot supports.
-// Kernel-name prefix for the IQ codebook formats, which share one generated
-// family of grouped expert kernels. Null for everything else.
-const char* qwen_iq_kernel_prefix(std::uint32_t type) {
-    // Only the formats with a device octet decoder. IQ2_S and IQ3_S pack
-    // their signs and grid indices differently and have no grouped kernel,
-    // so models using them still route experts to the CPU.
+// Kernel-name prefix for the formats that share the generated family of
+// grouped expert kernels (FLYWEIGHT_GROUPED_EXPERTS). Null for everything else,
+// which is what keeps such a model's routed experts on the CPU expert path --
+// that path decodes every type qwen_quant_dot supports.
+const char* qwen_grouped_expert_prefix(std::uint32_t type) {
+    // Only the formats with a device octet decoder. IQ2_S and IQ1_M pack their
+    // signs and grid indices differently and have none, so models using them
+    // still route experts to the CPU.
     const auto* format = flyweight::v2::qwen_format(type);
-    return format ? format->iq_expert_prefix : nullptr;
+    return format ? format->grouped_expert_prefix : nullptr;
 }
 
-// Grouped kernel name for an IQ type, empty when the type is not one.
-std::string qwen_iq_grouped_kernel(std::uint32_t type, const char* suffix) {
-    const char* prefix=qwen_iq_kernel_prefix(type);
+// Grouped kernel name for a type with that family, empty when it has none.
+std::string qwen_grouped_expert_kernel(std::uint32_t type, const char* suffix) {
+    const char* prefix=qwen_grouped_expert_prefix(type);
     return prefix?std::string(prefix)+suffix:std::string();
 }
 
@@ -4387,15 +4386,39 @@ std::string qwen_iq_grouped_kernel(std::uint32_t type, const char* suffix) {
 // format has none or the width does not divide its blocking: 256 for the
 // super-block formats, 32 for IQ4_NL's flat blocks (what lets qwen4exp's
 // 640-wide down projection in).
+//
+// Its own list rather than grouped_expert_prefix + suffix, because the two sets
+// are not the same one: Q4_0 has a grouped kernel and no MMQ kernel, so reading
+// the prefix here named "q40_q8_mmq_routed", which the module never defines --
+// caught only by the width check below, one Q4_0 expert stack at a 256-multiple
+// width away from launching a name that does not exist.
+//
+// IQ2_S (22) and IQ1_M (29) are omitted deliberately: the corpus defines
+// iq2s_q8_mmq_routed and iq1m_q8_mmq_routed and the driver registers both, but
+// this function has never named them, so admitting them here would enable an
+// unmeasured path rather than fix one. Same shape as the IQ4_XS rows-gate drift
+// recorded in the format table.
 std::string qwen_routed_mmq_kernel(std::uint32_t type, int in_size) {
-    auto name = qwen_iq_grouped_kernel(type, "_q8_mmq_routed");
-    if (name.empty()) {
-        const char* family = type == 10 ? "q2k" : type == 11 ? "q3k"
-            : type == 12 ? "q4k" : type == 13 ? "q5k" : type == 14 ? "q6k" : nullptr;
-        if (family) name = std::string(family) + "_q8_mmq_routed";
+    const char* family = nullptr;
+    switch (type) {
+        case 10: family = "q2k"; break;
+        case 11: family = "q3k"; break;
+        case 12: family = "q4k"; break;
+        case 13: family = "q5k"; break;
+        case 14: family = "q6k"; break;
+        case 16: family = "iq2xxs"; break;
+        case 17: family = "iq2xs"; break;
+        case 18: family = "iq3xxs"; break;
+        case 19: family = "iq1s"; break;
+        case 20: family = "iq4nl"; break;
+        case 21: family = "iq3s"; break;
+        case 23: family = "iq4xs"; break;
+        default: break;
     }
+    if (!family) return {};
     const int unit = type == 20 ? 32 : 256;
-    return (!name.empty() && in_size % unit == 0) ? name : std::string();
+    return in_size % unit == 0 ? std::string(family) + "_q8_mmq_routed"
+                               : std::string();
 }
 
 // Whether the routed MMQ carries most MoE layers: the UD checkpoints keep a
@@ -4423,7 +4446,7 @@ bool qwen_routed_mmq_available(const FlyweightV2QwenRuntime& runtime) {
 
 bool qwen_gpu_expert_type_supported(std::uint32_t type) {
     return type==8||type==12||type==13||type==14||type==40||
-           qwen_iq_kernel_prefix(type)!=nullptr;
+           qwen_grouped_expert_prefix(type)!=nullptr;
 }
 
 // Grouped SwiGLU kernel for the routed experts' gate/up type. The trailing
@@ -4435,13 +4458,13 @@ bool qwen_gpu_expert_type_supported(std::uint32_t type) {
 // the CPU, and this makes the silent path unreachable if that stops holding.
 std::string qwen_grouped_expert_unsupported(std::uint32_t type) {
     return "no routed-expert kernel decodes weight type "+std::to_string(type)+
-        "; the expert stacks have to be Q4_K, Q5_K, Q6_K, Q8_0, NVFP4 or an IQ "
-        "codebook type";
+        "; the expert stacks have to be Q2_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, "
+        "NVFP4 or an IQ codebook type";
 }
 
 std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool rows) {
     const char* suffix=rows?"_grouped_swiglu_rows":"_grouped_swiglu";
-    auto iq=qwen_iq_grouped_kernel(type,suffix);
+    auto iq=qwen_grouped_expert_kernel(type,suffix);
     if(!iq.empty())return iq;
     if(type==40)return rows?"nvfp4_grouped_swiglu_rows"
         :(nvfp4_tiled?"nvfp4_grouped_swiglu_tiled":"nvfp4_grouped_swiglu");
@@ -4455,7 +4478,7 @@ std::string qwen_grouped_swiglu_name(std::uint32_t type, bool nvfp4_tiled, bool 
 // Row-batched grouped accumulate, which the prefill path launches by name for
 // every weight type rather than through a driver entry point.
 std::string qwen_grouped_accumulate_rows_name(std::uint32_t type) {
-    auto iq=qwen_iq_grouped_kernel(type,"_grouped_accumulate_rows");
+    auto iq=qwen_grouped_expert_kernel(type,"_grouped_accumulate_rows");
     if(!iq.empty())return iq;
     if(type==8)return "q8_grouped_accumulate_rows";
     if(type==40)return "nvfp4_grouped_accumulate_rows";
@@ -4473,7 +4496,7 @@ int qwen_launch_grouped_accumulate(
     std::uint64_t activated, std::uint64_t output, std::uint64_t weights,
     int intermediate, int hidden_size, int count
 ) {
-    const auto iq=qwen_iq_grouped_kernel(down_type,"_grouped_accumulate");
+    const auto iq=qwen_grouped_expert_kernel(down_type,"_grouped_accumulate");
     if(!iq.empty()){
         void* args[]={&down_table,&activated,&output,&weights,
                       &intermediate,&hidden_size,&count};
@@ -4490,12 +4513,16 @@ int qwen_launch_grouped_accumulate(
     }
 }
 
-// True when any routed expert tensor uses an IQ codebook format.
-bool qwen_model_has_iq_experts(const FlyweightV2QwenRuntime& runtime) {
+// True when any routed expert tensor runs through the generated grouped-expert
+// family -- the IQ codebook formats, and now Q2_K/Q4_0 as well. The seeding gate
+// this feeds is about a cache that holds a fraction of the expert set paying a
+// host round trip per layer, which is a property of low-bit MoE checkpoints
+// generally and not of the codebook formats, so widening it is the intent.
+bool qwen_model_has_grouped_experts(const FlyweightV2QwenRuntime& runtime) {
     for(const auto& layer:runtime.layers){
         if(layer.dense_ffn||!layer.expert_tensors[0])continue;
         for(const auto index:layer.expert_tensors)
-            if(qwen_iq_kernel_prefix(runtime.model->tensors[index].type))return true;
+            if(qwen_grouped_expert_prefix(runtime.model->tensors[index].type))return true;
     }
     return false;
 }
@@ -5808,6 +5835,15 @@ int qwen_gpu_matvec_by_type(
                 "bf16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
+        // Q4_0: 32-element blocks, so it tiles the 320-wide hyper-connection
+        // rows a K-quant cannot. Launched by name rather than through a driver
+        // entry point of its own, like the f32/f16/bf16 cases above.
+        case 2: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return flyweight_gpu_launch_named(
+                "q40_matvec_transposed_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
         case 8: return flyweight_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 10: return flyweight_gpu_q2k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
         case 11: return flyweight_gpu_q3k_matvec_transposed(matrix, input, output, input_size, output_size, stream);
@@ -5863,7 +5899,7 @@ constexpr int kQwenMatvecUnsupported = -1000000;
 // is a load-time "type is unsupported" naming a number and nothing else.
 bool qwen_matvec_supported(std::uint32_t type) {
     switch (type) {
-        case 1: case 8: case 10: case 11: case 12: case 13: case 14:
+        case 1: case 2: case 8: case 10: case 11: case 12: case 13: case 14:
         case 16: case 17: case 18: case 19: case 21: case 22: case 23:
         case 29: case 30: case 40:
             return true;
@@ -5888,6 +5924,14 @@ int qwen_matvec_driver(
             void* args[] = {&matrix, &input, &output, &output_size, &input_size};
             return flyweight_gpu_launch_named(
                 "bf16_matvec_warp", (output_size + 7) / 8, 1, 256, 0,
+                stream, args);
+        }
+        // Q4_0 -- see qwen_gpu_matvec_by_type for why a 32-element block type
+        // reaches the dense path of a K-quant checkpoint at all.
+        case 2: {
+            void* args[] = {&matrix, &input, &output, &input_size, &output_size};
+            return flyweight_gpu_launch_named(
+                "q40_matvec_transposed_warp", (output_size + 7) / 8, 1, 256, 0,
                 stream, args);
         }
         case 8: return flyweight_gpu_q8_matvec_transposed(matrix, input, output, input_size, output_size, stream);
@@ -6001,10 +6045,19 @@ std::uint64_t qwen_device_tensor_size(
     const FlyweightV2QwenRuntime& runtime, std::uint64_t index
 ) {
     const auto& tensor = runtime.model->tensors[index];
-    if (qwen_device_type(runtime, index) == 8 && tensor.type != 8) {
+    const auto device_type = qwen_device_type(runtime, index);
+    if (device_type == 8 && tensor.type != 8) {
         std::uint64_t elements = 1;
         for (auto dimension : tensor.shape) elements *= dimension;
         return (elements / 32) * kQ8BlockSize;
+    }
+    // Widened rather than requantized: the causal-convolution kernels index
+    // their weights as raw f32, so a quantized conv1d has to arrive as f32.
+    // See the conv widening loop in prepare.
+    if (device_type == 0 && tensor.type != 0) {
+        std::uint64_t elements = 1;
+        for (auto dimension : tensor.shape) elements *= dimension;
+        return elements * sizeof(float);
     }
     return tensor.size;
 }
@@ -15588,6 +15641,22 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
         }
         std::vector<bool> persistent(runtime->model->tensors.size(),false);
         std::vector<bool> preserve_bf16(runtime->model->tensors.size(),false);
+        // Conv1d weights have to reach the device as f32; see the flip after
+        // the requant decisions below for why. Collected here so the bf16
+        // requant loop skips them -- it would otherwise book savings that the
+        // flip then undoes, and report a "MiB freed" figure the arena
+        // contradicts.
+        std::vector<std::uint64_t> conv_f32_tensors;
+        for(std::uint64_t index=0;index<runtime->model->tensors.size();++index){
+            const auto& name=runtime->model->tensors[index].name;
+            static constexpr char kConvWeight[]="conv1d.weight";
+            constexpr std::size_t kConvWeightLength=sizeof(kConvWeight)-1;
+            if(name.size()<kConvWeightLength)continue;
+            if(name.compare(name.size()-kConvWeightLength,
+                            kConvWeightLength,kConvWeight)!=0)continue;
+            conv_f32_tensors.push_back(index);
+            preserve_bf16[index]=true;
+        }
         if(!runtime->embeddings_host_resident)
             persistent[runtime->token_embeddings]=true;
         persistent[runtime->final_norm]=true;
@@ -15875,6 +15944,25 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 static_cast<unsigned long long>(
                     runtime->requantized_saved_bytes/(1024ull*1024)));
         }
+        // The causal-convolution kernels -- delta_conv_step/_sequence for the
+        // DeltaNet mixer, qwen4_ple_conv_step/_sequence for the PLE n-gram
+        // branch -- take their weight as `const float*` and index one
+        // contiguous tap run per channel. That argument has no type dispatch
+        // anywhere, and every checkpoint until now shipped conv1d weights as
+        // f32, so the assumption held silently. Qwen3.8-Flash-Next packed as
+        // Q2_K ships ple_conv1d as f16: read as f32 that is garbage taps and
+        // two bytes past the tensor per element, and the residual went
+        // non-finite in the first PLE layer -- which surfaced only as the
+        // router's duplicate-expert guard firing, naming neither the tensor
+        // nor the type.
+        //
+        // Widen them on the way to the device instead of teaching four kernels
+        // a type argument: a conv1d weight is `kernel_size` taps per channel
+        // (four here), so the whole set is a few hundred KiB. This must run
+        // after every requant decision above -- those assign from the file
+        // type and would overwrite the flip -- and before the arena is sized
+        // below, which reads the effective size.
+        for(const auto index:conv_f32_tensors)runtime->device_tensor_types[index]=0;
         // Aliased tensors are read straight out of the GGUF mapping and need no
         // arena space; see qwen_alias_static_tensor.
         for(std::uint64_t index=0;index<persistent.size();++index)if(persistent[index]&&!qwen_alias_static_tensor(*runtime,index))runtime->static_arena_bytes+=device_align(qwen_device_tensor_size(*runtime,index));
@@ -16327,7 +16415,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             // Whole pinned layers page each bundle once and never again,
             // which is the static GPU/CPU layer split llama.cpp runs.
             const bool whole_layer_enabled=(runtime->gemma4||
-                (runtime->laguna&&qwen_model_has_iq_experts(*runtime)))&&
+                (runtime->laguna&&qwen_model_has_grouped_experts(*runtime)))&&
                 (!whole_layer_setting||whole_layer_setting[0]!='0');
             if(whole_layer_enabled&&!runtime->options.strict_resident){
                 const auto experts=runtime->model->config.expert_count;
@@ -16596,7 +16684,7 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
             *runtime,flyweight::v2::ExpertExecutionPhase::decode).is_cpu();
         if(gpu_at_decode&&runtime->model->config.expert_count&&
            (!qwen_gpu_experts_executable(*runtime)||
-            (qwen_model_has_iq_experts(*runtime)&&!seeded_placement&&
+            (qwen_model_has_grouped_experts(*runtime)&&!seeded_placement&&
              runtime->whole_expert_layer_slots.empty()))){
             runtime->expert_mode=flyweight::v2::ExpertExecutionMode::cpu;
             runtime->options.moe_device=flyweight::v2::expert_execution_mode_value(
@@ -16662,6 +16750,14 @@ int flyweight_v2_qwen_runtime_prepare(FlyweightV2QwenRuntime*runtime){return gua
                 }
                 pack_q8_0(widened.data(),elements,packed.data());
                 if(flyweight_gpu_upload_sync(runtime->device_tensors[index],packed.data(),device_bytes)!=0)throw std::runtime_error("failed to upload requantized native Qwen static tensor");
+            }else if(qwen_device_type(*runtime,index)==0&&t.type!=0){
+                // Conv1d weights widened to f32; see the loop in prepare.
+                const std::uint64_t elements=device_bytes/sizeof(float);
+                widened.resize(elements);
+                const auto* source=tensor_data(*runtime->model,t);
+                for(std::uint64_t i=0;i<elements;++i)
+                    widened[i]=tensor_value(source,t.type,i);
+                if(flyweight_gpu_upload_sync(runtime->device_tensors[index],widened.data(),device_bytes)!=0)throw std::runtime_error("failed to upload widened native Qwen static tensor");
             }else if(flyweight_gpu_upload_sync(runtime->device_tensors[index],tensor_data(*runtime->model,t),t.size)!=0)throw std::runtime_error("failed to upload native Qwen static tensor");
             cursor+=device_align(device_bytes);
         }

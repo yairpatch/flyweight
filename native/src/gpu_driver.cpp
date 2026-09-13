@@ -1229,6 +1229,9 @@ extern "C" int flyweight_gpu_compile(
              "iq2xs_matmul_rows", "iq4xs_matmul_rows",
              "iq1m_matmul_rows", "iq1s_matmul_rows",
              "iq4nl_matmul_rows",
+             // Q4_0 dense: the hyper-connection up projections of a Q2_K
+             // qwen4exp, whose 320-wide rows no K-quant can tile.
+             "q40_matmul_rows", "q40_matvec_transposed_warp",
              // Fused block-major MoE (one launch per layer)
              "iq1s_block_swiglu", "iq4nl_block_swiglu", "iq2xxs_block_swiglu",
              "iq1s_block_accumulate", "iq4nl_block_accumulate",
@@ -1292,7 +1295,12 @@ extern "C" int flyweight_gpu_compile(
              "iq3s_q8_matmul_tiled", "iq3s_q8_mmq",
              "quantize_q8_blocks_rows",
              "route_topk_sigmoid_bias", "route_topk_sigmoid_bias_rows",
-             // Grouped routed-expert kernels for the IQ codebook formats.
+             // Grouped routed-expert kernels: the IQ codebook formats, plus
+             // Q2_K gate/up and Q4_0 down for a Q2_K-packed MoE checkpoint.
+             "q2k_grouped_swiglu", "q2k_grouped_swiglu_rows",
+             "q2k_grouped_accumulate", "q2k_grouped_accumulate_rows",
+             "q40_grouped_swiglu", "q40_grouped_swiglu_rows",
+             "q40_grouped_accumulate", "q40_grouped_accumulate_rows",
              "iq2xs_grouped_swiglu", "iq2xs_grouped_swiglu_rows",
              "iq2xs_grouped_accumulate", "iq2xs_grouped_accumulate_rows",
              "iq3xxs_grouped_swiglu", "iq3xxs_grouped_swiglu_rows",
