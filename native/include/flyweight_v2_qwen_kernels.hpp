@@ -6430,7 +6430,52 @@ __device__ __forceinline__ void iq3s_octet(
     }
 }
 
-#define FLYWEIGHT_IQ_GROUPED(prefix, octet_at)                                    \
+// Q2_K by octet. Same 84-byte layout q2k_value walks, hoisting everything the
+// eight elements share: an octet cannot straddle a half (128), a group (32) or
+// a sub-block (16) because all three are multiples of 8, so only the quant byte
+// index moves and the scale/min pair is read once.
+__device__ __forceinline__ void q2k_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const int within = octet * 8;
+    const unsigned char* base = packed + block * 84;
+    const float d = __half2float(*((const __half*)(base + 80)));
+    const float dmin = __half2float(*((const __half*)(base + 82)));
+    const int half = within >> 7;
+    const int rest = within & 127;
+    const int group = rest >> 5;
+    const int lane = rest & 31;
+    const int sub = lane >> 4;
+    const unsigned char* quants =
+        base + 16 + half * 32 + sub * 16 + (lane & 15);
+    const unsigned char scale_byte = base[half * 8 + group * 2 + sub];
+    const float scale = d * (float)(scale_byte & 15);
+    const float offset = dmin * (float)(scale_byte >> 4);
+    const int shift = 2 * group;
+    for (int k = 0; k < 8; ++k)
+        out[k] = scale * (float)((quants[k] >> shift) & 3) - offset;
+}
+
+// Q4_0 by octet: iq4nl_octet's traversal -- same 18-byte flat block of 32 and
+// the same nibble order -- over the linear (code - 8) levels instead of the
+// IQ4_NL codebook. `block` arrives as the caller's 256-element unit, so the
+// absolute octet is recomputed rather than assumed.
+__device__ __forceinline__ void q40_octet(
+    const unsigned char* packed, int block, int octet, float* out
+) {
+    const int absolute_octet = block * 32 + octet;
+    const unsigned char* base = packed + (absolute_octet >> 2) * 18;
+    const float d = __half2float(*((const __half*)base));
+    const int part = absolute_octet & 3;
+    const unsigned char* quants = base + 2 + (part & 1) * 8;
+    const int high = part >> 1;
+    for (int k = 0; k < 8; ++k) {
+        const unsigned char byte = quants[k];
+        out[k] = d * (float)((high ? (byte >> 4) : (byte & 15)) - 8);
+    }
+}
+
+#define FLYWEIGHT_GROUPED_EXPERTS(prefix, octet_at)                                    \
 extern "C" __global__                                                           \
 void prefix##_grouped_swiglu(                                                   \
     const unsigned long long* gate_ptrs, const unsigned long long* up_ptrs,     \
@@ -6556,15 +6601,18 @@ void prefix##_grouped_accumulate_rows(                                          
     if (threadIdx.x == 0) output[token * output_size + row] += partial;         \
 }
 
-FLYWEIGHT_IQ_GROUPED(iq2xs, iq2xs_octet)
-FLYWEIGHT_IQ_GROUPED(iq3xxs, iq3xxs_octet)
-FLYWEIGHT_IQ_GROUPED(iq3s, iq3s_octet)
-FLYWEIGHT_IQ_GROUPED(iq4xs, iq4xs_octet)
-FLYWEIGHT_IQ_GROUPED(iq1s, iq1s_octet)
-FLYWEIGHT_IQ_GROUPED(iq4nl, iq4nl_octet)
-FLYWEIGHT_IQ_GROUPED(iq2xxs, iq2xxs_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq2xs, iq2xs_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq3xxs, iq3xxs_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq3s, iq3s_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq4xs, iq4xs_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq1s, iq1s_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq4nl, iq4nl_octet)
+FLYWEIGHT_GROUPED_EXPERTS(iq2xxs, iq2xxs_octet)
+// The K-quant/flat pair a Q2_K MoE checkpoint needs: Q2_K gate/up, Q4_0 down.
+FLYWEIGHT_GROUPED_EXPERTS(q2k, q2k_octet)
+FLYWEIGHT_GROUPED_EXPERTS(q40, q40_octet)
 
-#undef FLYWEIGHT_IQ_GROUPED
+#undef FLYWEIGHT_GROUPED_EXPERTS
 )FLYWEIGHT_CUDA"
 R"FLYWEIGHT_CUDA(
 // Fused block-major MoE, the shape neither existing path has.
@@ -10369,6 +10417,10 @@ FLYWEIGHT_LOWBIT_MATVEC_WARP(iq2xs_matvec_transposed_warp, iq2xs_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq4xs_matvec_transposed_warp, iq4xs_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq1m_matvec_transposed_warp, iq1m_value)
 FLYWEIGHT_LOWBIT_MATVEC_WARP(iq1s_matvec_transposed_warp, iq1s_value)
+// Q4_0 has no q40_value of its own: ggml_q4_0_load above is that decoder,
+// named for the layout rather than the family because the Gemma kernels
+// reached it first.
+FLYWEIGHT_LOWBIT_MATVEC_WARP(q40_matvec_transposed_warp, ggml_q4_0_load)
 #undef FLYWEIGHT_LOWBIT_MATVEC_WARP
 
 extern "C" __global__ void q5k_matvec_transposed_warp(
@@ -10428,6 +10480,7 @@ FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq4xs_matmul_rows, iq4xs_value)
 FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq1m_matmul_rows, iq1m_value)
 FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq1s_matmul_rows, iq1s_value)
 FLYWEIGHT_LOWBIT_MATMUL_ROWS(iq4nl_matmul_rows, iq4nl_value)
+FLYWEIGHT_LOWBIT_MATMUL_ROWS(q40_matmul_rows, ggml_q4_0_load)
 #undef FLYWEIGHT_LOWBIT_MATMUL_ROWS
 
 #define KV_ATTENTION_FUSED_TILES_W(name, KT, VT, WIDTH) \

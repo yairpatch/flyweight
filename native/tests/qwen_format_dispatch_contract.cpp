@@ -89,8 +89,8 @@ int main() {
                f.type, "matmul_rows and its grid enum disagree");
 
         // The grouped IQ expert stem is the family stem where present.
-        expect(!f.iq_expert_prefix ||
-                   std::strcmp(f.iq_expert_prefix, f.family) == 0,
+        expect(!f.grouped_expert_prefix ||
+                   std::strcmp(f.grouped_expert_prefix, f.family) == 0,
                f.type, "IQ expert prefix disagrees with the family");
     }
 
