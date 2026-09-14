@@ -32,6 +32,7 @@
 #include "turboquant.h"
 #include "unicode_categories.h"
 #include "flyweight_v2_deepseek4.hpp"
+#include "flyweight_cpu_topology.hpp"
 
 #include <algorithm>
 #include <array>
@@ -4173,6 +4174,21 @@ bool qwen_iq_avx512_enabled(){
     }();
     return enabled;
 }
+// Gate/up formats with an int8 Q8_K expert dot, and which kernel runs it.
+// IQ1_S has a 256-bit AVX-VNNI form beside the AVX512-VNNI one, so hybrid
+// Intel parts (AVX-VNNI, no AVX-512) keep the integer path; IQ3_S's masked
+// signs exist only in the 512-bit kernel.
+using QwenIqQ8Dot=float(*)(const std::uint8_t*,const QwenQ8KBlock*,int,std::uint64_t);
+bool qwen_iq_q8_admitted(std::uint32_t type){
+    const auto features=flyweight_cpu_features();
+    if((features&8u)!=0)return type==19||type==21;
+    return (features&4u)!=0&&type==19;
+}
+QwenIqQ8Dot qwen_iq_q8_dot(std::uint32_t type){
+    if(type==21)return &qwen_iq3s_dot_q8_k_vnni512;
+    return (flyweight_cpu_features()&8u)!=0
+        ?&qwen_iq1s_dot_q8_k_vnni512:&qwen_iq1s_dot_q8_k_avx_vnni;
+}
 // Same treatment: the diagnostic gate sat as a raw getenv inside per-layer
 // decode code, costing an environ scan per layer per token when it was off.
 bool qwen_lm_diag_enabled(){
@@ -4642,16 +4658,118 @@ void qwen_quant_dot_two_rows(
 }
 
 #if defined(_OPENMP)
-int qwen_cpu_thread_count(const FlyweightV2QwenRuntime& runtime) {
+// An explicit --cpu-threads wins, then OMP_NUM_THREADS, then the host topology
+// (flyweight_cpu_topology.hpp): every physical core for batch work, and on a
+// hybrid part only the fast cores for a single decode step, whose phases would
+// otherwise wait on the efficiency cores. The getenv is read once -- these run
+// per layer per token.
+int qwen_cpu_team(const FlyweightV2QwenRuntime& runtime, int topology_team) {
     if (runtime.options.cpu_threads)
         return std::min<int>(runtime.options.cpu_threads, omp_get_num_procs());
-    int team = omp_get_max_threads();
-    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
-        const int physical = omp_get_num_procs() / 2;
-        if (physical >= 1 && team > physical) team = physical;
-    }
-    return team;
+    static const bool omp_threads_set = std::getenv("OMP_NUM_THREADS") != nullptr;
+    const int limit = omp_get_max_threads();
+    if (omp_threads_set) return limit;
+    return std::max(1, std::min(topology_team, limit));
 }
+int qwen_cpu_thread_count(const FlyweightV2QwenRuntime& runtime) {
+    return qwen_cpu_team(runtime, flyweight::cpu_topology::batch_threads());
+}
+// Which cores a decode step wants depends on what bounds it, and the choice is
+// made per model so every decode region -- routed experts, a spilled dense FFN
+// -- runs one team: libgomp retires the extra threads whenever a region asks
+// for a smaller team than the last and recreates them for the next larger one,
+// so a per-layer choice on a mixed checkpoint would pay thread creation every
+// layer. K-quant and Q8 experts are bandwidth-bound, so a hybrid part runs them
+// on its fast cores alone (Q4_K on an i9-13980HX: 29.9 tok/s pinned to the 8
+// P-cores, 27.8 on all 24 cores). The low-bit codebook formats decode a grid
+// lookup per group and are compute-bound, so they take every core (UD-IQ1_S
+// qwen4exp: 15.6 tok/s on 24 cores, 10.6 on the 8 P-cores).
+bool qwen_codebook_experts(const FlyweightV2QwenRuntime& runtime) {
+    for (const auto& layer : runtime.layers) {
+        // Unset expert indices stay 0, which is the token embedding.
+        if (layer.dense_ffn || layer.expert_tensors[0] == 0) continue;
+        for (std::uint32_t role = 0; role < layer.expert_tensor_count && role < 3; ++role) {
+            const auto type = runtime.model->tensors[layer.expert_tensors[role]].type;
+            if (type == 16 || type == 17 || type == 18 || type == 19
+                || type == 21 || type == 22 || type == 29)
+                return true;
+        }
+    }
+    return false;
+}
+int qwen_cpu_decode_thread_count(const FlyweightV2QwenRuntime& runtime) {
+    return qwen_cpu_team(runtime, qwen_codebook_experts(runtime)
+        ? flyweight::cpu_topology::batch_threads()
+        : flyweight::cpu_topology::decode_threads());
+}
+#endif
+
+// Decode-team pinning on hybrid parts. A decode team left to the scheduler
+// spills onto efficiency cores and every phase waits for them: 8 unpinned
+// threads decoded a 35B-A3B Q4_K_S MoE at 17.8 tok/s on an i9-13980HX, worse
+// than the old 16-thread default's 23.8, against 30.1 with one thread per
+// P-core. Each member pins itself to its own fast core the first time it runs a
+// decode phase: libgomp keeps a member's thread, and so its affinity, until a
+// smaller team retires it, and a thread created later pins itself the same way.
+// The calling thread belongs to the host, so it is only held to the first fast
+// core for the duration of a call. Off when the user binds threads
+// (OMP_PROC_BIND, OMP_PLACES, GOMP_CPU_AFFINITY) or the team outgrows the fast
+// cores; Linux only for now.
+#if defined(_OPENMP) && defined(__linux__)
+const std::vector<std::vector<int>>* qwen_decode_pin_cores() {
+    static const std::vector<std::vector<int>>* cores =
+        []() -> const std::vector<std::vector<int>>* {
+            const auto& topology = flyweight::cpu_topology::host();
+            if (topology.performance >= topology.physical
+                || topology.performance_cores.size() < 2)
+                return nullptr;
+            for (const char* name : {"OMP_PROC_BIND", "OMP_PLACES", "GOMP_CPU_AFFINITY"})
+                if (std::getenv(name) != nullptr) return nullptr;
+            return &topology.performance_cores;
+        }();
+    return cores;
+}
+bool qwen_set_affinity(const std::vector<int>& cpus) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    for (int cpu : cpus) CPU_SET(cpu, &mask);
+    return sched_setaffinity(0, sizeof(mask), &mask) == 0;
+}
+// First statement inside a decode-team parallel region.
+void qwen_pin_decode_member() {
+    const auto* cores = qwen_decode_pin_cores();
+    const int member = omp_get_thread_num();
+    if (cores == nullptr || member == 0
+        || omp_get_num_threads() > static_cast<int>(cores->size()))
+        return;
+    thread_local int pinned_as = -1;
+    if (pinned_as == member) return;
+    qwen_set_affinity((*cores)[static_cast<std::size_t>(member)]);
+    pinned_as = member;
+}
+class QwenDecodeCaller {
+public:
+    explicit QwenDecodeCaller(int team) {
+        const auto* cores = qwen_decode_pin_cores();
+        if (cores == nullptr || team < 2 || team > static_cast<int>(cores->size())) return;
+        restore_ = sched_getaffinity(0, sizeof(saved_), &saved_) == 0
+            && qwen_set_affinity(cores->front());
+    }
+    ~QwenDecodeCaller() {
+        if (restore_) sched_setaffinity(0, sizeof(saved_), &saved_);
+    }
+    QwenDecodeCaller(const QwenDecodeCaller&) = delete;
+    QwenDecodeCaller& operator=(const QwenDecodeCaller&) = delete;
+private:
+    cpu_set_t saved_{};
+    bool restore_ = false;
+};
+#else
+void qwen_pin_decode_member() {}
+class QwenDecodeCaller {
+public:
+    explicit QwenDecodeCaller(int) {}
+};
 #endif
 
 // Q8 activations for the Q4_0 expert dots: quantize the shared input once and
@@ -4699,12 +4817,16 @@ void gemma_cpu_moe(const FlyweightV2QwenRuntime&runtime,const QwenLayerPlan&laye
         qwen_quantize_q8_0(input,hidden,input_q8.data());
     }
     const auto*input_q8_data=input_q8.data();
+#if defined(_OPENMP)
+    const QwenDecodeCaller decode_caller(qwen_cpu_decode_thread_count(runtime));
+#endif
     // Every task is the same two fixed-width dots, so static scheduling costs
     // nothing in balance and removes the chunk-queue contention that made this
     // loop run SLOWER with more threads (measured 40ms/token at 16 threads
     // against 21ms at 8 with dynamic,4 on a 16-core Zen 5).
-    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_decode_thread_count(runtime))
     for(int task=0;task<routed_count*intermediate;++task){
+        qwen_pin_decode_member();
         const int rank=task/intermediate,row=task%intermediate,expert=selected[rank];
         if(expert<0||expert>=experts)continue;
         const auto*gate_up=tensor_data(*runtime.model,gate_up_tensor)+static_cast<std::uint64_t>(expert)*gate_up_bytes;
@@ -4725,8 +4847,9 @@ void gemma_cpu_moe(const FlyweightV2QwenRuntime&runtime,const QwenLayerPlan&laye
                                activated_q8.data()+static_cast<std::size_t>(rank)*(intermediate/32));
     }
     const auto*activated_q8_data=activated_q8.data();
-    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_thread_count(runtime))
+    #pragma omp parallel for schedule(static) num_threads(qwen_cpu_decode_thread_count(runtime))
     for(int row=0;row<hidden;++row){
+        qwen_pin_decode_member();
         float sum=0.0f;
         for(int rank=0;rank<routed_count;++rank){
             const int expert=selected[rank];
@@ -5067,8 +5190,12 @@ void qwen_cpu_dense_ffn(
     // orders the down projection after the SwiGLU, and a spilled 27B pays this
     // per block, thirty-odd times a token, so the second region launch was
     // pure overhead.
-    #pragma omp parallel num_threads(qwen_cpu_thread_count(runtime))
+#if defined(_OPENMP)
+    const QwenDecodeCaller decode_caller(qwen_cpu_decode_thread_count(runtime));
+#endif
+    #pragma omp parallel num_threads(qwen_cpu_decode_thread_count(runtime))
     {
+        qwen_pin_decode_member();
         #pragma omp for schedule(static)
         for(int row=0;row<intermediate;++row){
             const float gate=qwen_quant_dot(gate_data,gate_type,local_input,hidden,row);
@@ -6580,13 +6707,11 @@ void qwen_cpu_moe(
     // path for A/B; FLYWEIGHT_Q8_ACTIVATIONS=0 turns every int8-activation
     // path off, this one included.
     static const char* iq1s_q8_setting = std::getenv("FLYWEIGHT_IQ1S_Q8");
-    const bool iq1s_q8 = !use_q8 && (cpu_features & 8u) != 0
-        && (gate_type == 19 || gate_type == 21) && up_type == gate_type
-        && hidden % 256 == 0
+    const bool iq1s_q8 = !use_q8 && qwen_iq_q8_admitted(gate_type)
+        && up_type == gate_type && hidden % 256 == 0
         && !(iq1s_q8_setting && iq1s_q8_setting[0] == '0')
         && !(q8_setting && q8_setting[0] == '0');
-    const auto iq_q8_dot = gate_type == 21
-        ? &qwen_iq3s_dot_q8_k_vnni512 : &qwen_iq1s_dot_q8_k_vnni512;
+    const auto iq_q8_dot = qwen_iq_q8_dot(gate_type);
     thread_local std::vector<QwenQ8KBlock> input_q8, activated_q8;
     if (use_q8 || iq1s_q8) {
         input_q8.resize(hidden / 256);
@@ -6595,10 +6720,10 @@ void qwen_cpu_moe(
     if (use_q8)
         activated_q8.resize(static_cast<std::size_t>(routed_count) * (intermediate / 256));
 #if defined(_OPENMP)
-    // Decode is bandwidth-bound on expert weights. SMT siblings contend for the
-    // same load ports and memory bandwidth, so use physical cores by default.
-    // Keep an explicit OMP_NUM_THREADS override for machine-specific tuning.
-    const int team = qwen_cpu_thread_count(runtime);
+    // Physical cores, chosen per model by qwen_cpu_decode_thread_count();
+    // OMP_NUM_THREADS and --cpu-threads win.
+    const int team = qwen_cpu_decode_thread_count(runtime);
+    const QwenDecodeCaller decode_caller(team);
 #endif
     const auto* input_q8_data = input_q8.data();
     auto* activated_q8_data = activated_q8.data();
@@ -6701,6 +6826,7 @@ void qwen_cpu_moe(
 #pragma omp parallel num_threads(team)
 #endif
         {
+            qwen_pin_decode_member();
             // `omp for` carries an implicit barrier, so a timestamp taken by one
             // thread between them is a true phase boundary rather than a sample
             // of whichever thread got there first.
@@ -6761,6 +6887,7 @@ void qwen_cpu_moe(
 #pragma omp parallel num_threads(team)
 #endif
         {
+            qwen_pin_decode_member();
             if (q4_tiled) {
 #if defined(_OPENMP)
 #pragma omp for schedule(static)
@@ -7022,12 +7149,11 @@ void qwen_cpu_moe_rows(
     // qwen_cpu_moe's iq1s_q8.
     static const char* iq1s_q8_setting=std::getenv("FLYWEIGHT_IQ1S_Q8");
     static const char* q8_setting=std::getenv("FLYWEIGHT_Q8_ACTIVATIONS");
-    const bool iq1s_q8=(flyweight_cpu_features()&8u)!=0
-        &&(gate_type==19||gate_type==21)&&up_type==gate_type&&hidden%256==0
+    const bool iq1s_q8=qwen_iq_q8_admitted(gate_type)
+        &&up_type==gate_type&&hidden%256==0
         &&!(iq1s_q8_setting&&iq1s_q8_setting[0]=='0')
         &&!(q8_setting&&q8_setting[0]=='0');
-    const auto iq_q8_dot=gate_type==21
-        ?&qwen_iq3s_dot_q8_k_vnni512:&qwen_iq1s_dot_q8_k_vnni512;
+    const auto iq_q8_dot=qwen_iq_q8_dot(gate_type);
     thread_local std::vector<QwenQ8KBlock> tl_input_q8;
     auto& input_q8=tl_input_q8;
     const int q8_blocks=hidden/256;

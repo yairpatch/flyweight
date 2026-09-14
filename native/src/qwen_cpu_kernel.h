@@ -187,6 +187,15 @@ float qwen_iq1s_dot_q8_k_vnni512(
     std::uint64_t row
 );
 
+// The same IQ1_S x Q8_K dot on AVX-VNNI (VEX, 256-bit), for parts without
+// AVX-512: one dpbusd per 32-value group. Requires AVX-VNNI (feature bit 2).
+float qwen_iq1s_dot_q8_k_avx_vnni(
+    const std::uint8_t* packed,
+    const QwenQ8KBlock* input,
+    int elements,
+    std::uint64_t row
+);
+
 // IQ3_S row against Q8_K activations: masked high bits, masked signs, gathered
 // unsigned magnitudes into dpbusd. Requires AVX512-VNNI (feature bit 3).
 float qwen_iq3s_dot_q8_k_vnni512(

@@ -23,6 +23,8 @@
 #include <optional>
 #include <vector>
 
+#include "flyweight_cpu_topology.hpp"
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -645,31 +647,16 @@ inline void swiglu(
 // memory bandwidth and cache, not by issue width, so a second thread on the
 // same physical core buys nothing and costs contention for its L1/L2.
 //
-// So the default is one thread per physical core, read from Linux's topology
-// rather than assumed. An explicit OMP_NUM_THREADS always wins: if the caller
-// said what they wanted, they meant it.
+// So the default is one thread per physical core, counted from the host
+// topology (flyweight_cpu_topology.hpp) rather than assumed -- dividing by
+// cpu0's sibling count undercounts hybrid parts, whose efficiency cores have
+// none. An explicit OMP_NUM_THREADS always wins: if the caller said what they
+// wanted, they meant it.
 inline int matvec_threads() {
 #ifdef _OPENMP
     static const int threads = [] {
         if (std::getenv("OMP_NUM_THREADS")) return omp_get_max_threads();
-        int siblings = 1;
-#if defined(__linux__)
-        if (std::FILE* file = std::fopen(
-                "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", "r")) {
-            char line[256] = {};
-            if (std::fgets(line, sizeof(line), file)) {
-                // "0,16" or "0-1": one entry per hardware thread on this core.
-                siblings = 1;
-                for (const char* c = line; *c; ++c)
-                    if (*c == ',') ++siblings;
-                    else if (*c == '-') siblings = 2;
-            }
-            std::fclose(file);
-        }
-#endif
-        const int procs = omp_get_num_procs();
-        const int physical = siblings > 1 ? procs / siblings : procs;
-        return physical > 0 ? physical : 1;
+        return ::flyweight::cpu_topology::batch_threads();
     }();
     return threads;
 #else

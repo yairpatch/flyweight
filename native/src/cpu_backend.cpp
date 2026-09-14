@@ -18,6 +18,7 @@
 #include <flyweight_cpu_kernels_api.hpp>
 #include <flyweight_cpu_native.hpp>
 #include <flyweight_cpu_shim_geometry.hpp>
+#include <flyweight_cpu_topology.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -241,20 +242,16 @@ int worker_count() {
     // Ryzen 9 9955HX with a 35B Q8_0 MoE: 8.30 tok/s at 16 threads against
     // 5.73 at 32, so the logical-core default was costing 31%.
     //
+    // The cores are counted from the host topology (flyweight_cpu_topology.hpp),
+    // which logical processors / 2 undercounts on hybrid parts.
     // qwen_cpu_thread_count() applies the same rule to the CPU MoE path; an
     // explicit OMP_NUM_THREADS still wins in both places.
 #if defined(_OPENMP)
-    int team = omp_get_max_threads();
-    if (std::getenv("OMP_NUM_THREADS") == nullptr) {
-        const int physical = omp_get_num_procs() / 2;
-        if (physical >= 1 && team > physical) team = physical;
-    }
-    return team;
+    const int limit = omp_get_max_threads();
+    if (std::getenv("OMP_NUM_THREADS") != nullptr) return limit;
+    return std::max(1, std::min(flyweight::cpu_topology::batch_threads(), limit));
 #else
-    const unsigned int detected = std::thread::hardware_concurrency();
-    if (detected == 0) return 1;
-    const int physical = static_cast<int>(detected) / 2;
-    return physical >= 1 ? physical : 1;
+    return flyweight::cpu_topology::batch_threads();
 #endif
 }
 
