@@ -490,6 +490,29 @@ CACHE_TYPE_NAMES = {code: name for name, code in CACHE_TYPE_CODES.items()}
 
 
 _TokenCallback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p)
+_DiffusionProgress = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32
+)
+
+
+class _DiffusionInfo(ctypes.Structure):
+    _fields_ = [
+        ("host_weights", ctypes.c_uint32),
+        ("exact", ctypes.c_uint32),
+        ("balanced", ctypes.c_uint32),
+        ("max_width", ctypes.c_uint32),
+        ("max_height", ctypes.c_uint32),
+        ("device_bytes", ctypes.c_uint64),
+        ("host_bytes", ctypes.c_uint64),
+    ]
+
+
+# Where the image model's weights live; see flyweight_v2.h.
+DIFFUSION_WEIGHTS = {"device": 0, "host": 1, "auto": 2}
+# OR-ed into the weights flag: exact f32 activations instead of the Q8/bf16 paths.
+DIFFUSION_EXACT = 8
+DIFFUSION_BALANCED = 16
+DIFFUSION_PRECISION = {"fast": 0, "balanced": DIFFUSION_BALANCED, "exact": DIFFUSION_EXACT}
 
 
 class _QwenTaskEvent(ctypes.Structure):
@@ -605,6 +628,67 @@ def _library() -> ctypes.CDLL:
                     ctypes.c_uint64,
                 ]
                 lib.flyweight_v2_qwen_vision_encode.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_create.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ]
+                lib.flyweight_v2_diffusion_create.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_destroy.argtypes = [ctypes.c_void_p]
+                lib.flyweight_v2_diffusion_destroy.restype = None
+                lib.flyweight_v2_diffusion_info.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(_DiffusionInfo),
+                ]
+                lib.flyweight_v2_diffusion_info.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_encode_text.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                ]
+                lib.flyweight_v2_diffusion_encode_text.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_transformer_step.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_float,
+                    ctypes.c_void_p,
+                ]
+                lib.flyweight_v2_diffusion_transformer_step.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_decode_latents.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                ]
+                lib.flyweight_v2_diffusion_decode_latents.restype = ctypes.c_int
+                lib.flyweight_v2_diffusion_generate.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_float,
+                    ctypes.c_uint64,
+                    ctypes.c_void_p,
+                    _DiffusionProgress,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                ]
+                lib.flyweight_v2_diffusion_generate.restype = ctypes.c_int
                 lib.flyweight_v2_hf_quant_options.argtypes = [
                     ctypes.c_char_p,
                     ctypes.POINTER(_HfQuantOption),
@@ -3352,3 +3436,177 @@ class V2KvCache:
                 or b"native v2 cached decoder step failed"
             )
             raise V2Error(message.decode(errors="replace"))
+
+
+class V2Diffusion:
+    """Z-Image-Turbo on the native tower: text encoder, DiT and VAE decoder.
+
+    The three ``V2Model`` handles are the diffusers component directories
+    (``text_encoder``, ``transformer``, ``vae``) opened as models; they must
+    outlive the tower. Latents are ``[16][height/8][width/8]`` float32 arrays,
+    images come back as ``height*width*3`` interleaved RGB bytes.
+
+    ``weights`` places the encoder's and DiT's weights: ``"device"``,
+    ``"host"`` (pinned host memory, streamed a layer at a time through a few
+    hundred MiB of device memory, so a chat model can share the card), or
+    ``"auto"`` (host when they would take more than half the card).
+    ``precision`` is ``"fast"`` (Q8 activations, bf16 attention and
+    convolutions on tensor cores), ``"balanced"`` (bf16 activations into a
+    tensor-core GEMM over the stored Q8_0 weights, bf16 attention and
+    convolutions) or ``"exact"`` (f32 everywhere but the stored weights;
+    several times slower).
+    """
+
+    def __init__(
+        self,
+        encoder: V2Model,
+        transformer: V2Model,
+        vae: V2Model,
+        *,
+        device: int = 0,
+        max_width: int = 1024,
+        max_height: int = 1024,
+        max_prompt_tokens: int = 512,
+        weights: str = "auto",
+        precision: str = "fast",
+    ) -> None:
+        if weights not in DIFFUSION_WEIGHTS:
+            raise ValueError(f"weights must be one of {sorted(DIFFUSION_WEIGHTS)}")
+        if precision not in DIFFUSION_PRECISION:
+            raise ValueError(f"precision must be one of {sorted(DIFFUSION_PRECISION)}")
+        self._lib = _library()
+        self._models = (encoder, transformer, vae)
+        self._handle = ctypes.c_void_p()
+        self.max_width = max_width
+        self.max_height = max_height
+        self.max_prompt_tokens = max_prompt_tokens
+        self.caption_width = int(str(encoder.config.get("hidden_size", 0)))
+        self._check(
+            self._lib.flyweight_v2_diffusion_create(
+                encoder._handle, transformer._handle, vae._handle,
+                ctypes.c_int32(device), ctypes.c_uint32(max_width),
+                ctypes.c_uint32(max_height), ctypes.c_uint32(max_prompt_tokens),
+                ctypes.c_uint32(DIFFUSION_WEIGHTS[weights] | DIFFUSION_PRECISION[precision]),
+                ctypes.byref(self._handle),
+            )
+        )
+
+    @property
+    def info(self) -> dict[str, int | bool]:
+        """Where the weights ended up and what the tower holds on the device."""
+        value = _DiffusionInfo()
+        self._check(self._lib.flyweight_v2_diffusion_info(self._handle, ctypes.byref(value)))
+        return {
+            "host_weights": bool(value.host_weights),
+            "exact": bool(value.exact),
+            "balanced": bool(value.balanced),
+            "max_width": int(value.max_width),
+            "max_height": int(value.max_height),
+            "device_bytes": int(value.device_bytes),
+            "host_bytes": int(value.host_bytes),
+        }
+
+    def close(self) -> None:
+        if self._handle:
+            self._lib.flyweight_v2_diffusion_destroy(self._handle)
+            self._handle = ctypes.c_void_p()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _check(self, status: int) -> None:
+        if status:
+            message = self._lib.flyweight_v2_last_error() or b"native v2 error"
+            raise V2Error(message.decode(errors="replace"))
+
+    @staticmethod
+    def _floats(values: Any, count: int, name: str) -> "array.array[float]":
+        data = values if isinstance(values, array.array) and values.typecode == "f" else array.array("f", values)
+        if len(data) != count:
+            raise ValueError(f"{name} must hold {count} floats, got {len(data)}")
+        return data
+
+    def encode_text(self, tokens: Sequence[int]) -> "array.array[float]":
+        """hidden_states[-2] of the encoder: ``len(tokens) * caption_width`` floats."""
+        ids = (ctypes.c_uint32 * len(tokens))(*tokens)
+        out = array.array("f", bytes(4 * len(tokens) * self.caption_width))
+        buffer = (ctypes.c_float * len(out)).from_buffer(out)
+        self._check(
+            self._lib.flyweight_v2_diffusion_encode_text(
+                self._handle, ids, ctypes.c_uint64(len(tokens)), buffer, ctypes.c_uint64(len(out))
+            )
+        )
+        return out
+
+    def transformer_step(
+        self, latents: Any, latent_h: int, latent_w: int, caption: Any, caption_tokens: int, time: float
+    ) -> "array.array[float]":
+        """One DiT forward: the raw model output (before negation) for the latents."""
+        count = 16 * latent_h * latent_w
+        x = self._floats(latents, count, "latents")
+        c = self._floats(caption, caption_tokens * self.caption_width, "caption")
+        out = array.array("f", bytes(4 * count))
+        self._check(
+            self._lib.flyweight_v2_diffusion_transformer_step(
+                self._handle,
+                (ctypes.c_float * count).from_buffer(x), ctypes.c_uint32(latent_h), ctypes.c_uint32(latent_w),
+                (ctypes.c_float * len(c)).from_buffer(c), ctypes.c_uint64(caption_tokens),
+                ctypes.c_float(time), (ctypes.c_float * count).from_buffer(out),
+            )
+        )
+        return out
+
+    def decode_latents(self, latents: Any, latent_h: int, latent_w: int) -> bytes:
+        """VAE decode: ``(latent_h*8) * (latent_w*8) * 3`` RGB bytes."""
+        count = 16 * latent_h * latent_w
+        x = self._floats(latents, count, "latents")
+        rgb = ctypes.create_string_buffer(latent_h * 8 * latent_w * 8 * 3)
+        self._check(
+            self._lib.flyweight_v2_diffusion_decode_latents(
+                self._handle, (ctypes.c_float * count).from_buffer(x),
+                ctypes.c_uint32(latent_h), ctypes.c_uint32(latent_w), rgb,
+            )
+        )
+        return rgb.raw
+
+    def generate(
+        self,
+        tokens: Sequence[int],
+        width: int,
+        height: int,
+        *,
+        steps: int = 8,
+        shift: float = 3.0,
+        seed: int = 0,
+        initial_latents: Any = None,
+        progress: Any = None,
+    ) -> bytes:
+        """The whole pipeline: ``width*height*3`` RGB bytes.
+
+        ``progress(step, steps)`` is called after the encoder and after each
+        denoising step; returning a true value cancels the run.
+        """
+        ids = (ctypes.c_uint32 * len(tokens))(*tokens)
+        rgb = ctypes.create_string_buffer(width * height * 3)
+        latents = None
+        if initial_latents is not None:
+            latents = self._floats(initial_latents, 16 * (height // 8) * (width // 8), "initial_latents")
+
+        def on_progress(_user: Any, step: int, total: int) -> int:
+            if progress is None:
+                return 0
+            return 1 if progress(step, total) else 0
+
+        callback = _DiffusionProgress(on_progress)
+        self._check(
+            self._lib.flyweight_v2_diffusion_generate(
+                self._handle, ids, ctypes.c_uint64(len(tokens)), ctypes.c_uint32(width), ctypes.c_uint32(height),
+                ctypes.c_uint32(steps), ctypes.c_float(shift), ctypes.c_uint64(seed),
+                (ctypes.c_float * len(latents)).from_buffer(latents) if latents is not None else None,
+                callback, None, rgb,
+            )
+        )
+        return rgb.raw

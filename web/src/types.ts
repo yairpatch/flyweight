@@ -135,6 +135,19 @@ export interface Preset {
   tools: ToolDefinition[];
 }
 
+/** A rendered picture in the studio's history, the PNG kept as a Blob. */
+export interface ImageRecord {
+  id: string;
+  createdAt: number;
+  prompt: string;
+  seed: number;
+  width: number;
+  height: number;
+  steps: number;
+  seconds: number;
+  blob: Blob;
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -160,6 +173,7 @@ export interface HealthPayload {
   execution?: Record<string, unknown> & {
     backend?: string;
     vision?: Record<string, unknown> | null;
+    images?: Record<string, unknown> | null;
   };
 }
 

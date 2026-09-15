@@ -17,7 +17,8 @@ from pathlib import Path
 import cupy as cp
 
 INCLUDE = Path(__file__).resolve().parent.parent / "include"
-HEADERS = ("flyweight_v2_qwen_kernels.hpp", "flyweight_v2_native_kernels.hpp")
+HEADERS = ("flyweight_v2_qwen_kernels.hpp", "flyweight_v2_native_kernels.hpp",
+           "flyweight_v2_diffusion_kernels.hpp")
 
 _OPEN = 'R"FLYWEIGHT_CUDA('
 _CLOSE = ')FLYWEIGHT_CUDA"'

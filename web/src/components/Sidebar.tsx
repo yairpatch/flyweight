@@ -1,6 +1,8 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
+  Image as ImageIcon,
+  MessageSquare,
   MessageSquarePlus,
   PanelLeftClose,
   PanelLeftOpen,
@@ -23,6 +25,9 @@ export function Sidebar() {
   const selectConversation = useStore((state) => state.selectConversation);
   const importConversation = useStore((state) => state.importConversation);
   const toast = useStore((state) => state.toast);
+  const mode = useStore((state) => state.mode);
+  const setMode = useStore((state) => state.setMode);
+  const imagesEnabled = useStore((state) => Boolean(state.health?.execution?.images));
   const [query, setQuery] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -70,11 +75,34 @@ export function Sidebar() {
         <button className="icon-button" onClick={() => toggleSidebar()} title={open ? "Collapse sidebar (Ctrl+B)" : "Expand sidebar (Ctrl+B)"} aria-label="Toggle sidebar">
           {open ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}
         </button>
-        <button className="button button--primary sidebar__new" onClick={() => newConversation()} title="New conversation (Ctrl+Shift+O)">
-          <MessageSquarePlus size={16} />
-          <span className="sidebar__label">New chat</span>
-        </button>
+        {mode === "images" ? (
+          <button className="button button--primary sidebar__new" onClick={() => { useStore.getState().selectImage(null); useStore.getState().setImagePrompt(""); }} title="Clear the canvas for a new picture">
+            <ImageIcon size={16} />
+            <span className="sidebar__label">New picture</span>
+          </button>
+        ) : (
+          <button className="button button--primary sidebar__new" onClick={() => newConversation()} title="New conversation (Ctrl+Shift+O)">
+            <MessageSquarePlus size={16} />
+            <span className="sidebar__label">New chat</span>
+          </button>
+        )}
       </div>
+      {(imagesEnabled || mode === "images") && (
+        <div className="sidebar__modes" role="tablist" aria-label="Workspace">
+          <button role="tab" aria-selected={mode === "chat"} className={`sidebar__mode${mode === "chat" ? " sidebar__mode--active" : ""}`} onClick={() => setMode("chat")} title="Chat">
+            <MessageSquare size={15} />
+            <span className="sidebar__label">Chat</span>
+          </button>
+          <button role="tab" aria-selected={mode === "images"} className={`sidebar__mode${mode === "images" ? " sidebar__mode--active" : ""}`} onClick={() => setMode("images")} title="Images">
+            <ImageIcon size={15} />
+            <span className="sidebar__label">Images</span>
+          </button>
+        </div>
+      )}
+      {mode === "images" ? (
+        <ImageHistory />
+      ) : (
+        <>
       <label className="sidebar__search">
         <Search size={14} />
         <input
@@ -96,6 +124,9 @@ export function Sidebar() {
           </section>
         ))}
       </nav>
+        </>
+      )}
+      {mode !== "images" && (
       <div className="sidebar__bottom">
         <button className="button button--ghost" onClick={() => fileInput.current?.click()} title="Import conversations from JSON">
           <Upload size={15} />
@@ -115,7 +146,35 @@ export function Sidebar() {
         </button>
         <input ref={fileInput} type="file" accept="application/json,.json" hidden onChange={(event) => void onImport(event.target.files)} />
       </div>
+      )}
     </aside>
+  );
+}
+
+/** The studio's rendered pictures, newest first; clicking one shows it on the canvas. */
+function ImageHistory() {
+  const images = useStore((state) => state.images);
+  const currentImageId = useStore((state) => state.currentImageId);
+  const selectImage = useStore((state) => state.selectImage);
+  const urls = useMemo(() => new Map(images.map((image) => [image.id, URL.createObjectURL(image.blob)])), [images]);
+  useEffect(() => () => { for (const url of urls.values()) URL.revokeObjectURL(url); }, [urls]);
+  return (
+    <nav className="sidebar__list history" aria-label="Rendered images">
+      {images.length === 0 && <p className="sidebar__empty">No pictures yet.</p>}
+      <div className="history__grid">
+        {images.map((image) => (
+          <button
+            key={image.id}
+            className={`history__item${image.id === currentImageId ? " history__item--active" : ""}`}
+            onClick={() => selectImage(image.id)}
+            title={`${image.prompt}\n${image.width}x${image.height} · seed ${image.seed}`}
+            aria-current={image.id === currentImageId ? "true" : undefined}
+          >
+            <img src={urls.get(image.id)} alt={image.prompt} loading="lazy" />
+          </button>
+        ))}
+      </div>
+    </nav>
   );
 }
 

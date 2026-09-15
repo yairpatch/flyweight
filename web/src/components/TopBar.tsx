@@ -19,6 +19,7 @@ export function TopBar() {
   const setTheme = useStore((state) => state.setTheme);
   const setPaletteOpen = useStore((state) => state.setPaletteOpen);
   const conversation = useActiveConversation();
+  const mode = useStore((state) => state.mode);
 
   const execution = health?.execution ?? {};
   const backend = String(execution.backend ?? "");
@@ -43,8 +44,8 @@ export function TopBar() {
         <button className="icon-button topbar__menu" onClick={() => useStore.getState().toggleSidebar()} aria-label="Toggle conversations">
           <Menu size={18} />
         </button>
-        <h1 className="topbar__title" title={conversation?.title}>
-          {conversation?.title ?? "Flyweight Chat"}
+        <h1 className="topbar__title" title={mode === "images" ? "Image studio" : conversation?.title}>
+          {mode === "images" ? "Image studio" : (conversation?.title ?? "Flyweight Chat")}
         </h1>
       </div>
       <div className="topbar__center">

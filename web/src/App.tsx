@@ -7,6 +7,7 @@ import { Toasts } from "./components/Toasts";
 import { PreviewOverlay } from "./components/PreviewOverlay";
 import { CommandPalette } from "./components/CommandPalette";
 import { SidePanel } from "./components/SidePanel";
+import { Studio } from "./components/Studio";
 import { useStore } from "./store";
 
 const POLL_MS = 5000;
@@ -17,6 +18,7 @@ export function App() {
   const ready = useStore((state) => state.ready);
   const sidebarOpen = useStore((state) => state.sidebarOpen);
   const panel = useStore((state) => state.panel);
+  const mode = useStore((state) => state.mode);
 
   useEffect(() => {
     void init();
@@ -86,8 +88,14 @@ export function App() {
       <div className="scrim" onClick={() => useStore.getState().toggleSidebar(false)} aria-hidden="true" />
       <main className="main" aria-busy={!ready}>
         <TopBar />
-        <Transcript />
-        <Composer />
+        {mode === "images" ? (
+          <Studio />
+        ) : (
+          <>
+            <Transcript />
+            <Composer />
+          </>
+        )}
       </main>
       <SidePanel />
       <Toasts />

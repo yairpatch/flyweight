@@ -3,8 +3,9 @@
 // to IndexedDB (conversations, presets) and localStorage (settings, tools,
 // UI preferences).
 import { create } from "zustand";
-import { api, ApiError } from "./lib/api";
+import { api, ApiError, openStream } from "./lib/api";
 import { db, migrateLegacyHistory } from "./lib/db";
+import { readSse } from "./lib/sse";
 import { generate } from "./lib/generate";
 import { identifier, titleFromPrompt } from "./lib/format";
 import { buildRequest } from "./lib/protocols";
@@ -27,9 +28,27 @@ import type {
   StreamEvent,
   ToolCall,
   ToolDefinition,
+  ImageRecord,
 } from "./types";
 
 export type Panel = "settings" | "tools" | "runtime" | "tokenizer" | "playground" | "inspector" | null;
+/** Which workspace the main area shows. */
+export type Mode = "chat" | "images";
+
+export interface ImageSettings {
+  aspect: "1:1" | "3:2" | "2:3" | "16:9" | "9:16";
+  /** The longer side in pixels; the other follows the aspect, both rounded to 16. */
+  size: number;
+  steps: number;
+  /** A fixed seed, or null for a fresh one per render. */
+  seed: number | null;
+}
+
+export interface ImageProgress {
+  step: number;
+  steps: number;
+  startedAt: number;
+}
 export type ThemePreference = "system" | "light" | "dark";
 export type RuntimeStatus = "connecting" | "online" | "busy" | "offline" | "locked";
 
@@ -48,6 +67,20 @@ const TOOLS_KEY = "flyweight.tools.v1";
 const THEME_KEY = "flyweight.theme";
 const SIDEBAR_KEY = "flyweight.sidebar";
 const MODEL_KEY = "flyweight.model";
+const MODE_KEY = "flyweight.mode";
+const IMAGE_SETTINGS_KEY = "flyweight.images.settings.v1";
+
+const DEFAULT_IMAGE_SETTINGS: ImageSettings = { aspect: "1:1", size: 1024, steps: 8, seed: null };
+
+/** Pixel dimensions for the studio's aspect and size, multiples of 16 within `limit`. */
+export function imageDimensions(settings: ImageSettings, limit: number): { width: number; height: number } {
+  const ratios: Record<ImageSettings["aspect"], [number, number]> = { "1:1": [1, 1], "3:2": [3, 2], "2:3": [2, 3], "16:9": [16, 9], "9:16": [9, 16] };
+  const [rw, rh] = ratios[settings.aspect];
+  const long = Math.min(settings.size, limit);
+  const round16 = (value: number) => Math.max(256, Math.round(value / 16) * 16);
+  if (rw >= rh) return { width: round16(long), height: round16((long * rh) / rw) };
+  return { width: round16((long * rw) / rh), height: round16(long) };
+}
 const HEALTH_HISTORY = 180;
 const REQUEST_HISTORY = 25;
 
@@ -99,6 +132,13 @@ const DEFAULT_TOOLS: ToolDefinition[] = [
 
 interface StoreState {
   ready: boolean;
+  mode: Mode;
+  images: ImageRecord[];
+  imageSettings: ImageSettings;
+  currentImageId: string | null;
+  imageProgress: ImageProgress | null;
+  imageError: string | null;
+  imagePrompt: string;
   conversations: Conversation[];
   activeId: string | null;
   settings: GenerationSettings;
@@ -172,6 +212,13 @@ interface StoreState {
 
   // ui
   setPanel: (panel: Panel) => void;
+  setMode: (mode: Mode) => void;
+  setImagePrompt: (prompt: string) => void;
+  updateImageSettings: (patch: Partial<ImageSettings>) => void;
+  generateImage: (options?: { seed?: number | null }) => Promise<void>;
+  cancelImage: () => void;
+  selectImage: (id: string | null) => void;
+  deleteImage: (id: string) => Promise<void>;
   setTheme: (theme: ThemePreference) => void;
   toggleSidebar: (open?: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
@@ -198,6 +245,8 @@ function isNarrow(): boolean {
 function touch(conversation: Conversation): Conversation {
   return { ...conversation, updatedAt: Date.now() };
 }
+
+let imageAbort: AbortController | null = null;
 
 export const useStore = create<StoreState>()((set, get) => {
   const persistTimers = new Map<string, number>();
@@ -439,6 +488,13 @@ export const useStore = create<StoreState>()((set, get) => {
 
   return {
     ready: false,
+    mode: (readString(MODE_KEY, "chat") === "images" ? "images" : "chat") as Mode,
+    images: [],
+    imageSettings: { ...DEFAULT_IMAGE_SETTINGS, ...readJson<Partial<ImageSettings>>(IMAGE_SETTINGS_KEY, {}) },
+    currentImageId: null,
+    imageProgress: null,
+    imageError: null,
+    imagePrompt: "",
     conversations: [],
     activeId: null,
     settings: loadSettings(),
@@ -472,11 +528,12 @@ export const useStore = create<StoreState>()((set, get) => {
       } catch {
         /* ignore */
       }
-      const [conversations, presets] = await Promise.all([
+      const [conversations, presets, images] = await Promise.all([
         db.conversations.orderBy("updatedAt").reverse().toArray(),
         db.presets.toArray(),
+        db.images.orderBy("createdAt").reverse().toArray().catch(() => [] as ImageRecord[]),
       ]);
-      set({ conversations, presets, ready: true, activeId: conversations[0]?.id ?? null });
+      set({ conversations, presets, images, currentImageId: images[0]?.id ?? null, ready: true, activeId: conversations[0]?.id ?? null });
       await get().pollRuntime();
     },
 
@@ -765,6 +822,94 @@ export const useStore = create<StoreState>()((set, get) => {
     },
 
     setPanel: (panel) => set((state) => ({ panel: state.panel === panel ? null : panel })),
+
+    setMode: (mode) => {
+      try {
+        localStorage.setItem(MODE_KEY, mode);
+      } catch {
+        /* ignore */
+      }
+      set({ mode });
+    },
+    setImagePrompt: (imagePrompt) => set({ imagePrompt }),
+    updateImageSettings: (patch) => {
+      const imageSettings = { ...get().imageSettings, ...patch };
+      try {
+        localStorage.setItem(IMAGE_SETTINGS_KEY, JSON.stringify(imageSettings));
+      } catch {
+        /* ignore */
+      }
+      set({ imageSettings });
+    },
+    selectImage: (currentImageId) => set({ currentImageId }),
+    deleteImage: async (id) => {
+      await db.images.delete(id);
+      set((state) => {
+        const images = state.images.filter((image) => image.id !== id);
+        const currentImageId = state.currentImageId === id ? (images[0]?.id ?? null) : state.currentImageId;
+        return { images, currentImageId };
+      });
+    },
+    cancelImage: () => {
+      imageAbort?.abort();
+    },
+    generateImage: async (options = {}) => {
+      const state = get();
+      const prompt = state.imagePrompt.trim();
+      if (!prompt || state.imageProgress) return;
+      const info = state.health?.execution?.images as { max_size?: string } | null | undefined;
+      const limit = parseInt(String(info?.max_size ?? "1024x1024").split("x")[0] ?? "1024", 10) || 1024;
+      const { width, height } = imageDimensions(state.imageSettings, limit);
+      const seed = options.seed === undefined ? state.imageSettings.seed : options.seed;
+      const body: Record<string, unknown> = { prompt, size: `${width}x${height}`, steps: state.imageSettings.steps, stream: true };
+      if (seed !== null) body.seed = seed;
+      const abort = new AbortController();
+      imageAbort = abort;
+      set({ imageProgress: { step: 0, steps: state.imageSettings.steps, startedAt: Date.now() }, imageError: null });
+      try {
+        const response = await openStream("/v1/images/generations", body, abort.signal);
+        if (!response.body) throw new Error("empty response");
+        for await (const frame of readSse(response.body)) {
+          if (frame.data === "[DONE]") break;
+          let event: Record<string, unknown>;
+          try {
+            event = JSON.parse(frame.data);
+          } catch {
+            continue;
+          }
+          if (event.error && typeof event.error === "object") {
+            throw new Error(String((event.error as { message?: string }).message ?? "image generation failed"));
+          }
+          if (event.type === "progress") {
+            set((current) => (current.imageProgress ? { imageProgress: { ...current.imageProgress, step: Number(event.step), steps: Number(event.steps) } } : {}));
+          } else if (event.type === "image") {
+            const bytes = Uint8Array.from(atob(String(event.b64_json)), (character) => character.charCodeAt(0));
+            const record: ImageRecord = {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              createdAt: Date.now(),
+              prompt,
+              seed: Number(event.seed),
+              width,
+              height,
+              steps: state.imageSettings.steps,
+              seconds: Number(event.seconds),
+              blob: new Blob([bytes], { type: "image/png" }),
+            };
+            await db.images.put(record).catch(() => get().toast("Could not save the picture", "error"));
+            set((current) => ({ images: [record, ...current.images], currentImageId: record.id }));
+          }
+        }
+      } catch (failure) {
+        if (!abort.signal.aborted) {
+          const message = failure instanceof ApiError ? failure.message : String(failure);
+          set({ imageError: message });
+          get().toast(message, "error");
+        }
+      } finally {
+        if (imageAbort === abort) imageAbort = null;
+        set({ imageProgress: null });
+      }
+    },
 
     setTheme: (theme) => {
       try {

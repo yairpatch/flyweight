@@ -48,6 +48,10 @@ loads from GGUF, including multi-file `-00001-of-0000N` splits.
   vision tower runs natively, images take part in prefix reuse, and OpenAI
   `image_url`, Responses `input_image` and Anthropic `image` parts are all
   accepted
+- Image generation with Z-Image-Turbo (`--image-model`): the Qwen3 text
+  encoder, the single-stream DiT and the KL autoencoder all run on the
+  engine's own kernels from the diffusers safetensors, quantized on load
+  and served at `/v1/images/generations` and in the chat UI's Image studio
 - Thinking controls: per-request effort for checkpoints that grade their
   reasoning, and a hard thinking-token budget the sampler cannot overrun
 - OpenAI Chat Completions, Responses, and legacy Completions APIs
@@ -468,6 +472,62 @@ does. Without a tower an image part degrades to a visible
 `[image omitted: ...]` note in the prompt (`[unsupported image block
 omitted]` for an Anthropic `image` block) rather than failing the request,
 since the part sits in the client's history and would return on every retry.
+
+### Image generation
+
+`--image-model` attaches a [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
+snapshot beside the chat model and serves it at `/v1/images/generations`
+(OpenAI's shape: `prompt`, `size`, `n`, `seed`, plus `steps` and `shift`),
+and in the chat UI's **Image studio** panel. The directory is the diffusers
+layout (`text_encoder/`, `transformer/`, `vae/`, `tokenizer/`); a
+`huggingface-cli download Tongyi-MAI/Z-Image-Turbo` snapshot works as is:
+
+~~~bash
+flyweight serve Qwen3.6-35B-A3B-Q6_K.gguf \
+  --image-model ~/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/<hash>
+
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "a red bicycle leaning on a brick wall", "size": "1024x1024", "seed": 7}'
+~~~
+
+All three components run on the engine's own kernels: the Qwen3-4B encoder
+(its second-to-last hidden state is the conditioning) and the 6B DiT are
+quantized on first open through the safetensors loader and cached beside
+the checkpoint -- both at Q8_0 (the DiT is 6.2 GB from 24.6 GB of f32),
+`FLYWEIGHT_HF_QUANT` overriding both -- and the 50M-parameter VAE decoder
+keeps f32 weights with its large convolutions on bf16 tensor cores. The
+DiT's attention runs on bf16 tensor cores too, and the decoder tiles
+anything past 512x512 the way diffusers' `enable_tiling` does, so the
+model's native 1024x1024 fits a 12 GB card. Eight steps take about 14 s at
+1024x1024 and 3 s at 512x512 on an RTX 5070 Ti laptop, almost all of it
+the DiT's GEMMs; the decode is under a second. Render at 1024: the model is trained there,
+and at 512 its compositions come out visibly weaker in diffusers as well.
+
+`--image-weights` decides where the 9 GB of encoder and DiT weights live.
+`device` keeps them on the GPU. `host` pins them in RAM and streams each
+layer through two 183 MiB device slots one layer ahead of compute, so the
+tower holds about 1.7 GB of VRAM at 1024x1024 (workspace, slots, norms) and
+a large chat model can be planned beside it; the streaming overlaps with
+the DiT's own work and costs well under a second per image. `auto` (the default)
+picks `host` when the weights would take more than half the card, which
+is what lets a 12 GB card serve Qwen3.6-35B and Z-Image together. The
+image model loads before the chat runtime plans its memory either way.
+`--image-precision` picks the arithmetic. `balanced` (the default) runs
+bf16 activations through a tensor-core GEMM that dequantizes the stored
+Q8_0 weights in place, with bf16 attention and convolutions: the DiT
+step lands 3.7% RMS from an f32 reference, inside diffusers' own bf16
+run at 5.1%, at no cost over `fast`. `fast` quantizes activations to
+int8 for the MMQ kernels instead (6.6%). `exact` keeps f32 activations
+everywhere (3.3%) at about eight times the render time. The stored
+weights stay Q8_0 in every mode. `--image-max-size` fixes the largest side (the workspace is
+reserved for it at startup) and sizes must be multiples of 16; larger
+sides work with a larger reservation, 1536x1536 taking about 45 s and
+2.9 GB of VRAM. Outputs are base64 PNG
+(`b64_json`), one render at a time; a second request while one is
+rendering gets a 429.
+`tools/zimage_reference.py` dumps a diffusers run and
+`tools/check_zimage_parity.py` compares the native tower against it.
 
 ## API
 
@@ -986,6 +1046,15 @@ device are skipped.
   is refused at attach until the decoder-side injection lands. The tower's
   attention and GEMM kernels are plain CUDA rather than tensor-core paths, so
   a 1024-token image costs a few seconds to encode.
+- Image generation covers Z-Image-Turbo only. Against an f32 reference
+  the native DiT step is within 7% RMS, which is the same distance
+  diffusers' own bf16 run sits at, so renders match diffusers in kind but
+  not pixel for pixel: a chaotic eight-step sampler amplifies either
+  rounding into different details. Seeds are reproducible on this engine,
+  not against diffusers, whose noise comes from torch's generator. The
+  step time at 1024x1024 is mostly the Q8 GEMMs at ~45 TOPS on the MMQ
+  kernel; a cuBLASLt int8 path would need per-channel scales in place of
+  Q8_0's per-block ones.
 - BailingMoE3 decodes its slots by interleaving rather than batching them, so
   `--parallel` removes the waiting but does not multiply throughput the way a
   batched forward would. Its prompt evaluation also runs at admission, so a
@@ -1057,8 +1126,11 @@ device are skipped.
 
 - `native/src/v2_runtime.cpp`: GGUF parsing, memory planning, scheduling,
   model orchestration, prefix reuse, sampling, and the native runtime ABI;
-  `native/src/v2_mtp_verifier.inc` (the prefill driver and MTP verifier) and
-  `native/src/v2_vision.inc` (the mmproj tower) are compiled into it
+  `native/src/v2_mtp_verifier.inc` (the prefill driver and MTP verifier),
+  `native/src/v2_vision.inc` (the mmproj tower) and
+  `native/src/v2_diffusion.inc` (the Z-Image text encoder, DiT and VAE
+  decoder; kernels in `flyweight_v2_diffusion_kernels.hpp`) are compiled
+  into it
 - `native/src/gpu_driver.cpp`: CUDA driver, NVRTC, cuBLAS/cuBLASLt, graph,
   and transfer integration
 - `native/include/flyweight_v2_qwen_kernels.hpp`: the CUDA kernel source,

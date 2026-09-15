@@ -526,6 +526,31 @@ def _add_runtime_options(
         help="whether image parts may name http(s) URLs for the server to "
              "fetch; data: URLs are always accepted",
     )
+    add(
+        placement, "--image-model", type=Path, metavar="DIR",
+        help="image generation: a Z-Image-Turbo diffusers snapshot directory "
+             "(text_encoder/, transformer/, vae/), served at "
+             "/v1/images/generations beside the chat model",
+    )
+    add(
+        placement, "--image-max-size", type=int, default=1024, metavar="N",
+        help="largest image side the image model renders; its workspace is "
+             "reserved for NxN at startup (default 1024, the model's native size)",
+    )
+    add(
+        placement, "--image-weights", choices=("auto", "device", "host"), default="auto",
+        help="where the image model's weights live: on the GPU, pinned in host "
+             "memory and streamed a layer at a time (leaves the card to the "
+             "chat model, costs a few seconds per image), or auto: host when "
+             "they would take more than half the card",
+    )
+    add(
+        placement, "--image-precision", choices=("fast", "balanced", "exact"), default="balanced",
+        help="fast: Q8 activations on int8 tensor cores; balanced: bf16 "
+             "activations over the Q8_0 weights on bf16 tensor cores (the "
+             "reference's own numerics); exact: f32 activations everywhere "
+             "but the stored weights, several times slower",
+    )
 
     add(
         tuning, "--hybrid-prefill", choices=("split", "cpu"), default=None,
@@ -1599,6 +1624,10 @@ def _serve(args: argparse.Namespace) -> int:
         mmproj_path=getattr(args, "mmproj", None),
         image_max_tokens=getattr(args, "image_max_tokens", 1024),
         image_urls=getattr(args, "image_urls", "allow"),
+        image_model_path=getattr(args, "image_model", None),
+        image_max_size=getattr(args, "image_max_size", 1024),
+        image_weights=getattr(args, "image_weights", "auto"),
+        image_precision=getattr(args, "image_precision", "balanced"),
         model_name=args.model_name,
         device=args.device,
         context_window=args.context_window,
