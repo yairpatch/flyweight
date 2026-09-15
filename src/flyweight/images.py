@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import base64
 import io
+import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from .server import APIError
-from .v2 import V2Diffusion, V2Model
+from .v2 import V2Diffusion, V2Error, V2Model
 
 # The Qwen3 chat template with add_generation_prompt=True and thinking left
 # enabled, which is how the reference pipeline conditions the DiT.
@@ -74,6 +75,10 @@ def snapshot_model_name(root: Path) -> str:
         if parts[index] == "snapshots" and parts[index - 1].startswith("models--"):
             return parts[index - 1][len("models--"):].replace("--", "/")
     return root.name
+
+
+class _Cancelled(Exception):
+    """The streaming client went away; the render stops at the next step."""
 
 
 class ImageGenerator:
@@ -152,11 +157,54 @@ class ImageGenerator:
             )
         return tokens
 
+    def stream(self, payload: Mapping[str, Any]) -> Iterator[dict[str, Any]]:
+        """``generate`` as server-sent events: ``progress`` per denoising step,
+        one ``image`` per picture, then ``done``. Closing the iterator (a client
+        that went away) cancels the render at the next step."""
+        events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        cancelled = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def on_progress(step: int, total: int) -> None:
+            events.put({"type": "progress", "step": step, "steps": total})
+            if cancelled.is_set():
+                raise _Cancelled()
+
+        def on_image(item: dict[str, Any], index: int, count: int) -> None:
+            events.put({"type": "image", "index": index, "count": count, **item})
+
+        def worker() -> None:
+            try:
+                outcome["result"] = self.generate(payload, progress=on_progress, on_image=on_image)
+            except BaseException as error:  # noqa: BLE001 - handed to the stream
+                outcome["error"] = error
+            finally:
+                events.put(None)
+
+        thread = threading.Thread(target=worker, name="image-render", daemon=True)
+        thread.start()
+        try:
+            while True:
+                event = events.get()
+                if event is None:
+                    break
+                yield event
+            error = outcome.get("error")
+            if isinstance(error, _Cancelled):
+                return
+            if error is not None:
+                raise error
+            result = outcome["result"]
+            yield {"type": "done", **{k: v for k, v in result.items() if k != "data"}}
+        finally:
+            cancelled.set()
+
     def generate(
         self,
         payload: Mapping[str, Any],
         *,
         progress: Callable[[int, int], None] | None = None,
+        on_image: Callable[[dict[str, Any], int, int], None] | None = None,
     ) -> dict[str, Any]:
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -199,25 +247,37 @@ class ImageGenerator:
             for index in range(count):
                 def on_progress(step: int, total: int, _index: int = index) -> bool:
                     if progress is not None:
-                        progress(_index * total + step, count * total)
+                        try:
+                            progress(_index * total + step, count * total)
+                        except _Cancelled:
+                            return True
                     return False
 
                 started = time.monotonic()
-                rgb = self.tower.generate(
-                    tokens, width, height, steps=steps, shift=float(shift),
-                    seed=seed + index, progress=on_progress,
-                )
+                try:
+                    rgb = self.tower.generate(
+                        tokens, width, height, steps=steps, shift=float(shift),
+                        seed=seed + index, progress=on_progress,
+                    )
+                except V2Error as error:
+                    # The tower reports a cancel from the callback as an error.
+                    if "cancelled" in str(error):
+                        raise _Cancelled() from None
+                    raise
                 elapsed = time.monotonic() - started
                 picture = Image.frombytes("RGB", (width, height), rgb)
                 buffer = io.BytesIO()
                 picture.save(buffer, format="PNG")
-                images.append({
+                item = {
                     "b64_json": base64.b64encode(buffer.getvalue()).decode("ascii"),
                     "revised_prompt": prompt,
                     "seed": seed + index,
                     "seconds": round(elapsed, 2),
-                })
+                }
+                images.append(item)
                 self.generated += 1
+                if on_image is not None:
+                    on_image(item, index, count)
         finally:
             self.busy = False
             self._lock.release()

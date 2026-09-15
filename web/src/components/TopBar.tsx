@@ -1,5 +1,5 @@
 import type React from "react";
-import { Activity, Braces, FlaskConical, Hash, Image as ImageIcon, Menu, Monitor, Moon, Settings2, Sun, Wrench, Command } from "lucide-react";
+import { Activity, Braces, FlaskConical, Hash, Menu, Monitor, Moon, Settings2, Sun, Wrench, Command } from "lucide-react";
 import { useStore, type Panel, type ThemePreference } from "../store";
 import { useActiveConversation } from "../store";
 import { formatBytes } from "../lib/format";
@@ -19,6 +19,7 @@ export function TopBar() {
   const setTheme = useStore((state) => state.setTheme);
   const setPaletteOpen = useStore((state) => state.setPaletteOpen);
   const conversation = useActiveConversation();
+  const mode = useStore((state) => state.mode);
 
   const execution = health?.execution ?? {};
   const backend = String(execution.backend ?? "");
@@ -43,8 +44,8 @@ export function TopBar() {
         <button className="icon-button topbar__menu" onClick={() => useStore.getState().toggleSidebar()} aria-label="Toggle conversations">
           <Menu size={18} />
         </button>
-        <h1 className="topbar__title" title={conversation?.title}>
-          {conversation?.title ?? "Flyweight Chat"}
+        <h1 className="topbar__title" title={mode === "images" ? "Image studio" : conversation?.title}>
+          {mode === "images" ? "Image studio" : (conversation?.title ?? "Flyweight Chat")}
         </h1>
       </div>
       <div className="topbar__center">
@@ -77,7 +78,6 @@ export function TopBar() {
         <button className="icon-button" onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl+K)" aria-label="Command palette">
           <Command size={17} />
         </button>
-        {execution.images ? panelButton("images", <ImageIcon size={17} />, "Image studio") : null}
         {panelButton("settings", <Settings2 size={17} />, "Generation settings", "Ctrl+,")}
         {panelButton("tools", <Wrench size={17} />, "Tools")}
         {panelButton("runtime", <Activity size={17} />, "Runtime dashboard")}

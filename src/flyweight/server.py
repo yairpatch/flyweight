@@ -1959,6 +1959,16 @@ class InferenceService:
             "not_found_error",
         )
 
+    def stream_images_generations(
+        self, payload: Mapping[str, Any]
+    ) -> Iterator[dict[str, Any] | str]:
+        """The same render as server-sent events: progress per step, then the images."""
+        raise APIError(
+            404,
+            "image generation is not enabled on this server (start with --image-model)",
+            "not_found_error",
+        )
+
     def tokenize(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         content = payload.get("content", payload.get("prompt"))
         if not isinstance(content, str):
@@ -3766,7 +3776,10 @@ def create_handler(
                     # Renders take seconds and hold the GPU; they count
                     # against the same admission slots as a completion.
                     with service._admission():
-                        self._send_json(200, service.images_generations(payload))
+                        if _boolean_option(payload, "stream", False):
+                            self._send_sse(service.stream_images_generations(payload))
+                        else:
+                            self._send_json(200, service.images_generations(payload))
                     self.log_message("request completed: %s", path)
                     return
                 if path == "/detokenize":

@@ -6,7 +6,6 @@ import { RuntimePanel } from "./panels/RuntimePanel";
 import { TokenizerPanel } from "./panels/TokenizerPanel";
 import { PlaygroundPanel } from "./panels/PlaygroundPanel";
 import { InspectorPanel } from "./panels/InspectorPanel";
-import { ImagesPanel } from "./panels/ImagesPanel";
 
 const TITLES = {
   settings: "Generation settings",
@@ -15,7 +14,6 @@ const TITLES = {
   tokenizer: "Tokenizer",
   playground: "Completions playground",
   inspector: "Request inspector",
-  images: "Image studio",
 } as const;
 
 export function SidePanel() {
@@ -37,7 +35,6 @@ export function SidePanel() {
         {panel === "tokenizer" && <TokenizerPanel />}
         {panel === "playground" && <PlaygroundPanel />}
         {panel === "inspector" && <InspectorPanel />}
-        {panel === "images" && <ImagesPanel />}
       </div>
     </aside>
   );

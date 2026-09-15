@@ -3019,6 +3019,14 @@ class NativeV2InferenceService(InferenceService):
             return super().images_generations(payload)
         return images.generate(payload)
 
+    def stream_images_generations(
+        self, payload: Mapping[str, Any]
+    ) -> Iterator[dict[str, Any] | str]:
+        images = getattr(self, "images", None)
+        if images is None:
+            return super().stream_images_generations(payload)
+        return images.stream(payload)
+
     def _vision_health(self) -> dict[str, object] | None:
         tokenizer = getattr(self.generator, "tokenizer", None)
         vision = getattr(tokenizer, "vision", None)

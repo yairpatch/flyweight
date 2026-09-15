@@ -188,6 +188,24 @@ class ImagesEndpointTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIn("--image-model", payload["error"]["message"])
 
+    def test_the_streaming_route_relays_progress_and_pictures(self) -> None:
+        def stream_images_generations(payload):
+            yield {"type": "progress", "step": 1, "steps": 2}
+            yield {"type": "image", "index": 0, "count": 1, "b64_json": "AAAA", "seed": 7, "seconds": 1.5}
+            yield {"type": "done", "created": 1, "steps": 2}
+
+        self.service.stream_images_generations = stream_images_generations
+        self.connection.request(
+            "POST", "/v1/images/generations", body=json.dumps({"prompt": "a boat", "stream": True}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/event-stream", response.getheader("Content-Type", ""))
+        frames = [line[6:] for line in response.read().decode("utf-8").splitlines() if line.startswith("data: ")]
+        kinds = [json.loads(frame).get("type") for frame in frames if frame != "[DONE]"]
+        self.assertEqual(kinds, ["progress", "image", "done"])
+
     def test_the_route_returns_what_the_service_renders(self) -> None:
         seen = {}
 
